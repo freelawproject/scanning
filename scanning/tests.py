@@ -224,9 +224,7 @@ class TestScanList(ScanningTestCase):
         ScanFactory.create_batch(30, uploaded_by=user)
         response = self.client.get(reverse("scan_list"))
         self.assertEqual(len(response.context["page_obj"]), 25)
-        response = self.client.get(
-            reverse("scan_list"), {"page": 2}
-        )
+        response = self.client.get(reverse("scan_list"), {"page": 2})
         self.assertEqual(len(response.context["page_obj"]), 5)
 
 
@@ -325,7 +323,5 @@ class TestScanModel(ScanningTestCase):
 
     def test_upload_path_format(self):
         scan = ScanFactory(volume=5)
-        self.assertTrue(
-            scan.original_pdf.name.startswith("uploads/us/5/")
-        )
+        self.assertTrue(scan.original_pdf.name.startswith("uploads/us/5/"))
         self.assertTrue(scan.original_pdf.name.endswith(".pdf"))

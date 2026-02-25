@@ -115,14 +115,11 @@ class Scan(AbstractDateTimeModel):
                 name="idx_reporter_volume",
             ),
             models.Index(fields=["status"], name="idx_status"),
-            models.Index(
-                fields=["uploaded_by"], name="idx_uploaded_by"
-            ),
+            models.Index(fields=["uploaded_by"], name="idx_uploaded_by"),
         ]
         ordering = ["-date_created"]
 
     def __str__(self):
         return (
-            f"{self.reporter} vol. {self.volume} "
-            f"({self.get_status_display()})"
+            f"{self.reporter} vol. {self.volume} ({self.get_status_display()})"
         )

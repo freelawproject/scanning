@@ -28,9 +28,7 @@ class ScanUploadForm(forms.ModelForm):
         ]
         widgets = {
             "reporter": forms.Select(attrs={"class": "input-text w-full"}),
-            "volume": forms.NumberInput(
-                attrs={"class": "input-text w-full"}
-            ),
+            "volume": forms.NumberInput(attrs={"class": "input-text w-full"}),
             "number_of_pages": forms.NumberInput(
                 attrs={"class": "input-text w-full"}
             ),

@@ -29,12 +29,8 @@ AWS_QUERYSTRING_AUTH = True
 AWS_S3_MAX_MEMORY_SIZE = 16 * 1024 * 1024
 
 if DEVELOPMENT:
-    AWS_STORAGE_BUCKET_NAME = (
-        "dev-com-freelawproject-scanning-storage"
-    )
+    AWS_STORAGE_BUCKET_NAME = "dev-com-freelawproject-scanning-storage"
     AWS_PRIVATE_STORAGE_BUCKET_NAME = (
         "dev-com-freelawproject-scanning-private-storage"
     )
-    AWS_S3_CUSTOM_DOMAIN = (
-        f"{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com"
-    )
+    AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com"
