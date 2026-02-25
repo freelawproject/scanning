@@ -1,0 +1,57 @@
+# Run using `docker compose up` from this directory
+networks:
+  scanning_net:
+    driver: bridge
+
+services:
+  # Database (PostgreSQL)
+  scanning-postgres:
+    container_name: scanning-postgres
+    image: postgres:16-alpine
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+      POSTGRES_DB: "scanning"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - scanning_net
+
+  # Tailwind CSS watcher (rebuilds on file change)
+  scanning-tailwind:
+    container_name: scanning-tailwind
+    image: node:22
+    volumes:
+      - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
+    working_dir: /opt/scanning
+    env_file:
+      - ../../.env.dev
+    command: sh -c 'npm install && npm run dev'
+    tty: true
+
+  # Django dev server
+  scanning-django:
+    container_name: scanning-django
+    build:
+      context: "${SCANNING_BASE_DIR:-../../}"
+      dockerfile: "./docker/django/Dockerfile"
+      args:
+        BUILD_ENV: dev
+    command: web-dev
+    depends_on:
+      scanning-postgres:
+        condition: service_healthy
+    ports:
+      - "8002:8000"
+    user: root
+    volumes:
+      - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
+    networks:
+      - scanning_net
+    env_file:
+      - ../../.env.dev
