@@ -1,0 +1,82 @@
+[
+  {
+    "model": "scanning.reporter",
+    "pk": 1,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "us",
+      "full_name": "U.S. Reports"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 2,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "fed-cas",
+      "full_name": "Federal Cases"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 3,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "f",
+      "full_name": "Federal Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 4,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "f2d",
+      "full_name": "Federal Reporter, 2d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 5,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "f3d",
+      "full_name": "Federal Reporter, 3d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 6,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "f-supp",
+      "full_name": "Federal Supplement"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 7,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "f-supp-2d",
+      "full_name": "Federal Supplement, 2d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 8,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "f-supp-3d",
+      "full_name": "Federal Supplement, 3d"
+    }
+  }
+]
