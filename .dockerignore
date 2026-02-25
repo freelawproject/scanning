@@ -1,0 +1,18 @@
+# Ignore everything...
+*
+
+# Except a few things...
+!scanning
+!pyproject.toml
+!uv.lock
+!docker
+!manage.py
+!package.json
+!package-lock.json
+
+# But no matter what, ignore these things.
+scanning/assets/media
+scanning/assets/static
+**/__pycache__
+*.env.dev
+*.env

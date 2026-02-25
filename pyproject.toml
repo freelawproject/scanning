@@ -1,0 +1,79 @@
+[project]
+name = "scanning"
+version = "1"
+description = "Upload portal for volunteer scanners to submit scanned legal documents."
+requires-python = ">=3.13,<3.14"
+authors = [
+  { name = "Free Law Project", email = "info@free.law" },
+]
+keywords = ["scanning", "legal", "documents", "upload"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "Intended Audience :: Developers",
+]
+license = "AGPL-3.0-only"
+dependencies = [
+  "Django>=6.0,<6.1",
+  "boto3",
+  "daphne",
+  "django-cotton",
+  "django-environ",
+  "django-storages",
+  "django-tailwind~=3.9.1",
+  "factory-boy",
+  "gunicorn",
+  "pillow",
+  "psycopg[binary,pool]",
+  "sentry-sdk[django]",
+  "time-machine",
+  "uvicorn[standard]",
+]
+
+[project.optional-dependencies]
+dev = [
+  "django-debug-toolbar",
+  "django-extensions",
+  "django-stubs",
+  "django-tailwind[reload]~=3.9.1",
+  "mypy",
+  "pre-commit",
+  "pytest",
+  "pytest-django",
+]
+
+[tool.setuptools.packages.find]
+include = ["scanning*"]
+
+[tool.ruff]
+line-length = 79
+lint.select = [
+  # pycodestyle
+  "E",
+  # Pyflakes errors
+  "F",
+  # isort
+  "I",
+  # pyupgrade
+  "UP",
+  # Pyflakes warnings
+  "W",
+]
+lint.ignore = [
+  # line-too-long
+  "E501",
+  # suppressible-exception
+  "SIM105",
+  # if-else-block-instead-of-if-exp
+  "SIM108",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scanning/settings/__init__.py" = ["F403"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "scanning.settings"
+python_files = ["tests.py", "test_*.py"]

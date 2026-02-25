@@ -1,0 +1,17 @@
+{
+  "name": "scanning-tailwind",
+  "version": "1.0.0",
+  "description": "Tailwind CSS build for FLP Scanning Portal",
+  "scripts": {
+    "start": "npm run dev",
+    "build": "npm run build:clean && npm run build:tailwind",
+    "build:clean": "rimraf scanning/assets/static-global/css/tailwind_styles.css",
+    "build:tailwind": "cross-env NODE_ENV=production tailwindcss --config ./scanning/assets/tailwind/tailwind.config.js -i ./scanning/assets/tailwind/input.css -o ./scanning/assets/static-global/css/tailwind_styles.css --minify",
+    "dev": "cross-env NODE_ENV=development tailwindcss --config ./scanning/assets/tailwind/tailwind.config.js -i ./scanning/assets/tailwind/input.css -o ./scanning/assets/static-global/css/tailwind_styles.css -w"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "rimraf": "^6.0.0",
+    "tailwindcss": "^3.4.17"
+  }
+}
