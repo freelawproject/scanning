@@ -368,8 +368,8 @@ DB_SSL_MODE=require
 # S3 (file storage + static files)
 AWS_ACCESS_KEY_ID=your-access-key
 AWS_SECRET_ACCESS_KEY=your-secret-key
-AWS_STORAGE_BUCKET_NAME=com-freelawproject-scanning-storage
-AWS_PRIVATE_STORAGE_BUCKET_NAME=com-freelawproject-scanning-private-storage
+AWS_STORAGE_BUCKET_NAME=your-bucket-name
+AWS_PRIVATE_STORAGE_BUCKET_NAME=your-private-bucket-name
 
 # Sentry (optional)
 SENTRY_DSN=https://examplePublicKey@o0.ingest.sentry.io/0
