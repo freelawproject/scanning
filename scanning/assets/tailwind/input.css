@@ -85,7 +85,7 @@
            dark:bg-red-900/30 dark:text-red-300 dark:border-red-800;
   }
 
-  /* Status badges */
+  /* Scan status badges */
   .badge {
     @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
   }
@@ -113,5 +113,26 @@
   .badge-extracted {
     @apply badge bg-purple-100 text-purple-800
            dark:bg-purple-900/50 dark:text-purple-300;
+  }
+
+  /* Opinion status badges */
+  .badge-no_status {
+    @apply badge bg-gray-100 text-gray-800
+           dark:bg-gray-700 dark:text-gray-200;
+  }
+
+  .badge-ok {
+    @apply badge bg-green-100 text-green-800
+           dark:bg-green-900/50 dark:text-green-300;
+  }
+
+  .badge-gap {
+    @apply badge bg-yellow-100 text-yellow-800
+           dark:bg-yellow-900/50 dark:text-yellow-300;
+  }
+
+  .badge-error {
+    @apply badge bg-red-100 text-red-800
+           dark:bg-red-900/50 dark:text-red-300;
   }
 }

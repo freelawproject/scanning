@@ -1,10 +1,10 @@
 {% extends "base.html" %}
 
-{% block title %}Scans - FLP Scanning Portal{% endblock %}
+{% block title %}Book Scans - FLP Scanning Portal{% endblock %}
 
 {% block content %}
 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4">
-  <h1 class="text-2xl font-bold">Scans</h1>
+  <h1 class="text-2xl font-bold">Book Scans</h1>
   <a href="{% url 'scan_upload' %}" class="btn-primary">Upload Scan</a>
 </div>
 
@@ -44,6 +44,7 @@
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Reporter</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Volume</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Pages</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Opinions</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Uploaded</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">By</th>
@@ -56,6 +57,7 @@
         <td class="px-4 py-3 text-sm">{{ scan.reporter }}</td>
         <td class="px-4 py-3 text-sm">{{ scan.volume }}</td>
         <td class="px-4 py-3 text-sm">{{ scan.number_of_pages }}</td>
+        <td class="px-4 py-3 text-sm">{{ scan.opinion_count }}</td>
         <td class="px-4 py-3 text-sm">
           <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
         </td>
@@ -79,7 +81,7 @@
       <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
     </div>
     <div class="text-sm text-gray-500 dark:text-gray-400">
-      Vol. {{ scan.volume }} &middot; {{ scan.number_of_pages }} pages &middot; {{ scan.date_created|date:"M j, Y g:i A" }}
+      Vol. {{ scan.volume }} &middot; {{ scan.number_of_pages }} pages &middot; {{ scan.opinion_count }} opinion{{ scan.opinion_count|pluralize }} &middot; {{ scan.date_created|date:"M j, Y g:i A" }}
     </div>
   </a>
   {% endfor %}
