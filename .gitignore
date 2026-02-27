@@ -39,3 +39,5 @@ scanning/settings/*private.py
 !.claude/skills/
 
 /scanning/assets/media/uploads/
+/scanning/assets/media/opinions/
+/scanning/assets/media/books/
