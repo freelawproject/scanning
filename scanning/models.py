@@ -1,5 +1,3 @@
-import uuid
-
 from django.conf import settings
 from django.db import models
 
@@ -101,8 +99,7 @@ def opinion_upload_path(instance, filename):
     :rtype: str
     """
     return (
-        f"opinions/{instance.reporter.short_name}/"
-        f"{instance.volume}/{filename}"
+        f"opinions/{instance.reporter.short_name}/{instance.volume}/{filename}"
     )
 
 

@@ -231,9 +231,7 @@ def opinion_detail(request, pk):
     review_form = None
     if request.user.is_staff and opinion.status != OpinionStatus.OK:
         if request.method == "POST":
-            review_form = OpinionScanReviewForm(
-                request.POST, instance=opinion
-            )
+            review_form = OpinionScanReviewForm(request.POST, instance=opinion)
             if review_form.is_valid():
                 updated_opinion = review_form.save(commit=False)
                 if updated_opinion.status == OpinionStatus.OK:

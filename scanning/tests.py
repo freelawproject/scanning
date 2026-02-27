@@ -3,6 +3,7 @@ import shutil
 import tempfile
 
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import models
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from PIL import Image
@@ -13,8 +14,6 @@ from scanning.factories import (
     ScanFactory,
     UserFactory,
 )
-from django.db import models
-
 from scanning.models import OpinionScan, OpinionStatus, Scan, Status
 
 MEDIA_ROOT = tempfile.mkdtemp()
@@ -123,7 +122,9 @@ class TestScanUpload(ScanningTestCase):
     def test_successful_upload(self):
         user = self.make_user()
         self.client.force_login(user)
-        reporter = ReporterFactory(short_name="a", full_name="Atlantic Reporter")
+        reporter = ReporterFactory(
+            short_name="a", full_name="Atlantic Reporter"
+        )
         response = self.client.post(
             reverse("scan_upload"),
             {
@@ -249,7 +250,6 @@ class TestScanList(ScanningTestCase):
         self.assertEqual(len(response.context["page_obj"]), 5)
 
 
-
 class TestScanDetail(ScanningTestCase):
     """Test the scan detail view."""
 
@@ -361,9 +361,7 @@ class TestOpinionScanModel(ScanningTestCase):
 
     def test_upload_path_format(self):
         opinion = OpinionScanFactory(volume=7)
-        self.assertTrue(
-            opinion.original_pdf.name.startswith("opinions/a/7/")
-        )
+        self.assertTrue(opinion.original_pdf.name.startswith("opinions/a/7/"))
 
     def test_protect_from_scan_delete(self):
         scan = ScanFactory()
@@ -390,9 +388,7 @@ class TestOpinionList(ScanningTestCase):
         scan = ScanFactory(uploaded_by=user)
         OpinionScanFactory(scan=scan, reporter=scan.reporter)
         OpinionScanFactory()  # standalone
-        response = self.client.get(
-            reverse("opinion_list"), {"scan": scan.pk}
-        )
+        response = self.client.get(reverse("opinion_list"), {"scan": scan.pk})
         self.assertEqual(len(response.context["page_obj"]), 1)
 
     def test_filter_by_reporter(self):
@@ -465,7 +461,6 @@ class TestOpinionDetail(ScanningTestCase):
             reverse("opinion_detail", kwargs={"pk": opinion.pk})
         )
         self.assertNotContains(response, "Parent Book")
-
 
 
 class TestOpinionReview(ScanningTestCase):
