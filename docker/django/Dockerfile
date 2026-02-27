@@ -27,9 +27,8 @@ FROM build-base AS python-base
 WORKDIR /opt/scanning
 
 # uv install dependencies
-# Copy lock file if it exists, generate it if not
 COPY pyproject.toml .
-COPY uv.loc[k] .
+COPY uv.lock .
 ENV \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
@@ -40,7 +39,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # npm install dependencies
 COPY package.json ./
-COPY package-lock.jso[n] ./
+COPY package-lock.json ./
 RUN npm install
 
 COPY . .
