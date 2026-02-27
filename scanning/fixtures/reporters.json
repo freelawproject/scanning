@@ -5,8 +5,8 @@
     "fields": {
       "date_created": "2026-02-25T00:00:00Z",
       "date_modified": "2026-02-25T00:00:00Z",
-      "short_name": "us",
-      "full_name": "U.S. Reports"
+      "short_name": "a",
+      "full_name": "Atlantic Reporter"
     }
   },
   {
@@ -15,13 +15,183 @@
     "fields": {
       "date_created": "2026-02-25T00:00:00Z",
       "date_modified": "2026-02-25T00:00:00Z",
-      "short_name": "fed-cas",
-      "full_name": "Federal Cases"
+      "short_name": "a2d",
+      "full_name": "Atlantic Reporter, 2d"
     }
   },
   {
     "model": "scanning.reporter",
     "pk": 3,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "a3d",
+      "full_name": "Atlantic Reporter, 3d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 4,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "ne",
+      "full_name": "North Eastern Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 5,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "ne2d",
+      "full_name": "North Eastern Reporter, 2d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 6,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "ne3d",
+      "full_name": "North Eastern Reporter, 3d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 7,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "nw",
+      "full_name": "North Western Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 8,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "nw2d",
+      "full_name": "North Western Reporter, 2d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 9,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "p",
+      "full_name": "Pacific Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 10,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "p2d",
+      "full_name": "Pacific Reporter, 2d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 11,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "p3d",
+      "full_name": "Pacific Reporter, 3d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 12,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "se",
+      "full_name": "South Eastern Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 13,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "se2d",
+      "full_name": "South Eastern Reporter, 2d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 14,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "sw",
+      "full_name": "South Western Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 15,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "sw2d",
+      "full_name": "South Western Reporter, 2d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 16,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "sw3d",
+      "full_name": "South Western Reporter, 3d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 17,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "so",
+      "full_name": "Southern Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 18,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "so2d",
+      "full_name": "Southern Reporter, 2d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 19,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "so3d",
+      "full_name": "Southern Reporter, 3d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 20,
     "fields": {
       "date_created": "2026-02-25T00:00:00Z",
       "date_modified": "2026-02-25T00:00:00Z",
@@ -31,7 +201,7 @@
   },
   {
     "model": "scanning.reporter",
-    "pk": 4,
+    "pk": 21,
     "fields": {
       "date_created": "2026-02-25T00:00:00Z",
       "date_modified": "2026-02-25T00:00:00Z",
@@ -41,7 +211,7 @@
   },
   {
     "model": "scanning.reporter",
-    "pk": 5,
+    "pk": 22,
     "fields": {
       "date_created": "2026-02-25T00:00:00Z",
       "date_modified": "2026-02-25T00:00:00Z",
@@ -51,7 +221,17 @@
   },
   {
     "model": "scanning.reporter",
-    "pk": 6,
+    "pk": 23,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "f4th",
+      "full_name": "Federal Reporter, 4th"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 24,
     "fields": {
       "date_created": "2026-02-25T00:00:00Z",
       "date_modified": "2026-02-25T00:00:00Z",
@@ -61,7 +241,7 @@
   },
   {
     "model": "scanning.reporter",
-    "pk": 7,
+    "pk": 25,
     "fields": {
       "date_created": "2026-02-25T00:00:00Z",
       "date_modified": "2026-02-25T00:00:00Z",
@@ -71,12 +251,82 @@
   },
   {
     "model": "scanning.reporter",
-    "pk": 8,
+    "pk": 26,
     "fields": {
       "date_created": "2026-02-25T00:00:00Z",
       "date_modified": "2026-02-25T00:00:00Z",
       "short_name": "f-supp-3d",
       "full_name": "Federal Supplement, 3d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 27,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "frd",
+      "full_name": "Federal Rules Decisions"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 28,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "f-appx",
+      "full_name": "Federal Appendix"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 29,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "s-ct",
+      "full_name": "Supreme Court Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 30,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "br",
+      "full_name": "Bankruptcy Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 31,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "fed-cl",
+      "full_name": "Federal Claims Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 32,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "vet-app",
+      "full_name": "Veterans Appeals Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 33,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "mj",
+      "full_name": "Military Justice Reporter"
     }
   }
 ]
