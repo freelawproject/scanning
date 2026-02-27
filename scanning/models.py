@@ -53,6 +53,8 @@ class Reporter(AbstractDateTimeModel):
 def book_upload_path(instance, filename):
     """Generate upload path for book scan PDFs.
 
+    Example: ``books/f3d/42_f3d_1-200.pdf``
+
     :param instance: The Scan model instance.
     :type instance: Scan
     :param filename: The original filename.
@@ -70,6 +72,8 @@ def book_upload_path(instance, filename):
 def book_cover_path(instance, filename):
     """Generate upload path for book cover images.
 
+    Example: ``books/f3d/42_f3d_cover.jpg``
+
     :param instance: The Scan model instance.
     :type instance: Scan
     :param filename: The original filename.
@@ -86,6 +90,8 @@ def book_cover_path(instance, filename):
 
 def opinion_upload_path(instance, filename):
     """Generate upload path for opinion PDFs.
+
+    Example: ``opinions/f3d/42/doe_v_smith.pdf``
 
     :param instance: The OpinionScan model instance.
     :type instance: OpinionScan
