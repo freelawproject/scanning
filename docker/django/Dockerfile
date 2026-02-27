@@ -39,7 +39,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # npm install dependencies
 COPY package.json ./
-COPY package-lock.json ./
+COPY package-lock.jso[n] ./
 RUN npm install
 
 COPY . .
