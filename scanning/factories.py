@@ -1,7 +1,7 @@
 import factory
 from django.contrib.auth.models import User
 
-from scanning.models import Reporter, Scan, Status
+from scanning.models import OpinionScan, OpinionStatus, Reporter, Scan, Status
 
 
 class UserFactory(factory.django.DjangoModelFactory):
@@ -43,16 +43,16 @@ class ReporterFactory(factory.django.DjangoModelFactory):
 
     Default declarations:
 
-    - ``short_name``: ``us``.
-    - ``full_name``: ``U.S. Reports``.
+    - ``short_name``: ``a``.
+    - ``full_name``: ``Atlantic Reporter``.
     """
 
     class Meta:
         model = Reporter
         django_get_or_create = ("short_name",)
 
-    short_name = "us"
-    full_name = "U.S. Reports"
+    short_name = "a"
+    full_name = "Atlantic Reporter"
 
 
 class ScanFactory(factory.django.DjangoModelFactory):
@@ -83,3 +83,29 @@ class ScanFactory(factory.django.DjangoModelFactory):
     )
     uploaded_by = factory.SubFactory(UserFactory)
     status = Status.UPLOADED
+
+
+class OpinionScanFactory(factory.django.DjangoModelFactory):
+    """Factory for creating OpinionScan instances.
+
+    Default declarations:
+
+    - ``scan``: None (standalone opinion).
+    - ``reporter``: auto-created via ``ReporterFactory``.
+    - ``volume``: sequential starting at 1.
+    - ``original_pdf``: dummy PDF file.
+    - ``uploaded_by``: auto-created via ``UserFactory``.
+    - ``status``: ``OpinionStatus.NO_STATUS``.
+    """
+
+    class Meta:
+        model = OpinionScan
+
+    scan = None
+    reporter = factory.SubFactory(ReporterFactory)
+    volume = factory.Sequence(lambda n: n + 1)
+    original_pdf = factory.django.FileField(
+        filename="opinion.pdf", data=b"%PDF-1.4 opinion"
+    )
+    uploaded_by = factory.SubFactory(UserFactory)
+    status = OpinionStatus.NO_STATUS
