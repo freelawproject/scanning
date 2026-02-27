@@ -49,6 +49,14 @@
           <dd class="whitespace-pre-wrap">{{ scan.notes }}</dd>
         </div>
         {% endif %}
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Opinions</dt>
+          <dd>
+            <a href="{% url 'opinion_list' %}?scan={{ scan.pk }}">
+              {{ opinion_count }} opinion{{ opinion_count|pluralize }}
+            </a>
+          </dd>
+        </div>
       </dl>
       {% if user.is_staff %}
       <a href="{% url 'admin:scanning_scan_change' scan.pk %}" class="btn-outline w-full mt-4 text-center">
@@ -100,31 +108,16 @@
 
 {% block full_width_content %}
 <div class="w-full px-4 pb-6">
-  <div class="flex flex-col {% if scan.redacted_pdf %}lg:flex-row{% endif %} gap-4">
-    <div class="{% if scan.redacted_pdf %}lg:w-1/2{% else %}max-w-content mx-auto w-full{% endif %}">
-      <div class="card">
-        <h2 class="text-lg font-bold mb-4">Original PDF</h2>
-        <iframe
-          src="{{ scan.original_pdf.url }}"
-          class="w-full border border-gray-200 dark:border-gray-700 rounded"
-          style="height: 75vh;"
-          title="Original PDF"
-        ></iframe>
-      </div>
+  <div class="max-w-content mx-auto w-full">
+    <div class="card">
+      <h2 class="text-lg font-bold mb-4">Original PDF</h2>
+      <iframe
+        src="{{ scan.original_pdf.url }}"
+        class="w-full border border-gray-200 dark:border-gray-700 rounded"
+        style="height: 75vh;"
+        title="Original PDF"
+      ></iframe>
     </div>
-    {% if scan.redacted_pdf %}
-    <div class="lg:w-1/2">
-      <div class="card">
-        <h2 class="text-lg font-bold mb-4">Redacted PDF</h2>
-        <iframe
-          src="{{ scan.redacted_pdf.url }}"
-          class="w-full border border-gray-200 dark:border-gray-700 rounded"
-          style="height: 75vh;"
-          title="Redacted PDF"
-        ></iframe>
-      </div>
-    </div>
-    {% endif %}
   </div>
 </div>
 {% endblock %}

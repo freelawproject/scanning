@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+
+{% block title %}Upload Opinion Scan - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl mx-auto">
+  <h1 class="text-2xl font-bold mb-6">Upload Opinion Scan</h1>
+
+  <div class="card">
+    <form method="post" enctype="multipart/form-data">
+      {% csrf_token %}
+
+      <div class="space-y-4">
+        <div>
+          <label for="id_reporter" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Reporter
+          </label>
+          {{ form.reporter }}
+          {% if form.reporter.errors %}
+          <p class="mt-1 text-sm text-red-600">{{ form.reporter.errors.0 }}</p>
+          {% endif %}
+        </div>
+
+        <div>
+          <label for="id_volume" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Volume
+          </label>
+          {{ form.volume }}
+          {% if form.volume.errors %}
+          <p class="mt-1 text-sm text-red-600">{{ form.volume.errors.0 }}</p>
+          {% endif %}
+        </div>
+
+        <div>
+          <label for="id_original_pdf" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Original PDF
+          </label>
+          {{ form.original_pdf }}
+          {% if form.original_pdf.errors %}
+          <p class="mt-1 text-sm text-red-600">{{ form.original_pdf.errors.0 }}</p>
+          {% endif %}
+        </div>
+
+        <div>
+          <label for="id_masked_pdf" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Masked PDF (optional)
+          </label>
+          {{ form.masked_pdf }}
+          {% if form.masked_pdf.errors %}
+          <p class="mt-1 text-sm text-red-600">{{ form.masked_pdf.errors.0 }}</p>
+          {% endif %}
+        </div>
+
+        <div>
+          <label for="id_redacted_pdf" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Redacted PDF (optional)
+          </label>
+          {{ form.redacted_pdf }}
+          {% if form.redacted_pdf.errors %}
+          <p class="mt-1 text-sm text-red-600">{{ form.redacted_pdf.errors.0 }}</p>
+          {% endif %}
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label for="id_page_start" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Page Start (optional)
+            </label>
+            {{ form.page_start }}
+            {% if form.page_start.errors %}
+            <p class="mt-1 text-sm text-red-600">{{ form.page_start.errors.0 }}</p>
+            {% endif %}
+          </div>
+
+          <div>
+            <label for="id_page_end" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Page End (optional)
+            </label>
+            {{ form.page_end }}
+            {% if form.page_end.errors %}
+            <p class="mt-1 text-sm text-red-600">{{ form.page_end.errors.0 }}</p>
+            {% endif %}
+          </div>
+        </div>
+
+        <div>
+          <label for="id_status" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Status
+          </label>
+          {{ form.status }}
+          {% if form.status.errors %}
+          <p class="mt-1 text-sm text-red-600">{{ form.status.errors.0 }}</p>
+          {% endif %}
+        </div>
+
+        <div>
+          <label for="id_notes" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Notes (optional)
+          </label>
+          {{ form.notes }}
+          {% if form.notes.errors %}
+          <p class="mt-1 text-sm text-red-600">{{ form.notes.errors.0 }}</p>
+          {% endif %}
+        </div>
+
+        <div class="flex justify-end gap-3 pt-2">
+          <a href="{% url 'opinion_list' %}" class="btn-outline">Cancel</a>
+          <button type="submit" class="btn-primary">Upload Opinion Scan</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

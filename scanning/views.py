@@ -1,12 +1,25 @@
 from django.contrib import messages
 from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required
+from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
+from django.db.models import Count
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 
-from scanning.forms import ScanReviewForm, ScanUploadForm
-from scanning.models import Reporter, Scan, Status
+from scanning.forms import (
+    OpinionScanReviewForm,
+    OpinionScanUploadForm,
+    ScanReviewForm,
+    ScanUploadForm,
+)
+from scanning.models import (
+    OpinionScan,
+    OpinionStatus,
+    Reporter,
+    Scan,
+    Status,
+)
 
 
 def login_view(request):
@@ -37,14 +50,18 @@ def logout_view(request):
 
 @login_required
 def scan_list(request):
-    """List scans. Regular users see their own, staff see all.
+    """List scans with opinion count annotation.
 
     :param request: The current HTTP request.
     :type request: django.http.HttpRequest
     :returns: The rendered scan list page.
     :rtype: django.http.HttpResponse
     """
-    scans = Scan.objects.select_related("reporter").all()
+    scans = (
+        Scan.objects.select_related("reporter")
+        .annotate(opinion_count=Count("opinions"))
+        .order_by("-date_created")
+    )
 
     # Filtering
     status_filter = request.GET.get("status")
@@ -65,9 +82,10 @@ def scan_list(request):
         {
             "page_obj": page_obj,
             "status_choices": Status.choices,
-            "reporter_choices": Reporter.objects.values_list(
-                "pk", "full_name"
-            ),
+            "reporter_choices": [
+                (r.pk, f"{r.full_name} ({r.short_name})")
+                for r in Reporter.objects.all()
+            ],
             "current_status": status_filter or "",
             "current_reporter": reporter_filter or "",
         },
@@ -114,6 +132,7 @@ def scan_detail(request, pk):
     :rtype: django.http.HttpResponse
     """
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
+    opinion_count = scan.opinions.count()
 
     review_form = None
     if request.user.is_staff and scan.status != Status.APPROVED:
@@ -141,5 +160,127 @@ def scan_detail(request, pk):
         {
             "scan": scan,
             "review_form": review_form,
+            "opinion_count": opinion_count,
         },
+    )
+
+
+@login_required
+def opinion_list(request):
+    """List opinion scans with filters for scan, reporter, and status.
+
+    :param request: The current HTTP request.
+    :type request: django.http.HttpRequest
+    :returns: The rendered opinion list page.
+    :rtype: django.http.HttpResponse
+    """
+    opinions = OpinionScan.objects.select_related(
+        "reporter", "scan", "uploaded_by"
+    ).all()
+
+    # Filtering
+    scan_filter = request.GET.get("scan")
+    if scan_filter:
+        opinions = opinions.filter(scan_id=scan_filter)
+
+    reporter_filter = request.GET.get("reporter")
+    if reporter_filter:
+        opinions = opinions.filter(reporter_id=reporter_filter)
+
+    status_filter = request.GET.get("status")
+    if status_filter:
+        opinions = opinions.filter(status=status_filter)
+
+    paginator = Paginator(opinions, 25)
+    page_number = request.GET.get("page")
+    page_obj = paginator.get_page(page_number)
+
+    return render(
+        request,
+        "scanning/opinion_list.html",
+        {
+            "page_obj": page_obj,
+            "status_choices": OpinionStatus.choices,
+            "reporter_choices": [
+                (r.pk, f"{r.full_name} ({r.short_name})")
+                for r in Reporter.objects.all()
+            ],
+            "current_scan": scan_filter or "",
+            "current_reporter": reporter_filter or "",
+            "current_status": status_filter or "",
+        },
+    )
+
+
+@login_required
+def opinion_detail(request, pk):
+    """Display opinion scan detail with side-by-side PDF iframes.
+
+    :param request: The current HTTP request.
+    :type request: django.http.HttpRequest
+    :param pk: The primary key of the opinion scan.
+    :type pk: int
+    :returns: The rendered opinion detail page.
+    :rtype: django.http.HttpResponse
+    """
+    opinion = get_object_or_404(
+        OpinionScan.objects.select_related("reporter", "scan", "uploaded_by"),
+        pk=pk,
+    )
+
+    review_form = None
+    if request.user.is_staff and opinion.status != OpinionStatus.OK:
+        if request.method == "POST":
+            review_form = OpinionScanReviewForm(
+                request.POST, instance=opinion
+            )
+            if review_form.is_valid():
+                updated_opinion = review_form.save(commit=False)
+                if updated_opinion.status == OpinionStatus.OK:
+                    messages.success(request, "Opinion scan approved.")
+                else:
+                    messages.info(
+                        request,
+                        "Opinion scan rejected, status reset to No status.",
+                    )
+                updated_opinion.save()
+                return redirect("opinion_detail", pk=opinion.pk)
+        else:
+            review_form = OpinionScanReviewForm(instance=opinion)
+
+    return render(
+        request,
+        "scanning/opinion_detail.html",
+        {"opinion": opinion, "review_form": review_form},
+    )
+
+
+@login_required
+def opinion_upload(request):
+    """Handle standalone opinion upload form (superuser only).
+
+    :param request: The current HTTP request.
+    :type request: django.http.HttpRequest
+    :returns: The rendered upload form or a redirect on success.
+    :rtype: django.http.HttpResponse
+    :raises PermissionDenied: If the user is not a superuser.
+    """
+    if not request.user.is_superuser:
+        raise PermissionDenied
+
+    if request.method == "POST":
+        form = OpinionScanUploadForm(request.POST, request.FILES)
+        if form.is_valid():
+            opinion = form.save(commit=False)
+            opinion.uploaded_by = request.user
+            opinion.save()
+            messages.success(request, "Opinion uploaded successfully.")
+            return redirect("opinion_detail", pk=opinion.pk)
+    else:
+        form = OpinionScanUploadForm()
+
+    return render(
+        request,
+        "scanning/opinion_upload.html",
+        {"form": form},
     )
