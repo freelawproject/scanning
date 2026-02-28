@@ -27,12 +27,10 @@
           <dd><a href="{% url 'scan_detail' pk=opinion.scan.pk %}">{{ opinion.scan }}</a></dd>
         </div>
         {% endif %}
-        {% if opinion.page_start %}
         <div>
           <dt class="font-medium text-gray-500 dark:text-gray-400">Pages</dt>
-          <dd>{{ opinion.page_start }}{% if opinion.page_end %} - {{ opinion.page_end }}{% endif %}</dd>
+          <dd>{{ opinion.page_start }} - {{ opinion.page_end }}</dd>
         </div>
-        {% endif %}
         <div>
           <dt class="font-medium text-gray-500 dark:text-gray-400">Status</dt>
           <dd><span class="badge-{{ opinion.status }}">{{ opinion.get_status_display }}</span></dd>
@@ -51,6 +49,16 @@
         <div>
           <dt class="font-medium text-gray-500 dark:text-gray-400">Notes</dt>
           <dd class="whitespace-pre-wrap">{{ opinion.notes }}</dd>
+        </div>
+        {% endif %}
+        {% if opinion.process_output %}
+        <div>
+          <details>
+            <summary class="font-medium text-gray-500 dark:text-gray-400 cursor-pointer">
+              Processing Output
+            </summary>
+            <dd class="whitespace-pre-wrap text-xs mt-1 font-mono max-h-96 overflow-y-auto">{{ opinion.process_output }}</dd>
+          </details>
         </div>
         {% endif %}
       </dl>

@@ -49,6 +49,16 @@
           <dd class="whitespace-pre-wrap">{{ scan.notes }}</dd>
         </div>
         {% endif %}
+        {% if scan.process_output %}
+        <div>
+          <details>
+            <summary class="font-medium text-gray-500 dark:text-gray-400 cursor-pointer">
+              Processing Output
+            </summary>
+            <dd class="whitespace-pre-wrap text-xs mt-1 font-mono max-h-96 overflow-y-auto">{{ scan.process_output }}</dd>
+          </details>
+        </div>
+        {% endif %}
         <div>
           <dt class="font-medium text-gray-500 dark:text-gray-400">Opinions</dt>
           <dd>
