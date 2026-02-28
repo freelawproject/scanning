@@ -96,6 +96,8 @@ class OpinionScanFactory(factory.django.DjangoModelFactory):
     - ``original_pdf``: dummy PDF file.
     - ``uploaded_by``: auto-created via ``UserFactory``.
     - ``status``: ``OpinionStatus.NO_STATUS``.
+    - ``page_start``: 1.
+    - ``page_end``: 10.
     """
 
     class Meta:
@@ -109,3 +111,5 @@ class OpinionScanFactory(factory.django.DjangoModelFactory):
     )
     uploaded_by = factory.SubFactory(UserFactory)
     status = OpinionStatus.NO_STATUS
+    page_start = 1
+    page_end = 10

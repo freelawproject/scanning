@@ -556,6 +556,8 @@ class TestOpinionUpload(ScanningTestCase):
                 "volume": 5,
                 "original_pdf": self.make_pdf("opinion.pdf"),
                 "status": OpinionStatus.NO_STATUS,
+                "page_start": 1,
+                "page_end": 10,
             },
         )
         self.assertEqual(response.status_code, 302)
