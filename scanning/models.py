@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.db import models
+from django.utils.deconstruct import deconstructible
 
 
 class Status(models.TextChoices):
@@ -51,7 +52,7 @@ class Reporter(AbstractDateTimeModel):
 def book_upload_path(instance, filename):
     """Generate upload path for book scan PDFs.
 
-    Example: ``books/f3d/42_f3d_1-200.pdf``
+    Example: ``books/f3d/original/42_f3d_1-200.pdf``
 
     :param instance: The Scan model instance.
     :type instance: Scan
@@ -61,7 +62,26 @@ def book_upload_path(instance, filename):
     :rtype: str
     """
     return (
-        f"books/{instance.reporter.short_name}/"
+        f"books/{instance.reporter.short_name}/original/"
+        f"{instance.volume}_{instance.reporter.short_name}"
+        f"_{instance.start_page}-{instance.end_page}.pdf"
+    )
+
+
+def compressed_upload_path(instance, filename):
+    """Generate upload path for compressed book scan PDFs.
+
+    Example: ``books/f3d/compressed/42_f3d_1-200.pdf``
+
+    :param instance: The Scan model instance.
+    :type instance: Scan
+    :param filename: The original filename.
+    :type filename: str
+    :returns: The upload path.
+    :rtype: str
+    """
+    return (
+        f"books/{instance.reporter.short_name}/compressed/"
         f"{instance.volume}_{instance.reporter.short_name}"
         f"_{instance.start_page}-{instance.end_page}.pdf"
     )
@@ -86,21 +106,40 @@ def book_cover_path(instance, filename):
     )
 
 
-def opinion_upload_path(instance, filename):
-    """Generate upload path for opinion PDFs.
+@deconstructible
+class opinion_pdf_path:
+    """Upload-path callable that places opinion PDFs under a typed subfolder.
 
-    Example: ``opinions/f3d/42/doe_v_smith.pdf``
+    The generated filename uses the format
+    ``<reporter_slug>.<volume>.<page_start>-<page_end>.<ext>``
+    with page numbers zero-padded to four digits.
 
-    :param instance: The OpinionScan model instance.
-    :type instance: OpinionScan
-    :param filename: The original filename.
-    :type filename: str
-    :returns: The upload path, preserving the original filename.
-    :rtype: str
+    Example: ``opinions/f3d/42/unredacted/f3d.42.0001-0025.pdf``
+
+    :param subfolder: Subdirectory name (e.g. "unredacted", "masked", "redacted").
+    :type subfolder: str
     """
-    return (
-        f"opinions/{instance.reporter.short_name}/{instance.volume}/{filename}"
-    )
+
+    def __init__(self, subfolder):
+        self.subfolder = subfolder
+
+    def __call__(self, instance, filename):
+        """Generate the upload path for the given instance and filename.
+
+        :param instance: The OpinionScan model instance.
+        :type instance: OpinionScan
+        :param filename: The original filename.
+        :type filename: str
+        :returns: The upload path.
+        :rtype: str
+        """
+        ext = filename.rsplit(".", 1)[-1] if "." in filename else "pdf"
+        return (
+            f"opinions/{instance.reporter.short_name}"
+            f"/{instance.volume}/{self.subfolder}"
+            f"/{instance.reporter.short_name}.{instance.volume}"
+            f".{instance.page_start:04d}-{instance.page_end:04d}.{ext}"
+        )
 
 
 class Scan(AbstractDateTimeModel):
@@ -123,6 +162,15 @@ class Scan(AbstractDateTimeModel):
     redacted_pdf = models.FileField(
         null=True,
         blank=True,
+    )
+    compressed_pdf = models.FileField(
+        upload_to=compressed_upload_path,
+        null=True,
+        blank=True,
+    )
+    process_output = models.TextField(
+        blank=True,
+        help_text="Verbose output from blackletter pipeline processing.",
     )
     status = models.CharField(
         max_length=20,
@@ -171,14 +219,14 @@ class OpinionScan(AbstractDateTimeModel):
         related_name="opinion_scans",
     )
     volume = models.PositiveIntegerField()
-    original_pdf = models.FileField(upload_to=opinion_upload_path)
+    original_pdf = models.FileField(upload_to=opinion_pdf_path("unredacted"))
     masked_pdf = models.FileField(
-        upload_to=opinion_upload_path,
+        upload_to=opinion_pdf_path("masked"),
         null=True,
         blank=True,
     )
     redacted_pdf = models.FileField(
-        upload_to=opinion_upload_path,
+        upload_to=opinion_pdf_path("redacted"),
         null=True,
         blank=True,
     )
@@ -187,8 +235,8 @@ class OpinionScan(AbstractDateTimeModel):
         choices=OpinionStatus.choices,
         default=OpinionStatus.NO_STATUS,
     )
-    page_start = models.PositiveIntegerField(null=True, blank=True)
-    page_end = models.PositiveIntegerField(null=True, blank=True)
+    page_start = models.PositiveIntegerField()
+    page_end = models.PositiveIntegerField()
     uploaded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -196,6 +244,10 @@ class OpinionScan(AbstractDateTimeModel):
         related_name="opinion_scans",
     )
     notes = models.TextField(blank=True)
+    process_output = models.TextField(
+        blank=True,
+        help_text="Verbose output from blackletter pipeline processing.",
+    )
 
     class Meta:
         indexes = [
