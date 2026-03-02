@@ -58,7 +58,10 @@ class ScanUploadForm(forms.ModelForm):
                 attrs={"class": "input-text w-full"}
             ),
             "book_cover": forms.ClearableFileInput(
-                attrs={"class": "input-text w-full", "accept": "image/*"}
+                attrs={
+                    "class": "input-text w-full",
+                    "accept": ".pdf,.jpg,.jpeg,.gif,.png",
+                }
             ),
             "notes": forms.Textarea(
                 attrs={

@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.core.validators import FileExtensionValidator
 from django.db import models
 from django.utils.deconstruct import deconstructible
 
@@ -163,9 +164,14 @@ class Scan(AbstractDateTimeModel):
         max_length=20,
         choices=Source.choices,
     )
-    book_cover = models.ImageField(
+    book_cover = models.FileField(
         upload_to=book_cover_path,
         blank=True,
+        validators=[
+            FileExtensionValidator(
+                allowed_extensions=["pdf", "jpg", "jpeg", "gif", "png"]
+            )
+        ],
     )
     original_pdf = models.FileField(
         upload_to=book_upload_path,
