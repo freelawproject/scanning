@@ -9,6 +9,7 @@ class PrivateS3Storage(S3Boto3Storage):
     """S3 storage for private file uploads (scanned documents)."""
 
     default_acl = "private"
+    file_overwrite = False
     querystring_auth = True
     querystring_expire = 300  # 5-minute signed URLs
 
