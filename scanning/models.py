@@ -18,9 +18,15 @@ class Source(models.TextChoices):
 
 
 class OpinionStatus(models.TextChoices):
+    """Review status for an individual opinion scan.
+
+    ``GAP`` indicates missing pages within an opinion's page range,
+    e.g. pages were skipped or lost during scanning.
+    """
+
     NO_STATUS = "no_status", "No status"
-    OK = "ok", "OK"
-    GAP = "gap", "Gap"
+    OK = "ok", "OK (opinion is correct)"
+    GAP = "gap", "Gap (missing pages in opinion)"
     ERROR = "error", "Error"
 
 
