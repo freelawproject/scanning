@@ -1,7 +1,7 @@
 import factory
 from django.contrib.auth.models import User
 
-from scanning.models import OpinionScan, OpinionStatus, Reporter, Scan, Status
+from scanning.models import OpinionScan, OpinionStatus, Reporter, Scan, Source, Status
 
 
 class UserFactory(factory.django.DjangoModelFactory):
@@ -65,6 +65,7 @@ class ScanFactory(factory.django.DjangoModelFactory):
     - ``number_of_pages``: 100.
     - ``start_page``: 1.
     - ``end_page``: 100.
+    - ``source``: ``Source.FULL``.
     - ``original_pdf``: dummy PDF file.
     - ``uploaded_by``: auto-created via ``UserFactory``.
     - ``status``: ``Status.UPLOADED``.
@@ -78,6 +79,7 @@ class ScanFactory(factory.django.DjangoModelFactory):
     number_of_pages = 100
     start_page = 1
     end_page = 100
+    source = Source.FULL
     original_pdf = factory.django.FileField(
         filename="test.pdf", data=b"%PDF-1.4 test"
     )

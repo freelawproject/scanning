@@ -14,7 +14,7 @@ from scanning.factories import (
     ScanFactory,
     UserFactory,
 )
-from scanning.models import OpinionScan, OpinionStatus, Scan, Status
+from scanning.models import OpinionScan, OpinionStatus, Scan, Source, Status
 
 MEDIA_ROOT = tempfile.mkdtemp()
 
@@ -129,6 +129,7 @@ class TestScanUpload(ScanningTestCase):
             reverse("scan_upload"),
             {
                 "reporter": reporter.pk,
+                "source": Source.FULL,
                 "volume": 1,
                 "number_of_pages": 50,
                 "start_page": 1,
@@ -149,6 +150,7 @@ class TestScanUpload(ScanningTestCase):
             reverse("scan_upload"),
             {
                 "reporter": reporter.pk,
+                "source": Source.FULL,
                 "volume": 1,
                 "number_of_pages": 50,
                 "start_page": 1,
@@ -168,6 +170,7 @@ class TestScanUpload(ScanningTestCase):
             reverse("scan_upload"),
             {
                 "reporter": reporter.pk,
+                "source": Source.FULL,
                 "volume": 42,
                 "number_of_pages": 200,
                 "start_page": 1,
@@ -191,6 +194,7 @@ class TestScanUpload(ScanningTestCase):
             reverse("scan_upload"),
             {
                 "reporter": reporter.pk,
+                "source": Source.FULL,
                 "volume": 1,
                 "number_of_pages": 50,
                 "start_page": 1,
@@ -353,7 +357,13 @@ class TestScanModel(ScanningTestCase):
 
     def test_book_upload_path_contains_pages(self):
         scan = ScanFactory(volume=3, start_page=10, end_page=200)
-        self.assertIn("3_a_10-200.pdf", scan.original_pdf.name)
+        self.assertIn("3_a_10-200_full.pdf", scan.original_pdf.name)
+
+    def test_book_upload_path_opinions_source(self):
+        scan = ScanFactory(
+            volume=3, start_page=10, end_page=200, source=Source.OPINIONS
+        )
+        self.assertIn("3_a_10-200_opinions.pdf", scan.original_pdf.name)
 
 
 class TestOpinionScanModel(ScanningTestCase):
