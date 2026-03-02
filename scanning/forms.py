@@ -1,7 +1,13 @@
 from django import forms
 from django.core.validators import FileExtensionValidator
 
-from scanning.models import OpinionScan, OpinionStatus, Reporter, Scan, Source, Status
+from scanning.models import (
+    OpinionScan,
+    OpinionStatus,
+    Reporter,
+    Scan,
+    Status,
+)
 
 
 class ReporterChoiceField(forms.ModelChoiceField):

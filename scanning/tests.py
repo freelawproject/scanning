@@ -635,4 +635,3 @@ class TestOpinionScanValidation(ScanningTestCase):
     def test_page_start_less_than_page_end_ok(self):
         opinion = OpinionScanFactory(page_start=1, page_end=10)
         opinion.full_clean()  # should not raise
-

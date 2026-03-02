@@ -290,9 +290,15 @@ class OpinionScan(AbstractDateTimeModel):
         :raises ValidationError: If page_start > page_end.
         """
         super().clean()
-        if self.page_start and self.page_end and self.page_start > self.page_end:
+        if (
+            self.page_start
+            and self.page_end
+            and self.page_start > self.page_end
+        ):
             raise ValidationError(
-                {"page_end": "End page must be greater than or equal to start page."}
+                {
+                    "page_end": "End page must be greater than or equal to start page."
+                }
             )
 
     def __str__(self):

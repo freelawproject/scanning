@@ -1,7 +1,14 @@
 import factory
 from django.contrib.auth.models import User
 
-from scanning.models import OpinionScan, OpinionStatus, Reporter, Scan, Source, Status
+from scanning.models import (
+    OpinionScan,
+    OpinionStatus,
+    Reporter,
+    Scan,
+    Source,
+    Status,
+)
 
 
 class UserFactory(factory.django.DjangoModelFactory):
