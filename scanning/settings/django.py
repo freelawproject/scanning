@@ -6,7 +6,7 @@ from .project.testing import TESTING
 
 env = environ.FileAwareEnv()
 
-DEVELOPMENT = env.bool("DEVELOPMENT", default=True)
+DEVELOPMENT = env.bool("DEVELOPMENT", default=False)
 
 # SECURITY: no default in production. Django will refuse to start if
 # the SECRET_KEY env var is missing, preventing accidental use of a
@@ -53,7 +53,7 @@ SESSION_ENGINE = "django.contrib.sessions.backends.db"
 #####################################
 INSTALL_ROOT = Path(__file__).resolve().parents[2]
 STATICFILES_DIRS = (INSTALL_ROOT / "scanning/assets/static-global/",)
-DEBUG = env.bool("DEBUG", default=True)
+DEBUG = env.bool("DEBUG", default=False)
 MEDIA_ROOT = env(
     "MEDIA_ROOT", default=str(INSTALL_ROOT / "scanning/assets/media/")
 )
