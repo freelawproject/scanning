@@ -26,6 +26,10 @@
           <dd>{{ scan.start_page }} - {{ scan.end_page }}</dd>
         </div>
         <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Source</dt>
+          <dd>{{ scan.get_source_display }}</dd>
+        </div>
+        <div>
           <dt class="font-medium text-gray-500 dark:text-gray-400">Status</dt>
           <dd><span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span></dd>
         </div>

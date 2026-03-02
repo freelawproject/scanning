@@ -15,12 +15,13 @@ class ScanAdmin(admin.ModelAdmin):
     list_display = [
         "reporter",
         "volume",
+        "source",
         "number_of_pages",
         "status",
         "uploaded_by",
         "date_created",
     ]
-    list_filter = ["status", "reporter"]
+    list_filter = ["status", "reporter", "source"]
     search_fields = [
         "volume",
         "reporter__full_name",

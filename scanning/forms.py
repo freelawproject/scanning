@@ -1,7 +1,7 @@
 from django import forms
 from django.core.validators import FileExtensionValidator
 
-from scanning.models import OpinionScan, OpinionStatus, Reporter, Scan, Status
+from scanning.models import OpinionScan, OpinionStatus, Reporter, Scan, Source, Status
 
 
 class ReporterChoiceField(forms.ModelChoiceField):
@@ -36,6 +36,7 @@ class ScanUploadForm(forms.ModelForm):
         model = Scan
         fields = [
             "reporter",
+            "source",
             "volume",
             "number_of_pages",
             "start_page",
@@ -45,6 +46,7 @@ class ScanUploadForm(forms.ModelForm):
             "notes",
         ]
         widgets = {
+            "source": forms.Select(attrs={"class": "input-text w-full"}),
             "volume": forms.NumberInput(attrs={"class": "input-text w-full"}),
             "number_of_pages": forms.NumberInput(
                 attrs={"class": "input-text w-full"}

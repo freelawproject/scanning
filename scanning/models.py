@@ -11,6 +11,11 @@ class Status(models.TextChoices):
     EXTRACTED = "extracted", "Extracted"
 
 
+class Source(models.TextChoices):
+    FULL = "full", "Full (Archival version)"
+    OPINIONS = "opinions", "Opinions only version"
+
+
 class OpinionStatus(models.TextChoices):
     NO_STATUS = "no_status", "No status"
     OK = "ok", "OK"
@@ -52,7 +57,7 @@ class Reporter(AbstractDateTimeModel):
 def book_upload_path(instance, filename):
     """Generate upload path for book scan PDFs.
 
-    Example: ``books/f3d/original/42_f3d_1-200.pdf``
+    Example: ``books/f3d/original/42_f3d_1-200_full.pdf``
 
     :param instance: The Scan model instance.
     :type instance: Scan
@@ -64,14 +69,15 @@ def book_upload_path(instance, filename):
     return (
         f"books/{instance.reporter.short_name}/original/"
         f"{instance.volume}_{instance.reporter.short_name}"
-        f"_{instance.start_page}-{instance.end_page}.pdf"
+        f"_{instance.start_page}-{instance.end_page}"
+        f"_{instance.source}.pdf"
     )
 
 
 def compressed_upload_path(instance, filename):
     """Generate upload path for compressed book scan PDFs.
 
-    Example: ``books/f3d/compressed/42_f3d_1-200.pdf``
+    Example: ``books/f3d/compressed/42_f3d_1-200_full.pdf``
 
     :param instance: The Scan model instance.
     :type instance: Scan
@@ -83,7 +89,8 @@ def compressed_upload_path(instance, filename):
     return (
         f"books/{instance.reporter.short_name}/compressed/"
         f"{instance.volume}_{instance.reporter.short_name}"
-        f"_{instance.start_page}-{instance.end_page}.pdf"
+        f"_{instance.start_page}-{instance.end_page}"
+        f"_{instance.source}.pdf"
     )
 
 
@@ -152,6 +159,10 @@ class Scan(AbstractDateTimeModel):
     number_of_pages = models.PositiveIntegerField()
     start_page = models.PositiveIntegerField()
     end_page = models.PositiveIntegerField()
+    source = models.CharField(
+        max_length=20,
+        choices=Source.choices,
+    )
     book_cover = models.ImageField(
         upload_to=book_cover_path,
         blank=True,

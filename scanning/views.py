@@ -18,6 +18,7 @@ from scanning.models import (
     OpinionStatus,
     Reporter,
     Scan,
+    Source,
     Status,
 )
 
@@ -72,6 +73,10 @@ def scan_list(request):
     if reporter_filter:
         scans = scans.filter(reporter_id=reporter_filter)
 
+    source_filter = request.GET.get("source")
+    if source_filter:
+        scans = scans.filter(source=source_filter)
+
     paginator = Paginator(scans, 25)
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
@@ -86,8 +91,10 @@ def scan_list(request):
                 (r.pk, f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
+            "source_choices": Source.choices,
             "current_status": status_filter or "",
             "current_reporter": reporter_filter or "",
+            "current_source": source_filter or "",
         },
     )
 

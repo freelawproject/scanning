@@ -21,6 +21,16 @@
           {% endif %}
         </div>
 
+        <div>
+          <label for="id_source" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Source
+          </label>
+          {{ form.source }}
+          {% if form.source.errors %}
+          <p class="mt-1 text-sm text-red-600">{{ form.source.errors.0 }}</p>
+          {% endif %}
+        </div>
+
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <label for="id_volume" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
