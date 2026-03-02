@@ -2,6 +2,7 @@ import io
 import shutil
 import tempfile
 
+from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import models
 from django.test import TestCase, override_settings
@@ -14,7 +15,13 @@ from scanning.factories import (
     ScanFactory,
     UserFactory,
 )
-from scanning.models import OpinionScan, OpinionStatus, Scan, Source, Status
+from scanning.models import (
+    OpinionScan,
+    OpinionStatus,
+    Scan,
+    Source,
+    Status,
+)
 
 MEDIA_ROOT = tempfile.mkdtemp()
 
@@ -610,3 +617,22 @@ class TestOpinionUpload(ScanningTestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(OpinionScan.objects.count(), 0)
+
+
+class TestOpinionScanValidation(ScanningTestCase):
+    """Test OpinionScan model validation."""
+
+    def test_page_start_greater_than_page_end_raises(self):
+        opinion = OpinionScanFactory.build(page_start=20, page_end=10)
+        with self.assertRaises(ValidationError) as cm:
+            opinion.full_clean()
+        self.assertIn("page_end", cm.exception.message_dict)
+
+    def test_page_start_equal_to_page_end_ok(self):
+        opinion = OpinionScanFactory(page_start=5, page_end=5)
+        opinion.full_clean()  # should not raise
+
+    def test_page_start_less_than_page_end_ok(self):
+        opinion = OpinionScanFactory(page_start=1, page_end=10)
+        opinion.full_clean()  # should not raise
+

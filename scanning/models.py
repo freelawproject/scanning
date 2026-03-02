@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.validators import FileExtensionValidator
 from django.db import models
 from django.utils.deconstruct import deconstructible
@@ -282,6 +283,17 @@ class OpinionScan(AbstractDateTimeModel):
             models.Index(fields=["status"], name="idx_opinion_status"),
         ]
         ordering = ["-date_created"]
+
+    def clean(self):
+        """Validate that page_start does not exceed page_end.
+
+        :raises ValidationError: If page_start > page_end.
+        """
+        super().clean()
+        if self.page_start and self.page_end and self.page_start > self.page_end:
+            raise ValidationError(
+                {"page_end": "End page must be greater than or equal to start page."}
+            )
 
     def __str__(self):
         return (
