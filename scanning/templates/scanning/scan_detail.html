@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+
+{% block title %}{{ scan.reporter }} vol. {{ scan.volume }} - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+  <a href="{% url 'scan_list' %}" class="text-sm text-gray-500 dark:text-gray-400 hover:text-primary-600">&laquo; Back to scans</a>
+</div>
+
+<div class="flex flex-col lg:flex-row gap-4">
+  <!-- Data card -->
+  <div class="{% if review_form or scan.status == 'approved' %}lg:w-1/2{% else %}w-full{% endif %}">
+    <div class="card h-full">
+      <h1 class="text-xl font-bold mb-4">{{ scan.reporter }}</h1>
+      <dl class="space-y-3 text-sm">
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Volume</dt>
+          <dd>{{ scan.volume }}</dd>
+        </div>
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Number of Pages</dt>
+          <dd>{{ scan.number_of_pages }}</dd>
+        </div>
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Page Range</dt>
+          <dd>{{ scan.start_page }} - {{ scan.end_page }}</dd>
+        </div>
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Source</dt>
+          <dd>{{ scan.get_source_display }}</dd>
+        </div>
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Status</dt>
+          <dd><span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span></dd>
+        </div>
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Uploaded by</dt>
+          <dd>{{ scan.uploaded_by.username }}</dd>
+        </div>
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Uploaded at</dt>
+          <dd>{{ scan.date_created|date:"M j, Y g:i A" }}</dd>
+        </div>
+        {% if scan.processed_at %}
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Processed at</dt>
+          <dd>{{ scan.processed_at|date:"M j, Y g:i A" }}</dd>
+        </div>
+        {% endif %}
+        {% if scan.notes %}
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Notes</dt>
+          <dd class="whitespace-pre-wrap">{{ scan.notes }}</dd>
+        </div>
+        {% endif %}
+        {% if scan.process_output %}
+        <div>
+          <details>
+            <summary class="font-medium text-gray-500 dark:text-gray-400 cursor-pointer">
+              Processing Output
+            </summary>
+            <dd class="whitespace-pre-wrap text-xs mt-1 font-mono max-h-96 overflow-y-auto">{{ scan.process_output }}</dd>
+          </details>
+        </div>
+        {% endif %}
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400">Opinions</dt>
+          <dd>
+            <a href="{% url 'opinion_list' %}?scan={{ scan.pk }}">
+              {{ opinion_count }} opinion{{ opinion_count|pluralize }}
+            </a>
+          </dd>
+        </div>
+      </dl>
+      {% if user.is_staff %}
+      <a href="{% url 'admin:scanning_scan_change' scan.pk %}" class="btn-outline w-full mt-4 text-center">
+        Edit in admin
+      </a>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Staff review form -->
+  {% if review_form %}
+  <div class="lg:w-1/2">
+    <div class="card h-full">
+      <h2 class="text-lg font-bold mb-4">Review</h2>
+      <form method="post">
+        {% csrf_token %}
+        <div class="space-y-4">
+          <div>
+            <label for="id_status" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Decision
+            </label>
+            {{ review_form.status }}
+          </div>
+          <div>
+            <label for="id_notes" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Notes
+            </label>
+            {{ review_form.notes }}
+          </div>
+          <button type="submit" class="btn-primary w-full">Submit Review</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  {% elif scan.status == "approved" %}
+  <div class="lg:w-1/2">
+    <div class="card h-full">
+      <h2 class="text-lg font-bold mb-2">Review Decision</h2>
+      <p><span class="badge-approved">Approved</span></p>
+      {% if scan.notes %}
+      <dt class="font-medium text-gray-500 dark:text-gray-400 mt-3">Notes</dt>
+      <dd class="whitespace-pre-wrap text-sm">{{ scan.notes }}</dd>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block full_width_content %}
+<div class="w-full px-4 pb-6">
+  <div class="max-w-content mx-auto w-full">
+    <div class="card">
+      <h2 class="text-lg font-bold mb-4">Original PDF</h2>
+      <iframe
+        src="{{ scan.original_pdf.url }}"
+        class="w-full border border-gray-200 dark:border-gray-700 rounded"
+        style="height: 75vh;"
+        title="Original PDF"
+      ></iframe>
+    </div>
+  </div>
+</div>
+{% endblock %}

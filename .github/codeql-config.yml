@@ -1,0 +1,9 @@
+name: CodeQL config for FLP Scanning
+
+paths-ignore:
+  - "scanning/*/migrations/"
+  - "scanning/*/tests.py"
+  - "scanning/*/test_*.py"
+  - "scanning/conftest.py"
+  - "scanning/assets/static/"
+  - "node_modules/"

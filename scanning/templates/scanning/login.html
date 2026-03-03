@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block title %}Sign In - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-center min-h-[60vh]">
+  <div class="card w-full max-w-md">
+    <h1 class="text-2xl font-bold text-center mb-6">Sign In</h1>
+
+    {% if form.errors %}
+    <div class="alert alert-danger mb-4">
+      Invalid username or password. Please try again.
+    </div>
+    {% endif %}
+
+    <form method="post">
+      {% csrf_token %}
+
+      <div class="space-y-4">
+        <div>
+          <label for="id_username" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Username
+          </label>
+          <input
+            type="text"
+            name="username"
+            id="id_username"
+            class="input-text w-full"
+            autocomplete="username"
+            autofocus
+            required
+          >
+        </div>
+
+        <div>
+          <label for="id_password" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Password
+          </label>
+          <input
+            type="password"
+            name="password"
+            id="id_password"
+            class="input-text w-full"
+            autocomplete="current-password"
+            required
+          >
+        </div>
+
+        <button type="submit" class="btn-primary w-full">
+          Sign In
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
