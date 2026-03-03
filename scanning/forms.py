@@ -78,14 +78,23 @@ class ScanUploadForm(forms.ModelForm):
         }
 
     def clean_original_pdf(self):
-        """Validate that the uploaded file is a PDF by MIME type.
+        """Validate that the uploaded file is a PDF by MIME type and magic bytes.
 
         :returns: The validated file.
         :rtype: django.core.files.uploadedfile.UploadedFile
         """
         pdf = self.cleaned_data.get("original_pdf")
-        if pdf and pdf.content_type != "application/pdf":
-            raise forms.ValidationError("The uploaded file must be a PDF.")
+        if pdf:
+            if pdf.content_type != "application/pdf":
+                raise forms.ValidationError(
+                    "The uploaded file must be a PDF."
+                )
+            header = pdf.read(5)
+            pdf.seek(0)
+            if header != b"%PDF-":
+                raise forms.ValidationError(
+                    "The uploaded file must be a PDF."
+                )
         return pdf
 
 
@@ -198,12 +207,21 @@ class OpinionScanUploadForm(forms.ModelForm):
         }
 
     def clean_original_pdf(self):
-        """Validate that the uploaded file is a PDF by MIME type.
+        """Validate that the uploaded file is a PDF by MIME type and magic bytes.
 
         :returns: The validated file.
         :rtype: django.core.files.uploadedfile.UploadedFile
         """
         pdf = self.cleaned_data.get("original_pdf")
-        if pdf and pdf.content_type != "application/pdf":
-            raise forms.ValidationError("The uploaded file must be a PDF.")
+        if pdf:
+            if pdf.content_type != "application/pdf":
+                raise forms.ValidationError(
+                    "The uploaded file must be a PDF."
+                )
+            header = pdf.read(5)
+            pdf.seek(0)
+            if header != b"%PDF-":
+                raise forms.ValidationError(
+                    "The uploaded file must be a PDF."
+                )
         return pdf
