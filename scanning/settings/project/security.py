@@ -2,7 +2,13 @@ import socket
 
 import environ
 
-from ..django import DATABASES, DEVELOPMENT, INSTALLED_APPS, MIDDLEWARE, TESTING
+from ..django import (
+    DATABASES,
+    DEVELOPMENT,
+    INSTALLED_APPS,
+    MIDDLEWARE,
+    TESTING,
+)
 
 env = environ.FileAwareEnv()
 
