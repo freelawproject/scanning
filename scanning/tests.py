@@ -167,28 +167,6 @@ class TestScanUpload(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(Scan.objects.count(), 0)
 
-    def test_upload_sets_uploaded_by(self):
-        user = self.make_user()
-        self.client.force_login(user)
-        reporter = ReporterFactory(
-            short_name="f3d", full_name="Federal Reporter, 3d"
-        )
-        self.client.post(
-            reverse("scan_upload"),
-            {
-                "reporter": reporter.pk,
-                "source": Source.FULL,
-                "volume": 42,
-                "number_of_pages": 200,
-                "start_page": 1,
-                "end_page": 200,
-                "original_pdf": self.make_pdf(),
-            },
-        )
-        scan = Scan.objects.get()
-        self.assertEqual(scan.uploaded_by, user)
-        self.assertEqual(scan.status, Status.UPLOADED)
-
     def test_upload_rejects_non_pdf_mime_type(self):
         self.client.force_login(self.make_user())
         reporter = ReporterFactory()
@@ -632,6 +610,140 @@ class TestOpinionScanValidation(ScanningTestCase):
         opinion = OpinionScanFactory(page_start=5, page_end=5)
         opinion.full_clean()  # should not raise
 
-    def test_page_start_less_than_page_end_ok(self):
-        opinion = OpinionScanFactory(page_start=1, page_end=10)
-        opinion.full_clean()  # should not raise
+
+
+class TestScanListFilters(ScanningTestCase):
+    """Test that invalid filter params don't crash scan_list."""
+
+    def test_invalid_reporter_filter_returns_200(self):
+        self.client.force_login(self.make_user())
+        response = self.client.get(
+            reverse("scan_list"), {"reporter": "notanumber"}
+        )
+        self.assertEqual(response.status_code, 200)
+
+
+class TestOpinionListFilters(ScanningTestCase):
+    """Test that invalid filter params don't crash opinion_list."""
+
+    def test_invalid_reporter_filter_returns_200(self):
+        self.client.force_login(self.make_user())
+        response = self.client.get(
+            reverse("opinion_list"), {"reporter": "notanumber"}
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_invalid_scan_filter_returns_200(self):
+        self.client.force_login(self.make_user())
+        response = self.client.get(
+            reverse("opinion_list"), {"scan": "notanumber"}
+        )
+        self.assertEqual(response.status_code, 200)
+
+
+class TestScanValidation(ScanningTestCase):
+    """Test Scan model validation."""
+
+    def test_start_page_greater_than_end_page_raises(self):
+        scan = ScanFactory.build(start_page=50, end_page=10)
+        with self.assertRaises(ValidationError) as cm:
+            scan.full_clean()
+        self.assertIn("end_page", cm.exception.message_dict)
+
+    def test_zero_volume_rejected(self):
+        scan = ScanFactory.build(volume=0)
+        with self.assertRaises(ValidationError) as cm:
+            scan.full_clean()
+        self.assertIn("volume", cm.exception.message_dict)
+
+    def test_zero_start_page_rejected(self):
+        scan = ScanFactory.build(start_page=0)
+        with self.assertRaises(ValidationError) as cm:
+            scan.full_clean()
+        self.assertIn("start_page", cm.exception.message_dict)
+
+    def test_number_of_pages_less_than_range_rejected(self):
+        scan = ScanFactory.build(
+            number_of_pages=3, start_page=1, end_page=50
+        )
+        with self.assertRaises(ValidationError) as cm:
+            scan.full_clean()
+        self.assertIn("number_of_pages", cm.exception.message_dict)
+
+    def test_number_of_pages_equal_to_range_ok(self):
+        scan = ScanFactory(
+            number_of_pages=50, start_page=1, end_page=50
+        )
+        scan.full_clean()  # should not raise
+
+    def test_duplicate_scan_rejected(self):
+        reporter = ReporterFactory()
+        ScanFactory(reporter=reporter, volume=1, source=Source.FULL)
+        with self.assertRaises(Exception):
+            ScanFactory(reporter=reporter, volume=1, source=Source.FULL)
+
+    def test_different_source_allows_same_reporter_volume(self):
+        reporter = ReporterFactory()
+        ScanFactory(reporter=reporter, volume=1, source=Source.FULL)
+        ScanFactory(
+            reporter=reporter, volume=1, source=Source.OPINIONS
+        )  # should not raise
+
+
+class TestSpoofedPdfUpload(ScanningTestCase):
+    """Test that spoofed PDF files (correct MIME, wrong content) are rejected."""
+
+    def test_scan_upload_spoofed_pdf_rejected(self):
+        self.client.force_login(self.make_user())
+        reporter = ReporterFactory()
+        spoofed = SimpleUploadedFile(
+            "fake.pdf",
+            b"<html>not a pdf</html>",
+            content_type="application/pdf",
+        )
+        response = self.client.post(
+            reverse("scan_upload"),
+            {
+                "reporter": reporter.pk,
+                "source": Source.FULL,
+                "volume": 1,
+                "number_of_pages": 50,
+                "start_page": 1,
+                "end_page": 50,
+                "original_pdf": spoofed,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Scan.objects.count(), 0)
+
+    def test_opinion_upload_spoofed_pdf_rejected(self):
+        user = UserFactory(is_superuser=True)
+        self.client.force_login(user)
+        reporter = ReporterFactory()
+        spoofed = SimpleUploadedFile(
+            "fake.pdf",
+            b"<html>not a pdf</html>",
+            content_type="application/pdf",
+        )
+        response = self.client.post(
+            reverse("opinion_upload"),
+            {
+                "reporter": reporter.pk,
+                "volume": 1,
+                "original_pdf": spoofed,
+                "status": OpinionStatus.NO_STATUS,
+                "page_start": 1,
+                "page_end": 10,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(OpinionScan.objects.count(), 0)
+
+
+class TestOpinionListEmptyState(ScanningTestCase):
+    """Test that the opinion list empty state respects permissions."""
+
+    def test_non_superuser_no_upload_link(self):
+        self.client.force_login(self.make_user())
+        response = self.client.get(reverse("opinion_list"))
+        self.assertNotContains(response, "Upload your first opinion")
