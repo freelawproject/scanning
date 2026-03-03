@@ -2,10 +2,9 @@ import socket
 
 import environ
 
-from ..django import DATABASES, INSTALLED_APPS, MIDDLEWARE, TESTING
+from ..django import DATABASES, DEVELOPMENT, INSTALLED_APPS, MIDDLEWARE, TESTING
 
 env = environ.FileAwareEnv()
-DEVELOPMENT = env.bool("DEVELOPMENT", default=True)
 
 ALLOWED_HOSTS: list[str] = env(
     "ALLOWED_HOSTS", default=["localhost", "127.0.0.1"]

@@ -1,7 +1,8 @@
 import environ
 
+from ..django import DEVELOPMENT
+
 env = environ.FileAwareEnv()
-DEVELOPMENT = env.bool("DEVELOPMENT", default=True)
 
 # S3
 if DEVELOPMENT:
