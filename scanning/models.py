@@ -1,6 +1,6 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.core.validators import FileExtensionValidator
+from django.core.validators import FileExtensionValidator, MinValueValidator
 from django.db import models
 from django.utils.deconstruct import deconstructible
 
@@ -163,10 +163,14 @@ class Scan(AbstractDateTimeModel):
         on_delete=models.PROTECT,
         related_name="scans",
     )
-    volume = models.PositiveIntegerField()
-    number_of_pages = models.PositiveIntegerField()
-    start_page = models.PositiveIntegerField()
-    end_page = models.PositiveIntegerField()
+    volume = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    number_of_pages = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)]
+    )
+    start_page = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)]
+    )
+    end_page = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     source = models.CharField(
         max_length=20,
         choices=Source.choices,
@@ -219,7 +223,47 @@ class Scan(AbstractDateTimeModel):
             models.Index(fields=["status"], name="idx_status"),
             models.Index(fields=["uploaded_by"], name="idx_uploaded_by"),
         ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["reporter", "volume", "source"],
+                name="unique_reporter_volume_source",
+                violation_error_message=(
+                    "A scan for this reporter, volume, and source"
+                    " already exists."
+                ),
+            ),
+        ]
         ordering = ["-date_created"]
+
+    def clean(self):
+        """Validate page range and page count consistency.
+
+        :raises ValidationError: If start_page > end_page or
+            number_of_pages is less than the page range.
+        """
+        super().clean()
+        errors = {}
+        if (
+            self.start_page
+            and self.end_page
+            and self.start_page > self.end_page
+        ):
+            errors["end_page"] = (
+                "End page must be greater than or equal to start page."
+            )
+        if (
+            self.number_of_pages
+            and self.start_page
+            and self.end_page
+            and self.start_page <= self.end_page
+            and self.number_of_pages < self.end_page - self.start_page + 1
+        ):
+            errors["number_of_pages"] = (
+                "Number of pages cannot be less than the page range"
+                " (end_page - start_page + 1)."
+            )
+        if errors:
+            raise ValidationError(errors)
 
     def __str__(self):
         return (
@@ -242,7 +286,7 @@ class OpinionScan(AbstractDateTimeModel):
         on_delete=models.PROTECT,
         related_name="opinion_scans",
     )
-    volume = models.PositiveIntegerField()
+    volume = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     original_pdf = models.FileField(upload_to=opinion_pdf_path("unredacted"))
     masked_pdf = models.FileField(
         upload_to=opinion_pdf_path("masked"),
@@ -259,8 +303,12 @@ class OpinionScan(AbstractDateTimeModel):
         choices=OpinionStatus.choices,
         default=OpinionStatus.NO_STATUS,
     )
-    page_start = models.PositiveIntegerField()
-    page_end = models.PositiveIntegerField()
+    page_start = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)]
+    )
+    page_end = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)]
+    )
     uploaded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
