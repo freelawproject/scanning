@@ -122,7 +122,9 @@
 {% else %}
 <div class="card text-center py-12">
   <p class="text-gray-500 dark:text-gray-400 mb-4">No opinions found.</p>
+  {% if user.is_superuser %}
   <a href="{% url 'opinion_upload' %}" class="btn-primary">Upload your first opinion</a>
+  {% endif %}
 </div>
 {% endif %}
 {% endblock %}
