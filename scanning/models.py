@@ -167,9 +167,7 @@ class Scan(AbstractDateTimeModel):
     number_of_pages = models.PositiveIntegerField(
         validators=[MinValueValidator(1)]
     )
-    start_page = models.PositiveIntegerField(
-        validators=[MinValueValidator(1)]
-    )
+    start_page = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     end_page = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     source = models.CharField(
         max_length=20,
@@ -303,12 +301,8 @@ class OpinionScan(AbstractDateTimeModel):
         choices=OpinionStatus.choices,
         default=OpinionStatus.NO_STATUS,
     )
-    page_start = models.PositiveIntegerField(
-        validators=[MinValueValidator(1)]
-    )
-    page_end = models.PositiveIntegerField(
-        validators=[MinValueValidator(1)]
-    )
+    page_start = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    page_end = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     uploaded_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,

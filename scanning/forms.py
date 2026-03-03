@@ -86,15 +86,11 @@ class ScanUploadForm(forms.ModelForm):
         pdf = self.cleaned_data.get("original_pdf")
         if pdf:
             if pdf.content_type != "application/pdf":
-                raise forms.ValidationError(
-                    "The uploaded file must be a PDF."
-                )
+                raise forms.ValidationError("The uploaded file must be a PDF.")
             header = pdf.read(5)
             pdf.seek(0)
             if header != b"%PDF-":
-                raise forms.ValidationError(
-                    "The uploaded file must be a PDF."
-                )
+                raise forms.ValidationError("The uploaded file must be a PDF.")
         return pdf
 
 
@@ -215,13 +211,9 @@ class OpinionScanUploadForm(forms.ModelForm):
         pdf = self.cleaned_data.get("original_pdf")
         if pdf:
             if pdf.content_type != "application/pdf":
-                raise forms.ValidationError(
-                    "The uploaded file must be a PDF."
-                )
+                raise forms.ValidationError("The uploaded file must be a PDF.")
             header = pdf.read(5)
             pdf.seek(0)
             if header != b"%PDF-":
-                raise forms.ValidationError(
-                    "The uploaded file must be a PDF."
-                )
+                raise forms.ValidationError("The uploaded file must be a PDF.")
         return pdf

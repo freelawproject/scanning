@@ -611,7 +611,6 @@ class TestOpinionScanValidation(ScanningTestCase):
         opinion.full_clean()  # should not raise
 
 
-
 class TestScanListFilters(ScanningTestCase):
     """Test that invalid filter params don't crash scan_list."""
 
@@ -663,17 +662,13 @@ class TestScanValidation(ScanningTestCase):
         self.assertIn("start_page", cm.exception.message_dict)
 
     def test_number_of_pages_less_than_range_rejected(self):
-        scan = ScanFactory.build(
-            number_of_pages=3, start_page=1, end_page=50
-        )
+        scan = ScanFactory.build(number_of_pages=3, start_page=1, end_page=50)
         with self.assertRaises(ValidationError) as cm:
             scan.full_clean()
         self.assertIn("number_of_pages", cm.exception.message_dict)
 
     def test_number_of_pages_equal_to_range_ok(self):
-        scan = ScanFactory(
-            number_of_pages=50, start_page=1, end_page=50
-        )
+        scan = ScanFactory(number_of_pages=50, start_page=1, end_page=50)
         scan.full_clean()  # should not raise
 
     def test_duplicate_scan_rejected(self):
