@@ -70,7 +70,7 @@ def scan_list(request):
         scans = scans.filter(status=status_filter)
 
     reporter_filter = request.GET.get("reporter")
-    if reporter_filter:
+    if reporter_filter and reporter_filter.isdigit():
         scans = scans.filter(reporter_id=reporter_filter)
 
     source_filter = request.GET.get("source")
@@ -187,11 +187,11 @@ def opinion_list(request):
 
     # Filtering
     scan_filter = request.GET.get("scan")
-    if scan_filter:
+    if scan_filter and scan_filter.isdigit():
         opinions = opinions.filter(scan_id=scan_filter)
 
     reporter_filter = request.GET.get("reporter")
-    if reporter_filter:
+    if reporter_filter and reporter_filter.isdigit():
         opinions = opinions.filter(reporter_id=reporter_filter)
 
     status_filter = request.GET.get("status")
