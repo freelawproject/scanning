@@ -3,6 +3,7 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
+from scanning.monitoring import health_check, heartbeat, sentry_fail
 from scanning.views import (
     login_view,
     logout_view,
@@ -24,6 +25,9 @@ urlpatterns = [
     path("opinions/upload/", opinion_upload, name="opinion_upload"),
     path("opinions/<int:pk>/", opinion_detail, name="opinion_detail"),
     path("admin/", admin.site.urls),
+    path("monitoring/heartbeat/", heartbeat, name="heartbeat"),
+    path("monitoring/health-check/", health_check, name="health_check"),
+    path("sentry/error/", sentry_fail, name="sentry_fail"),
 ]
 
 if settings.DEBUG:

@@ -742,3 +742,20 @@ class TestOpinionListEmptyState(ScanningTestCase):
         self.client.force_login(self.make_user())
         response = self.client.get(reverse("opinion_list"))
         self.assertNotContains(response, "Upload your first opinion")
+
+
+class TestMonitoring(TestCase):
+    """Test the monitoring endpoints."""
+
+    def test_heartbeat_returns_ok(self):
+        response = self.client.get(reverse("heartbeat"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"OK")
+        self.assertEqual(response["Content-Type"], "text/plain")
+
+    def test_health_check_returns_json(self):
+        response = self.client.get(reverse("health_check"))
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("is_postgresql_up", data)
+        self.assertTrue(data["is_postgresql_up"])
