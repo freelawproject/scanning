@@ -3,7 +3,7 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
-from scanning.monitoring import heartbeat, health_check, sentry_fail
+from scanning.monitoring import health_check, heartbeat, sentry_fail
 from scanning.views import (
     login_view,
     logout_view,
