@@ -18,11 +18,24 @@ def check_postgresql() -> bool:
 
 
 def heartbeat(request: HttpRequest) -> HttpResponse:
+    """Return a plain-text OK response for uptime monitoring.
+
+    :param request: The incoming HTTP request.
+    :type request: HttpRequest
+    :returns: A 200 response with body "OK".
+    :rtype: HttpResponse
+    """
     return HttpResponse("OK", content_type="text/plain")
 
 
 def health_check(request: HttpRequest) -> JsonResponse:
-    """Check if we can connect to various services."""
+    """Check connectivity to backing services and return their status.
+
+    :param request: The incoming HTTP request.
+    :type request: HttpRequest
+    :returns: JSON with service statuses (200 if all healthy, 500 otherwise).
+    :rtype: JsonResponse
+    """
     is_postgresql_up = check_postgresql()
 
     status = HTTPStatus.OK
@@ -36,4 +49,10 @@ def health_check(request: HttpRequest) -> JsonResponse:
 
 
 def sentry_fail(request: HttpRequest) -> NoReturn:
+    """Raise an intentional error to verify Sentry integration.
+
+    :param request: The incoming HTTP request.
+    :type request: HttpRequest
+    :raises ZeroDivisionError: Always.
+    """
     raise ZeroDivisionError("Intentional error for Sentry")
