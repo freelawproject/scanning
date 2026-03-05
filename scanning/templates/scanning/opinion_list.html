@@ -31,6 +31,11 @@
         {% endfor %}
       </select>
     </div>
+    <div class="flex-1">
+      <label for="filter-volume" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Volume</label>
+      <input id="filter-volume" name="volume" type="text" inputmode="numeric" pattern="[0-9]*"
+             value="{{ current_volume }}" placeholder="e.g. 42" class="input-text w-full">
+    </div>
     <div class="flex items-end">
       <button type="submit" class="btn-outline">Filter</button>
     </div>
@@ -43,36 +48,26 @@
   <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
     <thead class="bg-gray-50 dark:bg-gray-800">
       <tr>
-        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Reporter</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Volume</th>
-        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Parent Book</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Reporter</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Page</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Uploaded</th>
-        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">By</th>
         <th class="px-4 py-3"></th>
       </tr>
     </thead>
     <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
       {% for opinion in page_obj %}
       <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50">
-        <td class="px-4 py-3 text-sm">{{ opinion.reporter }}</td>
-        <td class="px-4 py-3 text-sm">{{ opinion.volume }}</td>
-        <td class="px-4 py-3 text-sm">
-          {% if opinion.scan %}
-          <a href="{% url 'scan_detail' pk=opinion.scan.pk %}">Book #{{ opinion.scan.pk }}</a>
-          {% else %}
-          <span class="text-gray-400">Standalone</span>
-          {% endif %}
-        </td>
+        <td class="px-4 py-3 text-sm">{{ opinion.volume }}{% if opinion.scan %} (<a href="{% url 'scan_detail' pk=opinion.scan.pk %}">Book #{{ opinion.scan.pk }}</a>){% endif %}</td>
+        <td class="px-4 py-3 text-sm">{{ opinion.reporter.full_name }} ({{ opinion.reporter.short_name }})</td>
         <td class="px-4 py-3 text-sm">
           {% if opinion.page_start %}{{ opinion.page_start }}{% if opinion.page_end %} - {{ opinion.page_end }}{% endif %}{% else %}-{% endif %}
         </td>
         <td class="px-4 py-3 text-sm">
           <span class="badge-{{ opinion.status }}">{{ opinion.get_status_display }}</span>
         </td>
-        <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{{ opinion.date_created|date:"M j, Y g:i A" }}</td>
-        <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{{ opinion.uploaded_by.username|default:"-" }}</td>
+        <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{{ opinion.date_created|date:"M j, Y g:i A" }}{% if opinion.uploaded_by %} by {{ opinion.uploaded_by.username }}{% endif %}</td>
         <td class="px-4 py-3 text-sm">
           <a href="{% url 'opinion_detail' pk=opinion.pk %}" class="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300">View</a>
         </td>
@@ -104,7 +99,7 @@
 {% if page_obj.has_other_pages %}
 <nav class="flex items-center justify-center gap-2 mt-6" aria-label="Pagination">
   {% if page_obj.has_previous %}
-  <a href="?page={{ page_obj.previous_page_number }}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_scan %}&scan={{ current_scan }}{% endif %}"
+  <a href="?page={{ page_obj.previous_page_number }}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}"
      class="btn-outline text-sm">&laquo; Previous</a>
   {% endif %}
 
@@ -113,7 +108,7 @@
   </span>
 
   {% if page_obj.has_next %}
-  <a href="?page={{ page_obj.next_page_number }}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_scan %}&scan={{ current_scan }}{% endif %}"
+  <a href="?page={{ page_obj.next_page_number }}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}"
      class="btn-outline text-sm">Next &raquo;</a>
   {% endif %}
 </nav>
