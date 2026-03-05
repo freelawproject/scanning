@@ -24,9 +24,7 @@ class Command(BaseCommand):
             return
 
         for scan in scans:
-            self.stdout.write(
-                f"Processing {scan}"
-            )
+            self.stdout.write(f"Processing {scan}")
             # Change Scan status and store start time
             scan.status = Status.PROCESSING
             scan.processed_at = timezone.now()
@@ -34,9 +32,7 @@ class Command(BaseCommand):
 
             # TODO implement blackletter call and use result to update Scan object and create OpinionScan objects
 
-            self.stdout.write(
-                f"Blackletter finished for {scan}"
-            )
+            self.stdout.write(f"Blackletter finished for {scan}")
 
             # Change scan status
             scan.status = Status.EXTRACTED
