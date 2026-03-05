@@ -23,8 +23,11 @@ case "$1" in
         --max-requests-jitter 100 \
         --bind 0.0.0.0:8000
     ;;
+'run_daemon')
+    exec python manage.py run_daemon
+    ;;
 *)
-    # Pass through to manage.py for cron jobs, e.g.:
+    # Pass through to manage.py, e.g.:
     #   docker exec scanning-django python manage.py createsuperuser
     exec python manage.py "$@"
     ;;
