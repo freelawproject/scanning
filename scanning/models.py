@@ -291,9 +291,7 @@ class Scan(AbstractDateTimeModel):
         if self.status != Status.PROCESSING or not self.processed_at:
             return False
         timeout = settings.DAEMON_PROCESSING_TIMEOUT
-        return (
-            timezone.now() - self.processed_at
-        ).total_seconds() > timeout
+        return (timezone.now() - self.processed_at).total_seconds() > timeout
 
     def __str__(self):
         return (

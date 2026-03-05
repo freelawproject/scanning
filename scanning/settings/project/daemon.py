@@ -8,6 +8,4 @@ DAEMON_PROCESS_SCANS_INTERVAL = env.int(
 )
 
 # Seconds before a PROCESSING scan is considered stuck.
-DAEMON_PROCESSING_TIMEOUT = env.int(
-    "DAEMON_PROCESSING_TIMEOUT", default=3600
-)
+DAEMON_PROCESSING_TIMEOUT = env.int("DAEMON_PROCESSING_TIMEOUT", default=3600)
