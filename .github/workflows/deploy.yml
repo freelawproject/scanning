@@ -125,10 +125,10 @@ jobs:
       - name: Delete Temporary Pod
         run: kubectl delete pod -n ${{ env.EKS_NAMESPACE }} temp-pod-${{ steps.vars.outputs.sha_short }}
 
-  deploy-web:
+  deploy:
     needs: [get-pr-labels, setup-deploy]
     runs-on: ubuntu-latest
-    if: ${{ !contains(needs.get-pr-labels.outputs.labels, 'skip-web-deploy') }}
+    if: ${{ !contains(needs.get-pr-labels.outputs.labels, 'skip-deploy') }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
@@ -147,7 +147,7 @@ jobs:
   complete-deploy:
     needs:
       [
-        deploy-web,
+        deploy,
       ]
     runs-on: ubuntu-latest
     concurrency: production
