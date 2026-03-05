@@ -1,6 +1,10 @@
 version = 1
 revision = 3
 requires-python = "==3.13.*"
+resolution-markers = [
+    "sys_platform == 'win32'",
+    "sys_platform != 'win32'",
+]
 
 [[package]]
 name = "anyio"
@@ -856,8 +860,10 @@ dependencies = [
     { name = "boto3" },
     { name = "daphne" },
     { name = "django" },
+    { name = "django-browser-reload" },
     { name = "django-cotton" },
     { name = "django-environ" },
+    { name = "django-extensions" },
     { name = "django-storages" },
     { name = "django-tailwind" },
     { name = "factory-boy" },
@@ -886,9 +892,11 @@ requires-dist = [
     { name = "boto3" },
     { name = "daphne" },
     { name = "django", specifier = ">=6.0,<6.1" },
+    { name = "django-browser-reload", specifier = ">=1.21.0" },
     { name = "django-cotton" },
     { name = "django-debug-toolbar", marker = "extra == 'dev'" },
     { name = "django-environ" },
+    { name = "django-extensions", specifier = ">=4.1" },
     { name = "django-extensions", marker = "extra == 'dev'" },
     { name = "django-storages" },
     { name = "django-stubs", marker = "extra == 'dev'" },
