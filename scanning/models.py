@@ -2,6 +2,8 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import FileExtensionValidator, MinValueValidator
 from django.db import models
+from django.db.models import Q
+from django.utils import timezone
 from django.utils.deconstruct import deconstructible
 
 
@@ -157,7 +159,23 @@ class opinion_pdf_path:
         )
 
 
+class ScanManager(models.Manager):
+    """Custom manager for the Scan model."""
+
+    def needs_processing(self):
+        """Return scans that are uploaded but missing redacted or compressed PDFs.
+
+        :returns: QuerySet of scans needing processing.
+        :rtype: QuerySet
+        """
+        return self.filter(
+            status=Status.UPLOADED,
+        ).filter(Q(redacted_pdf="") | Q(compressed_pdf=""))
+
+
 class Scan(AbstractDateTimeModel):
+    objects = ScanManager()
+
     reporter = models.ForeignKey(
         Reporter,
         on_delete=models.PROTECT,
@@ -262,6 +280,20 @@ class Scan(AbstractDateTimeModel):
             )
         if errors:
             raise ValidationError(errors)
+
+    @property
+    def is_stale_processing(self):
+        """Check if this scan has been stuck in PROCESSING too long.
+
+        :returns: True if the scan has exceeded the processing timeout.
+        :rtype: bool
+        """
+        if self.status != Status.PROCESSING or not self.processed_at:
+            return False
+        timeout = settings.DAEMON_PROCESSING_TIMEOUT
+        return (
+            timezone.now() - self.processed_at
+        ).total_seconds() > timeout
 
     def __str__(self):
         return (
