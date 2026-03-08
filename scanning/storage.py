@@ -15,7 +15,9 @@ class PrivateS3Storage(S3Boto3Storage):
     file_overwrite = False
     querystring_auth = True
     querystring_expire = 300  # 5-minute signed URLs
-    custom_domain = False  # disable custom domain so signed URLs use the S3 hostname
+    custom_domain = (
+        False  # disable custom domain so signed URLs use the S3 hostname
+    )
 
     def __init__(self, **kwargs):
         from django.conf import settings
