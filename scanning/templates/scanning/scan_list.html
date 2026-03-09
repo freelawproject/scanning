@@ -75,19 +75,10 @@
         <td class="px-4 py-3 text-sm">{{ scan.opinion_count }}</td>
         <td class="px-4 py-3 text-sm">
           <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
-          {% if scan.is_stale_processing %}
-          <span class="block text-xs text-amber-600 dark:text-amber-400 mt-1" title="This scan has exceeded the processing timeout and may need attention.">
-            ⚠ Stale
-          </span>
-          {% endif %}
         </td>
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}</td>
         <td class="px-4 py-3 text-sm">
           <a href="{% url 'scan_detail' pk=scan.pk %}" class="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300">View</a>
-          {% if scan.is_stale_processing and user.is_superuser %}
-          <a href="#" class="block text-xs text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300 mt-1"
-             title="This action will enqueue the file again to be processed.">Reprocess</a>
-          {% endif %}
         </td>
       </tr>
       {% endfor %}
@@ -102,19 +93,10 @@
     <div class="flex items-center justify-between mb-2">
       <span class="font-medium text-sm">{{ scan.reporter }}</span>
       <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
-      {% if scan.is_stale_processing %}
-      <span class="text-xs text-amber-600 dark:text-amber-400 ml-1" title="This scan has exceeded the processing timeout and may need attention.">
-        ⚠ Stale
-      </span>
-      {% endif %}
     </div>
     <div class="text-sm text-gray-500 dark:text-gray-400">
       Vol. {{ scan.volume }} &middot; {{ scan.get_source_display }} &middot; {{ scan.number_of_pages }} pages &middot; {{ scan.opinion_count }} opinion{{ scan.opinion_count|pluralize }} &middot; {{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}
     </div>
-    {% if scan.is_stale_processing and user.is_superuser %}
-    <a href="#" class="block text-xs text-amber-600 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300 mt-2"
-       title="This action will enqueue the file again to be processed.">Reprocess</a>
-    {% endif %}
   </a>
   {% endfor %}
 </div>
