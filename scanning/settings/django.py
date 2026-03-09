@@ -129,12 +129,6 @@ INSTALLED_APPS = [
 if DEVELOPMENT:
     INSTALLED_APPS.append("django_extensions")
 
-    # used to hot reload css changes
-    INSTALLED_APPS.append("django_browser_reload")
-    MIDDLEWARE.append(
-        "django_browser_reload.middleware.BrowserReloadMiddleware"
-    )
-
 TAILWIND_APP_NAME = "scanning"
 TAILWIND_CSS_PATH = "css/tailwind_styles.css"
 

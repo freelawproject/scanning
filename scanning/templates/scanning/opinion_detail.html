@@ -116,16 +116,12 @@
     <div class="{% if opinion.redacted_pdf %}lg:w-1/2{% else %}max-w-content mx-auto w-full{% endif %}">
       <div class="card">
         <h2 class="text-lg font-bold mb-4">Original PDF</h2>
-        {% if opinion.original_pdf %}
         <iframe
           src="{{ opinion.original_pdf.url }}"
           class="w-full border border-gray-200 dark:border-gray-700 rounded"
           style="height: 75vh;"
           title="Original PDF"
         ></iframe>
-        {% else %}
-        <p class="text-gray-500 dark:text-gray-400">File does not exist.</p>
-        {% endif %}
       </div>
     </div>
     {% if opinion.redacted_pdf %}

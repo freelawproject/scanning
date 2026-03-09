@@ -35,6 +35,3 @@ if settings.DEVELOPMENT and not settings.TESTING:
     urlpatterns += [
         path("__debug__/", include("debug_toolbar.urls")),
     ]
-    urlpatterns.append(
-        path("__reload__/", include("django_browser_reload.urls")),
-    )
