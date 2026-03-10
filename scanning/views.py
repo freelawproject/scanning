@@ -77,6 +77,14 @@ def scan_list(request):
     if source_filter:
         scans = scans.filter(source=source_filter)
 
+    volume_filter = request.GET.get("volume")
+    if volume_filter:
+        if volume_filter.isdigit():
+            scans = scans.filter(volume=volume_filter)
+        else:
+            messages.error(request, "Volume must be a number.")
+            volume_filter = ""
+
     paginator = Paginator(scans, 25)
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
@@ -88,13 +96,14 @@ def scan_list(request):
             "page_obj": page_obj,
             "status_choices": Status.choices,
             "reporter_choices": [
-                (r.pk, f"{r.full_name} ({r.short_name})")
+                (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
             "source_choices": Source.choices,
             "current_status": status_filter or "",
             "current_reporter": reporter_filter or "",
             "current_source": source_filter or "",
+            "current_volume": volume_filter or "",
         },
     )
 
@@ -198,6 +207,14 @@ def opinion_list(request):
     if status_filter:
         opinions = opinions.filter(status=status_filter)
 
+    volume_filter = request.GET.get("volume")
+    if volume_filter:
+        if volume_filter.isdigit():
+            opinions = opinions.filter(volume=volume_filter)
+        else:
+            messages.error(request, "Volume must be a number.")
+            volume_filter = ""
+
     paginator = Paginator(opinions, 25)
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
@@ -209,12 +226,13 @@ def opinion_list(request):
             "page_obj": page_obj,
             "status_choices": OpinionStatus.choices,
             "reporter_choices": [
-                (r.pk, f"{r.full_name} ({r.short_name})")
+                (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
             "current_scan": scan_filter or "",
             "current_reporter": reporter_filter or "",
             "current_status": status_filter or "",
+            "current_volume": volume_filter or "",
         },
     )
 
