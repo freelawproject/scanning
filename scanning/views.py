@@ -153,7 +153,7 @@ def scan_detail(request, pk):
     opinion_count = scan.opinions.count()
 
     review_form = None
-    if request.user.is_staff and scan.status != Status.APPROVED:
+    if scan.status != Status.APPROVED:
         if request.method == "POST":
             review_form = ScanReviewForm(request.POST, instance=scan)
             if review_form.is_valid():
@@ -256,7 +256,7 @@ def opinion_detail(request, pk):
     )
 
     review_form = None
-    if request.user.is_staff and opinion.status != OpinionStatus.OK:
+    if opinion.status != OpinionStatus.OK:
         if request.method == "POST":
             review_form = OpinionScanReviewForm(request.POST, instance=opinion)
             if review_form.is_valid():
