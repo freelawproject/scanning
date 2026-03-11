@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}Profile - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-center min-h-[60vh]">
+  <div class="card w-full max-w-md">
+    <h1 class="text-2xl font-bold text-center mb-6">Profile</h1>
+
+    <form method="post">
+      {% csrf_token %}
+
+      <div class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Username
+          </label>
+          <input
+            type="text"
+            value="{{ user.username }}"
+            class="input-text w-full bg-gray-100 dark:bg-gray-800"
+            disabled
+          >
+        </div>
+
+        <div>
+          <label for="id_first_name" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            First name
+          </label>
+          {{ form.first_name }}
+          {% if form.first_name.errors %}
+          <p class="text-red-600 text-sm mt-1">{{ form.first_name.errors.0 }}</p>
+          {% endif %}
+        </div>
+
+        <div>
+          <label for="id_last_name" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Last name
+          </label>
+          {{ form.last_name }}
+          {% if form.last_name.errors %}
+          <p class="text-red-600 text-sm mt-1">{{ form.last_name.errors.0 }}</p>
+          {% endif %}
+        </div>
+
+        <div>
+          <label for="id_email" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Email
+          </label>
+          {{ form.email }}
+          {% if form.email.errors %}
+          <p class="text-red-600 text-sm mt-1">{{ form.email.errors.0 }}</p>
+          {% endif %}
+        </div>
+
+        <div class="flex items-center justify-between pt-2">
+          <a href="{% url 'password_change' %}" class="text-sm text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300">
+            <i class="fa fa-lock"></i> Change password
+          </a>
+          <button type="submit" class="btn-primary"><i class="fa fa-check"></i> Save changes</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

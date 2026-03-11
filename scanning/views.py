@@ -1,6 +1,7 @@
 from django.contrib import messages
-from django.contrib.auth import views as auth_views
+from django.contrib.auth import update_session_auth_hash, views as auth_views
 from django.contrib.auth.decorators import login_required
+from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db.models import Count
@@ -10,6 +11,7 @@ from django.utils import timezone
 from scanning.forms import (
     OpinionScanReviewForm,
     OpinionScanUploadForm,
+    ProfileForm,
     ScanReviewForm,
     ScanUploadForm,
 )
@@ -306,4 +308,49 @@ def opinion_upload(request):
         request,
         "scanning/opinion_upload.html",
         {"form": form},
+    )
+
+
+@login_required
+def profile(request):
+    """Display and handle the user profile edit form.
+
+    :param request: The current HTTP request.
+    :type request: django.http.HttpRequest
+    :returns: The rendered profile page or a redirect on success.
+    :rtype: django.http.HttpResponse
+    """
+    if request.method == "POST":
+        form = ProfileForm(request.POST, instance=request.user)
+        if form.is_valid():
+            form.save()
+            messages.success(request, "Profile updated.")
+            return redirect("profile")
+    else:
+        form = ProfileForm(instance=request.user)
+
+    return render(request, "scanning/profile.html", {"form": form})
+
+
+@login_required
+def password_change(request):
+    """Handle password change using Django's PasswordChangeForm.
+
+    :param request: The current HTTP request.
+    :type request: django.http.HttpRequest
+    :returns: The rendered password change page or a redirect on success.
+    :rtype: django.http.HttpResponse
+    """
+    if request.method == "POST":
+        form = PasswordChangeForm(request.user, request.POST)
+        if form.is_valid():
+            user = form.save()
+            update_session_auth_hash(request, user)
+            messages.success(request, "Password changed.")
+            return redirect("profile")
+    else:
+        form = PasswordChangeForm(request.user)
+
+    return render(
+        request, "scanning/password_change.html", {"form": form}
     )
