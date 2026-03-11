@@ -860,7 +860,6 @@ dependencies = [
     { name = "boto3" },
     { name = "daphne" },
     { name = "django" },
-    { name = "django-browser-reload" },
     { name = "django-cotton" },
     { name = "django-environ" },
     { name = "django-extensions" },
@@ -877,6 +876,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "django-browser-reload" },
     { name = "django-debug-toolbar" },
     { name = "django-extensions" },
     { name = "django-stubs" },
@@ -892,7 +892,7 @@ requires-dist = [
     { name = "boto3" },
     { name = "daphne" },
     { name = "django", specifier = ">=6.0,<6.1" },
-    { name = "django-browser-reload", specifier = ">=1.21.0" },
+    { name = "django-browser-reload", marker = "extra == 'dev'", specifier = ">=1.21.0" },
     { name = "django-cotton" },
     { name = "django-debug-toolbar", marker = "extra == 'dev'" },
     { name = "django-environ" },
