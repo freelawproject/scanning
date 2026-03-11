@@ -64,7 +64,7 @@
       </dl>
       {% if user.is_staff %}
       <a href="{% url 'admin:scanning_opinionscan_change' opinion.pk %}" class="btn-outline w-full mt-4 text-center">
-        Edit in admin
+        <i class="fa fa-pencil"></i> Edit in admin
       </a>
       {% endif %}
     </div>
@@ -90,7 +90,7 @@
             </label>
             {{ review_form.notes }}
           </div>
-          <button type="submit" class="btn-primary w-full">Submit Review</button>
+          <button type="submit" class="btn-primary w-full"><i class="fa fa-check"></i> Submit Review</button>
         </div>
       </form>
     </div>
