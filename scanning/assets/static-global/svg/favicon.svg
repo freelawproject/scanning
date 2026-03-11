@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12" fill="#6D28D9"/>
+  <!-- Open book: spine in center, pages fanning out left and right -->
+  <g transform="translate(32, 32)">
+    <!-- Left page -->
+    <path d="M-2 -16 C-2 -16 -6 -17 -18 -14 C-20 -13.5 -21 -12 -21 -10 L-21 14 C-21 15.5 -19.5 16.5 -18 16 C-6 13 -2 14 -2 14 Z" fill="white" opacity="0.95"/>
+    <!-- Right page -->
+    <path d="M2 -16 C2 -16 6 -17 18 -14 C20 -13.5 21 -12 21 -10 L21 14 C21 15.5 19.5 16.5 18 16 C6 13 2 14 2 14 Z" fill="white" opacity="0.85"/>
+    <!-- Spine -->
+    <line x1="0" y1="-17" x2="0" y2="15" stroke="white" stroke-width="1.5" opacity="0.6"/>
+    <!-- Left page lines -->
+    <line x1="-17" y1="-8" x2="-6" y2="-10.5" stroke="#6D28D9" stroke-width="1.2" stroke-linecap="round" opacity="0.3"/>
+    <line x1="-17" y1="-3" x2="-6" y2="-5.5" stroke="#6D28D9" stroke-width="1.2" stroke-linecap="round" opacity="0.3"/>
+    <line x1="-17" y1="2" x2="-6" y2="-0.5" stroke="#6D28D9" stroke-width="1.2" stroke-linecap="round" opacity="0.3"/>
+    <!-- Right page lines -->
+    <line x1="6" y1="-10.5" x2="17" y2="-8" stroke="#6D28D9" stroke-width="1.2" stroke-linecap="round" opacity="0.3"/>
+    <line x1="6" y1="-5.5" x2="17" y2="-3" stroke="#6D28D9" stroke-width="1.2" stroke-linecap="round" opacity="0.3"/>
+    <line x1="6" y1="-0.5" x2="17" y2="2" stroke="#6D28D9" stroke-width="1.2" stroke-linecap="round" opacity="0.3"/>
+  </g>
+</svg>
