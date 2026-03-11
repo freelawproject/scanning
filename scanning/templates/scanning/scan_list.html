@@ -5,7 +5,7 @@
 {% block content %}
 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4">
   <h1 class="text-2xl font-bold">Book Scans</h1>
-  <a href="{% url 'scan_upload' %}" class="btn-primary"><i class="fa fa-upload"></i> Upload Scan</a>
+  <a href="{% url 'scan_upload' %}" class="btn-primary"><i class="fa-solid fa-upload"></i> Upload Scan</a>
 </div>
 
 <!-- Filters -->
@@ -46,8 +46,8 @@
       </div>
     </div>
     <div class="flex items-center justify-end gap-2 mt-3">
-      <a href="{% url 'scan_list' %}" class="btn-ghost text-sm"><i class="fa fa-times"></i> Clear filters</a>
-      <button type="submit" class="btn-outline"><i class="fa fa-search"></i> Filter</button>
+      <a href="{% url 'scan_list' %}" class="btn-ghost text-sm"><i class="fa-solid fa-xmark"></i> Clear filters</a>
+      <button type="submit" class="btn-outline"><i class="fa-solid fa-magnifying-glass"></i> Filter</button>
     </div>
   </form>
 </div>
