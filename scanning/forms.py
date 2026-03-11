@@ -21,12 +21,8 @@ class ProfileForm(forms.ModelForm):
             "first_name": forms.TextInput(
                 attrs={"class": "input-text w-full"}
             ),
-            "last_name": forms.TextInput(
-                attrs={"class": "input-text w-full"}
-            ),
-            "email": forms.EmailInput(
-                attrs={"class": "input-text w-full"}
-            ),
+            "last_name": forms.TextInput(attrs={"class": "input-text w-full"}),
+            "email": forms.EmailInput(attrs={"class": "input-text w-full"}),
         }
 
 

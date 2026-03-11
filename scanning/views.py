@@ -1,5 +1,6 @@
 from django.contrib import messages
-from django.contrib.auth import update_session_auth_hash, views as auth_views
+from django.contrib.auth import update_session_auth_hash
+from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
@@ -351,6 +352,4 @@ def password_change(request):
     else:
         form = PasswordChangeForm(request.user)
 
-    return render(
-        request, "scanning/password_change.html", {"form": form}
-    )
+    return render(request, "scanning/password_change.html", {"form": form})
