@@ -5,6 +5,7 @@ case "$1" in
 'web-dev')
     python manage.py migrate
     python manage.py loaddata reporters
+    python manage.py make_dev_data
     python manage.py createcachetable
     echo ""
     echo "  Scanning Portal running at: http://localhost:8002"
