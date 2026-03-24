@@ -28,6 +28,7 @@ dependencies = [
   "gunicorn",
   "pillow",
   "psycopg[binary,pool]",
+  "pymupdf>=1.25",
   "sentry-sdk[django]",
   "time-machine",
   "uvicorn[standard]",

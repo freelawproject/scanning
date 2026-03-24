@@ -251,7 +251,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 var current = ocr && ocr.detected ? ocr.detected : '';
                 var num = prompt('Enter the correct page number for PDF page ' + pdfPage + ':', current);
                 if (num !== null && num.trim()) {
-                    fetch('/document/' + documentId + '/assign-page/', {
+                    fetch('/scans/' + documentId + '/assign-page/', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
@@ -282,7 +282,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // --- Delete page ---
     function deletePage(pdfPage, pageDiv) {
-        fetch('/document/' + documentId + '/delete-page/', {
+        fetch('/scans/' + documentId + '/delete-page/', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -440,7 +440,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
 
         var fill = activeRedactionFill;
-        fetch('/document/' + documentId + '/redaction/add/', {
+        fetch('/scans/' + documentId + '/save-redaction-rect/', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -513,7 +513,7 @@ document.addEventListener('DOMContentLoaded', function () {
             btn.style.top = (r.y * SCALE + 2) + 'px';
             btn.addEventListener('click', function (e) {
                 e.stopPropagation();
-                fetch('/document/' + documentId + '/redaction/' + r.id + '/delete/', {
+                fetch('/scans/' + documentId + '/save-redaction-rect/', {
                     method: 'POST',
                     headers: { 'X-CSRFToken': csrfToken },
                 }).then(function (resp) { return resp.json(); })
@@ -541,7 +541,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var placeholder = pageDiv.querySelector('.missing-placeholder');
         if (placeholder) placeholder.innerHTML = '<p>Uploading...</p>';
 
-        fetch('/document/' + documentId + '/insert/', {
+        fetch('/scans/' + documentId + '/insert/', {
             method: 'POST',
             headers: { 'X-CSRFToken': csrfToken },
             body: formData,
@@ -618,7 +618,7 @@ document.addEventListener('DOMContentLoaded', function () {
             delBtn.className = 'btn dupe-modal-delete';
             delBtn.textContent = 'Delete this page';
             delBtn.addEventListener('click', function () {
-                fetch('/document/' + documentId + '/delete-page/', {
+                fetch('/scans/' + documentId + '/delete-page/', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
                     body: JSON.stringify({ pdf_page: entry.pdf_index + 1 }),
@@ -660,7 +660,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // --- Dismiss an issue ---
     window.dismissIssue = function (btn, issueId) {
-        fetch('/document/' + documentId + '/dismiss-issue/', {
+        fetch('/scans/' + documentId + '/dismiss-issue/', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -704,7 +704,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
 
         var promises = toDelete.map(function (pdfPage) {
-            return fetch('/document/' + documentId + '/delete-page/', {
+            return fetch('/scans/' + documentId + '/delete-page/', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',

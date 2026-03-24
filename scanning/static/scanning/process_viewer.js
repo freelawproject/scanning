@@ -89,7 +89,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // Preload data for instant overlays (skip in view-only mode)
     if (!viewOnly) {
         (function() {
-            fetch('/process/' + documentId + '/detections/')
+            fetch('/scans/' + documentId + '/detections/')
                 .then(function(r) { if (r.ok) return r.json(); return []; })
                 .then(function(data) {
                     allDetections = data;
@@ -99,11 +99,11 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                 })
                 .catch(function() {});
-            fetch('/process/' + documentId + '/redaction-rects/')
+            fetch('/scans/' + documentId + '/redaction-rects/')
                 .then(function(r) { if (r.ok) return r.json(); return []; })
                 .then(function(data) { redactionRects = data; if (redactionsVisible) drawRedactionOverlays(); })
                 .catch(function() {});
-            fetch('/process/' + documentId + '/margin-rects/')
+            fetch('/scans/' + documentId + '/margin-rects/')
                 .then(function(r) { if (r.ok) return r.json(); return []; })
                 .then(function(data) { marginRects = data; })
                 .catch(function() {});
@@ -211,7 +211,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         var current = ocr && ocr.detected ? ocr.detected : '';
                         var num = prompt('Enter the correct page number for PDF page ' + pp + ':', current);
                         if (num !== null && num.trim()) {
-                            fetch('/document/' + documentId + '/assign-page/', {
+                            fetch('/scans/' + documentId + '/assign-page/', {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
                                 body: JSON.stringify({ pdf_page: pp, page_number: num.trim() }),
@@ -303,7 +303,7 @@ document.addEventListener('DOMContentLoaded', function () {
         formData.append('image', file);
         var placeholder = pageDiv.querySelector('.missing-placeholder');
         if (placeholder) placeholder.innerHTML = '<p>Uploading...</p>';
-        fetch('/document/' + documentId + '/insert/', {
+        fetch('/scans/' + documentId + '/insert/', {
             method: 'POST',
             headers: { 'X-CSRFToken': csrfToken },
             body: formData,
@@ -327,7 +327,7 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     function deletePage(pdfPage, pageDiv) {
-        fetch('/document/' + documentId + '/delete-page/', {
+        fetch('/scans/' + documentId + '/delete-page/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
             body: JSON.stringify({ pdf_page: pdfPage }),
@@ -509,7 +509,7 @@ document.addEventListener('DOMContentLoaded', function () {
             var pxPerPtX = imgW / (overlay.width / SCALE);
             var pxPerPtY = imgH / (overlay.height / SCALE);
 
-            fetch('/document/' + documentId + '/save-redaction-rect/', {
+            fetch('/scans/' + documentId + '/save-redaction-rect/', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
                 body: JSON.stringify({
@@ -531,7 +531,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 refreshOverlays();
                 if (redactionsVisible) {
                     clearOverlaysByClass('redaction-overlay-box');
-                    fetch('/process/' + documentId + '/redaction-rects/')
+                    fetch('/scans/' + documentId + '/redaction-rects/')
                         .then(function(r2) { return r2.json(); })
                         .then(function(d2) { redactionRects = d2; drawRedactionOverlays(); });
                 }
@@ -571,7 +571,7 @@ document.addEventListener('DOMContentLoaded', function () {
             btn.style.top = (r.y * SCALE + 2) + 'px';
             btn.addEventListener('click', function (e) {
                 e.stopPropagation();
-                fetch('/document/' + documentId + '/redaction/' + r.id + '/delete/', {
+                fetch('/scans/' + documentId + '/redaction/' + r.id + '/delete/', {
                     method: 'POST',
                     headers: { 'X-CSRFToken': csrfToken },
                 }).then(function (resp) { return resp.json(); })
@@ -619,7 +619,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function loadDetections(callback) {
         if (allDetections !== null) { callback(); return; }
-        fetch('/process/' + documentId + '/detections/')
+        fetch('/scans/' + documentId + '/detections/')
             .then(function (r) { return r.json(); })
             .then(function (data) {
                 allDetections = data;
@@ -737,7 +737,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var model = modelSelect ? modelSelect.value : 'medium';
         btn.textContent = 'Processing...';
         btn.disabled = true;
-        fetch('/document/' + documentId + '/reprocess-section/', {
+        fetch('/scans/' + documentId + '/reprocess-section/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
             body: JSON.stringify({ page_start: ps, page_end: pe, model: model }),
@@ -962,7 +962,7 @@ document.addEventListener('DOMContentLoaded', function () {
         };
 
         // Save directly to detections.json
-        fetch('/document/' + documentId + '/add-single-detection/', {
+        fetch('/scans/' + documentId + '/add-single-detection/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
             body: JSON.stringify(detData),
@@ -980,7 +980,7 @@ document.addEventListener('DOMContentLoaded', function () {
             // Auto re-pair if pairing label
             var _pLabels = ['CASE_CAPTION', 'KEY_ICON'];
             if (_pLabels.indexOf(labelName) >= 0) {
-                fetch('/document/' + documentId + '/repare-opinions/', {
+                fetch('/scans/' + documentId + '/repare-opinions/', {
                     method: 'POST',
                     headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                 }).then(function(r) { return r.json(); })
@@ -1013,7 +1013,7 @@ document.addEventListener('DOMContentLoaded', function () {
         _viewingOpinion = true;
         clearOverlaysByClass('redaction-overlay-box');
         clearOverlaysByClass('margin-overlay-box');
-        var url = '/process/' + documentId + '/opinion/' + filename + '/';
+        var url = '/scans/' + documentId + '/opinion/' + filename + '/';
         loadPdf(url);
     };
 
@@ -1029,9 +1029,9 @@ document.addEventListener('DOMContentLoaded', function () {
 
         var url;
         if (mode === 'unredacted') {
-            url = '/process/' + documentId + '/unredacted/' + filename + '/';
+            url = '/scans/' + documentId + '/unredacted/' + filename + '/';
         } else {
-            url = '/process/' + documentId + '/opinion/' + filename + '/';
+            url = '/scans/' + documentId + '/opinion/' + filename + '/';
         }
         loadPdf(url);
     };
@@ -1042,7 +1042,7 @@ document.addEventListener('DOMContentLoaded', function () {
         redactionRects = null;
         marginRects = null;
         // Reload detections first (needed for img dimensions), then overlays
-        fetch('/process/' + documentId + '/detections/')
+        fetch('/scans/' + documentId + '/detections/')
             .then(function(r) { if (r.ok) return r.json(); return []; })
             .then(function(data) {
                 allDetections = data;
@@ -1051,10 +1051,10 @@ document.addEventListener('DOMContentLoaded', function () {
                     cachedImgH = data[0].img_height || cachedImgH;
                 }
             }).catch(function() {});
-        fetch('/process/' + documentId + '/redaction-rects/')
+        fetch('/scans/' + documentId + '/redaction-rects/')
             .then(function(r) { if (r.ok) return r.json(); return []; })
             .then(function(data) { redactionRects = data; if (redactionsVisible) drawRedactionOverlays(); });
-        fetch('/process/' + documentId + '/margin-rects/')
+        fetch('/scans/' + documentId + '/margin-rects/')
             .then(function(r) { if (r.ok) return r.json(); return []; })
             .then(function(data) { marginRects = data; if (marginsVisible) drawMarginOverlays(); });
     }
@@ -1068,7 +1068,7 @@ document.addEventListener('DOMContentLoaded', function () {
             overlayMode = 'transparent';
             // Load rects if needed
             if (!redactionRects) {
-                fetch('/process/' + documentId + '/redaction-rects/')
+                fetch('/scans/' + documentId + '/redaction-rects/')
                     .then(function(r) { if (r.ok) return r.json(); return []; })
                     .then(function(data) {
                         redactionRects = data;
@@ -1080,7 +1080,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 drawRedactionOverlays();
             }
             if (!marginRects) {
-                fetch('/process/' + documentId + '/margin-rects/')
+                fetch('/scans/' + documentId + '/margin-rects/')
                     .then(function(r) { if (r.ok) return r.json(); return []; })
                     .then(function(data) { marginRects = data; marginsVisible = true; drawMarginOverlays(); });
             } else {
@@ -1133,7 +1133,7 @@ document.addEventListener('DOMContentLoaded', function () {
         btn.style.background = marginsVisible ? '#2563eb' : '#6b7280';
 
         if (marginsVisible && !marginRects) {
-            fetch('/process/' + documentId + '/margin-rects/')
+            fetch('/scans/' + documentId + '/margin-rects/')
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
                     marginRects = data;
@@ -1206,7 +1206,7 @@ document.addEventListener('DOMContentLoaded', function () {
             btn.textContent = 'Loading...';
             // Ensure detections are loaded for img dimensions
             loadDetections(function() {});
-            fetch('/process/' + documentId + '/redaction-rects/')
+            fetch('/scans/' + documentId + '/redaction-rects/')
                 .then(function(r) {
                     if (!r.ok) throw new Error('HTTP ' + r.status);
                     return r.json();
@@ -1322,7 +1322,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
             // Remove rect directly from redaction_rects.json
             var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
-            fetch('/document/' + documentId + '/save-redaction-rect/', {
+            fetch('/scans/' + documentId + '/save-redaction-rect/', {
                 method: 'POST',
                 headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                 body: JSON.stringify({
@@ -1427,7 +1427,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
             // Save the adjusted rect directly to redaction_rects.json
             var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
-            fetch('/document/' + documentId + '/save-redaction-rect/', {
+            fetch('/scans/' + documentId + '/save-redaction-rect/', {
                 method: 'POST',
                 headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                 body: JSON.stringify({
@@ -1534,7 +1534,7 @@ document.addEventListener('DOMContentLoaded', function () {
         suppressBtn.style.cssText = 'background:#ef4444;color:white;border:none;padding:2px 6px;font-size:10px;border-radius:3px;cursor:pointer;';
         suppressBtn.addEventListener('click', function(e) {
             e.stopPropagation();
-            fetch('/document/' + documentId + '/flag/', {
+            fetch('/scans/' + documentId + '/flag/', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
                 body: JSON.stringify({
@@ -1549,11 +1549,11 @@ document.addEventListener('DOMContentLoaded', function () {
                     _selectedDetBox = null;
                     var _pLabels = ['CASE_CAPTION', 'KEY_ICON'];
                     if (_pLabels.indexOf(det.label) >= 0) {
-                        fetch('/document/' + documentId + '/repare-opinions/', {
+                        fetch('/scans/' + documentId + '/repare-opinions/', {
                             method: 'POST', headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                         }).then(function(r) { return r.json(); }).then(function(d2) { alert(d2.message); window.location.reload(); });
                     } else {
-                        fetch('/document/' + documentId + '/save-redaction-rect/', {
+                        fetch('/scans/' + documentId + '/save-redaction-rect/', {
                             method: 'POST', headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                             body: JSON.stringify({page_index: det.page_index, action: 'delete', original: {x0: det.bbox[0], y0: det.bbox[1], x1: det.bbox[2], y1: det.bbox[3]}, type: det.label}),
                         }).then(function() { refreshOverlays(); });
@@ -1568,13 +1568,13 @@ document.addEventListener('DOMContentLoaded', function () {
         approveBtn.addEventListener('click', function(e) {
             e.stopPropagation();
             // 1) Create the RedactionRect via add-single-detection
-            fetch('/document/' + documentId + '/add-single-detection/', {
+            fetch('/scans/' + documentId + '/add-single-detection/', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
                 body: JSON.stringify(det),
             }).then(function(r) { return r.json(); }).then(function() {
                 // 2) Also create an approve flag for tracking
-                return fetch('/document/' + documentId + '/flag/', {
+                return fetch('/scans/' + documentId + '/flag/', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
                     body: JSON.stringify({
@@ -1589,7 +1589,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     _deselectDetectionBox();
                     var _pLabels2 = ['CASE_CAPTION', 'KEY_ICON'];
                     if (_pLabels2.indexOf(det.label) >= 0) {
-                        fetch('/document/' + documentId + '/repare-opinions/', {
+                        fetch('/scans/' + documentId + '/repare-opinions/', {
                             method: 'POST', headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                         }).then(function(r) { return r.json(); }).then(function(d2) { alert(d2.message); window.location.reload(); });
                     } else {
@@ -1650,7 +1650,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         Math.round((nT + nH) / scaleY),
                     ];
                     // Update detection in detections.json
-                    fetch('/document/' + documentId + '/update-detection-bbox/', {
+                    fetch('/scans/' + documentId + '/update-detection-bbox/', {
                         method: 'POST',
                         headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                         body: JSON.stringify({
@@ -1701,7 +1701,7 @@ document.addEventListener('DOMContentLoaded', function () {
         delBtn.addEventListener('click', function(e) {
             e.stopPropagation();
             if (!confirm('Delete this margin?')) return;
-            fetch('/document/' + documentId + '/save-margin-rect/', {
+            fetch('/scans/' + documentId + '/save-margin-rect/', {
                 method: 'POST',
                 headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                 body: JSON.stringify({page_index: pageIdx, action: 'delete', original: rectData}),
@@ -1769,7 +1769,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         x1: Math.round((nL + nW) / scaleX * 10) / 10,
                         y1: Math.round((nT + nH) / scaleY * 10) / 10,
                     };
-                    fetch('/document/' + documentId + '/save-margin-rect/', {
+                    fetch('/scans/' + documentId + '/save-margin-rect/', {
                         method: 'POST',
                         headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                         body: JSON.stringify({
@@ -1813,7 +1813,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // ── Re-pair opinions ──
     window.repairOpinions = function() {
         var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
-        fetch('/document/' + documentId + '/repare-opinions/', {
+        fetch('/scans/' + documentId + '/repare-opinions/', {
             method: 'POST',
             headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
         })
@@ -1860,7 +1860,7 @@ document.addEventListener('DOMContentLoaded', function () {
         btn.textContent = 'Scanning...';
         btn.disabled = true;
 
-        fetch('/document/' + documentId + '/scan-for-label/', {
+        fetch('/scans/' + documentId + '/scan-for-label/', {
             method: 'POST',
             headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
             body: JSON.stringify({label: label, model: model, page_start: pageStart, page_end: pageEnd}),
@@ -1876,7 +1876,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 if (data.added > 0) {
                     // Re-pair to regenerate redaction_rects.json with new detections
                     btn.textContent = 'Re-pairing...';
-                    fetch('/document/' + documentId + '/repare-opinions/', {
+                    fetch('/scans/' + documentId + '/repare-opinions/', {
                         method: 'POST',
                         headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                     })
@@ -1924,7 +1924,7 @@ document.addEventListener('DOMContentLoaded', function () {
         btn.disabled = true;
         var pageIdx = pageNum - 1;
 
-        fetch('/document/' + documentId + '/redetect-page/', {
+        fetch('/scans/' + documentId + '/redetect-page/', {
             method: 'POST',
             headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
             body: JSON.stringify({page_index: pageIdx, model: 'all', action: 'preview'}),
@@ -1987,7 +1987,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     detBox.addEventListener('click', function(e) {
                         e.stopPropagation();
                         if (!_accepted) {
-                            fetch('/document/' + documentId + '/add-single-detection/', {
+                            fetch('/scans/' + documentId + '/add-single-detection/', {
                                 method: 'POST',
                                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
                                 body: JSON.stringify(det),
@@ -2003,7 +2003,7 @@ document.addEventListener('DOMContentLoaded', function () {
                                 refreshOverlays();
                                 var _pLabels3 = ['CASE_CAPTION', 'KEY_ICON'];
                                 if (_pLabels3.indexOf(det.label) >= 0) {
-                                    fetch('/document/' + documentId + '/repare-opinions/', {
+                                    fetch('/scans/' + documentId + '/repare-opinions/', {
                                         method: 'POST',
                                         headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                                     }).then(function(r) { return r.json(); })
@@ -2014,7 +2014,7 @@ document.addEventListener('DOMContentLoaded', function () {
                                 }
                             });
                         } else {
-                            fetch('/document/' + documentId + '/save-redaction-rect/', {
+                            fetch('/scans/' + documentId + '/save-redaction-rect/', {
                                 method: 'POST',
                                 headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                                 body: JSON.stringify({
@@ -2048,7 +2048,7 @@ document.addEventListener('DOMContentLoaded', function () {
             acceptAllBtn.textContent = 'Accept All (' + newDets.length + ')';
             acceptAllBtn.style.cssText = 'background:#059669;color:white;border:none;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;';
             acceptAllBtn.addEventListener('click', function() {
-                fetch('/document/' + documentId + '/redetect-page/', {
+                fetch('/scans/' + documentId + '/redetect-page/', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
                     body: JSON.stringify({page_index: pageIdx, model: 'all', action: 'accept_new'}),
@@ -2061,7 +2061,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         detectionsVisible[pageNum] = false;
                         toggleDetections(pageDiv, pageNum);
                     }
-                    fetch('/document/' + documentId + '/repare-opinions/', {
+                    fetch('/scans/' + documentId + '/repare-opinions/', {
                         method: 'POST',
                         headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                     }).then(function() { refreshOverlays(); });
@@ -2100,7 +2100,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function _loadOpinionsData(cb) {
         if (_opinionsData) { cb(); return; }
-        fetch('/process/' + documentId + '/opinions/')
+        fetch('/scans/' + documentId + '/opinions-json/')
             .then(function(r) { return r.json(); })
             .then(function(data) { _opinionsData = data; cb(); });
     }

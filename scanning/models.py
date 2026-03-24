@@ -190,10 +190,20 @@ class Scan(AbstractDateTimeModel):
     )
     volume = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     number_of_pages = models.PositiveIntegerField(
-        validators=[MinValueValidator(1)]
+        validators=[MinValueValidator(1)],
+        null=True,
+        blank=True,
     )
-    start_page = models.PositiveIntegerField(validators=[MinValueValidator(1)])
-    end_page = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    start_page = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)],
+        null=True,
+        blank=True,
+    )
+    end_page = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)],
+        null=True,
+        blank=True,
+    )
     source = models.CharField(
         max_length=20,
         choices=Source.choices,
@@ -209,6 +219,7 @@ class Scan(AbstractDateTimeModel):
     )
     original_pdf = models.FileField(
         upload_to=book_upload_path,
+        blank=True,
     )
     redacted_pdf = models.FileField(
         null=True,
