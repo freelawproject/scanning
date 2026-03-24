@@ -11,6 +11,14 @@ class Status(models.TextChoices):
     PENDING_REVIEW = "pending_review", "Pending Review"
     APPROVED = "approved", "Approved"
     EXTRACTED = "extracted", "Extracted"
+    ERROR = "error", "Error"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class Stage(models.TextChoices):
+    VALIDATE = "validate", "Validate"
+    PROCESS = "process", "Process"
+    APPROVED = "approved", "Approved"
 
 
 class Source(models.TextChoices):
@@ -211,6 +219,47 @@ class Scan(AbstractDateTimeModel):
     )
     processed_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(blank=True)
+    output_dir = models.CharField(max_length=1024, blank=True, default="")
+    stage = models.CharField(
+        max_length=20,
+        choices=Stage.choices,
+        default=Stage.VALIDATE,
+    )
+    progress_current = models.PositiveIntegerField(default=0)
+    progress_total = models.PositiveIntegerField(default=0)
+    progress_message = models.CharField(max_length=255, blank=True, default="")
+    progress_log = models.TextField(
+        blank=True,
+        default="",
+        help_text="Captured stdout from processing.",
+    )
+    ocr_results = models.TextField(
+        blank=True,
+        default="",
+        help_text="JSON: per-page OCR detection results.",
+    )
+    opinions_json = models.TextField(
+        blank=True,
+        default="",
+        help_text="JSON: opinion boundary data.",
+    )
+    page_map = models.TextField(
+        blank=True,
+        default="",
+        help_text="JSON: viewer page sequence.",
+    )
+    missing_pages = models.TextField(
+        blank=True,
+        default="",
+        help_text="JSON: list of missing logical page numbers.",
+    )
+    page_count = models.PositiveIntegerField(default=0)
+    has_issues = models.BooleanField(default=False)
+    checked = models.BooleanField(default=False)
+    redacted_pdf_path = models.CharField(
+        max_length=1024, blank=True, default=""
+    )
+    has_state_abbrev = models.BooleanField(default=True)
 
     class Meta:
         indexes = [
@@ -220,6 +269,7 @@ class Scan(AbstractDateTimeModel):
             ),
             models.Index(fields=["status"], name="idx_status"),
             models.Index(fields=["uploaded_by"], name="idx_uploaded_by"),
+            models.Index(fields=["stage"], name="idx_stage"),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -262,6 +312,15 @@ class Scan(AbstractDateTimeModel):
             )
         if errors:
             raise ValidationError(errors)
+
+    @property
+    def pdf_path(self):
+        """Return the path to the original uploaded PDF.
+
+        :returns: The filesystem path of the original PDF.
+        :rtype: str
+        """
+        return self.original_pdf.path
 
     def __str__(self):
         return (
@@ -314,6 +373,10 @@ class OpinionScan(AbstractDateTimeModel):
         blank=True,
         help_text="Verbose output from blackletter pipeline processing.",
     )
+    opinion_order = models.PositiveIntegerField(default=0)
+    caption_page_index = models.PositiveIntegerField(null=True, blank=True)
+    key_page_index = models.PositiveIntegerField(null=True, blank=True)
+    has_image = models.BooleanField(default=False)
 
     class Meta:
         indexes = [
@@ -324,7 +387,7 @@ class OpinionScan(AbstractDateTimeModel):
             ),
             models.Index(fields=["status"], name="idx_opinion_status"),
         ]
-        ordering = ["-date_created"]
+        ordering = ["opinion_order", "-date_created"]
 
     def clean(self):
         """Validate that page_start does not exceed page_end.
@@ -348,3 +411,182 @@ class OpinionScan(AbstractDateTimeModel):
             f"{self.reporter} vol. {self.volume} opinion"
             f" ({self.get_status_display()})"
         )
+
+
+class Issue(AbstractDateTimeModel):
+    """A validation or processing issue found in a scan."""
+
+    class Severity(models.TextChoices):
+        ERROR = "error", "Error"
+        WARNING = "warning", "Warning"
+        INFO = "info", "Info"
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="issues",
+    )
+    page_number = models.PositiveIntegerField(null=True, blank=True)
+    check_name = models.CharField(max_length=100)
+    severity = models.CharField(
+        max_length=10,
+        choices=Severity.choices,
+        default=Severity.ERROR,
+    )
+    message = models.TextField()
+    metadata = models.TextField(
+        blank=True,
+        default="",
+        help_text="JSON for structured data (e.g. suppression info).",
+    )
+
+    class Meta:
+        ordering = ["page_number", "severity"]
+
+    def __str__(self):
+        page = f"p.{self.page_number}" if self.page_number else "doc"
+        return f"[{self.severity}] {page}: {self.message}"
+
+
+class Detection(AbstractDateTimeModel):
+    """YOLO detection stored in DB.
+
+    Each row is one bounding box from one model.
+    Coordinates are in image pixels.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="detections",
+    )
+    page_index = models.PositiveIntegerField(db_index=True)
+    label = models.CharField(max_length=50)
+    label_id = models.SmallIntegerField()
+    confidence = models.FloatField()
+    x0 = models.FloatField()
+    y0 = models.FloatField()
+    x1 = models.FloatField()
+    y1 = models.FloatField()
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+    model_name = models.CharField(max_length=20, blank=True, default="")
+    model_count = models.PositiveSmallIntegerField(default=1)
+    found_by = models.TextField(
+        blank=True,
+        default="",
+        help_text="JSON: per-model confidence breakdown.",
+    )
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["page_index", "y0", "x0"]
+        indexes = [
+            models.Index(
+                fields=["scan", "page_index"],
+                name="idx_det_scan_page",
+            ),
+            models.Index(
+                fields=["scan", "label"],
+                name="idx_det_scan_label",
+            ),
+            models.Index(
+                fields=["scan", "active"],
+                name="idx_det_scan_active",
+            ),
+        ]
+
+    def __str__(self):
+        state = "" if self.active else " [suppressed]"
+        return (
+            f"{self.label} p.{self.page_index}"
+            f" conf={self.confidence:.2f}{state}"
+        )
+
+
+class PageInsert(AbstractDateTimeModel):
+    """User-uploaded image to replace a missing page."""
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="inserts",
+    )
+    logical_page_number = models.PositiveIntegerField()
+    image = models.FileField(upload_to="page_inserts/")
+
+    class Meta:
+        unique_together = ("scan", "logical_page_number")
+
+    def __str__(self):
+        return f"Insert p.{self.logical_page_number} for {self.scan}"
+
+
+class PageDeletion(AbstractDateTimeModel):
+    """Page marked for deletion from the PDF."""
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="deletions",
+    )
+    pdf_page = models.PositiveIntegerField(
+        help_text="1-based PDF page number.",
+    )
+
+    class Meta:
+        unique_together = ("scan", "pdf_page")
+
+    def __str__(self):
+        return f"Delete PDF p.{self.pdf_page} from {self.scan}"
+
+
+class LLMScan(AbstractDateTimeModel):
+    """A masked PDF batch sent to an LLM for text extraction."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        QUEUED = "queued", "Queued"
+        SENT = "sent", "Sent to LLM"
+        EXTRACTED = "extracted", "Extracted"
+        MERGED = "merged", "Merged"
+        ERROR = "error", "Error"
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="llm_scans",
+    )
+    opinions = models.ManyToManyField(
+        OpinionScan,
+        related_name="llm_scans",
+        blank=True,
+    )
+    masked_pdf = models.FileField(
+        upload_to="llm/",
+        null=True,
+        blank=True,
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+    )
+    llm_model = models.CharField(max_length=100, blank=True, default="")
+    prompt_tokens = models.PositiveIntegerField(default=0)
+    completion_tokens = models.PositiveIntegerField(default=0)
+    cost_cents = models.PositiveIntegerField(default=0)
+    raw_response = models.TextField(blank=True, default="")
+    extracted_text = models.TextField(blank=True, default="")
+    extracted_metadata = models.TextField(blank=True, default="")
+    sent_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    error_message = models.TextField(blank=True, default="")
+    retry_count = models.PositiveIntegerField(default=0)
+    task_id = models.CharField(max_length=255, blank=True, default="")
+
+    class Meta:
+        ordering = ["-date_created"]
+
+    def __str__(self):
+        return f"LLM batch #{self.pk} ({self.get_status_display()})"
