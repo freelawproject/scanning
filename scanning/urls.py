@@ -5,14 +5,18 @@ from django.urls import include, path
 
 from scanning.monitoring import health_check, heartbeat, sentry_fail
 from scanning.views import (
+    claim_scan,
     login_view,
     logout_view,
     opinion_detail,
     opinion_list,
     opinion_upload,
+    queue_detail_view,
+    queue_view,
     scan_detail,
     scan_list,
     scan_upload,
+    update_scan_status,
 )
 
 urlpatterns = [
@@ -24,6 +28,10 @@ urlpatterns = [
     path("opinions/", opinion_list, name="opinion_list"),
     path("opinions/upload/", opinion_upload, name="opinion_upload"),
     path("opinions/<int:pk>/", opinion_detail, name="opinion_detail"),
+    path("queue/", queue_view, name="queue"),
+    path("queue/<int:pk>/", queue_detail_view, name="queue_detail"),
+    path("queue/<int:pk>/claim/", claim_scan, name="claim_scan"),
+    path("queue/<int:pk>/status/", update_scan_status, name="update_scan_status"),
     path("admin/", admin.site.urls),
     path("monitoring/heartbeat/", heartbeat, name="heartbeat"),
     path("monitoring/health-check/", health_check, name="health_check"),

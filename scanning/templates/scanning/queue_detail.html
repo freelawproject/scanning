@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+
+{% block title %}{{ scan.reporter.short_name }} vol. {{ scan.volume }} - Queue - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+  <a href="{% url 'queue' %}" class="text-sm text-gray-500 dark:text-gray-400 hover:text-primary-600">&laquo; Back to Queue</a>
+</div>
+
+<!-- Header -->
+<div class="flex flex-col sm:flex-row sm:items-start sm:justify-between mb-6 gap-4">
+  <div>
+    <h1 class="text-2xl font-bold">{{ scan.reporter.full_name }}</h1>
+    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+      Volume {{ scan.volume }}
+      {% if scan.start_page and scan.end_page %}
+      &middot; Pages {{ scan.start_page }}-{{ scan.end_page }}
+      {% endif %}
+    </p>
+  </div>
+  <div class="flex items-center gap-2">
+    <span class="badge-priority-{{ scan.priority }}">{{ scan.get_priority_display }}</span>
+    <span class="badge-{{ scan.queue_status }}">{{ scan.get_queue_status_display }}</span>
+  </div>
+</div>
+
+<!-- Info cards -->
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
+  <div class="card">
+    <div class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">Assignment</div>
+    {% if scan.assigned_to %}
+    <div class="font-semibold">{{ scan.assigned_to.username }}</div>
+    {% if scan.assigned_at %}
+    <div class="text-sm text-gray-500 dark:text-gray-400">since {{ scan.assigned_at|date:"M d, Y" }}</div>
+    {% endif %}
+    {% if scan.assigned_to == user %}
+    <form method="post" action="{% url 'claim_scan' scan.pk %}" class="mt-2">
+      {% csrf_token %}
+      <input type="hidden" name="unclaim" value="1">
+      <input type="hidden" name="next" value="{% url 'queue_detail' scan.pk %}">
+      <button type="submit" class="btn-outline text-sm">Unclaim</button>
+    </form>
+    {% endif %}
+    {% elif scan.queue_status == 'needs_scanning' and user.is_authenticated %}
+    <form method="post" action="{% url 'claim_scan' scan.pk %}" class="mt-1">
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{% url 'queue_detail' scan.pk %}">
+      <button type="submit" class="btn-primary text-sm">Claim this volume</button>
+    </form>
+    {% else %}
+    <div class="text-gray-400">Unassigned</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">Source</div>
+    <div>{{ scan.source_library|default:"Not specified" }}</div>
+    {% if scan.source_url %}
+    <a href="{{ scan.source_url }}" target="_blank" class="text-sm mt-1 inline-block">View source</a>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Coverage info -->
+{% if scan.start_page and scan.end_page %}
+<div class="rounded-lg bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 px-4 py-3 text-sm text-blue-800 dark:text-blue-300 mb-4">
+  <span class="font-semibold">Page range:</span> {{ scan.start_page }}-{{ scan.end_page }}
+  ({{ scan.number_of_pages }} pages)
+</div>
+{% endif %}
+
+{% if scan.notes %}
+<div class="rounded-lg bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 px-4 py-3 text-sm text-yellow-800 dark:text-yellow-300 mb-6">
+  {{ scan.notes }}
+</div>
+{% endif %}
+
+<!-- Actions -->
+<div class="flex flex-wrap gap-2 mb-6">
+  {% if scan.queue_status == 'needs_scanning' and user.is_authenticated %}
+  <form method="post" action="{% url 'claim_scan' scan.pk %}">
+    {% csrf_token %}
+    <input type="hidden" name="next" value="{% url 'queue_detail' scan.pk %}">
+    <button type="submit" class="btn-primary">Claim this volume</button>
+  </form>
+  {% elif scan.queue_status == 'assigned' and scan.assigned_to == user %}
+  <form method="post" action="{% url 'update_scan_status' scan.pk %}">
+    {% csrf_token %}
+    <input type="hidden" name="status" value="scanning">
+    <input type="hidden" name="next" value="{% url 'queue_detail' scan.pk %}">
+    <button type="submit" class="btn-primary">Start Scanning</button>
+  </form>
+  {% elif scan.queue_status == 'scanning' and scan.assigned_to == user %}
+  <form method="post" action="{% url 'update_scan_status' scan.pk %}">
+    {% csrf_token %}
+    <input type="hidden" name="status" value="scanned">
+    <input type="hidden" name="next" value="{% url 'queue_detail' scan.pk %}">
+    <button type="submit" class="btn-primary">Mark Done</button>
+  </form>
+  {% endif %}
+
+  {% if user.is_staff %}
+  <form method="post" action="{% url 'update_scan_status' scan.pk %}" class="flex items-center gap-2">
+    {% csrf_token %}
+    <input type="hidden" name="next" value="{% url 'queue_detail' scan.pk %}">
+    <select name="status" class="input-text text-sm">
+      {% for val, label in queue_statuses %}
+      <option value="{{ val }}" {% if scan.queue_status == val %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="btn-outline">Update Status</button>
+  </form>
+  {% endif %}
+</div>
+
+<hr class="border-gray-200 dark:border-gray-700 my-6">
+
+<!-- Scan detail link -->
+{% if scan.original_pdf %}
+<div class="card mb-6">
+  <h2 class="text-lg font-bold mb-3">Uploaded Scan</h2>
+  <div class="flex items-center justify-between">
+    <div>
+      <div class="text-sm text-gray-500 dark:text-gray-400">
+        {{ scan.number_of_pages }} pages &middot;
+        <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
+        &middot; {{ scan.date_created|date:"M j, Y g:i A" }}
+        {% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}
+      </div>
+    </div>
+    <a href="{% url 'scan_detail' pk=scan.pk %}" class="btn-outline text-sm">View scan details</a>
+  </div>
+</div>
+{% endif %}
+
+<!-- PDF viewer -->
+{% if scan.original_pdf %}
+<div class="card">
+  <h2 class="text-lg font-bold mb-4">Original PDF</h2>
+  <iframe
+    src="{{ scan.original_pdf.url }}"
+    class="w-full border border-gray-200 dark:border-gray-700 rounded"
+    style="height: 60vh;"
+    title="Original PDF"
+  ></iframe>
+</div>
+{% else %}
+<div class="card text-center py-8">
+  <p class="text-gray-500 dark:text-gray-400 mb-2">No PDF uploaded for this volume yet.</p>
+  <a href="{% url 'scan_upload' %}" class="btn-primary">Upload a scan</a>
+</div>
+{% endif %}
+{% endblock %}

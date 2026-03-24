@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+
+{% block title %}Scanning Queue - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4">
+  <h1 class="text-2xl font-bold">Scanning Queue</h1>
+  <div class="text-sm text-gray-500 dark:text-gray-400">
+    {{ stats.total }} volumes &middot;
+    <span class="text-red-600 dark:text-red-400">{{ stats.needs_scanning }} to scan</span> &middot;
+    <span class="text-yellow-600 dark:text-yellow-400">{{ stats.assigned }} assigned</span> &middot;
+    <span class="text-blue-600 dark:text-blue-400">{{ stats.scanning }} in progress</span> &middot;
+    <span class="text-green-600 dark:text-green-400">{{ stats.complete }} complete</span>
+  </div>
+</div>
+
+<!-- Status tabs -->
+<div class="flex flex-wrap gap-2 mb-4">
+  <a href="{% url 'queue' %}"
+     class="{% if not status_filter %}btn-primary{% else %}btn-outline{% endif %} text-sm">All</a>
+  <a href="{% url 'queue' %}?status=needs_scanning"
+     class="{% if status_filter == 'needs_scanning' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Needs Scanning</a>
+  <a href="{% url 'queue' %}?status=assigned"
+     class="{% if status_filter == 'assigned' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Assigned</a>
+  <a href="{% url 'queue' %}?status=scanning"
+     class="{% if status_filter == 'scanning' %}btn-primary{% else %}btn-outline{% endif %} text-sm">In Progress</a>
+  <a href="{% url 'queue' %}?status=complete"
+     class="{% if status_filter == 'complete' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Complete</a>
+</div>
+
+<!-- Filters -->
+<div class="card mb-6">
+  <form method="get" class="flex flex-col sm:flex-row gap-3">
+    {% if status_filter %}<input type="hidden" name="status" value="{{ status_filter }}">{% endif %}
+    <div class="flex-1">
+      <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
+      <select id="filter-reporter" name="reporter" class="input-text w-full">
+        <option value="">All reporters</option>
+        {% for r in reporters %}
+        <option value="{{ r.short_name }}" {% if selected_reporter == r.short_name %}selected{% endif %}>
+          {{ r.full_name }} ({{ r.short_name }})
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="flex-1">
+      <label for="filter-priority" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Priority</label>
+      <select id="filter-priority" name="priority" class="input-text w-full">
+        <option value="">All priorities</option>
+        {% for val, label in priorities %}
+        <option value="{{ val }}" {% if priority_filter == val %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="flex items-end gap-2">
+      <button type="submit" class="btn-outline">Filter</button>
+      {% if selected_reporter or priority_filter %}
+      <a href="{% url 'queue' %}{% if status_filter %}?status={{ status_filter }}{% endif %}"
+         class="btn-ghost text-sm">Clear</a>
+      {% endif %}
+    </div>
+  </form>
+</div>
+
+{% if scans %}
+<!-- Desktop table -->
+<div class="hidden sm:block card overflow-hidden p-0">
+  <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+    <thead class="bg-gray-50 dark:bg-gray-800">
+      <tr>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Reporter</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Vol</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Pages</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Priority</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Assigned</th>
+        <th class="px-4 py-3"></th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+      {% for scan in scans %}
+      <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50{% if scan.queue_status == 'complete' %} opacity-50{% endif %}">
+        <td class="px-4 py-3 text-sm font-medium">
+          <a href="{% url 'queue_detail' scan.pk %}">{{ scan.reporter.short_name }}</a>
+        </td>
+        <td class="px-4 py-3 text-sm">
+          <a href="{% url 'queue_detail' scan.pk %}">{{ scan.volume }}</a>
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
+          {{ scan.start_page }}-{{ scan.end_page }}
+        </td>
+        <td class="px-4 py-3 text-sm">
+          <span class="badge-priority-{{ scan.priority }}">{{ scan.get_priority_display }}</span>
+        </td>
+        <td class="px-4 py-3 text-sm">
+          <span class="badge-{{ scan.queue_status }}">{{ scan.get_queue_status_display }}</span>
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
+          {{ scan.assigned_to.username|default:"\u2014" }}
+        </td>
+        <td class="px-4 py-3 text-sm text-right whitespace-nowrap">
+          <div class="flex items-center gap-2 justify-end" onclick="event.stopPropagation();">
+            {% if scan.queue_status == 'needs_scanning' and user.is_authenticated %}
+            <form method="post" action="{% url 'claim_scan' scan.pk %}">
+              {% csrf_token %}
+              <button type="submit" class="btn-primary text-xs px-2 py-1">Claim</button>
+            </form>
+            {% elif scan.queue_status == 'assigned' and scan.assigned_to == user %}
+            <form method="post" action="{% url 'claim_scan' scan.pk %}">
+              {% csrf_token %}
+              <input type="hidden" name="unclaim" value="1">
+              <button type="submit" class="btn-outline text-xs px-2 py-1">Unclaim</button>
+            </form>
+            {% endif %}
+            <a href="{% url 'queue_detail' scan.pk %}" class="btn-outline text-xs px-2 py-1">View</a>
+            {% if user.is_staff %}
+            <form method="post" action="{% url 'update_scan_status' scan.pk %}" class="flex items-center">
+              {% csrf_token %}
+              <select name="status" onchange="this.form.submit()" class="input-text text-xs py-1 px-1">
+                <option value="">...</option>
+                {% for val, label in queue_statuses %}
+                <option value="{{ val }}">{{ label }}</option>
+                {% endfor %}
+              </select>
+            </form>
+            {% endif %}
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- Mobile cards -->
+<div class="sm:hidden space-y-3">
+  {% for scan in scans %}
+  <a href="{% url 'queue_detail' scan.pk %}" class="card block hover:shadow-md transition-shadow{% if scan.queue_status == 'complete' %} opacity-50{% endif %}">
+    <div class="flex items-center justify-between mb-2">
+      <span class="font-medium text-sm">{{ scan.reporter.short_name }} vol. {{ scan.volume }}</span>
+      <span class="badge-{{ scan.queue_status }}">{{ scan.get_queue_status_display }}</span>
+    </div>
+    <div class="flex items-center gap-2 mb-1">
+      <span class="badge-priority-{{ scan.priority }}">{{ scan.get_priority_display }}</span>
+      {% if scan.assigned_to %}
+      <span class="text-xs text-gray-500 dark:text-gray-400">Assigned to {{ scan.assigned_to.username }}</span>
+      {% endif %}
+    </div>
+    <div class="text-sm text-gray-500 dark:text-gray-400">
+      Pages {{ scan.start_page }}-{{ scan.end_page }}
+    </div>
+  </a>
+  {% endfor %}
+</div>
+
+{% else %}
+<div class="card text-center py-12">
+  <p class="text-gray-500 dark:text-gray-400">No scans match your filters.</p>
+</div>
+{% endif %}
+{% endblock %}

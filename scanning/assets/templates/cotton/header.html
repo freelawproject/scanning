@@ -21,6 +21,7 @@
       {% if user.is_authenticated %}
         <a href="{% url 'scan_upload' %}" class="btn-ghost text-sm">Upload book scan</a>
         <a href="{% url 'scan_list' %}" class="btn-ghost text-sm">Book Scans</a>
+        <a href="{% url 'queue' %}" class="btn-ghost text-sm">Queue</a>
         <a href="{% url 'opinion_list' %}" class="btn-ghost text-sm">Opinion Scans</a>
         <form method="post" action="{% url 'logout' %}">
           {% csrf_token %}
@@ -38,6 +39,7 @@
       {% if user.is_authenticated %}
         <a href="{% url 'scan_upload' %}" class="block btn-ghost text-sm">Upload book scan</a>
         <a href="{% url 'scan_list' %}" class="block btn-ghost text-sm">Book Scans</a>
+        <a href="{% url 'queue' %}" class="block btn-ghost text-sm">Queue</a>
         <a href="{% url 'opinion_list' %}" class="block btn-ghost text-sm">Opinion Scans</a>
         <form method="post" action="{% url 'logout' %}">
           {% csrf_token %}

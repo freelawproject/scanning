@@ -6,6 +6,7 @@ from django.core.paginator import Paginator
 from django.db.models import Count
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
+from django.views.decorators.http import require_POST
 
 from scanning.forms import (
     OpinionScanReviewForm,
@@ -16,6 +17,8 @@ from scanning.forms import (
 from scanning.models import (
     OpinionScan,
     OpinionStatus,
+    Priority,
+    QueueStatus,
     Reporter,
     Scan,
     Source,
@@ -307,3 +310,156 @@ def opinion_upload(request):
         "scanning/opinion_upload.html",
         {"form": form},
     )
+
+
+# ---------------------------------------------------------------------------
+# Queue views
+# ---------------------------------------------------------------------------
+
+
+@login_required
+def queue_view(request):
+    """Scanner work queue -- volumes that need scanning, with filters.
+
+    :param request: The current HTTP request.
+    :type request: django.http.HttpRequest
+    :returns: The rendered queue page.
+    :rtype: django.http.HttpResponse
+    """
+    reporters = Reporter.objects.all()
+    selected_reporter = request.GET.get("reporter", "")
+    status_filter = request.GET.get("status", "")
+    priority_filter = request.GET.get("priority", "")
+
+    scans = Scan.objects.select_related(
+        "reporter", "assigned_to"
+    ).order_by("reporter__short_name", "volume")
+
+    if selected_reporter:
+        scans = scans.filter(reporter__short_name=selected_reporter)
+    if status_filter:
+        scans = scans.filter(queue_status=status_filter)
+    if priority_filter:
+        scans = scans.filter(priority=priority_filter)
+
+    # Stats
+    total = Scan.objects.count()
+    by_status = dict(
+        Scan.objects.values_list("queue_status")
+        .annotate(c=Count("id"))
+        .values_list("queue_status", "c")
+    )
+
+    return render(
+        request,
+        "scanning/queue.html",
+        {
+            "scans": scans,
+            "reporters": reporters,
+            "selected_reporter": selected_reporter,
+            "status_filter": status_filter,
+            "priority_filter": priority_filter,
+            "stats": {
+                "total": total,
+                "needs_scanning": by_status.get("needs_scanning", 0),
+                "assigned": by_status.get("assigned", 0),
+                "scanning": by_status.get("scanning", 0),
+                "complete": by_status.get("complete", 0),
+            },
+            "queue_statuses": QueueStatus.choices,
+            "priorities": Priority.choices,
+        },
+    )
+
+
+@login_required
+def queue_detail_view(request, pk):
+    """Detail page for a queue item -- view info, assignment, and PDF.
+
+    :param request: The current HTTP request.
+    :type request: django.http.HttpRequest
+    :param pk: The primary key of the scan.
+    :type pk: int
+    :returns: The rendered queue detail page.
+    :rtype: django.http.HttpResponse
+    """
+    scan = get_object_or_404(
+        Scan.objects.select_related("reporter", "assigned_to", "uploaded_by"),
+        pk=pk,
+    )
+
+    return render(
+        request,
+        "scanning/queue_detail.html",
+        {
+            "scan": scan,
+            "queue_statuses": QueueStatus.choices,
+        },
+    )
+
+
+@login_required
+@require_POST
+def claim_scan(request, pk):
+    """Claim or unclaim a scan for scanning.
+
+    If the POST body contains ``unclaim=1`` and the scan is currently
+    assigned to the requesting user, the assignment is cleared and the
+    queue status is reset to *needs_scanning*.
+
+    :param request: The current HTTP request.
+    :type request: django.http.HttpRequest
+    :param pk: The primary key of the scan.
+    :type pk: int
+    :returns: A redirect to the queue or to the URL in ``next``.
+    :rtype: django.http.HttpResponseRedirect
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+
+    if request.POST.get("unclaim") == "1":
+        if scan.assigned_to == request.user:
+            scan.queue_status = QueueStatus.NEEDS_SCANNING
+            scan.assigned_to = None
+            scan.assigned_at = None
+            scan.save()
+            messages.info(request, "Scan unclaimed.")
+    elif scan.queue_status == QueueStatus.NEEDS_SCANNING:
+        scan.queue_status = QueueStatus.ASSIGNED
+        scan.assigned_to = request.user
+        scan.assigned_at = timezone.now()
+        scan.save()
+        messages.success(request, "Scan claimed.")
+
+    next_url = request.POST.get("next", "")
+    if next_url:
+        return redirect(next_url)
+    return redirect("queue")
+
+
+@login_required
+@require_POST
+def update_scan_status(request, pk):
+    """Update a scan's queue status.
+
+    :param request: The current HTTP request.
+    :type request: django.http.HttpRequest
+    :param pk: The primary key of the scan.
+    :type pk: int
+    :returns: A redirect to the queue or to the URL in ``next``.
+    :rtype: django.http.HttpResponseRedirect
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    new_status = request.POST.get("status")
+
+    if new_status and new_status in dict(QueueStatus.choices):
+        scan.queue_status = new_status
+        if new_status == QueueStatus.NEEDS_SCANNING:
+            scan.assigned_to = None
+            scan.assigned_at = None
+        scan.save()
+        messages.success(request, f"Status updated to {scan.get_queue_status_display()}.")
+
+    next_url = request.POST.get("next", "")
+    if next_url:
+        return redirect(next_url)
+    return redirect("queue")

@@ -21,6 +21,23 @@ class Stage(models.TextChoices):
     APPROVED = "approved", "Approved"
 
 
+class Priority(models.TextChoices):
+    CRITICAL = "critical", "Critical"
+    HIGH = "high", "High"
+    MEDIUM = "medium", "Medium"
+    LOW = "low", "Low"
+    BACKLOG = "backlog", "Backlog"
+
+
+class QueueStatus(models.TextChoices):
+    NEEDS_SCANNING = "needs_scanning", "Needs Scanning"
+    ASSIGNED = "assigned", "Assigned"
+    SCANNING = "scanning", "Scanning"
+    SCANNED = "scanned", "Scanned"
+    COMPLETE = "complete", "Complete"
+    UNAVAILABLE = "unavailable", "Unavailable"
+
+
 class Source(models.TextChoices):
     FULL = "full", "Full (Archival version)"
     OPINIONS = "opinions", "Opinions only version"
@@ -260,6 +277,26 @@ class Scan(AbstractDateTimeModel):
         max_length=1024, blank=True, default=""
     )
     has_state_abbrev = models.BooleanField(default=True)
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_scans",
+    )
+    assigned_at = models.DateTimeField(null=True, blank=True)
+    priority = models.CharField(
+        max_length=20,
+        choices=Priority.choices,
+        default=Priority.MEDIUM,
+    )
+    queue_status = models.CharField(
+        max_length=20,
+        choices=QueueStatus.choices,
+        default=QueueStatus.NEEDS_SCANNING,
+    )
+    source_library = models.CharField(max_length=200, blank=True, default="")
+    source_url = models.URLField(blank=True, default="")
 
     class Meta:
         indexes = [
