@@ -15,6 +15,22 @@ document.addEventListener('DOMContentLoaded', function () {
     var flaggedPages = JSON.parse(container.dataset.flaggedPages || '[]');
     var ocrByPage = JSON.parse(container.dataset.ocrByPage || '{}');
 
+    // Build page_index ↔ logical_number mappings from pageMap
+    var _pageIndexToLogical = {};
+    var _logicalToPageIndex = {};
+    pageMap.forEach(function(entry) {
+        if (entry.type === 'pdf_page' && entry.pdf_index !== undefined) {
+            _pageIndexToLogical[entry.pdf_index] = entry.logical_number;
+            _logicalToPageIndex[entry.logical_number] = entry.pdf_index;
+        }
+    });
+    function _pageNumForIndex(pageIndex) {
+        return _pageIndexToLogical[pageIndex] || (pageIndex + 1);
+    }
+    function _pageIndexForNum(pageNum) {
+        return (_logicalToPageIndex[pageNum] !== undefined) ? _logicalToPageIndex[pageNum] : (_pageIndexForNum(pageNum));
+    }
+
     var viewerHeight = window.innerHeight - 140;
     var SCALE = Math.min(1.5, viewerHeight / 792);
     var PLACEHOLDER_HEIGHT = 1056;
@@ -499,7 +515,7 @@ document.addEventListener('DOMContentLoaded', function () {
             var imgW = cachedImgW || 1, imgH = cachedImgH || 1;
             if (allDetections) {
                 for (var di = 0; di < allDetections.length; di++) {
-                    if (allDetections[di].page_index === pageNum - 1) {
+                    if (allDetections[di].page_index === _pageIndexForNum(pageNum)) {
                         imgW = allDetections[di].img_width || imgW;
                         imgH = allDetections[di].img_height || imgH;
                         break;
@@ -513,7 +529,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
                 body: JSON.stringify({
-                    page_index: pageNum - 1,
+                    page_index: _pageIndexForNum(pageNum),
                     action: 'add',
                     adjusted: {
                         x0: Math.round(pdfX * pxPerPtX),
@@ -662,10 +678,10 @@ document.addEventListener('DOMContentLoaded', function () {
         wrapper.querySelectorAll('.detection-box').forEach(function (el) { el.remove(); });
 
         // pageNum is 1-based viewer page; detection page_index is 0-based from the full PDF
-        // We need to match by page_index = pageNum - 1 (for full redacted)
+        // We need to match by page_index = _pageIndexForNum(pageNum) (for full redacted)
         // or by page_number if available
         var pageDets = allDetections.filter(function (d) {
-            return d.page_index === pageNum - 1;
+            return d.page_index === _pageIndexForNum(pageNum);
         });
         if (!pageDets.length) return;
 
@@ -936,7 +952,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var canvasW = canvas.width, canvasH = canvas.height;
 
         // Get img dimensions from existing detections, or use cached/defaults
-        var pageIdx = pageNum - 1;
+        var pageIdx = _pageIndexForNum(pageNum);
         var imgW = cachedImgW || 1700, imgH = cachedImgH || 2200;
         if (allDetections) {
             var pd = allDetections.find(function (d) { return d.page_index === pageIdx; });
@@ -1151,7 +1167,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!marginRects || !marginsVisible) return;
 
         marginRects.forEach(function(pageData) {
-            var pageNum = pageData.page_index + 1;
+            var pageNum = _pageNumForIndex(pageData.page_index);
             var container = document.getElementById('pv-page-' + pageNum);
             if (!container) return;
             var wrapper = container.querySelector('.canvas-wrapper');
@@ -1234,7 +1250,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!redactionRects || !redactionsVisible) return;
 
         redactionRects.forEach(function(pageData) {
-            var pageNum = pageData.page_index + 1;
+            var pageNum = _pageNumForIndex(pageData.page_index);
             var container = document.getElementById('pv-page-' + pageNum);
             if (!container) return;
             var wrapper = container.querySelector('.canvas-wrapper');
@@ -1326,7 +1342,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 method: 'POST',
                 headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                 body: JSON.stringify({
-                    page_index: pageNum - 1,
+                    page_index: _pageIndexForNum(pageNum),
                     action: 'delete',
                     original: {x0: rectData.x0, y0: rectData.y0, x1: rectData.x1, y1: rectData.y1},
                     type: rectData.type,
@@ -1339,7 +1355,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 // Update cached rects
                 if (redactionRects) {
                     redactionRects.forEach(function(pd) {
-                        if (pd.page_index === pageNum - 1) {
+                        if (pd.page_index === _pageIndexForNum(pageNum)) {
                             pd.rects = pd.rects.filter(function(r) {
                                 return !(Math.abs(r.x0 - rectData.x0) < 2 && Math.abs(r.y0 - rectData.y0) < 2);
                             });
@@ -1431,7 +1447,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 method: 'POST',
                 headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                 body: JSON.stringify({
-                    page_index: pageNum - 1,
+                    page_index: _pageIndexForNum(pageNum),
                     original: {x0: startLeft / dsx, y0: startTop / dsy,
                                x1: (startLeft + startW) / dsx, y1: (startTop + startH) / dsy},
                     adjusted: {x0: rectData.x0, y0: rectData.y0, x1: rectData.x1, y1: rectData.y1},
@@ -1449,7 +1465,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!redactionRects || !redactionsVisible) return;
         var pageData = null;
         for (var i = 0; i < redactionRects.length; i++) {
-            if (redactionRects[i].page_index === pageNum - 1) {
+            if (redactionRects[i].page_index === _pageIndexForNum(pageNum)) {
                 pageData = redactionRects[i];
                 break;
             }
@@ -1468,7 +1484,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var imgW = cachedImgW || 1, imgH = cachedImgH || 1;
         if (allDetections) {
             for (var di = 0; di < allDetections.length; di++) {
-                if (allDetections[di].page_index === pageNum - 1) {
+                if (allDetections[di].page_index === _pageIndexForNum(pageNum)) {
                     imgW = allDetections[di].img_width || imgW;
                     imgH = allDetections[di].img_height || imgH;
                     break;
@@ -1922,7 +1938,7 @@ document.addEventListener('DOMContentLoaded', function () {
     function redetectPage(pageDiv, pageNum, btn) {
         btn.textContent = 'Running 3 models...';
         btn.disabled = true;
-        var pageIdx = pageNum - 1;
+        var pageIdx = _pageIndexForNum(pageNum);
 
         fetch('/scans/' + documentId + '/redetect-page/', {
             method: 'POST',
@@ -2111,8 +2127,8 @@ document.addEventListener('DOMContentLoaded', function () {
         document.querySelectorAll('.opinion-card').forEach(function(c) { c.classList.remove('selected'); });
         if (event && event.currentTarget) event.currentTarget.classList.add('selected');
 
-        var startPage = captionPage + 1;
-        var endPage = keyPage + 1;
+        var startPage = _pageNumForIndex(captionPage);
+        var endPage = _pageNumForIndex(keyPage);
 
         _loadOpinionsData(function() {
             var thisOp = (typeof opIndex === 'number' && opIndex < _opinionsData.length)
@@ -2139,7 +2155,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
             // Draw outside_rects as dim overlays (PDF coordinates)
             outsideRects.forEach(function(r) {
-                var pageNum = r.page_index + 1;
+                var pageNum = _pageNumForIndex(r.page_index);
                 var container = document.getElementById('pv-page-' + pageNum);
                 if (!container) return;
                 var wrapper = container.querySelector('.canvas-wrapper');
