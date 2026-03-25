@@ -1665,27 +1665,27 @@ def start_detect(request, pk):
             from blackletter.api import detect as bl_detect
             dets = bl_detect(pdf_path, str(output_dir), models=["small", "medium", "large"])
 
-                Detection.objects.filter(scan_id=scan_pk).delete()
-                from blackletter.models import Label
-                det_objects = []
-                for d in dets:
-                    try:
-                        label_name = Label(d["label_id"]).name
-                    except (ValueError, KeyError):
-                        label_name = d.get("label", "UNKNOWN")
-                    det_objects.append(Detection(
-                        scan_id=scan_pk, page_index=d["page_index"],
-                        label=label_name, label_id=d["label_id"],
-                        confidence=d["confidence"],
-                        x0=d["bbox"][0], y0=d["bbox"][1],
-                        x1=d["bbox"][2], y1=d["bbox"][3],
-                        img_width=d.get("img_width", 0),
-                        img_height=d.get("img_height", 0),
-                        model_name=d.get("found_by", [{}])[0].get("model", ""),
-                        model_count=d.get("model_count", 1),
-                        found_by=json.dumps(d.get("found_by", [])),
-                    ))
-                Detection.objects.bulk_create(det_objects)
+            Detection.objects.filter(scan_id=scan_pk).delete()
+            from blackletter.models import Label
+            det_objects = []
+            for d in dets:
+                try:
+                    label_name = Label(d["label_id"]).name
+                except (ValueError, KeyError):
+                    label_name = d.get("label", "UNKNOWN")
+                det_objects.append(Detection(
+                    scan_id=scan_pk, page_index=d["page_index"],
+                    label=label_name, label_id=d["label_id"],
+                    confidence=d["confidence"],
+                    x0=d["bbox"][0], y0=d["bbox"][1],
+                    x1=d["bbox"][2], y1=d["bbox"][3],
+                    img_width=d.get("img_width", 0),
+                    img_height=d.get("img_height", 0),
+                    model_name=d.get("found_by", [{}])[0].get("model", ""),
+                    model_count=d.get("model_count", 1),
+                    found_by=json.dumps(d.get("found_by", [])),
+                ))
+            Detection.objects.bulk_create(det_objects)
 
             Scan.objects.filter(pk=scan_pk).update(
                 progress_message=f"{len(dets)} detections. Pairing opinions..."
