@@ -231,6 +231,7 @@
 {% endblock %}
 
 {% block footer_scripts %}
+<script id="opinions-data" type="application/json">{% if opinions_json %}{{ opinions_json|safe }}{% else %}[]{% endif %}</script>
 <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 {% if step == 1 %}
 <script src="{% static 'scanning/viewer.js' %}"></script>
@@ -244,38 +245,25 @@ var docId = {{ scan.pk }};
 {% if step >= 2 %}
 var _currentOpinionIdx = -1;
 var _opinions = [];
+try { _opinions = JSON.parse(document.getElementById('opinions-data').textContent); } catch(e) {}
 
 function selectOpinion(el, pageNum) {
     var cards = document.querySelectorAll('.opinion-nav');
-    cards.forEach(function(c) { c.classList.remove('selected'); c.style.outline = ''; });
+    cards.forEach(function(c) { c.classList.remove('selected'); });
     el.classList.add('selected');
-    el.style.outline = '2px solid #2563eb';
     _currentOpinionIdx = parseInt(el.dataset.index || '0');
-    _dimOutsideOpinion(_currentOpinionIdx);
-    goToPage(pageNum);
-}
-
-function _dimOutsideOpinion(idx) {
-    document.querySelectorAll('.opinion-dim').forEach(function(d) { d.remove(); });
-    if (idx < 0 || idx >= _opinions.length) return;
-    var op = _opinions[idx];
-    var startPage = (op.caption_page || 0) + 1;
-    var endPage = (op.key_page || 0) + 1;
-    document.querySelectorAll('[id^="pv-page-"]').forEach(function(pageDiv) {
-        var num = parseInt(pageDiv.id.replace('pv-page-', ''));
-        if (num < startPage || num > endPage) {
-            var wrapper = pageDiv.querySelector('.canvas-wrapper');
-            if (!wrapper) return;
-            var dim = document.createElement('div');
-            dim.className = 'opinion-dim';
-            dim.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(255,255,255,0.7);z-index:15;pointer-events:none;';
-            wrapper.appendChild(dim);
+    if (_opinions.length && _currentOpinionIdx < _opinions.length) {
+        var op = _opinions[_currentOpinionIdx];
+        if (window.highlightOpinion) {
+            window.highlightOpinion(op.caption_page, op.key_page, _currentOpinionIdx);
         }
-    });
+    } else {
+        goToPage(pageNum);
+    }
 }
 
 function _clearDim() {
-    document.querySelectorAll('.opinion-dim').forEach(function(d) { d.remove(); });
+    document.querySelectorAll('.opinion-dim-overlay, .opinion-dim').forEach(function(d) { d.remove(); });
 }
 
 {% if step == 4 %}
