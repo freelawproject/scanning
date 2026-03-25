@@ -1107,7 +1107,7 @@ generate_files(
             [sys.executable, "-c", script],
             stdout=open(log_path, "w"),
             stderr=subprocess.STDOUT,
-            cwd=str(Path(settings.BASE_DIR)),
+            cwd=str(Path(settings.INSTALL_ROOT)),
         )
 
         import re as _re

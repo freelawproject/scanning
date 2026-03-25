@@ -29,6 +29,7 @@ DATABASES = {
         "PASSWORD": env("DB_PASSWORD", default="postgres"),
         "CONN_MAX_AGE": 0,
         "HOST": env("DB_HOST", default="scanning-postgres"),
+        "PORT": env("DB_PORT", default=""),
         "OPTIONS": {
             "sslmode": env("DB_SSL_MODE", default="require"),
         },

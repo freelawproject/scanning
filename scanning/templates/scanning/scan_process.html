@@ -3,6 +3,10 @@
 
 {% block title %}{{ scan.reporter.short_name|upper }} vol. {{ scan.volume }} - Processing{% endblock %}
 
+{% block head %}
+<link rel="stylesheet" href="{% static 'scanning/checker.css' %}">
+{% endblock %}
+
 {% block content %}
 {# Stepper bar #}
 <div class="flex items-center justify-center gap-0 mb-6">
