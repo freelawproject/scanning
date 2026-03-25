@@ -28,6 +28,7 @@ from scanning.models import (
     Issue,
     LLMScan,
     OpinionScan,
+    Volume,
     OpinionStatus,
     PageDeletion,
     PageInsert,
@@ -351,21 +352,21 @@ def queue_view(request):
     status_filter = request.GET.get("status", "")
     priority_filter = request.GET.get("priority", "")
 
-    scans = Scan.objects.select_related(
+    volumes = Volume.objects.select_related(
         "reporter", "assigned_to"
-    ).order_by("reporter__short_name", "volume")
+    ).order_by("reporter__short_name", "volume_number")
 
     if selected_reporter:
-        scans = scans.filter(reporter__short_name=selected_reporter)
+        volumes = volumes.filter(reporter__short_name=selected_reporter)
     if status_filter:
-        scans = scans.filter(queue_status=status_filter)
+        volumes = volumes.filter(queue_status=status_filter)
     if priority_filter:
-        scans = scans.filter(priority=priority_filter)
+        volumes = volumes.filter(priority=priority_filter)
 
     # Stats
-    total = Scan.objects.count()
+    total = Volume.objects.count()
     by_status = dict(
-        Scan.objects.values_list("queue_status")
+        Volume.objects.values_list("queue_status")
         .annotate(c=Count("id"))
         .values_list("queue_status", "c")
     )
@@ -374,7 +375,7 @@ def queue_view(request):
         request,
         "scanning/queue.html",
         {
-            "scans": scans,
+            "volumes": volumes,
             "reporters": reporters,
             "selected_reporter": selected_reporter,
             "status_filter": status_filter,
@@ -393,96 +394,263 @@ def queue_view(request):
 
 
 @login_required
-def queue_detail_view(request, pk):
-    """Detail page for a queue item -- view info, assignment, and PDF.
+def queue_detail_view(request, reporter_slug, vol):
+    """Detail page for a volume in the queue.
 
-    :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
-    :param pk: The primary key of the scan.
-    :type pk: int
-    :returns: The rendered queue detail page.
-    :rtype: django.http.HttpResponse
+    Shows volume info, assignment, and all scans (parts) with
+    upload buttons for each.
     """
-    scan = get_object_or_404(
-        Scan.objects.select_related("reporter", "assigned_to", "uploaded_by"),
-        pk=pk,
+    volume = get_object_or_404(
+        Volume.objects.select_related("reporter", "assigned_to"),
+        reporter__short_name=reporter_slug,
+        volume_number=vol,
     )
+    scans = volume.scans.select_related(
+        "uploaded_by"
+    ).order_by("start_page")
 
     return render(
         request,
         "scanning/queue_detail.html",
         {
-            "scan": scan,
+            "volume": volume,
+            "scans": scans,
             "queue_statuses": QueueStatus.choices,
         },
     )
 
 
+def _get_volume(reporter_slug, vol):
+    """Helper to look up a Volume by reporter slug and number."""
+    return get_object_or_404(
+        Volume.objects.select_related("reporter", "assigned_to"),
+        reporter__short_name=reporter_slug,
+        volume_number=vol,
+    )
+
+
 @login_required
 @require_POST
-def claim_scan(request, pk):
-    """Claim or unclaim a scan for scanning.
-
-    If the POST body contains ``unclaim=1`` and the scan is currently
-    assigned to the requesting user, the assignment is cleared and the
-    queue status is reset to *needs_scanning*.
-
-    :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
-    :param pk: The primary key of the scan.
-    :type pk: int
-    :returns: A redirect to the queue or to the URL in ``next``.
-    :rtype: django.http.HttpResponseRedirect
-    """
-    scan = get_object_or_404(Scan, pk=pk)
+def claim_scan(request, reporter_slug, vol):
+    """Claim or unclaim a volume for scanning."""
+    volume = _get_volume(reporter_slug, vol)
 
     if request.POST.get("unclaim") == "1":
-        if scan.assigned_to == request.user:
-            scan.queue_status = QueueStatus.NEEDS_SCANNING
-            scan.assigned_to = None
-            scan.assigned_at = None
-            scan.save()
-            messages.info(request, "Scan unclaimed.")
-    elif scan.queue_status == QueueStatus.NEEDS_SCANNING:
-        scan.queue_status = QueueStatus.ASSIGNED
-        scan.assigned_to = request.user
-        scan.assigned_at = timezone.now()
-        scan.save()
-        messages.success(request, "Scan claimed.")
+        if volume.assigned_to == request.user:
+            volume.queue_status = QueueStatus.NEEDS_SCANNING
+            volume.assigned_to = None
+            volume.assigned_at = None
+            volume.save()
+            messages.info(request, "Volume unclaimed.")
+    elif volume.queue_status == QueueStatus.NEEDS_SCANNING:
+        volume.queue_status = QueueStatus.ASSIGNED
+        volume.assigned_to = request.user
+        volume.assigned_at = timezone.now()
+        volume.save()
+        messages.success(request, "Volume claimed.")
 
-    next_url = request.POST.get("next", "")
-    if next_url:
-        return redirect(next_url)
-    return redirect("queue")
+    return redirect(
+        "queue_detail",
+        reporter_slug=reporter_slug,
+        vol=vol,
+    )
 
 
 @login_required
 @require_POST
-def update_scan_status(request, pk):
-    """Update a scan's queue status.
+def queue_upload(request, reporter_slug, vol):
+    """Upload a PDF for a specific scan within a volume."""
+    volume = _get_volume(reporter_slug, vol)
 
-    :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
-    :param pk: The primary key of the scan.
-    :type pk: int
-    :returns: A redirect to the queue or to the URL in ``next``.
-    :rtype: django.http.HttpResponseRedirect
-    """
-    scan = get_object_or_404(Scan, pk=pk)
+    if request.POST.get("new_scan") == "1":
+        # Create a new scan under this volume
+        scan = Scan(
+            volume_obj=volume,
+            reporter=volume.reporter,
+            volume=volume.volume_number,
+            part_label=request.POST.get("part_label", "").strip(),
+            source=Source.FULL,
+            has_state_abbrev="has_state_abbrev" in request.POST,
+        )
+    else:
+        scan_pk = request.POST.get("scan_pk")
+        if not scan_pk:
+            messages.error(request, "No scan specified.")
+            return redirect(
+                "queue_detail",
+                reporter_slug=reporter_slug,
+                vol=vol,
+            )
+        scan = get_object_or_404(
+            Scan, pk=scan_pk, volume_obj=volume
+        )
+    pdf = request.FILES.get("original_pdf")
+    if not pdf:
+        messages.error(request, "No PDF file provided.")
+        return redirect(
+            "queue_detail",
+            reporter_slug=reporter_slug,
+            vol=vol,
+        )
+
+    if not pdf.name.lower().endswith(".pdf"):
+        messages.error(request, "Only PDF files are accepted.")
+        return redirect(
+            "queue_detail",
+            reporter_slug=reporter_slug,
+            vol=vol,
+        )
+
+    header = pdf.read(5)
+    pdf.seek(0)
+    if header != b"%PDF-":
+        messages.error(
+            request, "The uploaded file is not a valid PDF."
+        )
+        return redirect(
+            "queue_detail",
+            reporter_slug=reporter_slug,
+            vol=vol,
+        )
+
+    # Update page range if provided
+    first_page = request.POST.get("first_page", "").strip()
+    last_page = request.POST.get("last_page", "").strip()
+    if first_page:
+        scan.start_page = int(first_page)
+    if last_page:
+        scan.end_page = int(last_page)
+
+    scan.has_state_abbrev = "has_state_abbrev" in request.POST
+    scan.uploaded_by = request.user
+    scan.status = Status.UPLOADED
+    scan.save()  # Save first to get a PK
+
+    # Create processing directory and save original PDF there
+    from pathlib import Path as _P
+    output_dir = (
+        _P(settings.MEDIA_ROOT) / "processed" / str(scan.pk)
+        / volume.reporter.short_name
+        / str(volume.volume_number)
+        / str(scan.start_page or 1)
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    scan.output_dir = str(output_dir)
+
+    original_name = (
+        f"{volume.reporter.short_name}.{volume.volume_number}"
+        f".{scan.start_page or 1}.{scan.end_page or 0}"
+        f".original.pdf"
+    )
+    original_path = output_dir / original_name
+    with open(original_path, "wb") as f:
+        for chunk in pdf.chunks():
+            f.write(chunk)
+
+    scan.original_pdf.name = str(
+        original_path.relative_to(_P(settings.MEDIA_ROOT))
+    )
+    scan.save(update_fields=["output_dir", "original_pdf"])
+
+    action = request.POST.get("action", "upload_only")
+    if action == "upload_validate":
+        # Kick off validation
+        scan.status = Status.PROCESSING
+        scan.stage = Stage.VALIDATE
+        scan.progress_message = "Converting to bitonal..."
+        scan.save()
+
+        def _bg_validate(scan_pk):
+            import django
+            import traceback as _tb
+            django.db.connections.close_all()
+            from pathlib import Path
+
+            try:
+                scan = Scan.objects.get(pk=scan_pk)
+            except Exception as _e:
+                _tb.print_exc()
+                return
+            try:
+                print(f"[validate] scan {scan_pk} pdf_path={scan.pdf_path}", flush=True)
+                if not scan.output_dir:
+                    output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
+                    if scan.reporter and scan.volume:
+                        output_dir = (
+                            output_dir / scan.reporter.short_name
+                            / str(scan.volume) / str(scan.start_page or 1)
+                        )
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    Scan.objects.filter(pk=scan_pk).update(output_dir=str(output_dir))
+                else:
+                    output_dir = Path(scan.output_dir)
+                    output_dir.mkdir(parents=True, exist_ok=True)
+
+                bitonal_path = output_dir / "bitonal.pdf"
+                if not bitonal_path.exists():
+                    from blackletter.api import bitonal as bl_bitonal
+                    def _prog(current, total, message):
+                        Scan.objects.filter(pk=scan_pk).update(
+                            progress_message=message,
+                            progress_current=current,
+                            progress_total=total,
+                        )
+                    bl_bitonal(scan.pdf_path, str(output_dir), progress_callback=_prog)
+                    pdf = fitz.open(str(bitonal_path))
+                    count = pdf.page_count
+                    pdf.close()
+                    Scan.objects.filter(pk=scan_pk).update(page_count=count)
+
+                _run_incremental_validation(scan_pk, str(bitonal_path))
+
+            except Exception as exc:
+                _tb.print_exc()
+                print(f"[validate] ERROR: {exc}", flush=True)
+                Scan.objects.filter(pk=scan_pk).update(
+                    status=Status.ERROR, progress_message=str(exc)[:255],
+                )
+
+        t = threading.Thread(
+            target=_bg_validate, args=(scan.pk,), daemon=True
+        )
+        t.start()
+        messages.success(
+            request, "PDF uploaded — validation starting."
+        )
+        return redirect("scan_process", pk=scan.pk)
+
+    messages.success(request, "PDF uploaded successfully.")
+    return redirect(
+        "queue_detail",
+        reporter_slug=reporter_slug,
+        vol=vol,
+    )
+
+
+@login_required
+@require_POST
+def update_scan_status(request, reporter_slug, vol):
+    """Update a volume's queue status."""
+    volume = _get_volume(reporter_slug, vol)
     new_status = request.POST.get("status")
 
     if new_status and new_status in dict(QueueStatus.choices):
-        scan.queue_status = new_status
+        volume.queue_status = new_status
         if new_status == QueueStatus.NEEDS_SCANNING:
-            scan.assigned_to = None
-            scan.assigned_at = None
-        scan.save()
-        messages.success(request, f"Status updated to {scan.get_queue_status_display()}.")
+            volume.assigned_to = None
+            volume.assigned_at = None
+        volume.save()
+        messages.success(
+            request,
+            f"Status updated to"
+            f" {volume.get_queue_status_display()}.",
+        )
 
-    next_url = request.POST.get("next", "")
-    if next_url:
-        return redirect(next_url)
-    return redirect("queue")
+    return redirect(
+        "queue_detail",
+        reporter_slug=reporter_slug,
+        vol=vol,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1277,6 +1445,65 @@ def scan_process_view(request, pk):
             )
             opinion_scans.append(s)
 
+    # Detection warnings for step 2
+    detect_warnings = []
+    if step >= 2:
+        from collections import Counter as _Counter
+        det_labels = _Counter(
+            Detection.objects.filter(
+                scan=scan, active=True
+            ).values_list("label", flat=True)
+        )
+        n_keys = det_labels.get("KEY_ICON", 0)
+        n_captions = det_labels.get("CASE_CAPTION", 0)
+        n_opinions = len(opinions)
+
+        if n_keys != n_opinions:
+            detect_warnings.append(
+                f"{n_keys} KEY_ICONs detected but"
+                f" {n_opinions} opinions paired"
+                f" — {n_keys - n_opinions} unmatched"
+            )
+        if n_captions != n_opinions:
+            detect_warnings.append(
+                f"{n_captions} CASE_CAPTIONs detected but"
+                f" {n_opinions} opinions paired"
+                f" — {n_captions - n_opinions} unmatched"
+            )
+
+        # Coverage gaps
+        if opinions and scan.start_page and scan.end_page:
+            covered = set()
+            for op in opinions:
+                cp = op.get("caption_page", 0) + (
+                    scan.start_page or 1
+                )
+                kp = (
+                    op.get("key_page", 0)
+                    + (scan.start_page or 1)
+                    + op.get("page_count", 1)
+                    - 1
+                )
+                for p in range(cp, kp + 1):
+                    covered.add(p)
+            expected = set(
+                range(scan.start_page, scan.end_page + 1)
+            )
+            missing = sorted(expected - covered)
+            if missing:
+                import itertools
+
+                for _, g in itertools.groupby(
+                    enumerate(missing),
+                    lambda x: x[0] - x[1],
+                ):
+                    run = [v for _, v in g]
+                    detect_warnings.append(
+                        f"Pages {run[0]}-{run[-1]}"
+                        f" ({len(run)} pages) not covered"
+                        " by any opinion"
+                    )
+
     return render(request, "scanning/scan_process.html", {
         "scan": scan,
         "step": step,
@@ -1289,8 +1516,10 @@ def scan_process_view(request, pk):
         "has_pending_changes": has_pending_changes,
         "is_processing": is_processing,
         "opinions": opinions,
+        "opinions_json": json.dumps(opinions),
         "has_redaction_rects": has_redaction_rects,
         "opinion_scans": opinion_scans,
+        "detect_warnings": detect_warnings,
     })
 
 
@@ -1332,6 +1561,7 @@ def start_validate(request, pk):
 
     def _validate_with_bitonal(scan_pk):
         import django
+        import traceback as _tb
         django.db.connections.close_all()
         from pathlib import Path
 
@@ -1363,14 +1593,15 @@ def start_validate(request, pk):
 
                 bl_bitonal(scan.pdf_path, str(output_dir), progress_callback=_bitonal_progress)
                 pdf = fitz.open(str(bitonal_path))
-                Scan.objects.filter(pk=scan_pk).update(page_count=pdf.page_count)
+                count = pdf.page_count
                 pdf.close()
+                Scan.objects.filter(pk=scan_pk).update(page_count=count)
 
             _run_incremental_validation(scan_pk, str(bitonal_path))
 
         except Exception as exc:
-            import traceback
-            traceback.print_exc()
+            _tb.print_exc()
+            print(f"[validate] ERROR: {exc}", flush=True)
             Scan.objects.filter(pk=scan_pk).update(
                 status=Status.ERROR, progress_message=str(exc)[:255],
             )
@@ -1428,28 +1659,13 @@ def start_detect(request, pk):
 
             pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
 
-            existing_count = Detection.objects.filter(scan_id=scan_pk).count()
-            if existing_count > 0:
-                Scan.objects.filter(pk=scan_pk).update(
-                    progress_message=f"Using {existing_count} existing detections..."
-                )
-                dets_qs = Detection.objects.filter(
-                    scan_id=scan_pk, active=True
-                ).order_by("page_index", "y0")
-                dets = [{
-                    "page_index": d.page_index, "label": d.label,
-                    "label_id": d.label_id, "confidence": d.confidence,
-                    "bbox": [d.x0, d.y0, d.x1, d.y1],
-                    "img_width": d.img_width, "img_height": d.img_height,
-                } for d in dets_qs]
-                (output_dir / "detections.json").write_text(json.dumps(dets))
-            else:
-                Scan.objects.filter(pk=scan_pk).update(
-                    progress_message="Running YOLO detection..."
-                )
-                from blackletter.api import detect as bl_detect
-                dets = bl_detect(pdf_path, str(output_dir), models=["medium", "large"])
+            Scan.objects.filter(pk=scan_pk).update(
+                progress_message="Running YOLO detection..."
+            )
+            from blackletter.api import detect as bl_detect
+            dets = bl_detect(pdf_path, str(output_dir), models=["small", "medium", "large"])
 
+                Detection.objects.filter(scan_id=scan_pk).delete()
                 from blackletter.models import Label
                 det_objects = []
                 for d in dets:
@@ -2131,8 +2347,10 @@ def redetect_page(request, pk):
             break
     if not ocr_pdf:
         return JsonResponse({"error": "No PDF found"}, status=404)
-    model_map = {"small": "best.pt", "medium": "medium.pt", "large": "analyze.pt"}
-    model_file = _P("/Users/Palin/Code/blackletter/blackletter/models") / model_map.get(model_name, "analyze.pt")
+    model_map = {"small": "small.pt", "medium": "medium.pt", "large": "large.pt"}
+    import blackletter as _bl
+    models_dir = _P(_bl.__file__).parent / "models"
+    model_file = models_dir / model_map.get(model_name, "large.pt")
     model = YOLO(str(model_file))
     pdf = fitz.open(str(ocr_pdf))
     DPI = 200
@@ -2260,8 +2478,10 @@ def scan_for_label(request, pk):
             break
     if not ocr_pdf:
         return JsonResponse({"error": "No PDF found"}, status=404)
-    model_map = {"small": "best.pt", "medium": "medium.pt", "large": "analyze.pt"}
-    model_file = _P("/Users/Palin/Code/blackletter/blackletter/models") / model_map.get(model_name, "analyze.pt")
+    model_map = {"small": "small.pt", "medium": "medium.pt", "large": "large.pt"}
+    import blackletter as _bl
+    models_dir = _P(_bl.__file__).parent / "models"
+    model_file = models_dir / model_map.get(model_name, "large.pt")
     model = YOLO(str(model_file))
     target_label = None
     for lbl in Label:

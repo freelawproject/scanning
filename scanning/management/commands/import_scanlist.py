@@ -11,6 +11,7 @@ from scanning.models import (
     Scan,
     Source,
     Status,
+    Volume,
 )
 
 STATUS_MAP = {
@@ -48,15 +49,21 @@ class Command(BaseCommand):
         csv_path = options["csv_file"]
         dry_run = options["dry_run"]
 
-        reporters = {r.short_name: r for r in Reporter.objects.all()}
-        created = skipped = errors = 0
+        reporters = {
+            r.short_name: r for r in Reporter.objects.all()
+        }
+        volumes_created = scans_created = skipped = errors = 0
 
         with open(csv_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter="\t")
             for row in reader:
                 slug = (row.get("Slug") or "").strip()
-                volume_str = (row.get("Volume #") or "").strip()
-                status_str = (row.get("Status") or "").strip()
+                volume_str = (
+                    row.get("Volume #") or ""
+                ).strip()
+                status_str = (
+                    row.get("Status") or ""
+                ).strip()
                 priority_str = (
                     row.get("Priority") or ""
                 ).strip().upper()
@@ -76,6 +83,7 @@ class Command(BaseCommand):
                 is_advance = (
                     row.get("Advance Sheet/Volume") or ""
                 ).strip()
+                book_num = (row.get("Book") or "").strip()
 
                 if not slug or not volume_str:
                     skipped += 1
@@ -89,22 +97,30 @@ class Command(BaseCommand):
                     errors += 1
                     continue
 
-                # Parse volume (handle "141A", "141B" etc)
-                try:
-                    volume = int(volume_str)
-                except ValueError:
-                    # Strip trailing letter for volume number
-                    vol_digits = "".join(
-                        c for c in volume_str if c.isdigit()
+                # Parse volume number (strip trailing A/B/C)
+                vol_digits = "".join(
+                    c for c in volume_str if c.isdigit()
+                )
+                if not vol_digits:
+                    self.stderr.write(
+                        f"Bad volume: {volume_str}"
                     )
-                    if vol_digits:
-                        volume = int(vol_digits)
-                    else:
-                        self.stderr.write(
-                            f"Bad volume: {volume_str}"
-                        )
-                        errors += 1
-                        continue
+                    errors += 1
+                    continue
+                vol_num = int(vol_digits)
+
+                # Part label: "142A" → "A", advance sheet "3" → "3"
+                part_label = volume_str[len(vol_digits):]
+                if not part_label and book_num:
+                    part_label = book_num
+                if (
+                    not part_label
+                    and is_advance
+                    and is_advance.lower() == "yes"
+                ):
+                    # Use page range as label for advance sheets
+                    if first_page:
+                        part_label = first_page
 
                 source = (
                     Source.OPINIONS
@@ -112,14 +128,12 @@ class Command(BaseCommand):
                     and is_advance.lower() == "yes"
                     else Source.FULL
                 )
-
                 queue_status = STATUS_MAP.get(
                     status_str, QueueStatus.NEEDS_SCANNING
                 )
                 priority = PRIORITY_MAP.get(
                     priority_str, Priority.MEDIUM
                 )
-
                 start = int(first_page) if first_page else None
                 end = int(last_page) if last_page else None
 
@@ -129,14 +143,55 @@ class Command(BaseCommand):
                     parts.append(notes)
                 if assigned:
                     parts.append(f"Assigned to: {assigned}")
-                if source_library:
-                    parts.append(f"Located: {source_library}")
                 combined_notes = "\n".join(parts)
 
-                # Check for existing
+                is_partial = bool(part_label)
+
+                if dry_run:
+                    self.stdout.write(
+                        f"  {slug} vol {vol_num}"
+                        f"{'/' + part_label if part_label else ''}"
+                        f" [{queue_status}] {priority}"
+                        f" pp.{start or '?'}-{end or '?'}"
+                    )
+                    scans_created += 1
+                    continue
+
+                # Get or create Volume
+                vol, vol_created = Volume.objects.get_or_create(
+                    reporter=reporter,
+                    volume_number=vol_num,
+                    defaults={
+                        "priority": priority,
+                        "queue_status": queue_status,
+                        "source_library": source_library,
+                        "is_partial": is_partial,
+                        "notes": "",
+                    },
+                )
+                if vol_created:
+                    volumes_created += 1
+                elif is_partial and not vol.is_partial:
+                    vol.is_partial = True
+                    vol.save(update_fields=["is_partial"])
+
+                # Update volume page range to cover all scans
+                if start and (
+                    not vol.expected_start_page
+                    or start < vol.expected_start_page
+                ):
+                    vol.expected_start_page = start
+                if end and (
+                    not vol.expected_end_page
+                    or end > vol.expected_end_page
+                ):
+                    vol.expected_end_page = end
+                vol.save()
+
+                # Create Scan
                 exists = Scan.objects.filter(
                     reporter=reporter,
-                    volume=volume,
+                    volume=vol_num,
                     source=source,
                     start_page=start,
                 ).exists()
@@ -144,33 +199,27 @@ class Command(BaseCommand):
                     skipped += 1
                     continue
 
-                if dry_run:
-                    self.stdout.write(
-                        f"  {slug} vol {volume_str}"
-                        f" [{queue_status}] {priority}"
-                        f" pp.{start or '?'}-{end or '?'}"
-                    )
-                else:
-                    Scan.objects.create(
-                        reporter=reporter,
-                        volume=volume,
-                        source=source,
-                        start_page=start,
-                        end_page=end,
-                        queue_status=queue_status,
-                        priority=priority,
-                        status=Status.UPLOADED
-                        if queue_status == QueueStatus.COMPLETE
-                        else Status.UPLOADED,
-                        notes=combined_notes,
-                        source_library=source_library,
-                    )
-                created += 1
+                Scan.objects.create(
+                    volume_obj=vol,
+                    reporter=reporter,
+                    volume=vol_num,
+                    part_label=part_label,
+                    source=source,
+                    start_page=start,
+                    end_page=end,
+                    notes=combined_notes,
+                    source_library=source_library,
+                    status=Status.UPLOADED
+                    if queue_status == QueueStatus.COMPLETE
+                    else Status.UPLOADED,
+                )
+                scans_created += 1
 
         action = "Would create" if dry_run else "Created"
         self.stdout.write(
             self.style.SUCCESS(
-                f"{action} {created} scans,"
+                f"{action} {volumes_created} volumes,"
+                f" {scans_created} scans,"
                 f" skipped {skipped},"
                 f" {errors} errors."
             )

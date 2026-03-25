@@ -87,6 +87,108 @@ class Reporter(AbstractDateTimeModel):
         return self.full_name
 
 
+class Volume(AbstractDateTimeModel):
+    """A logical volume in the scanning queue.
+
+    One volume may require multiple scans (e.g. a volume split into
+    books A/B/C, or advance sheets covering different page ranges).
+    """
+
+    reporter = models.ForeignKey(
+        Reporter,
+        on_delete=models.PROTECT,
+        related_name="volumes",
+    )
+    volume_number = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)]
+    )
+    expected_start_page = models.PositiveIntegerField(
+        null=True, blank=True
+    )
+    expected_end_page = models.PositiveIntegerField(
+        null=True, blank=True
+    )
+    priority = models.CharField(
+        max_length=20,
+        choices=Priority.choices,
+        default=Priority.MEDIUM,
+    )
+    queue_status = models.CharField(
+        max_length=20,
+        choices=QueueStatus.choices,
+        default=QueueStatus.NEEDS_SCANNING,
+    )
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_volumes",
+    )
+    assigned_at = models.DateTimeField(null=True, blank=True)
+    source_library = models.CharField(
+        max_length=200, blank=True, default=""
+    )
+    source_url = models.URLField(blank=True, default="")
+    is_partial = models.BooleanField(
+        default=False,
+        help_text=(
+            "Volume is split into multiple parts"
+            " (e.g. books A/B or advance sheets)."
+        ),
+    )
+    expected_parts = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="How many scans make up this volume.",
+    )
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["reporter", "volume_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["reporter", "volume_number"],
+                name="unique_volume_reporter_number",
+            ),
+        ]
+
+    @property
+    def scans_complete(self):
+        return self.scans.filter(
+            status=Status.APPROVED
+        ).count()
+
+    @property
+    def coverage(self):
+        ranges = []
+        for s in self.scans.order_by("start_page"):
+            if s.start_page and s.end_page:
+                ranges.append((s.start_page, s.end_page))
+        return ranges
+
+    @property
+    def is_fully_covered(self):
+        if not self.expected_start_page or not self.expected_end_page:
+            return False
+        covered = set()
+        for start, end in self.coverage:
+            covered.update(range(start, end + 1))
+        expected = set(
+            range(
+                self.expected_start_page,
+                self.expected_end_page + 1,
+            )
+        )
+        return expected.issubset(covered)
+
+    def __str__(self):
+        return (
+            f"{self.reporter.short_name} vol."
+            f" {self.volume_number}"
+        )
+
+
 def book_upload_path(instance, filename):
     """Generate upload path for book scan PDFs.
 
@@ -183,12 +285,26 @@ class opinion_pdf_path:
 
 
 class Scan(AbstractDateTimeModel):
+    volume_obj = models.ForeignKey(
+        Volume,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="scans",
+        help_text="The Volume this scan belongs to.",
+    )
     reporter = models.ForeignKey(
         Reporter,
         on_delete=models.PROTECT,
         related_name="scans",
     )
     volume = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    part_label = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        help_text="Part identifier (e.g. 'A', 'B', '3' for advance sheets).",
+    )
     number_of_pages = models.PositiveIntegerField(
         validators=[MinValueValidator(1)],
         null=True,
@@ -288,26 +404,7 @@ class Scan(AbstractDateTimeModel):
         max_length=1024, blank=True, default=""
     )
     has_state_abbrev = models.BooleanField(default=True)
-    assigned_to = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="assigned_scans",
-    )
-    assigned_at = models.DateTimeField(null=True, blank=True)
-    priority = models.CharField(
-        max_length=20,
-        choices=Priority.choices,
-        default=Priority.MEDIUM,
-    )
-    queue_status = models.CharField(
-        max_length=20,
-        choices=QueueStatus.choices,
-        default=QueueStatus.NEEDS_SCANNING,
-    )
     source_library = models.CharField(max_length=200, blank=True, default="")
-    source_url = models.URLField(blank=True, default="")
 
     class Meta:
         indexes = [
@@ -319,16 +416,7 @@ class Scan(AbstractDateTimeModel):
             models.Index(fields=["uploaded_by"], name="idx_uploaded_by"),
             models.Index(fields=["stage"], name="idx_stage"),
         ]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["reporter", "volume", "source"],
-                name="unique_reporter_volume_source",
-                violation_error_message=(
-                    "A scan for this reporter, volume, and source"
-                    " already exists."
-                ),
-            ),
-        ]
+        constraints = []
         ordering = ["-date_created"]
 
     def clean(self):
@@ -392,14 +480,18 @@ class OpinionScan(AbstractDateTimeModel):
         related_name="opinion_scans",
     )
     volume = models.PositiveIntegerField(validators=[MinValueValidator(1)])
-    original_pdf = models.FileField(upload_to=opinion_pdf_path("unredacted"))
+    original_pdf = models.FileField(
+        upload_to=opinion_pdf_path("unredacted"), max_length=512
+    )
     masked_pdf = models.FileField(
         upload_to=opinion_pdf_path("masked"),
+        max_length=512,
         null=True,
         blank=True,
     )
     redacted_pdf = models.FileField(
         upload_to=opinion_pdf_path("redacted"),
+        max_length=512,
         null=True,
         blank=True,
     )
@@ -612,6 +704,7 @@ class LLMScan(AbstractDateTimeModel):
     )
     masked_pdf = models.FileField(
         upload_to="llm/",
+        max_length=512,
         null=True,
         blank=True,
     )
