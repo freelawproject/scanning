@@ -143,7 +143,7 @@ def scan_upload(request):
             scan.status = Status.UPLOADED
             scan.save()
             messages.success(request, "Scan uploaded successfully.")
-            return redirect("scan_detail", pk=scan.pk)
+            return redirect("scan_process", pk=scan.pk)
     else:
         form = ScanUploadForm()
 

@@ -11,7 +11,9 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --quiet=2 \
     libpq-dev postgresql-client \
     nodejs npm \
-    curl git
+    curl git \
+    tesseract-ocr tesseract-ocr-eng \
+    libgl1 libglib2.0-0
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:0.9.22 /uv /uvx /bin/

@@ -51,6 +51,7 @@ services:
     user: root
     volumes:
       - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
+      - ${BLACKLETTER_DIR:-../../../blackletter}:/opt/blackletter
     networks:
       - scanning_net
     env_file:

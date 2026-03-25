@@ -3,6 +3,10 @@ set -e
 
 case "$1" in
 'web-dev')
+    # Install blackletter from local mount if available
+    if [ -d /opt/blackletter ]; then
+        uv pip install -e /opt/blackletter 2>/dev/null || pip install -e /opt/blackletter 2>/dev/null || true
+    fi
     python manage.py migrate
     python manage.py loaddata reporters
     python manage.py make_dev_data
