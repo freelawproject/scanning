@@ -1542,7 +1542,7 @@ def serve_scan_pdf(request, pk):
         from pathlib import Path as _P
         out = _P(scan.output_dir)
         for f in sorted(out.glob("*.pdf")):
-            if f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf"):
+            if f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf") and not f.name.endswith(".original.pdf"):
                 return FileResponse(open(f, "rb"), content_type="application/pdf")
         bitonal = out / "bitonal.pdf"
         if bitonal.exists():
@@ -1633,7 +1633,7 @@ def start_detect(request, pk):
             bitonal = output_dir / "bitonal.pdf"
 
             ocr_exists = any(
-                f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf")
+                f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf") and not f.name.endswith(".original.pdf")
                 for f in output_dir.glob("*.pdf")
             )
             if not ocr_exists and bitonal.exists():
@@ -2105,26 +2105,31 @@ def compute_redactions_api(request, pk):
     if not scan.opinions_json:
         return JsonResponse({"error": "No opinions paired yet"}, status=400)
     output_dir = _P(scan.output_dir)
-    dets = Detection.objects.filter(scan=scan, active=True).order_by("page_index", "y0")
-    det_data = [{
-        "page_index": d.page_index, "label": d.label, "label_id": d.label_id,
-        "confidence": d.confidence, "bbox": [d.x0, d.y0, d.x1, d.y1],
-        "img_width": d.img_width, "img_height": d.img_height,
-    } for d in dets]
-    if not det_data:
-        return JsonResponse({"error": "No detections found"}, status=400)
-    (output_dir / "detections.json").write_text(json.dumps(det_data))
-    opinions_data = json.loads(scan.opinions_json)
-    (output_dir / "opinions.json").write_text(json.dumps(opinions_data))
-    pdf_path = scan.pdf_path
-    for f in sorted(output_dir.glob("*.pdf")):
-        if f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf"):
-            pdf_path = str(f)
-            break
-    else:
-        bitonal = output_dir / "bitonal.pdf"
-        if bitonal.exists():
-            pdf_path = str(bitonal)
+    try:
+        dets = Detection.objects.filter(scan=scan, active=True).order_by("page_index", "y0")
+        det_data = [{
+            "page_index": d.page_index, "label": d.label, "label_id": d.label_id,
+            "confidence": d.confidence, "bbox": [d.x0, d.y0, d.x1, d.y1],
+            "img_width": d.img_width, "img_height": d.img_height,
+        } for d in dets]
+        if not det_data:
+            return JsonResponse({"error": "No detections found"}, status=400)
+        (output_dir / "detections.json").write_text(json.dumps(det_data))
+        opinions_data = json.loads(scan.opinions_json)
+        (output_dir / "opinions.json").write_text(json.dumps(opinions_data))
+        pdf_path = scan.pdf_path
+        for f in sorted(output_dir.glob("*.pdf")):
+            if f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf") and not f.name.endswith(".original.pdf"):
+                pdf_path = str(f)
+                break
+        else:
+            bitonal = output_dir / "bitonal.pdf"
+            if bitonal.exists():
+                pdf_path = str(bitonal)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return JsonResponse({"error": str(exc)[:500]}, status=500)
     try:
         from blackletter.models import BBox, Detection as BLDetection, Document as BLDoc, Label, Page
         from blackletter.scanner import _pair_opinions

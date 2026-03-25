@@ -2,7 +2,7 @@
 name = "scanning"
 version = "1"
 description = "Upload portal for volunteer scanners to submit scanned legal documents."
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.12,<3.14"
 authors = [
   { name = "Free Law Project", email = "info@free.law" },
 ]
@@ -35,6 +35,9 @@ dependencies = [
   "sentry-sdk[django]",
   "time-machine",
   "uvicorn[standard]",
+  "pytesseract>=0.3.13",
+  "opencv-python==4.10.0.84",
+  "paddleocr>=3.4.0",
 ]
 
 [project.optional-dependencies]
