@@ -113,8 +113,6 @@
       {% endif %}
 
     {% elif step == 3 %}
-      <button class="btn-primary text-sm" style="background:#dc2626" onclick="computeRedactions()">Compute Redactions</button>
-      <button class="btn-primary text-sm" style="background:#7c3aed" onclick="refineRedactions(this)">Refine (docTR)</button>
       <a href="?step=4" class="btn-primary text-sm no-underline" style="background:#059669">Next: Generate &rarr;</a>
 
     {% elif step == 4 %}
@@ -499,102 +497,19 @@ function pairOpinions() {
     });
 }
 
-function computeRedactions() {
-    var btn = event.target;
-    btn.textContent = 'Computing...';
-    btn.disabled = true;
+{% endif %}
+</script>
+{% if step == 3 and not is_processing and not has_redaction_rects %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
     fetch('/scans/' + docId + '/compute-redactions/', {
         method: 'POST',
         headers: {'X-CSRFToken': csrfToken},
     })
     .then(function(r) { return r.json(); })
     .then(function(data) {
-        if (data.error) { btn.textContent = 'Compute Redactions'; btn.disabled = false; alert('Error: ' + data.error); return; }
         if (window.refreshOverlays) window.refreshOverlays();
-        if (data.refining) {
-            btn.textContent = 'Refining (docTR)...';
-            var _pollCount = 0;
-            var _pollInterval = setInterval(function() {
-                _pollCount++;
-                if (window.refreshOverlays) window.refreshOverlays();
-                if (_pollCount > 120) {
-                    clearInterval(_pollInterval);
-                    btn.textContent = 'Compute Redactions';
-                    btn.disabled = false;
-                }
-            }, 3000);
-            var _lastSize = data.rects;
-            var _stableCount = 0;
-            var _checkDone = setInterval(function() {
-                fetch('/scans/' + docId + '/redaction-rects/')
-                    .then(function(r) { return r.json(); })
-                    .then(function(rects) {
-                        var total = 0;
-                        for (var i = 0; i < rects.length; i++) total += rects[i].rects.length;
-                        if (total === _lastSize) { _stableCount++; } else { _stableCount = 0; _lastSize = total; }
-                        if (_stableCount >= 3) {
-                            clearInterval(_pollInterval);
-                            clearInterval(_checkDone);
-                            btn.textContent = 'Compute Redactions';
-                            btn.disabled = false;
-                            if (window.refreshOverlays) window.refreshOverlays();
-                        }
-                    });
-            }, 5000);
-        } else {
-            btn.textContent = 'Compute Redactions';
-            btn.disabled = false;
-        }
-    })
-    .catch(function(err) {
-        btn.textContent = 'Compute Redactions';
-        btn.disabled = false;
-        alert('Error: ' + err);
     });
-}
-
-function refineRedactions(btn) {
-    btn.textContent = 'Refining...';
-    btn.disabled = true;
-    fetch('/scans/' + docId + '/refine-redactions/', {
-        method: 'POST',
-        headers: {'X-CSRFToken': csrfToken},
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-        if (data.error) { btn.textContent = 'Refine (docTR)'; btn.disabled = false; alert('Error: ' + data.error); return; }
-        var _lastSize = 0;
-        var _stableCount = 0;
-        var _poll = setInterval(function() {
-            fetch('/scans/' + docId + '/redaction-rects/')
-                .then(function(r) { return r.json(); })
-                .then(function(rects) {
-                    var total = 0;
-                    for (var i = 0; i < rects.length; i++) total += rects[i].rects.length;
-                    if (total !== _lastSize) { _stableCount = 0; _lastSize = total; }
-                    else { _stableCount++; }
-                    btn.textContent = 'Refining... (' + total + ' rects)';
-                    if (_stableCount >= 3) {
-                        clearInterval(_poll);
-                        btn.textContent = 'Refine (docTR)';
-                        btn.disabled = false;
-                        if (window.refreshOverlays) window.refreshOverlays();
-                    }
-                });
-        }, 4000);
-    })
-    .catch(function(err) {
-        btn.textContent = 'Refine (docTR)';
-        btn.disabled = false;
-        alert('Error: ' + err);
-    });
-}
-{% endif %}
-</script>
-{% if step == 3 and not is_processing and not has_redaction_rects %}
-<script>
-document.addEventListener('DOMContentLoaded', function() {
-    computeRedactions();
 });
 </script>
 {% endif %}
