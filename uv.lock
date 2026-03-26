@@ -138,7 +138,7 @@ wheels = [
 [[package]]
 name = "blackletter"
 version = "0.0.3"
-source = { git = "https://github.com/freelawproject/blackletter.git?rev=de-thread#0248dcb2da88f1966d9e9f329a8424b22b184e3e" }
+source = { git = "https://github.com/freelawproject/blackletter.git?rev=de-thread#de18c33af412c4cf91f76d177d25b26cb405008e" }
 dependencies = [
     { name = "ocrmypdf" },
     { name = "opencv-python" },
@@ -146,6 +146,12 @@ dependencies = [
     { name = "pymupdf" },
     { name = "python-doctr" },
     { name = "ultralytics" },
+]
+
+[package.optional-dependencies]
+analyze = [
+    { name = "paddleocr" },
+    { name = "pypdfium2" },
 ]
 
 [[package]]
@@ -2576,7 +2582,7 @@ name = "scanning"
 version = "1"
 source = { virtual = "." }
 dependencies = [
-    { name = "blackletter" },
+    { name = "blackletter", extra = ["analyze"] },
     { name = "boto3" },
     { name = "daphne" },
     { name = "django" },
@@ -2613,7 +2619,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "blackletter", git = "https://github.com/freelawproject/blackletter.git?rev=de-thread" },
+    { name = "blackletter", extras = ["analyze"], git = "https://github.com/freelawproject/blackletter.git?rev=de-thread" },
     { name = "boto3" },
     { name = "daphne" },
     { name = "django", specifier = ">=6.0,<6.1" },

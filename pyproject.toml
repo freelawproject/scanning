@@ -28,7 +28,7 @@ dependencies = [
   "gunicorn",
   "pillow",
   "psycopg[binary,pool]",
-  "blackletter @ git+https://github.com/freelawproject/blackletter.git@de-thread",
+  "blackletter[analyze] @ git+https://github.com/freelawproject/blackletter.git@de-thread",
   "ocrmypdf>=17",
   "pymupdf>=1.25",
   "ultralytics>=8.3",
