@@ -1229,8 +1229,8 @@ def _run_generate_background(scan_pk):
 
         ocr_pdf = None
         if scan.output_dir:
-            for f in Path(scan.output_dir).glob("*.pdf"):
-                if "redacted" not in f.name and "bitonal" not in f.name:
+            for f in sorted(Path(scan.output_dir).glob("*.pdf")):
+                if "redacted" not in f.name and "bitonal" not in f.name and not f.name.endswith(".original.pdf"):
                     ocr_pdf = f
                     break
         if not ocr_pdf:
@@ -2231,11 +2231,181 @@ def compute_redactions_api(request, pk):
         rects_path = output_dir / "redaction_rects.json"
         rects_path.write_text(json.dumps(rects))
         total_rects = sum(len(r["rects"]) for r in rects)
+        margin_rects_path = output_dir / "margin_rects.json"
+        if not margin_rects_path.exists():
+            from blackletter.margins import compute_margin_rects
+            margin_rects = compute_margin_rects(pdf_path)
+            margin_rects_path.write_text(json.dumps(margin_rects))
         return JsonResponse({"status": "ok", "pages": len(rects), "rects": total_rects})
     except Exception as exc:
         import traceback
         traceback.print_exc()
         return JsonResponse({"error": str(exc)[:500]}, status=500)
+
+
+@login_required
+@require_POST
+def refine_redactions_api(request, pk):
+    """Run docTR refinement in background on the small OCR'd PDF, updating redaction_rects.json."""
+    import subprocess
+    import sys
+    import threading
+    from pathlib import Path as _P
+
+    scan = get_object_or_404(Scan, pk=pk)
+    if not scan.output_dir:
+        return JsonResponse({"error": "No output directory"}, status=400)
+
+    output_dir = _P(scan.output_dir)
+    rects_path = output_dir / "redaction_rects.json"
+    if not rects_path.exists():
+        return JsonResponse({"error": "Run Compute Redactions first"}, status=400)
+
+    # Pick the small OCR'd PDF (same logic as serve_scan_pdf)
+    pdf_path = None
+    for f in sorted(output_dir.glob("*.pdf")):
+        if f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf") and not f.name.endswith(".original.pdf"):
+            pdf_path = str(f)
+            break
+    if not pdf_path:
+        return JsonResponse({"error": "No OCR'd PDF found"}, status=400)
+
+    scan_pk = scan.pk
+
+    def _run():
+        import django
+        django.db.connections.close_all()
+        from pathlib import Path
+        log_path = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk) / "refine.log"
+        script = f"""
+import os
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+import json
+from pathlib import Path
+from blackletter.refine import refine_headnote_rects
+from blackletter.models import Page, BBox, Detection as BLDetection, Label
+import fitz
+
+rects_path = Path("{rects_path}")
+rects_data = json.loads(rects_path.read_text())
+
+# Extract headnote rects (in pixel coords) per page
+from blackletter.scanner import _pair_opinions
+# Rebuild pages from detections json
+dets_path = Path("{output_dir}") / "detections.json"
+ops_path = Path("{output_dir}") / "opinions.json"
+if not dets_path.exists() or not ops_path.exists():
+    print("No detections.json/opinions.json — cannot refine", flush=True)
+    raise SystemExit(0)
+
+det_data = json.loads(dets_path.read_text())
+src_pdf = fitz.open("{pdf_path}")
+pages_data = {{}}
+for entry in det_data:
+    pi = entry["page_index"]
+    if pi not in pages_data:
+        pages_data[pi] = {{"img_width": entry.get("img_width", 1), "img_height": entry.get("img_height", 1), "detections": []}}
+    pages_data[pi]["detections"].append(entry)
+pages = []
+for pi in sorted(pages_data.keys()):
+    pd = pages_data[pi]
+    pw, ph = (src_pdf[pi].rect.width, src_pdf[pi].rect.height) if pi < src_pdf.page_count else (612.0, 792.0)
+    page = Page(index=pi, pdf_width=pw, pdf_height=ph, img_width=pd["img_width"], img_height=pd["img_height"])
+    for d in pd["detections"]:
+        b = d.get("bbox", [0,0,1,1])
+        page.detections.append(BLDetection(bbox=BBox(x1=b[0],y1=b[1],x2=b[2],y2=b[3]), label=Label(d["label_id"]), confidence=d["confidence"], page_index=pi))
+    pages.append(page)
+pages_by_index = {{p.index: p for p in pages}}
+
+from blackletter.models import Document as BLDoc
+document = BLDoc(pdf_path="{pdf_path}", pages=pages, reporter="", volume="", first_page=1, ocr_applied=True)
+opinions = _pair_opinions(document)
+
+# Collect headnote rects (PDF point coords) same as compute_redaction_rects does
+import fitz as _fitz
+from blackletter.scanner import _find_redaction_end, _find_redaction_start
+from blackletter.process import _redaction_rects, _headnote_fallback_rects
+mid = pages[0].midpoint if pages else 0.5
+all_headnote_rects = []
+for caption, key in opinions:
+    opinion_dets = []
+    for p in pages:
+        for d in p.detections:
+            sk = d.sort_key(mid)
+            if caption.sort_key(mid) <= sk <= key.sort_key(mid):
+                opinion_dets.append(d)
+    opinion_dets.sort(key=lambda d: d.sort_key(mid))
+    end_marker = _find_redaction_end(opinion_dets, caption, key, mid, reporter="")
+    if end_marker is not None:
+        start = _find_redaction_start(opinion_dets, caption, mid)
+        all_headnote_rects.extend(_redaction_rects(caption, end_marker, pages_by_index, start_marker=start if start is not caption else None))
+    else:
+        all_headnote_rects.extend(_headnote_fallback_rects(opinion_dets, caption, pages_by_index, mid))
+
+print(f"Refining {{len(all_headnote_rects)}} headnote rects on {{len(set(pi for pi,_ in all_headnote_rects))}} pages...", flush=True)
+
+# Group headnote rects by page
+by_page = {{}}
+for pi, rect in all_headnote_rects:
+    by_page.setdefault(pi, []).append(rect)
+
+# Start with existing non-headnote rects
+rects_by_page = {{entry["page_index"]: [r for r in entry["rects"] if r.get("type") != "headnote"] for entry in rects_data}}
+
+from blackletter.refine import _get_doctr_model, _refine_single_rect
+import numpy as np
+_SCALE = 200 / 72
+det_model = _get_doctr_model()
+mat = fitz.Matrix(_SCALE, _SCALE)
+
+total_pages = len(by_page)
+done = 0
+for pi, rects in sorted(by_page.items()):
+    done += 1
+    fitz_page = src_pdf[pi]
+    pix = fitz_page.get_pixmap(matrix=mat)
+    page_img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    p = pages_by_index.get(pi)
+    sx = p.scale_x if p else 1.0
+    sy = p.scale_y if p else 1.0
+    for rect in rects:
+        px_rect = (rect.x0 * _SCALE, rect.y0 * _SCALE, rect.x1 * _SCALE, rect.y1 * _SCALE)
+        refined_px = _refine_single_rect(det_model, page_img, px_rect)
+        for rpx in refined_px:
+            rects_by_page.setdefault(pi, []).append({{
+                "x0": round(rpx[0] / _SCALE / sx, 1), "y0": round(rpx[1] / _SCALE / sy, 1),
+                "x1": round(rpx[2] / _SCALE / sx, 1), "y1": round(rpx[3] / _SCALE / sy, 1),
+                "fill": "black", "type": "headnote"
+            }})
+    # Write incrementally after each page
+    result = [{{"page_index": k, "rects": v}} for k, v in sorted(rects_by_page.items())]
+    rects_path.write_text(json.dumps(result))
+    print(f"docTR: {{done}}/{{total_pages}} pages", flush=True)
+
+total = sum(len(v) for v in rects_by_page.values())
+print(f"Refinement complete: {{total}} rects", flush=True)
+"""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=open(log_path, "w"),
+            stderr=subprocess.STDOUT,
+            cwd=str(_P(settings.INSTALL_ROOT)),
+        )
+        import time as _time
+        while proc.poll() is None:
+            _time.sleep(2)
+            try:
+                log_text = log_path.read_text(errors="replace").replace("\x00", "")
+                lines = [l for l in log_text.strip().split("\n") if l.strip()]
+                msg = lines[-1].strip() if lines else "Refining..."
+                Scan.objects.filter(pk=scan_pk).update(progress_message=msg[:255])
+            except Exception:
+                pass
+        Scan.objects.filter(pk=scan_pk).update(progress_message="")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return JsonResponse({"status": "ok", "refining": True})
 
 
 @login_required
