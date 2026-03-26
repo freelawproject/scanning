@@ -1447,28 +1447,45 @@ def scan_process_view(request, pk):
 
     # Detection warnings for step 2
     detect_warnings = []
-    if step >= 2:
-        from collections import Counter as _Counter
-        det_labels = _Counter(
-            Detection.objects.filter(
-                scan=scan, active=True
-            ).values_list("label", flat=True)
-        )
-        n_keys = det_labels.get("KEY_ICON", 0)
-        n_captions = det_labels.get("CASE_CAPTION", 0)
-        n_opinions = len(opinions)
+    unmatched_keys = []
+    unmatched_captions = []
+    if step >= 2 and opinions:
+        # Build suppressed set from issues
+        suppressed = set()
+        for iss in scan.issues.filter(check_name="suppress_detection"):
+            if iss.metadata:
+                try:
+                    m = json.loads(iss.metadata)
+                    bb = m.get("bbox", [0, 0, 0, 0])
+                    suppressed.add((m.get("page_index", 0), m.get("label_id", 0), round(bb[0]), round(bb[1])))
+                except Exception:
+                    pass
 
-        if n_keys != n_opinions:
+        paired_caption_keys = set()
+        paired_key_keys = set()
+        for op in opinions:
+            cb = op.get("caption_bbox", [0, 0, 0, 0])
+            kb = op.get("key_bbox", [0, 0, 0, 0])
+            paired_caption_keys.add((op.get("caption_page", 0), round(cb[0]), round(cb[1])))
+            paired_key_keys.add((op.get("key_page", 0), round(kb[0]), round(kb[1])))
+
+        for d in Detection.objects.filter(scan=scan, active=True, label="KEY_ICON").order_by("page_index"):
+            if (d.page_index, round(d.x0), round(d.y0)) not in paired_key_keys:
+                if (d.page_index, d.label_id, round(d.x0), round(d.y0)) not in suppressed:
+                    unmatched_keys.append({"pdf_page": d.page_index + 1, "page_index": d.page_index, "conf": round(d.confidence, 2)})
+
+        for d in Detection.objects.filter(scan=scan, active=True, label="CASE_CAPTION").order_by("page_index"):
+            if (d.page_index, round(d.x0), round(d.y0)) not in paired_caption_keys:
+                if (d.page_index, d.label_id, round(d.x0), round(d.y0)) not in suppressed:
+                    unmatched_captions.append({"pdf_page": d.page_index + 1, "page_index": d.page_index, "conf": round(d.confidence, 2)})
+
+        if unmatched_keys:
             detect_warnings.append(
-                f"{n_keys} KEY_ICONs detected but"
-                f" {n_opinions} opinions paired"
-                f" — {n_keys - n_opinions} unmatched"
+                f"{len(unmatched_keys)} KEY_ICON(s) not matched to any opinion"
             )
-        if n_captions != n_opinions:
+        if unmatched_captions:
             detect_warnings.append(
-                f"{n_captions} CASE_CAPTIONs detected but"
-                f" {n_opinions} opinions paired"
-                f" — {n_captions - n_opinions} unmatched"
+                f"{len(unmatched_captions)} CASE_CAPTION(s) not matched to any opinion"
             )
 
         # Coverage gaps
@@ -1520,6 +1537,8 @@ def scan_process_view(request, pk):
         "has_redaction_rects": has_redaction_rects,
         "opinion_scans": opinion_scans,
         "detect_warnings": detect_warnings,
+        "unmatched_keys": unmatched_keys,
+        "unmatched_captions": unmatched_captions,
     })
 
 
@@ -2212,57 +2231,7 @@ def compute_redactions_api(request, pk):
         rects_path = output_dir / "redaction_rects.json"
         rects_path.write_text(json.dumps(rects))
         total_rects = sum(len(r["rects"]) for r in rects)
-
-        def _refine_in_background(scan_pk, pdf_path, output_dir_str):
-            import django
-            django.db.connections.close_all()
-            try:
-                from blackletter.process import compute_redaction_rects as _compute
-                from blackletter.models import BBox as _BBox, Detection as _BLDet, Document as _BLDoc, Label as _Label, Page as _Page
-                from blackletter.scanner import _pair_opinions as _pair
-                _output_dir = _P(output_dir_str)
-                _det_data = json.loads((_output_dir / "detections.json").read_text())
-                _src = fitz.open(pdf_path)
-                _pages_data = {}
-                for entry in _det_data:
-                    pi = entry["page_index"]
-                    if pi not in _pages_data:
-                        _pages_data[pi] = {"img_width": entry.get("img_width", 1),
-                                           "img_height": entry.get("img_height", 1), "detections": []}
-                    _pages_data[pi]["detections"].append(entry)
-                _pages = []
-                for pi in sorted(_pages_data.keys()):
-                    pd = _pages_data[pi]
-                    pw, ph = (_src[pi].rect.width, _src[pi].rect.height) if pi < _src.page_count else (612.0, 792.0)
-                    page = _Page(index=pi, pdf_width=pw, pdf_height=ph,
-                                 img_width=pd["img_width"], img_height=pd["img_height"])
-                    for d in pd["detections"]:
-                        b = d.get("bbox", [0, 0, 1, 1])
-                        page.detections.append(_BLDet(
-                            bbox=_BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
-                            label=_Label(d["label_id"]), confidence=d["confidence"], page_index=pi,
-                        ))
-                    _pages.append(page)
-                _src.close()
-                scan_obj = Scan.objects.get(pk=scan_pk)
-                _document = _BLDoc(
-                    pdf_path=pdf_path, pages=_pages,
-                    reporter=scan_obj.reporter.short_name or "", volume=str(scan_obj.volume) or "",
-                    first_page=scan_obj.start_page or 1, ocr_applied=True,
-                )
-                _opinions = _pair(_document)
-                refined_rects = _compute(_document, _opinions, skip_doctr=False)
-                (_output_dir / "redaction_rects.json").write_text(json.dumps(refined_rects))
-            except Exception:
-                import traceback
-                traceback.print_exc()
-
-        t = threading.Thread(
-            target=_refine_in_background,
-            args=(scan.pk, pdf_path, str(output_dir)), daemon=True,
-        )
-        t.start()
-        return JsonResponse({"status": "ok", "pages": len(rects), "rects": total_rects, "refining": True})
+        return JsonResponse({"status": "ok", "pages": len(rects), "rects": total_rects})
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -2597,8 +2566,7 @@ def scan_for_label(request, pk):
 @login_required
 @require_POST
 def repare_opinions(request, pk):
-    from pathlib import Path as _P
-    scan = get_object_or_404(Scan, pk=pk)
+    return JsonResponse({"error": "disabled"}, status=503)
     output_base = _P(scan.output_dir) if scan.output_dir else _P(settings.MEDIA_ROOT) / "processed" / str(pk)
     det_path = None
     for candidate in [output_base / "detections.json", output_base.parent / "detections.json",
@@ -2719,7 +2687,7 @@ def repare_opinions(request, pk):
             candidate.write_text(json.dumps(opinions_data))
             break
     from blackletter.process import compute_redaction_rects
-    redaction_rects = compute_redaction_rects(document, opinions, excluded=excluded or None, approved=approved or None)
+    redaction_rects = compute_redaction_rects(document, opinions, excluded=excluded or None, approved=approved or None, skip_doctr=True)
     for candidate in [output_base / "redaction_rects.json", output_base.parent / "redaction_rects.json",
                       output_base.parent.parent / "redaction_rects.json"]:
         if candidate.parent.exists():

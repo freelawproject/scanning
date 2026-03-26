@@ -5,6 +5,16 @@
 
 {% block head %}
 <link rel="stylesheet" href="{% static 'scanning/checker.css' %}">
+<style>
+.opinion-nav.selected {
+    background-color: #1d4ed8 !important;
+    border-color: #1d4ed8 !important;
+    color: white !important;
+}
+.opinion-nav.selected span {
+    color: #bfdbfe !important;
+}
+</style>
 {% endblock %}
 
 {% block content %}
@@ -220,11 +230,37 @@
       </div>
       {% endfor %}
       {% endif %}
+
+      {% if unmatched_captions %}
+      <h2 class="text-sm font-bold mb-1 mt-2">Unmatched Captions ({{ unmatched_captions|length }})</h2>
+      {% for d in unmatched_captions %}
+      <div class="rounded border border-orange-300 bg-orange-50 dark:border-orange-700 dark:bg-orange-900/20 px-2 py-1 mb-1 text-xs flex items-center justify-between cursor-pointer hover:bg-orange-100 dark:hover:bg-orange-900/40"
+           data-unmatched-page="{{ d.page_index }}" data-unmatched-label="CASE_CAPTION"
+           onclick="goToPage({{ d.pdf_page }})">
+        <span class="font-medium">PDF p.{{ d.pdf_page }}</span>
+        <span class="text-gray-500 dark:text-gray-400">conf {{ d.conf }}</span>
+      </div>
+      {% endfor %}
+      {% endif %}
+
+      {% if unmatched_keys %}
+      <h2 class="text-sm font-bold mb-1 mt-2">Unmatched Key Icons ({{ unmatched_keys|length }})</h2>
+      {% for d in unmatched_keys %}
+      <div class="rounded border border-red-300 bg-red-50 dark:border-red-700 dark:bg-red-900/20 px-2 py-1 mb-1 text-xs flex items-center justify-between cursor-pointer hover:bg-red-100 dark:hover:bg-red-900/40"
+           data-unmatched-page="{{ d.page_index }}" data-unmatched-label="KEY_ICON"
+           onclick="goToPage({{ d.pdf_page }})">
+        <span class="font-medium">PDF p.{{ d.pdf_page }}</span>
+        <span class="text-gray-500 dark:text-gray-400">conf {{ d.conf }}</span>
+      </div>
+      {% endfor %}
+      {% endif %}
       {% if opinions %}
       <h2 class="text-sm font-bold mb-2">Opinions ({{ opinions|length }})</h2>
       {% for op in opinions %}
       <div class="rounded border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-2 py-1.5 mb-1 cursor-pointer text-xs opinion-nav"
            data-index="{{ forloop.counter0 }}"
+           data-caption-page="{{ op.caption_page|add:1 }}"
+           data-key-page="{{ op.key_page|add:1 }}"
            onclick="selectOpinion(this, {{ op.caption_page|add:1 }})">
         <span class="font-bold">{{ forloop.counter }}</span>
         <span class="text-gray-600 dark:text-gray-300">Pages {{ op.caption_page|add:1 }}&ndash;{{ op.key_page|add:1 }} ({{ op.page_count }} pg)</span>
@@ -275,11 +311,21 @@ var _currentOpinionIdx = -1;
 var _opinions = [];
 try { _opinions = JSON.parse(document.getElementById('opinions-data').textContent); } catch(e) {}
 
-function selectOpinion(el, pageNum) {
+function _highlightSidebarOpinion(idx) {
     var cards = document.querySelectorAll('.opinion-nav');
-    cards.forEach(function(c) { c.classList.remove('selected'); });
-    el.classList.add('selected');
+    cards.forEach(function(c, i) {
+        if (i === idx) {
+            c.classList.add('selected');
+            c.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+        } else {
+            c.classList.remove('selected');
+        }
+    });
+}
+
+function selectOpinion(el, pageNum) {
     _currentOpinionIdx = parseInt(el.dataset.index || '0');
+    _highlightSidebarOpinion(_currentOpinionIdx);
     if (_opinions.length && _currentOpinionIdx < _opinions.length) {
         var op = _opinions[_currentOpinionIdx];
         if (window.highlightOpinion) {
@@ -335,6 +381,52 @@ document.addEventListener('keydown', function(e) {
         _currentOpinionIdx = -1;
     }
 });
+
+// Auto-highlight sidebar opinion based on scroll position
+(function() {
+    document.addEventListener('DOMContentLoaded', function() {
+        var viewer = document.querySelector('.viewer-panel');
+        if (!viewer) return;
+        var cards = document.querySelectorAll('.opinion-nav');
+        if (!cards.length) return;
+
+        function _opinionForPage(pageNum) {
+            // pageNum is 1-based; data-caption-page / data-key-page are 1-based
+            for (var i = 0; i < cards.length; i++) {
+                var cap = parseInt(cards[i].dataset.captionPage || '0');
+                var key = parseInt(cards[i].dataset.keyPage || '0');
+                if (pageNum >= cap && pageNum <= key) return i;
+            }
+            return -1;
+        }
+
+        var _lastIdx = -1;
+        var _timer;
+        function _onScroll() {
+            clearTimeout(_timer);
+            _timer = setTimeout(function() {
+                var viewerRect = viewer.getBoundingClientRect();
+                var pages = viewer.querySelectorAll('.lazy-page');
+                var bestPageNum = -1;
+                for (var i = 0; i < pages.length; i++) {
+                    var r = pages[i].getBoundingClientRect();
+                    if (r.bottom > viewerRect.top && r.top < viewerRect.bottom) {
+                        bestPageNum = parseInt(pages[i].dataset.pageNum || '0');
+                        break;
+                    }
+                }
+                if (bestPageNum < 1) return;
+                var idx = _opinionForPage(bestPageNum);
+                if (idx === _lastIdx) return;
+                _lastIdx = idx;
+                if (idx >= 0) _highlightSidebarOpinion(idx);
+            }, 120);
+        }
+
+        viewer.addEventListener('scroll', _onScroll);
+        setTimeout(_onScroll, 800);
+    });
+})();
 {% endif %}
 
 function goToPage(pageNum) {

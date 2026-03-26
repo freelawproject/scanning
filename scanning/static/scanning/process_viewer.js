@@ -682,8 +682,16 @@ document.addEventListener('DOMContentLoaded', function () {
         // pageNum is 1-based viewer page; detection page_index is 0-based from the full PDF
         // We need to match by page_index = _pageIndexForNum(pageNum) (for full redacted)
         // or by page_number if available
+        // Only show labels that affect the pipeline (pairing, redaction, headnotes, layout)
+        var USED_LABELS = {
+            CASE_CAPTION: true, KEY_ICON: true,
+            STATE_ABBREVIATION: true, PAGE_HEADER: true, PAGE_NUMBER: true,
+            DIVIDER: true, HEADNOTE_BRACKET: true, EDITORIAL: true,
+            CASE_SEQUENCE: true, HEADNOTE: true, CASE_METADATA: true,
+            FOOTNOTES: true,
+        };
         var pageDets = allDetections.filter(function (d) {
-            return d.page_index === _pageIndexForNum(pageNum);
+            return d.page_index === _pageIndexForNum(pageNum) && (d.manual || USED_LABELS[d.label]);
         });
         if (!pageDets.length) return;
 
@@ -1545,11 +1553,11 @@ document.addEventListener('DOMContentLoaded', function () {
         // Action buttons toolbar
         var toolbar = document.createElement('div');
         toolbar.className = 'det-resize-handle';
-        toolbar.style.cssText = 'position:absolute;top:-26px;left:0;display:flex;gap:3px;z-index:23;';
+        toolbar.style.cssText = 'position:absolute;top:-30px;left:0;display:flex;gap:4px;z-index:23;white-space:nowrap;';
 
         var suppressBtn = document.createElement('button');
         suppressBtn.textContent = 'Suppress';
-        suppressBtn.style.cssText = 'background:#ef4444;color:white;border:none;padding:2px 6px;font-size:10px;border-radius:3px;cursor:pointer;';
+        suppressBtn.style.cssText = 'background:#ef4444;color:white;border:none;padding:4px 10px;font-size:11px;border-radius:3px;cursor:pointer;white-space:nowrap;flex-shrink:0;';
         suppressBtn.addEventListener('click', function(e) {
             e.stopPropagation();
             fetch('/scans/' + documentId + '/flag/', {
@@ -1562,15 +1570,13 @@ document.addEventListener('DOMContentLoaded', function () {
                 }),
             }).then(function(r) { return r.json(); }).then(function(data) {
                 if (data.status === 'ok') {
-                    div.style.opacity = '0.3';
-                    div.style.pointerEvents = 'none';
+                    div.remove();
                     _selectedDetBox = null;
+                    // Remove matching sidebar item for unmatched captions/keys
+                    var sidebarItems = document.querySelectorAll('[data-unmatched-page="' + det.page_index + '"][data-unmatched-label="' + det.label + '"]');
+                    sidebarItems.forEach(function(el) { el.remove(); });
                     var _pLabels = ['CASE_CAPTION', 'KEY_ICON'];
-                    if (_pLabels.indexOf(det.label) >= 0) {
-                        fetch('/scans/' + documentId + '/repare-opinions/', {
-                            method: 'POST', headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-                        }).then(function(r) { return r.json(); }).then(function(d2) { alert(d2.message); window.location.reload(); });
-                    } else {
+                    if (_pLabels.indexOf(det.label) < 0) {
                         fetch('/scans/' + documentId + '/save-redaction-rect/', {
                             method: 'POST', headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                             body: JSON.stringify({page_index: det.page_index, action: 'delete', original: {x0: det.bbox[0], y0: det.bbox[1], x1: det.bbox[2], y1: det.bbox[3]}, type: det.label}),
@@ -1582,7 +1588,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
         var approveBtn = document.createElement('button');
         approveBtn.textContent = 'Approve';
-        approveBtn.style.cssText = 'background:#059669;color:white;border:none;padding:2px 6px;font-size:10px;border-radius:3px;cursor:pointer;';
+        approveBtn.style.cssText = 'background:#059669;color:white;border:none;padding:4px 10px;font-size:11px;border-radius:3px;cursor:pointer;white-space:nowrap;flex-shrink:0;';
         approveBtn.addEventListener('click', function(e) {
             e.stopPropagation();
             // 1) Create the RedactionRect via add-single-detection
