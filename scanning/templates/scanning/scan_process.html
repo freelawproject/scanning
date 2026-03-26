@@ -39,11 +39,11 @@
   </a>
 </div>
 
-{% if is_processing %}
-<div class="bg-blue-600 text-white py-2 px-4 text-center text-sm rounded mb-4">
-  Processing... <span id="processing-msg">{{ scan.progress_message }}</span>
-</div>
-{% endif %}
+{#{% if is_processing %}#}
+{#<div class="bg-blue-600 text-white py-2 px-4 text-center text-sm rounded mb-4">#}
+{#  Processing... <span id="processing-msg">{{ scan.progress_message }}</span>#}
+{#</div>#}
+{#{% endif %}#}
 
 {# Header #}
 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-4 gap-3">
@@ -479,12 +479,17 @@ document.addEventListener('DOMContentLoaded', function() {
             .then(function(data) {
                 var sbar = document.getElementById('sidebar-bar');
                 var sstatus = document.getElementById('sidebar-status');
+                var spages = document.getElementById('sidebar-pages');
                 var pmsg = document.getElementById('processing-msg');
                 if (data.total > 0 && sbar) {
                     sbar.style.width = Math.round(data.current / data.total * 100) + '%';
                 }
                 if (sstatus) sstatus.textContent = data.message || 'Processing...';
                 if (pmsg) pmsg.textContent = data.message || '';
+                if (spages && data.log) {
+                    spages.innerHTML = '<pre class="text-[10px] text-gray-600 dark:text-gray-300 whitespace-pre-wrap break-all leading-relaxed m-0">' + data.log.replace(/</g, '&lt;') + '</pre>';
+                    spages.scrollTop = spages.scrollHeight;
+                }
 
                 if (data.status === 'approved' || data.status === 'pending_review') {
                     window.location.reload();
@@ -502,3 +507,4 @@ document.addEventListener('DOMContentLoaded', function() {
 </script>
 {% endif %}
 {% endblock %}
+{% block footer %}{% endblock %}

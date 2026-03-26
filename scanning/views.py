@@ -614,9 +614,9 @@ def queue_upload(request, reporter_slug, vol):
             target=_bg_validate, args=(scan.pk,), daemon=True
         )
         t.start()
-        messages.success(
-            request, "PDF uploaded — validation starting."
-        )
+        # messages.success(
+        #     request, "PDF uploaded — validation starting."
+        # )
         return redirect("scan_process", pk=scan.pk)
 
     messages.success(request, "PDF uploaded successfully.")
@@ -1623,7 +1623,10 @@ def start_detect(request, pk):
     scan.save()
 
     def _run_detect(scan_pk):
+        import subprocess
+        import sys
         import django
+        import time as _time
         django.db.connections.close_all()
         from pathlib import Path as _P
 
@@ -1659,11 +1662,48 @@ def start_detect(request, pk):
 
             pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
 
+            # Run YOLO detection as a subprocess so stdout progress is captured
+            script = f"""
+import os
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+from blackletter.api import detect as bl_detect
+dets = bl_detect("{pdf_path}", "{output_dir}", models=["small", "medium", "large"])
+print(f"\\nDetect complete: {{len(dets)}} detections", flush=True)
+"""
+            log_path = _P(settings.MEDIA_ROOT) / "processed" / str(scan_pk) / "detect.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             Scan.objects.filter(pk=scan_pk).update(
-                progress_message="Running YOLO detection..."
+                progress_message="Running YOLO detection...",
+                progress_log="",
             )
-            from blackletter.api import detect as bl_detect
-            dets = bl_detect(pdf_path, str(output_dir), models=["small", "medium", "large"])
+            proc = subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdout=open(log_path, "w"),
+                stderr=subprocess.STDOUT,
+                cwd=str(_P(settings.INSTALL_ROOT)),
+            )
+            while proc.poll() is None:
+                _time.sleep(1)
+                try:
+                    log_text = log_path.read_text(errors="replace").replace("\x00", "")
+                    lines = [l for l in log_text.strip().split("\n") if l.strip()]
+                    msg = lines[-1].strip() if lines else "Running YOLO detection..."
+                    Scan.objects.filter(pk=scan_pk).update(
+                        progress_message=msg[:255],
+                        progress_log=log_text[-5000:],
+                    )
+                except Exception:
+                    pass
+
+            log_text = log_path.read_text(errors="replace").replace("\x00", "")
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"YOLO detection failed (exit {proc.returncode}): {log_text[-500:]}"
+                )
+
+            # Load detections from detections.json written by subprocess
+            det_path = output_dir / "detections.json"
+            dets = json.loads(det_path.read_text())
 
             Detection.objects.filter(scan_id=scan_pk).delete()
             from blackletter.models import Label
@@ -1687,11 +1727,12 @@ def start_detect(request, pk):
                 ))
             Detection.objects.bulk_create(det_objects)
 
+            pair_log = log_text + f"\n{len(dets)} detections saved. Pairing opinions..."
             Scan.objects.filter(pk=scan_pk).update(
-                progress_message=f"{len(dets)} detections. Pairing opinions..."
+                progress_message=f"{len(dets)} detections. Pairing opinions...",
+                progress_log=pair_log[-5000:],
             )
 
-            det_path = output_dir / "detections.json"
             from blackletter.api import pair as bl_pair
             opinions = bl_pair(
                 str(det_path), pdf_path,
@@ -1700,10 +1741,12 @@ def start_detect(request, pk):
                 first_page=scan.start_page or 1,
             )
 
+            done_log = pair_log + f"\nPairing complete: {len(opinions)} opinions."
             Scan.objects.filter(pk=scan_pk).update(
                 opinions_json=json.dumps(opinions),
                 status=Status.APPROVED,
-                progress_message=f"Done -- {len(dets)} detections, {len(opinions)} opinions",
+                progress_message=f"Done — {len(dets)} detections, {len(opinions)} opinions",
+                progress_log=done_log[-5000:],
             )
 
         except Exception as exc:
