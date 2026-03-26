@@ -138,7 +138,7 @@ wheels = [
 [[package]]
 name = "blackletter"
 version = "0.0.3"
-source = { git = "https://github.com/freelawproject/blackletter.git?rev=de-thread#d3a64db3c78402cb24d36cf0b4176d63478e6655" }
+source = { git = "https://github.com/freelawproject/blackletter.git?rev=de-thread#0248dcb2da88f1966d9e9f329a8424b22b184e3e" }
 dependencies = [
     { name = "ocrmypdf" },
     { name = "opencv-python" },
