@@ -1461,9 +1461,9 @@ def scan_process_view(request, pk):
     opinion_scans = []
     if step == 4:
         for s in OpinionScan.objects.filter(scan=scan).order_by("opinion_order"):
-            s.redacted_filename = (
-                os.path.basename(s.redacted_pdf.name) if s.redacted_pdf.name else ""
-            )
+            s.redacted_filename = os.path.basename(s.redacted_pdf.name) if s.redacted_pdf and s.redacted_pdf.name else ""
+            s.masked_filename = os.path.basename(s.masked_pdf.name) if s.masked_pdf and s.masked_pdf.name else ""
+            s.unredacted_filename = os.path.basename(s.original_pdf.name) if s.original_pdf and s.original_pdf.name else ""
             opinion_scans.append(s)
 
     # Detection warnings for step 2
@@ -2354,6 +2354,17 @@ def serve_unredacted_opinion_pdf(request, pk, filename):
     file_path = os.path.join(scan.output_dir, "unredacted", filename)
     if not os.path.isfile(file_path):
         return HttpResponse("Unredacted opinion PDF not found", status=404)
+    return FileResponse(open(file_path, "rb"), content_type="application/pdf")
+
+
+@login_required
+def serve_masked_opinion_pdf(request, pk, filename):
+    scan = get_object_or_404(Scan, pk=pk)
+    if not scan.output_dir:
+        return HttpResponse("No output directory", status=404)
+    file_path = os.path.join(scan.output_dir, "masked", filename)
+    if not os.path.isfile(file_path):
+        return HttpResponse("Masked opinion PDF not found", status=404)
     return FileResponse(open(file_path, "rb"), content_type="application/pdf")
 
 

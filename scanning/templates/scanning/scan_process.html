@@ -210,10 +210,18 @@
 
       {% elif step == 4 and opinion_scans %}
       {# Step 4: Generated opinion files #}
+      <div class="flex gap-1 mb-2">
+        <button onclick="setViewMode('redacted')" id="mode-redacted" class="flex-1 text-xs px-2 py-1 rounded border font-medium bg-blue-600 text-white border-blue-600">Redacted</button>
+        <button onclick="setViewMode('masked')" id="mode-masked" class="flex-1 text-xs px-2 py-1 rounded border font-medium bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 border-gray-300 dark:border-gray-600">Masked</button>
+        <button onclick="setViewMode('unredacted')" id="mode-unredacted" class="flex-1 text-xs px-2 py-1 rounded border font-medium bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 border-gray-300 dark:border-gray-600">Original</button>
+      </div>
       <h2 class="text-sm font-bold mb-2">Generated ({{ opinion_scans|length }})</h2>
       {% for s in opinion_scans %}
       <div class="rounded border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-2 py-1.5 mb-1 cursor-pointer text-xs issue-card"
-           onclick="viewOpinion({{ forloop.counter0 }}, '{{ s.redacted_filename }}')">
+           data-redacted="{{ s.redacted_filename }}"
+           data-masked="{{ s.masked_filename }}"
+           data-unredacted="{{ s.unredacted_filename }}"
+           onclick="viewOpinionByMode({{ forloop.counter0 }}, this)">
         <span class="font-bold">{{ forloop.counter }}</span>
         <span class="text-gray-600 dark:text-gray-300 text-[11px]">{{ s.redacted_filename }}</span>
       </div>
@@ -340,15 +348,41 @@ function _clearDim() {
 }
 
 {% if step == 4 %}
-function viewOpinion(index, filename) {
-    if (!filename) return;
+var _viewMode = 'redacted';
+var _currentOpinionCard = null;
+
+function setViewMode(mode) {
+    _viewMode = mode;
+    ['redacted', 'masked', 'unredacted'].forEach(function(m) {
+        var btn = document.getElementById('mode-' + m);
+        if (!btn) return;
+        if (m === mode) {
+            btn.className = btn.className.replace(/bg-white.*border-gray-\d+[^'"]*/g, '') + ' bg-blue-600 text-white border-blue-600';
+        } else {
+            btn.className = btn.className.replace(/bg-blue-600 text-white border-blue-600/g, '') + ' bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 border-gray-300 dark:border-gray-600';
+        }
+    });
+    if (_currentOpinionCard) viewOpinionByMode(_currentOpinionIdx, _currentOpinionCard);
+}
+
+function viewOpinionByMode(index, el) {
+    var filename = el.dataset[_viewMode] || '';
+    var urlPart = _viewMode === 'redacted' ? 'opinion' : (_viewMode === 'masked' ? 'masked' : 'unredacted');
     _currentOpinionIdx = index;
+    _currentOpinionCard = el;
     document.querySelectorAll('aside .issue-card').forEach(function(c, i) {
         c.style.outline = i === index ? '2px solid #2563eb' : '';
     });
-    if (window.loadOpinion) {
+    if (window.loadOpinionUrl) {
+        window.loadOpinionUrl('/scans/{{ scan.pk }}/' + urlPart + '/' + filename + '/');
+    } else if (window.loadOpinion) {
         window.loadOpinion(filename);
     }
+}
+
+function viewOpinion(index, filename) {
+    var cards = document.querySelectorAll('aside .issue-card');
+    if (cards[index]) viewOpinionByMode(index, cards[index]);
 }
 {% endif %}
 

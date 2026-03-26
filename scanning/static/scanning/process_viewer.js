@@ -1028,6 +1028,13 @@ document.addEventListener('DOMContentLoaded', function () {
         loadPdf(initialPdfUrl);
     };
 
+    window.loadOpinionUrl = function (url) {
+        _viewingOpinion = true;
+        clearOverlaysByClass('redaction-overlay-box');
+        clearOverlaysByClass('margin-overlay-box');
+        loadPdf(url);
+    };
+
     window.loadOpinion = function (filename, card) {
         document.querySelectorAll('.opinion-card').forEach(function (c) { c.classList.remove('selected'); });
         if (card) card.classList.add('selected');
