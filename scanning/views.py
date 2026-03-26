@@ -1236,6 +1236,27 @@ def _run_generate_background(scan_pk):
         if not ocr_pdf:
             raise ValueError("No OCR'd PDF found in output directory")
 
+        # Write current DB detections → detections.json so manual edits are used
+        from scanning.models import Detection as ScanDetection
+        output_dir = Path(scan.output_dir)
+        active_dets = list(ScanDetection.objects.filter(scan=scan, active=True).order_by("page_index", "y0"))
+        det_data = [
+            {
+                "page_index": d.page_index,
+                "label": d.label,
+                "label_id": d.label_id,
+                "confidence": d.confidence,
+                "bbox": [d.x0, d.y0, d.x1, d.y1],
+                "img_width": d.img_width,
+                "img_height": d.img_height,
+                "model_count": d.model_count,
+            }
+            for d in active_dets
+        ]
+        det_path = output_dir / "detections.json"
+        det_path.write_text(json.dumps(det_data))
+        Scan.objects.filter(pk=scan_pk).update(progress_message=f"Generating files ({len(det_data)} detections)...")
+
         suppression_excluded = set()
         for issue in scan.issues.filter(check_name="suppress_detection"):
             if issue.metadata:
