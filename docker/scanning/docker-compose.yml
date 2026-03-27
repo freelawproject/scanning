@@ -37,6 +37,7 @@ services:
   # Django dev server
   scanning-django:
     container_name: scanning-django
+    platform: linux/amd64
     build:
       context: "${SCANNING_BASE_DIR:-../../}"
       dockerfile: "./docker/django/Dockerfile"
