@@ -79,6 +79,47 @@
 </div>
 {% endif %}
 
+<!-- Upload form -->
+<div class="card mb-6">
+  <h2 class="text-sm font-bold mb-3">Upload a scan</h2>
+  <form method="post" action="{% url 'queue_upload' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}" enctype="multipart/form-data">
+    {% csrf_token %}
+    <input type="hidden" name="new_scan" value="1">
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+      <div>
+        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">First Page</label>
+        <input type="number" name="first_page" placeholder="1" class="input-text text-sm w-full">
+      </div>
+      <div>
+        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Last Page</label>
+        <input type="number" name="last_page" class="input-text text-sm w-full">
+      </div>
+      <div>
+        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Part Label</label>
+        <input type="text" name="part_label" placeholder="e.g. A, B, 3" class="input-text text-sm w-full">
+      </div>
+      <div class="flex flex-col justify-end gap-1">
+        <label class="flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-300">
+          <input type="checkbox" name="has_state_abbrev" checked>
+          State Abbreviation
+        </label>
+        <label class="flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-300">
+          <input type="checkbox" name="is_partial">
+          Partial scan
+        </label>
+      </div>
+    </div>
+    <div class="mb-3">
+      <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">PDF File</label>
+      <input type="file" name="original_pdf" accept=".pdf" required class="input-text text-sm w-full">
+    </div>
+    <div class="flex gap-2">
+      <button type="submit" name="action" value="upload_validate" class="btn-primary text-sm">Upload &amp; Validate</button>
+      <button type="submit" name="action" value="upload_only" class="btn-outline text-sm">Upload Only</button>
+    </div>
+  </form>
+</div>
+
 <!-- Existing scans -->
 {% if scans %}
 <h2 class="text-lg font-bold mb-3">Scans ({{ scans|length }})</h2>
@@ -109,45 +150,4 @@
   {% endfor %}
 </div>
 {% endif %}
-
-<!-- Upload form -->
-<div class="card">
-  <h2 class="text-sm font-bold mb-3">Upload a scan</h2>
-  <form method="post" action="{% url 'queue_upload' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}" enctype="multipart/form-data">
-    {% csrf_token %}
-    <input type="hidden" name="new_scan" value="1">
-    <div class="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-3">
-      <div>
-        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">First Page</label>
-        <input type="number" name="first_page" placeholder="1" class="input-text text-sm w-full">
-      </div>
-      <div>
-        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Last Page</label>
-        <input type="number" name="last_page" class="input-text text-sm w-full">
-      </div>
-      <div>
-        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Part Label</label>
-        <input type="text" name="part_label" placeholder="e.g. A, B, 3" class="input-text text-sm w-full">
-      </div>
-      <div>
-        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">PDF File</label>
-        <input type="file" name="original_pdf" accept=".pdf" required class="input-text text-sm w-full">
-      </div>
-      <div class="flex flex-col justify-end gap-1">
-        <label class="flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-300">
-          <input type="checkbox" name="has_state_abbrev" checked>
-          State Abbreviation
-        </label>
-        <label class="flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-300">
-          <input type="checkbox" name="is_partial">
-          Partial scan
-        </label>
-      </div>
-    </div>
-    <div class="flex gap-2">
-      <button type="submit" name="action" value="upload_validate" class="btn-primary text-sm">Upload &amp; Validate</button>
-      <button type="submit" name="action" value="upload_only" class="btn-outline text-sm">Upload Only</button>
-    </div>
-  </form>
-</div>
 {% endblock %}

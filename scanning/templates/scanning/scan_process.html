@@ -210,9 +210,8 @@
 
       {% elif step == 4 and opinion_scans %}
       {# Step 4: Generated opinion files #}
-      <div class="flex gap-1 mb-2">
+      <div class="flex gap-1 mb-2 sticky top-0 z-10 bg-white dark:bg-gray-900 pb-1">
         <button onclick="setViewMode('redacted')" id="mode-redacted" class="flex-1 text-xs px-2 py-1 rounded border font-medium bg-blue-600 text-white border-blue-600">Redacted</button>
-        <button onclick="setViewMode('masked')" id="mode-masked" class="flex-1 text-xs px-2 py-1 rounded border font-medium bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 border-gray-300 dark:border-gray-600">Masked</button>
         <button onclick="setViewMode('unredacted')" id="mode-unredacted" class="flex-1 text-xs px-2 py-1 rounded border font-medium bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 border-gray-300 dark:border-gray-600">Original</button>
       </div>
       <h2 class="text-sm font-bold mb-2">Generated ({{ opinion_scans|length }})</h2>
