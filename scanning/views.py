@@ -904,12 +904,7 @@ def dismiss_issue(request, pk):
     data = json.loads(request.body)
     issue_id = data.get("issue_id")
     issue = Issue.objects.filter(pk=issue_id, scan=scan).first()
-    if issue and issue.severity == "error":
-        return JsonResponse(
-            {"status": "error", "message": "Cannot dismiss errors -- fix the issue first."},
-            status=400,
-        )
-    Issue.objects.filter(pk=issue_id, scan=scan).exclude(severity="error").delete()
+    Issue.objects.filter(pk=issue_id, scan=scan).delete()
     if not scan.issues.exists():
         scan.has_issues = False
         scan.save()
