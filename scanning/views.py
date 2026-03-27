@@ -1,7 +1,5 @@
 import json
 import os
-import shutil
-import tempfile
 import threading
 
 import fitz
@@ -17,6 +15,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
+from scanning import services
 from scanning.forms import (
     OpinionScanReviewForm,
     OpinionScanUploadForm,
@@ -40,6 +39,7 @@ from scanning.models import (
     Stage,
     Status,
 )
+from scanning.utils import get_volume, get_output_base, find_json_file, find_ocr_pdf
 
 
 def login_view(request):
@@ -420,20 +420,11 @@ def queue_detail_view(request, reporter_slug, vol):
     )
 
 
-def _get_volume(reporter_slug, vol):
-    """Helper to look up a Volume by reporter slug and number."""
-    return get_object_or_404(
-        Volume.objects.select_related("reporter", "assigned_to"),
-        reporter__short_name=reporter_slug,
-        volume_number=vol,
-    )
-
-
 @login_required
 @require_POST
 def claim_scan(request, reporter_slug, vol):
     """Claim or unclaim a volume for scanning."""
-    volume = _get_volume(reporter_slug, vol)
+    volume = get_volume(reporter_slug, vol)
 
     if request.POST.get("unclaim") == "1":
         if volume.assigned_to == request.user:
@@ -460,7 +451,7 @@ def claim_scan(request, reporter_slug, vol):
 @require_POST
 def queue_upload(request, reporter_slug, vol):
     """Upload a PDF for a specific scan within a volume."""
-    volume = _get_volume(reporter_slug, vol)
+    volume = get_volume(reporter_slug, vol)
 
     if request.POST.get("new_scan") == "1":
         # Create a new scan under this volume
@@ -560,63 +551,10 @@ def queue_upload(request, reporter_slug, vol):
         scan.progress_message = "Converting to bitonal..."
         scan.save()
 
-        def _bg_validate(scan_pk):
-            import django
-            import traceback as _tb
-            django.db.connections.close_all()
-            from pathlib import Path
-
-            try:
-                scan = Scan.objects.get(pk=scan_pk)
-            except Exception as _e:
-                _tb.print_exc()
-                return
-            try:
-                print(f"[validate] scan {scan_pk} pdf_path={scan.pdf_path}", flush=True)
-                if not scan.output_dir:
-                    output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
-                    if scan.reporter and scan.volume:
-                        output_dir = (
-                            output_dir / scan.reporter.short_name
-                            / str(scan.volume) / str(scan.start_page or 1)
-                        )
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    Scan.objects.filter(pk=scan_pk).update(output_dir=str(output_dir))
-                else:
-                    output_dir = Path(scan.output_dir)
-                    output_dir.mkdir(parents=True, exist_ok=True)
-
-                bitonal_path = output_dir / "bitonal.pdf"
-                if not bitonal_path.exists():
-                    from blackletter.api import bitonal as bl_bitonal
-                    def _prog(current, total, message):
-                        Scan.objects.filter(pk=scan_pk).update(
-                            progress_message=message,
-                            progress_current=current,
-                            progress_total=total,
-                        )
-                    bl_bitonal(scan.pdf_path, str(output_dir), progress_callback=_prog)
-                    pdf = fitz.open(str(bitonal_path))
-                    count = pdf.page_count
-                    pdf.close()
-                    Scan.objects.filter(pk=scan_pk).update(page_count=count)
-
-                _run_incremental_validation(scan_pk, str(bitonal_path))
-
-            except Exception as exc:
-                _tb.print_exc()
-                print(f"[validate] ERROR: {exc}", flush=True)
-                Scan.objects.filter(pk=scan_pk).update(
-                    status=Status.ERROR, progress_message=str(exc)[:255],
-                )
-
         t = threading.Thread(
-            target=_bg_validate, args=(scan.pk,), daemon=True
+            target=services.run_validate_with_bitonal, args=(scan.pk,), daemon=True
         )
         t.start()
-        # messages.success(
-        #     request, "PDF uploaded — validation starting."
-        # )
         return redirect("scan_process", pk=scan.pk)
 
     messages.success(request, "PDF uploaded successfully.")
@@ -631,7 +569,7 @@ def queue_upload(request, reporter_slug, vol):
 @require_POST
 def update_scan_status(request, reporter_slug, vol):
     """Update a volume's queue status."""
-    volume = _get_volume(reporter_slug, vol)
+    volume = get_volume(reporter_slug, vol)
     new_status = request.POST.get("status")
 
     if new_status and new_status in dict(QueueStatus.choices):
@@ -651,765 +589,6 @@ def update_scan_status(request, reporter_slug, vol):
         reporter_slug=reporter_slug,
         vol=vol,
     )
-
-
-# ---------------------------------------------------------------------------
-# Processing: background helpers
-# ---------------------------------------------------------------------------
-
-
-class _Cancelled(Exception):
-    pass
-
-
-def _run_incremental_validation(scan_pk, pdf_path):
-    """Validate page by page, saving results incrementally."""
-    os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-    from blackletter.analyze import DEFAULT_ANALYZE_MODEL, _process_page
-    from blackletter.models import Label
-    from pathlib import Path as _P
-
-    scan = Scan.objects.get(pk=scan_pk)
-    total = scan.page_count
-    if not total:
-        pdf = fitz.open(pdf_path)
-        total = pdf.page_count
-        pdf.close()
-
-    model_path = str(DEFAULT_ANALYZE_MODEL)
-    exp_start = scan.start_page or 1
-    exp_end = scan.end_page
-
-    all_results = []
-    all_detections = []
-
-    for i in range(total):
-        status = (
-            Scan.objects.filter(pk=scan_pk)
-            .values_list("status", flat=True)
-            .first()
-        )
-        if status == Status.CANCELLED:
-            return
-
-        try:
-            result = _process_page(
-                (i, pdf_path, exp_start, exp_end, model_path)
-            )
-        except Exception as exc:
-            import traceback
-
-            print(f"  Page {i + 1} FAILED: {exc}", flush=True)
-            traceback.print_exc()
-            result = {
-                "pdf_page": i + 1,
-                "detected": None,
-                "type": "error",
-                "zone": "error",
-                "score": 0,
-                "ocr": "failed",
-                "detections": [],
-                "img_width": 0,
-                "img_height": 0,
-            }
-
-        all_results.append(result)
-
-        page_dets = result.get("detections", [])
-        img_w = result.get("img_width", 0)
-        img_h = result.get("img_height", 0)
-        for d in page_dets:
-            try:
-                label_name = Label(d["label_id"]).name
-            except (ValueError, KeyError):
-                continue
-            all_detections.append(
-                Detection(
-                    scan_id=scan_pk,
-                    page_index=i,
-                    label=label_name,
-                    label_id=d["label_id"],
-                    confidence=d["confidence"],
-                    x0=d["bbox"][0],
-                    y0=d["bbox"][1],
-                    x1=d["bbox"][2],
-                    y1=d["bbox"][3],
-                    img_width=img_w,
-                    img_height=img_h,
-                    model_name="large",
-                    model_count=1,
-                    found_by=json.dumps(
-                        [{"model": "large", "confidence": d["confidence"]}]
-                    ),
-                )
-            )
-
-        detected = result.get("detected")
-        page_status = f"#{detected}" if detected else "no #"
-        Scan.objects.filter(pk=scan_pk).update(
-            progress_current=i + 1,
-            progress_total=total,
-            progress_message=f"Page {i + 1}/{total}: {page_status}",
-            ocr_results=json.dumps(all_results),
-        )
-
-        if (i + 1) % 10 == 0 or i == total - 1:
-            if all_detections:
-                if i < 10:
-                    Detection.objects.filter(scan_id=scan_pk).delete()
-                Detection.objects.bulk_create(all_detections)
-                all_detections = []
-
-    if scan.output_dir:
-        all_saved = Detection.objects.filter(scan_id=scan_pk).order_by(
-            "page_index", "y0"
-        )
-        det_data = [
-            {
-                "page_index": d.page_index,
-                "label": d.label,
-                "label_id": d.label_id,
-                "confidence": d.confidence,
-                "bbox": [d.x0, d.y0, d.x1, d.y1],
-                "img_width": d.img_width,
-                "img_height": d.img_height,
-                "model_count": d.model_count,
-            }
-            for d in all_saved
-        ]
-        det_path = _P(scan.output_dir) / "detections.json"
-        det_path.write_text(json.dumps(det_data))
-
-    from blackletter.validate import _build_issues, _split_in_out_of_range, _auto_correct
-
-    out_of_range, seen_nums = _split_in_out_of_range(
-        all_results, exp_start, exp_end
-    )
-    all_results, corrections = _auto_correct(
-        all_results, out_of_range, seen_nums
-    )
-    if corrections:
-        out_of_range, seen_nums = _split_in_out_of_range(
-            all_results, exp_start, exp_end
-        )
-
-    all_nums = sorted(seen_nums.keys())
-    duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
-    not_detected = [x for x in all_results if not x["detected"]]
-    out_of_range_pages = {r["pdf_page"] for r in out_of_range}
-
-    seq_issues = []
-    prev_num = prev_pdf = None
-    for r in all_results:
-        if not r["detected"] or r.get("type") == "range":
-            prev_num = None
-            continue
-        try:
-            num = int(r["detected"])
-        except ValueError:
-            continue
-        if r["pdf_page"] in out_of_range_pages:
-            continue
-        if prev_num is not None:
-            diff = num - prev_num
-            if diff == 0:
-                seq_issues.append(
-                    ("DUPLICATE", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff < 0:
-                seq_issues.append(
-                    ("BACKWARD", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff > 2:
-                seq_issues.append(
-                    (
-                        "GAP",
-                        r["pdf_page"],
-                        num,
-                        prev_pdf,
-                        prev_num,
-                        list(range(prev_num + 1, num)),
-                    )
-                )
-        prev_num = num
-        prev_pdf = r["pdf_page"]
-
-    if exp_start is not None and exp_end is not None:
-        expected = set(range(exp_start, exp_end + 1))
-        found = {n for n in seen_nums if exp_start <= n <= exp_end}
-        missing_pages = sorted(expected - found)
-    else:
-        missing_pages = []
-
-    ranges_found = [r for r in all_results if r.get("type") == "range"]
-
-    analysis = {
-        "total_pages": total,
-        "results": all_results,
-        "seen_nums": seen_nums,
-        "all_nums": all_nums,
-        "duplicates": duplicates,
-        "not_detected": not_detected,
-        "seq_issues": seq_issues,
-        "missing_pages": missing_pages,
-        "ranges_found": ranges_found,
-    }
-
-    result = _build_issues(analysis, total, exp_start, exp_end)
-
-    scan.refresh_from_db()
-    scan.page_count = total
-    scan.page_map = json.dumps(result.get("page_map", []))
-    scan.missing_pages = json.dumps(result.get("missing_pages", []))
-    scan.ocr_results = json.dumps(all_results)
-    scan.has_issues = len(result.get("issues", [])) > 0
-    scan.checked = True
-    scan.status = Status.APPROVED
-    scan.progress_message = "Done"
-    scan.save()
-
-    Issue.objects.filter(scan=scan).delete()
-    Issue.objects.bulk_create(
-        [Issue(scan=scan, **issue_data) for issue_data in result.get("issues", [])]
-    )
-
-
-def _do_recalculate(scan):
-    """Rebuild issues from scan.ocr_results without re-running OCR."""
-    import re as re_mod
-    from collections import Counter
-    from blackletter.validate import _parse_expected_range
-    from blackletter.validate import _build_issues as _build_from_ocr
-
-    ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
-    if not ocr_results:
-        return
-
-    exp_start, exp_end = _parse_expected_range(scan.pdf_path)
-
-    def _split(results):
-        oor, s = [], {}
-        for r in results:
-            if not r["detected"] or r.get("type") == "range":
-                continue
-            try:
-                num = int(r["detected"])
-            except ValueError:
-                continue
-            if num < 1:
-                oor.append(r)
-            elif exp_start is not None and (
-                num < exp_start - 5 or num > exp_end + 5
-            ):
-                oor.append(r)
-            else:
-                s.setdefault(num, []).append(r["pdf_page"])
-        return oor, s
-
-    out_of_range, seen_nums = _split(ocr_results)
-
-    auto_corrected = []
-    if out_of_range and seen_nums:
-        in_range_by_page = {
-            p: num for num, pages in seen_nums.items() for p in pages
-        }
-        in_range_sorted = sorted(in_range_by_page.items())
-        offsets = {}
-        for r in out_of_range:
-            p, detected = r["pdf_page"], int(r["detected"])
-            before = [(pp, n) for pp, n in in_range_sorted if pp < p]
-            after = [(pp, n) for pp, n in in_range_sorted if pp > p]
-            if before and after:
-                pp_b, n_b = before[-1]
-                pp_a, n_a = after[0]
-                expected = round(
-                    n_b
-                    + (n_a - n_b) / max(pp_a - pp_b, 1) * (p - pp_b)
-                )
-            elif before:
-                pp_b, n_b = before[-1]
-                expected = n_b + (p - pp_b)
-            elif after:
-                pp_a, n_a = after[0]
-                expected = n_a - (pp_a - p)
-            else:
-                continue
-            offsets[p] = (detected, expected, expected - detected)
-
-        if offsets:
-            offset_vals = [v[2] for v in offsets.values()]
-            modal_offset, modal_count = Counter(offset_vals).most_common(1)[
-                0
-            ]
-            if modal_count >= len(offset_vals) * 0.5 and modal_offset != 0:
-                to_fix = {
-                    p
-                    for p, (d, e, o) in offsets.items()
-                    if o == modal_offset
-                }
-                new_results = []
-                for r in ocr_results:
-                    if r["pdf_page"] in to_fix and r.get("detected"):
-                        old_val = r["detected"]
-                        r = dict(r)
-                        r["detected"] = str(int(old_val) + modal_offset)
-                        auto_corrected.append(
-                            (r["pdf_page"], old_val, r["detected"])
-                        )
-                    new_results.append(r)
-                ocr_results = new_results
-                scan.ocr_results = json.dumps(ocr_results)
-                out_of_range, seen_nums = _split(ocr_results)
-
-    out_of_range_pages = {r["pdf_page"] for r in out_of_range}
-    all_nums = sorted(seen_nums.keys())
-    duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
-
-    prev_num = prev_pdf = None
-    seq_issues = []
-    for r in ocr_results:
-        if not r["detected"] or r.get("type") == "range":
-            prev_num = None
-            continue
-        try:
-            num = int(r["detected"])
-        except ValueError:
-            continue
-        if r["pdf_page"] in out_of_range_pages:
-            continue
-        if prev_num is not None:
-            diff = num - prev_num
-            if diff == 0:
-                seq_issues.append(
-                    ("DUPLICATE", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff < 0:
-                seq_issues.append(
-                    ("BACKWARD", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff > 2:
-                seq_issues.append(
-                    (
-                        "GAP",
-                        r["pdf_page"],
-                        num,
-                        prev_pdf,
-                        prev_num,
-                        list(range(prev_num + 1, num)),
-                    )
-                )
-        prev_num = num
-        prev_pdf = r["pdf_page"]
-
-    range_re = re_mod.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
-    range_pages = set()
-    ranges_found = [r for r in ocr_results if r.get("type") == "range"]
-    for r in ranges_found:
-        m = range_re.match(r["detected"].replace("\u2013", "-"))
-        if m:
-            for pg in range(int(m.group(1)), int(m.group(2)) + 1):
-                range_pages.add(pg)
-
-    if exp_start is not None and all_nums:
-        missing_pages = sorted(
-            (set(range(exp_start, exp_end + 1)) - set(all_nums))
-            - range_pages
-            - {0}
-        )
-    elif all_nums:
-        missing_pages = sorted(
-            (set(range(all_nums[0], all_nums[-1] + 1)) - set(all_nums))
-            - range_pages
-            - {0}
-        )
-    else:
-        missing_pages = []
-
-    analysis = {
-        "results": ocr_results,
-        "seq_issues": seq_issues,
-        "duplicates": duplicates,
-        "seen_nums": seen_nums,
-        "all_nums": all_nums,
-        "missing_pages": missing_pages,
-        "ranges_found": ranges_found,
-        "not_detected": [r for r in ocr_results if not r["detected"]],
-        "out_of_range": out_of_range,
-    }
-
-    result = _build_from_ocr(
-        analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
-    )
-
-    for pdf_page, old_val, new_val in auto_corrected:
-        result["issues"].append(
-            {
-                "page_number": pdf_page,
-                "check_name": "auto_corrected",
-                "severity": "warning",
-                "message": (
-                    f"PDF page {pdf_page}: OCR read '{old_val}', "
-                    f"auto-corrected to '{new_val}' "
-                    f"based on surrounding page numbers."
-                ),
-            }
-        )
-
-    pdf_fitz = fitz.open(scan.pdf_path)
-    scan.page_count = len(pdf_fitz)
-    pdf_fitz.close()
-
-    scan.page_map = json.dumps(result["page_map"])
-    scan.missing_pages = json.dumps(result["missing_pages"])
-    scan.has_issues = len(result["issues"]) > 0
-    scan.status = Status.APPROVED
-    scan.progress_message = "Done"
-    scan.save()
-
-    scan.issues.all().delete()
-    Issue.objects.bulk_create(
-        [Issue(scan=scan, **i) for i in result["issues"]]
-    )
-
-
-def _run_reprocess_background(scan_pk):
-    """Apply PDF fixes (inserts/deletions), rebuild, bitonal -> OCR -> validate."""
-    import django
-    django.db.connections.close_all()
-    from pathlib import Path as _P
-
-    scan = Scan.objects.get(pk=scan_pk)
-
-    try:
-        has_changes = scan.deletions.exists() or scan.inserts.exists()
-
-        if has_changes:
-            Scan.objects.filter(pk=scan_pk).update(
-                progress_message="Applying fixes..."
-            )
-
-            pdf_doc = fitz.open(scan.pdf_path)
-            page_map = json.loads(scan.page_map) if scan.page_map else []
-
-            deleted_pdf_pages = sorted(d.pdf_page for d in scan.deletions.all())
-            for pdf_page in sorted(deleted_pdf_pages, reverse=True):
-                pdf_index = pdf_page - 1
-                if 0 <= pdf_index < len(pdf_doc):
-                    pdf_doc.delete_page(pdf_index)
-
-            inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
-            insert_ops = []
-            for i, entry in enumerate(page_map):
-                if entry["type"] == "missing" and entry["logical_number"] in inserts:
-                    insert_before = None
-                    for j in range(i + 1, len(page_map)):
-                        if page_map[j]["type"] == "pdf_page":
-                            insert_before = page_map[j]["pdf_index"]
-                            break
-                    insert_ops.append(
-                        (insert_before, entry["logical_number"], inserts[entry["logical_number"]])
-                    )
-
-            offset = 0
-            for insert_before, logical_num, insert_obj in insert_ops:
-                img_path = insert_obj.image.path
-                if insert_before is not None:
-                    adjusted = insert_before - len(
-                        [d for d in deleted_pdf_pages if d <= insert_before]
-                    )
-                    pno = adjusted + offset
-                    ref_page = pdf_doc.load_page(min(pno, len(pdf_doc) - 1))
-                else:
-                    pno = len(pdf_doc)
-                    ref_page = pdf_doc.load_page(len(pdf_doc) - 1)
-                w, h = ref_page.rect.width, ref_page.rect.height
-                if img_path.lower().endswith(".pdf"):
-                    insert_pdf = fitz.open(img_path)
-                    pdf_doc.insert_pdf(
-                        insert_pdf, from_page=0,
-                        to_page=insert_pdf.page_count - 1, start_at=pno,
-                    )
-                    offset += insert_pdf.page_count - 1
-                    insert_pdf.close()
-                else:
-                    new_page = pdf_doc.new_page(pno=pno, width=w, height=h)
-                    new_page.insert_image(new_page.rect, filename=img_path)
-                offset += 1
-
-            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-            pdf_doc.save(tmp.name, deflate=True)
-            pdf_doc.close()
-            shutil.move(tmp.name, scan.pdf_path)
-
-            scan.deletions.all().delete()
-            scan.inserts.all().delete()
-            scan.save()
-
-        if scan.output_dir:
-            output_dir = _P(scan.output_dir)
-            for old_file in output_dir.glob("*.pdf"):
-                if old_file.name != _P(scan.pdf_path).name:
-                    old_file.unlink(missing_ok=True)
-            for old_file in output_dir.glob("*.json"):
-                old_file.unlink(missing_ok=True)
-
-        Detection.objects.filter(scan_id=scan_pk).delete()
-
-        Scan.objects.filter(pk=scan_pk).update(
-            ocr_results="", opinions_json="", page_map="", missing_pages="",
-        )
-
-        scan.refresh_from_db()
-        if not scan.output_dir:
-            output_dir = _P(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            Scan.objects.filter(pk=scan_pk).update(output_dir=str(output_dir))
-        else:
-            output_dir = _P(scan.output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-        Scan.objects.filter(pk=scan_pk).update(progress_message="Converting to bitonal...")
-        from blackletter.api import bitonal as bl_bitonal
-
-        def _bitonal_progress(current, total, message):
-            Scan.objects.filter(pk=scan_pk).update(
-                progress_message=message, progress_current=current, progress_total=total,
-            )
-
-        bitonal_path = bl_bitonal(
-            scan.pdf_path, str(output_dir), progress_callback=_bitonal_progress,
-        )
-
-        pdf = fitz.open(str(bitonal_path))
-        Scan.objects.filter(pk=scan_pk).update(page_count=pdf.page_count)
-        pdf.close()
-
-        scan.refresh_from_db()
-        from blackletter.api import ocr as bl_ocr
-        Scan.objects.filter(pk=scan_pk).update(progress_message="Running Tesseract OCR...")
-        ocr_path = bl_ocr(
-            str(bitonal_path), str(output_dir),
-            reporter=scan.reporter.short_name or "",
-            volume=str(scan.volume) or "",
-            first_page=scan.start_page or 1,
-        )
-
-        _run_incremental_validation(scan_pk, str(ocr_path))
-
-    except _Cancelled:
-        pass
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR, progress_message=str(exc)[:255],
-        )
-
-
-def _run_generate_background(scan_pk):
-    """Generate redacted/split files from existing detections."""
-    import subprocess
-    import sys
-    os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-
-    import django
-    django.db.connections.close_all()
-    from pathlib import Path
-
-    scan = Scan.objects.get(pk=scan_pk)
-
-    try:
-        Scan.objects.filter(pk=scan_pk).update(progress_message="Generating files...", progress_log="")
-
-        reporter = scan.reporter.short_name
-        volume = str(scan.volume)
-        first_page = scan.start_page or 1
-
-        output_base = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
-
-        ocr_pdf = None
-        if scan.output_dir:
-            for f in sorted(Path(scan.output_dir).glob("*.pdf")):
-                if "redacted" not in f.name and "bitonal" not in f.name and not f.name.endswith(".original.pdf"):
-                    ocr_pdf = f
-                    break
-        if not ocr_pdf:
-            raise ValueError("No OCR'd PDF found in output directory")
-
-        # Write current DB detections → detections.json so manual edits are used
-        from scanning.models import Detection as ScanDetection
-        output_dir = Path(scan.output_dir)
-        active_dets = list(ScanDetection.objects.filter(scan=scan, active=True).order_by("page_index", "y0"))
-        det_data = [
-            {
-                "page_index": d.page_index,
-                "label": d.label,
-                "label_id": d.label_id,
-                "confidence": d.confidence,
-                "bbox": [d.x0, d.y0, d.x1, d.y1],
-                "img_width": d.img_width,
-                "img_height": d.img_height,
-                "model_count": d.model_count,
-            }
-            for d in active_dets
-        ]
-        det_path = output_dir / "detections.json"
-        det_path.write_text(json.dumps(det_data))
-        Scan.objects.filter(pk=scan_pk).update(progress_message=f"Generating files ({len(det_data)} detections)...")
-
-        suppression_excluded = set()
-        for issue in scan.issues.filter(check_name="suppress_detection"):
-            if issue.metadata:
-                try:
-                    meta = json.loads(issue.metadata)
-                    bbox = meta.get("bbox", [0, 0, 0, 0])
-                    suppression_excluded.add((
-                        meta.get("page_index", 0), meta.get("label_id", 0),
-                        round(bbox[0]), round(bbox[1]),
-                    ))
-                except Exception:
-                    pass
-        suppression_excluded_json = json.dumps(list(suppression_excluded))
-
-        script = f"""
-import os, json
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-from pathlib import Path
-from blackletter.process import generate_files
-
-excluded_raw = json.loads('{suppression_excluded_json}')
-excluded = set(tuple(e) for e in excluded_raw) if excluded_raw else None
-
-generate_files(
-    ocr_pdf="{ocr_pdf}",
-    output=Path("{scan.output_dir if scan.output_dir else output_base}"),
-    reporter="{reporter}",
-    volume="{volume}",
-    first_page={first_page},
-    unredacted=True,
-    excluded=excluded,
-)
-"""
-        log_path = output_base / "generate.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.Popen(
-            [sys.executable, "-c", script],
-            stdout=open(log_path, "w"),
-            stderr=subprocess.STDOUT,
-            cwd=str(Path(settings.INSTALL_ROOT)),
-        )
-
-        import re as _re
-        import time
-        _progress_re = _re.compile(r"(\d+(?:\.\d+)?)\s*/\s*(\d+)")
-        while proc.poll() is None:
-            time.sleep(1)
-            try:
-                log_text = log_path.read_text(errors="replace").replace("\x00", "")
-                lines = [l for l in log_text.strip().split("\n") if l.strip()]
-                msg = lines[-1].strip() if lines else "Generating..."
-                current, total = 0, 0
-                for l in reversed(lines):
-                    m = _progress_re.search(l)
-                    if m:
-                        current = int(float(m.group(1)))
-                        total = int(m.group(2))
-                        break
-                Scan.objects.filter(pk=scan_pk).update(
-                    progress_message=msg[:255], progress_log=log_text[-5000:],
-                    progress_current=current, progress_total=total,
-                )
-            except Exception:
-                pass
-
-        log_text = log_path.read_text(errors="replace").replace("\x00", "")
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"generate_files failed (exit {proc.returncode}): {log_text[-500:]}"
-            )
-
-        output_dir = output_base
-        for d in sorted(output_base.rglob("redacted"), key=lambda p: len(p.parts)):
-            output_dir = d.parent
-            break
-
-        redacted_dir = output_dir / "redacted"
-        redacted_files = sorted(redacted_dir.glob("*.pdf")) if redacted_dir.is_dir() else []
-
-        scan.refresh_from_db()
-        existing_opinions = json.loads(scan.opinions_json) if scan.opinions_json else []
-
-        if existing_opinions and "caption_page" in existing_opinions[0]:
-            for i, op in enumerate(existing_opinions):
-                if i < len(redacted_files):
-                    op["filename"] = redacted_files[i].name
-        else:
-            existing_opinions = []
-            for f in redacted_files:
-                existing_opinions.append({"filename": f.name, "first_page": 0, "last_page": 0})
-
-        redacted_pdf = list(output_dir.glob("*.redacted.pdf"))
-
-        scan.output_dir = str(output_dir)
-        scan.redacted_pdf_path = str(redacted_pdf[0]) if redacted_pdf else ""
-        scan.opinions_json = json.dumps(existing_opinions)
-        scan.stage = Stage.APPROVED
-        scan.status = Status.APPROVED
-        scan.progress_message = f"Generated {len(existing_opinions)} opinions"
-        scan.progress_log = log_text[-5000:]
-        scan.save()
-
-        OpinionScan.objects.filter(scan=scan).delete()
-        LLMScan.objects.filter(scan=scan).delete()
-        unredacted_dir = output_dir / "unredacted"
-        masked_dir = output_dir / "masked"
-        for i, op in enumerate(existing_opinions):
-            page_start = op.get("caption_page", op.get("first_page", 0))
-            if isinstance(page_start, int) and "caption_page" in op:
-                page_start += scan.start_page or 1
-            page_end = op.get("key_page", op.get("last_page", 0))
-            if isinstance(page_end, int) and "key_page" in op:
-                page_end += (scan.start_page or 1) + op.get("page_count", 1) - 1
-            fname = op.get("filename", "")
-            opinion = OpinionScan.objects.create(
-                scan=scan, reporter=scan.reporter, volume=scan.volume,
-                opinion_order=i, page_start=page_start or 1,
-                page_end=page_end or page_start or 1,
-                caption_page_index=op.get("caption_page"),
-                key_page_index=op.get("key_page"),
-                has_image=op.get("has_image", False),
-                status=OpinionStatus.OK, uploaded_by=scan.uploaded_by,
-            )
-            if fname:
-                rp = redacted_dir / fname
-                if rp.exists():
-                    opinion.redacted_pdf.name = str(rp)
-                up = unredacted_dir / fname if unredacted_dir.exists() else None
-                if up and up.exists():
-                    opinion.original_pdf.name = str(up)
-                mp = masked_dir / fname if masked_dir.exists() else None
-                if mp and mp.exists():
-                    opinion.masked_pdf.name = str(mp)
-                opinion.save()
-
-            if opinion.masked_pdf.name:
-                llm_scan = LLMScan.objects.create(
-                    scan=scan, masked_pdf=opinion.masked_pdf.name,
-                    status=LLMScan.Status.PENDING,
-                )
-                llm_scan.opinions.add(opinion)
-
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR, progress_message=str(exc)[:255],
-        )
-
-
-# ---------------------------------------------------------------------------
-# Processing views
-# ---------------------------------------------------------------------------
 
 
 @login_required
@@ -1579,12 +758,11 @@ def progress_api(request, pk):
 def serve_scan_pdf(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
     if scan.output_dir:
+        ocr = find_ocr_pdf(scan.output_dir)
+        if ocr:
+            return FileResponse(open(ocr, "rb"), content_type="application/pdf")
         from pathlib import Path as _P
-        out = _P(scan.output_dir)
-        for f in sorted(out.glob("*.pdf")):
-            if f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf") and not f.name.endswith(".original.pdf"):
-                return FileResponse(open(f, "rb"), content_type="application/pdf")
-        bitonal = out / "bitonal.pdf"
+        bitonal = _P(scan.output_dir) / "bitonal.pdf"
         if bitonal.exists():
             return FileResponse(open(bitonal, "rb"), content_type="application/pdf")
     return FileResponse(open(scan.pdf_path, "rb"), content_type="application/pdf")
@@ -1599,54 +777,7 @@ def start_validate(request, pk):
     scan.progress_message = "Converting to bitonal..."
     scan.save()
 
-    def _validate_with_bitonal(scan_pk):
-        import django
-        import traceback as _tb
-        django.db.connections.close_all()
-        from pathlib import Path
-
-        scan = Scan.objects.get(pk=scan_pk)
-        try:
-            if not scan.output_dir:
-                output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
-                if scan.reporter and scan.volume:
-                    output_dir = (
-                        output_dir / scan.reporter.short_name
-                        / str(scan.volume) / str(scan.start_page or 1)
-                    )
-                output_dir.mkdir(parents=True, exist_ok=True)
-                Scan.objects.filter(pk=scan_pk).update(output_dir=str(output_dir))
-            else:
-                output_dir = Path(scan.output_dir)
-                output_dir.mkdir(parents=True, exist_ok=True)
-
-            bitonal_path = output_dir / "bitonal.pdf"
-            if not bitonal_path.exists():
-                from blackletter.api import bitonal as bl_bitonal
-
-                def _bitonal_progress(current, total, message):
-                    Scan.objects.filter(pk=scan_pk).update(
-                        progress_message=message,
-                        progress_current=current,
-                        progress_total=total,
-                    )
-
-                bl_bitonal(scan.pdf_path, str(output_dir), progress_callback=_bitonal_progress)
-                pdf = fitz.open(str(bitonal_path))
-                count = pdf.page_count
-                pdf.close()
-                Scan.objects.filter(pk=scan_pk).update(page_count=count)
-
-            _run_incremental_validation(scan_pk, str(bitonal_path))
-
-        except Exception as exc:
-            _tb.print_exc()
-            print(f"[validate] ERROR: {exc}", flush=True)
-            Scan.objects.filter(pk=scan_pk).update(
-                status=Status.ERROR, progress_message=str(exc)[:255],
-            )
-
-    t = threading.Thread(target=_validate_with_bitonal, args=(scan.pk,), daemon=True)
+    t = threading.Thread(target=services.run_validate_with_bitonal, args=(scan.pk,), daemon=True)
     t.start()
     return redirect("scan_process", pk=scan.pk)
 
@@ -1662,141 +793,7 @@ def start_detect(request, pk):
     scan.progress_message = "Starting detection..."
     scan.save()
 
-    def _run_detect(scan_pk):
-        import subprocess
-        import sys
-        import django
-        import time as _time
-        django.db.connections.close_all()
-        from pathlib import Path as _P
-
-        scan = Scan.objects.get(pk=scan_pk)
-        try:
-            output_dir = _P(scan.output_dir)
-            bitonal = output_dir / "bitonal.pdf"
-
-            ocr_exists = any(
-                f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf") and not f.name.endswith(".original.pdf")
-                for f in output_dir.glob("*.pdf")
-            )
-            if not ocr_exists and bitonal.exists():
-                def _run_ocr_bg(scan_pk, bitonal_str, output_dir_str):
-                    try:
-                        import django as _dj
-                        _dj.db.connections.close_all()
-                        _scan = Scan.objects.get(pk=scan_pk)
-                        from blackletter.api import ocr as _ocr
-                        _ocr(
-                            bitonal_str, output_dir_str,
-                            reporter=_scan.reporter.short_name or "",
-                            volume=str(_scan.volume) or "",
-                            first_page=_scan.start_page or 1,
-                        )
-                    except Exception as _e:
-                        print(f"  Background OCR failed: {_e}", flush=True)
-                threading.Thread(
-                    target=_run_ocr_bg,
-                    args=(scan_pk, str(bitonal), str(output_dir)),
-                    daemon=True,
-                ).start()
-
-            pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
-
-            # Run YOLO detection as a subprocess so stdout progress is captured
-            script = f"""
-import os
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-from blackletter.api import detect as bl_detect
-dets = bl_detect("{pdf_path}", "{output_dir}", models=["small", "medium", "large"])
-print(f"\\nDetect complete: {{len(dets)}} detections", flush=True)
-"""
-            log_path = _P(settings.MEDIA_ROOT) / "processed" / str(scan_pk) / "detect.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            Scan.objects.filter(pk=scan_pk).update(
-                progress_message="Running YOLO detection...",
-                progress_log="",
-            )
-            proc = subprocess.Popen(
-                [sys.executable, "-c", script],
-                stdout=open(log_path, "w"),
-                stderr=subprocess.STDOUT,
-                cwd=str(_P(settings.INSTALL_ROOT)),
-            )
-            while proc.poll() is None:
-                _time.sleep(1)
-                try:
-                    log_text = log_path.read_text(errors="replace").replace("\x00", "")
-                    lines = [l for l in log_text.strip().split("\n") if l.strip()]
-                    msg = lines[-1].strip() if lines else "Running YOLO detection..."
-                    Scan.objects.filter(pk=scan_pk).update(
-                        progress_message=msg[:255],
-                        progress_log=log_text[-5000:],
-                    )
-                except Exception:
-                    pass
-
-            log_text = log_path.read_text(errors="replace").replace("\x00", "")
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    f"YOLO detection failed (exit {proc.returncode}): {log_text[-500:]}"
-                )
-
-            # Load detections from detections.json written by subprocess
-            det_path = output_dir / "detections.json"
-            dets = json.loads(det_path.read_text())
-
-            Detection.objects.filter(scan_id=scan_pk).delete()
-            from blackletter.models import Label
-            det_objects = []
-            for d in dets:
-                try:
-                    label_name = Label(d["label_id"]).name
-                except (ValueError, KeyError):
-                    label_name = d.get("label", "UNKNOWN")
-                det_objects.append(Detection(
-                    scan_id=scan_pk, page_index=d["page_index"],
-                    label=label_name, label_id=d["label_id"],
-                    confidence=d["confidence"],
-                    x0=d["bbox"][0], y0=d["bbox"][1],
-                    x1=d["bbox"][2], y1=d["bbox"][3],
-                    img_width=d.get("img_width", 0),
-                    img_height=d.get("img_height", 0),
-                    model_name=d.get("found_by", [{}])[0].get("model", ""),
-                    model_count=d.get("model_count", 1),
-                    found_by=json.dumps(d.get("found_by", [])),
-                ))
-            Detection.objects.bulk_create(det_objects)
-
-            pair_log = log_text + f"\n{len(dets)} detections saved. Pairing opinions..."
-            Scan.objects.filter(pk=scan_pk).update(
-                progress_message=f"{len(dets)} detections. Pairing opinions...",
-                progress_log=pair_log[-5000:],
-            )
-
-            from blackletter.api import pair as bl_pair
-            opinions = bl_pair(
-                str(det_path), pdf_path,
-                reporter=scan.reporter.short_name or "",
-                volume=str(scan.volume) or "",
-                first_page=scan.start_page or 1,
-            )
-
-            done_log = pair_log + f"\nPairing complete: {len(opinions)} opinions."
-            Scan.objects.filter(pk=scan_pk).update(
-                opinions_json=json.dumps(opinions),
-                status=Status.APPROVED,
-                progress_message=f"Done — {len(dets)} detections, {len(opinions)} opinions",
-                progress_log=done_log[-5000:],
-            )
-
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            Scan.objects.filter(pk=scan_pk).update(
-                status=Status.ERROR, progress_message=str(exc)[:255],
-            )
-
-    t = threading.Thread(target=_run_detect, args=(scan.pk,), daemon=True)
+    t = threading.Thread(target=services.run_detect, args=(scan.pk,), daemon=True)
     t.start()
     return redirect(f"/scans/{scan.pk}/process/?step=2")
 
@@ -1825,7 +822,7 @@ def recalculate(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.ocr_results:
         return redirect("scan_process", pk=pk)
-    _do_recalculate(scan)
+    services.recalculate_issues(scan)
     return redirect("scan_process", pk=pk)
 
 
@@ -1838,7 +835,7 @@ def reprocess(request, pk):
     scan.progress_total = 0
     scan.progress_message = "Starting reprocess..."
     scan.save()
-    t = threading.Thread(target=_run_reprocess_background, args=(scan.pk,), daemon=True)
+    t = threading.Thread(target=services.run_reprocess, args=(scan.pk,), daemon=True)
     t.start()
     return redirect("scan_process", pk=scan.pk)
 
@@ -1944,41 +941,20 @@ def serve_detections(request, pk):
 
 @login_required
 def serve_opinions(request, pk):
-    from pathlib import Path as _Path
     scan = get_object_or_404(Scan, pk=pk)
-    output_base = _Path(scan.output_dir) if scan.output_dir else None
-    if not output_base:
-        output_base = _Path(settings.MEDIA_ROOT) / "processed" / str(pk)
-    for candidate in [
-        output_base / "opinions.json",
-        output_base.parent / "opinions.json",
-        output_base.parent.parent / "opinions.json",
-    ]:
-        if candidate.exists():
-            return JsonResponse(json.loads(candidate.read_text()), safe=False)
+    if scan.opinions_json:
+        return JsonResponse(json.loads(scan.opinions_json), safe=False)
     return JsonResponse([], safe=False)
 
 
 @login_required
 def serve_margin_rects(request, pk):
-    from pathlib import Path as _Path
     scan = get_object_or_404(Scan, pk=pk)
-    output_base = _Path(scan.output_dir) if scan.output_dir else None
-    if not output_base:
-        output_base = _Path(settings.MEDIA_ROOT) / "processed" / str(pk)
-    for candidate in [
-        output_base / "margin_rects.json",
-        output_base.parent / "margin_rects.json",
-        output_base.parent.parent / "margin_rects.json",
-    ]:
-        if candidate.exists():
-            return JsonResponse(json.loads(candidate.read_text()), safe=False)
-    ocr_pdf = None
-    if output_base.is_dir():
-        for f in sorted(output_base.rglob("*.pdf")):
-            if f.is_file() and "redacted" not in f.name and "bitonal" not in f.name:
-                ocr_pdf = f
-                break
+    output_base = get_output_base(scan)
+    path = find_json_file(output_base, "margin_rects.json")
+    if path:
+        return JsonResponse(json.loads(path.read_text()), safe=False)
+    ocr_pdf = find_ocr_pdf(output_base) if output_base.is_dir() else None
     if not ocr_pdf:
         return JsonResponse([], safe=False)
     from blackletter.margins import compute_margin_rects
@@ -1988,25 +964,17 @@ def serve_margin_rects(request, pk):
 
 @login_required
 def serve_redaction_rects(request, pk):
-    from pathlib import Path as _Path
     scan = get_object_or_404(Scan, pk=pk)
-    output_base = _Path(scan.output_dir) if scan.output_dir else None
-    if not output_base:
-        output_base = _Path(settings.MEDIA_ROOT) / "processed" / str(pk)
-    for candidate in [
-        output_base / "redaction_rects.json",
-        output_base.parent / "redaction_rects.json",
-        output_base.parent.parent / "redaction_rects.json",
-    ]:
-        if candidate.exists():
-            return JsonResponse(json.loads(candidate.read_text()), safe=False)
+    output_base = get_output_base(scan)
+    path = find_json_file(output_base, "redaction_rects.json")
+    if path:
+        return JsonResponse(json.loads(path.read_text()), safe=False)
     return JsonResponse([], safe=False)
 
 
 @login_required
 @require_POST
 def save_redaction_rect(request, pk):
-    from pathlib import Path as _Path
     scan = get_object_or_404(Scan, pk=pk)
     data = json.loads(request.body)
     page_idx = data["page_index"]
@@ -2015,18 +983,8 @@ def save_redaction_rect(request, pk):
     adjusted = data.get("adjusted", {})
     rect_type = data.get("type", "")
     fill = data.get("fill", "black")
-    output_base = _Path(scan.output_dir) if scan.output_dir else None
-    if not output_base:
-        output_base = _Path(settings.MEDIA_ROOT) / "processed" / str(pk)
-    rects_path = None
-    for candidate in [
-        output_base / "redaction_rects.json",
-        output_base.parent / "redaction_rects.json",
-        output_base.parent.parent / "redaction_rects.json",
-    ]:
-        if candidate.exists():
-            rects_path = candidate
-            break
+    output_base = get_output_base(scan)
+    rects_path = find_json_file(output_base, "redaction_rects.json")
     if not rects_path:
         return JsonResponse({"error": "No redaction_rects.json"}, status=404)
     rects = json.loads(rects_path.read_text())
@@ -2076,21 +1034,14 @@ def save_redaction_rect(request, pk):
 @login_required
 @require_POST
 def save_margin_rect(request, pk):
-    from pathlib import Path as _Path
     scan = get_object_or_404(Scan, pk=pk)
     data = json.loads(request.body)
     page_idx = data["page_index"]
     original = data.get("original", {})
     action = data.get("action", "update")
     adjusted = data.get("adjusted", {})
-    output_base = _Path(scan.output_dir) if scan.output_dir else None
-    if not output_base:
-        output_base = _Path(settings.MEDIA_ROOT) / "processed" / str(pk)
-    rects_path = None
-    for candidate in [output_base / "margin_rects.json", output_base.parent / "margin_rects.json"]:
-        if candidate.exists():
-            rects_path = candidate
-            break
+    output_base = get_output_base(scan)
+    rects_path = find_json_file(output_base, "margin_rects.json")
     if not rects_path:
         return JsonResponse({"error": "No margin_rects.json"}, status=404)
     rects = json.loads(rects_path.read_text())
@@ -2128,11 +1079,10 @@ def save_margin_rect(request, pk):
 @login_required
 @require_POST
 def pair_opinions_api(request, pk):
-    from pathlib import Path as _P
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.output_dir:
         return JsonResponse({"error": "No output directory"}, status=400)
-    output_dir = _P(scan.output_dir)
+    output_dir = get_output_base(scan)
     det_path = output_dir / "detections.json"
     dets = Detection.objects.filter(scan=scan, active=True).order_by("page_index", "y0")
     det_data = [{
@@ -2198,8 +1148,6 @@ def compute_redactions_api(request, pk):
         if not det_data:
             return JsonResponse({"error": "No detections found"}, status=400)
         (output_dir / "detections.json").write_text(json.dumps(det_data))
-        opinions_data = json.loads(scan.opinions_json)
-        (output_dir / "opinions.json").write_text(json.dumps(opinions_data))
         pdf_path = scan.pdf_path
         for f in sorted(output_dir.glob("*.pdf")):
             if f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf") and not f.name.endswith(".original.pdf"):
@@ -2321,7 +1269,7 @@ def generate_files(request, pk):
     scan.progress_message = "Generating files..."
     scan.progress_log = ""
     scan.save()
-    t = threading.Thread(target=_run_generate_background, args=(scan.pk,), daemon=True)
+    t = threading.Thread(target=services.run_generate_files, args=(scan.pk,), daemon=True)
     t.start()
     return redirect(f"/scans/{scan.pk}/process/?step=4")
 
@@ -2428,15 +1376,10 @@ def remove_flag(request, pk, flag_id):
 @login_required
 @require_POST
 def add_single_detection(request, pk):
-    from pathlib import Path as _P
     scan = get_object_or_404(Scan, pk=pk)
     det = json.loads(request.body)
-    output_base = _P(scan.output_dir) if scan.output_dir else _P(settings.MEDIA_ROOT) / "processed" / str(pk)
-    det_path = None
-    for candidate in [output_base / "detections.json", output_base.parent / "detections.json"]:
-        if candidate.exists():
-            det_path = candidate
-            break
+    output_base = get_output_base(scan)
+    det_path = find_json_file(output_base, "detections.json")
     if not det_path:
         return JsonResponse({"error": "No detections.json"}, status=404)
     existing = json.loads(det_path.read_text())
@@ -2474,224 +1417,6 @@ def add_single_detection(request, pk):
             pass
     det_path.write_text(json.dumps(existing))
     return JsonResponse({"status": "ok", "added": not boosted})
-
-
-@login_required
-@require_POST
-def repare_opinions(request, pk):
-    return JsonResponse({"error": "disabled"}, status=503)
-    output_base = _P(scan.output_dir) if scan.output_dir else _P(settings.MEDIA_ROOT) / "processed" / str(pk)
-    det_path = None
-    for candidate in [output_base / "detections.json", output_base.parent / "detections.json",
-                      output_base.parent.parent / "detections.json"]:
-        if candidate.exists():
-            det_path = candidate
-            break
-    if not det_path:
-        return JsonResponse({"error": "No detections found"}, status=404)
-    ocr_pdf = None
-    search_dir = output_base if output_base.is_dir() else output_base.parent
-    for f in sorted(search_dir.rglob("*.pdf")):
-        if "redacted" not in f.name and "bitonal" not in f.name:
-            ocr_pdf = f
-            break
-    if not ocr_pdf:
-        return JsonResponse({"error": "No OCR PDF found"}, status=404)
-    from blackletter.models import BBox, Detection as BLDetection, Document as BLDoc, Label, Page
-    from blackletter.scanner import _pair_opinions
-    raw = json.loads(det_path.read_text())
-    for issue in scan.issues.filter(check_name="add_detection"):
-        if issue.metadata:
-            try:
-                meta = json.loads(issue.metadata)
-                raw.append({
-                    "page_index": meta.get("page_index", 0),
-                    "label": Label(meta["label_id"]).name, "label_id": meta["label_id"],
-                    "confidence": 1.0, "bbox": meta.get("bbox", [0, 0, 1, 1]),
-                    "img_width": meta.get("img_width", 1), "img_height": meta.get("img_height", 1),
-                })
-            except Exception:
-                pass
-    src_pdf = fitz.open(str(ocr_pdf))
-    page_dims = {}
-    for i in range(len(src_pdf)):
-        r = src_pdf.load_page(i).rect
-        page_dims[i] = (r.width, r.height)
-    src_pdf.close()
-    pages_data = {}
-    for entry in raw:
-        pi = entry["page_index"]
-        if pi not in pages_data:
-            pages_data[pi] = {"page_number": entry.get("page_number"),
-                              "img_width": entry.get("img_width", 1),
-                              "img_height": entry.get("img_height", 1), "detections": []}
-        pages_data[pi]["detections"].append(entry)
-    pages_meta = {}
-    for candidate in [output_base / "pages_meta.json", output_base.parent / "pages_meta.json"]:
-        if candidate.exists():
-            pages_meta = json.loads(candidate.read_text())
-            break
-    pages = []
-    for pi in sorted(pages_data.keys()):
-        pd = pages_data[pi]
-        pdf_w, pdf_h = page_dims.get(pi, (612.0, 792.0))
-        meta = pages_meta.get(str(pi), pages_meta.get(pi, {}))
-        page = Page(index=pi, pdf_width=pdf_w, pdf_height=pdf_h,
-                    img_width=pd["img_width"], img_height=pd["img_height"],
-                    page_number=pd["page_number"],
-                    col_left_x1=meta.get("col_left_x1", 0), col_left_x2=meta.get("col_left_x2", 0),
-                    col_right_x1=meta.get("col_right_x1", 0), col_right_x2=meta.get("col_right_x2", 0),
-                    midpoint=meta.get("midpoint", 0))
-        for d in pd["detections"]:
-            bbox_raw = d.get("bbox", [0, 0, 1, 1])
-            page.detections.append(BLDetection(
-                bbox=BBox(x1=bbox_raw[0], y1=bbox_raw[1], x2=bbox_raw[2], y2=bbox_raw[3]),
-                label=Label(d["label_id"]), confidence=d["confidence"], page_index=pi,
-            ))
-        pages.append(page)
-    document = BLDoc(pdf_path=ocr_pdf, pages=pages,
-                     reporter=scan.reporter.short_name or "", volume=str(scan.volume) or "",
-                     first_page=scan.start_page or 1, ocr_applied=True)
-    excluded = set()
-    approved = set()
-    for issue in scan.issues.filter(check_name__in=["suppress_detection", "approve_detection"]):
-        if issue.metadata:
-            try:
-                meta = json.loads(issue.metadata)
-                bbox = meta.get("bbox", [0, 0, 0, 0])
-                tup = (meta.get("page_index", 0), meta.get("label_id", 0), round(bbox[0]), round(bbox[1]))
-                if issue.check_name == "suppress_detection":
-                    excluded.add(tup)
-                else:
-                    approved.add(tup)
-            except Exception:
-                pass
-    opinions = _pair_opinions(document, excluded=excluded or None)
-    from blackletter.scanner import _outside_opinion_rects
-    _pages_by_index = {p.index: p for p in document.pages}
-    _src = fitz.open(str(ocr_pdf))
-    opinions_data = []
-    for caption, key in opinions:
-        outside_rects = []
-        for pi in range(caption.page_index, key.page_index + 1):
-            pg = _pages_by_index[pi]
-            is_first = pi == caption.page_index
-            is_last = pi == key.page_index
-            pw = _src[pi].rect.width
-            for rect in _outside_opinion_rects(pg, pw, caption, key, is_first, is_last):
-                outside_rects.append({
-                    "page_index": pi, "x0": round(rect.x0, 1), "y0": round(rect.y0, 1),
-                    "x1": round(rect.x1, 1), "y1": round(rect.y1, 1),
-                })
-        opinions_data.append({
-            "caption_page": caption.page_index,
-            "caption_bbox": [round(caption.bbox.x1, 1), round(caption.bbox.y1, 1),
-                             round(caption.bbox.x2, 1), round(caption.bbox.y2, 1)],
-            "key_page": key.page_index,
-            "key_bbox": [round(key.bbox.x1, 1), round(key.bbox.y1, 1),
-                         round(key.bbox.x2, 1), round(key.bbox.y2, 1)],
-            "page_count": key.page_index - caption.page_index + 1,
-            "outside_rects": outside_rects,
-        })
-    _src.close()
-    for candidate in [output_base / "opinions.json", output_base.parent / "opinions.json",
-                      output_base.parent.parent / "opinions.json"]:
-        if candidate.parent.exists():
-            candidate.write_text(json.dumps(opinions_data))
-            break
-    from blackletter.process import compute_redaction_rects
-    redaction_rects = compute_redaction_rects(document, opinions, excluded=excluded or None, approved=approved or None, skip_doctr=True)
-    for candidate in [output_base / "redaction_rects.json", output_base.parent / "redaction_rects.json",
-                      output_base.parent.parent / "redaction_rects.json"]:
-        if candidate.parent.exists():
-            candidate.write_text(json.dumps(redaction_rects))
-            break
-    return JsonResponse({"opinions": len(opinions), "message": f"Re-paired: {len(opinions)} opinions"})
-
-
-@login_required
-@require_POST
-def reprocess_section_view(request, pk):
-    from pathlib import Path as _P
-    scan = get_object_or_404(Scan, pk=pk)
-    data = json.loads(request.body)
-    page_start = data["page_start"]
-    page_end = data["page_end"]
-    model_name = data.get("model", "medium")
-    model_map = {
-        "small": "/Users/Palin/Code/blackletter/blackletter/models/best.pt",
-        "medium": "/Users/Palin/Code/blackletter/blackletter/models/medium.pt",
-        "large": "/Users/Palin/Code/blackletter/blackletter/models/analyze.pt",
-    }
-    model_path = model_map.get(model_name, model_map["medium"])
-    import glob
-    import subprocess
-    import sys
-    ocr_pdfs = [f for f in glob.glob(f"{scan.output_dir}/*.pdf") if ".redacted." not in f]
-    if not ocr_pdfs:
-        return JsonResponse({"status": "error", "message": "No OCR'd PDF found"}, status=400)
-    ocr_pdf = ocr_pdfs[0]
-    first_page = scan.start_page or 1
-    excluded = set()
-    for issue in scan.issues.filter(check_name="suppress_detection"):
-        if issue.metadata:
-            meta = json.loads(issue.metadata)
-            bbox = meta.get("bbox", [0, 0, 0, 0])
-            excluded.add((meta.get("page_index", 0), meta.get("label_id", 0), round(bbox[0]), round(bbox[1])))
-    injected = []
-    for issue in scan.issues.filter(check_name="add_detection"):
-        if issue.metadata:
-            meta = json.loads(issue.metadata)
-            pi = meta.get("page_index", -1)
-            if page_start - first_page <= pi <= page_end - first_page:
-                injected.append({
-                    "page_index": pi, "label_id": meta.get("label_id", 0),
-                    "bbox": meta.get("bbox", [0, 0, 1, 1]),
-                    "img_width": meta.get("img_width", 1700), "img_height": meta.get("img_height", 2200),
-                    "confidence": 1.0,
-                })
-    section_output = f"{scan.output_dir}/section_{page_start}_{page_end}"
-    excluded_json = json.dumps(list(excluded)) if excluded else "[]"
-    injected_json = json.dumps(injected) if injected else "[]"
-    reporter = scan.reporter.short_name
-    volume = str(scan.volume)
-    script = f"""
-import os, json
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-from pathlib import Path
-from blackletter.process import reprocess_section
-excluded_raw = json.loads('{excluded_json}')
-excluded = set(tuple(e) for e in excluded_raw)
-injected = json.loads('{injected_json}')
-result = reprocess_section(
-    ocr_pdf_path="{ocr_pdf}", output_dir=Path("{section_output}"),
-    page_start={page_start}, page_end={page_end}, first_page={first_page},
-    reporter="{reporter}", volume="{volume}", model=Path("{model_path}"),
-    excluded=excluded if excluded else None, injected=injected if injected else None,
-)
-print(json.dumps(result))
-"""
-    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600)
-    if proc.returncode != 0:
-        return JsonResponse({"status": "error", "message": f"Reprocess failed: {proc.stderr[-500:]}"}, status=500)
-    result_line = [l for l in proc.stdout.strip().split("\n") if l.startswith("{")]
-    if not result_line:
-        return JsonResponse({"status": "error", "message": "No result from reprocess"}, status=500)
-    result = json.loads(result_line[-1])
-    opinions = json.loads(scan.opinions_json) if scan.opinions_json else []
-    opinions = [op for op in opinions if not (op["first_page"] >= page_start and op["last_page"] <= page_end)]
-    for subdir in ["redacted", "unredacted"]:
-        src_dir = f"{section_output}/{subdir}"
-        dst_dir = f"{scan.output_dir}/{subdir}"
-        if os.path.isdir(src_dir):
-            for f in os.listdir(src_dir):
-                shutil.move(os.path.join(src_dir, f), os.path.join(dst_dir, f))
-    opinions.extend(result["opinions"])
-    opinions.sort(key=lambda o: o["first_page"])
-    scan.opinions_json = json.dumps(opinions)
-    scan.save()
-    shutil.rmtree(section_output, ignore_errors=True)
-    return JsonResponse({"status": "ok", "opinions": len(opinions)})
 
 
 @login_required

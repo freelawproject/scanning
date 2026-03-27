@@ -84,3 +84,6 @@ lint.ignore = [
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "scanning.settings"
 python_files = ["tests.py", "test_*.py"]
+
+[tool.uv.sources]
+blackletter = { git = "https://github.com/freelawproject/blackletter.git", rev = "de-thread" }
