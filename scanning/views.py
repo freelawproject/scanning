@@ -545,14 +545,13 @@ def queue_upload(request, reporter_slug, vol):
 
     action = request.POST.get("action", "upload_only")
     if action == "upload_validate":
-        # Kick off validation
         scan.status = Status.PROCESSING
         scan.stage = Stage.VALIDATE
         scan.progress_message = "Converting to bitonal..."
         scan.save()
 
         t = threading.Thread(
-            target=services.run_validate_with_bitonal, args=(scan.pk,), daemon=True
+            target=services.run_full_pipeline, args=(scan.pk,), daemon=True
         )
         t.start()
         return redirect("scan_process", pk=scan.pk)
@@ -777,7 +776,7 @@ def start_validate(request, pk):
     scan.progress_message = "Converting to bitonal..."
     scan.save()
 
-    t = threading.Thread(target=services.run_validate_with_bitonal, args=(scan.pk,), daemon=True)
+    t = threading.Thread(target=services.run_full_pipeline, args=(scan.pk,), daemon=True)
     t.start()
     return redirect("scan_process", pk=scan.pk)
 
@@ -786,6 +785,10 @@ def start_validate(request, pk):
 @require_POST
 def start_detect(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
+    if Detection.objects.filter(scan=scan).exists():
+        # Detections already exist (from full pipeline). Skip to review.
+        return redirect(f"/scans/{scan.pk}/process/?step=2")
+
     scan.status = Status.PROCESSING
     scan.stage = Stage.PROCESS
     scan.progress_current = 0
@@ -1126,124 +1129,21 @@ def pair_opinions_api(request, pk):
 @login_required
 @require_POST
 def compute_redactions_api(request, pk):
-    from pathlib import Path as _P
+    from scanning.services import (
+        _compute_and_save_margin_rects,
+        _compute_and_save_redaction_rects,
+    )
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.output_dir:
         return JsonResponse({"error": "No output directory"}, status=400)
     if not scan.opinions_json:
         return JsonResponse({"error": "No opinions paired yet"}, status=400)
-    output_dir = _P(scan.output_dir)
+    output_dir = scan.output_dir
+    pdf_path = find_ocr_pdf(output_dir) or scan.pdf_path
     try:
-        dets = Detection.objects.filter(scan=scan, active=True).order_by("page_index", "y0")
-        det_data = [{
-            "page_index": d.page_index, "label": d.label, "label_id": d.label_id,
-            "confidence": d.confidence, "bbox": [d.x0, d.y0, d.x1, d.y1],
-            "img_width": d.img_width, "img_height": d.img_height,
-        } for d in dets]
-        if not det_data:
-            return JsonResponse({"error": "No detections found"}, status=400)
-        (output_dir / "detections.json").write_text(json.dumps(det_data))
-        pdf_path = scan.pdf_path
-        for f in sorted(output_dir.glob("*.pdf")):
-            if f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf") and not f.name.endswith(".original.pdf"):
-                pdf_path = str(f)
-                break
-        else:
-            bitonal = output_dir / "bitonal.pdf"
-            if bitonal.exists():
-                pdf_path = str(bitonal)
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        return JsonResponse({"error": str(exc)[:500]}, status=500)
-    try:
-        from blackletter.models import BBox, Detection as BLDetection, Document as BLDoc, Label, Page
-        from blackletter.scanner import _pair_opinions
-        from blackletter.process import compute_redaction_rects
-        src_pdf = fitz.open(pdf_path)
-        pages_data = {}
-        for entry in det_data:
-            pi = entry["page_index"]
-            if pi not in pages_data:
-                pages_data[pi] = {"img_width": entry.get("img_width", 1),
-                                  "img_height": entry.get("img_height", 1), "detections": []}
-            pages_data[pi]["detections"].append(entry)
-        pages = []
-        for pi in sorted(pages_data.keys()):
-            pd = pages_data[pi]
-            if pi < src_pdf.page_count:
-                pw, ph = src_pdf[pi].rect.width, src_pdf[pi].rect.height
-            else:
-                pw, ph = 612.0, 792.0
-            page = Page(index=pi, pdf_width=pw, pdf_height=ph,
-                        img_width=pd["img_width"], img_height=pd["img_height"])
-            for d in pd["detections"]:
-                b = d.get("bbox", [0, 0, 1, 1])
-                page.detections.append(BLDetection(
-                    bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
-                    label=Label(d["label_id"]), confidence=d["confidence"], page_index=pi,
-                ))
-            pages.append(page)
-        src_pdf.close()
-        document = BLDoc(
-            pdf_path=pdf_path, pages=pages,
-            reporter=scan.reporter.short_name or "", volume=str(scan.volume) or "",
-            first_page=scan.start_page or 1, ocr_applied=True,
-        )
-        opinions = _pair_opinions(document)
-        rects = compute_redaction_rects(document, opinions, skip_doctr=True)
-
-        # Split each headnote block at HEADNOTE detection boundaries
-        # so the big block becomes N sub-blocks with visible gaps between headnotes
-        _GAP = 6  # px gap between sub-blocks
-        hn_dets_by_page = {}
-        for d in Detection.objects.filter(scan=scan, active=True, label="HEADNOTE"):
-            hn_dets_by_page.setdefault(d.page_index, []).append(d)
-        for page_entry in rects:
-            pi = page_entry["page_index"]
-            if pi not in hn_dets_by_page:
-                continue
-            hn_dets = sorted(hn_dets_by_page[pi], key=lambda d: d.y0)
-            new_page_rects = []
-            for r in page_entry["rects"]:
-                if r.get("type") != "headnote":
-                    new_page_rects.append(r)
-                    continue
-                # Find HEADNOTE detections whose y0 falls inside this block
-                # Get detections in this column, sorted by y0
-                col_dets = sorted(
-                    (d for d in hn_dets
-                     if r["y0"] + _GAP < d.y0 < r["y1"] - _GAP
-                     and d.x0 < r["x1"] and d.x1 > r["x0"]),
-                    key=lambda d: d.y0
-                )
-                # Merge overlapping detections into non-overlapping groups
-                merged = []
-                for d in col_dets:
-                    if merged and d.y0 < merged[-1][1]:  # overlaps previous
-                        merged[-1] = (merged[-1][0], max(merged[-1][1], d.y1))
-                    else:
-                        merged.append((d.y0, d.y1))
-                splits = [m[0] for m in merged]
-                if not splits:
-                    new_page_rects.append(r)
-                    continue
-                prev_y = r["y0"]
-                for sp in splits:
-                    if sp - _GAP / 2 > prev_y:
-                        new_page_rects.append({**r, "y0": round(prev_y, 1), "y1": round(sp - _GAP / 2, 1)})
-                    prev_y = sp + _GAP / 2
-                new_page_rects.append({**r, "y0": round(prev_y, 1), "y1": round(r["y1"], 1)})
-            page_entry["rects"] = new_page_rects
-
-        rects_path = output_dir / "redaction_rects.json"
-        rects_path.write_text(json.dumps(rects))
+        rects = _compute_and_save_redaction_rects(pk, pdf_path, output_dir)
+        _compute_and_save_margin_rects(pdf_path, output_dir)
         total_rects = sum(len(r["rects"]) for r in rects)
-        margin_rects_path = output_dir / "margin_rects.json"
-        if not margin_rects_path.exists():
-            from blackletter.margins import compute_margin_rects
-            margin_rects = compute_margin_rects(pdf_path)
-            margin_rects_path.write_text(json.dumps(margin_rects))
         return JsonResponse({"status": "ok", "pages": len(rects), "rects": total_rects})
     except Exception as exc:
         import traceback

@@ -9,16 +9,31 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
+import time as _time
+from pathlib import Path
 
 import fitz
 from django.conf import settings
+from django.db.models import F
 
-from blackletter.analyze import DEFAULT_ANALYZE_MODEL, _process_page
+from blackletter.analyze import (
+    CROP_FRAC,
+    DEFAULT_ANALYZE_MODEL,
+    MIN_SCORE,
+    _ocr_crop_multi,
+    _pick_best,
+    _process_page,
+    _scan_crop,
+)
 from blackletter.api import bitonal as bl_bitonal, ocr as bl_ocr, pair as bl_pair
+from blackletter.margins import compute_margin_rects
 from blackletter.models import Label
-from blackletter.process import generate_files
+from blackletter.process import generate_files, compute_redaction_rects
+from blackletter.scanner import _pair_opinions
 from blackletter.validate import (
     _auto_correct,
     _build_issues,
@@ -36,6 +51,7 @@ from scanning.models import (
     Stage,
     Status,
 )
+from scanning.utils import find_ocr_pdf, get_output_base
 
 
 class ProcessingCancelled(Exception):
@@ -43,14 +59,558 @@ class ProcessingCancelled(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _update_progress(scan_pk, message, current=None, total=None, **kwargs):
+    """Update scan progress fields."""
+    updates = {"progress_message": message[:255]}
+    if current is not None:
+        updates["progress_current"] = current
+    if total is not None:
+        updates["progress_total"] = total
+    updates.update(kwargs)
+    Scan.objects.filter(pk=scan_pk).update(**updates)
+
+
+def _run_yolo_subprocess(scan_pk, pdf_path, output_dir):
+    """Run YOLO detection as a subprocess (all 3 models).
+
+    Saves detections.json to output_dir. Blocks until complete.
+    """
+    script = f"""
+import os
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+from blackletter.api import detect as bl_detect
+dets = bl_detect("{pdf_path}", "{output_dir}", models=["small", "medium", "large"])
+print(f"\\nDetect complete: {{len(dets)}} detections", flush=True)
+"""
+    log_path = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk) / "detect.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _update_progress(scan_pk, "Running YOLO detection...", progress_log="")
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=open(log_path, "w"),
+        stderr=subprocess.STDOUT,
+        cwd=str(Path(settings.INSTALL_ROOT)),
+    )
+    while proc.poll() is None:
+        _time.sleep(1)
+        try:
+            log_text = log_path.read_text(errors="replace").replace("\x00", "")
+            lines = [l for l in log_text.strip().split("\n") if l.strip()]
+            msg = lines[-1].strip() if lines else "Running YOLO detection..."
+            _update_progress(scan_pk, msg, progress_log=log_text[-5000:])
+        except Exception:
+            pass
+
+    log_text = log_path.read_text(errors="replace").replace("\x00", "")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"YOLO detection failed (exit {proc.returncode}): {log_text[-500:]}"
+        )
+
+
+def _import_detections_from_json(scan_pk, output_dir):
+    """Load detections.json from disk into Detection model.
+
+    Clears existing detections first. Returns the detection list.
+    """
+    det_path = Path(output_dir) / "detections.json"
+    dets = json.loads(det_path.read_text())
+
+    Detection.objects.filter(scan_id=scan_pk).delete()
+    det_objects = []
+    for d in dets:
+        try:
+            label_name = Label(d["label_id"]).name
+        except (ValueError, KeyError):
+            label_name = d.get("label", "UNKNOWN")
+        det_objects.append(Detection(
+            scan_id=scan_pk, page_index=d["page_index"],
+            label=label_name, label_id=d["label_id"],
+            confidence=d["confidence"],
+            x0=d["bbox"][0], y0=d["bbox"][1],
+            x1=d["bbox"][2], y1=d["bbox"][3],
+            img_width=d.get("img_width", 0),
+            img_height=d.get("img_height", 0),
+            model_name=d.get("found_by", [{}])[0].get("model", ""),
+            model_count=d.get("model_count", 1),
+            found_by=json.dumps(d.get("found_by", [])),
+        ))
+    Detection.objects.bulk_create(det_objects)
+    return dets
+
+
+def _sync_detections_to_disk(scan_pk):
+    """Write current DB detections to detections.json on disk."""
+    scan = Scan.objects.get(pk=scan_pk)
+    if not scan.output_dir:
+        return
+    output_dir = Path(scan.output_dir)
+    all_saved = Detection.objects.filter(
+        scan_id=scan_pk, active=True
+    ).order_by("page_index", "y0")
+    det_data = [
+        {
+            "page_index": d.page_index,
+            "label": d.label,
+            "label_id": d.label_id,
+            "confidence": d.confidence,
+            "bbox": [d.x0, d.y0, d.x1, d.y1],
+            "img_width": d.img_width,
+            "img_height": d.img_height,
+            "model_count": d.model_count,
+        }
+        for d in all_saved
+    ]
+    (output_dir / "detections.json").write_text(json.dumps(det_data))
+    return det_data
+
+
+def _build_document_from_detections(scan, det_data, pdf_path):
+    """Build a blackletter Document from detection data and a PDF.
+
+    Returns (document, opinions) tuple.
+    """
+    from blackletter.models import (
+        BBox,
+        Detection as BLDetection,
+        Document as BLDoc,
+        Page,
+    )
+
+    src_pdf = fitz.open(str(pdf_path))
+    pages_data = {}
+    for entry in det_data:
+        pi = entry["page_index"]
+        if pi not in pages_data:
+            pages_data[pi] = {
+                "img_width": entry.get("img_width", 1),
+                "img_height": entry.get("img_height", 1),
+                "detections": [],
+            }
+        pages_data[pi]["detections"].append(entry)
+    pages = []
+    for pi in sorted(pages_data.keys()):
+        pd = pages_data[pi]
+        if pi < src_pdf.page_count:
+            pw, ph = src_pdf[pi].rect.width, src_pdf[pi].rect.height
+        else:
+            pw, ph = 612.0, 792.0
+        page = Page(
+            index=pi, pdf_width=pw, pdf_height=ph,
+            img_width=pd["img_width"], img_height=pd["img_height"],
+        )
+        for d in pd["detections"]:
+            b = d.get("bbox", [0, 0, 1, 1])
+            page.detections.append(BLDetection(
+                bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
+                label=Label(d["label_id"]),
+                confidence=d["confidence"],
+                page_index=pi,
+            ))
+        pages.append(page)
+    src_pdf.close()
+
+    scan_obj = scan if isinstance(scan, Scan) else Scan.objects.get(pk=scan)
+    document = BLDoc(
+        pdf_path=str(pdf_path), pages=pages,
+        reporter=scan_obj.reporter.short_name or "",
+        volume=str(scan_obj.volume) or "",
+        first_page=scan_obj.start_page or 1,
+        ocr_applied=True,
+    )
+    return document
+
+
+def _compute_and_save_redaction_rects(scan_pk, pdf_path, output_dir):
+    """Compute redaction rects and save to disk. Returns the rects list."""
+    scan = Scan.objects.get(pk=scan_pk)
+    output_dir = Path(output_dir)
+
+    det_data = _sync_detections_to_disk(scan_pk)
+    if not det_data:
+        return []
+
+    document = _build_document_from_detections(scan, det_data, pdf_path)
+    opinions = _pair_opinions(document)
+    rects = compute_redaction_rects(document, opinions, skip_doctr=True)
+
+    # Split headnote blocks at HEADNOTE detection boundaries
+    _GAP = 6
+    hn_dets_by_page = {}
+    for d in Detection.objects.filter(scan=scan, active=True, label="HEADNOTE"):
+        hn_dets_by_page.setdefault(d.page_index, []).append(d)
+    for page_entry in rects:
+        pi = page_entry["page_index"]
+        if pi not in hn_dets_by_page:
+            continue
+        hn_dets = sorted(hn_dets_by_page[pi], key=lambda d: d.y0)
+        new_page_rects = []
+        for r in page_entry["rects"]:
+            if r.get("type") != "headnote":
+                new_page_rects.append(r)
+                continue
+            col_dets = sorted(
+                (d for d in hn_dets
+                 if r["y0"] + _GAP < d.y0 < r["y1"] - _GAP
+                 and d.x0 < r["x1"] and d.x1 > r["x0"]),
+                key=lambda d: d.y0
+            )
+            merged = []
+            for d in col_dets:
+                if merged and d.y0 < merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], d.y1))
+                else:
+                    merged.append((d.y0, d.y1))
+            splits = [m[0] for m in merged]
+            if not splits:
+                new_page_rects.append(r)
+                continue
+            prev_y = r["y0"]
+            for sp in splits:
+                if sp - _GAP / 2 > prev_y:
+                    new_page_rects.append({
+                        **r,
+                        "y0": round(prev_y, 1),
+                        "y1": round(sp - _GAP / 2, 1),
+                    })
+                prev_y = sp + _GAP / 2
+            new_page_rects.append({
+                **r,
+                "y0": round(prev_y, 1),
+                "y1": round(r["y1"], 1),
+            })
+        page_entry["rects"] = new_page_rects
+
+    rects_path = output_dir / "redaction_rects.json"
+    rects_path.write_text(json.dumps(rects))
+    return rects
+
+
+def _compute_and_save_margin_rects(pdf_path, output_dir):
+    """Compute margin rects and save to disk."""
+    output_dir = Path(output_dir)
+    margin_rects_path = output_dir / "margin_rects.json"
+    if not margin_rects_path.exists():
+        margin_rects = compute_margin_rects(str(pdf_path))
+        margin_rects_path.write_text(json.dumps(margin_rects))
+        return margin_rects
+    return json.loads(margin_rects_path.read_text())
+
+
+def _re_pair_opinions(scan_pk):
+    """Re-pair opinions from current DB detections."""
+    scan = Scan.objects.get(pk=scan_pk)
+    det_data = _sync_detections_to_disk(scan_pk)
+    if not det_data:
+        return []
+
+    pdf_path = find_ocr_pdf(scan.output_dir) or scan.pdf_path
+    opinions = bl_pair(
+        det_data, str(pdf_path),
+        reporter=scan.reporter.short_name or "",
+        volume=str(scan.volume) or "",
+        first_page=scan.start_page or 1,
+    )
+    Scan.objects.filter(pk=scan_pk).update(
+        opinions_json=json.dumps(opinions),
+    )
+    return opinions
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
+
+def _ocr_page_number(ocr, pdf_path, page_idx, exp_start, exp_end,
+                     scan_pk=None):
+    """Detect page number on a single page using PaddleOCR.
+
+    If scan_pk is provided, uses existing YOLO PAGE_NUMBER and PAGE_HEADER
+    detection boxes to guide the crop — much faster and more accurate than
+    blind corner crops. Falls back to corner crops only when no detection
+    boxes exist for this page.
+
+    Returns a dict with keys: pdf_page, detected, zone, type, score, ocr.
+    """
+    import io
+    from PIL import Image
+
+    PAGE_NUMBER_ID = 8
+    PAGE_HEADER_ID = 2
+
+    pdf = fitz.open(pdf_path)
+    page = pdf[page_idx]
+    pix = page.get_pixmap(dpi=200)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    img_w, img_h = img.size
+    pdf.close()
+
+    def img_to_bytes(pil_img):
+        buf = io.BytesIO()
+        pil_img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    page_num = None
+
+    # Strategy 1: Use YOLO detection boxes if we have them
+    if scan_pk is not None:
+        dets = Detection.objects.filter(
+            scan_id=scan_pk, page_index=page_idx, active=True,
+            label_id__in=[PAGE_NUMBER_ID, PAGE_HEADER_ID],
+        ).order_by("-confidence")
+
+        pn_dets = [d for d in dets if d.label_id == PAGE_NUMBER_ID]
+        hdr_dets = [d for d in dets if d.label_id == PAGE_HEADER_ID]
+
+        # 1a) PAGE_NUMBER boxes — crop and OCR each
+        pad = 10
+        for d in pn_dets:
+            if d.y0 < 5 or d.y1 > img_h - 5:
+                continue
+            crop = img.crop((
+                max(0, int(d.x0) - pad),
+                max(0, int(d.y0) - pad),
+                min(img_w, int(d.x1) + pad),
+                min(img_h, int(d.y1) + pad),
+            ))
+            if crop.size[0] < 30 or crop.size[1] < 30:
+                continue
+            result = _ocr_crop_multi(
+                ocr, None, None, crop, "yolo-pn",
+                page_idx, exp_start, exp_end,
+            )
+            if result:
+                page_num = result
+                break
+
+        # 1b) PAGE_HEADER box — crop left/right sides for page number
+        if not page_num and hdr_dets:
+            best = hdr_dets[0]
+            top = max(0, int(best.y0) - pad)
+            bot = min(img_h, int(best.y1) + pad)
+            for side_crop, sname in [
+                (img.crop((0, top, max(1, int(best.x0)), bot)), "hdr-L"),
+                (img.crop((min(img_w - 1, int(best.x1)), top, img_w, bot)), "hdr-R"),
+            ]:
+                if side_crop.size[0] < 10:
+                    continue
+                result = _ocr_crop_multi(
+                    ocr, None, None, side_crop, sname,
+                    page_idx, exp_start, exp_end,
+                )
+                if result:
+                    page_num = result
+                    break
+
+    # Strategy 2: Fall back to corner crops (no detection boxes)
+    if not page_num:
+        crop_h = int(img_h * CROP_FRAC)
+        half_w = img_w // 2
+        candidates = []
+        for crop, cname, x_off in [
+            (img.crop((0, 0, half_w, crop_h)), "corner-L", 0),
+            (img.crop((half_w, 0, img_w, crop_h)), "corner-R", half_w),
+        ]:
+            hits, _ = _scan_crop(
+                ocr, img_to_bytes(crop), cname, page_idx, x_offset=x_off,
+            )
+            candidates.extend(hits)
+        result = _pick_best(candidates, img_w, img_h, exp_start, exp_end)
+
+        if not result or result["score"] < MIN_SCORE:
+            top_crop = img.crop((0, 0, img_w, crop_h))
+            hits, _ = _scan_crop(
+                ocr, img_to_bytes(top_crop), "top", page_idx,
+            )
+            candidates.extend(hits)
+            result = _pick_best(candidates, img_w, img_h, exp_start, exp_end)
+
+        if result:
+            page_num = result
+
+    return {
+        "pdf_page": page_idx + 1,
+        "detected": page_num["text"] if page_num else None,
+        "zone": page_num.get("zone") if page_num else None,
+        "type": page_num.get("type") if page_num else None,
+        "score": page_num.get("score") if page_num else None,
+        "ocr": page_num.get("ocr", "paddle") if page_num else None,
+        "detections": [],
+        "img_width": img_w,
+        "img_height": img_h,
+    }
+
+
+def run_paddleocr_validation(scan_pk, pdf_path):
+    """Validate page numbers using PaddleOCR guided by existing detections.
+
+    Uses PAGE_NUMBER and PAGE_HEADER detection boxes from the DB to guide
+    OCR crops. Falls back to corner crops for pages without detection boxes.
+    Much faster and more accurate than running YOLO again.
+    """
+    os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+    from paddleocr import PaddleOCR
+
+    scan = Scan.objects.get(pk=scan_pk)
+    total = scan.page_count
+    if not total:
+        pdf = fitz.open(pdf_path)
+        total = pdf.page_count
+        pdf.close()
+
+    exp_start = scan.start_page or 1
+    exp_end = scan.end_page
+
+    ocr = PaddleOCR(
+        text_detection_model_name="PP-OCRv5_server_det",
+        text_recognition_model_name="PP-OCRv5_server_rec",
+        use_textline_orientation=False,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+    )
+
+    all_results = []
+    for i in range(total):
+        status = (
+            Scan.objects.filter(pk=scan_pk)
+            .values_list("status", flat=True)
+            .first()
+        )
+        if status == Status.CANCELLED:
+            return
+
+        try:
+            result = _ocr_page_number(
+                ocr, pdf_path, i, exp_start, exp_end, scan_pk=scan_pk,
+            )
+        except Exception as exc:
+            import traceback
+            print(f"  Page {i + 1} FAILED: {exc}", flush=True)
+            traceback.print_exc()
+            result = {
+                "pdf_page": i + 1,
+                "detected": None,
+                "type": "error",
+                "zone": "error",
+                "score": 0,
+                "ocr": "paddle",
+                "detections": [],
+                "img_width": 0,
+                "img_height": 0,
+            }
+
+        all_results.append(result)
+
+        detected = result.get("detected")
+        page_status = f"#{detected}" if detected else "no #"
+        _update_progress(
+            scan_pk,
+            f"Page {i + 1}/{total}: {page_status}",
+            current=i + 1,
+            total=total,
+            ocr_results=json.dumps(all_results),
+        )
+
+    out_of_range, seen_nums = _split_in_out_of_range(
+        all_results, exp_start, exp_end
+    )
+    all_results, corrections = _auto_correct(
+        all_results, out_of_range, seen_nums
+    )
+    if corrections:
+        out_of_range, seen_nums = _split_in_out_of_range(
+            all_results, exp_start, exp_end
+        )
+
+    all_nums = sorted(seen_nums.keys())
+    duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
+    not_detected = [x for x in all_results if not x["detected"]]
+    out_of_range_pages = {r["pdf_page"] for r in out_of_range}
+
+    seq_issues = []
+    prev_num = prev_pdf = None
+    for r in all_results:
+        if not r["detected"] or r.get("type") == "range":
+            prev_num = None
+            continue
+        try:
+            num = int(r["detected"])
+        except ValueError:
+            continue
+        if r["pdf_page"] in out_of_range_pages:
+            continue
+        if prev_num is not None:
+            diff = num - prev_num
+            if diff == 0:
+                seq_issues.append(
+                    ("DUPLICATE", r["pdf_page"], num, prev_pdf, prev_num)
+                )
+            elif diff < 0:
+                seq_issues.append(
+                    ("BACKWARD", r["pdf_page"], num, prev_pdf, prev_num)
+                )
+            elif diff > 2:
+                seq_issues.append(
+                    (
+                        "GAP",
+                        r["pdf_page"],
+                        num,
+                        prev_pdf,
+                        prev_num,
+                        list(range(prev_num + 1, num)),
+                    )
+                )
+        prev_num = num
+        prev_pdf = r["pdf_page"]
+
+    if exp_start is not None and exp_end is not None:
+        expected = set(range(exp_start, exp_end + 1))
+        found = {n for n in seen_nums if exp_start <= n <= exp_end}
+        missing_pages = sorted(expected - found)
+    else:
+        missing_pages = []
+
+    ranges_found = [r for r in all_results if r.get("type") == "range"]
+
+    analysis = {
+        "total_pages": total,
+        "results": all_results,
+        "seen_nums": seen_nums,
+        "all_nums": all_nums,
+        "duplicates": duplicates,
+        "not_detected": not_detected,
+        "seq_issues": seq_issues,
+        "missing_pages": missing_pages,
+        "ranges_found": ranges_found,
+    }
+
+    result = _build_issues(analysis, total, exp_start, exp_end)
+
+    scan.refresh_from_db()
+    scan.page_count = total
+    scan.page_map = json.dumps(result.get("page_map", []))
+    scan.missing_pages = json.dumps(result.get("missing_pages", []))
+    scan.ocr_results = json.dumps(all_results)
+    scan.has_issues = len(result.get("issues", [])) > 0
+    scan.checked = True
+    scan.status = Status.APPROVED
+    scan.progress_message = "Done"
+    scan.save()
+
+    Issue.objects.filter(scan=scan).delete()
+    Issue.objects.bulk_create(
+        [Issue(scan=scan, **issue_data) for issue_data in result.get("issues", [])]
+    )
 
 
 def run_incremental_validation(scan_pk, pdf_path):
     """Validate page by page, saving results incrementally."""
     os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-    from pathlib import Path as _P
 
     scan = Scan.objects.get(pk=scan_pk)
     total = scan.page_count
@@ -144,24 +704,7 @@ def run_incremental_validation(scan_pk, pdf_path):
                 all_detections = []
 
     if scan.output_dir:
-        all_saved = Detection.objects.filter(scan_id=scan_pk).order_by(
-            "page_index", "y0"
-        )
-        det_data = [
-            {
-                "page_index": d.page_index,
-                "label": d.label,
-                "label_id": d.label_id,
-                "confidence": d.confidence,
-                "bbox": [d.x0, d.y0, d.x1, d.y1],
-                "img_width": d.img_width,
-                "img_height": d.img_height,
-                "model_count": d.model_count,
-            }
-            for d in all_saved
-        ]
-        det_path = _P(scan.output_dir) / "detections.json"
-        det_path.write_text(json.dumps(det_data))
+        _sync_detections_to_disk(scan_pk)
 
     out_of_range, seen_nums = _split_in_out_of_range(
         all_results, exp_start, exp_end
@@ -469,7 +1012,6 @@ def run_validate_with_bitonal(scan_pk):
     import django
     import traceback as _tb
     django.db.connections.close_all()
-    from pathlib import Path
 
     try:
         scan = Scan.objects.get(pk=scan_pk)
@@ -518,134 +1060,202 @@ def run_validate_with_bitonal(scan_pk):
 
 
 # ---------------------------------------------------------------------------
+# Full pipeline (upload and walk away)
+# ---------------------------------------------------------------------------
+
+
+def run_full_pipeline(scan_pk):
+    """Run the full processing pipeline: bitonal → OCR → YOLO → validate → pair → rects.
+
+    Designed to run in a background thread. After this completes, the scan
+    is ready for review — the user only needs to approve and generate.
+    """
+    import django
+    import traceback as _tb
+    django.db.connections.close_all()
+
+    try:
+        scan = Scan.objects.get(pk=scan_pk)
+    except Exception:
+        _tb.print_exc()
+        return
+
+    try:
+        # 1. Ensure output directory exists
+        if not scan.output_dir:
+            output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
+            if scan.reporter and scan.volume:
+                output_dir = (
+                    output_dir / scan.reporter.short_name
+                    / str(scan.volume) / str(scan.start_page or 1)
+                )
+            output_dir.mkdir(parents=True, exist_ok=True)
+            Scan.objects.filter(pk=scan_pk).update(output_dir=str(output_dir))
+        else:
+            output_dir = Path(scan.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 2. Bitonal conversion
+        bitonal_path = output_dir / "bitonal.pdf"
+        if not bitonal_path.exists():
+            def _bitonal_progress(current, total, message):
+                _update_progress(scan_pk, message, current=current, total=total)
+
+            bl_bitonal(scan.pdf_path, str(output_dir), progress_callback=_bitonal_progress)
+
+        pdf = fitz.open(str(bitonal_path))
+        page_count = pdf.page_count
+        pdf.close()
+        Scan.objects.filter(pk=scan_pk).update(page_count=page_count)
+
+        # 3. Tesseract OCR (on bitonal)
+        _update_progress(scan_pk, "Running Tesseract OCR...")
+        scan.refresh_from_db()
+        ocr_pdf = find_ocr_pdf(str(output_dir))
+        if not ocr_pdf:
+            ocr_pdf = bl_ocr(
+                str(bitonal_path), str(output_dir),
+                reporter=scan.reporter.short_name or "",
+                volume=str(scan.volume) or "",
+                first_page=scan.start_page or 1,
+            )
+
+        # 4. YOLO detection (all 3 models on bitonal)
+        _run_yolo_subprocess(scan_pk, str(bitonal_path), str(output_dir))
+        dets = _import_detections_from_json(scan_pk, str(output_dir))
+        _update_progress(
+            scan_pk,
+            f"{len(dets)} detections. Running validation...",
+        )
+
+        # 5. PaddleOCR validation (on original PDF for better OCR)
+        run_paddleocr_validation(scan_pk, scan.pdf_path)
+
+        # 6. Pair opinions
+        _update_progress(scan_pk, "Pairing opinions...")
+        opinions = _re_pair_opinions(scan_pk)
+
+        # 7. Compute margin and redaction rects
+        _update_progress(scan_pk, "Computing redaction rects...")
+        pdf_path = str(ocr_pdf) if ocr_pdf else scan.pdf_path
+        _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
+        _compute_and_save_margin_rects(pdf_path, str(output_dir))
+
+        Scan.objects.filter(pk=scan_pk).update(
+            status=Status.APPROVED,
+            progress_message=(
+                f"Done — {len(dets)} detections, {len(opinions)} opinions"
+            ),
+        )
+
+    except ProcessingCancelled:
+        pass
+    except Exception as exc:
+        _tb.print_exc()
+        print(f"[pipeline] ERROR: {exc}", flush=True)
+        Scan.objects.filter(pk=scan_pk).update(
+            status=Status.ERROR, progress_message=str(exc)[:255],
+        )
+
+
+# ---------------------------------------------------------------------------
 # Reprocess (apply fixes, re-bitonal, re-OCR, re-validate)
 # ---------------------------------------------------------------------------
 
 
 def run_reprocess(scan_pk):
-    """Apply PDF fixes (inserts/deletions), rebuild, bitonal -> OCR -> validate.
+    """Apply PDF fixes (inserts/deletions) using smart edits.
+
+    Instead of nuking all derived files and re-running the full pipeline,
+    this applies deletes/inserts to all PDFs, shifts detection indices,
+    and re-runs only PaddleOCR validation + opinion pairing.
 
     Designed to run in a background thread.
     """
     import django
     django.db.connections.close_all()
-    from pathlib import Path as _P
 
     scan = Scan.objects.get(pk=scan_pk)
 
     try:
-        has_changes = scan.deletions.exists() or scan.inserts.exists()
+        has_deletions = scan.deletions.exists()
+        has_inserts = scan.inserts.exists()
 
-        if has_changes:
-            Scan.objects.filter(pk=scan_pk).update(
-                progress_message="Applying fixes..."
+        if not has_deletions and not has_inserts:
+            # Nothing to do — just re-validate
+            _update_progress(scan_pk, "Re-validating...")
+            run_paddleocr_validation(scan_pk, scan.pdf_path)
+            _re_pair_opinions(scan_pk)
+            return
+
+        output_dir = Path(scan.output_dir) if scan.output_dir else None
+        page_map = json.loads(scan.page_map) if scan.page_map else []
+
+        # Apply deletions (process in reverse order to keep indices stable)
+        if has_deletions:
+            _update_progress(scan_pk, "Deleting pages...")
+            deleted_pdf_pages = sorted(
+                (d.pdf_page for d in scan.deletions.all()), reverse=True
             )
+            for pdf_page in deleted_pdf_pages:
+                page_idx = pdf_page - 1
+                for pdf_path in _collect_pdf_paths(scan, output_dir):
+                    doc = fitz.open(str(pdf_path))
+                    if 0 <= page_idx < doc.page_count:
+                        doc.delete_page(page_idx)
+                        doc.saveIncr()
+                    doc.close()
 
-            pdf_doc = fitz.open(scan.pdf_path)
-            page_map = json.loads(scan.page_map) if scan.page_map else []
-
-            deleted_pdf_pages = sorted(d.pdf_page for d in scan.deletions.all())
-            for pdf_page in sorted(deleted_pdf_pages, reverse=True):
-                pdf_index = pdf_page - 1
-                if 0 <= pdf_index < len(pdf_doc):
-                    pdf_doc.delete_page(pdf_index)
-
-            inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
-            insert_ops = []
-            for i, entry in enumerate(page_map):
-                if entry["type"] == "missing" and entry["logical_number"] in inserts:
-                    insert_before = None
-                    for j in range(i + 1, len(page_map)):
-                        if page_map[j]["type"] == "pdf_page":
-                            insert_before = page_map[j]["pdf_index"]
-                            break
-                    insert_ops.append(
-                        (insert_before, entry["logical_number"], inserts[entry["logical_number"]])
-                    )
-
-            offset = 0
-            for insert_before, logical_num, insert_obj in insert_ops:
-                img_path = insert_obj.image.path
-                if insert_before is not None:
-                    adjusted = insert_before - len(
-                        [d for d in deleted_pdf_pages if d <= insert_before]
-                    )
-                    pno = adjusted + offset
-                    ref_page = pdf_doc.load_page(min(pno, len(pdf_doc) - 1))
-                else:
-                    pno = len(pdf_doc)
-                    ref_page = pdf_doc.load_page(len(pdf_doc) - 1)
-                w, h = ref_page.rect.width, ref_page.rect.height
-                if img_path.lower().endswith(".pdf"):
-                    insert_pdf = fitz.open(img_path)
-                    pdf_doc.insert_pdf(
-                        insert_pdf, from_page=0,
-                        to_page=insert_pdf.page_count - 1, start_at=pno,
-                    )
-                    offset += insert_pdf.page_count - 1
-                    insert_pdf.close()
-                else:
-                    new_page = pdf_doc.new_page(pno=pno, width=w, height=h)
-                    new_page.insert_image(new_page.rect, filename=img_path)
-                offset += 1
-
-            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-            pdf_doc.save(tmp.name, deflate=True)
-            pdf_doc.close()
-            shutil.move(tmp.name, scan.pdf_path)
+                Detection.objects.filter(
+                    scan_id=scan_pk, page_index=page_idx
+                ).delete()
+                Detection.objects.filter(
+                    scan_id=scan_pk, page_index__gt=page_idx
+                ).update(page_index=F("page_index") - 1)
 
             scan.deletions.all().delete()
+
+        # Apply inserts
+        if has_inserts:
+            _update_progress(scan_pk, "Inserting pages...")
+            inserts = {
+                ins.logical_page_number: ins for ins in scan.inserts.all()
+            }
+            for i, entry in enumerate(page_map):
+                if entry.get("type") != "missing":
+                    continue
+                logical_num = entry.get("logical_number")
+                if logical_num not in inserts:
+                    continue
+                insert_obj = inserts[logical_num]
+                run_smart_insert(
+                    scan_pk, logical_num, insert_obj.image.path
+                )
             scan.inserts.all().delete()
-            scan.save()
 
-        if scan.output_dir:
-            output_dir = _P(scan.output_dir)
-            for old_file in output_dir.glob("*.pdf"):
-                if old_file.name != _P(scan.pdf_path).name:
-                    old_file.unlink(missing_ok=True)
-            for old_file in output_dir.glob("*.json"):
-                old_file.unlink(missing_ok=True)
+        # Update page count
+        pdf = fitz.open(scan.pdf_path)
+        new_count = pdf.page_count
+        pdf.close()
+        Scan.objects.filter(pk=scan_pk).update(page_count=new_count)
 
-        Detection.objects.filter(scan_id=scan_pk).delete()
+        # Sync detections and re-validate
+        if output_dir:
+            _sync_detections_to_disk(scan_pk)
+
+        _update_progress(scan_pk, "Re-validating...")
+        run_paddleocr_validation(scan_pk, scan.pdf_path)
+        _re_pair_opinions(scan_pk)
+
+        if output_dir:
+            pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
+            _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
+            _compute_and_save_margin_rects(pdf_path, str(output_dir))
 
         Scan.objects.filter(pk=scan_pk).update(
-            ocr_results="", opinions_json="", page_map="", missing_pages="",
+            status=Status.APPROVED,
+            progress_message="Done",
         )
-
-        scan.refresh_from_db()
-        if not scan.output_dir:
-            output_dir = _P(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            Scan.objects.filter(pk=scan_pk).update(output_dir=str(output_dir))
-        else:
-            output_dir = _P(scan.output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-        Scan.objects.filter(pk=scan_pk).update(progress_message="Converting to bitonal...")
-
-        def _bitonal_progress(current, total, message):
-            Scan.objects.filter(pk=scan_pk).update(
-                progress_message=message, progress_current=current, progress_total=total,
-            )
-
-        bitonal_path = bl_bitonal(
-            scan.pdf_path, str(output_dir), progress_callback=_bitonal_progress,
-        )
-
-        pdf = fitz.open(str(bitonal_path))
-        Scan.objects.filter(pk=scan_pk).update(page_count=pdf.page_count)
-        pdf.close()
-
-        scan.refresh_from_db()
-        Scan.objects.filter(pk=scan_pk).update(progress_message="Running Tesseract OCR...")
-        ocr_path = bl_ocr(
-            str(bitonal_path), str(output_dir),
-            reporter=scan.reporter.short_name or "",
-            volume=str(scan.volume) or "",
-            first_page=scan.start_page or 1,
-        )
-
-        run_incremental_validation(scan_pk, str(ocr_path))
 
     except ProcessingCancelled:
         pass
@@ -655,6 +1265,137 @@ def run_reprocess(scan_pk):
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.ERROR, progress_message=str(exc)[:255],
         )
+
+
+# ---------------------------------------------------------------------------
+# Smart page edits (patch single pages without full re-run)
+# ---------------------------------------------------------------------------
+
+
+def run_smart_delete(scan_pk, pdf_page):
+    """Delete a single page and patch detections/validation in place.
+
+    pdf_page is 1-based. Removes the page from the original PDF, bitonal PDF,
+    and OCR PDF; deletes detections on that page; shifts subsequent detection
+    page_index values down by 1; re-runs PaddleOCR validation and re-pairs.
+    """
+    scan = Scan.objects.get(pk=scan_pk)
+    page_idx = pdf_page - 1
+    output_dir = Path(scan.output_dir) if scan.output_dir else None
+
+    # Remove page from all PDFs
+    for pdf_path in _collect_pdf_paths(scan, output_dir):
+        doc = fitz.open(str(pdf_path))
+        if 0 <= page_idx < doc.page_count:
+            doc.delete_page(page_idx)
+            doc.saveIncr()
+        doc.close()
+
+    # Delete detections on the removed page
+    Detection.objects.filter(scan_id=scan_pk, page_index=page_idx).delete()
+
+    # Shift subsequent detections down
+    Detection.objects.filter(
+        scan_id=scan_pk, page_index__gt=page_idx
+    ).update(page_index=F("page_index") - 1)
+
+    # Update page count
+    pdf = fitz.open(scan.pdf_path)
+    new_count = pdf.page_count
+    pdf.close()
+    Scan.objects.filter(pk=scan_pk).update(page_count=new_count)
+
+    # Sync detections to disk and re-validate/re-pair
+    if output_dir:
+        _sync_detections_to_disk(scan_pk)
+
+    run_paddleocr_validation(scan_pk, scan.pdf_path)
+    _re_pair_opinions(scan_pk)
+
+    if output_dir:
+        pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
+        _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
+        _compute_and_save_margin_rects(pdf_path, str(output_dir))
+
+
+def run_smart_insert(scan_pk, logical_page_number, image_path):
+    """Insert a page and run detection/validation on just that page.
+
+    Inserts the page image into the original PDF, bitonal PDF, and OCR PDF
+    at the correct position; shifts subsequent detection page_index values up
+    by 1; runs YOLO on just the new page; re-validates and re-pairs.
+    """
+    scan = Scan.objects.get(pk=scan_pk)
+    output_dir = Path(scan.output_dir) if scan.output_dir else None
+
+    # Determine insertion position from page_map
+    page_map = json.loads(scan.page_map) if scan.page_map else []
+    insert_idx = len(fitz.open(scan.pdf_path))  # default: append
+    for i, entry in enumerate(page_map):
+        if entry.get("logical_number") == logical_page_number:
+            # Insert before the next pdf_page entry
+            for j in range(i + 1, len(page_map)):
+                if page_map[j].get("type") == "pdf_page":
+                    insert_idx = page_map[j]["pdf_index"]
+                    break
+            break
+
+    # Insert into all PDFs
+    for pdf_path in _collect_pdf_paths(scan, output_dir):
+        doc = fitz.open(str(pdf_path))
+        ref_page = doc[min(insert_idx, doc.page_count - 1)]
+        w, h = ref_page.rect.width, ref_page.rect.height
+
+        if str(image_path).lower().endswith(".pdf"):
+            insert_pdf = fitz.open(str(image_path))
+            doc.insert_pdf(
+                insert_pdf, from_page=0,
+                to_page=insert_pdf.page_count - 1, start_at=insert_idx,
+            )
+            insert_pdf.close()
+        else:
+            new_page = doc.new_page(pno=insert_idx, width=w, height=h)
+            new_page.insert_image(new_page.rect, filename=str(image_path))
+        doc.saveIncr()
+        doc.close()
+
+    # Shift subsequent detections up
+    Detection.objects.filter(
+        scan_id=scan_pk, page_index__gte=insert_idx
+    ).update(page_index=F("page_index") + 1)
+
+    # Update page count
+    pdf = fitz.open(scan.pdf_path)
+    new_count = pdf.page_count
+    pdf.close()
+    Scan.objects.filter(pk=scan_pk).update(page_count=new_count)
+
+    # Sync detections to disk
+    if output_dir:
+        _sync_detections_to_disk(scan_pk)
+
+    # Re-validate, re-pair, recompute rects
+    run_paddleocr_validation(scan_pk, scan.pdf_path)
+    _re_pair_opinions(scan_pk)
+
+    if output_dir:
+        pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
+        _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
+        _compute_and_save_margin_rects(pdf_path, str(output_dir))
+
+
+def _collect_pdf_paths(scan, output_dir):
+    """Collect all PDF paths that need page edits applied."""
+    paths = [Path(scan.pdf_path)]
+    if output_dir:
+        output_dir = Path(output_dir)
+        bitonal = output_dir / "bitonal.pdf"
+        if bitonal.exists():
+            paths.append(bitonal)
+        ocr_pdf = find_ocr_pdf(str(output_dir))
+        if ocr_pdf and Path(ocr_pdf) not in paths:
+            paths.append(Path(ocr_pdf))
+    return paths
 
 
 # ---------------------------------------------------------------------------
@@ -827,16 +1568,12 @@ def run_detect(scan_pk):
 
     Designed to run in a background thread.
     """
-    import subprocess
-    import sys
-    import time as _time
     import django
     django.db.connections.close_all()
-    from pathlib import Path as _P
 
     scan = Scan.objects.get(pk=scan_pk)
     try:
-        output_dir = _P(scan.output_dir)
+        output_dir = Path(scan.output_dir)
         bitonal = output_dir / "bitonal.pdf"
 
         ocr_exists = any(
@@ -865,88 +1602,19 @@ def run_detect(scan_pk):
 
         pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
 
-        script = f"""
-import os
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-from blackletter.api import detect as bl_detect
-dets = bl_detect("{pdf_path}", "{output_dir}", models=["small", "medium", "large"])
-print(f"\\nDetect complete: {{len(dets)}} detections", flush=True)
-"""
-        log_path = _P(settings.MEDIA_ROOT) / "processed" / str(scan_pk) / "detect.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _run_yolo_subprocess(scan_pk, pdf_path, str(output_dir))
+        dets = _import_detections_from_json(scan_pk, str(output_dir))
+
+        _update_progress(
+            scan_pk,
+            f"{len(dets)} detections. Pairing opinions...",
+        )
+
+        opinions = _re_pair_opinions(scan_pk)
+
         Scan.objects.filter(pk=scan_pk).update(
-            progress_message="Running YOLO detection...",
-            progress_log="",
-        )
-        proc = subprocess.Popen(
-            [sys.executable, "-c", script],
-            stdout=open(log_path, "w"),
-            stderr=subprocess.STDOUT,
-            cwd=str(_P(settings.INSTALL_ROOT)),
-        )
-        while proc.poll() is None:
-            _time.sleep(1)
-            try:
-                log_text = log_path.read_text(errors="replace").replace("\x00", "")
-                lines = [l for l in log_text.strip().split("\n") if l.strip()]
-                msg = lines[-1].strip() if lines else "Running YOLO detection..."
-                Scan.objects.filter(pk=scan_pk).update(
-                    progress_message=msg[:255],
-                    progress_log=log_text[-5000:],
-                )
-            except Exception:
-                pass
-
-        log_text = log_path.read_text(errors="replace").replace("\x00", "")
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"YOLO detection failed (exit {proc.returncode}): {log_text[-500:]}"
-            )
-
-        det_path = output_dir / "detections.json"
-        dets = json.loads(det_path.read_text())
-
-        Detection.objects.filter(scan_id=scan_pk).delete()
-
-        det_objects = []
-        for d in dets:
-            try:
-                label_name = Label(d["label_id"]).name
-            except (ValueError, KeyError):
-                label_name = d.get("label", "UNKNOWN")
-            det_objects.append(Detection(
-                scan_id=scan_pk, page_index=d["page_index"],
-                label=label_name, label_id=d["label_id"],
-                confidence=d["confidence"],
-                x0=d["bbox"][0], y0=d["bbox"][1],
-                x1=d["bbox"][2], y1=d["bbox"][3],
-                img_width=d.get("img_width", 0),
-                img_height=d.get("img_height", 0),
-                model_name=d.get("found_by", [{}])[0].get("model", ""),
-                model_count=d.get("model_count", 1),
-                found_by=json.dumps(d.get("found_by", [])),
-            ))
-        Detection.objects.bulk_create(det_objects)
-
-        pair_log = log_text + f"\n{len(dets)} detections saved. Pairing opinions..."
-        Scan.objects.filter(pk=scan_pk).update(
-            progress_message=f"{len(dets)} detections. Pairing opinions...",
-            progress_log=pair_log[-5000:],
-        )
-
-        opinions = bl_pair(
-            str(det_path), pdf_path,
-            reporter=scan.reporter.short_name or "",
-            volume=str(scan.volume) or "",
-            first_page=scan.start_page or 1,
-        )
-
-        done_log = pair_log + f"\nPairing complete: {len(opinions)} opinions."
-        Scan.objects.filter(pk=scan_pk).update(
-            opinions_json=json.dumps(opinions),
             status=Status.APPROVED,
             progress_message=f"Done — {len(dets)} detections, {len(opinions)} opinions",
-            progress_log=done_log[-5000:],
         )
 
     except Exception as exc:
