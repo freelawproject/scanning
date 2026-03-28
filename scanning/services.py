@@ -143,17 +143,48 @@ def _import_detections_from_json(scan_pk, output_dir):
     return dets
 
 
+def _page_number_lookup(scan):
+    """Build {page_index: (page_number, page_number_end)} from ocr_results.
+
+    For range pages like "677-685", returns (677, 685).
+    For single pages like "677", returns (677, None).
+    """
+    ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+    lookup = {}
+    range_re = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
+    for r in ocr_results:
+        pdf_idx = r["pdf_page"] - 1
+        detected = r.get("detected")
+        if not detected:
+            continue
+        if r.get("type") == "range":
+            m = range_re.match(str(detected).replace("\u2013", "-"))
+            if m:
+                lookup[pdf_idx] = (int(m.group(1)), int(m.group(2)))
+            continue
+        try:
+            lookup[pdf_idx] = (int(detected), None)
+        except (ValueError, TypeError):
+            pass
+    return lookup
+
+
 def _sync_detections_to_disk(scan_pk):
     """Write current DB detections to detections.json on disk."""
     scan = Scan.objects.get(pk=scan_pk)
     if not scan.output_dir:
         return
     output_dir = Path(scan.output_dir)
+
+    # Build page_number lookup from ocr_results
+    page_numbers = _page_number_lookup(scan)
+
     all_saved = Detection.objects.filter(
         scan_id=scan_pk, active=True
     ).order_by("page_index", "y0")
-    det_data = [
-        {
+    det_data = []
+    for d in all_saved:
+        entry = {
             "page_index": d.page_index,
             "label": d.label,
             "label_id": d.label_id,
@@ -163,8 +194,12 @@ def _sync_detections_to_disk(scan_pk):
             "img_height": d.img_height,
             "model_count": d.model_count,
         }
-        for d in all_saved
-    ]
+        pn = page_numbers.get(d.page_index)
+        if pn:
+            entry["page_number"] = pn[0]
+            if pn[1] is not None:
+                entry["page_number_end"] = pn[1]
+        det_data.append(entry)
     (output_dir / "detections.json").write_text(json.dumps(det_data))
     return det_data
 
@@ -413,7 +448,7 @@ def _ocr_page_number(ocr, pdf_path, page_idx, exp_start, exp_end,
             bot = min(img_h, int(best.y1) + pad)
             for side_crop, sname in [
                 (img.crop((0, top, max(1, int(best.x0)), bot)), "hdr-L"),
-                (img.crop((min(img_w - 1, int(best.x1)), top, img_w, bot)), "hdr-R"),
+                (img.crop((min(img_w - 1, int(best.x1welll)), top, img_w, bot)), "hdr-R"),
             ]:
                 if side_crop.size[0] < 10:
                     continue
@@ -1447,25 +1482,9 @@ def run_generate_files(scan_pk):
         if not ocr_pdf:
             raise ValueError("No OCR'd PDF found in output directory")
 
-        # Write current DB detections -> detections.json so manual edits are used
-        output_dir = Path(scan.output_dir)
-        active_dets = list(Detection.objects.filter(scan=scan, active=True).order_by("page_index", "y0"))
-        det_data = [
-            {
-                "page_index": d.page_index,
-                "label": d.label,
-                "label_id": d.label_id,
-                "confidence": d.confidence,
-                "bbox": [d.x0, d.y0, d.x1, d.y1],
-                "img_width": d.img_width,
-                "img_height": d.img_height,
-                "model_count": d.model_count,
-            }
-            for d in active_dets
-        ]
-        det_path = output_dir / "detections.json"
-        det_path.write_text(json.dumps(det_data))
-        Scan.objects.filter(pk=scan_pk).update(progress_message=f"Generating files ({len(det_data)} detections)...")
+        # Write current DB detections -> detections.json (includes page numbers)
+        det_data = _sync_detections_to_disk(scan_pk)
+        Scan.objects.filter(pk=scan_pk).update(progress_message=f"Generating files ({len(det_data or [])} detections)...")
 
         suppression_excluded = set()
         for issue in scan.issues.filter(check_name="suppress_detection"):

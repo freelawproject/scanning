@@ -673,10 +673,38 @@ def scan_process_view(request, pk):
                 if (d.page_index, d.label_id, round(d.x0), round(d.y0)) not in suppressed:
                     unmatched_keys.append({"pdf_page": d.page_index + 1, "page_index": d.page_index, "conf": round(d.confidence, 2)})
 
-        for d in Detection.objects.filter(scan=scan, active=True, label="CASE_CAPTION").order_by("page_index"):
-            if (d.page_index, round(d.x0), round(d.y0)) not in paired_caption_keys:
-                if (d.page_index, d.label_id, round(d.x0), round(d.y0)) not in suppressed:
-                    unmatched_captions.append({"pdf_page": d.page_index + 1, "page_index": d.page_index, "conf": round(d.confidence, 2)})
+        # Only flag a caption if it's on a page that isn't already covered
+        # by a paired opinion's page range.  Extra caption boxes within an
+        # opinion's pages are just multi-column continuation — not warnings.
+        opinion_ranges = []
+        for op in opinions:
+            cp = op.get("caption_page", 0)
+            ep = op.get("end_page", op.get("key_page", cp))
+            opinion_ranges.append((cp, ep))
+
+        def _page_in_opinion(pi):
+            return any(start <= pi <= end for start, end in opinion_ranges)
+
+        seen_caption_pages = set()
+        for d in Detection.objects.filter(
+            scan=scan, active=True, label="CASE_CAPTION"
+        ).order_by("page_index", "y0"):
+            if (d.page_index, round(d.x0), round(d.y0)) in paired_caption_keys:
+                continue
+            if (d.page_index, d.label_id, round(d.x0), round(d.y0)) in suppressed:
+                continue
+            # Skip if this page is inside a paired opinion's range
+            if _page_in_opinion(d.page_index):
+                continue
+            # Only show one entry per page
+            if d.page_index in seen_caption_pages:
+                continue
+            seen_caption_pages.add(d.page_index)
+            unmatched_captions.append({
+                "pdf_page": d.page_index + 1,
+                "page_index": d.page_index,
+                "conf": round(d.confidence, 2),
+            })
 
         if unmatched_keys:
             detect_warnings.append(
@@ -1082,15 +1110,10 @@ def pair_opinions_api(request, pk):
         return JsonResponse({"error": "No output directory"}, status=400)
     output_dir = get_output_base(scan)
     det_path = output_dir / "detections.json"
-    dets = Detection.objects.filter(scan=scan, active=True).order_by("page_index", "y0")
-    det_data = [{
-        "page_index": d.page_index, "label": d.label, "label_id": d.label_id,
-        "confidence": d.confidence, "bbox": [d.x0, d.y0, d.x1, d.y1],
-        "img_width": d.img_width, "img_height": d.img_height, "model_count": d.model_count,
-    } for d in dets]
+    from scanning.services import _sync_detections_to_disk
+    det_data = _sync_detections_to_disk(scan.pk)
     if not det_data:
         return JsonResponse({"error": "No detections found"}, status=400)
-    det_path.write_text(json.dumps(det_data))
     pdf_path = None
     bitonal = output_dir / "bitonal.pdf"
     if bitonal.exists():
@@ -1274,14 +1297,21 @@ def delete_detection(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
     data = json.loads(request.body)
     page_index = data["page_index"]
-    label_id = data["label_id"]
+    label = data.get("label", "")
+    label_id = data.get("label_id")
     bbox = data["bbox"]
-    # Deactivate matching Detection(s) in DB
-    qs = Detection.objects.filter(
-        scan=scan, page_index=page_index, label_id=label_id,
+    # Deactivate matching Detection(s) in DB — match on label string (reliable)
+    # and fall back to label_id if label not provided
+    db_filter = dict(
+        scan=scan, page_index=page_index,
         x0__gte=bbox[0] - 15, x0__lte=bbox[0] + 15,
         y0__gte=bbox[1] - 15, y0__lte=bbox[1] + 15,
     )
+    if label:
+        db_filter["label"] = label
+    elif label_id is not None:
+        db_filter["label_id"] = label_id
+    qs = Detection.objects.filter(**db_filter)
     count = qs.update(active=False)
     # Remove from detections.json on disk
     output_base = get_output_base(scan)
@@ -1292,7 +1322,7 @@ def delete_detection(request, pk):
             e for e in existing
             if not (
                 e["page_index"] == page_index
-                and e["label_id"] == label_id
+                and (e.get("label") == label or e.get("label_id") == label_id)
                 and abs(e["bbox"][0] - bbox[0]) < 15
                 and abs(e["bbox"][1] - bbox[1]) < 15
             )

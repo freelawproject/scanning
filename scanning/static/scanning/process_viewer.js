@@ -685,7 +685,7 @@ document.addEventListener('DOMContentLoaded', function () {
             STATE_ABBREVIATION: true, PAGE_HEADER: true, PAGE_NUMBER: true,
             DIVIDER: true, HEADNOTE_BRACKET: true, EDITORIAL: true,
             CASE_SEQUENCE: true, HEADNOTE: true, CASE_METADATA: true,
-            FOOTNOTES: true,
+            FOOTNOTES: true, IMAGE: true,
         };
         var pageDets = allDetections.filter(function (d) {
             return d.page_index === _pageIndexForNum(pageNum) && (d.manual || USED_LABELS[d.label]);
@@ -719,6 +719,7 @@ document.addEventListener('DOMContentLoaded', function () {
             var label = document.createElement('span');
             label.className = 'detection-label';
             label.style.background = color;
+            label.style.display = 'none';
             label.textContent = d.label + (d.manual ? ' (manual)' : ' ' + d.confidence);
             box.appendChild(label);
 
@@ -1313,12 +1314,8 @@ document.addEventListener('DOMContentLoaded', function () {
                 div.style.pointerEvents = 'auto';
                 div.style.cursor = 'pointer';
                 div.style.zIndex = '6';
-                // Label
-                var label = document.createElement('span');
-                label.style.cssText = 'position:absolute;top:0;left:0;font-size:9px;padding:1px 3px;color:black;background:rgba(255,255,255,0.7);pointer-events:none;';
-                label.textContent = r.type || r.fill;
-                if (solid) label.style.display = 'none';
-                div.appendChild(label);
+                // Show label only on hover
+                div.title = r.type || r.fill;
 
                 // Double-click to select for editing
                 div.addEventListener('dblclick', function(e) {
@@ -1553,6 +1550,8 @@ document.addEventListener('DOMContentLoaded', function () {
         _selectedDetBox = div;
         div.style.outline = '2px solid #f59e0b';
         div.style.zIndex = '20';
+        var selLabel = div.querySelector('.detection-label');
+        if (selLabel) selLabel.style.display = '';
 
         // Action buttons toolbar
         var toolbar = document.createElement('div');
@@ -1569,11 +1568,13 @@ document.addEventListener('DOMContentLoaded', function () {
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
                 body: JSON.stringify({
                     page_index: det.page_index,
+                    label: det.label,
                     label_id: det.label_id,
                     bbox: det.bbox,
                 }),
             }).then(function(r) { return r.json(); }).then(function(data) {
                 if (data.status === 'ok') {
+                    console.log('Deleted ' + data.deleted + ' detection(s) from DB for ' + det.label + ' on page_index=' + det.page_index);
                     div.remove();
                     _selectedDetBox = null;
                     // Remove matching sidebar item for unmatched captions/keys
