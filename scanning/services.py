@@ -238,6 +238,24 @@ def _compute_and_save_redaction_rects(scan_pk, pdf_path, output_dir):
     opinions = _pair_opinions(document)
     rects = compute_redaction_rects(document, opinions, skip_doctr=True)
 
+    # Snap headnote rect x-bounds to TEXT_COLUMN detections for consistency
+    tc_by_page = {}
+    for d in Detection.objects.filter(scan=scan, active=True, label_id=16):
+        tc_by_page.setdefault(d.page_index, []).append(d)
+    for page_entry in rects:
+        pi = page_entry["page_index"]
+        cols = tc_by_page.get(pi, [])
+        if not cols:
+            continue
+        for r in page_entry["rects"]:
+            if r.get("type") != "headnote":
+                continue
+            # Find the TEXT_COLUMN that best overlaps this rect
+            cx = (r["x0"] + r["x1"]) / 2
+            best = min(cols, key=lambda c: abs((c.x0 + c.x1) / 2 - cx))
+            r["x0"] = round(best.x0, 1)
+            r["x1"] = round(best.x1, 1)
+
     # Split headnote blocks at HEADNOTE detection boundaries
     _GAP = 6
     hn_dets_by_page = {}
