@@ -7,6 +7,7 @@ from scanning.monitoring import health_check, heartbeat, sentry_fail
 from scanning.views import (
     add_page_insert,
     add_single_detection,
+    delete_detection,
     approve_scan,
     assign_page,
     bake_redactions,
@@ -93,6 +94,7 @@ urlpatterns = [
     path("scans/<int:pk>/flag/", flag_issue, name="flag_issue"),
     path("scans/<int:pk>/flag/<int:flag_id>/delete/", remove_flag, name="remove_flag"),
     path("scans/<int:pk>/add-single-detection/", add_single_detection, name="add_single_detection"),
+    path("scans/<int:pk>/delete-detection/", delete_detection, name="delete_detection"),
     # path("scans/<int:pk>/repare-opinions/", repare_opinions, name="repare_opinions"),
     # path("scans/<int:pk>/reprocess-section/", reprocess_section_view, name="reprocess_section"),
     path("scans/<int:pk>/bake-redactions/", bake_redactions, name="bake_redactions"),

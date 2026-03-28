@@ -1345,7 +1345,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var delBtn = document.createElement('button');
         delBtn.className = 'redaction-edit-btn redaction-del-btn';
         delBtn.textContent = 'Delete';
-        delBtn.style.cssText = 'position:absolute;top:-24px;right:0;background:#ef4444;color:white;border:none;padding:2px 8px;font-size:11px;border-radius:3px;cursor:pointer;z-index:21;';
+        delBtn.style.cssText = 'position:absolute;top:-28px;right:0;background:#ef4444;color:white;border:none;padding:4px 10px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;z-index:21;white-space:nowrap;line-height:1;';
         delBtn.addEventListener('click', function(e) {
             e.stopPropagation();
             if (!confirm('Delete this ' + (rectData.type || 'redaction') + '?')) return;
@@ -1559,18 +1559,18 @@ document.addEventListener('DOMContentLoaded', function () {
         toolbar.className = 'det-resize-handle';
         toolbar.style.cssText = 'position:absolute;top:-30px;left:0;display:flex;gap:4px;z-index:23;white-space:nowrap;';
 
-        var suppressBtn = document.createElement('button');
-        suppressBtn.textContent = 'Suppress';
-        suppressBtn.style.cssText = 'background:#ef4444;color:white;border:none;padding:4px 10px;font-size:11px;border-radius:3px;cursor:pointer;white-space:nowrap;flex-shrink:0;';
-        suppressBtn.addEventListener('click', function(e) {
+        var deleteBtn = document.createElement('button');
+        deleteBtn.textContent = 'Delete';
+        deleteBtn.style.cssText = 'background:#ef4444;color:white;border:none;padding:4px 10px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;white-space:nowrap;flex-shrink:0;line-height:1;';
+        deleteBtn.addEventListener('click', function(e) {
             e.stopPropagation();
-            fetch('/scans/' + documentId + '/flag/', {
+            fetch('/scans/' + documentId + '/delete-detection/', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
                 body: JSON.stringify({
-                    message: 'Suppress ' + det.label + ' page ' + pageNum,
-                    page_number: pageNum,
-                    metadata: {type: 'suppress_detection', page_index: det.page_index, label_id: det.label_id, label_name: det.label, bbox: det.bbox},
+                    page_index: det.page_index,
+                    label_id: det.label_id,
+                    bbox: det.bbox,
                 }),
             }).then(function(r) { return r.json(); }).then(function(data) {
                 if (data.status === 'ok') {
@@ -1579,56 +1579,12 @@ document.addEventListener('DOMContentLoaded', function () {
                     // Remove matching sidebar item for unmatched captions/keys
                     var sidebarItems = document.querySelectorAll('[data-unmatched-page="' + det.page_index + '"][data-unmatched-label="' + det.label + '"]');
                     sidebarItems.forEach(function(el) { el.remove(); });
-                    var _pLabels = ['CASE_CAPTION', 'KEY_ICON'];
-                    if (_pLabels.indexOf(det.label) < 0) {
-                        fetch('/scans/' + documentId + '/save-redaction-rect/', {
-                            method: 'POST', headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-                            body: JSON.stringify({page_index: det.page_index, action: 'delete', original: {x0: det.bbox[0], y0: det.bbox[1], x1: det.bbox[2], y1: det.bbox[3]}, type: det.label}),
-                        }).then(function() { refreshOverlays(); });
-                    }
+                    refreshOverlays();
                 }
             });
         });
 
-        var approveBtn = document.createElement('button');
-        approveBtn.textContent = 'Approve';
-        approveBtn.style.cssText = 'background:#059669;color:white;border:none;padding:4px 10px;font-size:11px;border-radius:3px;cursor:pointer;white-space:nowrap;flex-shrink:0;';
-        approveBtn.addEventListener('click', function(e) {
-            e.stopPropagation();
-            // 1) Create the RedactionRect via add-single-detection
-            fetch('/scans/' + documentId + '/add-single-detection/', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
-                body: JSON.stringify(det),
-            }).then(function(r) { return r.json(); }).then(function() {
-                // 2) Also create an approve flag for tracking
-                return fetch('/scans/' + documentId + '/flag/', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
-                    body: JSON.stringify({
-                        message: 'Approve ' + det.label + ' page ' + pageNum,
-                        page_number: pageNum,
-                        metadata: {type: 'approve_detection', page_index: det.page_index, label_id: det.label_id, label_name: det.label, bbox: det.bbox},
-                    }),
-                });
-            }).then(function(r) { return r.json(); }).then(function(data) {
-                if (data.status === 'ok') {
-                    div.style.borderWidth = '3px';
-                    _deselectDetectionBox();
-                    var _pLabels2 = ['CASE_CAPTION', 'KEY_ICON'];
-                    if (_pLabels2.indexOf(det.label) >= 0) {
-                        fetch('/scans/' + documentId + '/repare-opinions/', {
-                            method: 'POST', headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-                        }).then(function(r) { return r.json(); }).then(function(d2) { alert(d2.message); window.location.reload(); });
-                    } else {
-                        refreshOverlays();
-                    }
-                }
-            });
-        });
-
-        toolbar.appendChild(suppressBtn);
-        toolbar.appendChild(approveBtn);
+        toolbar.appendChild(deleteBtn);
         div.appendChild(toolbar);
 
         // Resize handles

@@ -1270,6 +1270,39 @@ def remove_flag(request, pk, flag_id):
 
 @login_required
 @require_POST
+def delete_detection(request, pk):
+    scan = get_object_or_404(Scan, pk=pk)
+    data = json.loads(request.body)
+    page_index = data["page_index"]
+    label_id = data["label_id"]
+    bbox = data["bbox"]
+    # Deactivate matching Detection(s) in DB
+    qs = Detection.objects.filter(
+        scan=scan, page_index=page_index, label_id=label_id,
+        x0__gte=bbox[0] - 15, x0__lte=bbox[0] + 15,
+        y0__gte=bbox[1] - 15, y0__lte=bbox[1] + 15,
+    )
+    count = qs.update(active=False)
+    # Remove from detections.json on disk
+    output_base = get_output_base(scan)
+    det_path = find_json_file(output_base, "detections.json")
+    if det_path:
+        existing = json.loads(det_path.read_text())
+        existing = [
+            e for e in existing
+            if not (
+                e["page_index"] == page_index
+                and e["label_id"] == label_id
+                and abs(e["bbox"][0] - bbox[0]) < 15
+                and abs(e["bbox"][1] - bbox[1]) < 15
+            )
+        ]
+        det_path.write_text(json.dumps(existing))
+    return JsonResponse({"status": "ok", "deleted": count})
+
+
+@login_required
+@require_POST
 def add_single_detection(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
     det = json.loads(request.body)
