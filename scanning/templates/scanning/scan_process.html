@@ -18,86 +18,92 @@
 {% endblock %}
 
 {% block content %}
-{# Compact header: stepper + title + actions in one row #}
-<div class="flex items-center justify-between mb-2 gap-3 flex-wrap">
+{# Header: stepper + title + actions in one row #}
+<div class="flex items-center justify-between mb-3 gap-4 flex-wrap">
   {# Left: stepper + title #}
-  <div class="flex items-center gap-3">
+  <div class="flex items-center gap-4">
     <div class="flex items-center gap-0">
-      <a class="flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium no-underline {% if step == 1 %}bg-blue-600 text-white{% elif step > 1 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=1">
-        <span class="inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] {% if step > 1 %}bg-green-600 text-white{% elif step == 1 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">1</span>Build</a>
-      <div class="w-4 h-0.5 {% if step > 1 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
-      <a class="flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium no-underline {% if step == 2 %}bg-blue-600 text-white{% elif step > 2 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=2">
-        <span class="inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] {% if step > 2 %}bg-green-600 text-white{% elif step == 2 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">2</span>Detect</a>
-      <div class="w-4 h-0.5 {% if step > 2 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
-      <a class="flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium no-underline {% if step == 3 %}bg-blue-600 text-white{% elif step > 3 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=3">
-        <span class="inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] {% if step > 3 %}bg-green-600 text-white{% elif step == 3 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">3</span>Redact</a>
-      <div class="w-4 h-0.5 {% if step > 3 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
-      <a class="flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium no-underline {% if step == 4 %}bg-blue-600 text-white{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=4">
-        <span class="inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] {% if step == 4 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">4</span>Generate</a>
+      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 1 %}bg-blue-600 text-white{% elif step > 1 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=1">
+        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step > 1 %}bg-green-600 text-white{% elif step == 1 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">1</span>
+        Build</a>
+      <div class="w-6 h-0.5 {% if step > 1 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
+      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 2 %}bg-blue-600 text-white{% elif step > 2 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=2">
+        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step > 2 %}bg-green-600 text-white{% elif step == 2 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">2</span>
+        Detect</a>
+      <div class="w-6 h-0.5 {% if step > 2 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
+      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 3 %}bg-blue-600 text-white{% elif step > 3 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=3">
+        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step > 3 %}bg-green-600 text-white{% elif step == 3 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">3</span>
+        Redact</a>
+      <div class="w-6 h-0.5 {% if step > 3 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
+      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 4 %}bg-blue-600 text-white{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=4">
+        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step == 4 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">4</span>
+        Generate</a>
     </div>
-    <span class="text-sm font-bold">{% if scan.reporter %}{{ scan.reporter.short_name|upper }} v{{ scan.volume }}{% else %}#{{ scan.pk }}{% endif %}</span>
-    <span class="text-xs text-gray-500 dark:text-gray-400">{{ scan.page_count }}p</span>
-    {% if missing_pages %}<span class="badge-error text-[10px]">{{ missing_pages|length }} missing</span>{% endif %}
-    {% if has_pending_changes %}<span class="badge-warning text-[10px]">Pending</span>{% endif %}
+    <div class="flex items-center gap-2">
+      <span class="text-base font-bold">{% if scan.reporter %}{{ scan.reporter.short_name|upper }} vol. {{ scan.volume }}{% else %}Scan #{{ scan.pk }}{% endif %}</span>
+      <span class="text-xs text-gray-500 dark:text-gray-400">{{ scan.page_count }} pages</span>
+      {% if missing_pages %}<span class="badge-error text-xs">{{ missing_pages|length }} missing</span>{% endif %}
+      {% if has_pending_changes %}<span class="badge-warning text-xs">Pending Changes</span>{% endif %}
+    </div>
   </div>
   {# Right: actions #}
-  <div class="flex flex-wrap gap-1.5">
+  <div class="flex flex-wrap gap-2">
     {% if is_processing %}
     <form method="post" action="{% url 'cancel_processing' scan.pk %}" class="inline">
       {% csrf_token %}
-      <button type="submit" class="btn-outline text-xs py-1 px-2">Stop</button>
+      <button type="submit" class="btn-outline text-sm">Stop</button>
     </form>
 
     {% elif step == 1 %}
       {% if has_pending_changes %}
       <form method="post" action="{% url 'reprocess' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-xs py-1 px-2" style="background:#7c3aed">Rebuild</button>
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed">Rebuild &amp; Validate</button>
       </form>
       {% elif not scan.page_count %}
       <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-xs py-1 px-2">Validate</button>
+        <button type="submit" class="btn-primary text-sm">Validate</button>
       </form>
       {% else %}
       <form method="post" action="{% url 'recalculate' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-xs py-1 px-2">Recheck</button>
+        <button type="submit" class="btn-primary text-sm">Recheck</button>
       </form>
       <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-outline text-xs py-1 px-2">Re-validate</button>
+        <button type="submit" class="btn-outline text-sm">Re-validate</button>
       </form>
       {% if not issues and not missing_pages %}
       <form method="post" action="{% url 'start_detect' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-xs py-1 px-2">Detect &rarr;</button>
+        <button type="submit" class="btn-primary text-sm">Next: Detect &rarr;</button>
       </form>
       {% endif %}
       {% endif %}
 
     {% elif step == 2 %}
-      <button class="btn-primary text-xs py-1 px-2" id="pair-btn" onclick="pairOpinions()">Re-pair</button>
+      <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()">Re-pair Opinions</button>
       {% if opinions %}
-      <a href="?step=3" class="btn-primary text-xs py-1 px-2 no-underline" style="background:#059669">Redact &rarr;</a>
+      <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669">Next: Redact &rarr;</a>
       {% endif %}
 
     {% elif step == 3 %}
-      <a href="?step=4" class="btn-primary text-xs py-1 px-2 no-underline" style="background:#059669">Generate &rarr;</a>
+      <a href="?step=4" class="btn-primary text-sm no-underline" style="background:#059669">Next: Generate &rarr;</a>
 
     {% elif step == 4 %}
       <form method="post" action="{% url 'generate_files' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-xs py-1 px-2" style="background:#7c3aed">{% if opinion_scans %}Regen{% else %}Generate{% endif %}</button>
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed">{% if opinion_scans %}Regenerate{% else %}Generate{% endif %} Files</button>
       </form>
       {% if opinion_scans %}
       <form method="post" action="{% url 'approve_scan' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-xs py-1 px-2">Approve</button>
+        <button type="submit" class="btn-primary text-sm">Approve</button>
       </form>
       {% endif %}
       {% if scan.stage == 'approved' %}
-      <a href="{% url 'scan_list' %}" class="btn-primary text-xs py-1 px-2 no-underline" style="background:#059669">Done &rarr;</a>
+      <a href="{% url 'scan_list' %}" class="btn-primary text-sm no-underline" style="background:#059669">Done &rarr; List</a>
       {% endif %}
     {% endif %}
   </div>
@@ -106,9 +112,9 @@
 
 {% block full_width_content %}
 <div class="w-full px-4 pb-6">
-  <div class="flex gap-4" style="height:calc(100vh - 180px);min-height:500px;">
+  <div class="flex gap-4" style="height:calc(100vh - 200px);min-height:500px;">
     {# Sidebar #}
-    <aside class="w-72 flex-shrink-0 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 p-3" style="max-height:calc(100vh - 180px);">
+    <aside class="w-72 flex-shrink-0 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 p-3" style="max-height:calc(100vh - 200px);">
       {% if is_processing %}
       <h2 class="text-sm font-bold mb-2">Processing</h2>
       <div class="rounded bg-gray-100 dark:bg-gray-800 p-3 mb-2">
@@ -389,13 +395,33 @@ document.addEventListener('keydown', function(e) {
     } else if (e.key === 'ArrowDown') {
         e.preventDefault();
         _clearDim();
+        var pages = document.querySelectorAll('.lazy-page');
         var viewer = document.querySelector('.viewer-panel');
-        if (viewer) viewer.scrollBy({ top: viewer.clientHeight * 0.9, behavior: 'smooth' });
+        if (viewer && pages.length) {
+            var vRect = viewer.getBoundingClientRect();
+            for (var i = 0; i < pages.length; i++) {
+                var pRect = pages[i].getBoundingClientRect();
+                if (pRect.top > vRect.top + 10) {
+                    viewer.scrollBy({ top: pRect.top - vRect.top, behavior: 'smooth' });
+                    break;
+                }
+            }
+        }
     } else if (e.key === 'ArrowUp') {
         e.preventDefault();
         _clearDim();
+        var pages = document.querySelectorAll('.lazy-page');
         var viewer = document.querySelector('.viewer-panel');
-        if (viewer) viewer.scrollBy({ top: -viewer.clientHeight * 0.9, behavior: 'smooth' });
+        if (viewer && pages.length) {
+            var vRect = viewer.getBoundingClientRect();
+            for (var i = pages.length - 1; i >= 0; i--) {
+                var pRect = pages[i].getBoundingClientRect();
+                if (pRect.top < vRect.top - 10) {
+                    viewer.scrollBy({ top: pRect.top - vRect.top, behavior: 'smooth' });
+                    break;
+                }
+            }
+        }
     } else if (e.key === 'Escape') {
         _clearDim();
         document.querySelectorAll('.opinion-nav, .issue-card').forEach(function(c) { c.style.outline = ''; });

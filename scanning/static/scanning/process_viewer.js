@@ -32,9 +32,11 @@ document.addEventListener('DOMContentLoaded', function () {
         return (_logicalToPageIndex[pageNum] !== undefined) ? _logicalToPageIndex[pageNum] : (_pageIndexForNum(pageNum));
     }
 
-    var viewerHeight = window.innerHeight - 140;
-    var SCALE = Math.min(1.5, viewerHeight / 792);
-    var PLACEHOLDER_HEIGHT = 1056;
+    var viewerPanel = container.closest('.viewer-panel') || container.parentElement;
+    var viewerHeight = viewerPanel ? viewerPanel.clientHeight : (window.innerHeight - 200);
+    // Scale so one full page (792pt letter height) fits within the viewer, never bigger
+    var SCALE = Math.min(1.0, (viewerHeight - 16) / 792);
+    var PLACEHOLDER_HEIGHT = Math.round(792 * SCALE);
     var pdfPages = {};  // cached PDF.js page objects for coordinate conversion
     var defaultPageWidth = 918;
     var pdfDoc = null;
