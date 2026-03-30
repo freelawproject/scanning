@@ -693,21 +693,8 @@ def scan_process_view(request, pk):
         for d in Detection.objects.filter(scan=scan, active=True, label="KEY_ICON").order_by("page_index"):
             if (d.page_index, round(d.x0), round(d.y0)) not in paired_key_keys:
                 if (d.page_index, d.label_id, round(d.x0), round(d.y0)) not in suppressed:
-                    unmatched_keys.append({"pdf_page": d.page_index + 1, "page_index": d.page_index, "logical_page": idx_to_logical.get(d.page_index, d.page_index + 1), "conf": round(d.confidence, 2)})
+                    unmatched_keys.append({"pdf_page": d.page_index + 1, "page_index": d.page_index, "logical_page": idx_to_logical.get(d.page_index, d.page_index + 1), "conf": round(d.confidence, 2), "bbox": [d.x0, d.y0, d.x1, d.y1], "img_width": d.img_width, "img_height": d.img_height})
 
-        # Only flag a caption if it's on a page that isn't already covered
-        # by a paired opinion's page range.  Extra caption boxes within an
-        # opinion's pages are just multi-column continuation — not warnings.
-        opinion_ranges = []
-        for op in opinions:
-            cp = op.get("caption_page", 0)
-            ep = op.get("end_page", op.get("key_page", cp))
-            opinion_ranges.append((cp, ep))
-
-        def _page_in_opinion(pi):
-            return any(start <= pi <= end for start, end in opinion_ranges)
-
-        seen_caption_pages = set()
         for d in Detection.objects.filter(
             scan=scan, active=True, label="CASE_CAPTION"
         ).order_by("page_index", "y0"):
@@ -715,18 +702,14 @@ def scan_process_view(request, pk):
                 continue
             if (d.page_index, d.label_id, round(d.x0), round(d.y0)) in suppressed:
                 continue
-            # Skip if this page is inside a paired opinion's range
-            if _page_in_opinion(d.page_index):
-                continue
-            # Only show one entry per page
-            if d.page_index in seen_caption_pages:
-                continue
-            seen_caption_pages.add(d.page_index)
             unmatched_captions.append({
                 "pdf_page": d.page_index + 1,
                 "page_index": d.page_index,
                 "logical_page": idx_to_logical.get(d.page_index, d.page_index + 1),
                 "conf": round(d.confidence, 2),
+                "bbox": [d.x0, d.y0, d.x1, d.y1],
+                "img_width": d.img_width,
+                "img_height": d.img_height,
             })
 
         if unmatched_keys:
