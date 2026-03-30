@@ -1608,10 +1608,12 @@ def _stamp_original_images(scan, ocr_pdf_path):
             # Stamp onto the OCR'd PDF
             ocr_page.insert_image(pdf_rect, stream=png_bytes)
 
-        ocr_doc.save(ocr_pdf_path, garbage=3, deflate=True)
+        tmp_path = ocr_pdf_path + ".tmp"
+        ocr_doc.save(tmp_path, garbage=3, deflate=True)
     finally:
         original_doc.close()
         ocr_doc.close()
+    shutil.move(tmp_path, ocr_pdf_path)
 
 
 def run_generate_files(scan_pk):

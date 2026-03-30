@@ -427,6 +427,9 @@ document.addEventListener('DOMContentLoaded', function () {
                     if (marginsVisible && marginRects) {
                         drawMarginOverlays();
                     }
+                    if (overlayMode === 'bounds' && _boundsPageOwners) {
+                        _drawBoundsForPage(pageDiv);
+                    }
                 }
             }
             if (!viewOnly && _globalDetections && allDetections) {
@@ -1168,12 +1171,138 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // ── Unified overlay toggle ──
-    // overlayMode cycles: 'off' → 'transparent' → 'solid' → 'off'
+    // overlayMode cycles: 'off' → 'bounds' → 'transparent' → 'solid' → 'off'
     var overlayMode = 'off';
+    var _boundsColors = [
+        '#3b82f6', '#f97316', '#10b981', '#a855f7',
+        '#ec4899', '#eab308', '#06b6d4', '#ef4444',
+    ];
+    function _hexToRgba(hex, alpha) {
+        var r = parseInt(hex.slice(1,3), 16);
+        var g = parseInt(hex.slice(3,5), 16);
+        var b = parseInt(hex.slice(5,7), 16);
+        return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+    }
+
+    // Cached page ownership map built from _opinionsData
+    var _boundsPageOwners = null;
+    // Cached outside_rects grouped by page number: {pageNum: [{opIdx, x0, y0, x1, y1}, ...]}
+    var _boundsOutsideByPage = null;
+
+    function _buildBoundsCache() {
+        _boundsPageOwners = {};
+        _boundsOutsideByPage = {};
+        _opinionsData.forEach(function(op, idx) {
+            var startPage = _pageNumForIndex(op.caption_page);
+            var kp = (op.key_page !== undefined) ? op.key_page : op.caption_page;
+            var endPage = _pageNumForIndex(kp);
+            for (var p = startPage; p <= endPage; p++) {
+                if (!_boundsPageOwners[p]) _boundsPageOwners[p] = [];
+                _boundsPageOwners[p].push({idx: idx, isFirst: p === startPage, isLast: p === endPage});
+            }
+            (op.outside_rects || []).forEach(function(r) {
+                var pn = _pageNumForIndex(r.page_index);
+                if (!_boundsOutsideByPage[pn]) _boundsOutsideByPage[pn] = [];
+                _boundsOutsideByPage[pn].push({opIdx: idx, x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1});
+            });
+        });
+    }
+
+    function _drawBoundsForPage(pageDiv) {
+        if (!_boundsPageOwners) return;
+        var num = parseInt(pageDiv.id.replace('pv-page-', ''));
+        var wrapper = pageDiv.querySelector('.canvas-wrapper');
+        if (!wrapper) return;
+
+        // Remove existing bounds on this page
+        wrapper.querySelectorAll('.opinion-bounds-overlay').forEach(function(el) { el.remove(); });
+
+        var owners = _boundsPageOwners[num];
+        if (!owners || owners.length === 0) {
+            var gap = document.createElement('div');
+            gap.className = 'opinion-bounds-overlay';
+            gap.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.08);z-index:4;pointer-events:none;';
+            wrapper.appendChild(gap);
+            return;
+        }
+
+        owners.forEach(function(own) {
+            var color = _boundsColors[own.idx % _boundsColors.length];
+
+            var strip = document.createElement('div');
+            strip.className = 'opinion-bounds-overlay';
+            strip.style.cssText = 'position:absolute;top:0;left:0;width:5px;height:100%;background:' + color + ';z-index:5;pointer-events:none;';
+            wrapper.appendChild(strip);
+
+            if (own.isFirst) {
+                var topBar = document.createElement('div');
+                topBar.className = 'opinion-bounds-overlay';
+                topBar.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:2px;background:' + color + ';z-index:5;pointer-events:none;';
+                wrapper.appendChild(topBar);
+
+                var lbl = document.createElement('span');
+                lbl.className = 'opinion-bounds-overlay';
+                lbl.style.cssText = 'position:absolute;top:4px;left:10px;font-size:11px;font-weight:700;padding:1px 6px;border-radius:3px;color:white;z-index:6;pointer-events:none;background:' + color + ';';
+                lbl.textContent = '#' + (own.idx + 1);
+                wrapper.appendChild(lbl);
+            }
+
+            if (own.isLast) {
+                var botBar = document.createElement('div');
+                botBar.className = 'opinion-bounds-overlay';
+                botBar.style.cssText = 'position:absolute;bottom:0;left:0;width:100%;height:2px;background:' + color + ';z-index:5;pointer-events:none;';
+                wrapper.appendChild(botBar);
+            }
+        });
+
+        // Draw outside_rects for this page (needs canvas for coordinate scaling)
+        var outsideRects = _boundsOutsideByPage[num];
+        if (outsideRects && outsideRects.length) {
+            var canvas = pageDiv.querySelector('.pdf-canvas');
+            if (canvas && canvas.width > 10) {
+                var dsx = canvas.offsetWidth / (canvas.width / SCALE);
+                var dsy = canvas.offsetHeight / (canvas.height / SCALE);
+
+                outsideRects.forEach(function(r) {
+                    var color = _boundsColors[r.opIdx % _boundsColors.length];
+                    var div = document.createElement('div');
+                    div.className = 'opinion-bounds-overlay';
+                    div.style.position = 'absolute';
+                    div.style.left = (r.x0 * dsx) + 'px';
+                    div.style.top = (r.y0 * dsy) + 'px';
+                    div.style.width = ((r.x1 - r.x0) * dsx) + 'px';
+                    div.style.height = ((r.y1 - r.y0) * dsy) + 'px';
+                    div.style.background = _hexToRgba(color, 0.08);
+                    div.style.border = '1px dashed ' + _hexToRgba(color, 0.5);
+                    div.style.zIndex = '5';
+                    div.style.pointerEvents = 'none';
+                    div.style.boxSizing = 'border-box';
+                    wrapper.appendChild(div);
+                });
+            }
+        }
+    }
+
+    function drawOpinionBounds() {
+        clearOverlaysByClass('opinion-bounds-overlay');
+        _loadOpinionsData(function() {
+            if (!_opinionsData || !_opinionsData.length) return;
+            _buildBoundsCache();
+            document.querySelectorAll('.lazy-page').forEach(_drawBoundsForPage);
+        });
+    }
 
     window.toggleOverlays = function() {
         if (overlayMode === 'off') {
+            overlayMode = 'bounds';
+            clearOverlaysByClass('redaction-overlay-box');
+            clearOverlaysByClass('margin-overlay-box');
+            redactionsVisible = false;
+            marginsVisible = false;
+            drawOpinionBounds();
+        } else if (overlayMode === 'bounds') {
             overlayMode = 'transparent';
+            clearOverlaysByClass('opinion-bounds-overlay');
             // Load rects if needed
             if (!redactionRects) {
                 fetch('/scans/' + documentId + '/redaction-rects/')
@@ -1197,7 +1326,6 @@ document.addEventListener('DOMContentLoaded', function () {
             }
         } else if (overlayMode === 'transparent') {
             overlayMode = 'solid';
-            var solid = true;
             document.querySelectorAll('.redaction-overlay-box').forEach(function(div) {
                 var fill = div.dataset.fill || 'black';
                 var lbl = div.querySelector('span');
@@ -1221,11 +1349,12 @@ document.addEventListener('DOMContentLoaded', function () {
             marginsVisible = false;
             clearOverlaysByClass('redaction-overlay-box');
             clearOverlaysByClass('margin-overlay-box');
+            clearOverlaysByClass('opinion-bounds-overlay');
         }
         var btn = document.getElementById('toggle-overlays-btn');
         if (btn) {
-            var labels = {'off': 'Overlays Off (r)', 'transparent': 'Overlays (r)', 'solid': 'Solid (r)'};
-            var colors = {'off': '#6b7280', 'transparent': '#dc2626', 'solid': '#059669'};
+            var labels = {'off': 'Overlays Off (r)', 'bounds': 'Bounds (r)', 'transparent': 'Overlays (r)', 'solid': 'Solid (r)'};
+            var colors = {'off': '#6b7280', 'bounds': '#2563eb', 'transparent': '#dc2626', 'solid': '#059669'};
             btn.textContent = labels[overlayMode];
             btn.style.background = colors[overlayMode];
         }
@@ -1929,8 +2058,11 @@ document.addEventListener('DOMContentLoaded', function () {
         var endPage = _pageNumForIndex(keyPage);
 
         _loadOpinionsData(function() {
-            // Only dim/whiteout when redactions are visible (R toggled on)
-            if (redactionsVisible) {
+            // off: no dimming, just scroll
+            // transparent: semi-transparent dim on other pages/regions
+            // solid: opaque whiteout on other pages/regions
+            if (overlayMode !== 'off') {
+                var solid = (overlayMode === 'solid');
                 var thisOp = (typeof opIndex === 'number' && opIndex < _opinionsData.length)
                     ? _opinionsData[opIndex] : null;
                 if (!thisOp) return;
@@ -1938,6 +2070,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 var outsideRects = thisOp.outside_rects || [];
 
                 // Dim pages outside the opinion
+                var pageBg = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.3)';
                 var allPages = document.querySelectorAll('.lazy-page');
                 allPages.forEach(function(pageDiv) {
                     var num = parseInt(pageDiv.id.replace('pv-page-', ''));
@@ -1947,12 +2080,13 @@ document.addEventListener('DOMContentLoaded', function () {
                     if (num < startPage || num > endPage) {
                         var dim = document.createElement('div');
                         dim.className = 'opinion-dim-overlay';
-                        dim.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(255,255,255,1);z-index:15;pointer-events:none;';
+                        dim.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:' + pageBg + ';z-index:15;pointer-events:none;';
                         wrapper.appendChild(dim);
                     }
                 });
 
                 // Draw outside_rects as dim overlays (PDF coordinates)
+                var rectBg = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.25)';
                 outsideRects.forEach(function(r) {
                     var pageNum = _pageNumForIndex(r.page_index);
                     var container = document.getElementById('pv-page-' + pageNum);
@@ -1971,7 +2105,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     dim.style.top = (r.y0 * dsy) + 'px';
                     dim.style.width = ((r.x1 - r.x0) * dsx) + 'px';
                     dim.style.height = ((r.y1 - r.y0) * dsy) + 'px';
-                    dim.style.background = 'rgba(255,255,255,1)';
+                    dim.style.background = rectBg;
                     dim.style.zIndex = '15';
                     dim.style.pointerEvents = 'none';
                     wrapper.appendChild(dim);
