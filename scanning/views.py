@@ -620,6 +620,12 @@ def scan_process_view(request, pk):
             entry["type"] = "inserted"
             entry["insert_url"] = inserts[entry["logical_number"]].image.url
 
+    # Map pdf_index → logical page number for navigation
+    idx_to_logical = {}
+    for entry in page_map:
+        if entry.get("type") == "pdf_page":
+            idx_to_logical[entry["pdf_index"]] = entry["logical_number"]
+
     flagged_pages = sorted(set(i.page_number for i in issues if i.page_number is not None))
 
     ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
@@ -630,6 +636,22 @@ def scan_process_view(request, pk):
     has_pending_changes = scan.deletions.exists() or scan.inserts.exists()
 
     opinions = json.loads(scan.opinions_json) if scan.opinions_json else []
+
+    # Build a set of page indices that contain IMAGE detections
+    image_page_indices = set(
+        Detection.objects.filter(scan=scan, label="IMAGE", active=True)
+        .values_list("page_index", flat=True)
+    )
+
+    # Attach image_pages (logical page numbers) to each opinion
+    for op in opinions:
+        cp = op.get("caption_page", 0)
+        ep = op.get("page_end", op.get("key_page", cp))
+        op["image_pages"] = sorted(
+            idx_to_logical.get(idx, idx + 1)
+            for idx in range(cp, ep + 1)
+            if idx in image_page_indices
+        )
 
     has_redaction_rects = False
     if scan.output_dir:
@@ -671,7 +693,7 @@ def scan_process_view(request, pk):
         for d in Detection.objects.filter(scan=scan, active=True, label="KEY_ICON").order_by("page_index"):
             if (d.page_index, round(d.x0), round(d.y0)) not in paired_key_keys:
                 if (d.page_index, d.label_id, round(d.x0), round(d.y0)) not in suppressed:
-                    unmatched_keys.append({"pdf_page": d.page_index + 1, "page_index": d.page_index, "conf": round(d.confidence, 2)})
+                    unmatched_keys.append({"pdf_page": d.page_index + 1, "page_index": d.page_index, "logical_page": idx_to_logical.get(d.page_index, d.page_index + 1), "conf": round(d.confidence, 2)})
 
         # Only flag a caption if it's on a page that isn't already covered
         # by a paired opinion's page range.  Extra caption boxes within an
@@ -703,6 +725,7 @@ def scan_process_view(request, pk):
             unmatched_captions.append({
                 "pdf_page": d.page_index + 1,
                 "page_index": d.page_index,
+                "logical_page": idx_to_logical.get(d.page_index, d.page_index + 1),
                 "conf": round(d.confidence, 2),
             })
 
@@ -796,6 +819,30 @@ def serve_scan_pdf(request, pk):
 
 
 @login_required
+def serve_original_crop(request, pk):
+    """Render a cropped region from the original (non-bitonal) PDF as PNG."""
+    scan = get_object_or_404(Scan, pk=pk)
+    page = int(request.GET.get("page", 0))
+    x0 = float(request.GET.get("x0", 0))
+    y0 = float(request.GET.get("y0", 0))
+    x1 = float(request.GET.get("x1", 0))
+    y1 = float(request.GET.get("y1", 0))
+    dpi = min(max(int(request.GET.get("dpi", 150)), 72), 300)
+
+    doc = fitz.open(scan.pdf_path)
+    if page < 0 or page >= doc.page_count:
+        doc.close()
+        return HttpResponse(status=404)
+    clip = fitz.Rect(x0, y0, x1, y1)
+    pix = doc[page].get_pixmap(clip=clip, dpi=dpi)
+    png_bytes = pix.tobytes("png")
+    doc.close()
+    resp = HttpResponse(png_bytes, content_type="image/png")
+    resp["Cache-Control"] = "max-age=3600"
+    return resp
+
+
+@login_required
 @require_POST
 def start_validate(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
@@ -844,7 +891,9 @@ def cancel_processing(request, pk):
             Scan.objects.filter(pk=pk).update(
                 status=Status.CANCELLED, progress_message="Cancelled by user.",
             )
-    return redirect("scan_list")
+        # Kill any running subprocesses (tesseract, YOLO, etc.)
+        services.kill_active_processes(pk)
+    return redirect("scan_process", pk=pk)
 
 
 @login_required
@@ -1232,6 +1281,48 @@ def serve_masked_opinion_pdf(request, pk, filename):
     if not os.path.isfile(file_path):
         return HttpResponse("Masked opinion PDF not found", status=404)
     return FileResponse(open(file_path, "rb"), content_type="application/pdf")
+
+
+def _apply_rect_to_pdf(pdf_path, page_index, x0, y0, x1, y1, fill):
+    """Apply a redaction rectangle directly to a PDF file on disk."""
+    doc = fitz.open(pdf_path)
+    if page_index < 0 or page_index >= doc.page_count:
+        doc.close()
+        raise ValueError(f"Page index {page_index} out of range (0-{doc.page_count - 1})")
+    page = doc.load_page(page_index)
+    rect = fitz.Rect(x0, y0, x1, y1)
+    color = (0, 0, 0) if fill == "black" else (1, 1, 1)
+    annot = page.add_redact_annot(rect, fill=color)
+    page.apply_redactions()
+    doc.save(pdf_path, garbage=3, deflate=True)
+    doc.close()
+
+
+@login_required
+@require_POST
+def apply_rect_to_opinion(request, pk, opinion_pk):
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(OpinionScan, pk=opinion_pk, scan=scan)
+    data = json.loads(request.body)
+    page_index = data["page_index"]
+    x0, y0, x1, y1 = data["x0"], data["y0"], data["x1"], data["y1"]
+    fill = data.get("fill", "black")
+
+    # Always apply to the redacted PDF
+    redacted_path = os.path.join(scan.output_dir, "redacted", os.path.basename(opinion.redacted_pdf.name))
+    if os.path.isfile(redacted_path):
+        _apply_rect_to_pdf(redacted_path, page_index, x0, y0, x1, y1, fill)
+
+    # Also apply to masked PDF if it exists
+    if opinion.masked_pdf and opinion.masked_pdf.name:
+        masked_path = os.path.join(scan.output_dir, "masked", os.path.basename(opinion.masked_pdf.name))
+        if os.path.isfile(masked_path):
+            try:
+                _apply_rect_to_pdf(masked_path, page_index, x0, y0, x1, y1, fill)
+            except ValueError:
+                pass  # masked PDF may have different page count
+
+    return JsonResponse({"status": "ok"})
 
 
 @login_required

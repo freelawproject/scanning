@@ -58,13 +58,57 @@ class ProcessingCancelled(Exception):
     pass
 
 
+# Map scan_pk → list of active subprocess PIDs for cancellation.
+_active_processes = {}
+_active_processes_lock = threading.Lock()
+
+
+def _register_process(scan_pk, proc):
+    """Track a subprocess so it can be killed on cancel."""
+    with _active_processes_lock:
+        _active_processes.setdefault(scan_pk, []).append(proc)
+
+
+def _unregister_process(scan_pk, proc):
+    """Remove a subprocess from tracking."""
+    with _active_processes_lock:
+        pids = _active_processes.get(scan_pk, [])
+        if proc in pids:
+            pids.remove(proc)
+
+
+def kill_active_processes(scan_pk):
+    """Kill all tracked subprocesses for a scan, plus their children."""
+    import signal
+
+    with _active_processes_lock:
+        procs = _active_processes.pop(scan_pk, [])
+
+    for proc in procs:
+        try:
+            # Kill the entire process group (catches tesseract workers)
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            proc.kill()
+        except (OSError, ProcessLookupError):
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
 def _update_progress(scan_pk, message, current=None, total=None, **kwargs):
-    """Update scan progress fields."""
+    """Update scan progress fields. Raises ProcessingCancelled if scan was cancelled."""
+    # Check for cancellation before updating
+    status = Scan.objects.filter(pk=scan_pk).values_list("status", flat=True).first()
+    if status == Status.CANCELLED:
+        kill_active_processes(scan_pk)
+        raise ProcessingCancelled(f"Scan {scan_pk} cancelled by user")
+
     updates = {"progress_message": message[:255]}
     if current is not None:
         updates["progress_current"] = current
@@ -72,6 +116,56 @@ def _update_progress(scan_pk, message, current=None, total=None, **kwargs):
         updates["progress_total"] = total
     updates.update(kwargs)
     Scan.objects.filter(pk=scan_pk).update(**updates)
+
+
+def _run_ocr_subprocess(scan_pk, bitonal_path, output_dir, reporter, volume, first_page):
+    """Run Tesseract OCR as a subprocess so it can be killed on cancel.
+
+    Returns the path to the OCR'd PDF.
+    """
+    script = f"""
+import sys
+sys.path.insert(0, ".")
+from blackletter.api import ocr as bl_ocr
+result = bl_ocr(
+    "{bitonal_path}", "{output_dir}",
+    reporter="{reporter}",
+    volume="{volume}",
+    first_page={first_page},
+)
+print("OCR_OUTPUT:" + str(result), flush=True)
+"""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(Path(settings.INSTALL_ROOT)),
+        start_new_session=True,
+    )
+    _register_process(scan_pk, proc)
+    try:
+        while proc.poll() is None:
+            _time.sleep(2)
+            # Check for cancellation
+            status = Scan.objects.filter(pk=scan_pk).values_list("status", flat=True).first()
+            if status == Status.CANCELLED:
+                kill_active_processes(scan_pk)
+                raise ProcessingCancelled(f"Scan {scan_pk} cancelled by user")
+
+        stdout = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
+        if proc.returncode != 0:
+            raise RuntimeError(f"OCR failed (exit {proc.returncode}): {stdout[-500:]}")
+
+        # Extract output path from stdout
+        for line in stdout.strip().split("\n"):
+            if line.startswith("OCR_OUTPUT:"):
+                return Path(line.split("OCR_OUTPUT:", 1)[1].strip())
+
+        # Fallback: find the OCR PDF in the output dir
+        from scanning.utils import find_ocr_pdf
+        return find_ocr_pdf(output_dir)
+    finally:
+        _unregister_process(scan_pk, proc)
 
 
 def _run_yolo_subprocess(scan_pk, pdf_path, output_dir):
@@ -94,22 +188,29 @@ print(f"\\nDetect complete: {{len(dets)}} detections", flush=True)
         stdout=open(log_path, "w"),
         stderr=subprocess.STDOUT,
         cwd=str(Path(settings.INSTALL_ROOT)),
+        start_new_session=True,
     )
-    while proc.poll() is None:
-        _time.sleep(1)
-        try:
-            log_text = log_path.read_text(errors="replace").replace("\x00", "")
-            lines = [l for l in log_text.strip().split("\n") if l.strip()]
-            msg = lines[-1].strip() if lines else "Running YOLO detection..."
-            _update_progress(scan_pk, msg, progress_log=log_text[-5000:])
-        except Exception:
-            pass
+    _register_process(scan_pk, proc)
+    try:
+        while proc.poll() is None:
+            _time.sleep(1)
+            try:
+                log_text = log_path.read_text(errors="replace").replace("\x00", "")
+                lines = [l for l in log_text.strip().split("\n") if l.strip()]
+                msg = lines[-1].strip() if lines else "Running YOLO detection..."
+                _update_progress(scan_pk, msg, progress_log=log_text[-5000:])
+            except ProcessingCancelled:
+                raise
+            except Exception:
+                pass
 
-    log_text = log_path.read_text(errors="replace").replace("\x00", "")
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"YOLO detection failed (exit {proc.returncode}): {log_text[-500:]}"
-        )
+        log_text = log_path.read_text(errors="replace").replace("\x00", "")
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"YOLO detection failed (exit {proc.returncode}): {log_text[-500:]}"
+            )
+    finally:
+        _unregister_process(scan_pk, proc)
 
 
 def _import_detections_from_json(scan_pk, output_dir):
@@ -1166,8 +1267,8 @@ def run_full_pipeline(scan_pk):
         scan.refresh_from_db()
         ocr_pdf = find_ocr_pdf(str(output_dir))
         if not ocr_pdf:
-            ocr_pdf = bl_ocr(
-                str(bitonal_path), str(output_dir),
+            ocr_pdf = _run_ocr_subprocess(
+                scan_pk, str(bitonal_path), str(output_dir),
                 reporter=scan.reporter.short_name or "",
                 volume=str(scan.volume) or "",
                 first_page=scan.start_page or 1,
@@ -1456,6 +1557,63 @@ def _collect_pdf_paths(scan, output_dir):
 # ---------------------------------------------------------------------------
 
 
+def _stamp_original_images(scan, ocr_pdf_path):
+    """Overlay original-quality image regions onto the OCR'd (bitonal) PDF.
+
+    For each active IMAGE detection, renders the bounding box from the
+    original scan PDF and inserts it into the OCR'd PDF at the same
+    position.  This preserves full-quality photographs/illustrations
+    that would otherwise be degraded by bitonal conversion.
+    """
+    from scanning.models import Detection
+
+    image_dets = list(
+        Detection.objects.filter(scan=scan, label="IMAGE", active=True)
+        .order_by("page_index")
+        .values("page_index", "x0", "y0", "x1", "y1", "img_width", "img_height")
+    )
+    if not image_dets:
+        return
+
+    original_doc = fitz.open(scan.pdf_path)
+    ocr_doc = fitz.open(ocr_pdf_path)
+
+    try:
+        for det in image_dets:
+            page_idx = det["page_index"]
+            if page_idx >= original_doc.page_count or page_idx >= ocr_doc.page_count:
+                continue
+
+            orig_page = original_doc[page_idx]
+            ocr_page = ocr_doc[page_idx]
+
+            # Convert image-pixel bbox to PDF points
+            page_rect = orig_page.rect
+            img_w = det["img_width"] or 1
+            img_h = det["img_height"] or 1
+            sx = page_rect.width / img_w
+            sy = page_rect.height / img_h
+
+            pdf_rect = fitz.Rect(
+                det["x0"] * sx,
+                det["y0"] * sy,
+                det["x1"] * sx,
+                det["y1"] * sy,
+            )
+
+            # Render the region from the original (non-bitonal) PDF
+            pix = orig_page.get_pixmap(clip=pdf_rect, dpi=150)
+            png_bytes = pix.tobytes("png")
+
+            # Stamp onto the OCR'd PDF
+            ocr_page.insert_image(pdf_rect, stream=png_bytes)
+
+        ocr_doc.save(ocr_pdf_path, garbage=3, deflate=True)
+    finally:
+        original_doc.close()
+        ocr_doc.close()
+
+
 def run_generate_files(scan_pk):
     """Generate redacted/split opinion files from existing detections.
 
@@ -1481,6 +1639,9 @@ def run_generate_files(scan_pk):
         ocr_pdf = find_ocr_pdf(scan.output_dir) if scan.output_dir else None
         if not ocr_pdf:
             raise ValueError("No OCR'd PDF found in output directory")
+
+        # Stamp original-quality images into the OCR'd PDF before generation
+        _stamp_original_images(scan, str(ocr_pdf))
 
         # Write current DB detections -> detections.json (includes page numbers)
         det_data = _sync_detections_to_disk(scan_pk)
@@ -1618,17 +1779,20 @@ def run_detect(scan_pk):
             for f in output_dir.glob("*.pdf")
         )
         if not ocr_exists and bitonal.exists():
+            # Run OCR as a background subprocess (killable on cancel)
             def _run_ocr_bg(scan_pk, bitonal_str, output_dir_str):
                 try:
                     import django as _dj
                     _dj.db.connections.close_all()
                     _scan = Scan.objects.get(pk=scan_pk)
-                    bl_ocr(
-                        bitonal_str, output_dir_str,
+                    _run_ocr_subprocess(
+                        scan_pk, bitonal_str, output_dir_str,
                         reporter=_scan.reporter.short_name or "",
                         volume=str(_scan.volume) or "",
                         first_page=_scan.start_page or 1,
                     )
+                except ProcessingCancelled:
+                    pass
                 except Exception as _e:
                     print(f"  Background OCR failed: {_e}", flush=True)
             threading.Thread(
@@ -1654,6 +1818,8 @@ def run_detect(scan_pk):
             progress_message=f"Done — {len(dets)} detections, {len(opinions)} opinions",
         )
 
+    except ProcessingCancelled:
+        pass
     except Exception as exc:
         import traceback
         traceback.print_exc()

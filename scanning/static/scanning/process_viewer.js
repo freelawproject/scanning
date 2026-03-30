@@ -11,6 +11,7 @@ document.addEventListener('DOMContentLoaded', function () {
     var documentId = container.dataset.documentId;
     var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
     var viewOnly = container.dataset.viewOnly === 'true';
+    var opinionEditMode = container.dataset.opinionEdit === 'true';
     var pageMap = JSON.parse(container.dataset.pageMap || '[]');
     var flaggedPages = JSON.parse(container.dataset.flaggedPages || '[]');
     var ocrByPage = JSON.parse(container.dataset.ocrByPage || '{}');
@@ -103,7 +104,7 @@ document.addEventListener('DOMContentLoaded', function () {
     if (initialPdfUrl) loadPdf(initialPdfUrl);
 
     // Preload data for instant overlays (skip in view-only mode)
-    if (!viewOnly) {
+    if (!viewOnly && !opinionEditMode) {
         (function() {
             fetch('/scans/' + documentId + '/detections/')
                 .then(function(r) { if (r.ok) return r.json(); return []; })
@@ -121,13 +122,13 @@ document.addEventListener('DOMContentLoaded', function () {
                 .catch(function() {});
             fetch('/scans/' + documentId + '/margin-rects/')
                 .then(function(r) { if (r.ok) return r.json(); return []; })
-                .then(function(data) { marginRects = data; })
+                .then(function(data) { marginRects = data; if (marginsVisible) drawMarginOverlays(); })
                 .catch(function() {});
         })();
     }
 
     function loadPdf(url) {
-        if (url === currentUrl) return;
+        if (url === currentUrl && url.indexOf('?t=') === -1) return;
         currentUrl = url;
 
         if (observer) { observer.disconnect(); observer = null; }
@@ -207,8 +208,9 @@ document.addEventListener('DOMContentLoaded', function () {
                  (entry.duplicate ? ' <span class="dupe-badge">DUPLICATE</span>' : '') + '</span>' +
             (viewOnly ? '' :
             '  <span class="page-tools">' +
+            (opinionEditMode ? '' :
             '    <button class="detect-btn" title="Show/hide detections">Detections</button>' +
-            '    <button class="draw-det-btn" title="Draw a detection box">Draw</button>' +
+            '    <button class="draw-det-btn" title="Draw a detection box">Draw</button>') +
             '    <button class="redact-btn" data-fill="black" title="Draw a black redaction">Redact</button>' +
             '    <button class="whiteout-btn" data-fill="white" title="Draw a white redaction">Whiteout</button>' +
             // '    <button class="delete-page-btn" title="Delete this page">Delete</button>' +
@@ -251,8 +253,8 @@ document.addEventListener('DOMContentLoaded', function () {
             var whiteoutBtn = div.querySelector('.whiteout-btn');
             var deletePageBtn = div.querySelector('.delete-page-btn');
             (function (pageDiv, pNum, pdfIdx) {
-                detectBtn.addEventListener('click', function () { toggleDetections(pageDiv, pNum); });
-                drawDetBtn.addEventListener('click', function () { activateDrawMode(pageDiv, pNum); });
+                if (detectBtn) detectBtn.addEventListener('click', function () { toggleDetections(pageDiv, pNum); });
+                if (drawDetBtn) drawDetBtn.addEventListener('click', function () { activateDrawMode(pageDiv, pNum); });
                 redactBtn.addEventListener('click', function () { toggleRedactionMode(pageDiv, pNum, 'black'); });
                 whiteoutBtn.addEventListener('click', function () { toggleRedactionMode(pageDiv, pNum, 'white'); });
                 // deletePageBtn.addEventListener('click', function () {
@@ -380,7 +382,8 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function renderPage(pageDiv, pdfIndex) {
         pdfDoc.getPage(pdfIndex + 1).then(function (page) {
-            pdfPages[pdfIndex + 1] = page;  // cache for overlay coordinate conversion
+            var pageNum = parseInt(pageDiv.dataset.pageNum);
+            pdfPages[pageNum] = page;  // cache for overlay coordinate conversion
             var viewport = page.getViewport({ scale: SCALE });
             var canvas = pageDiv.querySelector('.pdf-canvas');
             canvas.width = viewport.width;
@@ -429,6 +432,56 @@ document.addEventListener('DOMContentLoaded', function () {
             if (!viewOnly && _globalDetections && allDetections) {
                 detectionsVisible[pageNum] = true;
                 drawDetectionOverlay(pageDiv, pageNum);
+            }
+
+            // Overlay original PDF crops for IMAGE detections
+            if (allDetections && !_viewingOpinion) {
+                var pageIdx = parseInt(pageDiv.dataset.pdfIndex);
+                var imgDets = allDetections.filter(function(d) {
+                    return d.page_index === pageIdx && d.label === 'IMAGE';
+                });
+                if (imgDets.length > 0) {
+                    var canvasW = viewport.width;
+                    var canvasH = viewport.height;
+                    var imgW = imgDets[0].img_width || 1;
+                    var imgH = imgDets[0].img_height || 1;
+                    var sx = canvasW / imgW;
+                    var sy = canvasH / imgH;
+                    var pdfPtW = viewport.width / SCALE;
+                    var pdfPtH = viewport.height / SCALE;
+                    var pxToPtX = pdfPtW / imgW;
+                    var pxToPtY = pdfPtH / imgH;
+
+                    imgDets.forEach(function(d) {
+                        var ptX0 = d.bbox[0] * pxToPtX;
+                        var ptY0 = d.bbox[1] * pxToPtY;
+                        var ptX1 = d.bbox[2] * pxToPtX;
+                        var ptY1 = d.bbox[3] * pxToPtY;
+                        var displayW = (d.bbox[2] - d.bbox[0]) * sx;
+                        var displayH = (d.bbox[3] - d.bbox[1]) * sy;
+                        var cropPtW = ptX1 - ptX0;
+                        var dpi = Math.round((displayW / cropPtW) * 72);
+                        dpi = Math.min(Math.max(dpi, 72), 300);
+
+                        var img = document.createElement('img');
+                        img.className = 'image-overlay';
+                        img.style.position = 'absolute';
+                        img.style.left = (d.bbox[0] * sx) + 'px';
+                        img.style.top = (d.bbox[1] * sy) + 'px';
+                        img.style.width = displayW + 'px';
+                        img.style.height = displayH + 'px';
+                        img.style.zIndex = '3';
+                        img.style.pointerEvents = 'none';
+                        img.src = '/scans/' + documentId + '/original-crop/' +
+                            '?page=' + pageIdx +
+                            '&x0=' + ptX0.toFixed(2) +
+                            '&y0=' + ptY0.toFixed(2) +
+                            '&x1=' + ptX1.toFixed(2) +
+                            '&y1=' + ptY1.toFixed(2) +
+                            '&dpi=' + dpi;
+                        wrapper.appendChild(img);
+                    });
+                }
             }
         });
     }
@@ -509,48 +562,72 @@ document.addEventListener('DOMContentLoaded', function () {
                 return;
             }
 
-            var fillVal = activeRedactionFill;
-            // Convert to image pixel coords for RedactionRect
-            var imgW = cachedImgW || 1, imgH = cachedImgH || 1;
-            if (allDetections) {
-                for (var di = 0; di < allDetections.length; di++) {
-                    if (allDetections[di].page_index === _pageIndexForNum(pageNum)) {
-                        imgW = allDetections[di].img_width || imgW;
-                        imgH = allDetections[di].img_height || imgH;
-                        break;
+            if (opinionEditMode && _viewingOpinion) {
+                // Step 4: apply rect directly to opinion PDF file
+                var opinionPk = window._currentOpinionPk;
+                if (!opinionPk) { alert('No opinion selected'); return; }
+                fetch('/scans/' + documentId + '/opinion-edit/' + opinionPk + '/apply-rect/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+                    body: JSON.stringify({
+                        page_index: parseInt(pageDiv.dataset.pdfIndex),
+                        x0: pdfX, y0: pdfY,
+                        x1: pdfX + pdfW, y1: pdfY + pdfH,
+                        fill: activeRedactionFill,
+                    }),
+                })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.status === 'ok') {
+                        // Force reload with cache bust
+                        var savedUrl = currentUrl.split('?')[0];
+                        currentUrl = '';
+                        loadPdf(savedUrl + '?t=' + Date.now());
+                    }
+                });
+            } else {
+                // Steps 2-3: save to redaction_rects.json
+                var fillVal = activeRedactionFill;
+                var imgW = cachedImgW || 1, imgH = cachedImgH || 1;
+                if (allDetections) {
+                    for (var di = 0; di < allDetections.length; di++) {
+                        if (allDetections[di].page_index === _pageIndexForNum(pageNum)) {
+                            imgW = allDetections[di].img_width || imgW;
+                            imgH = allDetections[di].img_height || imgH;
+                            break;
+                        }
                     }
                 }
-            }
-            var pxPerPtX = imgW / (overlay.width / SCALE);
-            var pxPerPtY = imgH / (overlay.height / SCALE);
+                var pxPerPtX = imgW / (overlay.width / SCALE);
+                var pxPerPtY = imgH / (overlay.height / SCALE);
 
-            fetch('/scans/' + documentId + '/save-redaction-rect/', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
-                body: JSON.stringify({
-                    page_index: _pageIndexForNum(pageNum),
-                    action: 'add',
-                    adjusted: {
-                        x0: Math.round(pdfX * pxPerPtX),
-                        y0: Math.round(pdfY * pxPerPtY),
-                        x1: Math.round((pdfX + pdfW) * pxPerPtX),
-                        y1: Math.round((pdfY + pdfH) * pxPerPtY),
-                    },
-                    fill: fillVal,
-                    type: fillVal === 'white' ? 'whiteout' : 'manual_redact',
-                }),
-            })
-            .then(function (r) { return r.json(); })
-            .then(function (data) {
-                // Refresh overlays
-                refreshOverlays();
-                if (redactionsVisible) {
-                    clearOverlaysByClass('redaction-overlay-box');
-                    fetch('/scans/' + documentId + '/redaction-rects/')
-                        .then(function(r2) { return r2.json(); })
-                        .then(function(d2) { redactionRects = d2; drawRedactionOverlays(); });
-                }
-            });
+                fetch('/scans/' + documentId + '/save-redaction-rect/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+                    body: JSON.stringify({
+                        page_index: _pageIndexForNum(pageNum),
+                        action: 'add',
+                        adjusted: {
+                            x0: Math.round(pdfX * pxPerPtX),
+                            y0: Math.round(pdfY * pxPerPtY),
+                            x1: Math.round((pdfX + pdfW) * pxPerPtX),
+                            y1: Math.round((pdfY + pdfH) * pxPerPtY),
+                        },
+                        fill: fillVal,
+                        type: fillVal === 'white' ? 'whiteout' : 'manual_redact',
+                    }),
+                })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    refreshOverlays();
+                    if (redactionsVisible) {
+                        clearOverlaysByClass('redaction-overlay-box');
+                        fetch('/scans/' + documentId + '/redaction-rects/')
+                            .then(function(r2) { return r2.json(); })
+                            .then(function(d2) { redactionRects = d2; drawRedactionOverlays(); });
+                    }
+                });
+            }
         };
     }
 
@@ -1852,52 +1929,54 @@ document.addEventListener('DOMContentLoaded', function () {
         var endPage = _pageNumForIndex(keyPage);
 
         _loadOpinionsData(function() {
-            var thisOp = (typeof opIndex === 'number' && opIndex < _opinionsData.length)
-                ? _opinionsData[opIndex] : null;
-            if (!thisOp) return;
+            // Only dim/whiteout when redactions are visible (R toggled on)
+            if (redactionsVisible) {
+                var thisOp = (typeof opIndex === 'number' && opIndex < _opinionsData.length)
+                    ? _opinionsData[opIndex] : null;
+                if (!thisOp) return;
 
-            var outsideRects = thisOp.outside_rects || [];
+                var outsideRects = thisOp.outside_rects || [];
 
-            // Dim pages outside the opinion
-            var allPages = document.querySelectorAll('.lazy-page');
-            allPages.forEach(function(pageDiv) {
-                var num = parseInt(pageDiv.id.replace('pv-page-', ''));
-                var wrapper = pageDiv.querySelector('.canvas-wrapper');
-                if (!wrapper) return;
+                // Dim pages outside the opinion
+                var allPages = document.querySelectorAll('.lazy-page');
+                allPages.forEach(function(pageDiv) {
+                    var num = parseInt(pageDiv.id.replace('pv-page-', ''));
+                    var wrapper = pageDiv.querySelector('.canvas-wrapper');
+                    if (!wrapper) return;
 
-                if (num < startPage || num > endPage) {
+                    if (num < startPage || num > endPage) {
+                        var dim = document.createElement('div');
+                        dim.className = 'opinion-dim-overlay';
+                        dim.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(255,255,255,1);z-index:15;pointer-events:none;';
+                        wrapper.appendChild(dim);
+                    }
+                });
+
+                // Draw outside_rects as dim overlays (PDF coordinates)
+                outsideRects.forEach(function(r) {
+                    var pageNum = _pageNumForIndex(r.page_index);
+                    var container = document.getElementById('pv-page-' + pageNum);
+                    if (!container) return;
+                    var wrapper = container.querySelector('.canvas-wrapper');
+                    var canvas = container.querySelector('.pdf-canvas');
+                    if (!wrapper || !canvas) return;
+
+                    var dsx = canvas.offsetWidth / (canvas.width / SCALE);
+                    var dsy = canvas.offsetHeight / (canvas.height / SCALE);
+
                     var dim = document.createElement('div');
                     dim.className = 'opinion-dim-overlay';
-                    var bg = redactionsVisible ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.4)';
-                    dim.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:' + bg + ';z-index:15;pointer-events:none;';
+                    dim.style.position = 'absolute';
+                    dim.style.left = (r.x0 * dsx) + 'px';
+                    dim.style.top = (r.y0 * dsy) + 'px';
+                    dim.style.width = ((r.x1 - r.x0) * dsx) + 'px';
+                    dim.style.height = ((r.y1 - r.y0) * dsy) + 'px';
+                    dim.style.background = 'rgba(255,255,255,1)';
+                    dim.style.zIndex = '15';
+                    dim.style.pointerEvents = 'none';
                     wrapper.appendChild(dim);
-                }
-            });
-
-            // Draw outside_rects as dim overlays (PDF coordinates)
-            outsideRects.forEach(function(r) {
-                var pageNum = _pageNumForIndex(r.page_index);
-                var container = document.getElementById('pv-page-' + pageNum);
-                if (!container) return;
-                var wrapper = container.querySelector('.canvas-wrapper');
-                var canvas = container.querySelector('.pdf-canvas');
-                if (!wrapper || !canvas) return;
-
-                var dsx = canvas.offsetWidth / (canvas.width / SCALE);
-                var dsy = canvas.offsetHeight / (canvas.height / SCALE);
-
-                var dim = document.createElement('div');
-                dim.className = 'opinion-dim-overlay';
-                dim.style.position = 'absolute';
-                dim.style.left = (r.x0 * dsx) + 'px';
-                dim.style.top = (r.y0 * dsy) + 'px';
-                dim.style.width = ((r.x1 - r.x0) * dsx) + 'px';
-                dim.style.height = ((r.y1 - r.y0) * dsy) + 'px';
-                dim.style.background = redactionsVisible ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.3)';
-                dim.style.zIndex = '15';
-                dim.style.pointerEvents = 'none';
-                wrapper.appendChild(dim);
-            });
+                });
+            }
         });
 
         _highlightedOpinion = {start: startPage, end: endPage};

@@ -183,9 +183,15 @@
       </div>
       {% endfor %}
       {% else %}
+      {% if ocr_results %}
       <div class="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded px-2 py-2 text-xs text-green-700 dark:text-green-300 font-medium mb-2">
         All clear — no issues
       </div>
+      {% else %}
+      <div class="bg-gray-50 dark:bg-gray-900/20 border border-gray-200 dark:border-gray-700 rounded px-2 py-2 text-xs text-gray-500 dark:text-gray-400 font-medium mb-2">
+        Not yet processed
+      </div>
+      {% endif %}
       {% endif %}
 
       {% if ocr_results %}
@@ -220,6 +226,7 @@
            data-redacted="{{ s.redacted_filename }}"
            data-masked="{{ s.masked_filename }}"
            data-unredacted="{{ s.unredacted_filename }}"
+           data-opinion-pk="{{ s.pk }}"
            onclick="viewOpinionByMode({{ forloop.counter0 }}, this)">
         <span class="font-bold">{{ forloop.counter }}</span>
         <span class="text-gray-600 dark:text-gray-300 text-[11px]">{{ s.redacted_filename }}</span>
@@ -242,8 +249,8 @@
       {% for d in unmatched_captions %}
       <div class="rounded border border-orange-300 bg-orange-50 dark:border-orange-700 dark:bg-orange-900/20 px-2 py-1 mb-1 text-xs flex items-center justify-between cursor-pointer hover:bg-orange-100 dark:hover:bg-orange-900/40"
            data-unmatched-page="{{ d.page_index }}" data-unmatched-label="CASE_CAPTION"
-           onclick="goToPage({{ d.pdf_page }})">
-        <span class="font-medium">PDF p.{{ d.pdf_page }}</span>
+           onclick="goToPage({{ d.logical_page }})">
+        <span class="font-medium">p.{{ d.logical_page }}</span>
         <span class="text-gray-500 dark:text-gray-400">conf {{ d.conf }}</span>
       </div>
       {% endfor %}
@@ -254,8 +261,8 @@
       {% for d in unmatched_keys %}
       <div class="rounded border border-red-300 bg-red-50 dark:border-red-700 dark:bg-red-900/20 px-2 py-1 mb-1 text-xs flex items-center justify-between cursor-pointer hover:bg-red-100 dark:hover:bg-red-900/40"
            data-unmatched-page="{{ d.page_index }}" data-unmatched-label="KEY_ICON"
-           onclick="goToPage({{ d.pdf_page }})">
-        <span class="font-medium">PDF p.{{ d.pdf_page }}</span>
+           onclick="goToPage({{ d.logical_page }})">
+        <span class="font-medium">p.{{ d.logical_page }}</span>
         <span class="text-gray-500 dark:text-gray-400">conf {{ d.conf }}</span>
       </div>
       {% endfor %}
@@ -272,6 +279,15 @@
         {% if op.has_image %}<span title="Contains image(s)">🖼️</span>{% endif %}
         <span class="text-gray-600 dark:text-gray-300">Pages {% if op.first_page_number %}{{ op.first_page_number }}&ndash;{{ op.last_page_number }}{% else %}{{ op.caption_page|add:1 }}&ndash;{{ op.key_page|add:1 }}{% endif %} ({{ op.page_count }} pg)</span>
       </div>
+      {% if op.image_pages %}
+      <div class="ml-4 mb-1 flex flex-wrap gap-0.5">
+        {% for pg in op.image_pages %}
+        <span class="text-[10px] px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800 cursor-pointer hover:bg-amber-200 dark:hover:bg-amber-900/50"
+              onclick="event.stopPropagation(); goToPage({{ pg }})"
+              title="Image on page {{ pg }}">🖼️ {{ pg }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
       {% endfor %}
       {% else %}
       <p class="text-gray-500 dark:text-gray-400 text-xs p-2">No opinions yet. Run detection first.</p>
@@ -289,7 +305,7 @@
            data-flagged-pages='{{ flagged_pages_json }}'
            data-redactions='{}'
            data-ocr-by-page='{{ ocr_by_page_json }}'
-           {% if step == 4 %}data-view-only="true"{% endif %}>
+           {% if step == 4 %}data-opinion-edit="true"{% endif %}>
         {% if step == 4 %}
         <div class="flex items-center justify-center h-full text-gray-400 text-sm">Select an opinion from the sidebar to view it.</div>
         {% else %}
@@ -370,6 +386,8 @@ function viewOpinionByMode(index, el) {
     var urlPart = _viewMode === 'redacted' ? 'opinion' : (_viewMode === 'masked' ? 'masked' : 'unredacted');
     _currentOpinionIdx = index;
     _currentOpinionCard = el;
+    window._currentOpinionPk = parseInt(el.dataset.opinionPk || '0');
+    window._currentViewMode = _viewMode;
     document.querySelectorAll('aside .issue-card').forEach(function(c, i) {
         c.style.outline = i === index ? '2px solid #2563eb' : '';
     });
