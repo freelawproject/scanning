@@ -1,5 +1,7 @@
 import json
 import os
+import shutil
+import tempfile
 import threading
 
 import fitz
@@ -602,10 +604,16 @@ def scan_process_view(request, pk):
             step = int(request.GET.get("step", 1))
         elif scan.stage == Stage.APPROVED:
             step = 4
-        elif scan.opinions_json:
-            step = 3
-        elif scan.stage == Stage.PROCESS:
-            step = 2
+        elif scan.stage == Stage.PROCESS or scan.opinions_json:
+            # Stay on step 1 if there are unresolved issues
+            has_issues = scan.issues.exclude(
+                check_name="suppress_detection"
+            ).exists()
+            has_missing = bool(scan.missing_pages and json.loads(scan.missing_pages))
+            if has_issues or has_missing:
+                step = 1
+            else:
+                step = 2
         else:
             step = 1
 
@@ -1017,6 +1025,9 @@ def serve_margin_rects(request, pk):
         return JsonResponse([], safe=False)
     from blackletter.margins import compute_margin_rects
     rects = compute_margin_rects(ocr_pdf)
+    # Save so subsequent requests don't recompute
+    margin_path = output_base / "margin_rects.json"
+    margin_path.write_text(json.dumps(rects))
     return JsonResponse(rects, safe=False)
 
 
@@ -1275,10 +1286,14 @@ def _apply_rect_to_pdf(pdf_path, page_index, x0, y0, x1, y1, fill):
     page = doc.load_page(page_index)
     rect = fitz.Rect(x0, y0, x1, y1)
     color = (0, 0, 0) if fill == "black" else (1, 1, 1)
-    annot = page.add_redact_annot(rect, fill=color)
+    page.add_redact_annot(rect, fill=color)
     page.apply_redactions()
-    doc.save(pdf_path, garbage=3, deflate=True)
+    # Save to temp file then move — fitz can't save to the same path it opened
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=os.path.dirname(pdf_path))
+    os.close(fd)
+    doc.save(tmp_path, garbage=3, deflate=True)
     doc.close()
+    shutil.move(tmp_path, pdf_path)
 
 
 @login_required

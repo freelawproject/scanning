@@ -670,96 +670,7 @@ def run_paddleocr_validation(scan_pk, pdf_path):
             ocr_results=json.dumps(all_results),
         )
 
-    out_of_range, seen_nums = _split_in_out_of_range(
-        all_results, exp_start, exp_end
-    )
-    all_results, corrections = _auto_correct(
-        all_results, out_of_range, seen_nums
-    )
-    if corrections:
-        out_of_range, seen_nums = _split_in_out_of_range(
-            all_results, exp_start, exp_end
-        )
-
-    all_nums = sorted(seen_nums.keys())
-    duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
-    not_detected = [x for x in all_results if not x["detected"]]
-    out_of_range_pages = {r["pdf_page"] for r in out_of_range}
-
-    seq_issues = []
-    prev_num = prev_pdf = None
-    for r in all_results:
-        if not r["detected"] or r.get("type") == "range":
-            prev_num = None
-            continue
-        try:
-            num = int(r["detected"])
-        except ValueError:
-            continue
-        if r["pdf_page"] in out_of_range_pages:
-            continue
-        if prev_num is not None:
-            diff = num - prev_num
-            if diff == 0:
-                seq_issues.append(
-                    ("DUPLICATE", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff < 0:
-                seq_issues.append(
-                    ("BACKWARD", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff > 2:
-                seq_issues.append(
-                    (
-                        "GAP",
-                        r["pdf_page"],
-                        num,
-                        prev_pdf,
-                        prev_num,
-                        list(range(prev_num + 1, num)),
-                    )
-                )
-        prev_num = num
-        prev_pdf = r["pdf_page"]
-
-    if exp_start is not None and exp_end is not None:
-        expected = set(range(exp_start, exp_end + 1))
-        found = {n for n in seen_nums if exp_start <= n <= exp_end}
-        missing_pages = sorted(expected - found)
-    else:
-        missing_pages = []
-
-    ranges_found = [r for r in all_results if r.get("type") == "range"]
-
-    analysis = {
-        "total_pages": total,
-        "results": all_results,
-        "seen_nums": seen_nums,
-        "all_nums": all_nums,
-        "duplicates": duplicates,
-        "not_detected": not_detected,
-        "seq_issues": seq_issues,
-        "missing_pages": missing_pages,
-        "ranges_found": ranges_found,
-    }
-
-    result = _build_issues(analysis, total, exp_start, exp_end)
-
-    scan.refresh_from_db()
-    scan.page_count = total
-    scan.page_map = json.dumps(result.get("page_map", []))
-    scan.missing_pages = json.dumps(result.get("missing_pages", []))
-    scan.ocr_results = json.dumps(all_results)
-    scan.has_issues = len(result.get("issues", [])) > 0
-    scan.checked = True
-    scan.status = Status.APPROVED
-    scan.progress_message = "Done"
-    scan.save()
-
-    Issue.objects.filter(scan=scan).delete()
-    Issue.objects.bulk_create(
-        [Issue(scan=scan, **issue_data) for issue_data in result.get("issues", [])]
-    )
+    _rebuild_issues_from_results(scan_pk, all_results)
 
 
 def run_incremental_validation(scan_pk, pdf_path):
@@ -860,96 +771,7 @@ def run_incremental_validation(scan_pk, pdf_path):
     if scan.output_dir:
         _sync_detections_to_disk(scan_pk)
 
-    out_of_range, seen_nums = _split_in_out_of_range(
-        all_results, exp_start, exp_end
-    )
-    all_results, corrections = _auto_correct(
-        all_results, out_of_range, seen_nums
-    )
-    if corrections:
-        out_of_range, seen_nums = _split_in_out_of_range(
-            all_results, exp_start, exp_end
-        )
-
-    all_nums = sorted(seen_nums.keys())
-    duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
-    not_detected = [x for x in all_results if not x["detected"]]
-    out_of_range_pages = {r["pdf_page"] for r in out_of_range}
-
-    seq_issues = []
-    prev_num = prev_pdf = None
-    for r in all_results:
-        if not r["detected"] or r.get("type") == "range":
-            prev_num = None
-            continue
-        try:
-            num = int(r["detected"])
-        except ValueError:
-            continue
-        if r["pdf_page"] in out_of_range_pages:
-            continue
-        if prev_num is not None:
-            diff = num - prev_num
-            if diff == 0:
-                seq_issues.append(
-                    ("DUPLICATE", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff < 0:
-                seq_issues.append(
-                    ("BACKWARD", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff > 2:
-                seq_issues.append(
-                    (
-                        "GAP",
-                        r["pdf_page"],
-                        num,
-                        prev_pdf,
-                        prev_num,
-                        list(range(prev_num + 1, num)),
-                    )
-                )
-        prev_num = num
-        prev_pdf = r["pdf_page"]
-
-    if exp_start is not None and exp_end is not None:
-        expected = set(range(exp_start, exp_end + 1))
-        found = {n for n in seen_nums if exp_start <= n <= exp_end}
-        missing_pages = sorted(expected - found)
-    else:
-        missing_pages = []
-
-    ranges_found = [r for r in all_results if r.get("type") == "range"]
-
-    analysis = {
-        "total_pages": total,
-        "results": all_results,
-        "seen_nums": seen_nums,
-        "all_nums": all_nums,
-        "duplicates": duplicates,
-        "not_detected": not_detected,
-        "seq_issues": seq_issues,
-        "missing_pages": missing_pages,
-        "ranges_found": ranges_found,
-    }
-
-    result = _build_issues(analysis, total, exp_start, exp_end)
-
-    scan.refresh_from_db()
-    scan.page_count = total
-    scan.page_map = json.dumps(result.get("page_map", []))
-    scan.missing_pages = json.dumps(result.get("missing_pages", []))
-    scan.ocr_results = json.dumps(all_results)
-    scan.has_issues = len(result.get("issues", [])) > 0
-    scan.checked = True
-    scan.status = Status.APPROVED
-    scan.progress_message = "Done"
-    scan.save()
-
-    Issue.objects.filter(scan=scan).delete()
-    Issue.objects.bulk_create(
-        [Issue(scan=scan, **issue_data) for issue_data in result.get("issues", [])]
-    )
+    _rebuild_issues_from_results(scan_pk, all_results)
 
 
 # ---------------------------------------------------------------------------
@@ -1289,11 +1111,10 @@ def run_full_pipeline(scan_pk):
         _update_progress(scan_pk, "Pairing opinions...")
         opinions = _re_pair_opinions(scan_pk)
 
-        # 7. Compute margin and redaction rects
+        # 7. Compute redaction rects (margin rects computed lazily when viewer requests them)
         _update_progress(scan_pk, "Computing redaction rects...")
         pdf_path = str(ocr_pdf) if ocr_pdf else scan.pdf_path
         _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
-        _compute_and_save_margin_rects(pdf_path, str(output_dir))
 
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.APPROVED,
@@ -1317,12 +1138,110 @@ def run_full_pipeline(scan_pk):
 # ---------------------------------------------------------------------------
 
 
+def _rebuild_issues_from_results(scan_pk, all_results):
+    """Re-analyze ocr_results and rebuild issues/page_map without re-running OCR.
+
+    Preserves the actual OCR results (including manual assignments) but
+    recalculates sequence issues, missing pages, duplicates, etc.
+    """
+    scan = Scan.objects.get(pk=scan_pk)
+    total = len(all_results)
+    exp_start = scan.start_page or 1
+    exp_end = scan.end_page
+
+    out_of_range, seen_nums = _split_in_out_of_range(
+        all_results, exp_start, exp_end
+    )
+    all_results, corrections = _auto_correct(
+        all_results, out_of_range, seen_nums
+    )
+    if corrections:
+        out_of_range, seen_nums = _split_in_out_of_range(
+            all_results, exp_start, exp_end
+        )
+
+    all_nums = sorted(seen_nums.keys())
+    duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
+    not_detected = [x for x in all_results if not x["detected"]]
+    out_of_range_pages = {r["pdf_page"] for r in out_of_range}
+
+    seq_issues = []
+    prev_num = prev_pdf = None
+    for r in all_results:
+        if not r["detected"] or r.get("type") == "range":
+            prev_num = None
+            continue
+        try:
+            num = int(r["detected"])
+        except ValueError:
+            continue
+        if r["pdf_page"] in out_of_range_pages:
+            continue
+        if prev_num is not None:
+            diff = num - prev_num
+            if diff == 0:
+                seq_issues.append(
+                    ("DUPLICATE", r["pdf_page"], num, prev_pdf, prev_num)
+                )
+            elif diff < 0:
+                seq_issues.append(
+                    ("BACKWARD", r["pdf_page"], num, prev_pdf, prev_num)
+                )
+            elif diff > 2:
+                seq_issues.append(
+                    ("GAP", r["pdf_page"], num, prev_pdf, prev_num,
+                     list(range(prev_num + 1, num)))
+                )
+        prev_num = num
+        prev_pdf = r["pdf_page"]
+
+    if exp_start is not None and exp_end is not None:
+        expected = set(range(exp_start, exp_end + 1))
+        found = {n for n in seen_nums if exp_start <= n <= exp_end}
+        missing_pages = sorted(expected - found)
+    else:
+        missing_pages = []
+
+    ranges_found = [r for r in all_results if r.get("type") == "range"]
+
+    analysis = {
+        "total_pages": total,
+        "results": all_results,
+        "seen_nums": seen_nums,
+        "all_nums": all_nums,
+        "duplicates": duplicates,
+        "not_detected": not_detected,
+        "seq_issues": seq_issues,
+        "missing_pages": missing_pages,
+        "ranges_found": ranges_found,
+    }
+
+    result = _build_issues(analysis, total, exp_start, exp_end)
+
+    scan.refresh_from_db()
+    scan.page_count = total
+    scan.page_map = json.dumps(result.get("page_map", []))
+    scan.missing_pages = json.dumps(result.get("missing_pages", []))
+    scan.ocr_results = json.dumps(all_results)
+    scan.has_issues = len(result.get("issues", [])) > 0
+    scan.checked = True
+    scan.status = Status.APPROVED
+    scan.progress_message = "Done"
+    scan.save()
+
+    Issue.objects.filter(scan=scan).exclude(
+        check_name="suppress_detection"
+    ).delete()
+    Issue.objects.bulk_create(
+        [Issue(scan=scan, **d) for d in result.get("issues", [])]
+    )
+
+
 def run_reprocess(scan_pk):
     """Apply PDF fixes (inserts/deletions) using smart edits.
 
-    Instead of nuking all derived files and re-running the full pipeline,
-    this applies deletes/inserts to all PDFs, shifts detection indices,
-    and re-runs only PaddleOCR validation + opinion pairing.
+    Only OCRs newly inserted pages. Deleted pages are removed from
+    ocr_results. Manual page assignments are preserved.
 
     Designed to run in a background thread.
     """
@@ -1336,14 +1255,23 @@ def run_reprocess(scan_pk):
         has_inserts = scan.inserts.exists()
 
         if not has_deletions and not has_inserts:
-            # Nothing to do — just re-validate
-            _update_progress(scan_pk, "Re-validating...")
-            run_paddleocr_validation(scan_pk, scan.pdf_path)
+            # Nothing changed — just rebuild issues from existing results
+            _update_progress(scan_pk, "Re-checking...")
+            all_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+            _rebuild_issues_from_results(scan_pk, all_results)
             _re_pair_opinions(scan_pk)
             return
 
         output_dir = Path(scan.output_dir) if scan.output_dir else None
         page_map = json.loads(scan.page_map) if scan.page_map else []
+        all_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+
+        # Stale margin/redaction rects are indexed by old page positions — delete them
+        if output_dir:
+            for stale in ("margin_rects.json", "redaction_rects.json"):
+                stale_path = output_dir / stale
+                if stale_path.exists():
+                    stale_path.unlink()
 
         # Apply deletions (process in reverse order to keep indices stable)
         if has_deletions:
@@ -1367,7 +1295,16 @@ def run_reprocess(scan_pk):
                     scan_id=scan_pk, page_index__gt=page_idx
                 ).update(page_index=F("page_index") - 1)
 
+                # Remove from ocr_results and shift pdf_page numbers
+                all_results = [r for r in all_results if r["pdf_page"] != pdf_page]
+                for r in all_results:
+                    if r["pdf_page"] > pdf_page:
+                        r["pdf_page"] -= 1
+
             scan.deletions.all().delete()
+
+        # Track which pdf_pages need OCR (newly inserted)
+        new_page_indices = []
 
         # Apply inserts
         if has_inserts:
@@ -1382,9 +1319,30 @@ def run_reprocess(scan_pk):
                 if logical_num not in inserts:
                     continue
                 insert_obj = inserts[logical_num]
+
+                # Record the page index before insert shifts things
+                pdf = fitz.open(scan.pdf_path)
+                pre_count = pdf.page_count
+                pdf.close()
+
                 run_smart_insert(
                     scan_pk, logical_num, insert_obj.image.path
                 )
+
+                pdf = fitz.open(scan.pdf_path)
+                post_count = pdf.page_count
+                pdf.close()
+
+                if post_count > pre_count:
+                    # Figure out where it was inserted
+                    # Smart insert puts it at the right position based on
+                    # logical page number. The new page's pdf_page is its
+                    # 1-based position.
+                    new_idx = post_count  # last page (1-based)
+                    # Actually find it — it's the page that wasn't there before
+                    # For simplicity, just track the new page count
+                    new_page_indices.append(post_count - 1)  # 0-based
+
             scan.inserts.all().delete()
 
         # Update page count
@@ -1393,18 +1351,67 @@ def run_reprocess(scan_pk):
         pdf.close()
         Scan.objects.filter(pk=scan_pk).update(page_count=new_count)
 
-        # Sync detections and re-validate
+        # OCR only the newly inserted pages
+        if new_page_indices:
+            _update_progress(scan_pk, f"OCR on {len(new_page_indices)} new page(s)...")
+            os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+            from paddleocr import PaddleOCR
+            ocr = PaddleOCR(
+                text_detection_model_name="PP-OCRv5_server_det",
+                text_recognition_model_name="PP-OCRv5_server_rec",
+                use_textline_orientation=False,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+            )
+            scan.refresh_from_db()
+            exp_start = scan.start_page or 1
+            exp_end = scan.end_page
+
+            for page_idx in new_page_indices:
+                result = _ocr_page_number(
+                    ocr, scan.pdf_path, page_idx, exp_start, exp_end,
+                    scan_pk=scan_pk,
+                )
+                # Insert into all_results at the right position
+                pdf_page = page_idx + 1
+                # Shift existing results at or after this position
+                for r in all_results:
+                    if r["pdf_page"] >= pdf_page:
+                        r["pdf_page"] += 1
+                # Find insertion point
+                insert_at = len(all_results)
+                for idx, r in enumerate(all_results):
+                    if r["pdf_page"] > pdf_page:
+                        insert_at = idx
+                        break
+                all_results.insert(insert_at, result)
+
+        # Ensure all_results covers every page (fill gaps for safety)
+        existing_pages = {r["pdf_page"] for r in all_results}
+        for p in range(1, new_count + 1):
+            if p not in existing_pages:
+                all_results.append({
+                    "pdf_page": p, "detected": None,
+                    "type": "missing_ocr", "zone": "none",
+                    "score": 0, "ocr": "skipped",
+                })
+        all_results.sort(key=lambda r: r["pdf_page"])
+
+        # Sync detections and rebuild issues
         if output_dir:
             _sync_detections_to_disk(scan_pk)
 
-        _update_progress(scan_pk, "Re-validating...")
-        run_paddleocr_validation(scan_pk, scan.pdf_path)
+        _update_progress(scan_pk, "Rebuilding issues...")
+        _rebuild_issues_from_results(scan_pk, all_results)
         _re_pair_opinions(scan_pk)
 
         if output_dir:
             pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
             _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
-            _compute_and_save_margin_rects(pdf_path, str(output_dir))
+            # Delete stale margin rects — will be recomputed lazily when viewer requests them
+            stale_margins = Path(output_dir) / "margin_rects.json"
+            if stale_margins.exists():
+                stale_margins.unlink()
 
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.APPROVED,
@@ -1469,7 +1476,6 @@ def run_smart_delete(scan_pk, pdf_page):
     if output_dir:
         pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
         _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
-        _compute_and_save_margin_rects(pdf_path, str(output_dir))
 
 
 def run_smart_insert(scan_pk, logical_page_number, image_path):
@@ -1535,7 +1541,6 @@ def run_smart_insert(scan_pk, logical_page_number, image_path):
     if output_dir:
         pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
         _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
-        _compute_and_save_margin_rects(pdf_path, str(output_dir))
 
 
 def _collect_pdf_paths(scan, output_dir):
@@ -1558,12 +1563,15 @@ def _collect_pdf_paths(scan, output_dir):
 
 
 def _stamp_original_images(scan, ocr_pdf_path):
-    """Overlay original-quality image regions onto the OCR'd (bitonal) PDF.
+    """Overlay original-quality image regions onto a *copy* of the OCR'd PDF.
 
     For each active IMAGE detection, renders the bounding box from the
-    original scan PDF and inserts it into the OCR'd PDF at the same
-    position.  This preserves full-quality photographs/illustrations
+    original scan PDF and inserts it into a copy of the OCR'd PDF at the
+    same position.  This preserves full-quality photographs/illustrations
     that would otherwise be degraded by bitonal conversion.
+
+    Returns the path to the stamped copy, or the original path if no
+    images needed stamping (so the OCR PDF is never modified).
     """
     from scanning.models import Detection
 
@@ -1573,7 +1581,9 @@ def _stamp_original_images(scan, ocr_pdf_path):
         .values("page_index", "x0", "y0", "x1", "y1", "img_width", "img_height")
     )
     if not image_dets:
-        return
+        return ocr_pdf_path
+
+    stamped_path = os.path.join(os.path.dirname(ocr_pdf_path), "stamped.pdf")
 
     original_doc = fitz.open(scan.pdf_path)
     ocr_doc = fitz.open(ocr_pdf_path)
@@ -1608,12 +1618,11 @@ def _stamp_original_images(scan, ocr_pdf_path):
             # Stamp onto the OCR'd PDF
             ocr_page.insert_image(pdf_rect, stream=png_bytes)
 
-        tmp_path = ocr_pdf_path + ".tmp"
-        ocr_doc.save(tmp_path, garbage=3, deflate=True)
+        ocr_doc.save(stamped_path, garbage=3, deflate=True)
     finally:
         original_doc.close()
         ocr_doc.close()
-    shutil.move(tmp_path, ocr_pdf_path)
+    return stamped_path
 
 
 def run_generate_files(scan_pk):
@@ -1642,8 +1651,8 @@ def run_generate_files(scan_pk):
         if not ocr_pdf:
             raise ValueError("No OCR'd PDF found in output directory")
 
-        # Stamp original-quality images into the OCR'd PDF before generation
-        _stamp_original_images(scan, str(ocr_pdf))
+        # Stamp original-quality images into a copy — leaves OCR PDF untouched
+        gen_pdf = _stamp_original_images(scan, str(ocr_pdf))
 
         # Write current DB detections -> detections.json (includes page numbers)
         det_data = _sync_detections_to_disk(scan_pk)
@@ -1666,7 +1675,7 @@ def run_generate_files(scan_pk):
         )
         output = Path(scan.output_dir if scan.output_dir else str(output_base))
         generate_files(
-            ocr_pdf=str(ocr_pdf),
+            ocr_pdf=str(gen_pdf),
             output=output,
             reporter=reporter,
             volume=volume,

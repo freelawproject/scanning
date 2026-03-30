@@ -50,7 +50,7 @@ def find_ocr_pdf(output_dir):
     """
     for f in sorted(Path(output_dir).glob("*.pdf")):
         if (
-            f.name not in ("bitonal.pdf",)
+            f.name not in ("bitonal.pdf", "stamped.pdf")
             and not f.name.endswith(".redacted.pdf")
             and not f.name.endswith(".original.pdf")
             and "redacted" not in f.name
