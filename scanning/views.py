@@ -1252,6 +1252,13 @@ def serve_redaction_rects(request, pk):
 @login_required
 @require_POST
 def save_redaction_rect(request, pk):
+    """Create, update, or delete a redaction rectangle on disk.
+
+    :param request: The HTTP request (JSON body with page_index,
+        action, original, adjusted, type, and fill).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the operation.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     data = json.loads(request.body)
     page_idx = data["page_index"]
@@ -1321,6 +1328,13 @@ def save_redaction_rect(request, pk):
 @login_required
 @require_POST
 def save_margin_rect(request, pk):
+    """Update or delete a margin rectangle on disk.
+
+    :param request: The HTTP request (JSON body with page_index,
+        action, original, and adjusted).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the operation.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     data = json.loads(request.body)
     page_idx = data["page_index"]
@@ -1371,6 +1385,12 @@ def save_margin_rect(request, pk):
 @login_required
 @require_POST
 def pair_opinions_api(request, pk):
+    """Run opinion pairing on detections and save the result.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON response with paired opinions and coverage gaps.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.output_dir:
         return JsonResponse({"error": "No output directory"}, status=400)
@@ -1434,6 +1454,12 @@ def pair_opinions_api(request, pk):
 @login_required
 @require_POST
 def compute_redactions_api(request, pk):
+    """Compute and save redaction and margin rectangles for a scan.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON response with page and rect counts.
+    """
     from scanning.services import (
         _compute_and_save_margin_rects,
         _compute_and_save_redaction_rects,
@@ -1463,6 +1489,12 @@ def compute_redactions_api(request, pk):
 @login_required
 @require_POST
 def generate_files(request, pk):
+    """Queue a scan for opinion file generation (step 4).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page (step 4).
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.status in (Status.PROCESSING, Status.QUEUED):
         return redirect(f"/scans/{scan.pk}/process/?step=4")
@@ -1477,6 +1509,12 @@ def generate_files(request, pk):
 @login_required
 @require_POST
 def approve_scan(request, pk):
+    """Mark a scan as approved and redirect to the scan list.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan list.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     scan.stage = Stage.APPROVED
     scan.save()
@@ -1485,6 +1523,13 @@ def approve_scan(request, pk):
 
 @login_required
 def serve_opinion_pdf(request, pk, filename):
+    """Serve a redacted opinion PDF by filename.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param filename: Name of the PDF file in the redacted directory.
+    :return: File response streaming the PDF.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.output_dir:
         return HttpResponse("No output directory", status=404)
@@ -1496,6 +1541,13 @@ def serve_opinion_pdf(request, pk, filename):
 
 @login_required
 def serve_unredacted_opinion_pdf(request, pk, filename):
+    """Serve an unredacted opinion PDF by filename.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param filename: Name of the PDF file in the unredacted directory.
+    :return: File response streaming the PDF.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.output_dir:
         return HttpResponse("No output directory", status=404)
@@ -1507,6 +1559,13 @@ def serve_unredacted_opinion_pdf(request, pk, filename):
 
 @login_required
 def serve_masked_opinion_pdf(request, pk, filename):
+    """Serve a masked opinion PDF by filename.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param filename: Name of the PDF file in the masked directory.
+    :return: File response streaming the PDF.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.output_dir:
         return HttpResponse("No output directory", status=404)
@@ -1517,7 +1576,17 @@ def serve_masked_opinion_pdf(request, pk, filename):
 
 
 def _apply_rect_to_pdf(pdf_path: str, page_index: int, x0: float, y0: float, x1: float, y1: float, fill: str) -> None:
-    """Apply a redaction rectangle directly to a PDF file on disk."""
+    """Apply a redaction rectangle directly to a PDF file on disk.
+
+    :param pdf_path: Filesystem path to the PDF to modify.
+    :param page_index: Zero-based page index.
+    :param x0: Left coordinate of the rectangle.
+    :param y0: Top coordinate of the rectangle.
+    :param x1: Right coordinate of the rectangle.
+    :param y1: Bottom coordinate of the rectangle.
+    :param fill: Fill color, either ``"black"`` or ``"white"``.
+    :return: None.
+    """
     doc = fitz.open(pdf_path)
     if page_index < 0 or page_index >= doc.page_count:
         doc.close()
@@ -1542,6 +1611,14 @@ def _apply_rect_to_pdf(pdf_path: str, page_index: int, x0: float, y0: float, x1:
 @login_required
 @require_POST
 def apply_rect_to_opinion(request, pk, opinion_pk):
+    """Apply a redaction rectangle to an opinion's redacted and masked PDFs.
+
+    :param request: The HTTP request (JSON body with page_index,
+        x0, y0, x1, y1, and fill).
+    :param pk: Scan primary key.
+    :param opinion_pk: OpinionScan primary key.
+    :return: JSON response confirming the operation.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     opinion = get_object_or_404(OpinionScan, pk=opinion_pk, scan=scan)
     data = json.loads(request.body)
@@ -1578,6 +1655,12 @@ def apply_rect_to_opinion(request, pk, opinion_pk):
 
 @login_required
 def serve_redacted_pdf(request, pk):
+    """Serve the redacted PDF for a scan, falling back to any available PDF.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: File response streaming the PDF.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.redacted_pdf_path and os.path.isfile(scan.redacted_pdf_path):
         return FileResponse(
@@ -1596,6 +1679,12 @@ def serve_redacted_pdf(request, pk):
 
 @login_required
 def serve_ocr_results(request, pk):
+    """Return OCR page-number results for a scan as JSON.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON response with a list of OCR result dicts.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.ocr_results:
         return JsonResponse(json.loads(scan.ocr_results), safe=False)
@@ -1605,6 +1694,13 @@ def serve_ocr_results(request, pk):
 @login_required
 @require_POST
 def flag_issue(request, pk):
+    """Create a user-flagged issue on a scan.
+
+    :param request: The HTTP request (JSON body with message,
+        page_number, and metadata).
+    :param pk: Scan primary key.
+    :return: JSON response with the new issue ID.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     data = json.loads(request.body)
     message = data.get("message", "").strip()
@@ -1635,6 +1731,13 @@ def flag_issue(request, pk):
 @login_required
 @require_POST
 def remove_flag(request, pk, flag_id):
+    """Remove a user-flagged issue from a scan.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param flag_id: Primary key of the Issue to remove.
+    :return: JSON response confirming removal.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     Issue.objects.filter(
         pk=flag_id,
@@ -1652,6 +1755,13 @@ def remove_flag(request, pk, flag_id):
 @login_required
 @require_POST
 def delete_detection(request, pk):
+    """Deactivate a detection in the database and remove it from disk.
+
+    :param request: The HTTP request (JSON body with page_index,
+        label, label_id, and bbox).
+    :param pk: Scan primary key.
+    :return: JSON response with the count of deactivated detections.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     data = json.loads(request.body)
     page_index = data["page_index"]
@@ -1696,6 +1806,13 @@ def delete_detection(request, pk):
 @login_required
 @require_POST
 def add_single_detection(request, pk):
+    """Add or boost a single detection for a scan.
+
+    :param request: The HTTP request (JSON body with page_index,
+        label_id, bbox, img_width, and img_height).
+    :param pk: Scan primary key.
+    :return: JSON response indicating whether a new detection was added.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     det = json.loads(request.body)
     output_base = get_output_base(scan)
@@ -1757,6 +1874,12 @@ def add_single_detection(request, pk):
 @login_required
 @require_POST
 def bake_redactions(request, pk):
+    """Bake pending redaction rectangles into the scan PDF (no-op stub).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON response with the bake result.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.output_dir:
         return JsonResponse(
@@ -1769,6 +1892,12 @@ def bake_redactions(request, pk):
 
 @login_required
 def export_pdf(request, pk):
+    """Export a corrected PDF with deletions and inserts applied.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: PDF file download response.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     pdf_doc = fitz.open(scan.pdf_path)
     page_map = json.loads(scan.page_map) if scan.page_map else []
