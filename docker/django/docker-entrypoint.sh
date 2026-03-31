@@ -16,6 +16,13 @@ case "$1" in
     echo ""
     exec python manage.py runserver 0.0.0.0:8000
     ;;
+'run_daemon')
+    # Install blackletter from local mount if available
+    if [ -d /opt/blackletter ]; then
+        uv pip install -e /opt/blackletter 2>/dev/null || pip install -e /opt/blackletter 2>/dev/null || true
+    fi
+    exec python manage.py run_daemon
+    ;;
 'web-prod')
     exec gunicorn scanning.asgi:application \
         --chdir /opt/scanning/ \

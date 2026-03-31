@@ -1,0 +1,128 @@
+"""Daemon that polls for queued scans and processes them one at a time."""
+
+import logging
+import signal
+import time
+
+from django.conf import settings
+from django.core.management.base import BaseCommand
+
+logger = logging.getLogger(__name__)
+
+
+class Command(BaseCommand):
+    help = "Run the scanning daemon that polls for queued scans."
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.shutdown = False
+
+    def handle(self, *args, **options):
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+
+        interval = settings.DAEMON_POLL_INTERVAL
+        timeout = settings.DAEMON_PROCESSING_TIMEOUT
+        self.stdout.write(
+            f"Daemon started, polling every {interval}s, "
+            f"stale timeout {timeout}s"
+        )
+
+        while not self.shutdown:
+            try:
+                self._recover_stale()
+                self._process_next()
+            except Exception:
+                logger.exception("Daemon loop error")
+            time.sleep(interval)
+
+        self.stdout.write("Daemon shutting down.")
+
+    def _recover_stale(self):
+        """Reset scans stuck in PROCESSING past the timeout back to QUEUED."""
+        from django.conf import settings
+        from django.utils import timezone
+        from datetime import timedelta
+
+        from scanning.models import Scan, Status
+
+        cutoff = timezone.now() - timedelta(
+            seconds=settings.DAEMON_PROCESSING_TIMEOUT
+        )
+        stale = Scan.objects.filter(
+            status=Status.PROCESSING,
+            processed_at__lt=cutoff,
+        )
+        for scan in stale:
+            self.stdout.write(
+                f"Recovering stale scan {scan.pk} "
+                f"(processing since {scan.processed_at})"
+            )
+            Scan.objects.filter(pk=scan.pk).update(
+                status=Status.QUEUED,
+                progress_message="Re-queued (previous attempt timed out)",
+            )
+
+    def _process_next(self):
+        from django.db import connections
+        from django.utils import timezone
+
+        from scanning.models import Scan, Status
+        from scanning import services
+
+        # Close stale DB connections before each cycle
+        connections.close_all()
+
+        scan = (
+            Scan.objects.filter(status=Status.QUEUED)
+            .order_by("date_created")
+            .first()
+        )
+        if scan is None:
+            return
+
+        action = scan.queued_action or "full_pipeline"
+        self.stdout.write(f"Processing scan {scan.pk} ({action})")
+
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.PROCESSING,
+            processed_at=timezone.now(),
+            progress_message=f"Starting {action}...",
+            progress_current=0,
+            progress_total=0,
+        )
+
+        dispatch = {
+            "full_pipeline": services.run_full_pipeline,
+            "validate": services.run_validate_with_bitonal,
+            "detect": services.run_detect,
+            "reprocess": services.run_reprocess,
+            "generate_files": services.run_generate_files,
+        }
+
+        fn = dispatch.get(action)
+        if fn is None:
+            logger.error("Unknown queued_action %r for scan %s", action, scan.pk)
+            Scan.objects.filter(pk=scan.pk).update(
+                status=Status.ERROR,
+                progress_message=f"Unknown action: {action}",
+            )
+            return
+
+        try:
+            fn(scan.pk)
+        except Exception:
+            logger.exception("Scan %s (%s) failed", scan.pk, action)
+            # Only set ERROR if the pipeline didn't already handle it
+            current = Scan.objects.filter(pk=scan.pk).values_list(
+                "status", flat=True
+            ).first()
+            if current == Status.PROCESSING:
+                Scan.objects.filter(pk=scan.pk).update(
+                    status=Status.ERROR,
+                    progress_message="Unexpected error (check logs)",
+                )
+
+    def _handle_signal(self, signum, frame):
+        self.stdout.write(f"Received signal {signum}, shutting down...")
+        self.shutdown = True

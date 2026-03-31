@@ -34,6 +34,28 @@ services:
     command: sh -c 'npm install && npm run dev'
     tty: true
 
+  # Background daemon — run locally for dev (PaddlePaddle segfaults under x86 emulation):
+  #   DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer uv run python manage.py run_daemon
+  # scanning-daemon:
+  #   container_name: scanning-daemon
+  #   platform: linux/amd64
+  #   build:
+  #     context: "${SCANNING_BASE_DIR:-../../}"
+  #     dockerfile: "./docker/django/Dockerfile"
+  #     args:
+  #       BUILD_ENV: dev
+  #   command: run_daemon
+  #   depends_on:
+  #     scanning-postgres:
+  #       condition: service_healthy
+  #   user: root
+  #   volumes:
+  #     - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
+  #   networks:
+  #     - scanning_net
+  #   env_file:
+  #     - ../../.env.dev
+
   # Django dev server
   scanning-django:
     container_name: scanning-django
@@ -52,7 +74,7 @@ services:
     user: root
     volumes:
       - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
-      - ${BLACKLETTER_DIR:-../../../blackletter}:/opt/blackletter
+#      - ${BLACKLETTER_DIR:-../../../blackletter}:/opt/blackletter
     networks:
       - scanning_net
     env_file:
