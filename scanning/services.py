@@ -1,37 +1,49 @@
 """Background processing pipelines and business logic.
 
-Functions in this module run outside the request/response cycle, typically
-in background threads.  They must NOT import Django HTTP machinery
+Functions in this module run outside the request/response cycle, in the
+daemon process.  They must NOT import Django HTTP machinery
 (HttpResponse, render, redirect, etc.).
 """
 
+import django
+import traceback
+
+from pathlib import Path
+from scanning.utils import find_ocr_pdf
+from scanning.models import Detection
 import json
 import os
 import re
 import shutil
-import subprocess
-import sys
-import tempfile
-import threading
-import time as _time
 from pathlib import Path
+
+import re as re_mod
+from collections import Counter
 
 import fitz
 from django.conf import settings
 from django.db.models import F
 
 from blackletter.analyze import (
-    CROP_FRAC,
     DEFAULT_ANALYZE_MODEL,
-    MIN_SCORE,
-    _ocr_crop_multi,
-    _pick_best,
     _process_page,
-    _scan_crop,
+    analyze_pdf as bl_analyze_pdf,
 )
-from blackletter.api import bitonal as bl_bitonal, ocr as bl_ocr, pair as bl_pair
+from blackletter.api import (
+    bitonal as bl_bitonal,
+    detect as bl_detect,
+    ocr as bl_ocr,
+    pair as bl_pair,
+)
+from blackletter.models import (
+    BBox,
+    Detection as BLDetection,
+    Document as BLDoc,
+    Label,
+    Page,
+)
+
 from blackletter.margins import compute_margin_rects
-from blackletter.models import Label
 from blackletter.process import generate_files, compute_redaction_rects
 from blackletter.scanner import _pair_opinions
 from blackletter.validate import (
@@ -51,49 +63,9 @@ from scanning.models import (
     Stage,
     Status,
 )
-from scanning.utils import find_ocr_pdf, get_output_base
+import shutil
 
-
-class ProcessingCancelled(Exception):
-    pass
-
-
-# Map scan_pk → list of active subprocess PIDs for cancellation.
-_active_processes = {}
-_active_processes_lock = threading.Lock()
-
-
-def _register_process(scan_pk, proc):
-    """Track a subprocess so it can be killed on cancel."""
-    with _active_processes_lock:
-        _active_processes.setdefault(scan_pk, []).append(proc)
-
-
-def _unregister_process(scan_pk, proc):
-    """Remove a subprocess from tracking."""
-    with _active_processes_lock:
-        pids = _active_processes.get(scan_pk, [])
-        if proc in pids:
-            pids.remove(proc)
-
-
-def kill_active_processes(scan_pk):
-    """Kill all tracked subprocesses for a scan, plus their children."""
-    import signal
-
-    with _active_processes_lock:
-        procs = _active_processes.pop(scan_pk, [])
-
-    for proc in procs:
-        try:
-            # Kill the entire process group (catches tesseract workers)
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            pass
-        try:
-            proc.kill()
-        except (OSError, ProcessLookupError):
-            pass
+from scanning.utils import find_ocr_pdf
 
 
 # ---------------------------------------------------------------------------
@@ -102,13 +74,7 @@ def kill_active_processes(scan_pk):
 
 
 def _update_progress(scan_pk, message, current=None, total=None, **kwargs):
-    """Update scan progress fields. Raises ProcessingCancelled if scan was cancelled."""
-    # Check for cancellation before updating
-    status = Scan.objects.filter(pk=scan_pk).values_list("status", flat=True).first()
-    if status == Status.CANCELLED:
-        kill_active_processes(scan_pk)
-        raise ProcessingCancelled(f"Scan {scan_pk} cancelled by user")
-
+    """Update scan progress fields."""
     updates = {"progress_message": message[:255]}
     if current is not None:
         updates["progress_current"] = current
@@ -118,99 +84,22 @@ def _update_progress(scan_pk, message, current=None, total=None, **kwargs):
     Scan.objects.filter(pk=scan_pk).update(**updates)
 
 
-def _run_ocr_subprocess(scan_pk, bitonal_path, output_dir, reporter, volume, first_page):
-    """Run Tesseract OCR as a subprocess so it can be killed on cancel.
-
-    Returns the path to the OCR'd PDF.
-    """
-    script = f"""
-import sys
-sys.path.insert(0, ".")
-from blackletter.api import ocr as bl_ocr
-result = bl_ocr(
-    "{bitonal_path}", "{output_dir}",
-    reporter="{reporter}",
-    volume="{volume}",
-    first_page={first_page},
-)
-print("OCR_OUTPUT:" + str(result), flush=True)
-"""
-    proc = subprocess.Popen(
-        [sys.executable, "-c", script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        cwd=str(Path(settings.INSTALL_ROOT)),
-        start_new_session=True,
+def _run_ocr(scan_pk, bitonal_path, output_dir, reporter, volume, first_page):
+    """Run Tesseract OCR via blackletter. Returns path to OCR'd PDF."""
+    _update_progress(scan_pk, "Running Tesseract OCR...")
+    return bl_ocr(
+        bitonal_path, output_dir,
+        reporter=reporter, volume=volume, first_page=first_page,
     )
-    _register_process(scan_pk, proc)
-    try:
-        while proc.poll() is None:
-            _time.sleep(2)
-            # Check for cancellation
-            status = Scan.objects.filter(pk=scan_pk).values_list("status", flat=True).first()
-            if status == Status.CANCELLED:
-                kill_active_processes(scan_pk)
-                raise ProcessingCancelled(f"Scan {scan_pk} cancelled by user")
-
-        stdout = proc.stdout.read().decode(errors="replace") if proc.stdout else ""
-        if proc.returncode != 0:
-            raise RuntimeError(f"OCR failed (exit {proc.returncode}): {stdout[-500:]}")
-
-        # Extract output path from stdout
-        for line in stdout.strip().split("\n"):
-            if line.startswith("OCR_OUTPUT:"):
-                return Path(line.split("OCR_OUTPUT:", 1)[1].strip())
-
-        # Fallback: find the OCR PDF in the output dir
-        from scanning.utils import find_ocr_pdf
-        return find_ocr_pdf(output_dir)
-    finally:
-        _unregister_process(scan_pk, proc)
 
 
-def _run_yolo_subprocess(scan_pk, pdf_path, output_dir):
-    """Run YOLO detection as a subprocess (all 3 models).
+def _run_yolo(scan_pk, pdf_path, output_dir):
+    """Run YOLO detection (all 3 models) via blackletter.
 
-    Saves detections.json to output_dir. Blocks until complete.
+    Saves detections.json to output_dir.
     """
-    script = f"""
-import os
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-from blackletter.api import detect as bl_detect
-dets = bl_detect("{pdf_path}", "{output_dir}", models=["small", "medium", "large"])
-print(f"\\nDetect complete: {{len(dets)}} detections", flush=True)
-"""
-    log_path = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk) / "detect.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    _update_progress(scan_pk, "Running YOLO detection...", progress_log="")
-    proc = subprocess.Popen(
-        [sys.executable, "-c", script],
-        stdout=open(log_path, "w"),
-        stderr=subprocess.STDOUT,
-        cwd=str(Path(settings.INSTALL_ROOT)),
-        start_new_session=True,
-    )
-    _register_process(scan_pk, proc)
-    try:
-        while proc.poll() is None:
-            _time.sleep(1)
-            try:
-                log_text = log_path.read_text(errors="replace").replace("\x00", "")
-                lines = [l for l in log_text.strip().split("\n") if l.strip()]
-                msg = lines[-1].strip() if lines else "Running YOLO detection..."
-                _update_progress(scan_pk, msg, progress_log=log_text[-5000:])
-            except ProcessingCancelled:
-                raise
-            except Exception:
-                pass
-
-        log_text = log_path.read_text(errors="replace").replace("\x00", "")
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"YOLO detection failed (exit {proc.returncode}): {log_text[-500:]}"
-            )
-    finally:
-        _unregister_process(scan_pk, proc)
+    _update_progress(scan_pk, "Running YOLO detection...")
+    bl_detect(pdf_path, output_dir, models=["small", "medium", "large"])
 
 
 def _import_detections_from_json(scan_pk, output_dir):
@@ -310,13 +199,6 @@ def _build_document_from_detections(scan, det_data, pdf_path):
 
     Returns (document, opinions) tuple.
     """
-    from blackletter.models import (
-        BBox,
-        Detection as BLDetection,
-        Document as BLDoc,
-        Page,
-    )
-
     src_pdf = fitz.open(str(pdf_path))
     pages_data = {}
     for entry in det_data:
@@ -488,253 +370,76 @@ def _re_pair_opinions(scan_pk):
 # ---------------------------------------------------------------------------
 
 
-def _ocr_page_number(ocr, pdf_path, page_idx, exp_start, exp_end,
-                     scan_pk=None):
-    """Detect page number on a single page using PaddleOCR.
-
-    If scan_pk is provided, uses existing YOLO PAGE_NUMBER and PAGE_HEADER
-    detection boxes to guide the crop — much faster and more accurate than
-    blind corner crops. Falls back to corner crops only when no detection
-    boxes exist for this page.
-
-    Returns a dict with keys: pdf_page, detected, zone, type, score, ocr.
-    """
-    import io
-    from PIL import Image
-
-    PAGE_NUMBER_ID = 8
-    PAGE_HEADER_ID = 2
-
-    pdf = fitz.open(pdf_path)
-    page = pdf[page_idx]
-    pix = page.get_pixmap(dpi=200)
-    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-    img_w, img_h = img.size
-    pdf.close()
-
-    def img_to_bytes(pil_img):
-        buf = io.BytesIO()
-        pil_img.save(buf, format="PNG")
-        return buf.getvalue()
-
-    page_num = None
-
-    # Strategy 1: Use YOLO detection boxes if we have them
-    if scan_pk is not None:
-        dets = Detection.objects.filter(
-            scan_id=scan_pk, page_index=page_idx, active=True,
-            label_id__in=[PAGE_NUMBER_ID, PAGE_HEADER_ID],
-        ).order_by("-confidence")
-
-        pn_dets = [d for d in dets if d.label_id == PAGE_NUMBER_ID]
-        hdr_dets = [d for d in dets if d.label_id == PAGE_HEADER_ID]
-
-        # 1a) PAGE_NUMBER boxes — crop and OCR each
-        pad = 10
-        for d in pn_dets:
-            if d.y0 < 5 or d.y1 > img_h - 5:
-                continue
-            crop = img.crop((
-                max(0, int(d.x0) - pad),
-                max(0, int(d.y0) - pad),
-                min(img_w, int(d.x1) + pad),
-                min(img_h, int(d.y1) + pad),
-            ))
-            if crop.size[0] < 30 or crop.size[1] < 30:
-                continue
-            result = _ocr_crop_multi(
-                ocr, None, None, crop, "yolo-pn",
-                page_idx, exp_start, exp_end,
-            )
-            if result:
-                page_num = result
-                break
-
-        # 1b) PAGE_HEADER box — crop left/right sides for page number
-        if not page_num and hdr_dets:
-            best = hdr_dets[0]
-            top = max(0, int(best.y0) - pad)
-            bot = min(img_h, int(best.y1) + pad)
-            for side_crop, sname in [
-                (img.crop((0, top, max(1, int(best.x0)), bot)), "hdr-L"),
-                (img.crop((min(img_w - 1, int(best.x1welll)), top, img_w, bot)), "hdr-R"),
-            ]:
-                if side_crop.size[0] < 10:
-                    continue
-                result = _ocr_crop_multi(
-                    ocr, None, None, side_crop, sname,
-                    page_idx, exp_start, exp_end,
-                )
-                if result:
-                    page_num = result
-                    break
-
-    # Strategy 2: Fall back to corner crops (no detection boxes)
-    if not page_num:
-        crop_h = int(img_h * CROP_FRAC)
-        half_w = img_w // 2
-        candidates = []
-        for crop, cname, x_off in [
-            (img.crop((0, 0, half_w, crop_h)), "corner-L", 0),
-            (img.crop((half_w, 0, img_w, crop_h)), "corner-R", half_w),
-        ]:
-            hits, _ = _scan_crop(
-                ocr, img_to_bytes(crop), cname, page_idx, x_offset=x_off,
-            )
-            candidates.extend(hits)
-        result = _pick_best(candidates, img_w, img_h, exp_start, exp_end)
-
-        if not result or result["score"] < MIN_SCORE:
-            top_crop = img.crop((0, 0, img_w, crop_h))
-            hits, _ = _scan_crop(
-                ocr, img_to_bytes(top_crop), "top", page_idx,
-            )
-            candidates.extend(hits)
-            result = _pick_best(candidates, img_w, img_h, exp_start, exp_end)
-
-        if result:
-            page_num = result
-
-    return {
-        "pdf_page": page_idx + 1,
-        "detected": page_num["text"] if page_num else None,
-        "zone": page_num.get("zone") if page_num else None,
-        "type": page_num.get("type") if page_num else None,
-        "score": page_num.get("score") if page_num else None,
-        "ocr": page_num.get("ocr", "paddle") if page_num else None,
-        "detections": [],
-        "img_width": img_w,
-        "img_height": img_h,
-    }
-
-
 def run_paddleocr_validation(scan_pk, pdf_path):
-    """Validate page numbers using PaddleOCR guided by existing detections.
+    """Validate page numbers using blackletter's analyze_pdf.
 
-    Uses PAGE_NUMBER and PAGE_HEADER detection boxes from the DB to guide
-    OCR crops. Falls back to corner crops for pages without detection boxes.
-    Much faster and more accurate than running YOLO again.
+    Delegates all OCR/YOLO work to blackletter, keeping only the Django-
+    specific parts here: progress updates, cancellation checks, and saving
+    results to the DB.
     """
-    os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-    from paddleocr import PaddleOCR
-
     scan = Scan.objects.get(pk=scan_pk)
-    total = scan.page_count
-    if not total:
-        pdf = fitz.open(pdf_path)
-        total = pdf.page_count
-        pdf.close()
-
     exp_start = scan.start_page or 1
     exp_end = scan.end_page
 
-    ocr = PaddleOCR(
-        text_detection_model_name="PP-OCRv5_server_det",
-        text_recognition_model_name="PP-OCRv5_server_rec",
-        use_textline_orientation=False,
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
+    def _progress(current, total, message):
+        _update_progress(
+            scan_pk, message,
+            current=current, total=total,
+        )
+
+    result = bl_analyze_pdf(
+        pdf_path,
+        exp_start=exp_start,
+        exp_end=exp_end,
+        num_workers=1,
+        progress_callback=_progress,
     )
 
-    all_results = []
-    for i in range(total):
-        status = (
-            Scan.objects.filter(pk=scan_pk)
-            .values_list("status", flat=True)
-            .first()
-        )
-        if status == Status.CANCELLED:
-            return
-
-        try:
-            result = _ocr_page_number(
-                ocr, pdf_path, i, exp_start, exp_end, scan_pk=scan_pk,
-            )
-        except Exception as exc:
-            import traceback
-            print(f"  Page {i + 1} FAILED: {exc}", flush=True)
-            traceback.print_exc()
-            result = {
-                "pdf_page": i + 1,
-                "detected": None,
-                "type": "error",
-                "zone": "error",
-                "score": 0,
-                "ocr": "paddle",
-                "detections": [],
-                "img_width": 0,
-                "img_height": 0,
-            }
-
-        all_results.append(result)
-
-        detected = result.get("detected")
-        page_status = f"#{detected}" if detected else "no #"
-        _update_progress(
-            scan_pk,
-            f"Page {i + 1}/{total}: {page_status}",
-            current=i + 1,
-            total=total,
-            ocr_results=json.dumps(all_results),
-        )
-
+    all_results = result["results"]
+    Scan.objects.filter(pk=scan_pk).update(
+        ocr_results=json.dumps(all_results),
+    )
     _rebuild_issues_from_results(scan_pk, all_results)
 
 
 def run_incremental_validation(scan_pk, pdf_path):
-    """Validate page by page, saving results incrementally."""
-    os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+    """Run YOLO + PaddleOCR on every page via blackletter's analyze_pdf.
 
+    Saves detections to the DB and updates progress incrementally.
+    """
     scan = Scan.objects.get(pk=scan_pk)
-    total = scan.page_count
-    if not total:
-        pdf = fitz.open(pdf_path)
-        total = pdf.page_count
-        pdf.close()
-
-    model_path = str(DEFAULT_ANALYZE_MODEL)
     exp_start = scan.start_page or 1
     exp_end = scan.end_page
 
     all_results = []
-    all_detections = []
 
-    for i in range(total):
-        status = (
-            Scan.objects.filter(pk=scan_pk)
-            .values_list("status", flat=True)
-            .first()
+    def _progress(current, total, message):
+        _update_progress(
+            scan_pk, message,
+            current=current, total=total,
         )
-        if status == Status.CANCELLED:
-            return
-
-        try:
-            result = _process_page(
-                (i, pdf_path, exp_start, exp_end, model_path)
+        # Store partial results for live display
+        if current <= len(all_results):
+            Scan.objects.filter(pk=scan_pk).update(
+                ocr_results=json.dumps(all_results[:current]),
             )
-        except Exception as exc:
-            import traceback
 
-            print(f"  Page {i + 1} FAILED: {exc}", flush=True)
-            traceback.print_exc()
-            result = {
-                "pdf_page": i + 1,
-                "detected": None,
-                "type": "error",
-                "zone": "error",
-                "score": 0,
-                "ocr": "failed",
-                "detections": [],
-                "img_width": 0,
-                "img_height": 0,
-            }
+    result = bl_analyze_pdf(
+        pdf_path,
+        exp_start=exp_start,
+        exp_end=exp_end,
+        progress_callback=_progress,
+    )
+    all_results = result["results"]
 
-        all_results.append(result)
-
-        page_dets = result.get("detections", [])
-        img_w = result.get("img_width", 0)
-        img_h = result.get("img_height", 0)
-        for d in page_dets:
+    # Save detections from each page result
+    Detection.objects.filter(scan_id=scan_pk).delete()
+    all_detections = []
+    for r in all_results:
+        page_idx = r["pdf_page"] - 1
+        img_w = r.get("img_width", 0)
+        img_h = r.get("img_height", 0)
+        for d in r.get("detections", []):
             try:
                 label_name = Label(d["label_id"]).name
             except (ValueError, KeyError):
@@ -742,7 +447,7 @@ def run_incremental_validation(scan_pk, pdf_path):
             all_detections.append(
                 Detection(
                     scan_id=scan_pk,
-                    page_index=i,
+                    page_index=page_idx,
                     label=label_name,
                     label_id=d["label_id"],
                     confidence=d["confidence"],
@@ -759,22 +464,12 @@ def run_incremental_validation(scan_pk, pdf_path):
                     ),
                 )
             )
+    if all_detections:
+        Detection.objects.bulk_create(all_detections)
 
-        detected = result.get("detected")
-        page_status = f"#{detected}" if detected else "no #"
-        Scan.objects.filter(pk=scan_pk).update(
-            progress_current=i + 1,
-            progress_total=total,
-            progress_message=f"Page {i + 1}/{total}: {page_status}",
-            ocr_results=json.dumps(all_results),
-        )
-
-        if (i + 1) % 10 == 0 or i == total - 1:
-            if all_detections:
-                if i < 10:
-                    Detection.objects.filter(scan_id=scan_pk).delete()
-                Detection.objects.bulk_create(all_detections)
-                all_detections = []
+    Scan.objects.filter(pk=scan_pk).update(
+        ocr_results=json.dumps(all_results),
+    )
 
     if scan.output_dir:
         _sync_detections_to_disk(scan_pk)
@@ -789,8 +484,6 @@ def run_incremental_validation(scan_pk, pdf_path):
 
 def recalculate_issues(scan):
     """Rebuild issues from scan.ocr_results without re-running OCR."""
-    import re as re_mod
-    from collections import Counter
 
     ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
     if not ocr_results:
@@ -993,14 +686,12 @@ def run_validate_with_bitonal(scan_pk):
 
     Designed to run in a background thread.
     """
-    import django
-    import traceback as _tb
     django.db.connections.close_all()
 
     try:
         scan = Scan.objects.get(pk=scan_pk)
     except Exception:
-        _tb.print_exc()
+        traceback.print_exc()
         return
 
     try:
@@ -1036,7 +727,7 @@ def run_validate_with_bitonal(scan_pk):
         run_incremental_validation(scan_pk, str(bitonal_path))
 
     except Exception as exc:
-        _tb.print_exc()
+        traceback.print_exc()
         print(f"[validate] ERROR: {exc}", flush=True)
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.ERROR, progress_message=str(exc)[:255],
@@ -1054,14 +745,12 @@ def run_full_pipeline(scan_pk):
     Designed to run in a background thread. After this completes, the scan
     is ready for review — the user only needs to approve and generate.
     """
-    import django
-    import traceback as _tb
     django.db.connections.close_all()
 
     try:
         scan = Scan.objects.get(pk=scan_pk)
     except Exception:
-        _tb.print_exc()
+        traceback.print_exc()
         return
 
     try:
@@ -1093,11 +782,10 @@ def run_full_pipeline(scan_pk):
         Scan.objects.filter(pk=scan_pk).update(page_count=page_count)
 
         # 3. Tesseract OCR (on bitonal)
-        _update_progress(scan_pk, "Running Tesseract OCR...")
         scan.refresh_from_db()
         ocr_pdf = find_ocr_pdf(str(output_dir))
         if not ocr_pdf:
-            ocr_pdf = _run_ocr_subprocess(
+            ocr_pdf = _run_ocr(
                 scan_pk, str(bitonal_path), str(output_dir),
                 reporter=scan.reporter.short_name or "",
                 volume=str(scan.volume) or "",
@@ -1105,7 +793,7 @@ def run_full_pipeline(scan_pk):
             )
 
         # 4. YOLO detection (all 3 models on bitonal)
-        _run_yolo_subprocess(scan_pk, str(bitonal_path), str(output_dir))
+        _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
         dets = _import_detections_from_json(scan_pk, str(output_dir))
         _update_progress(
             scan_pk,
@@ -1131,10 +819,8 @@ def run_full_pipeline(scan_pk):
             ),
         )
 
-    except ProcessingCancelled:
-        pass
     except Exception as exc:
-        _tb.print_exc()
+        traceback.print_exc()
         print(f"[pipeline] ERROR: {exc}", flush=True)
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.ERROR, progress_message=str(exc)[:255],
@@ -1253,7 +939,6 @@ def run_reprocess(scan_pk):
 
     Designed to run in a background thread.
     """
-    import django
     django.db.connections.close_all()
 
     scan = Scan.objects.get(pk=scan_pk)
@@ -1362,23 +1047,14 @@ def run_reprocess(scan_pk):
         # OCR only the newly inserted pages
         if new_page_indices:
             _update_progress(scan_pk, f"OCR on {len(new_page_indices)} new page(s)...")
-            os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
-            from paddleocr import PaddleOCR
-            ocr = PaddleOCR(
-                text_detection_model_name="PP-OCRv5_server_det",
-                text_recognition_model_name="PP-OCRv5_server_rec",
-                use_textline_orientation=False,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-            )
             scan.refresh_from_db()
             exp_start = scan.start_page or 1
             exp_end = scan.end_page
+            model_path = str(DEFAULT_ANALYZE_MODEL)
 
             for page_idx in new_page_indices:
-                result = _ocr_page_number(
-                    ocr, scan.pdf_path, page_idx, exp_start, exp_end,
-                    scan_pk=scan_pk,
+                result = _process_page(
+                    (page_idx, scan.pdf_path, exp_start, exp_end, model_path)
                 )
                 # Insert into all_results at the right position
                 pdf_page = page_idx + 1
@@ -1426,10 +1102,7 @@ def run_reprocess(scan_pk):
             progress_message="Done",
         )
 
-    except ProcessingCancelled:
-        pass
     except Exception as exc:
-        import traceback
         traceback.print_exc()
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.ERROR, progress_message=str(exc)[:255],
@@ -1581,7 +1254,7 @@ def _stamp_original_images(scan, ocr_pdf_path):
     Returns the path to the stamped copy, or the original path if no
     images needed stamping (so the OCR PDF is never modified).
     """
-    from scanning.models import Detection
+
 
     stamped_path = os.path.join(os.path.dirname(ocr_pdf_path), "stamped.pdf")
 
@@ -1592,7 +1265,6 @@ def _stamp_original_images(scan, ocr_pdf_path):
     )
     if not image_dets:
         # Always copy so the OCR PDF is never modified by downstream steps
-        import shutil
         shutil.copy2(ocr_pdf_path, stamped_path)
         return stamped_path
 
@@ -1641,11 +1313,8 @@ def run_generate_files(scan_pk):
 
     Designed to run in a background thread.
     """
-    import django
     django.db.connections.close_all()
-    from pathlib import Path
 
-    from scanning.utils import find_ocr_pdf
 
     scan = Scan.objects.get(pk=scan_pk)
 
@@ -1774,7 +1443,6 @@ def run_generate_files(scan_pk):
                 llm_scan.opinions.add(opinion)
 
     except Exception as exc:
-        import traceback
         traceback.print_exc()
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.ERROR, progress_message=str(exc)[:255],
@@ -1791,7 +1459,6 @@ def run_detect(scan_pk):
 
     Designed to run in a background thread.
     """
-    import django
     django.db.connections.close_all()
 
     scan = Scan.objects.get(pk=scan_pk)
@@ -1799,36 +1466,18 @@ def run_detect(scan_pk):
         output_dir = Path(scan.output_dir)
         bitonal = output_dir / "bitonal.pdf"
 
-        ocr_exists = any(
-            f.name not in ("bitonal.pdf",) and not f.name.endswith(".redacted.pdf") and not f.name.endswith(".original.pdf")
-            for f in output_dir.glob("*.pdf")
-        )
-        if not ocr_exists and bitonal.exists():
-            # Run OCR as a background subprocess (killable on cancel)
-            def _run_ocr_bg(scan_pk, bitonal_str, output_dir_str):
-                try:
-                    import django as _dj
-                    _dj.db.connections.close_all()
-                    _scan = Scan.objects.get(pk=scan_pk)
-                    _run_ocr_subprocess(
-                        scan_pk, bitonal_str, output_dir_str,
-                        reporter=_scan.reporter.short_name or "",
-                        volume=str(_scan.volume) or "",
-                        first_page=_scan.start_page or 1,
-                    )
-                except ProcessingCancelled:
-                    pass
-                except Exception as _e:
-                    print(f"  Background OCR failed: {_e}", flush=True)
-            threading.Thread(
-                target=_run_ocr_bg,
-                args=(scan_pk, str(bitonal), str(output_dir)),
-                daemon=True,
-            ).start()
+        # OCR if needed (no existing OCR PDF)
+        if not find_ocr_pdf(str(output_dir)) and bitonal.exists():
+            _run_ocr(
+                scan_pk, str(bitonal), str(output_dir),
+                reporter=scan.reporter.short_name or "",
+                volume=str(scan.volume) or "",
+                first_page=scan.start_page or 1,
+            )
 
         pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
 
-        _run_yolo_subprocess(scan_pk, pdf_path, str(output_dir))
+        _run_yolo(scan_pk, pdf_path, str(output_dir))
         dets = _import_detections_from_json(scan_pk, str(output_dir))
 
         _update_progress(
@@ -1843,10 +1492,7 @@ def run_detect(scan_pk):
             progress_message=f"Done — {len(dets)} detections, {len(opinions)} opinions",
         )
 
-    except ProcessingCancelled:
-        pass
     except Exception as exc:
-        import traceback
         traceback.print_exc()
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.ERROR, progress_message=str(exc)[:255],

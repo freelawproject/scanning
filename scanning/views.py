@@ -2,7 +2,6 @@ import json
 import os
 import shutil
 import tempfile
-import threading
 
 import fitz
 from django.conf import settings
@@ -528,15 +527,11 @@ def queue_upload(request, reporter_slug, vol):
 
     action = request.POST.get("action", "upload_only")
     if action == "upload_validate":
-        scan.status = Status.PROCESSING
+        scan.status = Status.QUEUED
         scan.stage = Stage.VALIDATE
-        scan.progress_message = "Converting to bitonal..."
+        scan.queued_action = "full_pipeline"
+        scan.progress_message = "Queued for processing..."
         scan.save()
-
-        t = threading.Thread(
-            target=services.run_full_pipeline, args=(scan.pk,), daemon=True
-        )
-        t.start()
         return redirect("scan_process", pk=scan.pk)
 
     messages.success(request, "PDF uploaded successfully.")
@@ -577,7 +572,7 @@ def update_scan_status(request, reporter_slug, vol):
 def scan_process_view(request, pk):
     """Unified scan processing page with 4-step workflow."""
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
-    is_processing = scan.status == Status.PROCESSING
+    is_processing = scan.status in (Status.PROCESSING, Status.QUEUED)
 
     step = int(request.GET.get("step", 0))
     if step < 1 or step > 4:
@@ -851,13 +846,11 @@ def serve_original_crop(request, pk):
 @require_POST
 def start_validate(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
-    scan.status = Status.PROCESSING
+    scan.status = Status.QUEUED
     scan.stage = Stage.VALIDATE
-    scan.progress_message = "Converting to bitonal..."
+    scan.queued_action = "full_pipeline"
+    scan.progress_message = "Queued for processing..."
     scan.save()
-
-    t = threading.Thread(target=services.run_full_pipeline, args=(scan.pk,), daemon=True)
-    t.start()
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -869,15 +862,11 @@ def start_detect(request, pk):
         # Detections already exist (from full pipeline). Skip to review.
         return redirect(f"/scans/{scan.pk}/process/?step=2")
 
-    scan.status = Status.PROCESSING
+    scan.status = Status.QUEUED
     scan.stage = Stage.PROCESS
-    scan.progress_current = 0
-    scan.progress_total = 0
-    scan.progress_message = "Starting detection..."
+    scan.queued_action = "detect"
+    scan.progress_message = "Queued for detection..."
     scan.save()
-
-    t = threading.Thread(target=services.run_detect, args=(scan.pk,), daemon=True)
-    t.start()
     return redirect(f"/scans/{scan.pk}/process/?step=2")
 
 
@@ -896,8 +885,6 @@ def cancel_processing(request, pk):
             Scan.objects.filter(pk=pk).update(
                 status=Status.CANCELLED, progress_message="Cancelled by user.",
             )
-        # Kill any running subprocesses (tesseract, YOLO, etc.)
-        services.kill_active_processes(pk)
     return redirect("scan_process", pk=pk)
 
 
@@ -915,13 +902,10 @@ def recalculate(request, pk):
 @require_POST
 def reprocess(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
-    scan.status = Status.PROCESSING
-    scan.progress_current = 0
-    scan.progress_total = 0
-    scan.progress_message = "Starting reprocess..."
+    scan.status = Status.QUEUED
+    scan.queued_action = "reprocess"
+    scan.progress_message = "Queued for reprocessing..."
     scan.save()
-    t = threading.Thread(target=services.run_reprocess, args=(scan.pk,), daemon=True)
-    t.start()
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -1235,17 +1219,13 @@ def compute_redactions_api(request, pk):
 @require_POST
 def generate_files(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.status == Status.PROCESSING:
+    if scan.status in (Status.PROCESSING, Status.QUEUED):
         return redirect(f"/scans/{scan.pk}/process/?step=4")
     scan.stage = Stage.PROCESS
-    scan.status = Status.PROCESSING
-    scan.progress_current = 0
-    scan.progress_total = 0
-    scan.progress_message = "Generating files..."
-    scan.progress_log = ""
+    scan.status = Status.QUEUED
+    scan.queued_action = "generate_files"
+    scan.progress_message = "Queued for file generation..."
     scan.save()
-    t = threading.Thread(target=services.run_generate_files, args=(scan.pk,), daemon=True)
-    t.start()
     return redirect(f"/scans/{scan.pk}/process/?step=4")
 
 

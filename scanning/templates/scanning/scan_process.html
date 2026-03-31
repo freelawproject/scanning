@@ -53,10 +53,6 @@
   {# Right: actions #}
   <div class="flex flex-wrap gap-2">
     {% if is_processing %}
-    <form method="post" action="{% url 'cancel_processing' scan.pk %}" class="inline">
-      {% csrf_token %}
-      <button type="submit" class="btn-outline text-sm">Stop</button>
-    </form>
 
     {% elif step == 1 %}
       {% if has_pending_changes %}
