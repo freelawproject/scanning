@@ -11,7 +11,7 @@ from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db.models import Count
-from django.http import FileResponse, HttpResponse, JsonResponse
+from django.http import FileResponse, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views.decorators.http import require_POST
@@ -39,29 +39,30 @@ from scanning.models import (
     Stage,
     Status,
 )
-from scanning.utils import get_volume, get_output_base, find_json_file, find_ocr_pdf
+from scanning.utils import (
+    get_volume,
+    get_output_base,
+    find_json_file,
+    find_ocr_pdf,
+)
 
 
-def login_view(request):
+def login_view(request: HttpRequest) -> HttpResponse:
     """Display the login page using Django's built-in LoginView.
 
     :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
-    :returns: The rendered login page.
-    :rtype: django.http.HttpResponse
+    :return: The rendered login page.
     """
     return auth_views.LoginView.as_view(
         template_name="scanning/login.html",
     )(request)
 
 
-def logout_view(request):
+def logout_view(request: HttpRequest) -> HttpResponse:
     """Log the user out and redirect to login.
 
     :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
-    :returns: A redirect to the login page.
-    :rtype: django.http.HttpResponseRedirect
+    :return: A redirect to the login page.
     """
     return auth_views.LogoutView.as_view(
         next_page="/login/",
@@ -69,13 +70,11 @@ def logout_view(request):
 
 
 @login_required
-def scan_list(request):
+def scan_list(request: HttpRequest) -> HttpResponse:
     """List scans with opinion count annotation.
 
     :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
-    :returns: The rendered scan list page.
-    :rtype: django.http.HttpResponse
+    :return: The rendered scan list page.
     """
     scans = (
         Scan.objects.select_related("reporter")
@@ -128,13 +127,11 @@ def scan_list(request):
 
 
 @login_required
-def scan_upload(request):
+def scan_upload(request: HttpRequest) -> HttpResponse:
     """Handle scan upload form.
 
     :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
-    :returns: The rendered upload form or a redirect on success.
-    :rtype: django.http.HttpResponse
+    :return: The rendered upload form or a redirect on success.
     """
     if request.method == "POST":
         form = ScanUploadForm(request.POST, request.FILES)
@@ -156,15 +153,12 @@ def scan_upload(request):
 
 
 @login_required
-def scan_detail(request, pk):
+def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
     """Display scan detail and handle staff review.
 
     :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
     :param pk: The primary key of the scan.
-    :type pk: int
-    :returns: The rendered detail page.
-    :rtype: django.http.HttpResponse
+    :return: The rendered detail page.
     """
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
 
@@ -206,13 +200,11 @@ def scan_detail(request, pk):
 
 
 @login_required
-def opinion_list(request):
+def opinion_list(request: HttpRequest) -> HttpResponse:
     """List opinion scans with filters for scan, reporter, and status.
 
     :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
-    :returns: The rendered opinion list page.
-    :rtype: django.http.HttpResponse
+    :return: The rendered opinion list page.
     """
     opinions = OpinionScan.objects.select_related(
         "reporter", "scan", "uploaded_by"
@@ -262,15 +254,12 @@ def opinion_list(request):
 
 
 @login_required
-def opinion_detail(request, pk):
+def opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
     """Display opinion scan detail with side-by-side PDF iframes.
 
     :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
     :param pk: The primary key of the opinion scan.
-    :type pk: int
-    :returns: The rendered opinion detail page.
-    :rtype: django.http.HttpResponse
+    :return: The rendered opinion detail page.
     """
     opinion = get_object_or_404(
         OpinionScan.objects.select_related("reporter", "scan", "uploaded_by"),
@@ -285,13 +274,11 @@ def opinion_detail(request, pk):
 
 
 @login_required
-def opinion_upload(request):
+def opinion_upload(request: HttpRequest) -> HttpResponse:
     """Handle standalone opinion upload form (superuser only).
 
     :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
-    :returns: The rendered upload form or a redirect on success.
-    :rtype: django.http.HttpResponse
+    :return: The rendered upload form or a redirect on success.
     :raises PermissionDenied: If the user is not a superuser.
     """
     if not request.user.is_superuser:
@@ -321,13 +308,11 @@ def opinion_upload(request):
 
 
 @login_required
-def queue_view(request):
+def queue_view(request: HttpRequest) -> HttpResponse:
     """Scanner work queue -- volumes that need scanning, with filters.
 
     :param request: The current HTTP request.
-    :type request: django.http.HttpRequest
-    :returns: The rendered queue page.
-    :rtype: django.http.HttpResponse
+    :return: The rendered queue page.
     """
     reporters = Reporter.objects.all()
     selected_reporter = request.GET.get("reporter", "")
@@ -376,20 +361,23 @@ def queue_view(request):
 
 
 @login_required
-def queue_detail_view(request, reporter_slug, vol):
+def queue_detail_view(request: HttpRequest, reporter_slug: str, vol: int) -> HttpResponse:
     """Detail page for a volume in the queue.
 
     Shows volume info, assignment, and all scans (parts) with
     upload buttons for each.
+
+    :param request: The HTTP request.
+    :param reporter_slug: Short-name slug identifying the reporter.
+    :param vol: Volume number within the reporter.
+    :return: Rendered queue detail page.
     """
     volume = get_object_or_404(
         Volume.objects.select_related("reporter", "assigned_to"),
         reporter__short_name=reporter_slug,
         volume_number=vol,
     )
-    scans = volume.scans.select_related(
-        "uploaded_by"
-    ).order_by("start_page")
+    scans = volume.scans.select_related("uploaded_by").order_by("start_page")
 
     return render(
         request,
@@ -405,7 +393,13 @@ def queue_detail_view(request, reporter_slug, vol):
 @login_required
 @require_POST
 def claim_scan(request, reporter_slug, vol):
-    """Claim or unclaim a volume for scanning."""
+    """Claim or unclaim a volume for scanning.
+
+    :param request: The HTTP request.
+    :param reporter_slug: Short-name slug identifying the reporter.
+    :param vol: Volume number within the reporter.
+    :return: Redirect to the queue detail page.
+    """
     volume = get_volume(reporter_slug, vol)
 
     if request.POST.get("unclaim") == "1":
@@ -432,7 +426,13 @@ def claim_scan(request, reporter_slug, vol):
 @login_required
 @require_POST
 def queue_upload(request, reporter_slug, vol):
-    """Upload a PDF for a specific scan within a volume."""
+    """Upload a PDF for a specific scan within a volume.
+
+    :param request: The HTTP request.
+    :param reporter_slug: Short-name slug identifying the reporter.
+    :param vol: Volume number within the reporter.
+    :return: Redirect to queue detail or scan processing page.
+    """
     volume = get_volume(reporter_slug, vol)
 
     if request.POST.get("new_scan") == "1":
@@ -454,9 +454,7 @@ def queue_upload(request, reporter_slug, vol):
                 reporter_slug=reporter_slug,
                 vol=vol,
             )
-        scan = get_object_or_404(
-            Scan, pk=scan_pk, volume_obj=volume
-        )
+        scan = get_object_or_404(Scan, pk=scan_pk, volume_obj=volume)
     pdf = request.FILES.get("original_pdf")
     if not pdf:
         messages.error(request, "No PDF file provided.")
@@ -477,9 +475,7 @@ def queue_upload(request, reporter_slug, vol):
     header = pdf.read(5)
     pdf.seek(0)
     if header != b"%PDF-":
-        messages.error(
-            request, "The uploaded file is not a valid PDF."
-        )
+        messages.error(request, "The uploaded file is not a valid PDF.")
         return redirect(
             "queue_detail",
             reporter_slug=reporter_slug,
@@ -501,8 +497,11 @@ def queue_upload(request, reporter_slug, vol):
 
     # Create processing directory and save original PDF there
     from pathlib import Path as _P
+
     output_dir = (
-        _P(settings.MEDIA_ROOT) / "processed" / str(scan.pk)
+        _P(settings.MEDIA_ROOT)
+        / "processed"
+        / str(scan.pk)
         / volume.reporter.short_name
         / str(volume.volume_number)
         / str(scan.start_page or 1)
@@ -545,7 +544,13 @@ def queue_upload(request, reporter_slug, vol):
 @login_required
 @require_POST
 def update_scan_status(request, reporter_slug, vol):
-    """Update a volume's queue status."""
+    """Update a volume's queue status.
+
+    :param request: The HTTP request.
+    :param reporter_slug: Short-name slug identifying the reporter.
+    :param vol: Volume number within the reporter.
+    :return: Redirect to the queue detail page.
+    """
     volume = get_volume(reporter_slug, vol)
     new_status = request.POST.get("status")
 
@@ -557,8 +562,7 @@ def update_scan_status(request, reporter_slug, vol):
         volume.save()
         messages.success(
             request,
-            f"Status updated to"
-            f" {volume.get_queue_status_display()}.",
+            f"Status updated to {volume.get_queue_status_display()}.",
         )
 
     return redirect(
@@ -570,7 +574,12 @@ def update_scan_status(request, reporter_slug, vol):
 
 @login_required
 def scan_process_view(request, pk):
-    """Unified scan processing page with 4-step workflow."""
+    """Unified scan processing page with 4-step workflow.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Rendered processing page.
+    """
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
     is_processing = scan.status in (Status.PROCESSING, Status.QUEUED)
 
@@ -585,7 +594,9 @@ def scan_process_view(request, pk):
             has_issues = scan.issues.exclude(
                 check_name="suppress_detection"
             ).exists()
-            has_missing = bool(scan.missing_pages and json.loads(scan.missing_pages))
+            has_missing = bool(
+                scan.missing_pages and json.loads(scan.missing_pages)
+            )
             if has_issues or has_missing:
                 step = 1
             else:
@@ -597,7 +608,9 @@ def scan_process_view(request, pk):
     inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
 
     page_map = json.loads(scan.page_map) if scan.page_map else []
-    missing_pages = json.loads(scan.missing_pages) if scan.missing_pages else []
+    missing_pages = (
+        json.loads(scan.missing_pages) if scan.missing_pages else []
+    )
 
     for entry in page_map:
         if entry["type"] == "missing" and entry["logical_number"] in inserts:
@@ -610,7 +623,9 @@ def scan_process_view(request, pk):
         if entry.get("type") == "pdf_page":
             idx_to_logical[entry["pdf_index"]] = entry["logical_number"]
 
-    flagged_pages = sorted(set(i.page_number for i in issues if i.page_number is not None))
+    flagged_pages = sorted(
+        set(i.page_number for i in issues if i.page_number is not None)
+    )
 
     ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
     ocr_by_page = {}
@@ -623,8 +638,9 @@ def scan_process_view(request, pk):
 
     # Build a set of page indices that contain IMAGE detections
     image_page_indices = set(
-        Detection.objects.filter(scan=scan, label="IMAGE", active=True)
-        .values_list("page_index", flat=True)
+        Detection.objects.filter(
+            scan=scan, label="IMAGE", active=True
+        ).values_list("page_index", flat=True)
     )
 
     # Attach image_pages (logical page numbers) to each opinion
@@ -640,7 +656,10 @@ def scan_process_view(request, pk):
     has_redaction_rects = False
     if scan.output_dir:
         from pathlib import Path as _P
-        has_redaction_rects = (_P(scan.output_dir) / "redaction_rects.json").exists()
+
+        has_redaction_rects = (
+            _P(scan.output_dir) / "redaction_rects.json"
+        ).exists()
 
     # Find HEADNOTE detections not covered by headnote redaction rects
     uncovered_hn_pages = set()
@@ -677,10 +696,24 @@ def scan_process_view(request, pk):
 
     opinion_scans = []
     if step == 4:
-        for s in OpinionScan.objects.filter(scan=scan).order_by("opinion_order"):
-            s.redacted_filename = os.path.basename(s.redacted_pdf.name) if s.redacted_pdf and s.redacted_pdf.name else ""
-            s.masked_filename = os.path.basename(s.masked_pdf.name) if s.masked_pdf and s.masked_pdf.name else ""
-            s.unredacted_filename = os.path.basename(s.original_pdf.name) if s.original_pdf and s.original_pdf.name else ""
+        for s in OpinionScan.objects.filter(scan=scan).order_by(
+            "opinion_order"
+        ):
+            s.redacted_filename = (
+                os.path.basename(s.redacted_pdf.name)
+                if s.redacted_pdf and s.redacted_pdf.name
+                else ""
+            )
+            s.masked_filename = (
+                os.path.basename(s.masked_pdf.name)
+                if s.masked_pdf and s.masked_pdf.name
+                else ""
+            )
+            s.unredacted_filename = (
+                os.path.basename(s.original_pdf.name)
+                if s.original_pdf and s.original_pdf.name
+                else ""
+            )
             opinion_scans.append(s)
 
     # Detection warnings for step 2
@@ -695,7 +728,14 @@ def scan_process_view(request, pk):
                 try:
                     m = json.loads(iss.metadata)
                     bb = m.get("bbox", [0, 0, 0, 0])
-                    suppressed.add((m.get("page_index", 0), m.get("label_id", 0), round(bb[0]), round(bb[1])))
+                    suppressed.add(
+                        (
+                            m.get("page_index", 0),
+                            m.get("label_id", 0),
+                            round(bb[0]),
+                            round(bb[1]),
+                        )
+                    )
                 except Exception:
                     pass
 
@@ -704,30 +744,62 @@ def scan_process_view(request, pk):
         for op in opinions:
             cb = op.get("caption_bbox", [0, 0, 0, 0])
             kb = op.get("key_bbox", [0, 0, 0, 0])
-            paired_caption_keys.add((op.get("caption_page", 0), round(cb[0]), round(cb[1])))
-            paired_key_keys.add((op.get("key_page", 0), round(kb[0]), round(kb[1])))
+            paired_caption_keys.add(
+                (op.get("caption_page", 0), round(cb[0]), round(cb[1]))
+            )
+            paired_key_keys.add(
+                (op.get("key_page", 0), round(kb[0]), round(kb[1]))
+            )
 
-        for d in Detection.objects.filter(scan=scan, active=True, label="KEY_ICON").order_by("page_index"):
+        for d in Detection.objects.filter(
+            scan=scan, active=True, label="KEY_ICON"
+        ).order_by("page_index"):
             if (d.page_index, round(d.x0), round(d.y0)) not in paired_key_keys:
-                if (d.page_index, d.label_id, round(d.x0), round(d.y0)) not in suppressed:
-                    unmatched_keys.append({"pdf_page": d.page_index + 1, "page_index": d.page_index, "logical_page": idx_to_logical.get(d.page_index, d.page_index + 1), "conf": round(d.confidence, 2), "bbox": [d.x0, d.y0, d.x1, d.y1], "img_width": d.img_width, "img_height": d.img_height})
+                if (
+                    d.page_index,
+                    d.label_id,
+                    round(d.x0),
+                    round(d.y0),
+                ) not in suppressed:
+                    unmatched_keys.append(
+                        {
+                            "pdf_page": d.page_index + 1,
+                            "page_index": d.page_index,
+                            "logical_page": idx_to_logical.get(
+                                d.page_index, d.page_index + 1
+                            ),
+                            "conf": round(d.confidence, 2),
+                            "bbox": [d.x0, d.y0, d.x1, d.y1],
+                            "img_width": d.img_width,
+                            "img_height": d.img_height,
+                        }
+                    )
 
         for d in Detection.objects.filter(
             scan=scan, active=True, label="CASE_CAPTION"
         ).order_by("page_index", "y0"):
             if (d.page_index, round(d.x0), round(d.y0)) in paired_caption_keys:
                 continue
-            if (d.page_index, d.label_id, round(d.x0), round(d.y0)) in suppressed:
+            if (
+                d.page_index,
+                d.label_id,
+                round(d.x0),
+                round(d.y0),
+            ) in suppressed:
                 continue
-            unmatched_captions.append({
-                "pdf_page": d.page_index + 1,
-                "page_index": d.page_index,
-                "logical_page": idx_to_logical.get(d.page_index, d.page_index + 1),
-                "conf": round(d.confidence, 2),
-                "bbox": [d.x0, d.y0, d.x1, d.y1],
-                "img_width": d.img_width,
-                "img_height": d.img_height,
-            })
+            unmatched_captions.append(
+                {
+                    "pdf_page": d.page_index + 1,
+                    "page_index": d.page_index,
+                    "logical_page": idx_to_logical.get(
+                        d.page_index, d.page_index + 1
+                    ),
+                    "conf": round(d.confidence, 2),
+                    "bbox": [d.x0, d.y0, d.x1, d.y1],
+                    "img_width": d.img_width,
+                    "img_height": d.img_height,
+                }
+            )
 
         if unmatched_keys:
             detect_warnings.append(
@@ -742,9 +814,7 @@ def scan_process_view(request, pk):
         if opinions and scan.start_page and scan.end_page:
             covered = set()
             for op in opinions:
-                cp = op.get("caption_page", 0) + (
-                    scan.start_page or 1
-                )
+                cp = op.get("caption_page", 0) + (scan.start_page or 1)
                 kp = (
                     op.get("key_page", 0)
                     + (scan.start_page or 1)
@@ -753,9 +823,7 @@ def scan_process_view(request, pk):
                 )
                 for p in range(cp, kp + 1):
                     covered.add(p)
-            expected = set(
-                range(scan.start_page, scan.end_page + 1)
-            )
+            expected = set(range(scan.start_page, scan.end_page + 1))
             missing = sorted(expected - covered)
             if missing:
                 import itertools
@@ -771,56 +839,86 @@ def scan_process_view(request, pk):
                         " by any opinion"
                     )
 
-    return render(request, "scanning/scan_process.html", {
-        "scan": scan,
-        "step": step,
-        "issues": issues,
-        "page_map_json": json.dumps(page_map),
-        "missing_pages": missing_pages,
-        "flagged_pages_json": json.dumps(flagged_pages),
-        "ocr_results": ocr_results,
-        "ocr_by_page_json": json.dumps(ocr_by_page),
-        "has_pending_changes": has_pending_changes,
-        "is_processing": is_processing,
-        "opinions": opinions,
-        "opinions_json": json.dumps(opinions),
-        "has_redaction_rects": has_redaction_rects,
-        "opinion_scans": opinion_scans,
-        "detect_warnings": detect_warnings,
-        "unmatched_keys": unmatched_keys,
-        "unmatched_captions": unmatched_captions,
-    })
+    return render(
+        request,
+        "scanning/scan_process.html",
+        {
+            "scan": scan,
+            "step": step,
+            "issues": issues,
+            "page_map_json": json.dumps(page_map),
+            "missing_pages": missing_pages,
+            "flagged_pages_json": json.dumps(flagged_pages),
+            "ocr_results": ocr_results,
+            "ocr_by_page_json": json.dumps(ocr_by_page),
+            "has_pending_changes": has_pending_changes,
+            "is_processing": is_processing,
+            "opinions": opinions,
+            "opinions_json": json.dumps(opinions),
+            "has_redaction_rects": has_redaction_rects,
+            "opinion_scans": opinion_scans,
+            "detect_warnings": detect_warnings,
+            "unmatched_keys": unmatched_keys,
+            "unmatched_captions": unmatched_captions,
+        },
+    )
 
 
 @login_required
 def progress_api(request, pk):
+    """Return current processing progress for a scan.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON response with status, progress, and log fields.
+    """
     scan = get_object_or_404(Scan, pk=pk)
-    return JsonResponse({
-        "status": scan.status,
-        "current": scan.progress_current,
-        "total": scan.progress_total,
-        "message": scan.progress_message,
-        "log": scan.progress_log,
-    })
+    return JsonResponse(
+        {
+            "status": scan.status,
+            "current": scan.progress_current,
+            "total": scan.progress_total,
+            "message": scan.progress_message,
+            "log": scan.progress_log,
+        }
+    )
 
 
 @login_required
 def serve_scan_pdf(request, pk):
+    """Serve the best available PDF for a scan (OCR, bitonal, or original).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: File response streaming the PDF.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.output_dir:
         ocr = find_ocr_pdf(scan.output_dir)
         if ocr:
-            return FileResponse(open(ocr, "rb"), content_type="application/pdf")
+            return FileResponse(
+                open(ocr, "rb"), content_type="application/pdf"
+            )
         from pathlib import Path as _P
+
         bitonal = _P(scan.output_dir) / "bitonal.pdf"
         if bitonal.exists():
-            return FileResponse(open(bitonal, "rb"), content_type="application/pdf")
-    return FileResponse(open(scan.pdf_path, "rb"), content_type="application/pdf")
+            return FileResponse(
+                open(bitonal, "rb"), content_type="application/pdf"
+            )
+    return FileResponse(
+        open(scan.pdf_path, "rb"), content_type="application/pdf"
+    )
 
 
 @login_required
-def serve_original_crop(request, pk):
-    """Render a cropped region from the original (non-bitonal) PDF as PNG."""
+def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
+    """Render a cropped region from the original (non-bitonal) PDF as PNG.
+
+    :param request: The HTTP request (crop coordinates via query params).
+    :param pk: Scan primary key.
+    :return: PNG image response of the cropped region.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     page = int(request.GET.get("page", 0))
     x0 = float(request.GET.get("x0", 0))
@@ -845,6 +943,12 @@ def serve_original_crop(request, pk):
 @login_required
 @require_POST
 def start_validate(request, pk):
+    """Queue a scan for validation (first step of the full pipeline).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     scan.status = Status.QUEUED
     scan.stage = Stage.VALIDATE
@@ -857,6 +961,12 @@ def start_validate(request, pk):
 @login_required
 @require_POST
 def start_detect(request, pk):
+    """Queue a scan for detection or skip to review if detections exist.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page (step 2).
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if Detection.objects.filter(scan=scan).exists():
         # Detections already exist (from full pipeline). Skip to review.
@@ -873,17 +983,27 @@ def start_detect(request, pk):
 @login_required
 @require_POST
 def cancel_processing(request, pk):
+    """Cancel an in-progress scan processing task.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.status == Status.PROCESSING:
         if scan.stage == Stage.PROCESS:
             Scan.objects.filter(pk=pk).update(
-                status=Status.APPROVED, stage=Stage.VALIDATE,
-                progress_message="", progress_log="",
-                redacted_pdf_path="", opinions_json="",
+                status=Status.APPROVED,
+                stage=Stage.VALIDATE,
+                progress_message="",
+                progress_log="",
+                redacted_pdf_path="",
+                opinions_json="",
             )
         else:
             Scan.objects.filter(pk=pk).update(
-                status=Status.CANCELLED, progress_message="Cancelled by user.",
+                status=Status.CANCELLED,
+                progress_message="Cancelled by user.",
             )
     return redirect("scan_process", pk=pk)
 
@@ -891,6 +1011,12 @@ def cancel_processing(request, pk):
 @login_required
 @require_POST
 def recalculate(request, pk):
+    """Recalculate validation issues from existing OCR results.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.ocr_results:
         return redirect("scan_process", pk=pk)
@@ -901,6 +1027,12 @@ def recalculate(request, pk):
 @login_required
 @require_POST
 def reprocess(request, pk):
+    """Queue a scan for reprocessing (re-run the full pipeline).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     scan.status = Status.QUEUED
     scan.queued_action = "reprocess"
@@ -912,6 +1044,13 @@ def reprocess(request, pk):
 @login_required
 @require_POST
 def assign_page(request, pk):
+    """Manually assign a page number to a PDF page.
+
+    :param request: The HTTP request (JSON body with pdf_page and
+        page_number).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the assignment.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     data = json.loads(request.body)
     pdf_page = data["pdf_page"]
@@ -926,7 +1065,9 @@ def assign_page(request, pk):
             r["ocr"] = "manual"
             break
     scan.ocr_results = json.dumps(ocr_results)
-    scan.issues.filter(check_name="no_page_number", page_number=pdf_page).delete()
+    scan.issues.filter(
+        check_name="no_page_number", page_number=pdf_page
+    ).delete()
     if not scan.issues.exists():
         scan.has_issues = False
     scan.save()
@@ -936,6 +1077,12 @@ def assign_page(request, pk):
 @login_required
 @require_POST
 def delete_page(request, pk):
+    """Mark a PDF page for deletion during reprocessing.
+
+    :param request: The HTTP request (JSON body with pdf_page).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the deletion record.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     data = json.loads(request.body)
     pdf_page = data["pdf_page"]
@@ -946,28 +1093,51 @@ def delete_page(request, pk):
 @login_required
 @require_POST
 def add_page_insert(request, pk):
+    """Upload an image to insert at a missing page position.
+
+    :param request: The HTTP request (form data with page_number and
+        image file).
+    :param pk: Scan primary key.
+    :return: JSON response with the insert URL and page number.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     page_number = int(request.POST.get("page_number", 0))
     image_file = request.FILES.get("image")
     if not page_number or not image_file:
-        return JsonResponse({"error": "Missing page_number or image"}, status=400)
+        return JsonResponse(
+            {"error": "Missing page_number or image"}, status=400
+        )
     insert, _created = PageInsert.objects.update_or_create(
-        scan=scan, logical_page_number=page_number,
+        scan=scan,
+        logical_page_number=page_number,
         defaults={"image": image_file},
     )
-    return JsonResponse({
-        "status": "ok", "page_number": page_number, "image_url": insert.image.url,
-    })
+    return JsonResponse(
+        {
+            "status": "ok",
+            "page_number": page_number,
+            "image_url": insert.image.url,
+        }
+    )
 
 
 @login_required
 @require_POST
 def dismiss_issue(request, pk):
+    """Dismiss a single validation issue for a scan.
+
+    :param request: The HTTP request (JSON body with issue_id).
+    :param pk: Scan primary key.
+    :return: JSON response confirming dismissal.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     has_pending = scan.deletions.exists() or scan.inserts.exists()
     if has_pending:
         return JsonResponse(
-            {"status": "error", "message": "Reprocess first -- there are pending changes."},
+            {
+                "status": "error",
+                "message": "Reprocess first -- there are pending changes.",
+            },
             status=400,
         )
     data = json.loads(request.body)
@@ -983,6 +1153,12 @@ def dismiss_issue(request, pk):
 @login_required
 @require_POST
 def dismiss_issues(request, pk):
+    """Dismiss all validation issues for a scan.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan list.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     scan.issues.all().delete()
     scan.has_issues = False
@@ -992,19 +1168,40 @@ def dismiss_issues(request, pk):
 
 @login_required
 def serve_detections(request, pk):
+    """Return active detections for a scan as JSON.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON response with a list of detection dicts.
+    """
     scan = get_object_or_404(Scan, pk=pk)
-    dets = Detection.objects.filter(scan=scan, active=True).order_by("page_index", "y0")
-    data = [{
-        "page_index": d.page_index, "label": d.label, "label_id": d.label_id,
-        "confidence": d.confidence, "bbox": [d.x0, d.y0, d.x1, d.y1],
-        "img_width": d.img_width, "img_height": d.img_height,
-        "model_count": d.model_count,
-    } for d in dets]
+    dets = Detection.objects.filter(scan=scan, active=True).order_by(
+        "page_index", "y0"
+    )
+    data = [
+        {
+            "page_index": d.page_index,
+            "label": d.label,
+            "label_id": d.label_id,
+            "confidence": d.confidence,
+            "bbox": [d.x0, d.y0, d.x1, d.y1],
+            "img_width": d.img_width,
+            "img_height": d.img_height,
+            "model_count": d.model_count,
+        }
+        for d in dets
+    ]
     return JsonResponse(data, safe=False)
 
 
 @login_required
 def serve_opinions(request, pk):
+    """Return paired opinion data for a scan as JSON.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON response with a list of opinion dicts.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.opinions_json:
         return JsonResponse(json.loads(scan.opinions_json), safe=False)
@@ -1013,6 +1210,12 @@ def serve_opinions(request, pk):
 
 @login_required
 def serve_margin_rects(request, pk):
+    """Return margin rectangles for a scan, computing them if absent.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON response with per-page margin rect data.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     output_base = get_output_base(scan)
     path = find_json_file(output_base, "margin_rects.json")
@@ -1022,6 +1225,7 @@ def serve_margin_rects(request, pk):
     if not ocr_pdf:
         return JsonResponse([], safe=False)
     from blackletter.margins import compute_margin_rects
+
     rects = compute_margin_rects(ocr_pdf)
     # Save so subsequent requests don't recompute
     margin_path = output_base / "margin_rects.json"
@@ -1031,6 +1235,12 @@ def serve_margin_rects(request, pk):
 
 @login_required
 def serve_redaction_rects(request, pk):
+    """Return redaction rectangles for a scan as JSON.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON response with per-page redaction rect data.
+    """
     scan = get_object_or_404(Scan, pk=pk)
     output_base = get_output_base(scan)
     path = find_json_file(output_base, "redaction_rects.json")
@@ -1060,10 +1270,13 @@ def save_redaction_rect(request, pk):
             if page_data["page_index"] != page_idx:
                 continue
             page_data["rects"] = [
-                r for r in page_data["rects"]
-                if not (abs(r["x0"] - original["x0"]) < 2
-                        and abs(r["y0"] - original["y0"]) < 2
-                        and r.get("type", "") == rect_type)
+                r
+                for r in page_data["rects"]
+                if not (
+                    abs(r["x0"] - original["x0"]) < 2
+                    and abs(r["y0"] - original["y0"]) < 2
+                    and r.get("type", "") == rect_type
+                )
             ]
             break
         rects_path.write_text(json.dumps(rects))
@@ -1073,9 +1286,11 @@ def save_redaction_rect(request, pk):
         if page_data["page_index"] != page_idx:
             continue
         for r in page_data["rects"]:
-            if (abs(r["x0"] - original.get("x0", -999)) < 2
-                    and abs(r["y0"] - original.get("y0", -999)) < 2
-                    and r.get("type") == rect_type):
+            if (
+                abs(r["x0"] - original.get("x0", -999)) < 2
+                and abs(r["y0"] - original.get("y0", -999)) < 2
+                and r.get("type") == rect_type
+            ):
                 r["x0"] = round(adjusted["x0"], 1)
                 r["y0"] = round(adjusted["y0"], 1)
                 r["x1"] = round(adjusted["x1"], 1)
@@ -1087,11 +1302,16 @@ def save_redaction_rect(request, pk):
     if not found:
         for page_data in rects:
             if page_data["page_index"] == page_idx:
-                page_data["rects"].append({
-                    "x0": round(adjusted["x0"], 1), "y0": round(adjusted["y0"], 1),
-                    "x1": round(adjusted["x1"], 1), "y1": round(adjusted["y1"], 1),
-                    "fill": fill, "type": rect_type,
-                })
+                page_data["rects"].append(
+                    {
+                        "x0": round(adjusted["x0"], 1),
+                        "y0": round(adjusted["y0"], 1),
+                        "x1": round(adjusted["x1"], 1),
+                        "y1": round(adjusted["y1"], 1),
+                        "fill": fill,
+                        "type": rect_type,
+                    }
+                )
                 found = True
                 break
     rects_path.write_text(json.dumps(rects))
@@ -1117,9 +1337,12 @@ def save_margin_rect(request, pk):
             if page_data["page_index"] != page_idx:
                 continue
             page_data["rects"] = [
-                r for r in page_data["rects"]
-                if not (abs(r["x0"] - original.get("x0", -999)) < 2
-                        and abs(r["y0"] - original.get("y0", -999)) < 2)
+                r
+                for r in page_data["rects"]
+                if not (
+                    abs(r["x0"] - original.get("x0", -999)) < 2
+                    and abs(r["y0"] - original.get("y0", -999)) < 2
+                )
             ]
             break
         rects_path.write_text(json.dumps(rects))
@@ -1129,8 +1352,10 @@ def save_margin_rect(request, pk):
         if page_data["page_index"] != page_idx:
             continue
         for r in page_data["rects"]:
-            if (abs(r["x0"] - original.get("x0", -999)) < 2
-                    and abs(r["y0"] - original.get("y0", -999)) < 2):
+            if (
+                abs(r["x0"] - original.get("x0", -999)) < 2
+                and abs(r["y0"] - original.get("y0", -999)) < 2
+            ):
                 r["x0"] = round(adjusted["x0"], 1)
                 r["y0"] = round(adjusted["y0"], 1)
                 r["x1"] = round(adjusted["x1"], 1)
@@ -1152,6 +1377,7 @@ def pair_opinions_api(request, pk):
     output_dir = get_output_base(scan)
     det_path = output_dir / "detections.json"
     from scanning.services import _sync_detections_to_disk
+
     det_data = _sync_detections_to_disk(scan.pk)
     if not det_data:
         return JsonResponse({"error": "No detections found"}, status=400)
@@ -1163,9 +1389,12 @@ def pair_opinions_api(request, pk):
         pdf_path = scan.pdf_path
     try:
         from blackletter.api import pair as bl_pair
+
         opinions = bl_pair(
-            str(det_path), pdf_path,
-            reporter=scan.reporter.short_name, volume=str(scan.volume),
+            str(det_path),
+            pdf_path,
+            reporter=scan.reporter.short_name,
+            volume=str(scan.volume),
             first_page=scan.start_page or 1,
         )
         scan.opinions_json = json.dumps(opinions)
@@ -1175,17 +1404,29 @@ def pair_opinions_api(request, pk):
             covered = set()
             for op in opinions:
                 cp = op.get("caption_page", 0) + (scan.start_page or 1)
-                kp = op.get("key_page", 0) + (scan.start_page or 1) + op.get("page_count", 1) - 1
+                kp = (
+                    op.get("key_page", 0)
+                    + (scan.start_page or 1)
+                    + op.get("page_count", 1)
+                    - 1
+                )
                 for p in range(cp, kp + 1):
                     covered.add(p)
             expected = set(range(scan.start_page, scan.end_page + 1))
             missing = sorted(expected - covered)
             if missing:
                 import itertools
-                for _, g in itertools.groupby(enumerate(missing), lambda x: x[0] - x[1]):
+
+                for _, g in itertools.groupby(
+                    enumerate(missing), lambda x: x[0] - x[1]
+                ):
                     run = [v for _, v in g]
-                    gaps.append({"start": run[0], "end": run[-1], "count": len(run)})
-        return JsonResponse({"status": "ok", "opinions": opinions, "gaps": gaps})
+                    gaps.append(
+                        {"start": run[0], "end": run[-1], "count": len(run)}
+                    )
+        return JsonResponse(
+            {"status": "ok", "opinions": opinions, "gaps": gaps}
+        )
     except Exception as exc:
         return JsonResponse({"error": str(exc)[:255]}, status=500)
 
@@ -1197,6 +1438,7 @@ def compute_redactions_api(request, pk):
         _compute_and_save_margin_rects,
         _compute_and_save_redaction_rects,
     )
+
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.output_dir:
         return JsonResponse({"error": "No output directory"}, status=400)
@@ -1208,9 +1450,12 @@ def compute_redactions_api(request, pk):
         rects = _compute_and_save_redaction_rects(pk, pdf_path, output_dir)
         _compute_and_save_margin_rects(pdf_path, output_dir)
         total_rects = sum(len(r["rects"]) for r in rects)
-        return JsonResponse({"status": "ok", "pages": len(rects), "rects": total_rects})
+        return JsonResponse(
+            {"status": "ok", "pages": len(rects), "rects": total_rects}
+        )
     except Exception as exc:
         import traceback
+
         traceback.print_exc()
         return JsonResponse({"error": str(exc)[:500]}, status=500)
 
@@ -1271,19 +1516,23 @@ def serve_masked_opinion_pdf(request, pk, filename):
     return FileResponse(open(file_path, "rb"), content_type="application/pdf")
 
 
-def _apply_rect_to_pdf(pdf_path, page_index, x0, y0, x1, y1, fill):
+def _apply_rect_to_pdf(pdf_path: str, page_index: int, x0: float, y0: float, x1: float, y1: float, fill: str) -> None:
     """Apply a redaction rectangle directly to a PDF file on disk."""
     doc = fitz.open(pdf_path)
     if page_index < 0 or page_index >= doc.page_count:
         doc.close()
-        raise ValueError(f"Page index {page_index} out of range (0-{doc.page_count - 1})")
+        raise ValueError(
+            f"Page index {page_index} out of range (0-{doc.page_count - 1})"
+        )
     page = doc.load_page(page_index)
     rect = fitz.Rect(x0, y0, x1, y1)
     color = (0, 0, 0) if fill == "black" else (1, 1, 1)
     page.add_redact_annot(rect, fill=color)
     page.apply_redactions()
     # Save to temp file then move — fitz can't save to the same path it opened
-    fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=os.path.dirname(pdf_path))
+    fd, tmp_path = tempfile.mkstemp(
+        suffix=".pdf", dir=os.path.dirname(pdf_path)
+    )
     os.close(fd)
     doc.save(tmp_path, garbage=3, deflate=True)
     doc.close()
@@ -1301,16 +1550,26 @@ def apply_rect_to_opinion(request, pk, opinion_pk):
     fill = data.get("fill", "black")
 
     # Always apply to the redacted PDF
-    redacted_path = os.path.join(scan.output_dir, "redacted", os.path.basename(opinion.redacted_pdf.name))
+    redacted_path = os.path.join(
+        scan.output_dir,
+        "redacted",
+        os.path.basename(opinion.redacted_pdf.name),
+    )
     if os.path.isfile(redacted_path):
         _apply_rect_to_pdf(redacted_path, page_index, x0, y0, x1, y1, fill)
 
     # Also apply to masked PDF if it exists
     if opinion.masked_pdf and opinion.masked_pdf.name:
-        masked_path = os.path.join(scan.output_dir, "masked", os.path.basename(opinion.masked_pdf.name))
+        masked_path = os.path.join(
+            scan.output_dir,
+            "masked",
+            os.path.basename(opinion.masked_pdf.name),
+        )
         if os.path.isfile(masked_path):
             try:
-                _apply_rect_to_pdf(masked_path, page_index, x0, y0, x1, y1, fill)
+                _apply_rect_to_pdf(
+                    masked_path, page_index, x0, y0, x1, y1, fill
+                )
             except ValueError:
                 pass  # masked PDF may have different page count
 
@@ -1321,12 +1580,17 @@ def apply_rect_to_opinion(request, pk, opinion_pk):
 def serve_redacted_pdf(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
     if scan.redacted_pdf_path and os.path.isfile(scan.redacted_pdf_path):
-        return FileResponse(open(scan.redacted_pdf_path, "rb"), content_type="application/pdf")
+        return FileResponse(
+            open(scan.redacted_pdf_path, "rb"), content_type="application/pdf"
+        )
     if scan.output_dir:
         from pathlib import Path as _P
+
         for f in sorted(_P(scan.output_dir).glob("*.pdf")):
             if "redacted" not in f.name and "bitonal" not in f.name:
-                return FileResponse(open(f, "rb"), content_type="application/pdf")
+                return FileResponse(
+                    open(f, "rb"), content_type="application/pdf"
+                )
     return HttpResponse("No PDF available", status=404)
 
 
@@ -1347,7 +1611,9 @@ def flag_issue(request, pk):
     page = data.get("page_number")
     metadata = data.get("metadata", {})
     if not message:
-        return JsonResponse({"status": "error", "message": "Message required"}, status=400)
+        return JsonResponse(
+            {"status": "error", "message": "Message required"}, status=400
+        )
     check_name = "process_flag"
     if metadata.get("type") == "suppress_detection":
         check_name = "suppress_detection"
@@ -1356,8 +1622,11 @@ def flag_issue(request, pk):
     elif metadata.get("type") == "approve_detection":
         check_name = "approve_detection"
     issue = Issue.objects.create(
-        scan=scan, page_number=page, check_name=check_name,
-        severity="warning", message=message,
+        scan=scan,
+        page_number=page,
+        check_name=check_name,
+        severity="warning",
+        message=message,
         metadata=json.dumps(metadata) if metadata else "",
     )
     return JsonResponse({"status": "ok", "id": issue.pk})
@@ -1368,8 +1637,14 @@ def flag_issue(request, pk):
 def remove_flag(request, pk, flag_id):
     scan = get_object_or_404(Scan, pk=pk)
     Issue.objects.filter(
-        pk=flag_id, scan=scan,
-        check_name__in=["process_flag", "suppress_detection", "add_detection", "approve_detection"],
+        pk=flag_id,
+        scan=scan,
+        check_name__in=[
+            "process_flag",
+            "suppress_detection",
+            "add_detection",
+            "approve_detection",
+        ],
     ).delete()
     return JsonResponse({"status": "ok"})
 
@@ -1386,9 +1661,12 @@ def delete_detection(request, pk):
     # Deactivate matching Detection(s) in DB — match on label string (reliable)
     # and fall back to label_id if label not provided
     db_filter = dict(
-        scan=scan, page_index=page_index,
-        x0__gte=bbox[0] - 15, x0__lte=bbox[0] + 15,
-        y0__gte=bbox[1] - 15, y0__lte=bbox[1] + 15,
+        scan=scan,
+        page_index=page_index,
+        x0__gte=bbox[0] - 15,
+        x0__lte=bbox[0] + 15,
+        y0__gte=bbox[1] - 15,
+        y0__lte=bbox[1] + 15,
     )
     if label:
         db_filter["label"] = label
@@ -1402,7 +1680,8 @@ def delete_detection(request, pk):
     if det_path:
         existing = json.loads(det_path.read_text())
         existing = [
-            e for e in existing
+            e
+            for e in existing
             if not (
                 e["page_index"] == page_index
                 and (e.get("label") == label or e.get("label_id") == label_id)
@@ -1430,28 +1709,43 @@ def add_single_detection(request, pk):
             continue
         if e["label_id"] != det["label_id"]:
             continue
-        if abs(e["bbox"][0] - det["bbox"][0]) < 15 and abs(e["bbox"][1] - det["bbox"][1]) < 15:
+        if (
+            abs(e["bbox"][0] - det["bbox"][0]) < 15
+            and abs(e["bbox"][1] - det["bbox"][1]) < 15
+        ):
             e["confidence"] = 1.0
             boosted = True
             Detection.objects.filter(
-                scan=scan, page_index=det["page_index"], label_id=det["label_id"],
-                x0__gte=det["bbox"][0] - 15, x0__lte=det["bbox"][0] + 15,
-                y0__gte=det["bbox"][1] - 15, y0__lte=det["bbox"][1] + 15,
+                scan=scan,
+                page_index=det["page_index"],
+                label_id=det["label_id"],
+                x0__gte=det["bbox"][0] - 15,
+                x0__lte=det["bbox"][0] + 15,
+                y0__gte=det["bbox"][1] - 15,
+                y0__lte=det["bbox"][1] + 15,
             ).update(confidence=1.0, model_name="approved")
             break
     if not boosted:
         det["confidence"] = 1.0
         existing.append(det)
         from blackletter.models import Label
+
         try:
             label_name = Label(det["label_id"]).name
             Detection.objects.create(
-                scan=scan, page_index=det["page_index"],
-                label=label_name, label_id=det["label_id"], confidence=1.0,
-                x0=det["bbox"][0], y0=det["bbox"][1],
-                x1=det["bbox"][2], y1=det["bbox"][3],
-                img_width=det.get("img_width", 0), img_height=det.get("img_height", 0),
-                model_name="manual", model_count=1,
+                scan=scan,
+                page_index=det["page_index"],
+                label=label_name,
+                label_id=det["label_id"],
+                confidence=1.0,
+                x0=det["bbox"][0],
+                y0=det["bbox"][1],
+                x1=det["bbox"][2],
+                y1=det["bbox"][3],
+                img_width=det.get("img_width", 0),
+                img_height=det.get("img_height", 0),
+                model_name="manual",
+                model_count=1,
                 found_by=json.dumps([{"model": "manual", "confidence": 1.0}]),
             )
         except Exception:
@@ -1465,8 +1759,12 @@ def add_single_detection(request, pk):
 def bake_redactions(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.output_dir:
-        return JsonResponse({"status": "error", "message": "No output dir"}, status=400)
-    return JsonResponse({"status": "ok", "message": "No redactions to bake", "count": 0})
+        return JsonResponse(
+            {"status": "error", "message": "No output dir"}, status=400
+        )
+    return JsonResponse(
+        {"status": "ok", "message": "No redactions to bake", "count": 0}
+    )
 
 
 @login_required
@@ -1488,12 +1786,16 @@ def export_pdf(request, pk):
                 if page_map[j]["type"] == "pdf_page":
                     insert_before = page_map[j]["pdf_index"]
                     break
-            insert_ops.append((insert_before, inserts[entry["logical_number"]]))
+            insert_ops.append(
+                (insert_before, inserts[entry["logical_number"]])
+            )
     offset = 0
     for insert_before, insert_obj in insert_ops:
         img_path = insert_obj.image.path
         if insert_before is not None:
-            adjusted = insert_before - len([d for d in deleted_pages if d <= insert_before])
+            adjusted = insert_before - len(
+                [d for d in deleted_pages if d <= insert_before]
+            )
             pno = adjusted + offset
             ref_page = pdf_doc.load_page(min(pno, len(pdf_doc) - 1))
         else:
@@ -1502,7 +1804,12 @@ def export_pdf(request, pk):
         w, h = ref_page.rect.width, ref_page.rect.height
         if img_path.lower().endswith(".pdf"):
             insert_pdf = fitz.open(img_path)
-            pdf_doc.insert_pdf(insert_pdf, from_page=0, to_page=insert_pdf.page_count - 1, start_at=pno)
+            pdf_doc.insert_pdf(
+                insert_pdf,
+                from_page=0,
+                to_page=insert_pdf.page_count - 1,
+                start_at=pno,
+            )
             offset += insert_pdf.page_count - 1
             insert_pdf.close()
         else:

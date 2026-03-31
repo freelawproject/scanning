@@ -122,8 +122,15 @@ class TestImportDetections(TestCase):
             scan = _make_scan_with_output(tmpdir)
             # Create a dummy detection
             Detection.objects.create(
-                scan=scan, page_index=0, label="DUMMY", label_id=99,
-                confidence=0.9, x0=0, y0=0, x1=1, y1=1,
+                scan=scan,
+                page_index=0,
+                label="DUMMY",
+                label_id=99,
+                confidence=0.9,
+                x0=0,
+                y0=0,
+                x1=1,
+                y1=1,
             )
             self.assertEqual(Detection.objects.filter(scan=scan).count(), 1)
 
@@ -269,9 +276,15 @@ class TestSmartDeleteIndexShifting(TestCase):
         # Create detections on three pages
         for page_idx in range(3):
             Detection.objects.create(
-                scan=scan, page_index=page_idx,
-                label="CASE_CAPTION", label_id=0,
-                confidence=0.95, x0=10, y0=10, x1=100, y1=100,
+                scan=scan,
+                page_index=page_idx,
+                label="CASE_CAPTION",
+                label_id=0,
+                confidence=0.95,
+                x0=10,
+                y0=10,
+                x1=100,
+                y1=100,
             )
 
         self.assertEqual(Detection.objects.filter(scan=scan).count(), 3)
@@ -280,9 +293,10 @@ class TestSmartDeleteIndexShifting(TestCase):
         delete_idx = 1
         Detection.objects.filter(scan=scan, page_index=delete_idx).delete()
         from django.db.models import F
-        Detection.objects.filter(
-            scan=scan, page_index__gt=delete_idx
-        ).update(page_index=F("page_index") - 1)
+
+        Detection.objects.filter(scan=scan, page_index__gt=delete_idx).update(
+            page_index=F("page_index") - 1
+        )
 
         remaining = list(
             Detection.objects.filter(scan=scan)
@@ -295,17 +309,24 @@ class TestSmartDeleteIndexShifting(TestCase):
         scan = ScanFactory(page_count=3)
         for page_idx in range(3):
             Detection.objects.create(
-                scan=scan, page_index=page_idx,
-                label="KEY_ICON", label_id=1,
-                confidence=0.9, x0=0, y0=0, x1=50, y1=50,
+                scan=scan,
+                page_index=page_idx,
+                label="KEY_ICON",
+                label_id=1,
+                confidence=0.9,
+                x0=0,
+                y0=0,
+                x1=50,
+                y1=50,
             )
 
         delete_idx = 0
         Detection.objects.filter(scan=scan, page_index=delete_idx).delete()
         from django.db.models import F
-        Detection.objects.filter(
-            scan=scan, page_index__gt=delete_idx
-        ).update(page_index=F("page_index") - 1)
+
+        Detection.objects.filter(scan=scan, page_index__gt=delete_idx).update(
+            page_index=F("page_index") - 1
+        )
 
         remaining = list(
             Detection.objects.filter(scan=scan)
@@ -318,17 +339,24 @@ class TestSmartDeleteIndexShifting(TestCase):
         scan = ScanFactory(page_count=3)
         for page_idx in range(3):
             Detection.objects.create(
-                scan=scan, page_index=page_idx,
-                label="HEADNOTE", label_id=3,
-                confidence=0.85, x0=0, y0=0, x1=50, y1=50,
+                scan=scan,
+                page_index=page_idx,
+                label="HEADNOTE",
+                label_id=3,
+                confidence=0.85,
+                x0=0,
+                y0=0,
+                x1=50,
+                y1=50,
             )
 
         delete_idx = 2
         Detection.objects.filter(scan=scan, page_index=delete_idx).delete()
         from django.db.models import F
-        Detection.objects.filter(
-            scan=scan, page_index__gt=delete_idx
-        ).update(page_index=F("page_index") - 1)
+
+        Detection.objects.filter(scan=scan, page_index__gt=delete_idx).update(
+            page_index=F("page_index") - 1
+        )
 
         remaining = list(
             Detection.objects.filter(scan=scan)
@@ -346,17 +374,24 @@ class TestSmartInsertIndexShifting(TestCase):
         scan = ScanFactory(page_count=2)
         for page_idx in range(2):
             Detection.objects.create(
-                scan=scan, page_index=page_idx,
-                label="CASE_CAPTION", label_id=0,
-                confidence=0.95, x0=10, y0=10, x1=100, y1=100,
+                scan=scan,
+                page_index=page_idx,
+                label="CASE_CAPTION",
+                label_id=0,
+                confidence=0.95,
+                x0=10,
+                y0=10,
+                x1=100,
+                y1=100,
             )
 
         # Simulate inserting at index 1
         insert_idx = 1
         from django.db.models import F
-        Detection.objects.filter(
-            scan=scan, page_index__gte=insert_idx
-        ).update(page_index=F("page_index") + 1)
+
+        Detection.objects.filter(scan=scan, page_index__gte=insert_idx).update(
+            page_index=F("page_index") + 1
+        )
 
         remaining = list(
             Detection.objects.filter(scan=scan)
@@ -519,8 +554,15 @@ class TestStartDetectSkipsIfExists(TestCase):
         self.client.force_login(user)
         scan = ScanFactory(uploaded_by=user, status=Status.APPROVED)
         Detection.objects.create(
-            scan=scan, page_index=0, label="CASE_CAPTION", label_id=0,
-            confidence=0.95, x0=10, y0=10, x1=100, y1=100,
+            scan=scan,
+            page_index=0,
+            label="CASE_CAPTION",
+            label_id=0,
+            confidence=0.95,
+            x0=10,
+            y0=10,
+            x1=100,
+            y1=100,
         )
 
         response = self.client.post(f"/scans/{scan.pk}/start-detect/")
@@ -536,7 +578,11 @@ class TestStartDetectSkipsIfExists(TestCase):
 # ---------------------------------------------------------------------------
 PDF_23_PATH = (
     pathlib.Path(__file__).resolve().parents[1]
-    / "assets" / "media" / "books" / "a3d" / "original"
+    / "assets"
+    / "media"
+    / "books"
+    / "a3d"
+    / "original"
     / "332_a3d_1-23_opinions.pdf"
 )
 
@@ -558,7 +604,9 @@ class TestSmartEditEndToEnd(TestCase):
         """Create a scan pointing at the 23-page (or modified) PDF."""
         import fitz
 
-        reporter = ReporterFactory(short_name="a3d", full_name="Atlantic Reporter 3d")
+        reporter = ReporterFactory(
+            short_name="a3d", full_name="Atlantic Reporter 3d"
+        )
         doc = fitz.open(str(pdf_dest))
         page_count = doc.page_count
         doc.close()
@@ -628,7 +676,10 @@ class TestSmartEditEndToEnd(TestCase):
             self.assertEqual(scan.page_count, 20)
 
             from blackletter.api import detect
-            dets = detect(str(damaged_path), tmpdir, models=["small", "medium", "large"])
+
+            dets = detect(
+                str(damaged_path), tmpdir, models=["small", "medium", "large"]
+            )
             self.assertGreater(len(dets), 0)
             _import_detections_from_json(scan.pk, tmpdir)
 
@@ -640,13 +691,16 @@ class TestSmartEditEndToEnd(TestCase):
             run_paddleocr_validation(scan.pk, str(damaged_path))
             scan.refresh_from_db()
 
-            missing = json.loads(scan.missing_pages) if scan.missing_pages else []
+            missing = (
+                json.loads(scan.missing_pages) if scan.missing_pages else []
+            )
             print(f"  Missing pages identified: {missing}")
 
             # Pages 8, 12, 17 should be in the missing list
             for pg in remove_pages:
                 self.assertIn(
-                    pg, missing,
+                    pg,
+                    missing,
                     f"Page {pg} should be identified as missing but got {missing}",
                 )
 
@@ -664,7 +718,9 @@ class TestSmartEditEndToEnd(TestCase):
 
             # --- Step 5: Verify the PDF is back to 23 pages ---
             scan.refresh_from_db()
-            self.assertEqual(scan.page_count, 23, "PDF should be back to 23 pages")
+            self.assertEqual(
+                scan.page_count, 23, "PDF should be back to 23 pages"
+            )
 
             # Check the actual PDF
             final_pdf = fitz.open(scan.pdf_path)
@@ -672,7 +728,9 @@ class TestSmartEditEndToEnd(TestCase):
             final_pdf.close()
 
             # --- Step 6: Verify all 23 page numbers are detected ---
-            ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+            ocr_results = (
+                json.loads(scan.ocr_results) if scan.ocr_results else []
+            )
             detected_nums = set()
             for r in ocr_results:
                 if r.get("detected"):
@@ -689,7 +747,8 @@ class TestSmartEditEndToEnd(TestCase):
 
             # All 23 pages should be detected
             self.assertEqual(
-                detected_nums, expected_nums,
+                detected_nums,
+                expected_nums,
                 f"Expected all pages 1-23 detected. Missing: {sorted(still_missing)}",
             )
 
@@ -698,6 +757,7 @@ class TestSmartEditEndToEnd(TestCase):
                 json.loads(scan.missing_pages) if scan.missing_pages else []
             )
             self.assertEqual(
-                final_missing, [],
+                final_missing,
+                [],
                 f"No missing pages expected after re-insert, got: {final_missing}",
             )

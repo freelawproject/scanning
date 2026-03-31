@@ -5,9 +5,11 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ("scanning", "0004_alter_scan_end_page_alter_scan_number_of_pages_and_more"),
+        (
+            "scanning",
+            "0004_alter_scan_end_page_alter_scan_number_of_pages_and_more",
+        ),
     ]
 
     operations = [
@@ -25,7 +27,8 @@ class Migration(migrations.Migration):
             model_name="opinionscan",
             name="original_pdf",
             field=models.FileField(
-                max_length=512, upload_to=scanning.models.opinion_pdf_path("unredacted")
+                max_length=512,
+                upload_to=scanning.models.opinion_pdf_path("unredacted"),
             ),
         ),
         migrations.AlterField(

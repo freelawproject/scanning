@@ -73,8 +73,21 @@ from scanning.utils import find_ocr_pdf
 # ---------------------------------------------------------------------------
 
 
-def _update_progress(scan_pk, message, current=None, total=None, **kwargs):
-    """Update scan progress fields."""
+def _update_progress(
+    scan_pk: int,
+    message: str,
+    current: int | None = None,
+    total: int | None = None,
+    **kwargs,
+) -> None:
+    """Update scan progress fields.
+
+    :param scan_pk: Primary key of the scan to update.
+    :param message: Human-readable progress message (truncated to 255 chars).
+    :param current: Current step number, if applicable.
+    :param total: Total step count, if applicable.
+    :param kwargs: Additional Scan fields to update.
+    """
     updates = {"progress_message": message[:255]}
     if current is not None:
         updates["progress_current"] = current
@@ -84,28 +97,53 @@ def _update_progress(scan_pk, message, current=None, total=None, **kwargs):
     Scan.objects.filter(pk=scan_pk).update(**updates)
 
 
-def _run_ocr(scan_pk, bitonal_path, output_dir, reporter, volume, first_page):
-    """Run Tesseract OCR via blackletter. Returns path to OCR'd PDF."""
+def _run_ocr(
+    scan_pk: int,
+    bitonal_path: str,
+    output_dir: str,
+    reporter: str,
+    volume: str,
+    first_page: int,
+) -> str:
+    """Run Tesseract OCR via blackletter.
+
+    :param scan_pk: Primary key of the scan (for progress updates).
+    :param bitonal_path: Path to the bitonal PDF.
+    :param output_dir: Directory to write the OCR'd PDF into.
+    :param reporter: Reporter short name (e.g. "f3d").
+    :param volume: Volume number as a string.
+    :param first_page: First logical page number in the PDF.
+    :return: Path to the OCR'd PDF.
+    """
     _update_progress(scan_pk, "Running Tesseract OCR...")
     return bl_ocr(
-        bitonal_path, output_dir,
-        reporter=reporter, volume=volume, first_page=first_page,
+        bitonal_path,
+        output_dir,
+        reporter=reporter,
+        volume=volume,
+        first_page=first_page,
     )
 
 
-def _run_yolo(scan_pk, pdf_path, output_dir):
+def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     """Run YOLO detection (all 3 models) via blackletter.
 
-    Saves detections.json to output_dir.
+    :param scan_pk: Primary key of the scan (for progress updates).
+    :param pdf_path: Path to the PDF to run detection on.
+    :param output_dir: Directory where detections.json will be saved.
     """
     _update_progress(scan_pk, "Running YOLO detection...")
     bl_detect(pdf_path, output_dir, models=["small", "medium", "large"])
 
 
-def _import_detections_from_json(scan_pk, output_dir):
+def _import_detections_from_json(scan_pk: int, output_dir: str) -> list:
     """Load detections.json from disk into Detection model.
 
-    Clears existing detections first. Returns the detection list.
+    Clears existing detections first.
+
+    :param scan_pk: Primary key of the scan to import detections for.
+    :param output_dir: Directory containing detections.json.
+    :return: The raw detection list from the JSON file.
     """
     det_path = Path(output_dir) / "detections.json"
     dets = json.loads(det_path.read_text())
@@ -117,27 +155,36 @@ def _import_detections_from_json(scan_pk, output_dir):
             label_name = Label(d["label_id"]).name
         except (ValueError, KeyError):
             label_name = d.get("label", "UNKNOWN")
-        det_objects.append(Detection(
-            scan_id=scan_pk, page_index=d["page_index"],
-            label=label_name, label_id=d["label_id"],
-            confidence=d["confidence"],
-            x0=d["bbox"][0], y0=d["bbox"][1],
-            x1=d["bbox"][2], y1=d["bbox"][3],
-            img_width=d.get("img_width", 0),
-            img_height=d.get("img_height", 0),
-            model_name=d.get("found_by", [{}])[0].get("model", ""),
-            model_count=d.get("model_count", 1),
-            found_by=json.dumps(d.get("found_by", [])),
-        ))
+        det_objects.append(
+            Detection(
+                scan_id=scan_pk,
+                page_index=d["page_index"],
+                label=label_name,
+                label_id=d["label_id"],
+                confidence=d["confidence"],
+                x0=d["bbox"][0],
+                y0=d["bbox"][1],
+                x1=d["bbox"][2],
+                y1=d["bbox"][3],
+                img_width=d.get("img_width", 0),
+                img_height=d.get("img_height", 0),
+                model_name=d.get("found_by", [{}])[0].get("model", ""),
+                model_count=d.get("model_count", 1),
+                found_by=json.dumps(d.get("found_by", [])),
+            )
+        )
     Detection.objects.bulk_create(det_objects)
     return dets
 
 
-def _page_number_lookup(scan):
+def _page_number_lookup(scan: "Scan") -> dict:
     """Build {page_index: (page_number, page_number_end)} from ocr_results.
 
     For range pages like "677-685", returns (677, 685).
     For single pages like "677", returns (677, None).
+
+    :param scan: The Scan instance whose ocr_results to parse.
+    :return: Mapping of page index to (start, end) page number tuple.
     """
     ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
     lookup = {}
@@ -159,8 +206,12 @@ def _page_number_lookup(scan):
     return lookup
 
 
-def _sync_detections_to_disk(scan_pk):
-    """Write current DB detections to detections.json on disk."""
+def _sync_detections_to_disk(scan_pk: int) -> list | None:
+    """Write current DB detections to detections.json on disk.
+
+    :param scan_pk: Primary key of the scan whose detections to sync.
+    :return: The detection data written, or None if no output_dir.
+    """
     scan = Scan.objects.get(pk=scan_pk)
     if not scan.output_dir:
         return
@@ -194,10 +245,15 @@ def _sync_detections_to_disk(scan_pk):
     return det_data
 
 
-def _build_document_from_detections(scan, det_data, pdf_path):
+def _build_document_from_detections(
+    scan: "Scan", det_data: list, pdf_path: str
+) -> "BLDoc":
     """Build a blackletter Document from detection data and a PDF.
 
-    Returns (document, opinions) tuple.
+    :param scan: The Scan instance for reporter/volume metadata.
+    :param det_data: List of detection dicts (from detections.json).
+    :param pdf_path: Path to the PDF to read page dimensions from.
+    :return: The constructed Document.
     """
     src_pdf = fitz.open(str(pdf_path))
     pages_data = {}
@@ -218,23 +274,29 @@ def _build_document_from_detections(scan, det_data, pdf_path):
         else:
             pw, ph = 612.0, 792.0
         page = Page(
-            index=pi, pdf_width=pw, pdf_height=ph,
-            img_width=pd["img_width"], img_height=pd["img_height"],
+            index=pi,
+            pdf_width=pw,
+            pdf_height=ph,
+            img_width=pd["img_width"],
+            img_height=pd["img_height"],
         )
         for d in pd["detections"]:
             b = d.get("bbox", [0, 0, 1, 1])
-            page.detections.append(BLDetection(
-                bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
-                label=Label(d["label_id"]),
-                confidence=d["confidence"],
-                page_index=pi,
-            ))
+            page.detections.append(
+                BLDetection(
+                    bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
+                    label=Label(d["label_id"]),
+                    confidence=d["confidence"],
+                    page_index=pi,
+                )
+            )
         pages.append(page)
     src_pdf.close()
 
     scan_obj = scan if isinstance(scan, Scan) else Scan.objects.get(pk=scan)
     document = BLDoc(
-        pdf_path=str(pdf_path), pages=pages,
+        pdf_path=str(pdf_path),
+        pages=pages,
         reporter=scan_obj.reporter.short_name or "",
         volume=str(scan_obj.volume) or "",
         first_page=scan_obj.start_page or 1,
@@ -243,8 +305,16 @@ def _build_document_from_detections(scan, det_data, pdf_path):
     return document
 
 
-def _compute_and_save_redaction_rects(scan_pk, pdf_path, output_dir):
-    """Compute redaction rects and save to disk. Returns the rects list."""
+def _compute_and_save_redaction_rects(
+    scan_pk: int, pdf_path: str, output_dir: str
+) -> list:
+    """Compute redaction rects and save to disk.
+
+    :param scan_pk: Primary key of the scan to compute rects for.
+    :param pdf_path: Path to the PDF used for page dimensions.
+    :param output_dir: Directory where redaction_rects.json is saved.
+    :return: The computed rects list.
+    """
     scan = Scan.objects.get(pk=scan_pk)
     output_dir = Path(output_dir)
 
@@ -274,8 +344,11 @@ def _compute_and_save_redaction_rects(scan_pk, pdf_path, output_dir):
                 continue
             cx = (r["x0"] + r["x1"]) / 2
             # Only consider TEXT_COLUMNs on the same side of the midpoint
-            same_side = [c for c in cols if (c.x0 + c.x1) / 2 < img_mid] if cx < img_mid \
+            same_side = (
+                [c for c in cols if (c.x0 + c.x1) / 2 < img_mid]
+                if cx < img_mid
                 else [c for c in cols if (c.x0 + c.x1) / 2 >= img_mid]
+            )
             if not same_side:
                 continue
             best = min(same_side, key=lambda c: abs((c.x0 + c.x1) / 2 - cx))
@@ -285,7 +358,9 @@ def _compute_and_save_redaction_rects(scan_pk, pdf_path, output_dir):
     # Split headnote blocks at HEADNOTE detection boundaries
     _GAP = 6
     hn_dets_by_page = {}
-    for d in Detection.objects.filter(scan=scan, active=True, label="HEADNOTE"):
+    for d in Detection.objects.filter(
+        scan=scan, active=True, label="HEADNOTE"
+    ):
         hn_dets_by_page.setdefault(d.page_index, []).append(d)
     for page_entry in rects:
         pi = page_entry["page_index"]
@@ -298,10 +373,14 @@ def _compute_and_save_redaction_rects(scan_pk, pdf_path, output_dir):
                 new_page_rects.append(r)
                 continue
             col_dets = sorted(
-                (d for d in hn_dets
-                 if r["y0"] + _GAP < d.y0 < r["y1"] - _GAP
-                 and d.x0 < r["x1"] and d.x1 > r["x0"]),
-                key=lambda d: d.y0
+                (
+                    d
+                    for d in hn_dets
+                    if r["y0"] + _GAP < d.y0 < r["y1"] - _GAP
+                    and d.x0 < r["x1"]
+                    and d.x1 > r["x0"]
+                ),
+                key=lambda d: d.y0,
             )
             merged = []
             for d in col_dets:
@@ -316,17 +395,21 @@ def _compute_and_save_redaction_rects(scan_pk, pdf_path, output_dir):
             prev_y = r["y0"]
             for sp in splits:
                 if sp - _GAP / 2 > prev_y:
-                    new_page_rects.append({
-                        **r,
-                        "y0": round(prev_y, 1),
-                        "y1": round(sp - _GAP / 2, 1),
-                    })
+                    new_page_rects.append(
+                        {
+                            **r,
+                            "y0": round(prev_y, 1),
+                            "y1": round(sp - _GAP / 2, 1),
+                        }
+                    )
                 prev_y = sp + _GAP / 2
-            new_page_rects.append({
-                **r,
-                "y0": round(prev_y, 1),
-                "y1": round(r["y1"], 1),
-            })
+            new_page_rects.append(
+                {
+                    **r,
+                    "y0": round(prev_y, 1),
+                    "y1": round(r["y1"], 1),
+                }
+            )
         page_entry["rects"] = new_page_rects
 
     rects_path = output_dir / "redaction_rects.json"
@@ -334,8 +417,13 @@ def _compute_and_save_redaction_rects(scan_pk, pdf_path, output_dir):
     return rects
 
 
-def _compute_and_save_margin_rects(pdf_path, output_dir):
-    """Compute margin rects and save to disk."""
+def _compute_and_save_margin_rects(pdf_path: str, output_dir: str) -> list:
+    """Compute margin rects and save to disk.
+
+    :param pdf_path: Path to the PDF to compute margins for.
+    :param output_dir: Directory where margin_rects.json is saved.
+    :return: The computed margin rects list.
+    """
     output_dir = Path(output_dir)
     margin_rects_path = output_dir / "margin_rects.json"
     if not margin_rects_path.exists():
@@ -345,8 +433,12 @@ def _compute_and_save_margin_rects(pdf_path, output_dir):
     return json.loads(margin_rects_path.read_text())
 
 
-def _re_pair_opinions(scan_pk):
-    """Re-pair opinions from current DB detections."""
+def _re_pair_opinions(scan_pk: int) -> list:
+    """Re-pair opinions from current DB detections.
+
+    :param scan_pk: Primary key of the scan to re-pair.
+    :return: The list of paired opinion dicts.
+    """
     scan = Scan.objects.get(pk=scan_pk)
     det_data = _sync_detections_to_disk(scan_pk)
     if not det_data:
@@ -354,7 +446,8 @@ def _re_pair_opinions(scan_pk):
 
     pdf_path = find_ocr_pdf(scan.output_dir) or scan.pdf_path
     opinions = bl_pair(
-        det_data, str(pdf_path),
+        det_data,
+        str(pdf_path),
         reporter=scan.reporter.short_name or "",
         volume=str(scan.volume) or "",
         first_page=scan.start_page or 1,
@@ -370,12 +463,15 @@ def _re_pair_opinions(scan_pk):
 # ---------------------------------------------------------------------------
 
 
-def run_paddleocr_validation(scan_pk, pdf_path):
+def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
     """Validate page numbers using blackletter's analyze_pdf.
 
     Delegates all OCR/YOLO work to blackletter, keeping only the Django-
     specific parts here: progress updates, cancellation checks, and saving
     results to the DB.
+
+    :param scan_pk: Primary key of the scan to validate.
+    :param pdf_path: Path to the PDF to run validation on.
     """
     scan = Scan.objects.get(pk=scan_pk)
     exp_start = scan.start_page or 1
@@ -383,8 +479,10 @@ def run_paddleocr_validation(scan_pk, pdf_path):
 
     def _progress(current, total, message):
         _update_progress(
-            scan_pk, message,
-            current=current, total=total,
+            scan_pk,
+            message,
+            current=current,
+            total=total,
         )
 
     result = bl_analyze_pdf(
@@ -402,10 +500,13 @@ def run_paddleocr_validation(scan_pk, pdf_path):
     _rebuild_issues_from_results(scan_pk, all_results)
 
 
-def run_incremental_validation(scan_pk, pdf_path):
+def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
     """Run YOLO + PaddleOCR on every page via blackletter's analyze_pdf.
 
     Saves detections to the DB and updates progress incrementally.
+
+    :param scan_pk: Primary key of the scan to validate.
+    :param pdf_path: Path to the PDF to run validation on.
     """
     scan = Scan.objects.get(pk=scan_pk)
     exp_start = scan.start_page or 1
@@ -415,8 +516,10 @@ def run_incremental_validation(scan_pk, pdf_path):
 
     def _progress(current, total, message):
         _update_progress(
-            scan_pk, message,
-            current=current, total=total,
+            scan_pk,
+            message,
+            current=current,
+            total=total,
         )
         # Store partial results for live display
         if current <= len(all_results):
@@ -482,8 +585,11 @@ def run_incremental_validation(scan_pk, pdf_path):
 # ---------------------------------------------------------------------------
 
 
-def recalculate_issues(scan):
-    """Rebuild issues from scan.ocr_results without re-running OCR."""
+def recalculate_issues(scan: "Scan") -> None:
+    """Rebuild issues from scan.ocr_results without re-running OCR.
+
+    :param scan: The Scan instance to recalculate issues for.
+    """
 
     ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
     if not ocr_results:
@@ -527,8 +633,7 @@ def recalculate_issues(scan):
                 pp_b, n_b = before[-1]
                 pp_a, n_a = after[0]
                 expected = round(
-                    n_b
-                    + (n_a - n_b) / max(pp_a - pp_b, 1) * (p - pp_b)
+                    n_b + (n_a - n_b) / max(pp_a - pp_b, 1) * (p - pp_b)
                 )
             elif before:
                 pp_b, n_b = before[-1]
@@ -542,14 +647,10 @@ def recalculate_issues(scan):
 
         if offsets:
             offset_vals = [v[2] for v in offsets.values()]
-            modal_offset, modal_count = Counter(offset_vals).most_common(1)[
-                0
-            ]
+            modal_offset, modal_count = Counter(offset_vals).most_common(1)[0]
             if modal_count >= len(offset_vals) * 0.5 and modal_offset != 0:
                 to_fix = {
-                    p
-                    for p, (d, e, o) in offsets.items()
-                    if o == modal_offset
+                    p for p, (d, e, o) in offsets.items() if o == modal_offset
                 }
                 new_results = []
                 for r in ocr_results:
@@ -681,10 +782,12 @@ def recalculate_issues(scan):
 # ---------------------------------------------------------------------------
 
 
-def run_validate_with_bitonal(scan_pk):
+def run_validate_with_bitonal(scan_pk: int) -> None:
     """Convert to bitonal (if needed) then run incremental validation.
 
-    Designed to run in a background thread.
+    Designed to run in the daemon process.
+
+    :param scan_pk: Primary key of the scan to validate.
     """
     django.db.connections.close_all()
 
@@ -695,13 +798,17 @@ def run_validate_with_bitonal(scan_pk):
         return
 
     try:
-        print(f"[validate] scan {scan_pk} pdf_path={scan.pdf_path}", flush=True)
+        print(
+            f"[validate] scan {scan_pk} pdf_path={scan.pdf_path}", flush=True
+        )
         if not scan.output_dir:
             output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
             if scan.reporter and scan.volume:
                 output_dir = (
-                    output_dir / scan.reporter.short_name
-                    / str(scan.volume) / str(scan.start_page or 1)
+                    output_dir
+                    / scan.reporter.short_name
+                    / str(scan.volume)
+                    / str(scan.start_page or 1)
                 )
             output_dir.mkdir(parents=True, exist_ok=True)
             Scan.objects.filter(pk=scan_pk).update(output_dir=str(output_dir))
@@ -711,6 +818,7 @@ def run_validate_with_bitonal(scan_pk):
 
         bitonal_path = output_dir / "bitonal.pdf"
         if not bitonal_path.exists():
+
             def _bitonal_progress(current, total, message):
                 Scan.objects.filter(pk=scan_pk).update(
                     progress_message=message,
@@ -718,7 +826,11 @@ def run_validate_with_bitonal(scan_pk):
                     progress_total=total,
                 )
 
-            bl_bitonal(scan.pdf_path, str(output_dir), progress_callback=_bitonal_progress)
+            bl_bitonal(
+                scan.pdf_path,
+                str(output_dir),
+                progress_callback=_bitonal_progress,
+            )
             pdf = fitz.open(str(bitonal_path))
             count = pdf.page_count
             pdf.close()
@@ -730,7 +842,8 @@ def run_validate_with_bitonal(scan_pk):
         traceback.print_exc()
         print(f"[validate] ERROR: {exc}", flush=True)
         Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR, progress_message=str(exc)[:255],
+            status=Status.ERROR,
+            progress_message=str(exc)[:255],
         )
 
 
@@ -739,11 +852,13 @@ def run_validate_with_bitonal(scan_pk):
 # ---------------------------------------------------------------------------
 
 
-def run_full_pipeline(scan_pk):
+def run_full_pipeline(scan_pk: int) -> None:
     """Run the full processing pipeline: bitonal → OCR → YOLO → validate → pair → rects.
 
-    Designed to run in a background thread. After this completes, the scan
-    is ready for review — the user only needs to approve and generate.
+    Designed to run in the daemon process. After this completes, the scan
+    is ready for review -- the user only needs to approve and generate.
+
+    :param scan_pk: Primary key of the scan to process.
     """
     django.db.connections.close_all()
 
@@ -759,8 +874,10 @@ def run_full_pipeline(scan_pk):
             output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
             if scan.reporter and scan.volume:
                 output_dir = (
-                    output_dir / scan.reporter.short_name
-                    / str(scan.volume) / str(scan.start_page or 1)
+                    output_dir
+                    / scan.reporter.short_name
+                    / str(scan.volume)
+                    / str(scan.start_page or 1)
                 )
             output_dir.mkdir(parents=True, exist_ok=True)
             Scan.objects.filter(pk=scan_pk).update(output_dir=str(output_dir))
@@ -771,10 +888,17 @@ def run_full_pipeline(scan_pk):
         # 2. Bitonal conversion
         bitonal_path = output_dir / "bitonal.pdf"
         if not bitonal_path.exists():
-            def _bitonal_progress(current, total, message):
-                _update_progress(scan_pk, message, current=current, total=total)
 
-            bl_bitonal(scan.pdf_path, str(output_dir), progress_callback=_bitonal_progress)
+            def _bitonal_progress(current, total, message):
+                _update_progress(
+                    scan_pk, message, current=current, total=total
+                )
+
+            bl_bitonal(
+                scan.pdf_path,
+                str(output_dir),
+                progress_callback=_bitonal_progress,
+            )
 
         pdf = fitz.open(str(bitonal_path))
         page_count = pdf.page_count
@@ -786,7 +910,9 @@ def run_full_pipeline(scan_pk):
         ocr_pdf = find_ocr_pdf(str(output_dir))
         if not ocr_pdf:
             ocr_pdf = _run_ocr(
-                scan_pk, str(bitonal_path), str(output_dir),
+                scan_pk,
+                str(bitonal_path),
+                str(output_dir),
                 reporter=scan.reporter.short_name or "",
                 volume=str(scan.volume) or "",
                 first_page=scan.start_page or 1,
@@ -823,7 +949,8 @@ def run_full_pipeline(scan_pk):
         traceback.print_exc()
         print(f"[pipeline] ERROR: {exc}", flush=True)
         Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR, progress_message=str(exc)[:255],
+            status=Status.ERROR,
+            progress_message=str(exc)[:255],
         )
 
 
@@ -832,11 +959,14 @@ def run_full_pipeline(scan_pk):
 # ---------------------------------------------------------------------------
 
 
-def _rebuild_issues_from_results(scan_pk, all_results):
+def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
     """Re-analyze ocr_results and rebuild issues/page_map without re-running OCR.
 
     Preserves the actual OCR results (including manual assignments) but
     recalculates sequence issues, missing pages, duplicates, etc.
+
+    :param scan_pk: Primary key of the scan to rebuild issues for.
+    :param all_results: List of per-page OCR result dicts.
     """
     scan = Scan.objects.get(pk=scan_pk)
     total = len(all_results)
@@ -883,8 +1013,14 @@ def _rebuild_issues_from_results(scan_pk, all_results):
                 )
             elif diff > 2:
                 seq_issues.append(
-                    ("GAP", r["pdf_page"], num, prev_pdf, prev_num,
-                     list(range(prev_num + 1, num)))
+                    (
+                        "GAP",
+                        r["pdf_page"],
+                        num,
+                        prev_pdf,
+                        prev_num,
+                        list(range(prev_num + 1, num)),
+                    )
                 )
         prev_num = num
         prev_pdf = r["pdf_page"]
@@ -931,13 +1067,15 @@ def _rebuild_issues_from_results(scan_pk, all_results):
     )
 
 
-def run_reprocess(scan_pk):
+def run_reprocess(scan_pk: int) -> None:
     """Apply PDF fixes (inserts/deletions) using smart edits.
 
     Only OCRs newly inserted pages. Deleted pages are removed from
     ocr_results. Manual page assignments are preserved.
 
-    Designed to run in a background thread.
+    Designed to run in the daemon process.
+
+    :param scan_pk: Primary key of the scan to reprocess.
     """
     django.db.connections.close_all()
 
@@ -950,7 +1088,9 @@ def run_reprocess(scan_pk):
         if not has_deletions and not has_inserts:
             # Nothing changed — just rebuild issues from existing results
             _update_progress(scan_pk, "Re-checking...")
-            all_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+            all_results = (
+                json.loads(scan.ocr_results) if scan.ocr_results else []
+            )
             _rebuild_issues_from_results(scan_pk, all_results)
             _re_pair_opinions(scan_pk)
             return
@@ -989,7 +1129,9 @@ def run_reprocess(scan_pk):
                 ).update(page_index=F("page_index") - 1)
 
                 # Remove from ocr_results and shift pdf_page numbers
-                all_results = [r for r in all_results if r["pdf_page"] != pdf_page]
+                all_results = [
+                    r for r in all_results if r["pdf_page"] != pdf_page
+                ]
                 for r in all_results:
                     if r["pdf_page"] > pdf_page:
                         r["pdf_page"] -= 1
@@ -1018,9 +1160,7 @@ def run_reprocess(scan_pk):
                 pre_count = pdf.page_count
                 pdf.close()
 
-                run_smart_insert(
-                    scan_pk, logical_num, insert_obj.image.path
-                )
+                run_smart_insert(scan_pk, logical_num, insert_obj.image.path)
 
                 pdf = fitz.open(scan.pdf_path)
                 post_count = pdf.page_count
@@ -1046,7 +1186,9 @@ def run_reprocess(scan_pk):
 
         # OCR only the newly inserted pages
         if new_page_indices:
-            _update_progress(scan_pk, f"OCR on {len(new_page_indices)} new page(s)...")
+            _update_progress(
+                scan_pk, f"OCR on {len(new_page_indices)} new page(s)..."
+            )
             scan.refresh_from_db()
             exp_start = scan.start_page or 1
             exp_end = scan.end_page
@@ -1074,11 +1216,16 @@ def run_reprocess(scan_pk):
         existing_pages = {r["pdf_page"] for r in all_results}
         for p in range(1, new_count + 1):
             if p not in existing_pages:
-                all_results.append({
-                    "pdf_page": p, "detected": None,
-                    "type": "missing_ocr", "zone": "none",
-                    "score": 0, "ocr": "skipped",
-                })
+                all_results.append(
+                    {
+                        "pdf_page": p,
+                        "detected": None,
+                        "type": "missing_ocr",
+                        "zone": "none",
+                        "score": 0,
+                        "ocr": "skipped",
+                    }
+                )
         all_results.sort(key=lambda r: r["pdf_page"])
 
         # Sync detections and rebuild issues
@@ -1091,7 +1238,9 @@ def run_reprocess(scan_pk):
 
         if output_dir:
             pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
-            _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
+            _compute_and_save_redaction_rects(
+                scan_pk, pdf_path, str(output_dir)
+            )
             # Delete stale margin rects — will be recomputed lazily when viewer requests them
             stale_margins = Path(output_dir) / "margin_rects.json"
             if stale_margins.exists():
@@ -1105,7 +1254,8 @@ def run_reprocess(scan_pk):
     except Exception as exc:
         traceback.print_exc()
         Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR, progress_message=str(exc)[:255],
+            status=Status.ERROR,
+            progress_message=str(exc)[:255],
         )
 
 
@@ -1114,12 +1264,15 @@ def run_reprocess(scan_pk):
 # ---------------------------------------------------------------------------
 
 
-def run_smart_delete(scan_pk, pdf_page):
+def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
     """Delete a single page and patch detections/validation in place.
 
-    pdf_page is 1-based. Removes the page from the original PDF, bitonal PDF,
-    and OCR PDF; deletes detections on that page; shifts subsequent detection
+    Removes the page from the original PDF, bitonal PDF, and OCR PDF;
+    deletes detections on that page; shifts subsequent detection
     page_index values down by 1; re-runs PaddleOCR validation and re-pairs.
+
+    :param scan_pk: Primary key of the scan to edit.
+    :param pdf_page: 1-based PDF page number to delete.
     """
     scan = Scan.objects.get(pk=scan_pk)
     page_idx = pdf_page - 1
@@ -1137,9 +1290,9 @@ def run_smart_delete(scan_pk, pdf_page):
     Detection.objects.filter(scan_id=scan_pk, page_index=page_idx).delete()
 
     # Shift subsequent detections down
-    Detection.objects.filter(
-        scan_id=scan_pk, page_index__gt=page_idx
-    ).update(page_index=F("page_index") - 1)
+    Detection.objects.filter(scan_id=scan_pk, page_index__gt=page_idx).update(
+        page_index=F("page_index") - 1
+    )
 
     # Update page count
     pdf = fitz.open(scan.pdf_path)
@@ -1159,12 +1312,16 @@ def run_smart_delete(scan_pk, pdf_page):
         _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
 
 
-def run_smart_insert(scan_pk, logical_page_number, image_path):
+def run_smart_insert(scan_pk: int, logical_page_number: int, image_path: str) -> None:
     """Insert a page and run detection/validation on just that page.
 
     Inserts the page image into the original PDF, bitonal PDF, and OCR PDF
     at the correct position; shifts subsequent detection page_index values up
-    by 1; runs YOLO on just the new page; re-validates and re-pairs.
+    by 1; re-validates and re-pairs.
+
+    :param scan_pk: Primary key of the scan to edit.
+    :param logical_page_number: The logical page number to insert at.
+    :param image_path: Path to the image or PDF file to insert.
     """
     scan = Scan.objects.get(pk=scan_pk)
     output_dir = Path(scan.output_dir) if scan.output_dir else None
@@ -1190,8 +1347,10 @@ def run_smart_insert(scan_pk, logical_page_number, image_path):
         if str(image_path).lower().endswith(".pdf"):
             insert_pdf = fitz.open(str(image_path))
             doc.insert_pdf(
-                insert_pdf, from_page=0,
-                to_page=insert_pdf.page_count - 1, start_at=insert_idx,
+                insert_pdf,
+                from_page=0,
+                to_page=insert_pdf.page_count - 1,
+                start_at=insert_idx,
             )
             insert_pdf.close()
         else:
@@ -1224,8 +1383,13 @@ def run_smart_insert(scan_pk, logical_page_number, image_path):
         _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
 
 
-def _collect_pdf_paths(scan, output_dir):
-    """Collect all PDF paths that need page edits applied."""
+def _collect_pdf_paths(scan: "Scan", output_dir: str | None) -> list[Path]:
+    """Collect all PDF paths that need page edits applied.
+
+    :param scan: The Scan instance to collect paths for.
+    :param output_dir: Output directory to check for bitonal/OCR PDFs.
+    :return: List of Path objects for all relevant PDFs.
+    """
     paths = [Path(scan.pdf_path)]
     if output_dir:
         output_dir = Path(output_dir)
@@ -1243,7 +1407,7 @@ def _collect_pdf_paths(scan, output_dir):
 # ---------------------------------------------------------------------------
 
 
-def _stamp_original_images(scan, ocr_pdf_path):
+def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
     """Overlay original-quality image regions onto a *copy* of the OCR'd PDF.
 
     For each active IMAGE detection, renders the bounding box from the
@@ -1251,17 +1415,20 @@ def _stamp_original_images(scan, ocr_pdf_path):
     same position.  This preserves full-quality photographs/illustrations
     that would otherwise be degraded by bitonal conversion.
 
-    Returns the path to the stamped copy, or the original path if no
-    images needed stamping (so the OCR PDF is never modified).
+    :param scan: The Scan instance with the original PDF path.
+    :param ocr_pdf_path: Path to the OCR'd PDF to stamp onto.
+    :return: Path to the stamped copy, or the original path if no
+        images needed stamping (so the OCR PDF is never modified).
     """
-
 
     stamped_path = os.path.join(os.path.dirname(ocr_pdf_path), "stamped.pdf")
 
     image_dets = list(
         Detection.objects.filter(scan=scan, label="IMAGE", active=True)
         .order_by("page_index")
-        .values("page_index", "x0", "y0", "x1", "y1", "img_width", "img_height")
+        .values(
+            "page_index", "x0", "y0", "x1", "y1", "img_width", "img_height"
+        )
     )
     if not image_dets:
         # Always copy so the OCR PDF is never modified by downstream steps
@@ -1274,7 +1441,10 @@ def _stamp_original_images(scan, ocr_pdf_path):
     try:
         for det in image_dets:
             page_idx = det["page_index"]
-            if page_idx >= original_doc.page_count or page_idx >= ocr_doc.page_count:
+            if (
+                page_idx >= original_doc.page_count
+                or page_idx >= ocr_doc.page_count
+            ):
                 continue
 
             orig_page = original_doc[page_idx]
@@ -1308,18 +1478,21 @@ def _stamp_original_images(scan, ocr_pdf_path):
     return stamped_path
 
 
-def run_generate_files(scan_pk):
+def run_generate_files(scan_pk: int) -> None:
     """Generate redacted/split opinion files from existing detections.
 
-    Designed to run in a background thread.
+    Designed to run in the daemon process.
+
+    :param scan_pk: Primary key of the scan to generate files for.
     """
     django.db.connections.close_all()
-
 
     scan = Scan.objects.get(pk=scan_pk)
 
     try:
-        Scan.objects.filter(pk=scan_pk).update(progress_message="Generating files...", progress_log="")
+        Scan.objects.filter(pk=scan_pk).update(
+            progress_message="Generating files...", progress_log=""
+        )
 
         reporter = scan.reporter.short_name
         volume = str(scan.volume)
@@ -1336,7 +1509,9 @@ def run_generate_files(scan_pk):
 
         # Write current DB detections -> detections.json (includes page numbers)
         det_data = _sync_detections_to_disk(scan_pk)
-        Scan.objects.filter(pk=scan_pk).update(progress_message=f"Generating files ({len(det_data or [])} detections)...")
+        Scan.objects.filter(pk=scan_pk).update(
+            progress_message=f"Generating files ({len(det_data or [])} detections)..."
+        )
 
         suppression_excluded = set()
         for issue in scan.issues.filter(check_name="suppress_detection"):
@@ -1344,10 +1519,14 @@ def run_generate_files(scan_pk):
                 try:
                     meta = json.loads(issue.metadata)
                     bbox = meta.get("bbox", [0, 0, 0, 0])
-                    suppression_excluded.add((
-                        meta.get("page_index", 0), meta.get("label_id", 0),
-                        round(bbox[0]), round(bbox[1]),
-                    ))
+                    suppression_excluded.add(
+                        (
+                            meta.get("page_index", 0),
+                            meta.get("label_id", 0),
+                            round(bbox[0]),
+                            round(bbox[1]),
+                        )
+                    )
                 except Exception:
                     pass
         Scan.objects.filter(pk=scan_pk).update(
@@ -1370,10 +1549,14 @@ def run_generate_files(scan_pk):
             break
 
         redacted_dir = output_dir / "redacted"
-        redacted_files = sorted(redacted_dir.glob("*.pdf")) if redacted_dir.is_dir() else []
+        redacted_files = (
+            sorted(redacted_dir.glob("*.pdf")) if redacted_dir.is_dir() else []
+        )
 
         scan.refresh_from_db()
-        existing_opinions = json.loads(scan.opinions_json) if scan.opinions_json else []
+        existing_opinions = (
+            json.loads(scan.opinions_json) if scan.opinions_json else []
+        )
 
         if existing_opinions and "caption_page" in existing_opinions[0]:
             for i, op in enumerate(existing_opinions):
@@ -1382,7 +1565,9 @@ def run_generate_files(scan_pk):
         else:
             existing_opinions = []
             for f in redacted_files:
-                existing_opinions.append({"filename": f.name, "first_page": 0, "last_page": 0})
+                existing_opinions.append(
+                    {"filename": f.name, "first_page": 0, "last_page": 0}
+                )
 
         redacted_pdf = list(output_dir.glob("*.redacted.pdf"))
 
@@ -1404,40 +1589,43 @@ def run_generate_files(scan_pk):
             page_end = op.get("last_page_number", page_start)
             fname = op.get("filename", "")
             opinion = OpinionScan.objects.create(
-                scan=scan, reporter=scan.reporter, volume=scan.volume,
-                opinion_order=i, page_start=page_start or 1,
+                scan=scan,
+                reporter=scan.reporter,
+                volume=scan.volume,
+                opinion_order=i,
+                page_start=page_start or 1,
                 page_end=page_end or page_start or 1,
                 caption_page_index=op.get("caption_page"),
                 key_page_index=op.get("key_page"),
                 has_image=op.get("has_image", False),
-                status=OpinionStatus.OK, uploaded_by=scan.uploaded_by,
+                status=OpinionStatus.OK,
+                uploaded_by=scan.uploaded_by,
             )
             if fname:
                 media_root = Path(settings.MEDIA_ROOT)
                 rp = redacted_dir / fname
                 if rp.exists():
-                    opinion.redacted_pdf.name = str(
-                        rp.relative_to(media_root)
-                    )
-                up = unredacted_dir / fname if unredacted_dir.exists() else None
+                    opinion.redacted_pdf.name = str(rp.relative_to(media_root))
+                up = (
+                    unredacted_dir / fname if unredacted_dir.exists() else None
+                )
                 if up and up.exists():
-                    opinion.original_pdf.name = str(
-                        up.relative_to(media_root)
-                    )
+                    opinion.original_pdf.name = str(up.relative_to(media_root))
                 # Opinion suffix is 1-3 unpadded digits (e.g. -1, -2, -3).
                 # Page numbers are always 4 zero-padded digits (e.g. -0006).
                 # Only strip the suffix if it's 1-3 digits preceded by a 4-digit page number.
-                masked_fname = re.sub(r"(\d{4})-\d{1,3}\.pdf$", r"\1.pdf", fname)
+                masked_fname = re.sub(
+                    r"(\d{4})-\d{1,3}\.pdf$", r"\1.pdf", fname
+                )
                 mp = masked_dir / masked_fname if masked_dir.exists() else None
                 if mp and mp.exists():
-                    opinion.masked_pdf.name = str(
-                        mp.relative_to(media_root)
-                    )
+                    opinion.masked_pdf.name = str(mp.relative_to(media_root))
                 opinion.save()
 
             if opinion.masked_pdf.name:
                 llm_scan = LLMScan.objects.create(
-                    scan=scan, masked_pdf=opinion.masked_pdf.name,
+                    scan=scan,
+                    masked_pdf=opinion.masked_pdf.name,
                     status=LLMScan.Status.PENDING,
                 )
                 llm_scan.opinions.add(opinion)
@@ -1445,7 +1633,8 @@ def run_generate_files(scan_pk):
     except Exception as exc:
         traceback.print_exc()
         Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR, progress_message=str(exc)[:255],
+            status=Status.ERROR,
+            progress_message=str(exc)[:255],
         )
 
 
@@ -1454,10 +1643,12 @@ def run_generate_files(scan_pk):
 # ---------------------------------------------------------------------------
 
 
-def run_detect(scan_pk):
-    """Run YOLO detection as subprocess, then pair opinions.
+def run_detect(scan_pk: int) -> None:
+    """Run YOLO detection and pair opinions.
 
-    Designed to run in a background thread.
+    Designed to run in the daemon process.
+
+    :param scan_pk: Primary key of the scan to detect on.
     """
     django.db.connections.close_all()
 
@@ -1469,7 +1660,9 @@ def run_detect(scan_pk):
         # OCR if needed (no existing OCR PDF)
         if not find_ocr_pdf(str(output_dir)) and bitonal.exists():
             _run_ocr(
-                scan_pk, str(bitonal), str(output_dir),
+                scan_pk,
+                str(bitonal),
+                str(output_dir),
                 reporter=scan.reporter.short_name or "",
                 volume=str(scan.volume) or "",
                 first_page=scan.start_page or 1,
@@ -1495,5 +1688,6 @@ def run_detect(scan_pk):
     except Exception as exc:
         traceback.print_exc()
         Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR, progress_message=str(exc)[:255],
+            status=Status.ERROR,
+            progress_message=str(exc)[:255],
         )

@@ -4,9 +4,11 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ("scanning", "0007_volume_remove_scan_unique_reporter_volume_source_and_more"),
+        (
+            "scanning",
+            "0007_volume_remove_scan_unique_reporter_volume_source_and_more",
+        ),
     ]
 
     operations = [

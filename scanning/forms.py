@@ -1,4 +1,5 @@
 from django import forms
+from django.core.files.uploadedfile import UploadedFile
 from django.core.validators import FileExtensionValidator
 
 from scanning.models import (
@@ -13,13 +14,11 @@ from scanning.models import (
 class ReporterChoiceField(forms.ModelChoiceField):
     """ModelChoiceField that displays reporters as 'Full Name (slug)'."""
 
-    def label_from_instance(self, obj):
+    def label_from_instance(self, obj: Reporter) -> str:
         """Format the display label for a Reporter instance.
 
         :param obj: The Reporter instance.
-        :type obj: Reporter
-        :returns: The formatted label.
-        :rtype: str
+        :return: The formatted label.
         """
         return f"{obj.full_name} ({obj.short_name})"
 
@@ -77,11 +76,10 @@ class ScanUploadForm(forms.ModelForm):
             ),
         }
 
-    def clean_original_pdf(self):
+    def clean_original_pdf(self) -> UploadedFile:
         """Validate that the uploaded file is a PDF by MIME type and magic bytes.
 
-        :returns: The validated file.
-        :rtype: django.core.files.uploadedfile.UploadedFile
+        :return: The validated file.
         """
         pdf = self.cleaned_data.get("original_pdf")
         if pdf:
@@ -202,11 +200,10 @@ class OpinionScanUploadForm(forms.ModelForm):
             ),
         }
 
-    def clean_original_pdf(self):
+    def clean_original_pdf(self) -> UploadedFile:
         """Validate that the uploaded file is a PDF by MIME type and magic bytes.
 
-        :returns: The validated file.
-        :rtype: django.core.files.uploadedfile.UploadedFile
+        :return: The validated file.
         """
         pdf = self.cleaned_data.get("original_pdf")
         if pdf:

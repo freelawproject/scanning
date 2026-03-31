@@ -103,12 +103,8 @@ class Volume(AbstractDateTimeModel):
     volume_number = models.PositiveIntegerField(
         validators=[MinValueValidator(1)]
     )
-    expected_start_page = models.PositiveIntegerField(
-        null=True, blank=True
-    )
-    expected_end_page = models.PositiveIntegerField(
-        null=True, blank=True
-    )
+    expected_start_page = models.PositiveIntegerField(null=True, blank=True)
+    expected_end_page = models.PositiveIntegerField(null=True, blank=True)
     priority = models.CharField(
         max_length=20,
         choices=Priority.choices,
@@ -127,9 +123,7 @@ class Volume(AbstractDateTimeModel):
         related_name="assigned_volumes",
     )
     assigned_at = models.DateTimeField(null=True, blank=True)
-    source_library = models.CharField(
-        max_length=200, blank=True, default=""
-    )
+    source_library = models.CharField(max_length=200, blank=True, default="")
     source_url = models.URLField(blank=True, default="")
     is_partial = models.BooleanField(
         default=False,
@@ -156,9 +150,7 @@ class Volume(AbstractDateTimeModel):
 
     @property
     def scans_complete(self):
-        return self.scans.filter(
-            status=Status.APPROVED
-        ).count()
+        return self.scans.filter(status=Status.APPROVED).count()
 
     @property
     def coverage(self):
@@ -184,23 +176,17 @@ class Volume(AbstractDateTimeModel):
         return expected.issubset(covered)
 
     def __str__(self):
-        return (
-            f"{self.reporter.short_name} vol."
-            f" {self.volume_number}"
-        )
+        return f"{self.reporter.short_name} vol. {self.volume_number}"
 
 
-def book_upload_path(instance, filename):
+def book_upload_path(instance: "Scan", filename: str) -> str:
     """Generate upload path for book scan PDFs.
 
     Example: ``books/f3d/original/42_f3d_1-200_full.pdf``
 
     :param instance: The Scan model instance.
-    :type instance: Scan
     :param filename: The original filename.
-    :type filename: str
-    :returns: The upload path.
-    :rtype: str
+    :return: The upload path.
     """
     return (
         f"books/{instance.reporter.short_name}/original/"
@@ -210,17 +196,14 @@ def book_upload_path(instance, filename):
     )
 
 
-def compressed_upload_path(instance, filename):
+def compressed_upload_path(instance: "Scan", filename: str) -> str:
     """Generate upload path for compressed book scan PDFs.
 
     Example: ``books/f3d/compressed/42_f3d_1-200_full.pdf``
 
     :param instance: The Scan model instance.
-    :type instance: Scan
     :param filename: The original filename.
-    :type filename: str
-    :returns: The upload path.
-    :rtype: str
+    :return: The upload path.
     """
     return (
         f"books/{instance.reporter.short_name}/compressed/"
@@ -230,17 +213,14 @@ def compressed_upload_path(instance, filename):
     )
 
 
-def book_cover_path(instance, filename):
+def book_cover_path(instance: "Scan", filename: str) -> str:
     """Generate upload path for book cover images.
 
     Example: ``books/f3d/42_f3d_cover.jpg``
 
     :param instance: The Scan model instance.
-    :type instance: Scan
     :param filename: The original filename.
-    :type filename: str
-    :returns: The upload path.
-    :rtype: str
+    :return: The upload path.
     """
     ext = filename.rsplit(".", 1)[-1] if "." in filename else "jpg"
     return (
@@ -260,21 +240,17 @@ class opinion_pdf_path:
     Example: ``opinions/f3d/42/unredacted/f3d.42.0001-0025.pdf``
 
     :param subfolder: Subdirectory name (e.g. "unredacted", "masked", "redacted").
-    :type subfolder: str
     """
 
-    def __init__(self, subfolder):
+    def __init__(self, subfolder: str) -> None:
         self.subfolder = subfolder
 
-    def __call__(self, instance, filename):
+    def __call__(self, instance: "OpinionScan", filename: str) -> str:
         """Generate the upload path for the given instance and filename.
 
         :param instance: The OpinionScan model instance.
-        :type instance: OpinionScan
         :param filename: The original filename.
-        :type filename: str
-        :returns: The upload path.
-        :rtype: str
+        :return: The upload path.
         """
         ext = filename.rsplit(".", 1)[-1] if "." in filename else "pdf"
         return (
@@ -457,11 +433,10 @@ class Scan(AbstractDateTimeModel):
             raise ValidationError(errors)
 
     @property
-    def pdf_path(self):
+    def pdf_path(self) -> str:
         """Return the path to the original uploaded PDF.
 
-        :returns: The filesystem path of the original PDF.
-        :rtype: str
+        :return: The filesystem path of the original PDF.
         """
         return self.original_pdf.path
 

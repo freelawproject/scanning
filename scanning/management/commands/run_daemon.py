@@ -18,6 +18,12 @@ class Command(BaseCommand):
         self.shutdown = False
 
     def handle(self, *args, **options):
+        """Poll for queued scans and process them until shutdown.
+
+        :param args: Positional arguments from the management command.
+        :param options: Parsed command-line options.
+        :return: None.
+        """
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
 
@@ -39,7 +45,10 @@ class Command(BaseCommand):
         self.stdout.write("Daemon shutting down.")
 
     def _recover_stale(self):
-        """Reset scans stuck in PROCESSING past the timeout back to QUEUED."""
+        """Reset scans stuck in PROCESSING past the timeout back to QUEUED.
+
+        :return: None.
+        """
         from django.conf import settings
         from django.utils import timezone
         from datetime import timedelta
@@ -64,6 +73,10 @@ class Command(BaseCommand):
             )
 
     def _process_next(self):
+        """Fetch the next queued scan and dispatch its action.
+
+        :return: None.
+        """
         from django.db import connections
         from django.utils import timezone
 
@@ -102,7 +115,9 @@ class Command(BaseCommand):
 
         fn = dispatch.get(action)
         if fn is None:
-            logger.error("Unknown queued_action %r for scan %s", action, scan.pk)
+            logger.error(
+                "Unknown queued_action %r for scan %s", action, scan.pk
+            )
             Scan.objects.filter(pk=scan.pk).update(
                 status=Status.ERROR,
                 progress_message=f"Unknown action: {action}",
@@ -114,9 +129,11 @@ class Command(BaseCommand):
         except Exception:
             logger.exception("Scan %s (%s) failed", scan.pk, action)
             # Only set ERROR if the pipeline didn't already handle it
-            current = Scan.objects.filter(pk=scan.pk).values_list(
-                "status", flat=True
-            ).first()
+            current = (
+                Scan.objects.filter(pk=scan.pk)
+                .values_list("status", flat=True)
+                .first()
+            )
             if current == Status.PROCESSING:
                 Scan.objects.filter(pk=scan.pk).update(
                     status=Status.ERROR,
@@ -124,5 +141,11 @@ class Command(BaseCommand):
                 )
 
     def _handle_signal(self, signum, frame):
+        """Set the shutdown flag on receipt of a termination signal.
+
+        :param signum: The signal number received.
+        :param frame: The interrupted stack frame.
+        :return: None.
+        """
         self.stdout.write(f"Received signal {signum}, shutting down...")
         self.shutdown = True

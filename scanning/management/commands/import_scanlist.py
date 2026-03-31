@@ -36,9 +36,7 @@ class Command(BaseCommand):
     help = "Import scan queue from pdfchecker's scanlist.csv."
 
     def add_arguments(self, parser):
-        parser.add_argument(
-            "csv_file", help="Path to scanlist.csv"
-        )
+        parser.add_argument("csv_file", help="Path to scanlist.csv")
         parser.add_argument(
             "--dry-run",
             action="store_true",
@@ -49,40 +47,22 @@ class Command(BaseCommand):
         csv_path = options["csv_file"]
         dry_run = options["dry_run"]
 
-        reporters = {
-            r.short_name: r for r in Reporter.objects.all()
-        }
+        reporters = {r.short_name: r for r in Reporter.objects.all()}
         volumes_created = scans_created = skipped = errors = 0
 
         with open(csv_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter="\t")
             for row in reader:
                 slug = (row.get("Slug") or "").strip()
-                volume_str = (
-                    row.get("Volume #") or ""
-                ).strip()
-                status_str = (
-                    row.get("Status") or ""
-                ).strip()
-                priority_str = (
-                    row.get("Priority") or ""
-                ).strip().upper()
-                first_page = (
-                    row.get("First Page") or ""
-                ).strip()
-                last_page = (
-                    row.get("Last Page") or ""
-                ).strip()
+                volume_str = (row.get("Volume #") or "").strip()
+                status_str = (row.get("Status") or "").strip()
+                priority_str = (row.get("Priority") or "").strip().upper()
+                first_page = (row.get("First Page") or "").strip()
+                last_page = (row.get("Last Page") or "").strip()
                 notes = (row.get("Notes") or "").strip()
-                assigned = (
-                    row.get("Assigned To") or ""
-                ).strip()
-                source_library = (
-                    row.get("Located") or ""
-                ).strip()
-                is_advance = (
-                    row.get("Advance Sheet/Volume") or ""
-                ).strip()
+                assigned = (row.get("Assigned To") or "").strip()
+                source_library = (row.get("Located") or "").strip()
+                is_advance = (row.get("Advance Sheet/Volume") or "").strip()
                 book_num = (row.get("Book") or "").strip()
 
                 if not slug or not volume_str:
@@ -91,26 +71,20 @@ class Command(BaseCommand):
 
                 reporter = reporters.get(slug)
                 if not reporter:
-                    self.stderr.write(
-                        f"Unknown reporter slug: {slug}"
-                    )
+                    self.stderr.write(f"Unknown reporter slug: {slug}")
                     errors += 1
                     continue
 
                 # Parse volume number (strip trailing A/B/C)
-                vol_digits = "".join(
-                    c for c in volume_str if c.isdigit()
-                )
+                vol_digits = "".join(c for c in volume_str if c.isdigit())
                 if not vol_digits:
-                    self.stderr.write(
-                        f"Bad volume: {volume_str}"
-                    )
+                    self.stderr.write(f"Bad volume: {volume_str}")
                     errors += 1
                     continue
                 vol_num = int(vol_digits)
 
                 # Part label: "142A" → "A", advance sheet "3" → "3"
-                part_label = volume_str[len(vol_digits):]
+                part_label = volume_str[len(vol_digits) :]
                 if not part_label and book_num:
                     part_label = book_num
                 if (
@@ -124,16 +98,13 @@ class Command(BaseCommand):
 
                 source = (
                     Source.OPINIONS
-                    if is_advance
-                    and is_advance.lower() == "yes"
+                    if is_advance and is_advance.lower() == "yes"
                     else Source.FULL
                 )
                 queue_status = STATUS_MAP.get(
                     status_str, QueueStatus.NEEDS_SCANNING
                 )
-                priority = PRIORITY_MAP.get(
-                    priority_str, Priority.MEDIUM
-                )
+                priority = PRIORITY_MAP.get(priority_str, Priority.MEDIUM)
                 start = int(first_page) if first_page else None
                 end = int(last_page) if last_page else None
 
@@ -182,8 +153,7 @@ class Command(BaseCommand):
                 ):
                     vol.expected_start_page = start
                 if end and (
-                    not vol.expected_end_page
-                    or end > vol.expected_end_page
+                    not vol.expected_end_page or end > vol.expected_end_page
                 ):
                     vol.expected_end_page = end
                 vol.save()

@@ -6,30 +6,46 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('scanning', '0003_scan_assigned_at_scan_assigned_to_scan_priority_and_more'),
+        (
+            "scanning",
+            "0003_scan_assigned_at_scan_assigned_to_scan_priority_and_more",
+        ),
     ]
 
     operations = [
         migrations.AlterField(
-            model_name='scan',
-            name='end_page',
-            field=models.PositiveIntegerField(blank=True, null=True, validators=[django.core.validators.MinValueValidator(1)]),
+            model_name="scan",
+            name="end_page",
+            field=models.PositiveIntegerField(
+                blank=True,
+                null=True,
+                validators=[django.core.validators.MinValueValidator(1)],
+            ),
         ),
         migrations.AlterField(
-            model_name='scan',
-            name='number_of_pages',
-            field=models.PositiveIntegerField(blank=True, null=True, validators=[django.core.validators.MinValueValidator(1)]),
+            model_name="scan",
+            name="number_of_pages",
+            field=models.PositiveIntegerField(
+                blank=True,
+                null=True,
+                validators=[django.core.validators.MinValueValidator(1)],
+            ),
         ),
         migrations.AlterField(
-            model_name='scan',
-            name='original_pdf',
-            field=models.FileField(blank=True, upload_to=scanning.models.book_upload_path),
+            model_name="scan",
+            name="original_pdf",
+            field=models.FileField(
+                blank=True, upload_to=scanning.models.book_upload_path
+            ),
         ),
         migrations.AlterField(
-            model_name='scan',
-            name='start_page',
-            field=models.PositiveIntegerField(blank=True, null=True, validators=[django.core.validators.MinValueValidator(1)]),
+            model_name="scan",
+            name="start_page",
+            field=models.PositiveIntegerField(
+                blank=True,
+                null=True,
+                validators=[django.core.validators.MinValueValidator(1)],
+            ),
         ),
     ]

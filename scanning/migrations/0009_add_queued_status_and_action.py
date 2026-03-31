@@ -2,7 +2,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("scanning", "0008_remove_scan_unique_reporter_volume_source_start"),
     ]

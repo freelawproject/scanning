@@ -131,4 +131,9 @@ class LLMScanAdmin(admin.ModelAdmin):
     ]
     list_filter = ["status", "llm_model"]
     raw_id_fields = ["scan"]
-    readonly_fields = ["date_created", "date_modified", "sent_at", "completed_at"]
+    readonly_fields = [
+        "date_created",
+        "date_modified",
+        "sent_at",
+        "completed_at",
+    ]

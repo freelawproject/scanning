@@ -4,7 +4,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("scanning", "0005_alter_opinionscan_masked_pdf_and_more"),
     ]

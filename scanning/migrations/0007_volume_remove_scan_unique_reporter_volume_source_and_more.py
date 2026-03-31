@@ -7,7 +7,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("scanning", "0006_alter_llmscan_masked_pdf"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
@@ -45,7 +44,9 @@ class Migration(migrations.Migration):
                 (
                     "volume_number",
                     models.PositiveIntegerField(
-                        validators=[django.core.validators.MinValueValidator(1)]
+                        validators=[
+                            django.core.validators.MinValueValidator(1)
+                        ]
                     ),
                 ),
                 (

@@ -6,41 +6,70 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('scanning', '0002_detection_issue_llmscan_pagedeletion_pageinsert_and_more'),
+        (
+            "scanning",
+            "0002_detection_issue_llmscan_pagedeletion_pageinsert_and_more",
+        ),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='scan',
-            name='assigned_at',
+            model_name="scan",
+            name="assigned_at",
             field=models.DateTimeField(blank=True, null=True),
         ),
         migrations.AddField(
-            model_name='scan',
-            name='assigned_to',
-            field=models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='assigned_scans', to=settings.AUTH_USER_MODEL),
+            model_name="scan",
+            name="assigned_to",
+            field=models.ForeignKey(
+                blank=True,
+                null=True,
+                on_delete=django.db.models.deletion.SET_NULL,
+                related_name="assigned_scans",
+                to=settings.AUTH_USER_MODEL,
+            ),
         ),
         migrations.AddField(
-            model_name='scan',
-            name='priority',
-            field=models.CharField(choices=[('critical', 'Critical'), ('high', 'High'), ('medium', 'Medium'), ('low', 'Low'), ('backlog', 'Backlog')], default='medium', max_length=20),
+            model_name="scan",
+            name="priority",
+            field=models.CharField(
+                choices=[
+                    ("critical", "Critical"),
+                    ("high", "High"),
+                    ("medium", "Medium"),
+                    ("low", "Low"),
+                    ("backlog", "Backlog"),
+                ],
+                default="medium",
+                max_length=20,
+            ),
         ),
         migrations.AddField(
-            model_name='scan',
-            name='queue_status',
-            field=models.CharField(choices=[('needs_scanning', 'Needs Scanning'), ('assigned', 'Assigned'), ('scanning', 'Scanning'), ('scanned', 'Scanned'), ('complete', 'Complete'), ('unavailable', 'Unavailable')], default='needs_scanning', max_length=20),
+            model_name="scan",
+            name="queue_status",
+            field=models.CharField(
+                choices=[
+                    ("needs_scanning", "Needs Scanning"),
+                    ("assigned", "Assigned"),
+                    ("scanning", "Scanning"),
+                    ("scanned", "Scanned"),
+                    ("complete", "Complete"),
+                    ("unavailable", "Unavailable"),
+                ],
+                default="needs_scanning",
+                max_length=20,
+            ),
         ),
         migrations.AddField(
-            model_name='scan',
-            name='source_library',
-            field=models.CharField(blank=True, default='', max_length=200),
+            model_name="scan",
+            name="source_library",
+            field=models.CharField(blank=True, default="", max_length=200),
         ),
         migrations.AddField(
-            model_name='scan',
-            name='source_url',
-            field=models.URLField(blank=True, default=''),
+            model_name="scan",
+            name="source_url",
+            field=models.URLField(blank=True, default=""),
         ),
     ]

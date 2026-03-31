@@ -25,43 +25,53 @@ class TestDetectionPipeline(django.test.SimpleTestCase):
 
     def setUp(self):
         if not PDF_PATH.exists():
-            self.skipTest(f"Test PDF not found at {PDF_PATH}. Copy it into scanning/tests/fixtures/")
+            self.skipTest(
+                f"Test PDF not found at {PDF_PATH}. Copy it into scanning/tests/fixtures/"
+            )
 
     def test_detect_finds_three_case_captions(self):
         from blackletter.api import detect
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            dets = detect(str(PDF_PATH), tmpdir, models=["small", "medium", "large"])
+            dets = detect(
+                str(PDF_PATH), tmpdir, models=["small", "medium", "large"]
+            )
             captions = [d for d in dets if d.get("label") == "CASE_CAPTION"]
             self.assertEqual(
-                len(captions), 3,
+                len(captions),
+                3,
                 f"Expected 3 CASE_CAPTIONs, got {len(captions)}. "
-                f"All labels: {[d['label'] for d in dets]}"
+                f"All labels: {[d['label'] for d in dets]}",
             )
 
     def test_detect_finds_three_key_icons(self):
         from blackletter.api import detect
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            dets = detect(str(PDF_PATH), tmpdir, models=["small", "medium", "large"])
+            dets = detect(
+                str(PDF_PATH), tmpdir, models=["small", "medium", "large"]
+            )
             keys = [d for d in dets if d.get("label") == "KEY_ICON"]
             self.assertEqual(
-                len(keys), 3,
-                f"Expected 3 KEY_ICONs, got {len(keys)}."
+                len(keys), 3, f"Expected 3 KEY_ICONs, got {len(keys)}."
             )
 
     def test_detect_and_pair_finds_three_opinions(self):
         from blackletter.api import detect, pair
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            dets = detect(str(PDF_PATH), tmpdir, models=["small", "medium", "large"])
+            dets = detect(
+                str(PDF_PATH), tmpdir, models=["small", "medium", "large"]
+            )
             det_path = pathlib.Path(tmpdir) / "detections.json"
             det_path.write_text(json.dumps(dets))
             opinions = pair(
-                str(det_path), str(PDF_PATH),
-                reporter="a3d", volume="332", first_page=1,
+                str(det_path),
+                str(PDF_PATH),
+                reporter="a3d",
+                volume="332",
+                first_page=1,
             )
             self.assertEqual(
-                len(opinions), 3,
-                f"Expected 3 opinions, got {len(opinions)}."
+                len(opinions), 3, f"Expected 3 opinions, got {len(opinions)}."
             )
