@@ -7,6 +7,7 @@ from django.utils.deconstruct import deconstructible
 
 class Status(models.TextChoices):
     UPLOADED = "uploaded", "Uploaded"
+    QUEUED = "queued", "Queued"
     PROCESSING = "processing", "Processing"
     PENDING_REVIEW = "pending_review", "Pending Review"
     APPROVED = "approved", "Approved"
@@ -362,6 +363,12 @@ class Scan(AbstractDateTimeModel):
         related_name="scans",
     )
     processed_at = models.DateTimeField(null=True, blank=True)
+    queued_action = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+        help_text="Action for daemon to run: full_pipeline, detect, reprocess, generate_files, validate.",
+    )
     notes = models.TextField(blank=True)
     output_dir = models.CharField(max_length=1024, blank=True, default="")
     stage = models.CharField(
