@@ -1583,15 +1583,18 @@ def _stamp_original_images(scan, ocr_pdf_path):
     """
     from scanning.models import Detection
 
+    stamped_path = os.path.join(os.path.dirname(ocr_pdf_path), "stamped.pdf")
+
     image_dets = list(
         Detection.objects.filter(scan=scan, label="IMAGE", active=True)
         .order_by("page_index")
         .values("page_index", "x0", "y0", "x1", "y1", "img_width", "img_height")
     )
     if not image_dets:
-        return ocr_pdf_path
-
-    stamped_path = os.path.join(os.path.dirname(ocr_pdf_path), "stamped.pdf")
+        # Always copy so the OCR PDF is never modified by downstream steps
+        import shutil
+        shutil.copy2(ocr_pdf_path, stamped_path)
+        return stamped_path
 
     original_doc = fitz.open(scan.pdf_path)
     ocr_doc = fitz.open(ocr_pdf_path)

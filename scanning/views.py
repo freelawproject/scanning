@@ -666,6 +666,39 @@ def scan_process_view(request, pk):
         from pathlib import Path as _P
         has_redaction_rects = (_P(scan.output_dir) / "redaction_rects.json").exists()
 
+    # Find HEADNOTE detections not covered by headnote redaction rects
+    uncovered_hn_pages = set()
+    if has_redaction_rects and scan.output_dir:
+        rects_data = json.loads(
+            (_P(scan.output_dir) / "redaction_rects.json").read_text()
+        )
+        hn_rects_by_page = {}
+        for entry in rects_data:
+            hn_rects_by_page[entry["page_index"]] = [
+                r for r in entry["rects"] if r.get("type") == "headnote"
+            ]
+        for d in Detection.objects.filter(
+            scan=scan, label="HEADNOTE", active=True
+        ).filter(confidence__gte=0.8):
+            page_rects = hn_rects_by_page.get(d.page_index, [])
+            cx = (d.x0 + d.x1) / 2
+            cy = (d.y0 + d.y1) / 2
+            covered = any(
+                r["x0"] <= cx <= r["x1"] and r["y0"] <= cy <= r["y1"]
+                for r in page_rects
+            )
+            if not covered:
+                uncovered_hn_pages.add(d.page_index)
+
+    for op in opinions:
+        cp = op.get("caption_page", 0)
+        ep = op.get("page_end", op.get("key_page", cp))
+        op["uncovered_headnote_pages"] = sorted(
+            idx_to_logical.get(idx, idx + 1)
+            for idx in range(cp, ep + 1)
+            if idx in uncovered_hn_pages
+        )
+
     opinion_scans = []
     if step == 4:
         for s in OpinionScan.objects.filter(scan=scan).order_by("opinion_order"):

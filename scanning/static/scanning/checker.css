@@ -733,7 +733,7 @@ a.doc-name:hover { text-decoration: underline; }
     gap: 6px;
 }
 .det-draw-confirm {
-    padding: 4px 12px;
+    padding: 8px 22px;
     font-size: 11px;
     background: #22c55e;
     color: white;

@@ -1890,7 +1890,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var delBtn = document.createElement('button');
         delBtn.className = 'margin-resize-handle';
         delBtn.textContent = 'Delete';
-        delBtn.style.cssText = 'position:absolute;top:-24px;right:0;background:#ef4444;color:white;border:none;padding:2px 8px;font-size:11px;border-radius:3px;cursor:pointer;z-index:23;';
+        delBtn.style.cssText = 'position:absolute;top:-24px;right:0;background:#ef4444;color:white;border:none;padding:10px 8px;font-size:11px;border-radius:3px;cursor:pointer;z-index:23;';
         delBtn.addEventListener('click', function(e) {
             e.stopPropagation();
             if (!confirm('Delete this margin?')) return;

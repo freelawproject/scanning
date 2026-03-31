@@ -257,6 +257,7 @@
            onclick="selectOpinion(this, {{ op.caption_page|add:1 }})">
         <span class="font-bold">{{ forloop.counter }}</span>
         {% if op.has_image %}<span title="Contains image(s)">🖼️</span>{% endif %}
+        {% if op.uncovered_headnote_pages %}<span title="Uncovered headnote(s)">⚠️</span>{% endif %}
         <span class="text-gray-600 dark:text-gray-300">Pages {% if op.first_page_number %}{{ op.first_page_number }}&ndash;{{ op.last_page_number }}{% else %}{{ op.caption_page|add:1 }}&ndash;{{ op.key_page|add:1 }}{% endif %} ({{ op.page_count }} pg)</span>
       </div>
       {% if op.image_pages %}
@@ -265,6 +266,15 @@
         <span class="text-[10px] px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800 cursor-pointer hover:bg-amber-200 dark:hover:bg-amber-900/50"
               onclick="event.stopPropagation(); goToPage({{ pg }})"
               title="Image on page {{ pg }}">🖼️ {{ pg }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% if op.uncovered_headnote_pages %}
+      <div class="ml-4 mb-1 flex flex-wrap gap-0.5">
+        {% for pg in op.uncovered_headnote_pages %}
+        <span class="text-[10px]" style="border: 1px solid; padding: 3px; background-color: yellow"
+              onclick="event.stopPropagation(); goToPage({{ pg }})"
+              title="Uncovered headnote on page {{ pg }}">Page {{ pg }}</span>
         {% endfor %}
       </div>
       {% endif %}
