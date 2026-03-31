@@ -19,7 +19,6 @@ from django.views.decorators.http import require_POST
 
 from scanning import services
 from scanning.forms import (
-    OpinionScanReviewForm,
     OpinionScanUploadForm,
     ScanReviewForm,
     ScanUploadForm,
@@ -218,7 +217,7 @@ def opinion_list(request):
     """
     opinions = OpinionScan.objects.select_related(
         "reporter", "scan", "uploaded_by"
-    ).all()
+    ).order_by("-date_created")
 
     # Filtering
     scan_filter = request.GET.get("scan")
@@ -279,28 +278,10 @@ def opinion_detail(request, pk):
         pk=pk,
     )
 
-    review_form = None
-    if request.user.is_staff and opinion.status != OpinionStatus.OK:
-        if request.method == "POST":
-            review_form = OpinionScanReviewForm(request.POST, instance=opinion)
-            if review_form.is_valid():
-                updated_opinion = review_form.save(commit=False)
-                if updated_opinion.status == OpinionStatus.OK:
-                    messages.success(request, "Opinion scan approved.")
-                else:
-                    messages.info(
-                        request,
-                        "Opinion scan rejected, status reset to No status.",
-                    )
-                updated_opinion.save()
-                return redirect("opinion_detail", pk=opinion.pk)
-        else:
-            review_form = OpinionScanReviewForm(instance=opinion)
-
     return render(
         request,
         "scanning/opinion_detail.html",
-        {"opinion": opinion, "review_form": review_form},
+        {"opinion": opinion},
     )
 
 

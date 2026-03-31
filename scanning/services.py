@@ -1731,12 +1731,8 @@ def run_generate_files(scan_pk):
         unredacted_dir = output_dir / "unredacted"
         masked_dir = output_dir / "masked"
         for i, op in enumerate(existing_opinions):
-            page_start = op.get("caption_page", op.get("first_page", 0))
-            if isinstance(page_start, int) and "caption_page" in op:
-                page_start += scan.start_page or 1
-            page_end = op.get("key_page", op.get("last_page", 0))
-            if isinstance(page_end, int) and "key_page" in op:
-                page_end += (scan.start_page or 1) + op.get("page_count", 1) - 1
+            page_start = op.get("first_page_number", 1)
+            page_end = op.get("last_page_number", page_start)
             fname = op.get("filename", "")
             opinion = OpinionScan.objects.create(
                 scan=scan, reporter=scan.reporter, volume=scan.volume,
@@ -1748,19 +1744,26 @@ def run_generate_files(scan_pk):
                 status=OpinionStatus.OK, uploaded_by=scan.uploaded_by,
             )
             if fname:
+                media_root = Path(settings.MEDIA_ROOT)
                 rp = redacted_dir / fname
                 if rp.exists():
-                    opinion.redacted_pdf.name = str(rp)
+                    opinion.redacted_pdf.name = str(
+                        rp.relative_to(media_root)
+                    )
                 up = unredacted_dir / fname if unredacted_dir.exists() else None
                 if up and up.exists():
-                    opinion.original_pdf.name = str(up)
+                    opinion.original_pdf.name = str(
+                        up.relative_to(media_root)
+                    )
                 # Opinion suffix is 1-3 unpadded digits (e.g. -1, -2, -3).
                 # Page numbers are always 4 zero-padded digits (e.g. -0006).
                 # Only strip the suffix if it's 1-3 digits preceded by a 4-digit page number.
                 masked_fname = re.sub(r"(\d{4})-\d{1,3}\.pdf$", r"\1.pdf", fname)
                 mp = masked_dir / masked_fname if masked_dir.exists() else None
                 if mp and mp.exists():
-                    opinion.masked_pdf.name = str(mp)
+                    opinion.masked_pdf.name = str(
+                        mp.relative_to(media_root)
+                    )
                 opinion.save()
 
             if opinion.masked_pdf.name:
