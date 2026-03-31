@@ -374,10 +374,14 @@ def _compute_and_save_redaction_rects(scan_pk, pdf_path, output_dir):
     opinions = _pair_opinions(document)
     rects = compute_redaction_rects(document, opinions, skip_doctr=True)
 
-    # Snap headnote rect x-bounds to TEXT_COLUMN detections for consistency
+    # Snap headnote rect x-bounds to TEXT_COLUMN detections for consistency.
+    # Only snap to a TEXT_COLUMN on the same side of the page midpoint —
+    # otherwise a missing left TEXT_COLUMN causes the left rect to be
+    # snapped to the right column, destroying it.
     tc_by_page = {}
     for d in Detection.objects.filter(scan=scan, active=True, label_id=16):
         tc_by_page.setdefault(d.page_index, []).append(d)
+    img_mid = document.pages[0].img_width / 2 if document.pages else 850
     for page_entry in rects:
         pi = page_entry["page_index"]
         cols = tc_by_page.get(pi, [])
@@ -386,9 +390,13 @@ def _compute_and_save_redaction_rects(scan_pk, pdf_path, output_dir):
         for r in page_entry["rects"]:
             if r.get("type") != "headnote":
                 continue
-            # Find the TEXT_COLUMN that best overlaps this rect
             cx = (r["x0"] + r["x1"]) / 2
-            best = min(cols, key=lambda c: abs((c.x0 + c.x1) / 2 - cx))
+            # Only consider TEXT_COLUMNs on the same side of the midpoint
+            same_side = [c for c in cols if (c.x0 + c.x1) / 2 < img_mid] if cx < img_mid \
+                else [c for c in cols if (c.x0 + c.x1) / 2 >= img_mid]
+            if not same_side:
+                continue
+            best = min(same_side, key=lambda c: abs((c.x0 + c.x1) / 2 - cx))
             r["x0"] = round(best.x0, 1)
             r["x1"] = round(best.x1, 1)
 

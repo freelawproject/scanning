@@ -24,7 +24,7 @@ def _require_fixture(test_case):
     if not PDF_PATH.exists():
         test_case.skipTest(
             f"Test PDF not found at {PDF_PATH}. "
-            "Copy it into scanning/tests/fixtures/"
+            "Copy it in to scanning/tests/fixtures/"
         )
 
 
