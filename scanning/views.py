@@ -524,7 +524,7 @@ def queue_upload(request, reporter_slug, vol):
             f.write(chunk)
 
     scan.original_pdf.name = str(
-        original_path.relative_to(_P(settings.MEDIA_ROOT))
+        original_path.resolve().relative_to(_P(settings.MEDIA_ROOT).resolve())
     )
     scan.save(update_fields=["output_dir", "original_pdf"])
 

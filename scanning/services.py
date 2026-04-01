@@ -44,7 +44,7 @@ from blackletter.models import (
 )
 
 from blackletter.margins import compute_margin_rects
-from blackletter.process import generate_files, compute_redaction_rects
+from blackletter.process import compute_redaction_rects
 from blackletter.scanner import _pair_opinions
 from blackletter.validate import (
     _auto_correct,
@@ -606,6 +606,113 @@ def _compute_and_save_margin_rects(pdf_path: str, output_dir: str) -> list:
         margin_rects_path.write_text(json.dumps(margin_rects))
         return margin_rects
     return json.loads(margin_rects_path.read_text())
+
+
+def _build_combined_redactions(scan_pk: int) -> Path:
+    """Combine margin_rects, redaction_rects, and opinions into redactions.json.
+
+    All coordinates in the output are in PDF points. This file is passed
+    to blackletter's ``generate`` API as the single source of redaction data.
+
+    :param scan_pk: Primary key of the scan.
+    :return: Path to the generated redactions.json.
+    """
+    scan = Scan.objects.get(pk=scan_pk)
+    output_dir = Path(scan.output_dir)
+
+    margin_path = output_dir / "margin_rects.json"
+    rects_path = output_dir / "redaction_rects.json"
+    det_path = output_dir / "detections.json"
+
+    margins_data = json.loads(margin_path.read_text()) if margin_path.exists() else []
+    rects_data = json.loads(rects_path.read_text()) if rects_path.exists() else []
+    opinions = json.loads(scan.opinions_json) if scan.opinions_json else []
+
+    # Add filenames based on reporter, volume, and page numbers
+    reporter = scan.reporter.short_name or ""
+    volume = str(scan.volume) or ""
+    prefix = f"{reporter}.{volume}" if reporter and volume else ""
+    for op in opinions:
+        if prefix:
+            first = op.get("first_page_number", 0)
+            last = op.get("last_page_number", first)
+            op["filename"] = f"{prefix}.{first:04d}-{last:04d}.pdf"
+
+    # Image dims for pixel→PDF conversion
+    img_dims = {}
+    if det_path.exists():
+        for d in json.loads(det_path.read_text()):
+            pi = d["page_index"]
+            if pi not in img_dims:
+                img_dims[pi] = (d.get("img_width", 1), d.get("img_height", 1))
+
+    # PDF page dims
+    pdf_path = find_ocr_pdf(scan.output_dir) or scan.pdf_path
+    src = fitz.open(str(pdf_path))
+    pdf_dims = {}
+    for i in range(src.page_count):
+        r = src[i].rect
+        pdf_dims[i] = (r.width, r.height)
+    src.close()
+
+    pages: dict[int, list] = {}
+
+    # Margin rects (already in PDF points)
+    for entry in margins_data:
+        pi = entry["page_index"]
+        if pi not in pages:
+            pages[pi] = []
+        for r in entry.get("rects", []):
+            pages[pi].append({
+                "x0": round(r["x0"], 1),
+                "y0": round(r["y0"], 1),
+                "x1": round(r["x1"], 1),
+                "y1": round(r["y1"], 1),
+                "fill": "white",
+                "type": "margin",
+            })
+
+    # Redaction rects (pixels → PDF points)
+    for entry in rects_data:
+        pi = entry["page_index"]
+        if pi not in pages:
+            pages[pi] = []
+
+        iw, ih = img_dims.get(pi, (1, 1))
+        pdf_w, pdf_h = pdf_dims.get(pi, (612.0, 792.0))
+        to_x = pdf_w / iw if iw > 1 else 1.0
+        to_y = pdf_h / ih if ih > 1 else 1.0
+
+        for r in entry.get("rects", []):
+            x0 = r["x0"] * to_x
+            y0 = r["y0"] * to_y
+            x1 = r["x1"] * to_x
+            y1 = r["y1"] * to_y
+            if x0 >= x1 or y0 >= y1:
+                continue
+            pages[pi].append({
+                "x0": round(x0, 1),
+                "y0": round(y0, 1),
+                "x1": round(x1, 1),
+                "y1": round(y1, 1),
+                "fill": r["fill"],
+                "type": r["type"],
+            })
+
+    combined = {
+        "opinions": opinions,
+        "pages": {str(k): v for k, v in sorted(pages.items())},
+    }
+
+    out_path = output_dir / "redactions.json"
+    out_path.write_text(json.dumps(combined))
+    n_rects = sum(len(v) for v in pages.values())
+    print(
+        f"  Combined redactions: {len(pages)} pages, "
+        f"{n_rects} rects, {len(opinions)} opinions",
+        flush=True,
+    )
+    return out_path
 
 
 def _adjust_margins_for_detections(
@@ -1701,6 +1808,12 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
     original_doc = fitz.open(scan.pdf_path)
     ocr_doc = fitz.open(ocr_pdf_path)
 
+    # Save extracted images to images/ directory
+    images_dir = Path(os.path.dirname(ocr_pdf_path)) / "images"
+    images_dir.mkdir(exist_ok=True)
+    page_numbers = _page_number_lookup(scan)
+    img_count_by_page: dict[int, int] = {}
+
     try:
         for det in image_dets:
             page_idx = det["page_index"]
@@ -1734,6 +1847,13 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
             # Stamp onto the OCR'd PDF
             ocr_page.insert_image(pdf_rect, stream=png_bytes)
 
+            # Save image to images/ directory
+            pn = page_numbers.get(page_idx)
+            page_num = pn[0] if pn else page_idx + (scan.start_page or 1)
+            img_count_by_page[page_idx] = img_count_by_page.get(page_idx, 0) + 1
+            img_name = f"{page_num}-{img_count_by_page[page_idx]:03d}.png"
+            (images_dir / img_name).write_bytes(png_bytes)
+
         ocr_doc.save(stamped_path, garbage=3, deflate=True)
     finally:
         original_doc.close()
@@ -1757,10 +1877,6 @@ def run_generate_files(scan_pk: int) -> None:
             progress_message="Generating files...", progress_log=""
         )
 
-        reporter = scan.reporter.short_name
-        volume = str(scan.volume)
-        first_page = scan.start_page or 1
-
         output_base = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
 
         ocr_pdf = find_ocr_pdf(scan.output_dir) if scan.output_dir else None
@@ -1776,42 +1892,37 @@ def run_generate_files(scan_pk: int) -> None:
             progress_message=f"Generating files ({len(det_data or [])} detections)..."
         )
 
-        suppression_excluded = set()
-        for issue in scan.issues.filter(check_name="suppress_detection"):
-            if issue.metadata:
-                try:
-                    meta = json.loads(issue.metadata)
-                    bbox = meta.get("bbox", [0, 0, 0, 0])
-                    suppression_excluded.add(
-                        (
-                            meta.get("page_index", 0),
-                            meta.get("label_id", 0),
-                            round(bbox[0]),
-                            round(bbox[1]),
-                        )
-                    )
-                except Exception:
-                    pass
+        # Build combined redactions.json (margins + redaction rects + opinions)
+        Scan.objects.filter(pk=scan_pk).update(
+            progress_message="Building combined redactions...",
+        )
+        redactions_path = _build_combined_redactions(scan_pk)
+
+        output = Path(scan.output_dir if scan.output_dir else str(output_base))
+
         Scan.objects.filter(pk=scan_pk).update(
             progress_message="Generating files...",
         )
-        output = Path(scan.output_dir if scan.output_dir else str(output_base))
-        generate_files(
-            ocr_pdf=str(gen_pdf),
-            output=output,
-            reporter=reporter,
-            volume=volume,
-            first_page=first_page,
+
+        from blackletter.api import generate as bl_generate
+
+
+        result = bl_generate(
+            pdf_path=str(gen_pdf),
+            redactions=str(redactions_path),
+            output_dir=output,
+            reporter=scan.reporter.short_name or "",
+            volume=str(scan.volume) or "",
             unredacted=True,
-            excluded=suppression_excluded or None,
         )
 
-        output_dir = output
-        for d in sorted(output.rglob("redacted"), key=lambda p: len(p.parts)):
-            output_dir = d.parent
-            break
+        opinion_count = result.get("opinion_count", 0)
+        full_redacted = result.get("full_redacted", "")
+        redacted_dir = Path(result.get("redacted_dir", output / "redacted"))
+        masked_dir = Path(result.get("masked_dir", output / "masked"))
+        unredacted_dir = output / "unredacted"
+        output_dir = redacted_dir.parent
 
-        redacted_dir = output_dir / "redacted"
         redacted_files = (
             sorted(redacted_dir.glob("*.pdf")) if redacted_dir.is_dir() else []
         )
@@ -1832,21 +1943,17 @@ def run_generate_files(scan_pk: int) -> None:
                     {"filename": f.name, "first_page": 0, "last_page": 0}
                 )
 
-        redacted_pdf = list(output_dir.glob("*.redacted.pdf"))
-
         scan.output_dir = str(output_dir)
-        scan.redacted_pdf_path = str(redacted_pdf[0]) if redacted_pdf else ""
+        scan.redacted_pdf_path = str(full_redacted) if full_redacted else ""
         scan.opinions_json = json.dumps(existing_opinions)
         scan.stage = Stage.APPROVED
         scan.status = Status.APPROVED
-        scan.progress_message = f"Generated {len(existing_opinions)} opinions"
+        scan.progress_message = f"Generated {opinion_count} opinions"
         scan.progress_log = ""
         scan.save()
 
         OpinionScan.objects.filter(scan=scan).delete()
         LLMScan.objects.filter(scan=scan).delete()
-        unredacted_dir = output_dir / "unredacted"
-        masked_dir = output_dir / "masked"
         for i, op in enumerate(existing_opinions):
             page_start = op.get("first_page_number", 1)
             page_end = op.get("last_page_number", page_start)
@@ -1865,24 +1972,31 @@ def run_generate_files(scan_pk: int) -> None:
                 uploaded_by=scan.uploaded_by,
             )
             if fname:
-                media_root = Path(settings.MEDIA_ROOT)
+                media_root = Path(settings.MEDIA_ROOT).resolve()
                 rp = redacted_dir / fname
                 if rp.exists():
-                    opinion.redacted_pdf.name = str(rp.relative_to(media_root))
+                    opinion.redacted_pdf.name = str(
+                        rp.resolve().relative_to(media_root)
+                    )
                 up = (
-                    unredacted_dir / fname if unredacted_dir.exists() else None
+                    unredacted_dir / fname
+                    if unredacted_dir.exists() else None
                 )
                 if up and up.exists():
-                    opinion.original_pdf.name = str(up.relative_to(media_root))
-                # Opinion suffix is 1-3 unpadded digits (e.g. -1, -2, -3).
-                # Page numbers are always 4 zero-padded digits (e.g. -0006).
-                # Only strip the suffix if it's 1-3 digits preceded by a 4-digit page number.
+                    opinion.original_pdf.name = str(
+                        up.resolve().relative_to(media_root)
+                    )
                 masked_fname = re.sub(
                     r"(\d{4})-\d{1,3}\.pdf$", r"\1.pdf", fname
                 )
-                mp = masked_dir / masked_fname if masked_dir.exists() else None
+                mp = (
+                    masked_dir / masked_fname
+                    if masked_dir.exists() else None
+                )
                 if mp and mp.exists():
-                    opinion.masked_pdf.name = str(mp.relative_to(media_root))
+                    opinion.masked_pdf.name = str(
+                        mp.resolve().relative_to(media_root)
+                    )
                 opinion.save()
 
             if opinion.masked_pdf.name:
