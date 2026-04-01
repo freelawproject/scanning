@@ -319,9 +319,11 @@ def queue_view(request: HttpRequest) -> HttpResponse:
     status_filter = request.GET.get("status", "")
     priority_filter = request.GET.get("priority", "")
 
-    volumes = Volume.objects.select_related(
-        "reporter", "assigned_to"
-    ).order_by("reporter__short_name", "volume_number")
+    volumes = (
+        Volume.objects.select_related("reporter", "assigned_to")
+        .prefetch_related("scans")
+        .order_by("reporter__short_name", "volume_number")
+    )
 
     if selected_reporter:
         volumes = volumes.filter(reporter__short_name=selected_reporter)
@@ -416,6 +418,8 @@ def claim_scan(request, reporter_slug, vol):
         volume.save()
         messages.success(request, "Volume claimed.")
 
+    if request.POST.get("next") == "queue":
+        return redirect("queue")
     return redirect(
         "queue_detail",
         reporter_slug=reporter_slug,
@@ -574,7 +578,7 @@ def update_scan_status(request, reporter_slug, vol):
 
 @login_required
 def scan_process_view(request, pk):
-    """Unified scan processing page with 4-step workflow.
+    """Unified scan processing page with 3-step workflow.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -584,11 +588,11 @@ def scan_process_view(request, pk):
     is_processing = scan.status in (Status.PROCESSING, Status.QUEUED)
 
     step = int(request.GET.get("step", 0))
-    if step < 1 or step > 4:
+    if step < 1 or step > 3:
         if is_processing:
             step = int(request.GET.get("step", 1))
         elif scan.stage == Stage.APPROVED:
-            step = 4
+            step = 3
         elif scan.stage == Stage.PROCESS or scan.opinions_json:
             # Stay on step 1 if there are unresolved issues
             has_issues = scan.issues.exclude(
@@ -717,7 +721,7 @@ def scan_process_view(request, pk):
         )
 
     opinion_scans = []
-    if step == 4:
+    if step == 3:
         for s in OpinionScan.objects.filter(scan=scan).order_by(
             "opinion_order"
         ):
@@ -1566,13 +1570,13 @@ def generate_files(request, pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.status in (Status.PROCESSING, Status.QUEUED):
-        return redirect(f"/scans/{scan.pk}/process/?step=4")
+        return redirect(f"/scans/{scan.pk}/process/?step=3")
     scan.stage = Stage.PROCESS
     scan.status = Status.QUEUED
     scan.queued_action = "generate_files"
     scan.progress_message = "Queued for file generation..."
     scan.save()
-    return redirect(f"/scans/{scan.pk}/process/?step=4")
+    return redirect(f"/scans/{scan.pk}/process/?step=3")
 
 
 @login_required

@@ -33,14 +33,10 @@
       <div class="w-6 h-0.5 {% if step > 1 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
       <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 2 %}bg-blue-600 text-white{% elif step > 2 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=2">
         <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step > 2 %}bg-green-600 text-white{% elif step == 2 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">2</span>
-        Detect</a>
+        Review</a>
       <div class="w-6 h-0.5 {% if step > 2 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
-      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 3 %}bg-blue-600 text-white{% elif step > 3 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=3">
-        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step > 3 %}bg-green-600 text-white{% elif step == 3 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">3</span>
-        Redact</a>
-      <div class="w-6 h-0.5 {% if step > 3 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
-      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 4 %}bg-blue-600 text-white{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=4">
-        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step == 4 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">4</span>
+      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 3 %}bg-blue-600 text-white{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=3">
+        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step == 3 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">3</span>
         Generate</a>
     </div>
     <div class="flex items-center gap-2">
@@ -85,13 +81,10 @@
     {% elif step == 2 %}
       <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()">Re-pair Opinions</button>
       {% if opinions %}
-      <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669">Next: Redact &rarr;</a>
+      <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669">Next: Generate &rarr;</a>
       {% endif %}
 
     {% elif step == 3 %}
-      <a href="?step=4" class="btn-primary text-sm no-underline" style="background:#059669">Next: Generate &rarr;</a>
-
-    {% elif step == 4 %}
       <form method="post" action="{% url 'generate_files' scan.pk %}" class="inline">
         {% csrf_token %}
         <button type="submit" class="btn-primary text-sm" style="background:#7c3aed">{% if opinion_scans %}Regenerate{% else %}Generate{% endif %} Files</button>
@@ -215,7 +208,7 @@
       </div>
       {% endif %}
 
-      {% elif step == 4 and opinion_scans %}
+      {% elif step == 3 and opinion_scans %}
       {# Step 4: Generated opinion files #}
       <div class="flex gap-1 mb-2 sticky top-0 z-10 bg-white dark:bg-gray-900 pb-1">
         <button onclick="setViewMode('redacted')" id="mode-redacted" class="flex-1 text-xs px-2 py-1 rounded border font-medium bg-blue-600 text-white border-blue-600">Redacted</button>
@@ -316,14 +309,14 @@
     <main class="flex-1 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 viewer-panel">
       {% csrf_token %}
       <div id="pdf-viewer"
-           data-pdf-url="{% if step == 4 %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
+           data-pdf-url="{% if step == 3 %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
            data-document-id="{{ scan.pk }}"
            data-page-map='{{ page_map_json }}'
            data-flagged-pages='{{ flagged_pages_json }}'
            data-redactions='{}'
            data-ocr-by-page='{{ ocr_by_page_json }}'
-           {% if step == 4 %}data-opinion-edit="true"{% endif %}>
-        {% if step == 4 %}
+           {% if step == 3 %}data-opinion-edit="true"{% endif %}>
+        {% if step == 3 %}
         <div class="flex items-center justify-center h-full text-gray-400 text-sm">Select an opinion from the sidebar to view it.</div>
         {% else %}
         <div class="flex items-center justify-center h-full text-gray-400 text-sm">Loading PDF...</div>
@@ -380,7 +373,7 @@ function _clearDim() {
     document.querySelectorAll('.opinion-dim-overlay, .opinion-dim').forEach(function(d) { d.remove(); });
 }
 
-{% if step == 4 %}
+{% if step == 3 %}
 var _viewMode = 'redacted';
 var _currentOpinionCard = null;
 
@@ -437,7 +430,7 @@ function _getVisiblePageNum() {
 
 document.addEventListener('keydown', function(e) {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
-    var cards = document.querySelectorAll('{% if step == 4 %}aside .issue-card{% else %}.opinion-nav{% endif %}');
+    var cards = document.querySelectorAll('{% if step == 3 %}aside .issue-card{% else %}.opinion-nav{% endif %}');
     if (e.key === 'ArrowRight' && cards.length) {
         e.preventDefault();
         _currentOpinionIdx = Math.min(_currentOpinionIdx + 1, cards.length - 1);
@@ -685,7 +678,7 @@ function pairOpinions() {
 
 {% endif %}
 </script>
-{% if step == 3 and not is_processing and not has_redaction_rects %}
+{% if step == 2 and not is_processing and not has_redaction_rects %}
 <script>
 document.addEventListener('DOMContentLoaded', function() {
     fetch('/scans/' + docId + '/compute-redactions/', {

@@ -77,9 +77,9 @@
         <th class="px-4 py-3"></th>
       </tr>
     </thead>
-    <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+    <tbody>
       {% for vol in volumes %}
-      <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50{% if vol.queue_status == 'complete' %} opacity-50{% endif %}">
+      <tr class="border-t border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800/50{% if vol.queue_status == 'complete' %} opacity-50{% endif %}">
         <td class="px-4 py-3 text-sm font-medium">
           <a href="{% url 'queue_detail' reporter_slug=vol.reporter.short_name vol=vol.volume_number %}">{{ vol.reporter.short_name }}</a>
         </td>
@@ -99,12 +99,46 @@
           <span class="badge-{{ vol.queue_status }}">{{ vol.get_queue_status_display }}</span>
         </td>
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-          {{ vol.assigned_to.username|default:"\u2014" }}
+          {% if vol.assigned_to %}
+            {{ vol.assigned_to.username }}
+          {% else %}
+            <form method="post" action="{% url 'claim_scan' reporter_slug=vol.reporter.short_name vol=vol.volume_number %}" class="inline">
+              {% csrf_token %}
+              <input type="hidden" name="next" value="queue">
+              <button type="submit" class="text-xs text-blue-600 dark:text-blue-400 hover:underline">Claim</button>
+            </form>
+          {% endif %}
         </td>
         <td class="px-4 py-3 text-sm text-right">
           <a href="{% url 'queue_detail' reporter_slug=vol.reporter.short_name vol=vol.volume_number %}" class="btn-outline text-xs px-2 py-1">View</a>
         </td>
       </tr>
+      {% for scan in vol.scans.all %}
+      <tr class="bg-gray-50/50 dark:bg-gray-800/20 border-t border-gray-100 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-gray-800/40">
+        <td class="py-1.5 text-xs text-gray-400 dark:text-gray-500"></td>
+        <td class="py-1.5 text-xs" colspan="2">
+          <a href="{% url 'scan_process' scan.pk %}" class="text-blue-600 dark:text-blue-400 hover:underline pl-2">
+            {% if scan.part_label %}{{ scan.part_label }}{% else %}#{{ scan.pk }}{% endif %}
+          </a>
+          <span class="text-gray-400 dark:text-gray-500 ml-1">
+            {% if scan.start_page and scan.end_page %}{{ scan.start_page }}&ndash;{{ scan.end_page }}{% elif scan.page_count %}{{ scan.page_count }}pg{% endif %}
+          </span>
+        </td>
+        <td class="py-1.5 text-xs text-gray-400 dark:text-gray-500">
+          {{ scan.uploaded_by.username|default:"" }}
+        </td>
+        <td class="py-1.5 text-xs"></td>
+        <td class="py-1.5 text-xs">
+          <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
+        </td>
+        <td class="py-1.5 text-xs text-gray-400 dark:text-gray-500">
+          {{ scan.date_created|date:"M j" }}
+        </td>
+        <td class="py-1.5 text-xs text-right text-gray-400 dark:text-gray-500 pr-4">
+          {% if scan.page_count %}{{ scan.page_count }}{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
       {% endfor %}
     </tbody>
   </table>
