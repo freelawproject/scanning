@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'darwin'",
@@ -137,7 +137,7 @@ wheels = [
 
 [[package]]
 name = "blackletter"
-version = "0.0.4"
+version = "0.0.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ocrmypdf" },
@@ -147,9 +147,9 @@ dependencies = [
     { name = "python-doctr" },
     { name = "ultralytics" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/86/74/532811ae4f9f781b147ad13dd13ee4806569f092d150ab8053cdf4052d60/blackletter-0.0.4.tar.gz", hash = "sha256:b828b93852b06d4271f9d9b2108d8521c257dd71860e51b024885a366988323f", size = 68856439, upload-time = "2026-03-31T15:08:08.468Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2d/23/2cc63bd58af7965347dfb6562560b5d31ac00b2bb860be6b2bf993d96924/blackletter-0.0.6.tar.gz", hash = "sha256:4e079822193e8cbb8822f26a6e05b8f6823476e179ced64e455b3871b3a34b3c", size = 68856748, upload-time = "2026-04-01T18:23:58.633Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/d6/78d6746b98b6c8ecd43605c7a11ff81a978b6ca7d56638197063be49a1ca/blackletter-0.0.4-py3-none-any.whl", hash = "sha256:69c81014568227db680d574bbf09cc20c7c91f04d75c89a5bfb16ef58df5640b", size = 68848737, upload-time = "2026-03-31T15:08:04.159Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/7c/87ed6b289b7f37f9298abdb6546b47dba2b7f1ea5d37f41bec56bb39ab57/blackletter-0.0.6-py3-none-any.whl", hash = "sha256:8fabedcb7cf5410b1c9a1790705d682142a0a978c059b2159ec19de3e8bf61f1", size = 68848920, upload-time = "2026-04-01T18:23:54.048Z" },
 ]
 
 [package.optional-dependencies]
@@ -2478,7 +2478,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "blackletter", extras = ["analyze"], specifier = ">=0.0.4" },
+    { name = "blackletter", extras = ["analyze"], specifier = ">=0.0.6" },
     { name = "boto3" },
     { name = "daphne" },
     { name = "django", specifier = ">=6.0,<6.1" },

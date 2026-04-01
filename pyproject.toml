@@ -29,7 +29,7 @@ dependencies = [
   "gunicorn",
   "pillow",
   "psycopg[binary,pool]",
-  "blackletter[analyze]>=0.0.4",
+  "blackletter[analyze]>=0.0.6",
   "ocrmypdf>=17",
   "pymupdf>=1.25",
   "torch",
