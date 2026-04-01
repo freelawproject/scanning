@@ -115,25 +115,193 @@ def _run_ocr(
     :param first_page: First logical page number in the PDF.
     :return: Path to the OCR'd PDF.
     """
-    _update_progress(scan_pk, "Running Tesseract OCR...")
-    return bl_ocr(
-        bitonal_path,
-        output_dir,
-        reporter=reporter,
-        volume=volume,
-        first_page=first_page,
+    pdf = fitz.open(bitonal_path)
+    total_pages = pdf.page_count
+    pdf.close()
+    _update_progress(
+        scan_pk, f"Running Tesseract OCR (0/{total_pages} pages)...",
+        current=0, total=total_pages,
     )
+    return _ocr(
+        scan_pk, bitonal_path, output_dir,
+        reporter=reporter, volume=volume,
+        first_page=first_page, total_pages=total_pages,
+    )
+
+
+def _ocr(
+    scan_pk: int,
+    pdf_path: str | Path,
+    output_dir: str | Path,
+    reporter: str = "",
+    volume: str = "",
+    first_page: int = 1,
+    total_pages: int = 0,
+    language: str = "eng",
+) -> Path:
+    """OCR a PDF (add text layer via ocrmypdf/Tesseract).
+
+    Temporary local copy of blackletter's ``ocr`` function with
+    progress callback support. Will be moved to blackletter once
+    validated.
+
+    :param scan_pk: Primary key of the scan (for progress updates).
+    :param pdf_path: Path to the input PDF.
+    :param output_dir: Directory to write the OCR'd PDF into.
+    :param reporter: Reporter short name (e.g. "f3d").
+    :param volume: Volume number as a string.
+    :param first_page: First logical page number in the PDF.
+    :param total_pages: Total page count (for progress messages).
+    :param language: Tesseract language code.
+    :return: Path to the OCR'd PDF.
+    """
+    import logging
+    import time
+
+    import ocrmypdf
+    from ocrmypdf import hookimpl
+    from ocrmypdf._plugin_manager import get_plugin_manager
+
+    pdf_path = Path(pdf_path)
+    output_dir = Path(output_dir)
+
+    # Build output filename
+    last_page = first_page + total_pages - 1
+    parts = [
+        p for p in [reporter, str(volume), str(first_page), str(last_page)]
+        if p
+    ]
+    scan_name = ".".join(parts) if parts else pdf_path.stem
+    output_path = output_dir / f"{scan_name}.pdf"
+
+    # Suppress noisy loggers
+    for name in (
+        "pikepdf", "fontTools", "fontTools.subset",
+        "fontTools.ttLib", "ocrmypdf",
+    ):
+        logging.getLogger(name).setLevel(logging.ERROR)
+    for _n in list(logging.root.manager.loggerDict):
+        if _n.startswith("ocrmypdf"):
+            logging.getLogger(_n).setLevel(logging.ERROR)
+
+    # Progress bar class that updates the scan record per page
+    class _ScanProgressBar:
+        def __init__(self, *, total=None, desc=None, unit=None,
+                     disable=False, **kw):
+            self._total = total or total_pages
+            self._unit = unit
+            self._desc = desc
+            self._current = 0
+            print(
+                f"  [progress] unit={unit!r} desc={desc!r} "
+                f"total={total}",
+                flush=True,
+            )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def update(self, n=1, *, completed=None):
+            self._current += n
+            if self._unit == "page" and (
+                self._current % 10 == 0
+                or self._current == self._total
+            ):
+                _update_progress(
+                    scan_pk,
+                    f"Tesseract OCR: {self._current}"
+                    f"/{self._total} pages...",
+                    current=self._current,
+                    total=self._total,
+                )
+
+    class _ScanProgressPlugin:
+        @hookimpl
+        def get_progressbar_class(self):
+            return _ScanProgressBar
+
+    pm = get_plugin_manager()
+    pm._pm.register(_ScanProgressPlugin())
+
+    print(f"  OCR {total_pages} pages...", flush=True)
+    t0 = time.time()
+    ocrmypdf.ocr(
+        str(pdf_path),
+        str(output_path),
+        pdf_renderer="auto",
+        optimize=1,
+        output_type="pdf",
+        language=[language],
+        tesseract_timeout=120,
+        progress_bar=True,
+        plugin_manager=pm,
+    )
+    print(f"  OCR done ({time.time() - t0:.0f}s)", flush=True)
+    return output_path
+
+
 
 
 def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     """Run YOLO detection (all 3 models) via blackletter.
 
+    Captures stdout from ``bl_detect`` to relay per-model and per-batch
+    progress back to the scan's progress fields.
+
     :param scan_pk: Primary key of the scan (for progress updates).
     :param pdf_path: Path to the PDF to run detection on.
     :param output_dir: Directory where detections.json will be saved.
     """
-    _update_progress(scan_pk, "Running YOLO detection...")
-    bl_detect(pdf_path, output_dir, models=["small", "medium", "large"])
+    import io
+    import sys
+
+    _update_progress(scan_pk, "YOLO detection: loading models...")
+
+    real_stdout = sys.stdout
+
+    class _ProgressWriter(io.TextIOBase):
+        """Intercept bl_detect stdout and relay to _update_progress."""
+
+        def __init__(self):
+            self._buf = ""
+
+        def write(self, s):
+            real_stdout.write(s)
+            real_stdout.flush()
+            self._buf += s
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                self._handle_line(line.strip())
+            return len(s)
+
+        def flush(self):
+            real_stdout.flush()
+
+        def _handle_line(self, line):
+            if not line:
+                return
+            # "Detecting with small..."
+            if line.startswith("Detecting with"):
+                model = line.replace("Detecting with", "").strip().rstrip(".")
+                _update_progress(scan_pk, f"YOLO detection: {model}...")
+            # "  23/23 pages"
+            elif "/" in line and "pages" in line:
+                _update_progress(scan_pk, f"YOLO detection: {line}")
+            # "  small done (2s)"
+            elif "done" in line:
+                _update_progress(scan_pk, f"YOLO: {line}")
+            # "363 detections (786 raw from 3 models)"
+            elif "detections" in line:
+                _update_progress(scan_pk, f"YOLO: {line}")
+
+    sys.stdout = _ProgressWriter()
+    try:
+        bl_detect(pdf_path, output_dir, models=["small", "medium", "large"])
+    finally:
+        sys.stdout = real_stdout
 
 
 def _import_detections_from_json(scan_pk: int, output_dir: str) -> list:
@@ -418,7 +586,11 @@ def _compute_and_save_redaction_rects(
 
 
 def _compute_and_save_margin_rects(pdf_path: str, output_dir: str) -> list:
-    """Compute margin rects and save to disk.
+    """Compute margin rects, adjust for detections, and save to disk.
+
+    After computing raw margins from the PDF, shrink any margin rect
+    that overlaps with an active detection so that key icons, captions,
+    and other content near page edges are not masked.
 
     :param pdf_path: Path to the PDF to compute margins for.
     :param output_dir: Directory where margin_rects.json is saved.
@@ -428,9 +600,96 @@ def _compute_and_save_margin_rects(pdf_path: str, output_dir: str) -> list:
     margin_rects_path = output_dir / "margin_rects.json"
     if not margin_rects_path.exists():
         margin_rects = compute_margin_rects(str(pdf_path))
+        margin_rects = _adjust_margins_for_detections(
+            margin_rects, output_dir
+        )
         margin_rects_path.write_text(json.dumps(margin_rects))
         return margin_rects
     return json.loads(margin_rects_path.read_text())
+
+
+def _adjust_margins_for_detections(
+    margin_rects: list, output_dir: Path
+) -> list:
+    """Shrink margin rects that overlap with active detections.
+
+    For each page, convert detection bboxes from image coords to PDF
+    coords and push back the edge of any margin rect that would cover
+    a detection.
+
+    :param margin_rects: List of ``{"page_index": int, "rects": [...]}``
+        dicts from ``compute_margin_rects``.
+    :param output_dir: Output directory containing detections.json.
+    :return: The adjusted margin rects list (modified in place).
+    """
+    det_path = output_dir / "detections.json"
+    if not det_path.exists():
+        return margin_rects
+
+    detections = json.loads(det_path.read_text())
+
+    # Labels that should not push back margins (noisy edge detections)
+    ignore_labels = {"PAGE_NUMBER", "PAGE_HEADER", "STATE_ABBREVIATION"}
+
+    # Group detections by page_index, skipping ignored labels
+    dets_by_page: dict[int, list] = {}
+    for d in detections:
+        if d.get("label", "") in ignore_labels:
+            continue
+        dets_by_page.setdefault(d["page_index"], []).append(d)
+
+    padding = 0.0  # extra PDF-pt clearance around detections
+
+    for page_entry in margin_rects:
+        page_idx = page_entry["page_index"]
+        page_dets = dets_by_page.get(page_idx)
+        if not page_dets:
+            continue
+
+        # Get image dimensions from the first detection on this page
+        img_w = page_dets[0].get("img_width", 1)
+        img_h = page_dets[0].get("img_height", 1)
+        if not img_w or not img_h:
+            continue
+
+        # Determine PDF page size from the margin rects themselves
+        # (full-width rects span x0=0 to x1=page_width, etc.)
+        pdf_w = max(r["x1"] for r in page_entry["rects"])
+        pdf_h = max(r["y1"] for r in page_entry["rects"])
+        sx = pdf_w / img_w
+        sy = pdf_h / img_h
+
+        # Convert detection bboxes to PDF coords
+        pdf_dets = []
+        for d in page_dets:
+            bb = d["bbox"]
+            pdf_dets.append((bb[0] * sx, bb[1] * sy, bb[2] * sx, bb[3] * sy))
+
+        # Adjust each margin rect
+        for rect in page_entry["rects"]:
+            for dx0, dy0, dx1, dy1 in pdf_dets:
+                # Check if detection overlaps this rect
+                if (
+                    dx0 < rect["x1"]
+                    and dx1 > rect["x0"]
+                    and dy0 < rect["y1"]
+                    and dy1 > rect["y0"]
+                ):
+                    # Shrink the rect edge that intrudes on the detection
+                    # Bottom margin (rect covers lower portion of page)
+                    if rect["y0"] > 0 and rect["y1"] >= pdf_h - 1:
+                        rect["y0"] = max(rect["y0"], dy1 + padding)
+                    # Top margin (rect covers upper portion of page)
+                    if rect["y0"] <= 1 and rect["y1"] < pdf_h - 1:
+                        rect["y1"] = min(rect["y1"], dy0 - padding)
+                    # Left margin (rect covers left portion of page)
+                    if rect["x0"] <= 1 and rect["x1"] < pdf_w - 1:
+                        rect["x1"] = min(rect["x1"], dx0 - padding)
+                    # Right margin (rect covers right portion of page)
+                    if rect["x0"] > 0 and rect["y0"] <= 1 and rect["y1"] >= pdf_h - 1:
+                        rect["x0"] = max(rect["x0"], dx1 + padding)
+
+    return margin_rects
 
 
 def _re_pair_opinions(scan_pk: int) -> list:
@@ -468,7 +727,8 @@ def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
 
     Delegates all OCR/YOLO work to blackletter, keeping only the Django-
     specific parts here: progress updates, cancellation checks, and saving
-    results to the DB.
+    results to the DB.  Saves partial ``ocr_results`` every 5 pages so the
+    frontend can render the sidebar incrementally.
 
     :param scan_pk: Primary key of the scan to validate.
     :param pdf_path: Path to the PDF to run validation on.
@@ -920,20 +1180,23 @@ def run_full_pipeline(scan_pk: int) -> None:
 
         # 4. YOLO detection (all 3 models on bitonal)
         _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
+
+        # 5. Import detections into DB
+        _update_progress(scan_pk, "Importing detections...")
         dets = _import_detections_from_json(scan_pk, str(output_dir))
+
+        # 6. PaddleOCR validation (on original PDF for better OCR)
         _update_progress(
             scan_pk,
-            f"{len(dets)} detections. Running validation...",
+            f"{len(dets)} detections imported. Running page number validation...",
         )
-
-        # 5. PaddleOCR validation (on original PDF for better OCR)
         run_paddleocr_validation(scan_pk, scan.pdf_path)
 
-        # 6. Pair opinions
+        # 7. Pair opinions
         _update_progress(scan_pk, "Pairing opinions...")
         opinions = _re_pair_opinions(scan_pk)
 
-        # 7. Compute redaction rects (margin rects computed lazily when viewer requests them)
+        # 8. Compute redaction rects (margin rects computed lazily when viewer requests them)
         _update_progress(scan_pk, "Computing redaction rects...")
         pdf_path = str(ocr_pdf) if ocr_pdf else scan.pdf_path
         _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))

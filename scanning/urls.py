@@ -7,6 +7,7 @@ from scanning.monitoring import health_check, heartbeat, sentry_fail
 from scanning.views import (
     add_page_insert,
     add_single_detection,
+    approve_detection,
     delete_detection,
     apply_rect_to_opinion,
     approve_scan,
@@ -167,6 +168,11 @@ urlpatterns = [
         "scans/<int:pk>/add-single-detection/",
         add_single_detection,
         name="add_single_detection",
+    ),
+    path(
+        "scans/<int:pk>/approve-detection/",
+        approve_detection,
+        name="approve_detection",
     ),
     path(
         "scans/<int:pk>/delete-detection/",

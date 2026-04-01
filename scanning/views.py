@@ -632,6 +632,28 @@ def scan_process_view(request, pk):
     for r in ocr_results:
         ocr_by_page[r["pdf_page"]] = r
 
+    # Annotate sequence issues for the sidebar page list
+    prev_num = None
+    for r in ocr_results:
+        r["seq_issue"] = ""
+        if not r.get("detected") or r.get("type") == "range":
+            prev_num = None
+            continue
+        try:
+            num = int(r["detected"])
+        except (ValueError, TypeError):
+            prev_num = None
+            continue
+        if prev_num is not None:
+            diff = num - prev_num
+            if diff == 0:
+                r["seq_issue"] = "duplicate"
+            elif diff < 0:
+                r["seq_issue"] = "backward"
+            elif diff > 2:
+                r["seq_issue"] = "gap"
+        prev_num = num
+
     has_pending_changes = scan.deletions.exists() or scan.inserts.exists()
 
     opinions = json.loads(scan.opinions_json) if scan.opinions_json else []
@@ -765,6 +787,7 @@ def scan_process_view(request, pk):
                         {
                             "pdf_page": d.page_index + 1,
                             "page_index": d.page_index,
+                            "label_id": d.label_id,
                             "logical_page": idx_to_logical.get(
                                 d.page_index, d.page_index + 1
                             ),
@@ -774,6 +797,44 @@ def scan_process_view(request, pk):
                             "img_height": d.img_height,
                         }
                     )
+
+        # Build sorted list of paired key icon positions so we can
+        # determine which key-icon span an unmatched caption falls in.
+        # If a span already has a paired caption, extra captions in
+        # that span are continuations — not missed opinions.
+        paired_keys_sorted = sorted(paired_key_keys)
+        paired_caption_pages = {
+            (op.get("caption_page", 0), round(
+                op.get("caption_bbox", [0, 0, 0, 0])[1]
+            ))
+            for op in opinions
+        }
+
+        def _caption_is_continuation(det):
+            """Check if det falls in a key-icon span that already
+            has a paired caption."""
+            pos = (det.page_index, det.y0)
+            # Find which key-icon span this caption is in
+            for i, (kp, kx, ky) in enumerate(paired_keys_sorted):
+                if i + 1 < len(paired_keys_sorted):
+                    next_kp, _, next_ky = paired_keys_sorted[i + 1]
+                else:
+                    next_kp, next_ky = float("inf"), float("inf")
+                # Caption is in this span if it's after this key
+                # and before the next key
+                after_key = (
+                    det.page_index > kp
+                    or (det.page_index == kp and det.y0 > ky)
+                )
+                before_next = (
+                    det.page_index < next_kp
+                    or (det.page_index == next_kp
+                        and det.y0 < next_ky)
+                )
+                if after_key and before_next:
+                    # There's already a paired caption in this span
+                    return True
+            return False
 
         for d in Detection.objects.filter(
             scan=scan, active=True, label="CASE_CAPTION"
@@ -787,10 +848,13 @@ def scan_process_view(request, pk):
                 round(d.y0),
             ) in suppressed:
                 continue
+            if _caption_is_continuation(d):
+                continue
             unmatched_captions.append(
                 {
                     "pdf_page": d.page_index + 1,
                     "page_index": d.page_index,
+                    "label_id": d.label_id,
                     "logical_page": idx_to_logical.get(
                         d.page_index, d.page_index + 1
                     ),
@@ -873,15 +937,18 @@ def progress_api(request, pk):
     :return: JSON response with status, progress, and log fields.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    return JsonResponse(
-        {
-            "status": scan.status,
-            "current": scan.progress_current,
-            "total": scan.progress_total,
-            "message": scan.progress_message,
-            "log": scan.progress_log,
-        }
-    )
+    data = {
+        "status": scan.status,
+        "current": scan.progress_current,
+        "total": scan.progress_total,
+        "message": scan.progress_message,
+        "log": scan.progress_log,
+    }
+    # Include ocr_results when available so the frontend can render
+    # the pages sidebar live without a full page reload.
+    if scan.ocr_results:
+        data["ocr_results"] = json.loads(scan.ocr_results)
+    return JsonResponse(data)
 
 
 @login_required
@@ -1225,8 +1292,10 @@ def serve_margin_rects(request, pk):
     if not ocr_pdf:
         return JsonResponse([], safe=False)
     from blackletter.margins import compute_margin_rects
+    from scanning.services import _adjust_margins_for_detections
 
     rects = compute_margin_rects(ocr_pdf)
+    rects = _adjust_margins_for_detections(rects, output_base)
     # Save so subsequent requests don't recompute
     margin_path = output_base / "margin_rects.json"
     margin_path.write_text(json.dumps(rects))
@@ -1869,6 +1938,60 @@ def add_single_detection(request, pk):
             pass
     det_path.write_text(json.dumps(existing))
     return JsonResponse({"status": "ok", "added": not boosted})
+
+
+@login_required
+@require_POST
+def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
+    """Set a detection's confidence to 1.0 in the DB and on disk.
+
+    :param request: The HTTP request (JSON body with page_index,
+        label, label_id, and bbox).
+    :param pk: Scan primary key.
+    :return: JSON response with the count of updated detections.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    data = json.loads(request.body)
+    page_index = data["page_index"]
+    label = data.get("label", "")
+    label_id = data.get("label_id")
+    bbox = data["bbox"]
+
+    # Update matching Detection(s) in DB
+    db_filter = dict(
+        scan=scan,
+        page_index=page_index,
+        x0__gte=bbox[0] - 15,
+        x0__lte=bbox[0] + 15,
+        y0__gte=bbox[1] - 15,
+        y0__lte=bbox[1] + 15,
+    )
+    if label:
+        db_filter["label"] = label
+    elif label_id is not None:
+        db_filter["label_id"] = label_id
+    count = Detection.objects.filter(**db_filter).update(confidence=1.0)
+
+    # Update confidence in detections.json on disk
+    output_base = get_output_base(scan)
+    det_path = find_json_file(output_base, "detections.json")
+    if det_path:
+        existing = json.loads(det_path.read_text())
+        for e in existing:
+            if e["page_index"] != page_index:
+                continue
+            if label and e.get("label") != label:
+                continue
+            if not label and label_id is not None and e.get("label_id") != label_id:
+                continue
+            if (
+                abs(e["bbox"][0] - bbox[0]) < 15
+                and abs(e["bbox"][1] - bbox[1]) < 15
+            ):
+                e["confidence"] = 1.0
+        det_path.write_text(json.dumps(existing))
+
+    return JsonResponse({"status": "ok", "updated": count})
 
 
 @login_required

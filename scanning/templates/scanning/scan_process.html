@@ -171,20 +171,45 @@
       {% endif %}
 
       {% if ocr_results %}
-      <h2 class="text-sm font-bold mt-3 mb-1 cursor-pointer" onclick="document.getElementById('pages-list').classList.toggle('hidden'); this.querySelector('span').textContent = document.getElementById('pages-list').classList.contains('hidden') ? '▼' : '▲'">
-        Pages ({{ scan.page_count }}) <span class="text-[10px]">▼</span>
-      </h2>
-      <div id="pages-list" class="hidden max-h-64 overflow-y-auto">
+      <h2 class="text-sm font-bold mt-3 mb-1">Pages ({{ scan.page_count }})</h2>
+      <div id="pages-list">
       {% for r in ocr_results %}
-      <div class="rounded px-2 py-0.5 mb-0.5 cursor-pointer text-xs
-           {% if not r.detected %}bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800{% else %}bg-green-50 dark:bg-green-900/20{% endif %}"
-           onclick="goToPage({{ r.pdf_page }})">
-        <span class="font-medium">p.{{ r.pdf_page }}</span>
-        {% if r.detected %}
-        <span class="text-green-700 dark:text-green-300">#{{ r.detected }}</span>
-        {% else %}
-        <span class="text-red-600 dark:text-red-400">No page #</span>
+        {% if r.seq_issue == 'gap' %}
+        <div class="flex items-center gap-1 my-1">
+          <div class="flex-1 border-t-2 border-dashed border-yellow-400"></div>
+          <span class="text-[9px] text-yellow-600 dark:text-yellow-400 font-bold whitespace-nowrap">GAP</span>
+          <div class="flex-1 border-t-2 border-dashed border-yellow-400"></div>
+        </div>
+        {% elif r.seq_issue == 'backward' %}
+        <div class="flex items-center gap-1 my-1">
+          <div class="flex-1 border-t-2 border-dashed border-red-400"></div>
+          <span class="text-[9px] text-red-600 dark:text-red-400 font-bold whitespace-nowrap">ORDER</span>
+          <div class="flex-1 border-t-2 border-dashed border-red-400"></div>
+        </div>
+        {% elif r.seq_issue == 'duplicate' %}
+        <div class="flex items-center gap-1 my-1">
+          <div class="flex-1 border-t-2 border-dashed border-orange-400"></div>
+          <span class="text-[9px] text-orange-600 dark:text-orange-400 font-bold whitespace-nowrap">DUP</span>
+          <div class="flex-1 border-t-2 border-dashed border-orange-400"></div>
+        </div>
         {% endif %}
+      <div class="rounded px-2 py-0.5 mb-0.5 cursor-pointer text-xs flex items-center justify-between
+           {% if not r.detected %}bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800
+           {% elif r.seq_issue == 'backward' %}bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700
+           {% elif r.seq_issue == 'duplicate' %}bg-orange-100 dark:bg-orange-900/30 border border-orange-300 dark:border-orange-700
+           {% elif r.seq_issue == 'gap' %}bg-yellow-100 dark:bg-yellow-900/30 border border-yellow-300 dark:border-yellow-700
+           {% else %}bg-green-50 dark:bg-green-900/20{% endif %}"
+           onclick="goToPage({{ r.pdf_page }})">
+        <span>
+          <span class="font-medium text-gray-500">{{ r.pdf_page }}</span>
+          {% if r.detected %}
+          <span class="{% if r.seq_issue == 'backward' %}text-red-700 dark:text-red-300{% elif r.seq_issue == 'duplicate' %}text-orange-700 dark:text-orange-300{% elif r.seq_issue == 'gap' %}text-yellow-700 dark:text-yellow-300{% else %}text-green-700 dark:text-green-300{% endif %} font-semibold ml-1">#{{ r.detected }}</span>
+          {% else %}
+          <span class="text-red-600 dark:text-red-400 ml-1">—</span>
+          {% endif %}
+        </span>
+        {% if r.type == 'range' %}<span class="text-[9px] text-blue-500">range</span>{% endif %}
+        {% if r.zone == 'manual' %}<span class="text-[9px] text-purple-500">manual</span>{% endif %}
       </div>
       {% endfor %}
       </div>
@@ -227,7 +252,13 @@
            data-unmatched-page="{{ d.page_index }}" data-unmatched-label="CASE_CAPTION"
            onclick="highlightDetection({{ d.logical_page }}, {{ d.page_index }}, [{{ d.bbox.0 }},{{ d.bbox.1 }},{{ d.bbox.2 }},{{ d.bbox.3 }}], {{ d.img_width }}, {{ d.img_height }})">
         <span class="font-medium">p.{{ d.logical_page }}</span>
-        <span class="text-gray-500 dark:text-gray-400">conf {{ d.conf }}</span>
+        <span class="text-gray-500 dark:text-gray-400">{{ d.conf }}</span>
+        <span class="flex gap-1 ml-1">
+          <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Approve (boost to 1.0)"
+                  onclick="event.stopPropagation(); approveDetection(this, {{ d.page_index }}, 'CASE_CAPTION', {{ d.label_id }}, [{{ d.bbox.0 }},{{ d.bbox.1 }},{{ d.bbox.2 }},{{ d.bbox.3 }}], {{ d.img_width }}, {{ d.img_height }})">&#10003;</button>
+          <button class="px-1 py-0.5 rounded bg-red-600 text-white text-[10px] hover:bg-red-700" title="Delete detection"
+                  onclick="event.stopPropagation(); deleteUnmatchedDetection(this, {{ d.page_index }}, 'CASE_CAPTION', {{ d.label_id }}, [{{ d.bbox.0 }},{{ d.bbox.1 }},{{ d.bbox.2 }},{{ d.bbox.3 }}])">&#10005;</button>
+        </span>
       </div>
       {% endfor %}
       {% endif %}
@@ -239,7 +270,7 @@
            data-unmatched-page="{{ d.page_index }}" data-unmatched-label="KEY_ICON"
            onclick="highlightDetection({{ d.logical_page }}, {{ d.page_index }}, [{{ d.bbox.0 }},{{ d.bbox.1 }},{{ d.bbox.2 }},{{ d.bbox.3 }}], {{ d.img_width }}, {{ d.img_height }})">
         <span class="font-medium">p.{{ d.logical_page }}</span>
-        <span class="text-gray-500 dark:text-gray-400">conf {{ d.conf }}</span>
+        <span class="text-gray-500 dark:text-gray-400">{{ d.conf }}</span>
       </div>
       {% endfor %}
       {% endif %}
@@ -550,6 +581,48 @@ function highlightDetection(pageNum, pageIndex, bbox, imgW, imgH) {
     }, 400);
 }
 
+function approveDetection(btn, pageIndex, label, labelId, bbox, imgW, imgH) {
+    btn.disabled = true;
+    btn.textContent = '...';
+    fetch('/scans/' + docId + '/approve-detection/', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+        body: JSON.stringify({
+            page_index: pageIndex, label: label, label_id: labelId,
+            bbox: bbox,
+        }),
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        var row = btn.closest('[data-unmatched-page]');
+        row.style.opacity = '0.3';
+        row.style.pointerEvents = 'none';
+        btn.textContent = '\u2713';
+        // Auto re-pair after approving
+        pairOpinions();
+    });
+}
+
+function deleteUnmatchedDetection(btn, pageIndex, label, labelId, bbox) {
+    btn.disabled = true;
+    btn.textContent = '...';
+    fetch('/scans/' + docId + '/delete-detection/', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+        body: JSON.stringify({
+            page_index: pageIndex, label: label, label_id: labelId,
+            bbox: bbox,
+        }),
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        var row = btn.closest('[data-unmatched-page]');
+        row.style.opacity = '0.3';
+        row.style.pointerEvents = 'none';
+        btn.textContent = '\u2717';
+    });
+}
+
 function deleteDuplicates(btn) {
     var msg = btn.dataset.message;
     var match = msg.match(/\[([0-9, ]+)\]/);
@@ -630,6 +703,75 @@ document.addEventListener('DOMContentLoaded', function() {
 <script>
 (function() {
     var apiUrl = '{% url "progress_api" scan.pk %}';
+    var lastPageCount = 0;
+
+    function renderPages(results) {
+        var spages = document.getElementById('sidebar-pages');
+        if (!spages || !results || results.length === 0) return;
+        if (results.length === lastPageCount) return;
+        lastPageCount = results.length;
+
+        // Compute sequence issues
+        var prevNum = null;
+        for (var i = 0; i < results.length; i++) {
+            var r = results[i];
+            r.seq_issue = '';
+            if (r.detected && prevNum !== null) {
+                var num = parseInt(r.detected);
+                if (!isNaN(num)) {
+                    var diff = num - prevNum;
+                    if (diff === 0) r.seq_issue = 'duplicate';
+                    else if (diff < 0) r.seq_issue = 'backward';
+                    else if (diff > 2) r.seq_issue = 'gap';
+                    prevNum = num;
+                }
+            } else if (r.detected) {
+                var parsed = parseInt(r.detected);
+                if (!isNaN(parsed)) prevNum = parsed;
+            }
+        }
+
+        var html = '<h2 class="text-sm font-bold mt-3 mb-1">Pages (' + results.length + ')</h2>';
+        for (var i = 0; i < results.length; i++) {
+            var r = results[i];
+            // Sequence dividers
+            if (r.seq_issue === 'gap') {
+                html += '<div class="flex items-center gap-1 my-1"><div class="flex-1 border-t-2 border-dashed border-yellow-400"></div><span class="text-[9px] text-yellow-600 dark:text-yellow-400 font-bold">GAP</span><div class="flex-1 border-t-2 border-dashed border-yellow-400"></div></div>';
+            } else if (r.seq_issue === 'backward') {
+                html += '<div class="flex items-center gap-1 my-1"><div class="flex-1 border-t-2 border-dashed border-red-400"></div><span class="text-[9px] text-red-600 dark:text-red-400 font-bold">ORDER</span><div class="flex-1 border-t-2 border-dashed border-red-400"></div></div>';
+            } else if (r.seq_issue === 'duplicate') {
+                html += '<div class="flex items-center gap-1 my-1"><div class="flex-1 border-t-2 border-dashed border-orange-400"></div><span class="text-[9px] text-orange-600 dark:text-orange-400 font-bold">DUP</span><div class="flex-1 border-t-2 border-dashed border-orange-400"></div></div>';
+            }
+
+            var bg = 'bg-green-50 dark:bg-green-900/20';
+            var numClass = 'text-green-700 dark:text-green-300';
+            if (!r.detected) {
+                bg = 'bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800';
+            } else if (r.seq_issue === 'backward') {
+                bg = 'bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700';
+                numClass = 'text-red-700 dark:text-red-300';
+            } else if (r.seq_issue === 'duplicate') {
+                bg = 'bg-orange-100 dark:bg-orange-900/30 border border-orange-300 dark:border-orange-700';
+                numClass = 'text-orange-700 dark:text-orange-300';
+            } else if (r.seq_issue === 'gap') {
+                bg = 'bg-yellow-100 dark:bg-yellow-900/30 border border-yellow-300 dark:border-yellow-700';
+                numClass = 'text-yellow-700 dark:text-yellow-300';
+            }
+
+            html += '<div class="rounded px-2 py-0.5 mb-0.5 cursor-pointer text-xs flex items-center justify-between ' + bg + '" onclick="goToPage(' + r.pdf_page + ')">';
+            html += '<span><span class="font-medium text-gray-500">' + r.pdf_page + '</span>';
+            if (r.detected) {
+                html += ' <span class="' + numClass + ' font-semibold ml-1">#' + r.detected + '</span>';
+            } else {
+                html += ' <span class="text-red-600 dark:text-red-400 ml-1">\u2014</span>';
+            }
+            html += '</span>';
+            if (r.type === 'range') html += '<span class="text-[9px] text-blue-500">range</span>';
+            if (r.zone === 'manual') html += '<span class="text-[9px] text-purple-500">manual</span>';
+            html += '</div>';
+        }
+        spages.innerHTML = html;
+    }
 
     function poll() {
         fetch(apiUrl)
@@ -637,17 +779,14 @@ document.addEventListener('DOMContentLoaded', function() {
             .then(function(data) {
                 var sbar = document.getElementById('sidebar-bar');
                 var sstatus = document.getElementById('sidebar-status');
-                var spages = document.getElementById('sidebar-pages');
                 var pmsg = document.getElementById('processing-msg');
                 if (data.total > 0 && sbar) {
                     sbar.style.width = Math.round(data.current / data.total * 100) + '%';
                 }
                 if (sstatus) sstatus.textContent = data.message || 'Processing...';
                 if (pmsg) pmsg.textContent = data.message || '';
-                if (spages && data.log) {
-                    spages.innerHTML = '<pre class="text-[10px] text-gray-600 dark:text-gray-300 whitespace-pre-wrap break-all leading-relaxed m-0">' + data.log.replace(/</g, '&lt;') + '</pre>';
-                    spages.scrollTop = spages.scrollHeight;
-                }
+
+                if (data.ocr_results) renderPages(data.ocr_results);
 
                 if (data.status === 'approved' || data.status === 'pending_review') {
                     window.location.reload();
