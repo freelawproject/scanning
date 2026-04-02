@@ -805,6 +805,7 @@ def scan_process_view(request, pk):
         # If a span already has a paired caption, extra captions in
         # that span are continuations — not missed opinions.
         paired_keys_sorted = sorted(paired_key_keys)
+
         def _caption_is_continuation(det):
             """Check if det falls in a key-icon span that already
             has a paired caption."""
@@ -1537,7 +1538,9 @@ def compute_redactions_api(request, pk):
         import traceback
 
         traceback.print_exc()
-        return JsonResponse({"error": "Redaction computation failed"}, status=500)
+        return JsonResponse(
+            {"error": "Redaction computation failed"}, status=500
+        )
 
 
 @login_required
