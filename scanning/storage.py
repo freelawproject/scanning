@@ -3,6 +3,7 @@ from storages.backends.s3boto3 import S3Boto3Storage, S3ManifestStaticStorage
 
 class SubDirectoryS3ManifestStaticStorage(S3ManifestStaticStorage):
     location = "static"
+    default_acl = "public-read"
     # Fall back to unhashed URLs instead of raising ValueError
     # when a file is missing from the staticfiles manifest.
     manifest_strict = False

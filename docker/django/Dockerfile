@@ -19,6 +19,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 COPY --from=ghcr.io/astral-sh/uv:0.9.22 /uv /uvx /bin/
 
 ENV PYTHONUNBUFFERED=1
+ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
+ENV PADDLEX_HOME=/tmp/paddlex
 
 ARG BUILD_ENV=prod
 ARG GIT_SHA=""
