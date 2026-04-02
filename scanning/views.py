@@ -679,20 +679,12 @@ def scan_process_view(request, pk):
             if idx in image_page_indices
         )
 
-    has_redaction_rects = False
-    if scan.output_dir:
-        from pathlib import Path as _P
-
-        has_redaction_rects = (
-            _P(scan.output_dir) / "redaction_rects.json"
-        ).exists()
+    has_redaction_rects = bool(scan.redaction_rects)
 
     # Find HEADNOTE detections not covered by headnote redaction rects
     uncovered_hn_pages = set()
-    if has_redaction_rects and scan.output_dir:
-        rects_data = json.loads(
-            (_P(scan.output_dir) / "redaction_rects.json").read_text()
-        )
+    if has_redaction_rects:
+        rects_data = json.loads(scan.redaction_rects)
         hn_rects_by_page = {}
         for entry in rects_data:
             hn_rects_by_page[entry["page_index"]] = [
@@ -1288,10 +1280,9 @@ def serve_margin_rects(request, pk):
     :return: JSON response with per-page margin rect data.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if scan.margin_rects:
+        return JsonResponse(json.loads(scan.margin_rects), safe=False)
     output_base = get_output_base(scan)
-    path = find_json_file(output_base, "margin_rects.json")
-    if path:
-        return JsonResponse(json.loads(path.read_text()), safe=False)
     ocr_pdf = find_ocr_pdf(output_base) if output_base.is_dir() else None
     if not ocr_pdf:
         return JsonResponse([], safe=False)
@@ -1300,9 +1291,7 @@ def serve_margin_rects(request, pk):
 
     rects = compute_margin_rects(ocr_pdf)
     rects = _adjust_margins_for_detections(rects, output_base)
-    # Save so subsequent requests don't recompute
-    margin_path = output_base / "margin_rects.json"
-    margin_path.write_text(json.dumps(rects))
+    Scan.objects.filter(pk=pk).update(margin_rects=json.dumps(rects))
     return JsonResponse(rects, safe=False)
 
 
@@ -1315,10 +1304,8 @@ def serve_redaction_rects(request, pk):
     :return: JSON response with per-page redaction rect data.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    output_base = get_output_base(scan)
-    path = find_json_file(output_base, "redaction_rects.json")
-    if path:
-        return JsonResponse(json.loads(path.read_text()), safe=False)
+    if scan.redaction_rects:
+        return JsonResponse(json.loads(scan.redaction_rects), safe=False)
     return JsonResponse([], safe=False)
 
 
@@ -1340,11 +1327,9 @@ def save_redaction_rect(request, pk):
     adjusted = data.get("adjusted", {})
     rect_type = data.get("type", "")
     fill = data.get("fill", "black")
-    output_base = get_output_base(scan)
-    rects_path = find_json_file(output_base, "redaction_rects.json")
-    if not rects_path:
-        return JsonResponse({"error": "No redaction_rects.json"}, status=404)
-    rects = json.loads(rects_path.read_text())
+    if not scan.redaction_rects:
+        return JsonResponse({"error": "No redaction rects"}, status=404)
+    rects = json.loads(scan.redaction_rects)
     if action == "delete":
         for page_data in rects:
             if page_data["page_index"] != page_idx:
@@ -1359,7 +1344,7 @@ def save_redaction_rect(request, pk):
                 )
             ]
             break
-        rects_path.write_text(json.dumps(rects))
+        Scan.objects.filter(pk=pk).update(redaction_rects=json.dumps(rects))
         return JsonResponse({"status": "ok", "action": "deleted"})
     found = False
     for page_data in rects:
@@ -1394,7 +1379,7 @@ def save_redaction_rect(request, pk):
                 )
                 found = True
                 break
-    rects_path.write_text(json.dumps(rects))
+    Scan.objects.filter(pk=pk).update(redaction_rects=json.dumps(rects))
     return JsonResponse({"status": "ok", "found": found})
 
 
@@ -1414,11 +1399,9 @@ def save_margin_rect(request, pk):
     original = data.get("original", {})
     action = data.get("action", "update")
     adjusted = data.get("adjusted", {})
-    output_base = get_output_base(scan)
-    rects_path = find_json_file(output_base, "margin_rects.json")
-    if not rects_path:
-        return JsonResponse({"error": "No margin_rects.json"}, status=404)
-    rects = json.loads(rects_path.read_text())
+    if not scan.margin_rects:
+        return JsonResponse({"error": "No margin rects"}, status=404)
+    rects = json.loads(scan.margin_rects)
     if action == "delete":
         for page_data in rects:
             if page_data["page_index"] != page_idx:
@@ -1432,7 +1415,7 @@ def save_margin_rect(request, pk):
                 )
             ]
             break
-        rects_path.write_text(json.dumps(rects))
+        Scan.objects.filter(pk=pk).update(margin_rects=json.dumps(rects))
         return JsonResponse({"status": "ok", "action": "deleted"})
     found = False
     for page_data in rects:
@@ -1451,7 +1434,7 @@ def save_margin_rect(request, pk):
                 break
         if found:
             break
-    rects_path.write_text(json.dumps(rects))
+    Scan.objects.filter(pk=pk).update(margin_rects=json.dumps(rects))
     return JsonResponse({"status": "ok", "found": found})
 
 
@@ -1547,7 +1530,7 @@ def compute_redactions_api(request, pk):
     pdf_path = find_ocr_pdf(output_dir) or scan.pdf_path
     try:
         rects = _compute_and_save_redaction_rects(pk, pdf_path, output_dir)
-        _compute_and_save_margin_rects(pdf_path, output_dir)
+        _compute_and_save_margin_rects(pk, pdf_path, output_dir)
         total_rects = sum(len(r["rects"]) for r in rects)
         return JsonResponse(
             {"status": "ok", "pages": len(rects), "rects": total_rects}
