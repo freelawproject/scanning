@@ -380,6 +380,16 @@ class Scan(AbstractDateTimeModel):
         default="",
         help_text="JSON: list of missing logical page numbers.",
     )
+    margin_rects = models.TextField(
+        blank=True,
+        default="",
+        help_text="JSON: per-page margin rects in PDF points.",
+    )
+    redaction_rects = models.TextField(
+        blank=True,
+        default="",
+        help_text="JSON: per-page redaction rects in image pixels.",
+    )
     page_count = models.PositiveIntegerField(default=0)
     has_issues = models.BooleanField(default=False)
     checked = models.BooleanField(default=False)

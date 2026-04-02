@@ -476,11 +476,11 @@ def _build_document_from_detections(
 def _compute_and_save_redaction_rects(
     scan_pk: int, pdf_path: str, output_dir: str
 ) -> list:
-    """Compute redaction rects and save to disk.
+    """Compute redaction rects and save to the Scan model.
 
     :param scan_pk: Primary key of the scan to compute rects for.
     :param pdf_path: Path to the PDF used for page dimensions.
-    :param output_dir: Directory where redaction_rects.json is saved.
+    :param output_dir: Directory (used for detection sync only).
     :return: The computed rects list.
     """
     scan = Scan.objects.get(pk=scan_pk)
@@ -580,32 +580,38 @@ def _compute_and_save_redaction_rects(
             )
         page_entry["rects"] = new_page_rects
 
-    rects_path = output_dir / "redaction_rects.json"
-    rects_path.write_text(json.dumps(rects))
+    Scan.objects.filter(pk=scan_pk).update(
+        redaction_rects=json.dumps(rects),
+    )
     return rects
 
 
-def _compute_and_save_margin_rects(pdf_path: str, output_dir: str) -> list:
-    """Compute margin rects, adjust for detections, and save to disk.
+def _compute_and_save_margin_rects(
+    scan_pk: int, pdf_path: str, output_dir: str
+) -> list:
+    """Compute margin rects, adjust for detections, and save to the Scan model.
 
     After computing raw margins from the PDF, shrink any margin rect
     that overlaps with an active detection so that key icons, captions,
     and other content near page edges are not masked.
 
+    :param scan_pk: Primary key of the scan.
     :param pdf_path: Path to the PDF to compute margins for.
-    :param output_dir: Directory where margin_rects.json is saved.
+    :param output_dir: Directory (used for detection lookup only).
     :return: The computed margin rects list.
     """
+    scan = Scan.objects.get(pk=scan_pk)
+    if scan.margin_rects:
+        return json.loads(scan.margin_rects)
     output_dir = Path(output_dir)
-    margin_rects_path = output_dir / "margin_rects.json"
-    if not margin_rects_path.exists():
-        margin_rects = compute_margin_rects(str(pdf_path))
-        margin_rects = _adjust_margins_for_detections(
-            margin_rects, output_dir
-        )
-        margin_rects_path.write_text(json.dumps(margin_rects))
-        return margin_rects
-    return json.loads(margin_rects_path.read_text())
+    margin_rects = compute_margin_rects(str(pdf_path))
+    margin_rects = _adjust_margins_for_detections(
+        margin_rects, output_dir
+    )
+    Scan.objects.filter(pk=scan_pk).update(
+        margin_rects=json.dumps(margin_rects),
+    )
+    return margin_rects
 
 
 def _build_combined_redactions(scan_pk: int) -> Path:
@@ -620,12 +626,10 @@ def _build_combined_redactions(scan_pk: int) -> Path:
     scan = Scan.objects.get(pk=scan_pk)
     output_dir = Path(scan.output_dir)
 
-    margin_path = output_dir / "margin_rects.json"
-    rects_path = output_dir / "redaction_rects.json"
     det_path = output_dir / "detections.json"
 
-    margins_data = json.loads(margin_path.read_text()) if margin_path.exists() else []
-    rects_data = json.loads(rects_path.read_text()) if rects_path.exists() else []
+    margins_data = json.loads(scan.margin_rects) if scan.margin_rects else []
+    rects_data = json.loads(scan.redaction_rects) if scan.redaction_rects else []
     opinions = json.loads(scan.opinions_json) if scan.opinions_json else []
 
     # Add filenames based on reporter, volume, and page numbers
@@ -748,6 +752,8 @@ def _adjust_margins_for_detections(
     padding = 0.0  # extra PDF-pt clearance around detections
 
     for page_entry in margin_rects:
+        if not page_entry["rects"]:
+            continue
         page_idx = page_entry["page_index"]
         page_dets = dets_by_page.get(page_idx)
         if not page_dets:
@@ -1469,12 +1475,10 @@ def run_reprocess(scan_pk: int) -> None:
         page_map = json.loads(scan.page_map) if scan.page_map else []
         all_results = json.loads(scan.ocr_results) if scan.ocr_results else []
 
-        # Stale margin/redaction rects are indexed by old page positions — delete them
-        if output_dir:
-            for stale in ("margin_rects.json", "redaction_rects.json"):
-                stale_path = output_dir / stale
-                if stale_path.exists():
-                    stale_path.unlink()
+        # Stale margin/redaction rects are indexed by old page positions — clear them
+        Scan.objects.filter(pk=scan_pk).update(
+            margin_rects="", redaction_rects=""
+        )
 
         # Apply deletions (process in reverse order to keep indices stable)
         if has_deletions:
@@ -1508,8 +1512,14 @@ def run_reprocess(scan_pk: int) -> None:
 
             scan.deletions.all().delete()
 
-        # Track which pdf_pages need OCR (newly inserted)
-        new_page_indices = []
+        # After deletions, rebuild page_map so inserts use correct pdf indices
+        if has_deletions:
+            Scan.objects.filter(pk=scan_pk).update(
+                ocr_results=json.dumps(all_results)
+            )
+            _rebuild_issues_from_results(scan_pk, all_results)
+            scan.refresh_from_db()
+            page_map = json.loads(scan.page_map) if scan.page_map else []
 
         # Apply inserts
         if has_inserts:
@@ -1523,98 +1533,34 @@ def run_reprocess(scan_pk: int) -> None:
                 logical_num = entry.get("logical_number")
                 if logical_num not in inserts:
                     continue
-                insert_obj = inserts[logical_num]
-
-                # Record the page index before insert shifts things
-                pdf = fitz.open(scan.pdf_path)
-                pre_count = pdf.page_count
-                pdf.close()
-
-                run_smart_insert(scan_pk, logical_num, insert_obj.image.path)
-
-                pdf = fitz.open(scan.pdf_path)
-                post_count = pdf.page_count
-                pdf.close()
-
-                if post_count > pre_count:
-                    # Figure out where it was inserted
-                    # Smart insert puts it at the right position based on
-                    # logical page number. The new page's pdf_page is its
-                    # 1-based position.
-                    new_idx = post_count  # last page (1-based)
-                    # Actually find it — it's the page that wasn't there before
-                    # For simplicity, just track the new page count
-                    new_page_indices.append(post_count - 1)  # 0-based
+                run_smart_insert(
+                    scan_pk, logical_num, inserts[logical_num].image.path
+                )
 
             scan.inserts.all().delete()
 
-        # Update page count
-        pdf = fitz.open(scan.pdf_path)
-        new_count = pdf.page_count
-        pdf.close()
-        Scan.objects.filter(pk=scan_pk).update(page_count=new_count)
+        # run_smart_insert already handled OCR, detection, validation,
+        # re-pairing, and rect computation for each insert. Reload the
+        # final state from the DB.
+        scan.refresh_from_db()
+        all_results = json.loads(scan.ocr_results) if scan.ocr_results else []
 
-        # OCR only the newly inserted pages
-        if new_page_indices:
-            _update_progress(
-                scan_pk, f"OCR on {len(new_page_indices)} new page(s)..."
-            )
-            scan.refresh_from_db()
-            exp_start = scan.start_page or 1
-            exp_end = scan.end_page
-            model_path = str(DEFAULT_ANALYZE_MODEL)
-
-            for page_idx in new_page_indices:
-                result = _process_page(
-                    (page_idx, scan.pdf_path, exp_start, exp_end, model_path)
-                )
-                # Insert into all_results at the right position
-                pdf_page = page_idx + 1
-                # Shift existing results at or after this position
-                for r in all_results:
-                    if r["pdf_page"] >= pdf_page:
-                        r["pdf_page"] += 1
-                # Find insertion point
-                insert_at = len(all_results)
-                for idx, r in enumerate(all_results):
-                    if r["pdf_page"] > pdf_page:
-                        insert_at = idx
-                        break
-                all_results.insert(insert_at, result)
-
-        # Ensure all_results covers every page (fill gaps for safety)
-        existing_pages = {r["pdf_page"] for r in all_results}
-        for p in range(1, new_count + 1):
-            if p not in existing_pages:
-                all_results.append(
-                    {
-                        "pdf_page": p,
-                        "detected": None,
-                        "type": "missing_ocr",
-                        "zone": "none",
-                        "score": 0,
-                        "ocr": "skipped",
-                    }
-                )
-        all_results.sort(key=lambda r: r["pdf_page"])
-
-        # Sync detections and rebuild issues
-        if output_dir:
-            _sync_detections_to_disk(scan_pk)
-
+        # Final rebuild with the fully updated results
         _update_progress(scan_pk, "Rebuilding issues...")
         _rebuild_issues_from_results(scan_pk, all_results)
         _re_pair_opinions(scan_pk)
 
         if output_dir:
             pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
+            Scan.objects.filter(pk=scan_pk).update(
+                margin_rects="", redaction_rects=""
+            )
+            _compute_and_save_margin_rects(
+                scan_pk, pdf_path, str(output_dir)
+            )
             _compute_and_save_redaction_rects(
                 scan_pk, pdf_path, str(output_dir)
             )
-            # Delete stale margin rects — will be recomputed lazily when viewer requests them
-            stale_margins = Path(output_dir) / "margin_rects.json"
-            if stale_margins.exists():
-                stale_margins.unlink()
 
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.APPROVED,
@@ -1682,6 +1628,52 @@ def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
         _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
 
 
+def _ocr_single_page(ocr_pdf_path: str, page_idx: int) -> None:
+    """Run Tesseract OCR on a single page of a PDF to add a text layer.
+
+    Extracts the page to a temp file, OCRs it, then replaces the page
+    in the original PDF with the OCR'd version.
+
+    :param ocr_pdf_path: Path to the OCR PDF to update.
+    :param page_idx: Zero-based page index to OCR.
+    """
+    import tempfile
+
+    import ocrmypdf
+
+    ocr_pdf_path = str(ocr_pdf_path)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        # Extract the single page
+        single_path = tmp / "page.pdf"
+        doc = fitz.open(ocr_pdf_path)
+        single = fitz.open()
+        single.insert_pdf(doc, from_page=page_idx, to_page=page_idx)
+        single.save(str(single_path))
+        single.close()
+
+        # OCR it
+        ocrd_path = tmp / "page_ocr.pdf"
+        ocrmypdf.ocr(
+            str(single_path),
+            str(ocrd_path),
+            pdf_renderer="auto",
+            optimize=1,
+            output_type="pdf",
+            language=["eng"],
+            tesseract_timeout=120,
+            progress_bar=False,
+        )
+
+        # Replace the page in the OCR PDF
+        ocrd_doc = fitz.open(str(ocrd_path))
+        doc.delete_page(page_idx)
+        doc.insert_pdf(ocrd_doc, from_page=0, to_page=0, start_at=page_idx)
+        doc.saveIncr()
+        ocrd_doc.close()
+        doc.close()
+
+
 def run_smart_insert(scan_pk: int, logical_page_number: int, image_path: str) -> None:
     """Insert a page and run detection/validation on just that page.
 
@@ -1729,6 +1721,12 @@ def run_smart_insert(scan_pk: int, logical_page_number: int, image_path: str) ->
         doc.saveIncr()
         doc.close()
 
+    # OCR the inserted page in the OCR PDF so it gets a text layer
+    if output_dir:
+        ocr_pdf_path = find_ocr_pdf(str(output_dir))
+        if ocr_pdf_path:
+            _ocr_single_page(ocr_pdf_path, insert_idx)
+
     # Shift subsequent detections up
     Detection.objects.filter(
         scan_id=scan_pk, page_index__gte=insert_idx
@@ -1745,12 +1743,17 @@ def run_smart_insert(scan_pk: int, logical_page_number: int, image_path: str) ->
         _sync_detections_to_disk(scan_pk)
 
     # Re-validate, re-pair, recompute rects
-    run_paddleocr_validation(scan_pk, scan.pdf_path)
+    scan.refresh_from_db()
+    pdf_path = find_ocr_pdf(str(output_dir)) if output_dir else scan.pdf_path
+    run_incremental_validation(scan_pk, pdf_path or scan.pdf_path)
     _re_pair_opinions(scan_pk)
 
     if output_dir:
-        pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
-        _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
+        Scan.objects.filter(pk=scan_pk).update(margin_rects="", redaction_rects="")
+        _compute_and_save_margin_rects(scan_pk, pdf_path or scan.pdf_path, str(output_dir))
+        _compute_and_save_redaction_rects(
+            scan_pk, pdf_path or scan.pdf_path, str(output_dir)
+        )
 
 
 def _collect_pdf_paths(scan: "Scan", output_dir: str | None) -> list[Path]:
