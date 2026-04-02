@@ -18,7 +18,6 @@ from scanning.factories import (
 from scanning.models import (
     OpinionScan,
     OpinionStatus,
-    Scan,
     Source,
     Status,
 )
@@ -384,8 +383,6 @@ class TestOpinionDetail(ScanningTestCase):
         self.assertNotContains(response, "Parent Book")
 
 
-
-
 class TestOpinionUpload(ScanningTestCase):
     """Test the opinion upload functionality (superuser only)."""
 
@@ -539,7 +536,6 @@ class TestScanValidation(ScanningTestCase):
     def test_number_of_pages_equal_to_range_ok(self):
         scan = ScanFactory(number_of_pages=50, start_page=1, end_page=50)
         scan.full_clean()  # should not raise
-
 
     def test_allows_same_reporter_volume_source(self):
         reporter = ReporterFactory()
