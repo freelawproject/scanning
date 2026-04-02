@@ -38,7 +38,7 @@
           </tr>
           {% endif %}
           <tr class="border-b border-gray-100 dark:border-gray-700/50">
-            <td class="px-4 py-2.5 text-gray-500 dark:text-gray-400 font-medium">Date</td>
+            <td class="px-4 py-2.5 text-gray-500 dark:text-gray-400 font-medium">Uploaded</td>
             <td class="px-4 py-2.5">{{ opinion.date_created|date:"M j, Y g:i A" }}</td>
           </tr>
         </tbody>
@@ -86,12 +86,10 @@
       {% endif %}
     </div>
 
-    <!-- Single PDF iframe -->
-    <div class="flex-1 relative p-4 bg-gray-100 dark:bg-gray-800">
-      {% if opinion.redacted_pdf %}
-      <iframe id="pdf-viewer" src="{{ opinion.redacted_pdf.url }}#zoom=page-fit" class="absolute inset-4 border border-gray-200 dark:border-gray-700 rounded bg-white" style="width: calc(100% - 2rem); height: calc(100% - 2rem);"></iframe>
-      {% elif opinion.original_pdf %}
-      <iframe id="pdf-viewer" src="{{ opinion.original_pdf.url }}#zoom=page-fit" class="absolute inset-4 border border-gray-200 dark:border-gray-700 rounded bg-white" style="width: calc(100% - 2rem); height: calc(100% - 2rem);"></iframe>
+    <!-- PDF viewer -->
+    <div id="pdf-container" class="flex-1 overflow-y-auto bg-gray-100 dark:bg-gray-800 p-4">
+      {% if opinion.redacted_pdf or opinion.original_pdf %}
+      <div id="pdf-pages" class="flex flex-col items-center gap-4"></div>
       {% else %}
       <div class="flex items-center justify-center h-full">
         <p class="text-gray-400 dark:text-gray-500">No PDF files available.</p>
@@ -101,23 +99,61 @@
   </div>
 </div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script>
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+var _currentUrl = '{% if opinion.redacted_pdf %}{{ opinion.redacted_pdf.url }}{% elif opinion.original_pdf %}{{ opinion.original_pdf.url }}{% endif %}';
+
+function loadPdf(url) {
+    _currentUrl = url;
+    var container = document.getElementById('pdf-pages');
+    container.innerHTML = '';
+    if (!url) return;
+
+    pdfjsLib.getDocument(url).promise.then(function(pdf) {
+        var containerEl = document.getElementById('pdf-container');
+        var containerWidth = containerEl.clientWidth - 32;
+        var containerHeight = containerEl.clientHeight - 32;
+        for (var i = 1; i <= pdf.numPages; i++) {
+            (function(pageNum) {
+                pdf.getPage(pageNum).then(function(page) {
+                    var unscaled = page.getViewport({ scale: 1 });
+                    var scaleW = containerWidth / unscaled.width;
+                    var scaleH = containerHeight / unscaled.height;
+                    var scale = Math.min(scaleW, scaleH);
+                    var viewport = page.getViewport({ scale: scale });
+
+                    var canvas = document.createElement('canvas');
+                    canvas.width = viewport.width;
+                    canvas.height = viewport.height;
+                    canvas.className = 'border border-gray-200 dark:border-gray-700 rounded bg-white shadow-sm';
+                    container.appendChild(canvas);
+
+                    page.render({ canvasContext: canvas.getContext('2d'), viewport: viewport });
+                });
+            })(i);
+        }
+    });
+}
+
 function switchTab(btn) {
     var url = btn.getAttribute('data-url');
-    var viewer = document.getElementById('pdf-viewer');
-    if (viewer && url) viewer.src = url + '#zoom=page-fit';
+    loadPdf(url);
 
     document.querySelectorAll('.pdf-tab').forEach(function(t) {
         t.className = 'pdf-tab text-sm px-4 py-2 font-medium rounded-t border border-b-0 border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/50 -mb-px';
     });
     btn.className = 'pdf-tab active text-sm px-4 py-2 font-medium rounded-t border border-b-0 bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-700 text-gray-900 dark:text-gray-100 -mb-px relative z-10';
 }
-{% if not opinion.redacted_pdf and opinion.original_pdf %}
+
 document.addEventListener('DOMContentLoaded', function() {
+    if (_currentUrl) loadPdf(_currentUrl);
+    {% if not opinion.redacted_pdf and opinion.original_pdf %}
     var btn = document.querySelector('.pdf-tab');
     if (btn) switchTab(btn);
+    {% endif %}
 });
-{% endif %}
 </script>
 {% endblock %}
 {% block footer %}{% endblock %}

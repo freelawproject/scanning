@@ -48,6 +48,7 @@ class OpinionScanAdmin(admin.ModelAdmin):
     list_display = [
         "reporter",
         "volume",
+        "page_start",
         "status",
         "scan",
         "uploaded_by",

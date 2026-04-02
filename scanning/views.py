@@ -207,8 +207,8 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     :return: The rendered opinion list page.
     """
     opinions = OpinionScan.objects.select_related(
-        "reporter", "scan", "uploaded_by"
-    ).order_by("-date_created")
+        "reporter", "scan"
+    ).order_by("reporter__short_name", "volume", "page_start")
 
     # Filtering
     scan_filter = request.GET.get("scan")
@@ -231,7 +231,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
             messages.error(request, "Volume must be a number.")
             volume_filter = ""
 
-    paginator = Paginator(opinions, 25)
+    paginator = Paginator(opinions, 50)
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
 
@@ -245,7 +245,6 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
                 (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
-            "current_scan": scan_filter or "",
             "current_reporter": reporter_filter or "",
             "current_status": status_filter or "",
             "current_volume": volume_filter or "",
