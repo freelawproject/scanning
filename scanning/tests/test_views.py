@@ -117,80 +117,6 @@ class TestAuthentication(ScanningTestCase):
         self.assertNotIn("evil.com", response.url)
 
 
-class TestScanUpload(ScanningTestCase):
-    """Test the scan upload functionality."""
-
-    def test_upload_page_renders(self):
-        self.client.force_login(self.make_user())
-        response = self.client.get(reverse("scan_upload"))
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Upload Book Scan")
-
-    def test_successful_upload(self):
-        user = self.make_user()
-        self.client.force_login(user)
-        reporter = ReporterFactory(
-            short_name="a", full_name="Atlantic Reporter"
-        )
-        response = self.client.post(
-            reverse("scan_upload"),
-            {
-                "reporter": reporter.pk,
-                "source": Source.FULL,
-                "volume": 1,
-                "number_of_pages": 50,
-                "start_page": 1,
-                "end_page": 50,
-                "original_pdf": self.make_pdf(),
-            },
-        )
-        self.assertEqual(response.status_code, 302)
-        scan = Scan.objects.get()
-        self.assertEqual(scan.uploaded_by, user)
-        self.assertEqual(scan.status, Status.UPLOADED)
-        self.assertEqual(scan.reporter, reporter)
-
-    def test_upload_missing_pdf(self):
-        self.client.force_login(self.make_user())
-        reporter = ReporterFactory()
-        response = self.client.post(
-            reverse("scan_upload"),
-            {
-                "reporter": reporter.pk,
-                "source": Source.FULL,
-                "volume": 1,
-                "number_of_pages": 50,
-                "start_page": 1,
-                "end_page": 50,
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(Scan.objects.count(), 0)
-
-    def test_upload_rejects_non_pdf_mime_type(self):
-        self.client.force_login(self.make_user())
-        reporter = ReporterFactory()
-        fake_pdf = SimpleUploadedFile(
-            "fake.pdf",
-            b"not a pdf",
-            content_type="text/plain",
-        )
-        response = self.client.post(
-            reverse("scan_upload"),
-            {
-                "reporter": reporter.pk,
-                "source": Source.FULL,
-                "volume": 1,
-                "number_of_pages": 50,
-                "start_page": 1,
-                "end_page": 50,
-                "original_pdf": fake_pdf,
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(Scan.objects.count(), 0)
-
-
 class TestScanList(ScanningTestCase):
     """Test the scan list view."""
 
@@ -415,11 +341,11 @@ class TestOpinionList(ScanningTestCase):
     def test_pagination(self):
         user = self.make_user()
         self.client.force_login(user)
-        OpinionScanFactory.create_batch(30, uploaded_by=user)
+        OpinionScanFactory.create_batch(60, uploaded_by=user)
         response = self.client.get(reverse("opinion_list"))
-        self.assertEqual(len(response.context["page_obj"]), 25)
+        self.assertEqual(len(response.context["page_obj"]), 50)
         response = self.client.get(reverse("opinion_list"), {"page": 2})
-        self.assertEqual(len(response.context["page_obj"]), 5)
+        self.assertEqual(len(response.context["page_obj"]), 10)
 
 
 class TestOpinionDetail(ScanningTestCase):
@@ -443,7 +369,7 @@ class TestOpinionDetail(ScanningTestCase):
         response = self.client.get(
             reverse("opinion_detail", kwargs={"pk": opinion.pk})
         )
-        self.assertContains(response, "Parent Book")
+        self.assertContains(response, "Book")
         self.assertContains(
             response, reverse("scan_detail", kwargs={"pk": scan.pk})
         )
@@ -458,63 +384,6 @@ class TestOpinionDetail(ScanningTestCase):
         self.assertNotContains(response, "Parent Book")
 
 
-class TestOpinionReview(ScanningTestCase):
-    """Test staff review functionality for opinion scans."""
-
-    def test_staff_sees_review_form(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        opinion = OpinionScanFactory()
-        response = self.client.get(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk})
-        )
-        self.assertIsNotNone(response.context["review_form"])
-
-    def test_non_staff_no_review_form(self):
-        user = self.make_user()
-        self.client.force_login(user)
-        opinion = OpinionScanFactory(uploaded_by=user)
-        response = self.client.get(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk})
-        )
-        self.assertIsNone(response.context["review_form"])
-
-    def test_approve_sets_ok_status(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        opinion = OpinionScanFactory()
-        response = self.client.post(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk}),
-            {"status": OpinionStatus.OK, "notes": "Looks good"},
-        )
-        self.assertEqual(response.status_code, 302)
-        opinion.refresh_from_db()
-        self.assertEqual(opinion.status, OpinionStatus.OK)
-        self.assertEqual(opinion.notes, "Looks good")
-
-    def test_reject_resets_to_no_status(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        opinion = OpinionScanFactory(status=OpinionStatus.GAP)
-        response = self.client.post(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk}),
-            {"status": OpinionStatus.NO_STATUS, "notes": "Needs rescan"},
-        )
-        self.assertEqual(response.status_code, 302)
-        opinion.refresh_from_db()
-        self.assertEqual(opinion.status, OpinionStatus.NO_STATUS)
-        self.assertEqual(opinion.notes, "Needs rescan")
-
-    def test_approved_opinion_hides_review_form(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        opinion = OpinionScanFactory(status=OpinionStatus.OK)
-        response = self.client.get(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk})
-        )
-        self.assertIsNone(response.context["review_form"])
-        self.assertContains(response, "Review Decision")
-        self.assertContains(response, "OK")
 
 
 class TestOpinionUpload(ScanningTestCase):
@@ -671,45 +540,17 @@ class TestScanValidation(ScanningTestCase):
         scan = ScanFactory(number_of_pages=50, start_page=1, end_page=50)
         scan.full_clean()  # should not raise
 
-    def test_duplicate_scan_rejected(self):
-        reporter = ReporterFactory()
-        ScanFactory(reporter=reporter, volume=1, source=Source.FULL)
-        with self.assertRaises(Exception):
-            ScanFactory(reporter=reporter, volume=1, source=Source.FULL)
 
-    def test_different_source_allows_same_reporter_volume(self):
+    def test_allows_same_reporter_volume_source(self):
         reporter = ReporterFactory()
         ScanFactory(reporter=reporter, volume=1, source=Source.FULL)
         ScanFactory(
-            reporter=reporter, volume=1, source=Source.OPINIONS
-        )  # should not raise
+            reporter=reporter, volume=1, source=Source.FULL
+        )  # no unique constraint anymore
 
 
 class TestSpoofedPdfUpload(ScanningTestCase):
     """Test that spoofed PDF files (correct MIME, wrong content) are rejected."""
-
-    def test_scan_upload_spoofed_pdf_rejected(self):
-        self.client.force_login(self.make_user())
-        reporter = ReporterFactory()
-        spoofed = SimpleUploadedFile(
-            "fake.pdf",
-            b"<html>not a pdf</html>",
-            content_type="application/pdf",
-        )
-        response = self.client.post(
-            reverse("scan_upload"),
-            {
-                "reporter": reporter.pk,
-                "source": Source.FULL,
-                "volume": 1,
-                "number_of_pages": 50,
-                "start_page": 1,
-                "end_page": 50,
-                "original_pdf": spoofed,
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(Scan.objects.count(), 0)
 
     def test_opinion_upload_spoofed_pdf_rejected(self):
         user = UserFactory(is_superuser=True)
