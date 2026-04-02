@@ -49,9 +49,10 @@ class Command(BaseCommand):
 
         :return: None.
         """
+        from datetime import timedelta
+
         from django.conf import settings
         from django.utils import timezone
-        from datetime import timedelta
 
         from scanning.models import Scan, Status
 
@@ -80,8 +81,8 @@ class Command(BaseCommand):
         from django.db import connections
         from django.utils import timezone
 
-        from scanning.models import Scan, Status
         from scanning import services
+        from scanning.models import Scan, Status
 
         # Close stale DB connections before each cycle
         connections.close_all()

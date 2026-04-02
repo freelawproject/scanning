@@ -5,45 +5,41 @@ daemon process.  They must NOT import Django HTTP machinery
 (HttpResponse, render, redirect, etc.).
 """
 
-import django
-import traceback
-
-from pathlib import Path
-from scanning.utils import find_ocr_pdf
-from scanning.models import Detection
 import json
 import os
 import re
+import re as re_mod
 import shutil
+import traceback
+from collections import Counter
 from pathlib import Path
 
-import re as re_mod
-from collections import Counter
-
+import django
 import fitz
-from django.conf import settings
-from django.db.models import F
-
 from blackletter.analyze import (
-    DEFAULT_ANALYZE_MODEL,
-    _process_page,
     analyze_pdf as bl_analyze_pdf,
 )
 from blackletter.api import (
     bitonal as bl_bitonal,
+)
+from blackletter.api import (
     detect as bl_detect,
-    ocr as bl_ocr,
+)
+from blackletter.api import (
     pair as bl_pair,
 )
+from blackletter.margins import compute_margin_rects
 from blackletter.models import (
     BBox,
-    Detection as BLDetection,
-    Document as BLDoc,
     Label,
     Page,
 )
-
-from blackletter.margins import compute_margin_rects
+from blackletter.models import (
+    Detection as BLDetection,
+)
+from blackletter.models import (
+    Document as BLDoc,
+)
 from blackletter.process import compute_redaction_rects
 from blackletter.scanner import _pair_opinions
 from blackletter.validate import (
@@ -52,6 +48,8 @@ from blackletter.validate import (
     _parse_expected_range,
     _split_in_out_of_range,
 )
+from django.conf import settings
+from django.db.models import F
 
 from scanning.models import (
     Detection,
@@ -63,10 +61,7 @@ from scanning.models import (
     Stage,
     Status,
 )
-import shutil
-
 from scanning.utils import find_ocr_pdf
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -119,13 +114,19 @@ def _run_ocr(
     total_pages = pdf.page_count
     pdf.close()
     _update_progress(
-        scan_pk, f"Running Tesseract OCR (0/{total_pages} pages)...",
-        current=0, total=total_pages,
+        scan_pk,
+        f"Running Tesseract OCR (0/{total_pages} pages)...",
+        current=0,
+        total=total_pages,
     )
     return _ocr(
-        scan_pk, bitonal_path, output_dir,
-        reporter=reporter, volume=volume,
-        first_page=first_page, total_pages=total_pages,
+        scan_pk,
+        bitonal_path,
+        output_dir,
+        reporter=reporter,
+        volume=volume,
+        first_page=first_page,
+        total_pages=total_pages,
     )
 
 
@@ -168,7 +169,8 @@ def _ocr(
     # Build output filename
     last_page = first_page + total_pages - 1
     parts = [
-        p for p in [reporter, str(volume), str(first_page), str(last_page)]
+        p
+        for p in [reporter, str(volume), str(first_page), str(last_page)]
         if p
     ]
     scan_name = ".".join(parts) if parts else pdf_path.stem
@@ -176,8 +178,11 @@ def _ocr(
 
     # Suppress noisy loggers
     for name in (
-        "pikepdf", "fontTools", "fontTools.subset",
-        "fontTools.ttLib", "ocrmypdf",
+        "pikepdf",
+        "fontTools",
+        "fontTools.subset",
+        "fontTools.ttLib",
+        "ocrmypdf",
     ):
         logging.getLogger(name).setLevel(logging.ERROR)
     for _n in list(logging.root.manager.loggerDict):
@@ -186,15 +191,15 @@ def _ocr(
 
     # Progress bar class that updates the scan record per page
     class _ScanProgressBar:
-        def __init__(self, *, total=None, desc=None, unit=None,
-                     disable=False, **kw):
+        def __init__(
+            self, *, total=None, desc=None, unit=None, disable=False, **kw
+        ):
             self._total = total or total_pages
             self._unit = unit
             self._desc = desc
             self._current = 0
             print(
-                f"  [progress] unit={unit!r} desc={desc!r} "
-                f"total={total}",
+                f"  [progress] unit={unit!r} desc={desc!r} total={total}",
                 flush=True,
             )
 
@@ -207,13 +212,11 @@ def _ocr(
         def update(self, n=1, *, completed=None):
             self._current += n
             if self._unit == "page" and (
-                self._current % 10 == 0
-                or self._current == self._total
+                self._current % 10 == 0 or self._current == self._total
             ):
                 _update_progress(
                     scan_pk,
-                    f"Tesseract OCR: {self._current}"
-                    f"/{self._total} pages...",
+                    f"Tesseract OCR: {self._current}/{self._total} pages...",
                     current=self._current,
                     total=self._total,
                 )
@@ -241,8 +244,6 @@ def _ocr(
     )
     print(f"  OCR done ({time.time() - t0:.0f}s)", flush=True)
     return output_path
-
-
 
 
 def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
@@ -605,9 +606,7 @@ def _compute_and_save_margin_rects(
         return json.loads(scan.margin_rects)
     output_dir = Path(output_dir)
     margin_rects = compute_margin_rects(str(pdf_path))
-    margin_rects = _adjust_margins_for_detections(
-        margin_rects, output_dir
-    )
+    margin_rects = _adjust_margins_for_detections(margin_rects, output_dir)
     Scan.objects.filter(pk=scan_pk).update(
         margin_rects=json.dumps(margin_rects),
     )
@@ -629,7 +628,9 @@ def _build_combined_redactions(scan_pk: int) -> Path:
     det_path = output_dir / "detections.json"
 
     margins_data = json.loads(scan.margin_rects) if scan.margin_rects else []
-    rects_data = json.loads(scan.redaction_rects) if scan.redaction_rects else []
+    rects_data = (
+        json.loads(scan.redaction_rects) if scan.redaction_rects else []
+    )
     opinions = json.loads(scan.opinions_json) if scan.opinions_json else []
 
     # Add filenames based on reporter, volume, and page numbers
@@ -667,14 +668,16 @@ def _build_combined_redactions(scan_pk: int) -> Path:
         if pi not in pages:
             pages[pi] = []
         for r in entry.get("rects", []):
-            pages[pi].append({
-                "x0": round(r["x0"], 1),
-                "y0": round(r["y0"], 1),
-                "x1": round(r["x1"], 1),
-                "y1": round(r["y1"], 1),
-                "fill": "white",
-                "type": "margin",
-            })
+            pages[pi].append(
+                {
+                    "x0": round(r["x0"], 1),
+                    "y0": round(r["y0"], 1),
+                    "x1": round(r["x1"], 1),
+                    "y1": round(r["y1"], 1),
+                    "fill": "white",
+                    "type": "margin",
+                }
+            )
 
     # Redaction rects (pixels → PDF points)
     for entry in rects_data:
@@ -694,14 +697,16 @@ def _build_combined_redactions(scan_pk: int) -> Path:
             y1 = r["y1"] * to_y
             if x0 >= x1 or y0 >= y1:
                 continue
-            pages[pi].append({
-                "x0": round(x0, 1),
-                "y0": round(y0, 1),
-                "x1": round(x1, 1),
-                "y1": round(y1, 1),
-                "fill": r["fill"],
-                "type": r["type"],
-            })
+            pages[pi].append(
+                {
+                    "x0": round(x0, 1),
+                    "y0": round(y0, 1),
+                    "x1": round(x1, 1),
+                    "y1": round(y1, 1),
+                    "fill": r["fill"],
+                    "type": r["type"],
+                }
+            )
 
     combined = {
         "opinions": opinions,
@@ -799,7 +804,11 @@ def _adjust_margins_for_detections(
                     if rect["x0"] <= 1 and rect["x1"] < pdf_w - 1:
                         rect["x1"] = min(rect["x1"], dx0 - padding)
                     # Right margin (rect covers right portion of page)
-                    if rect["x0"] > 0 and rect["y0"] <= 1 and rect["y1"] >= pdf_h - 1:
+                    if (
+                        rect["x0"] > 0
+                        and rect["y0"] <= 1
+                        and rect["y1"] >= pdf_h - 1
+                    ):
                         rect["x0"] = max(rect["x0"], dx1 + padding)
 
     return margin_rects
@@ -1555,9 +1564,7 @@ def run_reprocess(scan_pk: int) -> None:
             Scan.objects.filter(pk=scan_pk).update(
                 margin_rects="", redaction_rects=""
             )
-            _compute_and_save_margin_rects(
-                scan_pk, pdf_path, str(output_dir)
-            )
+            _compute_and_save_margin_rects(scan_pk, pdf_path, str(output_dir))
             _compute_and_save_redaction_rects(
                 scan_pk, pdf_path, str(output_dir)
             )
@@ -1674,7 +1681,9 @@ def _ocr_single_page(ocr_pdf_path: str, page_idx: int) -> None:
         doc.close()
 
 
-def run_smart_insert(scan_pk: int, logical_page_number: int, image_path: str) -> None:
+def run_smart_insert(
+    scan_pk: int, logical_page_number: int, image_path: str
+) -> None:
     """Insert a page and run detection/validation on just that page.
 
     Inserts the page image into the original PDF, bitonal PDF, and OCR PDF
@@ -1749,8 +1758,12 @@ def run_smart_insert(scan_pk: int, logical_page_number: int, image_path: str) ->
     _re_pair_opinions(scan_pk)
 
     if output_dir:
-        Scan.objects.filter(pk=scan_pk).update(margin_rects="", redaction_rects="")
-        _compute_and_save_margin_rects(scan_pk, pdf_path or scan.pdf_path, str(output_dir))
+        Scan.objects.filter(pk=scan_pk).update(
+            margin_rects="", redaction_rects=""
+        )
+        _compute_and_save_margin_rects(
+            scan_pk, pdf_path or scan.pdf_path, str(output_dir)
+        )
         _compute_and_save_redaction_rects(
             scan_pk, pdf_path or scan.pdf_path, str(output_dir)
         )
@@ -1853,7 +1866,9 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
             # Save image to images/ directory
             pn = page_numbers.get(page_idx)
             page_num = pn[0] if pn else page_idx + (scan.start_page or 1)
-            img_count_by_page[page_idx] = img_count_by_page.get(page_idx, 0) + 1
+            img_count_by_page[page_idx] = (
+                img_count_by_page.get(page_idx, 0) + 1
+            )
             img_name = f"{page_num}-{img_count_by_page[page_idx]:03d}.png"
             (images_dir / img_name).write_bytes(png_bytes)
 
@@ -1908,7 +1923,6 @@ def run_generate_files(scan_pk: int) -> None:
         )
 
         from blackletter.api import generate as bl_generate
-
 
         result = bl_generate(
             pdf_path=str(gen_pdf),
@@ -1982,8 +1996,7 @@ def run_generate_files(scan_pk: int) -> None:
                         rp.resolve().relative_to(media_root)
                     )
                 up = (
-                    unredacted_dir / fname
-                    if unredacted_dir.exists() else None
+                    unredacted_dir / fname if unredacted_dir.exists() else None
                 )
                 if up and up.exists():
                     opinion.original_pdf.name = str(
@@ -1992,10 +2005,7 @@ def run_generate_files(scan_pk: int) -> None:
                 masked_fname = re.sub(
                     r"(\d{4})-\d{1,3}\.pdf$", r"\1.pdf", fname
                 )
-                mp = (
-                    masked_dir / masked_fname
-                    if masked_dir.exists() else None
-                )
+                mp = masked_dir / masked_fname if masked_dir.exists() else None
                 if mp and mp.exists():
                     opinion.masked_pdf.name = str(
                         mp.resolve().relative_to(media_root)

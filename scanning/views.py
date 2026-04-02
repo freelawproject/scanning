@@ -25,9 +25,7 @@ from scanning.forms import (
 from scanning.models import (
     Detection,
     Issue,
-    LLMScan,
     OpinionScan,
-    Volume,
     OpinionStatus,
     PageDeletion,
     PageInsert,
@@ -38,12 +36,13 @@ from scanning.models import (
     Source,
     Stage,
     Status,
+    Volume,
 )
 from scanning.utils import (
-    get_volume,
-    get_output_base,
     find_json_file,
     find_ocr_pdf,
+    get_output_base,
+    get_volume,
 )
 
 
@@ -206,9 +205,9 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     :param request: The current HTTP request.
     :return: The rendered opinion list page.
     """
-    opinions = OpinionScan.objects.select_related(
-        "reporter", "scan"
-    ).order_by("reporter__short_name", "volume", "page_start")
+    opinions = OpinionScan.objects.select_related("reporter", "scan").order_by(
+        "reporter__short_name", "volume", "page_start"
+    )
 
     # Filtering
     scan_filter = request.GET.get("scan")
@@ -362,7 +361,9 @@ def queue_view(request: HttpRequest) -> HttpResponse:
 
 
 @login_required
-def queue_detail_view(request: HttpRequest, reporter_slug: str, vol: int) -> HttpResponse:
+def queue_detail_view(
+    request: HttpRequest, reporter_slug: str, vol: int
+) -> HttpResponse:
     """Detail page for a volume in the queue.
 
     Shows volume info, assignment, and all scans (parts) with
@@ -799,9 +800,10 @@ def scan_process_view(request, pk):
         # that span are continuations — not missed opinions.
         paired_keys_sorted = sorted(paired_key_keys)
         paired_caption_pages = {
-            (op.get("caption_page", 0), round(
-                op.get("caption_bbox", [0, 0, 0, 0])[1]
-            ))
+            (
+                op.get("caption_page", 0),
+                round(op.get("caption_bbox", [0, 0, 0, 0])[1]),
+            )
             for op in opinions
         }
 
@@ -817,14 +819,11 @@ def scan_process_view(request, pk):
                     next_kp, next_ky = float("inf"), float("inf")
                 # Caption is in this span if it's after this key
                 # and before the next key
-                after_key = (
-                    det.page_index > kp
-                    or (det.page_index == kp and det.y0 > ky)
+                after_key = det.page_index > kp or (
+                    det.page_index == kp and det.y0 > ky
                 )
-                before_next = (
-                    det.page_index < next_kp
-                    or (det.page_index == next_kp
-                        and det.y0 < next_ky)
+                before_next = det.page_index < next_kp or (
+                    det.page_index == next_kp and det.y0 < next_ky
                 )
                 if after_key and before_next:
                     # There's already a paired caption in this span
@@ -1286,6 +1285,7 @@ def serve_margin_rects(request, pk):
     if not ocr_pdf:
         return JsonResponse([], safe=False)
     from blackletter.margins import compute_margin_rects
+
     from scanning.services import _adjust_margins_for_detections
 
     rects = compute_margin_rects(ocr_pdf)
@@ -1630,7 +1630,15 @@ def serve_masked_opinion_pdf(request, pk, filename):
     return FileResponse(open(file_path, "rb"), content_type="application/pdf")
 
 
-def _apply_rect_to_pdf(pdf_path: str, page_index: int, x0: float, y0: float, x1: float, y1: float, fill: str) -> None:
+def _apply_rect_to_pdf(
+    pdf_path: str,
+    page_index: int,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    fill: str,
+) -> None:
     """Apply a redaction rectangle directly to a PDF file on disk.
 
     :param pdf_path: Filesystem path to the PDF to modify.
@@ -1968,7 +1976,11 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 continue
             if label and e.get("label") != label:
                 continue
-            if not label and label_id is not None and e.get("label_id") != label_id:
+            if (
+                not label
+                and label_id is not None
+                and e.get("label_id") != label_id
+            ):
                 continue
             if (
                 abs(e["bbox"][0] - bbox[0]) < 15
