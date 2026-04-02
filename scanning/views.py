@@ -1583,9 +1583,9 @@ def _serve_opinion_file(scan, subfolder, filename):
     safe_name = os.path.basename(filename)
     if not scan.output_dir:
         raise Http404
-    file_path = os.path.join(scan.output_dir, subfolder, safe_name)
     base_dir = os.path.realpath(os.path.join(scan.output_dir, subfolder))
-    if not os.path.realpath(file_path).startswith(base_dir):
+    file_path = os.path.realpath(os.path.join(base_dir, safe_name))
+    if os.path.commonpath([base_dir, file_path]) != base_dir:
         raise Http404
     if not os.path.isfile(file_path):
         raise Http404
