@@ -1581,13 +1581,12 @@ def approve_scan(request, pk):
 def _serve_opinion_file(scan, subfolder, filename):
     """Serve a PDF from a scan's output subdirectory.
 
-    Sanitises the filename to prevent path traversal.
+    Normalises and constrains the path to prevent traversal.
     """
-    safe_name = os.path.basename(filename)
     if not scan.output_dir:
         raise Http404
     base_dir = os.path.realpath(os.path.join(scan.output_dir, subfolder))
-    file_path = os.path.realpath(os.path.join(base_dir, safe_name))
+    file_path = os.path.realpath(os.path.join(base_dir, filename))
     if os.path.commonpath([base_dir, file_path]) != base_dir:
         raise Http404
     if not os.path.isfile(file_path):
