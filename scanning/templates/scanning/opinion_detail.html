@@ -74,15 +74,15 @@
     <div class="flex items-center gap-0 bg-gray-100 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-2 pt-1">
       {% if opinion.redacted_pdf %}
       <button class="pdf-tab active text-sm px-4 py-2 font-medium rounded-t border border-b-0 bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-700 text-gray-900 dark:text-gray-100 -mb-px relative z-10"
-              data-url="{{ opinion.redacted_pdf.url }}" onclick="switchTab(this)">Redacted</button>
+              data-url="{% url 'serve_opinionscan_pdf' pk=opinion.pk variant='redacted' %}" onclick="switchTab(this)">Redacted</button>
       {% endif %}
       {% if opinion.original_pdf %}
       <button class="pdf-tab text-sm px-4 py-2 font-medium rounded-t border border-b-0 border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/50 -mb-px"
-              data-url="{{ opinion.original_pdf.url }}" onclick="switchTab(this)">Original</button>
+              data-url="{% url 'serve_opinionscan_pdf' pk=opinion.pk variant='original' %}" onclick="switchTab(this)">Original</button>
       {% endif %}
       {% if opinion.masked_pdf %}
       <button class="pdf-tab text-sm px-4 py-2 font-medium rounded-t border border-b-0 border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/50 -mb-px"
-              data-url="{{ opinion.masked_pdf.url }}" onclick="switchTab(this)">Masked</button>
+              data-url="{% url 'serve_opinionscan_pdf' pk=opinion.pk variant='masked' %}" onclick="switchTab(this)">Masked</button>
       {% endif %}
     </div>
 
@@ -103,7 +103,7 @@
 <script>
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-var _currentUrl = '{% if opinion.redacted_pdf %}{{ opinion.redacted_pdf.url }}{% elif opinion.original_pdf %}{{ opinion.original_pdf.url }}{% endif %}';
+var _currentUrl = '{% if opinion.redacted_pdf %}{% url "serve_opinionscan_pdf" pk=opinion.pk variant="redacted" %}{% elif opinion.original_pdf %}{% url "serve_opinionscan_pdf" pk=opinion.pk variant="original" %}{% endif %}';
 
 function loadPdf(url) {
     _currentUrl = url;

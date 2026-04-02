@@ -1578,41 +1578,27 @@ def approve_scan(request, pk):
     return redirect("scan_list")
 
 
-def _serve_opinion_file(scan, subfolder, filename):
-    """Serve a PDF from a scan's output subdirectory.
+@login_required
+def serve_opinionscan_pdf(request, pk, variant):
+    """Serve a PDF for an OpinionScan by variant (redacted/original/masked).
 
-    Normalises and constrains the path to prevent traversal.
+    The file path comes from the model field, not from user input.
+
+    :param request: The HTTP request.
+    :param pk: OpinionScan primary key.
+    :param variant: One of 'redacted', 'original', or 'masked'.
+    :return: File response streaming the PDF.
     """
-    if not scan.output_dir:
+    opinion = get_object_or_404(OpinionScan, pk=pk)
+    field_map = {
+        "redacted": opinion.redacted_pdf,
+        "original": opinion.original_pdf,
+        "masked": opinion.masked_pdf,
+    }
+    field = field_map.get(variant)
+    if not field or not field.name:
         raise Http404
-    base_dir = os.path.realpath(os.path.join(scan.output_dir, subfolder))
-    file_path = os.path.realpath(os.path.join(base_dir, filename))
-    if os.path.commonpath([base_dir, file_path]) != base_dir:
-        raise Http404
-    if not os.path.isfile(file_path):
-        raise Http404
-    return FileResponse(open(file_path, "rb"), content_type="application/pdf")
-
-
-@login_required
-def serve_opinion_pdf(request, pk, filename):
-    """Serve a redacted opinion PDF by filename."""
-    scan = get_object_or_404(Scan, pk=pk)
-    return _serve_opinion_file(scan, "redacted", filename)
-
-
-@login_required
-def serve_unredacted_opinion_pdf(request, pk, filename):
-    """Serve an unredacted opinion PDF by filename."""
-    scan = get_object_or_404(Scan, pk=pk)
-    return _serve_opinion_file(scan, "unredacted", filename)
-
-
-@login_required
-def serve_masked_opinion_pdf(request, pk, filename):
-    """Serve a masked opinion PDF by filename."""
-    scan = get_object_or_404(Scan, pk=pk)
-    return _serve_opinion_file(scan, "masked", filename)
+    return FileResponse(field.open("rb"), content_type="application/pdf")
 
 
 def _apply_rect_to_pdf(

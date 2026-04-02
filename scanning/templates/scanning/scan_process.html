@@ -392,19 +392,21 @@ function setViewMode(mode) {
 }
 
 function viewOpinionByMode(index, el) {
-    var filename = el.dataset[_viewMode] || '';
-    var urlPart = _viewMode === 'redacted' ? 'opinion' : (_viewMode === 'masked' ? 'masked' : 'unredacted');
+    var pk = el.dataset.opinionPk || '0';
+    var variantMap = {'redacted': 'redacted', 'masked': 'masked', 'unredacted': 'original'};
+    var variant = variantMap[_viewMode] || 'redacted';
     _currentOpinionIdx = index;
     _currentOpinionCard = el;
-    window._currentOpinionPk = parseInt(el.dataset.opinionPk || '0');
+    window._currentOpinionPk = parseInt(pk);
     window._currentViewMode = _viewMode;
     document.querySelectorAll('aside .issue-card').forEach(function(c, i) {
         c.style.outline = i === index ? '2px solid #2563eb' : '';
     });
+    var url = '/opinions/' + pk + '/pdf/' + variant + '/';
     if (window.loadOpinionUrl) {
-        window.loadOpinionUrl('/scans/{{ scan.pk }}/' + urlPart + '/' + filename + '/');
+        window.loadOpinionUrl(url);
     } else if (window.loadOpinion) {
-        window.loadOpinion(filename);
+        window.loadOpinion(url);
     }
 }
 
