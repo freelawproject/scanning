@@ -78,11 +78,53 @@ class AbstractDateTimeModel(models.Model):
 class Reporter(AbstractDateTimeModel):
     """A legal reporter series (e.g. U.S. Reports, Federal Reporter)."""
 
+    # Mapping from short_name to Bluebook citation abbreviation.
+    CITE_MAP = {
+        "a": "A.",
+        "a2d": "A.2d",
+        "a3d": "A.3d",
+        "br": "B.R.",
+        "f": "F.",
+        "f2d": "F.2d",
+        "f3d": "F.3d",
+        "f4th": "F.4th",
+        "f-appx": "F. App'x",
+        "f-supp": "F. Supp.",
+        "f-supp-2d": "F. Supp. 2d",
+        "f-supp-3d": "F. Supp. 3d",
+        "ne": "N.E.",
+        "ne2d": "N.E.2d",
+        "ne3d": "N.E.3d",
+        "nw": "N.W.",
+        "nw2d": "N.W.2d",
+        "p": "P.",
+        "p2d": "P.2d",
+        "p3d": "P.3d",
+        "se": "S.E.",
+        "se2d": "S.E.2d",
+        "so": "So.",
+        "so2d": "So. 2d",
+        "so3d": "So. 3d",
+        "sw": "S.W.",
+        "sw2d": "S.W.2d",
+        "sw3d": "S.W.3d",
+        "s-ct": "S. Ct.",
+        "us": "U.S.",
+        "l-ed": "L. Ed.",
+        "l-ed-2d": "L. Ed. 2d",
+        "am-tribal-law": "Am. Tribal Law",
+    }
+
     short_name = models.CharField(max_length=20, unique=True, db_index=True)
     full_name = models.CharField(max_length=100)
 
     class Meta:
         ordering = ["full_name"]
+
+    @property
+    def cite_name(self):
+        """Bluebook citation abbreviation (e.g. 'a3d' → 'A.3d')."""
+        return self.CITE_MAP.get(self.short_name, self.short_name.upper())
 
     def __str__(self):
         return self.full_name
