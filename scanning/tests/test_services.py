@@ -235,8 +235,8 @@ class TestComputeAndSaveRedactionRects(TestCase):
             )
             self.assertGreater(len(rects), 0)
 
-            rects_path = pathlib.Path(tmpdir) / "redaction_rects.json"
-            self.assertTrue(rects_path.exists())
+            scan.refresh_from_db()
+            self.assertTrue(scan.redaction_rects)
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -246,22 +246,36 @@ class TestComputeAndSaveMarginRects(TestCase):
     def setUp(self):
         _require_fixture(self)
 
-    def test_writes_margin_rects_json(self):
+    def test_writes_margin_rects_to_model(self):
         from scanning.services import _compute_and_save_margin_rects
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            rects = _compute_and_save_margin_rects(str(PDF_PATH), tmpdir)
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            rects = _compute_and_save_margin_rects(
+                scan.pk, str(PDF_PATH), tmpdir
+            )
             self.assertIsNotNone(rects)
 
-            margin_path = pathlib.Path(tmpdir) / "margin_rects.json"
-            self.assertTrue(margin_path.exists())
+            scan.refresh_from_db()
+            self.assertTrue(scan.margin_rects)
 
     def test_returns_cached_on_second_call(self):
         from scanning.services import _compute_and_save_margin_rects
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            first = _compute_and_save_margin_rects(str(PDF_PATH), tmpdir)
-            second = _compute_and_save_margin_rects(str(PDF_PATH), tmpdir)
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            first = _compute_and_save_margin_rects(
+                scan.pk, str(PDF_PATH), tmpdir
+            )
+            second = _compute_and_save_margin_rects(
+                scan.pk, str(PDF_PATH), tmpdir
+            )
             self.assertEqual(first, second)
 
 
