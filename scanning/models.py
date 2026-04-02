@@ -4,6 +4,10 @@ from django.core.validators import FileExtensionValidator, MinValueValidator
 from django.db import models
 from django.utils.deconstruct import deconstructible
 
+from scanning.storage import LocalProcessingStorage
+
+_local_storage = LocalProcessingStorage()
+
 
 class Status(models.TextChoices):
     UPLOADED = "uploaded", "Uploaded"
@@ -357,11 +361,13 @@ class Scan(AbstractDateTimeModel):
         blank=True,
     )
     redacted_pdf = models.FileField(
+        storage=_local_storage,
         null=True,
         blank=True,
     )
     compressed_pdf = models.FileField(
         upload_to=compressed_upload_path,
+        storage=_local_storage,
         null=True,
         blank=True,
     )
@@ -515,16 +521,20 @@ class OpinionScan(AbstractDateTimeModel):
     )
     volume = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     original_pdf = models.FileField(
-        upload_to=opinion_pdf_path("unredacted"), max_length=512
+        upload_to=opinion_pdf_path("unredacted"),
+        storage=_local_storage,
+        max_length=512,
     )
     masked_pdf = models.FileField(
         upload_to=opinion_pdf_path("masked"),
+        storage=_local_storage,
         max_length=512,
         null=True,
         blank=True,
     )
     redacted_pdf = models.FileField(
         upload_to=opinion_pdf_path("redacted"),
+        storage=_local_storage,
         max_length=512,
         null=True,
         blank=True,
@@ -687,7 +697,7 @@ class PageInsert(AbstractDateTimeModel):
         related_name="inserts",
     )
     logical_page_number = models.PositiveIntegerField()
-    image = models.FileField(upload_to="page_inserts/")
+    image = models.FileField(upload_to="page_inserts/", storage=_local_storage)
 
     class Meta:
         unique_together = ("scan", "logical_page_number")
@@ -738,6 +748,7 @@ class LLMScan(AbstractDateTimeModel):
     )
     masked_pdf = models.FileField(
         upload_to="llm/",
+        storage=_local_storage,
         max_length=512,
         null=True,
         blank=True,
