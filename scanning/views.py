@@ -211,9 +211,9 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     :param request: The current HTTP request.
     :return: The rendered opinion list page.
     """
-    opinions = OpinionScan.objects.select_related(
-        "reporter", "scan"
-    ).order_by("reporter__short_name", "volume", "page_start")
+    opinions = OpinionScan.objects.select_related("reporter", "scan").order_by(
+        "reporter__short_name", "volume", "page_start"
+    )
 
     # Filtering
     scan_filter = request.GET.get("scan")
@@ -367,7 +367,9 @@ def queue_view(request: HttpRequest) -> HttpResponse:
 
 
 @login_required
-def queue_detail_view(request: HttpRequest, reporter_slug: str, vol: int) -> HttpResponse:
+def queue_detail_view(
+    request: HttpRequest, reporter_slug: str, vol: int
+) -> HttpResponse:
     """Detail page for a volume in the queue.
 
     Shows volume info, assignment, and all scans (parts) with
@@ -814,14 +816,11 @@ def scan_process_view(request, pk):
                     next_kp, next_ky = float("inf"), float("inf")
                 # Caption is in this span if it's after this key
                 # and before the next key
-                after_key = (
-                    det.page_index > kp
-                    or (det.page_index == kp and det.y0 > ky)
+                after_key = det.page_index > kp or (
+                    det.page_index == kp and det.y0 > ky
                 )
-                before_next = (
-                    det.page_index < next_kp
-                    or (det.page_index == next_kp
-                        and det.y0 < next_ky)
+                before_next = det.page_index < next_kp or (
+                    det.page_index == next_kp and det.y0 < next_ky
                 )
                 if after_key and before_next:
                     # There's already a paired caption in this span
@@ -1614,7 +1613,15 @@ def serve_masked_opinion_pdf(request, pk, filename):
     return _serve_opinion_file(scan, "masked", filename)
 
 
-def _apply_rect_to_pdf(pdf_path: str, page_index: int, x0: float, y0: float, x1: float, y1: float, fill: str) -> None:
+def _apply_rect_to_pdf(
+    pdf_path: str,
+    page_index: int,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    fill: str,
+) -> None:
     """Apply a redaction rectangle directly to a PDF file on disk.
 
     :param pdf_path: Filesystem path to the PDF to modify.
@@ -1952,7 +1959,11 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 continue
             if label and e.get("label") != label:
                 continue
-            if not label and label_id is not None and e.get("label_id") != label_id:
+            if (
+                not label
+                and label_id is not None
+                and e.get("label_id") != label_id
+            ):
                 continue
             if (
                 abs(e["bbox"][0] - bbox[0]) < 15
