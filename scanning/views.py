@@ -11,7 +11,13 @@ from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db.models import Count
-from django.http import FileResponse, HttpRequest, HttpResponse, JsonResponse
+from django.http import (
+    FileResponse,
+    Http404,
+    HttpRequest,
+    HttpResponse,
+    JsonResponse,
+)
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views.decorators.http import require_POST
@@ -25,9 +31,7 @@ from scanning.forms import (
 from scanning.models import (
     Detection,
     Issue,
-    LLMScan,
     OpinionScan,
-    Volume,
     OpinionStatus,
     PageDeletion,
     PageInsert,
@@ -38,12 +42,13 @@ from scanning.models import (
     Source,
     Stage,
     Status,
+    Volume,
 )
 from scanning.utils import (
-    get_volume,
-    get_output_base,
     find_json_file,
     find_ocr_pdf,
+    get_output_base,
+    get_volume,
 )
 
 
@@ -798,17 +803,9 @@ def scan_process_view(request, pk):
         # If a span already has a paired caption, extra captions in
         # that span are continuations — not missed opinions.
         paired_keys_sorted = sorted(paired_key_keys)
-        paired_caption_pages = {
-            (op.get("caption_page", 0), round(
-                op.get("caption_bbox", [0, 0, 0, 0])[1]
-            ))
-            for op in opinions
-        }
-
         def _caption_is_continuation(det):
             """Check if det falls in a key-icon span that already
             has a paired caption."""
-            pos = (det.page_index, det.y0)
             # Find which key-icon span this caption is in
             for i, (kp, kx, ky) in enumerate(paired_keys_sorted):
                 if i + 1 < len(paired_keys_sorted):
@@ -1204,7 +1201,6 @@ def dismiss_issue(request, pk):
         )
     data = json.loads(request.body)
     issue_id = data.get("issue_id")
-    issue = Issue.objects.filter(pk=issue_id, scan=scan).first()
     Issue.objects.filter(pk=issue_id, scan=scan).delete()
     if not scan.issues.exists():
         scan.has_issues = False
@@ -1286,6 +1282,7 @@ def serve_margin_rects(request, pk):
     if not ocr_pdf:
         return JsonResponse([], safe=False)
     from blackletter.margins import compute_margin_rects
+
     from scanning.services import _adjust_margins_for_detections
 
     rects = compute_margin_rects(ocr_pdf)
@@ -1502,8 +1499,11 @@ def pair_opinions_api(request, pk):
         return JsonResponse(
             {"status": "ok", "opinions": opinions, "gaps": gaps}
         )
-    except Exception as exc:
-        return JsonResponse({"error": str(exc)[:255]}, status=500)
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        return JsonResponse({"error": "Opinion pairing failed"}, status=500)
 
 
 @login_required
@@ -1534,11 +1534,11 @@ def compute_redactions_api(request, pk):
         return JsonResponse(
             {"status": "ok", "pages": len(rects), "rects": total_rects}
         )
-    except Exception as exc:
+    except Exception:
         import traceback
 
         traceback.print_exc()
-        return JsonResponse({"error": str(exc)[:500]}, status=500)
+        return JsonResponse({"error": "Redaction computation failed"}, status=500)
 
 
 @login_required
@@ -1576,58 +1576,42 @@ def approve_scan(request, pk):
     return redirect("scan_list")
 
 
+def _serve_opinion_file(scan, subfolder, filename):
+    """Serve a PDF from a scan's output subdirectory.
+
+    Sanitises the filename to prevent path traversal.
+    """
+    safe_name = os.path.basename(filename)
+    if not scan.output_dir:
+        raise Http404
+    file_path = os.path.join(scan.output_dir, subfolder, safe_name)
+    base_dir = os.path.realpath(os.path.join(scan.output_dir, subfolder))
+    if not os.path.realpath(file_path).startswith(base_dir):
+        raise Http404
+    if not os.path.isfile(file_path):
+        raise Http404
+    return FileResponse(open(file_path, "rb"), content_type="application/pdf")
+
+
 @login_required
 def serve_opinion_pdf(request, pk, filename):
-    """Serve a redacted opinion PDF by filename.
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :param filename: Name of the PDF file in the redacted directory.
-    :return: File response streaming the PDF.
-    """
+    """Serve a redacted opinion PDF by filename."""
     scan = get_object_or_404(Scan, pk=pk)
-    if not scan.output_dir:
-        return HttpResponse("No output directory", status=404)
-    file_path = os.path.join(scan.output_dir, "redacted", filename)
-    if not os.path.isfile(file_path):
-        return HttpResponse("Opinion PDF not found", status=404)
-    return FileResponse(open(file_path, "rb"), content_type="application/pdf")
+    return _serve_opinion_file(scan, "redacted", filename)
 
 
 @login_required
 def serve_unredacted_opinion_pdf(request, pk, filename):
-    """Serve an unredacted opinion PDF by filename.
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :param filename: Name of the PDF file in the unredacted directory.
-    :return: File response streaming the PDF.
-    """
+    """Serve an unredacted opinion PDF by filename."""
     scan = get_object_or_404(Scan, pk=pk)
-    if not scan.output_dir:
-        return HttpResponse("No output directory", status=404)
-    file_path = os.path.join(scan.output_dir, "unredacted", filename)
-    if not os.path.isfile(file_path):
-        return HttpResponse("Unredacted opinion PDF not found", status=404)
-    return FileResponse(open(file_path, "rb"), content_type="application/pdf")
+    return _serve_opinion_file(scan, "unredacted", filename)
 
 
 @login_required
 def serve_masked_opinion_pdf(request, pk, filename):
-    """Serve a masked opinion PDF by filename.
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :param filename: Name of the PDF file in the masked directory.
-    :return: File response streaming the PDF.
-    """
+    """Serve a masked opinion PDF by filename."""
     scan = get_object_or_404(Scan, pk=pk)
-    if not scan.output_dir:
-        return HttpResponse("No output directory", status=404)
-    file_path = os.path.join(scan.output_dir, "masked", filename)
-    if not os.path.isfile(file_path):
-        return HttpResponse("Masked opinion PDF not found", status=404)
-    return FileResponse(open(file_path, "rb"), content_type="application/pdf")
+    return _serve_opinion_file(scan, "masked", filename)
 
 
 def _apply_rect_to_pdf(pdf_path: str, page_index: int, x0: float, y0: float, x1: float, y1: float, fill: str) -> None:

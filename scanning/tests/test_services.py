@@ -11,7 +11,7 @@ import tempfile
 from django.test import TestCase, override_settings
 
 from scanning.factories import ReporterFactory, ScanFactory, UserFactory
-from scanning.models import Detection, Issue, Scan, Status
+from scanning.models import Detection, Status
 
 FIXTURE_DIR = pathlib.Path(__file__).parent / "fixtures"
 PDF_PATH = FIXTURE_DIR / "a3d.332.1.1.pdf"
@@ -631,9 +631,9 @@ class TestSmartEditEndToEnd(TestCase):
     def test_remove_detect_insert_revalidate(self):
         """Full cycle: remove pages, detect, find gaps, insert, re-validate."""
         import fitz
+
         from scanning.services import (
             _import_detections_from_json,
-            _sync_detections_to_disk,
             run_paddleocr_validation,
             run_smart_insert,
         )
@@ -708,8 +708,6 @@ class TestSmartEditEndToEnd(TestCase):
             # We need to copy the damaged PDF to where scan.pdf_path points
             # since run_smart_insert modifies the file in place
             scan.refresh_from_db()
-            scan_pdf = pathlib.Path(scan.pdf_path)
-
             for pg in sorted(missing):
                 if pg in extracted_pdfs:
                     print(f"  Inserting page {pg} back...")
