@@ -752,4 +752,14 @@ class Migration(migrations.Migration):
                 name="unique_volume_reporter_number",
             ),
         ),
+        migrations.AddField(
+            model_name='scan',
+            name='s3_path',
+            field=models.CharField(blank=True, default='', help_text='Relative S3 key prefix for approved files, e.g. approved/a3d/218/1/', max_length=512),
+        ),
+        migrations.AddField(
+            model_name='scan',
+            name='s3_uploaded',
+            field=models.BooleanField(default=False, help_text='Whether final files have been uploaded to S3.'),
+        ),
     ]

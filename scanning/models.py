@@ -447,6 +447,16 @@ class Scan(AbstractDateTimeModel):
     )
     has_state_abbrev = models.BooleanField(default=True)
     source_library = models.CharField(max_length=200, blank=True, default="")
+    s3_uploaded = models.BooleanField(
+        default=False,
+        help_text="Whether final files have been uploaded to S3.",
+    )
+    s3_path = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text="Relative S3 key prefix for approved files, e.g. approved/a3d/218/1/",
+    )
 
     class Meta:
         indexes = [
