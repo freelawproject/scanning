@@ -133,6 +133,7 @@
           {% if scan.start_page and scan.end_page %}Pages {{ scan.start_page }}-{{ scan.end_page }}{% else %}Page range not set{% endif %}
         </span>
         <span class="badge-{{ scan.status }} ml-2">{{ scan.get_status_display }}</span>
+        {% if scan.s3_uploaded %}<span class="badge-s3 ml-1">S3</span>{% endif %}
         {% if scan.original_pdf %}<span class="text-xs text-green-600 ml-1">PDF</span>{% endif %}
       </div>
       <div class="flex items-center gap-2">

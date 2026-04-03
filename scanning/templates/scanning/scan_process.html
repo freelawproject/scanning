@@ -44,6 +44,7 @@
       <span class="text-xs text-gray-500 dark:text-gray-400">{{ scan.page_count }} pages</span>
       {% if missing_pages %}<span class="badge-error text-xs">{{ missing_pages|length }} missing</span>{% endif %}
       {% if has_pending_changes %}<span class="badge-warning text-xs">Pending Changes</span>{% endif %}
+      {% if scan.s3_uploaded %}<span class="badge-s3 text-xs">Uploaded to S3</span>{% endif %}
     </div>
   </div>
   {# Right: actions #}

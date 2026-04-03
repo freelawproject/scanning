@@ -130,6 +130,7 @@
         <td class="py-1.5 text-xs"></td>
         <td class="py-1.5 text-xs">
           <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
+          {% if scan.s3_uploaded %}<span class="badge-s3">S3</span>{% endif %}
         </td>
         <td class="py-1.5 text-xs text-gray-400 dark:text-gray-500">
           {{ scan.date_created|date:"M j" }}

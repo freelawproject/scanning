@@ -115,6 +115,11 @@
            dark:bg-purple-900/50 dark:text-purple-300;
   }
 
+  .badge-s3 {
+    @apply badge bg-cyan-100 text-cyan-800
+           dark:bg-cyan-900/50 dark:text-cyan-300;
+  }
+
   /* Queue status badges */
   .badge-needs_scanning {
     @apply badge bg-red-100 text-red-800
