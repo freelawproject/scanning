@@ -651,7 +651,7 @@ class TestApproveScan(ScanningTestCase):
         self.client.force_login(user)
         scan = self._make_scan_with_generated_files()
 
-        response = self.client.post(
+        self.client.post(
             reverse("approve_scan", kwargs={"pk": scan.pk}),
             follow=True,
         )
@@ -681,7 +681,7 @@ class TestApproveScan(ScanningTestCase):
             patch.dict("os.environ", mock_env),
             patch("boto3.client", return_value=mock_client),
         ):
-            response = self.client.post(
+            self.client.post(
                 reverse("approve_scan", kwargs={"pk": scan.pk}),
                 follow=True,
             )
