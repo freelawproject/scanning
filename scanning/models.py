@@ -228,17 +228,18 @@ class Volume(AbstractDateTimeModel):
 def book_upload_path(instance: "Scan", filename: str) -> str:
     """Generate upload path for book scan PDFs.
 
-    Example: ``books/f3d/original/42_f3d_1-200_full.pdf``
+    Example: ``original_scans/a3d/218/1/a3d.218.1.95.original.pdf``
 
     :param instance: The Scan model instance.
     :param filename: The original filename.
     :return: The upload path.
     """
+    short = instance.reporter.short_name
+    start = instance.start_page or 1
+    end = instance.end_page or 0
     return (
-        f"books/{instance.reporter.short_name}/original/"
-        f"{instance.volume}_{instance.reporter.short_name}"
-        f"_{instance.start_page}-{instance.end_page}"
-        f"_{instance.source}.pdf"
+        f"original_scans/{short}/{instance.volume}/{start}/"
+        f"{short}.{instance.volume}.{start}.{end}.original.pdf"
     )
 
 
@@ -492,10 +493,22 @@ class Scan(AbstractDateTimeModel):
 
     @property
     def pdf_path(self) -> str:
-        """Return the path to the original uploaded PDF.
+        """Return a local filesystem path to the original uploaded PDF.
+
+        Looks for the file in ``output_dir`` first (always present after
+        upload), falling back to ``FileField.path`` for local storage.
+        This ensures the processing pipeline can use ``fitz.open()``,
+        ``open()``, etc. regardless of the storage backend.
 
         :return: The filesystem path of the original PDF.
+        :rtype: str
         """
+        if self.output_dir and self.original_pdf.name:
+            from pathlib import Path
+
+            local = Path(self.output_dir) / Path(self.original_pdf.name).name
+            if local.exists():
+                return str(local)
         return self.original_pdf.path
 
     def __str__(self):

@@ -2020,6 +2020,11 @@ def run_generate_files(scan_pk: int) -> None:
                 )
                 llm_scan.opinions.add(opinion)
 
+        # TODO: Upload final files to S3 here (or implement a
+        # helper). e.g., redacted/*.pdf, unredacted/*.pdf,
+        # masked/*.pdf, and the full redacted PDF. Intermediate files
+        # (bitonal, detections.json, stamped.pdf, etc.) can stay local.
+
     except Exception as exc:
         traceback.print_exc()
         Scan.objects.filter(pk=scan_pk).update(

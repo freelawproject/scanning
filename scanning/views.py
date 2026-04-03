@@ -524,14 +524,17 @@ def queue_upload(request, reporter_slug, vol):
         f".{scan.start_page or 1}.{scan.end_page or 0}"
         f".original.pdf"
     )
-    original_path = output_dir / original_name
-    with open(original_path, "wb") as f:
+
+    # Always keep a local copy in output_dir for the processing pipeline
+    local_path = output_dir / original_name
+    with open(local_path, "wb") as f:
         for chunk in pdf.chunks():
             f.write(chunk)
 
-    scan.original_pdf.name = str(
-        original_path.resolve().relative_to(_P(settings.MEDIA_ROOT).resolve())
-    )
+    # Save through Django's storage backend (S3 in prod, local in dev).
+    # Reset the file pointer so .save() can read the full content.
+    pdf.seek(0)
+    scan.original_pdf.save(original_name, pdf, save=False)
     scan.save(update_fields=["output_dir", "original_pdf"])
 
     action = request.POST.get("action", "upload_only")
