@@ -1569,16 +1569,29 @@ def generate_files(request, pk):
 @login_required
 @require_POST
 def approve_scan(request, pk):
-    """Mark a scan as approved and redirect to the scan list.
+    """Approve a scan and upload final files to S3.
+
+    Validates that generated files exist before approving. Uploads
+    redacted, masked, original, and redacted PDFs to the private S3
+    bucket (in prod) or logs a dev message (in dev).
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: Redirect to the scan list.
+    :return: Redirect to the process page.
     """
+    from scanning.services import upload_approved_files
+
     scan = get_object_or_404(Scan, pk=pk)
+
+    result = upload_approved_files(scan.pk)
+    if result.startswith("Before approving"):
+        messages.error(request, result)
+        return redirect("scan_process", pk=scan.pk)
+
     scan.stage = Stage.APPROVED
-    scan.save()
-    return redirect("scan_list")
+    scan.save(update_fields=["stage"])
+    messages.success(request, result)
+    return redirect("scan_process", pk=scan.pk)
 
 
 @login_required
