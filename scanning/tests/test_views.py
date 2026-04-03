@@ -677,8 +677,10 @@ class TestApproveScan(ScanningTestCase):
             "AWS_ACCESS_KEY_ID": "test",
             "AWS_SECRET_ACCESS_KEY": "test",
         }
-        with patch.dict("os.environ", mock_env), \
-             patch("boto3.client", return_value=mock_client):
+        with (
+            patch.dict("os.environ", mock_env),
+            patch("boto3.client", return_value=mock_client),
+        ):
             response = self.client.post(
                 reverse("approve_scan", kwargs={"pk": scan.pk}),
                 follow=True,

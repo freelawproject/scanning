@@ -796,12 +796,12 @@ class TestUploadApprovedFiles(TestCase):
             (masked_dir / name).write_bytes(b"%PDF-1.4 masked")
 
         short = scan.reporter.short_name
-        (pathlib.Path(tmpdir) / f"{short}.{scan.volume}.1.95.original.pdf").write_bytes(
-            b"%PDF-1.4 original"
-        )
-        (pathlib.Path(tmpdir) / f"{short}.{scan.volume}.1.95.redacted.pdf").write_bytes(
-            b"%PDF-1.4 redacted-full"
-        )
+        (
+            pathlib.Path(tmpdir) / f"{short}.{scan.volume}.1.95.original.pdf"
+        ).write_bytes(b"%PDF-1.4 original")
+        (
+            pathlib.Path(tmpdir) / f"{short}.{scan.volume}.1.95.redacted.pdf"
+        ).write_bytes(b"%PDF-1.4 redacted-full")
         return scan
 
     def test_missing_files_returns_error(self):
@@ -880,8 +880,10 @@ class TestUploadApprovedFiles(TestCase):
         )
 
         env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
-        with patch.dict("os.environ", env), \
-             patch("boto3.client", return_value=mock_client):
+        with (
+            patch.dict("os.environ", env),
+            patch("boto3.client", return_value=mock_client),
+        ):
             result = upload_approved_files(scan.pk)
 
         self.assertIn("uploaded", result)
@@ -896,7 +898,7 @@ class TestUploadApprovedFiles(TestCase):
     )
     def test_upload_skips_existing_files(self):
         """Files that already exist in S3 (HEAD succeeds) are skipped."""
-        from unittest.mock import MagicMock, call, patch
+        from unittest.mock import MagicMock, patch
 
         from botocore.exceptions import ClientError
 
@@ -912,15 +914,15 @@ class TestUploadApprovedFiles(TestCase):
             call_count[0] += 1
             if call_count[0] <= 2:
                 return {"ContentLength": 100}
-            raise ClientError(
-                {"Error": {"Code": "404"}}, "HeadObject"
-            )
+            raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
 
         mock_client.head_object.side_effect = head_side_effect
 
         env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
-        with patch.dict("os.environ", env), \
-             patch("boto3.client", return_value=mock_client):
+        with (
+            patch.dict("os.environ", env),
+            patch("boto3.client", return_value=mock_client),
+        ):
             result = upload_approved_files(scan.pk)
 
         self.assertIn("already existed", result)
@@ -935,8 +937,6 @@ class TestUploadApprovedFiles(TestCase):
         """On retry, only files not yet in S3 are uploaded."""
         from unittest.mock import MagicMock, patch
 
-        from botocore.exceptions import ClientError
-
         from scanning.services import upload_approved_files
 
         scan = self._make_scan_with_generated_files()
@@ -945,8 +945,10 @@ class TestUploadApprovedFiles(TestCase):
         mock_client.head_object.return_value = {"ContentLength": 100}
 
         env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
-        with patch.dict("os.environ", env), \
-             patch("boto3.client", return_value=mock_client):
+        with (
+            patch.dict("os.environ", env),
+            patch("boto3.client", return_value=mock_client),
+        ):
             result = upload_approved_files(scan.pk)
 
         self.assertIn("0 uploaded", result)
