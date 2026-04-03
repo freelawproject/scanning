@@ -19,7 +19,7 @@ package-lock.json
 
 # Generated assets
 scanning/assets/static/
-scanning/assets/static-global/css/tailwind_styles.css
+scanning/assets/static-global/
 
 # IntelliJ IDEA files
 .idea
