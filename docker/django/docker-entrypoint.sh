@@ -24,6 +24,8 @@ case "$1" in
     exec python manage.py run_daemon
     ;;
 'web-prod')
+    mkdir -p /opt/scanning/scanning/assets/media/processed
+    chown -R www-data:www-data /opt/scanning/scanning/assets/media
     exec gunicorn scanning.asgi:application \
         --chdir /opt/scanning/ \
         --user www-data \

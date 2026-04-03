@@ -51,11 +51,15 @@ COPY . .
 # Build Tailwind CSS
 RUN npm run build
 
-RUN mkdir -p /opt/scanning/scanning/assets/static/
+# Create directories for collectstatic output and uploaded/processed files
+RUN mkdir -p /opt/scanning/scanning/assets/static/ \
+             /opt/scanning/scanning/assets/media/
 
 USER root
 RUN chmod +x /opt/scanning/docker/django/docker-entrypoint.sh
-RUN chown www-data:www-data /opt/scanning/docker/django/docker-entrypoint.sh
+# media/ must be writable by www-data (gunicorn runs as www-data in prod)
+RUN chown www-data:www-data /opt/scanning/docker/django/docker-entrypoint.sh \
+                            /opt/scanning/scanning/assets/media/
 
 USER www-data
 ENTRYPOINT ["/bin/sh", "/opt/scanning/docker/django/docker-entrypoint.sh"]
