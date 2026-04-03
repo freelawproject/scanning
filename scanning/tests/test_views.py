@@ -262,18 +262,20 @@ class TestScanModel(ScanningTestCase):
 
     def test_upload_path_format(self):
         scan = ScanFactory(volume=5, start_page=1, end_page=100)
-        self.assertTrue(scan.original_pdf.name.startswith("books/a/"))
+        self.assertTrue(scan.original_pdf.name.startswith("original_scans/a/"))
         self.assertTrue(scan.original_pdf.name.endswith(".pdf"))
 
     def test_book_upload_path_contains_pages(self):
         scan = ScanFactory(volume=3, start_page=10, end_page=200)
-        self.assertIn("3_a_10-200_full.pdf", scan.original_pdf.name)
+        self.assertTrue(scan.original_pdf.name.startswith("original_scans/a/3/10/"))
+        self.assertTrue(scan.original_pdf.name.endswith(".original.pdf"))
 
     def test_book_upload_path_opinions_source(self):
         scan = ScanFactory(
             volume=3, start_page=10, end_page=200, source=Source.OPINIONS
         )
-        self.assertIn("3_a_10-200_opinions.pdf", scan.original_pdf.name)
+        self.assertTrue(scan.original_pdf.name.startswith("original_scans/a/3/10/"))
+        self.assertTrue(scan.original_pdf.name.endswith(".original.pdf"))
 
 
 class TestOpinionScanModel(ScanningTestCase):
