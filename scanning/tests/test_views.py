@@ -602,3 +602,106 @@ class TestMonitoring(TestCase):
         data = response.json()
         self.assertIn("is_postgresql_up", data)
         self.assertTrue(data["is_postgresql_up"])
+
+
+class TestApproveScan(ScanningTestCase):
+    """Test the approve_scan view."""
+
+    def _make_scan_with_generated_files(self):
+        """Create a scan with generated files in output_dir."""
+        import pathlib
+
+        scan = ScanFactory(start_page=1, end_page=95)
+        tmpdir = pathlib.Path(MEDIA_ROOT) / f"processed_{scan.pk}"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        scan.output_dir = str(tmpdir)
+        scan.save(update_fields=["output_dir"])
+
+        redacted_dir = tmpdir / "redacted"
+        masked_dir = tmpdir / "masked"
+        redacted_dir.mkdir()
+        masked_dir.mkdir()
+        (redacted_dir / "a.1.0001-0010.pdf").write_bytes(b"%PDF-1.4")
+        (masked_dir / "a.1.0001-0010.pdf").write_bytes(b"%PDF-1.4")
+        return scan
+
+    def test_approve_without_files_shows_error(self):
+        """Approving without generated files redirects with error."""
+        import pathlib
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan = ScanFactory(start_page=1, end_page=95)
+        tmpdir = pathlib.Path(MEDIA_ROOT) / f"empty_{scan.pk}"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        scan.output_dir = str(tmpdir)
+        scan.save(update_fields=["output_dir"])
+
+        response = self.client.post(
+            reverse("approve_scan", kwargs={"pk": scan.pk}),
+            follow=True,
+        )
+        self.assertContains(response, "Before approving")
+        scan.refresh_from_db()
+        self.assertFalse(scan.s3_uploaded)
+
+    def test_approve_with_files_sets_path(self):
+        """Approving with generated files sets s3_path."""
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan = self._make_scan_with_generated_files()
+
+        response = self.client.post(
+            reverse("approve_scan", kwargs={"pk": scan.pk}),
+            follow=True,
+        )
+        scan.refresh_from_db()
+        self.assertTrue(scan.s3_path.startswith("approved/"))
+
+    @override_settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket")
+    def test_approve_with_creds_sets_uploaded_flag(self):
+        """Approving with AWS creds sets s3_uploaded to True."""
+        from unittest.mock import MagicMock, patch
+
+        from botocore.exceptions import ClientError
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan = self._make_scan_with_generated_files()
+
+        mock_client = MagicMock()
+        mock_client.head_object.side_effect = ClientError(
+            {"Error": {"Code": "404"}}, "HeadObject"
+        )
+        mock_env = {
+            "AWS_ACCESS_KEY_ID": "test",
+            "AWS_SECRET_ACCESS_KEY": "test",
+        }
+        with patch.dict("os.environ", mock_env), \
+             patch("boto3.client", return_value=mock_client):
+            response = self.client.post(
+                reverse("approve_scan", kwargs={"pk": scan.pk}),
+                follow=True,
+            )
+        scan.refresh_from_db()
+        self.assertTrue(scan.s3_uploaded)
+        self.assertTrue(scan.s3_path.startswith("approved/"))
+
+    def test_approve_requires_login(self):
+        """Approve endpoint redirects to login for anonymous users."""
+        scan = ScanFactory()
+        response = self.client.post(
+            reverse("approve_scan", kwargs={"pk": scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("login", response.url)
+
+    def test_approve_requires_post(self):
+        """Approve endpoint rejects GET requests."""
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan = ScanFactory()
+        response = self.client.get(
+            reverse("approve_scan", kwargs={"pk": scan.pk})
+        )
+        self.assertEqual(response.status_code, 405)
