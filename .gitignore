@@ -41,3 +41,4 @@ scanning/settings/*private.py
 /scanning/assets/media/uploads/
 /scanning/assets/media/opinions/
 /scanning/assets/media/books/
+/scanning/assets/media/processed/
