@@ -2020,11 +2020,6 @@ def run_generate_files(scan_pk: int) -> None:
                 )
                 llm_scan.opinions.add(opinion)
 
-        # TODO: Upload final files to S3 here (or implement a
-        # helper). e.g., redacted/*.pdf, unredacted/*.pdf,
-        # masked/*.pdf, and the full redacted PDF. Intermediate files
-        # (bitonal, detections.json, stamped.pdf, etc.) can stay local.
-
     except Exception as exc:
         traceback.print_exc()
         Scan.objects.filter(pk=scan_pk).update(
@@ -2086,3 +2081,114 @@ def run_detect(scan_pk: int) -> None:
             status=Status.ERROR,
             progress_message=str(exc)[:255],
         )
+
+
+# ---------------------------------------------------------------------------
+# S3 upload of approved files
+# ---------------------------------------------------------------------------
+
+
+def _has_s3_credentials() -> bool:
+    """Check whether AWS credentials are configured.
+
+    :return: True if the required AWS env vars are set.
+    :rtype: bool
+    """
+    import os
+
+    return bool(
+        os.environ.get("AWS_ACCESS_KEY_ID")
+        or os.environ.get("AWS_DEV_ACCESS_KEY_ID")
+    ) and bool(
+        os.environ.get("AWS_SECRET_ACCESS_KEY")
+        or os.environ.get("AWS_DEV_SECRET_ACCESS_KEY")
+    )
+
+
+def upload_approved_files(scan_pk: int) -> str:
+    """Upload final deliverables to the private S3 bucket.
+
+    Uploads redacted/, masked/ opinion PDFs and the original + redacted
+    full PDFs to ``approved/{reporter}/{volume}/{start_page}/``.
+
+    Skips the upload (with a message) if the scan was already uploaded
+    or if no AWS credentials are configured.
+
+    :param scan_pk: Primary key of the scan to upload.
+    :return: A user-facing message describing the result.
+    :rtype: str
+    """
+    scan = Scan.objects.get(pk=scan_pk)
+
+    if scan.s3_uploaded and scan.s3_path:
+        return f"Files were already uploaded to S3 ({scan.s3_path})."
+
+    output_dir = Path(scan.output_dir)
+
+    # Verify final files exist
+    redacted_dir = output_dir / "redacted"
+    masked_dir = output_dir / "masked"
+    if not redacted_dir.is_dir() or not list(redacted_dir.glob("*.pdf")):
+        return "Before approving you need to generate the files."
+
+    # Build S3 prefix
+    short = scan.reporter.short_name
+    start = scan.start_page or 1
+    s3_prefix = f"approved/{short}/{scan.volume}/{start}/"
+
+    if not _has_s3_credentials():
+        Scan.objects.filter(pk=scan_pk).update(
+            s3_path=s3_prefix,
+        )
+        return (
+            "No AWS credentials configured, skipping S3 upload. "
+            "Path would be: " + s3_prefix
+        )
+
+    # Collect files to upload
+    files_to_upload = []
+
+    for pdf in redacted_dir.glob("*.pdf"):
+        files_to_upload.append((pdf, f"{s3_prefix}redacted/{pdf.name}"))
+
+    if masked_dir.is_dir():
+        for pdf in masked_dir.glob("*.pdf"):
+            files_to_upload.append((pdf, f"{s3_prefix}masked/{pdf.name}"))
+
+    # Original and redacted full PDFs
+    for f in output_dir.iterdir():
+        if f.is_file() and f.suffix == ".pdf":
+            if ".original.pdf" in f.name:
+                files_to_upload.append((f, f"{s3_prefix}{f.name}"))
+            elif ".redacted.pdf" in f.name:
+                files_to_upload.append((f, f"{s3_prefix}{f.name}"))
+
+    # Upload to S3 via boto3 directly (not Django storage) so that
+    # retries are safe: HEAD checks skip already-uploaded files,
+    # and upload_file() streams from disk with automatic multipart.
+    import boto3
+    from botocore.exceptions import ClientError
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    s3_client = boto3.client("s3")
+    uploaded = 0
+    skipped = 0
+    for local_path, s3_key in files_to_upload:
+        try:
+            s3_client.head_object(Bucket=bucket, Key=s3_key)
+            skipped += 1
+            continue
+        except ClientError:
+            pass
+        s3_client.upload_file(str(local_path), bucket, s3_key)
+        uploaded += 1
+
+    Scan.objects.filter(pk=scan_pk).update(
+        s3_uploaded=True,
+        s3_path=s3_prefix,
+    )
+    msg = f"Files uploaded successfully to S3 ({uploaded} uploaded"
+    if skipped:
+        msg += f", {skipped} already existed"
+    msg += ")."
+    return msg
