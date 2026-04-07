@@ -8,7 +8,6 @@ daemon process.  They must NOT import Django HTTP machinery
 import json
 import os
 import re
-import re as re_mod
 import shutil
 import traceback
 from collections import Counter
@@ -1120,7 +1119,7 @@ def recalculate_issues(scan: "Scan") -> None:
         prev_num = num
         prev_pdf = r["pdf_page"]
 
-    range_re = re_mod.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
+    range_re = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
     range_pages = set()
     ranges_found = [r for r in ocr_results if r.get("type") == "range"]
     for r in ranges_found:
