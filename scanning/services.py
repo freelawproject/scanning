@@ -135,9 +135,7 @@ def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
     if not bitonal_path.exists():
 
         def _bitonal_progress(current, total, message):
-            _update_progress(
-                scan.pk, message, current=current, total=total
-            )
+            _update_progress(scan.pk, message, current=current, total=total)
 
         bl_bitonal(
             scan.pdf_path,
