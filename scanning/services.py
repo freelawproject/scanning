@@ -92,6 +92,66 @@ def _update_progress(
     Scan.objects.filter(pk=scan_pk).update(**updates)
 
 
+def _ensure_output_dir(scan: "Scan") -> Path:
+    """Return the scan's output directory, creating it if necessary.
+
+    If the scan has no ``output_dir`` set, builds the path from
+    ``MEDIA_ROOT/processed/{pk}/{reporter}/{volume}/{start_page}/``
+    and persists it to the database.
+
+    :param scan: The Scan instance.
+    :return: The output directory as a Path.
+    :rtype: Path
+    """
+    if not scan.output_dir:
+        output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan.pk)
+        if scan.reporter and scan.volume:
+            output_dir = (
+                output_dir
+                / scan.reporter.short_name
+                / str(scan.volume)
+                / str(scan.start_page or 1)
+            )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        Scan.objects.filter(pk=scan.pk).update(output_dir=str(output_dir))
+    else:
+        output_dir = Path(scan.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
+    """Convert to bitonal if needed, returning the bitonal PDF path.
+
+    Skips conversion if ``bitonal.pdf`` already exists. Updates the
+    scan's ``page_count`` after conversion.
+
+    :param scan: The Scan instance.
+    :param output_dir: Directory where ``bitonal.pdf`` is stored.
+    :return: Path to the bitonal PDF.
+    :rtype: Path
+    """
+    bitonal_path = output_dir / "bitonal.pdf"
+    if not bitonal_path.exists():
+
+        def _bitonal_progress(current, total, message):
+            _update_progress(
+                scan.pk, message, current=current, total=total
+            )
+
+        bl_bitonal(
+            scan.pdf_path,
+            str(output_dir),
+            progress_callback=_bitonal_progress,
+        )
+
+    pdf = fitz.open(str(bitonal_path))
+    page_count = pdf.page_count
+    pdf.close()
+    Scan.objects.filter(pk=scan.pk).update(page_count=page_count)
+    return bitonal_path
+
+
 def _run_ocr(
     scan_pk: int,
     bitonal_path: str,
@@ -1183,41 +1243,8 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
         print(
             f"[validate] scan {scan_pk} pdf_path={scan.pdf_path}", flush=True
         )
-        if not scan.output_dir:
-            output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
-            if scan.reporter and scan.volume:
-                output_dir = (
-                    output_dir
-                    / scan.reporter.short_name
-                    / str(scan.volume)
-                    / str(scan.start_page or 1)
-                )
-            output_dir.mkdir(parents=True, exist_ok=True)
-            Scan.objects.filter(pk=scan_pk).update(output_dir=str(output_dir))
-        else:
-            output_dir = Path(scan.output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-        bitonal_path = output_dir / "bitonal.pdf"
-        if not bitonal_path.exists():
-
-            def _bitonal_progress(current, total, message):
-                Scan.objects.filter(pk=scan_pk).update(
-                    progress_message=message,
-                    progress_current=current,
-                    progress_total=total,
-                )
-
-            bl_bitonal(
-                scan.pdf_path,
-                str(output_dir),
-                progress_callback=_bitonal_progress,
-            )
-            pdf = fitz.open(str(bitonal_path))
-            count = pdf.page_count
-            pdf.close()
-            Scan.objects.filter(pk=scan_pk).update(page_count=count)
-
+        output_dir = _ensure_output_dir(scan)
+        bitonal_path = _ensure_bitonal(scan, output_dir)
         run_incremental_validation(scan_pk, str(bitonal_path))
 
     except Exception as exc:
@@ -1252,40 +1279,10 @@ def run_full_pipeline(scan_pk: int) -> None:
 
     try:
         # 1. Ensure output directory exists
-        if not scan.output_dir:
-            output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
-            if scan.reporter and scan.volume:
-                output_dir = (
-                    output_dir
-                    / scan.reporter.short_name
-                    / str(scan.volume)
-                    / str(scan.start_page or 1)
-                )
-            output_dir.mkdir(parents=True, exist_ok=True)
-            Scan.objects.filter(pk=scan_pk).update(output_dir=str(output_dir))
-        else:
-            output_dir = Path(scan.output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = _ensure_output_dir(scan)
 
         # 2. Bitonal conversion
-        bitonal_path = output_dir / "bitonal.pdf"
-        if not bitonal_path.exists():
-
-            def _bitonal_progress(current, total, message):
-                _update_progress(
-                    scan_pk, message, current=current, total=total
-                )
-
-            bl_bitonal(
-                scan.pdf_path,
-                str(output_dir),
-                progress_callback=_bitonal_progress,
-            )
-
-        pdf = fitz.open(str(bitonal_path))
-        page_count = pdf.page_count
-        pdf.close()
-        Scan.objects.filter(pk=scan_pk).update(page_count=page_count)
+        bitonal_path = _ensure_bitonal(scan, output_dir)
 
         # 3. Tesseract OCR (on bitonal)
         scan.refresh_from_db()
