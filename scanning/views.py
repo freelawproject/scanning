@@ -961,7 +961,7 @@ def serve_scan_pdf(request, pk):
             return FileResponse(
                 open(ocr, "rb"), content_type="application/pdf"
             )
-    
+
         bitonal = Path(scan.output_dir) / "bitonal.pdf"
         if bitonal.exists():
             return FileResponse(
@@ -1716,7 +1716,6 @@ def serve_redacted_pdf(request, pk):
             open(scan.redacted_pdf_path, "rb"), content_type="application/pdf"
         )
     if scan.output_dir:
-    
         for f in sorted(Path(scan.output_dir).glob("*.pdf")):
             if "redacted" not in f.name and "bitonal" not in f.name:
                 return FileResponse(
