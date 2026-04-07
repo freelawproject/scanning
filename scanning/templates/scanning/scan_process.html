@@ -44,7 +44,7 @@
       <span class="text-xs text-gray-500 dark:text-gray-400">{{ scan.page_count }} pages</span>
       {% if missing_pages %}<span class="badge-error text-xs">{{ missing_pages|length }} missing</span>{% endif %}
       {% if has_pending_changes %}<span class="badge-warning text-xs">Pending Changes</span>{% endif %}
-      {% if scan.s3_uploaded %}<span class="badge-s3 text-xs">Uploaded to S3</span>{% endif %}
+      {% if scan.s3_uploaded %}<span class="badge-s3 text-xs" title="Files uploaded to S3">S3</span>{% endif %}
     </div>
   </div>
   {# Right: actions #}
@@ -55,53 +55,58 @@
       {% if has_pending_changes %}
       <form method="post" action="{% url 'reprocess' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed">Rebuild &amp; Validate</button>
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Apply pending page inserts and deletions, then re-run OCR and validation">Rebuild &amp; Validate</button>
       </form>
       {% elif not scan.page_count %}
       <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm">Validate</button>
+        <button type="submit" class="btn-primary text-sm" title="Run the full processing pipeline: bitonal conversion, OCR, detection, and page number validation">Validate</button>
       </form>
       {% else %}
       <form method="post" action="{% url 'recalculate' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm">Recheck</button>
+        <button type="submit" class="btn-primary text-sm" title="Re-check page numbers and issues using existing OCR results without re-running the pipeline">Recheck</button>
       </form>
       <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-outline text-sm">Re-validate</button>
+        <button type="submit" class="btn-outline text-sm" title="Re-run the full pipeline from scratch: bitonal, OCR, detection, and validation">Re-validate</button>
       </form>
       {% if not issues and not missing_pages %}
       <form method="post" action="{% url 'start_detect' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm">Next: Detect &rarr;</button>
+        <button type="submit" class="btn-primary text-sm" title="Run YOLO detection to find opinions, captions, and key icons in the scan">Next: Detect &rarr;</button>
       </form>
       {% endif %}
       {% endif %}
 
     {% elif step == 2 %}
-      <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()">Re-pair Opinions</button>
+      <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()" title="Match detected captions and key icons to identify individual opinions">Re-pair Opinions</button>
       {% if opinions %}
-      <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669">Next: Generate &rarr;</a>
+      <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
       {% endif %}
 
     {% elif step == 3 %}
       <form method="post" action="{% url 'generate_files' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed">{% if opinion_scans %}Regenerate{% else %}Generate{% endif %} Files</button>
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Create redacted, masked, and unredacted PDF files for each opinion">{% if opinion_scans %}Regenerate{% else %}Generate{% endif %} Files</button>
       </form>
       {% if opinion_scans %}
       <form method="post" action="{% url 'approve_scan' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm">Approve</button>
+        <button type="submit" class="btn-primary text-sm" title="Mark this scan as approved and upload the final files to S3">Approve</button>
       </form>
       {% endif %}
       {% if scan.stage == 'approved' %}
-      <a href="{% url 'scan_list' %}" class="btn-primary text-sm no-underline" style="background:#059669">Done &rarr; List</a>
+      <a href="{% url 'scan_list' %}" class="btn-primary text-sm no-underline" style="background:#059669" title="Return to the scan list">Done &rarr; List</a>
       {% endif %}
     {% endif %}
   </div>
 </div>
+{% if step == 3 and not scan.s3_uploaded %}
+<div class="px-4 mt-2">
+  <div class="alert-warning text-sm">The final files have not been uploaded to S3. Click "Approve" to upload.</div>
+</div>
+{% endif %}
 {% endblock %}
 
 {% block full_width_content %}
