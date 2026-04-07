@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from django.conf import settings
 from django.shortcuts import get_object_or_404
 
-from scanning.models import Volume
-
-if TYPE_CHECKING:
-    from scanning.models import Scan
+from scanning.models import Scan, Volume
 
 
 def get_volume(reporter_slug: str, vol: int) -> Volume:
@@ -75,3 +72,46 @@ def find_ocr_pdf(output_dir: str | Path) -> Path | None:
         ):
             return f
     return None
+
+
+def has_s3_credentials() -> bool:
+    """Check whether AWS credentials are configured.
+
+    :return: True if the required AWS env vars are set.
+    :rtype: bool
+    """
+    return bool(
+        os.environ.get("AWS_ACCESS_KEY_ID")
+        or os.environ.get("AWS_DEV_ACCESS_KEY_ID")
+    ) and bool(
+        os.environ.get("AWS_SECRET_ACCESS_KEY")
+        or os.environ.get("AWS_DEV_SECRET_ACCESS_KEY")
+    )
+
+
+def ensure_output_dir(scan: Scan) -> Path:
+    """Return the scan's output directory, creating it if necessary.
+
+    If the scan has no ``output_dir`` set, builds the path from
+    ``MEDIA_ROOT/processed/{pk}/{reporter}/{volume}/{start_page}/``
+    and persists it to the database.
+
+    :param scan: The Scan instance.
+    :return: The output directory as a Path.
+    :rtype: Path
+    """
+    if not scan.output_dir:
+        output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan.pk)
+        if scan.reporter and scan.volume:
+            output_dir = (
+                output_dir
+                / scan.reporter.short_name
+                / str(scan.volume)
+                / str(scan.start_page or 1)
+            )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        Scan.objects.filter(pk=scan.pk).update(output_dir=str(output_dir))
+    else:
+        output_dir = Path(scan.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir

@@ -61,7 +61,7 @@ from scanning.models import (
     Stage,
     Status,
 )
-from scanning.utils import find_ocr_pdf
+from scanning.utils import ensure_output_dir, find_ocr_pdf, has_s3_credentials
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -90,34 +90,6 @@ def _update_progress(
         updates["progress_total"] = total
     updates.update(kwargs)
     Scan.objects.filter(pk=scan_pk).update(**updates)
-
-
-def _ensure_output_dir(scan: "Scan") -> Path:
-    """Return the scan's output directory, creating it if necessary.
-
-    If the scan has no ``output_dir`` set, builds the path from
-    ``MEDIA_ROOT/processed/{pk}/{reporter}/{volume}/{start_page}/``
-    and persists it to the database.
-
-    :param scan: The Scan instance.
-    :return: The output directory as a Path.
-    :rtype: Path
-    """
-    if not scan.output_dir:
-        output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan.pk)
-        if scan.reporter and scan.volume:
-            output_dir = (
-                output_dir
-                / scan.reporter.short_name
-                / str(scan.volume)
-                / str(scan.start_page or 1)
-            )
-        output_dir.mkdir(parents=True, exist_ok=True)
-        Scan.objects.filter(pk=scan.pk).update(output_dir=str(output_dir))
-    else:
-        output_dir = Path(scan.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
 
 
 def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
@@ -1243,7 +1215,7 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
         print(
             f"[validate] scan {scan_pk} pdf_path={scan.pdf_path}", flush=True
         )
-        output_dir = _ensure_output_dir(scan)
+        output_dir = ensure_output_dir(scan)
         bitonal_path = _ensure_bitonal(scan, output_dir)
         run_incremental_validation(scan_pk, str(bitonal_path))
 
@@ -1279,7 +1251,7 @@ def run_full_pipeline(scan_pk: int) -> None:
 
     try:
         # 1. Ensure output directory exists
-        output_dir = _ensure_output_dir(scan)
+        output_dir = ensure_output_dir(scan)
 
         # 2. Bitonal conversion
         bitonal_path = _ensure_bitonal(scan, output_dir)
@@ -2085,23 +2057,6 @@ def run_detect(scan_pk: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _has_s3_credentials() -> bool:
-    """Check whether AWS credentials are configured.
-
-    :return: True if the required AWS env vars are set.
-    :rtype: bool
-    """
-    import os
-
-    return bool(
-        os.environ.get("AWS_ACCESS_KEY_ID")
-        or os.environ.get("AWS_DEV_ACCESS_KEY_ID")
-    ) and bool(
-        os.environ.get("AWS_SECRET_ACCESS_KEY")
-        or os.environ.get("AWS_DEV_SECRET_ACCESS_KEY")
-    )
-
-
 def upload_approved_files(scan_pk: int) -> str:
     """Upload final deliverables to the private S3 bucket.
 
@@ -2133,7 +2088,7 @@ def upload_approved_files(scan_pk: int) -> str:
     start = scan.start_page or 1
     s3_prefix = f"approved/{short}/{scan.volume}/{start}/"
 
-    if not _has_s3_credentials():
+    if not has_s3_credentials():
         Scan.objects.filter(pk=scan_pk).update(
             s3_path=s3_prefix,
         )
