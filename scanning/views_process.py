@@ -458,6 +458,7 @@ def start_validate(request, pk):
     scan.status = Status.QUEUED
     scan.stage = Stage.VALIDATE
     scan.queued_action = "full_pipeline"
+    scan.s3_uploaded = False
     scan.progress_message = "Queued for processing..."
     scan.save()
     return redirect("scan_process", pk=scan.pk)
@@ -480,6 +481,7 @@ def start_detect(request, pk):
     scan.status = Status.QUEUED
     scan.stage = Stage.PROCESS
     scan.queued_action = "detect"
+    scan.s3_uploaded = False
     scan.progress_message = "Queued for detection..."
     scan.save()
     return redirect(f"/scans/{scan.pk}/process/?step=2")
@@ -541,6 +543,7 @@ def reprocess(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
     scan.status = Status.QUEUED
     scan.queued_action = "reprocess"
+    scan.s3_uploaded = False
     scan.progress_message = "Queued for reprocessing..."
     scan.save()
     return redirect("scan_process", pk=scan.pk)

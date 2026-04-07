@@ -276,6 +276,7 @@ def pair_opinions_api(request, pk):
             first_page=scan.start_page or 1,
         )
         scan.opinions_json = json.dumps(opinions)
+        scan.s3_uploaded = False
         scan.save()
         gaps = []
         if opinions and scan.start_page and scan.end_page:
@@ -336,6 +337,7 @@ def compute_redactions_api(request, pk):
     try:
         rects = _compute_and_save_redaction_rects(pk, pdf_path, output_dir)
         _compute_and_save_margin_rects(pk, pdf_path, output_dir)
+        Scan.objects.filter(pk=pk).update(s3_uploaded=False)
         total_rects = sum(len(r["rects"]) for r in rects)
         return JsonResponse(
             {"status": "ok", "pages": len(rects), "rects": total_rects}
@@ -364,6 +366,7 @@ def generate_files(request, pk):
     scan.stage = Stage.PROCESS
     scan.status = Status.QUEUED
     scan.queued_action = "generate_files"
+    scan.s3_uploaded = False
     scan.progress_message = "Queued for file generation..."
     scan.save()
     return redirect(f"/scans/{scan.pk}/process/?step=3")
