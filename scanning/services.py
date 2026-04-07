@@ -2117,36 +2117,19 @@ def upload_approved_files(scan_pk: int) -> str:
             elif ".redacted.pdf" in f.name:
                 files_to_upload.append((f, f"{s3_prefix}{f.name}"))
 
-    # Upload to S3 via boto3 directly (not Django storage) so that
-    # retries are safe: HEAD checks skip already-uploaded files,
-    # and upload_file() streams from disk with automatic multipart.
-    # When s3_uploaded is False (files changed since last upload),
-    # skip the HEAD check and re-upload everything.
+    # Upload to S3 via boto3 directly (not Django storage).
+    # upload_file() streams from disk with automatic multipart.
+    # The early return above prevents duplicate uploads when
+    # s3_uploaded is already True, so we always upload all files here.
     import boto3
-    from botocore.exceptions import ClientError
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     s3_client = boto3.client("s3")
-    skip_existing = scan.s3_uploaded
-    uploaded = 0
-    skipped = 0
     for local_path, s3_key in files_to_upload:
-        if skip_existing:
-            try:
-                s3_client.head_object(Bucket=bucket, Key=s3_key)
-                skipped += 1
-                continue
-            except ClientError:
-                pass
         s3_client.upload_file(str(local_path), bucket, s3_key)
-        uploaded += 1
 
     Scan.objects.filter(pk=scan_pk).update(
         s3_uploaded=True,
         s3_path=s3_prefix,
     )
-    msg = f"Files uploaded successfully to S3 ({uploaded} uploaded"
-    if skipped:
-        msg += f", {skipped} already existed"
-    msg += ")."
-    return msg
+    return f"Files uploaded successfully to S3 ({len(files_to_upload)} files)."

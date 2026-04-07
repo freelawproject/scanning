@@ -865,19 +865,13 @@ class TestUploadApprovedFiles(TestCase):
         AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
     )
     def test_upload_calls_boto3(self):
-        """Verify boto3 upload_file and head_object are called."""
+        """Verify boto3 upload_file is called for all files on fresh upload."""
         from unittest.mock import MagicMock, patch
-
-        from botocore.exceptions import ClientError
 
         from scanning.services import upload_approved_files
 
         scan = self._make_scan_with_generated_files()
         mock_client = MagicMock()
-        # All files are new (HEAD returns 404)
-        mock_client.head_object.side_effect = ClientError(
-            {"Error": {"Code": "404"}}, "HeadObject"
-        )
 
         env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
         with (
@@ -889,34 +883,26 @@ class TestUploadApprovedFiles(TestCase):
         self.assertIn("uploaded", result)
         # 2 redacted + 2 masked + 1 original + 1 redacted-full = 6
         self.assertEqual(mock_client.upload_file.call_count, 6)
-        self.assertEqual(mock_client.head_object.call_count, 6)
+        # No HEAD checks on fresh upload (s3_uploaded=False)
+        self.assertEqual(mock_client.head_object.call_count, 0)
         scan.refresh_from_db()
         self.assertTrue(scan.s3_uploaded)
 
     @override_settings(
         AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
     )
-    def test_upload_skips_existing_files(self):
-        """Files that already exist in S3 (HEAD succeeds) are skipped."""
+    def test_re_upload_after_changes(self):
+        """After reprocessing (s3_uploaded reset), all files are re-uploaded."""
         from unittest.mock import MagicMock, patch
-
-        from botocore.exceptions import ClientError
 
         from scanning.services import upload_approved_files
 
         scan = self._make_scan_with_generated_files()
+        # Simulate: was uploaded, then reprocessed (flag reset)
+        scan.s3_uploaded = False
+        scan.s3_path = "approved/a/1/1/"
+        scan.save(update_fields=["s3_uploaded", "s3_path"])
         mock_client = MagicMock()
-
-        call_count = [0]
-
-        def head_side_effect(**kwargs):
-            """First 2 calls succeed (file exists), rest raise 404."""
-            call_count[0] += 1
-            if call_count[0] <= 2:
-                return {"ContentLength": 100}
-            raise ClientError({"Error": {"Code": "404"}}, "HeadObject")
-
-        mock_client.head_object.side_effect = head_side_effect
 
         env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
         with (
@@ -925,34 +911,9 @@ class TestUploadApprovedFiles(TestCase):
         ):
             result = upload_approved_files(scan.pk)
 
-        self.assertIn("already existed", result)
-        # 6 total files, 2 existed, 4 uploaded
-        self.assertEqual(mock_client.upload_file.call_count, 4)
-        self.assertEqual(mock_client.head_object.call_count, 6)
-
-    @override_settings(
-        AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
-    )
-    def test_retry_uploads_only_missing(self):
-        """On retry, only files not yet in S3 are uploaded."""
-        from unittest.mock import MagicMock, patch
-
-        from scanning.services import upload_approved_files
-
-        scan = self._make_scan_with_generated_files()
-        mock_client = MagicMock()
-        # All files already exist (HEAD succeeds for all)
-        mock_client.head_object.return_value = {"ContentLength": 100}
-
-        env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
-        with (
-            patch.dict("os.environ", env),
-            patch("boto3.client", return_value=mock_client),
-        ):
-            result = upload_approved_files(scan.pk)
-
-        self.assertIn("0 uploaded", result)
-        self.assertIn("already existed", result)
-        self.assertEqual(mock_client.upload_file.call_count, 0)
+        self.assertIn("6 files", result)
+        # No HEAD checks on fresh/re-upload
+        self.assertEqual(mock_client.head_object.call_count, 0)
+        self.assertEqual(mock_client.upload_file.call_count, 6)
         scan.refresh_from_db()
         self.assertTrue(scan.s3_uploaded)
