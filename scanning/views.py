@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import tempfile
+from pathlib import Path
 
 import fitz
 from django.conf import settings
@@ -506,10 +507,9 @@ def queue_upload(request, reporter_slug, vol):
     scan.save()  # Save first to get a PK
 
     # Create processing directory and save original PDF there
-    from pathlib import Path as _P
 
     output_dir = (
-        _P(settings.MEDIA_ROOT)
+        Path(settings.MEDIA_ROOT)
         / "processed"
         / str(scan.pk)
         / volume.reporter.short_name
@@ -961,9 +961,8 @@ def serve_scan_pdf(request, pk):
             return FileResponse(
                 open(ocr, "rb"), content_type="application/pdf"
             )
-        from pathlib import Path as _P
-
-        bitonal = _P(scan.output_dir) / "bitonal.pdf"
+    
+        bitonal = Path(scan.output_dir) / "bitonal.pdf"
         if bitonal.exists():
             return FileResponse(
                 open(bitonal, "rb"), content_type="application/pdf"
@@ -1717,9 +1716,8 @@ def serve_redacted_pdf(request, pk):
             open(scan.redacted_pdf_path, "rb"), content_type="application/pdf"
         )
     if scan.output_dir:
-        from pathlib import Path as _P
-
-        for f in sorted(_P(scan.output_dir).glob("*.pdf")):
+    
+        for f in sorted(Path(scan.output_dir).glob("*.pdf")):
             if "redacted" not in f.name and "bitonal" not in f.name:
                 return FileResponse(
                     open(f, "rb"), content_type="application/pdf"
