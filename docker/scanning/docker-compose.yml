@@ -15,7 +15,7 @@ services:
       POSTGRES_PASSWORD: "postgres"
       POSTGRES_DB: "scanning"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -36,25 +36,31 @@ services:
 
   # Background daemon — run locally for dev (PaddlePaddle segfaults under x86 emulation):
   #   DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer uv run python manage.py run_daemon
-  # scanning-daemon:
-  #   container_name: scanning-daemon
-  #   platform: linux/amd64
-  #   build:
-  #     context: "${SCANNING_BASE_DIR:-../../}"
-  #     dockerfile: "./docker/django/Dockerfile"
-  #     args:
-  #       BUILD_ENV: dev
-  #   command: run_daemon
-  #   depends_on:
-  #     scanning-postgres:
-  #       condition: service_healthy
-  #   user: root
-  #   volumes:
-  #     - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
-  #   networks:
-  #     - scanning_net
-  #   env_file:
-  #     - ../../.env.dev
+  scanning-daemon:
+    container_name: scanning-daemon
+    platform: linux/amd64
+    build:
+      context: "${SCANNING_BASE_DIR:-../../}"
+      dockerfile: "./docker/django/Dockerfile"
+      args:
+        BUILD_ENV: dev
+    command: run_daemon
+    depends_on:
+      scanning-postgres:
+        condition: service_healthy
+    user: root
+    volumes:
+      - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
+    networks:
+      - scanning_net
+    env_file:
+      - ../../.env.dev
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      - AWS_DEV_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_DEV_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
 
   # Django dev server
   scanning-django:
@@ -74,8 +80,14 @@ services:
     user: root
     volumes:
       - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
-#      - ${BLACKLETTER_DIR:-../../../blackletter}:/opt/blackletter
+    #      - ${BLACKLETTER_DIR:-../../../blackletter}:/opt/blackletter
     networks:
       - scanning_net
     env_file:
       - ../../.env.dev
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      - AWS_DEV_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_DEV_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
