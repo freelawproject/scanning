@@ -647,14 +647,17 @@ class TestApproveScan(ScanningTestCase):
 
     def test_approve_with_files_sets_path(self):
         """Approving with generated files sets s3_path."""
+        from unittest.mock import patch
+
         user = self.make_staff_user()
         self.client.force_login(user)
         scan = self._make_scan_with_generated_files()
 
-        self.client.post(
-            reverse("approve_scan", kwargs={"pk": scan.pk}),
-            follow=True,
-        )
+        with patch.dict("os.environ", {}, clear=True):
+            self.client.post(
+                reverse("approve_scan", kwargs={"pk": scan.pk}),
+                follow=True,
+            )
         scan.refresh_from_db()
         self.assertTrue(scan.s3_path.startswith("approved/"))
 
