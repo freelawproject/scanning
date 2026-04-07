@@ -564,4 +564,3 @@ def update_scan_status(request, reporter_slug, vol):
         reporter_slug=reporter_slug,
         vol=vol,
     )
-
