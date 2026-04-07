@@ -142,6 +142,9 @@
         {% else %}
         <span class="text-xs text-gray-400">No PDF yet</span>
         {% endif %}
+        {% if user.is_staff %}
+        <a href="{% url 'admin:scanning_scan_change' scan.pk %}" class="btn-outline text-sm" title="View scan in Django admin">Admin</a>
+        {% endif %}
       </div>
     </div>
     {% if scan.notes %}
