@@ -1178,7 +1178,8 @@ def recalculate_issues(scan: "Scan") -> None:
     scan.page_map = json.dumps(result["page_map"])
     scan.missing_pages = json.dumps(result["missing_pages"])
     scan.has_issues = len(result["issues"]) > 0
-    scan.status = Status.APPROVED
+    scan.status = Status.PENDING_REVIEW
+    scan.s3_uploaded = False
     scan.progress_message = "Done"
     scan.save()
 
@@ -1290,7 +1291,7 @@ def run_full_pipeline(scan_pk: int) -> None:
         _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
 
         Scan.objects.filter(pk=scan_pk).update(
-            status=Status.APPROVED,
+            status=Status.PENDING_REVIEW,
             progress_message=(
                 f"Done — {len(dets)} detections, {len(opinions)} opinions"
             ),
@@ -1406,7 +1407,8 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
     scan.ocr_results = json.dumps(all_results)
     scan.has_issues = len(result.get("issues", [])) > 0
     scan.checked = True
-    scan.status = Status.APPROVED
+    scan.status = Status.PENDING_REVIEW
+    scan.s3_uploaded = False
     scan.progress_message = "Done"
     scan.save()
 
@@ -1536,7 +1538,8 @@ def run_reprocess(scan_pk: int) -> None:
             )
 
         Scan.objects.filter(pk=scan_pk).update(
-            status=Status.APPROVED,
+            status=Status.PENDING_REVIEW,
+            s3_uploaded=False,
             progress_message="Done",
         )
 
@@ -1931,6 +1934,7 @@ def run_generate_files(scan_pk: int) -> None:
         scan.opinions_json = json.dumps(existing_opinions)
         scan.stage = Stage.APPROVED
         scan.status = Status.APPROVED
+        scan.s3_uploaded = False
         scan.progress_message = f"Generated {opinion_count} opinions"
         scan.progress_log = ""
         scan.save()
@@ -2037,7 +2041,8 @@ def run_detect(scan_pk: int) -> None:
         opinions = _re_pair_opinions(scan_pk)
 
         Scan.objects.filter(pk=scan_pk).update(
-            status=Status.APPROVED,
+            status=Status.PENDING_REVIEW,
+            s3_uploaded=False,
             progress_message=f"Done — {len(dets)} detections, {len(opinions)} opinions",
         )
 
@@ -2115,20 +2120,24 @@ def upload_approved_files(scan_pk: int) -> str:
     # Upload to S3 via boto3 directly (not Django storage) so that
     # retries are safe: HEAD checks skip already-uploaded files,
     # and upload_file() streams from disk with automatic multipart.
+    # When s3_uploaded is False (files changed since last upload),
+    # skip the HEAD check and re-upload everything.
     import boto3
     from botocore.exceptions import ClientError
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     s3_client = boto3.client("s3")
+    skip_existing = scan.s3_uploaded
     uploaded = 0
     skipped = 0
     for local_path, s3_key in files_to_upload:
-        try:
-            s3_client.head_object(Bucket=bucket, Key=s3_key)
-            skipped += 1
-            continue
-        except ClientError:
-            pass
+        if skip_existing:
+            try:
+                s3_client.head_object(Bucket=bucket, Key=s3_key)
+                skipped += 1
+                continue
+            except ClientError:
+                pass
         s3_client.upload_file(str(local_path), bucket, s3_key)
         uploaded += 1
 
