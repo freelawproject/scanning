@@ -711,7 +711,9 @@ class TestSmartEditEndToEnd(TestCase):
             from blackletter.api import detect
 
             dets = detect(
-                str(damaged_path), output_dir, models=["small", "medium", "large"]
+                str(damaged_path),
+                output_dir,
+                models=["small", "medium", "large"],
             )
             self.assertGreater(len(dets), 0)
             _import_detections_from_json(scan.pk, output_dir)
@@ -724,9 +726,7 @@ class TestSmartEditEndToEnd(TestCase):
             run_paddleocr_validation(scan.pk, str(damaged_path))
             scan.refresh_from_db()
 
-            missing = (
-                scan.missing_pages
-            )
+            missing = scan.missing_pages
             print(f"  Missing pages identified: {missing}")
 
             # Pages 8, 12, 17 should be in the missing list
@@ -759,9 +759,7 @@ class TestSmartEditEndToEnd(TestCase):
             final_pdf.close()
 
             # --- Step 6: Verify all 23 page numbers are detected ---
-            ocr_results = (
-                scan.ocr_results
-            )
+            ocr_results = scan.ocr_results
             detected_nums = set()
             for r in ocr_results:
                 if r.get("detected"):
@@ -784,9 +782,7 @@ class TestSmartEditEndToEnd(TestCase):
             )
 
             # No issues remaining
-            final_missing = (
-                scan.missing_pages
-            )
+            final_missing = scan.missing_pages
             self.assertEqual(
                 final_missing,
                 [],
