@@ -516,24 +516,34 @@ def apply_rect_to_opinion(request, pk, opinion_pk):
 
 @login_required
 def serve_redacted_pdf(request, pk):
-    """Serve the redacted PDF for a scan, falling back to any available PDF.
+    """Serve the redacted PDF for a scan.
+
+    Falls back to the OCR PDF if the redacted version hasn't been
+    generated yet, so the viewer has something to display.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: File response streaming the PDF.
     """
     scan = get_object_or_404(Scan, pk=pk)
+
+    # 1. Try the explicit redacted PDF path
     if scan.redacted_pdf_path and os.path.isfile(scan.redacted_pdf_path):
         return FileResponse(
             open(scan.redacted_pdf_path, "rb"), content_type="application/pdf"
         )
+
+    # 2. Fall back to the OCR PDF (for preview before generation)
     output = Path(scan.output_dir)
     if output.is_dir():
-        for f in sorted(output.glob("*.pdf")):
-            if "redacted" not in f.name and "bitonal" not in f.name:
-                return FileResponse(
-                    open(f, "rb"), content_type="application/pdf"
-                )
+        from scanning.utils import find_ocr_pdf
+
+        ocr = find_ocr_pdf(output)
+        if ocr:
+            return FileResponse(
+                open(ocr, "rb"), content_type="application/pdf"
+            )
+
     return HttpResponse("No PDF available", status=404)
 
 
