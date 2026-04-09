@@ -5,8 +5,6 @@ import logging
 
 from django.core.management.base import BaseCommand
 
-logger = logging.getLogger(__name__)
-
 from scanning.models import (
     Priority,
     QueueStatus,
@@ -16,6 +14,8 @@ from scanning.models import (
     Status,
     Volume,
 )
+
+logger = logging.getLogger(__name__)
 
 STATUS_MAP = {
     "Not Started": QueueStatus.NEEDS_SCANNING,

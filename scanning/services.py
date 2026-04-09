@@ -657,9 +657,7 @@ def _build_combined_redactions(scan_pk: int) -> Path:
     det_path = output_dir / "detections.json"
 
     margins_data = scan.margin_rects
-    rects_data = (
-        scan.redaction_rects
-    )
+    rects_data = scan.redaction_rects
     opinions = scan.opinions_json
 
     # Add filenames based on reporter, volume, and page numbers
@@ -973,7 +971,9 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
                     img_height=img_h,
                     model_name="large",
                     model_count=1,
-                    found_by=[{"model": "large", "confidence": d["confidence"]}],
+                    found_by=[
+                        {"model": "large", "confidence": d["confidence"]}
+                    ],
                 )
             )
     if all_detections:
@@ -1438,9 +1438,7 @@ def run_reprocess(scan_pk: int) -> None:
         if not has_deletions and not has_inserts:
             # Nothing changed — just rebuild issues from existing results
             _update_progress(scan_pk, "Re-checking...")
-            all_results = (
-                scan.ocr_results
-            )
+            all_results = scan.ocr_results
             _rebuild_issues_from_results(scan_pk, all_results)
             _re_pair_opinions(scan_pk)
             return
@@ -1488,9 +1486,7 @@ def run_reprocess(scan_pk: int) -> None:
 
         # After deletions, rebuild page_map so inserts use correct pdf indices
         if has_deletions:
-            Scan.objects.filter(pk=scan_pk).update(
-                ocr_results=all_results
-            )
+            Scan.objects.filter(pk=scan_pk).update(ocr_results=all_results)
             _rebuild_issues_from_results(scan_pk, all_results)
             scan.refresh_from_db()
             page_map = scan.page_map
@@ -1904,16 +1900,13 @@ def run_generate_files(scan_pk: int) -> None:
         redacted_dir = Path(result.get("redacted_dir", output / "redacted"))
         masked_dir = Path(result.get("masked_dir", output / "masked"))
         unredacted_dir = output / "unredacted"
-        output_dir = redacted_dir.parent
 
         redacted_files = (
             sorted(redacted_dir.glob("*.pdf")) if redacted_dir.is_dir() else []
         )
 
         scan.refresh_from_db()
-        existing_opinions = (
-            scan.opinions_json
-        )
+        existing_opinions = scan.opinions_json
 
         if existing_opinions and "caption_page" in existing_opinions[0]:
             for i, op in enumerate(existing_opinions):
