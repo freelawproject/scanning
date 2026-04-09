@@ -1,6 +1,7 @@
 """JSON API endpoints and file-serving views for the process page."""
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -30,6 +31,8 @@ from scanning.models import (
     Status,
 )
 from scanning.utils import find_json_file, find_ocr_pdf
+
+logger = logging.getLogger(__name__)
 
 
 @login_required
@@ -663,12 +666,20 @@ def delete_detection(request, pk):
 @login_required
 @require_POST
 def add_single_detection(request, pk):
-    """Add or boost a single detection for a scan.
+    """Add a new detection or boost an existing one.
+
+    If a detection with the same label and approximate position already
+    exists, its confidence is "boosted" to 1.0 (confirmed by the user).
+    Otherwise a new detection is created with confidence 1.0 and
+    model_name "manual".
+
+    Updates both the Detection DB record and detections.json on disk.
 
     :param request: The HTTP request (JSON body with page_index,
         label_id, bbox, img_width, and img_height).
     :param pk: Scan primary key.
-    :return: JSON response indicating whether a new detection was added.
+    :return: JSON response with ``added=True`` if new, ``added=False``
+        if an existing detection was boosted.
     """
     scan = get_object_or_404(Scan, pk=pk)
     det = json.loads(request.body)
@@ -723,7 +734,7 @@ def add_single_detection(request, pk):
                 found_by=[{"model": "manual", "confidence": 1.0}],
             )
         except Exception:
-            pass
+            logger.exception("Failed to create manual detection")
     det_path.write_text(json.dumps(existing))
     return JsonResponse({"status": "ok", "added": not boosted})
 
