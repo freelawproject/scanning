@@ -368,7 +368,7 @@ def _import_detections_from_json(scan_pk: int, output_dir: str) -> list:
                 img_height=d.get("img_height", 0),
                 model_name=d.get("found_by", [{}])[0].get("model", ""),
                 model_count=d.get("model_count", 1),
-                found_by=json.dumps(d.get("found_by", [])),
+                found_by=d.get("found_by", []),
             )
         )
     Detection.objects.bulk_create(det_objects)
@@ -384,7 +384,7 @@ def _page_number_lookup(scan: "Scan") -> dict:
     :param scan: The Scan instance whose ocr_results to parse.
     :return: Mapping of page index to (start, end) page number tuple.
     """
-    ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+    ocr_results = scan.ocr_results
     lookup = {}
     range_re = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
     for r in ocr_results:
@@ -611,7 +611,7 @@ def _compute_and_save_redaction_rects(
         page_entry["rects"] = new_page_rects
 
     Scan.objects.filter(pk=scan_pk).update(
-        redaction_rects=json.dumps(rects),
+        redaction_rects=rects,
     )
     return rects
 
@@ -632,12 +632,12 @@ def _compute_and_save_margin_rects(
     """
     scan = Scan.objects.get(pk=scan_pk)
     if scan.margin_rects:
-        return json.loads(scan.margin_rects)
+        return scan.margin_rects
     output_dir = Path(output_dir)
     margin_rects = compute_margin_rects(str(pdf_path))
     margin_rects = _adjust_margins_for_detections(margin_rects, output_dir)
     Scan.objects.filter(pk=scan_pk).update(
-        margin_rects=json.dumps(margin_rects),
+        margin_rects=margin_rects,
     )
     return margin_rects
 
@@ -656,11 +656,11 @@ def _build_combined_redactions(scan_pk: int) -> Path:
 
     det_path = output_dir / "detections.json"
 
-    margins_data = json.loads(scan.margin_rects) if scan.margin_rects else []
+    margins_data = scan.margin_rects
     rects_data = (
-        json.loads(scan.redaction_rects) if scan.redaction_rects else []
+        scan.redaction_rects
     )
-    opinions = json.loads(scan.opinions_json) if scan.opinions_json else []
+    opinions = scan.opinions_json
 
     # Add filenames based on reporter, volume, and page numbers
     reporter = scan.reporter.short_name or ""
@@ -863,7 +863,7 @@ def _re_pair_opinions(scan_pk: int) -> list:
         first_page=scan.start_page or 1,
     )
     Scan.objects.filter(pk=scan_pk).update(
-        opinions_json=json.dumps(opinions),
+        opinions_json=opinions,
     )
     return opinions
 
@@ -906,7 +906,7 @@ def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
 
     all_results = result["results"]
     Scan.objects.filter(pk=scan_pk).update(
-        ocr_results=json.dumps(all_results),
+        ocr_results=all_results,
     )
     _rebuild_issues_from_results(scan_pk, all_results)
 
@@ -935,7 +935,7 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
         # Store partial results for live display
         if current <= len(all_results):
             Scan.objects.filter(pk=scan_pk).update(
-                ocr_results=json.dumps(all_results[:current]),
+                ocr_results=all_results[:current],
             )
 
     result = bl_analyze_pdf(
@@ -973,16 +973,14 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
                     img_height=img_h,
                     model_name="large",
                     model_count=1,
-                    found_by=json.dumps(
-                        [{"model": "large", "confidence": d["confidence"]}]
-                    ),
+                    found_by=[{"model": "large", "confidence": d["confidence"]}],
                 )
             )
     if all_detections:
         Detection.objects.bulk_create(all_detections)
 
     Scan.objects.filter(pk=scan_pk).update(
-        ocr_results=json.dumps(all_results),
+        ocr_results=all_results,
     )
 
     _sync_detections_to_disk(scan_pk)
@@ -1001,7 +999,7 @@ def recalculate_issues(scan: "Scan") -> None:
     :param scan: The Scan instance to recalculate issues for.
     """
 
-    ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+    ocr_results = scan.ocr_results
     if not ocr_results:
         return
 
@@ -1073,7 +1071,7 @@ def recalculate_issues(scan: "Scan") -> None:
                         )
                     new_results.append(r)
                 ocr_results = new_results
-                scan.ocr_results = json.dumps(ocr_results)
+                scan.ocr_results = ocr_results
                 out_of_range, seen_nums = _split(ocr_results)
 
     out_of_range_pages = {r["pdf_page"] for r in out_of_range}
@@ -1174,8 +1172,8 @@ def recalculate_issues(scan: "Scan") -> None:
     scan.page_count = len(pdf_fitz)
     pdf_fitz.close()
 
-    scan.page_map = json.dumps(result["page_map"])
-    scan.missing_pages = json.dumps(result["missing_pages"])
+    scan.page_map = result["page_map"]
+    scan.missing_pages = result["missing_pages"]
     scan.has_issues = len(result["issues"]) > 0
     scan.status = Status.PENDING_REVIEW
     scan.s3_uploaded = False
@@ -1401,9 +1399,9 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
 
     scan.refresh_from_db()
     scan.page_count = total
-    scan.page_map = json.dumps(result.get("page_map", []))
-    scan.missing_pages = json.dumps(result.get("missing_pages", []))
-    scan.ocr_results = json.dumps(all_results)
+    scan.page_map = result.get("page_map", [])
+    scan.missing_pages = result.get("missing_pages", [])
+    scan.ocr_results = all_results
     scan.has_issues = len(result.get("issues", [])) > 0
     scan.checked = True
     scan.status = Status.PENDING_REVIEW
@@ -1441,15 +1439,15 @@ def run_reprocess(scan_pk: int) -> None:
             # Nothing changed — just rebuild issues from existing results
             _update_progress(scan_pk, "Re-checking...")
             all_results = (
-                json.loads(scan.ocr_results) if scan.ocr_results else []
+                scan.ocr_results
             )
             _rebuild_issues_from_results(scan_pk, all_results)
             _re_pair_opinions(scan_pk)
             return
 
         output_dir = Path(scan.output_dir) if scan.output_dir else None
-        page_map = json.loads(scan.page_map) if scan.page_map else []
-        all_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+        page_map = scan.page_map
+        all_results = scan.ocr_results
 
         # Stale margin/redaction rects are indexed by old page positions — clear them
         Scan.objects.filter(pk=scan_pk).update(
@@ -1491,11 +1489,11 @@ def run_reprocess(scan_pk: int) -> None:
         # After deletions, rebuild page_map so inserts use correct pdf indices
         if has_deletions:
             Scan.objects.filter(pk=scan_pk).update(
-                ocr_results=json.dumps(all_results)
+                ocr_results=all_results
             )
             _rebuild_issues_from_results(scan_pk, all_results)
             scan.refresh_from_db()
-            page_map = json.loads(scan.page_map) if scan.page_map else []
+            page_map = scan.page_map
 
         # Apply inserts
         if has_inserts:
@@ -1519,7 +1517,7 @@ def run_reprocess(scan_pk: int) -> None:
         # re-pairing, and rect computation for each insert. Reload the
         # final state from the DB.
         scan.refresh_from_db()
-        all_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+        all_results = scan.ocr_results
 
         # Final rebuild with the fully updated results
         _update_progress(scan_pk, "Rebuilding issues...")
@@ -1666,7 +1664,7 @@ def run_smart_insert(
     output_dir = Path(scan.output_dir) if scan.output_dir else None
 
     # Determine insertion position from page_map
-    page_map = json.loads(scan.page_map) if scan.page_map else []
+    page_map = scan.page_map
     insert_idx = len(fitz.open(scan.pdf_path))  # default: append
     for i, entry in enumerate(page_map):
         if entry.get("logical_number") == logical_page_number:
@@ -1914,7 +1912,7 @@ def run_generate_files(scan_pk: int) -> None:
 
         scan.refresh_from_db()
         existing_opinions = (
-            json.loads(scan.opinions_json) if scan.opinions_json else []
+            scan.opinions_json
         )
 
         if existing_opinions and "caption_page" in existing_opinions[0]:
@@ -1929,7 +1927,7 @@ def run_generate_files(scan_pk: int) -> None:
                 )
 
         scan.redacted_pdf_path = str(full_redacted) if full_redacted else ""
-        scan.opinions_json = json.dumps(existing_opinions)
+        scan.opinions_json = existing_opinions
         scan.stage = Stage.APPROVED
         scan.status = Status.APPROVED
         scan.s3_uploaded = False

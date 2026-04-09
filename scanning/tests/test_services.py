@@ -221,7 +221,7 @@ class TestRePairOpinions(TestCase):
             self.assertEqual(len(opinions), 3)
 
             scan.refresh_from_db()
-            stored = json.loads(scan.opinions_json)
+            stored = scan.opinions_json
             self.assertEqual(len(stored), 3)
 
 
@@ -534,7 +534,7 @@ class TestComputeRedactionsApiView(TestCase):
             _import_detections_from_json(scan.pk, tmpdir)
 
             # Set opinions_json so the view doesn't bail early
-            scan.opinions_json = json.dumps([{"dummy": True}])
+            scan.opinions_json = [{"dummy": True}]
             scan.save(update_fields=["opinions_json"])
 
             response = self.client.post(
@@ -556,7 +556,7 @@ class TestServeOpinions(TestCase):
         opinions_data = [{"caption_page": 0, "key_page": 0}]
         scan = ScanFactory(
             uploaded_by=user,
-            opinions_json=json.dumps(opinions_data),
+            opinions_json=opinions_data,
         )
         response = self.client.get(f"/scans/{scan.pk}/opinions-json/")
         self.assertEqual(response.status_code, 200)
@@ -725,7 +725,7 @@ class TestSmartEditEndToEnd(TestCase):
             scan.refresh_from_db()
 
             missing = (
-                json.loads(scan.missing_pages) if scan.missing_pages else []
+                scan.missing_pages
             )
             print(f"  Missing pages identified: {missing}")
 
@@ -760,7 +760,7 @@ class TestSmartEditEndToEnd(TestCase):
 
             # --- Step 6: Verify all 23 page numbers are detected ---
             ocr_results = (
-                json.loads(scan.ocr_results) if scan.ocr_results else []
+                scan.ocr_results
             )
             detected_nums = set()
             for r in ocr_results:
@@ -785,7 +785,7 @@ class TestSmartEditEndToEnd(TestCase):
 
             # No issues remaining
             final_missing = (
-                json.loads(scan.missing_pages) if scan.missing_pages else []
+                scan.missing_pages
             )
             self.assertEqual(
                 final_missing,

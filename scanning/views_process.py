@@ -53,7 +53,7 @@ def scan_process_view(request, pk):
                 check_name="suppress_detection"
             ).exists()
             has_missing = bool(
-                scan.missing_pages and json.loads(scan.missing_pages)
+                scan.missing_pages
             )
             if has_issues or has_missing:
                 step = 1
@@ -65,9 +65,9 @@ def scan_process_view(request, pk):
     issues = scan.issues.all()
     inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
 
-    page_map = json.loads(scan.page_map) if scan.page_map else []
+    page_map = scan.page_map
     missing_pages = (
-        json.loads(scan.missing_pages) if scan.missing_pages else []
+        scan.missing_pages
     )
 
     for entry in page_map:
@@ -85,7 +85,7 @@ def scan_process_view(request, pk):
         set(i.page_number for i in issues if i.page_number is not None)
     )
 
-    ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+    ocr_results = scan.ocr_results
     ocr_by_page = {}
     for r in ocr_results:
         ocr_by_page[r["pdf_page"]] = r
@@ -114,7 +114,7 @@ def scan_process_view(request, pk):
 
     has_pending_changes = scan.deletions.exists() or scan.inserts.exists()
 
-    opinions = json.loads(scan.opinions_json) if scan.opinions_json else []
+    opinions = scan.opinions_json
 
     # Build a set of page indices that contain IMAGE detections
     image_page_indices = set(
@@ -138,7 +138,7 @@ def scan_process_view(request, pk):
     # Find HEADNOTE detections not covered by headnote redaction rects
     uncovered_hn_pages = set()
     if has_redaction_rects:
-        rects_data = json.loads(scan.redaction_rects)
+        rects_data = scan.redaction_rects
         hn_rects_by_page = {}
         for entry in rects_data:
             hn_rects_by_page[entry["page_index"]] = [
@@ -387,7 +387,7 @@ def progress_api(request, pk):
     # Include ocr_results when available so the frontend can render
     # the pages sidebar live without a full page reload.
     if scan.ocr_results:
-        data["ocr_results"] = json.loads(scan.ocr_results)
+        data["ocr_results"] = scan.ocr_results
     return JsonResponse(data)
 
 
@@ -565,7 +565,7 @@ def assign_page(request, pk):
     data = json.loads(request.body)
     pdf_page = data["pdf_page"]
     page_number = data["page_number"]
-    ocr_results = json.loads(scan.ocr_results) if scan.ocr_results else []
+    ocr_results = scan.ocr_results
     for r in ocr_results:
         if r["pdf_page"] == pdf_page:
             r["detected"] = page_number
@@ -574,7 +574,7 @@ def assign_page(request, pk):
             r["score"] = 1.0
             r["ocr"] = "manual"
             break
-    scan.ocr_results = json.dumps(ocr_results)
+    scan.ocr_results = ocr_results
     scan.issues.filter(
         check_name="no_page_number", page_number=pdf_page
     ).delete()

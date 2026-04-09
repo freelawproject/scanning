@@ -419,35 +419,35 @@ class Scan(AbstractDateTimeModel):
         default="",
         help_text="Captured stdout from processing.",
     )
-    ocr_results = models.TextField(
+    ocr_results = models.JSONField(
+        default=list,
         blank=True,
-        default="",
-        help_text="JSON: per-page OCR detection results.",
+        help_text="Per-page OCR detection results.",
     )
-    opinions_json = models.TextField(
+    opinions_json = models.JSONField(
+        default=list,
         blank=True,
-        default="",
-        help_text="JSON: opinion boundary data.",
+        help_text="Opinion boundary data.",
     )
-    page_map = models.TextField(
+    page_map = models.JSONField(
+        default=list,
         blank=True,
-        default="",
-        help_text="JSON: viewer page sequence.",
+        help_text="Viewer page sequence.",
     )
-    missing_pages = models.TextField(
+    missing_pages = models.JSONField(
+        default=list,
         blank=True,
-        default="",
-        help_text="JSON: list of missing logical page numbers.",
+        help_text="List of missing logical page numbers.",
     )
-    margin_rects = models.TextField(
+    margin_rects = models.JSONField(
+        default=list,
         blank=True,
-        default="",
-        help_text="JSON: per-page margin rects in PDF points.",
+        help_text="Per-page margin rects in PDF points.",
     )
-    redaction_rects = models.TextField(
+    redaction_rects = models.JSONField(
+        default=list,
         blank=True,
-        default="",
-        help_text="JSON: per-page redaction rects in image pixels.",
+        help_text="Per-page redaction rects in image pixels.",
     )
     page_count = models.PositiveIntegerField(default=0)
     has_issues = models.BooleanField(default=False)
@@ -706,10 +706,10 @@ class Detection(AbstractDateTimeModel):
     img_height = models.PositiveIntegerField(default=0)
     model_name = models.CharField(max_length=20, blank=True, default="")
     model_count = models.PositiveSmallIntegerField(default=1)
-    found_by = models.TextField(
+    found_by = models.JSONField(
+        default=list,
         blank=True,
-        default="",
-        help_text="JSON: per-model confidence breakdown.",
+        help_text="Per-model confidence breakdown.",
     )
     active = models.BooleanField(default=True)
 

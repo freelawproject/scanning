@@ -69,7 +69,7 @@ def serve_opinions(request, pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.opinions_json:
-        return JsonResponse(json.loads(scan.opinions_json), safe=False)
+        return JsonResponse(scan.opinions_json, safe=False)
     return JsonResponse([], safe=False)
 
 
@@ -83,7 +83,7 @@ def serve_margin_rects(request, pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.margin_rects:
-        return JsonResponse(json.loads(scan.margin_rects), safe=False)
+        return JsonResponse(scan.margin_rects, safe=False)
     output_base = Path(scan.output_dir)
     ocr_pdf = find_ocr_pdf(output_base) if output_base.is_dir() else None
     if not ocr_pdf:
@@ -94,7 +94,7 @@ def serve_margin_rects(request, pk):
 
     rects = compute_margin_rects(ocr_pdf)
     rects = _adjust_margins_for_detections(rects, output_base)
-    Scan.objects.filter(pk=pk).update(margin_rects=json.dumps(rects))
+    Scan.objects.filter(pk=pk).update(margin_rects=rects)
     return JsonResponse(rects, safe=False)
 
 
@@ -108,7 +108,7 @@ def serve_redaction_rects(request, pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.redaction_rects:
-        return JsonResponse(json.loads(scan.redaction_rects), safe=False)
+        return JsonResponse(scan.redaction_rects, safe=False)
     return JsonResponse([], safe=False)
 
 
@@ -132,7 +132,7 @@ def save_redaction_rect(request, pk):
     fill = data.get("fill", "black")
     if not scan.redaction_rects:
         return JsonResponse({"error": "No redaction rects"}, status=404)
-    rects = json.loads(scan.redaction_rects)
+    rects = scan.redaction_rects
     if action == "delete":
         for page_data in rects:
             if page_data["page_index"] != page_idx:
@@ -147,7 +147,7 @@ def save_redaction_rect(request, pk):
                 )
             ]
             break
-        Scan.objects.filter(pk=pk).update(redaction_rects=json.dumps(rects))
+        Scan.objects.filter(pk=pk).update(redaction_rects=rects)
         return JsonResponse({"status": "ok", "action": "deleted"})
     found = False
     for page_data in rects:
@@ -182,7 +182,7 @@ def save_redaction_rect(request, pk):
                 )
                 found = True
                 break
-    Scan.objects.filter(pk=pk).update(redaction_rects=json.dumps(rects))
+    Scan.objects.filter(pk=pk).update(redaction_rects=rects)
     return JsonResponse({"status": "ok", "found": found})
 
 
@@ -204,7 +204,7 @@ def save_margin_rect(request, pk):
     adjusted = data.get("adjusted", {})
     if not scan.margin_rects:
         return JsonResponse({"error": "No margin rects"}, status=404)
-    rects = json.loads(scan.margin_rects)
+    rects = scan.margin_rects
     if action == "delete":
         for page_data in rects:
             if page_data["page_index"] != page_idx:
@@ -218,7 +218,7 @@ def save_margin_rect(request, pk):
                 )
             ]
             break
-        Scan.objects.filter(pk=pk).update(margin_rects=json.dumps(rects))
+        Scan.objects.filter(pk=pk).update(margin_rects=rects)
         return JsonResponse({"status": "ok", "action": "deleted"})
     found = False
     for page_data in rects:
@@ -237,7 +237,7 @@ def save_margin_rect(request, pk):
                 break
         if found:
             break
-    Scan.objects.filter(pk=pk).update(margin_rects=json.dumps(rects))
+    Scan.objects.filter(pk=pk).update(margin_rects=rects)
     return JsonResponse({"status": "ok", "found": found})
 
 
@@ -276,7 +276,7 @@ def pair_opinions_api(request, pk):
             volume=str(scan.volume),
             first_page=scan.start_page or 1,
         )
-        scan.opinions_json = json.dumps(opinions)
+        scan.opinions_json = opinions
         scan.s3_uploaded = False
         scan.save()
         gaps = []
@@ -543,7 +543,7 @@ def serve_ocr_results(request, pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.ocr_results:
-        return JsonResponse(json.loads(scan.ocr_results), safe=False)
+        return JsonResponse(scan.ocr_results, safe=False)
     return JsonResponse([], safe=False)
 
 
@@ -718,7 +718,7 @@ def add_single_detection(request, pk):
                 img_height=det.get("img_height", 0),
                 model_name="manual",
                 model_count=1,
-                found_by=json.dumps([{"model": "manual", "confidence": 1.0}]),
+                found_by=[{"model": "manual", "confidence": 1.0}],
             )
         except Exception:
             pass
@@ -813,7 +813,7 @@ def export_pdf(request, pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     pdf_doc = fitz.open(scan.pdf_path)
-    page_map = json.loads(scan.page_map) if scan.page_map else []
+    page_map = scan.page_map
     deleted_pages = set(d.pdf_page for d in scan.deletions.all())
     for pdf_page in sorted(deleted_pages, reverse=True):
         pdf_index = pdf_page - 1

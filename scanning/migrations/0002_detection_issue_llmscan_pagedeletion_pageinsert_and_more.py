@@ -58,10 +58,10 @@ class Migration(migrations.Migration):
                 ("model_count", models.PositiveSmallIntegerField(default=1)),
                 (
                     "found_by",
-                    models.TextField(
+                    models.JSONField(
                         blank=True,
-                        default="",
-                        help_text="JSON: per-model confidence breakdown.",
+                        default=list,
+                        help_text="Per-model confidence breakdown.",
                     ),
                 ),
                 ("active", models.BooleanField(default=True)),
@@ -412,35 +412,35 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name="scan",
             name="margin_rects",
-            field=models.TextField(
+            field=models.JSONField(
                 blank=True,
-                default="",
-                help_text="JSON: per-page margin rects in PDF points.",
+                default=list,
+                help_text="Per-page margin rects in PDF points.",
             ),
         ),
         migrations.AddField(
             model_name="scan",
             name="missing_pages",
-            field=models.TextField(
+            field=models.JSONField(
                 blank=True,
-                default="",
-                help_text="JSON: list of missing logical page numbers.",
+                default=list,
+                help_text="List of missing logical page numbers.",
             ),
         ),
         migrations.AddField(
             model_name="scan",
             name="ocr_results",
-            field=models.TextField(
+            field=models.JSONField(
                 blank=True,
-                default="",
-                help_text="JSON: per-page OCR detection results.",
+                default=list,
+                help_text="Per-page OCR detection results.",
             ),
         ),
         migrations.AddField(
             model_name="scan",
             name="opinions_json",
-            field=models.TextField(
-                blank=True, default="", help_text="JSON: opinion boundary data."
+            field=models.JSONField(
+                blank=True, default=list, help_text="Opinion boundary data."
             ),
         ),
         migrations.AddField(
@@ -451,8 +451,8 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name="scan",
             name="page_map",
-            field=models.TextField(
-                blank=True, default="", help_text="JSON: viewer page sequence."
+            field=models.JSONField(
+                blank=True, default=list, help_text="Viewer page sequence."
             ),
         ),
         migrations.AddField(
@@ -506,10 +506,10 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name="scan",
             name="redaction_rects",
-            field=models.TextField(
+            field=models.JSONField(
                 blank=True,
-                default="",
-                help_text="JSON: per-page redaction rects in image pixels.",
+                default=list,
+                help_text="Per-page redaction rects in image pixels.",
             ),
         ),
         migrations.AddField(
