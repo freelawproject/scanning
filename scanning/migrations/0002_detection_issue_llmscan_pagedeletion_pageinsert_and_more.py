@@ -99,7 +99,7 @@ class Migration(migrations.Migration):
                     ),
                 ),
                 ("page_number", models.PositiveIntegerField(blank=True, null=True)),
-                ("check_name", models.CharField(max_length=100)),
+                ("check_name", models.CharField(choices=[("no_page_number", "No page number detected"), ("missing_page", "Missing page in sequence"), ("duplicate_page", "Duplicate page number"), ("backward_page", "Page number goes backward"), ("large_gap", "Large gap in page numbers"), ("suspicious_reading", "Suspicious OCR reading"), ("page_range", "Page range detected"), ("mislabeled_document", "Mislabeled document type"), ("auto_corrected", "Auto-corrected page number"), ("blank_page", "Blank page detected"), ("orientation", "Page orientation issue"), ("process_flag", "User-flagged issue"), ("suppress_detection", "Suppress a detection"), ("add_detection", "Add a detection"), ("approve_detection", "Approve a detection")], max_length=100)),
                 (
                     "severity",
                     models.CharField(

@@ -17,6 +17,7 @@ from django.views.decorators.http import require_POST
 
 from scanning import services
 from scanning.models import (
+    CheckName,
     Detection,
     Issue,
     OpinionScan,
@@ -50,7 +51,7 @@ def scan_process_view(request, pk):
         elif scan.stage == Stage.PROCESS or scan.opinions_json:
             # Stay on step 1 if there are unresolved issues
             has_issues = scan.issues.exclude(
-                check_name="suppress_detection"
+                check_name=CheckName.SUPPRESS_DETECTION
             ).exists()
             has_missing = bool(scan.missing_pages)
             if has_issues or has_missing:
@@ -191,7 +192,7 @@ def scan_process_view(request, pk):
     if step >= 2 and opinions:
         # Build suppressed set from issues
         suppressed = set()
-        for iss in scan.issues.filter(check_name="suppress_detection"):
+        for iss in scan.issues.filter(check_name=CheckName.SUPPRESS_DETECTION):
             if iss.metadata:
                 try:
                     m = json.loads(iss.metadata)
@@ -572,7 +573,7 @@ def assign_page(request, pk):
             break
     scan.ocr_results = ocr_results
     scan.issues.filter(
-        check_name="no_page_number", page_number=pdf_page
+        check_name=CheckName.NO_PAGE_NUMBER, page_number=pdf_page
     ).delete()
     if not scan.issues.exists():
         scan.has_issues = False

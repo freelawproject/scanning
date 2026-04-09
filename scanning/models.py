@@ -647,6 +647,29 @@ class OpinionScan(AbstractDateTimeModel):
         )
 
 
+class CheckName(models.TextChoices):
+    """Types of validation and processing checks."""
+
+    # Page number validation (from blackletter)
+    NO_PAGE_NUMBER = "no_page_number", "No page number detected"
+    MISSING_PAGE = "missing_page", "Missing page in sequence"
+    DUPLICATE_PAGE = "duplicate_page", "Duplicate page number"
+    BACKWARD_PAGE = "backward_page", "Page number goes backward"
+    LARGE_GAP = "large_gap", "Large gap in page numbers"
+    SUSPICIOUS_READING = "suspicious_reading", "Suspicious OCR reading"
+    PAGE_RANGE = "page_range", "Page range detected"
+    MISLABELED_DOCUMENT = "mislabeled_document", "Mislabeled document type"
+    AUTO_CORRECTED = "auto_corrected", "Auto-corrected page number"
+    BLANK_PAGE = "blank_page", "Blank page detected"
+    ORIENTATION = "orientation", "Page orientation issue"
+
+    # User actions (from scanning views)
+    PROCESS_FLAG = "process_flag", "User-flagged issue"
+    SUPPRESS_DETECTION = "suppress_detection", "Suppress a detection"
+    ADD_DETECTION = "add_detection", "Add a detection"
+    APPROVE_DETECTION = "approve_detection", "Approve a detection"
+
+
 class Issue(AbstractDateTimeModel):
     """A validation or processing issue found in a scan."""
 
@@ -661,7 +684,10 @@ class Issue(AbstractDateTimeModel):
         related_name="issues",
     )
     page_number = models.PositiveIntegerField(null=True, blank=True)
-    check_name = models.CharField(max_length=100)
+    check_name = models.CharField(
+        max_length=100,
+        choices=CheckName.choices,
+    )
     severity = models.CharField(
         max_length=10,
         choices=Severity.choices,

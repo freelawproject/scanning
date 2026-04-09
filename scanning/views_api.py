@@ -20,6 +20,7 @@ from django.shortcuts import get_object_or_404, redirect
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
+    CheckName,
     Detection,
     Issue,
     OpinionScan,
@@ -566,13 +567,14 @@ def flag_issue(request, pk):
         return JsonResponse(
             {"status": "error", "message": "Message required"}, status=400
         )
-    check_name = "process_flag"
-    if metadata.get("type") == "suppress_detection":
-        check_name = "suppress_detection"
-    elif metadata.get("type") == "add_detection":
-        check_name = "add_detection"
-    elif metadata.get("type") == "approve_detection":
-        check_name = "approve_detection"
+    type_to_check = {
+        "suppress_detection": CheckName.SUPPRESS_DETECTION,
+        "add_detection": CheckName.ADD_DETECTION,
+        "approve_detection": CheckName.APPROVE_DETECTION,
+    }
+    check_name = type_to_check.get(
+        metadata.get("type", ""), CheckName.PROCESS_FLAG
+    )
     issue = Issue.objects.create(
         scan=scan,
         page_number=page,
@@ -599,10 +601,10 @@ def remove_flag(request, pk, flag_id):
         pk=flag_id,
         scan=scan,
         check_name__in=[
-            "process_flag",
-            "suppress_detection",
-            "add_detection",
-            "approve_detection",
+            CheckName.PROCESS_FLAG,
+            CheckName.SUPPRESS_DETECTION,
+            CheckName.ADD_DETECTION,
+            CheckName.APPROVE_DETECTION,
         ],
     ).delete()
     return JsonResponse({"status": "ok"})

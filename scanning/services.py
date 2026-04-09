@@ -51,6 +51,7 @@ from django.conf import settings
 from django.db.models import F
 
 from scanning.models import (
+    CheckName,
     Detection,
     Issue,
     LLMScan,
@@ -1410,7 +1411,7 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
     scan.save()
 
     Issue.objects.filter(scan=scan).exclude(
-        check_name="suppress_detection"
+        check_name=CheckName.SUPPRESS_DETECTION
     ).delete()
     Issue.objects.bulk_create(
         [Issue(scan=scan, **d) for d in result.get("issues", [])]
