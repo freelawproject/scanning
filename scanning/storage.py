@@ -38,11 +38,43 @@ class LocalProcessingStorage(FileSystemStorage):
 
     Ensures .path works regardless of the default storage backend,
     so the daemon pipeline can use fitz.open(), Path(), etc.
+
+    Reads ``MEDIA_ROOT`` lazily so that ``@override_settings`` in
+    tests is respected.
     """
 
     def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @property
+    def base_location(self):
+        """Return MEDIA_ROOT at access time, not import time.
+
+        :return: The current MEDIA_ROOT setting.
+        :rtype: str
+        """
         from django.conf import settings
 
-        kwargs.setdefault("location", settings.MEDIA_ROOT)
-        kwargs.setdefault("base_url", settings.MEDIA_URL)
-        super().__init__(**kwargs)
+        return settings.MEDIA_ROOT
+
+    @property
+    def location(self):
+        """Return the absolute path to MEDIA_ROOT.
+
+        :return: The resolved MEDIA_ROOT path.
+        :rtype: str
+        """
+        import os
+
+        return os.path.abspath(self.base_location)
+
+    @property
+    def base_url(self):
+        """Return MEDIA_URL at access time, not import time.
+
+        :return: The current MEDIA_URL setting.
+        :rtype: str
+        """
+        from django.conf import settings
+
+        return settings.MEDIA_URL
