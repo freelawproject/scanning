@@ -23,6 +23,7 @@ from scanning.models import (
     OpinionScan,
     OpinionStatus,
     Priority,
+    QueuedAction,
     QueueStatus,
     Reporter,
     Scan,
@@ -522,7 +523,7 @@ def queue_upload(request, reporter_slug, vol):
     if action == "upload_validate":
         scan.status = Status.QUEUED
         scan.stage = Stage.VALIDATE
-        scan.queued_action = "full_pipeline"
+        scan.queued_action = QueuedAction.FULL_PIPELINE
         scan.progress_message = "Queued for processing..."
         scan.save()
         return redirect("scan_process", pk=scan.pk)

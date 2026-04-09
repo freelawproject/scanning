@@ -23,6 +23,7 @@ from scanning.models import (
     Detection,
     Issue,
     OpinionScan,
+    QueuedAction,
     Scan,
     Stage,
     Status,
@@ -365,7 +366,7 @@ def generate_files(request, pk):
         return redirect(f"/scans/{scan.pk}/process/?step=3")
     scan.stage = Stage.PROCESS
     scan.status = Status.QUEUED
-    scan.queued_action = "generate_files"
+    scan.queued_action = QueuedAction.GENERATE_FILES
     scan.s3_uploaded = False
     scan.progress_message = "Queued for file generation..."
     scan.save()

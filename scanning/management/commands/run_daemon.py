@@ -82,7 +82,7 @@ class Command(BaseCommand):
         from django.utils import timezone
 
         from scanning import services
-        from scanning.models import Scan, Status
+        from scanning.models import QueuedAction, Scan, Status
 
         # Close stale DB connections before each cycle
         connections.close_all()
@@ -95,7 +95,7 @@ class Command(BaseCommand):
         if scan is None:
             return
 
-        action = scan.queued_action or "full_pipeline"
+        action = scan.queued_action or QueuedAction.FULL_PIPELINE
         self.stdout.write(f"Processing scan {scan.pk} ({action})")
 
         Scan.objects.filter(pk=scan.pk).update(
@@ -107,11 +107,11 @@ class Command(BaseCommand):
         )
 
         dispatch = {
-            "full_pipeline": services.run_full_pipeline,
-            "validate": services.run_validate_with_bitonal,
-            "detect": services.run_detect,
-            "reprocess": services.run_reprocess,
-            "generate_files": services.run_generate_files,
+            QueuedAction.FULL_PIPELINE: services.run_full_pipeline,
+            QueuedAction.VALIDATE: services.run_validate_with_bitonal,
+            QueuedAction.DETECT: services.run_detect,
+            QueuedAction.REPROCESS: services.run_reprocess,
+            QueuedAction.GENERATE_FILES: services.run_generate_files,
         }
 
         fn = dispatch.get(action)

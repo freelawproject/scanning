@@ -22,6 +22,7 @@ from scanning.models import (
     OpinionScan,
     PageDeletion,
     PageInsert,
+    QueuedAction,
     Scan,
     Stage,
     Status,
@@ -457,7 +458,7 @@ def start_validate(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
     scan.status = Status.QUEUED
     scan.stage = Stage.VALIDATE
-    scan.queued_action = "full_pipeline"
+    scan.queued_action = QueuedAction.FULL_PIPELINE
     scan.s3_uploaded = False
     scan.progress_message = "Queued for processing..."
     scan.save()
@@ -480,7 +481,7 @@ def start_detect(request, pk):
 
     scan.status = Status.QUEUED
     scan.stage = Stage.PROCESS
-    scan.queued_action = "detect"
+    scan.queued_action = QueuedAction.DETECT
     scan.s3_uploaded = False
     scan.progress_message = "Queued for detection..."
     scan.save()
@@ -542,7 +543,7 @@ def reprocess(request, pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     scan.status = Status.QUEUED
-    scan.queued_action = "reprocess"
+    scan.queued_action = QueuedAction.REPROCESS
     scan.s3_uploaded = False
     scan.progress_message = "Queued for reprocessing..."
     scan.save()

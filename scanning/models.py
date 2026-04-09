@@ -26,6 +26,14 @@ class Stage(models.TextChoices):
     APPROVED = "approved", "Approved"
 
 
+class QueuedAction(models.TextChoices):
+    FULL_PIPELINE = "full_pipeline", "Full Pipeline"
+    VALIDATE = "validate", "Validate"
+    DETECT = "detect", "Detect"
+    REPROCESS = "reprocess", "Reprocess"
+    GENERATE_FILES = "generate_files", "Generate Files"
+
+
 class Priority(models.TextChoices):
     CRITICAL = "critical", "Critical"
     HIGH = "high", "High"
@@ -390,9 +398,10 @@ class Scan(AbstractDateTimeModel):
     processed_at = models.DateTimeField(null=True, blank=True)
     queued_action = models.CharField(
         max_length=30,
+        choices=QueuedAction.choices,
         blank=True,
         default="",
-        help_text="Action for daemon to run: full_pipeline, detect, reprocess, generate_files, validate.",
+        help_text="Action for the daemon to run when status is queued.",
     )
     notes = models.TextField(blank=True)
     output_dir = models.CharField(max_length=1024, blank=True, default="")
