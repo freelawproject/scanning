@@ -1404,7 +1404,7 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
     scan.missing_pages = result.get("missing_pages", [])
     scan.ocr_results = all_results
     scan.has_issues = len(result.get("issues", [])) > 0
-    scan.checked = True
+
     scan.status = Status.PENDING_REVIEW
     scan.s3_uploaded = False
     scan.progress_message = "Done"
