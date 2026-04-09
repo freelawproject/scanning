@@ -28,7 +28,7 @@ from scanning.models import (
     Stage,
     Status,
 )
-from scanning.utils import find_json_file, find_ocr_pdf, get_output_base
+from scanning.utils import find_json_file, find_ocr_pdf
 
 
 @login_required
@@ -84,7 +84,7 @@ def serve_margin_rects(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
     if scan.margin_rects:
         return JsonResponse(json.loads(scan.margin_rects), safe=False)
-    output_base = get_output_base(scan)
+    output_base = Path(scan.output_dir)
     ocr_pdf = find_ocr_pdf(output_base) if output_base.is_dir() else None
     if not ocr_pdf:
         return JsonResponse([], safe=False)
@@ -251,9 +251,9 @@ def pair_opinions_api(request, pk):
     :return: JSON response with paired opinions and coverage gaps.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    if not scan.output_dir:
+    output_dir = Path(scan.output_dir)
+    if not output_dir.is_dir():
         return JsonResponse({"error": "No output directory"}, status=400)
-    output_dir = get_output_base(scan)
     det_path = output_dir / "detections.json"
     from scanning.services import _sync_detections_to_disk
 
@@ -329,7 +329,7 @@ def compute_redactions_api(request, pk):
     )
 
     scan = get_object_or_404(Scan, pk=pk)
-    if not scan.output_dir:
+    if not Path(scan.output_dir).is_dir():
         return JsonResponse({"error": "No output directory"}, status=400)
     if not scan.opinions_json:
         return JsonResponse({"error": "No opinions paired yet"}, status=400)
@@ -523,8 +523,9 @@ def serve_redacted_pdf(request, pk):
         return FileResponse(
             open(scan.redacted_pdf_path, "rb"), content_type="application/pdf"
         )
-    if scan.output_dir:
-        for f in sorted(Path(scan.output_dir).glob("*.pdf")):
+    output = Path(scan.output_dir)
+    if output.is_dir():
+        for f in sorted(output.glob("*.pdf")):
             if "redacted" not in f.name and "bitonal" not in f.name:
                 return FileResponse(
                     open(f, "rb"), content_type="application/pdf"
@@ -639,7 +640,7 @@ def delete_detection(request, pk):
     qs = Detection.objects.filter(**db_filter)
     count = qs.update(active=False)
     # Remove from detections.json on disk
-    output_base = get_output_base(scan)
+    output_base = Path(scan.output_dir)
     det_path = find_json_file(output_base, "detections.json")
     if det_path:
         existing = json.loads(det_path.read_text())
@@ -669,7 +670,7 @@ def add_single_detection(request, pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     det = json.loads(request.body)
-    output_base = get_output_base(scan)
+    output_base = Path(scan.output_dir)
     det_path = find_json_file(output_base, "detections.json")
     if not det_path:
         return JsonResponse({"error": "No detections.json"}, status=404)
@@ -758,7 +759,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     count = Detection.objects.filter(**db_filter).update(confidence=1.0)
 
     # Update confidence in detections.json on disk
-    output_base = get_output_base(scan)
+    output_base = Path(scan.output_dir)
     det_path = find_json_file(output_base, "detections.json")
     if det_path:
         existing = json.loads(det_path.read_text())
@@ -793,7 +794,7 @@ def bake_redactions(request, pk):
     :return: JSON response with the bake result.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    if not scan.output_dir:
+    if not Path(scan.output_dir).is_dir():
         return JsonResponse(
             {"status": "error", "message": "No output dir"}, status=400
         )

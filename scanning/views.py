@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required
@@ -151,7 +150,7 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
 
     # Redirect to processing view if scan has processing data
-    if scan.stage and scan.output_dir:
+    if scan.stage and Path(scan.output_dir).is_dir():
         return redirect("scan_process", pk=scan.pk)
 
     opinion_count = scan.opinions.count()
@@ -489,17 +488,8 @@ def queue_upload(request, reporter_slug, vol):
     scan.save()  # Save first to get a PK
 
     # Create processing directory and save original PDF there
-
-    output_dir = (
-        Path(settings.MEDIA_ROOT)
-        / "processed"
-        / str(scan.pk)
-        / volume.reporter.short_name
-        / str(volume.volume_number)
-        / str(scan.start_page or 1)
-    )
+    output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    scan.output_dir = str(output_dir)
 
     original_name = (
         f"{volume.reporter.short_name}.{volume.volume_number}"
@@ -517,7 +507,7 @@ def queue_upload(request, reporter_slug, vol):
     # Reset the file pointer so .save() can read the full content.
     pdf.seek(0)
     scan.original_pdf.save(original_name, pdf, save=False)
-    scan.save(update_fields=["output_dir", "original_pdf"])
+    scan.save(update_fields=["original_pdf"])
 
     action = request.POST.get("action", "upload_only")
     if action == "upload_validate":

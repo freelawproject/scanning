@@ -400,7 +400,8 @@ def serve_scan_pdf(request, pk):
     :return: File response streaming the PDF.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.output_dir:
+    output = Path(scan.output_dir)
+    if output.is_dir():
         ocr = find_ocr_pdf(scan.output_dir)
         if ocr:
             return FileResponse(

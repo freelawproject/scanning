@@ -411,9 +411,9 @@ def _sync_detections_to_disk(scan_pk: int) -> list | None:
     :return: The detection data written, or None if no output_dir.
     """
     scan = Scan.objects.get(pk=scan_pk)
-    if not scan.output_dir:
-        return
     output_dir = Path(scan.output_dir)
+    if not output_dir.is_dir():
+        return
 
     # Build page_number lookup from ocr_results
     page_numbers = _page_number_lookup(scan)
@@ -985,8 +985,7 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
         ocr_results=json.dumps(all_results),
     )
 
-    if scan.output_dir:
-        _sync_detections_to_disk(scan_pk)
+    _sync_detections_to_disk(scan_pk)
 
     _rebuild_issues_from_results(scan_pk, all_results)
 
@@ -1929,7 +1928,6 @@ def run_generate_files(scan_pk: int) -> None:
                     {"filename": f.name, "first_page": 0, "last_page": 0}
                 )
 
-        scan.output_dir = str(output_dir)
         scan.redacted_pdf_path = str(full_redacted) if full_redacted else ""
         scan.opinions_json = json.dumps(existing_opinions)
         scan.stage = Stage.APPROVED
