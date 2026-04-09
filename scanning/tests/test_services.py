@@ -930,3 +930,53 @@ class TestUploadApprovedFiles(TestCase):
         self.assertEqual(mock_client.upload_file.call_count, 6)
         scan.refresh_from_db()
         self.assertTrue(scan.s3_uploaded)
+
+    @override_settings(
+        AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
+        DEVELOPMENT=False,
+    )
+    def test_cleanup_after_upload_in_prod(self):
+        """In prod, generated files are deleted after S3 upload."""
+        from unittest.mock import MagicMock, patch
+
+        from scanning.services import upload_approved_files
+
+        scan = self._make_scan_with_generated_files()
+        output = pathlib.Path(scan.output_dir)
+
+        env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
+        with (
+            patch.dict("os.environ", env),
+            patch("boto3.client", return_value=MagicMock()),
+        ):
+            upload_approved_files(scan.pk)
+
+        # Generated dirs should be gone
+        self.assertFalse((output / "redacted").exists())
+        self.assertFalse((output / "masked").exists())
+        # Processing files should remain
+        self.assertTrue(output.exists())
+
+    @override_settings(
+        AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
+        DEVELOPMENT=True,
+    )
+    def test_no_cleanup_in_dev(self):
+        """In dev, generated files are kept after S3 upload."""
+        from unittest.mock import MagicMock, patch
+
+        from scanning.services import upload_approved_files
+
+        scan = self._make_scan_with_generated_files()
+        output = pathlib.Path(scan.output_dir)
+
+        env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
+        with (
+            patch.dict("os.environ", env),
+            patch("boto3.client", return_value=MagicMock()),
+        ):
+            upload_approved_files(scan.pk)
+
+        # Everything should still be there in dev
+        self.assertTrue((output / "redacted").exists())
+        self.assertTrue((output / "masked").exists())

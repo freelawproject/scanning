@@ -2121,4 +2121,18 @@ def upload_approved_files(scan_pk: int) -> str:
         s3_uploaded=True,
         s3_path=s3_prefix,
     )
+
+    # In prod, clean up generated files now that they're on S3. Keep
+    # processing files (bitonal, OCR PDF, detections, stamped, images,
+    # original) so the viewer and reprocessing still work.
+    # In dev, keep everything for easier debugging.
+    if not settings.DEVELOPMENT:
+        import shutil
+
+        for d in [redacted_dir, masked_dir, output_dir / "unredacted"]:
+            if d.is_dir():
+                shutil.rmtree(d)
+        for f in output_dir.glob("*.redacted.pdf"):
+            f.unlink()
+
     return f"Files uploaded successfully to S3 ({len(files_to_upload)} files)."
