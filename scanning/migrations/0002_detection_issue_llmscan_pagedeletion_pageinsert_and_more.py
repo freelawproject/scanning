@@ -445,11 +445,6 @@ class Migration(migrations.Migration):
         ),
         migrations.AddField(
             model_name="scan",
-            name="output_dir",
-            field=models.CharField(blank=True, default="", max_length=1024),
-        ),
-        migrations.AddField(
-            model_name="scan",
             name="page_count",
             field=models.PositiveIntegerField(default=0),
         ),
@@ -497,8 +492,9 @@ class Migration(migrations.Migration):
             name="queued_action",
             field=models.CharField(
                 blank=True,
+                choices=[("full_pipeline", "Full Pipeline"), ("validate", "Validate"), ("detect", "Detect"), ("reprocess", "Reprocess"), ("generate_files", "Generate Files")],
                 default="",
-                help_text="Action for daemon to run: full_pipeline, detect, reprocess, generate_files, validate.",
+                help_text="Action for the daemon to run when status is queued.",
                 max_length=30,
             ),
         ),

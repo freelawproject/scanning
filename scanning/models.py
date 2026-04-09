@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import FileExtensionValidator, MinValueValidator
@@ -404,7 +406,6 @@ class Scan(AbstractDateTimeModel):
         help_text="Action for the daemon to run when status is queued.",
     )
     notes = models.TextField(blank=True)
-    output_dir = models.CharField(max_length=1024, blank=True, default="")
     stage = models.CharField(
         max_length=20,
         choices=Stage.choices,
@@ -511,6 +512,25 @@ class Scan(AbstractDateTimeModel):
             raise ValidationError(errors)
 
     @property
+    def output_dir(self) -> str:
+        """Return the local processing directory for this scan.
+
+        Computed from ``MEDIA_ROOT/processed/{pk}/{reporter}/{volume}/{start_page}/``.
+
+        :return: The absolute path to the output directory.
+        :rtype: str
+        """
+        path = Path(settings.MEDIA_ROOT) / "processed" / str(self.pk)
+        if self.reporter and self.volume:
+            path = (
+                path
+                / self.reporter.short_name
+                / str(self.volume)
+                / str(self.start_page or 1)
+            )
+        return str(path)
+
+    @property
     def pdf_path(self) -> str:
         """Return a local filesystem path to the original uploaded PDF.
 
@@ -523,8 +543,6 @@ class Scan(AbstractDateTimeModel):
         :rtype: str
         """
         if self.output_dir and self.original_pdf.name:
-            from pathlib import Path
-
             local = Path(self.output_dir) / Path(self.original_pdf.name).name
             if local.exists():
                 return str(local)

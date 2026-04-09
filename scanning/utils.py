@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from django.conf import settings
 from django.shortcuts import get_object_or_404
 
 from scanning.models import Scan, Volume
@@ -23,20 +22,6 @@ def get_volume(reporter_slug: str, vol: int) -> Volume:
         reporter__short_name=reporter_slug,
         volume_number=vol,
     )
-
-
-def get_output_base(scan: Scan) -> Path:
-    """Resolve the output directory for a scan.
-
-    Uses scan.output_dir if set, otherwise falls back to
-    MEDIA_ROOT/processed/<pk>.
-
-    :param scan: The Scan instance.
-    :return: The resolved output directory.
-    """
-    if scan.output_dir:
-        return Path(scan.output_dir)
-    return Path(settings.MEDIA_ROOT) / "processed" / str(scan.pk)
 
 
 def find_json_file(output_base: Path, filename: str) -> Path | None:
@@ -90,28 +75,14 @@ def has_s3_credentials() -> bool:
 
 
 def ensure_output_dir(scan: Scan) -> Path:
-    """Return the scan's output directory, creating it if necessary.
+    """Return the scan's output directory, creating it if it doesn't exist.
 
-    If the scan has no ``output_dir`` set, builds the path from
-    ``MEDIA_ROOT/processed/{pk}/{reporter}/{volume}/{start_page}/``
-    and persists it to the database.
+    The path is computed by ``Scan.output_dir`` (a property).
 
     :param scan: The Scan instance.
     :return: The output directory as a Path.
     :rtype: Path
     """
-    if not scan.output_dir:
-        output_dir = Path(settings.MEDIA_ROOT) / "processed" / str(scan.pk)
-        if scan.reporter and scan.volume:
-            output_dir = (
-                output_dir
-                / scan.reporter.short_name
-                / str(scan.volume)
-                / str(scan.start_page or 1)
-            )
-        output_dir.mkdir(parents=True, exist_ok=True)
-        Scan.objects.filter(pk=scan.pk).update(output_dir=str(output_dir))
-    else:
-        output_dir = Path(scan.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(scan.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
