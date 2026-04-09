@@ -1,8 +1,11 @@
 """Import scan queue from pdfchecker's scanlist.csv."""
 
 import csv
+import logging
 
 from django.core.management.base import BaseCommand
+
+logger = logging.getLogger(__name__)
 
 from scanning.models import (
     Priority,
@@ -71,14 +74,14 @@ class Command(BaseCommand):
 
                 reporter = reporters.get(slug)
                 if not reporter:
-                    self.stderr.write(f"Unknown reporter slug: {slug}")
+                    logger.error("Unknown reporter slug: %s", slug)
                     errors += 1
                     continue
 
                 # Parse volume number (strip trailing A/B/C)
                 vol_digits = "".join(c for c in volume_str if c.isdigit())
                 if not vol_digits:
-                    self.stderr.write(f"Bad volume: {volume_str}")
+                    logger.error("Bad volume: %s", volume_str)
                     errors += 1
                     continue
                 vol_num = int(vol_digits)
@@ -179,9 +182,7 @@ class Command(BaseCommand):
                     end_page=end,
                     notes=combined_notes,
                     source_library=source_library,
-                    status=Status.UPLOADED
-                    if queue_status == QueueStatus.COMPLETE
-                    else Status.UPLOADED,
+                    status=Status.UPLOADED,
                 )
                 scans_created += 1
 
