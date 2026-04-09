@@ -28,8 +28,12 @@ def _require_fixture(test_case):
         )
 
 
-def _make_scan_with_output(tmpdir, **kwargs):
-    """Create a scan pointing at the fixture PDF with a temp output_dir."""
+def _make_scan_with_output(tmpdir=None, **kwargs):
+    """Create a scan pointing at the fixture PDF.
+
+    Uses the scan's computed output_dir property. If tmpdir is provided
+    (legacy), creates a symlink from the computed path to it.
+    """
     scan = ScanFactory(
         start_page=1,
         end_page=1,
@@ -42,9 +46,17 @@ def _make_scan_with_output(tmpdir, **kwargs):
     pdf_dest = media_dir / f"scan_{scan.pk}.pdf"
     shutil.copy2(PDF_PATH, pdf_dest)
     scan.original_pdf.name = str(pdf_dest.relative_to(MEDIA_ROOT))
-    scan.output_dir = tmpdir
     scan.page_count = 1
-    scan.save(update_fields=["original_pdf", "output_dir", "page_count"])
+    scan.save(update_fields=["original_pdf", "page_count"])
+
+    # Create the computed output_dir
+    output = pathlib.Path(scan.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    # If a tmpdir was provided, copy fixture files there too
+    if tmpdir:
+        shutil.copy2(PDF_PATH, pathlib.Path(tmpdir) / "bitonal.pdf")
+        shutil.copy2(PDF_PATH, output / "bitonal.pdf")
     return scan
 
 
@@ -157,12 +169,17 @@ class TestSyncDetectionsToDisk(TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(tmpdir)
+            output = pathlib.Path(scan.output_dir)
             _run_detect_on_fixture(tmpdir)
             _import_detections_from_json(scan.pk, tmpdir)
 
-            # Delete the file and re-sync from DB
-            det_path = pathlib.Path(tmpdir) / "detections.json"
-            det_path.unlink()
+            # Delete the file from output_dir and re-sync from DB
+            det_path = output / "detections.json"
+            # Copy detections.json from tmpdir to output_dir first
+            src = pathlib.Path(tmpdir) / "detections.json"
+            if src.exists():
+                shutil.copy2(src, det_path)
+            det_path.unlink(missing_ok=True)
             self.assertFalse(det_path.exists())
 
             det_data = _sync_detections_to_disk(scan.pk)
@@ -170,12 +187,11 @@ class TestSyncDetectionsToDisk(TestCase):
             on_disk = json.loads(det_path.read_text())
             self.assertEqual(len(on_disk), len(det_data))
 
-    def test_returns_none_without_output_dir(self):
+    def test_returns_none_without_detections(self):
         from scanning.services import _sync_detections_to_disk
 
         scan = ScanFactory()
-        scan.output_dir = ""
-        scan.save(update_fields=["output_dir"])
+        # output_dir is computed but directory doesn't exist on disk
         result = _sync_detections_to_disk(scan.pk)
         self.assertIsNone(result)
 
@@ -483,9 +499,7 @@ class TestComputeRedactionsApiView(TestCase):
         user = UserFactory()
         self.client.force_login(user)
         scan = ScanFactory(uploaded_by=user)
-        scan.output_dir = ""
-        scan.save(update_fields=["output_dir"])
-
+        # output_dir is computed but the directory doesn't exist on disk
         response = self.client.post(f"/scans/{scan.pk}/compute-redactions/")
         self.assertEqual(response.status_code, 400)
         self.assertIn("error", response.json())
@@ -638,8 +652,12 @@ class TestSmartEditEndToEnd(TestCase):
         media_pdf = media_dir / f"scan_{scan.pk}.pdf"
         shutil.copy2(pdf_dest, media_pdf)
         scan.original_pdf.name = str(media_pdf.relative_to(MEDIA_ROOT))
-        scan.output_dir = tmpdir
-        scan.save(update_fields=["original_pdf", "output_dir", "page_count"])
+        scan.save(update_fields=["original_pdf", "page_count"])
+
+        # Create computed output_dir and copy PDF there
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(pdf_dest, output / pdf_dest.name)
         return scan
 
     def test_remove_detect_insert_revalidate(self):
@@ -688,14 +706,15 @@ class TestSmartEditEndToEnd(TestCase):
             # --- Step 2: Create scan + run YOLO detection on 20-page PDF ---
             scan = self._make_scan_23(damaged_path, tmpdir)
             self.assertEqual(scan.page_count, 20)
+            output_dir = scan.output_dir
 
             from blackletter.api import detect
 
             dets = detect(
-                str(damaged_path), tmpdir, models=["small", "medium", "large"]
+                str(damaged_path), output_dir, models=["small", "medium", "large"]
             )
             self.assertGreater(len(dets), 0)
-            _import_detections_from_json(scan.pk, tmpdir)
+            _import_detections_from_json(scan.pk, output_dir)
 
             det_count = Detection.objects.filter(scan=scan).count()
             self.assertGreater(det_count, 0)
@@ -781,13 +800,12 @@ class TestUploadApprovedFiles(TestCase):
 
     def _make_scan_with_generated_files(self):
         """Create a scan with a populated output_dir."""
-        tmpdir = tempfile.mkdtemp(dir=MEDIA_ROOT)
         scan = ScanFactory(start_page=1, end_page=95)
-        scan.output_dir = tmpdir
-        scan.save(update_fields=["output_dir"])
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
 
-        redacted_dir = pathlib.Path(tmpdir) / "redacted"
-        masked_dir = pathlib.Path(tmpdir) / "masked"
+        redacted_dir = output / "redacted"
+        masked_dir = output / "masked"
         redacted_dir.mkdir()
         masked_dir.mkdir()
 
@@ -796,22 +814,21 @@ class TestUploadApprovedFiles(TestCase):
             (masked_dir / name).write_bytes(b"%PDF-1.4 masked")
 
         short = scan.reporter.short_name
-        (
-            pathlib.Path(tmpdir) / f"{short}.{scan.volume}.1.95.original.pdf"
-        ).write_bytes(b"%PDF-1.4 original")
-        (
-            pathlib.Path(tmpdir) / f"{short}.{scan.volume}.1.95.redacted.pdf"
-        ).write_bytes(b"%PDF-1.4 redacted-full")
+        (output / f"{short}.{scan.volume}.1.95.original.pdf").write_bytes(
+            b"%PDF-1.4 original"
+        )
+        (output / f"{short}.{scan.volume}.1.95.redacted.pdf").write_bytes(
+            b"%PDF-1.4 redacted-full"
+        )
         return scan
 
     def test_missing_files_returns_error(self):
         """Return error message when redacted dir is missing."""
         from scanning.services import upload_approved_files
 
-        tmpdir = tempfile.mkdtemp(dir=MEDIA_ROOT)
         scan = ScanFactory(start_page=1, end_page=95)
-        scan.output_dir = tmpdir
-        scan.save(update_fields=["output_dir"])
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
 
         result = upload_approved_files(scan.pk)
         self.assertIn("Before approving", result)

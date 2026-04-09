@@ -612,13 +612,11 @@ class TestApproveScan(ScanningTestCase):
         import pathlib
 
         scan = ScanFactory(start_page=1, end_page=95)
-        tmpdir = pathlib.Path(MEDIA_ROOT) / f"processed_{scan.pk}"
-        tmpdir.mkdir(parents=True, exist_ok=True)
-        scan.output_dir = str(tmpdir)
-        scan.save(update_fields=["output_dir"])
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
 
-        redacted_dir = tmpdir / "redacted"
-        masked_dir = tmpdir / "masked"
+        redacted_dir = output / "redacted"
+        masked_dir = output / "masked"
         redacted_dir.mkdir()
         masked_dir.mkdir()
         (redacted_dir / "a.1.0001-0010.pdf").write_bytes(b"%PDF-1.4")
@@ -632,10 +630,8 @@ class TestApproveScan(ScanningTestCase):
         user = self.make_staff_user()
         self.client.force_login(user)
         scan = ScanFactory(start_page=1, end_page=95)
-        tmpdir = pathlib.Path(MEDIA_ROOT) / f"empty_{scan.pk}"
-        tmpdir.mkdir(parents=True, exist_ok=True)
-        scan.output_dir = str(tmpdir)
-        scan.save(update_fields=["output_dir"])
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
 
         response = self.client.post(
             reverse("approve_scan", kwargs={"pk": scan.pk}),
