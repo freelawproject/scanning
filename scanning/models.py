@@ -321,7 +321,7 @@ class opinion_pdf_path:
 class Scan(AbstractDateTimeModel):
     volume_obj = models.ForeignKey(
         Volume,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         null=True,
         blank=True,
         related_name="scans",

@@ -712,7 +712,7 @@ class Migration(migrations.Migration):
                 blank=True,
                 help_text="The Volume this scan belongs to.",
                 null=True,
-                on_delete=django.db.models.deletion.CASCADE,
+                on_delete=django.db.models.deletion.PROTECT,
                 related_name="scans",
                 to="scanning.volume",
             ),
