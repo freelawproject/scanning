@@ -970,7 +970,7 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
                     y1=d["bbox"][3],
                     img_width=img_w,
                     img_height=img_h,
-                    model_name="large",
+                    model_name=Detection.ModelName.LARGE,
                     model_count=1,
                     found_by=[
                         {"model": "large", "confidence": d["confidence"]}

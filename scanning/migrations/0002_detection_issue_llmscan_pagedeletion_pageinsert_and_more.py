@@ -54,7 +54,7 @@ class Migration(migrations.Migration):
                 ("y1", models.FloatField()),
                 ("img_width", models.PositiveIntegerField(default=0)),
                 ("img_height", models.PositiveIntegerField(default=0)),
-                ("model_name", models.CharField(blank=True, default="", max_length=20)),
+                ("model_name", models.CharField(blank=True, choices=[("small", "Small"), ("medium", "Medium"), ("large", "Large"), ("manual", "Manual")], default="", max_length=20)),
                 ("model_count", models.PositiveSmallIntegerField(default=1)),
                 (
                     "found_by",

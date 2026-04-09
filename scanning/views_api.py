@@ -697,7 +697,7 @@ def add_single_detection(request, pk):
                 x0__lte=det["bbox"][0] + 15,
                 y0__gte=det["bbox"][1] - 15,
                 y0__lte=det["bbox"][1] + 15,
-            ).update(confidence=1.0, model_name="approved")
+            ).update(confidence=1.0)
             break
     if not boosted:
         det["confidence"] = 1.0
@@ -718,7 +718,7 @@ def add_single_detection(request, pk):
                 y1=det["bbox"][3],
                 img_width=det.get("img_width", 0),
                 img_height=det.get("img_height", 0),
-                model_name="manual",
+                model_name=Detection.ModelName.MANUAL,
                 model_count=1,
                 found_by=[{"model": "manual", "confidence": 1.0}],
             )

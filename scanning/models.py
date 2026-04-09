@@ -720,6 +720,15 @@ class Detection(AbstractDateTimeModel):
         on_delete=models.CASCADE,
         related_name="detections",
     )
+
+    class ModelName(models.TextChoices):
+        """YOLO model tier or source of the detection."""
+
+        SMALL = "small", "Small"
+        MEDIUM = "medium", "Medium"
+        LARGE = "large", "Large"
+        MANUAL = "manual", "Manual"
+
     page_index = models.PositiveIntegerField(db_index=True)
     label = models.CharField(max_length=50)
     label_id = models.SmallIntegerField()
@@ -730,7 +739,12 @@ class Detection(AbstractDateTimeModel):
     y1 = models.FloatField()
     img_width = models.PositiveIntegerField(default=0)
     img_height = models.PositiveIntegerField(default=0)
-    model_name = models.CharField(max_length=20, blank=True, default="")
+    model_name = models.CharField(
+        max_length=20,
+        choices=ModelName.choices,
+        blank=True,
+        default="",
+    )
     model_count = models.PositiveSmallIntegerField(default=1)
     found_by = models.JSONField(
         default=list,
