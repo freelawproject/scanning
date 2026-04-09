@@ -52,9 +52,7 @@ def scan_process_view(request, pk):
             has_issues = scan.issues.exclude(
                 check_name="suppress_detection"
             ).exists()
-            has_missing = bool(
-                scan.missing_pages
-            )
+            has_missing = bool(scan.missing_pages)
             if has_issues or has_missing:
                 step = 1
             else:
@@ -66,9 +64,7 @@ def scan_process_view(request, pk):
     inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
 
     page_map = scan.page_map
-    missing_pages = (
-        scan.missing_pages
-    )
+    missing_pages = scan.missing_pages
 
     for entry in page_map:
         if entry["type"] == "missing" and entry["logical_number"] in inserts:
