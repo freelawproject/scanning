@@ -450,7 +450,6 @@ class Scan(AbstractDateTimeModel):
         help_text="Per-page redaction rects in image pixels.",
     )
     page_count = models.PositiveIntegerField(default=0)
-    has_issues = models.BooleanField(default=False)
     redacted_pdf_path = models.CharField(
         max_length=1024, blank=True, default=""
     )

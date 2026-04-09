@@ -1175,7 +1175,7 @@ def recalculate_issues(scan: "Scan") -> None:
 
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
-    scan.has_issues = len(result["issues"]) > 0
+
     scan.status = Status.PENDING_REVIEW
     scan.s3_uploaded = False
     scan.progress_message = "Done"
@@ -1403,7 +1403,6 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
     scan.page_map = result.get("page_map", [])
     scan.missing_pages = result.get("missing_pages", [])
     scan.ocr_results = all_results
-    scan.has_issues = len(result.get("issues", [])) > 0
 
     scan.status = Status.PENDING_REVIEW
     scan.s3_uploaded = False

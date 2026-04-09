@@ -575,8 +575,6 @@ def assign_page(request, pk):
     scan.issues.filter(
         check_name=CheckName.NO_PAGE_NUMBER, page_number=pdf_page
     ).delete()
-    if not scan.issues.exists():
-        scan.has_issues = False
     scan.save()
     return JsonResponse({"status": "ok"})
 
@@ -650,9 +648,6 @@ def dismiss_issue(request, pk):
     data = json.loads(request.body)
     issue_id = data.get("issue_id")
     Issue.objects.filter(pk=issue_id, scan=scan).delete()
-    if not scan.issues.exists():
-        scan.has_issues = False
-        scan.save()
     return JsonResponse({"status": "ok"})
 
 
@@ -667,6 +662,5 @@ def dismiss_issues(request, pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     scan.issues.all().delete()
-    scan.has_issues = False
     scan.save()
     return redirect("scan_list")
