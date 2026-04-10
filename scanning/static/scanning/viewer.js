@@ -225,8 +225,9 @@ document.addEventListener('DOMContentLoaded', function () {
             '<div class="page-label">' +
             '  <span>PDF p.' + pdfPage + (ocrLabel ? ' &rarr; ' + ocrLabel : '') + '</span>' +
             '  <span class="page-tools">' +
-            '    <button class="redact-btn" data-fill="black" title="Draw a black redaction">Redact</button>' +
-            '    <button class="whiteout-btn" data-fill="white" title="Draw a white redaction">Whiteout</button>' +
+            // Redact/whiteout buttons are only functional in step 2 (process_viewer.js)
+            // '    <button class="redact-btn" data-fill="black" title="Draw a black redaction">Redact</button>' +
+            // '    <button class="whiteout-btn" data-fill="white" title="Draw a white redaction">Whiteout</button>' +
             '    <button class="delete-btn" title="Delete this page">Delete</button>' +
             '  </span>' +
             '</div>' +
@@ -236,14 +237,18 @@ document.addEventListener('DOMContentLoaded', function () {
             '</div>';
 
         var redactBtn = div.querySelector('.redact-btn');
-        redactBtn.addEventListener('click', function () {
-            toggleRedactionMode(div, logicalNumber, 'black');
-        });
+        if (redactBtn) {
+            redactBtn.addEventListener('click', function () {
+                toggleRedactionMode(div, logicalNumber, 'black');
+            });
+        }
 
         var whiteoutBtn = div.querySelector('.whiteout-btn');
-        whiteoutBtn.addEventListener('click', function () {
-            toggleRedactionMode(div, logicalNumber, 'white');
-        });
+        if (whiteoutBtn) {
+            whiteoutBtn.addEventListener('click', function () {
+                toggleRedactionMode(div, logicalNumber, 'white');
+            });
+        }
 
         var editBtn = div.querySelector('.editable-page');
         if (editBtn) {
