@@ -29,7 +29,7 @@ document.addEventListener('DOMContentLoaded', function () {
         return _pageIndexToLogical[pageIndex] || (pageIndex + 1);
     }
     function _pageIndexForNum(pageNum) {
-        return (_logicalToPageIndex[pageNum] !== undefined) ? _logicalToPageIndex[pageNum] : (_pageIndexForNum(pageNum));
+        return (_logicalToPageIndex[pageNum] !== undefined) ? _logicalToPageIndex[pageNum] : (pageNum - 1);
     }
 
     var viewerPanel = container.closest('.viewer-panel') || container.parentElement;
