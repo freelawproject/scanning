@@ -140,8 +140,9 @@
            {% if issue.severity == 'error' %}border-red-300 bg-red-50 dark:border-red-700 dark:bg-red-900/20{% elif issue.severity == 'warning' %}border-yellow-300 bg-yellow-50 dark:border-yellow-700 dark:bg-yellow-900/20{% else %}border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-blue-900/20{% endif %}"
            data-message="{{ issue.message }}"
            data-check="{{ issue.check_name }}"
-           {% if issue.check_name == 'duplicate_page' and issue.page_number %}onclick="if(window.showDuplicates) showDuplicates({{ issue.page_number }}); else goToPage({{ issue.page_number }})"
-           {% elif issue.page_number %}onclick="goToPage({{ issue.page_number }})"{% endif %}>
+           {% if issue.page_number %}data-page="{{ issue.page_number }}"{% endif %}
+           {% if issue.check_name == 'duplicate_page' and issue.page_number %}onclick="if(window.showDuplicates) showDuplicates(this.dataset.page); else goToPage(this)"
+           {% elif issue.page_number %}onclick="goToPage(this)"{% endif %}>
         <div class="flex items-center gap-1.5">
           <span class="font-bold uppercase text-[10px]">{{ issue.get_severity_display }}</span>
           {% if issue.page_number %}<span class="text-gray-500">Page {{ issue.page_number }}</span>{% endif %}
@@ -198,7 +199,7 @@
            {% elif r.seq_issue == 'duplicate' %}bg-orange-100 dark:bg-orange-900/30 border border-orange-300 dark:border-orange-700
            {% elif r.seq_issue == 'gap' %}bg-yellow-100 dark:bg-yellow-900/30 border border-yellow-300 dark:border-yellow-700
            {% else %}bg-green-50 dark:bg-green-900/20{% endif %}"
-           onclick="goToPage({{ r.pdf_page }})">
+           data-page="{{ r.pdf_page }}" onclick="goToPage(this)">
         <span>
           <span class="font-medium text-gray-500">{{ r.pdf_page }}</span>
           {% if r.detected %}
@@ -296,7 +297,7 @@
       <div class="ml-4 mb-1 flex flex-wrap gap-0.5">
         {% for pg in op.image_pages %}
         <span class="text-[10px] px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800 cursor-pointer hover:bg-amber-200 dark:hover:bg-amber-900/50"
-              onclick="event.stopPropagation(); goToPage({{ pg }})"
+              data-page="{{ pg }}" onclick="event.stopPropagation(); goToPage(this)"
               title="Image on page {{ pg }}">🖼️ {{ pg }}</span>
         {% endfor %}
       </div>
@@ -305,7 +306,7 @@
       <div class="ml-4 mb-1 flex flex-wrap gap-0.5">
         {% for pg in op.uncovered_headnote_pages %}
         <span class="text-[10px]" style="border: 1px solid; padding: 3px; background-color: yellow"
-              onclick="event.stopPropagation(); goToPage({{ pg }})"
+              data-page="{{ pg }}" onclick="event.stopPropagation(); goToPage(this)"
               title="Uncovered headnote on page {{ pg }}">Page {{ pg }}</span>
         {% endfor %}
       </div>

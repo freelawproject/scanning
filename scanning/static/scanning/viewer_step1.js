@@ -620,9 +620,11 @@ document.addEventListener('DOMContentLoaded', function () {
     };
 
     // --- Scroll to page ---
-    window.goToPage = function (pageNumber) {
+    window.goToPage = function (elOrNum) {
+        // Accepts an element (with data-page) or a number.
         // Issues pass logical page numbers; PDF containers store data-logical-number.
         // OCR panel passes pdf_page (= pdf_index+1) so the ID fallback covers that case.
+        var pageNumber = (typeof elOrNum === 'object') ? elOrNum.dataset.page : elOrNum;
         var el = container.querySelector('[data-logical-number="' + pageNumber + '"]')
                  || document.getElementById('page-' + pageNumber);
         if (el) {

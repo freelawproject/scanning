@@ -257,7 +257,8 @@ var _opinions = [];
 
 // --- Global functions (called from template onclick handlers) ---
 
-function goToPage(pageNum) {
+function goToPage(elOrNum) {
+    var pageNum = (typeof elOrNum === "object") ? elOrNum.dataset.page : elOrNum;
     var el =
         document.getElementById("pv-page-" + pageNum) ||
         document.getElementById("page-" + pageNum);
