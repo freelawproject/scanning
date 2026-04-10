@@ -55,6 +55,7 @@ from scanning.views_process import (
     serve_scan_pdf,
     start_detect,
     start_validate,
+    undo_delete_page,
 )
 
 urlpatterns = [
@@ -107,6 +108,11 @@ urlpatterns = [
     path("scans/<int:pk>/reprocess/", reprocess, name="reprocess"),
     path("scans/<int:pk>/assign-page/", assign_page, name="assign_page"),
     path("scans/<int:pk>/delete-page/", delete_page, name="delete_page"),
+    path(
+        "scans/<int:pk>/undo-delete-page/",
+        undo_delete_page,
+        name="undo_delete_page",
+    ),
     path("scans/<int:pk>/insert/", add_page_insert, name="add_page_insert"),
     path("scans/<int:pk>/dismiss-issue/", dismiss_issue, name="dismiss_issue"),
     # views_api.py

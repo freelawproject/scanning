@@ -345,6 +345,7 @@
 <script>
 var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
 var docId = {{ scan.pk }};
+var deletedPages = {{ deleted_pages_json|safe }};
 
 {% if step >= 2 %}
 var _currentOpinionIdx = -1;

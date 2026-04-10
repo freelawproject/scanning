@@ -277,10 +277,13 @@ document.addEventListener('DOMContentLoaded', function () {
 
         var deleteBtn = div.querySelector('.delete-btn');
         deleteBtn.addEventListener('click', function () {
-            if (confirm('Delete PDF page ' + pdfPage + '?')) {
-                deletePageAndResolve(pdfPage, div);
-            }
+            deletePageAndResolve(pdfPage, div);
         });
+
+        // If page is already marked for deletion, show the deleted state
+        if (typeof deletedPages !== 'undefined' && deletedPages.indexOf(pdfPage) !== -1) {
+            markPageAsDeleted(div, pdfPage, 'PDF p.', csrfToken, documentId, deletePageAndResolve);
+        }
 
         return div;
     }
@@ -288,7 +291,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // --- Delete page ---
     // deletePage is defined in shared.js; call resolveIssuesForPage after
     function deletePageAndResolve(pdfPage, pageDiv) {
-        deletePage(csrfToken, documentId, pdfPage, pageDiv, 'PDF p.');
+        deletePage(csrfToken, documentId, pdfPage, pageDiv, 'PDF p.', deletePageAndResolve);
         setTimeout(function () { resolveIssuesForPage(pdfPage); }, 500);
     }
 

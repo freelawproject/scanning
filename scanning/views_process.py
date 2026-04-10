@@ -361,6 +361,9 @@ def scan_process_view(request, pk):
             "detect_warnings": detect_warnings,
             "unmatched_keys": unmatched_keys,
             "unmatched_captions": unmatched_captions,
+            "deleted_pages_json": json.dumps(
+                list(scan.deletions.values_list("pdf_page", flat=True))
+            ),
         },
     )
 
@@ -592,6 +595,22 @@ def delete_page(request, pk):
     data = json.loads(request.body)
     pdf_page = data["pdf_page"]
     PageDeletion.objects.get_or_create(scan=scan, pdf_page=pdf_page)
+    return JsonResponse({"status": "ok"})
+
+
+@login_required
+@require_POST
+def undo_delete_page(request, pk):
+    """Remove a page deletion record, restoring the page.
+
+    :param request: The HTTP request (JSON body with pdf_page).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the undo.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    data = json.loads(request.body)
+    pdf_page = data["pdf_page"]
+    PageDeletion.objects.filter(scan=scan, pdf_page=pdf_page).delete()
     return JsonResponse({"status": "ok"})
 
 
