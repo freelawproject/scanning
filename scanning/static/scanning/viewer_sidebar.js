@@ -270,30 +270,33 @@ function goToPage(pageNum) {
     }
 }
 
-function highlightDetection(pageNum, pageIndex, bbox, imgW, imgH) {
-    document.querySelectorAll(".unmatched-highlight").forEach(function (el) {
-        el.remove();
+function highlightDetection(el) {
+    var d = _getDetectionData(el);
+    if (!d) return;
+
+    document.querySelectorAll(".unmatched-highlight").forEach(function (e) {
+        e.remove();
     });
 
-    goToPage(pageNum);
+    goToPage(d.logicalPage);
 
     setTimeout(function () {
-        var container = document.getElementById("pv-page-" + pageNum);
+        var container = document.getElementById("pv-page-" + d.logicalPage);
         if (!container) return;
         var wrapper = container.querySelector(".canvas-wrapper");
         var canvas = container.querySelector(".pdf-canvas");
         if (!wrapper || !canvas) return;
 
-        var sx = canvas.offsetWidth / (imgW || 1);
-        var sy = canvas.offsetHeight / (imgH || 1);
+        var sx = canvas.offsetWidth / (d.imgW || 1);
+        var sy = canvas.offsetHeight / (d.imgH || 1);
 
         var div = document.createElement("div");
         div.className = "unmatched-highlight";
         div.style.position = "absolute";
-        div.style.left = bbox[0] * sx + "px";
-        div.style.top = bbox[1] * sy + "px";
-        div.style.width = (bbox[2] - bbox[0]) * sx + "px";
-        div.style.height = (bbox[3] - bbox[1]) * sy + "px";
+        div.style.left = d.bbox[0] * sx + "px";
+        div.style.top = d.bbox[1] * sy + "px";
+        div.style.width = (d.bbox[2] - d.bbox[0]) * sx + "px";
+        div.style.height = (d.bbox[3] - d.bbox[1]) * sy + "px";
         div.style.border = "3px solid #f59e0b";
         div.style.background = "rgba(245, 158, 11, 0.15)";
         div.style.zIndex = "20";
@@ -308,7 +311,9 @@ function highlightDetection(pageNum, pageIndex, bbox, imgW, imgH) {
     }, 400);
 }
 
-function approveDetection(btn, pageIndex, label, labelId, bbox, imgW, imgH) {
+function approveDetection(btn) {
+    var d = _getDetectionData(btn);
+    if (!d) return;
     var cfg = window.SCAN_CONFIG;
     btn.disabled = true;
     btn.textContent = "...";
@@ -319,10 +324,10 @@ function approveDetection(btn, pageIndex, label, labelId, bbox, imgW, imgH) {
             "X-CSRFToken": cfg.csrfToken,
         },
         body: JSON.stringify({
-            page_index: pageIndex,
-            label: label,
-            label_id: labelId,
-            bbox: bbox,
+            page_index: d.pageIndex,
+            label: d.label,
+            label_id: d.labelId,
+            bbox: d.bbox,
         }),
     })
         .then(function (r) {
@@ -337,7 +342,9 @@ function approveDetection(btn, pageIndex, label, labelId, bbox, imgW, imgH) {
         });
 }
 
-function deleteUnmatchedDetection(btn, pageIndex, label, labelId, bbox) {
+function deleteUnmatchedDetection(btn) {
+    var d = _getDetectionData(btn);
+    if (!d) return;
     var cfg = window.SCAN_CONFIG;
     btn.disabled = true;
     btn.textContent = "...";
@@ -348,10 +355,10 @@ function deleteUnmatchedDetection(btn, pageIndex, label, labelId, bbox) {
             "X-CSRFToken": cfg.csrfToken,
         },
         body: JSON.stringify({
-            page_index: pageIndex,
-            label: label,
-            label_id: labelId,
-            bbox: bbox,
+            page_index: d.pageIndex,
+            label: d.label,
+            label_id: d.labelId,
+            bbox: d.bbox,
         }),
     })
         .then(function (r) {
@@ -455,4 +462,20 @@ function pairOpinions() {
             btn.disabled = false;
             alert("Error: " + err);
         });
+}
+
+// --- Helper to read detection data from data-* attributes ---
+
+function _getDetectionData(el) {
+    var row = el.closest("[data-unmatched-page]");
+    if (!row) return null;
+    return {
+        logicalPage: parseInt(row.dataset.logicalPage),
+        pageIndex: parseInt(row.dataset.pageIndex),
+        bbox: row.dataset.bbox.split(",").map(function (s) { return parseFloat(s.trim()); }),
+        imgW: parseInt(row.dataset.imgW),
+        imgH: parseInt(row.dataset.imgH),
+        label: row.dataset.unmatchedLabel,
+        labelId: parseInt(row.dataset.labelId),
+    };
 }
