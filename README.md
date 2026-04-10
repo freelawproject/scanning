@@ -380,6 +380,18 @@ MAX_REQUESTS=2500
 ```
 
 
+## Keyboard Shortcuts (Process Viewer)
+
+These shortcuts work in the scan process page (`/scans/{pk}/process/`) when focus is not on an input field.
+
+| Key | Step | Action |
+|-----|------|--------|
+| `←` / `→` | 2, 3 | Navigate between opinions (step 2) or opinion cards (step 3) |
+| `↑` / `↓` | 2, 3 | Scroll to the previous/next page in the viewer |
+| `R` | 2, 3 | Cycle overlay mode: off, opinion bounds, transparent redactions, solid redactions |
+| `Escape` | 2, 3 | Clear opinion highlighting and selection |
+
+
 ## Key Design Decisions
 
 ### Single-App Architecture
