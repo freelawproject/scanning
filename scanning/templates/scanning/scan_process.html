@@ -338,9 +338,9 @@
 <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 <script src="{% static 'scanning/shared.js' %}"></script>
 {% if step == 1 %}
-<script src="{% static 'scanning/viewer.js' %}"></script>
+<script src="{% static 'scanning/viewer_step1.js' %}"></script>
 {% else %}
-<script src="{% static 'scanning/process_viewer.js' %}"></script>
+<script src="{% static 'scanning/viewer_step2.js' %}"></script>
 {% endif %}
 <script>
 var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
