@@ -273,7 +273,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var deleteBtn = div.querySelector('.delete-btn');
         deleteBtn.addEventListener('click', function () {
             if (confirm('Delete PDF page ' + pdfPage + '?')) {
-                deletePage(pdfPage, div);
+                deletePageAndResolve(pdfPage, div);
             }
         });
 
@@ -281,25 +281,10 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // --- Delete page ---
-    function deletePage(pdfPage, pageDiv) {
-        fetch('/scans/' + documentId + '/delete-page/', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-CSRFToken': csrfToken,
-            },
-            body: JSON.stringify({ pdf_page: pdfPage }),
-        })
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-            if (data.status === 'ok') {
-                pageDiv.style.opacity = '0.3';
-                pageDiv.style.pointerEvents = 'none';
-                var label = pageDiv.querySelector('.page-label');
-                label.innerHTML = '<span>PDF p.' + pdfPage + ' &mdash; MARKED FOR DELETION</span>';
-                resolveIssuesForPage(pdfPage);
-            }
-        });
+    // deletePage is defined in shared.js; call resolveIssuesForPage after
+    function deletePageAndResolve(pdfPage, pageDiv) {
+        deletePage(csrfToken, documentId, pdfPage, pageDiv, 'PDF p.');
+        setTimeout(function () { resolveIssuesForPage(pdfPage); }, 500);
     }
 
     function resolveIssuesForPage(pdfPage) {
@@ -476,26 +461,7 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 
-    function drawExistingRedactions(overlay, pageRedactions, scale) {
-        var ctx = overlay.getContext('2d');
-        pageRedactions.forEach(function (r) {
-            if (r.fill === 'white') {
-                ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
-                ctx.fillRect(r.x * scale, r.y * scale, r.width * scale, r.height * scale);
-                ctx.strokeStyle = '#3b82f6';
-                ctx.lineWidth = 1;
-                ctx.setLineDash([4, 3]);
-                ctx.strokeRect(r.x * scale, r.y * scale, r.width * scale, r.height * scale);
-                ctx.setLineDash([]);
-            } else {
-                ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
-                ctx.fillRect(r.x * scale, r.y * scale, r.width * scale, r.height * scale);
-                ctx.strokeStyle = '#ef4444';
-                ctx.lineWidth = 1;
-                ctx.strokeRect(r.x * scale, r.y * scale, r.width * scale, r.height * scale);
-            }
-        });
-    }
+    // drawExistingRedactions is defined in shared.js
 
     // Build clickable × buttons over each redaction so users can remove them
     function rebuildRedactionDivs(pageDiv, pageNumber) {

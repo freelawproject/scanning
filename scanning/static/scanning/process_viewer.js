@@ -345,22 +345,7 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 
-    function deletePage(pdfPage, pageDiv) {
-        fetch('/scans/' + documentId + '/delete-page/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
-            body: JSON.stringify({ pdf_page: pdfPage }),
-        })
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-            if (data.status === 'ok') {
-                pageDiv.style.opacity = '0.3';
-                pageDiv.style.pointerEvents = 'none';
-                var label = pageDiv.querySelector('.page-label');
-                label.innerHTML = '<span>Page ' + pdfPage + ' &mdash; MARKED FOR DELETION</span>';
-            }
-        });
-    }
+    // Defined in shared.js: deletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix)
 
     function setupLazyLoading() {
         observer = new IntersectionObserver(function (entries) {
@@ -636,24 +621,7 @@ document.addEventListener('DOMContentLoaded', function () {
         };
     }
 
-    function drawExistingRedactions(overlay, pageRedactions, scale) {
-        var ctx = overlay.getContext('2d');
-        pageRedactions.forEach(function (r) {
-            if (r.fill === 'white') {
-                ctx.fillStyle = 'rgba(255,255,255,0.9)';
-                ctx.fillRect(r.x * scale, r.y * scale, r.width * scale, r.height * scale);
-                ctx.strokeStyle = '#3b82f6'; ctx.lineWidth = 1;
-                ctx.setLineDash([4, 3]);
-                ctx.strokeRect(r.x * scale, r.y * scale, r.width * scale, r.height * scale);
-                ctx.setLineDash([]);
-            } else {
-                ctx.fillStyle = 'rgba(0,0,0,0.85)';
-                ctx.fillRect(r.x * scale, r.y * scale, r.width * scale, r.height * scale);
-                ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 1;
-                ctx.strokeRect(r.x * scale, r.y * scale, r.width * scale, r.height * scale);
-            }
-        });
-    }
+    // Defined in shared.js: drawExistingRedactions(overlay, pageRedactions, scale)
 
     function rebuildRedactionDivs(pageDiv, pageNum) {
         var wrapper = pageDiv.querySelector('.canvas-wrapper');

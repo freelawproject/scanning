@@ -336,6 +336,7 @@
 {% block footer_scripts %}
 <script id="opinions-data" type="application/json">{% if opinions_json %}{{ opinions_json|safe }}{% else %}[]{% endif %}</script>
 <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="{% static 'scanning/shared.js' %}"></script>
 {% if step == 1 %}
 <script src="{% static 'scanning/viewer.js' %}"></script>
 {% else %}
