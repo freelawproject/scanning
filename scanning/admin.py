@@ -3,7 +3,6 @@ from django.contrib import admin
 from scanning.models import (
     Detection,
     Issue,
-    LLMScan,
     OpinionScan,
     PageDeletion,
     PageInsert,
@@ -117,24 +116,3 @@ class PageDeletionAdmin(admin.ModelAdmin):
     list_display = ["scan", "pdf_page", "date_created"]
     raw_id_fields = ["scan"]
     readonly_fields = ["date_created", "date_modified"]
-
-
-@admin.register(LLMScan)
-class LLMScanAdmin(admin.ModelAdmin):
-    list_display = [
-        "scan",
-        "status",
-        "llm_model",
-        "prompt_tokens",
-        "completion_tokens",
-        "cost_cents",
-        "date_created",
-    ]
-    list_filter = ["status", "llm_model"]
-    raw_id_fields = ["scan"]
-    readonly_fields = [
-        "date_created",
-        "date_modified",
-        "sent_at",
-        "completed_at",
-    ]

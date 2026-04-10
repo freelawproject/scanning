@@ -127,76 +127,6 @@ class Migration(migrations.Migration):
             },
         ),
         migrations.CreateModel(
-            name="LLMScan",
-            fields=[
-                (
-                    "id",
-                    models.BigAutoField(
-                        auto_created=True,
-                        primary_key=True,
-                        serialize=False,
-                        verbose_name="ID",
-                    ),
-                ),
-                (
-                    "date_created",
-                    models.DateTimeField(
-                        auto_now_add=True,
-                        db_index=True,
-                        help_text="The moment when the item was created.",
-                    ),
-                ),
-                (
-                    "date_modified",
-                    models.DateTimeField(
-                        auto_now=True,
-                        db_index=True,
-                        help_text="The last moment when the item was modified.",
-                    ),
-                ),
-                (
-                    "masked_pdf",
-                    models.FileField(
-                        blank=True,
-                        max_length=512,
-                        null=True,
-                        storage=scanning.storage.LocalProcessingStorage(),
-                        upload_to="llm/",
-                    ),
-                ),
-                (
-                    "status",
-                    models.CharField(
-                        choices=[
-                            ("pending", "Pending"),
-                            ("queued", "Queued"),
-                            ("sent", "Sent to LLM"),
-                            ("extracted", "Extracted"),
-                            ("merged", "Merged"),
-                            ("error", "Error"),
-                        ],
-                        default="pending",
-                        max_length=20,
-                    ),
-                ),
-                ("llm_model", models.CharField(blank=True, default="", max_length=100)),
-                ("prompt_tokens", models.PositiveIntegerField(default=0)),
-                ("completion_tokens", models.PositiveIntegerField(default=0)),
-                ("cost_cents", models.PositiveIntegerField(default=0)),
-                ("raw_response", models.TextField(blank=True, default="")),
-                ("extracted_text", models.TextField(blank=True, default="")),
-                ("extracted_metadata", models.TextField(blank=True, default="")),
-                ("sent_at", models.DateTimeField(blank=True, null=True)),
-                ("completed_at", models.DateTimeField(blank=True, null=True)),
-                ("error_message", models.TextField(blank=True, default="")),
-                ("retry_count", models.PositiveIntegerField(default=0)),
-                ("task_id", models.CharField(blank=True, default="", max_length=255)),
-            ],
-            options={
-                "ordering": ["-date_created"],
-            },
-        ),
-        migrations.CreateModel(
             name="PageDeletion",
             fields=[
                 (
@@ -638,22 +568,6 @@ class Migration(migrations.Migration):
             field=models.ForeignKey(
                 on_delete=django.db.models.deletion.CASCADE,
                 related_name="issues",
-                to="scanning.scan",
-            ),
-        ),
-        migrations.AddField(
-            model_name="llmscan",
-            name="opinions",
-            field=models.ManyToManyField(
-                blank=True, related_name="llm_scans", to="scanning.opinionscan"
-            ),
-        ),
-        migrations.AddField(
-            model_name="llmscan",
-            name="scan",
-            field=models.ForeignKey(
-                on_delete=django.db.models.deletion.CASCADE,
-                related_name="llm_scans",
                 to="scanning.scan",
             ),
         ),

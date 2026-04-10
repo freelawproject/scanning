@@ -54,7 +54,6 @@ from scanning.models import (
     CheckName,
     Detection,
     Issue,
-    LLMScan,
     OpinionScan,
     OpinionStatus,
     Scan,
@@ -1929,7 +1928,6 @@ def run_generate_files(scan_pk: int) -> None:
         scan.save()
 
         OpinionScan.objects.filter(scan=scan).delete()
-        LLMScan.objects.filter(scan=scan).delete()
         for i, op in enumerate(existing_opinions):
             page_start = op.get("first_page_number", 1)
             page_end = op.get("last_page_number", page_start)
@@ -1970,14 +1968,6 @@ def run_generate_files(scan_pk: int) -> None:
                         mp.resolve().relative_to(media_root)
                     )
                 opinion.save()
-
-            if opinion.masked_pdf.name:
-                llm_scan = LLMScan.objects.create(
-                    scan=scan,
-                    masked_pdf=opinion.masked_pdf.name,
-                    status=LLMScan.Status.PENDING,
-                )
-                llm_scan.opinions.add(opinion)
 
     except Exception as exc:
         traceback.print_exc()
