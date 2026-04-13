@@ -127,7 +127,10 @@ def save_redaction_rect(request, pk):
     :return: JSON response confirming the operation.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     page_idx = data["page_index"]
     action = data.get("action", "update")
     original = data.get("original", {})
@@ -201,7 +204,10 @@ def save_margin_rect(request, pk):
     :return: JSON response confirming the operation.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     page_idx = data["page_index"]
     original = data.get("original", {})
     action = data.get("action", "update")
@@ -482,7 +488,10 @@ def apply_rect_to_opinion(request, pk, opinion_pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     opinion = get_object_or_404(OpinionScan, pk=opinion_pk, scan=scan)
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     page_index = data["page_index"]
     x0, y0, x1, y1 = data["x0"], data["y0"], data["x1"], data["y1"]
     fill = data.get("fill", "black")
@@ -572,7 +581,10 @@ def flag_issue(request, pk):
     :return: JSON response with the new issue ID.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     message = data.get("message", "").strip()
     page = data.get("page_number")
     metadata = data.get("metadata", {})
@@ -634,7 +646,10 @@ def delete_detection(request, pk):
     :return: JSON response with the count of deactivated detections.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     page_index = data["page_index"]
     label = data.get("label", "")
     label_id = data.get("label_id")
@@ -692,7 +707,10 @@ def add_single_detection(request, pk):
         if an existing detection was boosted.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    det = json.loads(request.body)
+    try:
+        det = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     output_base = Path(scan.output_dir)
     det_path = find_json_file(output_base, "detections.json")
     if not det_path:
@@ -760,7 +778,10 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with the count of updated detections.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     page_index = data["page_index"]
     label = data.get("label", "")
     label_id = data.get("label_id")

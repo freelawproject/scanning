@@ -78,7 +78,7 @@ class Command(BaseCommand):
 
         :return: None.
         """
-        from django.db import connections
+        from django.db import connections, transaction
         from django.utils import timezone
 
         from scanning import services
@@ -87,24 +87,28 @@ class Command(BaseCommand):
         # Close stale DB connections before each cycle
         connections.close_all()
 
-        scan = (
-            Scan.objects.filter(status=Status.QUEUED)
-            .order_by("date_created")
-            .first()
-        )
-        if scan is None:
-            return
+        # Atomically claim the next queued scan. skip_locked ensures a
+        # concurrent daemon picks a different row instead of blocking.
+        with transaction.atomic():
+            scan = (
+                Scan.objects.select_for_update(skip_locked=True)
+                .filter(status=Status.QUEUED)
+                .order_by("date_created")
+                .first()
+            )
+            if scan is None:
+                return
 
-        action = scan.queued_action or QueuedAction.FULL_PIPELINE
+            action = scan.queued_action or QueuedAction.FULL_PIPELINE
+            Scan.objects.filter(pk=scan.pk).update(
+                status=Status.PROCESSING,
+                processed_at=timezone.now(),
+                progress_message=f"Starting {action}...",
+                progress_current=0,
+                progress_total=0,
+            )
+
         self.stdout.write(f"Processing scan {scan.pk} ({action})")
-
-        Scan.objects.filter(pk=scan.pk).update(
-            status=Status.PROCESSING,
-            processed_at=timezone.now(),
-            progress_message=f"Starting {action}...",
-            progress_current=0,
-            progress_total=0,
-        )
 
         dispatch = {
             QueuedAction.FULL_PIPELINE: services.run_full_pipeline,

@@ -393,18 +393,27 @@ def claim_scan(request, reporter_slug, vol):
     volume = get_volume(reporter_slug, vol)
 
     if request.POST.get("unclaim") == "1":
-        if volume.assigned_to == request.user:
-            volume.queue_status = QueueStatus.NEEDS_SCANNING
-            volume.assigned_to = None
-            volume.assigned_at = None
-            volume.save()
+        unclaimed = Volume.objects.filter(
+            pk=volume.pk, assigned_to=request.user
+        ).update(
+            queue_status=QueueStatus.NEEDS_SCANNING,
+            assigned_to=None,
+            assigned_at=None,
+        )
+        if unclaimed:
             messages.info(request, "Volume unclaimed.")
-    elif volume.queue_status == QueueStatus.NEEDS_SCANNING:
-        volume.queue_status = QueueStatus.ASSIGNED
-        volume.assigned_to = request.user
-        volume.assigned_at = timezone.now()
-        volume.save()
-        messages.success(request, "Volume claimed.")
+    else:
+        claimed = Volume.objects.filter(
+            pk=volume.pk, queue_status=QueueStatus.NEEDS_SCANNING
+        ).update(
+            queue_status=QueueStatus.ASSIGNED,
+            assigned_to=request.user,
+            assigned_at=timezone.now(),
+        )
+        if claimed:
+            messages.success(request, "Volume claimed.")
+        else:
+            messages.error(request, "Volume is not available to claim.")
 
     if request.POST.get("next") == "queue":
         return redirect("queue")

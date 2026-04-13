@@ -507,7 +507,7 @@ def cancel_processing(request, pk):
                 progress_message="",
                 progress_log="",
                 redacted_pdf_path="",
-                opinions_json="",
+                opinions_json=[],
             )
         else:
             Scan.objects.filter(pk=pk).update(
@@ -562,7 +562,10 @@ def assign_page(request, pk):
     :return: JSON response confirming the assignment.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     pdf_page = data["pdf_page"]
     page_number = data["page_number"]
     ocr_results = scan.ocr_results
@@ -592,7 +595,10 @@ def delete_page(request, pk):
     :return: JSON response confirming the deletion record.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     pdf_page = data["pdf_page"]
     PageDeletion.objects.get_or_create(scan=scan, pdf_page=pdf_page)
     return JsonResponse({"status": "ok"})
@@ -608,7 +614,10 @@ def undo_delete_page(request, pk):
     :return: JSON response confirming the undo.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     pdf_page = data["pdf_page"]
     PageDeletion.objects.filter(scan=scan, pdf_page=pdf_page).delete()
     return JsonResponse({"status": "ok"})
@@ -664,7 +673,10 @@ def dismiss_issue(request, pk):
             },
             status=400,
         )
-    data = json.loads(request.body)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
     issue_id = data.get("issue_id")
     Issue.objects.filter(pk=issue_id, scan=scan).delete()
     return JsonResponse({"status": "ok"})
