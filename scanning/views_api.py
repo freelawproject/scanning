@@ -539,19 +539,16 @@ def serve_redacted_pdf(request, pk):
     # 1. Try the explicit redacted PDF path
     if scan.redacted_pdf_path and os.path.isfile(scan.redacted_pdf_path):
         return FileResponse(
-            open(scan.redacted_pdf_path, "rb"), content_type="application/pdf"
+            Path(scan.redacted_pdf_path).open("rb"),
+            content_type="application/pdf",
         )
 
     # 2. Fall back to the OCR PDF (for preview before generation)
     output = Path(scan.output_dir)
     if output.is_dir():
-        from scanning.utils import find_ocr_pdf
-
         ocr = find_ocr_pdf(output)
         if ocr:
-            return FileResponse(
-                open(ocr, "rb"), content_type="application/pdf"
-            )
+            return FileResponse(ocr.open("rb"), content_type="application/pdf")
 
     return HttpResponse("No PDF available", status=404)
 

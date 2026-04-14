@@ -486,9 +486,9 @@ def queue_upload(request, reporter_slug, vol):
     # Update page range if provided
     first_page = request.POST.get("first_page", "").strip()
     last_page = request.POST.get("last_page", "").strip()
-    if first_page:
+    if first_page.isdigit():
         scan.start_page = int(first_page)
-    if last_page:
+    if last_page.isdigit():
         scan.end_page = int(last_page)
 
     scan.has_state_abbrev = "has_state_abbrev" in request.POST

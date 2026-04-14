@@ -42,10 +42,13 @@ def scan_process_view(request, pk):
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
     is_processing = scan.status in (Status.PROCESSING, Status.QUEUED)
 
-    step = int(request.GET.get("step", 0))
+    try:
+        step = int(request.GET.get("step", 0))
+    except ValueError:
+        step = 0
     if step < 1 or step > 3:
         if is_processing:
-            step = int(request.GET.get("step", 1))
+            step = 1
         elif scan.stage == Stage.APPROVED:
             step = 3
         elif scan.stage == Stage.PROCESS or scan.opinions_json:
@@ -404,17 +407,15 @@ def serve_scan_pdf(request, pk):
     if output.is_dir():
         ocr = find_ocr_pdf(scan.output_dir)
         if ocr:
-            return FileResponse(
-                open(ocr, "rb"), content_type="application/pdf"
-            )
+            return FileResponse(ocr.open("rb"), content_type="application/pdf")
 
-        bitonal = Path(scan.output_dir) / "bitonal.pdf"
+        bitonal = output / "bitonal.pdf"
         if bitonal.exists():
             return FileResponse(
-                open(bitonal, "rb"), content_type="application/pdf"
+                bitonal.open("rb"), content_type="application/pdf"
             )
     return FileResponse(
-        open(scan.pdf_path, "rb"), content_type="application/pdf"
+        Path(scan.pdf_path).open("rb"), content_type="application/pdf"
     )
 
 
@@ -427,12 +428,15 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     :return: PNG image response of the cropped region.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    page = int(request.GET.get("page", 0))
-    x0 = float(request.GET.get("x0", 0))
-    y0 = float(request.GET.get("y0", 0))
-    x1 = float(request.GET.get("x1", 0))
-    y1 = float(request.GET.get("y1", 0))
-    dpi = min(max(int(request.GET.get("dpi", 150)), 72), 300)
+    try:
+        page = int(request.GET.get("page", 0))
+        x0 = float(request.GET.get("x0", 0))
+        y0 = float(request.GET.get("y0", 0))
+        x1 = float(request.GET.get("x1", 0))
+        y1 = float(request.GET.get("y1", 0))
+        dpi = min(max(int(request.GET.get("dpi", 150)), 72), 300)
+    except ValueError:
+        return HttpResponse(status=400)
 
     doc = fitz.open(scan.pdf_path)
     if page < 0 or page >= doc.page_count:
@@ -502,7 +506,7 @@ def cancel_processing(request, pk):
     if scan.status == Status.PROCESSING:
         if scan.stage == Stage.PROCESS:
             Scan.objects.filter(pk=pk).update(
-                status=Status.APPROVED,
+                status=Status.PENDING_REVIEW,
                 stage=Stage.VALIDATE,
                 progress_message="",
                 progress_log="",
@@ -634,7 +638,10 @@ def add_page_insert(request, pk):
     :return: JSON response with the insert URL and page number.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    page_number = int(request.POST.get("page_number", 0))
+    try:
+        page_number = int(request.POST.get("page_number", 0))
+    except ValueError:
+        page_number = 0
     image_file = request.FILES.get("image")
     if not page_number or not image_file:
         return JsonResponse(
