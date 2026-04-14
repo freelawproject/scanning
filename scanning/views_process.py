@@ -32,6 +32,34 @@ from scanning.models import (
 from scanning.utils import find_ocr_pdf
 
 
+def _caption_is_continuation(det, paired_keys_sorted):
+    """Check if a caption detection falls in a key-icon span.
+
+    If the caption is between two paired key icons, it's a
+    continuation of the opinion in that span, not a missed opinion.
+
+    :param det: A Detection instance with page_index, y0.
+    :param paired_keys_sorted: Sorted list of (page, x, y) tuples
+        for paired key icons.
+    :returns: True if the caption falls in an existing span.
+    :rtype: bool
+    """
+    for i, (kp, kx, ky) in enumerate(paired_keys_sorted):
+        if i + 1 < len(paired_keys_sorted):
+            next_kp, _, next_ky = paired_keys_sorted[i + 1]
+        else:
+            next_kp, next_ky = float("inf"), float("inf")
+        after_key = det.page_index > kp or (
+            det.page_index == kp and det.y0 > ky
+        )
+        before_next = det.page_index < next_kp or (
+            det.page_index == next_kp and det.y0 < next_ky
+        )
+        if after_key and before_next:
+            return True
+    return False
+
+
 @login_required
 def scan_process_view(request, pk):
     """Unified scan processing page with 3-step workflow.
@@ -255,28 +283,6 @@ def scan_process_view(request, pk):
         # that span are continuations — not missed opinions.
         paired_keys_sorted = sorted(paired_key_keys)
 
-        def _caption_is_continuation(det):
-            """Check if det falls in a key-icon span that already
-            has a paired caption."""
-            # Find which key-icon span this caption is in
-            for i, (kp, kx, ky) in enumerate(paired_keys_sorted):
-                if i + 1 < len(paired_keys_sorted):
-                    next_kp, _, next_ky = paired_keys_sorted[i + 1]
-                else:
-                    next_kp, next_ky = float("inf"), float("inf")
-                # Caption is in this span if it's after this key
-                # and before the next key
-                after_key = det.page_index > kp or (
-                    det.page_index == kp and det.y0 > ky
-                )
-                before_next = det.page_index < next_kp or (
-                    det.page_index == next_kp and det.y0 < next_ky
-                )
-                if after_key and before_next:
-                    # There's already a paired caption in this span
-                    return True
-            return False
-
         for d in Detection.objects.filter(
             scan=scan, active=True, label="CASE_CAPTION"
         ).order_by("page_index", "y0"):
@@ -289,7 +295,7 @@ def scan_process_view(request, pk):
                 round(d.y0),
             ) in suppressed:
                 continue
-            if _caption_is_continuation(d):
+            if _caption_is_continuation(d, paired_keys_sorted):
                 continue
             unmatched_captions.append(
                 {
