@@ -18,6 +18,7 @@ from django.http import (
     JsonResponse,
 )
 from django.shortcuts import get_object_or_404, redirect
+from django.urls import reverse
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
@@ -373,14 +374,18 @@ def generate_files(request, pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     if scan.status in (Status.PROCESSING, Status.QUEUED):
-        return redirect(f"/scans/{scan.pk}/process/?step=3")
+        return redirect(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=3"
+        )
     scan.stage = Stage.PROCESS
     scan.status = Status.QUEUED
     scan.queued_action = QueuedAction.GENERATE_FILES
     scan.s3_uploaded = False
     scan.progress_message = "Queued for file generation..."
     scan.save()
-    return redirect(f"/scans/{scan.pk}/process/?step=3")
+    return redirect(
+        reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=3"
+    )
 
 
 @login_required

@@ -13,6 +13,7 @@ from django.http import (
     JsonResponse,
 )
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.views.decorators.http import require_POST
 
 from scanning import services
@@ -482,7 +483,9 @@ def start_detect(request, pk):
     scan = get_object_or_404(Scan, pk=pk)
     if Detection.objects.filter(scan=scan).exists():
         # Detections already exist (from full pipeline). Skip to review.
-        return redirect(f"/scans/{scan.pk}/process/?step=2")
+        return redirect(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
+        )
 
     scan.status = Status.QUEUED
     scan.stage = Stage.PROCESS
@@ -490,7 +493,9 @@ def start_detect(request, pk):
     scan.s3_uploaded = False
     scan.progress_message = "Queued for detection..."
     scan.save()
-    return redirect(f"/scans/{scan.pk}/process/?step=2")
+    return redirect(
+        reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
+    )
 
 
 @login_required
@@ -646,6 +651,10 @@ def add_page_insert(request, pk):
     if not page_number or not image_file:
         return JsonResponse(
             {"error": "Missing page_number or image"}, status=400
+        )
+    if not image_file.content_type.startswith("image/"):
+        return JsonResponse(
+            {"error": "Uploaded file must be an image"}, status=400
         )
     insert, _created = PageInsert.objects.update_or_create(
         scan=scan,
