@@ -1290,7 +1290,7 @@ def run_full_pipeline(scan_pk: int) -> None:
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.PENDING_REVIEW,
             progress_message=(
-                f"Done — {len(dets)} detections, {len(opinions)} opinions"
+                f"Done, {len(dets)} detections, {len(opinions)} opinions"
             ),
         )
 
@@ -1446,7 +1446,7 @@ def run_reprocess(scan_pk: int) -> None:
         page_map = scan.page_map
         all_results = scan.ocr_results
 
-        # Stale margin/redaction rects are indexed by old page positions — clear them
+        # Stale margin/redaction rects are indexed by old page positions, clear them
         Scan.objects.filter(pk=scan_pk).update(
             margin_rects="", redaction_rects=""
         )
@@ -2022,7 +2022,7 @@ def run_detect(scan_pk: int) -> None:
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.PENDING_REVIEW,
             s3_uploaded=False,
-            progress_message=f"Done — {len(dets)} detections, {len(opinions)} opinions",
+            progress_message=f"Done, {len(dets)} detections, {len(opinions)} opinions",
         )
 
     except Exception as exc:

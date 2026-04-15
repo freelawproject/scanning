@@ -4,11 +4,69 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import FileExtensionValidator, MinValueValidator
 from django.db import models
+from django.utils import timezone
 from django.utils.deconstruct import deconstructible
 
 from scanning.storage import LocalProcessingStorage
 
 _local_storage = LocalProcessingStorage()
+
+
+class AutoNowQuerySet(models.QuerySet):
+    """QuerySet that stamps ``auto_now`` fields on bulk writes.
+
+    Django's ``QuerySet.update()`` and ``QuerySet.bulk_update()`` both
+    bypass the ``pre_save`` hooks that normally maintain ``auto_now``
+    fields, so ``date_modified`` (and any other ``auto_now`` field)
+    never advances when rows are written via either path. This
+    QuerySet introspects the model and stamps every ``auto_now`` field
+    to ``timezone.now()``, unless the caller explicitly provided a
+    value.
+
+    :cvar model: The model class this QuerySet is bound to.
+    """
+
+    def update(self, **kwargs):
+        """Update rows, stamping ``auto_now`` fields with the current time.
+
+        :param kwargs: Fields and values to update. Any ``auto_now`` field
+            not already in ``kwargs`` is set to ``timezone.now()``.
+        :returns: The number of rows matched by the update.
+        :rtype: int
+        """
+        for field in self.model._meta.get_fields():
+            if getattr(field, "auto_now", False):
+                kwargs.setdefault(field.name, timezone.now())
+        return super().update(**kwargs)
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        """Bulk-update rows, stamping ``auto_now`` fields on each instance.
+
+        Fields already listed in ``fields`` are respected as-is (the
+        caller is setting them explicitly). Any ``auto_now`` field not
+        in ``fields`` is appended and stamped with ``timezone.now()``
+        on every instance.
+
+        :param objs: Iterable of model instances to update.
+        :param fields: Iterable of field names to write.
+        :param batch_size: Optional batch size, forwarded to Django.
+        :returns: The number of rows matched by the update.
+        :rtype: int
+        """
+        fields = list(fields)
+        auto_now_fields = [
+            f.name
+            for f in self.model._meta.get_fields()
+            if getattr(f, "auto_now", False) and f.name not in fields
+        ]
+        if auto_now_fields:
+            now = timezone.now()
+            objs = list(objs)
+            fields.extend(auto_now_fields)
+            for obj in objs:
+                for name in auto_now_fields:
+                    setattr(obj, name, now)
+        return super().bulk_update(objs, fields, batch_size=batch_size)
 
 
 class Status(models.TextChoices):
@@ -84,6 +142,29 @@ class AbstractDateTimeModel(models.Model):
         auto_now=True,
         db_index=True,
     )
+
+    objects = AutoNowQuerySet.as_manager()
+
+    def save(self, *args, update_fields=None, **kwargs):
+        """Save, ensuring ``auto_now`` fields are included in ``update_fields``.
+
+        Django's ``save(update_fields=[...])`` silently skips ``auto_now``
+        fields unless they are listed explicitly, so ``date_modified`` is
+        never advanced. This override adds every ``auto_now`` field on the
+        model to ``update_fields`` so ``save(update_fields=["foo"])``
+        always stamps ``date_modified`` as callers expect.
+
+        :param args: Positional args forwarded to ``Model.save``.
+        :param update_fields: Iterable of field names to write, or None
+            to write all fields.
+        :param kwargs: Keyword args forwarded to ``Model.save``.
+        """
+        if update_fields is not None:
+            update_fields = set(update_fields)
+            for field in self._meta.get_fields():
+                if getattr(field, "auto_now", False):
+                    update_fields.add(field.name)
+        super().save(*args, update_fields=update_fields, **kwargs)
 
     class Meta:
         abstract = True

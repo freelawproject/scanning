@@ -1,12 +1,14 @@
 import io
 import shutil
 import tempfile
+from datetime import timedelta
 
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import models
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from PIL import Image
 
 from scanning.factories import (
@@ -16,8 +18,10 @@ from scanning.factories import (
     UserFactory,
 )
 from scanning.models import (
+    Detection,
     OpinionScan,
     OpinionStatus,
+    Scan,
     Source,
     Status,
 )
@@ -295,6 +299,100 @@ class TestOpinionScanModel(ScanningTestCase):
         with self.assertRaises(models.ProtectedError):
             scan.delete()
         self.assertEqual(OpinionScan.objects.count(), 1)
+
+
+class TestAutoNowQuerySet(ScanningTestCase):
+    """Test that AutoNowQuerySet stamps ``auto_now`` fields on ``.update()``.
+
+    Without the custom queryset, ``QuerySet.update()`` bypasses the
+    ``pre_save`` hooks that maintain ``auto_now`` fields, so
+    ``date_modified`` never advances. This behavior is structural (on
+    ``AbstractDateTimeModel``), so these tests also guard against the fix
+    being accidentally removed.
+    """
+
+    def test_update_stamps_date_modified_on_scan(self):
+        """Bulk .update() advances date_modified on Scan."""
+        scan = ScanFactory()
+        old = timezone.now() - timedelta(days=7)
+        # Seed an old timestamp (caller-provided value is respected).
+        Scan.objects.filter(pk=scan.pk).update(date_modified=old)
+        # A subsequent update with no date_modified kwarg should re-stamp it.
+        Scan.objects.filter(pk=scan.pk).update(progress_message="bumped")
+        scan.refresh_from_db()
+        self.assertGreater(scan.date_modified, old)
+
+    def test_update_stamps_date_modified_on_detection(self):
+        """Detection inherits the manager through AbstractDateTimeModel."""
+        scan = ScanFactory()
+        det = Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="KEY",
+            label_id=0,
+            confidence=0.5,
+            x0=0,
+            y0=0,
+            x1=10,
+            y1=10,
+            img_width=100,
+            img_height=100,
+        )
+        old = timezone.now() - timedelta(days=7)
+        Detection.objects.filter(pk=det.pk).update(date_modified=old)
+        Detection.objects.filter(pk=det.pk).update(confidence=1.0)
+        det.refresh_from_db()
+        self.assertGreater(det.date_modified, old)
+
+    def test_update_respects_explicit_date_modified(self):
+        """Caller-supplied date_modified is not overridden (setdefault)."""
+        scan = ScanFactory()
+        explicit = timezone.now() - timedelta(days=3)
+        Scan.objects.filter(pk=scan.pk).update(date_modified=explicit)
+        scan.refresh_from_db()
+        self.assertAlmostEqual(
+            scan.date_modified.timestamp(),
+            explicit.timestamp(),
+            delta=1,
+        )
+
+    def test_save_update_fields_stamps_date_modified(self):
+        """``save(update_fields=[...])`` still advances ``date_modified``.
+
+        Django's stock ``save(update_fields=[...])`` silently skips
+        ``auto_now`` fields, so ``AbstractDateTimeModel.save`` auto-adds
+        them to ``update_fields``. Without that override,
+        ``scan.save(update_fields=["status"])`` would leave
+        ``date_modified`` unchanged.
+        """
+        scan = ScanFactory()
+        old = timezone.now() - timedelta(days=7)
+        Scan.objects.filter(pk=scan.pk).update(date_modified=old)
+        scan.refresh_from_db()
+        scan.status = Status.CANCELLED
+        scan.save(update_fields=["status"])
+        scan.refresh_from_db()
+        self.assertGreater(scan.date_modified, old)
+
+    def test_bulk_update_stamps_date_modified(self):
+        """``bulk_update()`` stamps ``date_modified`` on every instance."""
+        scan1 = ScanFactory()
+        scan2 = ScanFactory()
+        old = timezone.now() - timedelta(days=7)
+        Scan.objects.filter(pk__in=[scan1.pk, scan2.pk]).update(
+            date_modified=old
+        )
+        scan1.refresh_from_db()
+        scan2.refresh_from_db()
+
+        scan1.status = Status.QUEUED
+        scan2.status = Status.PROCESSING
+        Scan.objects.bulk_update([scan1, scan2], ["status"])
+
+        scan1.refresh_from_db()
+        scan2.refresh_from_db()
+        self.assertGreater(scan1.date_modified, old)
+        self.assertGreater(scan2.date_modified, old)
 
 
 class TestOpinionList(ScanningTestCase):
