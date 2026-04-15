@@ -459,24 +459,22 @@ def _apply_rect_to_pdf(
     :param fill: Fill color, either ``"black"`` or ``"white"``.
     :return: None.
     """
-    doc = fitz.open(pdf_path)
-    if page_index < 0 or page_index >= doc.page_count:
-        doc.close()
-        raise ValueError(
-            f"Page index {page_index} out of range (0-{doc.page_count - 1})"
+    with fitz.open(pdf_path) as doc:
+        if page_index < 0 or page_index >= doc.page_count:
+            raise ValueError(
+                f"Page index {page_index} out of range (0-{doc.page_count - 1})"
+            )
+        page = doc.load_page(page_index)
+        rect = fitz.Rect(x0, y0, x1, y1)
+        color = (0, 0, 0) if fill == "black" else (1, 1, 1)
+        page.add_redact_annot(rect, fill=color)
+        page.apply_redactions()
+        # Save to temp file then move -- fitz can't save to the same path it opened
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".pdf", dir=os.path.dirname(pdf_path)
         )
-    page = doc.load_page(page_index)
-    rect = fitz.Rect(x0, y0, x1, y1)
-    color = (0, 0, 0) if fill == "black" else (1, 1, 1)
-    page.add_redact_annot(rect, fill=color)
-    page.apply_redactions()
-    # Save to temp file then move -- fitz can't save to the same path it opened
-    fd, tmp_path = tempfile.mkstemp(
-        suffix=".pdf", dir=os.path.dirname(pdf_path)
-    )
-    os.close(fd)
-    doc.save(tmp_path, garbage=3, deflate=True)
-    doc.close()
+        os.close(fd)
+        doc.save(tmp_path, garbage=3, deflate=True)
     shutil.move(tmp_path, pdf_path)
 
 
@@ -858,54 +856,55 @@ def export_pdf(request, pk):
     :return: PDF file download response.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    pdf_doc = fitz.open(scan.pdf_path)
-    page_map = scan.page_map
-    deleted_pages = set(d.pdf_page for d in scan.deletions.all())
-    for pdf_page in sorted(deleted_pages, reverse=True):
-        pdf_index = pdf_page - 1
-        if 0 <= pdf_index < len(pdf_doc):
-            pdf_doc.delete_page(pdf_index)
-    inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
-    insert_ops = []
-    for i, entry in enumerate(page_map):
-        if entry["type"] == "missing" and entry["logical_number"] in inserts:
-            insert_before = None
-            for j in range(i + 1, len(page_map)):
-                if page_map[j]["type"] == "pdf_page":
-                    insert_before = page_map[j]["pdf_index"]
-                    break
-            insert_ops.append(
-                (insert_before, inserts[entry["logical_number"]])
-            )
-    offset = 0
-    for insert_before, insert_obj in insert_ops:
-        img_path = insert_obj.image.path
-        if insert_before is not None:
-            adjusted = insert_before - len(
-                [d for d in deleted_pages if d <= insert_before]
-            )
-            pno = adjusted + offset
-            ref_page = pdf_doc.load_page(min(pno, len(pdf_doc) - 1))
-        else:
-            pno = len(pdf_doc)
-            ref_page = pdf_doc.load_page(len(pdf_doc) - 1)
-        w, h = ref_page.rect.width, ref_page.rect.height
-        if img_path.lower().endswith(".pdf"):
-            insert_pdf = fitz.open(img_path)
-            pdf_doc.insert_pdf(
-                insert_pdf,
-                from_page=0,
-                to_page=insert_pdf.page_count - 1,
-                start_at=pno,
-            )
-            offset += insert_pdf.page_count - 1
-            insert_pdf.close()
-        else:
-            new_page = pdf_doc.new_page(pno=pno, width=w, height=h)
-            new_page.insert_image(new_page.rect, filename=img_path)
-        offset += 1
-    pdf_bytes = pdf_doc.tobytes()
-    pdf_doc.close()
+    with fitz.open(scan.pdf_path) as pdf_doc:
+        page_map = scan.page_map
+        deleted_pages = set(d.pdf_page for d in scan.deletions.all())
+        for pdf_page in sorted(deleted_pages, reverse=True):
+            pdf_index = pdf_page - 1
+            if 0 <= pdf_index < len(pdf_doc):
+                pdf_doc.delete_page(pdf_index)
+        inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
+        insert_ops = []
+        for i, entry in enumerate(page_map):
+            if (
+                entry["type"] == "missing"
+                and entry["logical_number"] in inserts
+            ):
+                insert_before = None
+                for j in range(i + 1, len(page_map)):
+                    if page_map[j]["type"] == "pdf_page":
+                        insert_before = page_map[j]["pdf_index"]
+                        break
+                insert_ops.append(
+                    (insert_before, inserts[entry["logical_number"]])
+                )
+        offset = 0
+        for insert_before, insert_obj in insert_ops:
+            img_path = insert_obj.image.path
+            if insert_before is not None:
+                adjusted = insert_before - len(
+                    [d for d in deleted_pages if d <= insert_before]
+                )
+                pno = adjusted + offset
+                ref_page = pdf_doc.load_page(min(pno, len(pdf_doc) - 1))
+            else:
+                pno = len(pdf_doc)
+                ref_page = pdf_doc.load_page(len(pdf_doc) - 1)
+            w, h = ref_page.rect.width, ref_page.rect.height
+            if img_path.lower().endswith(".pdf"):
+                with fitz.open(img_path) as insert_pdf:
+                    pdf_doc.insert_pdf(
+                        insert_pdf,
+                        from_page=0,
+                        to_page=insert_pdf.page_count - 1,
+                        start_at=pno,
+                    )
+                    offset += insert_pdf.page_count - 1
+            else:
+                new_page = pdf_doc.new_page(pno=pno, width=w, height=h)
+                new_page.insert_image(new_page.rect, filename=img_path)
+            offset += 1
+        pdf_bytes = pdf_doc.tobytes()
     filename = f"{scan.reporter.short_name}_{scan.volume}_corrected.pdf"
     response = HttpResponse(pdf_bytes, content_type="application/pdf")
     response["Content-Disposition"] = f'attachment; filename="{filename}"'

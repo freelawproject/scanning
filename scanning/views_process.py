@@ -445,14 +445,12 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     except ValueError:
         return HttpResponse(status=400)
 
-    doc = fitz.open(scan.pdf_path)
-    if page < 0 or page >= doc.page_count:
-        doc.close()
-        return HttpResponse(status=404)
-    clip = fitz.Rect(x0, y0, x1, y1)
-    pix = doc[page].get_pixmap(clip=clip, dpi=dpi)
-    png_bytes = pix.tobytes("png")
-    doc.close()
+    with fitz.open(scan.pdf_path) as doc:
+        if page < 0 or page >= doc.page_count:
+            return HttpResponse(status=404)
+        clip = fitz.Rect(x0, y0, x1, y1)
+        pix = doc[page].get_pixmap(clip=clip, dpi=dpi)
+        png_bytes = pix.tobytes("png")
     resp = HttpResponse(png_bytes, content_type="image/png")
     resp["Cache-Control"] = "max-age=3600"
     return resp

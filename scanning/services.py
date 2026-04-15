@@ -114,9 +114,8 @@ def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
             progress_callback=_bitonal_progress,
         )
 
-    pdf = fitz.open(str(bitonal_path))
-    page_count = pdf.page_count
-    pdf.close()
+    with fitz.open(str(bitonal_path)) as pdf:
+        page_count = pdf.page_count
     Scan.objects.filter(pk=scan.pk).update(page_count=page_count)
     return bitonal_path
 
@@ -139,9 +138,8 @@ def _run_ocr(
     :param first_page: First logical page number in the PDF.
     :return: Path to the OCR'd PDF.
     """
-    pdf = fitz.open(bitonal_path)
-    total_pages = pdf.page_count
-    pdf.close()
+    with fitz.open(bitonal_path) as pdf:
+        total_pages = pdf.page_count
     _update_progress(
         scan_pk,
         f"Running Tesseract OCR (0/{total_pages} pages)...",
@@ -453,43 +451,42 @@ def _build_document_from_detections(
     :param pdf_path: Path to the PDF to read page dimensions from.
     :return: The constructed Document.
     """
-    src_pdf = fitz.open(str(pdf_path))
-    pages_data = {}
-    for entry in det_data:
-        pi = entry["page_index"]
-        if pi not in pages_data:
-            pages_data[pi] = {
-                "img_width": entry.get("img_width", 1),
-                "img_height": entry.get("img_height", 1),
-                "detections": [],
-            }
-        pages_data[pi]["detections"].append(entry)
-    pages = []
-    for pi in sorted(pages_data.keys()):
-        pd = pages_data[pi]
-        if pi < src_pdf.page_count:
-            pw, ph = src_pdf[pi].rect.width, src_pdf[pi].rect.height
-        else:
-            pw, ph = 612.0, 792.0
-        page = Page(
-            index=pi,
-            pdf_width=pw,
-            pdf_height=ph,
-            img_width=pd["img_width"],
-            img_height=pd["img_height"],
-        )
-        for d in pd["detections"]:
-            b = d.get("bbox", [0, 0, 1, 1])
-            page.detections.append(
-                BLDetection(
-                    bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
-                    label=Label(d["label_id"]),
-                    confidence=d["confidence"],
-                    page_index=pi,
-                )
+    with fitz.open(str(pdf_path)) as src_pdf:
+        pages_data = {}
+        for entry in det_data:
+            pi = entry["page_index"]
+            if pi not in pages_data:
+                pages_data[pi] = {
+                    "img_width": entry.get("img_width", 1),
+                    "img_height": entry.get("img_height", 1),
+                    "detections": [],
+                }
+            pages_data[pi]["detections"].append(entry)
+        pages = []
+        for pi in sorted(pages_data.keys()):
+            pd = pages_data[pi]
+            if pi < src_pdf.page_count:
+                pw, ph = src_pdf[pi].rect.width, src_pdf[pi].rect.height
+            else:
+                pw, ph = 612.0, 792.0
+            page = Page(
+                index=pi,
+                pdf_width=pw,
+                pdf_height=ph,
+                img_width=pd["img_width"],
+                img_height=pd["img_height"],
             )
-        pages.append(page)
-    src_pdf.close()
+            for d in pd["detections"]:
+                b = d.get("bbox", [0, 0, 1, 1])
+                page.detections.append(
+                    BLDetection(
+                        bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
+                        label=Label(d["label_id"]),
+                        confidence=d["confidence"],
+                        page_index=pi,
+                    )
+                )
+            pages.append(page)
 
     scan_obj = scan if isinstance(scan, Scan) else Scan.objects.get(pk=scan)
     document = BLDoc(
@@ -680,12 +677,11 @@ def _build_combined_redactions(scan_pk: int) -> Path:
 
     # PDF page dims
     pdf_path = find_ocr_pdf(scan.output_dir) or scan.pdf_path
-    src = fitz.open(str(pdf_path))
     pdf_dims = {}
-    for i in range(src.page_count):
-        r = src[i].rect
-        pdf_dims[i] = (r.width, r.height)
-    src.close()
+    with fitz.open(str(pdf_path)) as src:
+        for i in range(src.page_count):
+            r = src[i].rect
+            pdf_dims[i] = (r.width, r.height)
 
     pages: dict[int, list] = {}
 
@@ -1168,9 +1164,8 @@ def recalculate_issues(scan: "Scan") -> None:
             }
         )
 
-    pdf_fitz = fitz.open(scan.pdf_path)
-    scan.page_count = len(pdf_fitz)
-    pdf_fitz.close()
+    with fitz.open(scan.pdf_path) as pdf_fitz:
+        scan.page_count = len(pdf_fitz)
 
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
@@ -1460,11 +1455,10 @@ def run_reprocess(scan_pk: int) -> None:
             for pdf_page in deleted_pdf_pages:
                 page_idx = pdf_page - 1
                 for pdf_path in _collect_pdf_paths(scan, output_dir):
-                    doc = fitz.open(str(pdf_path))
-                    if 0 <= page_idx < doc.page_count:
-                        doc.delete_page(page_idx)
-                        doc.saveIncr()
-                    doc.close()
+                    with fitz.open(str(pdf_path)) as doc:
+                        if 0 <= page_idx < doc.page_count:
+                            doc.delete_page(page_idx)
+                            doc.saveIncr()
 
                 Detection.objects.filter(
                     scan_id=scan_pk, page_index=page_idx
@@ -1564,11 +1558,10 @@ def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
 
     # Remove page from all PDFs
     for pdf_path in _collect_pdf_paths(scan, output_dir):
-        doc = fitz.open(str(pdf_path))
-        if 0 <= page_idx < doc.page_count:
-            doc.delete_page(page_idx)
-            doc.saveIncr()
-        doc.close()
+        with fitz.open(str(pdf_path)) as doc:
+            if 0 <= page_idx < doc.page_count:
+                doc.delete_page(page_idx)
+                doc.saveIncr()
 
     # Delete detections on the removed page
     Detection.objects.filter(scan_id=scan_pk, page_index=page_idx).delete()
@@ -1579,9 +1572,8 @@ def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
     )
 
     # Update page count
-    pdf = fitz.open(scan.pdf_path)
-    new_count = pdf.page_count
-    pdf.close()
+    with fitz.open(scan.pdf_path) as pdf:
+        new_count = pdf.page_count
     Scan.objects.filter(pk=scan_pk).update(page_count=new_count)
 
     # Sync detections to disk and re-validate/re-pair
@@ -1614,32 +1606,31 @@ def _ocr_single_page(ocr_pdf_path: str, page_idx: int) -> None:
         tmp = Path(tmp)
         # Extract the single page
         single_path = tmp / "page.pdf"
-        doc = fitz.open(ocr_pdf_path)
-        single = fitz.open()
-        single.insert_pdf(doc, from_page=page_idx, to_page=page_idx)
-        single.save(str(single_path))
-        single.close()
+        with fitz.open(ocr_pdf_path) as doc:
+            with fitz.open() as single:
+                single.insert_pdf(doc, from_page=page_idx, to_page=page_idx)
+                single.save(str(single_path))
 
-        # OCR it
-        ocrd_path = tmp / "page_ocr.pdf"
-        ocrmypdf.ocr(
-            str(single_path),
-            str(ocrd_path),
-            pdf_renderer="auto",
-            optimize=1,
-            output_type="pdf",
-            language=["eng"],
-            tesseract_timeout=120,
-            progress_bar=False,
-        )
+            # OCR it
+            ocrd_path = tmp / "page_ocr.pdf"
+            ocrmypdf.ocr(
+                str(single_path),
+                str(ocrd_path),
+                pdf_renderer="auto",
+                optimize=1,
+                output_type="pdf",
+                language=["eng"],
+                tesseract_timeout=120,
+                progress_bar=False,
+            )
 
-        # Replace the page in the OCR PDF
-        ocrd_doc = fitz.open(str(ocrd_path))
-        doc.delete_page(page_idx)
-        doc.insert_pdf(ocrd_doc, from_page=0, to_page=0, start_at=page_idx)
-        doc.saveIncr()
-        ocrd_doc.close()
-        doc.close()
+            # Replace the page in the OCR PDF
+            with fitz.open(str(ocrd_path)) as ocrd_doc:
+                doc.delete_page(page_idx)
+                doc.insert_pdf(
+                    ocrd_doc, from_page=0, to_page=0, start_at=page_idx
+                )
+                doc.saveIncr()
 
 
 def run_smart_insert(
@@ -1660,7 +1651,8 @@ def run_smart_insert(
 
     # Determine insertion position from page_map
     page_map = scan.page_map
-    insert_idx = len(fitz.open(scan.pdf_path))  # default: append
+    with fitz.open(scan.pdf_path) as pdf:
+        insert_idx = len(pdf)  # default: append
     for i, entry in enumerate(page_map):
         if entry.get("logical_number") == logical_page_number:
             # Insert before the next pdf_page entry
@@ -1672,24 +1664,22 @@ def run_smart_insert(
 
     # Insert into all PDFs
     for pdf_path in _collect_pdf_paths(scan, output_dir):
-        doc = fitz.open(str(pdf_path))
-        ref_page = doc[min(insert_idx, doc.page_count - 1)]
-        w, h = ref_page.rect.width, ref_page.rect.height
+        with fitz.open(str(pdf_path)) as doc:
+            ref_page = doc[min(insert_idx, doc.page_count - 1)]
+            w, h = ref_page.rect.width, ref_page.rect.height
 
-        if str(image_path).lower().endswith(".pdf"):
-            insert_pdf = fitz.open(str(image_path))
-            doc.insert_pdf(
-                insert_pdf,
-                from_page=0,
-                to_page=insert_pdf.page_count - 1,
-                start_at=insert_idx,
-            )
-            insert_pdf.close()
-        else:
-            new_page = doc.new_page(pno=insert_idx, width=w, height=h)
-            new_page.insert_image(new_page.rect, filename=str(image_path))
-        doc.saveIncr()
-        doc.close()
+            if str(image_path).lower().endswith(".pdf"):
+                with fitz.open(str(image_path)) as insert_pdf:
+                    doc.insert_pdf(
+                        insert_pdf,
+                        from_page=0,
+                        to_page=insert_pdf.page_count - 1,
+                        start_at=insert_idx,
+                    )
+            else:
+                new_page = doc.new_page(pno=insert_idx, width=w, height=h)
+                new_page.insert_image(new_page.rect, filename=str(image_path))
+            doc.saveIncr()
 
     # OCR the inserted page in the OCR PDF so it gets a text layer
     if output_dir:
@@ -1703,9 +1693,8 @@ def run_smart_insert(
     ).update(page_index=F("page_index") + 1)
 
     # Update page count
-    pdf = fitz.open(scan.pdf_path)
-    new_count = pdf.page_count
-    pdf.close()
+    with fitz.open(scan.pdf_path) as pdf:
+        new_count = pdf.page_count
     Scan.objects.filter(pk=scan_pk).update(page_count=new_count)
 
     # Sync detections to disk
@@ -1782,16 +1771,16 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
         shutil.copy2(ocr_pdf_path, stamped_path)
         return stamped_path
 
-    original_doc = fitz.open(scan.pdf_path)
-    ocr_doc = fitz.open(ocr_pdf_path)
-
     # Save extracted images to images/ directory
     images_dir = Path(os.path.dirname(ocr_pdf_path)) / "images"
     images_dir.mkdir(exist_ok=True)
     page_numbers = _page_number_lookup(scan)
     img_count_by_page: dict[int, int] = {}
 
-    try:
+    with (
+        fitz.open(scan.pdf_path) as original_doc,
+        fitz.open(ocr_pdf_path) as ocr_doc,
+    ):
         for det in image_dets:
             page_idx = det["page_index"]
             if (
@@ -1834,9 +1823,6 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
             (images_dir / img_name).write_bytes(png_bytes)
 
         ocr_doc.save(stamped_path, garbage=3, deflate=True)
-    finally:
-        original_doc.close()
-        ocr_doc.close()
     return stamped_path
 
 
