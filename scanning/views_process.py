@@ -1,6 +1,7 @@
 """Process viewer and scan processing action views."""
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -29,10 +30,36 @@ from scanning.models import (
     Stage,
     Status,
 )
-from scanning.utils import find_ocr_pdf
+from scanning.utils import compute_coverage_gaps, find_ocr_pdf
+
+logger = logging.getLogger(__name__)
 
 
-def _caption_is_continuation(det, paired_keys_sorted):
+def _unmatched_detection_dict(
+    det: Detection, idx_to_logical: dict[int, int]
+) -> dict:
+    """Build the template dict for an unmatched detection.
+
+    :param det: The Detection instance.
+    :param idx_to_logical: Mapping from pdf_index to logical page number.
+    :returns: Dict of detection metadata for the template.
+    :rtype: dict
+    """
+    return {
+        "pdf_page": det.page_index + 1,
+        "page_index": det.page_index,
+        "label_id": det.label_id,
+        "logical_page": idx_to_logical.get(det.page_index, det.page_index + 1),
+        "conf": round(det.confidence, 2),
+        "bbox": [det.x0, det.y0, det.x1, det.y1],
+        "img_width": det.img_width,
+        "img_height": det.img_height,
+    }
+
+
+def _caption_is_continuation(
+    det: Detection, paired_keys_sorted: list[tuple[int, int, int]]
+) -> bool:
     """Check if a caption detection falls in a key-icon span.
 
     If the caption is between two paired key icons, it's a
@@ -61,7 +88,7 @@ def _caption_is_continuation(det, paired_keys_sorted):
 
 
 @login_required
-def scan_process_view(request, pk):
+def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     """Unified scan processing page with 3-step workflow.
 
     :param request: The HTTP request.
@@ -238,7 +265,10 @@ def scan_process_view(request, pk):
                         )
                     )
                 except Exception:
-                    pass
+                    logger.exception(
+                        "Failed to parse issue metadata for issue %s",
+                        iss.pk,
+                    )
 
         paired_caption_keys = set()
         paired_key_keys = set()
@@ -263,18 +293,7 @@ def scan_process_view(request, pk):
                     round(d.y0),
                 ) not in suppressed:
                     unmatched_keys.append(
-                        {
-                            "pdf_page": d.page_index + 1,
-                            "page_index": d.page_index,
-                            "label_id": d.label_id,
-                            "logical_page": idx_to_logical.get(
-                                d.page_index, d.page_index + 1
-                            ),
-                            "conf": round(d.confidence, 2),
-                            "bbox": [d.x0, d.y0, d.x1, d.y1],
-                            "img_width": d.img_width,
-                            "img_height": d.img_height,
-                        }
+                        _unmatched_detection_dict(d, idx_to_logical)
                     )
 
         # Build sorted list of paired key icon positions so we can
@@ -298,18 +317,7 @@ def scan_process_view(request, pk):
             if _caption_is_continuation(d, paired_keys_sorted):
                 continue
             unmatched_captions.append(
-                {
-                    "pdf_page": d.page_index + 1,
-                    "page_index": d.page_index,
-                    "label_id": d.label_id,
-                    "logical_page": idx_to_logical.get(
-                        d.page_index, d.page_index + 1
-                    ),
-                    "conf": round(d.confidence, 2),
-                    "bbox": [d.x0, d.y0, d.x1, d.y1],
-                    "img_width": d.img_width,
-                    "img_height": d.img_height,
-                }
+                _unmatched_detection_dict(d, idx_to_logical)
             )
 
         if unmatched_keys:
@@ -322,33 +330,14 @@ def scan_process_view(request, pk):
             )
 
         # Coverage gaps
-        if opinions and scan.start_page and scan.end_page:
-            covered = set()
-            for op in opinions:
-                cp = op.get("caption_page", 0) + (scan.start_page or 1)
-                kp = (
-                    op.get("key_page", 0)
-                    + (scan.start_page or 1)
-                    + op.get("page_count", 1)
-                    - 1
-                )
-                for p in range(cp, kp + 1):
-                    covered.add(p)
-            expected = set(range(scan.start_page, scan.end_page + 1))
-            missing = sorted(expected - covered)
-            if missing:
-                import itertools
-
-                for _, g in itertools.groupby(
-                    enumerate(missing),
-                    lambda x: x[0] - x[1],
-                ):
-                    run = [v for _, v in g]
-                    detect_warnings.append(
-                        f"Pages {run[0]}-{run[-1]}"
-                        f" ({len(run)} pages) not covered"
-                        " by any opinion"
-                    )
+        for start, end, count in compute_coverage_gaps(
+            opinions, scan.start_page, scan.end_page
+        ):
+            detect_warnings.append(
+                f"Pages {start}-{end}"
+                f" ({count} pages) not covered"
+                " by any opinion"
+            )
 
     return render(
         request,
@@ -379,7 +368,7 @@ def scan_process_view(request, pk):
 
 
 @login_required
-def progress_api(request, pk):
+def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     """Return current processing progress for a scan.
 
     :param request: The HTTP request.
@@ -402,7 +391,7 @@ def progress_api(request, pk):
 
 
 @login_required
-def serve_scan_pdf(request, pk):
+def serve_scan_pdf(request: HttpRequest, pk: int) -> FileResponse:
     """Serve the best available PDF for a scan (OCR, bitonal, or original).
 
     :param request: The HTTP request.
@@ -458,7 +447,7 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
 
 @login_required
 @require_POST
-def start_validate(request, pk):
+def start_validate(request: HttpRequest, pk: int) -> HttpResponse:
     """Queue a scan for validation (first step of the full pipeline).
 
     :param request: The HTTP request.
@@ -477,7 +466,7 @@ def start_validate(request, pk):
 
 @login_required
 @require_POST
-def start_detect(request, pk):
+def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     """Queue a scan for detection or skip to review if detections exist.
 
     :param request: The HTTP request.
@@ -504,7 +493,7 @@ def start_detect(request, pk):
 
 @login_required
 @require_POST
-def cancel_processing(request, pk):
+def cancel_processing(request: HttpRequest, pk: int) -> HttpResponse:
     """Cancel an in-progress scan processing task.
 
     :param request: The HTTP request.
@@ -532,7 +521,7 @@ def cancel_processing(request, pk):
 
 @login_required
 @require_POST
-def recalculate(request, pk):
+def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
     """Recalculate validation issues from existing OCR results.
 
     :param request: The HTTP request.
@@ -548,7 +537,7 @@ def recalculate(request, pk):
 
 @login_required
 @require_POST
-def reprocess(request, pk):
+def reprocess(request: HttpRequest, pk: int) -> HttpResponse:
     """Queue a scan for reprocessing (re-run the full pipeline).
 
     :param request: The HTTP request.
@@ -566,7 +555,7 @@ def reprocess(request, pk):
 
 @login_required
 @require_POST
-def assign_page(request, pk):
+def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
     """Manually assign a page number to a PDF page.
 
     :param request: The HTTP request (JSON body with pdf_page and
@@ -600,7 +589,7 @@ def assign_page(request, pk):
 
 @login_required
 @require_POST
-def delete_page(request, pk):
+def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     """Mark a PDF page for deletion during reprocessing.
 
     :param request: The HTTP request (JSON body with pdf_page).
@@ -619,7 +608,7 @@ def delete_page(request, pk):
 
 @login_required
 @require_POST
-def undo_delete_page(request, pk):
+def undo_delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     """Remove a page deletion record, restoring the page.
 
     :param request: The HTTP request (JSON body with pdf_page).
@@ -638,7 +627,7 @@ def undo_delete_page(request, pk):
 
 @login_required
 @require_POST
-def add_page_insert(request, pk):
+def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     """Upload an image to insert at a missing page position.
 
     :param request: The HTTP request (form data with page_number and
@@ -676,7 +665,7 @@ def add_page_insert(request, pk):
 
 @login_required
 @require_POST
-def dismiss_issue(request, pk):
+def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
     """Dismiss a single validation issue for a scan.
 
     :param request: The HTTP request (JSON body with issue_id).

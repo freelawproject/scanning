@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 from pathlib import Path
 
@@ -86,3 +87,47 @@ def ensure_output_dir(scan: Scan) -> Path:
     output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def compute_coverage_gaps(
+    opinions: list[dict],
+    start_page: int | None,
+    end_page: int | None,
+) -> list[tuple[int, int, int]]:
+    """Compute contiguous page runs not covered by any paired opinion.
+
+    A page in ``[start_page, end_page]`` is covered if it falls within
+    an opinion's ``caption_page`` through ``key_page + page_count - 1``
+    span (opinion page indices are offset by ``start_page``).
+
+    :param opinions: List of opinion dicts with caption_page, key_page,
+        and page_count.
+    :param start_page: First page in the scan's expected range.
+    :param end_page: Last page in the scan's expected range.
+    :returns: List of ``(start, end, count)`` tuples, one per gap run.
+    :rtype: list[tuple[int, int, int]]
+    """
+    if not opinions or not start_page or not end_page:
+        return []
+
+    covered: set[int] = set()
+    for op in opinions:
+        cp = op.get("caption_page", 0) + (start_page or 1)
+        kp = (
+            op.get("key_page", 0)
+            + (start_page or 1)
+            + op.get("page_count", 1)
+            - 1
+        )
+        for p in range(cp, kp + 1):
+            covered.add(p)
+    expected = set(range(start_page, end_page + 1))
+    missing = sorted(expected - covered)
+    if not missing:
+        return []
+
+    gaps = []
+    for _, g in itertools.groupby(enumerate(missing), lambda x: x[0] - x[1]):
+        run = [v for _, v in g]
+        gaps.append((run[0], run[-1], len(run)))
+    return gaps

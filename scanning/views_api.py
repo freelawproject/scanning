@@ -31,7 +31,11 @@ from scanning.models import (
     Stage,
     Status,
 )
-from scanning.utils import find_json_file, find_ocr_pdf
+from scanning.utils import (
+    compute_coverage_gaps,
+    find_json_file,
+    find_ocr_pdf,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -290,31 +294,12 @@ def pair_opinions_api(request, pk):
         scan.opinions_json = opinions
         scan.s3_uploaded = False
         scan.save()
-        gaps = []
-        if opinions and scan.start_page and scan.end_page:
-            covered = set()
-            for op in opinions:
-                cp = op.get("caption_page", 0) + (scan.start_page or 1)
-                kp = (
-                    op.get("key_page", 0)
-                    + (scan.start_page or 1)
-                    + op.get("page_count", 1)
-                    - 1
-                )
-                for p in range(cp, kp + 1):
-                    covered.add(p)
-            expected = set(range(scan.start_page, scan.end_page + 1))
-            missing = sorted(expected - covered)
-            if missing:
-                import itertools
-
-                for _, g in itertools.groupby(
-                    enumerate(missing), lambda x: x[0] - x[1]
-                ):
-                    run = [v for _, v in g]
-                    gaps.append(
-                        {"start": run[0], "end": run[-1], "count": len(run)}
-                    )
+        gaps = [
+            {"start": start, "end": end, "count": count}
+            for start, end, count in compute_coverage_gaps(
+                opinions, scan.start_page, scan.end_page
+            )
+        ]
         return JsonResponse(
             {"status": "ok", "opinions": opinions, "gaps": gaps}
         )
