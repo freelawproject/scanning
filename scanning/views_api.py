@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import tempfile
+import traceback
 from pathlib import Path
 
 import fitz
@@ -40,8 +41,37 @@ from scanning.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_json_body(request: HttpRequest) -> dict | JsonResponse:
+    """Parse a JSON request body or return an error response.
+
+    :param request: The HTTP request.
+    :returns: The parsed dict on success, or a ``JsonResponse`` with a
+        400 error on malformed JSON.
+    :rtype: dict | JsonResponse
+    """
+    try:
+        return json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+
+def _rounded_rect(adjusted: dict) -> dict:
+    """Round ``x0``/``y0``/``x1``/``y1`` to one decimal place.
+
+    :param adjusted: Dict with ``x0``, ``y0``, ``x1``, ``y1`` keys.
+    :returns: Dict with the same keys, values rounded to 1 decimal.
+    :rtype: dict
+    """
+    return {
+        "x0": round(adjusted["x0"], 1),
+        "y0": round(adjusted["y0"], 1),
+        "x1": round(adjusted["x1"], 1),
+        "y1": round(adjusted["y1"], 1),
+    }
+
+
 @login_required
-def serve_detections(request, pk):
+def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     """Return active detections for a scan as JSON.
 
     :param request: The HTTP request.
@@ -69,7 +99,7 @@ def serve_detections(request, pk):
 
 
 @login_required
-def serve_opinions(request, pk):
+def serve_opinions(request: HttpRequest, pk: int) -> JsonResponse:
     """Return paired opinion data for a scan as JSON.
 
     :param request: The HTTP request.
@@ -83,7 +113,7 @@ def serve_opinions(request, pk):
 
 
 @login_required
-def serve_margin_rects(request, pk):
+def serve_margin_rects(request: HttpRequest, pk: int) -> JsonResponse:
     """Return margin rectangles for a scan, computing them if absent.
 
     :param request: The HTTP request.
@@ -108,7 +138,7 @@ def serve_margin_rects(request, pk):
 
 
 @login_required
-def serve_redaction_rects(request, pk):
+def serve_redaction_rects(request: HttpRequest, pk: int) -> JsonResponse:
     """Return redaction rectangles for a scan as JSON.
 
     :param request: The HTTP request.
@@ -123,7 +153,7 @@ def serve_redaction_rects(request, pk):
 
 @login_required
 @require_POST
-def save_redaction_rect(request, pk):
+def save_redaction_rect(request: HttpRequest, pk: int) -> JsonResponse:
     """Create, update, or delete a redaction rectangle on disk.
 
     :param request: The HTTP request (JSON body with page_index,
@@ -132,10 +162,9 @@ def save_redaction_rect(request, pk):
     :return: JSON response confirming the operation.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
     page_idx = data["page_index"]
     action = data.get("action", "update")
     original = data.get("original", {})
@@ -171,10 +200,7 @@ def save_redaction_rect(request, pk):
                 and abs(r["y0"] - original.get("y0", -999)) < 2
                 and r.get("type") == rect_type
             ):
-                r["x0"] = round(adjusted["x0"], 1)
-                r["y0"] = round(adjusted["y0"], 1)
-                r["x1"] = round(adjusted["x1"], 1)
-                r["y1"] = round(adjusted["y1"], 1)
+                r.update(_rounded_rect(adjusted))
                 found = True
                 break
         if found:
@@ -184,10 +210,7 @@ def save_redaction_rect(request, pk):
             if page_data["page_index"] == page_idx:
                 page_data["rects"].append(
                     {
-                        "x0": round(adjusted["x0"], 1),
-                        "y0": round(adjusted["y0"], 1),
-                        "x1": round(adjusted["x1"], 1),
-                        "y1": round(adjusted["y1"], 1),
+                        **_rounded_rect(adjusted),
                         "fill": fill,
                         "type": rect_type,
                     }
@@ -200,7 +223,7 @@ def save_redaction_rect(request, pk):
 
 @login_required
 @require_POST
-def save_margin_rect(request, pk):
+def save_margin_rect(request: HttpRequest, pk: int) -> JsonResponse:
     """Update or delete a margin rectangle on disk.
 
     :param request: The HTTP request (JSON body with page_index,
@@ -209,10 +232,9 @@ def save_margin_rect(request, pk):
     :return: JSON response confirming the operation.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
     page_idx = data["page_index"]
     original = data.get("original", {})
     action = data.get("action", "update")
@@ -244,10 +266,7 @@ def save_margin_rect(request, pk):
                 abs(r["x0"] - original.get("x0", -999)) < 2
                 and abs(r["y0"] - original.get("y0", -999)) < 2
             ):
-                r["x0"] = round(adjusted["x0"], 1)
-                r["y0"] = round(adjusted["y0"], 1)
-                r["x1"] = round(adjusted["x1"], 1)
-                r["y1"] = round(adjusted["y1"], 1)
+                r.update(_rounded_rect(adjusted))
                 found = True
                 break
         if found:
@@ -258,7 +277,7 @@ def save_margin_rect(request, pk):
 
 @login_required
 @require_POST
-def pair_opinions_api(request, pk):
+def pair_opinions_api(request: HttpRequest, pk: int) -> JsonResponse:
     """Run opinion pairing on detections and save the result.
 
     :param request: The HTTP request.
@@ -275,12 +294,8 @@ def pair_opinions_api(request, pk):
     det_data = _sync_detections_to_disk(scan.pk)
     if not det_data:
         return JsonResponse({"error": "No detections found"}, status=400)
-    pdf_path = None
     bitonal = output_dir / "bitonal.pdf"
-    if bitonal.exists():
-        pdf_path = str(bitonal)
-    else:
-        pdf_path = scan.pdf_path
+    pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
     try:
         from blackletter.api import pair as bl_pair
 
@@ -304,15 +319,13 @@ def pair_opinions_api(request, pk):
             {"status": "ok", "opinions": opinions, "gaps": gaps}
         )
     except Exception:
-        import traceback
-
         traceback.print_exc()
         return JsonResponse({"error": "Opinion pairing failed"}, status=500)
 
 
 @login_required
 @require_POST
-def compute_redactions_api(request, pk):
+def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
     """Compute and save redaction and margin rectangles for a scan.
 
     :param request: The HTTP request.
@@ -340,8 +353,6 @@ def compute_redactions_api(request, pk):
             {"status": "ok", "pages": len(rects), "rects": total_rects}
         )
     except Exception:
-        import traceback
-
         traceback.print_exc()
         return JsonResponse(
             {"error": "Redaction computation failed"}, status=500
@@ -350,7 +361,7 @@ def compute_redactions_api(request, pk):
 
 @login_required
 @require_POST
-def generate_files(request, pk):
+def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
     """Queue a scan for opinion file generation (step 4).
 
     :param request: The HTTP request.
@@ -375,7 +386,7 @@ def generate_files(request, pk):
 
 @login_required
 @require_POST
-def approve_scan(request, pk):
+def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
     """Approve a scan and upload final files to S3.
 
     Validates that generated files exist before approving. Uploads
@@ -402,7 +413,9 @@ def approve_scan(request, pk):
 
 
 @login_required
-def serve_opinionscan_pdf(request, pk, variant):
+def serve_opinionscan_pdf(
+    request: HttpRequest, pk: int, variant: str
+) -> FileResponse:
     """Serve a PDF for an OpinionScan by variant (redacted/original/masked).
 
     The file path comes from the model field, not from user input.
@@ -465,7 +478,9 @@ def _apply_rect_to_pdf(
 
 @login_required
 @require_POST
-def apply_rect_to_opinion(request, pk, opinion_pk):
+def apply_rect_to_opinion(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
     """Apply a redaction rectangle to an opinion's redacted and masked PDFs.
 
     :param request: The HTTP request (JSON body with page_index,
@@ -476,10 +491,9 @@ def apply_rect_to_opinion(request, pk, opinion_pk):
     """
     scan = get_object_or_404(Scan, pk=pk)
     opinion = get_object_or_404(OpinionScan, pk=opinion_pk, scan=scan)
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
     page_index = data["page_index"]
     x0, y0, x1, y1 = data["x0"], data["y0"], data["x1"], data["y1"]
     fill = data.get("fill", "black")
@@ -512,7 +526,9 @@ def apply_rect_to_opinion(request, pk, opinion_pk):
 
 
 @login_required
-def serve_redacted_pdf(request, pk):
+def serve_redacted_pdf(
+    request: HttpRequest, pk: int
+) -> FileResponse | HttpResponse:
     """Serve the redacted PDF for a scan.
 
     Falls back to the OCR PDF if the redacted version hasn't been
@@ -542,7 +558,7 @@ def serve_redacted_pdf(request, pk):
 
 
 @login_required
-def serve_ocr_results(request, pk):
+def serve_ocr_results(request: HttpRequest, pk: int) -> JsonResponse:
     """Return OCR page-number results for a scan as JSON.
 
     :param request: The HTTP request.
@@ -557,7 +573,7 @@ def serve_ocr_results(request, pk):
 
 @login_required
 @require_POST
-def flag_issue(request, pk):
+def flag_issue(request: HttpRequest, pk: int) -> JsonResponse:
     """Create a user-flagged issue on a scan.
 
     :param request: The HTTP request (JSON body with message,
@@ -566,10 +582,9 @@ def flag_issue(request, pk):
     :return: JSON response with the new issue ID.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
     message = data.get("message", "").strip()
     page = data.get("page_number")
     metadata = data.get("metadata", {})
@@ -598,7 +613,7 @@ def flag_issue(request, pk):
 
 @login_required
 @require_POST
-def remove_flag(request, pk, flag_id):
+def remove_flag(request: HttpRequest, pk: int, flag_id: int) -> JsonResponse:
     """Remove a user-flagged issue from a scan.
 
     :param request: The HTTP request.
@@ -622,7 +637,7 @@ def remove_flag(request, pk, flag_id):
 
 @login_required
 @require_POST
-def delete_detection(request, pk):
+def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     """Deactivate a detection in the database and remove it from disk.
 
     :param request: The HTTP request (JSON body with page_index,
@@ -631,10 +646,9 @@ def delete_detection(request, pk):
     :return: JSON response with the count of deactivated detections.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
     page_index = data["page_index"]
     label = data.get("label", "")
     label_id = data.get("label_id")
@@ -675,7 +689,7 @@ def delete_detection(request, pk):
 
 @login_required
 @require_POST
-def add_single_detection(request, pk):
+def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
     """Add a new detection or boost an existing one.
 
     If a detection with the same label and approximate position already
@@ -692,10 +706,9 @@ def add_single_detection(request, pk):
         if an existing detection was boosted.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    try:
-        det = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    det = _parse_json_body(request)
+    if isinstance(det, JsonResponse):
+        return det
     output_base = Path(scan.output_dir)
     det_path = find_json_file(output_base, "detections.json")
     if not det_path:
@@ -763,10 +776,9 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with the count of updated detections.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
     page_index = data["page_index"]
     label = data.get("label", "")
     label_id = data.get("label_id")
@@ -815,7 +827,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
 
 @login_required
 @require_POST
-def bake_redactions(request, pk):
+def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     """Bake pending redaction rectangles into the scan PDF (no-op stub).
 
     :param request: The HTTP request.
@@ -833,7 +845,7 @@ def bake_redactions(request, pk):
 
 
 @login_required
-def export_pdf(request, pk):
+def export_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     """Export a corrected PDF with deletions and inserts applied.
 
     :param request: The HTTP request.
