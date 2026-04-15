@@ -253,23 +253,12 @@ document.addEventListener('DOMContentLoaded', function () {
             var drawDetBtn = div.querySelector('.draw-det-btn');
             var redactBtn = div.querySelector('.redact-btn');
             var whiteoutBtn = div.querySelector('.whiteout-btn');
-            var deletePageBtn = div.querySelector('.delete-page-btn');
-            (function (pageDiv, pNum, pdfIdx) {
+            (function (pageDiv, pNum) {
                 if (detectBtn) detectBtn.addEventListener('click', function () { toggleDetections(pageDiv, pNum); });
                 if (drawDetBtn) drawDetBtn.addEventListener('click', function () { activateDrawMode(pageDiv, pNum); });
                 redactBtn.addEventListener('click', function () { toggleRedactionMode(pageDiv, pNum, 'black'); });
                 whiteoutBtn.addEventListener('click', function () { toggleRedactionMode(pageDiv, pNum, 'white'); });
-                // deletePageBtn.addEventListener('click', function () {
-                //     if (confirm('Delete page ' + pNum + '?')) {
-                //         deletePage(pdfIdx + 1, pageDiv);
-                //     }
-                // });
-                var wrapper = pageDiv.querySelector('.canvas-wrapper');
-                // wrapper.addEventListener('dblclick', function (e) {
-                //     if (e.target.closest('.detection-box') || e.target.closest('.redetect-preview')) return;
-                //     redetectPage(pageDiv, pNum, redetectBtn);
-                // });
-            })(div, pageNum, entry.pdf_index);
+            })(div, pageNum);
         }
 
         container.appendChild(div);
@@ -401,7 +390,6 @@ document.addEventListener('DOMContentLoaded', function () {
                     overlay.height = viewport.height;
                 }
 
-                var pageNum = parseInt(pageDiv.dataset.pageNum);
                 var pageRedactions = redactions[String(pageNum)] || [];
                 if (overlay) drawExistingRedactions(overlay, pageRedactions, SCALE);
                 rebuildRedactionDivs(pageDiv, pageNum);
@@ -773,13 +761,13 @@ document.addEventListener('DOMContentLoaded', function () {
             label.textContent = d.label + (d.manual ? ' (manual)' : ' ' + d.confidence);
             box.appendChild(label);
 
-            // Double-click to select, resize, suppress, or approve
-            (function(det, detBox, scalex, scaley) {
+            // Double-click to select (shows Delete button)
+            (function(det, detBox) {
                 detBox.addEventListener('dblclick', function(e) {
                     e.stopPropagation();
-                    _selectDetectionBox(detBox, det, pageNum, scalex, scaley);
+                    _selectDetectionBox(detBox, det);
                 });
-            })(d, box, sx, sy);
+            })(d, box);
 
             wrapper.appendChild(box);
         });
@@ -788,47 +776,6 @@ document.addEventListener('DOMContentLoaded', function () {
     function clearDetectionOverlay(pageDiv, pageNum) {
         var wrapper = pageDiv.querySelector('.canvas-wrapper');
         wrapper.querySelectorAll('.detection-box').forEach(function (el) { el.remove(); });
-    }
-
-    // --- Reprocess page range from viewer ---
-
-    function reprocessPageRange(pageNum, btn) {
-        var totalPages = pdfDoc ? pdfDoc.numPages : pageNum;
-        var defaultStart = Math.max(1, pageNum - 5);
-        var defaultEnd = Math.min(totalPages, pageNum + 5);
-        var rangeStr = prompt(
-            'Reprocess page range (adjust as needed):\nFormat: start-end',
-            defaultStart + '-' + defaultEnd
-        );
-        if (!rangeStr) return;
-        var parts = rangeStr.split('-');
-        var ps = parseInt(parts[0]), pe = parseInt(parts[1] || parts[0]);
-        if (isNaN(ps) || isNaN(pe) || ps < 1 || pe < ps) {
-            alert('Invalid range');
-            return;
-        }
-        var modelSelect = document.getElementById('model-select');
-        var model = modelSelect ? modelSelect.value : 'medium';
-        btn.textContent = 'Processing...';
-        btn.disabled = true;
-        fetch('/scans/' + documentId + '/reprocess-section/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
-            body: JSON.stringify({ page_start: ps, page_end: pe, model: model }),
-        }).then(function (r) { return r.json(); })
-        .then(function (data) {
-            if (data.status === 'ok') {
-                location.reload();
-            } else {
-                alert('Error: ' + (data.message || 'unknown'));
-                btn.textContent = 'Reprocess';
-                btn.disabled = false;
-            }
-        }).catch(function (err) {
-            alert('Error: ' + err);
-            btn.textContent = 'Reprocess';
-            btn.disabled = false;
-        });
     }
 
     // --- Draw Detection Mode ---
@@ -1054,12 +1001,15 @@ document.addEventListener('DOMContentLoaded', function () {
             // Auto re-pair if pairing label
             var _pLabels = ['CASE_CAPTION', 'KEY_ICON'];
             if (_pLabels.indexOf(labelName) >= 0) {
-                fetch('/scans/' + documentId + '/repare-opinions/', {
+                fetch('/scans/' + documentId + '/pair-opinions/', {
                     method: 'POST',
                     headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
                 }).then(function(r) { return r.json(); })
                 .then(function(d2) {
-                    alert(d2.message || 'Re-paired');
+                    if (d2.error) {
+                        alert('Error: ' + d2.error);
+                        return;
+                    }
                     window.location.reload();
                 });
             }
@@ -1721,7 +1671,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // ── Detection box editing ──
     var _selectedDetBox = null;
 
-    function _selectDetectionBox(div, det, pageNum, scaleX, scaleY) {
+    function _selectDetectionBox(div, det) {
         _deselectDetectionBox();
         _selectedDetBox = div;
         div.style.outline = '2px solid #f59e0b';
@@ -1763,71 +1713,6 @@ document.addEventListener('DOMContentLoaded', function () {
 
         toolbar.appendChild(deleteBtn);
         div.appendChild(toolbar);
-
-        // Resize handles
-        var handles = ['nw','n','ne','w','e','sw','s','se'];
-        handles.forEach(function(pos) {
-            var h = document.createElement('div');
-            h.className = 'det-resize-handle';
-            h.style.cssText = 'position:absolute;width:8px;height:8px;background:#f59e0b;border:1px solid #fff;z-index:22;cursor:' + pos + '-resize;';
-            if (pos.indexOf('n') >= 0) h.style.top = '-4px';
-            if (pos.indexOf('s') >= 0) h.style.bottom = '-4px';
-            if (pos.indexOf('w') >= 0) h.style.left = '-4px';
-            if (pos.indexOf('e') >= 0) h.style.right = '-4px';
-            if (pos === 'n' || pos === 's') h.style.left = 'calc(50% - 4px)';
-            if (pos === 'w' || pos === 'e') h.style.top = 'calc(50% - 4px)';
-
-            h.addEventListener('mousedown', function(e) {
-                e.stopPropagation();
-                e.preventDefault();
-                var startX = e.clientX, startY = e.clientY;
-                var startLeft = parseFloat(div.style.left);
-                var startTop = parseFloat(div.style.top);
-                var startW = parseFloat(div.style.width);
-                var startH = parseFloat(div.style.height);
-
-                function onMove(ev) {
-                    var dx = ev.clientX - startX, dy = ev.clientY - startY;
-                    var nL = startLeft, nT = startTop, nW = startW, nH = startH;
-                    if (pos.indexOf('e') >= 0) nW = startW + dx;
-                    if (pos.indexOf('w') >= 0) { nW = startW - dx; nL = startLeft + dx; }
-                    if (pos.indexOf('s') >= 0) nH = startH + dy;
-                    if (pos.indexOf('n') >= 0) { nH = startH - dy; nT = startTop + dy; }
-                    if (nW > 5) { div.style.left = nL + 'px'; div.style.width = nW + 'px'; }
-                    if (nH > 5) { div.style.top = nT + 'px'; div.style.height = nH + 'px'; }
-                }
-                function onUp() {
-                    document.removeEventListener('mousemove', onMove);
-                    document.removeEventListener('mouseup', onUp);
-                    // Save updated bbox to detections.json (image pixel coords)
-                    var nL = parseFloat(div.style.left);
-                    var nT = parseFloat(div.style.top);
-                    var nW = parseFloat(div.style.width);
-                    var nH = parseFloat(div.style.height);
-                    var newBbox = [
-                        Math.round(nL / scaleX),
-                        Math.round(nT / scaleY),
-                        Math.round((nL + nW) / scaleX),
-                        Math.round((nT + nH) / scaleY),
-                    ];
-                    // Update detection in detections.json
-                    fetch('/scans/' + documentId + '/update-detection-bbox/', {
-                        method: 'POST',
-                        headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            page_index: det.page_index,
-                            label_id: det.label_id,
-                            original_bbox: det.bbox,
-                            new_bbox: newBbox,
-                        }),
-                    });
-                    det.bbox = newBbox;
-                }
-                document.addEventListener('mousemove', onMove);
-                document.addEventListener('mouseup', onUp);
-            });
-            div.appendChild(h);
-        });
     }
 
     function _deselectDetectionBox() {
@@ -1971,32 +1856,6 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 
-    // ── Re-pair opinions ──
-    window.repairOpinions = function() {
-        var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
-        fetch('/scans/' + documentId + '/repare-opinions/', {
-            method: 'POST',
-            headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-        })
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            if (data.error) {
-                alert('Error: ' + data.error);
-            } else {
-                alert(data.message);
-                // Clear cached redaction rects so they reload
-                refreshOverlays();
-                if (redactionsVisible) {
-                    clearOverlaysByClass('redaction-overlay-box');
-                    toggleRedactions();
-                }
-                // Reload the page to update opinion list
-                window.location.reload();
-            }
-        })
-        .catch(function(err) { alert('Re-pair failed: ' + err); });
-    };
-
     // ── Scroll to page and highlight opinion range ──
     var _highlightedOpinion = null;
     var _currentViewPage = null;
@@ -2115,7 +1974,6 @@ document.addEventListener('DOMContentLoaded', function () {
     });
 
     // Keep _currentOpIndex in sync when clicking
-    var _origHighlight = window.highlightOpinion;
     var _wrappedHighlight = window.highlightOpinion;
     window.highlightOpinion = function(cp, kp, idx) {
         _currentOpIndex = idx;
