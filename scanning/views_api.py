@@ -345,7 +345,7 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
     output_dir = scan.output_dir
     pdf_path = find_ocr_pdf(output_dir) or scan.pdf_path
     try:
-        rects = _compute_and_save_redaction_rects(pk, pdf_path, output_dir)
+        rects = _compute_and_save_redaction_rects(pk, pdf_path)
         _compute_and_save_margin_rects(pk, pdf_path, output_dir)
         Scan.objects.filter(pk=pk).update(s3_uploaded=False)
         total_rects = sum(len(r["rects"]) for r in rects)

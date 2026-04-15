@@ -246,9 +246,7 @@ class TestComputeAndSaveRedactionRects(TestCase):
             _run_detect_on_fixture(tmpdir)
             _import_detections_from_json(scan.pk, tmpdir)
 
-            rects = _compute_and_save_redaction_rects(
-                scan.pk, str(PDF_PATH), tmpdir
-            )
+            rects = _compute_and_save_redaction_rects(scan.pk, str(PDF_PATH))
             self.assertGreater(len(rects), 0)
 
             scan.refresh_from_db()

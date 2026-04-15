@@ -373,6 +373,92 @@ def _import_detections_from_json(scan_pk: int, output_dir: str) -> list:
     return dets
 
 
+def _delete_page_and_detections(
+    scan: "Scan",
+    scan_pk: int,
+    page_idx: int,
+    output_dir: Path | None,
+) -> None:
+    """Remove a page from all PDFs, then delete/shift its detections.
+
+    For each PDF in ``_collect_pdf_paths(scan, output_dir)``, deletes
+    the page at ``page_idx`` (if in bounds) and saves incrementally.
+    Then deletes Detection rows on that page and shifts the
+    ``page_index`` of subsequent detections down by 1.
+
+    :param scan: The Scan instance.
+    :param scan_pk: Primary key of the scan.
+    :param page_idx: Zero-based index of the page to delete.
+    :param output_dir: Output directory (passed to
+        ``_collect_pdf_paths``).
+    """
+    for pdf_path in _collect_pdf_paths(scan, output_dir):
+        with fitz.open(str(pdf_path)) as doc:
+            if 0 <= page_idx < doc.page_count:
+                doc.delete_page(page_idx)
+                doc.saveIncr()
+
+    Detection.objects.filter(scan_id=scan_pk, page_index=page_idx).delete()
+    Detection.objects.filter(scan_id=scan_pk, page_index__gt=page_idx).update(
+        page_index=F("page_index") - 1
+    )
+
+
+def _detect_sequence_issues(
+    ocr_results: list, out_of_range_pages: set
+) -> list[tuple]:
+    """Classify duplicate / backward / gap page-number runs.
+
+    Walks ocr_results in order, tracks the previous detected page number,
+    and yields an issue tuple whenever the difference between consecutive
+    pages is 0 (duplicate), negative (backward), or > 2 (gap).
+
+    :param ocr_results: List of per-page OCR result dicts.
+    :param out_of_range_pages: PDF page numbers already flagged as
+        out-of-range; these are skipped so they don't anchor the
+        prev_num chain.
+    :returns: List of issue tuples. GAP tuples include a trailing list
+        of missing page numbers; others have 5 elements.
+    :rtype: list[tuple]
+    """
+    seq_issues: list[tuple] = []
+    prev_num = prev_pdf = None
+    for r in ocr_results:
+        if not r["detected"] or r.get("type") == "range":
+            prev_num = None
+            continue
+        try:
+            num = int(r["detected"])
+        except ValueError:
+            continue
+        if r["pdf_page"] in out_of_range_pages:
+            continue
+        if prev_num is not None:
+            diff = num - prev_num
+            if diff == 0:
+                seq_issues.append(
+                    ("DUPLICATE", r["pdf_page"], num, prev_pdf, prev_num)
+                )
+            elif diff < 0:
+                seq_issues.append(
+                    ("BACKWARD", r["pdf_page"], num, prev_pdf, prev_num)
+                )
+            elif diff > 2:
+                seq_issues.append(
+                    (
+                        "GAP",
+                        r["pdf_page"],
+                        num,
+                        prev_pdf,
+                        prev_num,
+                        list(range(prev_num + 1, num)),
+                    )
+                )
+        prev_num = num
+        prev_pdf = r["pdf_page"]
+    return seq_issues
+
+
 def _page_number_lookup(scan: "Scan") -> dict:
     """Build {page_index: (page_number, page_number_end)} from ocr_results.
 
@@ -500,18 +586,14 @@ def _build_document_from_detections(
     return document
 
 
-def _compute_and_save_redaction_rects(
-    scan_pk: int, pdf_path: str, output_dir: str
-) -> list:
+def _compute_and_save_redaction_rects(scan_pk: int, pdf_path: str) -> list:
     """Compute redaction rects and save to the Scan model.
 
     :param scan_pk: Primary key of the scan to compute rects for.
     :param pdf_path: Path to the PDF used for page dimensions.
-    :param output_dir: Directory (used for detection sync only).
     :return: The computed rects list.
     """
     scan = Scan.objects.get(pk=scan_pk)
-    output_dir = Path(output_dir)
 
     det_data = _sync_detections_to_disk(scan_pk)
     if not det_data:
@@ -1074,41 +1156,7 @@ def recalculate_issues(scan: "Scan") -> None:
     all_nums = sorted(seen_nums.keys())
     duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
 
-    prev_num = prev_pdf = None
-    seq_issues = []
-    for r in ocr_results:
-        if not r["detected"] or r.get("type") == "range":
-            prev_num = None
-            continue
-        try:
-            num = int(r["detected"])
-        except ValueError:
-            continue
-        if r["pdf_page"] in out_of_range_pages:
-            continue
-        if prev_num is not None:
-            diff = num - prev_num
-            if diff == 0:
-                seq_issues.append(
-                    ("DUPLICATE", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff < 0:
-                seq_issues.append(
-                    ("BACKWARD", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff > 2:
-                seq_issues.append(
-                    (
-                        "GAP",
-                        r["pdf_page"],
-                        num,
-                        prev_pdf,
-                        prev_num,
-                        list(range(prev_num + 1, num)),
-                    )
-                )
-        prev_num = num
-        prev_pdf = r["pdf_page"]
+    seq_issues = _detect_sequence_issues(ocr_results, out_of_range_pages)
 
     range_re = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
     range_pages = set()
@@ -1280,7 +1328,7 @@ def run_full_pipeline(scan_pk: int) -> None:
         # 8. Compute redaction rects (margin rects computed lazily when viewer requests them)
         _update_progress(scan_pk, "Computing redaction rects...")
         pdf_path = str(ocr_pdf) if ocr_pdf else scan.pdf_path
-        _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
+        _compute_and_save_redaction_rects(scan_pk, pdf_path)
 
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.PENDING_REVIEW,
@@ -1333,41 +1381,7 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
     not_detected = [x for x in all_results if not x["detected"]]
     out_of_range_pages = {r["pdf_page"] for r in out_of_range}
 
-    seq_issues = []
-    prev_num = prev_pdf = None
-    for r in all_results:
-        if not r["detected"] or r.get("type") == "range":
-            prev_num = None
-            continue
-        try:
-            num = int(r["detected"])
-        except ValueError:
-            continue
-        if r["pdf_page"] in out_of_range_pages:
-            continue
-        if prev_num is not None:
-            diff = num - prev_num
-            if diff == 0:
-                seq_issues.append(
-                    ("DUPLICATE", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff < 0:
-                seq_issues.append(
-                    ("BACKWARD", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff > 2:
-                seq_issues.append(
-                    (
-                        "GAP",
-                        r["pdf_page"],
-                        num,
-                        prev_pdf,
-                        prev_num,
-                        list(range(prev_num + 1, num)),
-                    )
-                )
-        prev_num = num
-        prev_pdf = r["pdf_page"]
+    seq_issues = _detect_sequence_issues(all_results, out_of_range_pages)
 
     if exp_start is not None and exp_end is not None:
         expected = set(range(exp_start, exp_end + 1))
@@ -1454,18 +1468,9 @@ def run_reprocess(scan_pk: int) -> None:
             )
             for pdf_page in deleted_pdf_pages:
                 page_idx = pdf_page - 1
-                for pdf_path in _collect_pdf_paths(scan, output_dir):
-                    with fitz.open(str(pdf_path)) as doc:
-                        if 0 <= page_idx < doc.page_count:
-                            doc.delete_page(page_idx)
-                            doc.saveIncr()
-
-                Detection.objects.filter(
-                    scan_id=scan_pk, page_index=page_idx
-                ).delete()
-                Detection.objects.filter(
-                    scan_id=scan_pk, page_index__gt=page_idx
-                ).update(page_index=F("page_index") - 1)
+                _delete_page_and_detections(
+                    scan, scan_pk, page_idx, output_dir
+                )
 
                 # Remove from ocr_results and shift pdf_page numbers
                 all_results = [
@@ -1519,9 +1524,7 @@ def run_reprocess(scan_pk: int) -> None:
                 margin_rects="", redaction_rects=""
             )
             _compute_and_save_margin_rects(scan_pk, pdf_path, str(output_dir))
-            _compute_and_save_redaction_rects(
-                scan_pk, pdf_path, str(output_dir)
-            )
+            _compute_and_save_redaction_rects(scan_pk, pdf_path)
 
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.PENDING_REVIEW,
@@ -1556,20 +1559,7 @@ def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
     page_idx = pdf_page - 1
     output_dir = Path(scan.output_dir) if scan.output_dir else None
 
-    # Remove page from all PDFs
-    for pdf_path in _collect_pdf_paths(scan, output_dir):
-        with fitz.open(str(pdf_path)) as doc:
-            if 0 <= page_idx < doc.page_count:
-                doc.delete_page(page_idx)
-                doc.saveIncr()
-
-    # Delete detections on the removed page
-    Detection.objects.filter(scan_id=scan_pk, page_index=page_idx).delete()
-
-    # Shift subsequent detections down
-    Detection.objects.filter(scan_id=scan_pk, page_index__gt=page_idx).update(
-        page_index=F("page_index") - 1
-    )
+    _delete_page_and_detections(scan, scan_pk, page_idx, output_dir)
 
     # Update page count
     with fitz.open(scan.pdf_path) as pdf:
@@ -1585,7 +1575,7 @@ def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
 
     if output_dir:
         pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
-        _compute_and_save_redaction_rects(scan_pk, pdf_path, str(output_dir))
+        _compute_and_save_redaction_rects(scan_pk, pdf_path)
 
 
 def _ocr_single_page(ocr_pdf_path: str, page_idx: int) -> None:
@@ -1714,9 +1704,7 @@ def run_smart_insert(
         _compute_and_save_margin_rects(
             scan_pk, pdf_path or scan.pdf_path, str(output_dir)
         )
-        _compute_and_save_redaction_rects(
-            scan_pk, pdf_path or scan.pdf_path, str(output_dir)
-        )
+        _compute_and_save_redaction_rects(scan_pk, pdf_path or scan.pdf_path)
 
 
 def _collect_pdf_paths(scan: "Scan", output_dir: str | None) -> list[Path]:
