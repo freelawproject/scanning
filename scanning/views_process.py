@@ -700,18 +700,3 @@ def dismiss_issue(request, pk):
     issue_id = data.get("issue_id")
     Issue.objects.filter(pk=issue_id, scan=scan).delete()
     return JsonResponse({"status": "ok"})
-
-
-@login_required
-@require_POST
-def dismiss_issues(request, pk):
-    """Dismiss all validation issues for a scan.
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: Redirect to the scan list.
-    """
-    scan = get_object_or_404(Scan, pk=pk)
-    scan.issues.all().delete()
-    scan.save()
-    return redirect("scan_list")
