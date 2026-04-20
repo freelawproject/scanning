@@ -590,16 +590,13 @@ class Scan(AbstractDateTimeModel):
         if errors:
             raise ValidationError(errors)
 
-    @property
-    def output_dir(self) -> str:
-        """Return the local processing directory for this scan.
+    def _path_suffix(self) -> Path:
+        """Return the per-scan path suffix used by output_dir variants.
 
-        Computed from ``MEDIA_ROOT/processed/{pk}/{reporter}/{volume}/{start_page}/``.
-
-        :return: The absolute path to the output directory.
-        :rtype: str
+        :return: Relative path like ``{pk}/{reporter}/{vol}/{start}``.
+        :rtype: Path
         """
-        path = Path(settings.MEDIA_ROOT) / "processed" / str(self.pk)
+        path = Path(str(self.pk))
         if self.reporter and self.volume:
             path = (
                 path
@@ -607,25 +604,61 @@ class Scan(AbstractDateTimeModel):
                 / str(self.volume)
                 / str(self.start_page or 1)
             )
-        return str(path)
+        return path
+
+    @property
+    def output_dir(self) -> str:
+        """Return the processing directory for this scan.
+
+        In DEVELOPMENT, uses ``MEDIA_ROOT/processed/...`` so local work
+        stays in one place. In production, always uses the ephemeral
+        ``PROCESSING_TMP_DIR/...`` path; S3 is the source of truth, and
+        this directory is populated on upload or lazily by
+        ``s3_sync.download_processing_files`` when the viewer opens.
+
+        :return: The absolute path to the output directory.
+        :rtype: str
+        """
+        suffix = self._path_suffix()
+        if settings.DEVELOPMENT:
+            return str(Path(settings.MEDIA_ROOT) / "processed" / suffix)
+        return str(Path(settings.PROCESSING_TMP_DIR) / suffix)
 
     @property
     def pdf_path(self) -> str:
         """Return a local filesystem path to the original uploaded PDF.
 
-        Looks for the file in ``output_dir`` first (always present after
-        upload), falling back to ``FileField.path`` for local storage.
-        This ensures the processing pipeline can use ``fitz.open()``,
-        ``open()``, etc. regardless of the storage backend.
+        Resolution order:
+
+        1. ``output_dir/<name>.original.pdf`` (present after upload or
+           after pulling from S3).
+        2. Django ``FileField.path`` if the file actually exists on disk
+           (covers DEV and tests where the FileField was written to
+           MEDIA_ROOT).
+
+        Raises ``FileNotFoundError`` when no local copy exists: in prod
+        this signals the caller should invoke
+        ``s3_sync.download_processing_files(scan)`` first.
 
         :return: The filesystem path of the original PDF.
         :rtype: str
+        :raises FileNotFoundError: When no local file is available.
         """
         if self.output_dir and self.original_pdf.name:
             local = Path(self.output_dir) / Path(self.original_pdf.name).name
             if local.exists():
                 return str(local)
-        return self.original_pdf.path
+        if self.original_pdf and self.original_pdf.name:
+            try:
+                field_path = self.original_pdf.path
+            except (ValueError, NotImplementedError):
+                field_path = None
+            if field_path and Path(field_path).exists():
+                return field_path
+        raise FileNotFoundError(
+            f"scan {self.pk} has no local original PDF; "
+            "pull from S3 via s3_sync.download_processing_files first"
+        )
 
     def __str__(self):
         return (

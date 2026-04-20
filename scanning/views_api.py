@@ -434,7 +434,34 @@ def serve_opinionscan_pdf(
     field = field_map.get(variant)
     if not field or not field.name:
         raise Http404
-    return FileResponse(field.open("rb"), content_type="application/pdf")
+
+    # The FileField name is either a MEDIA_ROOT-relative path (DEV,
+    # resolves via the storage backend) or a scan.output_dir-relative
+    # path (prod, file lives under /tmp/scanning/{pk}/...). Try the
+    # storage backend first; fall back to resolving against the scan's
+    # output_dir.
+    if field.storage.exists(field.name):
+        return FileResponse(field.open("rb"), content_type="application/pdf")
+    if opinion.scan:
+        candidate = Path(opinion.scan.output_dir) / field.name
+        if candidate.is_file():
+            return FileResponse(
+                candidate.open("rb"), content_type="application/pdf"
+            )
+        # Lazy pull from S3: covers the case where the daemon generated
+        # files after the web container's /tmp/ was populated (or never
+        # was). Runs once per request; no-op if S3 is disabled.
+        try:
+            from scanning import s3_sync
+
+            s3_sync.download_processing_files(opinion.scan)
+        except Exception:
+            logger.exception("Lazy S3 pull failed for opinion %s", opinion.pk)
+        if candidate.is_file():
+            return FileResponse(
+                candidate.open("rb"), content_type="application/pdf"
+            )
+    raise Http404
 
 
 def _apply_rect_to_pdf(
@@ -549,6 +576,24 @@ def serve_redacted_pdf(
 
     # 2. Fall back to the OCR PDF (for preview before generation)
     output = Path(scan.output_dir)
+    if output.is_dir():
+        ocr = find_ocr_pdf(output)
+        if ocr:
+            return FileResponse(ocr.open("rb"), content_type="application/pdf")
+
+    # 3. Lazy S3 pull + retry: handles the case where the daemon just
+    # finished Generate Files and the web container's /tmp/ is stale.
+    try:
+        from scanning import s3_sync
+
+        s3_sync.download_processing_files(scan)
+    except Exception:
+        logger.exception("Lazy S3 pull failed for scan %s", scan.pk)
+    if scan.redacted_pdf_path and os.path.isfile(scan.redacted_pdf_path):
+        return FileResponse(
+            Path(scan.redacted_pdf_path).open("rb"),
+            content_type="application/pdf",
+        )
     if output.is_dir():
         ocr = find_ocr_pdf(output)
         if ocr:

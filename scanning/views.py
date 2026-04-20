@@ -1,7 +1,9 @@
 """Auth, scan CRUD, opinion, and queue views."""
 
+import logging
 from pathlib import Path
 
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import views as auth_views
 from django.contrib.auth.decorators import login_required
@@ -31,7 +33,9 @@ from scanning.models import (
     Status,
     Volume,
 )
-from scanning.utils import get_volume
+from scanning.utils import get_volume, has_s3_credentials
+
+logger = logging.getLogger(__name__)
 
 
 def login_view(request: HttpRequest) -> HttpResponse:
@@ -506,17 +510,61 @@ def queue_upload(request, reporter_slug, vol):
         f".original.pdf"
     )
 
-    # Always keep a local copy in output_dir for the processing pipeline
+    # Keep a local copy in output_dir for the processing pipeline. In
+    # prod this is /tmp/scanning/{pk}/...; in DEV it is under MEDIA_ROOT.
     local_path = output_dir / original_name
     with open(local_path, "wb") as f:
         for chunk in pdf.chunks():
             f.write(chunk)
 
-    # Save through Django's storage backend (S3 in prod, local in dev).
-    # Reset the file pointer so .save() can read the full content.
-    pdf.seek(0)
-    scan.original_pdf.save(original_name, pdf, save=False)
-    scan.save(update_fields=["original_pdf"])
+    if settings.DEVELOPMENT:
+        # DEV: store via Django FileField (MEDIA_ROOT/original_scans/...)
+        # so the shared mount makes the file available to the daemon.
+        pdf.seek(0)
+        scan.original_pdf.save(original_name, pdf, save=False)
+        scan.save(update_fields=["original_pdf"])
+    else:
+        # PROD: push to S3 under processing/{pk}/... so the daemon can
+        # pull it (containers don't share /tmp/). Skip the FileField
+        # write so MEDIA_ROOT stays empty.
+        from scanning import s3_sync
+
+        if not has_s3_credentials():
+            logger.error(
+                "Prod upload attempted without AWS credentials for scan %s",
+                scan.pk,
+            )
+            scan.delete()
+            messages.error(
+                request,
+                "Storage is not configured; contact an administrator.",
+            )
+            return redirect(
+                "queue_detail",
+                reporter_slug=reporter_slug,
+                vol=vol,
+            )
+
+        try:
+            uploaded = s3_sync.upload_file_to_s3(scan, original_name)
+        except Exception:
+            logger.exception(
+                "Failed to upload original PDF to S3 for scan %s", scan.pk
+            )
+            uploaded = False
+        if not uploaded:
+            scan.delete()
+            messages.error(
+                request,
+                "Upload to storage failed. Please try again in a moment.",
+            )
+            return redirect(
+                "queue_detail",
+                reporter_slug=reporter_slug,
+                vol=vol,
+            )
+        scan.original_pdf.name = original_name
+        scan.save(update_fields=["original_pdf"])
 
     action = request.POST.get("action", "upload_only")
     if action == "upload_validate":

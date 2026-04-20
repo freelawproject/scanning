@@ -131,7 +131,7 @@
     <div class="card">
       <h2 class="text-lg font-bold mb-4">Original PDF</h2>
       <iframe
-        src="{{ scan.original_pdf.url }}"
+        src="{% url 'serve_scan_pdf' pk=scan.pk %}"
         class="w-full border border-gray-200 dark:border-gray-700 rounded"
         style="height: 75vh;"
         title="Original PDF"

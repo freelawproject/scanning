@@ -1,24 +1,101 @@
-"""Daemon that polls for queued scans and processes them one at a time."""
+"""Scheduler daemon that invokes per-task management commands at intervals.
+
+Each task's logic lives in its own management command. This process is
+just a loop that calls each command when its interval has elapsed.
+Adding a new periodic job means adding another entry to
+``_build_schedule``.
+
+Current schedule:
+
+- ``process_next_scan`` every ``DAEMON_POLL_INTERVAL`` seconds (default 5s)
+- ``cleanup_processing_tmp`` every ``PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS``
+  seconds (default 900s)
+
+Examples:
+
+    # Start the daemon in the foreground (docker-compose runs this
+    # automatically in the scanning-daemon service).
+    docker exec scanning-daemon python manage.py run_daemon
+
+    # Ad-hoc run inside the web container, e.g. when debugging locally.
+    docker exec scanning-django python manage.py run_daemon
+"""
 
 import logging
 import signal
 import time
+from dataclasses import dataclass, field
 
 from django.conf import settings
+from django.core.management import call_command
 from django.core.management.base import BaseCommand
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class ScheduledTask:
+    """A management command to invoke at a fixed interval.
+
+    :ivar name: Name of the management command (as passed to call_command).
+    :ivar interval_seconds: Minimum time between consecutive runs.
+    :ivar last_ran: Monotonic timestamp of the most recent run. 0.0 means
+        "never ran"; the task fires on the first scheduler tick.
+    """
+
+    name: str
+    interval_seconds: float
+    last_ran: float = field(default=0.0)
+
+    def due(self, now: float) -> bool:
+        """Return True if the task should fire at ``now``.
+
+        :param now: Current monotonic timestamp.
+        :return: Whether the task's interval has elapsed.
+        :rtype: bool
+        """
+        return (now - self.last_ran) >= self.interval_seconds
+
+    def mark_ran(self, now: float) -> None:
+        """Record that the task ran at ``now``.
+
+        :param now: Current monotonic timestamp.
+        :return: None.
+        """
+        self.last_ran = now
+
+
 class Command(BaseCommand):
-    help = "Run the scanning daemon that polls for queued scans."
+    help = (
+        "Run the scanning daemon. Invokes process_next_scan and "
+        "cleanup_processing_tmp on their configured intervals."
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.shutdown = False
 
+    def _build_schedule(self) -> list[ScheduledTask]:
+        """Return the list of tasks this daemon should run.
+
+        :return: Tasks with their intervals.
+        :rtype: list[ScheduledTask]
+        """
+        return [
+            ScheduledTask(
+                name="process_next_scan",
+                interval_seconds=float(settings.DAEMON_POLL_INTERVAL),
+            ),
+            ScheduledTask(
+                name="cleanup_processing_tmp",
+                interval_seconds=float(
+                    settings.PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS
+                ),
+            ),
+        ]
+
     def handle(self, *args, **options):
-        """Poll for queued scans and process them until shutdown.
+        """Tick the schedule until a termination signal is received.
 
         :param args: Positional arguments from the management command.
         :param options: Parsed command-line options.
@@ -27,123 +104,25 @@ class Command(BaseCommand):
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
 
-        interval = settings.DAEMON_POLL_INTERVAL
-        timeout = settings.DAEMON_PROCESSING_TIMEOUT
-        self.stdout.write(
-            f"Daemon started, polling every {interval}s, "
-            f"stale timeout {timeout}s"
+        schedule = self._build_schedule()
+        intervals = ", ".join(
+            f"{t.name}={t.interval_seconds:g}s" for t in schedule
         )
+        self.stdout.write(f"Daemon started. Schedule: {intervals}")
 
         while not self.shutdown:
-            try:
-                self._recover_stale()
-                self._process_next()
-            except Exception:
-                logger.exception("Daemon loop error")
-            time.sleep(interval)
+            now = time.monotonic()
+            for task in schedule:
+                if not task.due(now):
+                    continue
+                try:
+                    call_command(task.name)
+                except Exception:
+                    logger.exception("Scheduled task %s failed", task.name)
+                task.mark_ran(time.monotonic())
+            time.sleep(1)
 
         self.stdout.write("Daemon shutting down.")
-
-    def _recover_stale(self):
-        """Reset scans stuck in PROCESSING past the timeout back to QUEUED.
-
-        :return: None.
-        """
-        from datetime import timedelta
-
-        from django.conf import settings
-        from django.utils import timezone
-
-        from scanning.models import Scan, Status
-
-        cutoff = timezone.now() - timedelta(
-            seconds=settings.DAEMON_PROCESSING_TIMEOUT
-        )
-        stale = Scan.objects.filter(
-            status=Status.PROCESSING,
-            processed_at__lt=cutoff,
-        )
-        for scan in stale:
-            self.stdout.write(
-                f"Recovering stale scan {scan.pk} "
-                f"(processing since {scan.processed_at})"
-            )
-            Scan.objects.filter(pk=scan.pk).update(
-                status=Status.QUEUED,
-                progress_message="Re-queued (previous attempt timed out)",
-            )
-
-    def _process_next(self):
-        """Fetch the next queued scan and dispatch its action.
-
-        :return: None.
-        """
-        from django.db import connections, transaction
-        from django.utils import timezone
-
-        from scanning import services
-        from scanning.models import QueuedAction, Scan, Status
-
-        # Close stale DB connections before each cycle
-        connections.close_all()
-
-        # Atomically claim the next queued scan. skip_locked ensures a
-        # concurrent daemon picks a different row instead of blocking.
-        with transaction.atomic():
-            scan = (
-                Scan.objects.select_for_update(skip_locked=True)
-                .filter(status=Status.QUEUED)
-                .order_by("date_created")
-                .first()
-            )
-            if scan is None:
-                return
-
-            action = scan.queued_action or QueuedAction.FULL_PIPELINE
-            Scan.objects.filter(pk=scan.pk).update(
-                status=Status.PROCESSING,
-                processed_at=timezone.now(),
-                progress_message=f"Starting {action}...",
-                progress_current=0,
-                progress_total=0,
-            )
-
-        self.stdout.write(f"Processing scan {scan.pk} ({action})")
-
-        dispatch = {
-            QueuedAction.FULL_PIPELINE: services.run_full_pipeline,
-            QueuedAction.VALIDATE: services.run_validate_with_bitonal,
-            QueuedAction.DETECT: services.run_detect,
-            QueuedAction.REPROCESS: services.run_reprocess,
-            QueuedAction.GENERATE_FILES: services.run_generate_files,
-        }
-
-        fn = dispatch.get(action)
-        if fn is None:
-            logger.error(
-                "Unknown queued_action %r for scan %s", action, scan.pk
-            )
-            Scan.objects.filter(pk=scan.pk).update(
-                status=Status.ERROR,
-                progress_message=f"Unknown action: {action}",
-            )
-            return
-
-        try:
-            fn(scan.pk)
-        except Exception:
-            logger.exception("Scan %s (%s) failed", scan.pk, action)
-            # Only set ERROR if the pipeline didn't already handle it
-            current = (
-                Scan.objects.filter(pk=scan.pk)
-                .values_list("status", flat=True)
-                .first()
-            )
-            if current == Status.PROCESSING:
-                Scan.objects.filter(pk=scan.pk).update(
-                    status=Status.ERROR,
-                    progress_message="Unexpected error (check logs)",
-                )
 
     def _handle_signal(self, signum, frame):
         """Set the shutdown flag on receipt of a termination signal.

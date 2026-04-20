@@ -804,3 +804,230 @@ class TestApproveScan(ScanningTestCase):
             reverse("approve_scan", kwargs={"pk": scan.pk})
         )
         self.assertEqual(response.status_code, 405)
+
+
+class TestQueueUploadS3(ScanningTestCase):
+    """Upload view pushes originals to S3 in prod, MEDIA_ROOT in dev."""
+
+    def _post_upload(self):
+        """Helper: create Volume + post a valid PDF upload.
+
+        :returns: The HTTP response.
+        """
+
+        from scanning.models import Volume
+
+        user = self.make_user()
+        self.client.force_login(user)
+        reporter = ReporterFactory(short_name="tu")
+        volume = Volume.objects.create(
+            reporter=reporter,
+            volume_number=42,
+        )
+        pdf = SimpleUploadedFile(
+            "scan.pdf", b"%PDF-1.4 body", content_type="application/pdf"
+        )
+        return self.client.post(
+            reverse(
+                "queue_upload",
+                kwargs={"reporter_slug": "tu", "vol": 42},
+            ),
+            {
+                "new_scan": "1",
+                "first_page": "1",
+                "last_page": "10",
+                "original_pdf": pdf,
+            },
+        ), volume
+
+    @override_settings(DEVELOPMENT=True)
+    def test_dev_writes_filefield_and_skips_s3(self):
+        from unittest.mock import patch
+
+        with patch("scanning.s3_sync.upload_file_to_s3") as mock_s3:
+            response, _ = self._post_upload()
+
+        self.assertEqual(response.status_code, 302)
+        mock_s3.assert_not_called()
+        scan = Scan.objects.get()
+        # FileField has a real file (ends with .original.pdf).
+        self.assertTrue(scan.original_pdf.name.endswith(".original.pdf"))
+        # Django's FileField wrote an actual file to storage.
+        self.assertTrue(
+            scan.original_pdf.storage.exists(scan.original_pdf.name)
+        )
+
+    @override_settings(DEVELOPMENT=False, TESTING=False)
+    def test_prod_uploads_to_s3_and_skips_filefield(self):
+        from unittest.mock import patch
+
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.upload_file_to_s3", return_value=True
+            ) as mock_s3,
+        ):
+            response, _ = self._post_upload()
+
+        self.assertEqual(response.status_code, 302)
+        mock_s3.assert_called_once()
+        scan = Scan.objects.get()
+        self.assertTrue(scan.original_pdf.name.endswith(".original.pdf"))
+        # FileField was NOT written to MEDIA_ROOT, only metadata set.
+        self.assertFalse(
+            scan.original_pdf.storage.exists(scan.original_pdf.name)
+        )
+
+    @override_settings(DEVELOPMENT=False, TESTING=False)
+    def test_prod_s3_exception_deletes_scan_and_shows_error(self):
+        from unittest.mock import patch
+
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.upload_file_to_s3",
+                side_effect=RuntimeError("boom"),
+            ),
+            self.assertLogs("scanning.views", level="ERROR") as cm,
+        ):
+            response, _ = self._post_upload()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(Scan.objects.count(), 0)
+        self.assertTrue(
+            any("Failed to upload original PDF" in m for m in cm.output)
+        )
+
+    @override_settings(DEVELOPMENT=False, TESTING=False)
+    def test_prod_missing_creds_deletes_scan_early(self):
+        from unittest.mock import patch
+
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=False),
+            patch("scanning.s3_sync.upload_file_to_s3") as mock_s3,
+            self.assertLogs("scanning.views", level="ERROR") as cm,
+        ):
+            response, _ = self._post_upload()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(Scan.objects.count(), 0)
+        mock_s3.assert_not_called()
+        self.assertTrue(any("without AWS credentials" in m for m in cm.output))
+
+    @override_settings(DEVELOPMENT=False, TESTING=False)
+    def test_prod_upload_returning_false_deletes_scan(self):
+        from unittest.mock import patch
+
+        # upload_file_to_s3 returning False (e.g. the helper's own
+        # short-circuit) should be treated as a failure by the view.
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch("scanning.s3_sync.upload_file_to_s3", return_value=False),
+        ):
+            response, _ = self._post_upload()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(Scan.objects.count(), 0)
+
+
+class TestPdfPathFallback(ScanningTestCase):
+    """Scan.pdf_path raises FileNotFoundError in prod when no local file."""
+
+    @override_settings(DEVELOPMENT=False, TESTING=False)
+    def test_prod_raises_when_no_local_file(self):
+        scan = ScanFactory(original_pdf=None)
+        scan.original_pdf.name = "nothing.pdf"
+        scan.save(update_fields=["original_pdf"])
+        with self.assertRaises(FileNotFoundError):
+            _ = scan.pdf_path
+
+    @override_settings(DEVELOPMENT=True)
+    def test_dev_falls_back_to_filefield_path(self):
+        # ScanFactory populates original_pdf via FileField, so .path works.
+        scan = ScanFactory()
+        self.assertTrue(scan.pdf_path.endswith(".pdf"))
+
+
+class TestServeOpinionPdfLazyPull(ScanningTestCase):
+    """serve_opinionscan_pdf falls back to S3 pull when /tmp/ is stale."""
+
+    def test_lazy_pull_populates_tmp_and_serves(self):
+        import pathlib
+        import tempfile
+        from unittest.mock import patch
+
+        from scanning.models import OpinionScan, OpinionStatus
+
+        user = self.make_user()
+        self.client.force_login(user)
+
+        # Create a scan + opinion whose redacted_pdf.name is relative to
+        # the scan's output_dir (prod-style layout).
+        tmp_root = tempfile.mkdtemp()
+        reporter = ReporterFactory(short_name="tp")
+        scan = ScanFactory(
+            reporter=reporter, volume=77, start_page=1, end_page=2
+        )
+        opinion = OpinionScan.objects.create(
+            scan=scan,
+            reporter=reporter,
+            volume=77,
+            opinion_order=0,
+            page_start=1,
+            page_end=2,
+            status=OpinionStatus.OK,
+            uploaded_by=user,
+        )
+        opinion.redacted_pdf.name = "redacted/op.pdf"
+        opinion.save(update_fields=["redacted_pdf"])
+
+        def _fake_download(scan_arg):
+            # Simulate the pull writing the file to the scan's output dir.
+            target = pathlib.Path(scan_arg.output_dir) / "redacted" / "op.pdf"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"%PDF-1.4 pulled")
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch(
+                "scanning.s3_sync.download_processing_files",
+                side_effect=_fake_download,
+            ) as mock_pull,
+        ):
+            response = self.client.get(
+                reverse(
+                    "serve_opinionscan_pdf",
+                    kwargs={"pk": opinion.pk, "variant": "redacted"},
+                )
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_pull.assert_called_once()
+
+
+class TestRunFullPipelinePullsFromS3(ScanningTestCase):
+    """run_full_pipeline pulls files from S3 at entry (prod only)."""
+
+    def test_invokes_pull_helper(self):
+        from unittest.mock import patch
+
+        scan = ScanFactory(status=Status.QUEUED)
+        with (
+            patch(
+                "scanning.services._pull_processing_files_from_s3"
+            ) as mock_pull,
+            # Stop the pipeline early by failing the first read.
+            patch(
+                "scanning.services.ensure_output_dir",
+                side_effect=RuntimeError("stop"),
+            ),
+        ):
+            from scanning.services import run_full_pipeline
+
+            run_full_pipeline(scan.pk)
+
+        mock_pull.assert_called_once_with(scan.pk)

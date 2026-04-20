@@ -1,0 +1,254 @@
+"""Tests for scanning.s3_sync with mocked boto3."""
+
+import os
+import pathlib
+import tempfile
+from unittest.mock import MagicMock, patch
+
+from django.test import TestCase, override_settings
+
+from scanning import s3_sync
+from scanning.factories import ReporterFactory, ScanFactory
+from scanning.models import Status
+
+MEDIA_ROOT = tempfile.mkdtemp()
+
+
+def _reporter_scan(**kwargs):
+    """Build a scan with a reporter for predictable S3 prefixes.
+
+    :returns: A Scan instance with reporter/volume/start_page set.
+    :rtype: Scan
+    """
+    reporter = ReporterFactory(short_name="tc")
+    defaults = {
+        "reporter": reporter,
+        "volume": 164,
+        "start_page": 1,
+        "end_page": 2,
+    }
+    defaults.update(kwargs)
+    return ScanFactory(**defaults)
+
+
+@override_settings(
+    MEDIA_ROOT=MEDIA_ROOT,
+    DEVELOPMENT=True,
+    AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
+)
+class TestShortCircuitOnDevelopment(TestCase):
+    """When DEVELOPMENT=True, sync helpers must never call boto3."""
+
+    def test_upload_processing_files_noop(self):
+        scan = _reporter_scan()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            result = s3_sync.upload_processing_files(scan)
+        self.assertEqual(result, 0)
+        mock_boto3.client.assert_not_called()
+
+    def test_download_processing_files_noop(self):
+        scan = _reporter_scan()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            result = s3_sync.download_processing_files(scan)
+        self.assertIsNone(result)
+        mock_boto3.client.assert_not_called()
+
+    def test_upload_file_to_s3_noop(self):
+        scan = _reporter_scan()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            result = s3_sync.upload_file_to_s3(scan, "detections.json")
+        self.assertFalse(result)
+        mock_boto3.client.assert_not_called()
+
+
+@override_settings(
+    MEDIA_ROOT=MEDIA_ROOT,
+    DEVELOPMENT=False,
+    TESTING=False,
+    AWS_ACCESS_KEY_ID="fake",
+    AWS_SECRET_ACCESS_KEY="fake",
+    AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
+    PROCESSING_TMP_DIR=tempfile.mkdtemp(),
+)
+class TestSyncHelpersWithCredentials(TestCase):
+    """With creds and DEV=False, helpers should hit boto3."""
+
+    def setUp(self):
+        # has_s3_credentials reads os.environ, not Django settings.
+        self._env_patch = patch.dict(
+            os.environ,
+            {"AWS_ACCESS_KEY_ID": "fake", "AWS_SECRET_ACCESS_KEY": "fake"},
+        )
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+
+    def test_prefix_is_deterministic(self):
+        scan = _reporter_scan()
+        expected = f"processing/{scan.pk}/tc/164/1/"
+        self.assertEqual(s3_sync.s3_processing_prefix(scan), expected)
+
+    def test_upload_processing_files_walks_local_root(self):
+        scan = _reporter_scan()
+        local_root = pathlib.Path(scan.output_dir)
+        local_root.mkdir(parents=True, exist_ok=True)
+        (local_root / "bitonal.pdf").write_bytes(b"pdf")
+        (local_root / "detections.json").write_text("[]")
+        (local_root / "images").mkdir()
+        (local_root / "images" / "1-001.png").write_bytes(b"png")
+        # Now these should also be uploaded (recursive walk).
+        (local_root / "redacted").mkdir()
+        (local_root / "redacted" / "op.pdf").write_bytes(b"r")
+        (local_root / "masked").mkdir()
+        (local_root / "masked" / "op.pdf").write_bytes(b"m")
+        (local_root / "unredacted").mkdir()
+        (local_root / "unredacted" / "op.pdf").write_bytes(b"u")
+
+        mock_s3 = MagicMock()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            count = s3_sync.upload_processing_files(scan)
+
+        self.assertEqual(count, 6)
+        uploaded_keys = {
+            call.args[2] for call in mock_s3.upload_file.call_args_list
+        }
+        prefix = f"processing/{scan.pk}/tc/164/1/"
+        self.assertEqual(
+            uploaded_keys,
+            {
+                f"{prefix}bitonal.pdf",
+                f"{prefix}detections.json",
+                f"{prefix}images/1-001.png",
+                f"{prefix}redacted/op.pdf",
+                f"{prefix}masked/op.pdf",
+                f"{prefix}unredacted/op.pdf",
+            },
+        )
+
+    def test_is_approved_deliverable(self):
+        self.assertTrue(s3_sync._is_approved_deliverable("redacted/foo.pdf"))
+        self.assertTrue(s3_sync._is_approved_deliverable("masked/foo.pdf"))
+        self.assertTrue(s3_sync._is_approved_deliverable("images/1-001.png"))
+        self.assertTrue(
+            s3_sync._is_approved_deliverable("tc.1.1.2.original.pdf")
+        )
+        self.assertTrue(
+            s3_sync._is_approved_deliverable("tc.1.1.2.redacted.pdf")
+        )
+        self.assertFalse(
+            s3_sync._is_approved_deliverable("unredacted/foo.pdf")
+        )
+        self.assertFalse(s3_sync._is_approved_deliverable("bitonal.pdf"))
+        self.assertFalse(s3_sync._is_approved_deliverable("detections.json"))
+        # Guard against nested paths under one of the approved subdirs.
+        self.assertFalse(
+            s3_sync._is_approved_deliverable("redacted/sub/x.pdf")
+        )
+
+    def test_copy_processing_to_approved_copies_only_deliverables(self):
+        scan = _reporter_scan()
+        src_prefix = s3_sync.s3_processing_prefix(scan)
+        mock_s3 = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": f"{src_prefix}bitonal.pdf"},
+                    {"Key": f"{src_prefix}detections.json"},
+                    {"Key": f"{src_prefix}tc.164.1.2.original.pdf"},
+                    {"Key": f"{src_prefix}tc.164.1.2.redacted.pdf"},
+                    {"Key": f"{src_prefix}redacted/a.pdf"},
+                    {"Key": f"{src_prefix}masked/a.pdf"},
+                    {"Key": f"{src_prefix}unredacted/a.pdf"},
+                    {"Key": f"{src_prefix}images/1-001.png"},
+                ]
+            }
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            prefix, count = s3_sync.copy_processing_to_approved(scan)
+
+        expected_prefix = "approved/tc/164/1/"
+        self.assertEqual(prefix, expected_prefix)
+        self.assertEqual(count, 5)
+        copied = {c.kwargs["Key"] for c in mock_s3.copy_object.call_args_list}
+        self.assertEqual(
+            copied,
+            {
+                f"{expected_prefix}tc.164.1.2.original.pdf",
+                f"{expected_prefix}tc.164.1.2.redacted.pdf",
+                f"{expected_prefix}redacted/a.pdf",
+                f"{expected_prefix}masked/a.pdf",
+                f"{expected_prefix}images/1-001.png",
+            },
+        )
+
+    def test_download_processing_files_skips_same_size(self):
+        scan = _reporter_scan()
+        scan.status = Status.PENDING_REVIEW
+        scan.save(update_fields=["status"])
+        tmp_root = s3_sync.tmp_output_dir(scan)
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        existing = tmp_root / "detections.json"
+        existing.write_text("abc")
+
+        prefix = s3_sync.s3_processing_prefix(scan)
+        mock_s3 = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": f"{prefix}detections.json", "Size": 3},
+                    {"Key": f"{prefix}bitonal.pdf", "Size": 5},
+                ]
+            }
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        def _fake_download(bucket, key, dest):
+            pathlib.Path(dest).write_bytes(b"12345")
+
+        mock_s3.download_file.side_effect = _fake_download
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            result = s3_sync.download_processing_files(scan)
+
+        self.assertEqual(result, tmp_root)
+        # Only the new file (bitonal.pdf) should be downloaded.
+        self.assertEqual(mock_s3.download_file.call_count, 1)
+        self.assertEqual(
+            mock_s3.download_file.call_args.args[1],
+            f"{prefix}bitonal.pdf",
+        )
+
+    def test_upload_file_to_s3_missing_local_file(self):
+        scan = _reporter_scan()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            result = s3_sync.upload_file_to_s3(scan, "missing.json")
+        self.assertFalse(result)
+        mock_boto3.client.assert_not_called()
+
+    def test_upload_file_to_s3_happy_path(self):
+        scan = _reporter_scan()
+        scan.status = Status.PENDING_REVIEW
+        scan.save(update_fields=["status"])
+        # output_dir now resolves to /tmp/...
+        local_dir = pathlib.Path(scan.output_dir)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "detections.json").write_text("[]")
+
+        mock_s3 = MagicMock()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            ok = s3_sync.upload_file_to_s3(scan, "detections.json")
+
+        self.assertTrue(ok)
+        mock_s3.upload_file.assert_called_once()
+        _, bucket, key = mock_s3.upload_file.call_args.args
+        self.assertEqual(bucket, "test-bucket")
+        self.assertEqual(key, f"processing/{scan.pk}/tc/164/1/detections.json")

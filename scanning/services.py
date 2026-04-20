@@ -6,6 +6,7 @@ daemon process.  They must NOT import Django HTTP machinery
 """
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -61,6 +62,8 @@ from scanning.models import (
     Status,
 )
 from scanning.utils import ensure_output_dir, find_ocr_pdf, has_s3_credentials
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -488,6 +491,62 @@ def _page_number_lookup(scan: "Scan") -> dict:
     return lookup
 
 
+def _push_processing_files_to_s3(scan_pk: int) -> None:
+    """Upload a scan's intermediate processing files to S3.
+
+    Wraps ``s3_sync.upload_processing_files`` with an exception guard so
+    a failed S3 call never fails the pipeline that just succeeded. Logs
+    a distinct ``logger.error`` when creds are missing in prod so the
+    Sentry alert makes the root cause obvious (otherwise
+    ``upload_processing_files`` silently returns 0).
+
+    :param scan_pk: Primary key of the scan whose files to upload.
+    :return: None.
+    """
+    from scanning import s3_sync
+    from scanning.utils import has_s3_credentials
+
+    if (
+        not settings.DEVELOPMENT
+        and not getattr(settings, "TESTING", False)
+        and not has_s3_credentials()
+    ):
+        logger.error(
+            "Skipping S3 push for scan %s: AWS credentials not configured",
+            scan_pk,
+        )
+        return
+    try:
+        scan = Scan.objects.get(pk=scan_pk)
+        s3_sync.upload_processing_files(scan)
+    except Exception:
+        logger.exception(
+            "Failed to push processing files to S3 for scan %s", scan_pk
+        )
+
+
+def _pull_processing_files_from_s3(scan_pk: int) -> None:
+    """Download a scan's processing files from S3 to its local output dir.
+
+    Used at the start of pipelines that expect existing files (reprocess,
+    detect, generate_files, validate). No-op when S3 sync is disabled or
+    the prefix has nothing (e.g. first-time full pipeline). Safely
+    swallows exceptions so a missing/offline S3 doesn't abort the run.
+
+    :param scan_pk: Primary key of the scan to pull files for.
+    :return: None.
+    """
+    try:
+        from scanning import s3_sync
+
+        scan = Scan.objects.get(pk=scan_pk)
+        s3_sync.download_processing_files(scan)
+    except Exception:
+        logger.exception(
+            "Failed to pull processing files from S3 for scan %s", scan_pk
+        )
+
+
 def _sync_detections_to_disk(scan_pk: int) -> list | None:
     """Write current DB detections to detections.json on disk.
 
@@ -524,6 +583,14 @@ def _sync_detections_to_disk(scan_pk: int) -> list | None:
                 entry["page_number_end"] = pn[1]
         det_data.append(entry)
     (output_dir / "detections.json").write_text(json.dumps(det_data))
+    try:
+        from scanning import s3_sync
+
+        s3_sync.upload_file_to_s3(scan, "detections.json")
+    except Exception:
+        logger.exception(
+            "Failed to push detections.json to S3 for scan %s", scan_pk
+        )
     return det_data
 
 
@@ -1242,6 +1309,7 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to validate.
     """
     django.db.connections.close_all()
+    _pull_processing_files_from_s3(scan_pk)
 
     try:
         scan = Scan.objects.get(pk=scan_pk)
@@ -1256,6 +1324,7 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
         output_dir = ensure_output_dir(scan)
         bitonal_path = _ensure_bitonal(scan, output_dir)
         run_incremental_validation(scan_pk, str(bitonal_path))
+        _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
         traceback.print_exc()
@@ -1280,6 +1349,7 @@ def run_full_pipeline(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to process.
     """
     django.db.connections.close_all()
+    _pull_processing_files_from_s3(scan_pk)
 
     try:
         scan = Scan.objects.get(pk=scan_pk)
@@ -1336,6 +1406,7 @@ def run_full_pipeline(scan_pk: int) -> None:
                 f"Done, {len(dets)} detections, {len(opinions)} opinions"
             ),
         )
+        _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
         traceback.print_exc()
@@ -1436,6 +1507,7 @@ def run_reprocess(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to reprocess.
     """
     django.db.connections.close_all()
+    _pull_processing_files_from_s3(scan_pk)
 
     scan = Scan.objects.get(pk=scan_pk)
 
@@ -1531,6 +1603,7 @@ def run_reprocess(scan_pk: int) -> None:
             s3_uploaded=False,
             progress_message="Done",
         )
+        _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
         traceback.print_exc()
@@ -1822,6 +1895,7 @@ def run_generate_files(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to generate files for.
     """
     django.db.connections.close_all()
+    _pull_processing_files_from_s3(scan_pk)
 
     scan = Scan.objects.get(pk=scan_pk)
 
@@ -1830,13 +1904,12 @@ def run_generate_files(scan_pk: int) -> None:
             progress_message="Generating files...", progress_log=""
         )
 
-        output_base = Path(settings.MEDIA_ROOT) / "processed" / str(scan_pk)
-
-        ocr_pdf = find_ocr_pdf(scan.output_dir) if scan.output_dir else None
+        output = Path(scan.output_dir)
+        ocr_pdf = find_ocr_pdf(str(output))
         if not ocr_pdf:
             raise ValueError("No OCR'd PDF found in output directory")
 
-        # Stamp original-quality images into a copy — leaves OCR PDF untouched
+        # Stamp original-quality images into a copy, leaves OCR PDF untouched
         gen_pdf = _stamp_original_images(scan, str(ocr_pdf))
 
         # Write current DB detections -> detections.json (includes page numbers)
@@ -1850,8 +1923,6 @@ def run_generate_files(scan_pk: int) -> None:
             progress_message="Building combined redactions...",
         )
         redactions_path = _build_combined_redactions(scan_pk)
-
-        output = Path(scan.output_dir if scan.output_dir else str(output_base))
 
         Scan.objects.filter(pk=scan_pk).update(
             progress_message="Generating files...",
@@ -1921,27 +1992,38 @@ def run_generate_files(scan_pk: int) -> None:
             )
             if fname:
                 media_root = Path(settings.MEDIA_ROOT).resolve()
+                scan_output = Path(scan.output_dir).resolve()
+
+                def _field_name(path: Path) -> str:
+                    """Prefer a MEDIA_ROOT-relative name so Django storage
+                    can resolve the file in DEV. When the file lives
+                    outside MEDIA_ROOT (prod /tmp/ case), fall back to a
+                    path relative to the scan's output_dir, which
+                    ``serve_opinionscan_pdf`` resolves at request time.
+                    """
+                    resolved = path.resolve()
+                    try:
+                        return str(resolved.relative_to(media_root))
+                    except ValueError:
+                        return str(resolved.relative_to(scan_output))
+
                 rp = redacted_dir / fname
                 if rp.exists():
-                    opinion.redacted_pdf.name = str(
-                        rp.resolve().relative_to(media_root)
-                    )
+                    opinion.redacted_pdf.name = _field_name(rp)
                 up = (
                     unredacted_dir / fname if unredacted_dir.exists() else None
                 )
                 if up and up.exists():
-                    opinion.original_pdf.name = str(
-                        up.resolve().relative_to(media_root)
-                    )
+                    opinion.original_pdf.name = _field_name(up)
                 masked_fname = re.sub(
                     r"(\d{4})-\d{1,3}\.pdf$", r"\1.pdf", fname
                 )
                 mp = masked_dir / masked_fname if masked_dir.exists() else None
                 if mp and mp.exists():
-                    opinion.masked_pdf.name = str(
-                        mp.resolve().relative_to(media_root)
-                    )
+                    opinion.masked_pdf.name = _field_name(mp)
                 opinion.save()
+
+        _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
         traceback.print_exc()
@@ -1964,6 +2046,7 @@ def run_detect(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to detect on.
     """
     django.db.connections.close_all()
+    _pull_processing_files_from_s3(scan_pk)
 
     scan = Scan.objects.get(pk=scan_pk)
     try:
@@ -1998,6 +2081,7 @@ def run_detect(scan_pk: int) -> None:
             s3_uploaded=False,
             progress_message=f"Done, {len(dets)} detections, {len(opinions)} opinions",
         )
+        _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
         traceback.print_exc()
@@ -2013,90 +2097,53 @@ def run_detect(scan_pk: int) -> None:
 
 
 def upload_approved_files(scan_pk: int) -> str:
-    """Upload final deliverables to the private S3 bucket.
+    """Copy approved deliverables from processing/ to approved/ on S3.
 
-    Uploads redacted/, masked/ opinion PDFs and the original + redacted
-    full PDFs to ``approved/{reporter}/{volume}/{start_page}/``.
+    The generate-files step already pushed every file under the scan's
+    output dir to ``processing/{pk}/...`` on S3, so this function issues
+    a server-side ``copy_object`` for each deliverable (redacted/masked
+    opinion PDFs, original and redacted full PDFs) rather than
+    re-uploading from local disk.
 
-    Skips the upload (with a message) if the scan was already uploaded
-    or if no AWS credentials are configured.
+    Skips the copy (with a message) if the scan was already approved or
+    if no AWS credentials are configured.
 
-    :param scan_pk: Primary key of the scan to upload.
+    :param scan_pk: Primary key of the scan to approve.
     :return: A user-facing message describing the result.
     :rtype: str
     """
+    from scanning import s3_sync
+
     scan = Scan.objects.get(pk=scan_pk)
 
     if scan.s3_uploaded and scan.s3_path:
         return f"Files were already uploaded to S3 ({scan.s3_path})."
 
     output_dir = Path(scan.output_dir)
-
-    # Verify final files exist
     redacted_dir = output_dir / "redacted"
-    masked_dir = output_dir / "masked"
     if not redacted_dir.is_dir() or not list(redacted_dir.glob("*.pdf")):
         return "Before approving you need to generate the files."
 
-    # Build S3 prefix
-    short = scan.reporter.short_name
-    start = scan.start_page or 1
-    s3_prefix = f"approved/{short}/{scan.volume}/{start}/"
+    s3_prefix = s3_sync.approved_prefix(scan)
 
     if not has_s3_credentials():
-        Scan.objects.filter(pk=scan_pk).update(
-            s3_path=s3_prefix,
-        )
+        Scan.objects.filter(pk=scan_pk).update(s3_path=s3_prefix)
         return (
             "No AWS credentials configured, skipping S3 upload. "
             "Path would be: " + s3_prefix
         )
 
-    # Collect files to upload
-    files_to_upload = []
-
-    for pdf in redacted_dir.glob("*.pdf"):
-        files_to_upload.append((pdf, f"{s3_prefix}redacted/{pdf.name}"))
-
-    if masked_dir.is_dir():
-        for pdf in masked_dir.glob("*.pdf"):
-            files_to_upload.append((pdf, f"{s3_prefix}masked/{pdf.name}"))
-
-    # Original and redacted full PDFs
-    for f in output_dir.iterdir():
-        if f.is_file() and f.suffix == ".pdf":
-            if ".original.pdf" in f.name:
-                files_to_upload.append((f, f"{s3_prefix}{f.name}"))
-            elif ".redacted.pdf" in f.name:
-                files_to_upload.append((f, f"{s3_prefix}{f.name}"))
-
-    # Upload to S3 via boto3 directly (not Django storage).
-    # upload_file() streams from disk with automatic multipart.
-    # The early return above prevents duplicate uploads when
-    # s3_uploaded is already True, so we always upload all files here.
-    import boto3
-
-    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
-    s3_client = boto3.client("s3")
-    for local_path, s3_key in files_to_upload:
-        s3_client.upload_file(str(local_path), bucket, s3_key)
+    _, count = s3_sync.copy_processing_to_approved(scan)
 
     Scan.objects.filter(pk=scan_pk).update(
         s3_uploaded=True,
         s3_path=s3_prefix,
     )
 
-    # In prod, clean up generated files now that they're on S3. Keep
-    # processing files (bitonal, OCR PDF, detections, stamped, images,
-    # original) so the viewer and reprocessing still work.
-    # In dev, keep everything for easier debugging.
-    if not settings.DEVELOPMENT:
-        import shutil
-
-        for d in [redacted_dir, masked_dir, output_dir / "unredacted"]:
-            if d.is_dir():
-                shutil.rmtree(d)
-        for f in output_dir.glob("*.redacted.pdf"):
-            f.unlink()
-
-    return f"Files uploaded successfully to S3 ({len(files_to_upload)} files)."
+    msg = f"Files copied on S3 from processing/ to approved/ ({count} files)."
+    if settings.DEVELOPMENT:
+        msg += (
+            " (DEVELOPMENT=True: no real S3 calls are made; set AWS "
+            "credentials and DEVELOPMENT=False to exercise the flow.)"
+        )
+    return msg

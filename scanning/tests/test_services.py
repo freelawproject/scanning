@@ -874,46 +874,42 @@ class TestUploadApprovedFiles(TestCase):
 
     @override_settings(
         AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
+        DEVELOPMENT=False,
+        TESTING=False,
     )
-    def test_upload_calls_boto3(self):
-        """Verify boto3 upload_file is called for all files on fresh upload."""
+    def test_copy_calls_s3_copy_object(self):
+        """Approve should issue copy_object per deliverable, not upload_file."""
         from unittest.mock import MagicMock, patch
 
         from scanning.services import upload_approved_files
 
         scan = self._make_scan_with_generated_files()
         mock_client = MagicMock()
-
-        env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
-        with (
-            patch.dict("os.environ", env),
-            patch("boto3.client", return_value=mock_client),
-        ):
-            result = upload_approved_files(scan.pk)
-
-        self.assertIn("uploaded", result)
-        # 2 redacted + 2 masked + 1 original + 1 redacted-full = 6
-        self.assertEqual(mock_client.upload_file.call_count, 6)
-        # No HEAD checks on fresh upload (s3_uploaded=False)
-        self.assertEqual(mock_client.head_object.call_count, 0)
-        scan.refresh_from_db()
-        self.assertTrue(scan.s3_uploaded)
-
-    @override_settings(
-        AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
-    )
-    def test_re_upload_after_changes(self):
-        """After reprocessing (s3_uploaded reset), all files are re-uploaded."""
-        from unittest.mock import MagicMock, patch
-
-        from scanning.services import upload_approved_files
-
-        scan = self._make_scan_with_generated_files()
-        # Simulate: was uploaded, then reprocessed (flag reset)
-        scan.s3_uploaded = False
-        scan.s3_path = "approved/a/1/1/"
-        scan.save(update_fields=["s3_uploaded", "s3_path"])
-        mock_client = MagicMock()
+        # Simulate processing/ has deliverables + non-deliverables.
+        short = scan.reporter.short_name
+        src_prefix = f"processing/{scan.pk}/{short}/{scan.volume}/1/"
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": f"{src_prefix}redacted/a.pdf"},
+                    {"Key": f"{src_prefix}redacted/b.pdf"},
+                    {"Key": f"{src_prefix}masked/a.pdf"},
+                    {"Key": f"{src_prefix}masked/b.pdf"},
+                    {
+                        "Key": f"{src_prefix}{short}.{scan.volume}.1.95.original.pdf"
+                    },
+                    {
+                        "Key": f"{src_prefix}{short}.{scan.volume}.1.95.redacted.pdf"
+                    },
+                    {"Key": f"{src_prefix}bitonal.pdf"},  # not a deliverable
+                    {
+                        "Key": f"{src_prefix}detections.json"
+                    },  # not a deliverable
+                ]
+            }
+        ]
+        mock_client.get_paginator.return_value = mock_paginator
 
         env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
         with (
@@ -923,58 +919,39 @@ class TestUploadApprovedFiles(TestCase):
             result = upload_approved_files(scan.pk)
 
         self.assertIn("6 files", result)
-        # No HEAD checks on fresh/re-upload
-        self.assertEqual(mock_client.head_object.call_count, 0)
-        self.assertEqual(mock_client.upload_file.call_count, 6)
+        # upload_file must NOT be used; copy_object handles everything.
+        self.assertEqual(mock_client.upload_file.call_count, 0)
+        self.assertEqual(mock_client.copy_object.call_count, 6)
         scan.refresh_from_db()
         self.assertTrue(scan.s3_uploaded)
 
     @override_settings(
         AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
         DEVELOPMENT=False,
+        TESTING=False,
     )
-    def test_cleanup_after_upload_in_prod(self):
-        """In prod, generated files are deleted after S3 upload."""
+    def test_re_upload_after_changes(self):
+        """After reprocessing (s3_uploaded reset), copy runs again."""
         from unittest.mock import MagicMock, patch
 
         from scanning.services import upload_approved_files
 
         scan = self._make_scan_with_generated_files()
-        output = pathlib.Path(scan.output_dir)
+        scan.s3_uploaded = False
+        scan.s3_path = "approved/a/1/1/"
+        scan.save(update_fields=["s3_uploaded", "s3_path"])
+        mock_client = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [{"Contents": []}]
+        mock_client.get_paginator.return_value = mock_paginator
 
         env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
         with (
             patch.dict("os.environ", env),
-            patch("boto3.client", return_value=MagicMock()),
+            patch("boto3.client", return_value=mock_client),
         ):
             upload_approved_files(scan.pk)
 
-        # Generated dirs should be gone
-        self.assertFalse((output / "redacted").exists())
-        self.assertFalse((output / "masked").exists())
-        # Processing files should remain
-        self.assertTrue(output.exists())
-
-    @override_settings(
-        AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
-        DEVELOPMENT=True,
-    )
-    def test_no_cleanup_in_dev(self):
-        """In dev, generated files are kept after S3 upload."""
-        from unittest.mock import MagicMock, patch
-
-        from scanning.services import upload_approved_files
-
-        scan = self._make_scan_with_generated_files()
-        output = pathlib.Path(scan.output_dir)
-
-        env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
-        with (
-            patch.dict("os.environ", env),
-            patch("boto3.client", return_value=MagicMock()),
-        ):
-            upload_approved_files(scan.pk)
-
-        # Everything should still be there in dev
-        self.assertTrue((output / "redacted").exists())
-        self.assertTrue((output / "masked").exists())
+        self.assertEqual(mock_client.upload_file.call_count, 0)
+        scan.refresh_from_db()
+        self.assertTrue(scan.s3_uploaded)

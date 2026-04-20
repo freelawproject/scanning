@@ -98,6 +98,19 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
     is_processing = scan.status in (Status.PROCESSING, Status.QUEUED)
 
+    # Always attempt the S3 pull. The helper is size-based idempotent
+    # and no-ops in DEV/TESTING, so calling it during QUEUED/PROCESSING
+    # is cheap. This ensures the web container's /tmp/ stays current
+    # with files the daemon pushed to S3 (e.g. after Generate Files).
+    try:
+        from scanning import s3_sync
+
+        s3_sync.download_processing_files(scan)
+    except Exception:
+        logger.exception(
+            "Failed to pull processing files from S3 for scan %s", scan.pk
+        )
+
     try:
         step = int(request.GET.get("step", 0))
     except ValueError:
