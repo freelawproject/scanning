@@ -266,22 +266,16 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         suppressed = set()
         for iss in scan.issues.filter(check_name=CheckName.SUPPRESS_DETECTION):
             if iss.metadata:
-                try:
-                    m = json.loads(iss.metadata)
-                    bb = m.get("bbox", [0, 0, 0, 0])
-                    suppressed.add(
-                        (
-                            m.get("page_index", 0),
-                            m.get("label_id", 0),
-                            round(bb[0]),
-                            round(bb[1]),
-                        )
+                m = iss.metadata
+                bb = m.get("bbox", [0, 0, 0, 0])
+                suppressed.add(
+                    (
+                        m.get("page_index", 0),
+                        m.get("label_id", 0),
+                        round(bb[0]),
+                        round(bb[1]),
                     )
-                except Exception:
-                    logger.exception(
-                        "Failed to parse issue metadata for issue %s",
-                        iss.pk,
-                    )
+                )
 
         paired_caption_keys = set()
         paired_key_keys = set()

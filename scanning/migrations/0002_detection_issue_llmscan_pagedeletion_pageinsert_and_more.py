@@ -115,10 +115,10 @@ class Migration(migrations.Migration):
                 ("message", models.TextField()),
                 (
                     "metadata",
-                    models.TextField(
+                    models.JSONField(
                         blank=True,
-                        default="",
-                        help_text="JSON for structured data (e.g. suppression info).",
+                        default=dict,
+                        help_text="Structured data (e.g. suppression info).",
                     ),
                 ),
             ],

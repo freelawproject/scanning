@@ -651,7 +651,7 @@ def flag_issue(request: HttpRequest, pk: int) -> JsonResponse:
         check_name=check_name,
         severity="warning",
         message=message,
-        metadata=json.dumps(metadata) if metadata else "",
+        metadata=metadata or {},
     )
     return JsonResponse({"status": "ok", "id": issue.pk})
 

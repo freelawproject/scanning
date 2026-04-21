@@ -806,10 +806,10 @@ class Issue(AbstractDateTimeModel):
         default=Severity.ERROR,
     )
     message = models.TextField()
-    metadata = models.TextField(
+    metadata = models.JSONField(
         blank=True,
-        default="",
-        help_text="JSON for structured data (e.g. suppression info).",
+        default=dict,
+        help_text="Structured data (e.g. suppression info).",
     )
 
     class Meta:
