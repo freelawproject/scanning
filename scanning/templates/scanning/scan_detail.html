@@ -109,7 +109,12 @@
   <div class="lg:w-1/2">
     <div class="card h-full">
       <h2 class="text-lg font-bold mb-2">Review Decision</h2>
-      <p><span class="badge-approved">Approved</span></p>
+      <p>
+        <span class="badge-approved">Approved</span>
+        {% if scan.s3_uploaded %}
+        <span class="badge-s3">Uploaded to S3</span>
+        {% endif %}
+      </p>
       {% if scan.notes %}
       <dt class="font-medium text-gray-500 dark:text-gray-400 mt-3">Notes</dt>
       <dd class="whitespace-pre-wrap text-sm">{{ scan.notes }}</dd>
@@ -126,7 +131,7 @@
     <div class="card">
       <h2 class="text-lg font-bold mb-4">Original PDF</h2>
       <iframe
-        src="{{ scan.original_pdf.url }}"
+        src="{% url 'serve_scan_pdf' pk=scan.pk %}"
         class="w-full border border-gray-200 dark:border-gray-700 rounded"
         style="height: 75vh;"
         title="Original PDF"

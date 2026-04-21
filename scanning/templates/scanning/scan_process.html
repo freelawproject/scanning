@@ -1,0 +1,384 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% block title %}{{ scan.reporter.short_name|upper }} vol. {{ scan.volume }} - Processing{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{% static 'scanning/checker.css' %}">
+<style>
+.opinion-nav.selected {
+    background-color: #1d4ed8 !important;
+    border-color: #1d4ed8 !important;
+    color: white !important;
+}
+.opinion-nav.selected span {
+    color: #bfdbfe !important;
+}
+@keyframes unmatched-pulse {
+    0%, 100% { border-color: #f59e0b; background: rgba(245, 158, 11, 0.15); }
+    50% { border-color: #ef4444; background: rgba(239, 68, 68, 0.2); }
+}
+</style>
+{% endblock %}
+
+{% block content %}
+{# Header: stepper + title + actions in one row #}
+<div class="flex items-center justify-between mb-3 gap-4 flex-wrap">
+  {# Left: stepper + title #}
+  <div class="flex items-center gap-4">
+    <div class="flex items-center gap-0">
+      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 1 %}bg-blue-600 text-white{% elif step > 1 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=1">
+        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step > 1 %}bg-green-600 text-white{% elif step == 1 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">1</span>
+        Build</a>
+      <div class="w-6 h-0.5 {% if step > 1 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
+      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 2 %}bg-blue-600 text-white{% elif step > 2 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=2">
+        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step > 2 %}bg-green-600 text-white{% elif step == 2 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">2</span>
+        Review</a>
+      <div class="w-6 h-0.5 {% if step > 2 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
+      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 3 %}bg-blue-600 text-white{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=3">
+        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step == 3 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">3</span>
+        Generate</a>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="text-base font-bold">{% if scan.reporter %}{{ scan.reporter.short_name|upper }} vol. {{ scan.volume }}{% else %}Scan #{{ scan.pk }}{% endif %}</span>
+      <span class="text-xs text-gray-500 dark:text-gray-400">{{ scan.page_count }} pages</span>
+      {% if missing_pages %}<span class="badge-error text-xs">{{ missing_pages|length }} missing</span>{% endif %}
+      {% if has_pending_changes %}<span class="badge-warning text-xs">Pending Changes</span>{% endif %}
+      {% if scan.s3_uploaded %}<span class="badge-s3 text-xs" title="Files uploaded to S3">S3</span>{% endif %}
+    </div>
+  </div>
+  {# Right: actions #}
+  <div class="flex flex-wrap gap-2">
+    {% if is_processing %}
+
+    {% elif step == 1 %}
+      {% if has_pending_changes %}
+      <form method="post" action="{% url 'reprocess' scan.pk %}" class="inline">
+        {% csrf_token %}
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Apply pending page inserts and deletions, then re-run OCR and validation">Rebuild &amp; Validate</button>
+      </form>
+      {% elif not scan.page_count %}
+      <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
+        {% csrf_token %}
+        <button type="submit" class="btn-primary text-sm" title="Run the full processing pipeline: bitonal conversion, OCR, detection, and page number validation">Validate</button>
+      </form>
+      {% else %}
+      <form method="post" action="{% url 'recalculate' scan.pk %}" class="inline">
+        {% csrf_token %}
+        <button type="submit" class="btn-primary text-sm" title="Re-check page numbers and issues using existing OCR results without re-running the pipeline">Recheck</button>
+      </form>
+      <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
+        {% csrf_token %}
+        <button type="submit" class="btn-outline text-sm" title="Re-run the full pipeline from scratch: bitonal, OCR, detection, and validation">Re-validate</button>
+      </form>
+      {% if not issues and not missing_pages %}
+      <form method="post" action="{% url 'start_detect' scan.pk %}" class="inline">
+        {% csrf_token %}
+        <button type="submit" class="btn-primary text-sm" title="Run YOLO detection to find opinions, captions, and key icons in the scan">Next: Detect &rarr;</button>
+      </form>
+      {% endif %}
+      {% endif %}
+
+    {% elif step == 2 %}
+      <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()" title="Match detected captions and key icons to identify individual opinions">Re-pair Opinions</button>
+      {% if opinions %}
+      <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
+      {% endif %}
+
+    {% elif step == 3 %}
+      <form method="post" action="{% url 'generate_files' scan.pk %}" class="inline">
+        {% csrf_token %}
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Create redacted, masked, and unredacted PDF files for each opinion">{% if opinion_scans %}Regenerate{% else %}Generate{% endif %} Files</button>
+      </form>
+      {% if opinion_scans %}
+      <form method="post" action="{% url 'approve_scan' scan.pk %}" class="inline">
+        {% csrf_token %}
+        <button type="submit" class="btn-primary text-sm" title="Mark this scan as approved and upload the final files to S3">Approve</button>
+      </form>
+      {% endif %}
+      {% if scan.stage == 'approved' %}
+      <a href="{% url 'scan_list' %}" class="btn-primary text-sm no-underline" style="background:#059669" title="Return to the scan list">Done &rarr; List</a>
+      {% endif %}
+    {% endif %}
+  </div>
+</div>
+{% if step == 3 and not scan.s3_uploaded %}
+<div class="px-4 mt-2">
+  <div class="alert-warning text-sm">The final files have not been uploaded to S3. Click "Approve" to upload.</div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block full_width_content %}
+<div class="w-full px-4 pb-6">
+  <div class="flex gap-4" style="height:calc(100vh - 200px);min-height:500px;">
+    {# Sidebar #}
+    <aside class="w-72 flex-shrink-0 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 p-3" style="max-height:calc(100vh - 200px);">
+      {% if is_processing %}
+      <h2 class="text-sm font-bold mb-2">Processing</h2>
+      <div class="rounded bg-gray-100 dark:bg-gray-800 p-3 mb-2">
+        <div class="h-1.5 bg-gray-200 dark:bg-gray-700 rounded overflow-hidden mb-2">
+          <div id="sidebar-bar" class="h-full bg-blue-600 rounded transition-all" style="width:0%"></div>
+        </div>
+        <p id="sidebar-status" class="text-xs text-gray-600 dark:text-gray-300 m-0">Starting...</p>
+      </div>
+      <div id="sidebar-pages" class="max-h-96 overflow-y-auto"></div>
+
+      {% elif step == 1 %}
+      {# Step 1: Build - issues first, then collapsible pages #}
+
+      {% if has_pending_changes %}
+      <div class="bg-yellow-100 dark:bg-yellow-900/30 text-yellow-800 dark:text-yellow-200 text-xs rounded px-2 py-1 mb-2">
+        Pending changes &mdash; rebuild to apply
+      </div>
+      {% endif %}
+
+      {% if issues %}
+      <h2 class="text-sm font-bold mb-2">Issues ({{ issues|length }})</h2>
+      {% for issue in issues %}
+      <div class="issue-card rounded border px-2 py-1.5 mb-1 cursor-pointer text-xs
+           {% if issue.severity == 'error' %}border-red-300 bg-red-50 dark:border-red-700 dark:bg-red-900/20{% elif issue.severity == 'warning' %}border-yellow-300 bg-yellow-50 dark:border-yellow-700 dark:bg-yellow-900/20{% else %}border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-blue-900/20{% endif %}"
+           data-message="{{ issue.message }}"
+           data-check="{{ issue.check_name }}"
+           {% if issue.page_number %}data-page="{{ issue.page_number }}"{% endif %}
+           {% if issue.check_name == 'duplicate_page' and issue.page_number %}onclick="if(window.showDuplicates) showDuplicates(this.dataset.page); else goToPage(this)"
+           {% elif issue.page_number %}onclick="goToPage(this)"{% endif %}>
+        <div class="flex items-center gap-1.5">
+          <span class="font-bold uppercase text-[10px]">{{ issue.get_severity_display }}</span>
+          {% if issue.page_number %}<span class="text-gray-500">Page {{ issue.page_number }}</span>{% endif %}
+        </div>
+        <p class="mt-0.5 text-gray-700 dark:text-gray-300">{{ issue.message }}</p>
+        <div class="flex gap-1 mt-1">
+          {% if issue.check_name == 'duplicate_page' %}
+          <button class="text-[10px] px-2 py-0.5 rounded bg-red-600 text-white" onclick="event.stopPropagation(); deleteDuplicates(this)" data-message="{{ issue.message }}">Delete Duplicates</button>
+          {% endif %}
+          {% if issue.severity != 'error' %}
+          <button class="text-[10px] px-2 py-0.5 rounded bg-green-600 text-white" onclick="event.stopPropagation(); dismissIssue(this, {{ issue.pk }})">Dismiss</button>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+      {% else %}
+      {% if ocr_results %}
+      <div class="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded px-2 py-2 text-xs text-green-700 dark:text-green-300 font-medium mb-2">
+        All clear — no issues
+      </div>
+      {% else %}
+      <div class="bg-gray-50 dark:bg-gray-900/20 border border-gray-200 dark:border-gray-700 rounded px-2 py-2 text-xs text-gray-500 dark:text-gray-400 font-medium mb-2">
+        Not yet processed
+      </div>
+      {% endif %}
+      {% endif %}
+
+      {% if ocr_results %}
+      <h2 class="text-sm font-bold mt-3 mb-1">Pages ({{ scan.page_count }})</h2>
+      <div id="pages-list">
+      {% for r in ocr_results %}
+        {% if r.seq_issue == 'gap' %}
+        <div class="flex items-center gap-1 my-1">
+          <div class="flex-1 border-t-2 border-dashed border-yellow-400"></div>
+          <span class="text-[9px] text-yellow-600 dark:text-yellow-400 font-bold whitespace-nowrap">GAP</span>
+          <div class="flex-1 border-t-2 border-dashed border-yellow-400"></div>
+        </div>
+        {% elif r.seq_issue == 'backward' %}
+        <div class="flex items-center gap-1 my-1">
+          <div class="flex-1 border-t-2 border-dashed border-red-400"></div>
+          <span class="text-[9px] text-red-600 dark:text-red-400 font-bold whitespace-nowrap">ORDER</span>
+          <div class="flex-1 border-t-2 border-dashed border-red-400"></div>
+        </div>
+        {% elif r.seq_issue == 'duplicate' %}
+        <div class="flex items-center gap-1 my-1">
+          <div class="flex-1 border-t-2 border-dashed border-orange-400"></div>
+          <span class="text-[9px] text-orange-600 dark:text-orange-400 font-bold whitespace-nowrap">DUP</span>
+          <div class="flex-1 border-t-2 border-dashed border-orange-400"></div>
+        </div>
+        {% endif %}
+      <div class="rounded px-2 py-0.5 mb-0.5 cursor-pointer text-xs flex items-center justify-between
+           {% if not r.detected %}bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800
+           {% elif r.seq_issue == 'backward' %}bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700
+           {% elif r.seq_issue == 'duplicate' %}bg-orange-100 dark:bg-orange-900/30 border border-orange-300 dark:border-orange-700
+           {% elif r.seq_issue == 'gap' %}bg-yellow-100 dark:bg-yellow-900/30 border border-yellow-300 dark:border-yellow-700
+           {% else %}bg-green-50 dark:bg-green-900/20{% endif %}"
+           data-page="{{ r.pdf_page }}" onclick="goToPage(this)">
+        <span>
+          <span class="font-medium text-gray-500">{{ r.pdf_page }}</span>
+          {% if r.detected %}
+          <span class="{% if r.seq_issue == 'backward' %}text-red-700 dark:text-red-300{% elif r.seq_issue == 'duplicate' %}text-orange-700 dark:text-orange-300{% elif r.seq_issue == 'gap' %}text-yellow-700 dark:text-yellow-300{% else %}text-green-700 dark:text-green-300{% endif %} font-semibold ml-1">#{{ r.detected }}</span>
+          {% else %}
+          <span class="text-red-600 dark:text-red-400 ml-1">—</span>
+          {% endif %}
+        </span>
+        {% if r.type == 'range' %}<span class="text-[9px] text-blue-500">range</span>{% endif %}
+        {% if r.zone == 'manual' %}<span class="text-[9px] text-purple-500">manual</span>{% endif %}
+      </div>
+      {% endfor %}
+      </div>
+      {% endif %}
+
+      {% elif step == 3 and opinion_scans %}
+      {# Step 4: Generated opinion files #}
+      <div class="flex gap-1 mb-2 sticky top-0 z-10 bg-white dark:bg-gray-900 pb-1">
+        <button onclick="setViewMode('redacted')" id="mode-redacted" class="flex-1 text-xs px-2 py-1 rounded border font-medium bg-blue-600 text-white border-blue-600">Redacted</button>
+        <button onclick="setViewMode('unredacted')" id="mode-unredacted" class="flex-1 text-xs px-2 py-1 rounded border font-medium bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 border-gray-300 dark:border-gray-600">Original</button>
+      </div>
+      <h2 class="text-sm font-bold mb-2">Generated ({{ opinion_scans|length }})</h2>
+      {% for s in opinion_scans %}
+      <div class="rounded border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-2 py-1.5 mb-1 cursor-pointer text-xs issue-card"
+           data-redacted="{{ s.redacted_filename }}"
+           data-masked="{{ s.masked_filename }}"
+           data-unredacted="{{ s.unredacted_filename }}"
+           data-opinion-pk="{{ s.pk }}"
+           onclick="viewOpinionByMode({{ forloop.counter0 }}, this)">
+        <span class="font-bold">{{ forloop.counter }}</span>
+        <span class="text-gray-600 dark:text-gray-300 text-[11px]">{{ s.redacted_filename }}</span>
+      </div>
+      {% endfor %}
+
+      {% else %}
+      {# Steps 2-3: Opinions sidebar #}
+      {% if detect_warnings %}
+      <h2 class="text-sm font-bold mb-2">Warnings</h2>
+      {% for w in detect_warnings %}
+      <div class="rounded border border-yellow-300 bg-yellow-50 dark:border-yellow-700 dark:bg-yellow-900/20 px-2 py-1.5 mb-1 text-xs text-yellow-800 dark:text-yellow-200">
+        {{ w }}
+      </div>
+      {% endfor %}
+      {% endif %}
+
+      {% if unmatched_captions %}
+      <h2 class="text-sm font-bold mb-1 mt-2">Unmatched Captions ({{ unmatched_captions|length }})</h2>
+      {% for d in unmatched_captions %}
+      <div class="rounded border border-orange-300 bg-orange-50 dark:border-orange-700 dark:bg-orange-900/20 px-2 py-1 mb-1 text-xs flex items-center justify-between cursor-pointer hover:bg-orange-100 dark:hover:bg-orange-900/40"
+           data-unmatched-page="{{ d.page_index }}" data-unmatched-label="CASE_CAPTION"
+           data-logical-page="{{ d.logical_page }}" data-page-index="{{ d.page_index }}"
+           data-bbox="{{ d.bbox.0 }},{{ d.bbox.1 }},{{ d.bbox.2 }},{{ d.bbox.3 }}"
+           data-img-w="{{ d.img_width }}" data-img-h="{{ d.img_height }}" data-label-id="{{ d.label_id }}"
+           onclick="highlightDetection(this)">
+        <span class="font-medium">p.{{ d.logical_page }}</span>
+        <span class="text-gray-500 dark:text-gray-400">{{ d.conf }}</span>
+        <span class="flex gap-1 ml-1">
+          <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Approve (boost to 1.0)"
+                  onclick="event.stopPropagation(); approveDetection(this)">&#10003;</button>
+          <button class="px-1 py-0.5 rounded bg-red-600 text-white text-[10px] hover:bg-red-700" title="Delete detection"
+                  onclick="event.stopPropagation(); deleteUnmatchedDetection(this)">&#10005;</button>
+        </span>
+      </div>
+      {% endfor %}
+      {% endif %}
+
+      {% if unmatched_keys %}
+      <h2 class="text-sm font-bold mb-1 mt-2">Unmatched Key Icons ({{ unmatched_keys|length }})</h2>
+      {% for d in unmatched_keys %}
+      <div class="rounded border border-red-300 bg-red-50 dark:border-red-700 dark:bg-red-900/20 px-2 py-1 mb-1 text-xs flex items-center justify-between cursor-pointer hover:bg-red-100 dark:hover:bg-red-900/40"
+           data-unmatched-page="{{ d.page_index }}" data-unmatched-label="KEY_ICON"
+           data-logical-page="{{ d.logical_page }}" data-page-index="{{ d.page_index }}"
+           data-bbox="{{ d.bbox.0 }},{{ d.bbox.1 }},{{ d.bbox.2 }},{{ d.bbox.3 }}"
+           data-img-w="{{ d.img_width }}" data-img-h="{{ d.img_height }}" data-label-id="{{ d.label_id }}"
+           onclick="highlightDetection(this)">
+        <span class="font-medium">p.{{ d.logical_page }}</span>
+        <span class="text-gray-500 dark:text-gray-400">{{ d.conf }}</span>
+      </div>
+      {% endfor %}
+      {% endif %}
+      {% if opinions %}
+      <h2 class="text-sm font-bold mb-2">Opinions ({{ opinions|length }})</h2>
+      {% for op in opinions %}
+      <div class="rounded border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-2 py-1.5 mb-1 cursor-pointer text-xs opinion-nav"
+           data-index="{{ forloop.counter0 }}"
+           data-caption-page="{{ op.caption_page|add:1 }}"
+           data-key-page="{% if op.end_page %}{{ op.end_page|add:1 }}{% else %}{{ op.key_page|add:1 }}{% endif %}"
+           onclick="selectOpinion(this, {{ op.caption_page|add:1 }})">
+        <span class="font-bold">{{ forloop.counter }}</span>
+        {% if op.has_image %}<span title="Contains image(s)">🖼️</span>{% endif %}
+        {% if op.uncovered_headnote_pages %}<span title="Uncovered headnote(s)">⚠️</span>{% endif %}
+        <span class="text-gray-600 dark:text-gray-300">Pages {% if op.first_page_number %}{{ op.first_page_number }}&ndash;{{ op.last_page_number }}{% else %}{{ op.caption_page|add:1 }}&ndash;{{ op.key_page|add:1 }}{% endif %} ({{ op.page_count }} pg)</span>
+      </div>
+      {% if op.image_pages %}
+      <div class="ml-4 mb-1 flex flex-wrap gap-0.5">
+        {% for pg in op.image_pages %}
+        <span class="text-[10px] px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800 cursor-pointer hover:bg-amber-200 dark:hover:bg-amber-900/50"
+              data-page="{{ pg }}" onclick="event.stopPropagation(); goToPage(this)"
+              title="Image on page {{ pg }}">🖼️ {{ pg }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% if op.uncovered_headnote_pages %}
+      <div class="ml-4 mb-1 flex flex-wrap gap-0.5">
+        {% for pg in op.uncovered_headnote_pages %}
+        <span class="text-[10px]" style="border: 1px solid; padding: 3px; background-color: yellow"
+              data-page="{{ pg }}" onclick="event.stopPropagation(); goToPage(this)"
+              title="Uncovered headnote on page {{ pg }}">Page {{ pg }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+      {% endfor %}
+      {% else %}
+      <p class="text-gray-500 dark:text-gray-400 text-xs p-2">No opinions yet. Run detection first.</p>
+      {% endif %}
+      {% endif %}
+    </aside>
+
+    {# PDF viewer #}
+    <main class="flex-1 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 viewer-panel">
+      {% csrf_token %}
+      <div id="pdf-viewer"
+           data-pdf-url="{% if step == 3 %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
+           data-document-id="{{ scan.pk }}"
+           data-page-map='{{ page_map_json }}'
+           data-flagged-pages='{{ flagged_pages_json }}'
+           data-redactions='{}'
+           data-ocr-by-page='{{ ocr_by_page_json }}'
+           {% if step == 3 %}data-opinion-edit="true"{% endif %}>
+        {% if step == 3 %}
+        <div class="flex items-center justify-center h-full text-gray-400 text-sm">Select an opinion from the sidebar to view it.</div>
+        {% else %}
+        <div class="flex items-center justify-center h-full text-gray-400 text-sm">Loading PDF...</div>
+        {% endif %}
+      </div>
+    </main>
+  </div>
+</div>
+{% endblock %}
+
+{% block footer_scripts %}
+<script id="opinions-data" type="application/json">{% if opinions_json %}{{ opinions_json|safe }}{% else %}[]{% endif %}</script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="{% static 'scanning/shared.js' %}"></script>
+{% if step == 1 %}
+<script src="{% static 'scanning/viewer_step1.js' %}"></script>
+{% else %}
+<script src="{% static 'scanning/viewer_step2.js' %}"></script>
+{% endif %}
+<script>
+var SCAN_CONFIG = {
+    csrfToken: document.querySelector('[name=csrfmiddlewaretoken]').value,
+    docId: {{ scan.pk }},
+    step: {{ step }},
+    deletedPages: {{ deleted_pages_json|safe }},
+    {% if is_processing %}progressUrl: '{% url "progress_api" scan.pk %}',{% endif %}
+};
+// Backward-compatible globals used by viewer_step1.js and shared.js
+var csrfToken = SCAN_CONFIG.csrfToken;
+var docId = SCAN_CONFIG.docId;
+var deletedPages = SCAN_CONFIG.deletedPages;
+</script>
+<script src="{% static 'scanning/viewer_sidebar.js' %}"></script>
+{% if is_processing %}
+<script src="{% static 'scanning/viewer_progress.js' %}"></script>
+{% endif %}
+{% if step == 2 and not is_processing and not has_redaction_rects %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    fetch('/scans/' + SCAN_CONFIG.docId + '/compute-redactions/', {
+        method: 'POST',
+        headers: {'X-CSRFToken': SCAN_CONFIG.csrfToken},
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+        if (window.refreshOverlays) window.refreshOverlays();
+    });
+});
+</script>
+{% endif %}
+{% endblock %}
+{% block footer %}{% endblock %}

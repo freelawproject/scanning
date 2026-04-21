@@ -1,6 +1,16 @@
-from django.contrib import admin
+from django.contrib import admin, messages
 
-from scanning.models import OpinionScan, Reporter, Scan
+from scanning.models import (
+    Detection,
+    Issue,
+    OpinionScan,
+    PageDeletion,
+    PageInsert,
+    Reporter,
+    Scan,
+    Status,
+    Volume,
+)
 
 
 @admin.register(Reporter)
@@ -31,6 +41,40 @@ class ScanAdmin(admin.ModelAdmin):
     raw_id_fields = ["uploaded_by", "reporter"]
     readonly_fields = ["date_created", "date_modified", "processed_at"]
     date_hierarchy = "date_created"
+    actions = ["reset_to_queued"]
+
+    @admin.action(
+        description=(
+            "Reset selected scans to QUEUED "
+            "(recover scans stuck in PROCESSING)"
+        )
+    )
+    def reset_to_queued(self, request, queryset):
+        """Flip selected scans back to QUEUED so the daemon re-runs them.
+
+        Use this to recover a scan whose daemon process was killed (OOM,
+        pod restart, SIGKILL, etc.) and which remained stuck in
+        ``PROCESSING`` with a frozen progress message. Waiting for
+        ``_recover_stale()`` to pick it up takes up to
+        ``DAEMON_PROCESSING_TIMEOUT`` (default 3600s); this action is
+        the manual shortcut.
+
+        :param request: The admin HTTP request.
+        :param queryset: Selected Scan queryset.
+        :return: None.
+        """
+        updated = queryset.update(
+            status=Status.QUEUED,
+            progress_message="Re-queued via admin",
+            progress_current=0,
+            progress_total=0,
+        )
+        self.message_user(
+            request,
+            f"Re-queued {updated} scan(s). The daemon will pick them up "
+            "on the next tick.",
+            level=messages.SUCCESS,
+        )
 
 
 @admin.register(OpinionScan)
@@ -38,6 +82,7 @@ class OpinionScanAdmin(admin.ModelAdmin):
     list_display = [
         "reporter",
         "volume",
+        "page_start",
         "status",
         "scan",
         "uploaded_by",
@@ -51,4 +96,58 @@ class OpinionScanAdmin(admin.ModelAdmin):
         "uploaded_by__username",
     ]
     raw_id_fields = ["uploaded_by", "reporter", "scan"]
+    readonly_fields = ["date_created", "date_modified"]
+
+
+@admin.register(Volume)
+class VolumeAdmin(admin.ModelAdmin):
+    list_display = [
+        "reporter",
+        "volume_number",
+        "queue_status",
+        "priority",
+        "assigned_to",
+        "is_partial",
+        "date_created",
+    ]
+    list_filter = ["queue_status", "priority", "reporter", "is_partial"]
+    search_fields = ["reporter__full_name", "volume_number", "notes"]
+    raw_id_fields = ["reporter", "assigned_to"]
+    readonly_fields = ["date_created", "date_modified"]
+
+
+@admin.register(Issue)
+class IssueAdmin(admin.ModelAdmin):
+    list_display = ["scan", "page_number", "check_name", "severity", "message"]
+    list_filter = ["severity", "check_name"]
+    search_fields = ["message", "check_name"]
+    raw_id_fields = ["scan"]
+
+
+@admin.register(Detection)
+class DetectionAdmin(admin.ModelAdmin):
+    list_display = [
+        "scan",
+        "page_index",
+        "label",
+        "confidence",
+        "model_name",
+        "active",
+    ]
+    list_filter = ["label", "active", "model_name"]
+    search_fields = ["label"]
+    raw_id_fields = ["scan"]
+
+
+@admin.register(PageInsert)
+class PageInsertAdmin(admin.ModelAdmin):
+    list_display = ["scan", "logical_page_number", "date_created"]
+    raw_id_fields = ["scan"]
+    readonly_fields = ["date_created", "date_modified"]
+
+
+@admin.register(PageDeletion)
+class PageDeletionAdmin(admin.ModelAdmin):
+    list_display = ["scan", "pdf_page", "date_created"]
+    raw_id_fields = ["scan"]
     readonly_fields = ["date_created", "date_modified"]

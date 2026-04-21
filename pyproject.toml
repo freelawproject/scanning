@@ -2,7 +2,7 @@
 name = "scanning"
 version = "1"
 description = "Upload portal for volunteer scanners to submit scanned legal documents."
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.12,<3.14"
 authors = [
   { name = "Free Law Project", email = "info@free.law" },
 ]
@@ -12,6 +12,7 @@ classifiers = [
   "Natural Language :: English",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Intended Audience :: Developers",
 ]
@@ -28,9 +29,19 @@ dependencies = [
   "gunicorn",
   "pillow",
   "psycopg[binary,pool]",
+  "blackletter[analyze]>=0.0.8",
+  "ocrmypdf>=17",
+  "pymupdf>=1.25",
+  "torch",
+  "torchvision",
+  "ultralytics>=8.3",
   "sentry-sdk[django]",
   "time-machine",
   "uvicorn[standard]",
+  "pytesseract>=0.3.13",
+  "opencv-python==4.10.0.84",
+  "paddlepaddle",
+  "paddleocr>=3.4.0",
 ]
 
 [project.optional-dependencies]
@@ -77,3 +88,18 @@ lint.ignore = [
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "scanning.settings"
 python_files = ["tests.py", "test_*.py"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+paddlepaddle = { index = "paddle-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "paddle-cpu"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"
+explicit = true
