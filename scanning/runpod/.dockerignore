@@ -1,0 +1,20 @@
+# Keep the build context tiny and predictable. Only the files
+# explicitly `COPY`d by the Dockerfile should ever be in it.
+
+# Anything Python-build-local
+.venv
+__pycache__
+*.pyc
+*.pyo
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# Editor / VCS noise
+.idea
+.vscode
+.DS_Store
+
+# Docs / notes (the README is still available in the repo; no need
+# to ship it to the build daemon)
+README.md

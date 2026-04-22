@@ -29,7 +29,9 @@ dependencies = [
   "gunicorn",
   "pillow",
   "psycopg[binary,pool]",
-  "blackletter[analyze]>=0.0.8",
+  # TODO: flip back to a PyPI pin once blackletter releases a version
+  # that includes ensure_weights (feat/ensure-weights branch).
+  "blackletter[analyze] @ git+https://github.com/freelawproject/blackletter.git@feat/ensure-weights",
   "ocrmypdf>=17",
   "pymupdf>=1.25",
   "torch",

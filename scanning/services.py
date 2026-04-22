@@ -16,14 +16,8 @@ from pathlib import Path
 
 import django
 import fitz
-from blackletter.analyze import (
-    analyze_pdf as bl_analyze_pdf,
-)
 from blackletter.api import (
     bitonal as bl_bitonal,
-)
-from blackletter.api import (
-    detect as bl_detect,
 )
 from blackletter.api import (
     pair as bl_pair,
@@ -92,6 +86,44 @@ def _update_progress(
         updates["progress_total"] = total
     updates.update(kwargs)
     Scan.objects.filter(pk=scan_pk).update(**updates)
+
+
+def _handle_pipeline_exception(
+    scan_pk: int, exc: Exception, context: str = "pipeline"
+) -> None:
+    """Classify a pipeline-level exception and update the scan status.
+
+    Transient RunPod failures (e.g. worker scheduled without a GPU)
+    re-queue the scan so the next daemon tick retries on a different
+    worker. All other exceptions mark the scan as ``ERROR`` with the
+    exception message.
+
+    :param scan_pk: Primary key of the scan that failed.
+    :param exc: The exception that was raised.
+    :param context: Short label for log messages (e.g. ``"pipeline"``,
+        ``"validate"``, ``"detect"``).
+    """
+    from scanning.runpod_client import RunpodTransientError
+
+    if isinstance(exc, RunpodTransientError):
+        logger.warning(
+            "[%s] scan %s transient RunPod failure, re-queuing: %s",
+            context,
+            scan_pk,
+            exc,
+        )
+        Scan.objects.filter(pk=scan_pk).update(
+            status=Status.QUEUED,
+            progress_message=f"Retrying: {str(exc)[:200]}",
+        )
+        return
+
+    traceback.print_exc()
+    print(f"[{context}] ERROR: {exc}", flush=True)
+    Scan.objects.filter(pk=scan_pk).update(
+        status=Status.ERROR,
+        progress_message=str(exc)[:255],
+    )
 
 
 def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
@@ -277,10 +309,14 @@ def _ocr(
 
 
 def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
-    """Run YOLO detection (all 3 models) via blackletter.
+    """Run YOLO detection via runpod_client (local or remote).
 
-    Captures stdout from ``bl_detect`` to relay per-model and per-batch
-    progress back to the scan's progress fields.
+    In local mode (``RUNPOD_ENABLED=False``) the client calls
+    ``bl_detect`` in-process; its per-model and per-batch progress is
+    printed to stdout, which ``_ProgressWriter`` captures and relays
+    to the scan's progress fields. In remote mode the client's own
+    coarse events (``_remote_progress``) drive progress instead, and
+    the stdout capture simply sees no blackletter output.
 
     :param scan_pk: Primary key of the scan (for progress updates).
     :param pdf_path: Path to the PDF to run detection on.
@@ -289,7 +325,10 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     import io
     import sys
 
+    from scanning import runpod_client
+
     _update_progress(scan_pk, "YOLO detection: loading models...")
+    scan = Scan.objects.get(pk=scan_pk)
 
     real_stdout = sys.stdout
 
@@ -328,11 +367,25 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
             elif "detections" in line:
                 _update_progress(scan_pk, f"YOLO: {line}")
 
+    def _remote_progress(current, total, message):
+        _update_progress(scan_pk, f"YOLO: {message}")
+
     sys.stdout = _ProgressWriter()
     try:
-        bl_detect(pdf_path, output_dir, models=["small", "medium", "large"])
+        detections = runpod_client.detect(
+            scan,
+            pdf_path,
+            models=["small", "medium", "large"],
+            progress_callback=_remote_progress,
+        )
     finally:
         sys.stdout = real_stdout
+
+    # ``bl_detect`` used to write detections.json as a side effect;
+    # preserve that here so ``_import_detections_from_json`` (and any
+    # other disk consumers) still see the file.
+    (Path(output_dir) / "detections.json").write_text(json.dumps(detections))
+    _update_progress(scan_pk, f"YOLO: {len(detections)} detections")
 
 
 def _import_detections_from_json(scan_pk: int, output_dir: str) -> list:
@@ -1017,16 +1070,20 @@ def _re_pair_opinions(scan_pk: int) -> list:
 
 
 def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
-    """Validate page numbers using blackletter's analyze_pdf.
+    """Validate page numbers using the runpod_client analyze action.
 
-    Delegates all OCR/YOLO work to blackletter, keeping only the Django-
-    specific parts here: progress updates, cancellation checks, and saving
-    results to the DB.  Saves partial ``ocr_results`` every 5 pages so the
-    frontend can render the sidebar incrementally.
+    In local mode (``RUNPOD_ENABLED=False``) this calls
+    ``blackletter.analyze.analyze_pdf`` in-process with the same
+    ``num_workers=1`` the previous implementation used. In remote
+    mode the analysis runs on a RunPod Serverless GPU worker and
+    only coarse ``(None, None, status)`` progress events fire
+    (per-page partial results are lost).
 
     :param scan_pk: Primary key of the scan to validate.
     :param pdf_path: Path to the PDF to run validation on.
     """
+    from scanning import runpod_client
+
     scan = Scan.objects.get(pk=scan_pk)
     exp_start = scan.start_page or 1
     exp_end = scan.end_page
@@ -1039,7 +1096,8 @@ def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
             total=total,
         )
 
-    result = bl_analyze_pdf(
+    result = runpod_client.analyze(
+        scan,
         pdf_path,
         exp_start=exp_start,
         exp_end=exp_end,
@@ -1055,13 +1113,21 @@ def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
 
 
 def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
-    """Run YOLO + PaddleOCR on every page via blackletter's analyze_pdf.
+    """Run YOLO + PaddleOCR on every page via the runpod_client.
 
-    Saves detections to the DB and updates progress incrementally.
+    In local mode, ``blackletter.analyze.analyze_pdf`` is called with
+    its default parallelism and the per-page progress callback drives
+    live partial results into ``ocr_results`` so the frontend can
+    render the sidebar incrementally. In remote mode, the entire run
+    happens on the GPU worker and only coarse progress events fire;
+    the live partial display is skipped because ``current`` is
+    ``None`` until the final return value arrives.
 
     :param scan_pk: Primary key of the scan to validate.
     :param pdf_path: Path to the PDF to run validation on.
     """
+    from scanning import runpod_client
+
     scan = Scan.objects.get(pk=scan_pk)
     exp_start = scan.start_page or 1
     exp_end = scan.end_page
@@ -1075,13 +1141,15 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
             current=current,
             total=total,
         )
-        # Store partial results for live display
-        if current <= len(all_results):
+        # Store partial results for live display (local mode only,
+        # remote mode emits current=None).
+        if current is not None and current <= len(all_results):
             Scan.objects.filter(pk=scan_pk).update(
                 ocr_results=all_results[:current],
             )
 
-    result = bl_analyze_pdf(
+    result = runpod_client.analyze(
+        scan,
         pdf_path,
         exp_start=exp_start,
         exp_end=exp_end,
@@ -1327,12 +1395,7 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
         _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
-        traceback.print_exc()
-        print(f"[validate] ERROR: {exc}", flush=True)
-        Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR,
-            progress_message=str(exc)[:255],
-        )
+        _handle_pipeline_exception(scan_pk, exc, context="validate")
 
 
 # ---------------------------------------------------------------------------
@@ -1409,12 +1472,7 @@ def run_full_pipeline(scan_pk: int) -> None:
         _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
-        traceback.print_exc()
-        print(f"[pipeline] ERROR: {exc}", flush=True)
-        Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR,
-            progress_message=str(exc)[:255],
-        )
+        _handle_pipeline_exception(scan_pk, exc, context="pipeline")
 
 
 # ---------------------------------------------------------------------------
@@ -1606,11 +1664,7 @@ def run_reprocess(scan_pk: int) -> None:
         _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
-        traceback.print_exc()
-        Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR,
-            progress_message=str(exc)[:255],
-        )
+        _handle_pipeline_exception(scan_pk, exc, context="reprocess")
 
 
 # ---------------------------------------------------------------------------
@@ -2026,11 +2080,7 @@ def run_generate_files(scan_pk: int) -> None:
         _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
-        traceback.print_exc()
-        Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR,
-            progress_message=str(exc)[:255],
-        )
+        _handle_pipeline_exception(scan_pk, exc, context="generate_files")
 
 
 # ---------------------------------------------------------------------------
@@ -2084,11 +2134,7 @@ def run_detect(scan_pk: int) -> None:
         _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
-        traceback.print_exc()
-        Scan.objects.filter(pk=scan_pk).update(
-            status=Status.ERROR,
-            progress_message=str(exc)[:255],
-        )
+        _handle_pipeline_exception(scan_pk, exc, context="detect")
 
 
 # ---------------------------------------------------------------------------

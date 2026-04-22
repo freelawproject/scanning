@@ -10,6 +10,10 @@ repos:
     rev: v6.0.0
     hooks:
      - id: check-added-large-files
+       # scanning/runpod/uv.lock is intentionally large (locked GPU
+       # worker deps: torch cu126 + paddlepaddle-gpu + blackletter and
+       # their transitives). Reproducible builds require tracking it.
+       exclude: ^scanning/runpod/uv\.lock$
      - id: check-ast
      - id: check-json
      - id: check-merge-conflict
