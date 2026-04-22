@@ -4,7 +4,7 @@ from storages.backends.s3boto3 import S3Boto3Storage, S3ManifestStaticStorage
 
 class SubDirectoryS3ManifestStaticStorage(S3ManifestStaticStorage):
     location = "static"
-    default_acl = "public-read"
+    default_acl = None  # Check #40 on ACL configuration
     # Fall back to unhashed URLs instead of raising ValueError
     # when a file is missing from the staticfiles manifest.
     manifest_strict = False
@@ -16,7 +16,7 @@ class PrivateS3Storage(S3Boto3Storage):
     Used for archiving originals and storing approved deliverables.
     """
 
-    default_acl = "private"
+    default_acl = None
     file_overwrite = False
     querystring_auth = True
     querystring_expire = 300  # 5-minute signed URLs
