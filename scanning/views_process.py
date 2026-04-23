@@ -17,7 +17,6 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
-from scanning import services
 from scanning.models import (
     CheckName,
     Detection,
@@ -538,6 +537,8 @@ def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
     scan = get_object_or_404(Scan, pk=pk)
     if not scan.ocr_results:
         return redirect("scan_process", pk=pk)
+    from scanning import services
+
     services.recalculate_issues(scan)
     return redirect("scan_process", pk=pk)
 
