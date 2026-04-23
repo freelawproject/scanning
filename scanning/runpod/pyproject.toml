@@ -1,7 +1,7 @@
 [project]
-name = "blackletter-gpu-worker"
+name = "blackletter-gpu-pod"
 version = "0.0.1"
-description = "RunPod Serverless handler for the blackletter GPU steps (detect, analyze)."
+description = "FastAPI GPU worker for the blackletter detect/analyze steps, deployed as a RunPod pod."
 requires-python = ">=3.12,<3.14"
 dependencies = [
     # GPU stack
@@ -21,13 +21,14 @@ dependencies = [
     "pypdfium2>=4.0.0",
     "huggingface_hub>=0.20.0",
 
-    # RunPod plumbing
+    # HTTP server
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
     "requests",
-    "runpod",
     "sentry-sdk",
 
     # blackletter is pinned to the same git branch scanning/pyproject.toml
-    # uses so the worker and the daemon always run identical library code.
+    # uses so the pod and the daemon always run identical library code.
     # TODO: flip to a PyPI pin once blackletter releases ensure_weights.
     "blackletter @ git+https://github.com/freelawproject/blackletter.git@feat/ensure-weights",
 ]

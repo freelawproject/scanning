@@ -81,7 +81,7 @@ class Command(BaseCommand):
         :return: Tasks with their intervals.
         :rtype: list[ScheduledTask]
         """
-        return [
+        tasks = [
             ScheduledTask(
                 name="process_next_scan",
                 interval_seconds=float(settings.DAEMON_POLL_INTERVAL),
@@ -93,6 +93,16 @@ class Command(BaseCommand):
                 ),
             ),
         ]
+        if getattr(settings, "RUNPOD_ENABLED", False):
+            tasks.append(
+                ScheduledTask(
+                    name="stop_idle_gpu_pod",
+                    interval_seconds=float(
+                        getattr(settings, "RUNPOD_POD_STOP_POLL_SECONDS", 30)
+                    ),
+                )
+            )
+        return tasks
 
     def handle(self, *args, **options):
         """Tick the schedule until a termination signal is received.

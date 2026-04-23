@@ -1,16 +1,19 @@
 # syntax=docker/dockerfile:1.6
 #
-# GPU worker image for RunPod Serverless.
+# GPU pod image for the scanning pipeline.
 #
 # Runs the blackletter detect and analyze_pdf steps only. No Django,
 # no AWS credentials, no DB client. Weights (YOLO small/medium/large
 # + PaddleOCR PP-OCRv5) are baked in so cold start skips the network.
+# Exposes a FastAPI server on port 8000 so the daemon can dispatch
+# jobs directly over HTTP.
 #
 # Build from the scanning/runpod/ directory:
-#     docker build -t blackletter-gpu-worker:local scanning/runpod/
+#     docker build -t blackletter-gpu-pod:local scanning/runpod/
 #
 # Run locally (requires --gpus all + nvidia-container-toolkit):
-#     docker run --rm --gpus all blackletter-gpu-worker:local
+#     docker run --rm --gpus all -p 8000:8000 \
+#         -e POD_API_KEY=test blackletter-gpu-pod:local
 #
 # CUDA 12.6 on Ubuntu 24.04 LTS (Noble). 24.04 ships Python 3.12 as
 # the default system python, so no deadsnakes PPA is needed. The
@@ -118,9 +121,13 @@ PaddleOCR(text_detection_model_name='PP-OCRv5_server_det', \
 print('PaddleOCR warmup OK')" \
  && find /opt/paddlex -name '*.pdiparams' | head -5
 
-COPY handler.py .
+COPY actions.py server.py ./
 
-# RunPod's serverless runtime imports handler.py; running it directly
-# (via `runpod.serverless.start`) works for both local smoke-testing
-# and the production RunPod worker lifecycle.
-CMD ["python", "-u", "handler.py"]
+EXPOSE 8000
+
+# Launch the FastAPI server. The daemon talks to /detect, /analyze,
+# /warmup, /health over plain HTTP (use RunPod's TLS proxy URL from
+# the client side). Single worker: Paddle + torch CUDA context cannot
+# be forked safely.
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--log-level", "info"]
