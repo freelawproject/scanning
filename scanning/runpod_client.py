@@ -433,7 +433,8 @@ def _submit(
                 exc,
                 sleep_for,
             )
-            time.sleep(sleep_for)
+            if attempt < max_retries:
+                time.sleep(sleep_for)
 
     raise RunpodError(
         f"failed to submit RunPod job after {max_retries + 1} attempts: {last_exc}"
@@ -541,11 +542,20 @@ def _poll(
                     else RunpodError
                 )
                 raise exc_cls(f"handler error_code={err_code!r}: {err_msg}")
+            execution_ms = body.get("executionTime", "?")
+            action_ms = output.get("duration_ms", "?")
+            model_durations = output.get("model_durations_ms")
+            detail_parts = [f"action={action_ms}ms"]
+            if model_durations:
+                detail_parts += [
+                    f"{m}={ms}ms" for m, ms in model_durations.items()
+                ]
             logger.info(
-                "runpod %s job %s COMPLETED in %s ms",
+                "runpod %s job %s COMPLETED in %sms (%s)",
                 action,
                 job_id,
-                output.get("duration_ms", "?"),
+                execution_ms,
+                ", ".join(detail_parts),
             )
             return output
 
