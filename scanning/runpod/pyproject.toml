@@ -22,9 +22,9 @@ dependencies = [
     "huggingface_hub>=0.20.0",
 
     # RunPod plumbing
-    "requests",
-    "runpod",
-    "sentry-sdk",
+    "requests>=2.33,<3",
+    "runpod>=1.9,<2",
+    "sentry-sdk>=2,<3",
 
     # blackletter is pinned to the same git branch scanning/pyproject.toml
     # uses so the worker and the daemon always run identical library code.

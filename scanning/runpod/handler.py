@@ -191,7 +191,11 @@ def _with_worker_meta(payload: dict) -> dict:
 
 
 def _tag_sentry(job: dict, action: str, scan_pk: Any) -> None:
-    """Attach job-identifying tags to the current Sentry scope.
+    """Tag the current Sentry scope with job-identifying context.
+
+    Every exception captured during a handler invocation will carry
+    these tags, making it easy to correlate a Sentry event with the
+    specific scan and RunPod job that triggered it.
 
     :param job: RunPod job dict (expects an ``id`` field).
     :param action: The handler action being executed.
@@ -199,16 +203,18 @@ def _tag_sentry(job: dict, action: str, scan_pk: Any) -> None:
     """
     if sentry_sdk is None:
         return
-    with sentry_sdk.configure_scope() as scope:
-        scope.set_tag("action", action)
-        scope.set_tag("gpu_available", str(_CUDA_AVAILABLE))
-        scope.set_tag("worker_boot_ms", str(_WORKER_BOOT_MS))
-        scope.set_tag("worker_uptime_ms", str(_worker_uptime_ms()))
-        if scan_pk is not None:
-            scope.set_tag("scan_pk", str(scan_pk))
-        job_id = job.get("id")
-        if job_id:
-            scope.set_tag("runpod_job_id", str(job_id))
+    sentry_sdk.set_tag("action", action)
+    sentry_sdk.set_tag("gpu_available", str(_CUDA_AVAILABLE))
+    sentry_sdk.set_tag("worker_boot_ms", str(_WORKER_BOOT_MS))
+    sentry_sdk.set_tag("worker_uptime_ms", str(_worker_uptime_ms()))
+    if scan_pk is not None:
+        try:
+            sentry_sdk.set_tag("scan_pk", str(int(scan_pk)))
+        except (TypeError, ValueError):
+            logger.warning("ignoring non-integer scan_pk: %r", scan_pk)
+    job_id = job.get("id")
+    if job_id:
+        sentry_sdk.set_tag("runpod_job_id", str(job_id))
 
 
 def _download_pdf(url: str, dest: Path) -> None:
@@ -287,6 +293,9 @@ class _DetectStdoutTap(io.TextIOBase):
     def flush(self) -> None:
         self._real.flush()
 
+    def fileno(self) -> int:
+        return self._real.fileno()
+
     def _handle(self, line: str) -> None:
         m = _DETECT_START_RE.search(line)
         if m:
@@ -311,8 +320,8 @@ def _action_detect(inputs: dict, tmp_dir: Path) -> dict:
     :param tmp_dir: Per-job scratch directory.
     :returns: ``{"detections": list[dict], "page_count": int,
         "duration_ms": int, "model_durations_ms":
-        {model_name: int, ...}}``. Missing models (skipped because
-        weight absent) are simply absent from ``model_durations_ms``.
+        {model_name: int, ...}}``. Per-model durations are populated
+        only for models that actually ran, as parsed from stdout.
     :rtype: dict
     """
     from blackletter.api import detect, ensure_weights
