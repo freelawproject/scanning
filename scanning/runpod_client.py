@@ -457,7 +457,13 @@ def _poll(
         discarded after internal retries; the inputs are still on S3
         so a fresh submit will re-run the work).
     """
-    sleep_s = 1.0
+    # Happy-path cadence: 1 s, 2 s, 4 s, 8 s, 15 s, 15 s, ... Advances
+    # on every successful poll that returns a non-terminal status.
+    poll_sleep_s = 1.0
+    # Error-retry cadence: independent of poll_sleep_s so a single
+    # 5xx or network blip doesn't permanently slow down happy-path
+    # polling after the underlying issue resolves.
+    error_sleep_s = 1.0
     last_status: str | None = None
     label = _ACTION_LABELS.get(action, action)
 
@@ -490,13 +496,20 @@ def _poll(
             raise
         except Exception as exc:
             # Transient status-poll error (5xx, network blip, timeout):
-            # keep trying until deadline.
+            # keep trying until deadline. Uses its own backoff counter
+            # so happy-path poll cadence is unaffected once the blip
+            # resolves.
             logger.warning(
                 "runpod status poll for %s failed: %s; retrying", job_id, exc
             )
-            time.sleep(min(sleep_s, 10))
-            sleep_s = min(sleep_s * 2, 15)
+            time.sleep(min(error_sleep_s, 10))
+            error_sleep_s = min(error_sleep_s * 2, 15)
             continue
+
+        # Status poll succeeded: reset the error backoff so the next
+        # transient blip starts fresh rather than inheriting the
+        # previous escalation.
+        error_sleep_s = 1.0
 
         status = body.get("status")
         logger.debug("poll runpod job %s -> %s", job_id, status)
@@ -543,8 +556,8 @@ def _poll(
                 )
             last_status = status
 
-        time.sleep(min(sleep_s, 15))
-        sleep_s = min(sleep_s * 2, 15)
+        time.sleep(min(poll_sleep_s, 15))
+        poll_sleep_s = min(poll_sleep_s * 2, 15)
 
 
 def _cancel(base_url: str, headers: dict[str, str], job_id: str) -> None:
