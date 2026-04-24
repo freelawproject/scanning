@@ -389,26 +389,139 @@ implemented yet.
 
 ## Using this image from the scanning daemon
 
-The daemon side is toggled by a single env var:
+The daemon has three modes, picked by env vars only. No code change
+is needed to move between them, and the pipeline entry points
+(`services.run_full_pipeline`, etc.) are identical across all three.
+
+### Mode 1: local CPU processing (default)
+
+When `RUNPOD_ENABLED` is unset or `False`, the daemon runs
+blackletter in-process on the CPU. The scanning project installs
+**CPU-only** torch / ultralytics / paddleocr wheels (see
+`pyproject.toml`), so local mode never uses a GPU even if one is
+present on the host. Fine for dev, CI, the test suite, and small
+test PDFs; too slow for production-sized volumes (hundreds to
+thousands of pages).
+
+No RunPod account, no image, no extra config needed.
+
+Two equivalent ways to actually process queued scans in this mode:
+
+- **Daemon container** (`scanning-daemon` service in
+  `docker/scanning/docker-compose.yml`) runs `run_daemon`
+  continuously in the background. This is the normal path.
+- **Ad-hoc in the Django container** for debugging a single scan:
+
+  ```bash
+  docker exec scanning-django python manage.py run_daemon
+  ```
+
+  Or claim and process exactly one QUEUED scan then exit:
+
+  ```bash
+  docker exec scanning-django python manage.py process_next_scan
+  ```
+
+### Mode 2: RunPod enabled from local dev (smoke test)
+
+Point your local daemon at a real RunPod endpoint. Useful for
+verifying end-to-end wiring before deploying to staging, and the
+only way to exercise the GPU path from a dev machine (since the
+local install is CPU-only). Set in your local `.env`:
 
 ```bash
-# Enables remote dispatch through the runpod_client
 RUNPOD_ENABLED=True
 RUNPOD_ENDPOINT_ID=<endpoint-id>
 RUNPOD_API_KEY=<runpod-api-key>
-# Optional tuning (defaults shown)
-RUNPOD_REQUEST_TIMEOUT=900        # wall-clock deadline for submit+poll
+# Optional tuning (defaults shown). Leave as-is unless you have a
+# reason to change them.
+RUNPOD_REQUEST_TIMEOUT=1800       # wall-clock deadline for submit+poll
 RUNPOD_MAX_RETRIES=2              # transport-error retries on /run
-RUNPOD_PRESIGNED_TTL=3600         # presigned GET URL lifetime, in seconds
+RUNPOD_PRESIGNED_TTL=86400        # presigned GET URL lifetime, in seconds
 ```
 
-When `RUNPOD_ENABLED` is unset or `False` (the default), the daemon
-falls through to running blackletter in-process — exactly the
-pre-migration behaviour. This is how local dev and the test suite
-work; no image needed.
+Caveat: remote mode uploads the PDF to S3 under the scan's
+processing prefix and generates a presigned GET URL the worker uses
+to fetch it, so AWS credentials
+(`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+`AWS_STORAGE_BUCKET_NAME`) must also be set locally. Without those
+you'll get `RunpodError: RUNPOD_ENABLED is true but no AWS
+credentials are configured`.
+
+After setting those, restart the daemon (or run `process_next_scan`
+manually) and submit a scan through the UI. Daemon logs should show
+`runpod <action> job <id> submitted` / `COMPLETED`.
+
+### Mode 3: RunPod in production
+
+The staging / production daemon should set:
+
+```bash
+RUNPOD_ENABLED=True
+RUNPOD_ENDPOINT_ID=<endpoint-id>         # from the RunPod console
+RUNPOD_API_KEY=<runpod-api-key>          # keep secret; never log
+# Optional tuning (defaults shown)
+RUNPOD_REQUEST_TIMEOUT=1800              # wall-clock cap on submit+poll
+RUNPOD_MAX_RETRIES=2                     # transport-error retries on /run
+RUNPOD_PRESIGNED_TTL=86400               # presigned GET URL lifetime, seconds
+```
+
+Plus the AWS credentials the rest of the app already uses.
+
+Env vars that belong on the **RunPod endpoint** (not the daemon):
+`SENTRY_DSN_GPU`, `SENTRY_ENV`, `GIT_SHA`, `HANDLER_MAX_PAGES`,
+`HANDLER_DOWNLOAD_TIMEOUT`. See
+[Configuring the RunPod endpoint](#configuring-the-runpod-endpoint).
 
 Full per-setting documentation:
 `scanning/settings/project/runpod.py`.
+
+### Debugging the client
+
+By default the `scanning` logger runs at `INFO`, which emits one line
+per job on submit, one line per status **change**
+(`IN_QUEUE → IN_PROGRESS → COMPLETED`), and one line on completion.
+That's enough for routine operations.
+
+When a job is misbehaving (stuck in `IN_QUEUE`, silent failures,
+suspicious boot times), raise the level:
+
+```bash
+# .env or environment
+SCANNING_LOG_LEVEL=DEBUG
+```
+
+Then restart the daemon. You'll see every poll tick, e.g.:
+
+```
+DEBUG poll runpod job 63b2d3f6-...-u2 -> IN_QUEUE
+DEBUG poll runpod job 63b2d3f6-...-u2 -> IN_QUEUE
+INFO  runpod job 63b2d3f6-...-u2 -> IN_PROGRESS      # status change
+DEBUG poll runpod job 63b2d3f6-...-u2 -> IN_PROGRESS
+INFO  runpod detect job 63b2d3f6-...-u2 COMPLETED in 7883 ms
+```
+
+Set back to `INFO` for production.
+
+The presigned `pdf_url` is **never logged** at any level. Submit-time
+log lines show the full input dict except that `pdf_url` is replaced
+with `***`:
+
+```
+INFO runpod detect job 63b2d3f6-...-u2 submitted
+  (input={'action': 'detect', 'scan_pk': 1861,
+          'pdf_url': '***', 'models': [...], 'confidence': 0.2})
+```
+
+### Result expiry is recoverable
+
+RunPod purges job records 30 minutes after completion (async path).
+If the daemon misses the retention window (long pause, crash, etc.),
+`GET /status/{id}` returns 404. The client treats this as a
+**transient** error: the scan goes back to `QUEUED` and the next
+daemon tick submits a fresh job with a new presigned URL. The input
+files on S3 are untouched, so no work is lost beyond the one
+discarded GPU run.
 
 ## Development workflow
 

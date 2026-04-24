@@ -29,8 +29,10 @@ RUNPOD_REQUEST_TIMEOUT = env.int("RUNPOD_REQUEST_TIMEOUT", default=1800)
 # 5xx from the RunPod API). Terminal job failures are NOT retried.
 RUNPOD_MAX_RETRIES = env.int("RUNPOD_MAX_RETRIES", default=2)
 
-# Lifetime of presigned GET URLs handed to the worker (seconds). Long
-# enough to cover cold start + queue + retries + GPU-capacity-shortage
-# delays; trivially scoped (read on a single object key, so even a
-# leaked URL lets someone fetch one PDF they couldn't otherwise see).
-RUNPOD_PRESIGNED_TTL = env.int("RUNPOD_PRESIGNED_TTL", default=3600)
+# Lifetime of presigned GET URLs handed to the worker (seconds).
+# Default 86400 (1 day): generous headroom for cold start + queue +
+# retries + GPU-capacity-shortage delays, so a URL never expires
+# before the worker actually fetches it. Trivially scoped (read on a
+# single object key, so even a leaked URL lets someone fetch one PDF
+# they couldn't otherwise see); AWS SigV4 max is 7 days.
+RUNPOD_PRESIGNED_TTL = env.int("RUNPOD_PRESIGNED_TTL", default=86400)

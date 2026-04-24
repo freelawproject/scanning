@@ -65,6 +65,34 @@ class RunpodTransientError(RunpodError):
 _TRANSIENT_ERROR_CODES = {"NO_GPU"}
 
 
+# Friendly labels for progress-callback strings shown in the UI. The
+# raw action names (``detect`` / ``analyze``) are what the client
+# sends on the wire; the labels here are what scanners see.
+_ACTION_LABELS = {
+    "detect": "YOLO (detect)",
+    "analyze": "OCR (analyze)",
+}
+
+
+def _redact_pdf_url(body: dict[str, Any]) -> dict[str, Any]:
+    """Return a shallow copy of the RunPod submit body with any
+    ``pdf_url`` under ``input`` replaced by ``***``.
+
+    Presigned GET URLs grant time-limited read access to a single S3
+    object. They should never land in persistent logs (even at DEBUG),
+    so we mask them before passing the body to ``logger``.
+
+    :param body: The ``{"input": {...}}`` dict about to be POSTed.
+    :returns: A masked shallow copy safe to log.
+    :rtype: dict
+    """
+    redacted = {**body}
+    inp = redacted.get("input")
+    if isinstance(inp, dict) and "pdf_url" in inp:
+        redacted["input"] = {**inp, "pdf_url": "***"}
+    return redacted
+
+
 # ── Public API ──────────────────────────────────────────────────────
 ProgressCallback = Callable[[int | None, int | None, str], None]
 
@@ -292,7 +320,7 @@ def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
         )
         s3.upload_file(str(local), bucket, key)
 
-    ttl = int(getattr(settings, "RUNPOD_PRESIGNED_TTL", 1800))
+    ttl = int(getattr(settings, "RUNPOD_PRESIGNED_TTL", 86400))
     return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},
@@ -375,9 +403,17 @@ def _submit(
                 raise RunpodError(
                     f"RunPod /run returned no job id: {submit!r}"
                 )
-            logger.info("runpod %s job %s submitted", action, job_id)
+            logger.info(
+                "runpod %s job %s submitted (input=%s)",
+                action,
+                job_id,
+                _redact_pdf_url(body).get("input"),
+            )
             if progress_callback:
-                progress_callback(None, None, f"RunPod job {job_id} queued")
+                label = _ACTION_LABELS.get(action, action)
+                progress_callback(
+                    None, None, f"{label}: queued — RunPod job {job_id}"
+                )
             return job_id
         except Exception as exc:
             last_exc = exc
@@ -409,13 +445,21 @@ def _poll(
     Poll cadence starts at 1 s, doubles each idle tick, capped at 15 s.
     Exceeding ``deadline`` triggers ``/cancel/{job_id}`` and raises.
 
+    Every poll logs at DEBUG (enable with ``SCANNING_LOG_LEVEL=DEBUG``);
+    status transitions log at INFO.
+
     :returns: The handler's ``output`` dict on COMPLETED.
     :rtype: dict
     :raises RunpodError: On FAILED / TIMED_OUT / CANCELLED / deadline
         exceeded / malformed output.
+    :raises RunpodTransientError: On HTTP 404 from ``/status`` (the
+        job was either aged out of RunPod's retention window or
+        discarded after internal retries; the inputs are still on S3
+        so a fresh submit will re-run the work).
     """
     sleep_s = 1.0
     last_status: str | None = None
+    label = _ACTION_LABELS.get(action, action)
 
     while True:
         if time.monotonic() > deadline:
@@ -428,21 +472,21 @@ def _poll(
             r = requests.get(
                 f"{base_url}/status/{job_id}", headers=headers, timeout=30
             )
-            # 404 from /status is terminal, not transient: either the
-            # job was discarded by RunPod after exhausting its internal
-            # retries, or it aged past the result-retention window.
-            # Either way, polling further will never succeed.
+            # 404 from /status means the job is gone: either RunPod
+            # discarded it after exhausting their internal retries, or
+            # the result aged past the retention window (30 min async).
+            # The inputs are still on S3, so re-queueing the scan lets
+            # the next daemon tick resubmit with a fresh presigned URL.
             if r.status_code == 404:
-                raise RunpodError(
+                raise RunpodTransientError(
                     f"RunPod job {job_id} not found (HTTP 404 from "
-                    "/status). The job was either discarded after "
-                    "RunPod-internal retries or aged out of the "
-                    "result-retention window."
+                    "/status). Re-queueing so the next daemon tick "
+                    "submits a fresh job."
                 )
             r.raise_for_status()
             body = r.json()
         except RunpodError:
-            # Don't swallow the 404-derived RunpodError above.
+            # Don't swallow the 404-derived RunpodTransientError above.
             raise
         except Exception as exc:
             # Transient status-poll error (5xx, network blip, timeout):
@@ -455,6 +499,8 @@ def _poll(
             continue
 
         status = body.get("status")
+        logger.debug("poll runpod job %s -> %s", job_id, status)
+
         if status == "COMPLETED":
             output = body.get("output")
             if not isinstance(output, dict):
@@ -490,7 +536,11 @@ def _poll(
         if status and status != last_status:
             logger.info("runpod job %s -> %s", job_id, status)
             if progress_callback:
-                progress_callback(None, None, f"RunPod job {job_id}: {status}")
+                progress_callback(
+                    None,
+                    None,
+                    f"{label}: {status} — RunPod job {job_id}",
+                )
             last_status = status
 
         time.sleep(min(sleep_s, 15))
