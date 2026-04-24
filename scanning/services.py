@@ -43,7 +43,7 @@ from blackletter.validate import (
     _split_in_out_of_range,
 )
 from django.conf import settings
-from django.db.models import F
+from django.db.models import Case, F, Value, When
 
 from scanning.models import (
     CheckName,
@@ -94,15 +94,15 @@ def _handle_pipeline_exception(
     """Classify a pipeline-level exception and update the scan status.
 
     Transient RunPod failures (e.g. worker scheduled without a GPU)
-    re-queue the scan so the next daemon tick retries on a different
-    worker. All other exceptions mark the scan as ``ERROR`` with the
-    exception message.
+    increment ``Scan.retry_count`` and re-queue the scan so the next
+    daemon tick retries on a different worker, up to
+    ``settings.RUNPOD_MAX_TRANSIENT_RETRIES`` attempts. When the cap
+    is hit the scan is escalated to ERROR instead. All other exceptions
+    immediately mark the scan as ERROR.
 
-    Both transitions are guarded by ``status=Status.PROCESSING`` so
-    we never stomp a scan that a concurrent process (stale-recovery,
-    admin action, second daemon replica) has already moved out of
-    PROCESSING. If the guard doesn't match, the update is a no-op and
-    a warning is logged.
+    All transitions are guarded by ``status=Status.PROCESSING`` so we
+    never stomp a scan that a concurrent process (stale-recovery, admin
+    action, second daemon replica) has already moved out of PROCESSING.
 
     :param scan_pk: Primary key of the scan that failed.
     :param exc: The exception that was raised.
@@ -112,23 +112,63 @@ def _handle_pipeline_exception(
     from scanning.runpod_client import RunpodTransientError
 
     if isinstance(exc, RunpodTransientError):
-        logger.warning(
-            "[%s] scan %s transient RunPod failure, re-queuing: %s",
-            context,
-            scan_pk,
-            exc,
-        )
+        max_retries = getattr(settings, "RUNPOD_MAX_TRANSIENT_RETRIES", 5)
+        err_msg = f"Max retries exceeded: {str(exc)[:200]}"
+        retry_msg = f"Retrying: {str(exc)[:200]}"
+
+        # Single atomic UPDATE: increment retry_count and branch on the
+        # PRE-increment value using CASE/WHEN. This avoids a TOCTOU race
+        # between reading the count and deciding. The PROCESSING guard
+        # ensures we never stomp a scan already moved by another process.
+        #
+        # Pre-increment `retry_count >= max_retries` is equivalent to
+        # post-increment `retry_count > max_retries`.
         updated = Scan.objects.filter(
             pk=scan_pk, status=Status.PROCESSING
         ).update(
-            status=Status.QUEUED,
-            progress_message=f"Retrying: {str(exc)[:200]}",
+            retry_count=F("retry_count") + 1,
+            status=Case(
+                When(
+                    retry_count__gte=max_retries,
+                    then=Value(Status.ERROR_MAX_RETRIES),
+                ),
+                default=Value(Status.QUEUED),
+            ),
+            progress_message=Case(
+                When(retry_count__gte=max_retries, then=Value(err_msg)),
+                default=Value(retry_msg),
+            ),
         )
+
         if not updated:
             logger.warning(
-                "[%s] scan %s re-queue skipped: row no longer in PROCESSING",
+                "[%s] scan %s status update skipped: row no longer in PROCESSING",
                 context,
                 scan_pk,
+            )
+            return
+
+        # Read back post-update state for logging only (non-critical).
+        try:
+            scan = Scan.objects.only("retry_count", "status").get(pk=scan_pk)
+        except Scan.DoesNotExist:
+            return
+        if scan.status == Status.ERROR_MAX_RETRIES:
+            logger.warning(
+                "[%s] scan %s transient RunPod failure, max retries (%d) exceeded: %s",
+                context,
+                scan_pk,
+                max_retries,
+                exc,
+            )
+        else:
+            logger.warning(
+                "[%s] scan %s transient RunPod failure (%d/%d), re-queuing: %s",
+                context,
+                scan_pk,
+                scan.retry_count,
+                max_retries,
+                exc,
             )
         return
 
@@ -311,7 +351,10 @@ def _ocr(
     pm = get_plugin_manager()
     pm._pm.register(_ScanProgressPlugin())
 
-    print(f"  OCR {total_pages} pages...", flush=True)
+    print(
+        f"  OCR {total_pages} pages... ({os.cpu_count() or 1} CPUs)",
+        flush=True,
+    )
     t0 = time.time()
     ocrmypdf.ocr(
         str(pdf_path),
@@ -388,7 +431,7 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
                 _update_progress(scan_pk, f"YOLO: {line}")
 
     def _remote_progress(current, total, message):
-        _update_progress(scan_pk, f"YOLO: {message}")
+        _update_progress(scan_pk, message)
 
     sys.stdout = _ProgressWriter()
     try:
@@ -620,10 +663,13 @@ def _pull_processing_files_from_s3(scan_pk: int) -> None:
         )
 
 
-def _sync_detections_to_disk(scan_pk: int) -> list | None:
+def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
     """Write current DB detections to detections.json on disk.
 
     :param scan_pk: Primary key of the scan whose detections to sync.
+    :param upload: If ``True`` (default), also push detections.json to S3.
+        Pass ``False`` when a subsequent ``_push_processing_files_to_s3``
+        call will cover the upload, to avoid redundant round-trips.
     :return: The detection data written, or None if no output_dir.
     """
     scan = Scan.objects.get(pk=scan_pk)
@@ -656,14 +702,15 @@ def _sync_detections_to_disk(scan_pk: int) -> list | None:
                 entry["page_number_end"] = pn[1]
         det_data.append(entry)
     (output_dir / "detections.json").write_text(json.dumps(det_data))
-    try:
-        from scanning import s3_sync
+    if upload:
+        try:
+            from scanning import s3_sync
 
-        s3_sync.upload_file_to_s3(scan, "detections.json")
-    except Exception:
-        logger.exception(
-            "Failed to push detections.json to S3 for scan %s", scan_pk
-        )
+            s3_sync.upload_file_to_s3(scan, "detections.json")
+        except Exception:
+            logger.exception(
+                "Failed to push detections.json to S3 for scan %s", scan_pk
+            )
     return det_data
 
 
@@ -735,7 +782,7 @@ def _compute_and_save_redaction_rects(scan_pk: int, pdf_path: str) -> list:
     """
     scan = Scan.objects.get(pk=scan_pk)
 
-    det_data = _sync_detections_to_disk(scan_pk)
+    det_data = _sync_detections_to_disk(scan_pk, upload=False)
     if not det_data:
         return []
 
@@ -1089,6 +1136,58 @@ def _re_pair_opinions(scan_pk: int) -> list:
 # ---------------------------------------------------------------------------
 
 
+def _dispatch_analyze(
+    scan_pk: int,
+    pdf_path: str,
+    stream_partial: bool = False,
+) -> list[dict]:
+    """Shared scaffolding for submitting an analyze job via runpod_client.
+
+    Fetches the scan, builds ``exp_start`` / ``exp_end``, wires up a
+    progress callback (with optional live partial writes), calls
+    ``runpod_client.analyze``, and returns the raw results list.
+
+    :param scan_pk: Primary key of the scan to analyze.
+    :param pdf_path: Path to the PDF to run analysis on.
+    :param stream_partial: If ``True``, the progress callback writes
+        per-page partial results to ``Scan.ocr_results`` as pages
+        arrive (local mode only; remote mode emits ``current=None``
+        so no partial writes happen there). If ``False``, only coarse
+        submit/queued events fire.
+    :returns: The ``results`` list from the analyze response.
+    :rtype: list[dict]
+    """
+    from scanning import runpod_client
+
+    scan = Scan.objects.get(pk=scan_pk)
+    exp_start = scan.start_page or 1
+    exp_end = scan.end_page
+
+    all_results: list[dict] = []
+
+    def _progress(current, total, message):
+        _update_progress(scan_pk, message, current=current, total=total)
+        if (
+            stream_partial
+            and current is not None
+            and current <= len(all_results)
+        ):
+            Scan.objects.filter(pk=scan_pk).update(
+                ocr_results=all_results[:current],
+            )
+
+    result = runpod_client.analyze(
+        scan,
+        pdf_path,
+        exp_start=exp_start,
+        exp_end=exp_end,
+        num_workers=1,
+        progress_callback=_progress,
+    )
+    all_results = result["results"]
+    return all_results
+
+
 def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
     """Validate page numbers using the runpod_client analyze action.
 
@@ -1102,33 +1201,8 @@ def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
     :param scan_pk: Primary key of the scan to validate.
     :param pdf_path: Path to the PDF to run validation on.
     """
-    from scanning import runpod_client
-
-    scan = Scan.objects.get(pk=scan_pk)
-    exp_start = scan.start_page or 1
-    exp_end = scan.end_page
-
-    def _progress(current, total, message):
-        _update_progress(
-            scan_pk,
-            message,
-            current=current,
-            total=total,
-        )
-
-    result = runpod_client.analyze(
-        scan,
-        pdf_path,
-        exp_start=exp_start,
-        exp_end=exp_end,
-        num_workers=1,
-        progress_callback=_progress,
-    )
-
-    all_results = result["results"]
-    Scan.objects.filter(pk=scan_pk).update(
-        ocr_results=all_results,
-    )
+    all_results = _dispatch_analyze(scan_pk, pdf_path, stream_partial=False)
+    Scan.objects.filter(pk=scan_pk).update(ocr_results=all_results)
     _rebuild_issues_from_results(scan_pk, all_results)
 
 
@@ -1146,36 +1220,7 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
     :param scan_pk: Primary key of the scan to validate.
     :param pdf_path: Path to the PDF to run validation on.
     """
-    from scanning import runpod_client
-
-    scan = Scan.objects.get(pk=scan_pk)
-    exp_start = scan.start_page or 1
-    exp_end = scan.end_page
-
-    all_results = []
-
-    def _progress(current, total, message):
-        _update_progress(
-            scan_pk,
-            message,
-            current=current,
-            total=total,
-        )
-        # Store partial results for live display (local mode only,
-        # remote mode emits current=None).
-        if current is not None and current <= len(all_results):
-            Scan.objects.filter(pk=scan_pk).update(
-                ocr_results=all_results[:current],
-            )
-
-    result = runpod_client.analyze(
-        scan,
-        pdf_path,
-        exp_start=exp_start,
-        exp_end=exp_end,
-        progress_callback=_progress,
-    )
-    all_results = result["results"]
+    all_results = _dispatch_analyze(scan_pk, pdf_path, stream_partial=True)
 
     # Save detections from each page result
     Detection.objects.filter(scan_id=scan_pk).delete()
@@ -1397,6 +1442,7 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to validate.
     """
     django.db.connections.close_all()
+    Scan.objects.filter(pk=scan_pk).update(retry_count=0)
     _pull_processing_files_from_s3(scan_pk)
 
     try:
@@ -1432,6 +1478,7 @@ def run_full_pipeline(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to process.
     """
     django.db.connections.close_all()
+    Scan.objects.filter(pk=scan_pk).update(retry_count=0)
     _pull_processing_files_from_s3(scan_pk)
 
     try:
@@ -1585,6 +1632,7 @@ def run_reprocess(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to reprocess.
     """
     django.db.connections.close_all()
+    Scan.objects.filter(pk=scan_pk).update(retry_count=0)
     _pull_processing_files_from_s3(scan_pk)
 
     scan = Scan.objects.get(pk=scan_pk)
@@ -1969,6 +2017,7 @@ def run_generate_files(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to generate files for.
     """
     django.db.connections.close_all()
+    Scan.objects.filter(pk=scan_pk).update(retry_count=0)
     _pull_processing_files_from_s3(scan_pk)
 
     scan = Scan.objects.get(pk=scan_pk)
@@ -2116,6 +2165,7 @@ def run_detect(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to detect on.
     """
     django.db.connections.close_all()
+    Scan.objects.filter(pk=scan_pk).update(retry_count=0)
     _pull_processing_files_from_s3(scan_pk)
 
     scan = Scan.objects.get(pk=scan_pk)
