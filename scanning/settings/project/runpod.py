@@ -36,3 +36,11 @@ RUNPOD_MAX_RETRIES = env.int("RUNPOD_MAX_RETRIES", default=2)
 # single object key, so even a leaked URL lets someone fetch one PDF
 # they couldn't otherwise see); AWS SigV4 max is 7 days.
 RUNPOD_PRESIGNED_TTL = env.int("RUNPOD_PRESIGNED_TTL", default=86400)
+
+# Maximum number of transient RunPod failures (e.g. NO_GPU) before a
+# scan is escalated to ERROR instead of being re-queued. A scan that
+# hits this cap must be manually re-queued by staff. Default 5 keeps
+# a wedged endpoint from burning API quota indefinitely.
+RUNPOD_MAX_TRANSIENT_RETRIES = env.int(
+    "RUNPOD_MAX_TRANSIENT_RETRIES", default=5
+)
