@@ -214,10 +214,22 @@ def _tag_sentry(job: dict, action: str, scan_pk: Any) -> None:
 def _download_pdf(url: str, dest: Path) -> None:
     """Download a PDF from a presigned GET URL to ``dest``.
 
-    :param url: Presigned GET URL.
+    Only accepts ``http://`` or ``https://`` URLs. Rejects everything
+    else (``file://``, ``gopher://``, bare paths, etc.) defensively:
+    today the trust boundary is "only the daemon holds the RunPod API
+    key, so only the daemon can submit jobs," but a scheme check
+    costs nothing and eliminates the obvious SSRF / local-file-read
+    class of bugs if that boundary ever weakens.
+
+    :param url: PDF URL (typically a presigned S3 GET URL).
     :param dest: Local filesystem target.
+    :raises ValueError: If ``url`` is not http(s).
     :raises requests.HTTPError: On non-2xx response.
     """
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        raise ValueError(
+            f"refusing to download PDF from non-http(s) URL: {url!r}"
+        )
     with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
         r.raise_for_status()
         with dest.open("wb") as f:
