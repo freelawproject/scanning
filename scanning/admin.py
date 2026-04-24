@@ -13,6 +13,34 @@ from scanning.models import (
 )
 
 
+class RetryCapFilter(admin.SimpleListFilter):
+    """Filter scans that were stopped because they hit the transient retry cap."""
+
+    title = "retry cap hit"
+    parameter_name = "retry_cap"
+
+    def lookups(self, request, model_admin):
+        """Return the filter choices.
+
+        :param request: The admin HTTP request.
+        :param model_admin: The ModelAdmin instance.
+        :returns: Iterable of (value, label) tuples.
+        :rtype: list[tuple]
+        """
+        return [("1", "Yes")]
+
+    def queryset(self, request, queryset):
+        """Apply the filter to the queryset.
+
+        :param request: The admin HTTP request.
+        :param queryset: The base queryset.
+        :returns: Filtered queryset.
+        """
+        if self.value() == "1":
+            return queryset.filter(status=Status.ERROR_MAX_RETRIES)
+        return queryset
+
+
 @admin.register(Reporter)
 class ReporterAdmin(admin.ModelAdmin):
     list_display = ["short_name", "full_name", "date_created"]
@@ -28,10 +56,11 @@ class ScanAdmin(admin.ModelAdmin):
         "source",
         "number_of_pages",
         "status",
+        "retry_count",
         "uploaded_by",
         "date_created",
     ]
-    list_filter = ["status", "reporter", "source"]
+    list_filter = ["status", "reporter", "source", RetryCapFilter]
     search_fields = [
         "volume",
         "reporter__full_name",
@@ -41,7 +70,7 @@ class ScanAdmin(admin.ModelAdmin):
     raw_id_fields = ["uploaded_by", "reporter"]
     readonly_fields = ["date_created", "date_modified", "processed_at"]
     date_hierarchy = "date_created"
-    actions = ["reset_to_queued"]
+    actions = ["reset_to_queued", "requeue_retry_cap_scans"]
 
     @admin.action(
         description=(
@@ -73,6 +102,36 @@ class ScanAdmin(admin.ModelAdmin):
             request,
             f"Re-queued {updated} scan(s). The daemon will pick them up "
             "on the next tick.",
+            level=messages.SUCCESS,
+        )
+
+    @admin.action(
+        description=(
+            "Re-queue selected scans that hit the retry cap "
+            "(resets retry_count so the daemon will try again)"
+        )
+    )
+    def requeue_retry_cap_scans(self, request, queryset):
+        """Re-queue scans stopped after hitting the transient retry cap.
+
+        Resets ``status``, ``retry_count``, and ``progress_message`` so
+        the daemon will pick them up and attempt processing again.
+
+        :param request: The admin HTTP request.
+        :param queryset: Selected Scan queryset.
+        :return: None.
+        """
+        updated = queryset.filter(status=Status.ERROR_MAX_RETRIES).update(
+            status=Status.QUEUED,
+            retry_count=0,
+            progress_message="Re-queued via admin (retry cap reset)",
+            progress_current=0,
+            progress_total=0,
+        )
+        self.message_user(
+            request,
+            f"Re-queued {updated} scan(s) with retry_count reset. "
+            "The daemon will try them again on the next tick.",
             level=messages.SUCCESS,
         )
 
