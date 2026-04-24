@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 import boto3
 import requests
+from botocore.exceptions import ClientError
 from django.conf import settings
 
 if TYPE_CHECKING:
@@ -303,15 +304,22 @@ def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
     key = f"{s3_sync.s3_processing_prefix(scan)}{Path(pdf_path).name}"
     s3 = boto3.client("s3")
 
+    # Only "the object isn't there yet" should trigger an upload. Any
+    # other ClientError (bad credentials, wrong region, access denied,
+    # bucket missing) means S3 is misconfigured and must surface, not
+    # get swallowed by a fall-through to upload_file().
     try:
         s3.head_object(Bucket=bucket, Key=key)
-    except Exception:
+    except ClientError as exc:
+        err_code = exc.response.get("Error", {}).get("Code", "")
+        if err_code not in ("404", "NoSuchKey"):
+            raise
         local = Path(pdf_path)
         if not local.is_file():
             raise FileNotFoundError(
                 f"{pdf_path} not present locally and missing from "
                 f"s3://{bucket}/{key}; cannot run GPU step."
-            )
+            ) from exc
         logger.info(
             "uploading %s to s3://%s/%s before presign",
             local.name,
