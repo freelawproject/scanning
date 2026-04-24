@@ -98,6 +98,12 @@ def _handle_pipeline_exception(
     worker. All other exceptions mark the scan as ``ERROR`` with the
     exception message.
 
+    Both transitions are guarded by ``status=Status.PROCESSING`` so
+    we never stomp a scan that a concurrent process (stale-recovery,
+    admin action, second daemon replica) has already moved out of
+    PROCESSING. If the guard doesn't match, the update is a no-op and
+    a warning is logged.
+
     :param scan_pk: Primary key of the scan that failed.
     :param exc: The exception that was raised.
     :param context: Short label for log messages (e.g. ``"pipeline"``,
@@ -112,18 +118,32 @@ def _handle_pipeline_exception(
             scan_pk,
             exc,
         )
-        Scan.objects.filter(pk=scan_pk).update(
+        updated = Scan.objects.filter(
+            pk=scan_pk, status=Status.PROCESSING
+        ).update(
             status=Status.QUEUED,
             progress_message=f"Retrying: {str(exc)[:200]}",
         )
+        if not updated:
+            logger.warning(
+                "[%s] scan %s re-queue skipped: row no longer in PROCESSING",
+                context,
+                scan_pk,
+            )
         return
 
     traceback.print_exc()
     print(f"[{context}] ERROR: {exc}", flush=True)
-    Scan.objects.filter(pk=scan_pk).update(
+    updated = Scan.objects.filter(pk=scan_pk, status=Status.PROCESSING).update(
         status=Status.ERROR,
         progress_message=str(exc)[:255],
     )
+    if not updated:
+        logger.warning(
+            "[%s] scan %s ERROR mark skipped: row no longer in PROCESSING",
+            context,
+            scan_pk,
+        )
 
 
 def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
