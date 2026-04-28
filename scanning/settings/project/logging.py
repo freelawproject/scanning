@@ -3,6 +3,12 @@ import environ
 env = environ.FileAwareEnv()
 DEVELOPMENT = env.bool("DEVELOPMENT", default=True)
 
+# Log level for the top-level ``scanning`` logger. Default INFO.
+# Set SCANNING_LOG_LEVEL=DEBUG to see per-poll traces from the
+# RunPod client (``poll runpod job <id> -> IN_QUEUE`` every few
+# seconds) and other verbose scanning-side debug output.
+SCANNING_LOG_LEVEL = env.str("SCANNING_LOG_LEVEL", default="INFO").upper()
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -41,7 +47,7 @@ LOGGING = {
         },
         "scanning": {
             "handlers": ["console"],
-            "level": "INFO",
+            "level": SCANNING_LOG_LEVEL,
             "propagate": True,
         },
     },

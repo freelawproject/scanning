@@ -1017,6 +1017,9 @@ class TestRunFullPipelinePullsFromS3(ScanningTestCase):
 
         scan = ScanFactory(status=Status.QUEUED)
         with (
+            # close_all() resets connections for daemon-process forking; in
+            # tests it kills the test transaction -- patch it out.
+            patch("django.db.connections.close_all"),
             patch(
                 "scanning.services._pull_processing_files_from_s3"
             ) as mock_pull,

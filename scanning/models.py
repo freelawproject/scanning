@@ -77,6 +77,7 @@ class Status(models.TextChoices):
     APPROVED = "approved", "Approved"
     EXTRACTED = "extracted", "Extracted"
     ERROR = "error", "Error"
+    ERROR_MAX_RETRIES = "error_max_retries", "Error (retry cap hit)"
     CANCELLED = "cancelled", "Cancelled"
 
 
@@ -499,6 +500,10 @@ class Scan(AbstractDateTimeModel):
         blank=True,
         default="",
         help_text="Captured stdout from processing.",
+    )
+    retry_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of transient RunPod failures before the current run.",
     )
     ocr_results = models.JSONField(
         default=list,

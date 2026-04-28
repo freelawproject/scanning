@@ -98,6 +98,10 @@ def scan_list(request: HttpRequest) -> HttpResponse:
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
 
+    retry_cap_count = Scan.objects.filter(
+        status=Status.ERROR_MAX_RETRIES,
+    ).count()
+
     return render(
         request,
         "scanning/scan_list.html",
@@ -113,6 +117,7 @@ def scan_list(request: HttpRequest) -> HttpResponse:
             "current_reporter": reporter_filter or "",
             "current_source": source_filter or "",
             "current_volume": volume_filter or "",
+            "retry_cap_count": retry_cap_count,
         },
     )
 

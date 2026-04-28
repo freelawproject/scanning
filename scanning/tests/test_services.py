@@ -7,7 +7,9 @@ import json
 import pathlib
 import shutil
 import tempfile
+from unittest.mock import patch
 
+from django.db.models import F
 from django.test import TestCase, override_settings
 
 from scanning.factories import ReporterFactory, ScanFactory, UserFactory
@@ -297,100 +299,62 @@ class TestComputeAndSaveMarginRects(TestCase):
 class TestSmartDeleteIndexShifting(TestCase):
     """Test that run_smart_delete shifts detection page_index correctly."""
 
-    def test_deleting_page_shifts_subsequent_detections(self):
-        """Detections on pages after the deleted one should shift down by 1."""
-        scan = ScanFactory(page_count=3)
+    def _make_scan_with_detections(self, n_pages=3):
+        """Create a scan with one detection per page.
 
-        # Create detections on three pages
-        for page_idx in range(3):
+        :param n_pages: Number of pages (and detections) to create.
+        :returns: The created Scan instance.
+        """
+        scan = ScanFactory(page_count=n_pages)
+        for page_idx in range(n_pages):
             Detection.objects.create(
                 scan=scan,
                 page_index=page_idx,
                 label="CASE_CAPTION",
                 label_id=0,
                 confidence=0.95,
-                x0=10,
-                y0=10,
-                x1=100,
-                y1=100,
+                x0=0,
+                y0=0,
+                x1=50,
+                y1=50,
             )
+        return scan
 
-        self.assertEqual(Detection.objects.filter(scan=scan).count(), 3)
+    def _delete_and_shift(self, scan, delete_idx):
+        """Simulate the DB-side page delete: remove detections and shift indices.
 
-        # Simulate deleting page 1 (0-indexed) — just the DB operations
-        delete_idx = 1
+        :param scan: The Scan whose detections to update.
+        :param delete_idx: 0-based page index to remove.
+        :returns: Sorted list of remaining page_index values.
+        :rtype: list[int]
+        """
         Detection.objects.filter(scan=scan, page_index=delete_idx).delete()
-        from django.db.models import F
-
         Detection.objects.filter(scan=scan, page_index__gt=delete_idx).update(
             page_index=F("page_index") - 1
         )
-
-        remaining = list(
+        return list(
             Detection.objects.filter(scan=scan)
             .order_by("page_index")
             .values_list("page_index", flat=True)
         )
+
+    def test_deleting_page_shifts_subsequent_detections(self):
+        """Detections on pages after the deleted one should shift down by 1."""
+        scan = self._make_scan_with_detections()
+        self.assertEqual(Detection.objects.filter(scan=scan).count(), 3)
+        remaining = self._delete_and_shift(scan, delete_idx=1)
         self.assertEqual(remaining, [0, 1])
 
     def test_deleting_first_page_shifts_all(self):
-        scan = ScanFactory(page_count=3)
-        for page_idx in range(3):
-            Detection.objects.create(
-                scan=scan,
-                page_index=page_idx,
-                label="KEY_ICON",
-                label_id=1,
-                confidence=0.9,
-                x0=0,
-                y0=0,
-                x1=50,
-                y1=50,
-            )
-
-        delete_idx = 0
-        Detection.objects.filter(scan=scan, page_index=delete_idx).delete()
-        from django.db.models import F
-
-        Detection.objects.filter(scan=scan, page_index__gt=delete_idx).update(
-            page_index=F("page_index") - 1
-        )
-
-        remaining = list(
-            Detection.objects.filter(scan=scan)
-            .order_by("page_index")
-            .values_list("page_index", flat=True)
-        )
+        """Deleting page 0 should shift all remaining detections down by 1."""
+        scan = self._make_scan_with_detections()
+        remaining = self._delete_and_shift(scan, delete_idx=0)
         self.assertEqual(remaining, [0, 1])
 
     def test_deleting_last_page_no_shift_needed(self):
-        scan = ScanFactory(page_count=3)
-        for page_idx in range(3):
-            Detection.objects.create(
-                scan=scan,
-                page_index=page_idx,
-                label="HEADNOTE",
-                label_id=3,
-                confidence=0.85,
-                x0=0,
-                y0=0,
-                x1=50,
-                y1=50,
-            )
-
-        delete_idx = 2
-        Detection.objects.filter(scan=scan, page_index=delete_idx).delete()
-        from django.db.models import F
-
-        Detection.objects.filter(scan=scan, page_index__gt=delete_idx).update(
-            page_index=F("page_index") - 1
-        )
-
-        remaining = list(
-            Detection.objects.filter(scan=scan)
-            .order_by("page_index")
-            .values_list("page_index", flat=True)
-        )
+        """Deleting the last page should leave preceding indices unchanged."""
+        scan = self._make_scan_with_detections()
+        remaining = self._delete_and_shift(scan, delete_idx=2)
         self.assertEqual(remaining, [0, 1])
 
 
@@ -844,7 +808,6 @@ class TestUploadApprovedFiles(TestCase):
     @override_settings(DEVELOPMENT=True)
     def test_no_credentials_skips_upload(self):
         """Without AWS creds, set s3_path but not s3_uploaded."""
-        from unittest.mock import patch
 
         from scanning.services import upload_approved_files
 
@@ -859,7 +822,6 @@ class TestUploadApprovedFiles(TestCase):
 
     def test_s3_path_format(self):
         """Verify the S3 prefix follows the expected pattern."""
-        from unittest.mock import patch
 
         from scanning.services import upload_approved_files
 
@@ -879,7 +841,7 @@ class TestUploadApprovedFiles(TestCase):
     )
     def test_copy_calls_s3_copy_object(self):
         """Approve should issue copy_object per deliverable, not upload_file."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
 
         from scanning.services import upload_approved_files
 
@@ -932,7 +894,7 @@ class TestUploadApprovedFiles(TestCase):
     )
     def test_re_upload_after_changes(self):
         """After reprocessing (s3_uploaded reset), copy runs again."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
 
         from scanning.services import upload_approved_files
 
@@ -955,3 +917,44 @@ class TestUploadApprovedFiles(TestCase):
         self.assertEqual(mock_client.upload_file.call_count, 0)
         scan.refresh_from_db()
         self.assertTrue(scan.s3_uploaded)
+
+
+class TestHandlePipelineExceptionRetryCap(TestCase):
+    """Test the retry-cap logic in _handle_pipeline_exception."""
+
+    def _make_processing_scan(self, retry_count=0):
+        """Return a scan in PROCESSING status with the given retry_count."""
+        scan = ScanFactory(status=Status.PROCESSING, retry_count=retry_count)
+        return scan
+
+    def test_transient_error_increments_retry_count_and_requeues(self):
+        """A RunpodTransientError below the cap re-queues and increments retry_count."""
+        from scanning.runpod_client import RunpodTransientError
+        from scanning.services import _handle_pipeline_exception
+
+        scan = self._make_processing_scan(retry_count=0)
+        exc = RunpodTransientError("NO_GPU")
+
+        with self.settings(RUNPOD_MAX_TRANSIENT_RETRIES=5):
+            _handle_pipeline_exception(scan.pk, exc, context="test")
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.retry_count, 1)
+        self.assertIn("Retrying", scan.progress_message)
+
+    def test_transient_error_at_cap_escalates_to_error(self):
+        """When retry_count already equals the cap, the next failure marks ERROR."""
+        from scanning.runpod_client import RunpodTransientError
+        from scanning.services import _handle_pipeline_exception
+
+        scan = self._make_processing_scan(retry_count=5)
+        exc = RunpodTransientError("NO_GPU")
+
+        with self.settings(RUNPOD_MAX_TRANSIENT_RETRIES=5):
+            _handle_pipeline_exception(scan.pk, exc, context="test")
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.ERROR_MAX_RETRIES)
+        self.assertEqual(scan.retry_count, 6)
+        self.assertIn("Max retries exceeded", scan.progress_message)
