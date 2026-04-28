@@ -112,7 +112,7 @@ def _handle_pipeline_exception(
     from scanning.runpod_client import RunpodTransientError
 
     if isinstance(exc, RunpodTransientError):
-        max_retries = getattr(settings, "RUNPOD_MAX_TRANSIENT_RETRIES", 5)
+        max_retries = settings.RUNPOD_MAX_TRANSIENT_RETRIES
         err_msg = f"Max retries exceeded: {str(exc)[:200]}"
         retry_msg = f"Retrying: {str(exc)[:200]}"
 

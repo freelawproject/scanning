@@ -212,7 +212,7 @@ def _remote_enabled() -> bool:
     :returns: Whether the remote path is active.
     :rtype: bool
     """
-    return bool(getattr(settings, "RUNPOD_ENABLED", False))
+    return bool(settings.RUNPOD_ENABLED)
 
 
 def _detect_local(
@@ -328,7 +328,7 @@ def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
         )
         s3.upload_file(str(local), bucket, key)
 
-    ttl = int(getattr(settings, "RUNPOD_PRESIGNED_TTL", 86400))
+    ttl = int(settings.RUNPOD_PRESIGNED_TTL)
     return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},
@@ -356,8 +356,8 @@ def _invoke(
     :raises RunpodError: On terminal failure, handler error, or
         exhausted retries.
     """
-    endpoint = getattr(settings, "RUNPOD_ENDPOINT_ID", "")
-    api_key = getattr(settings, "RUNPOD_API_KEY", "")
+    endpoint = settings.RUNPOD_ENDPOINT_ID
+    api_key = settings.RUNPOD_API_KEY
     if not endpoint or not api_key:
         raise RunpodError("RUNPOD_ENDPOINT_ID / RUNPOD_API_KEY not configured")
 
@@ -367,10 +367,8 @@ def _invoke(
         "input": {"action": action, "scan_pk": scan.pk, **payload},
     }
 
-    deadline = time.monotonic() + int(
-        getattr(settings, "RUNPOD_REQUEST_TIMEOUT", 900)
-    )
-    max_retries = int(getattr(settings, "RUNPOD_MAX_RETRIES", 2))
+    deadline = time.monotonic() + int(settings.RUNPOD_REQUEST_TIMEOUT)
+    max_retries = int(settings.RUNPOD_MAX_RETRIES)
 
     job_id = _submit(
         base_url, headers, body, action, max_retries, progress_callback
