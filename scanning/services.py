@@ -1442,7 +1442,6 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to validate.
     """
     django.db.connections.close_all()
-    Scan.objects.filter(pk=scan_pk).update(retry_count=0)
     _pull_processing_files_from_s3(scan_pk)
 
     try:
@@ -1478,7 +1477,6 @@ def run_full_pipeline(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to process.
     """
     django.db.connections.close_all()
-    Scan.objects.filter(pk=scan_pk).update(retry_count=0)
     _pull_processing_files_from_s3(scan_pk)
 
     try:
@@ -1632,7 +1630,6 @@ def run_reprocess(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to reprocess.
     """
     django.db.connections.close_all()
-    Scan.objects.filter(pk=scan_pk).update(retry_count=0)
     _pull_processing_files_from_s3(scan_pk)
 
     scan = Scan.objects.get(pk=scan_pk)
@@ -2017,7 +2014,6 @@ def run_generate_files(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to generate files for.
     """
     django.db.connections.close_all()
-    Scan.objects.filter(pk=scan_pk).update(retry_count=0)
     _pull_processing_files_from_s3(scan_pk)
 
     scan = Scan.objects.get(pk=scan_pk)
@@ -2165,7 +2161,6 @@ def run_detect(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to detect on.
     """
     django.db.connections.close_all()
-    Scan.objects.filter(pk=scan_pk).update(retry_count=0)
     _pull_processing_files_from_s3(scan_pk)
 
     scan = Scan.objects.get(pk=scan_pk)

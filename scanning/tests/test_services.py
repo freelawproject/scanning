@@ -808,7 +808,6 @@ class TestUploadApprovedFiles(TestCase):
     @override_settings(DEVELOPMENT=True)
     def test_no_credentials_skips_upload(self):
         """Without AWS creds, set s3_path but not s3_uploaded."""
-        from unittest.mock import patch
 
         from scanning.services import upload_approved_files
 
@@ -823,7 +822,6 @@ class TestUploadApprovedFiles(TestCase):
 
     def test_s3_path_format(self):
         """Verify the S3 prefix follows the expected pattern."""
-        from unittest.mock import patch
 
         from scanning.services import upload_approved_files
 
@@ -843,7 +841,7 @@ class TestUploadApprovedFiles(TestCase):
     )
     def test_copy_calls_s3_copy_object(self):
         """Approve should issue copy_object per deliverable, not upload_file."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
 
         from scanning.services import upload_approved_files
 
@@ -896,7 +894,7 @@ class TestUploadApprovedFiles(TestCase):
     )
     def test_re_upload_after_changes(self):
         """After reprocessing (s3_uploaded reset), copy runs again."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
 
         from scanning.services import upload_approved_files
 
@@ -960,29 +958,3 @@ class TestHandlePipelineExceptionRetryCap(TestCase):
         self.assertEqual(scan.status, Status.ERROR_MAX_RETRIES)
         self.assertEqual(scan.retry_count, 6)
         self.assertIn("Max retries exceeded", scan.progress_message)
-
-    def test_retry_count_reset_on_pipeline_entry(self):
-        """retry_count is zeroed at the start of each daemon-dispatched function."""
-        from scanning.services import run_full_pipeline
-
-        scan = self._make_processing_scan(retry_count=3)
-
-        # close_all() is a daemon-process pattern that kills the test DB
-        # connection; patch it out so we can exercise the reset logic.
-        # _pull_processing_files_from_s3 is outside run_full_pipeline's
-        # inner try block, so its ValueError propagates uncaught -- we
-        # just need to verify retry_count was zeroed before it ran.
-        with (
-            patch("django.db.connections.close_all"),
-            patch(
-                "scanning.services._pull_processing_files_from_s3",
-                side_effect=ValueError("stop early"),
-            ),
-        ):
-            try:
-                run_full_pipeline(scan.pk)
-            except ValueError:
-                pass
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.retry_count, 0)
