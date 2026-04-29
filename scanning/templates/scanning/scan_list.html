@@ -96,7 +96,7 @@
         </td>
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}</td>
         <td class="px-4 py-3 text-sm">
-          <a href="{% url 'scan_detail' pk=scan.pk %}" class="text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300">View</a>
+          <a href="{% url 'scan_detail' pk=scan.pk %}" class="btn-outline text-xs px-2 py-1">View</a>
         </td>
       </tr>
       {% endfor %}
