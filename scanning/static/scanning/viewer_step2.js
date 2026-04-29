@@ -369,13 +369,17 @@ document.addEventListener('DOMContentLoaded', function () {
             wrapper.style.width = viewport.width + 'px';
             wrapper.style.height = viewport.height + 'px';
             wrapper.style.background = '';
+            pageDiv.style.width = viewport.width + 'px';
 
             if (defaultPageWidth === 918 && viewport.width !== 918) {
                 defaultPageWidth = viewport.width;
                 container.querySelectorAll('.lazy-page').forEach(function (el) {
                     if (!renderedPages[parseInt(el.dataset.pdfIndex)]) {
                         var w = el.querySelector('.canvas-wrapper');
-                        if (w) w.style.width = defaultPageWidth + 'px';
+                        if (w) {
+                            w.style.width = defaultPageWidth + 'px';
+                            el.style.width = defaultPageWidth + 'px';
+                        }
                     }
                 });
             }
