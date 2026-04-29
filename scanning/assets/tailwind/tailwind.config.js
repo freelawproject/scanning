@@ -5,11 +5,33 @@ module.exports = {
     'alert-info',
     'alert-warning',
     'alert-danger',
+    // Scan status badges (rendered via badge-{{ scan.status }})
     'badge-uploaded',
+    'badge-queued',
     'badge-processing',
     'badge-pending_review',
     'badge-approved',
     'badge-extracted',
+    'badge-error',
+    'badge-cancelled',
+    // Queue status badges (rendered via badge-{{ volume.queue_status }})
+    'badge-needs_scanning',
+    'badge-assigned',
+    'badge-scanning',
+    'badge-scanned',
+    'badge-complete',
+    'badge-unavailable',
+    // Other dynamic badges
+    'badge-s3',
+    'badge-no_status',
+    'badge-ok',
+    'badge-gap',
+    // Priority badges (rendered via badge-priority-{{ volume.priority }})
+    'badge-priority-critical',
+    'badge-priority-high',
+    'badge-priority-medium',
+    'badge-priority-low',
+    'badge-priority-backlog',
   ],
   content: {
     relative: true,

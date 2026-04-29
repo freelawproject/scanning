@@ -328,5 +328,35 @@
       "short_name": "mj",
       "full_name": "Military Justice Reporter"
     }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 34,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "nw3d",
+      "full_name": "North Western Reporter, 3d"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 35,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "tc",
+      "full_name": "Tax Court Reporter"
+    }
+  },
+  {
+    "model": "scanning.reporter",
+    "pk": 36,
+    "fields": {
+      "date_created": "2026-02-25T00:00:00Z",
+      "date_modified": "2026-02-25T00:00:00Z",
+      "short_name": "am-tribal-law",
+      "full_name": "American Tribal Law Reporter"
+    }
   }
 ]

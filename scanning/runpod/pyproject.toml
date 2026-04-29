@@ -1,0 +1,57 @@
+[project]
+name = "blackletter-gpu-worker"
+version = "0.0.1"
+description = "RunPod Serverless handler for the blackletter GPU steps (detect, analyze)."
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    # GPU stack
+    "torch",
+    "torchvision",
+    "paddlepaddle-gpu==3.1.0",
+
+    # Inference and OCR
+    "ultralytics>=8.3",
+    "opencv-python==4.10.0.84",
+    "paddleocr>=3.4.0",
+    "pytesseract>=0.3.13",
+    "ocrmypdf>=17",
+
+    # Weight fetching and PDF handling
+    "pymupdf>=1.25",
+    "pypdfium2>=4.0.0",
+    "huggingface_hub>=0.20.0",
+
+    # RunPod plumbing
+    "requests>=2.33,<3",
+    "runpod>=1.9,<2",
+    "sentry-sdk>=2,<3",
+
+    # blackletter is pinned to the same git branch scanning/pyproject.toml
+    # uses so the worker and the daemon always run identical library code.
+    # TODO: flip to a PyPI pin once blackletter releases ensure_weights.
+    "blackletter @ git+https://github.com/freelawproject/blackletter.git@feat/ensure-weights",
+]
+
+# This project is an application (handler.py), not a library. Tell uv
+# not to try to build it as an installable package.
+[tool.uv]
+package = false
+
+# Route GPU-specific wheels to their vendor indexes. Other deps come
+# from PyPI by default. ``explicit = true`` means these indexes are
+# only searched for packages explicitly routed via ``[tool.uv.sources]``
+# ; plain PyPI packages never accidentally fall through to them.
+[tool.uv.sources]
+torch = { index = "pytorch-gpu" }
+torchvision = { index = "pytorch-gpu" }
+paddlepaddle-gpu = { index = "paddle-gpu" }
+
+[[tool.uv.index]]
+name = "pytorch-gpu"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "paddle-gpu"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu126/"
+explicit = true

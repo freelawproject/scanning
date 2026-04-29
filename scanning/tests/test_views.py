@@ -1,12 +1,14 @@
 import io
 import shutil
 import tempfile
+from datetime import timedelta
 
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import models
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from PIL import Image
 
 from scanning.factories import (
@@ -16,6 +18,7 @@ from scanning.factories import (
     UserFactory,
 )
 from scanning.models import (
+    Detection,
     OpinionScan,
     OpinionStatus,
     Scan,
@@ -115,80 +118,6 @@ class TestAuthentication(ScanningTestCase):
         )
         self.assertEqual(response.status_code, 302)
         self.assertNotIn("evil.com", response.url)
-
-
-class TestScanUpload(ScanningTestCase):
-    """Test the scan upload functionality."""
-
-    def test_upload_page_renders(self):
-        self.client.force_login(self.make_user())
-        response = self.client.get(reverse("scan_upload"))
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Upload Book Scan")
-
-    def test_successful_upload(self):
-        user = self.make_user()
-        self.client.force_login(user)
-        reporter = ReporterFactory(
-            short_name="a", full_name="Atlantic Reporter"
-        )
-        response = self.client.post(
-            reverse("scan_upload"),
-            {
-                "reporter": reporter.pk,
-                "source": Source.FULL,
-                "volume": 1,
-                "number_of_pages": 50,
-                "start_page": 1,
-                "end_page": 50,
-                "original_pdf": self.make_pdf(),
-            },
-        )
-        self.assertEqual(response.status_code, 302)
-        scan = Scan.objects.get()
-        self.assertEqual(scan.uploaded_by, user)
-        self.assertEqual(scan.status, Status.UPLOADED)
-        self.assertEqual(scan.reporter, reporter)
-
-    def test_upload_missing_pdf(self):
-        self.client.force_login(self.make_user())
-        reporter = ReporterFactory()
-        response = self.client.post(
-            reverse("scan_upload"),
-            {
-                "reporter": reporter.pk,
-                "source": Source.FULL,
-                "volume": 1,
-                "number_of_pages": 50,
-                "start_page": 1,
-                "end_page": 50,
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(Scan.objects.count(), 0)
-
-    def test_upload_rejects_non_pdf_mime_type(self):
-        self.client.force_login(self.make_user())
-        reporter = ReporterFactory()
-        fake_pdf = SimpleUploadedFile(
-            "fake.pdf",
-            b"not a pdf",
-            content_type="text/plain",
-        )
-        response = self.client.post(
-            reverse("scan_upload"),
-            {
-                "reporter": reporter.pk,
-                "source": Source.FULL,
-                "volume": 1,
-                "number_of_pages": 50,
-                "start_page": 1,
-                "end_page": 50,
-                "original_pdf": fake_pdf,
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(Scan.objects.count(), 0)
 
 
 class TestScanList(ScanningTestCase):
@@ -337,18 +266,24 @@ class TestScanModel(ScanningTestCase):
 
     def test_upload_path_format(self):
         scan = ScanFactory(volume=5, start_page=1, end_page=100)
-        self.assertTrue(scan.original_pdf.name.startswith("books/a/"))
+        self.assertTrue(scan.original_pdf.name.startswith("original_scans/a/"))
         self.assertTrue(scan.original_pdf.name.endswith(".pdf"))
 
     def test_book_upload_path_contains_pages(self):
         scan = ScanFactory(volume=3, start_page=10, end_page=200)
-        self.assertIn("3_a_10-200_full.pdf", scan.original_pdf.name)
+        self.assertTrue(
+            scan.original_pdf.name.startswith("original_scans/a/3/10/")
+        )
+        self.assertTrue(scan.original_pdf.name.endswith(".original.pdf"))
 
     def test_book_upload_path_opinions_source(self):
         scan = ScanFactory(
             volume=3, start_page=10, end_page=200, source=Source.OPINIONS
         )
-        self.assertIn("3_a_10-200_opinions.pdf", scan.original_pdf.name)
+        self.assertTrue(
+            scan.original_pdf.name.startswith("original_scans/a/3/10/")
+        )
+        self.assertTrue(scan.original_pdf.name.endswith(".original.pdf"))
 
 
 class TestOpinionScanModel(ScanningTestCase):
@@ -364,6 +299,100 @@ class TestOpinionScanModel(ScanningTestCase):
         with self.assertRaises(models.ProtectedError):
             scan.delete()
         self.assertEqual(OpinionScan.objects.count(), 1)
+
+
+class TestAutoNowQuerySet(ScanningTestCase):
+    """Test that AutoNowQuerySet stamps ``auto_now`` fields on ``.update()``.
+
+    Without the custom queryset, ``QuerySet.update()`` bypasses the
+    ``pre_save`` hooks that maintain ``auto_now`` fields, so
+    ``date_modified`` never advances. This behavior is structural (on
+    ``AbstractDateTimeModel``), so these tests also guard against the fix
+    being accidentally removed.
+    """
+
+    def test_update_stamps_date_modified_on_scan(self):
+        """Bulk .update() advances date_modified on Scan."""
+        scan = ScanFactory()
+        old = timezone.now() - timedelta(days=7)
+        # Seed an old timestamp (caller-provided value is respected).
+        Scan.objects.filter(pk=scan.pk).update(date_modified=old)
+        # A subsequent update with no date_modified kwarg should re-stamp it.
+        Scan.objects.filter(pk=scan.pk).update(progress_message="bumped")
+        scan.refresh_from_db()
+        self.assertGreater(scan.date_modified, old)
+
+    def test_update_stamps_date_modified_on_detection(self):
+        """Detection inherits the manager through AbstractDateTimeModel."""
+        scan = ScanFactory()
+        det = Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="KEY",
+            label_id=0,
+            confidence=0.5,
+            x0=0,
+            y0=0,
+            x1=10,
+            y1=10,
+            img_width=100,
+            img_height=100,
+        )
+        old = timezone.now() - timedelta(days=7)
+        Detection.objects.filter(pk=det.pk).update(date_modified=old)
+        Detection.objects.filter(pk=det.pk).update(confidence=1.0)
+        det.refresh_from_db()
+        self.assertGreater(det.date_modified, old)
+
+    def test_update_respects_explicit_date_modified(self):
+        """Caller-supplied date_modified is not overridden (setdefault)."""
+        scan = ScanFactory()
+        explicit = timezone.now() - timedelta(days=3)
+        Scan.objects.filter(pk=scan.pk).update(date_modified=explicit)
+        scan.refresh_from_db()
+        self.assertAlmostEqual(
+            scan.date_modified.timestamp(),
+            explicit.timestamp(),
+            delta=1,
+        )
+
+    def test_save_update_fields_stamps_date_modified(self):
+        """``save(update_fields=[...])`` still advances ``date_modified``.
+
+        Django's stock ``save(update_fields=[...])`` silently skips
+        ``auto_now`` fields, so ``AbstractDateTimeModel.save`` auto-adds
+        them to ``update_fields``. Without that override,
+        ``scan.save(update_fields=["status"])`` would leave
+        ``date_modified`` unchanged.
+        """
+        scan = ScanFactory()
+        old = timezone.now() - timedelta(days=7)
+        Scan.objects.filter(pk=scan.pk).update(date_modified=old)
+        scan.refresh_from_db()
+        scan.status = Status.CANCELLED
+        scan.save(update_fields=["status"])
+        scan.refresh_from_db()
+        self.assertGreater(scan.date_modified, old)
+
+    def test_bulk_update_stamps_date_modified(self):
+        """``bulk_update()`` stamps ``date_modified`` on every instance."""
+        scan1 = ScanFactory()
+        scan2 = ScanFactory()
+        old = timezone.now() - timedelta(days=7)
+        Scan.objects.filter(pk__in=[scan1.pk, scan2.pk]).update(
+            date_modified=old
+        )
+        scan1.refresh_from_db()
+        scan2.refresh_from_db()
+
+        scan1.status = Status.QUEUED
+        scan2.status = Status.PROCESSING
+        Scan.objects.bulk_update([scan1, scan2], ["status"])
+
+        scan1.refresh_from_db()
+        scan2.refresh_from_db()
+        self.assertGreater(scan1.date_modified, old)
+        self.assertGreater(scan2.date_modified, old)
 
 
 class TestOpinionList(ScanningTestCase):
@@ -415,11 +444,11 @@ class TestOpinionList(ScanningTestCase):
     def test_pagination(self):
         user = self.make_user()
         self.client.force_login(user)
-        OpinionScanFactory.create_batch(30, uploaded_by=user)
+        OpinionScanFactory.create_batch(60, uploaded_by=user)
         response = self.client.get(reverse("opinion_list"))
-        self.assertEqual(len(response.context["page_obj"]), 25)
+        self.assertEqual(len(response.context["page_obj"]), 50)
         response = self.client.get(reverse("opinion_list"), {"page": 2})
-        self.assertEqual(len(response.context["page_obj"]), 5)
+        self.assertEqual(len(response.context["page_obj"]), 10)
 
 
 class TestOpinionDetail(ScanningTestCase):
@@ -443,7 +472,7 @@ class TestOpinionDetail(ScanningTestCase):
         response = self.client.get(
             reverse("opinion_detail", kwargs={"pk": opinion.pk})
         )
-        self.assertContains(response, "Parent Book")
+        self.assertContains(response, "Book")
         self.assertContains(
             response, reverse("scan_detail", kwargs={"pk": scan.pk})
         )
@@ -456,65 +485,6 @@ class TestOpinionDetail(ScanningTestCase):
             reverse("opinion_detail", kwargs={"pk": opinion.pk})
         )
         self.assertNotContains(response, "Parent Book")
-
-
-class TestOpinionReview(ScanningTestCase):
-    """Test staff review functionality for opinion scans."""
-
-    def test_staff_sees_review_form(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        opinion = OpinionScanFactory()
-        response = self.client.get(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk})
-        )
-        self.assertIsNotNone(response.context["review_form"])
-
-    def test_non_staff_sees_review_form(self):
-        user = self.make_user()
-        self.client.force_login(user)
-        opinion = OpinionScanFactory(uploaded_by=user)
-        response = self.client.get(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk})
-        )
-        self.assertIsNotNone(response.context["review_form"])
-
-    def test_approve_sets_ok_status(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        opinion = OpinionScanFactory()
-        response = self.client.post(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk}),
-            {"status": OpinionStatus.OK, "notes": "Looks good"},
-        )
-        self.assertEqual(response.status_code, 302)
-        opinion.refresh_from_db()
-        self.assertEqual(opinion.status, OpinionStatus.OK)
-        self.assertEqual(opinion.notes, "Looks good")
-
-    def test_reject_resets_to_no_status(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        opinion = OpinionScanFactory(status=OpinionStatus.GAP)
-        response = self.client.post(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk}),
-            {"status": OpinionStatus.NO_STATUS, "notes": "Needs rescan"},
-        )
-        self.assertEqual(response.status_code, 302)
-        opinion.refresh_from_db()
-        self.assertEqual(opinion.status, OpinionStatus.NO_STATUS)
-        self.assertEqual(opinion.notes, "Needs rescan")
-
-    def test_approved_opinion_hides_review_form(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        opinion = OpinionScanFactory(status=OpinionStatus.OK)
-        response = self.client.get(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk})
-        )
-        self.assertIsNone(response.context["review_form"])
-        self.assertContains(response, "Review Decision")
-        self.assertContains(response, "OK")
 
 
 class TestOpinionUpload(ScanningTestCase):
@@ -671,45 +641,16 @@ class TestScanValidation(ScanningTestCase):
         scan = ScanFactory(number_of_pages=50, start_page=1, end_page=50)
         scan.full_clean()  # should not raise
 
-    def test_duplicate_scan_rejected(self):
-        reporter = ReporterFactory()
-        ScanFactory(reporter=reporter, volume=1, source=Source.FULL)
-        with self.assertRaises(Exception):
-            ScanFactory(reporter=reporter, volume=1, source=Source.FULL)
-
-    def test_different_source_allows_same_reporter_volume(self):
+    def test_allows_same_reporter_volume_source(self):
         reporter = ReporterFactory()
         ScanFactory(reporter=reporter, volume=1, source=Source.FULL)
         ScanFactory(
-            reporter=reporter, volume=1, source=Source.OPINIONS
-        )  # should not raise
+            reporter=reporter, volume=1, source=Source.FULL
+        )  # no unique constraint anymore
 
 
 class TestSpoofedPdfUpload(ScanningTestCase):
     """Test that spoofed PDF files (correct MIME, wrong content) are rejected."""
-
-    def test_scan_upload_spoofed_pdf_rejected(self):
-        self.client.force_login(self.make_user())
-        reporter = ReporterFactory()
-        spoofed = SimpleUploadedFile(
-            "fake.pdf",
-            b"<html>not a pdf</html>",
-            content_type="application/pdf",
-        )
-        response = self.client.post(
-            reverse("scan_upload"),
-            {
-                "reporter": reporter.pk,
-                "source": Source.FULL,
-                "volume": 1,
-                "number_of_pages": 50,
-                "start_page": 1,
-                "end_page": 50,
-                "original_pdf": spoofed,
-            },
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(Scan.objects.count(), 0)
 
     def test_opinion_upload_spoofed_pdf_rejected(self):
         user = UserFactory(is_superuser=True)
@@ -836,3 +777,337 @@ class TestMonitoring(TestCase):
         data = response.json()
         self.assertIn("is_postgresql_up", data)
         self.assertTrue(data["is_postgresql_up"])
+
+
+class TestApproveScan(ScanningTestCase):
+    """Test the approve_scan view."""
+
+    def _make_scan_with_generated_files(self):
+        """Create a scan with generated files in output_dir."""
+        import pathlib
+
+        scan = ScanFactory(start_page=1, end_page=95)
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+
+        redacted_dir = output / "redacted"
+        masked_dir = output / "masked"
+        redacted_dir.mkdir()
+        masked_dir.mkdir()
+        (redacted_dir / "a.1.0001-0010.pdf").write_bytes(b"%PDF-1.4")
+        (masked_dir / "a.1.0001-0010.pdf").write_bytes(b"%PDF-1.4")
+        return scan
+
+    def test_approve_without_files_shows_error(self):
+        """Approving without generated files redirects with error."""
+        import pathlib
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan = ScanFactory(start_page=1, end_page=95)
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+
+        response = self.client.post(
+            reverse("approve_scan", kwargs={"pk": scan.pk}),
+            follow=True,
+        )
+        self.assertContains(response, "Before approving")
+        scan.refresh_from_db()
+        self.assertFalse(scan.s3_uploaded)
+
+    def test_approve_with_files_sets_path(self):
+        """Approving with generated files sets s3_path."""
+        from unittest.mock import patch
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan = self._make_scan_with_generated_files()
+
+        with patch.dict("os.environ", {}, clear=True):
+            self.client.post(
+                reverse("approve_scan", kwargs={"pk": scan.pk}),
+                follow=True,
+            )
+        scan.refresh_from_db()
+        self.assertTrue(scan.s3_path.startswith("approved/"))
+
+    @override_settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket")
+    def test_approve_with_creds_sets_uploaded_flag(self):
+        """Approving with AWS creds sets s3_uploaded to True."""
+        from unittest.mock import MagicMock, patch
+
+        from botocore.exceptions import ClientError
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan = self._make_scan_with_generated_files()
+
+        mock_client = MagicMock()
+        mock_client.head_object.side_effect = ClientError(
+            {"Error": {"Code": "404"}}, "HeadObject"
+        )
+        mock_env = {
+            "AWS_ACCESS_KEY_ID": "test",
+            "AWS_SECRET_ACCESS_KEY": "test",
+        }
+        with (
+            patch.dict("os.environ", mock_env),
+            patch("boto3.client", return_value=mock_client),
+        ):
+            self.client.post(
+                reverse("approve_scan", kwargs={"pk": scan.pk}),
+                follow=True,
+            )
+        scan.refresh_from_db()
+        self.assertTrue(scan.s3_uploaded)
+        self.assertTrue(scan.s3_path.startswith("approved/"))
+
+    def test_approve_requires_login(self):
+        """Approve endpoint redirects to login for anonymous users."""
+        scan = ScanFactory()
+        response = self.client.post(
+            reverse("approve_scan", kwargs={"pk": scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("login", response.url)
+
+    def test_approve_requires_post(self):
+        """Approve endpoint rejects GET requests."""
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan = ScanFactory()
+        response = self.client.get(
+            reverse("approve_scan", kwargs={"pk": scan.pk})
+        )
+        self.assertEqual(response.status_code, 405)
+
+
+class TestQueueUploadS3(ScanningTestCase):
+    """Upload view pushes originals to S3 in prod, MEDIA_ROOT in dev."""
+
+    def _post_upload(self):
+        """Helper: create Volume + post a valid PDF upload.
+
+        :returns: The HTTP response.
+        """
+
+        from scanning.models import Volume
+
+        user = self.make_user()
+        self.client.force_login(user)
+        reporter = ReporterFactory(short_name="tu")
+        volume = Volume.objects.create(
+            reporter=reporter,
+            volume_number=42,
+        )
+        pdf = SimpleUploadedFile(
+            "scan.pdf", b"%PDF-1.4 body", content_type="application/pdf"
+        )
+        return self.client.post(
+            reverse(
+                "queue_upload",
+                kwargs={"reporter_slug": "tu", "vol": 42},
+            ),
+            {
+                "new_scan": "1",
+                "first_page": "1",
+                "last_page": "10",
+                "original_pdf": pdf,
+            },
+        ), volume
+
+    @override_settings(DEVELOPMENT=True)
+    def test_dev_writes_filefield_and_skips_s3(self):
+        from unittest.mock import patch
+
+        with patch("scanning.s3_sync.upload_file_to_s3") as mock_s3:
+            response, _ = self._post_upload()
+
+        self.assertEqual(response.status_code, 302)
+        mock_s3.assert_not_called()
+        scan = Scan.objects.get()
+        # FileField has a real file (ends with .original.pdf).
+        self.assertTrue(scan.original_pdf.name.endswith(".original.pdf"))
+        # Django's FileField wrote an actual file to storage.
+        self.assertTrue(
+            scan.original_pdf.storage.exists(scan.original_pdf.name)
+        )
+
+    @override_settings(DEVELOPMENT=False, TESTING=False)
+    def test_prod_uploads_to_s3_and_skips_filefield(self):
+        from unittest.mock import patch
+
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.upload_file_to_s3", return_value=True
+            ) as mock_s3,
+        ):
+            response, _ = self._post_upload()
+
+        self.assertEqual(response.status_code, 302)
+        mock_s3.assert_called_once()
+        scan = Scan.objects.get()
+        self.assertTrue(scan.original_pdf.name.endswith(".original.pdf"))
+        # FileField was NOT written to MEDIA_ROOT, only metadata set.
+        self.assertFalse(
+            scan.original_pdf.storage.exists(scan.original_pdf.name)
+        )
+
+    @override_settings(DEVELOPMENT=False, TESTING=False)
+    def test_prod_s3_exception_deletes_scan_and_shows_error(self):
+        from unittest.mock import patch
+
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.upload_file_to_s3",
+                side_effect=RuntimeError("boom"),
+            ),
+            self.assertLogs("scanning.views", level="ERROR") as cm,
+        ):
+            response, _ = self._post_upload()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(Scan.objects.count(), 0)
+        self.assertTrue(
+            any("Failed to upload original PDF" in m for m in cm.output)
+        )
+
+    @override_settings(DEVELOPMENT=False, TESTING=False)
+    def test_prod_missing_creds_deletes_scan_early(self):
+        from unittest.mock import patch
+
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=False),
+            patch("scanning.s3_sync.upload_file_to_s3") as mock_s3,
+            self.assertLogs("scanning.views", level="ERROR") as cm,
+        ):
+            response, _ = self._post_upload()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(Scan.objects.count(), 0)
+        mock_s3.assert_not_called()
+        self.assertTrue(any("without AWS credentials" in m for m in cm.output))
+
+    @override_settings(DEVELOPMENT=False, TESTING=False)
+    def test_prod_upload_returning_false_deletes_scan(self):
+        from unittest.mock import patch
+
+        # upload_file_to_s3 returning False (e.g. the helper's own
+        # short-circuit) should be treated as a failure by the view.
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch("scanning.s3_sync.upload_file_to_s3", return_value=False),
+        ):
+            response, _ = self._post_upload()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(Scan.objects.count(), 0)
+
+
+class TestPdfPathFallback(ScanningTestCase):
+    """Scan.pdf_path raises FileNotFoundError in prod when no local file."""
+
+    @override_settings(DEVELOPMENT=False, TESTING=False)
+    def test_prod_raises_when_no_local_file(self):
+        scan = ScanFactory(original_pdf=None)
+        scan.original_pdf.name = "nothing.pdf"
+        scan.save(update_fields=["original_pdf"])
+        with self.assertRaises(FileNotFoundError):
+            _ = scan.pdf_path
+
+    @override_settings(DEVELOPMENT=True)
+    def test_dev_falls_back_to_filefield_path(self):
+        # ScanFactory populates original_pdf via FileField, so .path works.
+        scan = ScanFactory()
+        self.assertTrue(scan.pdf_path.endswith(".pdf"))
+
+
+class TestServeOpinionPdfLazyPull(ScanningTestCase):
+    """serve_opinionscan_pdf falls back to S3 pull when /tmp/ is stale."""
+
+    def test_lazy_pull_populates_tmp_and_serves(self):
+        import pathlib
+        import tempfile
+        from unittest.mock import patch
+
+        from scanning.models import OpinionScan, OpinionStatus
+
+        user = self.make_user()
+        self.client.force_login(user)
+
+        # Create a scan + opinion whose redacted_pdf.name is relative to
+        # the scan's output_dir (prod-style layout).
+        tmp_root = tempfile.mkdtemp()
+        reporter = ReporterFactory(short_name="tp")
+        scan = ScanFactory(
+            reporter=reporter, volume=77, start_page=1, end_page=2
+        )
+        opinion = OpinionScan.objects.create(
+            scan=scan,
+            reporter=reporter,
+            volume=77,
+            opinion_order=0,
+            page_start=1,
+            page_end=2,
+            status=OpinionStatus.OK,
+            uploaded_by=user,
+        )
+        opinion.redacted_pdf.name = "redacted/op.pdf"
+        opinion.save(update_fields=["redacted_pdf"])
+
+        def _fake_download(scan_arg):
+            # Simulate the pull writing the file to the scan's output dir.
+            target = pathlib.Path(scan_arg.output_dir) / "redacted" / "op.pdf"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"%PDF-1.4 pulled")
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch(
+                "scanning.s3_sync.download_processing_files",
+                side_effect=_fake_download,
+            ) as mock_pull,
+        ):
+            response = self.client.get(
+                reverse(
+                    "serve_opinionscan_pdf",
+                    kwargs={"pk": opinion.pk, "variant": "redacted"},
+                )
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_pull.assert_called_once()
+
+
+class TestRunFullPipelinePullsFromS3(ScanningTestCase):
+    """run_full_pipeline pulls files from S3 at entry (prod only)."""
+
+    def test_invokes_pull_helper(self):
+        from unittest.mock import patch
+
+        scan = ScanFactory(status=Status.QUEUED)
+        with (
+            # close_all() resets connections for daemon-process forking; in
+            # tests it kills the test transaction -- patch it out.
+            patch("django.db.connections.close_all"),
+            patch(
+                "scanning.services._pull_processing_files_from_s3"
+            ) as mock_pull,
+            # Stop the pipeline early by failing the first read.
+            patch(
+                "scanning.services.ensure_output_dir",
+                side_effect=RuntimeError("stop"),
+            ),
+        ):
+            from scanning.services import run_full_pipeline
+
+            run_full_pipeline(scan.pk)
+
+        mock_pull.assert_called_once_with(scan.pk)

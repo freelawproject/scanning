@@ -29,15 +29,14 @@ class UserFactory(factory.django.DjangoModelFactory):
     email = factory.LazyAttribute(lambda o: f"{o.username}@example.com")
 
     @factory.post_generation
-    def password(obj, create, extracted, **kwargs):
+    def password(
+        obj: User, create: bool, extracted: str | None, **kwargs
+    ) -> None:
         """Set and persist the user's password.
 
         :param obj: The User instance.
-        :type obj: User
         :param create: Whether the instance was created (vs built).
-        :type create: bool
         :param extracted: An explicit password, or None for default.
-        :type extracted: str | None
         """
         password = extracted or "testpass123"
         obj.set_password(password)

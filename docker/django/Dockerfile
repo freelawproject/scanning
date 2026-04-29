@@ -1,4 +1,4 @@
-FROM python:3.13 AS build-base
+FROM python:3.12 AS build-base
 
 # Install apt dependencies
 # caching: https://docs.docker.com/build/cache/optimize/#use-cache-mounts
@@ -11,12 +11,16 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --quiet=2 \
     libpq-dev postgresql-client \
     nodejs npm \
-    curl git
+    curl git \
+    tesseract-ocr tesseract-ocr-eng \
+    libgl1 libglib2.0-0
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:0.9.22 /uv /uvx /bin/
 
 ENV PYTHONUNBUFFERED=1
+ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
+ENV PADDLEX_HOME=/tmp/paddlex
 
 ARG BUILD_ENV=prod
 ARG GIT_SHA=""
@@ -47,11 +51,15 @@ COPY . .
 # Build Tailwind CSS
 RUN npm run build
 
-RUN mkdir -p /opt/scanning/scanning/assets/static/
+# Create directories for collectstatic output and uploaded/processed files
+RUN mkdir -p /opt/scanning/scanning/assets/static/ \
+             /opt/scanning/scanning/assets/media/
 
 USER root
 RUN chmod +x /opt/scanning/docker/django/docker-entrypoint.sh
-RUN chown www-data:www-data /opt/scanning/docker/django/docker-entrypoint.sh
+# media/ must be writable by www-data (gunicorn runs as www-data in prod)
+RUN chown www-data:www-data /opt/scanning/docker/django/docker-entrypoint.sh \
+                            /opt/scanning/scanning/assets/media/
 
 USER www-data
 ENTRYPOINT ["/bin/sh", "/opt/scanning/docker/django/docker-entrypoint.sh"]

@@ -32,10 +32,13 @@ if DEVELOPMENT:
         INSTALLED_APPS.append("debug_toolbar")
         MIDDLEWARE.append("debug_toolbar.middleware.DebugToolbarMiddleware")
 
-    hostname, _, ips = socket.gethostbyname_ex(socket.gethostname())
-    INTERNAL_IPS = [".".join(ip.split(".")[:-1] + ["1"]) for ip in ips] + [
-        "127.0.0.1"
-    ]
+    try:
+        hostname, _, ips = socket.gethostbyname_ex(socket.gethostname())
+        INTERNAL_IPS = [".".join(ip.split(".")[:-1] + ["1"]) for ip in ips] + [
+            "127.0.0.1"
+        ]
+    except socket.gaierror:
+        INTERNAL_IPS = ["127.0.0.1"]
 
     if TESTING:
         db = DATABASES["default"]

@@ -1,12 +1,26 @@
 {% extends "base.html" %}
 
-{% block title %}Book Scans - FLP Scanning Portal{% endblock %}
+{% block title %}Scans - FLP Scanning Portal{% endblock %}
 
 {% block content %}
 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4">
-  <h1 class="text-2xl font-bold">Book Scans</h1>
-  <a href="{% url 'scan_upload' %}" class="btn-primary"><i class="fa-solid fa-upload"></i> Upload Scan</a>
+  <h1 class="text-2xl font-bold">Scans</h1>
+  <a href="{% url 'queue' %}" class="btn-primary"><i class="fa-solid fa-upload"></i> Upload Scan</a>
 </div>
+
+{% if retry_cap_count %}
+<div class="alert-warning mb-4" role="alert">
+  {{ retry_cap_count }} scan{{ retry_cap_count|pluralize }} failed after hitting the RunPod retry cap.
+  {% if request.user.is_superuser %}
+  <a href="{% url 'admin:scanning_scan_changelist' %}?retry_cap=1"
+     class="font-semibold underline hover:no-underline ml-1">
+    Review and re-queue in admin.
+  </a>
+  {% else %}
+  Please notify an admin to re-queue them.
+  {% endif %}
+</div>
+{% endif %}
 
 <!-- Filters -->
 <div class="card mb-6">
@@ -78,6 +92,7 @@
         <td class="px-4 py-3 text-sm">{{ scan.opinion_count }}</td>
         <td class="px-4 py-3 text-sm">
           <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
+          {% if scan.s3_uploaded %}<span class="badge-s3">S3</span>{% endif %}
         </td>
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}</td>
         <td class="px-4 py-3 text-sm">
@@ -96,6 +111,7 @@
     <div class="flex items-center justify-between mb-2">
       <span class="font-medium text-sm">{{ scan.reporter }}</span>
       <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
+      {% if scan.s3_uploaded %}<span class="badge-s3">S3</span>{% endif %}
     </div>
     <div class="text-sm text-gray-500 dark:text-gray-400">
       Vol. {{ scan.volume }} &middot; {{ scan.get_source_display }} &middot; {{ scan.number_of_pages }} pages &middot; {{ scan.opinion_count }} opinion{{ scan.opinion_count|pluralize }} &middot; {{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}
@@ -126,7 +142,7 @@
 {% else %}
 <div class="card text-center py-12">
   <p class="text-gray-500 dark:text-gray-400 mb-4">No scans found.</p>
-  <a href="{% url 'scan_upload' %}" class="btn-primary">Upload your first scan</a>
+  <a href="{% url 'queue' %}" class="btn-primary">Upload your first scan</a>
 </div>
 {% endif %}
 {% endblock %}

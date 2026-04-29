@@ -21,9 +21,9 @@
     <!-- Desktop nav -->
     <nav class="hidden sm:flex items-center">
       {% if user.is_authenticated %}
-        <a href="{% url 'scan_upload' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-upload"></i> Upload book scan</a>
-        <a href="{% url 'scan_list' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-book"></i> Book Scans</a>
-        <a href="{% url 'opinion_list' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-file-lines"></i> Opinion Scans</a>
+        <a href="{% url 'scan_list' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-book"></i> Scans</a>
+        <a href="{% url 'queue' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-list-check"></i> Queue</a>
+        <a href="{% url 'opinion_list' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-file-lines"></i> Opinions</a>
         <!-- User dropdown -->
         <div class="relative">
           <button
@@ -55,9 +55,9 @@
   <div id="mobile-nav" class="hidden sm:hidden border-t border-gray-200 dark:border-gray-700">
     <div class="px-4 py-3 space-y-2">
       {% if user.is_authenticated %}
-        <a href="{% url 'scan_upload' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-upload"></i> Upload book scan</a>
-        <a href="{% url 'scan_list' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-book"></i> Book Scans</a>
-        <a href="{% url 'opinion_list' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-file-lines"></i> Opinion Scans</a>
+        <a href="{% url 'scan_list' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-book"></i> Scans</a>
+        <a href="{% url 'queue' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-list-check"></i> Queue</a>
+        <a href="{% url 'opinion_list' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-file-lines"></i> Opinions</a>
         <a href="{% url 'profile' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-gear"></i> Profile</a>
         <form method="post" action="{% url 'logout' %}">
           {% csrf_token %}

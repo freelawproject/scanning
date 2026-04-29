@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+
+{% block title %}{{ volume.reporter.short_name }} vol. {{ volume.volume_number }} - Queue{% endblock %}
+
+{% block content %}
+<div class="mb-4">
+  <a href="{% url 'queue' %}" class="text-sm text-gray-500 dark:text-gray-400 hover:text-primary-600">&laquo; Back to Queue</a>
+</div>
+
+<!-- Header -->
+<div class="flex flex-col sm:flex-row sm:items-start sm:justify-between mb-6 gap-4">
+  <div>
+    <h1 class="text-2xl font-bold">{{ volume.reporter.full_name }}</h1>
+    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
+      Volume {{ volume.volume_number }}
+      {% if volume.expected_start_page and volume.expected_end_page %}
+      &middot; Pages {{ volume.expected_start_page }}-{{ volume.expected_end_page }}
+      {% endif %}
+    </p>
+  </div>
+  <div class="flex items-center gap-2">
+    <span class="badge-priority-{{ volume.priority }}">{{ volume.get_priority_display }}</span>
+    <span class="badge-{{ volume.queue_status }}">{{ volume.get_queue_status_display }}</span>
+  </div>
+</div>
+
+<!-- Info cards -->
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
+  <div class="card">
+    <div class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">Assignment</div>
+    {% if volume.assigned_to %}
+    <div class="font-semibold">{{ volume.assigned_to.username }}</div>
+    {% if volume.assigned_at %}
+    <div class="text-sm text-gray-500 dark:text-gray-400">since {{ volume.assigned_at|date:"M d, Y" }}</div>
+    {% endif %}
+    {% if volume.assigned_to == user %}
+    <form method="post" action="{% url 'claim_scan' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}" class="mt-2">
+      {% csrf_token %}
+      <input type="hidden" name="unclaim" value="1">
+      <button type="submit" class="btn-outline text-sm">Unclaim</button>
+    </form>
+    {% endif %}
+    {% elif volume.queue_status == 'needs_scanning' and user.is_authenticated %}
+    <form method="post" action="{% url 'claim_scan' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}" class="mt-1">
+      {% csrf_token %}
+      <button type="submit" class="btn-primary text-sm">Claim this volume</button>
+    </form>
+    {% else %}
+    <div class="text-gray-400">Unassigned</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">Source</div>
+    <div>{{ volume.source_library|default:"Not specified" }}</div>
+    {% if volume.source_url %}
+    <a href="{{ volume.source_url }}" target="_blank" class="text-sm mt-1 inline-block">View source</a>
+    {% endif %}
+  </div>
+</div>
+
+{% if volume.notes %}
+<div class="rounded-lg bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 px-4 py-3 text-sm text-yellow-800 dark:text-yellow-300 mb-6">
+  {{ volume.notes }}
+</div>
+{% endif %}
+
+{% if user.is_staff %}
+<div class="mb-6">
+  <form method="post" action="{% url 'update_scan_status' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}" class="flex items-center gap-2">
+    {% csrf_token %}
+    <select name="status" class="input-text text-sm">
+      {% for val, label in queue_statuses %}
+      <option value="{{ val }}" {% if volume.queue_status == val %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="btn-outline text-sm">Update Status</button>
+  </form>
+</div>
+{% endif %}
+
+<!-- Upload form -->
+<div class="card mb-6">
+  <h2 class="text-sm font-bold mb-3">Upload a scan</h2>
+  <form method="post" action="{% url 'queue_upload' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}" enctype="multipart/form-data">
+    {% csrf_token %}
+    <input type="hidden" name="new_scan" value="1">
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+      <div>
+        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">First Page</label>
+        <input type="number" name="first_page" placeholder="1" class="input-text text-sm w-full">
+      </div>
+      <div>
+        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Last Page</label>
+        <input type="number" name="last_page" class="input-text text-sm w-full">
+      </div>
+      <div>
+        <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">Part Label</label>
+        <input type="text" name="part_label" placeholder="e.g. A, B, 3" class="input-text text-sm w-full">
+      </div>
+      <div class="flex flex-col justify-end gap-1">
+        <label class="flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-300">
+          <input type="checkbox" name="has_state_abbrev" checked>
+          State Abbreviation
+        </label>
+        <label class="flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-300">
+          <input type="checkbox" name="is_partial">
+          Partial scan
+        </label>
+      </div>
+    </div>
+    <div class="mb-3">
+      <label class="block text-xs text-gray-500 dark:text-gray-400 mb-0.5">PDF File</label>
+      <input type="file" name="original_pdf" accept=".pdf" required class="input-text text-sm w-full">
+    </div>
+    <div class="flex gap-2">
+      <button type="submit" name="action" value="upload_validate" class="btn-primary text-sm">Upload &amp; Validate</button>
+      <button type="submit" name="action" value="upload_only" class="btn-outline text-sm">Upload Only</button>
+    </div>
+  </form>
+</div>
+
+<!-- Existing scans -->
+{% if scans %}
+<h2 class="text-lg font-bold mb-3">Scans ({{ scans|length }})</h2>
+<div class="space-y-3 mb-6">
+  {% for scan in scans %}
+  <div class="card">
+    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+      <div>
+        <span class="font-medium text-sm">
+          {% if scan.part_label %}Part {{ scan.part_label }} &mdash; {% endif %}
+          {% if scan.start_page and scan.end_page %}Pages {{ scan.start_page }}-{{ scan.end_page }}{% else %}Page range not set{% endif %}
+        </span>
+        <span class="badge-{{ scan.status }} ml-2">{{ scan.get_status_display }}</span>
+        {% if scan.s3_uploaded %}<span class="badge-s3 ml-1">S3</span>{% endif %}
+        {% if scan.original_pdf %}<span class="text-xs text-green-600 ml-1">PDF</span>{% endif %}
+      </div>
+      <div class="flex items-center gap-2">
+        {% if scan.original_pdf %}
+        <a href="{% url 'scan_process' pk=scan.pk %}" class="btn-primary text-sm">Process</a>
+        {% else %}
+        <span class="text-xs text-gray-400">No PDF yet</span>
+        {% endif %}
+        {% if user.is_staff %}
+        <a href="{% url 'admin:scanning_scan_change' scan.pk %}" class="btn-outline text-sm" title="View scan in Django admin">Admin</a>
+        {% endif %}
+      </div>
+    </div>
+    {% if scan.notes %}
+    <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ scan.notes }}</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

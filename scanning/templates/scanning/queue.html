@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+
+{% block title %}Scanning Queue - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4">
+  <h1 class="text-2xl font-bold">Scanning Queue</h1>
+  <div class="text-sm text-gray-500 dark:text-gray-400">
+    {{ stats.total }} volumes &middot;
+    <span class="text-red-600 dark:text-red-400">{{ stats.needs_scanning }} to scan</span> &middot;
+    <span class="text-yellow-600 dark:text-yellow-400">{{ stats.assigned }} assigned</span> &middot;
+    <span class="text-blue-600 dark:text-blue-400">{{ stats.scanning }} in progress</span> &middot;
+    <span class="text-green-600 dark:text-green-400">{{ stats.complete }} complete</span>
+  </div>
+</div>
+
+<!-- Status tabs -->
+<div class="flex flex-wrap gap-2 mb-4">
+  <a href="{% url 'queue' %}"
+     class="{% if not status_filter %}btn-primary{% else %}btn-outline{% endif %} text-sm">All</a>
+  <a href="{% url 'queue' %}?status=needs_scanning"
+     class="{% if status_filter == 'needs_scanning' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Needs Scanning</a>
+  <a href="{% url 'queue' %}?status=assigned"
+     class="{% if status_filter == 'assigned' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Assigned</a>
+  <a href="{% url 'queue' %}?status=scanning"
+     class="{% if status_filter == 'scanning' %}btn-primary{% else %}btn-outline{% endif %} text-sm">In Progress</a>
+  <a href="{% url 'queue' %}?status=complete"
+     class="{% if status_filter == 'complete' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Complete</a>
+</div>
+
+<!-- Filters -->
+<div class="card mb-6">
+  <form method="get" class="flex flex-col sm:flex-row gap-3">
+    {% if status_filter %}<input type="hidden" name="status" value="{{ status_filter }}">{% endif %}
+    <div class="flex-1">
+      <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
+      <select id="filter-reporter" name="reporter" class="input-text w-full">
+        <option value="">All reporters</option>
+        {% for r in reporters %}
+        <option value="{{ r.short_name }}" {% if selected_reporter == r.short_name %}selected{% endif %}>
+          {{ r.full_name }} ({{ r.short_name }})
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="flex-1">
+      <label for="filter-priority" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Priority</label>
+      <select id="filter-priority" name="priority" class="input-text w-full">
+        <option value="">All priorities</option>
+        {% for val, label in priorities %}
+        <option value="{{ val }}" {% if priority_filter == val %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="flex items-end gap-2">
+      <button type="submit" class="btn-outline">Filter</button>
+      {% if selected_reporter or priority_filter %}
+      <a href="{% url 'queue' %}{% if status_filter %}?status={{ status_filter }}{% endif %}"
+         class="btn-ghost text-sm">Clear</a>
+      {% endif %}
+    </div>
+  </form>
+</div>
+
+{% if volumes %}
+<div class="hidden sm:block card overflow-hidden p-0">
+  <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+    <thead class="bg-gray-50 dark:bg-gray-800">
+      <tr>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Reporter</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Vol</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Pages</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Parts</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Priority</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Assigned</th>
+        <th class="px-4 py-3"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for vol in volumes %}
+      <tr class="border-t border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800/50{% if vol.queue_status == 'complete' %} opacity-50{% endif %}">
+        <td class="px-4 py-3 text-sm font-medium">
+          <a href="{% url 'queue_detail' reporter_slug=vol.reporter.short_name vol=vol.volume_number %}">{{ vol.reporter.short_name }}</a>
+        </td>
+        <td class="px-4 py-3 text-sm">
+          <a href="{% url 'queue_detail' reporter_slug=vol.reporter.short_name vol=vol.volume_number %}">{{ vol.volume_number }}</a>
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
+          {% if vol.expected_start_page and vol.expected_end_page %}{{ vol.expected_start_page }}-{{ vol.expected_end_page }}{% else %}&mdash;{% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
+          {% if vol.is_partial %}{{ vol.expected_parts|default:"multi" }}{% else %}1{% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm">
+          <span class="badge-priority-{{ vol.priority }}">{{ vol.get_priority_display }}</span>
+        </td>
+        <td class="px-4 py-3 text-sm">
+          <span class="badge-{{ vol.queue_status }}">{{ vol.get_queue_status_display }}</span>
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
+          {% if vol.assigned_to %}
+            {{ vol.assigned_to.username }}
+          {% else %}
+            <form method="post" action="{% url 'claim_scan' reporter_slug=vol.reporter.short_name vol=vol.volume_number %}" class="inline">
+              {% csrf_token %}
+              <input type="hidden" name="next" value="queue">
+              <button type="submit" class="text-xs text-blue-600 dark:text-blue-400 hover:underline">Claim</button>
+            </form>
+          {% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm text-right">
+          <a href="{% url 'queue_detail' reporter_slug=vol.reporter.short_name vol=vol.volume_number %}" class="btn-outline text-xs px-2 py-1">View</a>
+        </td>
+      </tr>
+      {% for scan in vol.scans.all %}
+      <tr class="bg-gray-50/50 dark:bg-gray-800/20 border-t border-gray-100 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-gray-800/40">
+        <td class="py-1.5 text-xs text-gray-400 dark:text-gray-500"></td>
+        <td class="py-1.5 text-xs" colspan="2">
+          <a href="{% url 'scan_process' scan.pk %}" class="text-blue-600 dark:text-blue-400 hover:underline pl-2">
+            {% if scan.part_label %}{{ scan.part_label }}{% else %}#{{ scan.pk }}{% endif %}
+          </a>
+          <span class="text-gray-400 dark:text-gray-500 ml-1">
+            {% if scan.start_page and scan.end_page %}{{ scan.start_page }}&ndash;{{ scan.end_page }}{% elif scan.page_count %}{{ scan.page_count }}pg{% endif %}
+          </span>
+        </td>
+        <td class="py-1.5 text-xs text-gray-400 dark:text-gray-500">
+          {{ scan.uploaded_by.username|default:"" }}
+        </td>
+        <td class="py-1.5 text-xs"></td>
+        <td class="py-1.5 text-xs">
+          <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
+          {% if scan.s3_uploaded %}<span class="badge-s3">S3</span>{% endif %}
+        </td>
+        <td class="py-1.5 text-xs text-gray-400 dark:text-gray-500">
+          {{ scan.date_created|date:"M j" }}
+        </td>
+        <td class="py-1.5 text-xs text-right text-gray-400 dark:text-gray-500 pr-4">
+          {% if scan.page_count %}{{ scan.page_count }}{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- Mobile cards -->
+<div class="sm:hidden space-y-3">
+  {% for vol in volumes %}
+  <a href="{% url 'queue_detail' reporter_slug=vol.reporter.short_name vol=vol.volume_number %}" class="card block hover:shadow-md transition-shadow{% if vol.queue_status == 'complete' %} opacity-50{% endif %}">
+    <div class="flex items-center justify-between mb-2">
+      <span class="font-medium text-sm">{{ vol.reporter.short_name }} vol. {{ vol.volume_number }}</span>
+      <span class="badge-{{ vol.queue_status }}">{{ vol.get_queue_status_display }}</span>
+    </div>
+    <div class="flex items-center gap-2 mb-1">
+      <span class="badge-priority-{{ vol.priority }}">{{ vol.get_priority_display }}</span>
+      {% if vol.assigned_to %}
+      <span class="text-xs text-gray-500 dark:text-gray-400">Assigned to {{ vol.assigned_to.username }}</span>
+      {% endif %}
+    </div>
+    <div class="text-sm text-gray-500 dark:text-gray-400">
+      {% if vol.expected_start_page %}Pages {{ vol.expected_start_page }}-{{ vol.expected_end_page }}{% endif %}
+      {% if vol.is_partial %} &middot; Multiple parts{% endif %}
+    </div>
+  </a>
+  {% endfor %}
+</div>
+
+{% else %}
+<div class="card text-center py-12">
+  <p class="text-gray-500 dark:text-gray-400">No volumes match your filters.</p>
+</div>
+{% endif %}
+{% endblock %}
