@@ -1534,12 +1534,59 @@ document.addEventListener('DOMContentLoaded', function () {
             });
             div.appendChild(h);
         });
+
+        div.style.cursor = 'move';
+
+        div.addEventListener('mousedown', function(e) {
+            if (e.target !== div) return;
+            e.stopPropagation();
+            e.preventDefault();
+            var startX = e.clientX, startY = e.clientY;
+            var startLeft = parseFloat(div.style.left);
+            var startTop  = parseFloat(div.style.top);
+
+            function onMove(ev) {
+                div.style.left = (startLeft + ev.clientX - startX) + 'px';
+                div.style.top  = (startTop  + ev.clientY - startY) + 'px';
+            }
+
+            function onUp() {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                var nL = parseFloat(div.style.left);
+                var nT = parseFloat(div.style.top);
+                var nW = parseFloat(div.style.width);
+                var nH = parseFloat(div.style.height);
+                var oldX0 = rectData.x0, oldY0 = rectData.y0;
+                var oldX1 = rectData.x1, oldY1 = rectData.y1;
+                rectData.x0 = Math.round(nL / dsx * 10) / 10;
+                rectData.y0 = Math.round(nT / dsy * 10) / 10;
+                rectData.x1 = Math.round((nL + nW) / dsx * 10) / 10;
+                rectData.y1 = Math.round((nT + nH) / dsy * 10) / 10;
+                var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
+                fetch('/scans/' + documentId + '/save-redaction-rect/', {
+                    method: 'POST',
+                    headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        page_index: _pageIndexForNum(pageNum),
+                        original: {x0: oldX0, y0: oldY0, x1: oldX1, y1: oldY1},
+                        adjusted: {x0: rectData.x0, y0: rectData.y0, x1: rectData.x1, y1: rectData.y1},
+                        type: rectData.type,
+                        fill: rectData.fill,
+                    }),
+                });
+            }
+
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        });
     }
 
     function _deselectRedactionBox() {
         if (!_selectedRedactionBox) return;
         _selectedRedactionBox.style.outline = '';
         _selectedRedactionBox.style.zIndex = '6';
+        _selectedRedactionBox.style.cursor = '';
         // Remove edit controls
         _selectedRedactionBox.querySelectorAll('.redaction-edit-btn, .redaction-resize-handle').forEach(function(el) { el.remove(); });
         _selectedRedactionBox = null;
