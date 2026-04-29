@@ -749,6 +749,10 @@ document.addEventListener('DOMContentLoaded', function () {
             box.style.top = (d.bbox[1] * sy) + 'px';
             box.style.width = ((d.bbox[2] - d.bbox[0]) * sx) + 'px';
             box.style.height = ((d.bbox[3] - d.bbox[1]) * sy) + 'px';
+            box.dataset.sx = sx;
+            box.dataset.sy = sy;
+            box.dataset.imgWidth = imgW;
+            box.dataset.imgHeight = imgH;
             box.style.borderColor = color;
             box.title = d.label + ' (' + d.confidence + ')';
 
@@ -1712,6 +1716,135 @@ document.addEventListener('DOMContentLoaded', function () {
         });
 
         toolbar.appendChild(deleteBtn);
+
+        var sx = parseFloat(div.dataset.sx) || 1;
+        var sy = parseFloat(div.dataset.sy) || 1;
+
+        ['nw','n','ne','w','e','sw','s','se'].forEach(function(pos) {
+            var h = document.createElement('div');
+            h.className = 'det-resize-handle';
+            h.dataset.pos = pos;
+            h.style.cssText = 'position:absolute;width:8px;height:8px;background:#f59e0b;border:1px solid #fff;z-index:22;cursor:' + pos + '-resize;';
+            if (pos.indexOf('n') >= 0) h.style.top = '-4px';
+            if (pos.indexOf('s') >= 0) h.style.bottom = '-4px';
+            if (pos.indexOf('w') >= 0) h.style.left = '-4px';
+            if (pos.indexOf('e') >= 0) h.style.right = '-4px';
+            if (pos === 'n' || pos === 's') h.style.left = 'calc(50% - 4px)';
+            if (pos === 'w' || pos === 'e') h.style.top = 'calc(50% - 4px)';
+
+            h.addEventListener('mousedown', function(e) {
+                e.stopPropagation();
+                e.preventDefault();
+                var startX = e.clientX, startY = e.clientY;
+                var startLeft = parseFloat(div.style.left);
+                var startTop  = parseFloat(div.style.top);
+                var startW    = parseFloat(div.style.width);
+                var startH    = parseFloat(div.style.height);
+
+                function onMove(ev) {
+                    var dx = ev.clientX - startX, dy = ev.clientY - startY;
+                    var nL = startLeft, nT = startTop, nW = startW, nH = startH;
+                    if (pos.indexOf('e') >= 0) nW = startW + dx;
+                    if (pos.indexOf('w') >= 0) { nW = startW - dx; nL = startLeft + dx; }
+                    if (pos.indexOf('s') >= 0) nH = startH + dy;
+                    if (pos.indexOf('n') >= 0) { nH = startH - dy; nT = startTop + dy; }
+                    if (nW > 5) { div.style.left = nL + 'px'; div.style.width  = nW + 'px'; }
+                    if (nH > 5) { div.style.top  = nT + 'px'; div.style.height = nH + 'px'; }
+                }
+
+                function onUp() {
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                    var nL = parseFloat(div.style.left);
+                    var nT = parseFloat(div.style.top);
+                    var nW = parseFloat(div.style.width);
+                    var nH = parseFloat(div.style.height);
+                    var newBbox = [
+                        Math.round(nL / sx * 10) / 10,
+                        Math.round(nT / sy * 10) / 10,
+                        Math.round((nL + nW) / sx * 10) / 10,
+                        Math.round((nT + nH) / sy * 10) / 10,
+                    ];
+                    var oldBbox = det.bbox.slice();
+                    fetch('/scans/' + documentId + '/update-detection/', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                        body: JSON.stringify({
+                            page_index: det.page_index,
+                            label:      det.label,
+                            label_id:   det.label_id,
+                            old_bbox:   oldBbox,
+                            new_bbox:   newBbox,
+                        }),
+                    }).then(function(r) { return r.json(); }).then(function(data) {
+                        if (data.status === 'ok') {
+                            det.bbox[0] = newBbox[0];
+                            det.bbox[1] = newBbox[1];
+                            det.bbox[2] = newBbox[2];
+                            det.bbox[3] = newBbox[3];
+                        }
+                    });
+                }
+
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+            div.appendChild(h);
+        });
+
+        div.style.cursor = 'move';
+
+        div.addEventListener('mousedown', function(e) {
+            if (e.target !== div) return;
+            e.stopPropagation();
+            e.preventDefault();
+            var startX = e.clientX, startY = e.clientY;
+            var startLeft = parseFloat(div.style.left);
+            var startTop  = parseFloat(div.style.top);
+
+            function onMove(ev) {
+                div.style.left = (startLeft + ev.clientX - startX) + 'px';
+                div.style.top  = (startTop  + ev.clientY - startY) + 'px';
+            }
+
+            function onUp() {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                var nL = parseFloat(div.style.left);
+                var nT = parseFloat(div.style.top);
+                var nW = parseFloat(div.style.width);
+                var nH = parseFloat(div.style.height);
+                var newBbox = [
+                    Math.round(nL / sx * 10) / 10,
+                    Math.round(nT / sy * 10) / 10,
+                    Math.round((nL + nW) / sx * 10) / 10,
+                    Math.round((nT + nH) / sy * 10) / 10,
+                ];
+                var oldBbox = det.bbox.slice();
+                fetch('/scans/' + documentId + '/update-detection/', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                    body: JSON.stringify({
+                        page_index: det.page_index,
+                        label:      det.label,
+                        label_id:   det.label_id,
+                        old_bbox:   oldBbox,
+                        new_bbox:   newBbox,
+                    }),
+                }).then(function(r) { return r.json(); }).then(function(data) {
+                    if (data.status === 'ok') {
+                        det.bbox[0] = newBbox[0];
+                        det.bbox[1] = newBbox[1];
+                        det.bbox[2] = newBbox[2];
+                        det.bbox[3] = newBbox[3];
+                    }
+                });
+            }
+
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        });
+
         div.appendChild(toolbar);
     }
 
@@ -1719,6 +1852,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!_selectedDetBox) return;
         _selectedDetBox.style.outline = '';
         _selectedDetBox.style.zIndex = '';
+        _selectedDetBox.style.cursor = '';
         _selectedDetBox.querySelectorAll('.det-resize-handle').forEach(function(el) { el.remove(); });
         _selectedDetBox = null;
     }
