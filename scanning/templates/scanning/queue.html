@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% load query_params %}
 
 {% block title %}Scanning Queue - FLP Scanning Portal{% endblock %}
 
@@ -16,48 +17,47 @@
 
 <!-- Status tabs -->
 <div class="flex flex-wrap gap-2 mb-4">
-  <a href="{% url 'queue' %}"
+  <a href="{% url 'queue' %}{% url_replace status='' %}"
      class="{% if not status_filter %}btn-primary{% else %}btn-outline{% endif %} text-sm">All</a>
-  <a href="{% url 'queue' %}?status=needs_scanning"
+  <a href="{% url 'queue' %}{% url_replace status='needs_scanning' %}"
      class="{% if status_filter == 'needs_scanning' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Needs Scanning</a>
-  <a href="{% url 'queue' %}?status=assigned"
+  <a href="{% url 'queue' %}{% url_replace status='assigned' %}"
      class="{% if status_filter == 'assigned' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Assigned</a>
-  <a href="{% url 'queue' %}?status=scanning"
+  <a href="{% url 'queue' %}{% url_replace status='scanning' %}"
      class="{% if status_filter == 'scanning' %}btn-primary{% else %}btn-outline{% endif %} text-sm">In Progress</a>
-  <a href="{% url 'queue' %}?status=complete"
+  <a href="{% url 'queue' %}{% url_replace status='complete' %}"
      class="{% if status_filter == 'complete' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Complete</a>
 </div>
 
 <!-- Filters -->
 <div class="card mb-6">
-  <form method="get" class="flex flex-col sm:flex-row gap-3">
+  <form method="get">
     {% if status_filter %}<input type="hidden" name="status" value="{{ status_filter }}">{% endif %}
-    <div class="flex-1">
-      <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
-      <select id="filter-reporter" name="reporter" class="input-text w-full">
-        <option value="">All reporters</option>
-        {% for r in reporters %}
-        <option value="{{ r.short_name }}" {% if selected_reporter == r.short_name %}selected{% endif %}>
-          {{ r.full_name }} ({{ r.short_name }})
-        </option>
-        {% endfor %}
-      </select>
+    <div class="flex flex-col sm:flex-row gap-3">
+      <div class="flex-1">
+        <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
+        <select id="filter-reporter" name="reporter" class="input-text w-full">
+          <option value="">All reporters</option>
+          {% for r in reporters %}
+          <option value="{{ r.short_name }}" {% if selected_reporter == r.short_name %}selected{% endif %}>
+            {{ r.full_name }} ({{ r.short_name }})
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="flex-1">
+        <label for="filter-priority" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Priority</label>
+        <select id="filter-priority" name="priority" class="input-text w-full">
+          <option value="">All priorities</option>
+          {% for val, label in priorities %}
+          <option value="{{ val }}" {% if priority_filter == val %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
     </div>
-    <div class="flex-1">
-      <label for="filter-priority" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Priority</label>
-      <select id="filter-priority" name="priority" class="input-text w-full">
-        <option value="">All priorities</option>
-        {% for val, label in priorities %}
-        <option value="{{ val }}" {% if priority_filter == val %}selected{% endif %}>{{ label }}</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div class="flex items-end gap-2">
-      <button type="submit" class="btn-outline">Filter</button>
-      {% if selected_reporter or priority_filter %}
-      <a href="{% url 'queue' %}{% if status_filter %}?status={{ status_filter }}{% endif %}"
-         class="btn-ghost text-sm">Clear</a>
-      {% endif %}
+    <div class="flex items-center justify-end gap-2 mt-3">
+      <a href="{% url 'queue' %}" class="btn-ghost text-sm"><i class="fa-solid fa-xmark"></i> Clear filters</a>
+      <button type="submit" class="btn-outline"><i class="fa-solid fa-magnifying-glass"></i> Filter</button>
     </div>
   </form>
 </div>
