@@ -1,5 +1,6 @@
 # blackletter-gpu-worker
 
+
 GPU worker image for [RunPod Serverless]. Runs the two GPU-heavy steps
 of the blackletter pipeline (`detect` and `analyze_pdf`) so the rest of
 the scanning app can stay on CPU-only boxes.
@@ -11,6 +12,7 @@ in RunPod endpoint env vars, never in the image.
 [RunPod Serverless]: https://docs.runpod.io/serverless/overview
 
 ## How it fits
+
 
 ```
 ┌─────────────────────┐        ┌──────────────────────┐
