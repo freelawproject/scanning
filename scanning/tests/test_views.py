@@ -1,4 +1,6 @@
 import io
+import json
+import pathlib
 import shutil
 import tempfile
 from datetime import timedelta
@@ -1034,3 +1036,131 @@ class TestRunFullPipelinePullsFromS3(ScanningTestCase):
             run_full_pipeline(scan.pk)
 
         mock_pull.assert_called_once_with(scan.pk)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestUpdateDetection(ScanningTestCase):
+    """Tests for the update_detection API endpoint."""
+
+    def _make_scan_with_detection(self):
+        """Create a scan, output dir, Detection, and detections.json.
+
+        :returns: Tuple of (scan, detection, det_path).
+        :rtype: tuple
+        """
+        scan = ScanFactory()
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        det = Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="CASE_CAPTION",
+            label_id=0,
+            confidence=0.9,
+            x0=100.0,
+            y0=100.0,
+            x1=200.0,
+            y1=200.0,
+            img_width=1000,
+            img_height=1000,
+        )
+        det_path = output / "detections.json"
+        det_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "page_index": 0,
+                        "label": "CASE_CAPTION",
+                        "label_id": 0,
+                        "confidence": 0.9,
+                        "bbox": [100.0, 100.0, 200.0, 200.0],
+                        "img_width": 1000,
+                        "img_height": 1000,
+                        "model_count": 1,
+                    }
+                ]
+            )
+        )
+        return scan, det, det_path
+
+    def _post(self, scan, body):
+        """POST JSON body to the update_detection endpoint.
+
+        :param scan: The scan instance.
+        :param body: Dict to serialize as JSON.
+        :returns: The response.
+        """
+        return self.client.post(
+            reverse("update_detection", kwargs={"pk": scan.pk}),
+            data=json.dumps(body),
+            content_type="application/json",
+        )
+
+    def test_updates_db_and_disk(self):
+        """Bbox update is persisted to both the DB and detections.json."""
+        user = self.make_user()
+        self.client.force_login(user)
+        scan, det, det_path = self._make_scan_with_detection()
+
+        response = self._post(
+            scan,
+            {
+                "page_index": 0,
+                "label": "CASE_CAPTION",
+                "old_bbox": [100.0, 100.0, 200.0, 200.0],
+                "new_bbox": [150.0, 150.0, 250.0, 250.0],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok", "updated": 1})
+        det.refresh_from_db()
+        self.assertEqual(det.x0, 150.0)
+        self.assertEqual(det.y0, 150.0)
+        self.assertEqual(det.x1, 250.0)
+        self.assertEqual(det.y1, 250.0)
+        disk = json.loads(det_path.read_text())
+        self.assertEqual(disk[0]["bbox"], [150.0, 150.0, 250.0, 250.0])
+
+    def test_updates_by_label_id(self):
+        """Bbox update works when matched by label_id instead of label."""
+        user = self.make_user()
+        self.client.force_login(user)
+        scan, det, det_path = self._make_scan_with_detection()
+
+        response = self._post(
+            scan,
+            {
+                "page_index": 0,
+                "label_id": 0,
+                "old_bbox": [100.0, 100.0, 200.0, 200.0],
+                "new_bbox": [10.0, 10.0, 50.0, 50.0],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["updated"], 1)
+        det.refresh_from_db()
+        self.assertEqual(det.x0, 10.0)
+        self.assertEqual(det.x1, 50.0)
+        disk = json.loads(det_path.read_text())
+        self.assertEqual(disk[0]["bbox"], [10.0, 10.0, 50.0, 50.0])
+
+    def test_missing_detections_json_returns_404(self):
+        """Returns 404 when detections.json does not exist on disk."""
+        user = self.make_user()
+        self.client.force_login(user)
+        scan, _det, det_path = self._make_scan_with_detection()
+        det_path.unlink()
+
+        response = self._post(
+            scan,
+            {
+                "page_index": 0,
+                "label": "CASE_CAPTION",
+                "old_bbox": [100.0, 100.0, 200.0, 200.0],
+                "new_bbox": [150.0, 150.0, 250.0, 250.0],
+            },
+        )
+
+        self.assertEqual(response.status_code, 404)
