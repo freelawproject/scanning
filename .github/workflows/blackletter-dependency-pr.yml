@@ -24,6 +24,7 @@ jobs:
       - name: Update blackletter dependency
         run: |
           uv sync --upgrade-package blackletter
+          uv sync --upgrade-package blackletter --project scanning/runpod
 
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v8
