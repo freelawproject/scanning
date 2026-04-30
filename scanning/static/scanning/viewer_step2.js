@@ -1726,13 +1726,35 @@ document.addEventListener('DOMContentLoaded', function () {
     // ── Detection box editing ──
     var _selectedDetBox = null;
 
+    function _saveDetectionBbox(newBbox, det) {
+        fetch('/scans/' + documentId + '/update-detection/', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+            body: JSON.stringify({detection_id: det.id, new_bbox: newBbox}),
+        }).then(function(r) { return r.json(); }).then(function(data) {
+            if (data.status === 'ok') {
+                det.bbox[0] = newBbox[0];
+                det.bbox[1] = newBbox[1];
+                det.bbox[2] = newBbox[2];
+                det.bbox[3] = newBbox[3];
+            }
+        }).catch(function() {
+            console.error('Failed to save detection bbox');
+        });
+    }
+
     function _selectDetectionBox(div, det) {
         _deselectDetectionBox();
         _selectedDetBox = div;
         div.style.outline = '2px solid #f59e0b';
         div.style.zIndex = '20';
+        div.style.cursor = 'move';
         var selLabel = div.querySelector('.detection-label');
         if (selLabel) selLabel.style.display = '';
+
+        // Scale factors: div is in display px, det.bbox is in image px
+        var sx = parseFloat(div.style.width) / (det.bbox[2] - det.bbox[0]);
+        var sy = parseFloat(div.style.height) / (det.bbox[3] - det.bbox[1]);
 
         // Action buttons toolbar
         var toolbar = document.createElement('div');
@@ -1758,19 +1780,16 @@ document.addEventListener('DOMContentLoaded', function () {
                     console.log('Deleted ' + data.deleted + ' detection(s) from DB for ' + det.label + ' on page_index=' + det.page_index);
                     div.remove();
                     _selectedDetBox = null;
-                    // Remove matching sidebar item for unmatched captions/keys
                     var sidebarItems = document.querySelectorAll('[data-unmatched-page="' + det.page_index + '"][data-unmatched-label="' + det.label + '"]');
                     sidebarItems.forEach(function(el) { el.remove(); });
                     refreshOverlays();
                 }
             });
         });
-
         toolbar.appendChild(deleteBtn);
+        div.appendChild(toolbar);
 
-        var sx = parseFloat(div.dataset.sx) || 1;
-        var sy = parseFloat(div.dataset.sy) || 1;
-
+        // Resize handles
         ['nw','n','ne','w','e','sw','s','se'].forEach(function(pos) {
             var h = document.createElement('div');
             h.className = 'det-resize-handle';
@@ -1788,53 +1807,33 @@ document.addEventListener('DOMContentLoaded', function () {
                 e.preventDefault();
                 var startX = e.clientX, startY = e.clientY;
                 var startLeft = parseFloat(div.style.left);
-                var startTop  = parseFloat(div.style.top);
-                var startW    = parseFloat(div.style.width);
-                var startH    = parseFloat(div.style.height);
+                var startTop = parseFloat(div.style.top);
+                var startW = parseFloat(div.style.width);
+                var startH = parseFloat(div.style.height);
 
-                function onMove(ev) {
-                    var dx = ev.clientX - startX, dy = ev.clientY - startY;
-                    var nL = startLeft, nT = startTop, nW = startW, nH = startH;
-                    if (pos.indexOf('e') >= 0) nW = startW + dx;
-                    if (pos.indexOf('w') >= 0) { nW = startW - dx; nL = startLeft + dx; }
-                    if (pos.indexOf('s') >= 0) nH = startH + dy;
-                    if (pos.indexOf('n') >= 0) { nH = startH - dy; nT = startTop + dy; }
-                    if (nW > 5) { div.style.left = nL + 'px'; div.style.width  = nW + 'px'; }
-                    if (nH > 5) { div.style.top  = nT + 'px'; div.style.height = nH + 'px'; }
+                function onMove(e) {
+                    var dx = e.clientX - startX, dy = e.clientY - startY;
+                    var newLeft = startLeft, newTop = startTop, newW = startW, newH = startH;
+                    if (pos.indexOf('e') >= 0) newW = Math.max(10, startW + dx);
+                    if (pos.indexOf('s') >= 0) newH = Math.max(10, startH + dy);
+                    if (pos.indexOf('w') >= 0) { newLeft = startLeft + dx; newW = Math.max(10, startW - dx); }
+                    if (pos.indexOf('n') >= 0) { newTop = startTop + dy; newH = Math.max(10, startH - dy); }
+                    div.style.left = newLeft + 'px';
+                    div.style.top = newTop + 'px';
+                    div.style.width = newW + 'px';
+                    div.style.height = newH + 'px';
                 }
 
                 function onUp() {
                     document.removeEventListener('mousemove', onMove);
                     document.removeEventListener('mouseup', onUp);
-                    var nL = parseFloat(div.style.left);
-                    var nT = parseFloat(div.style.top);
-                    var nW = parseFloat(div.style.width);
-                    var nH = parseFloat(div.style.height);
                     var newBbox = [
-                        Math.round(nL / sx * 10) / 10,
-                        Math.round(nT / sy * 10) / 10,
-                        Math.round((nL + nW) / sx * 10) / 10,
-                        Math.round((nT + nH) / sy * 10) / 10,
+                        parseFloat(div.style.left) / sx,
+                        parseFloat(div.style.top) / sy,
+                        (parseFloat(div.style.left) + parseFloat(div.style.width)) / sx,
+                        (parseFloat(div.style.top) + parseFloat(div.style.height)) / sy,
                     ];
-                    var oldBbox = det.bbox.slice();
-                    fetch('/scans/' + documentId + '/update-detection/', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
-                        body: JSON.stringify({
-                            page_index: det.page_index,
-                            label:      det.label,
-                            label_id:   det.label_id,
-                            old_bbox:   oldBbox,
-                            new_bbox:   newBbox,
-                        }),
-                    }).then(function(r) { return r.json(); }).then(function(data) {
-                        if (data.status === 'ok') {
-                            det.bbox[0] = newBbox[0];
-                            det.bbox[1] = newBbox[1];
-                            det.bbox[2] = newBbox[2];
-                            det.bbox[3] = newBbox[3];
-                        }
-                    });
+                    _saveDetectionBbox(newBbox, det);
                 }
 
                 document.addEventListener('mousemove', onMove);
@@ -1843,60 +1842,34 @@ document.addEventListener('DOMContentLoaded', function () {
             div.appendChild(h);
         });
 
-        div.style.cursor = 'move';
-
+        // Drag-to-move (click on box body, not handles)
         div.addEventListener('mousedown', function(e) {
             if (e.target !== div) return;
-            e.stopPropagation();
             e.preventDefault();
             var startX = e.clientX, startY = e.clientY;
             var startLeft = parseFloat(div.style.left);
-            var startTop  = parseFloat(div.style.top);
+            var startTop = parseFloat(div.style.top);
 
-            function onMove(ev) {
-                div.style.left = (startLeft + ev.clientX - startX) + 'px';
-                div.style.top  = (startTop  + ev.clientY - startY) + 'px';
+            function onMove(e) {
+                div.style.left = (startLeft + e.clientX - startX) + 'px';
+                div.style.top = (startTop + e.clientY - startY) + 'px';
             }
 
             function onUp() {
                 document.removeEventListener('mousemove', onMove);
                 document.removeEventListener('mouseup', onUp);
-                var nL = parseFloat(div.style.left);
-                var nT = parseFloat(div.style.top);
-                var nW = parseFloat(div.style.width);
-                var nH = parseFloat(div.style.height);
                 var newBbox = [
-                    Math.round(nL / sx * 10) / 10,
-                    Math.round(nT / sy * 10) / 10,
-                    Math.round((nL + nW) / sx * 10) / 10,
-                    Math.round((nT + nH) / sy * 10) / 10,
+                    parseFloat(div.style.left) / sx,
+                    parseFloat(div.style.top) / sy,
+                    (parseFloat(div.style.left) + parseFloat(div.style.width)) / sx,
+                    (parseFloat(div.style.top) + parseFloat(div.style.height)) / sy,
                 ];
-                var oldBbox = det.bbox.slice();
-                fetch('/scans/' + documentId + '/update-detection/', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
-                    body: JSON.stringify({
-                        page_index: det.page_index,
-                        label:      det.label,
-                        label_id:   det.label_id,
-                        old_bbox:   oldBbox,
-                        new_bbox:   newBbox,
-                    }),
-                }).then(function(r) { return r.json(); }).then(function(data) {
-                    if (data.status === 'ok') {
-                        det.bbox[0] = newBbox[0];
-                        det.bbox[1] = newBbox[1];
-                        det.bbox[2] = newBbox[2];
-                        det.bbox[3] = newBbox[3];
-                    }
-                });
+                _saveDetectionBbox(newBbox, det);
             }
 
             document.addEventListener('mousemove', onMove);
             document.addEventListener('mouseup', onUp);
         });
-
-        div.appendChild(toolbar);
     }
 
     function _deselectDetectionBox() {

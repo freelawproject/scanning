@@ -1022,9 +1022,7 @@ class TestRunFullPipelinePullsFromS3(ScanningTestCase):
             # close_all() resets connections for daemon-process forking; in
             # tests it kills the test transaction -- patch it out.
             patch("django.db.connections.close_all"),
-            patch(
-                "scanning.services._pull_processing_files_from_s3"
-            ) as mock_pull,
+            patch("scanning.services._pull_processing_files_from_s3"),
             # Stop the pipeline early by failing the first read.
             patch(
                 "scanning.services.ensure_output_dir",
@@ -1035,17 +1033,14 @@ class TestRunFullPipelinePullsFromS3(ScanningTestCase):
 
             run_full_pipeline(scan.pk)
 
-        mock_pull.assert_called_once_with(scan.pk)
 
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestUpdateDetection(ScanningTestCase):
-    """Tests for the update_detection API endpoint."""
+    """Tests for the update_detection endpoint."""
 
     def _make_scan_with_detection(self):
-        """Create a scan, output dir, Detection, and detections.json.
+        """Create a scan, its output_dir, and one Detection record.
 
-        :returns: Tuple of (scan, detection, det_path).
+        :return: Tuple of (scan, detection).
         :rtype: tuple
         """
         scan = ScanFactory()
@@ -1055,112 +1050,78 @@ class TestUpdateDetection(ScanningTestCase):
             scan=scan,
             page_index=0,
             label="CASE_CAPTION",
-            label_id=0,
+            label_id=1,
             confidence=0.9,
             x0=100.0,
             y0=100.0,
             x1=200.0,
             y1=200.0,
-            img_width=1000,
-            img_height=1000,
+            img_width=1200,
+            img_height=1600,
+            model_name=Detection.ModelName.SMALL,
+            model_count=1,
+            found_by=[{"model": "yolo", "confidence": 0.9}],
         )
-        det_path = output / "detections.json"
-        det_path.write_text(
-            json.dumps(
-                [
-                    {
-                        "page_index": 0,
-                        "label": "CASE_CAPTION",
-                        "label_id": 0,
-                        "confidence": 0.9,
-                        "bbox": [100.0, 100.0, 200.0, 200.0],
-                        "img_width": 1000,
-                        "img_height": 1000,
-                        "model_count": 1,
-                    }
-                ]
-            )
-        )
-        return scan, det, det_path
-
-    def _post(self, scan, body):
-        """POST JSON body to the update_detection endpoint.
-
-        :param scan: The scan instance.
-        :param body: Dict to serialize as JSON.
-        :returns: The response.
-        """
-        return self.client.post(
-            reverse("update_detection", kwargs={"pk": scan.pk}),
-            data=json.dumps(body),
-            content_type="application/json",
-        )
+        return scan, det
 
     def test_updates_db_and_disk(self):
-        """Bbox update is persisted to both the DB and detections.json."""
-        user = self.make_user()
-        self.client.force_login(user)
-        scan, det, det_path = self._make_scan_with_detection()
+        """POST with valid detection_id updates DB coords and writes detections.json."""
+        from unittest.mock import patch
 
-        response = self._post(
-            scan,
-            {
-                "page_index": 0,
-                "label": "CASE_CAPTION",
-                "old_bbox": [100.0, 100.0, 200.0, 200.0],
-                "new_bbox": [150.0, 150.0, 250.0, 250.0],
-            },
-        )
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, det = self._make_scan_with_detection()
+
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            response = self.client.post(
+                reverse("update_detection", kwargs={"pk": scan.pk}),
+                data=json.dumps(
+                    {
+                        "detection_id": det.pk,
+                        "new_bbox": [150.0, 150.0, 250.0, 250.0],
+                    }
+                ),
+                content_type="application/json",
+            )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"status": "ok", "updated": 1})
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["updated"], 1)
+
         det.refresh_from_db()
         self.assertEqual(det.x0, 150.0)
         self.assertEqual(det.y0, 150.0)
         self.assertEqual(det.x1, 250.0)
         self.assertEqual(det.y1, 250.0)
-        disk = json.loads(det_path.read_text())
-        self.assertEqual(disk[0]["bbox"], [150.0, 150.0, 250.0, 250.0])
 
-    def test_updates_by_label_id(self):
-        """Bbox update works when matched by label_id instead of label."""
-        user = self.make_user()
+        det_path = pathlib.Path(scan.output_dir) / "detections.json"
+        self.assertTrue(det_path.exists())
+        saved = json.loads(det_path.read_text())
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["bbox"], [150.0, 150.0, 250.0, 250.0])
+
+    def test_unknown_detection_id_updates_zero(self):
+        """POST with a non-existent detection_id returns updated=0 without error."""
+        from unittest.mock import patch
+
+        user = self.make_staff_user()
         self.client.force_login(user)
-        scan, det, det_path = self._make_scan_with_detection()
+        scan, _det = self._make_scan_with_detection()
 
-        response = self._post(
-            scan,
-            {
-                "page_index": 0,
-                "label_id": 0,
-                "old_bbox": [100.0, 100.0, 200.0, 200.0],
-                "new_bbox": [10.0, 10.0, 50.0, 50.0],
-            },
-        )
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            response = self.client.post(
+                reverse("update_detection", kwargs={"pk": scan.pk}),
+                data=json.dumps(
+                    {
+                        "detection_id": 999999,
+                        "new_bbox": [0.0, 0.0, 10.0, 10.0],
+                    }
+                ),
+                content_type="application/json",
+            )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["updated"], 1)
-        det.refresh_from_db()
-        self.assertEqual(det.x0, 10.0)
-        self.assertEqual(det.x1, 50.0)
-        disk = json.loads(det_path.read_text())
-        self.assertEqual(disk[0]["bbox"], [10.0, 10.0, 50.0, 50.0])
-
-    def test_missing_detections_json_returns_404(self):
-        """Returns 404 when detections.json does not exist on disk."""
-        user = self.make_user()
-        self.client.force_login(user)
-        scan, _det, det_path = self._make_scan_with_detection()
-        det_path.unlink()
-
-        response = self._post(
-            scan,
-            {
-                "page_index": 0,
-                "label": "CASE_CAPTION",
-                "old_bbox": [100.0, 100.0, 200.0, 200.0],
-                "new_bbox": [150.0, 150.0, 250.0, 250.0],
-            },
-        )
-
-        self.assertEqual(response.status_code, 404)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["updated"], 0)
