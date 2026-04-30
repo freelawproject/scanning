@@ -253,6 +253,7 @@
            data-logical-page="{{ d.logical_page }}" data-page-index="{{ d.page_index }}"
            data-bbox="{{ d.bbox.0 }},{{ d.bbox.1 }},{{ d.bbox.2 }},{{ d.bbox.3 }}"
            data-img-w="{{ d.img_width }}" data-img-h="{{ d.img_height }}" data-label-id="{{ d.label_id }}"
+           data-detection-id="{{ d.id }}"
            onclick="highlightDetection(this)">
         <span class="font-medium">p.{{ d.logical_page }}</span>
         <span class="text-gray-500 dark:text-gray-400">{{ d.conf }}</span>
@@ -274,6 +275,7 @@
            data-logical-page="{{ d.logical_page }}" data-page-index="{{ d.page_index }}"
            data-bbox="{{ d.bbox.0 }},{{ d.bbox.1 }},{{ d.bbox.2 }},{{ d.bbox.3 }}"
            data-img-w="{{ d.img_width }}" data-img-h="{{ d.img_height }}" data-label-id="{{ d.label_id }}"
+           data-detection-id="{{ d.id }}"
            onclick="highlightDetection(this)">
         <span class="font-medium">p.{{ d.logical_page }}</span>
         <span class="text-gray-500 dark:text-gray-400">{{ d.conf }}</span>

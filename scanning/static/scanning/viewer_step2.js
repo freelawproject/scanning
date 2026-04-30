@@ -1769,21 +1769,17 @@ document.addEventListener('DOMContentLoaded', function () {
             fetch('/scans/' + documentId + '/delete-detection/', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
-                body: JSON.stringify({
-                    page_index: det.page_index,
-                    label: det.label,
-                    label_id: det.label_id,
-                    bbox: det.bbox,
-                }),
+                body: JSON.stringify({detection_id: det.id}),
             }).then(function(r) { return r.json(); }).then(function(data) {
                 if (data.status === 'ok') {
-                    console.log('Deleted ' + data.deleted + ' detection(s) from DB for ' + det.label + ' on page_index=' + det.page_index);
                     div.remove();
                     _selectedDetBox = null;
                     var sidebarItems = document.querySelectorAll('[data-unmatched-page="' + det.page_index + '"][data-unmatched-label="' + det.label + '"]');
                     sidebarItems.forEach(function(el) { el.remove(); });
                     refreshOverlays();
                 }
+            }).catch(function() {
+                console.error('Failed to delete detection');
             });
         });
         toolbar.appendChild(deleteBtn);
