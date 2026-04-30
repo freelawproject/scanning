@@ -41,7 +41,7 @@ RUN ldconfig
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     YOLO_CONFIG_DIR=/opt/ultralytics \
-    PADDLEX_HOME=/opt/paddlex \
+    PADDLE_PDX_CACHE_HOME=/opt/paddlex \
     HF_HOME=/opt/hf \
     PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     UV_PROJECT_ENVIRONMENT=/opt/venv \

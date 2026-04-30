@@ -26,10 +26,7 @@ dependencies = [
     "runpod>=1.9,<2",
     "sentry-sdk>=2,<3",
 
-    # blackletter is pinned to the same git branch scanning/pyproject.toml
-    # uses so the worker and the daemon always run identical library code.
-    # TODO: flip to a PyPI pin once blackletter releases ensure_weights.
-    "blackletter @ git+https://github.com/freelawproject/blackletter.git@feat/ensure-weights",
+    "blackletter>=0.0.9",
 ]
 
 # This project is an application (handler.py), not a library. Tell uv
