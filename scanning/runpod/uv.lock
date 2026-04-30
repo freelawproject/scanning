@@ -326,8 +326,8 @@ wheels = [
 
 [[package]]
 name = "blackletter"
-version = "0.0.8"
-source = { git = "https://github.com/freelawproject/blackletter.git?rev=feat%2Fensure-weights#8d627f09898ed2e9ffb45b0592095e5cfe80a8fc" }
+version = "0.0.9"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ocrmypdf" },
     { name = "opencv-python" },
@@ -335,6 +335,10 @@ dependencies = [
     { name = "pymupdf" },
     { name = "python-doctr" },
     { name = "ultralytics" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a5/6f/8eba83da0713c0816c0c6f464b772d43ebc789d25855511b49939d049aee/blackletter-0.0.9.tar.gz", hash = "sha256:ee95627fa63cdbb76b362d8670dcefe8f2831a4039157b80b7abe54b22faa41b", size = 68865555, upload-time = "2026-04-30T00:15:56.149Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7f/dc/91a8276b75507e0d5587e7c8b1b8ec9f3ab7c9f12c5ae85013bbdd687516/blackletter-0.0.9-py3-none-any.whl", hash = "sha256:cbb3ed480f64b32777b9a1bbd7606e7b4a2e3f20ac72756ef98edcdef73222cb", size = 68855482, upload-time = "2026-04-30T00:15:51.933Z" },
 ]
 
 [[package]]
@@ -363,7 +367,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "blackletter", git = "https://github.com/freelawproject/blackletter.git?rev=feat%2Fensure-weights" },
+    { name = "blackletter", specifier = ">=0.0.9" },
     { name = "huggingface-hub", specifier = ">=0.20.0" },
     { name = "ocrmypdf", specifier = ">=17" },
     { name = "opencv-python", specifier = "==4.10.0.84" },
@@ -3276,9 +3280,9 @@ dependencies = [
     { name = "typing-extensions", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.11.0%2Bcu126-cp312-cp312-manylinux_2_28_aarch64.whl", upload-time = "2026-03-23T14:59:37Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.11.0%2Bcu126-cp313-cp313-manylinux_2_28_aarch64.whl", upload-time = "2026-03-23T14:59:44Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.11.0%2Bcu126-cp313-cp313t-manylinux_2_28_aarch64.whl", upload-time = "2026-03-23T14:59:56Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.11.0%2Bcu126-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:dc05f49d97c04a32d139df19d77209ceca3c484083f0db1dc332f168a19ef8d8", upload-time = "2026-04-27T20:54:02Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.11.0%2Bcu126-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:3bbbfc7ed16d878aef9b91a8e78c033bf131ffb8357e23ff80911210683a31b3", upload-time = "2026-04-27T20:58:05Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torch-2.11.0%2Bcu126-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:7945e39fe82b85d7d018f68085ffaa6c5305a1634adb0bc792d835953b36fc9b", upload-time = "2026-04-27T21:02:11Z" },
 ]
 
 [[package]]
