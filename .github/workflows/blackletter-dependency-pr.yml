@@ -1,0 +1,34 @@
+name: Auto-update blackletter Dependency
+
+on:
+  workflow_dispatch:
+
+jobs:
+  update-blackletter-dependency:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '>= 3.13'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          version: "0.9.x"
+
+      - name: Update blackletter dependency
+        run: |
+          uv sync --upgrade-package blackletter
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          commit-message: Update blackletter dependency
+          title: Update blackletter dependency
+          body: This PR updates the blackletter dependency to its latest version
+          branch: update-blackletter-dependency
