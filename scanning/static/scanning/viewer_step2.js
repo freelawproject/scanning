@@ -1740,6 +1740,7 @@ document.addEventListener('DOMContentLoaded', function () {
             }
         }).catch(function() {
             console.error('Failed to save detection bbox');
+            showToast('Failed to save detection bbox');
         });
     }
 
@@ -1780,6 +1781,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
             }).catch(function() {
                 console.error('Failed to delete detection');
+                showToast('Failed to delete detection');
             });
         });
         toolbar.appendChild(deleteBtn);
@@ -1807,7 +1809,9 @@ document.addEventListener('DOMContentLoaded', function () {
                 var startW = parseFloat(div.style.width);
                 var startH = parseFloat(div.style.height);
 
+                var hasMoved = false;
                 function onMove(e) {
+                    hasMoved = true;
                     var dx = e.clientX - startX, dy = e.clientY - startY;
                     var newLeft = startLeft, newTop = startTop, newW = startW, newH = startH;
                     if (pos.indexOf('e') >= 0) newW = Math.max(10, startW + dx);
@@ -1823,6 +1827,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 function onUp() {
                     document.removeEventListener('mousemove', onMove);
                     document.removeEventListener('mouseup', onUp);
+                    if (!hasMoved) return;
                     var newBbox = [
                         parseFloat(div.style.left) / sx,
                         parseFloat(div.style.top) / sy,
@@ -1839,14 +1844,16 @@ document.addEventListener('DOMContentLoaded', function () {
         });
 
         // Drag-to-move (click on box body, not handles)
-        div.addEventListener('mousedown', function(e) {
+        div._moveHandler = function(e) {
             if (e.target !== div) return;
             e.preventDefault();
             var startX = e.clientX, startY = e.clientY;
             var startLeft = parseFloat(div.style.left);
             var startTop = parseFloat(div.style.top);
+            var hasMoved = false;
 
             function onMove(e) {
+                hasMoved = true;
                 div.style.left = (startLeft + e.clientX - startX) + 'px';
                 div.style.top = (startTop + e.clientY - startY) + 'px';
             }
@@ -1854,6 +1861,7 @@ document.addEventListener('DOMContentLoaded', function () {
             function onUp() {
                 document.removeEventListener('mousemove', onMove);
                 document.removeEventListener('mouseup', onUp);
+                if (!hasMoved) return;
                 var newBbox = [
                     parseFloat(div.style.left) / sx,
                     parseFloat(div.style.top) / sy,
@@ -1865,7 +1873,8 @@ document.addEventListener('DOMContentLoaded', function () {
 
             document.addEventListener('mousemove', onMove);
             document.addEventListener('mouseup', onUp);
-        });
+        };
+        div.addEventListener('mousedown', div._moveHandler);
     }
 
     function _deselectDetectionBox() {
@@ -1874,6 +1883,10 @@ document.addEventListener('DOMContentLoaded', function () {
         _selectedDetBox.style.zIndex = '';
         _selectedDetBox.style.cursor = '';
         _selectedDetBox.querySelectorAll('.det-resize-handle').forEach(function(el) { el.remove(); });
+        if (_selectedDetBox._moveHandler) {
+            _selectedDetBox.removeEventListener('mousedown', _selectedDetBox._moveHandler);
+            _selectedDetBox._moveHandler = null;
+        }
         _selectedDetBox = null;
     }
 

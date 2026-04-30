@@ -338,6 +338,7 @@ function approveDetection(btn) {
         })
         .catch(function () {
             console.error("Failed to approve detection");
+            showToast("Failed to approve detection");
         });
 }
 
@@ -366,6 +367,7 @@ function deleteUnmatchedDetection(btn) {
         })
         .catch(function () {
             console.error("Failed to delete detection");
+            showToast("Failed to delete detection");
         });
 }
 
