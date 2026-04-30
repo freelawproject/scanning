@@ -1537,15 +1537,17 @@ document.addEventListener('DOMContentLoaded', function () {
 
         div.style.cursor = 'move';
 
-        div.addEventListener('mousedown', function(e) {
+        div._redactionMoveHandler = function(e) {
             if (e.target !== div) return;
             e.stopPropagation();
             e.preventDefault();
             var startX = e.clientX, startY = e.clientY;
             var startLeft = parseFloat(div.style.left);
             var startTop  = parseFloat(div.style.top);
+            var hasMoved = false;
 
             function onMove(ev) {
+                hasMoved = true;
                 div.style.left = (startLeft + ev.clientX - startX) + 'px';
                 div.style.top  = (startTop  + ev.clientY - startY) + 'px';
             }
@@ -1553,6 +1555,7 @@ document.addEventListener('DOMContentLoaded', function () {
             function onUp() {
                 document.removeEventListener('mousemove', onMove);
                 document.removeEventListener('mouseup', onUp);
+                if (!hasMoved) return;
                 var nL = parseFloat(div.style.left);
                 var nT = parseFloat(div.style.top);
                 var nW = parseFloat(div.style.width);
@@ -1579,7 +1582,8 @@ document.addEventListener('DOMContentLoaded', function () {
 
             document.addEventListener('mousemove', onMove);
             document.addEventListener('mouseup', onUp);
-        });
+        };
+        div.addEventListener('mousedown', div._redactionMoveHandler);
     }
 
     function _deselectRedactionBox() {
@@ -1589,6 +1593,10 @@ document.addEventListener('DOMContentLoaded', function () {
         _selectedRedactionBox.style.cursor = '';
         // Remove edit controls
         _selectedRedactionBox.querySelectorAll('.redaction-edit-btn, .redaction-resize-handle').forEach(function(el) { el.remove(); });
+        if (_selectedRedactionBox._redactionMoveHandler) {
+            _selectedRedactionBox.removeEventListener('mousedown', _selectedRedactionBox._redactionMoveHandler);
+            _selectedRedactionBox._redactionMoveHandler = null;
+        }
         _selectedRedactionBox = null;
     }
 
@@ -1605,7 +1613,9 @@ document.addEventListener('DOMContentLoaded', function () {
         var startW = parseFloat(div.style.width);
         var startH = parseFloat(div.style.height);
 
+        var hasMoved = false;
         function onMove(e) {
+            hasMoved = true;
             var dx = e.clientX - startX;
             var dy = e.clientY - startY;
             var newLeft = startLeft, newTop = startTop, newW = startW, newH = startH;
@@ -1622,6 +1632,7 @@ document.addEventListener('DOMContentLoaded', function () {
         function onUp() {
             document.removeEventListener('mousemove', onMove);
             document.removeEventListener('mouseup', onUp);
+            if (!hasMoved) return;
 
             // Update rectData with new position in PDF coordinates
             var newLeft = parseFloat(div.style.left);
@@ -1958,7 +1969,9 @@ document.addEventListener('DOMContentLoaded', function () {
                 var startW = parseFloat(div.style.width);
                 var startH = parseFloat(div.style.height);
 
+                var hasMoved = false;
                 function onMove(ev) {
+                    hasMoved = true;
                     var dx = ev.clientX - startX, dy = ev.clientY - startY;
                     var nL = startLeft, nT = startTop, nW = startW, nH = startH;
                     if (pos.indexOf('e') >= 0) nW = startW + dx;
@@ -1971,6 +1984,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 function onUp() {
                     document.removeEventListener('mousemove', onMove);
                     document.removeEventListener('mouseup', onUp);
+                    if (!hasMoved) return;
                     // Save updated margin rect (PDF points)
                     var nL = parseFloat(div.style.left);
                     var nT = parseFloat(div.style.top);
