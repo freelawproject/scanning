@@ -689,7 +689,7 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk)).
     :param pk: Scan primary key.
-    :return: JSON response with the count of deactivated detections.
+    :return: JSON response with ``deleted`` count, or 404 if not found.
     """
     from scanning.services import _sync_detections_to_disk
 
@@ -701,6 +701,10 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     count = Detection.objects.filter(pk=detection_id, scan=scan).update(
         active=False
     )
+    if count == 0:
+        return JsonResponse(
+            {"status": "error", "message": "Detection not found"}, status=404
+        )
     output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _sync_detections_to_disk(scan.pk)
@@ -719,7 +723,7 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk) and ``new_bbox`` (list[float], ``[x0,y0,x1,y1]``)).
     :param pk: Scan primary key.
-    :return: JSON response with ``updated`` count (0 if id not found).
+    :return: JSON response with ``updated`` count, or 404 if not found.
     """
     from scanning.services import _sync_detections_to_disk
 
@@ -735,6 +739,10 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
         x1=new_bbox[2],
         y1=new_bbox[3],
     )
+    if count == 0:
+        return JsonResponse(
+            {"status": "error", "message": "Detection not found"}, status=404
+        )
     output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _sync_detections_to_disk(scan.pk)
@@ -827,7 +835,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk)).
     :param pk: Scan primary key.
-    :return: JSON response with the count of updated detections.
+    :return: JSON response with ``updated`` count, or 404 if not found.
     """
     from scanning.services import _sync_detections_to_disk
 
@@ -839,6 +847,10 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     count = Detection.objects.filter(pk=detection_id, scan=scan).update(
         confidence=1.0
     )
+    if count == 0:
+        return JsonResponse(
+            {"status": "error", "message": "Detection not found"}, status=404
+        )
     output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _sync_detections_to_disk(scan.pk)

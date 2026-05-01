@@ -1022,7 +1022,9 @@ class TestRunFullPipelinePullsFromS3(ScanningTestCase):
             # close_all() resets connections for daemon-process forking; in
             # tests it kills the test transaction -- patch it out.
             patch("django.db.connections.close_all"),
-            patch("scanning.services._pull_processing_files_from_s3"),
+            patch(
+                "scanning.services._pull_processing_files_from_s3"
+            ) as mock_pull,
             # Stop the pipeline early by failing the first read.
             patch(
                 "scanning.services.ensure_output_dir",
@@ -1032,6 +1034,8 @@ class TestRunFullPipelinePullsFromS3(ScanningTestCase):
             from scanning.services import run_full_pipeline
 
             run_full_pipeline(scan.pk)
+
+        mock_pull.assert_called_once_with(scan.pk)
 
 
 class TestUpdateDetection(ScanningTestCase):
@@ -1101,8 +1105,8 @@ class TestUpdateDetection(ScanningTestCase):
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["bbox"], [150.0, 150.0, 250.0, 250.0])
 
-    def test_unknown_detection_id_updates_zero(self):
-        """POST with a non-existent detection_id returns updated=0 without error."""
+    def test_unknown_detection_id_returns_404(self):
+        """POST with a non-existent detection_id returns 404."""
         from unittest.mock import patch
 
         user = self.make_staff_user()
@@ -1121,10 +1125,9 @@ class TestUpdateDetection(ScanningTestCase):
                 content_type="application/json",
             )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 404)
         body = json.loads(response.content)
-        self.assertEqual(body["status"], "ok")
-        self.assertEqual(body["updated"], 0)
+        self.assertEqual(body["status"], "error")
 
 
 class TestDeleteDetection(ScanningTestCase):
@@ -1185,8 +1188,8 @@ class TestDeleteDetection(ScanningTestCase):
         saved = json.loads(det_path.read_text())
         self.assertEqual(len(saved), 0)
 
-    def test_unknown_id_deletes_zero(self):
-        """POST with a non-existent detection_id returns deleted=0 without error."""
+    def test_unknown_id_returns_404(self):
+        """POST with a non-existent detection_id returns 404."""
         from unittest.mock import patch
 
         user = self.make_staff_user()
@@ -1200,10 +1203,9 @@ class TestDeleteDetection(ScanningTestCase):
                 content_type="application/json",
             )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 404)
         body = json.loads(response.content)
-        self.assertEqual(body["status"], "ok")
-        self.assertEqual(body["deleted"], 0)
+        self.assertEqual(body["status"], "error")
 
 
 class TestApproveDetection(ScanningTestCase):
@@ -1265,8 +1267,8 @@ class TestApproveDetection(ScanningTestCase):
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["confidence"], 1.0)
 
-    def test_unknown_id_updates_zero(self):
-        """POST with a non-existent detection_id returns updated=0 without error."""
+    def test_unknown_id_returns_404(self):
+        """POST with a non-existent detection_id returns 404."""
         from unittest.mock import patch
 
         user = self.make_staff_user()
@@ -1280,7 +1282,6 @@ class TestApproveDetection(ScanningTestCase):
                 content_type="application/json",
             )
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 404)
         body = json.loads(response.content)
-        self.assertEqual(body["status"], "ok")
-        self.assertEqual(body["updated"], 0)
+        self.assertEqual(body["status"], "error")
