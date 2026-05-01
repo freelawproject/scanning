@@ -51,11 +51,9 @@ class RunpodError(RuntimeError):
 class RunpodTransientError(RunpodError):
     """Retriable RunPod failure.
 
-    Today this is raised when the handler reports ``error_code="NO_GPU"``
-    (worker scheduled onto a CPU-only host). Callers in
-    ``scanning/services.py`` catch this specifically and re-queue the
-    scan to ``Status.QUEUED`` so the next daemon tick retries on a
-    (hopefully) different worker. Contrast with the base
+    Callers in ``scanning/services.py`` catch this specifically and
+    re-queue the scan to ``Status.QUEUED`` so the next daemon tick
+    retries on a (hopefully) different worker. Contrast with the base
     ``RunpodError`` which signals a terminal failure worth marking
     the scan as ``ERROR``.
     """
@@ -529,9 +527,9 @@ def _poll(
                 )
             if "error" in output:
                 # Handler returned a structured error. ``error_code``
-                # disambiguates the retriable ones (NO_GPU →
-                # RunpodTransientError) from terminal ones (bad input,
-                # unknown action → RunpodError).
+                # disambiguates transient codes (re-queue with retry
+                # increment) from terminal ones (bad input, unknown
+                # action → ERROR).
                 err_code = output.get("error_code") or ""
                 err_msg = output.get("error") or err_code or "unknown"
                 exc_cls = (
@@ -558,8 +556,10 @@ def _poll(
             return output
 
         if status in ("FAILED", "TIMED_OUT", "CANCELLED"):
-            err = body.get("error") or status
-            raise RunpodError(f"RunPod job {job_id} {status}: {err}")
+            err = body.get("error") or ""
+            raise RunpodError(
+                f"RunPod job {job_id} {status}" + (f": {err}" if err else "")
+            )
 
         # IN_QUEUE / IN_PROGRESS / unknown — keep polling.
         if status and status != last_status:
