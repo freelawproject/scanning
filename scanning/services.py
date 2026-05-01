@@ -93,12 +93,10 @@ def _handle_pipeline_exception(
 ) -> None:
     """Classify a pipeline-level exception and update the scan status.
 
-    Transient RunPod failures (e.g. worker scheduled without a GPU)
-    increment ``Scan.retry_count`` and re-queue the scan so the next
-    daemon tick retries on a different worker, up to
-    ``settings.RUNPOD_MAX_TRANSIENT_RETRIES`` attempts. When the cap
-    is hit the scan is escalated to ERROR instead. All other exceptions
-    immediately mark the scan as ERROR.
+    - ``RunpodTransientError``: increment ``retry_count`` and re-queue
+      up to ``settings.RUNPOD_MAX_TRANSIENT_RETRIES`` attempts, then
+      escalate to ERROR.
+    - All other exceptions: immediately mark the scan as ERROR.
 
     All transitions are guarded by ``status=Status.PROCESSING`` so we
     never stomp a scan that a concurrent process (stale-recovery, admin

@@ -104,6 +104,39 @@ docker tag blackletter-gpu-worker:local \
 docker push ghcr.io/freelawproject/blackletter-gpu-worker:<tag>
 ```
 
+## Releasing a new image version
+
+Pushing a new image tag to the registry does **not** automatically update
+the running endpoint. You must create a new release in the RunPod console
+so workers boot from the new image:
+
+1. Go to the **Serverless** page and open your endpoint.
+2. Click **Manage**.
+3. Select **New Release**.
+4. In the **Container Image** field, paste the full new tag, e.g.
+   `freelawproject/blackletter-gpu-worker:ff73140`.
+5. Save. Existing warm workers drain their current jobs; new workers
+   start from the updated image.
+
+### Why we pin a commit SHA instead of using `:latest`
+
+Using `:latest` is unreliable for serverless deployments for three reasons:
+
+- **Caching conflicts.** RunPod caches images on each node for faster
+  cold starts. Pushing a new `:latest` does not invalidate that cache,
+  so workers on cached nodes may continue running the old image even
+  after you "updated" it.
+- **Unpredictable deployments.** You cannot guarantee which version of
+  the code is running, making it hard to reproduce issues or roll back
+  to a known-good state.
+- **Debugging difficulties.** When a problem occurs, you won't know
+  which exact image version caused it.
+
+Pinning to a commit SHA (e.g. `:8c71f45`) makes every release
+explicit, diffable in git history, and instantly reversible.
+
+See also: [RunPod image versioning docs](https://docs.runpod.io/serverless/workers/deploy#image-versioning).
+
 ## Configuring the RunPod endpoint
 
 In the RunPod Serverless console:

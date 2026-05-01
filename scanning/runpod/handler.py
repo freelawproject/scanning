@@ -102,7 +102,8 @@ def _preload() -> None:
     if not _CUDA_AVAILABLE:
         logger.error(
             "GPU not available; skipping weight/model preload. Jobs on "
-            "this worker will fail fast with error_code=NO_GPU."
+            "this worker will return error_code=NO_GPU; fitness check "
+            "will prevent this worker from accepting jobs."
         )
         return
 
@@ -160,6 +161,21 @@ _WORKER_BOOT_MS = int((_WORKER_READY_AT - _WORKER_BOOT_START) * 1000)
 logger.info(
     "worker ready: boot_ms=%d cuda=%s", _WORKER_BOOT_MS, _CUDA_AVAILABLE
 )
+
+
+# ── Fitness check ────────────────────────────────────────────────────
+@runpod.serverless.register_fitness_check
+def _require_gpu() -> None:
+    """Exit before accepting jobs if no GPU is available.
+
+    Runs at startup before RunPod's heartbeat, so the worker is never
+    added to the available pool and no jobs are ever assigned to it.
+    Queued jobs are picked up automatically by healthy GPU workers.
+    """
+    if not _CUDA_AVAILABLE:
+        raise RuntimeError(
+            "GPU not available on this worker. Exiting to avoid CPU-only billing."
+        )
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -465,9 +481,9 @@ def handler(job: dict) -> dict:
 
     _tag_sentry(job, action, scan_pk)
 
-    # Fail fast if this worker got scheduled onto a CPU-only host.
-    # Daemon-side maps error_code=NO_GPU to a transient error and
-    # re-queues the scan so the next daemon tick gets a fresh worker.
+    # Belt-and-suspenders: fitness check should prevent CPU-only workers
+    # from ever reaching this point, but handle it defensively in case
+    # CUDA becomes unavailable after startup.
     if not _CUDA_AVAILABLE:
         logger.error(
             "rejecting %s job for scan %s: no GPU on this worker",
