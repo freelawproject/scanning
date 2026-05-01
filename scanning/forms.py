@@ -1,4 +1,5 @@
 from django import forms
+from django.contrib.auth.models import User
 from django.core.files.uploadedfile import UploadedFile
 from django.core.validators import FileExtensionValidator
 
@@ -9,6 +10,21 @@ from scanning.models import (
     Scan,
     Status,
 )
+
+
+class ProfileForm(forms.ModelForm):
+    """Form for editing user profile information."""
+
+    class Meta:
+        model = User
+        fields = ["first_name", "last_name", "email"]
+        widgets = {
+            "first_name": forms.TextInput(
+                attrs={"class": "input-text w-full"}
+            ),
+            "last_name": forms.TextInput(attrs={"class": "input-text w-full"}),
+            "email": forms.EmailInput(attrs={"class": "input-text w-full"}),
+        }
 
 
 class ReporterChoiceField(forms.ModelChoiceField):

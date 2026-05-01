@@ -8,42 +8,42 @@
   <div class="flex items-center gap-3">
     <span class="text-sm text-gray-500 dark:text-gray-400">{{ page_obj.paginator.count }} opinions</span>
     {% if user.is_superuser %}
-    <a href="{% url 'opinion_upload' %}" class="btn-primary text-sm">Upload</a>
+    <a href="{% url 'opinion_upload' %}" class="btn-primary text-sm"><i class="fa-solid fa-upload"></i> Upload</a>
     {% endif %}
   </div>
 </div>
 
 <!-- Filters -->
 <div class="card mb-6">
-  <form method="get" class="flex flex-col sm:flex-row gap-3">
-    <div class="flex-1">
-      <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
-      <select id="filter-reporter" name="reporter" class="input-text w-full">
-        <option value="">All reporters</option>
-        {% for value, label in reporter_choices %}
-        <option value="{{ value }}" {% if current_reporter == value %}selected{% endif %}>{{ label }}</option>
-        {% endfor %}
-      </select>
+  <form method="get">
+    <div class="flex flex-col sm:flex-row gap-3">
+      <div class="flex-1">
+        <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
+        <select id="filter-reporter" name="reporter" class="input-text w-full">
+          <option value="">All reporters</option>
+          {% for value, label in reporter_choices %}
+          <option value="{{ value }}" {% if current_reporter == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="flex-1">
+        <label for="filter-volume" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Volume</label>
+        <input id="filter-volume" name="volume" type="text" inputmode="numeric" pattern="[0-9]*"
+               value="{{ current_volume }}" placeholder="e.g. 237" class="input-text w-full">
+      </div>
+      <div class="flex-1">
+        <label for="filter-status" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Status</label>
+        <select id="filter-status" name="status" class="input-text w-full">
+          <option value="">All</option>
+          {% for value, label in status_choices %}
+          <option value="{{ value }}" {% if current_status == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
     </div>
-    <div class="flex-1">
-      <label for="filter-volume" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Volume</label>
-      <input id="filter-volume" name="volume" type="text" inputmode="numeric" pattern="[0-9]*"
-             value="{{ current_volume }}" placeholder="e.g. 237" class="input-text w-full">
-    </div>
-    <div class="flex-1">
-      <label for="filter-status" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Status</label>
-      <select id="filter-status" name="status" class="input-text w-full">
-        <option value="">All</option>
-        {% for value, label in status_choices %}
-        <option value="{{ value }}" {% if current_status == value %}selected{% endif %}>{{ label }}</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div class="flex items-end gap-2">
-      <button type="submit" class="btn-outline">Filter</button>
-      {% if current_reporter or current_volume or current_status %}
-      <a href="{% url 'opinion_list' %}" class="btn-ghost text-sm">Clear</a>
-      {% endif %}
+    <div class="flex items-center justify-end gap-2 mt-3">
+      <a href="{% url 'opinion_list' %}" class="btn-ghost text-sm"><i class="fa-solid fa-xmark"></i> Clear filters</a>
+      <button type="submit" class="btn-outline"><i class="fa-solid fa-magnifying-glass"></i> Filter</button>
     </div>
   </form>
 </div>

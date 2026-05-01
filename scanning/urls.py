@@ -11,6 +11,8 @@ from scanning.views import (
     opinion_detail,
     opinion_list,
     opinion_upload,
+    password_change,
+    profile,
     queue_detail_view,
     queue_upload,
     queue_view,
@@ -67,6 +69,8 @@ urlpatterns = [
     path("opinions/", opinion_list, name="opinion_list"),
     path("opinions/upload/", opinion_upload, name="opinion_upload"),
     path("opinions/<int:pk>/", opinion_detail, name="opinion_detail"),
+    path("profile/", profile, name="profile"),
+    path("profile/password/", password_change, name="password_change"),
     path("queue/", queue_view, name="queue"),
     path(
         "queue/<str:reporter_slug>/<int:vol>/",

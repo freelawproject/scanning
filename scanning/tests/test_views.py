@@ -181,14 +181,14 @@ class TestScanDetail(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, scan.reporter.full_name)
 
-    def test_non_staff_no_review_form(self):
+    def test_non_staff_sees_review_form(self):
         user = self.make_user()
         self.client.force_login(user)
         scan = ScanFactory(uploaded_by=user)
         response = self.client.get(
             reverse("scan_detail", kwargs={"pk": scan.pk})
         )
-        self.assertIsNone(response.context["review_form"])
+        self.assertIsNotNone(response.context["review_form"])
 
     def test_can_view_other_users_scan(self):
         user = self.make_user()
@@ -683,6 +683,83 @@ class TestOpinionListEmptyState(ScanningTestCase):
         self.client.force_login(self.make_user())
         response = self.client.get(reverse("opinion_list"))
         self.assertNotContains(response, "Upload your first opinion")
+
+
+class TestProfile(ScanningTestCase):
+    """Test the user profile view."""
+
+    def test_login_required(self):
+        response = self.client.get(reverse("profile"))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/login/", response.url)
+
+    def test_get_renders_form(self):
+        self.client.force_login(self.make_user())
+        response = self.client.get(reverse("profile"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Profile")
+
+    def test_post_updates_fields(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        response = self.client.post(
+            reverse("profile"),
+            {
+                "first_name": "Jane",
+                "last_name": "Doe",
+                "email": "jane@example.com",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        user.refresh_from_db()
+        self.assertEqual(user.first_name, "Jane")
+        self.assertEqual(user.last_name, "Doe")
+        self.assertEqual(user.email, "jane@example.com")
+
+
+class TestPasswordChange(ScanningTestCase):
+    """Test the password change view."""
+
+    def test_login_required(self):
+        response = self.client.get(reverse("password_change"))
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/login/", response.url)
+
+    def test_get_renders_form(self):
+        self.client.force_login(self.make_user())
+        response = self.client.get(reverse("password_change"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Change Password")
+
+    def test_post_valid_passwords_redirects(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        response = self.client.post(
+            reverse("password_change"),
+            {
+                "old_password": "testpass123",
+                "new_password1": "newSecurePass456!",
+                "new_password2": "newSecurePass456!",
+            },
+        )
+        self.assertRedirects(response, reverse("profile"))
+        user.refresh_from_db()
+        self.assertTrue(user.check_password("newSecurePass456!"))
+
+    def test_post_wrong_old_password_fails(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        response = self.client.post(
+            reverse("password_change"),
+            {
+                "old_password": "wrongpass",
+                "new_password1": "newSecurePass456!",
+                "new_password2": "newSecurePass456!",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password("testpass123"))
 
 
 class TestMonitoring(TestCase):
