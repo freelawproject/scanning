@@ -525,19 +525,6 @@ def _poll(
                 raise RunpodError(
                     f"RunPod job {job_id} returned non-dict output: {output!r}"
                 )
-            if "error" in output:
-                # Handler returned a structured error. ``error_code``
-                # disambiguates transient codes (re-queue with retry
-                # increment) from terminal ones (bad input, unknown
-                # action → ERROR).
-                err_code = output.get("error_code") or ""
-                err_msg = output.get("error") or err_code or "unknown"
-                exc_cls = (
-                    RunpodTransientError
-                    if err_code in _TRANSIENT_ERROR_CODES
-                    else RunpodError
-                )
-                raise exc_cls(f"handler error_code={err_code!r}: {err_msg}")
             execution_ms = body.get("executionTime", "?")
             action_ms = output.get("duration_ms", "?")
             model_durations = output.get("model_durations_ms")
@@ -557,7 +544,38 @@ def _poll(
 
         if status in ("FAILED", "TIMED_OUT", "CANCELLED"):
             err = body.get("error") or ""
-            raise RunpodError(
+            # The RunPod SDK (rp_job.py::run_job) pops ``error`` from
+            # the handler's return dict and places it at the top level
+            # of the result payload before POSTing to RunPod. For example,
+            # a handler returning:
+            #
+            #   {"error": "bad input", "error_code": "BAD_INPUT", ...}
+            #
+            # becomes:
+            #
+            #   {"output": {"error_code": "BAD_INPUT", ...}, "error": "bad input"}
+            #
+            # RunPod marks this FAILED with ``error`` at the top level.
+            # ``error_code`` survives inside ``output``, so we can still
+            # distinguish transient errors (re-queue) from terminal ones
+            # (mark scan ERROR).
+            #
+            # When ``output`` is absent the failure is a RunPod platform
+            # error (e.g. "job timed out after 1 retries", worker crash).
+            # Those are infrastructure problems, not handler logic failures,
+            # so re-queue rather than permanently failing the scan.
+            err_code = (body.get("output") or {}).get("error_code") or ""
+            if err_code:
+                exc_cls = (
+                    RunpodTransientError
+                    if err_code in _TRANSIENT_ERROR_CODES
+                    else RunpodError
+                )
+            elif status == "FAILED":
+                exc_cls = RunpodTransientError
+            else:
+                exc_cls = RunpodError
+            raise exc_cls(
                 f"RunPod job {job_id} {status}" + (f": {err}" if err else "")
             )
 

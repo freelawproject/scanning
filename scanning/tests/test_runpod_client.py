@@ -374,34 +374,37 @@ class TestPoll(TestCase):
             self._poll([(404, None)])
 
     def test_no_gpu_output_raises_transient(self):
+        # Handler returns {"error": ..., "error_code": "NO_GPU", ...}.
+        # The SDK moves "error" to the top level; RunPod marks the job
+        # FAILED. The daemon reads error_code from output to raise
+        # RunpodTransientError so the scan is re-queued.
         with self.assertRaises(runpod_client.RunpodTransientError):
             self._poll(
                 [
                     (
                         200,
                         {
-                            "status": "COMPLETED",
-                            "output": {
-                                "error": "no gpu",
-                                "error_code": "NO_GPU",
-                            },
+                            "status": "FAILED",
+                            "error": "no gpu",
+                            "output": {"error_code": "NO_GPU"},
                         },
                     )
                 ]
             )
 
     def test_non_transient_handler_error_raises_runpod_error(self):
+        # Handler errors with non-transient codes (BAD_INPUT, UNKNOWN_ACTION)
+        # also arrive as FAILED but raise the base RunpodError, not the
+        # transient subclass, so the scan is marked ERROR rather than re-queued.
         with self.assertRaises(runpod_client.RunpodError) as ctx:
             self._poll(
                 [
                     (
                         200,
                         {
-                            "status": "COMPLETED",
-                            "output": {
-                                "error": "bad input",
-                                "error_code": "BAD_INPUT",
-                            },
+                            "status": "FAILED",
+                            "error": "bad input",
+                            "output": {"error_code": "BAD_INPUT"},
                         },
                     )
                 ]
@@ -411,13 +414,32 @@ class TestPoll(TestCase):
             ctx.exception, runpod_client.RunpodTransientError
         )
 
-    def test_terminal_failure_statuses_raise(self):
-        """FAILED / TIMED_OUT / CANCELLED all end the poll as RunpodError.
+    def test_failed_with_no_output_raises_transient(self):
+        # RunPod platform failures (worker timeout, "job timed out after N
+        # retries", worker crash) arrive as FAILED with no output field.
+        # These are infrastructure problems, not handler logic failures, so
+        # re-queue rather than permanently failing the scan.
+        with self.assertRaises(runpod_client.RunpodTransientError):
+            self._poll(
+                [
+                    (
+                        200,
+                        {
+                            "status": "FAILED",
+                            "error": "job timed out after 1 retries",
+                            "retries": 1,
+                        },
+                    )
+                ]
+            )
 
-        One test with subTest so coverage pins the tuple contents
-        without three nearly-identical test definitions.
+    def test_terminal_failure_statuses_raise(self):
+        """TIMED_OUT / CANCELLED end the poll as RunpodError.
+
+        FAILED without output is transient (platform failure); FAILED
+        with output.error_code is handled by the structured-error tests.
         """
-        for status in ("FAILED", "TIMED_OUT", "CANCELLED"):
+        for status in ("TIMED_OUT", "CANCELLED"):
             with self.subTest(status=status):
                 with self.assertRaises(runpod_client.RunpodError):
                     self._poll([(200, {"status": status, "error": "boom"})])
