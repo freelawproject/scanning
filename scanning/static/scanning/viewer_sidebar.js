@@ -324,12 +324,7 @@ function approveDetection(btn) {
             "Content-Type": "application/json",
             "X-CSRFToken": cfg.csrfToken,
         },
-        body: JSON.stringify({
-            page_index: d.pageIndex,
-            label: d.label,
-            label_id: d.labelId,
-            bbox: d.bbox,
-        }),
+        body: JSON.stringify({detection_id: d.detectionId}),
     })
         .then(function (r) {
             return r.json();
@@ -340,6 +335,10 @@ function approveDetection(btn) {
             row.style.pointerEvents = "none";
             btn.textContent = "\u2713";
             pairOpinions();
+        })
+        .catch(function () {
+            console.error("Failed to approve detection");
+            showToast("Failed to approve detection");
         });
 }
 
@@ -355,12 +354,7 @@ function deleteUnmatchedDetection(btn) {
             "Content-Type": "application/json",
             "X-CSRFToken": cfg.csrfToken,
         },
-        body: JSON.stringify({
-            page_index: d.pageIndex,
-            label: d.label,
-            label_id: d.labelId,
-            bbox: d.bbox,
-        }),
+        body: JSON.stringify({detection_id: d.detectionId}),
     })
         .then(function (r) {
             return r.json();
@@ -370,6 +364,10 @@ function deleteUnmatchedDetection(btn) {
             row.style.opacity = "0.3";
             row.style.pointerEvents = "none";
             btn.textContent = "\u2717";
+        })
+        .catch(function () {
+            console.error("Failed to delete detection");
+            showToast("Failed to delete detection");
         });
 }
 
@@ -478,5 +476,6 @@ function _getDetectionData(el) {
         imgH: parseInt(row.dataset.imgH),
         label: row.dataset.unmatchedLabel,
         labelId: parseInt(row.dataset.labelId),
+        detectionId: parseInt(row.dataset.detectionId),
     };
 }

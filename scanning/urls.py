@@ -42,6 +42,7 @@ from scanning.views_api import (
     serve_opinionscan_pdf,
     serve_redacted_pdf,
     serve_redaction_rects,
+    update_detection,
 )
 from scanning.views_process import (
     add_page_insert,
@@ -200,6 +201,11 @@ urlpatterns = [
         "scans/<int:pk>/delete-detection/",
         delete_detection,
         name="delete_detection",
+    ),
+    path(
+        "scans/<int:pk>/update-detection/",
+        update_detection,
+        name="update_detection",
     ),
     path(
         "scans/<int:pk>/bake-redactions/",

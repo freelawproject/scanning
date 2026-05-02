@@ -369,13 +369,17 @@ document.addEventListener('DOMContentLoaded', function () {
             wrapper.style.width = viewport.width + 'px';
             wrapper.style.height = viewport.height + 'px';
             wrapper.style.background = '';
+            pageDiv.style.width = viewport.width + 'px';
 
             if (defaultPageWidth === 918 && viewport.width !== 918) {
                 defaultPageWidth = viewport.width;
                 container.querySelectorAll('.lazy-page').forEach(function (el) {
                     if (!renderedPages[parseInt(el.dataset.pdfIndex)]) {
                         var w = el.querySelector('.canvas-wrapper');
-                        if (w) w.style.width = defaultPageWidth + 'px';
+                        if (w) {
+                            w.style.width = defaultPageWidth + 'px';
+                            el.style.width = defaultPageWidth + 'px';
+                        }
                     }
                 });
             }
@@ -749,6 +753,10 @@ document.addEventListener('DOMContentLoaded', function () {
             box.style.top = (d.bbox[1] * sy) + 'px';
             box.style.width = ((d.bbox[2] - d.bbox[0]) * sx) + 'px';
             box.style.height = ((d.bbox[3] - d.bbox[1]) * sy) + 'px';
+            box.dataset.sx = sx;
+            box.dataset.sy = sy;
+            box.dataset.imgWidth = imgW;
+            box.dataset.imgHeight = imgH;
             box.style.borderColor = color;
             box.title = d.label + ' (' + d.confidence + ')';
 
@@ -1526,14 +1534,69 @@ document.addEventListener('DOMContentLoaded', function () {
             });
             div.appendChild(h);
         });
+
+        div.style.cursor = 'move';
+
+        div._redactionMoveHandler = function(e) {
+            if (e.target !== div) return;
+            e.stopPropagation();
+            e.preventDefault();
+            var startX = e.clientX, startY = e.clientY;
+            var startLeft = parseFloat(div.style.left);
+            var startTop  = parseFloat(div.style.top);
+            var hasMoved = false;
+
+            function onMove(ev) {
+                hasMoved = true;
+                div.style.left = (startLeft + ev.clientX - startX) + 'px';
+                div.style.top  = (startTop  + ev.clientY - startY) + 'px';
+            }
+
+            function onUp() {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                if (!hasMoved) return;
+                var nL = parseFloat(div.style.left);
+                var nT = parseFloat(div.style.top);
+                var nW = parseFloat(div.style.width);
+                var nH = parseFloat(div.style.height);
+                var oldX0 = rectData.x0, oldY0 = rectData.y0;
+                var oldX1 = rectData.x1, oldY1 = rectData.y1;
+                rectData.x0 = Math.round(nL / dsx * 10) / 10;
+                rectData.y0 = Math.round(nT / dsy * 10) / 10;
+                rectData.x1 = Math.round((nL + nW) / dsx * 10) / 10;
+                rectData.y1 = Math.round((nT + nH) / dsy * 10) / 10;
+                var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
+                fetch('/scans/' + documentId + '/save-redaction-rect/', {
+                    method: 'POST',
+                    headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        page_index: _pageIndexForNum(pageNum),
+                        original: {x0: oldX0, y0: oldY0, x1: oldX1, y1: oldY1},
+                        adjusted: {x0: rectData.x0, y0: rectData.y0, x1: rectData.x1, y1: rectData.y1},
+                        type: rectData.type,
+                        fill: rectData.fill,
+                    }),
+                });
+            }
+
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        };
+        div.addEventListener('mousedown', div._redactionMoveHandler);
     }
 
     function _deselectRedactionBox() {
         if (!_selectedRedactionBox) return;
         _selectedRedactionBox.style.outline = '';
         _selectedRedactionBox.style.zIndex = '6';
+        _selectedRedactionBox.style.cursor = '';
         // Remove edit controls
         _selectedRedactionBox.querySelectorAll('.redaction-edit-btn, .redaction-resize-handle').forEach(function(el) { el.remove(); });
+        if (_selectedRedactionBox._redactionMoveHandler) {
+            _selectedRedactionBox.removeEventListener('mousedown', _selectedRedactionBox._redactionMoveHandler);
+            _selectedRedactionBox._redactionMoveHandler = null;
+        }
         _selectedRedactionBox = null;
     }
 
@@ -1550,7 +1613,9 @@ document.addEventListener('DOMContentLoaded', function () {
         var startW = parseFloat(div.style.width);
         var startH = parseFloat(div.style.height);
 
+        var hasMoved = false;
         function onMove(e) {
+            hasMoved = true;
             var dx = e.clientX - startX;
             var dy = e.clientY - startY;
             var newLeft = startLeft, newTop = startTop, newW = startW, newH = startH;
@@ -1567,6 +1632,7 @@ document.addEventListener('DOMContentLoaded', function () {
         function onUp() {
             document.removeEventListener('mousemove', onMove);
             document.removeEventListener('mouseup', onUp);
+            if (!hasMoved) return;
 
             // Update rectData with new position in PDF coordinates
             var newLeft = parseFloat(div.style.left);
@@ -1671,13 +1737,36 @@ document.addEventListener('DOMContentLoaded', function () {
     // ── Detection box editing ──
     var _selectedDetBox = null;
 
+    function _saveDetectionBbox(newBbox, det) {
+        fetch('/scans/' + documentId + '/update-detection/', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+            body: JSON.stringify({detection_id: det.id, new_bbox: newBbox}),
+        }).then(function(r) { return r.json(); }).then(function(data) {
+            if (data.status === 'ok') {
+                det.bbox[0] = newBbox[0];
+                det.bbox[1] = newBbox[1];
+                det.bbox[2] = newBbox[2];
+                det.bbox[3] = newBbox[3];
+            }
+        }).catch(function() {
+            console.error('Failed to save detection bbox');
+            showToast('Failed to save detection bbox');
+        });
+    }
+
     function _selectDetectionBox(div, det) {
         _deselectDetectionBox();
         _selectedDetBox = div;
         div.style.outline = '2px solid #f59e0b';
         div.style.zIndex = '20';
+        div.style.cursor = 'move';
         var selLabel = div.querySelector('.detection-label');
         if (selLabel) selLabel.style.display = '';
+
+        // Scale factors: div is in display px, det.bbox is in image px
+        var sx = parseFloat(div.style.width) / (det.bbox[2] - det.bbox[0]);
+        var sy = parseFloat(div.style.height) / (det.bbox[3] - det.bbox[1]);
 
         // Action buttons toolbar
         var toolbar = document.createElement('div');
@@ -1692,34 +1781,123 @@ document.addEventListener('DOMContentLoaded', function () {
             fetch('/scans/' + documentId + '/delete-detection/', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
-                body: JSON.stringify({
-                    page_index: det.page_index,
-                    label: det.label,
-                    label_id: det.label_id,
-                    bbox: det.bbox,
-                }),
+                body: JSON.stringify({detection_id: det.id}),
             }).then(function(r) { return r.json(); }).then(function(data) {
                 if (data.status === 'ok') {
-                    console.log('Deleted ' + data.deleted + ' detection(s) from DB for ' + det.label + ' on page_index=' + det.page_index);
                     div.remove();
                     _selectedDetBox = null;
-                    // Remove matching sidebar item for unmatched captions/keys
                     var sidebarItems = document.querySelectorAll('[data-unmatched-page="' + det.page_index + '"][data-unmatched-label="' + det.label + '"]');
                     sidebarItems.forEach(function(el) { el.remove(); });
                     refreshOverlays();
                 }
+            }).catch(function() {
+                console.error('Failed to delete detection');
+                showToast('Failed to delete detection');
             });
         });
-
         toolbar.appendChild(deleteBtn);
         div.appendChild(toolbar);
+
+        // Resize handles
+        ['nw','n','ne','w','e','sw','s','se'].forEach(function(pos) {
+            var h = document.createElement('div');
+            h.className = 'det-resize-handle';
+            h.dataset.pos = pos;
+            h.style.cssText = 'position:absolute;width:8px;height:8px;background:#f59e0b;border:1px solid #fff;z-index:22;cursor:' + pos + '-resize;';
+            if (pos.indexOf('n') >= 0) h.style.top = '-4px';
+            if (pos.indexOf('s') >= 0) h.style.bottom = '-4px';
+            if (pos.indexOf('w') >= 0) h.style.left = '-4px';
+            if (pos.indexOf('e') >= 0) h.style.right = '-4px';
+            if (pos === 'n' || pos === 's') h.style.left = 'calc(50% - 4px)';
+            if (pos === 'w' || pos === 'e') h.style.top = 'calc(50% - 4px)';
+
+            h.addEventListener('mousedown', function(e) {
+                e.stopPropagation();
+                e.preventDefault();
+                var startX = e.clientX, startY = e.clientY;
+                var startLeft = parseFloat(div.style.left);
+                var startTop = parseFloat(div.style.top);
+                var startW = parseFloat(div.style.width);
+                var startH = parseFloat(div.style.height);
+
+                var hasMoved = false;
+                function onMove(e) {
+                    hasMoved = true;
+                    var dx = e.clientX - startX, dy = e.clientY - startY;
+                    var newLeft = startLeft, newTop = startTop, newW = startW, newH = startH;
+                    if (pos.indexOf('e') >= 0) newW = Math.max(10, startW + dx);
+                    if (pos.indexOf('s') >= 0) newH = Math.max(10, startH + dy);
+                    if (pos.indexOf('w') >= 0) { newLeft = startLeft + dx; newW = Math.max(10, startW - dx); }
+                    if (pos.indexOf('n') >= 0) { newTop = startTop + dy; newH = Math.max(10, startH - dy); }
+                    div.style.left = newLeft + 'px';
+                    div.style.top = newTop + 'px';
+                    div.style.width = newW + 'px';
+                    div.style.height = newH + 'px';
+                }
+
+                function onUp() {
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                    if (!hasMoved) return;
+                    var newBbox = [
+                        parseFloat(div.style.left) / sx,
+                        parseFloat(div.style.top) / sy,
+                        (parseFloat(div.style.left) + parseFloat(div.style.width)) / sx,
+                        (parseFloat(div.style.top) + parseFloat(div.style.height)) / sy,
+                    ];
+                    _saveDetectionBbox(newBbox, det);
+                }
+
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+            div.appendChild(h);
+        });
+
+        // Drag-to-move (click on box body, not handles)
+        div._moveHandler = function(e) {
+            if (e.target !== div) return;
+            e.preventDefault();
+            var startX = e.clientX, startY = e.clientY;
+            var startLeft = parseFloat(div.style.left);
+            var startTop = parseFloat(div.style.top);
+            var hasMoved = false;
+
+            function onMove(e) {
+                hasMoved = true;
+                div.style.left = (startLeft + e.clientX - startX) + 'px';
+                div.style.top = (startTop + e.clientY - startY) + 'px';
+            }
+
+            function onUp() {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                if (!hasMoved) return;
+                var newBbox = [
+                    parseFloat(div.style.left) / sx,
+                    parseFloat(div.style.top) / sy,
+                    (parseFloat(div.style.left) + parseFloat(div.style.width)) / sx,
+                    (parseFloat(div.style.top) + parseFloat(div.style.height)) / sy,
+                ];
+                _saveDetectionBbox(newBbox, det);
+            }
+
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        };
+        div.addEventListener('mousedown', div._moveHandler);
     }
 
     function _deselectDetectionBox() {
         if (!_selectedDetBox) return;
         _selectedDetBox.style.outline = '';
         _selectedDetBox.style.zIndex = '';
+        _selectedDetBox.style.cursor = '';
         _selectedDetBox.querySelectorAll('.det-resize-handle').forEach(function(el) { el.remove(); });
+        if (_selectedDetBox._moveHandler) {
+            _selectedDetBox.removeEventListener('mousedown', _selectedDetBox._moveHandler);
+            _selectedDetBox._moveHandler = null;
+        }
         _selectedDetBox = null;
     }
 
@@ -1791,7 +1969,9 @@ document.addEventListener('DOMContentLoaded', function () {
                 var startW = parseFloat(div.style.width);
                 var startH = parseFloat(div.style.height);
 
+                var hasMoved = false;
                 function onMove(ev) {
+                    hasMoved = true;
                     var dx = ev.clientX - startX, dy = ev.clientY - startY;
                     var nL = startLeft, nT = startTop, nW = startW, nH = startH;
                     if (pos.indexOf('e') >= 0) nW = startW + dx;
@@ -1804,6 +1984,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 function onUp() {
                     document.removeEventListener('mousemove', onMove);
                     document.removeEventListener('mouseup', onUp);
+                    if (!hasMoved) return;
                     // Save updated margin rect (PDF points)
                     var nL = parseFloat(div.style.left);
                     var nT = parseFloat(div.style.top);

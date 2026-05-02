@@ -1,4 +1,6 @@
 import io
+import json
+import pathlib
 import shutil
 import tempfile
 from datetime import timedelta
@@ -1111,3 +1113,252 @@ class TestRunFullPipelinePullsFromS3(ScanningTestCase):
             run_full_pipeline(scan.pk)
 
         mock_pull.assert_called_once_with(scan.pk)
+
+
+class TestUpdateDetection(ScanningTestCase):
+    """Tests for the update_detection endpoint."""
+
+    def _make_scan_with_detection(self):
+        """Create a scan, its output_dir, and one Detection record.
+
+        :return: Tuple of (scan, detection).
+        :rtype: tuple
+        """
+        scan = ScanFactory()
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        det = Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="CASE_CAPTION",
+            label_id=1,
+            confidence=0.9,
+            x0=100.0,
+            y0=100.0,
+            x1=200.0,
+            y1=200.0,
+            img_width=1200,
+            img_height=1600,
+            model_name=Detection.ModelName.SMALL,
+            model_count=1,
+            found_by=[{"model": "yolo", "confidence": 0.9}],
+        )
+        return scan, det
+
+    def test_updates_db_and_disk(self):
+        """POST with valid detection_id updates DB coords and writes detections.json."""
+        from unittest.mock import patch
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, det = self._make_scan_with_detection()
+
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            response = self.client.post(
+                reverse("update_detection", kwargs={"pk": scan.pk}),
+                data=json.dumps(
+                    {
+                        "detection_id": det.pk,
+                        "new_bbox": [150.0, 150.0, 250.0, 250.0],
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["updated"], 1)
+
+        det.refresh_from_db()
+        self.assertEqual(det.x0, 150.0)
+        self.assertEqual(det.y0, 150.0)
+        self.assertEqual(det.x1, 250.0)
+        self.assertEqual(det.y1, 250.0)
+
+        det_path = pathlib.Path(scan.output_dir) / "detections.json"
+        self.assertTrue(det_path.exists())
+        saved = json.loads(det_path.read_text())
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["bbox"], [150.0, 150.0, 250.0, 250.0])
+
+    def test_unknown_detection_id_returns_404(self):
+        """POST with a non-existent detection_id returns 404."""
+        from unittest.mock import patch
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, _det = self._make_scan_with_detection()
+
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            response = self.client.post(
+                reverse("update_detection", kwargs={"pk": scan.pk}),
+                data=json.dumps(
+                    {
+                        "detection_id": 999999,
+                        "new_bbox": [0.0, 0.0, 10.0, 10.0],
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 404)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "error")
+
+
+class TestDeleteDetection(ScanningTestCase):
+    """Tests for the delete_detection endpoint."""
+
+    def _make_scan_with_detection(self):
+        """Create a scan, its output_dir, and one active Detection record.
+
+        :return: Tuple of (scan, detection).
+        :rtype: tuple
+        """
+        scan = ScanFactory()
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        det = Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="CASE_CAPTION",
+            label_id=1,
+            confidence=0.9,
+            x0=100.0,
+            y0=100.0,
+            x1=200.0,
+            y1=200.0,
+            img_width=1200,
+            img_height=1600,
+            model_name=Detection.ModelName.SMALL,
+            model_count=1,
+            found_by=[{"model": "small", "confidence": 0.9}],
+        )
+        return scan, det
+
+    def test_deactivates_db_and_removes_from_disk(self):
+        """POST with valid detection_id sets active=False and removes it from detections.json."""
+        from unittest.mock import patch
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, det = self._make_scan_with_detection()
+
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            response = self.client.post(
+                reverse("delete_detection", kwargs={"pk": scan.pk}),
+                data=json.dumps({"detection_id": det.pk}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["deleted"], 1)
+
+        det.refresh_from_db()
+        self.assertFalse(det.active)
+
+        det_path = pathlib.Path(scan.output_dir) / "detections.json"
+        self.assertTrue(det_path.exists())
+        saved = json.loads(det_path.read_text())
+        self.assertEqual(len(saved), 0)
+
+    def test_unknown_id_returns_404(self):
+        """POST with a non-existent detection_id returns 404."""
+        from unittest.mock import patch
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, _det = self._make_scan_with_detection()
+
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            response = self.client.post(
+                reverse("delete_detection", kwargs={"pk": scan.pk}),
+                data=json.dumps({"detection_id": 999999}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 404)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "error")
+
+
+class TestApproveDetection(ScanningTestCase):
+    """Tests for the approve_detection endpoint."""
+
+    def _make_scan_with_detection(self):
+        """Create a scan, its output_dir, and one Detection record.
+
+        :return: Tuple of (scan, detection).
+        :rtype: tuple
+        """
+        scan = ScanFactory()
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        det = Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="KEY_ICON",
+            label_id=2,
+            confidence=0.7,
+            x0=50.0,
+            y0=50.0,
+            x1=100.0,
+            y1=100.0,
+            img_width=1200,
+            img_height=1600,
+            model_name=Detection.ModelName.SMALL,
+            model_count=1,
+            found_by=[{"model": "small", "confidence": 0.7}],
+        )
+        return scan, det
+
+    def test_sets_confidence_and_syncs_disk(self):
+        """POST with valid detection_id sets confidence=1.0 and updates detections.json."""
+        from unittest.mock import patch
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, det = self._make_scan_with_detection()
+
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            response = self.client.post(
+                reverse("approve_detection", kwargs={"pk": scan.pk}),
+                data=json.dumps({"detection_id": det.pk}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["updated"], 1)
+
+        det.refresh_from_db()
+        self.assertEqual(det.confidence, 1.0)
+
+        det_path = pathlib.Path(scan.output_dir) / "detections.json"
+        self.assertTrue(det_path.exists())
+        saved = json.loads(det_path.read_text())
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["confidence"], 1.0)
+
+    def test_unknown_id_returns_404(self):
+        """POST with a non-existent detection_id returns 404."""
+        from unittest.mock import patch
+
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, _det = self._make_scan_with_detection()
+
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            response = self.client.post(
+                reverse("approve_detection", kwargs={"pk": scan.pk}),
+                data=json.dumps({"detection_id": 999999}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 404)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "error")

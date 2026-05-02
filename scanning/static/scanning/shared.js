@@ -105,6 +105,48 @@ function undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelet
 }
 
 /**
+ * Show a stacking toast notification that auto-dismisses after 5 seconds.
+ *
+ * @param {string} message - Text to display.
+ * @param {string} [type="error"] - "error" (red) or "info" (blue).
+ */
+function showToast(message, type) {
+    type = type || 'error';
+    var container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        container.style.cssText = 'position:fixed;bottom:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:9999;pointer-events:none;';
+        document.body.appendChild(container);
+    }
+    var toast = document.createElement('div');
+    var bg = type === 'error' ? '#dc2626' : '#2563eb';
+    toast.style.cssText = 'background:' + bg + ';color:#fff;padding:10px 16px;border-radius:6px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.3);opacity:1;transition:opacity 0.4s;max-width:320px;pointer-events:auto;display:flex;align-items:center;gap:10px;';
+
+    var text = document.createElement('span');
+    text.style.flex = '1';
+    text.textContent = message;
+    toast.appendChild(text);
+
+    var closeBtn = document.createElement('button');
+    closeBtn.textContent = '✕';
+    closeBtn.style.cssText = 'background:none;border:none;color:#fff;cursor:pointer;font-size:14px;padding:0;line-height:1;opacity:0.8;flex-shrink:0;';
+    closeBtn.addEventListener('click', function () { dismiss(); });
+    toast.appendChild(closeBtn);
+
+    container.appendChild(toast);
+
+    function dismiss() {
+        toast.style.opacity = '0';
+        setTimeout(function () { toast.remove(); }, 400);
+    }
+
+    var timer = setTimeout(dismiss, 5000);
+    closeBtn.addEventListener('mouseenter', function () { clearTimeout(timer); });
+    closeBtn.addEventListener('mouseleave', function () { timer = setTimeout(dismiss, 2000); });
+}
+
+/**
  * Draw existing redaction rectangles on a canvas overlay.
  *
  * @param {HTMLCanvasElement} overlay - The canvas element.

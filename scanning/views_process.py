@@ -45,6 +45,7 @@ def _unmatched_detection_dict(
     :rtype: dict
     """
     return {
+        "id": det.pk,
         "pdf_page": det.page_index + 1,
         "page_index": det.page_index,
         "label_id": det.label_id,

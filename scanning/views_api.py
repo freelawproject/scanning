@@ -84,6 +84,7 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     )
     data = [
         {
+            "id": d.pk,
             "page_index": d.page_index,
             "label": d.label,
             "label_id": d.label_id,
@@ -683,53 +684,69 @@ def remove_flag(request: HttpRequest, pk: int, flag_id: int) -> JsonResponse:
 @login_required
 @require_POST
 def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Deactivate a detection in the database and remove it from disk.
+    """Deactivate a detection in the database and sync the JSON file.
 
-    :param request: The HTTP request (JSON body with page_index,
-        label, label_id, and bbox).
+    :param request: The HTTP request (JSON body with ``detection_id``
+        (int, DB pk)).
     :param pk: Scan primary key.
-    :return: JSON response with the count of deactivated detections.
+    :return: JSON response with ``deleted`` count, or 404 if not found.
     """
+    from scanning.services import _sync_detections_to_disk
+
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    page_index = data["page_index"]
-    label = data.get("label", "")
-    label_id = data.get("label_id")
-    bbox = data["bbox"]
-    # Deactivate matching Detection(s) in DB
-    db_filter = dict(
-        scan=scan,
-        page_index=page_index,
-        x0__gte=bbox[0] - 15,
-        x0__lte=bbox[0] + 15,
-        y0__gte=bbox[1] - 15,
-        y0__lte=bbox[1] + 15,
+    detection_id = data["detection_id"]
+    count = Detection.objects.filter(pk=detection_id, scan=scan).update(
+        active=False
     )
-    if label:
-        db_filter["label"] = label
-    elif label_id is not None:
-        db_filter["label_id"] = label_id
-    qs = Detection.objects.filter(**db_filter)
-    count = qs.update(active=False)
-    # Remove from detections.json on disk
-    output_base = Path(scan.output_dir)
-    det_path = find_json_file(output_base, "detections.json")
-    if det_path:
-        existing = json.loads(det_path.read_text())
-        existing = [
-            e
-            for e in existing
-            if not (
-                e["page_index"] == page_index
-                and (e.get("label") == label or e.get("label_id") == label_id)
-                and abs(e["bbox"][0] - bbox[0]) < 15
-                and abs(e["bbox"][1] - bbox[1]) < 15
-            )
-        ]
-        det_path.write_text(json.dumps(existing))
+    if count == 0:
+        return JsonResponse(
+            {"status": "error", "message": "Detection not found"}, status=404
+        )
+    output_dir = Path(scan.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _sync_detections_to_disk(scan.pk)
     return JsonResponse({"status": "ok", "deleted": count})
+
+
+@login_required
+@require_POST
+def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
+    """Update the bounding box of an existing detection.
+
+    Looks up the detection by its DB primary key, updates the bbox
+    columns, then rebuilds ``detections.json`` from the DB via
+    ``_sync_detections_to_disk`` so the file and S3 stay in sync.
+
+    :param request: The HTTP request (JSON body with ``detection_id``
+        (int, DB pk) and ``new_bbox`` (list[float], ``[x0,y0,x1,y1]``)).
+    :param pk: Scan primary key.
+    :return: JSON response with ``updated`` count, or 404 if not found.
+    """
+    from scanning.services import _sync_detections_to_disk
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    detection_id = data["detection_id"]
+    new_bbox = data["new_bbox"]
+    count = Detection.objects.filter(pk=detection_id, scan=scan).update(
+        x0=new_bbox[0],
+        y0=new_bbox[1],
+        x1=new_bbox[2],
+        y1=new_bbox[3],
+    )
+    if count == 0:
+        return JsonResponse(
+            {"status": "error", "message": "Detection not found"}, status=404
+        )
+    output_dir = Path(scan.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _sync_detections_to_disk(scan.pk)
+    return JsonResponse({"status": "ok", "updated": count})
 
 
 @login_required
@@ -813,60 +830,30 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
 @login_required
 @require_POST
 def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Set a detection's confidence to 1.0 in the DB and on disk.
+    """Set a detection's confidence to 1.0 in the DB and sync the JSON file.
 
-    :param request: The HTTP request (JSON body with page_index,
-        label, label_id, and bbox).
+    :param request: The HTTP request (JSON body with ``detection_id``
+        (int, DB pk)).
     :param pk: Scan primary key.
-    :return: JSON response with the count of updated detections.
+    :return: JSON response with ``updated`` count, or 404 if not found.
     """
+    from scanning.services import _sync_detections_to_disk
+
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    page_index = data["page_index"]
-    label = data.get("label", "")
-    label_id = data.get("label_id")
-    bbox = data["bbox"]
-
-    # Update matching Detection(s) in DB
-    db_filter = dict(
-        scan=scan,
-        page_index=page_index,
-        x0__gte=bbox[0] - 15,
-        x0__lte=bbox[0] + 15,
-        y0__gte=bbox[1] - 15,
-        y0__lte=bbox[1] + 15,
+    detection_id = data["detection_id"]
+    count = Detection.objects.filter(pk=detection_id, scan=scan).update(
+        confidence=1.0
     )
-    if label:
-        db_filter["label"] = label
-    elif label_id is not None:
-        db_filter["label_id"] = label_id
-    count = Detection.objects.filter(**db_filter).update(confidence=1.0)
-
-    # Update confidence in detections.json on disk
-    output_base = Path(scan.output_dir)
-    det_path = find_json_file(output_base, "detections.json")
-    if det_path:
-        existing = json.loads(det_path.read_text())
-        for e in existing:
-            if e["page_index"] != page_index:
-                continue
-            if label and e.get("label") != label:
-                continue
-            if (
-                not label
-                and label_id is not None
-                and e.get("label_id") != label_id
-            ):
-                continue
-            if (
-                abs(e["bbox"][0] - bbox[0]) < 15
-                and abs(e["bbox"][1] - bbox[1]) < 15
-            ):
-                e["confidence"] = 1.0
-        det_path.write_text(json.dumps(existing))
-
+    if count == 0:
+        return JsonResponse(
+            {"status": "error", "message": "Detection not found"}, status=404
+        )
+    output_dir = Path(scan.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _sync_detections_to_disk(scan.pk)
     return JsonResponse({"status": "ok", "updated": count})
 
 
