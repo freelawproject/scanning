@@ -127,9 +127,46 @@ class Command(BaseCommand):
     def _handle_signal(self, signum, frame):
         """Set the shutdown flag on receipt of a termination signal.
 
+        Also re-queues any PROCESSING scans so they retry on the next
+        daemon tick instead of waiting out ``DAEMON_PROCESSING_TIMEOUT``,
+        and reports the shutdown to Sentry to help diagnose unexpected
+        kills (deploys, OOM, container restarts).
+
         :param signum: The signal number received.
         :param frame: The interrupted stack frame.
         :return: None.
         """
         self.stdout.write(f"Received signal {signum}, shutting down...")
         self.shutdown = True
+
+        try:
+            from scanning.models import Scan, Status
+
+            # Don't bump retry_count: the scan didn't fail, the daemon
+            # was killed. Only RunpodTransientError-driven re-queues
+            # (in _handle_pipeline_exception) consume the retry budget,
+            # so a stream of deploys can't push a scan to ERROR_MAX_RETRIES
+            # without a single real GPU/runpod failure.
+            requeued = Scan.objects.filter(status=Status.PROCESSING).update(
+                status=Status.QUEUED,
+                progress_message=(
+                    f"Daemon received signal {signum} mid-pipeline, "
+                    "re-queued for next tick."
+                ),
+            )
+            if requeued:
+                self.stdout.write(
+                    f"Re-queued {requeued} in-flight scan(s) before shutdown."
+                )
+        except Exception:
+            logger.exception("Failed to re-queue in-flight scans on shutdown")
+
+        try:
+            import sentry_sdk
+
+            sentry_sdk.capture_message(
+                f"scanning daemon received signal {signum}, shutting down",
+                level="warning",
+            )
+        except Exception:
+            logger.exception("Failed to report daemon shutdown to Sentry")
