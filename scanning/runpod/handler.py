@@ -461,10 +461,11 @@ def handler(job: dict) -> dict:
         (cold-start cost of this worker process, constant per
         worker), ``worker_uptime_ms`` (ms since preload finished, at
         job start), and ``gpu_available`` (whether torch.cuda saw a
-        device). On unknown action an ``{"error": ...}`` dict is
-        returned (status COMPLETED with an error payload, so the
-        client can distinguish "handler rejected input" from
-        "handler crashed").
+        device). On bad/unknown input an ``{"error": ..., "error_code":
+        ...}`` dict is returned; the SDK moves ``error`` to the top
+        level and RunPod marks the job ``FAILED``. The daemon reads
+        ``error_code`` from ``output`` to distinguish transient errors
+        (re-queue) from terminal ones (mark scan ERROR).
     :rtype: dict
     """
     inputs = job.get("input") or {}
