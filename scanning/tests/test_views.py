@@ -25,6 +25,7 @@ from scanning.models import (
     OpinionStatus,
     Scan,
     Source,
+    Stage,
     Status,
 )
 
@@ -785,10 +786,10 @@ class TestApproveScan(ScanningTestCase):
     """Test the approve_scan view."""
 
     def _make_scan_with_generated_files(self):
-        """Create a scan with generated files in output_dir."""
+        """Create a scan that has been through file generation."""
         import pathlib
 
-        scan = ScanFactory(start_page=1, end_page=95)
+        scan = ScanFactory(start_page=1, end_page=95, stage=Stage.APPROVED)
         output = pathlib.Path(scan.output_dir)
         output.mkdir(parents=True, exist_ok=True)
 
@@ -801,14 +802,10 @@ class TestApproveScan(ScanningTestCase):
         return scan
 
     def test_approve_without_files_shows_error(self):
-        """Approving without generated files redirects with error."""
-        import pathlib
-
+        """Approving before reaching the APPROVED stage shows an error."""
         user = self.make_staff_user()
         self.client.force_login(user)
         scan = ScanFactory(start_page=1, end_page=95)
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
 
         response = self.client.post(
             reverse("approve_scan", kwargs={"pk": scan.pk}),

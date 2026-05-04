@@ -13,7 +13,7 @@ from django.db.models import F
 from django.test import TestCase, override_settings
 
 from scanning.factories import ReporterFactory, ScanFactory, UserFactory
-from scanning.models import Detection, Status
+from scanning.models import Detection, Stage, Status
 
 FIXTURE_DIR = pathlib.Path(__file__).parent / "fixtures"
 PDF_PATH = FIXTURE_DIR / "a3d.332.1.1.pdf"
@@ -757,8 +757,8 @@ class TestUploadApprovedFiles(TestCase):
     """Test the upload_approved_files helper."""
 
     def _make_scan_with_generated_files(self):
-        """Create a scan with a populated output_dir."""
-        scan = ScanFactory(start_page=1, end_page=95)
+        """Create a scan that has been through file generation."""
+        scan = ScanFactory(start_page=1, end_page=95, stage=Stage.APPROVED)
         output = pathlib.Path(scan.output_dir)
         output.mkdir(parents=True, exist_ok=True)
 
@@ -780,13 +780,12 @@ class TestUploadApprovedFiles(TestCase):
         )
         return scan
 
-    def test_missing_files_returns_error(self):
-        """Return error message when redacted dir is missing."""
+    def test_pre_generation_returns_error(self):
+        """Return error when the scan hasn't reached the APPROVED stage."""
         from scanning.services import upload_approved_files
 
         scan = ScanFactory(start_page=1, end_page=95)
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
+        self.assertNotEqual(scan.stage, Stage.APPROVED)
 
         result = upload_approved_files(scan.pk)
         self.assertIn("Before approving", result)
