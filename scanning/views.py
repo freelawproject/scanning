@@ -146,9 +146,7 @@ def scan_upload(request: HttpRequest) -> HttpResponse:
                 with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
                     scan.page_count = pdf.page_count
             except Exception as exc:
-                form.add_error(
-                    "original_pdf", f"Could not read PDF: {exc}"
-                )
+                form.add_error("original_pdf", f"Could not read PDF: {exc}")
                 return render(
                     request,
                     "scanning/scan_upload.html",
