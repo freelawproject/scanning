@@ -421,11 +421,6 @@ class Scan(AbstractDateTimeModel):
         default="",
         help_text="Part identifier (e.g. 'A', 'B', '3' for advance sheets).",
     )
-    number_of_pages = models.PositiveIntegerField(
-        validators=[MinValueValidator(1)],
-        null=True,
-        blank=True,
-    )
     start_page = models.PositiveIntegerField(
         validators=[MinValueValidator(1)],
         null=True,
@@ -569,7 +564,7 @@ class Scan(AbstractDateTimeModel):
         """Validate page range and page count consistency.
 
         :raises ValidationError: If start_page > end_page or
-            number_of_pages is less than the page range.
+            page_count is less than the page range.
         """
         super().clean()
         errors = {}
@@ -582,14 +577,14 @@ class Scan(AbstractDateTimeModel):
                 "End page must be greater than or equal to start page."
             )
         if (
-            self.number_of_pages
+            self.page_count
             and self.start_page
             and self.end_page
             and self.start_page <= self.end_page
-            and self.number_of_pages < self.end_page - self.start_page + 1
+            and self.page_count < self.end_page - self.start_page + 1
         ):
-            errors["number_of_pages"] = (
-                "Number of pages cannot be less than the page range"
+            errors["page_count"] = (
+                "PDF page count cannot be less than the page range"
                 " (end_page - start_page + 1)."
             )
         if errors:

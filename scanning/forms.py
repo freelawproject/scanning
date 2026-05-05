@@ -59,7 +59,6 @@ class ScanUploadForm(forms.ModelForm):
             "reporter",
             "source",
             "volume",
-            "number_of_pages",
             "start_page",
             "end_page",
             "book_cover",
@@ -69,9 +68,6 @@ class ScanUploadForm(forms.ModelForm):
         widgets = {
             "source": forms.Select(attrs={"class": "input-text w-full"}),
             "volume": forms.NumberInput(attrs={"class": "input-text w-full"}),
-            "number_of_pages": forms.NumberInput(
-                attrs={"class": "input-text w-full"}
-            ),
             "start_page": forms.NumberInput(
                 attrs={"class": "input-text w-full"}
             ),

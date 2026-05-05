@@ -54,7 +54,7 @@ class ScanAdmin(admin.ModelAdmin):
         "reporter",
         "volume",
         "source",
-        "number_of_pages",
+        "page_count",
         "status",
         "retry_count",
         "uploaded_by",

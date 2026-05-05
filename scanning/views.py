@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 
+import fitz
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import update_session_auth_hash
@@ -138,6 +139,21 @@ def scan_upload(request: HttpRequest) -> HttpResponse:
             scan = form.save(commit=False)
             scan.uploaded_by = request.user
             scan.status = Status.UPLOADED
+            pdf_file = form.cleaned_data["original_pdf"]
+            pdf_bytes = pdf_file.read()
+            pdf_file.seek(0)
+            try:
+                with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
+                    scan.page_count = pdf.page_count
+            except Exception as exc:
+                form.add_error(
+                    "original_pdf", f"Could not read PDF: {exc}"
+                )
+                return render(
+                    request,
+                    "scanning/scan_upload.html",
+                    {"form": form},
+                )
             scan.save()
             messages.success(request, "Scan uploaded successfully.")
             return redirect("scan_process", pk=scan.pk)

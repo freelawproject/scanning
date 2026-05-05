@@ -68,7 +68,7 @@ class ScanFactory(factory.django.DjangoModelFactory):
 
     - ``reporter``: auto-created via ``ReporterFactory``.
     - ``volume``: sequential starting at 1.
-    - ``number_of_pages``: 100.
+    - ``page_count``: 100.
     - ``start_page``: 1.
     - ``end_page``: 100.
     - ``source``: ``Source.FULL``.
@@ -82,7 +82,7 @@ class ScanFactory(factory.django.DjangoModelFactory):
 
     reporter = factory.SubFactory(ReporterFactory)
     volume = factory.Sequence(lambda n: n + 1)
-    number_of_pages = 100
+    page_count = 100
     start_page = 1
     end_page = 100
     source = Source.FULL

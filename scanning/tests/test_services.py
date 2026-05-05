@@ -39,7 +39,7 @@ def _make_scan_with_output(tmpdir=None, **kwargs):
     scan = ScanFactory(
         start_page=1,
         end_page=1,
-        number_of_pages=1,
+        page_count=1,
         **kwargs,
     )
     # Copy fixture PDF into MEDIA_ROOT so Django's storage resolves it
@@ -605,7 +605,6 @@ class TestSmartEditEndToEnd(TestCase):
             reporter=reporter,
             start_page=1,
             end_page=23,
-            number_of_pages=page_count,
             page_count=page_count,
         )
         # Point original_pdf to media-relative path

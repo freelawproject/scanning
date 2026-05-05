@@ -633,14 +633,14 @@ class TestScanValidation(ScanningTestCase):
             scan.full_clean()
         self.assertIn("start_page", cm.exception.message_dict)
 
-    def test_number_of_pages_less_than_range_rejected(self):
-        scan = ScanFactory.build(number_of_pages=3, start_page=1, end_page=50)
+    def test_page_count_less_than_range_rejected(self):
+        scan = ScanFactory.build(page_count=3, start_page=1, end_page=50)
         with self.assertRaises(ValidationError) as cm:
             scan.full_clean()
-        self.assertIn("number_of_pages", cm.exception.message_dict)
+        self.assertIn("page_count", cm.exception.message_dict)
 
-    def test_number_of_pages_equal_to_range_ok(self):
-        scan = ScanFactory(number_of_pages=50, start_page=1, end_page=50)
+    def test_page_count_equal_to_range_ok(self):
+        scan = ScanFactory(page_count=50, start_page=1, end_page=50)
         scan.full_clean()  # should not raise
 
     def test_allows_same_reporter_volume_source(self):
