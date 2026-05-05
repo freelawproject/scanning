@@ -9,6 +9,7 @@ import fitz
 from django.contrib.auth.decorators import login_required
 from django.http import (
     FileResponse,
+    Http404,
     HttpRequest,
     HttpResponse,
     JsonResponse,
@@ -401,25 +402,55 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
 def serve_scan_pdf(request: HttpRequest, pk: int) -> FileResponse:
     """Serve the best available PDF for a scan (OCR, bitonal, or original).
 
+    Resolves the local file in three passes: try the cached ``output_dir``,
+    fall back to the original ``pdf_path``, and if neither is on disk,
+    lazy-pull processing files from S3 and try once more. The pull covers
+    prod where the daemon and web run in separate containers with separate
+    ``/tmp/`` volumes.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: File response streaming the PDF.
+    :raises Http404: When no local copy exists and S3 has nothing to pull.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    output = Path(scan.output_dir)
-    if output.is_dir():
-        ocr = find_ocr_pdf(scan.output_dir)
-        if ocr:
-            return FileResponse(ocr.open("rb"), content_type="application/pdf")
 
-        bitonal = output / "bitonal.pdf"
-        if bitonal.exists():
+    def _try_local() -> FileResponse | None:
+        output = Path(scan.output_dir)
+        if output.is_dir():
+            ocr = find_ocr_pdf(scan.output_dir)
+            if ocr:
+                return FileResponse(
+                    ocr.open("rb"), content_type="application/pdf"
+                )
+            bitonal = output / "bitonal.pdf"
+            if bitonal.exists():
+                return FileResponse(
+                    bitonal.open("rb"), content_type="application/pdf"
+                )
+        try:
             return FileResponse(
-                bitonal.open("rb"), content_type="application/pdf"
+                Path(scan.pdf_path).open("rb"),
+                content_type="application/pdf",
             )
-    return FileResponse(
-        Path(scan.pdf_path).open("rb"), content_type="application/pdf"
-    )
+        except FileNotFoundError:
+            return None
+
+    response = _try_local()
+    if response is not None:
+        return response
+
+    try:
+        from scanning import s3_sync
+
+        s3_sync.download_processing_files(scan)
+    except Exception:
+        logger.exception("Lazy S3 pull failed for scan %s", scan.pk)
+
+    response = _try_local()
+    if response is not None:
+        return response
+    raise Http404
 
 
 @login_required

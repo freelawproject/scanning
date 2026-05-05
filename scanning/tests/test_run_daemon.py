@@ -4,7 +4,9 @@ from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 
+from scanning.factories import ScanFactory
 from scanning.management.commands.run_daemon import Command, ScheduledTask
+from scanning.models import Scan, Status
 
 
 class TestScheduledTask(TestCase):
@@ -63,3 +65,36 @@ class TestRunDaemonSchedule(TestCase):
         self.assertIn(
             calls[0], {"process_next_scan", "cleanup_processing_tmp"}
         )
+
+
+class TestHandleSignal(TestCase):
+    """The signal handler should re-queue in-flight scans and report to Sentry."""
+
+    def test_signal_requeues_processing_scans(self):
+        """PROCESSING scans get reset to QUEUED so the next tick retries them."""
+        cmd = Command()
+        in_flight = ScanFactory(status=Status.PROCESSING)
+        other = ScanFactory(status=Status.UPLOADED)
+
+        with patch("sentry_sdk.capture_message") as mock_capture:
+            cmd._handle_signal(15, None)
+
+        in_flight.refresh_from_db()
+        other.refresh_from_db()
+        self.assertTrue(cmd.shutdown)
+        self.assertEqual(in_flight.status, Status.QUEUED)
+        self.assertIn("signal 15", in_flight.progress_message)
+        self.assertEqual(other.status, Status.UPLOADED)
+        mock_capture.assert_called_once()
+
+    def test_signal_with_no_processing_scans(self):
+        """No-op on the DB side if nothing is in flight, but Sentry still fires."""
+        cmd = Command()
+        ScanFactory(status=Status.UPLOADED)
+
+        with patch("sentry_sdk.capture_message") as mock_capture:
+            cmd._handle_signal(2, None)
+
+        self.assertTrue(cmd.shutdown)
+        self.assertEqual(Scan.objects.filter(status=Status.QUEUED).count(), 0)
+        mock_capture.assert_called_once()

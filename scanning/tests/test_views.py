@@ -1,9 +1,11 @@
 import io
 import json
+import os
 import pathlib
 import shutil
 import tempfile
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -25,6 +27,7 @@ from scanning.models import (
     OpinionStatus,
     Scan,
     Source,
+    Stage,
     Status,
 )
 
@@ -785,10 +788,10 @@ class TestApproveScan(ScanningTestCase):
     """Test the approve_scan view."""
 
     def _make_scan_with_generated_files(self):
-        """Create a scan with generated files in output_dir."""
+        """Create a scan that has been through file generation."""
         import pathlib
 
-        scan = ScanFactory(start_page=1, end_page=95)
+        scan = ScanFactory(start_page=1, end_page=95, stage=Stage.APPROVED)
         output = pathlib.Path(scan.output_dir)
         output.mkdir(parents=True, exist_ok=True)
 
@@ -801,14 +804,10 @@ class TestApproveScan(ScanningTestCase):
         return scan
 
     def test_approve_without_files_shows_error(self):
-        """Approving without generated files redirects with error."""
-        import pathlib
-
+        """Approving before reaching the APPROVED stage shows an error."""
         user = self.make_staff_user()
         self.client.force_login(user)
         scan = ScanFactory(start_page=1, end_page=95)
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
 
         response = self.client.post(
             reverse("approve_scan", kwargs={"pk": scan.pk}),
@@ -1086,6 +1085,76 @@ class TestServeOpinionPdfLazyPull(ScanningTestCase):
 
         self.assertEqual(response.status_code, 200)
         mock_pull.assert_called_once()
+
+
+class TestServeScanPdfLazyPull(ScanningTestCase):
+    """serve_scan_pdf falls back to S3 pull when /tmp/ is stale."""
+
+    def test_lazy_pull_when_local_dir_missing(self):
+        """When output_dir doesn't exist locally, pull from S3 and serve."""
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        reporter = ReporterFactory(short_name="se2d")
+        scan = ScanFactory(
+            reporter=reporter, volume=921, start_page=290, end_page=350
+        )
+        # Simulate the prod web container: no local FileField copy, no
+        # local /tmp/ dir. The only way to serve is via S3.
+        original_path = scan.original_pdf.path
+        if os.path.exists(original_path):
+            os.remove(original_path)
+
+        def _fake_download(scan_arg):
+            output = pathlib.Path(scan_arg.output_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "bitonal.pdf").write_bytes(b"%PDF-1.4 pulled")
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch(
+                "scanning.s3_sync.download_processing_files",
+                side_effect=_fake_download,
+            ) as mock_pull,
+        ):
+            response = self.client.get(
+                reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_pull.assert_called_once()
+
+    def test_returns_404_when_nothing_available(self):
+        """When local is empty and S3 pull yields nothing, return 404."""
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        scan = ScanFactory(start_page=1, end_page=2)
+        # Delete the local FileField file so scan.pdf_path can't resolve
+        # to the original upload either.
+        original_path = scan.original_pdf.path
+        if os.path.exists(original_path):
+            os.remove(original_path)
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch("scanning.s3_sync.download_processing_files"),
+        ):
+            response = self.client.get(
+                reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 404)
 
 
 class TestRunFullPipelinePullsFromS3(ScanningTestCase):

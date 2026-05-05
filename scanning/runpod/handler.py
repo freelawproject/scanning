@@ -100,10 +100,16 @@ def _preload() -> None:
         _CUDA_AVAILABLE = False
 
     if not _CUDA_AVAILABLE:
+        # The fitness check (_require_gpu) blocks this worker from the
+        # available pool, so queued jobs route to healthy GPU workers.
+        # If a job does leak through it returns error_code=NO_GPU, which
+        # the scanning daemon classifies as transient and re-queues the
+        # scan (up to RUNPOD_MAX_TRANSIENT_RETRIES attempts) for the next
+        # tick to resubmit to a different worker.
         logger.error(
-            "GPU not available; skipping weight/model preload. Jobs on "
-            "this worker will return error_code=NO_GPU; fitness check "
-            "will prevent this worker from accepting jobs."
+            "GPU not available; skipping weight/model preload. Jobs "
+            "will return error_code=NO_GPU; scans are re-queued "
+            "automatically by the daemon."
         )
         return
 
@@ -486,8 +492,12 @@ def handler(job: dict) -> dict:
     # from ever reaching this point, but handle it defensively in case
     # CUDA becomes unavailable after startup.
     if not _CUDA_AVAILABLE:
+        # error_code=NO_GPU is in scanning's _TRANSIENT_ERROR_CODES, so
+        # the daemon re-queues the scan (up to RUNPOD_MAX_TRANSIENT_RETRIES
+        # attempts) and the next tick lands on a different worker.
         logger.error(
-            "rejecting %s job for scan %s: no GPU on this worker",
+            "rejecting %s job for scan %s: no GPU on this worker; "
+            "daemon will re-queue.",
             action,
             scan_pk,
         )

@@ -2228,9 +2228,7 @@ def upload_approved_files(scan_pk: int) -> str:
     if scan.s3_uploaded and scan.s3_path:
         return f"Files were already uploaded to S3 ({scan.s3_path})."
 
-    output_dir = Path(scan.output_dir)
-    redacted_dir = output_dir / "redacted"
-    if not redacted_dir.is_dir() or not list(redacted_dir.glob("*.pdf")):
+    if scan.stage != Stage.APPROVED:
         return "Before approving you need to generate the files."
 
     s3_prefix = s3_sync.approved_prefix(scan)
