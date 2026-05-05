@@ -155,8 +155,9 @@ class Command(BaseCommand):
                 ),
             )
             if requeued:
-                self.stdout.write(
-                    f"Re-queued {requeued} in-flight scan(s) before shutdown."
+                logger.info(
+                    "Re-queued %d in-flight scan(s) before shutdown.",
+                    requeued,
                 )
         except Exception:
             logger.exception("Failed to re-queue in-flight scans on shutdown")

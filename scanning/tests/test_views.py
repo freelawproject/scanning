@@ -1,9 +1,11 @@
 import io
 import json
+import os
 import pathlib
 import shutil
 import tempfile
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -1090,11 +1092,6 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
 
     def test_lazy_pull_when_local_dir_missing(self):
         """When output_dir doesn't exist locally, pull from S3 and serve."""
-        import os
-        import pathlib
-        import tempfile
-        from unittest.mock import patch
-
         user = self.make_user()
         self.client.force_login(user)
 
@@ -1134,10 +1131,6 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
 
     def test_returns_404_when_nothing_available(self):
         """When local is empty and S3 pull yields nothing, return 404."""
-        import os
-        import tempfile
-        from unittest.mock import patch
-
         user = self.make_user()
         self.client.force_login(user)
 
