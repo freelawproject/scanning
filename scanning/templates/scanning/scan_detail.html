@@ -18,8 +18,12 @@
           <dd>{{ scan.volume }}</dd>
         </div>
         <div>
-          <dt class="font-medium text-gray-500 dark:text-gray-400">Number of Pages</dt>
-          <dd>{{ scan.number_of_pages }}</dd>
+          <dt class="font-medium text-gray-500 dark:text-gray-400" title="Canonical page count of the printed volume; excludes withdrawn opinions and may differ from the PDF's page count for volumes with special pages or skipped ranges.">Number of Pages</dt>
+          <dd>{{ scan.number_of_pages|default:"—" }}</dd>
+        </div>
+        <div>
+          <dt class="font-medium text-gray-500 dark:text-gray-400" title="Actual page count of the uploaded PDF file.">PDF Pages</dt>
+          <dd>{{ scan.page_count }}</dd>
         </div>
         <div>
           <dt class="font-medium text-gray-500 dark:text-gray-400">Page Range</dt>
