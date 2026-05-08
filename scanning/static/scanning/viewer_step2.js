@@ -80,8 +80,11 @@ document.addEventListener('DOMContentLoaded', function () {
     // Global drag handlers for draw detection resize/move
     document.addEventListener('mousemove', function (e) {
         if (!detDrawDragState || !detDrawPreview || !detDrawDragInitRect) return;
-        var dx = e.clientX - detDrawDragStartX;
-        var dy = e.clientY - detDrawDragStartY;
+        // detDrawRect is in wrapper-natural pixels; clientX deltas are in
+        // visual pixels, so divide by the active zoom to get natural deltas.
+        var zoom = getPdfZoom();
+        var dx = (e.clientX - detDrawDragStartX) / zoom;
+        var dy = (e.clientY - detDrawDragStartY) / zoom;
         var r = Object.assign({}, detDrawDragInitRect);
         if (detDrawDragState.type === 'move') {
             r.left += dx; r.top += dy;
@@ -465,6 +468,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     });
                 }
             }
+            applyZoomToPage(pageDiv);
         });
     }
 
@@ -506,15 +510,15 @@ document.addEventListener('DOMContentLoaded', function () {
 
         overlay.onmousedown = function (e) {
             isDrawing = true;
-            var rect = overlay.getBoundingClientRect();
-            startX = e.clientX - rect.left;
-            startY = e.clientY - rect.top;
+            var pt = eventToCanvasPixels(e, overlay);
+            startX = pt.x;
+            startY = pt.y;
         };
         overlay.onmousemove = function (e) {
             if (!isDrawing) return;
-            var rect = overlay.getBoundingClientRect();
-            var curX = e.clientX - rect.left;
-            var curY = e.clientY - rect.top;
+            var pt = eventToCanvasPixels(e, overlay);
+            var curX = pt.x;
+            var curY = pt.y;
             var ctx = overlay.getContext('2d');
             ctx.clearRect(0, 0, overlay.width, overlay.height);
             drawExistingRedactions(overlay, redactions[String(pageNum)] || [], SCALE);
@@ -529,9 +533,9 @@ document.addEventListener('DOMContentLoaded', function () {
         overlay.onmouseup = function (e) {
             if (!isDrawing) return;
             isDrawing = false;
-            var rect = overlay.getBoundingClientRect();
-            var endX = e.clientX - rect.left;
-            var endY = e.clientY - rect.top;
+            var pt = eventToCanvasPixels(e, overlay);
+            var endX = pt.x;
+            var endY = pt.y;
             var pdfX = Math.min(startX, endX) / SCALE;
             var pdfY = Math.min(startY, endY) / SCALE;
             var pdfW = Math.abs(endX - startX) / SCALE;
@@ -848,14 +852,14 @@ document.addEventListener('DOMContentLoaded', function () {
         overlay.onmousedown = function (e) {
             if (detDrawPreview) return; // wait for user to confirm/cancel existing
             isDetDrawing = true;
-            var r = overlay.getBoundingClientRect();
-            detDrawStartX = e.clientX - r.left;
-            detDrawStartY = e.clientY - r.top;
+            var pt = eventToCanvasPixels(e, overlay);
+            detDrawStartX = pt.x;
+            detDrawStartY = pt.y;
         };
         overlay.onmousemove = function (e) {
             if (!isDetDrawing) return;
-            var r = overlay.getBoundingClientRect();
-            var curX = e.clientX - r.left, curY = e.clientY - r.top;
+            var pt = eventToCanvasPixels(e, overlay);
+            var curX = pt.x, curY = pt.y;
             var ctx = overlay.getContext('2d');
             ctx.clearRect(0, 0, overlay.width, overlay.height);
             drawExistingRedactions(overlay, redactions[String(pageNum)] || [], SCALE);
@@ -867,8 +871,8 @@ document.addEventListener('DOMContentLoaded', function () {
         overlay.onmouseup = function (e) {
             if (!isDetDrawing) return;
             isDetDrawing = false;
-            var r = overlay.getBoundingClientRect();
-            var endX = e.clientX - r.left, endY = e.clientY - r.top;
+            var pt = eventToCanvasPixels(e, overlay);
+            var endX = pt.x, endY = pt.y;
             var x = Math.min(detDrawStartX, endX), y = Math.min(detDrawStartY, endY);
             var w = Math.abs(endX - detDrawStartX), h = Math.abs(endY - detDrawStartY);
             var ctx = overlay.getContext('2d');
@@ -1548,8 +1552,9 @@ document.addEventListener('DOMContentLoaded', function () {
 
             function onMove(ev) {
                 hasMoved = true;
-                div.style.left = (startLeft + ev.clientX - startX) + 'px';
-                div.style.top  = (startTop  + ev.clientY - startY) + 'px';
+                var z = getPdfZoom();
+                div.style.left = (startLeft + (ev.clientX - startX) / z) + 'px';
+                div.style.top  = (startTop  + (ev.clientY - startY) / z) + 'px';
             }
 
             function onUp() {
@@ -1616,8 +1621,9 @@ document.addEventListener('DOMContentLoaded', function () {
         var hasMoved = false;
         function onMove(e) {
             hasMoved = true;
-            var dx = e.clientX - startX;
-            var dy = e.clientY - startY;
+            var z = getPdfZoom();
+            var dx = (e.clientX - startX) / z;
+            var dy = (e.clientY - startY) / z;
             var newLeft = startLeft, newTop = startTop, newW = startW, newH = startH;
 
             if (pos.indexOf('e') >= 0) newW = startW + dx;
@@ -1823,7 +1829,8 @@ document.addEventListener('DOMContentLoaded', function () {
                 var hasMoved = false;
                 function onMove(e) {
                     hasMoved = true;
-                    var dx = e.clientX - startX, dy = e.clientY - startY;
+                    var z = getPdfZoom();
+                    var dx = (e.clientX - startX) / z, dy = (e.clientY - startY) / z;
                     var newLeft = startLeft, newTop = startTop, newW = startW, newH = startH;
                     if (pos.indexOf('e') >= 0) newW = Math.max(10, startW + dx);
                     if (pos.indexOf('s') >= 0) newH = Math.max(10, startH + dy);
@@ -1865,8 +1872,9 @@ document.addEventListener('DOMContentLoaded', function () {
 
             function onMove(e) {
                 hasMoved = true;
-                div.style.left = (startLeft + e.clientX - startX) + 'px';
-                div.style.top = (startTop + e.clientY - startY) + 'px';
+                var z = getPdfZoom();
+                div.style.left = (startLeft + (e.clientX - startX) / z) + 'px';
+                div.style.top = (startTop + (e.clientY - startY) / z) + 'px';
             }
 
             function onUp() {
@@ -1972,7 +1980,8 @@ document.addEventListener('DOMContentLoaded', function () {
                 var hasMoved = false;
                 function onMove(ev) {
                     hasMoved = true;
-                    var dx = ev.clientX - startX, dy = ev.clientY - startY;
+                    var z = getPdfZoom();
+                    var dx = (ev.clientX - startX) / z, dy = (ev.clientY - startY) / z;
                     var nL = startLeft, nT = startTop, nW = startW, nH = startH;
                     if (pos.indexOf('e') >= 0) nW = startW + dx;
                     if (pos.indexOf('w') >= 0) { nW = startW - dx; nL = startLeft + dx; }

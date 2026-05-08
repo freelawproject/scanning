@@ -147,6 +147,98 @@ function showToast(message, type) {
 }
 
 /**
+ * Convert a mouse event into the target's natural pixel coordinates.
+ * Robust to any CSS zoom or transform applied to the target's ancestors,
+ * which is what the PDF viewer's zoom controls rely on.
+ *
+ * @param {MouseEvent} e - The mouse event.
+ * @param {HTMLCanvasElement|HTMLElement} target - Element to map into; canvas
+ *   targets use canvas.width/height, others fall back to offsetWidth/Height.
+ * @returns {{x: number, y: number}} Coordinates in target natural pixels.
+ */
+function eventToCanvasPixels(e, target) {
+    var rect = target.getBoundingClientRect();
+    var w = target.width || target.offsetWidth || rect.width || 1;
+    var h = target.height || target.offsetHeight || rect.height || 1;
+    var sx = rect.width ? w / rect.width : 1;
+    var sy = rect.height ? h / rect.height : 1;
+    return {
+        x: (e.clientX - rect.left) * sx,
+        y: (e.clientY - rect.top) * sy,
+    };
+}
+
+// PDF viewer zoom controls.
+var PDF_ZOOM_MIN = 0.5;
+var PDF_ZOOM_MAX = 3;
+var PDF_ZOOM_STEP = 0.1;
+
+/**
+ * Read the persisted PDF viewer zoom level (multiplier; 1 = unzoomed).
+ *
+ * @returns {number} Zoom level clamped to [PDF_ZOOM_MIN, PDF_ZOOM_MAX].
+ */
+function getPdfZoom() {
+    var v = parseFloat(localStorage.getItem('pdfZoom'));
+    if (!isFinite(v) || v <= 0) return 1;
+    return Math.max(PDF_ZOOM_MIN, Math.min(PDF_ZOOM_MAX, v));
+}
+
+/**
+ * Apply the current zoom level to a single rendered page container.
+ * The wrapper is scaled with a CSS transform so detection boxes,
+ * redaction overlays, and image overlays (all positioned absolutely
+ * inside the wrapper) inherit the visual scale automatically. The
+ * page-container is sized to the scaled dimensions to reserve layout
+ * space without re-rendering pdf.js canvases.
+ *
+ * @param {HTMLElement} pageDiv - The .page-container element.
+ */
+function applyZoomToPage(pageDiv) {
+    if (!pageDiv) return;
+    var wrapper = pageDiv.querySelector('.canvas-wrapper');
+    if (!wrapper) return;
+    var canvas = wrapper.querySelector('.pdf-canvas');
+    if (!canvas || !canvas.width) return;
+    var zoom = getPdfZoom();
+    if (zoom === 1) {
+        wrapper.style.transform = '';
+        wrapper.style.transformOrigin = '';
+        pageDiv.style.width = '';
+        pageDiv.style.height = '';
+        return;
+    }
+    wrapper.style.transformOrigin = 'top left';
+    wrapper.style.transform = 'scale(' + zoom + ')';
+    var label = pageDiv.querySelector('.page-label');
+    var labelH = label ? label.offsetHeight : 0;
+    pageDiv.style.width = (canvas.width * zoom) + 'px';
+    pageDiv.style.height = (labelH + canvas.height * zoom) + 'px';
+}
+
+/**
+ * Re-apply the current zoom level to every rendered page and refresh
+ * the toolbar percentage display.
+ */
+function applyZoomAll() {
+    document.querySelectorAll('#pdf-viewer .page-container').forEach(applyZoomToPage);
+    var pct = document.getElementById('zoom-pct');
+    if (pct) pct.textContent = Math.round(getPdfZoom() * 100) + '%';
+}
+
+/**
+ * Set and persist the PDF viewer zoom level.
+ *
+ * @param {number} zoom - Desired zoom multiplier; clamped and rounded.
+ */
+function setPdfZoom(zoom) {
+    zoom = Math.max(PDF_ZOOM_MIN, Math.min(PDF_ZOOM_MAX, zoom));
+    zoom = Math.round(zoom * 100) / 100;
+    localStorage.setItem('pdfZoom', String(zoom));
+    applyZoomAll();
+}
+
+/**
  * Draw existing redaction rectangles on a canvas overlay.
  *
  * @param {HTMLCanvasElement} overlay - The canvas element.

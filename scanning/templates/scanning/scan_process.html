@@ -323,6 +323,12 @@
     {# PDF viewer #}
     <main class="flex-1 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 viewer-panel">
       {% csrf_token %}
+      <div class="zoom-toolbar" role="toolbar" aria-label="PDF zoom">
+        <button type="button" class="zoom-btn" data-zoom-action="out" title="Zoom out" aria-label="Zoom out">&minus;</button>
+        <span id="zoom-pct" class="zoom-pct" aria-live="polite">100%</span>
+        <button type="button" class="zoom-btn" data-zoom-action="in" title="Zoom in" aria-label="Zoom in">+</button>
+        <button type="button" class="zoom-btn zoom-reset" data-zoom-action="reset" title="Reset zoom">Reset</button>
+      </div>
       <div id="pdf-viewer"
            data-pdf-url="{% if step == 3 %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
            data-document-id="{{ scan.pk }}"
@@ -365,6 +371,22 @@ var docId = SCAN_CONFIG.docId;
 var deletedPages = SCAN_CONFIG.deletedPages;
 </script>
 <script src="{% static 'scanning/viewer_sidebar.js' %}"></script>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    var toolbar = document.querySelector('.zoom-toolbar');
+    if (!toolbar) return;
+    var pct = document.getElementById('zoom-pct');
+    if (pct) pct.textContent = Math.round(getPdfZoom() * 100) + '%';
+    toolbar.addEventListener('click', function (e) {
+        var btn = e.target.closest('[data-zoom-action]');
+        if (!btn) return;
+        var action = btn.dataset.zoomAction;
+        if (action === 'in') setPdfZoom(getPdfZoom() + PDF_ZOOM_STEP);
+        else if (action === 'out') setPdfZoom(getPdfZoom() - PDF_ZOOM_STEP);
+        else if (action === 'reset') setPdfZoom(1);
+    });
+});
+</script>
 {% if is_processing %}
 <script src="{% static 'scanning/viewer_progress.js' %}"></script>
 {% endif %}

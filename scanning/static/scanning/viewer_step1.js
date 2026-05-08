@@ -144,6 +144,7 @@ document.addEventListener('DOMContentLoaded', function () {
             pageDiv.dataset.scale = SCALE;
             pageDiv.dataset.pdfWidth = origViewport.width;
             pageDiv.dataset.pdfHeight = origViewport.height;
+            applyZoomToPage(pageDiv);
         });
     }
 
@@ -382,16 +383,16 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function onRedactStart(e, overlay, pageDiv, pageNumber) {
         isDrawing = true;
-        var rect = overlay.getBoundingClientRect();
-        startX = e.clientX - rect.left;
-        startY = e.clientY - rect.top;
+        var pt = eventToCanvasPixels(e, overlay);
+        startX = pt.x;
+        startY = pt.y;
     }
 
     function onRedactMove(e, overlay, pageNumber) {
         if (!isDrawing) return;
-        var rect = overlay.getBoundingClientRect();
-        var curX = e.clientX - rect.left;
-        var curY = e.clientY - rect.top;
+        var pt = eventToCanvasPixels(e, overlay);
+        var curX = pt.x;
+        var curY = pt.y;
 
         var ctx = overlay.getContext('2d');
         ctx.clearRect(0, 0, overlay.width, overlay.height);
@@ -414,9 +415,9 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!isDrawing) return;
         isDrawing = false;
 
-        var rect = overlay.getBoundingClientRect();
-        var endX = e.clientX - rect.left;
-        var endY = e.clientY - rect.top;
+        var pt = eventToCanvasPixels(e, overlay);
+        var endX = pt.x;
+        var endY = pt.y;
 
         var scale = parseFloat(pageDiv.dataset.scale) || SCALE;
 
