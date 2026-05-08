@@ -81,10 +81,11 @@ document.addEventListener('DOMContentLoaded', function () {
     document.addEventListener('mousemove', function (e) {
         if (!detDrawDragState || !detDrawPreview || !detDrawDragInitRect) return;
         // detDrawRect is in wrapper-natural pixels; clientX deltas are in
-        // visual pixels, so divide by the active zoom to get natural deltas.
-        var zoom = getPdfZoom();
-        var dx = (e.clientX - detDrawDragStartX) / zoom;
-        var dy = (e.clientY - detDrawDragStartY) / zoom;
+        // visual pixels, so divide by the wrapper's current visual scale
+        // (which may differ from getPdfZoom() between zoom click and re-render).
+        var z = cssToVisualScale(detDrawPreview);
+        var dx = (e.clientX - detDrawDragStartX) / z;
+        var dy = (e.clientY - detDrawDragStartY) / z;
         var r = Object.assign({}, detDrawDragInitRect);
         if (detDrawDragState.type === 'move') {
             r.left += dx; r.top += dy;
@@ -1633,7 +1634,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
             function onMove(ev) {
                 hasMoved = true;
-                var z = getPdfZoom();
+                var z = cssToVisualScale(div);
                 div.style.left = (startLeft + (ev.clientX - startX) / z) + 'px';
                 div.style.top  = (startTop  + (ev.clientY - startY) / z) + 'px';
             }
@@ -1702,7 +1703,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var hasMoved = false;
         function onMove(e) {
             hasMoved = true;
-            var z = getPdfZoom();
+            var z = cssToVisualScale(div);
             var dx = (e.clientX - startX) / z;
             var dy = (e.clientY - startY) / z;
             var newLeft = startLeft, newTop = startTop, newW = startW, newH = startH;
@@ -1910,7 +1911,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 var hasMoved = false;
                 function onMove(e) {
                     hasMoved = true;
-                    var z = getPdfZoom();
+                    var z = cssToVisualScale(div);
                     var dx = (e.clientX - startX) / z, dy = (e.clientY - startY) / z;
                     var newLeft = startLeft, newTop = startTop, newW = startW, newH = startH;
                     if (pos.indexOf('e') >= 0) newW = Math.max(10, startW + dx);
@@ -1953,7 +1954,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
             function onMove(e) {
                 hasMoved = true;
-                var z = getPdfZoom();
+                var z = cssToVisualScale(div);
                 div.style.left = (startLeft + (e.clientX - startX) / z) + 'px';
                 div.style.top = (startTop + (e.clientY - startY) / z) + 'px';
             }
@@ -2061,7 +2062,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 var hasMoved = false;
                 function onMove(ev) {
                     hasMoved = true;
-                    var z = getPdfZoom();
+                    var z = cssToVisualScale(div);
                     var dx = (ev.clientX - startX) / z, dy = (ev.clientY - startY) / z;
                     var nL = startLeft, nT = startTop, nW = startW, nH = startH;
                     if (pos.indexOf('e') >= 0) nW = startW + dx;

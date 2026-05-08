@@ -217,6 +217,24 @@ function pageRenderedZoom(pageDiv) {
 }
 
 /**
+ * Ratio of an element's visual size on screen to its CSS layout size,
+ * i.e. the cumulative scale of any CSS transforms on its ancestors.
+ * Use this to convert screen-pixel mouse deltas into the natural CSS
+ * pixel space the element's `style.left/top/width/height` live in,
+ * for drag handlers that operate while a wrapper is mid-zoom (between
+ * the immediate visual transform and the post-debounce re-render).
+ *
+ * @param {HTMLElement} el - The element being dragged.
+ * @returns {number} visual / natural ratio (1 if no transform).
+ */
+function cssToVisualScale(el) {
+    if (!el) return 1;
+    var rect = el.getBoundingClientRect();
+    var nat = el.offsetWidth || 1;
+    return rect.width && nat ? rect.width / nat : 1;
+}
+
+/**
  * Apply the active zoom level to a single rendered page container by
  * applying a CSS `transform: scale(visualZoom)` to its canvas wrapper.
  * `visualZoom` is the ratio between the active zoom and the zoom at
