@@ -258,17 +258,20 @@ function applyZoomToPage(pageDiv) {
     var canvas = wrapper.querySelector('.pdf-canvas');
     if (!canvas || !canvas.width) return;
     var visualZoom = getPdfZoom() / pageRenderedZoom(pageDiv);
+    var naturalW = parseFloat(wrapper.style.width) || canvas.offsetWidth || canvas.width;
+    var naturalH = parseFloat(wrapper.style.height) || canvas.offsetHeight || canvas.height;
     if (Math.abs(visualZoom - 1) < 0.001) {
         wrapper.style.transform = '';
         wrapper.style.transformOrigin = '';
-        pageDiv.style.width = '';
+        // Pin the page-container to the canvas width so that the page-label's
+        // toolbar (Detections, Redact, etc.) cannot stretch the container
+        // wider than the rendered page at small zooms.
+        pageDiv.style.width = naturalW + 'px';
         pageDiv.style.height = '';
         return;
     }
     wrapper.style.transformOrigin = 'top left';
     wrapper.style.transform = 'scale(' + visualZoom + ')';
-    var naturalW = parseFloat(wrapper.style.width) || canvas.offsetWidth || canvas.width;
-    var naturalH = parseFloat(wrapper.style.height) || canvas.offsetHeight || canvas.height;
     var label = pageDiv.querySelector('.page-label');
     var labelH = label ? label.offsetHeight : 0;
     pageDiv.style.width = (naturalW * visualZoom) + 'px';
