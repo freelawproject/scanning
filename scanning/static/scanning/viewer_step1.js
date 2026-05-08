@@ -106,10 +106,73 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 
+    // --- Zoom-driven re-render ---
+    // When zoom changes, rasterize visible/nearby pages at the new resolution
+    // and discard pages outside the viewport zone so they re-render fresh
+    // when scrolled back into view.
+
+    function isPageNearViewport(pageDiv, margin) {
+        margin = margin || 800;
+        var viewer = document.querySelector('.viewer-panel');
+        if (!viewer) return false;
+        var vRect = viewer.getBoundingClientRect();
+        var pRect = pageDiv.getBoundingClientRect();
+        return pRect.bottom > vRect.top - margin && pRect.top < vRect.bottom + margin;
+    }
+
+    function discardPage(pageDiv, pdfIndex) {
+        if (pageDiv._renderTask) {
+            try { pageDiv._renderTask.cancel(); } catch (_e) {}
+            pageDiv._renderTask = null;
+        }
+        renderedPages[pdfIndex] = false;
+        delete pageDiv.dataset.scale;
+        delete pageDiv.dataset.renderedZoom;
+        var canvas = pageDiv.querySelector('.pdf-canvas');
+        if (canvas) { canvas.width = 0; canvas.height = 0; }
+        var overlay = pageDiv.querySelector('.redaction-overlay');
+        if (overlay) { overlay.width = 0; overlay.height = 0; }
+        var wrapper = pageDiv.querySelector('.canvas-wrapper');
+        if (wrapper) {
+            wrapper.style.transform = '';
+            wrapper.style.transformOrigin = '';
+            wrapper.style.width = defaultPageWidth + 'px';
+            wrapper.style.height = PLACEHOLDER_HEIGHT + 'px';
+            wrapper.style.background = '#f0f0f0';
+            wrapper.querySelectorAll('.redaction-delete-btn').forEach(function (el) { el.remove(); });
+        }
+        pageDiv.style.width = '';
+        pageDiv.style.height = '';
+    }
+
+    function rerenderForCurrentZoom() {
+        var currentZoom = getPdfZoom();
+        container.querySelectorAll('.lazy-page').forEach(function (pageDiv) {
+            var pdfIndex = parseInt(pageDiv.dataset.pdfIndex);
+            if (!renderedPages[pdfIndex]) return;
+            if (Math.abs(pageRenderedZoom(pageDiv) - currentZoom) < 0.001) return;
+            if (isPageNearViewport(pageDiv)) {
+                renderPdfPage(pageDiv, pdfIndex, parseInt(pageDiv.dataset.logicalNumber));
+            } else {
+                discardPage(pageDiv, pdfIndex);
+            }
+        });
+    }
+
+    window.requestPdfRerender = (function () {
+        var t = null;
+        return function () {
+            if (t) clearTimeout(t);
+            t = setTimeout(function () { t = null; rerenderForCurrentZoom(); }, 150);
+        };
+    })();
+
     // --- Render a single PDF page into its placeholder ---
     function renderPdfPage(pageDiv, pdfIndex, logicalNumber) {
+        var zoom = getPdfZoom();
+        var effScale = SCALE * zoom;
         pdfDoc.getPage(pdfIndex + 1).then(function (page) {
-            var viewport = page.getViewport({ scale: SCALE });
+            var viewport = page.getViewport({ scale: effScale });
             var origViewport = page.getViewport({ scale: 1 });
 
             var canvas = pageDiv.querySelector('.pdf-canvas');
@@ -121,16 +184,27 @@ document.addEventListener('DOMContentLoaded', function () {
             wrapper.style.height = viewport.height + 'px';
             wrapper.style.background = '';
 
-            // Update default width on first render
-            if (defaultPageWidth === 918 && viewport.width !== 918) {
-                defaultPageWidth = viewport.width;
+            // Update default width on first render (compare at base scale to
+            // stay consistent regardless of the current zoom).
+            var widthAtBaseScale = viewport.width / zoom;
+            if (defaultPageWidth === 918 && widthAtBaseScale !== 918) {
+                defaultPageWidth = widthAtBaseScale;
                 updatePlaceholderWidths();
             }
 
-            page.render({
+            // Cancel any in-flight render on this page before kicking off a new one.
+            if (pageDiv._renderTask) {
+                try { pageDiv._renderTask.cancel(); } catch (_e) {}
+                pageDiv._renderTask = null;
+            }
+            var task = page.render({
                 canvasContext: canvas.getContext('2d'),
                 viewport: viewport,
             });
+            pageDiv._renderTask = task;
+            task.promise.then(function () {
+                if (pageDiv._renderTask === task) pageDiv._renderTask = null;
+            }, function () { /* swallow cancel */ });
 
             // Setup redaction overlay
             var overlay = pageDiv.querySelector('.redaction-overlay');
@@ -138,10 +212,11 @@ document.addEventListener('DOMContentLoaded', function () {
             overlay.height = viewport.height;
 
             var pageRedactions = redactions[String(logicalNumber)] || [];
-            drawExistingRedactions(overlay, pageRedactions, SCALE);
+            drawExistingRedactions(overlay, pageRedactions, effScale);
             rebuildRedactionDivs(pageDiv, logicalNumber);
 
-            pageDiv.dataset.scale = SCALE;
+            pageDiv.dataset.scale = effScale;
+            pageDiv.dataset.renderedZoom = zoom;
             pageDiv.dataset.pdfWidth = origViewport.width;
             pageDiv.dataset.pdfHeight = origViewport.height;
             applyZoomToPage(pageDiv);
@@ -377,7 +452,7 @@ document.addEventListener('DOMContentLoaded', function () {
         }
 
         overlay.onmousedown = function (e) { onRedactStart(e, overlay, pageDiv, pageNumber); };
-        overlay.onmousemove = function (e) { onRedactMove(e, overlay, pageNumber); };
+        overlay.onmousemove = function (e) { onRedactMove(e, overlay, pageDiv, pageNumber); };
         overlay.onmouseup = function (e) { onRedactEnd(e, overlay, pageDiv, pageNumber); };
     }
 
@@ -388,7 +463,7 @@ document.addEventListener('DOMContentLoaded', function () {
         startY = pt.y;
     }
 
-    function onRedactMove(e, overlay, pageNumber) {
+    function onRedactMove(e, overlay, pageDiv, pageNumber) {
         if (!isDrawing) return;
         var pt = eventToCanvasPixels(e, overlay);
         var curX = pt.x;
@@ -398,7 +473,7 @@ document.addEventListener('DOMContentLoaded', function () {
         ctx.clearRect(0, 0, overlay.width, overlay.height);
 
         var pageRedactions = redactions[String(pageNumber)] || [];
-        drawExistingRedactions(overlay, pageRedactions, SCALE);
+        drawExistingRedactions(overlay, pageRedactions, pageScale(pageDiv, SCALE));
 
         ctx.fillStyle = activeRedactionFill === 'white' ? 'rgba(255, 255, 255, 0.5)' : 'rgba(255, 0, 0, 0.3)';
         ctx.strokeStyle = activeRedactionFill === 'white' ? '#3b82f6' : 'red';
@@ -429,7 +504,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (pdfW < 5 || pdfH < 5) {
             var ctx = overlay.getContext('2d');
             ctx.clearRect(0, 0, overlay.width, overlay.height);
-            drawExistingRedactions(overlay, redactions[String(pageNumber)] || [], SCALE);
+            drawExistingRedactions(overlay, redactions[String(pageNumber)] || [], scale);
             return;
         }
 
@@ -465,7 +540,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
             var ctx = overlay.getContext('2d');
             ctx.clearRect(0, 0, overlay.width, overlay.height);
-            drawExistingRedactions(overlay, redactions[String(pageNumber)], SCALE);
+            drawExistingRedactions(overlay, redactions[String(pageNumber)], scale);
             rebuildRedactionDivs(pageDiv, pageNumber);
         });
     }
@@ -478,14 +553,15 @@ document.addEventListener('DOMContentLoaded', function () {
         // Remove old buttons
         wrapper.querySelectorAll('.redaction-delete-btn').forEach(function (el) { el.remove(); });
 
+        var scale = pageScale(pageDiv, SCALE);
         var pageRedactions = redactions[String(pageNumber)] || [];
         pageRedactions.forEach(function (r, idx) {
             var btn = document.createElement('button');
             btn.className = 'redaction-delete-btn';
             btn.title = 'Remove this ' + (r.fill === 'white' ? 'whiteout' : 'redaction');
             btn.textContent = '\u00d7';
-            btn.style.left = ((r.x + r.width) * SCALE - 18) + 'px';
-            btn.style.top = (r.y * SCALE + 2) + 'px';
+            btn.style.left = ((r.x + r.width) * scale - 18) + 'px';
+            btn.style.top = (r.y * scale + 2) + 'px';
             btn.addEventListener('click', function (e) {
                 e.stopPropagation();
                 fetch('/scans/' + documentId + '/save-redaction-rect/', {
@@ -498,7 +574,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         var overlay = pageDiv.querySelector('.redaction-overlay');
                         var ctx = overlay.getContext('2d');
                         ctx.clearRect(0, 0, overlay.width, overlay.height);
-                        drawExistingRedactions(overlay, redactions[String(pageNumber)], SCALE);
+                        drawExistingRedactions(overlay, redactions[String(pageNumber)], scale);
                         rebuildRedactionDivs(pageDiv, pageNumber);
                     }
                 });

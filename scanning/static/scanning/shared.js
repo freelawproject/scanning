@@ -147,19 +147,23 @@ function showToast(message, type) {
 }
 
 /**
- * Convert a mouse event into the target's natural pixel coordinates.
- * Robust to any CSS zoom or transform applied to the target's ancestors,
- * which is what the PDF viewer's zoom controls rely on.
+ * Convert a mouse event into the target's CSS-pixel layout coordinates,
+ * relative to the target's top-left corner. Robust to any CSS zoom or
+ * transform applied to ancestors, since the conversion is derived from
+ * the displayed bounding rect rather than the bitmap dimensions.
+ *
+ * For canvas targets, returns coords in the canvas's CSS layout space
+ * (matching style.width/height, or the bitmap size when style is unset).
+ * Pair with `pageScale(pageDiv)` to convert to PDF points.
  *
  * @param {MouseEvent} e - The mouse event.
- * @param {HTMLCanvasElement|HTMLElement} target - Element to map into; canvas
- *   targets use canvas.width/height, others fall back to offsetWidth/Height.
- * @returns {{x: number, y: number}} Coordinates in target natural pixels.
+ * @param {HTMLCanvasElement|HTMLElement} target - Element to map into.
+ * @returns {{x: number, y: number}} Coordinates in target CSS layout pixels.
  */
 function eventToCanvasPixels(e, target) {
     var rect = target.getBoundingClientRect();
-    var w = target.width || target.offsetWidth || rect.width || 1;
-    var h = target.height || target.offsetHeight || rect.height || 1;
+    var w = target.offsetWidth || target.width || rect.width || 1;
+    var h = target.offsetHeight || target.height || rect.height || 1;
     var sx = rect.width ? w / rect.width : 1;
     var sy = rect.height ? h / rect.height : 1;
     return {
@@ -185,12 +189,43 @@ function getPdfZoom() {
 }
 
 /**
- * Apply the current zoom level to a single rendered page container.
- * The wrapper is scaled with a CSS transform so detection boxes,
- * redaction overlays, and image overlays (all positioned absolutely
- * inside the wrapper) inherit the visual scale automatically. The
- * page-container is sized to the scaled dimensions to reserve layout
- * space without re-rendering pdf.js canvases.
+ * Effective render scale at which a page's canvas was rasterized,
+ * i.e. SCALE_base * renderedZoom. Used as the divisor when converting
+ * canvas-CSS pixels back to PDF points.
+ *
+ * @param {HTMLElement} pageDiv - The .page-container element.
+ * @param {number} [fallback=1] - Returned when the page hasn't been
+ *   rendered yet (no `data-scale` attribute).
+ * @returns {number} The effective scale.
+ */
+function pageScale(pageDiv, fallback) {
+    var v = pageDiv ? parseFloat(pageDiv.dataset.scale) : NaN;
+    return isFinite(v) && v > 0 ? v : (fallback || 1);
+}
+
+/**
+ * The zoom level at which a page was last rasterized. Used to compute
+ * the visual transform ratio when the active zoom diverges from the
+ * rendered zoom (e.g. before a re-render lands).
+ *
+ * @param {HTMLElement} pageDiv - The .page-container element.
+ * @returns {number} The rendered zoom (defaults to 1).
+ */
+function pageRenderedZoom(pageDiv) {
+    var v = pageDiv ? parseFloat(pageDiv.dataset.renderedZoom) : NaN;
+    return isFinite(v) && v > 0 ? v : 1;
+}
+
+/**
+ * Apply the active zoom level to a single rendered page container by
+ * applying a CSS `transform: scale(visualZoom)` to its canvas wrapper.
+ * `visualZoom` is the ratio between the active zoom and the zoom at
+ * which the page was last rasterized, so when a re-render lands at the
+ * new zoom the transform reduces to identity (no extra scaling).
+ *
+ * Detection boxes, redaction overlays, and image overlays all live as
+ * absolutely-positioned children of the wrapper, so they inherit the
+ * visual scale automatically.
  *
  * @param {HTMLElement} pageDiv - The .page-container element.
  */
@@ -200,8 +235,8 @@ function applyZoomToPage(pageDiv) {
     if (!wrapper) return;
     var canvas = wrapper.querySelector('.pdf-canvas');
     if (!canvas || !canvas.width) return;
-    var zoom = getPdfZoom();
-    if (zoom === 1) {
+    var visualZoom = getPdfZoom() / pageRenderedZoom(pageDiv);
+    if (Math.abs(visualZoom - 1) < 0.001) {
         wrapper.style.transform = '';
         wrapper.style.transformOrigin = '';
         pageDiv.style.width = '';
@@ -209,15 +244,17 @@ function applyZoomToPage(pageDiv) {
         return;
     }
     wrapper.style.transformOrigin = 'top left';
-    wrapper.style.transform = 'scale(' + zoom + ')';
+    wrapper.style.transform = 'scale(' + visualZoom + ')';
+    var naturalW = parseFloat(wrapper.style.width) || canvas.offsetWidth || canvas.width;
+    var naturalH = parseFloat(wrapper.style.height) || canvas.offsetHeight || canvas.height;
     var label = pageDiv.querySelector('.page-label');
     var labelH = label ? label.offsetHeight : 0;
-    pageDiv.style.width = (canvas.width * zoom) + 'px';
-    pageDiv.style.height = (labelH + canvas.height * zoom) + 'px';
+    pageDiv.style.width = (naturalW * visualZoom) + 'px';
+    pageDiv.style.height = (labelH + naturalH * visualZoom) + 'px';
 }
 
 /**
- * Re-apply the current zoom level to every rendered page and refresh
+ * Re-apply the active zoom level to every rendered page and refresh
  * the toolbar percentage display.
  */
 function applyZoomAll() {
@@ -227,7 +264,10 @@ function applyZoomAll() {
 }
 
 /**
- * Set and persist the PDF viewer zoom level.
+ * Set and persist the PDF viewer zoom level. Applies the visual
+ * transform to all rendered pages immediately for instant feedback,
+ * then asks the active viewer to re-rasterize at the new resolution
+ * (debounced inside the viewer).
  *
  * @param {number} zoom - Desired zoom multiplier; clamped and rounded.
  */
@@ -236,6 +276,9 @@ function setPdfZoom(zoom) {
     zoom = Math.round(zoom * 100) / 100;
     localStorage.setItem('pdfZoom', String(zoom));
     applyZoomAll();
+    if (typeof window.requestPdfRerender === 'function') {
+        window.requestPdfRerender();
+    }
 }
 
 /**
