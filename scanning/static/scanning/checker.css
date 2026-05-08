@@ -376,6 +376,8 @@ a.doc-name:hover { text-decoration: underline; }
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
+    row-gap: 4px;
     border-bottom: 1px solid #eee;
 }
 
