@@ -1,3 +1,8 @@
+// Step 1 persists its zoom level separately from steps 2/3 so that
+// reviewing page numbers at high zoom doesn't carry over to opinion
+// review (and vice versa).
+window.__pdfZoomKey = 'pdfZoom_step1';
+
 document.addEventListener('DOMContentLoaded', function () {
     const container = document.getElementById('pdf-viewer');
     if (!container) return;

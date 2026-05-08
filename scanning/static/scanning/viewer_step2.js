@@ -3,6 +3,12 @@
  * Supports switching between PDFs, redacted/unredacted toggle,
  * and drawing black/white redaction rectangles.
  */
+
+// Steps 2 and 3 share this viewer and a single persisted zoom level,
+// kept separate from step 1's zoom (page-number review benefits from
+// a different zoom than opinion review).
+window.__pdfZoomKey = 'pdfZoom_step2';
+
 document.addEventListener('DOMContentLoaded', function () {
     var container = document.getElementById('pdf-viewer');
     if (!container) return;

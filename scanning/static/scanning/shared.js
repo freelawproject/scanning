@@ -172,10 +172,14 @@ function eventToCanvasPixels(e, target) {
     };
 }
 
-// PDF viewer zoom controls.
+// PDF viewer zoom controls. The active viewer (step1 vs step2/3) sets
+// `window.__pdfZoomKey` at script-load time so each viewer persists its
+// own zoom level independently in localStorage.
 var PDF_ZOOM_MIN = 0.5;
 var PDF_ZOOM_MAX = 3;
 var PDF_ZOOM_STEP = 0.1;
+
+function _pdfZoomKey() { return window.__pdfZoomKey || 'pdfZoom'; }
 
 /**
  * Read the persisted PDF viewer zoom level (multiplier; 1 = unzoomed).
@@ -183,7 +187,7 @@ var PDF_ZOOM_STEP = 0.1;
  * @returns {number} Zoom level clamped to [PDF_ZOOM_MIN, PDF_ZOOM_MAX].
  */
 function getPdfZoom() {
-    var v = parseFloat(localStorage.getItem('pdfZoom'));
+    var v = parseFloat(localStorage.getItem(_pdfZoomKey()));
     if (!isFinite(v) || v <= 0) return 1;
     return Math.max(PDF_ZOOM_MIN, Math.min(PDF_ZOOM_MAX, v));
 }
@@ -292,7 +296,7 @@ function applyZoomAll() {
 function setPdfZoom(zoom) {
     zoom = Math.max(PDF_ZOOM_MIN, Math.min(PDF_ZOOM_MAX, zoom));
     zoom = Math.round(zoom * 100) / 100;
-    localStorage.setItem('pdfZoom', String(zoom));
+    localStorage.setItem(_pdfZoomKey(), String(zoom));
     applyZoomAll();
     if (typeof window.requestPdfRerender === 'function') {
         window.requestPdfRerender();
