@@ -37,3 +37,25 @@ jobs:
             freelawproject/blackletter-gpu-worker:latest
           cache-from: type=registry,ref=freelawproject/blackletter-gpu-worker:cache
           cache-to: type=registry,ref=freelawproject/blackletter-gpu-worker:cache,mode=max
+
+      - name: Update RunPod template image
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_TEMPLATE_ID: ${{ secrets.RUNPOD_TEMPLATE_ID }}
+          IMAGE: freelawproject/blackletter-gpu-worker:${{ steps.vars.outputs.sha_short }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -nc --arg img "$IMAGE" '{imageName: $img}')
+          response=$(curl -sS -w "\n%{http_code}" -X PATCH \
+            -H "Authorization: Bearer $RUNPOD_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data "$payload" \
+            "https://rest.runpod.io/v1/templates/$RUNPOD_TEMPLATE_ID")
+          body=$(printf '%s\n' "$response" | sed '$d')
+          status=$(printf '%s\n' "$response" | tail -n1)
+          echo "HTTP $status"
+          echo "$body"
+          if [ "$status" -ge 400 ]; then
+            echo "::error::RunPod template update failed (HTTP $status)"
+            exit 1
+          fi
