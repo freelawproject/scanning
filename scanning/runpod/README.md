@@ -108,9 +108,47 @@ docker push ghcr.io/freelawproject/blackletter-gpu-worker:<tag>
 
 ## Releasing a new image version
 
-Pushing a new image tag to the registry does **not** automatically update
-the running endpoint. You must create a new release in the RunPod console
-so workers boot from the new image:
+Pushing a new image tag to the registry alone does **not** update the
+running endpoint; the RunPod template that backs the endpoint has to
+be told about the new tag. We support two ways to do this:
+
+### Automated release (default)
+
+The `Build and Push RunPod Worker` GitHub Actions workflow
+(`.github/workflows/build-runpod-worker.yml`) handles this end-to-end.
+On any push to `main` that touches `scanning/runpod/**` (or a manual
+`workflow_dispatch` run), it:
+
+1. Builds `freelawproject/blackletter-gpu-worker` and pushes both
+   `:<sha_short>` and `:latest` tags to Docker Hub.
+2. Calls `PATCH https://rest.runpod.io/v1/templates/<id>` to update
+   the endpoint's backing template `imageName` to the SHA-pinned tag.
+3. With `Min Workers = 0`, warm workers drain on the 5-min Idle
+   Timeout and the next job dispatched to the endpoint cold-starts on
+   the new image.
+
+The workflow needs two GitHub Actions repo secrets:
+
+- `RUNPOD_API_KEY` — a RunPod API key with **Restricted** permission
+  set to **GraphQL: Read/Write** (leave AI API at None). This is the
+  tightest scope RunPod allows. There is no per-template scope, so
+  this key grants full management of every template, endpoint, and
+  pod on the account; treat it as a production credential.
+- `RUNPOD_TEMPLATE_ID` — the ID of the endpoint's backing template.
+  Endpoints created without explicitly picking a template still have
+  one, hidden from the default listing. Surface it via:
+  ```bash
+  curl -sS -H "Authorization: Bearer <API_KEY>" \
+    "https://rest.runpod.io/v1/templates?includeEndpointBoundTemplates=true"
+  ```
+  Find the entry where `isServerless: true` and `name` matches the
+  endpoint (e.g. `Blackletter gpu worker`); copy its `id`.
+
+### Manual release (via the RunPod console)
+
+Useful when publishing a hotfix from a non-`main` branch, or when the
+workflow is unavailable. Create a new release by hand so workers boot
+from the new image:
 
 1. Go to the **Serverless** page and open your endpoint.
 2. Click **Manage**.
