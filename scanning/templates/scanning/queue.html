@@ -96,7 +96,7 @@
           <span class="badge-priority-{{ vol.priority }}">{{ vol.get_priority_display }}</span>
         </td>
         <td class="px-4 py-3 text-sm">
-          <span class="badge-{{ vol.queue_status }}">{{ vol.get_queue_status_display }}</span>
+          <span class="badge-{{ vol.queue_status }}" title="Volume queue status: {{ vol.get_queue_status_display }}">{{ vol.get_queue_status_display }}</span>
         </td>
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
           {% if vol.assigned_to %}
@@ -129,8 +129,8 @@
         </td>
         <td class="py-1.5 text-xs"></td>
         <td class="py-1.5 text-xs">
-          <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
-          {% if scan.s3_uploaded %}<span class="badge-s3">S3</span>{% endif %}
+          <span class="badge-{{ scan.status }}" title="Scan status: {{ scan.get_status_display }}">{{ scan.get_status_display }}</span>
+          {% if scan.s3_uploaded %}<span class="badge-s3" title="Final files uploaded to S3">S3</span>{% endif %}
         </td>
         <td class="py-1.5 text-xs text-gray-400 dark:text-gray-500">
           {{ scan.date_created|date:"M j" }}
