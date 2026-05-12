@@ -6,7 +6,9 @@ import os
 import shutil
 import tempfile
 import traceback
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import fitz
 from django.contrib import messages
@@ -20,6 +22,8 @@ from django.http import (
 )
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
+from django.utils.cache import get_conditional_response
+from django.utils.http import http_date
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
@@ -413,18 +417,67 @@ def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=scan.pk)
 
 
+def _resolve_opinion_pdf(
+    field: Any, opinion: OpinionScan
+) -> tuple[int, datetime, Any] | None:
+    """Locate an OpinionScan PDF and return its size, mtime, and opener.
+
+    The FileField name is either a MEDIA_ROOT-relative path (DEV,
+    resolves via the storage backend) or a scan.output_dir-relative
+    path (prod, file lives under /tmp/scanning/{pk}/...). Try the
+    storage backend first; fall back to resolving against the scan's
+    output_dir, with a lazy S3 pull as a last resort.
+
+    :param field: The FileField from the OpinionScan instance.
+    :param opinion: The OpinionScan instance.
+    :returns: ``(size_bytes, mtime, opener)`` where ``opener`` is a
+        zero-arg callable returning an open binary file handle, or
+        ``None`` if the file cannot be located.
+    :rtype: tuple[int, datetime, Any] | None
+    """
+    if field.storage.exists(field.name):
+        size = field.storage.size(field.name)
+        mtime = field.storage.get_modified_time(field.name)
+        return size, mtime, lambda: field.open("rb")
+
+    if opinion.scan:
+        candidate = Path(opinion.scan.output_dir) / field.name
+        if not candidate.is_file():
+            try:
+                from scanning import s3_sync
+
+                s3_sync.download_processing_files(opinion.scan)
+            except Exception:
+                logger.exception(
+                    "Lazy S3 pull failed for opinion %s", opinion.pk
+                )
+        if candidate.is_file():
+            stat = candidate.stat()
+            mtime = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
+            return stat.st_size, mtime, lambda: candidate.open("rb")
+
+    return None
+
+
 @login_required
 def serve_opinionscan_pdf(
     request: HttpRequest, pk: int, variant: str
-) -> FileResponse:
+) -> FileResponse | HttpResponse:
     """Serve a PDF for an OpinionScan by variant (redacted/original/masked).
 
-    The file path comes from the model field, not from user input.
+    The file path comes from the model field, not from user input. The
+    response carries ``ETag`` / ``Last-Modified`` / ``Cache-Control`` so
+    that toggling between variants in the viewer reuses the browser's
+    HTTP cache instead of re-downloading the file on every click. The
+    ``ETag`` is derived from the file's mtime and size, so it
+    invalidates automatically when a redaction edit rewrites the file.
 
     :param request: The HTTP request.
     :param pk: OpinionScan primary key.
     :param variant: One of 'redacted', 'original', or 'masked'.
-    :return: File response streaming the PDF.
+    :return: File response streaming the PDF, or a 304 Not Modified
+        response when the client's cached copy is still fresh.
+    :rtype: FileResponse | HttpResponse
     """
     opinion = get_object_or_404(OpinionScan, pk=pk)
     field_map = {
@@ -436,33 +489,24 @@ def serve_opinionscan_pdf(
     if not field or not field.name:
         raise Http404
 
-    # The FileField name is either a MEDIA_ROOT-relative path (DEV,
-    # resolves via the storage backend) or a scan.output_dir-relative
-    # path (prod, file lives under /tmp/scanning/{pk}/...). Try the
-    # storage backend first; fall back to resolving against the scan's
-    # output_dir.
-    if field.storage.exists(field.name):
-        return FileResponse(field.open("rb"), content_type="application/pdf")
-    if opinion.scan:
-        candidate = Path(opinion.scan.output_dir) / field.name
-        if candidate.is_file():
-            return FileResponse(
-                candidate.open("rb"), content_type="application/pdf"
-            )
-        # Lazy pull from S3: covers the case where the daemon generated
-        # files after the web container's /tmp/ was populated (or never
-        # was). Runs once per request; no-op if S3 is disabled.
-        try:
-            from scanning import s3_sync
+    resolved = _resolve_opinion_pdf(field, opinion)
+    if resolved is None:
+        raise Http404
+    size, mtime, opener = resolved
 
-            s3_sync.download_processing_files(opinion.scan)
-        except Exception:
-            logger.exception("Lazy S3 pull failed for opinion %s", opinion.pk)
-        if candidate.is_file():
-            return FileResponse(
-                candidate.open("rb"), content_type="application/pdf"
-            )
-    raise Http404
+    last_modified = int(mtime.timestamp())
+    etag = f'"{last_modified}-{size}"'
+    conditional = get_conditional_response(
+        request, etag=etag, last_modified=last_modified
+    )
+    if conditional is not None:
+        response: FileResponse | HttpResponse = conditional
+    else:
+        response = FileResponse(opener(), content_type="application/pdf")
+    response["Cache-Control"] = "private, max-age=300"
+    response["ETag"] = etag
+    response["Last-Modified"] = http_date(last_modified)
+    return response
 
 
 def _apply_rect_to_pdf(

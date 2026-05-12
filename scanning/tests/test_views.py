@@ -1087,6 +1087,44 @@ class TestServeOpinionPdfLazyPull(ScanningTestCase):
         mock_pull.assert_called_once()
 
 
+class TestServeOpinionPdfCaching(ScanningTestCase):
+    """serve_opinionscan_pdf sets cache headers and honors revalidation."""
+
+    def test_response_carries_cache_headers(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        opinion = OpinionScanFactory()
+
+        response = self.client.get(
+            reverse(
+                "serve_opinionscan_pdf",
+                kwargs={"pk": opinion.pk, "variant": "original"},
+            )
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Cache-Control"], "private, max-age=300")
+        self.assertTrue(response["ETag"].startswith('"'))
+        self.assertIn("Last-Modified", response)
+
+    def test_if_none_match_returns_304(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        opinion = OpinionScanFactory()
+
+        url = reverse(
+            "serve_opinionscan_pdf",
+            kwargs={"pk": opinion.pk, "variant": "original"},
+        )
+        first = self.client.get(url)
+        etag = first["ETag"]
+
+        second = self.client.get(url, HTTP_IF_NONE_MATCH=etag)
+        self.assertEqual(second.status_code, 304)
+        self.assertEqual(second["ETag"], etag)
+        self.assertEqual(second["Cache-Control"], "private, max-age=300")
+
+
 class TestServeScanPdfLazyPull(ScanningTestCase):
     """serve_scan_pdf falls back to S3 pull when /tmp/ is stale."""
 
