@@ -25,10 +25,12 @@ from scanning.models import (
     Detection,
     OpinionScan,
     OpinionStatus,
+    QueueStatus,
     Scan,
     Source,
     Stage,
     Status,
+    Volume,
 )
 
 MEDIA_ROOT = tempfile.mkdtemp()
@@ -264,6 +266,110 @@ class TestStaffReview(ScanningTestCase):
         self.assertIsNone(response.context["review_form"])
         self.assertContains(response, "Review Decision")
         self.assertContains(response, "Approved")
+
+
+class TestVolumeQueueStatusIntegration(ScanningTestCase):
+    """Volume.queue_status updates when scans change state."""
+
+    def _make_volume(self, **kwargs):
+        defaults = {
+            "reporter": ReporterFactory(short_name="vq"),
+            "volume_number": 1,
+            "expected_start_page": 1,
+            "expected_end_page": 100,
+        }
+        defaults.update(kwargs)
+        return Volume.objects.create(**defaults)
+
+    def test_approval_bumps_volume_to_complete(self):
+        staff = self.make_staff_user()
+        self.client.force_login(staff)
+        volume = self._make_volume(queue_status=QueueStatus.SCANNED)
+        scan = ScanFactory(
+            volume_obj=volume,
+            reporter=volume.reporter,
+            volume=volume.volume_number,
+            start_page=1,
+            end_page=100,
+            status=Status.PENDING_REVIEW,
+        )
+        response = self.client.post(
+            reverse("scan_detail", kwargs={"pk": scan.pk}),
+            {"status": Status.APPROVED, "notes": "ok"},
+        )
+        self.assertEqual(response.status_code, 302)
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.COMPLETE)
+
+    def test_rejection_moves_volume_back_to_scanning(self):
+        staff = self.make_staff_user()
+        self.client.force_login(staff)
+        volume = self._make_volume(queue_status=QueueStatus.SCANNED)
+        scan = ScanFactory(
+            volume_obj=volume,
+            reporter=volume.reporter,
+            volume=volume.volume_number,
+            start_page=1,
+            end_page=50,
+            status=Status.PENDING_REVIEW,
+        )
+        response = self.client.post(
+            reverse("scan_detail", kwargs={"pk": scan.pk}),
+            {"status": Status.UPLOADED, "notes": "needs rescan"},
+        )
+        self.assertEqual(response.status_code, 302)
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
+
+    def test_unavailable_volume_is_not_recomputed(self):
+        staff = self.make_staff_user()
+        self.client.force_login(staff)
+        volume = self._make_volume(queue_status=QueueStatus.UNAVAILABLE)
+        scan = ScanFactory(
+            volume_obj=volume,
+            reporter=volume.reporter,
+            volume=volume.volume_number,
+            start_page=1,
+            end_page=100,
+            status=Status.PENDING_REVIEW,
+        )
+        self.client.post(
+            reverse("scan_detail", kwargs={"pk": scan.pk}),
+            {"status": Status.APPROVED, "notes": "ok"},
+        )
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.UNAVAILABLE)
+
+    @override_settings(DEVELOPMENT=True)
+    def test_upload_bumps_assigned_to_scanning(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        volume = self._make_volume(
+            queue_status=QueueStatus.ASSIGNED,
+            assigned_to=user,
+            assigned_at=timezone.now(),
+        )
+        pdf = SimpleUploadedFile(
+            "scan.pdf", b"%PDF-1.4 body", content_type="application/pdf"
+        )
+        response = self.client.post(
+            reverse(
+                "queue_upload",
+                kwargs={
+                    "reporter_slug": volume.reporter.short_name,
+                    "vol": volume.volume_number,
+                },
+            ),
+            {
+                "new_scan": "1",
+                "first_page": "1",
+                "last_page": "50",
+                "original_pdf": pdf,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
 
 
 class TestScanModel(ScanningTestCase):
