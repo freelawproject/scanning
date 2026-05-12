@@ -340,6 +340,50 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.UNAVAILABLE)
 
+    def test_admin_delete_refreshes_volume_queue_status(self):
+        """Deleting a Scan via admin should refresh its parent Volume."""
+        from django.contrib.admin.sites import AdminSite
+
+        from scanning.admin import ScanAdmin
+
+        volume = self._make_volume(queue_status=QueueStatus.COMPLETE)
+        scan = ScanFactory(
+            volume_obj=volume,
+            reporter=volume.reporter,
+            volume=volume.volume_number,
+            start_page=1,
+            end_page=100,
+            status=Status.APPROVED,
+        )
+        admin_instance = ScanAdmin(Scan, AdminSite())
+        admin_instance.delete_model(request=None, obj=scan)
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.NEEDS_SCANNING)
+        self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
+
+    def test_admin_bulk_delete_refreshes_volumes(self):
+        """Bulk-deleting Scans via admin should refresh each parent Volume."""
+        from django.contrib.admin.sites import AdminSite
+
+        from scanning.admin import ScanAdmin
+
+        volume = self._make_volume(queue_status=QueueStatus.COMPLETE)
+        ScanFactory(
+            volume_obj=volume,
+            reporter=volume.reporter,
+            volume=volume.volume_number,
+            start_page=1,
+            end_page=100,
+            status=Status.APPROVED,
+        )
+        admin_instance = ScanAdmin(Scan, AdminSite())
+        admin_instance.delete_queryset(
+            request=None, queryset=Scan.objects.filter(volume_obj=volume)
+        )
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.NEEDS_SCANNING)
+        self.assertEqual(Scan.objects.filter(volume_obj=volume).count(), 0)
+
     @override_settings(DEVELOPMENT=True)
     def test_upload_bumps_assigned_to_scanning(self):
         user = self.make_user()

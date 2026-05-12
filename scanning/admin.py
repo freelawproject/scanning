@@ -11,6 +11,7 @@ from scanning.models import (
     Status,
     Volume,
 )
+from scanning.services import refresh_volume_queue_status
 
 
 class RetryCapFilter(admin.SimpleListFilter):
@@ -71,6 +72,35 @@ class ScanAdmin(admin.ModelAdmin):
     readonly_fields = ["date_created", "date_modified", "processed_at"]
     date_hierarchy = "date_created"
     actions = ["reset_to_queued", "requeue_retry_cap_scans"]
+
+    def delete_model(self, request, obj):
+        """Delete a Scan and refresh its parent Volume's queue_status.
+
+        Without this, the volume can drift (e.g. stay at COMPLETE after
+        its only approved scan is deleted from the admin).
+
+        :param request: The admin HTTP request.
+        :param obj: The Scan to delete.
+        """
+        volume = obj.volume_obj
+        super().delete_model(request, obj)
+        if volume is not None:
+            refresh_volume_queue_status(volume)
+
+    def delete_queryset(self, request, queryset):
+        """Bulk-delete Scans and refresh affected Volumes.
+
+        :param request: The admin HTTP request.
+        :param queryset: Scans selected for deletion.
+        """
+        volume_ids = list(
+            queryset.exclude(volume_obj__isnull=True)
+            .values_list("volume_obj_id", flat=True)
+            .distinct()
+        )
+        super().delete_queryset(request, queryset)
+        for volume in Volume.objects.filter(pk__in=volume_ids):
+            refresh_volume_queue_status(volume)
 
     @admin.action(
         description=(
