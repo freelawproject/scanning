@@ -1,5 +1,3 @@
-import sys
-
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand
@@ -20,9 +18,9 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        if not settings.DEVELOPMENT:
-            self.stderr.write("Refusing to seed: DEVELOPMENT is not True.")
-            sys.exit(1)
+        if not settings.DEVELOPMENT or settings.RUNPOD_ENABLED:
+            self.stdout.write("Skipping dev seeding.")
+            return
 
         staff, created = User.objects.get_or_create(
             username="staff",
