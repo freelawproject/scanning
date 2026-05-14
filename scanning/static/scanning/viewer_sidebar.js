@@ -221,7 +221,14 @@ var _opinions = [];
 
         var _lastIdx = -1;
         var _timer;
+        var _scrollPaused = false;
+        window._pauseSidebarScroll = function () {
+            _scrollPaused = true;
+            clearTimeout(_timer);
+            setTimeout(function () { _scrollPaused = false; }, 2000);
+        };
         function _onScroll() {
+            if (_scrollPaused) return;
             clearTimeout(_timer);
             _timer = setTimeout(function () {
                 var viewerRect = viewer.getBoundingClientRect();
@@ -279,6 +286,7 @@ function highlightDetection(el) {
         e.remove();
     });
 
+    if (window._pauseSidebarScroll) window._pauseSidebarScroll();
     goToPage(d.logicalPage);
 
     setTimeout(function () {

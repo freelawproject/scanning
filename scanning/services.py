@@ -661,6 +661,76 @@ def _pull_processing_files_from_s3(scan_pk: int) -> None:
         )
 
 
+# Detection labels that map 1:1 to a redaction rect, keyed by fill color.
+# Mirrors blackletter's _REDACT_WHITE/_REDACT_BLACK sets; KEY_ICON is also
+# treated as black-filled here (blackletter has special "white before
+# caption" logic at generate time that we don't replicate at edit time).
+_SIMPLE_REDACT_RECTS: dict[str, str] = {
+    "KEY_ICON": "black",
+    "PAGE_HEADER": "white",
+    "STATE_ABBREVIATION": "white",
+    "DIVIDER": "black",
+    "HEADNOTE_BRACKET": "black",
+    "EDITORIAL": "black",
+}
+
+
+def _sync_redaction_rects_from_detections(scan_pk: int) -> None:
+    """Rebuild per-detection redaction rects from active Detection rows.
+
+    Only touches the 1:1 detection-to-rect entries (KEY_ICON, PAGE_HEADER,
+    STATE_ABBREVIATION, DIVIDER, HEADNOTE_BRACKET, EDITORIAL). Headnote
+    blocks, margins, and any manually-drawn rects are left untouched.
+
+    Called after any detection mutation so ``scan.redaction_rects`` stays
+    in sync with the user's current detection set. Without this, deleting
+    a KEY_ICON detection leaves its redaction rect orphaned, and adding a
+    new one produces no redaction in the generated PDF.
+
+    :param scan_pk: Primary key of the scan to sync.
+    :return: None
+    """
+    scan = Scan.objects.get(pk=scan_pk)
+    rects = scan.redaction_rects
+    if not isinstance(rects, list):
+        rects = []
+    by_page: dict[int, dict] = {entry["page_index"]: entry for entry in rects}
+
+    # Drop existing simple-label rects from every page; we rebuild below.
+    for entry in rects:
+        entry["rects"] = [
+            r
+            for r in entry["rects"]
+            if r.get("type") not in _SIMPLE_REDACT_RECTS
+        ]
+
+    dets = Detection.objects.filter(
+        scan_id=scan_pk,
+        active=True,
+        label__in=_SIMPLE_REDACT_RECTS.keys(),
+    ).order_by("page_index", "y0")
+
+    for d in dets:
+        entry = by_page.get(d.page_index)
+        if entry is None:
+            entry = {"page_index": d.page_index, "rects": []}
+            rects.append(entry)
+            by_page[d.page_index] = entry
+        entry["rects"].append(
+            {
+                "x0": round(d.x0, 1),
+                "y0": round(d.y0, 1),
+                "x1": round(d.x1, 1),
+                "y1": round(d.y1, 1),
+                "fill": _SIMPLE_REDACT_RECTS[d.label],
+                "type": d.label,
+            }
+        )
+
+    rects = [e for e in rects if e["rects"]]
+    Scan.objects.filter(pk=scan_pk).update(redaction_rects=rects)
+
+
 def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
     """Write current DB detections to detections.json on disk.
 
