@@ -34,7 +34,6 @@ from scanning.models import (
 )
 from scanning.utils import (
     compute_coverage_gaps,
-    find_json_file,
     find_ocr_pdf,
 )
 
