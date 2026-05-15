@@ -1103,7 +1103,7 @@ class TestServeOpinionPdfCaching(ScanningTestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response["Cache-Control"], "private, max-age=300")
+        self.assertEqual(response["Cache-Control"], "private, no-cache")
         self.assertTrue(response["ETag"].startswith('"'))
         self.assertIn("Last-Modified", response)
 
@@ -1122,7 +1122,7 @@ class TestServeOpinionPdfCaching(ScanningTestCase):
         second = self.client.get(url, HTTP_IF_NONE_MATCH=etag)
         self.assertEqual(second.status_code, 304)
         self.assertEqual(second["ETag"], etag)
-        self.assertEqual(second["Cache-Control"], "private, max-age=300")
+        self.assertEqual(second["Cache-Control"], "private, no-cache")
 
 
 class TestServeScanPdfLazyPull(ScanningTestCase):

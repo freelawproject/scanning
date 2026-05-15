@@ -466,9 +466,9 @@ def serve_opinionscan_pdf(
     """Serve a PDF for an OpinionScan by variant (redacted/original/masked).
 
     The file path comes from the model field, not from user input. The
-    response carries ``ETag`` / ``Last-Modified`` / ``Cache-Control`` so
-    that toggling between variants in the viewer reuses the browser's
-    HTTP cache instead of re-downloading the file on every click. The
+    response carries ``ETag`` / ``Last-Modified`` / ``Cache-Control:
+    no-cache`` so the browser always revalidates but skips re-downloading
+    the file when its cached copy is still fresh (returns 304). The
     ``ETag`` is derived from the file's mtime and size, so it
     invalidates automatically when a redaction edit rewrites the file.
 
@@ -503,7 +503,7 @@ def serve_opinionscan_pdf(
         response: FileResponse | HttpResponse = conditional
     else:
         response = FileResponse(opener(), content_type="application/pdf")
-    response["Cache-Control"] = "private, max-age=300"
+    response["Cache-Control"] = "private, no-cache"
     response["ETag"] = etag
     response["Last-Modified"] = http_date(last_modified)
     return response
