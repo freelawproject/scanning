@@ -2082,8 +2082,10 @@ def run_generate_files(scan_pk: int) -> None:
 
         scan.redacted_pdf_path = str(full_redacted) if full_redacted else ""
         scan.opinions_json = existing_opinions
+        # Files have been generated; the scan is ready for human review
+        # at step 3. The human clicks Approve to flip status -> APPROVED.
         scan.stage = Stage.APPROVED
-        scan.status = Status.APPROVED
+        scan.status = Status.PENDING_REVIEW
         scan.s3_uploaded = False
         scan.progress_message = f"Generated {opinion_count} opinions"
         scan.progress_log = ""

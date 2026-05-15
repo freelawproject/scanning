@@ -93,17 +93,12 @@
       {% if opinion_scans %}
       <form method="post" action="{% url 'approve_scan' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm" title="Mark this scan as approved and upload the final files to S3">Approve</button>
+        <button type="submit" class="btn-primary text-sm" title="Mark this scan as approved">Approve</button>
       </form>
       {% endif %}
     {% endif %}
   </div>
 </div>
-{% if step == 3 and not scan.s3_uploaded %}
-<div class="px-4 mt-2">
-  <div class="alert-warning text-sm">The final files have not been uploaded to S3. Click "Approve" to upload.</div>
-</div>
-{% endif %}
 {% endblock %}
 
 {% block full_width_content %}

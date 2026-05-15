@@ -388,28 +388,28 @@ def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
 @login_required
 @require_POST
 def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
-    """Approve a scan and upload final files to S3.
+    """Mark a scan as approved.
 
-    Validates that generated files exist before approving. Uploads
-    redacted opinion PDFs plus the full-book original and redacted PDFs
-    to the private S3 bucket (in prod) or logs a dev message (in dev).
+    Generate Files already pushed every output file to
+    ``processing/<pk>/...`` on S3, so this view is a pure status flip:
+    it validates that file generation has run, then sets
+    ``status=APPROVED``. No S3 promotion happens here.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the process page.
     """
-    from scanning.services import upload_approved_files
-
     scan = get_object_or_404(Scan, pk=pk)
 
-    result = upload_approved_files(scan.pk)
-    if result.startswith("Before approving"):
-        messages.error(request, result)
+    if scan.stage != Stage.APPROVED:
+        messages.error(
+            request, "Before approving you need to generate the files."
+        )
         return redirect("scan_process", pk=scan.pk)
 
-    scan.stage = Stage.APPROVED
-    scan.save(update_fields=["stage"])
-    messages.success(request, result)
+    scan.status = Status.APPROVED
+    scan.save(update_fields=["status"])
+    messages.success(request, "Scan approved.")
     return redirect("scan_process", pk=scan.pk)
 
 
