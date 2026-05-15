@@ -796,11 +796,8 @@ class TestApproveScan(ScanningTestCase):
         output.mkdir(parents=True, exist_ok=True)
 
         redacted_dir = output / "redacted"
-        masked_dir = output / "masked"
         redacted_dir.mkdir()
-        masked_dir.mkdir()
         (redacted_dir / "a.1.0001-0010.pdf").write_bytes(b"%PDF-1.4")
-        (masked_dir / "a.1.0001-0010.pdf").write_bytes(b"%PDF-1.4")
         return scan
 
     def test_approve_without_files_shows_error(self):

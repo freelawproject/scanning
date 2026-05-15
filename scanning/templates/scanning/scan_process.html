@@ -88,16 +88,13 @@
     {% elif step == 3 %}
       <form method="post" action="{% url 'generate_files' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Create redacted, masked, and unredacted PDF files for each opinion">{% if opinion_scans %}Regenerate{% else %}Generate{% endif %} Files</button>
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Create redacted and unredacted PDF files for each opinion">{% if opinion_scans %}Regenerate{% else %}Generate{% endif %} Files</button>
       </form>
       {% if opinion_scans %}
       <form method="post" action="{% url 'approve_scan' scan.pk %}" class="inline">
         {% csrf_token %}
         <button type="submit" class="btn-primary text-sm" title="Mark this scan as approved and upload the final files to S3">Approve</button>
       </form>
-      {% endif %}
-      {% if scan.stage == 'approved' %}
-      <a href="{% url 'scan_list' %}" class="btn-primary text-sm no-underline" style="background:#059669" title="Return to the scan list">Done &rarr; List</a>
       {% endif %}
     {% endif %}
   </div>
@@ -225,7 +222,6 @@
       {% for s in opinion_scans %}
       <div class="rounded border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-2 py-1.5 mb-1 cursor-pointer text-xs issue-card"
            data-redacted="{{ s.redacted_filename }}"
-           data-masked="{{ s.masked_filename }}"
            data-unredacted="{{ s.unredacted_filename }}"
            data-opinion-pk="{{ s.pk }}"
            onclick="viewOpinionByMode({{ forloop.counter0 }}, this)">

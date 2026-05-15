@@ -67,7 +67,7 @@ var _opinions = [];
 
         window.setViewMode = function (mode) {
             _viewMode = mode;
-            ["redacted", "masked", "unredacted"].forEach(function (m) {
+            ["redacted", "unredacted"].forEach(function (m) {
                 var btn = document.getElementById("mode-" + m);
                 if (!btn) return;
                 if (m === mode) {
@@ -93,7 +93,6 @@ var _opinions = [];
             var pk = el.dataset.opinionPk || "0";
             var variantMap = {
                 redacted: "redacted",
-                masked: "masked",
                 unredacted: "original",
             };
             var variant = variantMap[_viewMode] || "redacted";
