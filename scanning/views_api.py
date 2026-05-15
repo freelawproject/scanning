@@ -392,28 +392,28 @@ def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
 @login_required
 @require_POST
 def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
-    """Approve a scan and upload final files to S3.
+    """Mark a scan as approved.
 
-    Validates that generated files exist before approving. Uploads
-    redacted, masked, original, and redacted PDFs to the private S3
-    bucket (in prod) or logs a dev message (in dev).
+    Generate Files already pushed every output file to
+    ``processing/<pk>/...`` on S3, so this view is a pure status flip:
+    it validates that file generation has run, then sets
+    ``status=APPROVED``. No S3 promotion happens here.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the process page.
     """
-    from scanning.services import upload_approved_files
-
     scan = get_object_or_404(Scan, pk=pk)
 
-    result = upload_approved_files(scan.pk)
-    if result.startswith("Before approving"):
-        messages.error(request, result)
+    if scan.stage != Stage.APPROVED:
+        messages.error(
+            request, "Before approving you need to generate the files."
+        )
         return redirect("scan_process", pk=scan.pk)
 
-    scan.stage = Stage.APPROVED
-    scan.save(update_fields=["stage"])
-    messages.success(request, result)
+    scan.status = Status.APPROVED
+    scan.save(update_fields=["status"])
+    messages.success(request, "Scan approved.")
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -463,7 +463,7 @@ def _resolve_opinion_pdf(
 def serve_opinionscan_pdf(
     request: HttpRequest, pk: int, variant: str
 ) -> FileResponse | HttpResponse:
-    """Serve a PDF for an OpinionScan by variant (redacted/original/masked).
+    """Serve a PDF for an OpinionScan by variant (redacted/original).
 
     The file path comes from the model field, not from user input. The
     response carries ``ETag`` / ``Last-Modified`` / ``Cache-Control:
@@ -474,7 +474,7 @@ def serve_opinionscan_pdf(
 
     :param request: The HTTP request.
     :param pk: OpinionScan primary key.
-    :param variant: One of 'redacted', 'original', or 'masked'.
+    :param variant: One of 'redacted' or 'original'.
     :return: File response streaming the PDF, or a 304 Not Modified
         response when the client's cached copy is still fresh.
     :rtype: FileResponse | HttpResponse
@@ -483,7 +483,6 @@ def serve_opinionscan_pdf(
     field_map = {
         "redacted": opinion.redacted_pdf,
         "original": opinion.original_pdf,
-        "masked": opinion.masked_pdf,
     }
     field = field_map.get(variant)
     if not field or not field.name:
@@ -553,7 +552,7 @@ def _apply_rect_to_pdf(
 def apply_rect_to_opinion(
     request: HttpRequest, pk: int, opinion_pk: int
 ) -> JsonResponse:
-    """Apply a redaction rectangle to an opinion's redacted and masked PDFs.
+    """Apply a redaction rectangle to an opinion's redacted PDF.
 
     :param request: The HTTP request (JSON body with page_index,
         x0, y0, x1, y1, and fill).
@@ -578,21 +577,6 @@ def apply_rect_to_opinion(
     )
     if os.path.isfile(redacted_path):
         _apply_rect_to_pdf(redacted_path, page_index, x0, y0, x1, y1, fill)
-
-    # Also apply to masked PDF if it exists
-    if opinion.masked_pdf and opinion.masked_pdf.name:
-        masked_path = os.path.join(
-            scan.output_dir,
-            "masked",
-            os.path.basename(opinion.masked_pdf.name),
-        )
-        if os.path.isfile(masked_path):
-            try:
-                _apply_rect_to_pdf(
-                    masked_path, page_index, x0, y0, x1, y1, fill
-                )
-            except ValueError:
-                pass  # masked PDF may have different page count
 
     return JsonResponse({"status": "ok"})
 

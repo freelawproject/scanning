@@ -796,11 +796,8 @@ class TestApproveScan(ScanningTestCase):
         output.mkdir(parents=True, exist_ok=True)
 
         redacted_dir = output / "redacted"
-        masked_dir = output / "masked"
         redacted_dir.mkdir()
-        masked_dir.mkdir()
         (redacted_dir / "a.1.0001-0010.pdf").write_bytes(b"%PDF-1.4")
-        (masked_dir / "a.1.0001-0010.pdf").write_bytes(b"%PDF-1.4")
         return scan
 
     def test_approve_without_files_shows_error(self):
@@ -817,52 +814,23 @@ class TestApproveScan(ScanningTestCase):
         scan.refresh_from_db()
         self.assertFalse(scan.s3_uploaded)
 
-    def test_approve_with_files_sets_path(self):
-        """Approving with generated files sets s3_path."""
-        from unittest.mock import patch
+    def test_approve_with_files_flips_status(self):
+        """Approving a generated scan flips status to APPROVED.
 
+        Approve is now a pure status flip — the generate step already
+        pushed files to ``processing/<pk>/...`` on S3, so this view does
+        not promote anything. Just confirms the human signed off.
+        """
         user = self.make_staff_user()
         self.client.force_login(user)
         scan = self._make_scan_with_generated_files()
 
-        with patch.dict("os.environ", {}, clear=True):
-            self.client.post(
-                reverse("approve_scan", kwargs={"pk": scan.pk}),
-                follow=True,
-            )
-        scan.refresh_from_db()
-        self.assertTrue(scan.s3_path.startswith("approved/"))
-
-    @override_settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket")
-    def test_approve_with_creds_sets_uploaded_flag(self):
-        """Approving with AWS creds sets s3_uploaded to True."""
-        from unittest.mock import MagicMock, patch
-
-        from botocore.exceptions import ClientError
-
-        user = self.make_staff_user()
-        self.client.force_login(user)
-        scan = self._make_scan_with_generated_files()
-
-        mock_client = MagicMock()
-        mock_client.head_object.side_effect = ClientError(
-            {"Error": {"Code": "404"}}, "HeadObject"
+        self.client.post(
+            reverse("approve_scan", kwargs={"pk": scan.pk}),
+            follow=True,
         )
-        mock_env = {
-            "AWS_ACCESS_KEY_ID": "test",
-            "AWS_SECRET_ACCESS_KEY": "test",
-        }
-        with (
-            patch.dict("os.environ", mock_env),
-            patch("boto3.client", return_value=mock_client),
-        ):
-            self.client.post(
-                reverse("approve_scan", kwargs={"pk": scan.pk}),
-                follow=True,
-            )
         scan.refresh_from_db()
-        self.assertTrue(scan.s3_uploaded)
-        self.assertTrue(scan.s3_path.startswith("approved/"))
+        self.assertEqual(scan.status, Status.APPROVED)
 
     def test_approve_requires_login(self):
         """Approve endpoint redirects to login for anonymous users."""

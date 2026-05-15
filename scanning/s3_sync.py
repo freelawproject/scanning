@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # copied from processing/ to approved/ (the processing/ copy is kept).
 # Everything else in processing/ (bitonal, detections, unredacted/,
 # stamped, etc.) stays only under processing/.
-APPROVED_SUBDIR_PREFIXES = ("redacted/", "masked/", "images/")
+APPROVED_SUBDIR_PREFIXES = ("redacted/", "images/")
 APPROVED_FILE_SUFFIXES = (".original.pdf", ".redacted.pdf")
 
 
@@ -104,9 +104,9 @@ def _iter_files_to_sync(local_root: Path):
 def _is_approved_deliverable(relative_path: str) -> bool:
     """Return True if ``relative_path`` (under processing/) belongs in approved/.
 
-    Approved deliverables are opinion PDFs under ``redacted/`` and
-    ``masked/``, extracted figure images under ``images/``, plus the
-    full-book original and redacted PDFs. Everything else (bitonal,
+    Approved deliverables are opinion PDFs under ``redacted/``,
+    extracted figure images under ``images/``, plus the full-book
+    original and redacted PDFs. Everything else (bitonal,
     detections.json, unredacted/, stamped) stays under processing/.
 
     :param relative_path: Path relative to the scan's processing prefix.
