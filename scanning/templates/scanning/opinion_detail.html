@@ -80,10 +80,6 @@
       <button class="pdf-tab text-sm px-4 py-2 font-medium rounded-t border border-b-0 border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/50 -mb-px"
               data-url="{% url 'serve_opinionscan_pdf' pk=opinion.pk variant='original' %}" onclick="switchTab(this)">Original</button>
       {% endif %}
-      {% if opinion.masked_pdf %}
-      <button class="pdf-tab text-sm px-4 py-2 font-medium rounded-t border border-b-0 border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/50 -mb-px"
-              data-url="{% url 'serve_opinionscan_pdf' pk=opinion.pk variant='masked' %}" onclick="switchTab(this)">Masked</button>
-      {% endif %}
     </div>
 
     <!-- PDF viewer -->

@@ -246,11 +246,6 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 if s.redacted_pdf and s.redacted_pdf.name
                 else ""
             )
-            s.masked_filename = (
-                os.path.basename(s.masked_pdf.name)
-                if s.masked_pdf and s.masked_pdf.name
-                else ""
-            )
             s.unredacted_filename = (
                 os.path.basename(s.original_pdf.name)
                 if s.original_pdf and s.original_pdf.name

@@ -171,13 +171,6 @@ class OpinionScanUploadForm(forms.ModelForm):
             attrs={"class": "input-text w-full", "accept": ".pdf"}
         ),
     )
-    masked_pdf = forms.FileField(
-        required=False,
-        validators=[FileExtensionValidator(allowed_extensions=["pdf"])],
-        widget=forms.ClearableFileInput(
-            attrs={"class": "input-text w-full", "accept": ".pdf"}
-        ),
-    )
     redacted_pdf = forms.FileField(
         required=False,
         validators=[FileExtensionValidator(allowed_extensions=["pdf"])],
@@ -192,7 +185,6 @@ class OpinionScanUploadForm(forms.ModelForm):
             "reporter",
             "volume",
             "original_pdf",
-            "masked_pdf",
             "redacted_pdf",
             "page_start",
             "page_end",

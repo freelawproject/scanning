@@ -100,8 +100,6 @@ class TestSyncHelpersWithCredentials(TestCase):
         # Now these should also be uploaded (recursive walk).
         (local_root / "redacted").mkdir()
         (local_root / "redacted" / "op.pdf").write_bytes(b"r")
-        (local_root / "masked").mkdir()
-        (local_root / "masked" / "op.pdf").write_bytes(b"m")
         (local_root / "unredacted").mkdir()
         (local_root / "unredacted" / "op.pdf").write_bytes(b"u")
 
@@ -110,7 +108,7 @@ class TestSyncHelpersWithCredentials(TestCase):
             mock_boto3.client.return_value = mock_s3
             count = s3_sync.upload_processing_files(scan)
 
-        self.assertEqual(count, 6)
+        self.assertEqual(count, 5)
         uploaded_keys = {
             call.args[2] for call in mock_s3.upload_file.call_args_list
         }
@@ -122,14 +120,12 @@ class TestSyncHelpersWithCredentials(TestCase):
                 f"{prefix}detections.json",
                 f"{prefix}images/1-001.png",
                 f"{prefix}redacted/op.pdf",
-                f"{prefix}masked/op.pdf",
                 f"{prefix}unredacted/op.pdf",
             },
         )
 
     def test_is_approved_deliverable(self):
         self.assertTrue(s3_sync._is_approved_deliverable("redacted/foo.pdf"))
-        self.assertTrue(s3_sync._is_approved_deliverable("masked/foo.pdf"))
         self.assertTrue(s3_sync._is_approved_deliverable("images/1-001.png"))
         self.assertTrue(
             s3_sync._is_approved_deliverable("tc.1.1.2.original.pdf")
@@ -160,7 +156,6 @@ class TestSyncHelpersWithCredentials(TestCase):
                     {"Key": f"{src_prefix}tc.164.1.2.original.pdf"},
                     {"Key": f"{src_prefix}tc.164.1.2.redacted.pdf"},
                     {"Key": f"{src_prefix}redacted/a.pdf"},
-                    {"Key": f"{src_prefix}masked/a.pdf"},
                     {"Key": f"{src_prefix}unredacted/a.pdf"},
                     {"Key": f"{src_prefix}images/1-001.png"},
                 ]
@@ -174,7 +169,7 @@ class TestSyncHelpersWithCredentials(TestCase):
 
         expected_prefix = "approved/tc/164/1/"
         self.assertEqual(prefix, expected_prefix)
-        self.assertEqual(count, 5)
+        self.assertEqual(count, 4)
         copied = {c.kwargs["Key"] for c in mock_s3.copy_object.call_args_list}
         self.assertEqual(
             copied,
@@ -182,7 +177,6 @@ class TestSyncHelpersWithCredentials(TestCase):
                 f"{expected_prefix}tc.164.1.2.original.pdf",
                 f"{expected_prefix}tc.164.1.2.redacted.pdf",
                 f"{expected_prefix}redacted/a.pdf",
-                f"{expected_prefix}masked/a.pdf",
                 f"{expected_prefix}images/1-001.png",
             },
         )
