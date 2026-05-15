@@ -45,6 +45,9 @@ jobs:
           IMAGE: freelawproject/blackletter-gpu-worker:${{ steps.vars.outputs.sha_short }}
         run: |
           set -euo pipefail
+          # Sends only `imageName`. RunPod's partial PATCH preserves other
+          # fields, but if env vars are later added to the template,
+          # re-verify they survive or switch to read-modify-write.
           payload=$(jq -nc --arg img "$IMAGE" '{imageName: $img}')
           response=$(curl -sS -w "\n%{http_code}" -X PATCH \
             -H "Authorization: Bearer $RUNPOD_API_KEY" \
