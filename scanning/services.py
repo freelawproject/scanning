@@ -75,6 +75,13 @@ def _volume_fully_uploaded(volume: Volume, scan_count: int) -> bool:
     that a volume is "done", so we return False and leave it to a
     curator to mark via the manual dropdown.
 
+    Trade-off in the count fallback: when only ``expected_parts`` is
+    set, this returns True as soon as the scan count meets the
+    expectation, without verifying that the scans actually span
+    distinct page ranges. Two scans covering the same pages will look
+    "fully uploaded". The accurate path is the coverage check above;
+    set ``expected_start_page`` / ``expected_end_page`` when possible.
+
     :param volume: The Volume to check.
     :param scan_count: Pre-computed count of scans on the volume.
     :returns: True when every expected scan is present.
@@ -129,12 +136,16 @@ def refresh_volume_queue_status(volume: Volume) -> None:
 def refresh_volume_queue_status_for_scan(scan: Scan) -> None:
     """Convenience: refresh the parent Volume's queue_status from a Scan.
 
-    No-op when the scan is not attached to a Volume.
+    No-op when the scan is not attached to a Volume. Looks the volume
+    up by ``volume_obj_id`` rather than going through the FK descriptor
+    so the intent (and the resulting query) are explicit.
 
     :param scan: The scan whose parent volume should be refreshed.
     """
-    if scan.volume_obj_id:
-        refresh_volume_queue_status(scan.volume_obj)
+    if not scan.volume_obj_id:
+        return
+    volume = Volume.objects.get(pk=scan.volume_obj_id)
+    refresh_volume_queue_status(volume)
 
 
 def _update_progress(
