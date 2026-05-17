@@ -10,7 +10,7 @@ from unittest.mock import patch
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import models
-from django.test import TestCase, override_settings
+from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from PIL import Image
@@ -20,6 +20,7 @@ from scanning.factories import (
     ReporterFactory,
     ScanFactory,
     UserFactory,
+    VolumeFactory,
 )
 from scanning.models import (
     Detection,
@@ -271,28 +272,22 @@ class TestStaffReview(ScanningTestCase):
 class TestVolumeQueueStatusIntegration(ScanningTestCase):
     """Volume.queue_status updates when scans change state."""
 
-    def _make_volume(self, **kwargs):
-        defaults = {
-            "reporter": ReporterFactory(short_name="vq"),
-            "volume_number": 1,
-            "expected_start_page": 1,
-            "expected_end_page": 100,
-        }
-        defaults.update(kwargs)
-        return Volume.objects.create(**defaults)
+    def _make_scan(self, volume, start=1, end=100, status=Status.UPLOADED):
+        return ScanFactory(
+            volume_obj=volume,
+            reporter=volume.reporter,
+            volume=volume.volume_number,
+            start_page=start,
+            end_page=end,
+            number_of_pages=end - start + 1,
+            status=status,
+        )
 
     def test_approval_bumps_volume_to_complete(self):
         staff = self.make_staff_user()
         self.client.force_login(staff)
-        volume = self._make_volume(queue_status=QueueStatus.SCANNED)
-        scan = ScanFactory(
-            volume_obj=volume,
-            reporter=volume.reporter,
-            volume=volume.volume_number,
-            start_page=1,
-            end_page=100,
-            status=Status.PENDING_REVIEW,
-        )
+        volume = VolumeFactory(queue_status=QueueStatus.SCANNED)
+        scan = self._make_scan(volume, status=Status.PENDING_REVIEW)
         response = self.client.post(
             reverse("scan_detail", kwargs={"pk": scan.pk}),
             {"status": Status.APPROVED, "notes": "ok"},
@@ -304,15 +299,8 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
     def test_rejection_moves_volume_back_to_scanning(self):
         staff = self.make_staff_user()
         self.client.force_login(staff)
-        volume = self._make_volume(queue_status=QueueStatus.SCANNED)
-        scan = ScanFactory(
-            volume_obj=volume,
-            reporter=volume.reporter,
-            volume=volume.volume_number,
-            start_page=1,
-            end_page=50,
-            status=Status.PENDING_REVIEW,
-        )
+        volume = VolumeFactory(queue_status=QueueStatus.SCANNED)
+        scan = self._make_scan(volume, end=50, status=Status.PENDING_REVIEW)
         response = self.client.post(
             reverse("scan_detail", kwargs={"pk": scan.pk}),
             {"status": Status.UPLOADED, "notes": "needs rescan"},
@@ -324,15 +312,8 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
     def test_unavailable_volume_is_not_recomputed(self):
         staff = self.make_staff_user()
         self.client.force_login(staff)
-        volume = self._make_volume(queue_status=QueueStatus.UNAVAILABLE)
-        scan = ScanFactory(
-            volume_obj=volume,
-            reporter=volume.reporter,
-            volume=volume.volume_number,
-            start_page=1,
-            end_page=100,
-            status=Status.PENDING_REVIEW,
-        )
+        volume = VolumeFactory(queue_status=QueueStatus.UNAVAILABLE)
+        scan = self._make_scan(volume, status=Status.PENDING_REVIEW)
         self.client.post(
             reverse("scan_detail", kwargs={"pk": scan.pk}),
             {"status": Status.APPROVED, "notes": "ok"},
@@ -346,17 +327,12 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
 
         from scanning.admin import ScanAdmin
 
-        volume = self._make_volume(queue_status=QueueStatus.COMPLETE)
-        scan = ScanFactory(
-            volume_obj=volume,
-            reporter=volume.reporter,
-            volume=volume.volume_number,
-            start_page=1,
-            end_page=100,
-            status=Status.APPROVED,
-        )
+        volume = VolumeFactory(queue_status=QueueStatus.COMPLETE)
+        scan = self._make_scan(volume, status=Status.APPROVED)
         admin_instance = ScanAdmin(Scan, AdminSite())
-        admin_instance.delete_model(request=None, obj=scan)
+        request = RequestFactory().post("/admin/scanning/scan/")
+        request.user = self.make_staff_user(is_superuser=True)
+        admin_instance.delete_model(request=request, obj=scan)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.NEEDS_SCANNING)
         self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
@@ -367,18 +343,13 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
 
         from scanning.admin import ScanAdmin
 
-        volume = self._make_volume(queue_status=QueueStatus.COMPLETE)
-        ScanFactory(
-            volume_obj=volume,
-            reporter=volume.reporter,
-            volume=volume.volume_number,
-            start_page=1,
-            end_page=100,
-            status=Status.APPROVED,
-        )
+        volume = VolumeFactory(queue_status=QueueStatus.COMPLETE)
+        self._make_scan(volume, status=Status.APPROVED)
         admin_instance = ScanAdmin(Scan, AdminSite())
+        request = RequestFactory().post("/admin/scanning/scan/")
+        request.user = self.make_staff_user(is_superuser=True)
         admin_instance.delete_queryset(
-            request=None, queryset=Scan.objects.filter(volume_obj=volume)
+            request=request, queryset=Scan.objects.filter(volume_obj=volume)
         )
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.NEEDS_SCANNING)
@@ -388,7 +359,7 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
     def test_upload_bumps_assigned_to_scanning(self):
         user = self.make_user()
         self.client.force_login(user)
-        volume = self._make_volume(
+        volume = VolumeFactory(
             queue_status=QueueStatus.ASSIGNED,
             assigned_to=user,
             assigned_at=timezone.now(),

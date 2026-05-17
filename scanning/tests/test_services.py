@@ -12,14 +12,19 @@ from unittest.mock import patch
 from django.db.models import F
 from django.test import TestCase, override_settings
 
-from scanning.factories import ReporterFactory, ScanFactory, UserFactory
+from scanning.factories import (
+    ReporterFactory,
+    ScanFactory,
+    UserFactory,
+    VolumeFactory,
+)
 from scanning.models import (
     Detection,
     QueueStatus,
     Stage,
     Status,
-    Volume,
 )
+from scanning.services import refresh_volume_queue_status
 
 FIXTURE_DIR = pathlib.Path(__file__).parent / "fixtures"
 PDF_PATH = FIXTURE_DIR / "a3d.332.1.1.pdf"
@@ -965,94 +970,74 @@ class TestHandlePipelineExceptionRetryCap(TestCase):
         self.assertIn("Max retries exceeded", scan.progress_message)
 
 
+def _make_scan_for_volume(volume, start=1, end=100, status=Status.UPLOADED):
+    """Create a Scan attached to ``volume`` with sensible defaults."""
+    return ScanFactory(
+        volume_obj=volume,
+        reporter=volume.reporter,
+        volume=volume.volume_number,
+        start_page=start,
+        end_page=end,
+        number_of_pages=end - start + 1,
+        status=status,
+    )
+
+
 class TestRefreshVolumeQueueStatus(TestCase):
     """Test ``refresh_volume_queue_status`` and its derivation logic."""
 
-    def _make_volume(self, **kwargs):
-        defaults = {
-            "reporter": ReporterFactory(),
-            "volume_number": 1,
-            "expected_start_page": 1,
-            "expected_end_page": 100,
-        }
-        defaults.update(kwargs)
-        return Volume.objects.create(**defaults)
-
-    def _make_scan(self, volume, start=1, end=100, status=Status.UPLOADED):
-        return ScanFactory(
-            volume_obj=volume,
-            reporter=volume.reporter,
-            volume=volume.volume_number,
-            start_page=start,
-            end_page=end,
-            number_of_pages=end - start + 1,
-            status=status,
-        )
-
     def test_no_scans_unassigned(self):
-        from scanning.services import refresh_volume_queue_status
-
-        volume = self._make_volume()
+        volume = VolumeFactory()
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.NEEDS_SCANNING)
 
     def test_no_scans_assigned_user(self):
-        from scanning.services import refresh_volume_queue_status
-
         user = UserFactory()
-        volume = self._make_volume(assigned_to=user)
+        volume = VolumeFactory(assigned_to=user)
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.ASSIGNED)
 
     def test_partial_coverage_is_scanning(self):
-        from scanning.services import refresh_volume_queue_status
-
-        volume = self._make_volume()
-        self._make_scan(volume, start=1, end=50)
+        volume = VolumeFactory()
+        _make_scan_for_volume(volume, start=1, end=50)
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
 
     def test_full_coverage_not_approved_is_scanned(self):
-        from scanning.services import refresh_volume_queue_status
-
-        volume = self._make_volume()
-        self._make_scan(volume, start=1, end=100, status=Status.PENDING_REVIEW)
+        volume = VolumeFactory()
+        _make_scan_for_volume(
+            volume, start=1, end=100, status=Status.PENDING_REVIEW
+        )
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.SCANNED)
 
     def test_full_coverage_all_approved_is_complete(self):
-        from scanning.services import refresh_volume_queue_status
-
-        volume = self._make_volume()
-        self._make_scan(volume, start=1, end=100, status=Status.APPROVED)
+        volume = VolumeFactory()
+        _make_scan_for_volume(volume, start=1, end=100, status=Status.APPROVED)
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.COMPLETE)
 
     def test_unavailable_status_preserved(self):
-        from scanning.services import refresh_volume_queue_status
-
-        volume = self._make_volume(queue_status=QueueStatus.UNAVAILABLE)
-        self._make_scan(volume, start=1, end=100, status=Status.APPROVED)
+        volume = VolumeFactory(queue_status=QueueStatus.UNAVAILABLE)
+        _make_scan_for_volume(volume, start=1, end=100, status=Status.APPROVED)
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.UNAVAILABLE)
 
     def test_expected_parts_fallback_complete(self):
         """All approved + expected_parts met → COMPLETE even without page range."""
-        from scanning.services import refresh_volume_queue_status
-
-        volume = self._make_volume(
+        volume = VolumeFactory(
             expected_start_page=None,
             expected_end_page=None,
             expected_parts=2,
         )
-        self._make_scan(volume, start=1, end=50, status=Status.APPROVED)
-        self._make_scan(volume, start=51, end=100, status=Status.APPROVED)
+        _make_scan_for_volume(volume, start=1, end=50, status=Status.APPROVED)
+        _make_scan_for_volume(volume, start=51, end=100, status=Status.APPROVED)
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.COMPLETE)
@@ -1062,13 +1047,11 @@ class TestRefreshVolumeQueueStatus(TestCase):
         auto-completed: the helper has no way to know all work is in,
         so it leaves them at SCANNING until a curator marks otherwise.
         """
-        from scanning.services import refresh_volume_queue_status
-
-        volume = self._make_volume(
+        volume = VolumeFactory(
             expected_start_page=None,
             expected_end_page=None,
         )
-        self._make_scan(volume, start=1, end=100, status=Status.APPROVED)
+        _make_scan_for_volume(volume, start=1, end=100, status=Status.APPROVED)
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
