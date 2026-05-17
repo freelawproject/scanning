@@ -1037,7 +1037,9 @@ class TestRefreshVolumeQueueStatus(TestCase):
             expected_parts=2,
         )
         _make_scan_for_volume(volume, start=1, end=50, status=Status.APPROVED)
-        _make_scan_for_volume(volume, start=51, end=100, status=Status.APPROVED)
+        _make_scan_for_volume(
+            volume, start=51, end=100, status=Status.APPROVED
+        )
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.COMPLETE)

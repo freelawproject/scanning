@@ -1014,8 +1014,6 @@ class TestQueueUploadS3(ScanningTestCase):
         :returns: The HTTP response.
         """
 
-        from scanning.models import Volume
-
         user = self.make_user()
         self.client.force_login(user)
         reporter = ReporterFactory(short_name="tu")
