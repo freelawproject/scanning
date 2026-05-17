@@ -11,7 +11,10 @@ from scanning.models import (
     Status,
     Volume,
 )
-from scanning.services import refresh_volume_queue_status
+from scanning.services import (
+    refresh_volume_queue_status,
+    refresh_volume_queue_status_for_scan,
+)
 
 
 class RetryCapFilter(admin.SimpleListFilter):
@@ -72,6 +75,33 @@ class ScanAdmin(admin.ModelAdmin):
     readonly_fields = ["date_created", "date_modified", "processed_at"]
     date_hierarchy = "date_created"
     actions = ["reset_to_queued", "requeue_retry_cap_scans"]
+
+    def save_model(self, request, obj, form, change):
+        """Save a Scan and refresh affected Volume(s) queue_status.
+
+        Covers admin edits that the lifecycle helper would normally see
+        elsewhere: flipping ``status`` (e.g. PENDING_REVIEW → APPROVED)
+        and reassigning ``volume_obj`` to a different volume. In the
+        reassignment case both the old and new volumes are refreshed.
+
+        :param request: The admin HTTP request.
+        :param obj: The Scan being saved.
+        :param form: The admin form instance.
+        :param change: True for an edit, False for a new object.
+        """
+        old_volume_id = None
+        if change and obj.pk:
+            old_volume_id = (
+                Scan.objects.filter(pk=obj.pk)
+                .values_list("volume_obj_id", flat=True)
+                .first()
+            )
+        super().save_model(request, obj, form, change)
+        refresh_volume_queue_status_for_scan(obj)
+        if old_volume_id and old_volume_id != obj.volume_obj_id:
+            old_volume = Volume.objects.filter(pk=old_volume_id).first()
+            if old_volume is not None:
+                refresh_volume_queue_status(old_volume)
 
     def delete_model(self, request, obj):
         """Delete a Scan and refresh its parent Volume's queue_status.
