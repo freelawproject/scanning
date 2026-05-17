@@ -8,6 +8,7 @@ from scanning.models import (
     Scan,
     Source,
     Status,
+    Volume,
 )
 
 
@@ -59,6 +60,26 @@ class ReporterFactory(factory.django.DjangoModelFactory):
 
     short_name = "a"
     full_name = "Atlantic Reporter"
+
+
+class VolumeFactory(factory.django.DjangoModelFactory):
+    """Factory for creating Volume instances.
+
+    Default declarations:
+
+    - ``reporter``: auto-created via ``ReporterFactory``.
+    - ``volume_number``: sequential starting at 1.
+    - ``expected_start_page``: 1.
+    - ``expected_end_page``: 100.
+    """
+
+    class Meta:
+        model = Volume
+
+    reporter = factory.SubFactory(ReporterFactory)
+    volume_number = factory.Sequence(lambda n: n + 1)
+    expected_start_page = 1
+    expected_end_page = 100
 
 
 class ScanFactory(factory.django.DjangoModelFactory):
