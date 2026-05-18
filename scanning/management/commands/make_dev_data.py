@@ -28,9 +28,7 @@ class Command(BaseCommand):
             # Placeholder PDF bytes (b"%PDF-1.4 test") would fail the
             # moment YOLO or PaddleOCR tries to read them on the worker,
             # polluting the DB and burning endpoint quota on errors.
-            self.stdout.write(
-                "Skipping dev seeding: RUNPOD_ENABLED is True."
-            )
+            self.stdout.write("Skipping dev seeding: RUNPOD_ENABLED is True.")
             return
 
         staff, created = User.objects.get_or_create(

@@ -265,23 +265,17 @@ class TestS3EnabledBranches(SimpleTestCase):
 
     @override_settings(DEVELOPMENT=True, RUNPOD_ENABLED=True, TESTING=False)
     def test_dev_with_runpod_enabled_returns_true(self):
-        with patch(
-            "scanning.s3_sync.has_s3_credentials", return_value=True
-        ):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
             self.assertTrue(s3_sync._s3_enabled())
 
     @override_settings(DEVELOPMENT=True, RUNPOD_ENABLED=False, TESTING=False)
     def test_dev_without_runpod_returns_false(self):
-        with patch(
-            "scanning.s3_sync.has_s3_credentials", return_value=True
-        ):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
             self.assertFalse(s3_sync._s3_enabled())
 
     @override_settings(DEVELOPMENT=False, RUNPOD_ENABLED=False, TESTING=True)
     def test_testing_short_circuits_regardless_of_runpod(self):
-        with patch(
-            "scanning.s3_sync.has_s3_credentials", return_value=True
-        ):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
             self.assertFalse(s3_sync._s3_enabled())
         with self.settings(RUNPOD_ENABLED=True):
             with patch(
