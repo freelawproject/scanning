@@ -520,9 +520,9 @@ Two options:
 **Option A — paste the AWS console export block into your shell, then
 start the containers.** This is the easiest path when you're using
 temporary SSO / STS credentials that rotate. The docker-compose file
-forwards `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
-`AWS_SESSION_TOKEN` from your shell into the containers and maps them
-onto `AWS_DEV_*` automatically:
+(`docker/scanning/docker-compose.yml`) forwards `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` from your shell into the
+containers and maps them onto `AWS_DEV_*` automatically:
 
 ```bash
 export AWS_ACCESS_KEY_ID=...
@@ -551,7 +551,7 @@ Optional tuning knobs (all have sensible defaults, see
 |---|---|---|
 | `RUNPOD_REQUEST_TIMEOUT` | `1800` | Wall-clock ceiling (s) for submit + poll. |
 | `RUNPOD_MAX_RETRIES` | `2` | Transport-error retries on `/run`. |
-| `RUNPOD_PRESIGNED_TTL` | `86400` | Lifetime (s) of the GET URL handed to the worker. |
+| `RUNPOD_PRESIGNED_TTL` | `86400` (1 day) | Lifetime (s) of the GET URL handed to the worker. |
 | `RUNPOD_MAX_TRANSIENT_RETRIES` | `5` | Re-queues on `NO_GPU` before escalating to `ERROR`. |
 
 #### Why `make_dev_data` is a no-op in this mode
@@ -595,8 +595,7 @@ the same recovery path as production.
      from `s3_sync.upload_processing_files` once the pipeline
      completes — the artifact sync that's now active in the dev
      RunPod path.
-
-   Set `SCANNING_LOG_LEVEL=DEBUG` for per-poll detail.
+7. Set `SCANNING_LOG_LEVEL=DEBUG` for per-poll detail.
 
 ### Management Commands
 

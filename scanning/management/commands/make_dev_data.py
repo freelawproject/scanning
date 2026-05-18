@@ -18,8 +18,19 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        if not settings.DEVELOPMENT or settings.RUNPOD_ENABLED:
-            self.stdout.write("Skipping dev seeding.")
+        # Soft return (not sys.exit) so entrypoint/CI hooks that call
+        # this command unconditionally don't blow up outside dev. No
+        # data is written either way; the goal is just a quiet no-op.
+        if not settings.DEVELOPMENT:
+            self.stdout.write("Skipping dev seeding: DEVELOPMENT is not True.")
+            return
+        if settings.RUNPOD_ENABLED:
+            # Placeholder PDF bytes (b"%PDF-1.4 test") would fail the
+            # moment YOLO or PaddleOCR tries to read them on the worker,
+            # polluting the DB and burning endpoint quota on errors.
+            self.stdout.write(
+                "Skipping dev seeding: RUNPOD_ENABLED is True."
+            )
             return
 
         staff, created = User.objects.get_or_create(
