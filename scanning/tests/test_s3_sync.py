@@ -5,7 +5,7 @@ import pathlib
 import tempfile
 from unittest.mock import MagicMock, patch
 
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from scanning import s3_sync
 from scanning.factories import ReporterFactory, ScanFactory
@@ -246,3 +246,33 @@ class TestSyncHelpersWithCredentials(TestCase):
         _, bucket, key = mock_s3.upload_file.call_args.args
         self.assertEqual(bucket, "test-bucket")
         self.assertEqual(key, f"processing/{scan.pk}/tc/164/1/detections.json")
+
+
+class TestS3EnabledBranches(SimpleTestCase):
+    """Coverage for the ``_s3_enabled()`` branch matrix.
+
+    ``TESTING`` is auto-set during the test run, so each case overrides
+    it explicitly to exercise the intended branch. ``has_s3_credentials``
+    is patched to keep the result independent of the developer's
+    environment.
+    """
+
+    @override_settings(DEVELOPMENT=True, RUNPOD_ENABLED=True, TESTING=False)
+    def test_dev_with_runpod_enabled_returns_true(self):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            self.assertTrue(s3_sync._s3_enabled())
+
+    @override_settings(DEVELOPMENT=True, RUNPOD_ENABLED=False, TESTING=False)
+    def test_dev_without_runpod_returns_false(self):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            self.assertFalse(s3_sync._s3_enabled())
+
+    @override_settings(DEVELOPMENT=False, RUNPOD_ENABLED=False, TESTING=True)
+    def test_testing_short_circuits_regardless_of_runpod(self):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            self.assertFalse(s3_sync._s3_enabled())
+        with self.settings(RUNPOD_ENABLED=True):
+            with patch(
+                "scanning.s3_sync.has_s3_credentials", return_value=True
+            ):
+                self.assertFalse(s3_sync._s3_enabled())

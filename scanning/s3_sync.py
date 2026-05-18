@@ -7,9 +7,11 @@ Pushing them to S3 lets us recover after pod redeploys without a full
 re-run. Pulling them to /tmp/ when the viewer opens gives editing
 code fast local-filesystem access (PyMuPDF, Pillow, blackletter).
 
-All sync helpers short-circuit when ``settings.DEVELOPMENT`` is True
-or AWS credentials are missing, so local development keeps working
-against MEDIA_ROOT alone.
+All sync helpers short-circuit when running under ``TESTING``, when
+AWS credentials are missing, and during ``DEVELOPMENT`` unless
+``RUNPOD_ENABLED`` is also True. The RunPod-enabled dev path needs
+the full sync so a local end-to-end test exercises the same recovery
+behavior as prod.
 """
 
 from __future__ import annotations
@@ -37,13 +39,17 @@ APPROVED_FILE_SUFFIXES = (".original.pdf", ".redacted.pdf")
 def _s3_enabled() -> bool:
     """Return True when we should actually use S3.
 
-    Skipped during DEVELOPMENT, during TESTING (so unit tests don't
-    reach live AWS), and when AWS credentials are missing.
+    Skipped during TESTING (so unit tests don't reach live AWS) and
+    when AWS credentials are missing. Also skipped during DEVELOPMENT
+    unless RUNPOD_ENABLED is True, since the RunPod-enabled dev path
+    needs full S3 sync to mirror the prod recovery behavior.
 
     :returns: Whether S3 sync is active in the current environment.
     :rtype: bool
     """
-    if settings.DEVELOPMENT or getattr(settings, "TESTING", False):
+    if getattr(settings, "TESTING", False):
+        return False
+    if settings.DEVELOPMENT and not settings.RUNPOD_ENABLED:
         return False
     return has_s3_credentials()
 
