@@ -71,7 +71,13 @@ scanning/
     templates/        base.html, cotton components
     tailwind/         Config + input CSS
     static-global/    Generated CSS output
+  runpod/             GPU worker image for RunPod Serverless
 ```
+
+The GPU-heavy steps of the blackletter pipeline run on a RunPod Serverless
+worker built from `scanning/runpod/`. See
+[scanning/runpod/README.md](scanning/runpod/README.md) for the worker image,
+release workflow, endpoint configuration, and operational notes.
 
 ### Settings Pattern
 
