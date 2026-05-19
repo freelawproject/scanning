@@ -403,6 +403,8 @@ def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to the process page.
     """
+    from scanning.services import refresh_volume_queue_status_for_scan
+
     scan = get_object_or_404(Scan, pk=pk)
 
     if scan.stage != Stage.APPROVED:
@@ -413,6 +415,7 @@ def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
 
     scan.status = Status.APPROVED
     scan.save(update_fields=["status"])
+    refresh_volume_queue_status_for_scan(scan)
     messages.success(request, "Scan approved.")
     return redirect("scan_process", pk=scan.pk)
 
