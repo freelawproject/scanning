@@ -398,7 +398,10 @@ def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to the process page.
     """
-    from scanning.services import upload_approved_files
+    from scanning.services import (
+        refresh_volume_queue_status_for_scan,
+        upload_approved_files,
+    )
 
     scan = get_object_or_404(Scan, pk=pk)
 
@@ -409,6 +412,7 @@ def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
 
     scan.stage = Stage.APPROVED
     scan.save(update_fields=["stage"])
+    refresh_volume_queue_status_for_scan(scan)
     messages.success(request, result)
     return redirect("scan_process", pk=scan.pk)
 
