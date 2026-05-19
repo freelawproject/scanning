@@ -425,6 +425,13 @@ class Scan(AbstractDateTimeModel):
         validators=[MinValueValidator(1)],
         null=True,
         blank=True,
+        help_text=(
+            "Canonical page count of the printed volume, entered by the"
+            " scanner. Excludes withdrawn opinions and may not equal the"
+            " uploaded PDF's length when the volume contains special"
+            " pages (e.g. 1390A, 1390B) or skipped page ranges. See"
+            " page_count for the actual PDF length."
+        ),
     )
     start_page = models.PositiveIntegerField(
         validators=[MinValueValidator(1)],
@@ -535,7 +542,15 @@ class Scan(AbstractDateTimeModel):
         blank=True,
         help_text="Per-page redaction rects in image pixels.",
     )
-    page_count = models.PositiveIntegerField(default=0)
+    page_count = models.PositiveIntegerField(
+        default=0,
+        help_text=(
+            "Actual page count of the uploaded PDF file. Auto-populated"
+            " by the processing pipeline and updated when pages are"
+            " inserted or deleted. May differ from number_of_pages when"
+            " the printed volume has special pages or skipped ranges."
+        ),
+    )
     redacted_pdf_path = models.CharField(
         max_length=1024, blank=True, default=""
     )

@@ -47,6 +47,9 @@
               Number of Pages
             </label>
             {{ form.number_of_pages }}
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Canonical page count of the printed volume. Excludes withdrawn opinions; may differ from the PDF's page count for volumes with special pages (e.g. 1390A, 1390B) or skipped ranges.
+            </p>
             {% if form.number_of_pages.errors %}
             <p class="mt-1 text-sm text-red-600">{{ form.number_of_pages.errors.0 }}</p>
             {% endif %}

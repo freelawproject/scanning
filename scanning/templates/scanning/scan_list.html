@@ -87,7 +87,7 @@
       <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50">
         <td class="px-4 py-3 text-sm">{{ scan.volume }}</td>
         <td class="px-4 py-3 text-sm">{{ scan.reporter.full_name }} ({{ scan.reporter.short_name }})</td>
-        <td class="px-4 py-3 text-sm">{{ scan.number_of_pages }}</td>
+        <td class="px-4 py-3 text-sm">{{ scan.number_of_pages|default:scan.page_count }}</td>
         <td class="px-4 py-3 text-sm">{{ scan.get_source_display }}</td>
         <td class="px-4 py-3 text-sm">{{ scan.opinion_count }}</td>
         <td class="px-4 py-3 text-sm">
@@ -114,7 +114,7 @@
       {% if scan.s3_uploaded %}<span class="badge-s3">S3</span>{% endif %}
     </div>
     <div class="text-sm text-gray-500 dark:text-gray-400">
-      Vol. {{ scan.volume }} &middot; {{ scan.get_source_display }} &middot; {{ scan.number_of_pages }} pages &middot; {{ scan.opinion_count }} opinion{{ scan.opinion_count|pluralize }} &middot; {{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}
+      Vol. {{ scan.volume }} &middot; {{ scan.get_source_display }} &middot; {{ scan.number_of_pages|default:scan.page_count }} pages &middot; {{ scan.opinion_count }} opinion{{ scan.opinion_count|pluralize }} &middot; {{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}
     </div>
   </a>
   {% endfor %}
