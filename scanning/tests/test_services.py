@@ -774,13 +774,10 @@ class TestUploadApprovedFiles(TestCase):
         output.mkdir(parents=True, exist_ok=True)
 
         redacted_dir = output / "redacted"
-        masked_dir = output / "masked"
         redacted_dir.mkdir()
-        masked_dir.mkdir()
 
         for name in ["a.1.0001-0010.pdf", "a.1.0011-0020.pdf"]:
             (redacted_dir / name).write_bytes(b"%PDF-1.4 redacted")
-            (masked_dir / name).write_bytes(b"%PDF-1.4 masked")
 
         short = scan.reporter.short_name
         (output / f"{short}.{scan.volume}.1.95.original.pdf").write_bytes(
@@ -866,8 +863,6 @@ class TestUploadApprovedFiles(TestCase):
                 "Contents": [
                     {"Key": f"{src_prefix}redacted/a.pdf"},
                     {"Key": f"{src_prefix}redacted/b.pdf"},
-                    {"Key": f"{src_prefix}masked/a.pdf"},
-                    {"Key": f"{src_prefix}masked/b.pdf"},
                     {
                         "Key": f"{src_prefix}{short}.{scan.volume}.1.95.original.pdf"
                     },
@@ -890,10 +885,10 @@ class TestUploadApprovedFiles(TestCase):
         ):
             result = upload_approved_files(scan.pk)
 
-        self.assertIn("6 files", result)
+        self.assertIn("4 files", result)
         # upload_file must NOT be used; copy_object handles everything.
         self.assertEqual(mock_client.upload_file.call_count, 0)
-        self.assertEqual(mock_client.copy_object.call_count, 6)
+        self.assertEqual(mock_client.copy_object.call_count, 4)
         scan.refresh_from_db()
         self.assertTrue(scan.s3_uploaded)
 

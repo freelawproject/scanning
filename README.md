@@ -71,7 +71,13 @@ scanning/
     templates/        base.html, cotton components
     tailwind/         Config + input CSS
     static-global/    Generated CSS output
+  runpod/             GPU worker image for RunPod Serverless
 ```
+
+The GPU-heavy steps of the blackletter pipeline run on a RunPod Serverless
+worker built from `scanning/runpod/`. See
+[scanning/runpod/README.md](scanning/runpod/README.md) for the worker image,
+release workflow, endpoint configuration, and operational notes.
 
 ### Settings Pattern
 
@@ -493,6 +499,109 @@ automatically.
 
 Custom component classes: `.btn-primary`, `.btn-outline`, `.btn-danger`,
 `.btn-ghost`, `.card`, `.input-text`, `.alert-*`, `.badge-*` (status badges).
+
+### Testing RunPod Locally
+
+The daemon can offload the two GPU-heavy blackletter steps (`detect` and
+`analyze_pdf`) to a [RunPod Serverless](https://docs.runpod.io/serverless/overview)
+endpoint. When `RUNPOD_ENABLED=False` (the default) the daemon runs
+blackletter in-process, so most local development needs no RunPod
+configuration. Flip the flag when you want to exercise the remote path
+end-to-end.
+
+#### Required environment variables
+
+RunPod settings go in `.env.dev`:
+
+```bash
+RUNPOD_ENABLED=True
+RUNPOD_ENDPOINT_ID=<your-endpoint-id>
+RUNPOD_API_KEY=<your-runpod-api-key>
+```
+
+The daemon also needs AWS credentials so it can upload the local PDF
+to the dev private bucket and hand the worker a presigned GET URL.
+Two options:
+
+**Option A — paste the AWS console export block into your shell, then
+start the containers.** This is the easiest path when you're using
+temporary SSO / STS credentials that rotate. The docker-compose file
+(`docker/scanning/docker-compose.yml`) forwards `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` from your shell into the
+containers and maps them onto `AWS_DEV_*` automatically:
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...
+docker compose -f docker/scanning/docker-compose.yml up --build
+```
+
+**Option B — hard-code dev credentials in `.env.dev`.** Use this for
+long-lived IAM user keys:
+
+```bash
+AWS_DEV_ACCESS_KEY_ID=<your-aws-key>
+AWS_DEV_SECRET_ACCESS_KEY=<your-aws-secret>
+```
+
+Either way, the dev S3 buckets (`dev-com-freelawproject-scanning-storage`
+and `dev-com-freelawproject-scanning-private-storage`) are selected
+automatically when `DEVELOPMENT=True`; you do not need to set
+`AWS_PRIVATE_STORAGE_BUCKET_NAME`.
+
+Optional tuning knobs (all have sensible defaults, see
+`scanning/settings/project/runpod.py`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RUNPOD_REQUEST_TIMEOUT` | `1800` | Wall-clock ceiling (s) for submit + poll. |
+| `RUNPOD_MAX_RETRIES` | `2` | Transport-error retries on `/run`. |
+| `RUNPOD_PRESIGNED_TTL` | `86400` (1 day) | Lifetime (s) of the GET URL handed to the worker. |
+| `RUNPOD_MAX_TRANSIENT_RETRIES` | `5` | Re-queues on `NO_GPU` before escalating to `ERROR`. |
+
+#### Why `make_dev_data` is a no-op in this mode
+
+`python manage.py make_dev_data` (run automatically by the `web-dev`
+entrypoint) normally seeds two users (`staff` / `scanner`) and a
+handful of `Scan` rows with placeholder PDF bytes
+(`b"%PDF-1.4 test"`). Those placeholder bytes are not valid PDFs and
+will fail the moment YOLO or PaddleOCR tries to read them on the
+worker, polluting the DB and burning endpoint quota on guaranteed
+errors.
+
+When `RUNPOD_ENABLED=True`, the command short-circuits before doing
+anything. Create your own user with `createsuperuser` and upload a
+real PDF through the UI to drive the pipeline; the daemon will push
+it to the dev private bucket on demand and dispatch the GPU steps to
+RunPod.
+
+Setting `RUNPOD_ENABLED=True` also activates the full S3 artifact
+sync (`scanning/s3_sync.py`), which is otherwise skipped in
+`DEVELOPMENT=True`. Intermediate processing files (`detections.json`,
+`redacted/*.pdf`, etc.) get pushed to `dev-com-freelawproject-scanning-private-storage`
+and pulled back on reprocess, so a local end-to-end run exercises
+the same recovery path as production.
+
+#### Quick recipe
+
+1. Set the RunPod variables in `.env.dev`.
+2. Export AWS credentials in your shell (Option A) or add `AWS_DEV_*`
+   to `.env.dev` (Option B).
+3. `docker compose -f docker/scanning/docker-compose.yml up --build`.
+4. Create a user:
+   `docker compose -f docker/scanning/docker-compose.yml exec scanning-django python manage.py createsuperuser`.
+5. Log in at http://localhost:8002/login/ and upload a real PDF.
+6. Watch the daemon container logs. You should see:
+   - `uploading <name>.pdf to s3://dev-com-freelawproject-scanning-private-storage/<key> before presign`
+     from `runpod_client._ensure_presigned_url`, immediately before
+     the GPU step is dispatched.
+   - RunPod poll ticks while the worker runs.
+   - `Uploaded N processing file(s) for scan <pk> to s3://...`
+     from `s3_sync.upload_processing_files` once the pipeline
+     completes — the artifact sync that's now active in the dev
+     RunPod path.
+7. Set `SCANNING_LOG_LEVEL=DEBUG` for per-poll detail.
 
 ### Management Commands
 

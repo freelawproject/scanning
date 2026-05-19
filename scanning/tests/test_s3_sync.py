@@ -5,7 +5,7 @@ import pathlib
 import tempfile
 from unittest.mock import MagicMock, patch
 
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from scanning import s3_sync
 from scanning.factories import ReporterFactory, ScanFactory
@@ -100,8 +100,6 @@ class TestSyncHelpersWithCredentials(TestCase):
         # Now these should also be uploaded (recursive walk).
         (local_root / "redacted").mkdir()
         (local_root / "redacted" / "op.pdf").write_bytes(b"r")
-        (local_root / "masked").mkdir()
-        (local_root / "masked" / "op.pdf").write_bytes(b"m")
         (local_root / "unredacted").mkdir()
         (local_root / "unredacted" / "op.pdf").write_bytes(b"u")
 
@@ -110,7 +108,7 @@ class TestSyncHelpersWithCredentials(TestCase):
             mock_boto3.client.return_value = mock_s3
             count = s3_sync.upload_processing_files(scan)
 
-        self.assertEqual(count, 6)
+        self.assertEqual(count, 5)
         uploaded_keys = {
             call.args[2] for call in mock_s3.upload_file.call_args_list
         }
@@ -122,14 +120,12 @@ class TestSyncHelpersWithCredentials(TestCase):
                 f"{prefix}detections.json",
                 f"{prefix}images/1-001.png",
                 f"{prefix}redacted/op.pdf",
-                f"{prefix}masked/op.pdf",
                 f"{prefix}unredacted/op.pdf",
             },
         )
 
     def test_is_approved_deliverable(self):
         self.assertTrue(s3_sync._is_approved_deliverable("redacted/foo.pdf"))
-        self.assertTrue(s3_sync._is_approved_deliverable("masked/foo.pdf"))
         self.assertTrue(s3_sync._is_approved_deliverable("images/1-001.png"))
         self.assertTrue(
             s3_sync._is_approved_deliverable("tc.1.1.2.original.pdf")
@@ -160,7 +156,6 @@ class TestSyncHelpersWithCredentials(TestCase):
                     {"Key": f"{src_prefix}tc.164.1.2.original.pdf"},
                     {"Key": f"{src_prefix}tc.164.1.2.redacted.pdf"},
                     {"Key": f"{src_prefix}redacted/a.pdf"},
-                    {"Key": f"{src_prefix}masked/a.pdf"},
                     {"Key": f"{src_prefix}unredacted/a.pdf"},
                     {"Key": f"{src_prefix}images/1-001.png"},
                 ]
@@ -174,7 +169,7 @@ class TestSyncHelpersWithCredentials(TestCase):
 
         expected_prefix = "approved/tc/164/1/"
         self.assertEqual(prefix, expected_prefix)
-        self.assertEqual(count, 5)
+        self.assertEqual(count, 4)
         copied = {c.kwargs["Key"] for c in mock_s3.copy_object.call_args_list}
         self.assertEqual(
             copied,
@@ -182,7 +177,6 @@ class TestSyncHelpersWithCredentials(TestCase):
                 f"{expected_prefix}tc.164.1.2.original.pdf",
                 f"{expected_prefix}tc.164.1.2.redacted.pdf",
                 f"{expected_prefix}redacted/a.pdf",
-                f"{expected_prefix}masked/a.pdf",
                 f"{expected_prefix}images/1-001.png",
             },
         )
@@ -252,3 +246,33 @@ class TestSyncHelpersWithCredentials(TestCase):
         _, bucket, key = mock_s3.upload_file.call_args.args
         self.assertEqual(bucket, "test-bucket")
         self.assertEqual(key, f"processing/{scan.pk}/tc/164/1/detections.json")
+
+
+class TestS3EnabledBranches(SimpleTestCase):
+    """Coverage for the ``_s3_enabled()`` branch matrix.
+
+    ``TESTING`` is auto-set during the test run, so each case overrides
+    it explicitly to exercise the intended branch. ``has_s3_credentials``
+    is patched to keep the result independent of the developer's
+    environment.
+    """
+
+    @override_settings(DEVELOPMENT=True, RUNPOD_ENABLED=True, TESTING=False)
+    def test_dev_with_runpod_enabled_returns_true(self):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            self.assertTrue(s3_sync._s3_enabled())
+
+    @override_settings(DEVELOPMENT=True, RUNPOD_ENABLED=False, TESTING=False)
+    def test_dev_without_runpod_returns_false(self):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            self.assertFalse(s3_sync._s3_enabled())
+
+    @override_settings(DEVELOPMENT=False, RUNPOD_ENABLED=False, TESTING=True)
+    def test_testing_short_circuits_regardless_of_runpod(self):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            self.assertFalse(s3_sync._s3_enabled())
+        with self.settings(RUNPOD_ENABLED=True):
+            with patch(
+                "scanning.s3_sync.has_s3_credentials", return_value=True
+            ):
+                self.assertFalse(s3_sync._s3_enabled())

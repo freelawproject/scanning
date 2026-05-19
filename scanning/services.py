@@ -2001,7 +2001,7 @@ def _collect_pdf_paths(scan: "Scan", output_dir: str | None) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Generate (split into redacted/masked/unredacted opinions)
+# Generate (split into redacted/unredacted opinions)
 # ---------------------------------------------------------------------------
 
 
@@ -2138,12 +2138,12 @@ def run_generate_files(scan_pk: int) -> None:
             reporter=scan.reporter.short_name or "",
             volume=str(scan.volume) or "",
             unredacted=True,
+            llm=True,
         )
 
         opinion_count = result.get("opinion_count", 0)
         full_redacted = result.get("full_redacted", "")
         redacted_dir = Path(result.get("redacted_dir", output / "redacted"))
-        masked_dir = Path(result.get("masked_dir", output / "masked"))
         unredacted_dir = output / "unredacted"
 
         redacted_files = (
@@ -2166,8 +2166,10 @@ def run_generate_files(scan_pk: int) -> None:
 
         scan.redacted_pdf_path = str(full_redacted) if full_redacted else ""
         scan.opinions_json = existing_opinions
+        # Files have been generated; the scan is ready for human review
+        # at step 3. The human clicks Approve to flip status -> APPROVED.
         scan.stage = Stage.APPROVED
-        scan.status = Status.APPROVED
+        scan.status = Status.PENDING_REVIEW
         scan.s3_uploaded = False
         scan.progress_message = f"Generated {opinion_count} opinions"
         scan.progress_log = ""
@@ -2217,12 +2219,6 @@ def run_generate_files(scan_pk: int) -> None:
                 )
                 if up and up.exists():
                     opinion.original_pdf.name = _field_name(up)
-                masked_fname = re.sub(
-                    r"(\d{4})-\d{1,3}\.pdf$", r"\1.pdf", fname
-                )
-                mp = masked_dir / masked_fname if masked_dir.exists() else None
-                if mp and mp.exists():
-                    opinion.masked_pdf.name = _field_name(mp)
                 opinion.save()
 
         _push_processing_files_to_s3(scan_pk)
@@ -2295,9 +2291,9 @@ def upload_approved_files(scan_pk: int) -> str:
 
     The generate-files step already pushed every file under the scan's
     output dir to ``processing/{pk}/...`` on S3, so this function issues
-    a server-side ``copy_object`` for each deliverable (redacted/masked
-    opinion PDFs, original and redacted full PDFs) rather than
-    re-uploading from local disk.
+    a server-side ``copy_object`` for each deliverable (redacted opinion
+    PDFs, original and redacted full PDFs) rather than re-uploading from
+    local disk.
 
     Skips the copy (with a message) if the scan was already approved or
     if no AWS credentials are configured.

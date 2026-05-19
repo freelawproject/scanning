@@ -378,7 +378,7 @@ class opinion_pdf_path:
 
     Example: ``opinions/f3d/42/unredacted/f3d.42.0001-0025.pdf``
 
-    :param subfolder: Subdirectory name (e.g. "unredacted", "masked", "redacted").
+    :param subfolder: Subdirectory name (e.g. "unredacted", "redacted").
     """
 
     def __init__(self, subfolder: str) -> None:

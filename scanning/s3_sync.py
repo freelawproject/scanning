@@ -7,9 +7,11 @@ Pushing them to S3 lets us recover after pod redeploys without a full
 re-run. Pulling them to /tmp/ when the viewer opens gives editing
 code fast local-filesystem access (PyMuPDF, Pillow, blackletter).
 
-All sync helpers short-circuit when ``settings.DEVELOPMENT`` is True
-or AWS credentials are missing, so local development keeps working
-against MEDIA_ROOT alone.
+All sync helpers short-circuit when running under ``TESTING``, when
+AWS credentials are missing, and during ``DEVELOPMENT`` unless
+``RUNPOD_ENABLED`` is also True. The RunPod-enabled dev path needs
+the full sync so a local end-to-end test exercises the same recovery
+behavior as prod.
 """
 
 from __future__ import annotations
@@ -30,20 +32,24 @@ logger = logging.getLogger(__name__)
 # copied from processing/ to approved/ (the processing/ copy is kept).
 # Everything else in processing/ (bitonal, detections, unredacted/,
 # stamped, etc.) stays only under processing/.
-APPROVED_SUBDIR_PREFIXES = ("redacted/", "masked/", "images/")
+APPROVED_SUBDIR_PREFIXES = ("redacted/", "images/")
 APPROVED_FILE_SUFFIXES = (".original.pdf", ".redacted.pdf")
 
 
 def _s3_enabled() -> bool:
     """Return True when we should actually use S3.
 
-    Skipped during DEVELOPMENT, during TESTING (so unit tests don't
-    reach live AWS), and when AWS credentials are missing.
+    Skipped during TESTING (so unit tests don't reach live AWS) and
+    when AWS credentials are missing. Also skipped during DEVELOPMENT
+    unless RUNPOD_ENABLED is True, since the RunPod-enabled dev path
+    needs full S3 sync to mirror the prod recovery behavior.
 
     :returns: Whether S3 sync is active in the current environment.
     :rtype: bool
     """
-    if settings.DEVELOPMENT or getattr(settings, "TESTING", False):
+    if getattr(settings, "TESTING", False):
+        return False
+    if settings.DEVELOPMENT and not settings.RUNPOD_ENABLED:
         return False
     return has_s3_credentials()
 
@@ -104,9 +110,9 @@ def _iter_files_to_sync(local_root: Path):
 def _is_approved_deliverable(relative_path: str) -> bool:
     """Return True if ``relative_path`` (under processing/) belongs in approved/.
 
-    Approved deliverables are opinion PDFs under ``redacted/`` and
-    ``masked/``, extracted figure images under ``images/``, plus the
-    full-book original and redacted PDFs. Everything else (bitonal,
+    Approved deliverables are opinion PDFs under ``redacted/``,
+    extracted figure images under ``images/``, plus the full-book
+    original and redacted PDFs. Everything else (bitonal,
     detections.json, unredacted/, stamped) stays under processing/.
 
     :param relative_path: Path relative to the scan's processing prefix.
