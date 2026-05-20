@@ -282,9 +282,52 @@ a.doc-name:hover { text-decoration: underline; }
 /* PDF Viewer */
 .viewer-panel {
     flex: 1;
-    overflow-y: auto;
+    overflow: auto;
     background: #525659;
     padding: 20px;
+    position: relative;
+}
+
+/* Zoom toolbar — floats at the top-left of the viewer panel.
+   Sticky on both axes so it stays visible when horizontal overflow
+   appears at zoom > 1. */
+.zoom-toolbar {
+    position: sticky;
+    top: 0;
+    left: 0;
+    width: max-content;
+    margin-bottom: 12px;
+    padding: 4px 8px;
+    background: rgba(40, 42, 45, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    z-index: 30;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    backdrop-filter: blur(4px);
+}
+.zoom-toolbar .zoom-btn {
+    background: #3f4347;
+    color: #f3f4f6;
+    border: 1px solid #585c61;
+    border-radius: 4px;
+    padding: 3px 10px;
+    font-size: 13px;
+    line-height: 1.2;
+    cursor: pointer;
+    min-width: 28px;
+}
+.zoom-toolbar .zoom-btn:hover { background: #4b5056; }
+.zoom-toolbar .zoom-btn:active { background: #2f3337; }
+.zoom-toolbar .zoom-btn.zoom-reset { font-size: 11px; padding: 3px 8px; }
+.zoom-toolbar .zoom-pct {
+    color: #f3f4f6;
+    font-size: 12px;
+    min-width: 44px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
 }
 
 #pdf-viewer {
@@ -333,6 +376,8 @@ a.doc-name:hover { text-decoration: underline; }
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
+    row-gap: 4px;
     border-bottom: 1px solid #eee;
 }
 
