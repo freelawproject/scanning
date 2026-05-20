@@ -139,12 +139,25 @@ document.addEventListener('DOMContentLoaded', function () {
         redactions = {};
         container.innerHTML = '<div class="viewer-loading">Loading PDF...</div>';
 
+        _attemptLoadPdf(url, 3);
+    }
+
+    function _attemptLoadPdf(url, retriesLeft) {
         pdfjsLib.getDocument(url).promise.then(function (pdf) {
+            if (url !== currentUrl) return;
             pdfDoc = pdf;
             container.innerHTML = '';
             createPlaceholders(pdf.numPages);
             setupLazyLoading();
         }).catch(function (err) {
+            if (url !== currentUrl) return;
+            var isMissing = err && (err.name === 'MissingPDFException' || /Missing PDF/i.test(err.message || ''));
+            if (isMissing && retriesLeft > 0) {
+                var attempt = 4 - retriesLeft;
+                container.innerHTML = '<div class="viewer-loading">Loading PDF (retrying ' + attempt + '/3)...</div>';
+                setTimeout(function () { _attemptLoadPdf(url, retriesLeft - 1); }, attempt * 1000);
+                return;
+            }
             container.innerHTML = '<div class="viewer-loading">Error loading PDF: ' + err.message + '</div>';
         });
     }

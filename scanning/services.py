@@ -2166,15 +2166,8 @@ def run_generate_files(scan_pk: int) -> None:
 
         scan.redacted_pdf_path = str(full_redacted) if full_redacted else ""
         scan.opinions_json = existing_opinions
-        # Files have been generated; the scan is ready for human review
-        # at step 3. The human clicks Approve to flip status -> APPROVED.
-        scan.stage = Stage.APPROVED
-        scan.status = Status.PENDING_REVIEW
-        scan.s3_uploaded = False
-        scan.progress_message = f"Generated {opinion_count} opinions"
-        scan.progress_log = ""
+        scan.progress_message = "Saving opinion records..."
         scan.save()
-        refresh_volume_queue_status_for_scan(scan)
 
         OpinionScan.objects.filter(scan=scan).delete()
         for i, op in enumerate(existing_opinions):
@@ -2221,7 +2214,20 @@ def run_generate_files(scan_pk: int) -> None:
                     opinion.original_pdf.name = _field_name(up)
                 opinion.save()
 
+        _update_progress(scan_pk, "Finalizing files...")
         _push_processing_files_to_s3(scan_pk)
+
+        # Flip status only after OpinionScan rows and S3 push are done,
+        # so the frontend's poll-and-reload lands on a fully-ready step 3
+        # (avoids a 404 window where rows or files aren't yet available).
+        scan.refresh_from_db()
+        scan.stage = Stage.APPROVED
+        scan.status = Status.PENDING_REVIEW
+        scan.s3_uploaded = False
+        scan.progress_message = f"Generated {opinion_count} opinions"
+        scan.progress_log = ""
+        scan.save()
+        refresh_volume_queue_status_for_scan(scan)
 
     except Exception as exc:
         _handle_pipeline_exception(scan_pk, exc, context="generate_files")
