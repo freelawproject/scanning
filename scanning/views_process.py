@@ -182,7 +182,9 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 r["seq_issue"] = "gap"
         prev_num = num
 
-    has_pending_changes = scan.deletions.exists() or scan.inserts.exists()
+    has_pending_inserts = scan.inserts.exists()
+    has_pending_changes = scan.deletions.exists() or has_pending_inserts
+    has_detections = Detection.objects.filter(scan=scan).exists()
 
     opinions = scan.opinions_json
 
@@ -355,6 +357,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "ocr_results": ocr_results,
             "ocr_by_page_json": json.dumps(ocr_by_page),
             "has_pending_changes": has_pending_changes,
+            "has_pending_inserts": has_pending_inserts,
+            "has_detections": has_detections,
             "is_processing": is_processing,
             "opinions": opinions,
             "opinions_json": json.dumps(opinions),

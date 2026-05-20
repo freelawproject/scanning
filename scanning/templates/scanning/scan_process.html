@@ -55,12 +55,16 @@
       {% if has_pending_changes %}
       <form method="post" action="{% url 'reprocess' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Apply pending page inserts and deletions, then re-run OCR and validation">Rebuild &amp; Validate</button>
+        {% if has_pending_inserts %}
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Apply pending page inserts and deletions, then re-run OCR and validation. Inserted pages are OCR'd and validated on RunPod (incurs costs $$$)." onclick="return confirm('Pending page inserts will run OCR and validation on RunPod for each inserted page. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Rebuild &amp; Validate</button>
+        {% else %}
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Apply pending page deletions and rebuild issues (no RunPod, no extra cost)">Rebuild &amp; Validate</button>
+        {% endif %}
       </form>
       {% elif not scan.page_count %}
       <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm" title="Run the full processing pipeline: bitonal conversion, OCR, detection, and page number validation">Validate</button>
+        <button type="submit" class="btn-primary text-sm" title="Run the full processing pipeline: bitonal conversion, OCR, detection, and page number validation on RunPod (incurs costs $$$)" onclick="return confirm('Validate will run YOLO detection and PaddleOCR validation on RunPod. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Validate</button>
       </form>
       {% else %}
       <form method="post" action="{% url 'recalculate' scan.pk %}" class="inline">
@@ -69,12 +73,16 @@
       </form>
       <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-outline text-sm" title="Re-run the full pipeline from scratch: bitonal, OCR, detection, and validation">Re-validate</button>
+        <button type="submit" class="btn-outline text-sm" title="Re-run the full pipeline from scratch: bitonal, OCR, detection, and validation on RunPod (incurs costs $$$)" onclick="return confirm('Re-validate will run YOLO detection and PaddleOCR validation on RunPod. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Re-validate</button>
       </form>
       {% if not issues and not missing_pages %}
       <form method="post" action="{% url 'start_detect' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm" title="Run YOLO detection to find opinions, captions, and key icons in the scan">Next: Detect &rarr;</button>
+        {% if has_detections %}
+        <button type="submit" class="btn-primary text-sm" title="Detections already exist. Skip directly to review (no RunPod, no cost).">Next: Detect &rarr;</button>
+        {% else %}
+        <button type="submit" class="btn-primary text-sm" title="Run YOLO detection on RunPod to find opinions, captions, and key icons (incurs costs $$$)" onclick="return confirm('This will run YOLO detection on RunPod. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Next: Detect &rarr;</button>
+        {% endif %}
       </form>
       {% endif %}
       {% endif %}
