@@ -91,8 +91,8 @@
         <td class="px-4 py-3 text-sm">{{ scan.get_source_display }}</td>
         <td class="px-4 py-3 text-sm">{{ scan.opinion_count }}</td>
         <td class="px-4 py-3 text-sm">
-          <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
-          {% if scan.s3_uploaded %}<span class="badge-s3">S3</span>{% endif %}
+          <span class="badge-{{ scan.status }}" title="Scan status">{{ scan.get_status_display }}</span>
+          {% if scan.s3_uploaded %}<span class="badge-s3" title="Final files uploaded to S3">S3</span>{% endif %}
         </td>
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}</td>
         <td class="px-4 py-3 text-sm">
@@ -115,8 +115,8 @@
   <a href="{% url 'scan_detail' pk=scan.pk %}" class="card block hover:shadow-md transition-shadow">
     <div class="flex items-center justify-between mb-2">
       <span class="font-medium text-sm">{{ scan.reporter }}</span>
-      <span class="badge-{{ scan.status }}">{{ scan.get_status_display }}</span>
-      {% if scan.s3_uploaded %}<span class="badge-s3">S3</span>{% endif %}
+      <span class="badge-{{ scan.status }}" title="Scan status">{{ scan.get_status_display }}</span>
+      {% if scan.s3_uploaded %}<span class="badge-s3" title="Final files uploaded to S3">S3</span>{% endif %}
     </div>
     <div class="text-sm text-gray-500 dark:text-gray-400">
       Vol. {{ scan.volume }} &middot; {{ scan.get_source_display }} &middot; {{ scan.number_of_pages|default:scan.page_count }} pages &middot; {{ scan.opinion_count }} opinion{{ scan.opinion_count|pluralize }} &middot; {{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}

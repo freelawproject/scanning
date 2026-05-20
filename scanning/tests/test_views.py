@@ -10,7 +10,7 @@ from unittest.mock import patch
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import models
-from django.test import TestCase, override_settings
+from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from PIL import Image
@@ -20,15 +20,18 @@ from scanning.factories import (
     ReporterFactory,
     ScanFactory,
     UserFactory,
+    VolumeFactory,
 )
 from scanning.models import (
     Detection,
     OpinionScan,
     OpinionStatus,
+    QueueStatus,
     Scan,
     Source,
     Stage,
     Status,
+    Volume,
 )
 
 MEDIA_ROOT = tempfile.mkdtemp()
@@ -264,6 +267,124 @@ class TestStaffReview(ScanningTestCase):
         self.assertIsNone(response.context["review_form"])
         self.assertContains(response, "Review Decision")
         self.assertContains(response, "Approved")
+
+
+class TestVolumeQueueStatusIntegration(ScanningTestCase):
+    """Volume.queue_status updates when scans change state."""
+
+    def _make_scan(self, volume, start=1, end=100, status=Status.UPLOADED):
+        return ScanFactory(
+            volume_obj=volume,
+            reporter=volume.reporter,
+            volume=volume.volume_number,
+            start_page=start,
+            end_page=end,
+            number_of_pages=end - start + 1,
+            status=status,
+        )
+
+    def test_approval_bumps_volume_to_complete(self):
+        staff = self.make_staff_user()
+        self.client.force_login(staff)
+        volume = VolumeFactory(queue_status=QueueStatus.SCANNED)
+        scan = self._make_scan(volume, status=Status.PENDING_REVIEW)
+        response = self.client.post(
+            reverse("scan_detail", kwargs={"pk": scan.pk}),
+            {"status": Status.APPROVED, "notes": "ok"},
+        )
+        self.assertEqual(response.status_code, 302)
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.COMPLETE)
+
+    def test_rejection_moves_volume_back_to_scanning(self):
+        staff = self.make_staff_user()
+        self.client.force_login(staff)
+        volume = VolumeFactory(queue_status=QueueStatus.SCANNED)
+        scan = self._make_scan(volume, end=50, status=Status.PENDING_REVIEW)
+        response = self.client.post(
+            reverse("scan_detail", kwargs={"pk": scan.pk}),
+            {"status": Status.UPLOADED, "notes": "needs rescan"},
+        )
+        self.assertEqual(response.status_code, 302)
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
+
+    def test_unavailable_volume_is_not_recomputed(self):
+        staff = self.make_staff_user()
+        self.client.force_login(staff)
+        volume = VolumeFactory(queue_status=QueueStatus.UNAVAILABLE)
+        scan = self._make_scan(volume, status=Status.PENDING_REVIEW)
+        self.client.post(
+            reverse("scan_detail", kwargs={"pk": scan.pk}),
+            {"status": Status.APPROVED, "notes": "ok"},
+        )
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.UNAVAILABLE)
+
+    def test_admin_delete_refreshes_volume_queue_status(self):
+        """Deleting a Scan via admin should refresh its parent Volume."""
+        from django.contrib.admin.sites import AdminSite
+
+        from scanning.admin import ScanAdmin
+
+        volume = VolumeFactory(queue_status=QueueStatus.COMPLETE)
+        scan = self._make_scan(volume, status=Status.APPROVED)
+        admin_instance = ScanAdmin(Scan, AdminSite())
+        request = RequestFactory().post("/admin/scanning/scan/")
+        request.user = self.make_staff_user(is_superuser=True)
+        admin_instance.delete_model(request=request, obj=scan)
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.NEEDS_SCANNING)
+        self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
+
+    def test_admin_bulk_delete_refreshes_volumes(self):
+        """Bulk-deleting Scans via admin should refresh each parent Volume."""
+        from django.contrib.admin.sites import AdminSite
+
+        from scanning.admin import ScanAdmin
+
+        volume = VolumeFactory(queue_status=QueueStatus.COMPLETE)
+        self._make_scan(volume, status=Status.APPROVED)
+        admin_instance = ScanAdmin(Scan, AdminSite())
+        request = RequestFactory().post("/admin/scanning/scan/")
+        request.user = self.make_staff_user(is_superuser=True)
+        admin_instance.delete_queryset(
+            request=request, queryset=Scan.objects.filter(volume_obj=volume)
+        )
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.NEEDS_SCANNING)
+        self.assertEqual(Scan.objects.filter(volume_obj=volume).count(), 0)
+
+    @override_settings(DEVELOPMENT=True)
+    def test_upload_bumps_assigned_to_scanning(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        volume = VolumeFactory(
+            queue_status=QueueStatus.ASSIGNED,
+            assigned_to=user,
+            assigned_at=timezone.now(),
+        )
+        pdf = SimpleUploadedFile(
+            "scan.pdf", b"%PDF-1.4 body", content_type="application/pdf"
+        )
+        response = self.client.post(
+            reverse(
+                "queue_upload",
+                kwargs={
+                    "reporter_slug": volume.reporter.short_name,
+                    "vol": volume.volume_number,
+                },
+            ),
+            {
+                "new_scan": "1",
+                "first_page": "1",
+                "last_page": "50",
+                "original_pdf": pdf,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        volume.refresh_from_db()
+        self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
 
 
 class TestScanModel(ScanningTestCase):
@@ -861,8 +982,6 @@ class TestQueueUploadS3(ScanningTestCase):
         :returns: The HTTP response.
         """
 
-        from scanning.models import Volume
-
         user = self.make_user()
         self.client.force_login(user)
         reporter = ReporterFactory(short_name="tu")
@@ -1053,6 +1172,44 @@ class TestServeOpinionPdfLazyPull(ScanningTestCase):
 
         self.assertEqual(response.status_code, 200)
         mock_pull.assert_called_once()
+
+
+class TestServeOpinionPdfCaching(ScanningTestCase):
+    """serve_opinionscan_pdf sets cache headers and honors revalidation."""
+
+    def test_response_carries_cache_headers(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        opinion = OpinionScanFactory()
+
+        response = self.client.get(
+            reverse(
+                "serve_opinionscan_pdf",
+                kwargs={"pk": opinion.pk, "variant": "original"},
+            )
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Cache-Control"], "private, no-cache")
+        self.assertTrue(response["ETag"].startswith('"'))
+        self.assertIn("Last-Modified", response)
+
+    def test_if_none_match_returns_304(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        opinion = OpinionScanFactory()
+
+        url = reverse(
+            "serve_opinionscan_pdf",
+            kwargs={"pk": opinion.pk, "variant": "original"},
+        )
+        first = self.client.get(url)
+        etag = first["ETag"]
+
+        second = self.client.get(url, HTTP_IF_NONE_MATCH=etag)
+        self.assertEqual(second.status_code, 304)
+        self.assertEqual(second["ETag"], etag)
+        self.assertEqual(second["Cache-Control"], "private, no-cache")
 
 
 class TestServeScanPdfLazyPull(ScanningTestCase):

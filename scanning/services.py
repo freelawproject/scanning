@@ -51,9 +51,11 @@ from scanning.models import (
     Issue,
     OpinionScan,
     OpinionStatus,
+    QueueStatus,
     Scan,
     Stage,
     Status,
+    Volume,
 )
 from scanning.utils import ensure_output_dir, find_ocr_pdf, has_s3_credentials
 
@@ -62,6 +64,88 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _volume_fully_uploaded(volume: Volume, scan_count: int) -> bool:
+    """Whether a Volume has all its expected scans uploaded.
+
+    Coverage takes precedence when ``expected_start_page`` /
+    ``expected_end_page`` are set, then ``expected_parts`` as a count
+    fallback. When neither expectation is recorded we cannot decide
+    that a volume is "done", so we return False and leave it to a
+    curator to mark via the manual dropdown.
+
+    Trade-off in the count fallback: when only ``expected_parts`` is
+    set, this returns True as soon as the scan count meets the
+    expectation, without verifying that the scans actually span
+    distinct page ranges. Two scans covering the same pages will look
+    "fully uploaded". The accurate path is the coverage check above;
+    set ``expected_start_page`` / ``expected_end_page`` when possible.
+
+    :param volume: The Volume to check.
+    :param scan_count: Pre-computed count of scans on the volume.
+    :returns: True when every expected scan is present.
+    :rtype: bool
+    """
+    if volume.expected_start_page and volume.expected_end_page:
+        return volume.is_fully_covered
+    if volume.expected_parts:
+        return scan_count >= volume.expected_parts
+    return False
+
+
+def _compute_volume_queue_status(volume: Volume, scans: list[Scan]) -> str:
+    """Derive the queue status a Volume should have from its scans.
+
+    :param volume: The Volume to inspect.
+    :param scans: The Volume's current scans.
+    :returns: A ``QueueStatus`` value.
+    :rtype: str
+    """
+    if not scans:
+        if volume.assigned_to_id:
+            return QueueStatus.ASSIGNED
+        return QueueStatus.NEEDS_SCANNING
+    all_approved = all(s.status == Status.APPROVED for s in scans)
+    fully_uploaded = _volume_fully_uploaded(volume, len(scans))
+    if all_approved and fully_uploaded:
+        return QueueStatus.COMPLETE
+    if fully_uploaded:
+        return QueueStatus.SCANNED
+    return QueueStatus.SCANNING
+
+
+def refresh_volume_queue_status(volume: Volume) -> None:
+    """Recompute and persist a Volume's queue_status from its scans.
+
+    Manual ``UNAVAILABLE`` is preserved (it's a curator decision, not
+    derivable from observable state). All other states are recomputed
+    so callers don't have to track transitions individually.
+
+    :param volume: The Volume to refresh in place.
+    """
+    if volume.queue_status == QueueStatus.UNAVAILABLE:
+        return
+    scans = list(volume.scans.all())
+    new_status = _compute_volume_queue_status(volume, scans)
+    if new_status != volume.queue_status:
+        volume.queue_status = new_status
+        volume.save(update_fields=["queue_status"])
+
+
+def refresh_volume_queue_status_for_scan(scan: Scan) -> None:
+    """Convenience: refresh the parent Volume's queue_status from a Scan.
+
+    No-op when the scan is not attached to a Volume. Looks the volume
+    up by ``volume_obj_id`` rather than going through the FK descriptor
+    so the intent (and the resulting query) are explicit.
+
+    :param scan: The scan whose parent volume should be refreshed.
+    """
+    if not scan.volume_obj_id:
+        return
+    volume = Volume.objects.get(pk=scan.volume_obj_id)
+    refresh_volume_queue_status(volume)
 
 
 def _update_progress(
@@ -2090,6 +2174,7 @@ def run_generate_files(scan_pk: int) -> None:
         scan.progress_message = f"Generated {opinion_count} opinions"
         scan.progress_log = ""
         scan.save()
+        refresh_volume_queue_status_for_scan(scan)
 
         OpinionScan.objects.filter(scan=scan).delete()
         for i, op in enumerate(existing_opinions):
@@ -2189,6 +2274,7 @@ def _page_body_textless(
     """
     try:
         import pdfplumber
+
         with pdfplumber.open(pdf_path) as pdf:
             pg = pdf.pages[0]
             body = pg.crop((0, header_height_pts, pg.width, pg.height))
@@ -2340,7 +2426,7 @@ def _sync_pages_for_scan(scan_pk: int) -> int:
     # 0-based PDF indices — no reporter-page detour).
     starts_by_idx: dict[int, int] = {}
     ends_by_idx: dict[int, int] = {}
-    for op in (scan.opinions_json or []):
+    for op in scan.opinions_json or []:
         cap = op.get("caption_page")
         key = op.get("key_page")
         if isinstance(cap, int):
@@ -2359,9 +2445,7 @@ def _sync_pages_for_scan(scan_pk: int) -> int:
         pn = page_numbers.get(page_index)
         book_page = ""
         if pn:
-            book_page = (
-                str(pn[0]) if pn[1] is None else f"{pn[0]}-{pn[1]}"
-            )
+            book_page = str(pn[0]) if pn[1] is None else f"{pn[0]}-{pn[1]}"
 
         page_detections = detections_by_page.get(page_index, [])
         is_blank = _is_blank_via_sandwich(

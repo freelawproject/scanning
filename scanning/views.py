@@ -37,6 +37,7 @@ from scanning.models import (
     Status,
     Volume,
 )
+from scanning.services import refresh_volume_queue_status_for_scan
 from scanning.utils import get_volume, has_s3_credentials
 
 logger = logging.getLogger(__name__)
@@ -184,6 +185,7 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
                         "Scan rejected, status reset to Uploaded.",
                     )
                 updated_scan.save()
+                refresh_volume_queue_status_for_scan(updated_scan)
                 return redirect("scan_detail", pk=scan.pk)
         else:
             review_form = ScanReviewForm(instance=scan)
@@ -448,6 +450,11 @@ def claim_scan(request, reporter_slug, vol):
     """
     volume = get_volume(reporter_slug, vol)
 
+    # The two transitions handled here (NEEDS_SCANNING ↔ ASSIGNED) only
+    # apply to scan-less volumes, which the filter conditions enforce.
+    # In that state the inline values match what
+    # ``refresh_volume_queue_status`` would compute, so we set them
+    # directly and skip the extra query.
     if request.POST.get("unclaim") == "1":
         unclaimed = Volume.objects.filter(
             pk=volume.pk, assigned_to=request.user
@@ -625,8 +632,10 @@ def queue_upload(request, reporter_slug, vol):
         scan.queued_action = QueuedAction.FULL_PIPELINE
         scan.progress_message = "Queued for processing..."
         scan.save()
+        refresh_volume_queue_status_for_scan(scan)
         return redirect("scan_process", pk=scan.pk)
 
+    refresh_volume_queue_status_for_scan(scan)
     messages.success(request, "PDF uploaded successfully.")
     return redirect(
         "queue_detail",
@@ -648,6 +657,10 @@ def update_scan_status(request, reporter_slug, vol):
     volume = get_volume(reporter_slug, vol)
     new_status = request.POST.get("status")
 
+    # Curator manual-override path: intentionally bypasses
+    # ``refresh_volume_queue_status`` so a reviewer can force any value
+    # (e.g. UNAVAILABLE, or SCANNED before approval) regardless of
+    # what the helper would otherwise derive from the scans.
     if new_status and new_status in dict(QueueStatus.choices):
         volume.queue_status = new_status
         if new_status == QueueStatus.NEEDS_SCANNING:

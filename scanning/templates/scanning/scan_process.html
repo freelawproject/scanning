@@ -55,12 +55,16 @@
       {% if has_pending_changes %}
       <form method="post" action="{% url 'reprocess' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Apply pending page inserts and deletions, then re-run OCR and validation">Rebuild &amp; Validate</button>
+        {% if has_pending_inserts %}
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Apply pending page inserts and deletions, then re-run OCR and validation. Inserted pages are OCR'd and validated on RunPod (incurs costs $$$)." onclick="return confirm('Pending page inserts will run OCR and validation on RunPod for each inserted page. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Rebuild &amp; Validate</button>
+        {% else %}
+        <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Apply pending page deletions and rebuild issues (no RunPod, no extra cost)">Rebuild &amp; Validate</button>
+        {% endif %}
       </form>
       {% elif not scan.page_count %}
       <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm" title="Run the full processing pipeline: bitonal conversion, OCR, detection, and page number validation">Validate</button>
+        <button type="submit" class="btn-primary text-sm" title="Run the full processing pipeline: bitonal conversion, OCR, detection, and page number validation on RunPod (incurs costs $$$)" onclick="return confirm('Validate will run YOLO detection and PaddleOCR validation on RunPod. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Validate</button>
       </form>
       {% else %}
       <form method="post" action="{% url 'recalculate' scan.pk %}" class="inline">
@@ -69,12 +73,16 @@
       </form>
       <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-outline text-sm" title="Re-run the full pipeline from scratch: bitonal, OCR, detection, and validation">Re-validate</button>
+        <button type="submit" class="btn-outline text-sm" title="Re-run the full pipeline from scratch: bitonal, OCR, detection, and validation on RunPod (incurs costs $$$)" onclick="return confirm('Re-validate will run YOLO detection and PaddleOCR validation on RunPod. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Re-validate</button>
       </form>
       {% if not issues and not missing_pages %}
       <form method="post" action="{% url 'start_detect' scan.pk %}" class="inline">
         {% csrf_token %}
-        <button type="submit" class="btn-primary text-sm" title="Run YOLO detection to find opinions, captions, and key icons in the scan">Next: Detect &rarr;</button>
+        {% if has_detections %}
+        <button type="submit" class="btn-primary text-sm" title="Detections already exist. Skip directly to review (no RunPod, no cost).">Next: Detect &rarr;</button>
+        {% else %}
+        <button type="submit" class="btn-primary text-sm" title="Run YOLO detection on RunPod to find opinions, captions, and key icons (incurs costs $$$)" onclick="return confirm('This will run YOLO detection on RunPod. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Next: Detect &rarr;</button>
+        {% endif %}
       </form>
       {% endif %}
       {% endif %}
@@ -314,6 +322,12 @@
     {# PDF viewer #}
     <main class="flex-1 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 viewer-panel">
       {% csrf_token %}
+      <div class="zoom-toolbar" role="toolbar" aria-label="PDF zoom">
+        <button type="button" class="zoom-btn" data-zoom-action="out" title="Zoom out" aria-label="Zoom out">&minus;</button>
+        <span id="zoom-pct" class="zoom-pct" aria-live="polite">100%</span>
+        <button type="button" class="zoom-btn" data-zoom-action="in" title="Zoom in" aria-label="Zoom in">+</button>
+        <button type="button" class="zoom-btn zoom-reset" data-zoom-action="reset" title="Reset zoom">Reset</button>
+      </div>
       <div id="pdf-viewer"
            data-pdf-url="{% if step == 3 %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
            data-document-id="{{ scan.pk }}"
@@ -356,6 +370,22 @@ var docId = SCAN_CONFIG.docId;
 var deletedPages = SCAN_CONFIG.deletedPages;
 </script>
 <script src="{% static 'scanning/viewer_sidebar.js' %}"></script>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    var toolbar = document.querySelector('.zoom-toolbar');
+    if (!toolbar) return;
+    var pct = document.getElementById('zoom-pct');
+    if (pct) pct.textContent = Math.round(getPdfZoom() * 100) + '%';
+    toolbar.addEventListener('click', function (e) {
+        var btn = e.target.closest('[data-zoom-action]');
+        if (!btn) return;
+        var action = btn.dataset.zoomAction;
+        if (action === 'in') setPdfZoom(getPdfZoom() + PDF_ZOOM_STEP);
+        else if (action === 'out') setPdfZoom(getPdfZoom() - PDF_ZOOM_STEP);
+        else if (action === 'reset') setPdfZoom(1);
+    });
+});
+</script>
 {% if is_processing %}
 <script src="{% static 'scanning/viewer_progress.js' %}"></script>
 {% endif %}

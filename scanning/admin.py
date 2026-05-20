@@ -14,6 +14,10 @@ from scanning.models import (
     Status,
     Volume,
 )
+from scanning.services import (
+    refresh_volume_queue_status,
+    refresh_volume_queue_status_for_scan,
+)
 
 
 class RetryCapFilter(admin.SimpleListFilter):
@@ -98,6 +102,62 @@ class ScanAdmin(admin.ModelAdmin):
             obj.pk,
             count,
         )
+
+    def save_model(self, request, obj, form, change):
+        """Save a Scan and refresh affected Volume(s) queue_status.
+
+        Covers admin edits that the lifecycle helper would normally see
+        elsewhere: flipping ``status`` (e.g. PENDING_REVIEW → APPROVED)
+        and reassigning ``volume_obj`` to a different volume. In the
+        reassignment case both the old and new volumes are refreshed.
+
+        :param request: The admin HTTP request.
+        :param obj: The Scan being saved.
+        :param form: The admin form instance.
+        :param change: True for an edit, False for a new object.
+        """
+        old_volume_id = None
+        if change and obj.pk:
+            old_volume_id = (
+                Scan.objects.filter(pk=obj.pk)
+                .values_list("volume_obj_id", flat=True)
+                .first()
+            )
+        super().save_model(request, obj, form, change)
+        refresh_volume_queue_status_for_scan(obj)
+        if old_volume_id and old_volume_id != obj.volume_obj_id:
+            old_volume = Volume.objects.filter(pk=old_volume_id).first()
+            if old_volume is not None:
+                refresh_volume_queue_status(old_volume)
+
+    def delete_model(self, request, obj):
+        """Delete a Scan and refresh its parent Volume's queue_status.
+
+        Without this, the volume can drift (e.g. stay at COMPLETE after
+        its only approved scan is deleted from the admin).
+
+        :param request: The admin HTTP request.
+        :param obj: The Scan to delete.
+        """
+        volume = obj.volume_obj
+        super().delete_model(request, obj)
+        if volume is not None:
+            refresh_volume_queue_status(volume)
+
+    def delete_queryset(self, request, queryset):
+        """Bulk-delete Scans and refresh affected Volumes.
+
+        :param request: The admin HTTP request.
+        :param queryset: Scans selected for deletion.
+        """
+        volume_ids = list(
+            queryset.exclude(volume_obj__isnull=True)
+            .values_list("volume_obj_id", flat=True)
+            .distinct()
+        )
+        super().delete_queryset(request, queryset)
+        for volume in Volume.objects.filter(pk__in=volume_ids):
+            refresh_volume_queue_status(volume)
 
     @admin.action(
         description=(
