@@ -1022,9 +1022,7 @@ class Page(AbstractDateTimeModel):
     xml_content = models.TextField(
         blank=True,
         default="",
-        help_text=(
-            "Extracted XML for this page."
-        ),
+        help_text=("Extracted XML for this page."),
     )
     status = models.CharField(
         max_length=32,
@@ -1065,9 +1063,7 @@ class Page(AbstractDateTimeModel):
     )
     is_blank = models.BooleanField(
         default=False,
-        help_text=(
-            "Body is entirely covered by headnote redactions."
-        ),
+        help_text=("Body is entirely covered by headnote redactions."),
     )
 
     class Meta:

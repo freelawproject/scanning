@@ -217,9 +217,9 @@ def _opinion_roadmap(
     #    ``n_ends_only`` and decrements ``continuation_slots``.
     #  * Once ``continuation_slots`` is zero, normal stack pairing
     #    resumes.
-    events: list[tuple[str, dict[str, Any]]] = (
-        [("cap", c) for c in captions] + [("key", k) for k in keys]
-    )
+    events: list[tuple[str, dict[str, Any]]] = [
+        ("cap", c) for c in captions
+    ] + [("key", k) for k in keys]
     events.sort(key=lambda e: _order(e[1]))
 
     complete: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -253,13 +253,9 @@ def _opinion_roadmap(
             f"{n_ends_only} continuing from previous page (ends here)"
         )
     if n_starts:
-        summary_parts.append(
-            f"{n_starts} starts here, continues to next page"
-        )
+        summary_parts.append(f"{n_starts} starts here, continues to next page")
     if n_pass_through:
-        summary_parts.append(
-            f"{n_pass_through} passes through this page"
-        )
+        summary_parts.append(f"{n_pass_through} passes through this page")
 
     lines: list[str] = ["; ".join(summary_parts) + "."]
 
@@ -348,13 +344,11 @@ def _footnote_hint(
         return None
 
     high_conf = [
-        d for d in fn_dets
-        if d.get("confidence", 0) >= _FOOTNOTE_CONF_FLOOR
+        d for d in fn_dets if d.get("confidence", 0) >= _FOOTNOTE_CONF_FLOOR
     ]
     if not high_conf:
         return (
-            "FOOTNOTES may be present on this page "
-            "(low-confidence detection)."
+            "FOOTNOTES may be present on this page (low-confidence detection)."
         )
 
     lines = [

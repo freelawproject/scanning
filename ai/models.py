@@ -21,7 +21,6 @@ from django.db import models
 
 from scanning.models import AbstractDateTimeModel
 
-
 # ── enums ─────────────────────────────────────────────────────────────
 
 
@@ -34,7 +33,6 @@ class LLMProvider(models.IntegerChoices):
     GEMINI = 1, "Google Gemini"
     OPENAI = 2, "OpenAI"
     ANTHROPIC = 3, "Anthropic"
-
 
 
 class LLMTaskStatusChoices(models.IntegerChoices):
