@@ -20,6 +20,7 @@ from django.http import (
 )
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
+from django.views.decorators.clickjacking import xframe_options_sameorigin
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
@@ -393,7 +394,8 @@ def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
     Generate Files already pushed every output file to
     ``processing/<pk>/...`` on S3, so this view is a pure status flip:
     it validates that file generation has run, then sets
-    ``status=APPROVED``. No S3 promotion happens here.
+    ``status=APPROVED``. Phase 2 will wire Approve into the
+    LLM-extraction handoff.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -461,6 +463,44 @@ def serve_opinionscan_pdf(
             return FileResponse(
                 candidate.open("rb"), content_type="application/pdf"
             )
+    raise Http404
+
+
+@login_required
+@xframe_options_sameorigin
+def serve_page_pdf(request: HttpRequest, pk: int) -> FileResponse:
+    """Serve the per-page PDF for a ``Page`` row.
+
+    Resolves ``page.pdf_path`` (relative to ``scan.output_dir``) to a
+    local file, falling back to an S3 pull when the file is missing
+    locally — same pattern as ``serve_opinionscan_pdf``.
+
+    :param request: The HTTP request.
+    :param pk: Page primary key.
+    :return: File response streaming the PDF.
+    :raises Http404: When the page or its file can't be found.
+    """
+    from scanning.models import Page
+
+    page = get_object_or_404(Page.objects.select_related("scan"), pk=pk)
+    if not page.pdf_path or not page.scan:
+        raise Http404
+
+    candidate = Path(page.scan.output_dir) / page.pdf_path
+    if candidate.is_file():
+        return FileResponse(
+            candidate.open("rb"), content_type="application/pdf"
+        )
+    try:
+        from scanning import s3_sync
+
+        s3_sync.download_processing_files(page.scan)
+    except Exception:
+        logger.exception("Lazy S3 pull failed for page %s", page.pk)
+    if candidate.is_file():
+        return FileResponse(
+            candidate.open("rb"), content_type="application/pdf"
+        )
     raise Http404
 
 
