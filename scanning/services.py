@@ -16,6 +16,7 @@ from pathlib import Path
 
 import django
 import fitz
+import pdfplumber
 from blackletter.api import (
     bitonal as bl_bitonal,
 )
@@ -44,8 +45,6 @@ from blackletter.validate import (
 )
 from django.conf import settings
 from django.db.models import Case, F, Value, When
-
-import pdfplumber
 
 from scanning.models import (
     CheckName,
