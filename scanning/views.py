@@ -11,7 +11,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
@@ -24,6 +24,7 @@ from scanning.forms import (
     ScanUploadForm,
 )
 from scanning.models import (
+    ExtractionStatus,
     OpinionScan,
     OpinionStatus,
     Page,
@@ -693,8 +694,6 @@ def scan_pages_list(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Rendered pages-list page.
     """
-    from scanning.models import ExtractionStatus
-
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
     pages = scan.pages.select_related("user_prompt").order_by("page_index")
 
@@ -705,12 +704,12 @@ def scan_pages_list(request: HttpRequest, pk: int) -> HttpResponse:
     if review_filter:
         pages = pages.filter(needs_review=True)
 
-    counts = {
-        "total": scan.pages.count(),
-        "extracted": scan.pages.filter(xml_content__gt="").count(),
-        "with_prompt": scan.pages.filter(user_prompt__isnull=False).count(),
-        "needs_review": scan.pages.filter(needs_review=True).count(),
-    }
+    counts = scan.pages.aggregate(
+        total=Count("id"),
+        extracted=Count("id", filter=~Q(xml_content="")),
+        with_prompt=Count("id", filter=Q(user_prompt__isnull=False)),
+        needs_review=Count("id", filter=Q(needs_review=True)),
+    )
 
     return render(
         request,

@@ -45,6 +45,8 @@ from blackletter.validate import (
 from django.conf import settings
 from django.db.models import Case, F, Value, When
 
+import pdfplumber
+
 from scanning.models import (
     CheckName,
     Detection,
@@ -2273,8 +2275,6 @@ def _page_body_textless(
         ``text_floor`` chars.
     """
     try:
-        import pdfplumber
-
         with pdfplumber.open(pdf_path) as pdf:
             pg = pdf.pages[0]
             body = pg.crop((0, header_height_pts, pg.width, pg.height))

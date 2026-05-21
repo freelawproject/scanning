@@ -34,13 +34,9 @@ class PromptAdmin(admin.ModelAdmin):
         """Link to the Page admin filtered to pages currently using this prompt."""
         if not obj.pk:
             return "—"
-        count = obj.pages.count()
-        if not count:
-            return "0"
         url = reverse("admin:scanning_page_changelist")
         return format_html(
-            '<a href="{}?user_prompt__id__exact={}">{} page(s)</a>',
+            '<a href="{}?user_prompt__id__exact={}">View page</a>',
             url,
             obj.pk,
-            count,
         )
