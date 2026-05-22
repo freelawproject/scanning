@@ -124,6 +124,7 @@ INSTALLED_APPS = [
     "storages",
     "django_cotton",
     "scanning",
+    "ai",
     "tailwind",
 ]
 

@@ -113,7 +113,8 @@ def _is_approved_deliverable(relative_path: str) -> bool:
     Approved deliverables are opinion PDFs under ``redacted/``,
     extracted figure images under ``images/``, plus the full-book
     original and redacted PDFs. Everything else (bitonal,
-    detections.json, unredacted/, stamped) stays under processing/.
+    detections.json, unredacted/, stamped, llm/) stays under
+    processing/.
 
     :param relative_path: Path relative to the scan's processing prefix.
     :returns: Whether to copy this file into approved/.

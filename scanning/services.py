@@ -16,6 +16,7 @@ from pathlib import Path
 
 import django
 import fitz
+import pdfplumber
 from blackletter.api import (
     bitonal as bl_bitonal,
 )
@@ -2214,6 +2215,7 @@ def run_generate_files(scan_pk: int) -> None:
                     opinion.original_pdf.name = _field_name(up)
                 opinion.save()
 
+        _sync_pages_for_scan(scan_pk)
         _update_progress(scan_pk, "Finalizing files...")
         _push_processing_files_to_s3(scan_pk)
 
@@ -2231,6 +2233,272 @@ def run_generate_files(scan_pk: int) -> None:
 
     except Exception as exc:
         _handle_pipeline_exception(scan_pk, exc, context="generate_files")
+
+
+def _page_has_headnote(redactions_pages: dict, page_index: int) -> bool:
+    """Return True if any rect on this page has ``type=headnote``.
+
+    Cheap probe used by the sandwich rule to detect whether a
+    multi-page headnote block is currently flowing.
+
+    :param redactions_pages: ``redactions["pages"]`` — a dict keyed by
+        stringified page_index, each value a list of rect dicts.
+    :param page_index: 0-based PDF page index.
+    :return: True iff at least one rect on that page is a headnote
+        redaction.
+    """
+    return any(
+        r.get("type") == "headnote"
+        for r in redactions_pages.get(str(page_index), [])
+    )
+
+
+def _page_body_textless(
+    pdf_path: Path,
+    header_height_pts: float = 60.0,
+    text_floor: int = 5,
+) -> bool:
+    """Return True when the rendered page has no text below the header.
+
+    The per-page PDFs handed to the LLM are post-redaction, so a body
+    entirely covered by ``headnote`` rects extracts to nothing. Used as
+    the boundary-case confirmation for the sandwich rule: when only
+    one neighbor of a page has headnotes (the page is the leading or
+    trailing edge of a multi-page block), we verify the redaction
+    actually wiped the body text before calling the page blank.
+
+    Returns False on any exception so a corrupt PDF doesn't mis-flag
+    a page as blank.
+
+    :param pdf_path: Filesystem path to the per-page PDF.
+    :param header_height_pts: PDF-point band at the top of the page
+        treated as "header" and excluded from the text check. The
+        printed page number lives here.
+    :param text_floor: Chars of body text below which the page is
+        considered effectively empty.
+    :return: True if the cropped body extracts to fewer than
+        ``text_floor`` chars.
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            pg = pdf.pages[0]
+            body = pg.crop((0, header_height_pts, pg.width, pg.height))
+            return len((body.extract_text() or "").strip()) < text_floor
+    except Exception:
+        return False
+
+
+def _blank_page_xml(book_page: str, page_index: int) -> str:
+    """Return the canned ``<page><pagenumber/></page>`` XML.
+
+    Stamped directly onto ``Page.xml_content`` for fully-redacted /
+    blank pages so we skip the LLM call entirely. Uses ``book_page``
+    (the printed page number from OCR) when available, otherwise
+    falls back to the 1-based PDF position.
+
+    :param book_page: The printed page number on this page, or empty
+        string if OCR hasn't populated it.
+    :param page_index: 0-based PDF page index, used as the fallback.
+    :return: A two-line XML stub with the page number filled in both
+        the ``page`` attribute and the element text.
+    """
+    pn = book_page or str(page_index + 1)
+    return f'<page>\n    <pagenumber page="{pn}">{pn}</pagenumber>\n</page>'
+
+
+def _is_blank_via_sandwich(
+    page_index: int,
+    opinions: list[dict],
+    redactions_pages: dict,
+    page_detections: list[dict],
+    pdf_path: "Path | None" = None,
+) -> bool:
+    """Decide whether a page's body is entirely covered by headnotes.
+
+    Page must be interior of a 3+ page opinion AND its neighbors must
+    have ``headnote`` redactions, with no ``FOOTNOTES`` detected on
+    this page (the footnote band is readable content, so not blank).
+
+    Two firing conditions:
+
+      * **Strict sandwich** — both prev and next pages have headnote
+        rects. The page sits inside a multi-page headnote block;
+        fires directly.
+      * **Boundary sandwich** — only one neighbor has headnotes
+        (this page is the leading or trailing edge of the block).
+        Confirm with a text-extraction check on the rendered PDF;
+        since the per-page PDFs are post-redaction, an actually-empty
+        body extracts to nothing.
+
+    :param page_index: 0-based PDF page index.
+    :param opinions: ``scan.opinions_json`` — the curated opinion
+        list, each entry with ``caption_page`` / ``key_page`` /
+        ``page_count``.
+    :param redactions_pages: ``redactions["pages"]`` — per-page rect
+        list keyed by stringified page_index.
+    :param page_detections: All YOLO detections on this page (used
+        only to check for ``FOOTNOTES``).
+    :param pdf_path: Path to the per-page PDF, used for the boundary
+        text-extraction check. If omitted, the boundary case can't
+        fire and only strict sandwich pages are flagged.
+    :return: True iff the page's body is effectively blank under the
+        rule above.
+    """
+    if any(d.get("label") == "FOOTNOTES" for d in page_detections):
+        return False
+    if not _page_has_headnote(redactions_pages, page_index):
+        return False
+    for op in opinions:
+        cap = op.get("caption_page")
+        key = op.get("key_page")
+        if cap is None or key is None:
+            continue
+        if not (cap < page_index < key and op.get("page_count", 0) > 2):
+            continue
+        prev_hn = _page_has_headnote(redactions_pages, page_index - 1)
+        next_hn = _page_has_headnote(redactions_pages, page_index + 1)
+        if prev_hn and next_hn:
+            return True
+        # Boundary case: only one side has headnotes. Confirm via the
+        # rendered PDF — if the body is genuinely empty (post-redaction),
+        # it really is a blank page even though sandwich doesn't fire.
+        if (prev_hn or next_hn) and pdf_path is not None:
+            if _page_body_textless(pdf_path):
+                return True
+    return False
+
+
+def _sync_pages_for_scan(scan_pk: int) -> int:
+    """Create / refresh ``Page`` rows for each ``llm/page_NNNN.pdf``.
+
+    Called at the end of ``run_generate_files`` once blackletter has
+    produced the per-page PDFs. Loads ``detections.json`` once, slices
+    the per-page detection list onto each ``Page`` row, computes
+    ``is_blank``, and stamps the canned blank-
+    page XML for pages where the body is entirely redacted so we skip
+    the LLM call.
+
+    The per-page user prompt is then built via
+    ``ai.user_prompt.build_user_prompt(page)`` and persisted as an
+    ``ai.Prompt`` row that ``Page.user_prompt`` points at.
+
+    Idempotent. ``Page`` is keyed on ``(scan, page_index)``. On re-run:
+
+    - If the regenerated prompt matches the page's current
+      ``Prompt.text``, the FK is left alone (no new Prompt row).
+    - If it differs, a new ``Prompt`` row is created and the FK is
+      repointed; the old Prompt stays as queryable history.
+    - If a previously-not-blank page is now blank, the auto-blank
+      stub overwrites any empty ``xml_content``. If the page was
+      already extracted by Gemini, the existing result is preserved.
+    - If a previously-blank page is no longer blank, the auto-blank
+      stub is cleared so the LLM can pick it up on the next run.
+
+    :param scan_pk: Primary key of the scan to sync.
+    :return: Number of ``Page`` rows touched.
+    """
+    from ai.models import Prompt, PromptTypes
+    from ai.user_prompt import build_user_prompt
+    from scanning.models import ExtractedBy, ExtractionStatus, Page
+
+    scan = Scan.objects.get(pk=scan_pk)
+    output_dir = Path(scan.output_dir)
+    llm_dir = output_dir / "llm"
+    if not llm_dir.is_dir():
+        return 0
+
+    det_path = output_dir / "detections.json"
+    redact_path = output_dir / "redactions.json"
+    all_detections: list[dict] = (
+        json.loads(det_path.read_text()) if det_path.is_file() else []
+    )
+    redactions: dict = (
+        json.loads(redact_path.read_text()) if redact_path.is_file() else {}
+    )
+    redactions_pages: dict = redactions.get("pages", {}) or {}
+    opinions: list[dict] = redactions.get("opinions", []) or []
+    page_numbers = _page_number_lookup(scan)
+
+    # Pre-index detections by page_index so we slice per-page in O(1).
+    detections_by_page: dict[int, list[dict]] = {}
+    for d in all_detections:
+        pi = d.get("page_index")
+        if pi is not None:
+            detections_by_page.setdefault(pi, []).append(d)
+
+    # Tally how many opinions start / end on each page_index, directly
+    # from ``scan.opinions_json`` (caption_page / key_page are already
+    # 0-based PDF indices — no reporter-page detour).
+    starts_by_idx: dict[int, int] = {}
+    ends_by_idx: dict[int, int] = {}
+    for op in scan.opinions_json or []:
+        cap = op.get("caption_page")
+        key = op.get("key_page")
+        if isinstance(cap, int):
+            starts_by_idx[cap] = starts_by_idx.get(cap, 0) + 1
+        if isinstance(key, int):
+            ends_by_idx[key] = ends_by_idx.get(key, 0) + 1
+
+    n = 0
+    for pdf in sorted(llm_dir.glob("page_*.pdf")):
+        try:
+            # "page_0001.pdf" -> 0  (filenames are 1-based; we store 0-based)
+            page_index = int(pdf.stem.split("_", 1)[1]) - 1
+        except (IndexError, ValueError):
+            continue
+
+        pn = page_numbers.get(page_index)
+        book_page = ""
+        if pn:
+            book_page = str(pn[0]) if pn[1] is None else f"{pn[0]}-{pn[1]}"
+
+        page_detections = detections_by_page.get(page_index, [])
+        is_blank = _is_blank_via_sandwich(
+            page_index, opinions, redactions_pages, page_detections, pdf
+        )
+
+        page, _created = Page.objects.update_or_create(
+            scan=scan,
+            page_index=page_index,
+            defaults={
+                "pdf_path": f"llm/{pdf.name}",
+                "book_page": book_page,
+                "expected_opinion_starts": starts_by_idx.get(page_index, 0),
+                "expected_opinion_ends": ends_by_idx.get(page_index, 0),
+                "detections": page_detections,
+                "is_blank": is_blank,
+            },
+        )
+
+        # Auto-stamp the canned blank-page XML so we don't burn an API
+        # call on a page with nothing to extract. Preserves any earlier
+        # Gemini result if a previously-not-blank page is now blank.
+        if is_blank and not page.xml_content:
+            page.xml_content = _blank_page_xml(book_page, page_index)
+            page.extracted_by = ExtractedBy.BLANK_AUTO
+            page.status = ExtractionStatus.EXTRACTED
+            page.save(update_fields=["xml_content", "extracted_by", "status"])
+        elif not is_blank and page.extracted_by == ExtractedBy.BLANK_AUTO:
+            # Was auto-blank, no longer is — clear so the LLM can run.
+            page.xml_content = ""
+            page.extracted_by = ""
+            page.status = ExtractionStatus.PENDING
+            page.save(update_fields=["xml_content", "extracted_by", "status"])
+
+        prompt_text = build_user_prompt(page) or ""
+        if prompt_text:
+            current = page.user_prompt
+            if current is None or current.text != prompt_text:
+                new_prompt = Prompt.objects.create(
+                    name=f"scan {scan.pk} p{page_index:04d}",
+                    prompt_type=PromptTypes.USER,
+                    text=prompt_text,
+                )
+                page.user_prompt = new_prompt
+                page.save(update_fields=["user_prompt"])
+        n += 1
+
+    return n
 
 
 # ---------------------------------------------------------------------------

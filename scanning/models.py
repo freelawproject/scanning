@@ -707,13 +707,6 @@ class OpinionScan(AbstractDateTimeModel):
         storage=_local_storage,
         max_length=512,
     )
-    masked_pdf = models.FileField(
-        upload_to=opinion_pdf_path("masked"),
-        storage=_local_storage,
-        max_length=512,
-        null=True,
-        blank=True,
-    )
     redacted_pdf = models.FileField(
         upload_to=opinion_pdf_path("redacted"),
         storage=_local_storage,
@@ -945,3 +938,153 @@ class PageDeletion(AbstractDateTimeModel):
 
     def __str__(self):
         return f"Delete PDF p.{self.pdf_page} from {self.scan}"
+
+
+class ExtractionStatus(models.TextChoices):
+    """Lifecycle of a Page through the LLM extraction pipeline."""
+
+    PENDING = "pending", "Pending"
+    SUBMITTED = "submitted", "Submitted to batch"
+    EXTRACTED = "extracted", "Extracted"
+    FAILED = "failed", "Failed"
+    PROMPT_BLOCKED = "prompt_blocked", "Blocked at prompt level"
+    RESPONSE_BLOCKED = "response_blocked", "Blocked at response level"
+    RECITATION_BLOCKED = (
+        "recitation_blocked",
+        "Blocked by recitation filter",
+    )
+
+
+class ExtractedBy(models.TextChoices):
+    """Which pipeline produced the page's XML content."""
+
+    LLM = "LLM", "LLM"
+    OCR_FALLBACK = "ocr-fallback", "Local OCR fallback"
+    HUMAN = "human", "Human review"
+    BLANK_AUTO = "blank-auto", "Blank page (auto)"
+
+
+class Page(AbstractDateTimeModel):
+    """One PDF page of a ``Scan`` produced by ``run_generate_files``.
+
+    Holds the per-page artifact path plus all extraction state. The
+    user prompt that drives extraction lives in ``ai.Prompt``; this
+    model FKs to whichever Prompt row is currently bound to the page.
+    Tweaking the prompt creates a new Prompt and repoints this FK.
+
+    XML extraction details (``xml_content``, ``status``, etc.) are
+    populated by the Phase 2 batch flow.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="pages",
+    )
+    page_index = models.PositiveIntegerField(
+        help_text=(
+            "0-based, matching ``Detection.page_index``. The PDF "
+            "filename is ``llm/page_{page_index + 1:04d}.pdf``."
+        ),
+    )
+    book_page = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text=(
+            "Visible page number printed on this page of the book. "
+            "Usually one integer like '687'; rarely a range like "
+            "'678-686' when a single PDF page collapses several book "
+            "pages."
+        ),
+    )
+
+    pdf_path = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text=(
+            "Relative to ``scan.output_dir``, e.g. ``llm/page_0001.pdf``."
+        ),
+    )
+    user_prompt = models.ForeignKey(
+        "ai.Prompt",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="pages",
+        help_text=(
+            "Current user prompt for this page. A tweaked prompt is a "
+            "new Prompt row; this FK is repointed and the prior Prompt "
+            "stays as history."
+        ),
+    )
+    xml_content = models.TextField(
+        blank=True,
+        default="",
+        help_text=("Extracted XML for this page."),
+    )
+    status = models.CharField(
+        max_length=32,
+        choices=ExtractionStatus.choices,
+        default=ExtractionStatus.PENDING,
+    )
+    extracted_by = models.CharField(
+        max_length=32,
+        choices=ExtractedBy.choices,
+        blank=True,
+        default="",
+    )
+    needs_review = models.BooleanField(
+        default=False,
+        help_text=(
+            "Set when the OCR fallback ran or the model output looked "
+            "suspicious. Triage view filters by this."
+        ),
+    )
+
+    # Per-attempt LLM state lives on ``ai.LLMTask`` (GenericFK back to
+    # this Page). Page only carries the page-level rollup: which row
+    # is the canonical extraction (xml_content above), how the work
+    # was sourced (``extracted_by``), and overall lifecycle state
+    # (``status``). Cost, tokens, retry-level errors, and provider
+    # specifics are LLMTask/LLMRequest concerns.
+
+    expected_opinion_starts = models.PositiveIntegerField(default=0)
+    expected_opinion_ends = models.PositiveIntegerField(default=0)
+
+    detections = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "All YOLO detections on this page, filtered from "
+            "``detections.json`` at sync time."
+        ),
+    )
+    is_blank = models.BooleanField(
+        default=False,
+        help_text=("Body is entirely covered by headnote redactions."),
+    )
+
+    class Meta:
+        ordering = ("scan", "page_index")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scan", "page_index"],
+                name="unique_page_scan_index",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["scan", "page_index"],
+                name="idx_page_scan_idx",
+            ),
+            models.Index(fields=["status"], name="idx_page_status"),
+            models.Index(
+                fields=["scan", "needs_review"],
+                name="idx_page_review",
+            ),
+        ]
+
+    def __str__(self):
+        return f"scan {self.scan_id} p{self.page_index:04d}"

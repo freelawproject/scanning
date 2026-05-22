@@ -73,10 +73,14 @@ def _caption_is_continuation(
     :rtype: bool
     """
     for i, (kp, kx, ky) in enumerate(paired_keys_sorted):
-        if i + 1 < len(paired_keys_sorted):
-            next_kp, _, next_ky = paired_keys_sorted[i + 1]
-        else:
-            next_kp, next_ky = float("inf"), float("inf")
+        # A caption is only a continuation when it falls between two
+        # *actual* paired keys. The open-ended span past the last key
+        # is a new opinion whose closing key isn't on this scan
+        # (likely continues into the next volume), so leave it as
+        # unmatched.
+        if i + 1 >= len(paired_keys_sorted):
+            break
+        next_kp, _, next_ky = paired_keys_sorted[i + 1]
         after_key = det.page_index > kp or (
             det.page_index == kp and det.y0 > ky
         )

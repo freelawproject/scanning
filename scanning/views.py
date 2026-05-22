@@ -11,7 +11,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.http import HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
@@ -24,8 +24,10 @@ from scanning.forms import (
     ScanUploadForm,
 )
 from scanning.models import (
+    ExtractionStatus,
     OpinionScan,
     OpinionStatus,
+    Page,
     Priority,
     QueuedAction,
     QueueStatus,
@@ -675,4 +677,87 @@ def update_scan_status(request, reporter_slug, vol):
         "queue_detail",
         reporter_slug=reporter_slug,
         vol=vol,
+    )
+
+
+@login_required
+def scan_pages_list(request: HttpRequest, pk: int) -> HttpResponse:
+    """List every ``Page`` of a scan with extraction state.
+
+    Phase 1: read-only. Filters by status / needs_review let the human
+    surface the ~1-2 pages that need attention per volume without
+    scrolling the whole list. Each PDF link opens the per-page file via
+    ``serve_page_pdf``; each ``page_index`` cell links into the
+    per-page detail view.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Rendered pages-list page.
+    """
+    scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
+    pages = scan.pages.select_related("user_prompt").order_by("page_index")
+
+    status_filter = request.GET.get("status") or ""
+    review_filter = request.GET.get("needs_review") == "1"
+    if status_filter:
+        pages = pages.filter(status=status_filter)
+    if review_filter:
+        pages = pages.filter(needs_review=True)
+
+    counts = scan.pages.aggregate(
+        total=Count("id"),
+        extracted=Count("id", filter=~Q(xml_content="")),
+        with_prompt=Count("id", filter=Q(user_prompt__isnull=False)),
+        needs_review=Count("id", filter=Q(needs_review=True)),
+    )
+
+    return render(
+        request,
+        "scanning/pages_list.html",
+        {
+            "scan": scan,
+            "pages": pages,
+            "counts": counts,
+            "status_filter": status_filter,
+            "review_filter": review_filter,
+            "statuses": ExtractionStatus.choices,
+        },
+    )
+
+
+@login_required
+def page_detail(request: HttpRequest, pk: int) -> HttpResponse:
+    """Per-page review pane.
+
+    Phase 1: read-only — shows PDF link, current user prompt,
+    extraction metadata, and prev/next navigation within the scan.
+    Phase 2 will add edit / retry / OCR-fallback buttons.
+
+    :param request: The HTTP request.
+    :param pk: Page primary key.
+    :return: Rendered page-detail page.
+    """
+    page = get_object_or_404(
+        Page.objects.select_related("scan", "scan__reporter", "user_prompt"),
+        pk=pk,
+    )
+    prev_page = (
+        Page.objects.filter(scan=page.scan, page_index__lt=page.page_index)
+        .order_by("-page_index")
+        .first()
+    )
+    next_page = (
+        Page.objects.filter(scan=page.scan, page_index__gt=page.page_index)
+        .order_by("page_index")
+        .first()
+    )
+    return render(
+        request,
+        "scanning/page_detail.html",
+        {
+            "page": page,
+            "scan": page.scan,
+            "prev_page": prev_page,
+            "next_page": next_page,
+        },
     )
