@@ -1,6 +1,8 @@
 from django.contrib import admin, messages
-from django.urls import reverse
+from django.contrib.admin.utils import quote
+from django.urls import NoReverseMatch, reverse
 from django.utils.html import format_html
+from django.utils.text import capfirst
 
 from scanning.models import (
     Detection,
@@ -74,15 +76,98 @@ class ScanAdmin(admin.ModelAdmin):
         "notes",
         "uploaded_by__username",
     ]
-    raw_id_fields = ["uploaded_by", "reporter"]
+    raw_id_fields = ["uploaded_by", "reporter", "volume_obj"]
     readonly_fields = [
         "date_created",
         "date_modified",
         "processed_at",
         "pages_link",
     ]
+    # Per-page payload fields hold megabytes on a processed scan.
+    # Rendering them as editable textareas makes the change view crawl,
+    # so keep them off the form (they stay in the DB and are used by the
+    # pipeline).
+    exclude = [
+        "ocr_results",
+        "opinions_json",
+        "page_map",
+        "missing_pages",
+        "margin_rects",
+        "redaction_rects",
+        "process_output",
+    ]
     date_hierarchy = "date_created"
     actions = ["reset_to_queued", "requeue_retry_cap_scans"]
+
+    @staticmethod
+    def _admin_change_link(obj):
+        """Render an object as a clickable admin change-link.
+
+        Mirrors the link format Django's own delete confirmation uses,
+        so summarized rows still read as ``Verbose name: <a>obj</a>``.
+
+        :param obj: A model instance.
+        :return: ``Verbose name: <link>`` HTML, or plain text if the
+            model has no admin change URL.
+        :rtype: SafeString
+        """
+        opts = obj._meta
+        label = capfirst(opts.verbose_name)
+        try:
+            url = reverse(
+                f"admin:{opts.app_label}_{opts.model_name}_change",
+                args=(quote(obj.pk),),
+            )
+        except NoReverseMatch:
+            return format_html("{}: {}", label, str(obj))
+        return format_html('{}: <a href="{}">{}</a>', label, url, str(obj))
+
+    def get_deleted_objects(
+        self, objs, request
+    ) -> tuple[list[str], dict[str, int], set[str], list[str]]:
+        """Summarize cascade deletions without loading every related row.
+
+        The default admin collector instantiates every related object to
+        render the confirmation tree. A processed scan cascades to tens
+        of thousands of ``Detection`` rows (plus ``Page``, ``Issue``,
+        etc.), so the collector exhausts memory and takes the server
+        down before the user even confirms.
+
+        We keep clickable links only for the *bounded* sets a human would
+        actually click, the selected scans and any blocking
+        ``OpinionScan`` rows, and reduce the *unbounded* cascade tables to
+        COUNT-based summaries.
+
+        :param objs: Scans selected for deletion.
+        :param request: The admin HTTP request.
+        :return: ``(deletable_objects, model_count, perms_needed,
+            protected)``.
+        :rtype: tuple
+        """
+        scan_ids = [obj.pk for obj in objs]
+
+        # OpinionScan.scan is PROTECT: a scan with opinions cannot be
+        # deleted. Surface the blocking opinions as links so the
+        # confirmation page explains why, instead of letting the real
+        # delete raise ProtectedError (500). Opinions are bounded per
+        # volume, so instantiating them is cheap.
+        protected: list[str] = [
+            self._admin_change_link(opinion)
+            for opinion in OpinionScan.objects.filter(scan_id__in=scan_ids)
+        ]
+
+        model_count: dict[str, int] = {}
+        for model in (Scan, Page, Detection, Issue, PageInsert, PageDeletion):
+            field = "pk" if model is Scan else "scan_id"
+            count = model.objects.filter(**{f"{field}__in": scan_ids}).count()
+            if count:
+                model_count[str(model._meta.verbose_name_plural)] = count
+
+        deletable_objects: list[str] = [
+            self._admin_change_link(obj) for obj in objs
+        ]
+        perms_needed: set[str] = set()
+        return deletable_objects, model_count, perms_needed, protected
 
     @admin.display(description="Pages")
     def pages_link(self, obj):
