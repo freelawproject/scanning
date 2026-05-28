@@ -32,9 +32,10 @@ case "$1" in
         --group www-data \
         --workers ${NUM_WORKERS:-4} \
         --worker-class scanning.workers.UvicornWorker \
+        --preload \
         --no-control-socket \
         --timeout 180 \
-        --max-requests ${MAX_REQUESTS:-2500} \
+        --max-requests ${MAX_REQUESTS:-500} \
         --max-requests-jitter 100 \
         --bind 0.0.0.0:8000
     ;;
