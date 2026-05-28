@@ -19,6 +19,7 @@ from django.http import (
     HttpRequest,
     HttpResponse,
     JsonResponse,
+    StreamingHttpResponse,
 )
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
@@ -948,7 +949,7 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
 
 
 @login_required
-def export_pdf(request: HttpRequest, pk: int) -> HttpResponse:
+def export_pdf(request: HttpRequest, pk: int) -> StreamingHttpResponse:
     """Export a corrected PDF with deletions and inserts applied.
 
     :param request: The HTTP request.
@@ -956,56 +957,86 @@ def export_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     :return: PDF file download response.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    with fitz.open(scan.pdf_path) as pdf_doc:
-        page_map = scan.page_map
-        deleted_pages = set(d.pdf_page for d in scan.deletions.all())
-        for pdf_page in sorted(deleted_pages, reverse=True):
-            pdf_index = pdf_page - 1
-            if 0 <= pdf_index < len(pdf_doc):
-                pdf_doc.delete_page(pdf_index)
-        inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
-        insert_ops = []
-        for i, entry in enumerate(page_map):
-            if (
-                entry["type"] == "missing"
-                and entry["logical_number"] in inserts
-            ):
-                insert_before = None
-                for j in range(i + 1, len(page_map)):
-                    if page_map[j]["type"] == "pdf_page":
-                        insert_before = page_map[j]["pdf_index"]
-                        break
-                insert_ops.append(
-                    (insert_before, inserts[entry["logical_number"]])
-                )
-        offset = 0
-        for insert_before, insert_obj in insert_ops:
-            img_path = insert_obj.image.path
-            if insert_before is not None:
-                adjusted = insert_before - len(
-                    [d for d in deleted_pages if d <= insert_before]
-                )
-                pno = adjusted + offset
-                ref_page = pdf_doc.load_page(min(pno, len(pdf_doc) - 1))
-            else:
-                pno = len(pdf_doc)
-                ref_page = pdf_doc.load_page(len(pdf_doc) - 1)
-            w, h = ref_page.rect.width, ref_page.rect.height
-            if img_path.lower().endswith(".pdf"):
-                with fitz.open(img_path) as insert_pdf:
-                    pdf_doc.insert_pdf(
-                        insert_pdf,
-                        from_page=0,
-                        to_page=insert_pdf.page_count - 1,
-                        start_at=pno,
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    tmp.close()
+    tmp_path = tmp.name
+    try:
+        with fitz.open(scan.pdf_path) as pdf_doc:
+            page_map = scan.page_map
+            deleted_pages = set(d.pdf_page for d in scan.deletions.all())
+            for pdf_page in sorted(deleted_pages, reverse=True):
+                pdf_index = pdf_page - 1
+                if 0 <= pdf_index < len(pdf_doc):
+                    pdf_doc.delete_page(pdf_index)
+            inserts = {
+                ins.logical_page_number: ins for ins in scan.inserts.all()
+            }
+            insert_ops = []
+            for i, entry in enumerate(page_map):
+                if (
+                    entry["type"] == "missing"
+                    and entry["logical_number"] in inserts
+                ):
+                    insert_before = None
+                    for j in range(i + 1, len(page_map)):
+                        if page_map[j]["type"] == "pdf_page":
+                            insert_before = page_map[j]["pdf_index"]
+                            break
+                    insert_ops.append(
+                        (insert_before, inserts[entry["logical_number"]])
                     )
-                    offset += insert_pdf.page_count - 1
-            else:
-                new_page = pdf_doc.new_page(pno=pno, width=w, height=h)
-                new_page.insert_image(new_page.rect, filename=img_path)
-            offset += 1
-        pdf_bytes = pdf_doc.tobytes()
+            offset = 0
+            for insert_before, insert_obj in insert_ops:
+                img_path = insert_obj.image.path
+                if insert_before is not None:
+                    adjusted = insert_before - len(
+                        [d for d in deleted_pages if d <= insert_before]
+                    )
+                    pno = adjusted + offset
+                    ref_page = pdf_doc.load_page(min(pno, len(pdf_doc) - 1))
+                else:
+                    pno = len(pdf_doc)
+                    ref_page = pdf_doc.load_page(len(pdf_doc) - 1)
+                w, h = ref_page.rect.width, ref_page.rect.height
+                if img_path.lower().endswith(".pdf"):
+                    with fitz.open(img_path) as insert_pdf:
+                        pdf_doc.insert_pdf(
+                            insert_pdf,
+                            from_page=0,
+                            to_page=insert_pdf.page_count - 1,
+                            start_at=pno,
+                        )
+                        offset += insert_pdf.page_count - 1
+                else:
+                    new_page = pdf_doc.new_page(pno=pno, width=w, height=h)
+                    new_page.insert_image(new_page.rect, filename=img_path)
+                offset += 1
+            pdf_doc.save(tmp_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
     filename = f"{scan.reporter.short_name}_{scan.volume}_corrected.pdf"
-    response = HttpResponse(pdf_bytes, content_type="application/pdf")
+
+    def _stream_and_cleanup(path: str, chunk_size: int = 64 * 1024):
+        try:
+            with open(path, "rb") as fh:
+                while True:
+                    chunk = fh.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    response = StreamingHttpResponse(
+        _stream_and_cleanup(tmp_path), content_type="application/pdf"
+    )
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response

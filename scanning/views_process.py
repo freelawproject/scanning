@@ -481,6 +481,9 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
         clip = fitz.Rect(x0, y0, x1, y1)
         pix = doc[page].get_pixmap(clip=clip, dpi=dpi)
         png_bytes = pix.tobytes("png")
+        # Release the pixmap's C-side buffer immediately rather than
+        # waiting for GC; per-request crops at dpi=300 are 5-20 MB.
+        pix = None
     resp = HttpResponse(png_bytes, content_type="image/png")
     resp["Cache-Control"] = "max-age=3600"
     return resp
