@@ -272,3 +272,53 @@ class ExpectedTotalTest(SimpleTestCase):
         self.assertIsNone(
             handler._expected_total(self._resp({"Content-Range": "bytes */*"}))
         )
+
+
+class ValidatePdfTest(SimpleTestCase):
+    """``handler._validate_pdf`` structural validation."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.path = Path(self._tmpdir.name) / "input.pdf"
+
+    @staticmethod
+    def _pdf_bytes(pages=1):
+        """Build a real, complete PDF of ``pages`` pages."""
+        import fitz
+
+        doc = fitz.open()
+        for _ in range(pages):
+            doc.new_page()
+        data = doc.tobytes()
+        doc.close()
+        return data
+
+    def test_valid_single_page(self):
+        self.path.write_bytes(self._pdf_bytes(1))
+        self.assertEqual(handler._validate_pdf(self.path), 1)
+
+    def test_valid_multi_page(self):
+        self.path.write_bytes(self._pdf_bytes(5))
+        self.assertEqual(handler._validate_pdf(self.path), 5)
+
+    def test_truncated_pdf_missing_eof(self):
+        full = self._pdf_bytes(3)
+        # Lop off the tail so the %%EOF trailer is gone, simulating a
+        # download that died mid-transfer.
+        self.path.write_bytes(full[: len(full) // 2])
+
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            handler._validate_pdf(self.path)
+
+    def test_empty_file(self):
+        self.path.write_bytes(b"")
+        with self.assertRaisesRegex(ValueError, "empty"):
+            handler._validate_pdf(self.path)
+
+    def test_not_a_pdf(self):
+        self.path.write_bytes(b"<html>nope</html>\n%%EOF")
+        with self.assertRaisesRegex(ValueError, "not a PDF"):
+            handler._validate_pdf(self.path)

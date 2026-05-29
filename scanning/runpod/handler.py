@@ -425,17 +425,83 @@ def _download_pdf(url: str, dest: Path) -> None:
             )
 
 
-def _page_count(pdf_path: Path) -> int:
-    """Return the number of pages in a PDF.
+# Trailer window scanned for the %%EOF marker. A conforming PDF ends with
+# %%EOF (optionally followed by whitespace); incrementally-updated files
+# carry several, and only the last one matters. 2 KB comfortably covers
+# trailing newlines and a final cross-reference stream.
+_PDF_EOF_WINDOW = 2048
 
-    :param pdf_path: Path to the PDF on disk.
+
+def _validate_pdf(pdf_path: Path) -> int:
+    """Validate that ``pdf_path`` is a complete, openable PDF and return
+    its page count.
+
+    Defense-in-depth against a truncated download slipping through: the
+    resumable ``_download_pdf`` already checks the byte count against the
+    server's advertised size, but that only fires when the server sends a
+    size. The real hazard is a partial PDF that PyMuPDF can still *open*
+    by rebuilding a broken xref, reporting far fewer pages than the real
+    document — which would then silently produce wrong detections / page
+    analysis. Checking the header and the ``%%EOF`` trailer turns that
+    silent corruption into a hard failure.
+
+    A raised error propagates out of the action and (via ``handler()``)
+    marks the RunPod job FAILED with no ``error_code``; the daemon treats
+    a bare FAILED as transient and re-queues the scan with a freshly
+    signed URL. So a truncated download is re-fetched automatically; a
+    genuinely corrupt source PDF loops until the daemon's retry ceiling
+    and then surfaces as an error.
+
+    Checks run cheapest-first so a bad file fails before the fitz open.
+
+    :param pdf_path: Path to the downloaded PDF on disk.
     :returns: Page count.
     :rtype: int
+    :raises ValueError: If the file is empty, lacks a ``%PDF-`` header or
+        an ``%%EOF`` trailer, or cannot be opened as a PDF with at least
+        one page.
     """
     import fitz
 
-    with fitz.open(str(pdf_path)) as doc:
-        return doc.page_count
+    size = pdf_path.stat().st_size if pdf_path.exists() else 0
+    if size == 0:
+        raise ValueError(f"downloaded PDF is empty: {pdf_path}")
+
+    with pdf_path.open("rb") as f:
+        header = f.read(1024)
+        f.seek(max(0, size - _PDF_EOF_WINDOW))
+        trailer = f.read()
+
+    if b"%PDF-" not in header:
+        raise ValueError(
+            f"downloaded file is not a PDF (no %PDF- header): {pdf_path}"
+        )
+    if b"%%EOF" not in trailer:
+        raise ValueError(
+            "downloaded PDF is truncated (no %%EOF trailer in last "
+            f"{_PDF_EOF_WINDOW} bytes): {pdf_path}"
+        )
+
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            page_count = doc.page_count
+            # A rebuilt xref usually means damage; the %%EOF check above
+            # catches the common (truncation) cause, so this is just a
+            # breadcrumb rather than a hard failure.
+            if getattr(doc, "is_repaired", False):
+                logger.warning(
+                    "PyMuPDF repaired %s on open; proceeding", pdf_path
+                )
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(
+            f"downloaded file could not be opened as a PDF: {exc}"
+        ) from exc
+
+    if page_count < 1:
+        raise ValueError(f"downloaded PDF has no pages: {pdf_path}")
+    return page_count
 
 
 # ── Actions ─────────────────────────────────────────────────────────
@@ -517,7 +583,7 @@ def _action_detect(inputs: dict, tmp_dir: Path) -> dict:
     pdf_path = tmp_dir / "input.pdf"
     _download_pdf(pdf_url, pdf_path)
 
-    pages = _page_count(pdf_path)
+    pages = _validate_pdf(pdf_path)
     if pages > MAX_PAGES:
         raise ValueError(
             f"PDF has {pages} pages, exceeds MAX_PAGES={MAX_PAGES}"
@@ -574,7 +640,7 @@ def _action_analyze(inputs: dict, tmp_dir: Path) -> dict:
     pdf_path = tmp_dir / "input.pdf"
     _download_pdf(pdf_url, pdf_path)
 
-    pages = _page_count(pdf_path)
+    pages = _validate_pdf(pdf_path)
     if pages > MAX_PAGES:
         raise ValueError(
             f"PDF has {pages} pages, exceeds MAX_PAGES={MAX_PAGES}"
