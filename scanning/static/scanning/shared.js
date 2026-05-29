@@ -30,6 +30,9 @@ function deletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelete) {
     .then(function (data) {
         if (data.status === 'ok') {
             markPageAsDeleted(pageDiv, pdfPage, labelPrefix, csrfToken, docId, onDelete);
+            if (typeof window.refreshProcessActionBar === 'function') {
+                window.refreshProcessActionBar();
+            }
         }
     });
 }
@@ -99,6 +102,9 @@ function undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelet
                         onDelete(pdfPage, pageDiv);
                     });
                 }
+            }
+            if (typeof window.refreshProcessActionBar === 'function') {
+                window.refreshProcessActionBar();
             }
         }
     });
