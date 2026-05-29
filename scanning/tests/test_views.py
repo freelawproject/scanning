@@ -26,6 +26,8 @@ from scanning.models import (
     Detection,
     OpinionScan,
     OpinionStatus,
+    PageDeletion,
+    QueuedAction,
     QueueStatus,
     Scan,
     Source,
@@ -1556,3 +1558,94 @@ class TestApproveDetection(ScanningTestCase):
         self.assertEqual(response.status_code, 404)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "error")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestPendingChangesGuard(ScanningTestCase):
+    """The validate/detect/recheck actions are blocked while page
+    changes are pending, so a deletion can't be silently stranded
+    behind an action that ignores it (and a full re-validation can't
+    burn a RunPod run for nothing)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user, status=Status.PENDING_REVIEW
+        )
+        PageDeletion.objects.create(scan=self.scan, pdf_page=2)
+
+    def _assert_blocked(self, url_name):
+        response = self.client.post(
+            reverse(url_name, kwargs={"pk": self.scan.pk})
+        )
+        self.assertRedirects(
+            response,
+            reverse("scan_process", kwargs={"pk": self.scan.pk}) + "?step=1",
+            fetch_redirect_response=False,
+        )
+        self.scan.refresh_from_db()
+        # The action must NOT have queued the scan.
+        self.assertEqual(self.scan.status, Status.PENDING_REVIEW)
+        # The pending deletion is untouched.
+        self.assertTrue(self.scan.deletions.exists())
+
+    def test_start_validate_blocked(self):
+        """Re-validate is blocked while a deletion is pending."""
+        self._assert_blocked("start_validate")
+
+    def test_start_detect_blocked(self):
+        """Next: Detect is blocked while a deletion is pending."""
+        self._assert_blocked("start_detect")
+
+    def test_recalculate_blocked(self):
+        """Recheck is blocked while a deletion is pending."""
+        self._assert_blocked("recalculate")
+
+    def test_start_validate_allowed_without_pending(self):
+        """With no pending changes, Re-validate queues the scan."""
+        self.scan.deletions.all().delete()
+        response = self.client.post(
+            reverse("start_validate", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, Status.QUEUED)
+        self.assertEqual(self.scan.queued_action, QueuedAction.FULL_PIPELINE)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestProcessActionsFragment(ScanningTestCase):
+    """The process_actions endpoint renders the step action bar so the
+    viewer can refresh it in place after a deletion/undo."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user, status=Status.PENDING_REVIEW, page_count=5
+        )
+
+    def test_no_pending_changes(self):
+        """Without pending changes the bar has no Rebuild button."""
+        response = self.client.get(
+            reverse("process_actions", kwargs={"pk": self.scan.pk}) + "?step=1"
+        )
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.content)
+        self.assertFalse(body["has_pending_changes"])
+        self.assertNotIn("Rebuild &amp; Validate", body["html"])
+
+    def test_pending_deletion_shows_rebuild(self):
+        """A pending deletion makes the bar show Rebuild & Validate."""
+        PageDeletion.objects.create(scan=self.scan, pdf_page=2)
+        response = self.client.get(
+            reverse("process_actions", kwargs={"pk": self.scan.pk}) + "?step=1"
+        )
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.content)
+        self.assertTrue(body["has_pending_changes"])
+        self.assertIn("Rebuild &amp; Validate", body["html"])
+        self.assertIn(
+            reverse("reprocess", kwargs={"pk": self.scan.pk}), body["html"]
+        )

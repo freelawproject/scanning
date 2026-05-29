@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import fitz
+from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.http import (
     FileResponse,
@@ -15,6 +16,7 @@ from django.http import (
     JsonResponse,
 )
 from django.shortcuts import get_object_or_404, redirect, render
+from django.template.loader import render_to_string
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
@@ -489,6 +491,82 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     return resp
 
 
+def _block_if_pending_changes(
+    request: HttpRequest, scan: Scan
+) -> HttpResponse | None:
+    """Redirect back to step 1 when the scan has unapplied page changes.
+
+    The validate, detect, and recheck actions ignore pending
+    ``PageDeletion`` / ``PageInsert`` rows, so running them would
+    silently strand the user's edits (and, for a full re-validation,
+    spend a RunPod run for nothing). Pending changes must be applied via
+    "Rebuild & Validate" (the ``reprocess`` view).
+
+    :param request: The HTTP request.
+    :type request: HttpRequest
+    :param scan: The scan to check for pending changes.
+    :type scan: Scan
+    :returns: A redirect response if there are pending changes, else
+        ``None``.
+    :rtype: HttpResponse | None
+    """
+    if scan.deletions.exists() or scan.inserts.exists():
+        messages.warning(
+            request,
+            'Apply your pending page changes with "Rebuild & Validate" '
+            "before running this.",
+        )
+        return redirect(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+        )
+    return None
+
+
+@login_required
+def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
+    """Render the step action bar as an HTML fragment.
+
+    Lets the step-1/step-2 viewers refresh the action buttons in place
+    after a page is marked for (or restored from) deletion, so the
+    correct buttons appear without a full page reload.
+
+    :param request: The HTTP request (optional ``step`` query param).
+    :type request: HttpRequest
+    :param pk: Scan primary key.
+    :type pk: int
+    :returns: JSON with the rendered ``html`` and the current
+        ``has_pending_changes`` flag.
+    :rtype: JsonResponse
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        step = int(request.GET.get("step", 1))
+    except ValueError:
+        step = 1
+    if step < 1 or step > 3:
+        step = 1
+
+    has_pending_inserts = scan.inserts.exists()
+    has_pending_changes = scan.deletions.exists() or has_pending_inserts
+    context = {
+        "scan": scan,
+        "step": step,
+        "is_processing": scan.status in (Status.PROCESSING, Status.QUEUED),
+        "has_pending_changes": has_pending_changes,
+        "has_pending_inserts": has_pending_inserts,
+        "issues": scan.issues.all(),
+        "missing_pages": scan.missing_pages,
+        "has_detections": Detection.objects.filter(scan=scan).exists(),
+        "opinions": scan.opinions_json,
+    }
+    html = render_to_string(
+        "scanning/_process_actions.html", context, request=request
+    )
+    return JsonResponse(
+        {"html": html, "has_pending_changes": has_pending_changes}
+    )
+
+
 @login_required
 @require_POST
 def start_validate(request: HttpRequest, pk: int) -> HttpResponse:
@@ -499,6 +577,9 @@ def start_validate(request: HttpRequest, pk: int) -> HttpResponse:
     :return: Redirect to the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    guard = _block_if_pending_changes(request, scan)
+    if guard:
+        return guard
     scan.status = Status.QUEUED
     scan.stage = Stage.VALIDATE
     scan.queued_action = QueuedAction.FULL_PIPELINE
@@ -518,6 +599,9 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     :return: Redirect to the scan processing page (step 2).
     """
     scan = get_object_or_404(Scan, pk=pk)
+    guard = _block_if_pending_changes(request, scan)
+    if guard:
+        return guard
     if Detection.objects.filter(scan=scan).exists():
         # Detections already exist (from full pipeline). Skip to review.
         return redirect(
@@ -573,6 +657,9 @@ def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
     :return: Redirect to the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    guard = _block_if_pending_changes(request, scan)
+    if guard:
+        return guard
     if not scan.ocr_results:
         return redirect("scan_process", pk=pk)
     from scanning import services
