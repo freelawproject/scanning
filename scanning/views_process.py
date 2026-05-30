@@ -407,32 +407,47 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
 def serve_scan_pdf(request: HttpRequest, pk: int) -> FileResponse:
     """Serve the best available PDF for a scan (OCR, bitonal, or original).
 
-    Resolves the local file in three passes: try the cached ``output_dir``,
-    fall back to the original ``pdf_path``, and if neither is on disk,
-    lazy-pull processing files from S3 and try once more. The pull covers
-    prod where the daemon and web run in separate containers with separate
-    ``/tmp/`` volumes.
+    Prefers the small processed PDF (OCR text layer, else bitonal) over
+    the original, which for multi-GB scans is an order of magnitude
+    larger. The order is load-bearing: serving the original whenever it
+    happens to be on disk would short-circuit before the S3 pull that
+    fetches the processed PDF, so the viewer would keep streaming the
+    huge original even though a tiny bitonal exists in S3.
+
+    Resolution:
+
+    1. Serve the processed PDF (OCR > bitonal) if it is already local.
+    2. Otherwise pull the scan's processing files from S3 and look
+       again. This covers prod, where the daemon and web run in
+       separate containers with separate ephemeral ``/tmp/`` volumes, so
+       the web side typically only holds the original (or nothing).
+    3. Only if no processed PDF can be found locally or in S3 do we fall
+       back to the original.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: File response streaming the PDF.
-    :raises Http404: When no local copy exists and S3 has nothing to pull.
+    :raises Http404: When no PDF exists locally and S3 has nothing to pull.
     """
     scan = get_object_or_404(Scan, pk=pk)
 
-    def _try_local() -> FileResponse | None:
+    def _processed_local() -> FileResponse | None:
+        """Return the OCR pdf, else ``bitonal.pdf``, from ``output_dir``."""
         output = Path(scan.output_dir)
-        if output.is_dir():
-            ocr = find_ocr_pdf(scan.output_dir)
-            if ocr:
-                return FileResponse(
-                    ocr.open("rb"), content_type="application/pdf"
-                )
-            bitonal = output / "bitonal.pdf"
-            if bitonal.exists():
-                return FileResponse(
-                    bitonal.open("rb"), content_type="application/pdf"
-                )
+        if not output.is_dir():
+            return None
+        ocr = find_ocr_pdf(scan.output_dir)
+        if ocr:
+            return FileResponse(ocr.open("rb"), content_type="application/pdf")
+        bitonal = output / "bitonal.pdf"
+        if bitonal.exists():
+            return FileResponse(
+                bitonal.open("rb"), content_type="application/pdf"
+            )
+        return None
+
+    def _original_local() -> FileResponse | None:
+        """Return the original PDF if a local copy is resolvable."""
         try:
             return FileResponse(
                 Path(scan.pdf_path).open("rb"),
@@ -441,10 +456,15 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> FileResponse:
         except FileNotFoundError:
             return None
 
-    response = _try_local()
+    # 1. Prefer the small processed PDF if it is already on disk.
+    response = _processed_local()
     if response is not None:
         return response
 
+    # 2. Not local: pull processing files from S3 (also lands the
+    #    original for the fallback below) and re-check for the processed
+    #    PDF. Runs even when the original is already local, so the big
+    #    original never pre-empts a fetchable bitonal.
     try:
         from scanning import s3_sync
 
@@ -452,7 +472,12 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> FileResponse:
     except Exception:
         logger.exception("Lazy S3 pull failed for scan %s", scan.pk)
 
-    response = _try_local()
+    response = _processed_local()
+    if response is not None:
+        return response
+
+    # 3. No processed PDF anywhere: fall back to the original.
+    response = _original_local()
     if response is not None:
         return response
     raise Http404

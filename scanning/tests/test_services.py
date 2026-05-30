@@ -1052,3 +1052,99 @@ class TestRefreshVolumeQueueStatus(TestCase):
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestImmediateS3PushOnGeneration(TestCase):
+    """Bitonal and OCR PDFs are pushed to S3 the moment they're generated."""
+
+    def test_push_generated_delegates_to_upload(self):
+        """The helper forwards to s3_sync.upload_file_to_s3."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=2)
+        with patch("scanning.s3_sync.upload_file_to_s3") as up:
+            services._push_generated_file_to_s3(scan.pk, "bitonal.pdf")
+
+        up.assert_called_once_with(scan, "bitonal.pdf")
+
+    def test_push_generated_skips_in_prod_without_creds(self):
+        """In prod with no AWS creds, skip the upload (don't raise)."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=2)
+        with (
+            override_settings(DEVELOPMENT=False, TESTING=False),
+            patch.dict("os.environ", {}, clear=True),
+            patch("scanning.s3_sync.upload_file_to_s3") as up,
+        ):
+            services._push_generated_file_to_s3(scan.pk, "bitonal.pdf")
+
+        up.assert_not_called()
+
+    def test_ensure_bitonal_pushes_on_fresh_generation(self):
+        """A newly converted bitonal is uploaded immediately."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=2)
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+
+        def _fake_bitonal(src, out, progress_callback=None):
+            (pathlib.Path(out) / "bitonal.pdf").write_bytes(b"%PDF-1.4 bw")
+
+        with (
+            patch.object(services, "bl_bitonal", side_effect=_fake_bitonal),
+            patch.object(services, "_push_generated_file_to_s3") as push,
+            patch.object(services.fitz, "open") as fitz_open,
+        ):
+            fitz_open.return_value.__enter__.return_value.page_count = 2
+            services._ensure_bitonal(scan, output)
+
+        push.assert_called_once_with(scan.pk, "bitonal.pdf")
+
+    def test_ensure_bitonal_skips_push_when_already_present(self):
+        """An existing bitonal is neither reconverted nor re-uploaded."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=2)
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "bitonal.pdf").write_bytes(b"%PDF-1.4 existing")
+
+        with (
+            patch.object(services, "bl_bitonal") as bitonal,
+            patch.object(services, "_push_generated_file_to_s3") as push,
+            patch.object(services.fitz, "open") as fitz_open,
+        ):
+            fitz_open.return_value.__enter__.return_value.page_count = 2
+            services._ensure_bitonal(scan, output)
+
+        bitonal.assert_not_called()
+        push.assert_not_called()
+
+    def test_run_ocr_pushes_generated_pdf(self):
+        """The OCR PDF is uploaded immediately after it's produced."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=2)
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        ocr_pdf = output / "rep.1.1.2.pdf"
+
+        with (
+            patch.object(services, "_ocr", return_value=ocr_pdf),
+            patch.object(services, "_push_generated_file_to_s3") as push,
+            patch.object(services.fitz, "open") as fitz_open,
+        ):
+            fitz_open.return_value.__enter__.return_value.page_count = 2
+            services._run_ocr(
+                scan.pk,
+                "in.pdf",
+                str(output),
+                reporter="rep",
+                volume="1",
+                first_page=1,
+            )
+
+        push.assert_called_once_with(scan.pk, "rep.1.1.2.pdf")
