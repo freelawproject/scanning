@@ -291,6 +291,9 @@ def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
             str(output_dir),
             progress_callback=_bitonal_progress,
         )
+        # Persist as soon as it exists so a later crash, or a reprocess
+        # that skips the end-of-pipeline push, still leaves it in S3.
+        _push_generated_file_to_s3(scan.pk, "bitonal.pdf")
 
     with fitz.open(str(bitonal_path)) as pdf:
         page_count = pdf.page_count
@@ -324,7 +327,7 @@ def _run_ocr(
         current=0,
         total=total_pages,
     )
-    return _ocr(
+    ocr_path = _ocr(
         scan_pk,
         bitonal_path,
         output_dir,
@@ -333,6 +336,9 @@ def _run_ocr(
         first_page=first_page,
         total_pages=total_pages,
     )
+    # Persist the OCR PDF as soon as it exists (see _ensure_bitonal).
+    _push_generated_file_to_s3(scan_pk, Path(ocr_path).name)
+    return ocr_path
 
 
 def _ocr(
@@ -721,6 +727,48 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
     except Exception:
         logger.exception(
             "Failed to push processing files to S3 for scan %s", scan_pk
+        )
+
+
+def _push_generated_file_to_s3(scan_pk: int, relative_path: str) -> None:
+    """Upload a single just-generated processing file to S3 immediately.
+
+    Persists derived artifacts (``bitonal.pdf``, the OCR PDF) the moment
+    they are produced rather than only at the end-of-pipeline push, so a
+    later crash, or a ``reprocess`` run that never does the full push,
+    still leaves them in S3. Mirrors the credential guard in
+    ``_push_processing_files_to_s3`` so a missing-creds misconfiguration
+    in prod surfaces a distinct Sentry error.
+
+    Prod-only in practice: in local dev ``upload_file_to_s3`` is a no-op
+    (S3 disabled), and the file is already on disk under ``output_dir``,
+    so it is served locally without any upload.
+
+    :param scan_pk: Primary key of the scan the file belongs to.
+    :param relative_path: Path relative to the scan's output dir.
+    :return: None.
+    """
+    from scanning import s3_sync
+    from scanning.utils import has_s3_credentials
+
+    if (
+        not settings.DEVELOPMENT
+        and not getattr(settings, "TESTING", False)
+        and not has_s3_credentials()
+    ):
+        logger.error(
+            "Skipping S3 push of %s for scan %s: AWS credentials not "
+            "configured",
+            relative_path,
+            scan_pk,
+        )
+        return
+    try:
+        scan = Scan.objects.get(pk=scan_pk)
+        s3_sync.upload_file_to_s3(scan, relative_path)
+    except Exception:
+        logger.exception(
+            "Failed to push %s to S3 for scan %s", relative_path, scan_pk
         )
 
 

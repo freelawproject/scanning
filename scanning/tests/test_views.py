@@ -1256,6 +1256,53 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         mock_pull.assert_called_once()
 
+    def test_processed_pdf_preferred_over_local_original(self):
+        """A local original must not pre-empt a bitonal fetchable from S3.
+
+        Regression: the original being on disk used to short-circuit the
+        response before the S3 pull ran, so the viewer streamed the huge
+        original even though a tiny bitonal existed in S3.
+        """
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        reporter = ReporterFactory(short_name="bt2d")
+        scan = ScanFactory(
+            reporter=reporter, volume=12, start_page=1, end_page=2
+        )
+        # The original is resolvable locally via the FileField, so without
+        # the fix _try_local would serve it and skip the pull entirely.
+        self.assertTrue(os.path.exists(scan.original_pdf.path))
+
+        bitonal_bytes = b"%PDF-1.4 pulled bitonal"
+
+        def _fake_download(scan_arg):
+            output = pathlib.Path(scan_arg.output_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "bitonal.pdf").write_bytes(bitonal_bytes)
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch(
+                "scanning.s3_sync.download_processing_files",
+                side_effect=_fake_download,
+            ) as mock_pull,
+        ):
+            response = self.client.get(
+                reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_pull.assert_called_once()
+        # The bitonal was served, not the (different) original.
+        served = b"".join(response.streaming_content)
+        self.assertEqual(served, bitonal_bytes)
+
     def test_returns_404_when_nothing_available(self):
         """When local is empty and S3 pull yields nothing, return 404."""
         user = self.make_user()
