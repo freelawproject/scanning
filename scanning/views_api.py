@@ -40,7 +40,6 @@ from scanning.models import (
 )
 from scanning.utils import (
     compute_coverage_gaps,
-    find_json_file,
     find_ocr_pdf,
 )
 
@@ -763,7 +762,10 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with ``deleted`` count, or 404 if not found.
     """
-    from scanning.services import _sync_detections_to_disk
+    from scanning.services import (
+        _sync_detections_to_disk,
+        _sync_redaction_rects_from_detections,
+    )
 
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
@@ -780,6 +782,7 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _sync_detections_to_disk(scan.pk)
+    _sync_redaction_rects_from_detections(scan.pk)
     return JsonResponse({"status": "ok", "deleted": count})
 
 
@@ -797,7 +800,10 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with ``updated`` count, or 404 if not found.
     """
-    from scanning.services import _sync_detections_to_disk
+    from scanning.services import (
+        _sync_detections_to_disk,
+        _sync_redaction_rects_from_detections,
+    )
 
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
@@ -818,6 +824,7 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
     output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _sync_detections_to_disk(scan.pk)
+    _sync_redaction_rects_from_detections(scan.pk)
     return JsonResponse({"status": "ok", "updated": count})
 
 
@@ -839,64 +846,69 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with ``added=True`` if new, ``added=False``
         if an existing detection was boosted.
     """
+    from scanning.services import (
+        _sync_detections_to_disk,
+        _sync_redaction_rects_from_detections,
+    )
+
     scan = get_object_or_404(Scan, pk=pk)
     det = _parse_json_body(request)
     if isinstance(det, JsonResponse):
         return det
-    output_base = Path(scan.output_dir)
-    det_path = find_json_file(output_base, "detections.json")
-    if not det_path:
-        return JsonResponse({"error": "No detections.json"}, status=404)
-    existing = json.loads(det_path.read_text())
-    boosted = False
-    for e in existing:
-        if e["page_index"] != det["page_index"]:
-            continue
-        if e["label_id"] != det["label_id"]:
-            continue
-        if (
-            abs(e["bbox"][0] - det["bbox"][0]) < 15
-            and abs(e["bbox"][1] - det["bbox"][1]) < 15
-        ):
-            e["confidence"] = 1.0
-            boosted = True
-            Detection.objects.filter(
-                scan=scan,
-                page_index=det["page_index"],
-                label_id=det["label_id"],
-                x0__gte=det["bbox"][0] - 15,
-                x0__lte=det["bbox"][0] + 15,
-                y0__gte=det["bbox"][1] - 15,
-                y0__lte=det["bbox"][1] + 15,
-            ).update(confidence=1.0)
-            break
-    if not boosted:
-        det["confidence"] = 1.0
-        existing.append(det)
+    output_dir = Path(scan.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Match against the DB (source of truth). The previous implementation
+    # iterated detections.json, which could carry a stale entry for a
+    # soft-deleted row and trick the boost branch into silently dropping
+    # the user's new draw.
+    match = (
+        Detection.objects.filter(
+            scan=scan,
+            active=True,
+            page_index=det["page_index"],
+            label_id=det["label_id"],
+            x0__gte=det["bbox"][0] - 15,
+            x0__lte=det["bbox"][0] + 15,
+            y0__gte=det["bbox"][1] - 15,
+            y0__lte=det["bbox"][1] + 15,
+        )
+        .order_by("pk")
+        .first()
+    )
+    if match is not None:
+        match.confidence = 1.0
+        match.save(update_fields=["confidence"])
+    else:
         from blackletter.models import Label
 
         try:
             label_name = Label(det["label_id"]).name
-            Detection.objects.create(
-                scan=scan,
-                page_index=det["page_index"],
-                label=label_name,
-                label_id=det["label_id"],
-                confidence=1.0,
-                x0=det["bbox"][0],
-                y0=det["bbox"][1],
-                x1=det["bbox"][2],
-                y1=det["bbox"][3],
-                img_width=det.get("img_width", 0),
-                img_height=det.get("img_height", 0),
-                model_name=Detection.ModelName.MANUAL,
-                model_count=1,
-                found_by=[{"model": "manual", "confidence": 1.0}],
+        except ValueError:
+            return JsonResponse(
+                {"status": "error", "message": "Unknown label_id"},
+                status=400,
             )
-        except Exception:
-            logger.exception("Failed to create manual detection")
-    det_path.write_text(json.dumps(existing))
-    return JsonResponse({"status": "ok", "added": not boosted})
+        Detection.objects.create(
+            scan=scan,
+            page_index=det["page_index"],
+            label=label_name,
+            label_id=det["label_id"],
+            confidence=1.0,
+            x0=det["bbox"][0],
+            y0=det["bbox"][1],
+            x1=det["bbox"][2],
+            y1=det["bbox"][3],
+            img_width=det.get("img_width", 0),
+            img_height=det.get("img_height", 0),
+            model_name=Detection.ModelName.MANUAL,
+            model_count=1,
+            found_by=[{"model": "manual", "confidence": 1.0}],
+        )
+
+    _sync_detections_to_disk(scan.pk)
+    _sync_redaction_rects_from_detections(scan.pk)
+    return JsonResponse({"status": "ok", "added": match is None})
 
 
 @login_required
@@ -909,13 +921,21 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with ``updated`` count, or 404 if not found.
     """
-    from scanning.services import _sync_detections_to_disk
+    from scanning.services import (
+        _sync_detections_to_disk,
+        _sync_redaction_rects_from_detections,
+    )
 
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    detection_id = data["detection_id"]
+    detection_id = data.get("detection_id")
+    if detection_id is None:
+        return JsonResponse(
+            {"status": "error", "message": "detection_id required"},
+            status=400,
+        )
     count = Detection.objects.filter(pk=detection_id, scan=scan).update(
         confidence=1.0
     )
@@ -926,6 +946,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _sync_detections_to_disk(scan.pk)
+    _sync_redaction_rects_from_detections(scan.pk)
     return JsonResponse({"status": "ok", "updated": count})
 
 

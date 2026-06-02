@@ -1880,6 +1880,44 @@ document.addEventListener('DOMContentLoaded', function () {
         toolbar.className = 'det-resize-handle';
         toolbar.style.cssText = 'position:absolute;top:-30px;left:0;display:flex;gap:4px;z-index:23;white-space:nowrap;';
 
+        // Approve button – boost confidence to 1.0 and re-pair
+        var approveBtn = document.createElement('button');
+        approveBtn.textContent = 'Approve';
+        approveBtn.style.cssText = 'background:#16a34a;color:white;border:none;padding:4px 10px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;white-space:nowrap;flex-shrink:0;line-height:1;';
+        approveBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            approveBtn.disabled = true;
+            approveBtn.textContent = '...';
+            fetch('/scans/' + documentId + '/approve-detection/', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                body: JSON.stringify({detection_id: det.id}),
+            }).then(function(r) {
+                if (!r.ok) throw new Error('approve failed: ' + r.status);
+                return r.json();
+            }).then(function(data) {
+                approveBtn.textContent = '✓';
+                det.confidence = 1.0;
+                var lbl = div.querySelector('.detection-label');
+                if (lbl) lbl.textContent = det.label + ' 1.0';
+                var sidebarItems = document.querySelectorAll('[data-unmatched-page="' + det.page_index + '"][data-unmatched-label="' + det.label + '"]');
+                sidebarItems.forEach(function(el) { el.style.opacity = '0.3'; el.style.pointerEvents = 'none'; });
+                return fetch('/scans/' + documentId + '/pair-opinions/', {
+                    method: 'POST',
+                    headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
+                });
+            }).then(function() {
+                _deselectDetectionBox();
+                refreshOverlays();
+            }).catch(function(err) {
+                console.error(err);
+                approveBtn.disabled = false;
+                approveBtn.textContent = 'Approve';
+            });
+        });
+
+        toolbar.appendChild(approveBtn);
+
         var deleteBtn = document.createElement('button');
         deleteBtn.textContent = 'Delete';
         deleteBtn.style.cssText = 'background:#ef4444;color:white;border:none;padding:4px 10px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;white-space:nowrap;flex-shrink:0;line-height:1;';
