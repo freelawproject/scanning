@@ -20,7 +20,6 @@ from django.views.decorators.http import require_POST
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
-    ScanUploadForm,
 )
 from scanning.models import (
     ExtractionStatus,
@@ -124,32 +123,6 @@ def scan_list(request: HttpRequest) -> HttpResponse:
             "current_volume": volume_filter or "",
             "retry_cap_count": retry_cap_count,
         },
-    )
-
-
-@login_required
-def scan_upload(request: HttpRequest) -> HttpResponse:
-    """Handle scan upload form.
-
-    :param request: The current HTTP request.
-    :return: The rendered upload form or a redirect on success.
-    """
-    if request.method == "POST":
-        form = ScanUploadForm(request.POST, request.FILES)
-        if form.is_valid():
-            scan = form.save(commit=False)
-            scan.uploaded_by = request.user
-            scan.status = Status.UPLOADED
-            scan.save()
-            messages.success(request, "Scan uploaded successfully.")
-            return redirect("scan_process", pk=scan.pk)
-    else:
-        form = ScanUploadForm()
-
-    return render(
-        request,
-        "scanning/scan_upload.html",
-        {"form": form},
     )
 
 
