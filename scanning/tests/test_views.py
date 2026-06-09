@@ -324,6 +324,36 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
         self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
 
 
+class TestQueueView(ScanningTestCase):
+    """The queue page renders and paginates volumes."""
+
+    def test_renders_with_page_obj(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        VolumeFactory()
+        response = self.client.get(reverse("queue"))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("page_obj", response.context)
+
+    def test_paginates_at_100_per_page(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        VolumeFactory.create_batch(105)
+        first = self.client.get(reverse("queue"))
+        self.assertEqual(len(first.context["page_obj"]), 100)
+        self.assertEqual(first.context["page_obj"].paginator.num_pages, 2)
+        second = self.client.get(reverse("queue"), {"page": 2})
+        self.assertEqual(len(second.context["page_obj"]), 5)
+
+    def test_stats_count_all_volumes_not_just_page(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        VolumeFactory.create_batch(55, queue_status=QueueStatus.NEEDS_SCANNING)
+        response = self.client.get(reverse("queue"))
+        self.assertEqual(response.context["stats"]["total"], 55)
+        self.assertEqual(response.context["stats"]["needs_scanning"], 55)
+
+
 class TestScanModel(ScanningTestCase):
     """Test the Scan model."""
 

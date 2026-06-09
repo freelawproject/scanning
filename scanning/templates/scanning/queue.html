@@ -68,7 +68,7 @@
   </form>
 </div>
 
-{% if volumes %}
+{% if page_obj %}
 <div class="hidden sm:block card overflow-hidden p-0">
   <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
     <thead class="bg-gray-50 dark:bg-gray-800">
@@ -84,7 +84,7 @@
       </tr>
     </thead>
     <tbody>
-      {% for vol in volumes %}
+      {% for vol in page_obj %}
       <tr class="border-t border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-800/50{% if vol.queue_status == 'complete' %} opacity-50{% endif %}">
         <td class="px-4 py-3 text-sm font-medium">
           <a href="{% url 'queue_detail' reporter_slug=vol.reporter.short_name vol=vol.volume_number %}">{{ vol.reporter.short_name }}</a>
@@ -153,7 +153,7 @@
 
 <!-- Mobile cards -->
 <div class="sm:hidden space-y-3">
-  {% for vol in volumes %}
+  {% for vol in page_obj %}
   <a href="{% url 'queue_detail' reporter_slug=vol.reporter.short_name vol=vol.volume_number %}" class="card block hover:shadow-md transition-shadow{% if vol.queue_status == 'complete' %} opacity-50{% endif %}">
     <div class="flex items-center justify-between mb-2">
       <span class="font-medium text-sm">{{ vol.reporter.short_name }} vol. {{ vol.volume_number }}</span>
@@ -172,6 +172,20 @@
   </a>
   {% endfor %}
 </div>
+
+{% if page_obj.has_other_pages %}
+<div class="flex items-center justify-center gap-3 mt-6">
+  {% if page_obj.has_previous %}
+  <a href="{% url 'queue' %}{% url_replace page=page_obj.previous_page_number %}" class="btn-outline text-sm">&laquo; Previous</a>
+  {% endif %}
+  <span class="text-sm text-gray-500 dark:text-gray-400">
+    Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}
+  </span>
+  {% if page_obj.has_next %}
+  <a href="{% url 'queue' %}{% url_replace page=page_obj.next_page_number %}" class="btn-outline text-sm">Next &raquo;</a>
+  {% endif %}
+</div>
+{% endif %}
 
 {% else %}
 <div class="card text-center py-12">

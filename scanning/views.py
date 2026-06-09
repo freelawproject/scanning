@@ -317,7 +317,7 @@ def queue_view(request: HttpRequest) -> HttpResponse:
     if priority_filter:
         volumes = volumes.filter(priority=priority_filter)
 
-    # Stats
+    # Stats are aggregated over all volumes, independent of the page.
     total = Volume.objects.count()
     by_status = dict(
         Volume.objects.values_list("queue_status")
@@ -325,11 +325,14 @@ def queue_view(request: HttpRequest) -> HttpResponse:
         .values_list("queue_status", "c")
     )
 
+    paginator = Paginator(volumes, 100)
+    page_obj = paginator.get_page(request.GET.get("page"))
+
     return render(
         request,
         "scanning/queue.html",
         {
-            "volumes": volumes,
+            "page_obj": page_obj,
             "reporters": reporters,
             "selected_reporter": selected_reporter,
             "status_filter": status_filter,
