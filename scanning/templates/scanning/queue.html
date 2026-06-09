@@ -11,7 +11,9 @@
     <span class="text-red-600 dark:text-red-400">{{ stats.needs_scanning }} to scan</span> &middot;
     <span class="text-yellow-600 dark:text-yellow-400">{{ stats.assigned }} assigned</span> &middot;
     <span class="text-blue-600 dark:text-blue-400">{{ stats.scanning }} in progress</span> &middot;
-    <span class="text-green-600 dark:text-green-400">{{ stats.complete }} complete</span>
+    <span class="text-indigo-600 dark:text-indigo-400">{{ stats.scanned }} scanned</span> &middot;
+    <span class="text-green-600 dark:text-green-400">{{ stats.complete }} complete</span> &middot;
+    <span class="text-gray-500 dark:text-gray-400">{{ stats.unavailable }} unavailable</span>
   </div>
 </div>
 
@@ -25,8 +27,12 @@
      class="{% if status_filter == 'assigned' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Assigned</a>
   <a href="{% url 'queue' %}{% url_replace status='scanning' %}"
      class="{% if status_filter == 'scanning' %}btn-primary{% else %}btn-outline{% endif %} text-sm">In Progress</a>
+  <a href="{% url 'queue' %}{% url_replace status='scanned' %}"
+     class="{% if status_filter == 'scanned' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Scanned</a>
   <a href="{% url 'queue' %}{% url_replace status='complete' %}"
      class="{% if status_filter == 'complete' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Complete</a>
+  <a href="{% url 'queue' %}{% url_replace status='unavailable' %}"
+     class="{% if status_filter == 'unavailable' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Unavailable</a>
 </div>
 
 <!-- Filters -->
