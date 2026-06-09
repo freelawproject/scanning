@@ -20,7 +20,6 @@ from django.views.decorators.http import require_POST
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
-    ScanReviewForm,
     ScanUploadForm,
 )
 from scanning.models import (
@@ -156,50 +155,18 @@ def scan_upload(request: HttpRequest) -> HttpResponse:
 
 @login_required
 def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
-    """Display scan detail and handle staff review.
+    """Redirect the legacy scan detail URL to the process view.
+
+    The standalone detail page has been retired in favour of the unified
+    process view, which displays the PDF and handles review/approval.
+    This redirect keeps old/bookmarked ``/scans/<pk>/`` links working.
 
     :param request: The current HTTP request.
     :param pk: The primary key of the scan.
-    :return: The rendered detail page.
+    :return: A redirect to the scan process view.
     """
-    scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
-
-    # Redirect to processing view if scan has processing data
-    if scan.stage and Path(scan.output_dir).is_dir():
-        return redirect("scan_process", pk=scan.pk)
-
-    opinion_count = scan.opinions.count()
-
-    review_form = None
-    if scan.status != Status.APPROVED:
-        if request.method == "POST":
-            review_form = ScanReviewForm(request.POST, instance=scan)
-            if review_form.is_valid():
-                updated_scan = review_form.save(commit=False)
-                if updated_scan.status == Status.APPROVED:
-                    updated_scan.processed_at = timezone.now()
-                    messages.success(request, "Scan approved.")
-                else:
-                    updated_scan.processed_at = None
-                    messages.info(
-                        request,
-                        "Scan rejected, status reset to Uploaded.",
-                    )
-                updated_scan.save()
-                refresh_volume_queue_status_for_scan(updated_scan)
-                return redirect("scan_detail", pk=scan.pk)
-        else:
-            review_form = ScanReviewForm(instance=scan)
-
-    return render(
-        request,
-        "scanning/scan_detail.html",
-        {
-            "scan": scan,
-            "review_form": review_form,
-            "opinion_count": opinion_count,
-        },
-    )
+    scan = get_object_or_404(Scan, pk=pk)
+    return redirect("scan_process", pk=scan.pk)
 
 
 @login_required

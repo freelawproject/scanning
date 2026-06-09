@@ -28,7 +28,7 @@
           {% if opinion.scan %}
           <tr class="border-b border-gray-100 dark:border-gray-700/50">
             <td class="px-4 py-2.5 text-gray-500 dark:text-gray-400 font-medium">Book</td>
-            <td class="px-4 py-2.5"><a href="{% url 'scan_detail' pk=opinion.scan.pk %}" class="text-primary-600 hover:underline">#{{ opinion.scan.pk }}</a></td>
+            <td class="px-4 py-2.5"><a href="{% url 'scan_process' pk=opinion.scan.pk %}" class="text-primary-600 hover:underline">#{{ opinion.scan.pk }}</a></td>
           </tr>
           {% endif %}
           {% if opinion.uploaded_by %}
