@@ -12,8 +12,9 @@ from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db.models import Count, Q
-from django.http import HttpRequest, HttpResponse
+from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
@@ -433,6 +434,23 @@ def claim_scan(request, reporter_slug, vol):
     )
 
 
+def _upload_redirect(request: HttpRequest, url: str) -> HttpResponse:
+    """Send the post-upload destination to the client.
+
+    XHR uploads get the URL as JSON so the progress script can navigate
+    after the response arrives (a plain redirect would consume any queued
+    messages before the browser shows the page). Regular form posts get
+    an ordinary redirect.
+
+    :param request: The HTTP request.
+    :param url: Destination URL.
+    :return: A JSON payload for XHR requests, otherwise a redirect.
+    """
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return JsonResponse({"redirect": url})
+    return redirect(url)
+
+
 @login_required
 @require_POST
 def queue_upload(request, reporter_slug, vol):
@@ -444,6 +462,10 @@ def queue_upload(request, reporter_slug, vol):
     :return: Redirect to queue detail or scan processing page.
     """
     volume = get_volume(reporter_slug, vol)
+    queue_url = reverse(
+        "queue_detail",
+        kwargs={"reporter_slug": reporter_slug, "vol": vol},
+    )
 
     if request.POST.get("new_scan") == "1":
         # Create a new scan under this volume
@@ -459,38 +481,22 @@ def queue_upload(request, reporter_slug, vol):
         scan_pk = request.POST.get("scan_pk")
         if not scan_pk:
             messages.error(request, "No scan specified.")
-            return redirect(
-                "queue_detail",
-                reporter_slug=reporter_slug,
-                vol=vol,
-            )
+            return _upload_redirect(request, queue_url)
         scan = get_object_or_404(Scan, pk=scan_pk, volume_obj=volume)
     pdf = request.FILES.get("original_pdf")
     if not pdf:
         messages.error(request, "No PDF file provided.")
-        return redirect(
-            "queue_detail",
-            reporter_slug=reporter_slug,
-            vol=vol,
-        )
+        return _upload_redirect(request, queue_url)
 
     if not pdf.name.lower().endswith(".pdf"):
         messages.error(request, "Only PDF files are accepted.")
-        return redirect(
-            "queue_detail",
-            reporter_slug=reporter_slug,
-            vol=vol,
-        )
+        return _upload_redirect(request, queue_url)
 
     header = pdf.read(5)
     pdf.seek(0)
     if header != b"%PDF-":
         messages.error(request, "The uploaded file is not a valid PDF.")
-        return redirect(
-            "queue_detail",
-            reporter_slug=reporter_slug,
-            vol=vol,
-        )
+        return _upload_redirect(request, queue_url)
 
     # Update page range if provided
     first_page = request.POST.get("first_page", "").strip()
@@ -544,11 +550,7 @@ def queue_upload(request, reporter_slug, vol):
                 request,
                 "Storage is not configured; contact an administrator.",
             )
-            return redirect(
-                "queue_detail",
-                reporter_slug=reporter_slug,
-                vol=vol,
-            )
+            return _upload_redirect(request, queue_url)
 
         try:
             uploaded = s3_sync.upload_file_to_s3(scan, original_name)
@@ -563,11 +565,7 @@ def queue_upload(request, reporter_slug, vol):
                 request,
                 "Upload to storage failed. Please try again in a moment.",
             )
-            return redirect(
-                "queue_detail",
-                reporter_slug=reporter_slug,
-                vol=vol,
-            )
+            return _upload_redirect(request, queue_url)
         scan.original_pdf.name = original_name
         scan.save(update_fields=["original_pdf"])
 
@@ -579,15 +577,13 @@ def queue_upload(request, reporter_slug, vol):
         scan.progress_message = "Queued for processing..."
         scan.save()
         refresh_volume_queue_status_for_scan(scan)
-        return redirect("scan_process", pk=scan.pk)
+        return _upload_redirect(
+            request, reverse("scan_process", kwargs={"pk": scan.pk})
+        )
 
     refresh_volume_queue_status_for_scan(scan)
     messages.success(request, "PDF uploaded successfully.")
-    return redirect(
-        "queue_detail",
-        reporter_slug=reporter_slug,
-        vol=vol,
-    )
+    return _upload_redirect(request, queue_url)
 
 
 @login_required

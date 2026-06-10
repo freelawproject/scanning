@@ -82,7 +82,7 @@
 <!-- Upload form -->
 <div class="card mb-6">
   <h2 class="text-sm font-bold mb-3">Upload a scan</h2>
-  <form method="post" action="{% url 'queue_upload' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}" enctype="multipart/form-data">
+  <form id="upload-form" method="post" action="{% url 'queue_upload' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}" enctype="multipart/form-data">
     {% csrf_token %}
     <input type="hidden" name="new_scan" value="1">
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
@@ -117,6 +117,16 @@
       <button type="submit" name="action" value="upload_validate" class="btn-primary text-sm">Upload &amp; Validate</button>
       <button type="submit" name="action" value="upload_only" class="btn-outline text-sm">Upload Only</button>
     </div>
+    <div id="upload-progress" class="hidden mt-3">
+      <div class="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
+        <span id="upload-progress-label">Uploading&hellip;</span>
+        <span id="upload-progress-pct">0%</span>
+      </div>
+      <div class="w-full h-2 rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">
+        <div id="upload-progress-bar" class="h-2 rounded-full bg-primary-600 transition-all duration-300" style="width: 0%"></div>
+      </div>
+    </div>
+    <p id="upload-error" class="hidden mt-2 text-sm text-red-600"></p>
   </form>
 </div>
 
@@ -154,4 +164,103 @@
   {% endfor %}
 </div>
 {% endif %}
+{% endblock %}
+
+{% block footer_scripts %}
+<script>
+(function () {
+  var form = document.getElementById('upload-form');
+  if (!form) return;
+  var progressWrap = document.getElementById('upload-progress');
+  var progressBar = document.getElementById('upload-progress-bar');
+  var progressPct = document.getElementById('upload-progress-pct');
+  var progressLabel = document.getElementById('upload-progress-label');
+  var errorEl = document.getElementById('upload-error');
+  var buttons = form.querySelectorAll('button[type="submit"]');
+
+  var uploading = false;
+
+  // Fallback for browsers without SubmitEvent.submitter.
+  var lastClickedButton = null;
+  buttons.forEach(function (btn) {
+    btn.addEventListener('click', function () { lastClickedButton = btn; });
+  });
+
+  function warnBeforeUnload(e) {
+    if (!uploading) return;
+    e.preventDefault();
+    // Required for the confirmation dialog in some browsers.
+    e.returnValue = '';
+  }
+  window.addEventListener('beforeunload', warnBeforeUnload);
+
+  function setButtonsDisabled(disabled) {
+    buttons.forEach(function (btn) {
+      btn.disabled = disabled;
+      btn.classList.toggle('opacity-50', disabled);
+      btn.classList.toggle('cursor-not-allowed', disabled);
+    });
+  }
+
+  function showError(message) {
+    uploading = false;
+    progressWrap.classList.add('hidden');
+    errorEl.textContent = message;
+    errorEl.classList.remove('hidden');
+    setButtonsDisabled(false);
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+
+    var formData = new FormData(form);
+    var submitter = e.submitter || lastClickedButton;
+    if (submitter && submitter.name) {
+      formData.append(submitter.name, submitter.value);
+    }
+
+    errorEl.classList.add('hidden');
+    progressLabel.textContent = 'Uploading…';
+    progressBar.style.width = '0%';
+    progressPct.textContent = '0%';
+    progressWrap.classList.remove('hidden');
+    setButtonsDisabled(true);
+    uploading = true;
+
+    var xhr = new XMLHttpRequest();
+    // form.action would resolve to the submit buttons (name="action"),
+    // which shadow the form's action property, so read the attribute.
+    xhr.open('POST', form.getAttribute('action'));
+    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+    xhr.responseType = 'json';
+
+    xhr.upload.addEventListener('progress', function (ev) {
+      if (!ev.lengthComputable) return;
+      var pct = Math.round((ev.loaded / ev.total) * 100);
+      progressBar.style.width = pct + '%';
+      progressPct.textContent = pct + '%';
+      if (pct >= 100) {
+        // The browser is done sending; the server is still saving the
+        // file (and pushing it to S3 in prod) before it responds.
+        progressLabel.textContent = 'Processing upload, this may take a while…';
+      }
+    });
+
+    xhr.addEventListener('load', function () {
+      if (xhr.status >= 200 && xhr.status < 300 && xhr.response && xhr.response.redirect) {
+        uploading = false;
+        window.location.assign(xhr.response.redirect);
+      } else {
+        showError('Upload failed (status ' + xhr.status + '). Please try again.');
+      }
+    });
+
+    xhr.addEventListener('error', function () {
+      showError('Upload failed: network error. Please check your connection and try again.');
+    });
+
+    xhr.send(formData);
+  });
+})();
+</script>
 {% endblock %}
