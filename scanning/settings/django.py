@@ -174,3 +174,9 @@ if TESTING:
             "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
         }
     }
+    # Keep model FileFields (e.g. ScanFactory's original_pdf) out of the
+    # real dev media dir during tests. Without this, tests that don't
+    # override MEDIA_ROOT leave dummy PDFs in scanning/assets/media/.
+    import tempfile
+
+    MEDIA_ROOT = tempfile.mkdtemp(prefix="scanning-test-media-")

@@ -20,8 +20,6 @@ from django.views.decorators.http import require_POST
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
-    ScanReviewForm,
-    ScanUploadForm,
 )
 from scanning.models import (
     ExtractionStatus,
@@ -129,77 +127,19 @@ def scan_list(request: HttpRequest) -> HttpResponse:
 
 
 @login_required
-def scan_upload(request: HttpRequest) -> HttpResponse:
-    """Handle scan upload form.
-
-    :param request: The current HTTP request.
-    :return: The rendered upload form or a redirect on success.
-    """
-    if request.method == "POST":
-        form = ScanUploadForm(request.POST, request.FILES)
-        if form.is_valid():
-            scan = form.save(commit=False)
-            scan.uploaded_by = request.user
-            scan.status = Status.UPLOADED
-            scan.save()
-            messages.success(request, "Scan uploaded successfully.")
-            return redirect("scan_process", pk=scan.pk)
-    else:
-        form = ScanUploadForm()
-
-    return render(
-        request,
-        "scanning/scan_upload.html",
-        {"form": form},
-    )
-
-
-@login_required
 def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
-    """Display scan detail and handle staff review.
+    """Redirect the legacy scan detail URL to the process view.
+
+    The standalone detail page has been retired in favour of the unified
+    process view, which displays the PDF and handles review/approval.
+    This redirect keeps old/bookmarked ``/scans/<pk>/`` links working.
 
     :param request: The current HTTP request.
     :param pk: The primary key of the scan.
-    :return: The rendered detail page.
+    :return: A redirect to the scan process view.
     """
-    scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
-
-    # Redirect to processing view if scan has processing data
-    if scan.stage and Path(scan.output_dir).is_dir():
-        return redirect("scan_process", pk=scan.pk)
-
-    opinion_count = scan.opinions.count()
-
-    review_form = None
-    if scan.status != Status.APPROVED:
-        if request.method == "POST":
-            review_form = ScanReviewForm(request.POST, instance=scan)
-            if review_form.is_valid():
-                updated_scan = review_form.save(commit=False)
-                if updated_scan.status == Status.APPROVED:
-                    updated_scan.processed_at = timezone.now()
-                    messages.success(request, "Scan approved.")
-                else:
-                    updated_scan.processed_at = None
-                    messages.info(
-                        request,
-                        "Scan rejected, status reset to Uploaded.",
-                    )
-                updated_scan.save()
-                refresh_volume_queue_status_for_scan(updated_scan)
-                return redirect("scan_detail", pk=scan.pk)
-        else:
-            review_form = ScanReviewForm(instance=scan)
-
-    return render(
-        request,
-        "scanning/scan_detail.html",
-        {
-            "scan": scan,
-            "review_form": review_form,
-            "opinion_count": opinion_count,
-        },
-    )
+    scan = get_object_or_404(Scan, pk=pk)
+    return redirect("scan_process", pk=scan.pk)
 
 
 @login_required
@@ -377,7 +317,7 @@ def queue_view(request: HttpRequest) -> HttpResponse:
     if priority_filter:
         volumes = volumes.filter(priority=priority_filter)
 
-    # Stats
+    # Stats are aggregated over all volumes, independent of the page.
     total = Volume.objects.count()
     by_status = dict(
         Volume.objects.values_list("queue_status")
@@ -385,11 +325,14 @@ def queue_view(request: HttpRequest) -> HttpResponse:
         .values_list("queue_status", "c")
     )
 
+    paginator = Paginator(volumes, 100)
+    page_obj = paginator.get_page(request.GET.get("page"))
+
     return render(
         request,
         "scanning/queue.html",
         {
-            "volumes": volumes,
+            "page_obj": page_obj,
             "reporters": reporters,
             "selected_reporter": selected_reporter,
             "status_filter": status_filter,
@@ -399,7 +342,9 @@ def queue_view(request: HttpRequest) -> HttpResponse:
                 "needs_scanning": by_status.get("needs_scanning", 0),
                 "assigned": by_status.get("assigned", 0),
                 "scanning": by_status.get("scanning", 0),
+                "scanned": by_status.get("scanned", 0),
                 "complete": by_status.get("complete", 0),
+                "unavailable": by_status.get("unavailable", 0),
             },
             "queue_statuses": QueueStatus.choices,
             "priorities": Priority.choices,

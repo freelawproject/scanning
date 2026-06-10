@@ -6,8 +6,6 @@
 <div class="mb-4">
   <a href="{% url 'scan_list' %}" class="text-sm text-gray-500 dark:text-gray-400 hover:text-primary-600">&laquo; Back to scans</a>
   <span class="text-gray-300 dark:text-gray-600 mx-1">·</span>
-  <a href="{% url 'scan_detail' pk=scan.pk %}" class="text-sm text-gray-500 dark:text-gray-400 hover:text-primary-600">Scan detail</a>
-  <span class="text-gray-300 dark:text-gray-600 mx-1">·</span>
   <a href="{% url 'scan_process' pk=scan.pk %}?step=3" class="text-sm text-gray-500 dark:text-gray-400 hover:text-primary-600">Process viewer</a>
 </div>
 

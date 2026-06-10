@@ -179,96 +179,33 @@ class TestScanList(ScanningTestCase):
 
 
 class TestScanDetail(ScanningTestCase):
-    """Test the scan detail view."""
+    """The legacy scan detail URL redirects to the process view."""
 
-    def test_renders_detail(self):
+    def test_redirects_to_process(self):
         user = self.make_user()
         self.client.force_login(user)
         scan = ScanFactory(uploaded_by=user)
         response = self.client.get(
             reverse("scan_detail", kwargs={"pk": scan.pk})
         )
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, scan.reporter.full_name)
-
-    def test_non_staff_sees_review_form(self):
-        user = self.make_user()
-        self.client.force_login(user)
-        scan = ScanFactory(uploaded_by=user)
-        response = self.client.get(
-            reverse("scan_detail", kwargs={"pk": scan.pk})
+        self.assertRedirects(
+            response,
+            reverse("scan_process", kwargs={"pk": scan.pk}),
+            fetch_redirect_response=False,
         )
-        self.assertIsNotNone(response.context["review_form"])
 
-    def test_can_view_other_users_scan(self):
+    def test_redirects_for_other_users_scan(self):
         user = self.make_user()
         self.client.force_login(user)
         scan = ScanFactory()  # different user
         response = self.client.get(
             reverse("scan_detail", kwargs={"pk": scan.pk})
         )
-        self.assertEqual(response.status_code, 200)
-
-    def test_shows_only_original_pdf(self):
-        user = self.make_user()
-        self.client.force_login(user)
-        scan = ScanFactory(uploaded_by=user)
-        response = self.client.get(
-            reverse("scan_detail", kwargs={"pk": scan.pk})
+        self.assertRedirects(
+            response,
+            reverse("scan_process", kwargs={"pk": scan.pk}),
+            fetch_redirect_response=False,
         )
-        self.assertContains(response, "Original PDF")
-        self.assertNotContains(response, "Redacted PDF")
-
-
-class TestStaffReview(ScanningTestCase):
-    """Test staff review functionality."""
-
-    def test_staff_sees_review_form(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        scan = ScanFactory()
-        response = self.client.get(
-            reverse("scan_detail", kwargs={"pk": scan.pk})
-        )
-        self.assertIsNotNone(response.context["review_form"])
-
-    def test_approve_sets_processed_at(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        scan = ScanFactory()
-        response = self.client.post(
-            reverse("scan_detail", kwargs={"pk": scan.pk}),
-            {"status": Status.APPROVED, "notes": "Looks good"},
-        )
-        self.assertEqual(response.status_code, 302)
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.APPROVED)
-        self.assertIsNotNone(scan.processed_at)
-        self.assertEqual(scan.notes, "Looks good")
-
-    def test_reject_resets_status(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        scan = ScanFactory(status=Status.PENDING_REVIEW)
-        response = self.client.post(
-            reverse("scan_detail", kwargs={"pk": scan.pk}),
-            {"status": Status.UPLOADED, "notes": "Needs rescanning"},
-        )
-        self.assertEqual(response.status_code, 302)
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.UPLOADED)
-        self.assertIsNone(scan.processed_at)
-
-    def test_approved_scan_hides_review_form(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
-        scan = ScanFactory(status=Status.APPROVED)
-        response = self.client.get(
-            reverse("scan_detail", kwargs={"pk": scan.pk})
-        )
-        self.assertIsNone(response.context["review_form"])
-        self.assertContains(response, "Review Decision")
-        self.assertContains(response, "Approved")
 
 
 class TestVolumeQueueStatusIntegration(ScanningTestCase):
@@ -290,24 +227,23 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
         self.client.force_login(staff)
         volume = VolumeFactory(queue_status=QueueStatus.SCANNED)
         scan = self._make_scan(volume, status=Status.PENDING_REVIEW)
+        scan.stage = Stage.APPROVED
+        scan.save(update_fields=["stage"])
         response = self.client.post(
-            reverse("scan_detail", kwargs={"pk": scan.pk}),
-            {"status": Status.APPROVED, "notes": "ok"},
+            reverse("approve_scan", kwargs={"pk": scan.pk})
         )
         self.assertEqual(response.status_code, 302)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.COMPLETE)
 
     def test_rejection_moves_volume_back_to_scanning(self):
-        staff = self.make_staff_user()
-        self.client.force_login(staff)
+        from scanning.services import refresh_volume_queue_status_for_scan
+
         volume = VolumeFactory(queue_status=QueueStatus.SCANNED)
         scan = self._make_scan(volume, end=50, status=Status.PENDING_REVIEW)
-        response = self.client.post(
-            reverse("scan_detail", kwargs={"pk": scan.pk}),
-            {"status": Status.UPLOADED, "notes": "needs rescan"},
-        )
-        self.assertEqual(response.status_code, 302)
+        scan.status = Status.UPLOADED
+        scan.save(update_fields=["status"])
+        refresh_volume_queue_status_for_scan(scan)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
 
@@ -316,10 +252,9 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
         self.client.force_login(staff)
         volume = VolumeFactory(queue_status=QueueStatus.UNAVAILABLE)
         scan = self._make_scan(volume, status=Status.PENDING_REVIEW)
-        self.client.post(
-            reverse("scan_detail", kwargs={"pk": scan.pk}),
-            {"status": Status.APPROVED, "notes": "ok"},
-        )
+        scan.stage = Stage.APPROVED
+        scan.save(update_fields=["stage"])
+        self.client.post(reverse("approve_scan", kwargs={"pk": scan.pk}))
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.UNAVAILABLE)
 
@@ -387,6 +322,36 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
         self.assertEqual(response.status_code, 302)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
+
+
+class TestQueueView(ScanningTestCase):
+    """The queue page renders and paginates volumes."""
+
+    def test_renders_with_page_obj(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        VolumeFactory()
+        response = self.client.get(reverse("queue"))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("page_obj", response.context)
+
+    def test_paginates_at_100_per_page(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        VolumeFactory.create_batch(105)
+        first = self.client.get(reverse("queue"))
+        self.assertEqual(len(first.context["page_obj"]), 100)
+        self.assertEqual(first.context["page_obj"].paginator.num_pages, 2)
+        second = self.client.get(reverse("queue"), {"page": 2})
+        self.assertEqual(len(second.context["page_obj"]), 5)
+
+    def test_stats_count_all_volumes_not_just_page(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        VolumeFactory.create_batch(55, queue_status=QueueStatus.NEEDS_SCANNING)
+        response = self.client.get(reverse("queue"))
+        self.assertEqual(response.context["stats"]["total"], 55)
+        self.assertEqual(response.context["stats"]["needs_scanning"], 55)
 
 
 class TestScanModel(ScanningTestCase):
@@ -602,7 +567,7 @@ class TestOpinionDetail(ScanningTestCase):
         )
         self.assertContains(response, "Book")
         self.assertContains(
-            response, reverse("scan_detail", kwargs={"pk": scan.pk})
+            response, reverse("scan_process", kwargs={"pk": scan.pk})
         )
 
     def test_standalone_opinion_no_parent_link(self):

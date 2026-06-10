@@ -1,4 +1,9 @@
-"""Import scan queue from pdfchecker's scanlist.csv."""
+"""Import the volume queue from pdfchecker's scanlist.csv.
+
+Each CSV row describes a volume (or a part of one) to be scanned. This
+command only populates ``Volume`` records; it does not create ``Scan``
+objects, which are created later when a real PDF is uploaded.
+"""
 
 import csv
 import logging
@@ -9,9 +14,6 @@ from scanning.models import (
     Priority,
     QueueStatus,
     Reporter,
-    Scan,
-    Source,
-    Status,
     Volume,
 )
 
@@ -36,7 +38,7 @@ PRIORITY_MAP = {
 
 
 class Command(BaseCommand):
-    help = "Import scan queue from pdfchecker's scanlist.csv."
+    help = "Import the volume queue from pdfchecker's scanlist.csv."
 
     def add_arguments(self, parser):
         parser.add_argument("csv_file", help="Path to scanlist.csv")
@@ -46,12 +48,53 @@ class Command(BaseCommand):
             help="Show what would be imported without saving.",
         )
 
+    @staticmethod
+    def _merge_volume_row(
+        volume: Volume,
+        start: int | None,
+        end: int | None,
+        is_partial: bool,
+    ) -> None:
+        """Widen a volume's page range to cover an additional CSV row.
+
+        Used when several rows (e.g. parts A/B or advance sheets) map to
+        the same volume created earlier in this run.
+
+        :param volume: The volume created earlier in this run.
+        :param start: The row's first page, if any.
+        :param end: The row's last page, if any.
+        :param is_partial: Whether the row carries a part label.
+        """
+        changed = []
+        if start and (
+            not volume.expected_start_page
+            or start < volume.expected_start_page
+        ):
+            volume.expected_start_page = start
+            changed.append("expected_start_page")
+        if end and (
+            not volume.expected_end_page or end > volume.expected_end_page
+        ):
+            volume.expected_end_page = end
+            changed.append("expected_end_page")
+        if is_partial and not volume.is_partial:
+            volume.is_partial = True
+            changed.append("is_partial")
+        if changed:
+            volume.save(update_fields=changed)
+
     def handle(self, *args, **options):
         csv_path = options["csv_file"]
         dry_run = options["dry_run"]
 
         reporters = {r.short_name: r for r in Reporter.objects.all()}
-        volumes_created = scans_created = skipped = errors = 0
+        volumes_created = existing_skipped = invalid_rows = errors = 0
+        # Track volumes created during this run so multi-row volumes
+        # (parts A/B, advance sheets) merge into one record instead of
+        # being reported as already existing.
+        created_keys: set[tuple[int, int]] = set()
+        created_volumes: dict[tuple[int, int], Volume] = {}
+        skipped_keys: set[tuple[int, int]] = set()
 
         with open(csv_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f, delimiter="\t")
@@ -69,7 +112,7 @@ class Command(BaseCommand):
                 book_num = (row.get("Book") or "").strip()
 
                 if not slug or not volume_str:
-                    skipped += 1
+                    invalid_rows += 1
                     continue
 
                 reporter = reporters.get(slug)
@@ -99,11 +142,6 @@ class Command(BaseCommand):
                     if first_page:
                         part_label = first_page
 
-                source = (
-                    Source.OPINIONS
-                    if is_advance and is_advance.lower() == "yes"
-                    else Source.FULL
-                )
                 queue_status = STATUS_MAP.get(
                     status_str, QueueStatus.NEEDS_SCANNING
                 )
@@ -120,6 +158,34 @@ class Command(BaseCommand):
                 combined_notes = "\n".join(parts)
 
                 is_partial = bool(part_label)
+                key = (reporter.id, vol_num)
+
+                # A later row for a volume we already created this run
+                # (e.g. part B after part A): widen its page range and
+                # flag it partial, but do not report it as a duplicate.
+                if key in created_keys:
+                    if not dry_run:
+                        self._merge_volume_row(
+                            created_volumes[key], start, end, is_partial
+                        )
+                    continue
+
+                # Already messaged as existing earlier this run.
+                if key in skipped_keys:
+                    continue
+
+                # Skip volumes that already exist in the database.
+                if Volume.objects.filter(
+                    reporter=reporter, volume_number=vol_num
+                ).exists():
+                    skipped_keys.add(key)
+                    existing_skipped += 1
+                    self.stdout.write(
+                        self.style.WARNING(
+                            f"  Skipping existing volume: {slug} vol {vol_num}"
+                        )
+                    )
+                    continue
 
                 if dry_run:
                     self.stdout.write(
@@ -128,70 +194,31 @@ class Command(BaseCommand):
                         f" [{queue_status}] {priority}"
                         f" pp.{start or '?'}-{end or '?'}"
                     )
-                    scans_created += 1
+                    created_keys.add(key)
+                    volumes_created += 1
                     continue
 
-                # Get or create Volume
-                vol, vol_created = Volume.objects.get_or_create(
+                vol = Volume.objects.create(
                     reporter=reporter,
                     volume_number=vol_num,
-                    defaults={
-                        "priority": priority,
-                        "queue_status": queue_status,
-                        "source_library": source_library,
-                        "is_partial": is_partial,
-                        "notes": "",
-                    },
-                )
-                if vol_created:
-                    volumes_created += 1
-                elif is_partial and not vol.is_partial:
-                    vol.is_partial = True
-                    vol.save(update_fields=["is_partial"])
-
-                # Update volume page range to cover all scans
-                if start and (
-                    not vol.expected_start_page
-                    or start < vol.expected_start_page
-                ):
-                    vol.expected_start_page = start
-                if end and (
-                    not vol.expected_end_page or end > vol.expected_end_page
-                ):
-                    vol.expected_end_page = end
-                vol.save()
-
-                # Create Scan
-                exists = Scan.objects.filter(
-                    reporter=reporter,
-                    volume=vol_num,
-                    source=source,
-                    start_page=start,
-                ).exists()
-                if exists:
-                    skipped += 1
-                    continue
-
-                Scan.objects.create(
-                    volume_obj=vol,
-                    reporter=reporter,
-                    volume=vol_num,
-                    part_label=part_label,
-                    source=source,
-                    start_page=start,
-                    end_page=end,
-                    notes=combined_notes,
+                    priority=priority,
+                    queue_status=queue_status,
                     source_library=source_library,
-                    status=Status.UPLOADED,
+                    is_partial=is_partial,
+                    expected_start_page=start,
+                    expected_end_page=end,
+                    notes=combined_notes,
                 )
-                scans_created += 1
+                created_keys.add(key)
+                created_volumes[key] = vol
+                volumes_created += 1
 
         action = "Would create" if dry_run else "Created"
         self.stdout.write(
             self.style.SUCCESS(
                 f"{action} {volumes_created} volumes,"
-                f" {scans_created} scans,"
-                f" skipped {skipped},"
+                f" skipped {existing_skipped} existing,"
+                f" {invalid_rows} invalid rows,"
                 f" {errors} errors."
             )
         )

@@ -97,7 +97,7 @@
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}</td>
         <td class="px-4 py-3 text-sm">
           <div class="flex justify-end gap-1">
-            <a href="{% url 'scan_detail' pk=scan.pk %}" class="btn-outline text-xs px-2 py-1">View</a>
+            <a href="{% url 'scan_process' pk=scan.pk %}" class="btn-outline text-xs px-2 py-1">View</a>
             {% if scan.stage == 'approved' %}
               <a href="{% url 'scan_pages_list' pk=scan.pk %}" class="btn-outline text-xs px-2 py-1" title="Per-page review">Pages</a>
             {% endif %}
@@ -112,7 +112,7 @@
 <!-- Mobile cards -->
 <div class="sm:hidden space-y-3">
   {% for scan in page_obj %}
-  <a href="{% url 'scan_detail' pk=scan.pk %}" class="card block hover:shadow-md transition-shadow">
+  <a href="{% url 'scan_process' pk=scan.pk %}" class="card block hover:shadow-md transition-shadow">
     <div class="flex items-center justify-between mb-2">
       <span class="font-medium text-sm">{{ scan.reporter }}</span>
       <span class="badge-{{ scan.status }}" title="Scan status">{{ scan.get_status_display }}</span>

@@ -5,10 +5,7 @@ from django.core.validators import FileExtensionValidator
 
 from scanning.models import (
     OpinionScan,
-    OpinionStatus,
     Reporter,
-    Scan,
-    Status,
 )
 
 
@@ -37,125 +34,6 @@ class ReporterChoiceField(forms.ModelChoiceField):
         :return: The formatted label.
         """
         return f"{obj.full_name} ({obj.short_name})"
-
-
-class ScanUploadForm(forms.ModelForm):
-    """Form for uploading a new scan."""
-
-    reporter = ReporterChoiceField(
-        queryset=Reporter.objects.all(),
-        widget=forms.Select(attrs={"class": "input-text w-full"}),
-    )
-    original_pdf = forms.FileField(
-        validators=[FileExtensionValidator(allowed_extensions=["pdf"])],
-        widget=forms.ClearableFileInput(
-            attrs={"class": "input-text w-full", "accept": ".pdf"}
-        ),
-    )
-
-    class Meta:
-        model = Scan
-        fields = [
-            "reporter",
-            "source",
-            "volume",
-            "number_of_pages",
-            "start_page",
-            "end_page",
-            "book_cover",
-            "original_pdf",
-            "notes",
-        ]
-        widgets = {
-            "source": forms.Select(attrs={"class": "input-text w-full"}),
-            "volume": forms.NumberInput(attrs={"class": "input-text w-full"}),
-            "number_of_pages": forms.NumberInput(
-                attrs={"class": "input-text w-full"}
-            ),
-            "start_page": forms.NumberInput(
-                attrs={"class": "input-text w-full"}
-            ),
-            "end_page": forms.NumberInput(
-                attrs={"class": "input-text w-full"}
-            ),
-            "book_cover": forms.ClearableFileInput(
-                attrs={
-                    "class": "input-text w-full",
-                    "accept": ".pdf,.jpg,.jpeg,.gif,.png",
-                }
-            ),
-            "notes": forms.Textarea(
-                attrs={
-                    "class": "input-text w-full",
-                    "rows": 3,
-                }
-            ),
-        }
-
-    def clean_original_pdf(self) -> UploadedFile:
-        """Validate that the uploaded file is a PDF by MIME type and magic bytes.
-
-        :return: The validated file.
-        """
-        pdf = self.cleaned_data.get("original_pdf")
-        if pdf:
-            if pdf.content_type != "application/pdf":
-                raise forms.ValidationError("The uploaded file must be a PDF.")
-            header = pdf.read(5)
-            pdf.seek(0)
-            if header != b"%PDF-":
-                raise forms.ValidationError("The uploaded file must be a PDF.")
-        return pdf
-
-
-class ScanReviewForm(forms.ModelForm):
-    """Form for staff to review a scan."""
-
-    status = forms.ChoiceField(
-        choices=[
-            (Status.APPROVED, "Approve"),
-            (Status.UPLOADED, "Reject (reset to Uploaded)"),
-        ],
-        widget=forms.Select(attrs={"class": "input-text w-full"}),
-    )
-
-    class Meta:
-        model = Scan
-        fields = ["status", "notes"]
-        widgets = {
-            "notes": forms.Textarea(
-                attrs={
-                    "class": "input-text w-full",
-                    "rows": 3,
-                    "placeholder": "Review notes...",
-                }
-            ),
-        }
-
-
-class OpinionScanReviewForm(forms.ModelForm):
-    """Form for staff to review an opinion scan."""
-
-    status = forms.ChoiceField(
-        choices=[
-            (OpinionStatus.OK, "Approve"),
-            (OpinionStatus.NO_STATUS, "Reject (reset to No status)"),
-        ],
-        widget=forms.Select(attrs={"class": "input-text w-full"}),
-    )
-
-    class Meta:
-        model = OpinionScan
-        fields = ["status", "notes"]
-        widgets = {
-            "notes": forms.Textarea(
-                attrs={
-                    "class": "input-text w-full",
-                    "rows": 3,
-                    "placeholder": "Review notes...",
-                }
-            ),
-        }
 
 
 class OpinionScanUploadForm(forms.ModelForm):

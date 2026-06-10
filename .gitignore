@@ -42,3 +42,5 @@ scanning/settings/*private.py
 /scanning/assets/media/opinions/
 /scanning/assets/media/books/
 /scanning/assets/media/processed/
+/scanning/assets/media/original_scans/
+/scanning/assets/media/page_inserts/
