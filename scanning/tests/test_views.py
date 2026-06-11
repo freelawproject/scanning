@@ -324,6 +324,114 @@ class TestVolumeQueueStatusIntegration(ScanningTestCase):
         self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
 
 
+class TestQueueUploadXhr(ScanningTestCase):
+    """XHR uploads get a JSON redirect instead of a 302."""
+
+    def setUp(self):
+        super().setUp()
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.volume = VolumeFactory()
+        self.url = reverse(
+            "queue_upload",
+            kwargs={
+                "reporter_slug": self.volume.reporter.short_name,
+                "vol": self.volume.volume_number,
+            },
+        )
+        self.queue_url = reverse(
+            "queue_detail",
+            kwargs={
+                "reporter_slug": self.volume.reporter.short_name,
+                "vol": self.volume.volume_number,
+            },
+        )
+
+    @override_settings(DEVELOPMENT=True)
+    def test_xhr_upload_returns_json_redirect(self):
+        pdf = SimpleUploadedFile(
+            "scan.pdf", b"%PDF-1.4 body", content_type="application/pdf"
+        )
+        response = self.client.post(
+            self.url,
+            {"new_scan": "1", "original_pdf": pdf},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["redirect"], self.queue_url)
+
+    @override_settings(DEVELOPMENT=True)
+    def test_xhr_upload_validate_redirects_to_process(self):
+        pdf = SimpleUploadedFile(
+            "scan.pdf", b"%PDF-1.4 body", content_type="application/pdf"
+        )
+        response = self.client.post(
+            self.url,
+            {
+                "new_scan": "1",
+                "original_pdf": pdf,
+                "action": "upload_validate",
+            },
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 200)
+        scan = Scan.objects.get(volume_obj=self.volume)
+        self.assertEqual(
+            response.json()["redirect"],
+            reverse("scan_process", kwargs={"pk": scan.pk}),
+        )
+
+    def test_xhr_invalid_pdf_returns_json_redirect(self):
+        fake = SimpleUploadedFile(
+            "scan.pdf", b"not a pdf", content_type="application/pdf"
+        )
+        response = self.client.post(
+            self.url,
+            {"new_scan": "1", "original_pdf": fake},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["redirect"], self.queue_url)
+        self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
+
+    @override_settings(DEVELOPMENT=False)
+    def test_xhr_prod_upload_returns_json_redirect(self):
+        pdf = SimpleUploadedFile(
+            "scan.pdf", b"%PDF-1.4 body", content_type="application/pdf"
+        )
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.upload_file_to_s3", return_value=True
+            ) as mock_upload,
+        ):
+            response = self.client.post(
+                self.url,
+                {"new_scan": "1", "original_pdf": pdf},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["redirect"], self.queue_url)
+        mock_upload.assert_called_once()
+        scan = Scan.objects.get(volume_obj=self.volume)
+        self.assertTrue(scan.original_pdf.name)
+
+    @override_settings(DEVELOPMENT=False)
+    def test_xhr_prod_upload_without_credentials_returns_json_redirect(self):
+        pdf = SimpleUploadedFile(
+            "scan.pdf", b"%PDF-1.4 body", content_type="application/pdf"
+        )
+        with patch("scanning.views.has_s3_credentials", return_value=False):
+            response = self.client.post(
+                self.url,
+                {"new_scan": "1", "original_pdf": pdf},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["redirect"], self.queue_url)
+        self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
+
+
 class TestQueueView(ScanningTestCase):
     """The queue page renders and paginates volumes."""
 
