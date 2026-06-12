@@ -232,9 +232,11 @@ var _opinions = [];
                         r.bottom > viewerRect.top &&
                         r.top < viewerRect.bottom
                     ) {
-                        bestPageNum = parseInt(
-                            pages[i].dataset.pageNum || "0"
-                        );
+                        // data-caption-page / data-key-page on the cards
+                        // are 1-based PDF pages, so compare pdf index + 1
+                        // (logical numbers can repeat across the scan).
+                        bestPageNum =
+                            parseInt(pages[i].dataset.pdfIndex || "-1") + 1;
                         break;
                     }
                 }
@@ -278,11 +280,20 @@ function highlightDetection(el) {
         e.remove();
     });
 
-    goToPage(d.logicalPage);
+    // Resolve by pdf index: logical page numbers can repeat (e.g.
+    // unnumbered front matter colliding with the real pages), so
+    // 'pv-page-<logical>' ids are ambiguous.
+    var container = document.querySelector(
+        '.lazy-page[data-pdf-index="' + d.pageIndex + '"]'
+    );
+    if (!container) return;
+    container.scrollIntoView({ behavior: "smooth", block: "start" });
+    container.style.outline = "3px solid #2563eb";
+    setTimeout(function () {
+        container.style.outline = "";
+    }, 2000);
 
     setTimeout(function () {
-        var container = document.getElementById("pv-page-" + d.logicalPage);
-        if (!container) return;
         var wrapper = container.querySelector(".canvas-wrapper");
         var canvas = container.querySelector(".pdf-canvas");
         if (!wrapper || !canvas) return;
