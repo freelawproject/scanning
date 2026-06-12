@@ -85,6 +85,13 @@
     <!-- PDF viewer -->
     <div id="pdf-container" class="flex-1 overflow-y-auto bg-gray-100 dark:bg-gray-800 p-4">
       {% if opinion.redacted_pdf or opinion.original_pdf %}
+      <div id="pdf-loading" class="hidden items-center justify-center gap-2 h-full text-gray-400 dark:text-gray-500 text-sm">
+        <svg class="animate-spin w-5 h-5" fill="none" viewBox="0 0 24 24">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/>
+        </svg>
+        Loading PDF...
+      </div>
       <div id="pdf-pages" class="flex flex-col items-center gap-4"></div>
       {% else %}
       <div class="flex items-center justify-center h-full">
@@ -100,20 +107,30 @@
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
 var _currentUrl = '{% if opinion.redacted_pdf %}{% url "serve_opinionscan_pdf" pk=opinion.pk variant="redacted" %}{% elif opinion.original_pdf %}{% url "serve_opinionscan_pdf" pk=opinion.pk variant="original" %}{% endif %}';
+var _loadToken = 0;
 
 function loadPdf(url) {
     _currentUrl = url;
+    var token = ++_loadToken;
     var container = document.getElementById('pdf-pages');
+    var loading = document.getElementById('pdf-loading');
     container.innerHTML = '';
     if (!url) return;
 
+    loading.classList.remove('hidden');
+    loading.classList.add('flex');
+
     pdfjsLib.getDocument(url).promise.then(function(pdf) {
+        if (token !== _loadToken) return;
+        loading.classList.add('hidden');
+        loading.classList.remove('flex');
         var containerEl = document.getElementById('pdf-container');
         var containerWidth = containerEl.clientWidth - 32;
         var containerHeight = containerEl.clientHeight - 32;
         for (var i = 1; i <= pdf.numPages; i++) {
             (function(pageNum) {
                 pdf.getPage(pageNum).then(function(page) {
+                    if (token !== _loadToken) return;
                     var unscaled = page.getViewport({ scale: 1 });
                     var scaleW = containerWidth / unscaled.width;
                     var scaleH = containerHeight / unscaled.height;
@@ -130,6 +147,11 @@ function loadPdf(url) {
                 });
             })(i);
         }
+    }).catch(function() {
+        if (token !== _loadToken) return;
+        loading.classList.add('hidden');
+        loading.classList.remove('flex');
+        container.innerHTML = '<p class="text-gray-400 dark:text-gray-500 text-sm py-8">Failed to load PDF. Try reloading the page.</p>';
     });
 }
 
