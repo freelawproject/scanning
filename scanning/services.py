@@ -237,7 +237,10 @@ def _handle_pipeline_exception(
         except Scan.DoesNotExist:
             return
         if scan.status == Status.ERROR_MAX_RETRIES:
-            logger.warning(
+            # Error level (raises a Sentry event): the transient retries
+            # are exhausted, so this is no longer self-healing and likely
+            # signals a real RunPod capacity shortage worth investigating.
+            logger.error(
                 "[%s] scan %s transient RunPod failure, max retries (%d) exceeded: %s",
                 context,
                 scan_pk,

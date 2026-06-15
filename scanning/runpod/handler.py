@@ -136,7 +136,12 @@ def _preload() -> None:
         # the scanning daemon classifies as transient and re-queues the
         # scan (up to RUNPOD_MAX_TRANSIENT_RETRIES attempts) for the next
         # tick to resubmit to a different worker.
-        logger.error(
+        #
+        # Logged at warning, not error: this is expected and fully
+        # self-healing, so it must not raise a Sentry event. The daemon
+        # escalates to error only if a scan actually exhausts its
+        # transient retries.
+        logger.warning(
             "GPU not available; skipping weight/model preload. Jobs "
             "will return error_code=NO_GPU; scans are re-queued "
             "automatically by the daemon."
@@ -719,8 +724,10 @@ def handler(job: dict) -> dict:
     if not _CUDA_AVAILABLE:
         # error_code=NO_GPU is in scanning's _TRANSIENT_ERROR_CODES, so
         # the daemon re-queues the scan (up to RUNPOD_MAX_TRANSIENT_RETRIES
-        # attempts) and the next tick lands on a different worker.
-        logger.error(
+        # attempts) and the next tick lands on a different worker. Logged
+        # at warning, not error: expected and self-healing, so no Sentry
+        # event (the daemon escalates only on exhausted retries).
+        logger.warning(
             "rejecting %s job for scan %s: no GPU on this worker; "
             "daemon will re-queue.",
             action,
