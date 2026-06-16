@@ -157,7 +157,11 @@ function loadPdf(url) {
 
 function switchTab(btn) {
     var url = btn.getAttribute('data-url');
-    loadPdf(url);
+    // Only (re)load when the variant actually changed. On initial load the
+    // DOMContentLoaded handler already loads _currentUrl, so the styling-only
+    // switchTab call for original-only opinions must not trigger a second
+    // fetch of the same PDF (the serve endpoint lazily pulls from S3).
+    if (url !== _currentUrl) loadPdf(url);
 
     document.querySelectorAll('.pdf-tab').forEach(function(t) {
         t.className = 'pdf-tab text-sm px-4 py-2 font-medium rounded-t border border-b-0 border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700/50 -mb-px';
