@@ -702,29 +702,6 @@ document.addEventListener('DOMContentLoaded', function () {
     };
 
     // --- Scroll to page ---
-    // Lazy-rendered pages start at a fixed placeholder height and resize to
-    // their true height once rasterized, which shifts everything below them.
-    // A single jump to a far page therefore lands off-target (and a smooth
-    // scroll makes it worse by rendering every page it passes). Jump
-    // instantly, then re-align over a few frames until the target stops
-    // moving (i.e. the pages above it have settled to their real heights).
-    function scrollToPdfPage(el) {
-        var tries = 0;
-        (function settle() {
-            // Measure where the target sits now (it may have drifted while the
-            // pages above it finished rasterizing), then realign it.
-            var before = el.getBoundingClientRect().top;
-            el.scrollIntoView({ block: 'start' });
-            var after = el.getBoundingClientRect().top;
-            tries++;
-            // If realigning barely moved it, layout has settled → stop.
-            // Otherwise wait for the next render pass and correct again.
-            if (tries < 10 && Math.abs(after - before) > 2) {
-                setTimeout(settle, 90);
-            }
-        })();
-    }
-
     window.goToPage = function (elOrNum) {
         // Accepts an element or a number.
         //  - OCR "Pages" list items carry data-pdf-index: jump to that exact
@@ -743,7 +720,7 @@ document.addEventListener('DOMContentLoaded', function () {
                  || document.getElementById('page-' + pageNumber);
         }
         if (el) {
-            scrollToPdfPage(el);
+            window.scrollPageIntoView(el);
             el.classList.add('highlight');
             setTimeout(function () { el.classList.remove('highlight'); }, 2000);
         }
