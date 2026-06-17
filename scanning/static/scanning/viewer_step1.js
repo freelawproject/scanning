@@ -9,7 +9,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     const pdfUrl = container.dataset.pdfUrl;
     const pageMap = JSON.parse(container.dataset.pageMap || '[]');
-    const flaggedPages = JSON.parse(container.dataset.flaggedPages || '[]');
+    const flaggedIndices = JSON.parse(container.dataset.flaggedIndices || '[]');
     const redactions = JSON.parse(container.dataset.redactions || '{}');
     const ocrByPage = JSON.parse(container.dataset.ocrByPage || '{}');
     const documentId = container.dataset.documentId;
@@ -58,7 +58,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function createPdfPlaceholder(entry) {
         var pageDiv = createPageContainer(entry.logical_number, entry.pdf_index);
-        var isFlagged = flaggedPages.indexOf(entry.logical_number) !== -1;
+        var isFlagged = flaggedIndices.indexOf(entry.pdf_index) !== -1;
         if (isFlagged) {
             pageDiv.classList.add('flagged');
         }
@@ -702,15 +702,48 @@ document.addEventListener('DOMContentLoaded', function () {
     };
 
     // --- Scroll to page ---
+    // Lazy-rendered pages start at a fixed placeholder height and resize to
+    // their true height once rasterized, which shifts everything below them.
+    // A single jump to a far page therefore lands off-target (and a smooth
+    // scroll makes it worse by rendering every page it passes). Jump
+    // instantly, then re-align over a few frames until the target stops
+    // moving (i.e. the pages above it have settled to their real heights).
+    function scrollToPdfPage(el) {
+        var tries = 0;
+        (function settle() {
+            // Measure where the target sits now (it may have drifted while the
+            // pages above it finished rasterizing), then realign it.
+            var before = el.getBoundingClientRect().top;
+            el.scrollIntoView({ block: 'start' });
+            var after = el.getBoundingClientRect().top;
+            tries++;
+            // If realigning barely moved it, layout has settled → stop.
+            // Otherwise wait for the next render pass and correct again.
+            if (tries < 10 && Math.abs(after - before) > 2) {
+                setTimeout(settle, 90);
+            }
+        })();
+    }
+
     window.goToPage = function (elOrNum) {
-        // Accepts an element (with data-page) or a number.
-        // Issues pass logical page numbers; PDF containers store data-logical-number.
-        // OCR panel passes pdf_page (= pdf_index+1) so the ID fallback covers that case.
-        var pageNumber = (typeof elOrNum === 'object') ? elOrNum.dataset.page : elOrNum;
-        var el = container.querySelector('[data-logical-number="' + pageNumber + '"]')
+        // Accepts an element or a number.
+        //  - OCR "Pages" list items carry data-pdf-index: jump to that exact
+        //    PDF page. Unambiguous even when logical page numbers repeat (e.g.
+        //    unnumbered front matter borrowing the real pages' numbers, #90).
+        //  - Issue cards / image badges carry data-page (a logical page
+        //    number), resolved via data-logical-number with a page-<n> fallback.
+        var el;
+        if (typeof elOrNum === 'object' && elOrNum.dataset.pdfIndex !== undefined) {
+            el = container.querySelector(
+                '[data-pdf-index="' + elOrNum.dataset.pdfIndex + '"]'
+            );
+        } else {
+            var pageNumber = (typeof elOrNum === 'object') ? elOrNum.dataset.page : elOrNum;
+            el = container.querySelector('[data-logical-number="' + pageNumber + '"]')
                  || document.getElementById('page-' + pageNumber);
+        }
         if (el) {
-            el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            scrollToPdfPage(el);
             el.classList.add('highlight');
             setTimeout(function () { el.classList.remove('highlight'); }, 2000);
         }

@@ -19,7 +19,7 @@ document.addEventListener('DOMContentLoaded', function () {
     var viewOnly = container.dataset.viewOnly === 'true';
     var opinionEditMode = container.dataset.opinionEdit === 'true';
     var pageMap = JSON.parse(container.dataset.pageMap || '[]');
-    var flaggedPages = JSON.parse(container.dataset.flaggedPages || '[]');
+    var flaggedIndices = JSON.parse(container.dataset.flaggedIndices || '[]');
     var ocrByPage = JSON.parse(container.dataset.ocrByPage || '{}');
 
     // Map page_index → logical_number from pageMap (display only)
@@ -205,8 +205,9 @@ document.addEventListener('DOMContentLoaded', function () {
         div.dataset.pdfIndex = entry.pdf_index;
         div.dataset.pageNum = pageNum;
 
-        // Flagged?
-        if (flaggedPages.indexOf(pageNum) !== -1) {
+        // Flagged? (match by pdf_index: logical numbers can repeat, e.g.
+        // unnumbered front matter borrowing the real pages' numbers)
+        if (flaggedIndices.indexOf(entry.pdf_index) !== -1) {
             div.classList.add('flagged');
         }
         // Duplicate?
