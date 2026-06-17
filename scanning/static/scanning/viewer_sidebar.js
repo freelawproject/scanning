@@ -259,6 +259,22 @@ var _opinions = [];
 // --- Global functions (called from template onclick handlers) ---
 
 function goToPage(elOrNum) {
+    // Opinion image/headnote badges carry data-pdf-index: resolve to that
+    // exact page. Logical page numbers can repeat (e.g. unnumbered front
+    // matter borrowing the real pages' numbers), so pdf_index is unambiguous.
+    if (typeof elOrNum === "object" && elOrNum.dataset.pdfIndex !== undefined) {
+        var pel = document.querySelector(
+            '.lazy-page[data-pdf-index="' + elOrNum.dataset.pdfIndex + '"]'
+        );
+        if (pel) {
+            pel.scrollIntoView({ behavior: "smooth", block: "start" });
+            pel.style.outline = "3px solid #2563eb";
+            setTimeout(function () {
+                pel.style.outline = "";
+            }, 2000);
+        }
+        return;
+    }
     var pageNum = (typeof elOrNum === "object") ? elOrNum.dataset.page : elOrNum;
     var el =
         document.getElementById("pv-page-" + pageNum) ||
