@@ -2222,7 +2222,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (redactionsVisible) drawRedactionOverlays();
         if (marginsVisible) drawMarginOverlays();
         var startEl = _pageDivForIndex(captionPage);
-        if (startEl) startEl.scrollIntoView({behavior: 'smooth', block: 'start'});
+        if (startEl) window.scrollPageIntoView(startEl);
     };
 
     // Click on viewer background to clear opinion highlight

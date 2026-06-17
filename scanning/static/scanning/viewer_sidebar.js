@@ -267,7 +267,7 @@ function goToPage(elOrNum) {
             '.lazy-page[data-pdf-index="' + elOrNum.dataset.pdfIndex + '"]'
         );
         if (pel) {
-            pel.scrollIntoView({ behavior: "smooth", block: "start" });
+            window.scrollPageIntoView(pel);
             pel.style.outline = "3px solid #2563eb";
             setTimeout(function () {
                 pel.style.outline = "";
@@ -280,7 +280,7 @@ function goToPage(elOrNum) {
         document.getElementById("pv-page-" + pageNum) ||
         document.getElementById("page-" + pageNum);
     if (el) {
-        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        window.scrollPageIntoView(el);
         el.style.outline = "3px solid #2563eb";
         setTimeout(function () {
             el.style.outline = "";
@@ -303,7 +303,7 @@ function highlightDetection(el) {
         '.lazy-page[data-pdf-index="' + d.pageIndex + '"]'
     );
     if (!container) return;
-    container.scrollIntoView({ behavior: "smooth", block: "start" });
+    window.scrollPageIntoView(container);
     container.style.outline = "3px solid #2563eb";
     setTimeout(function () {
         container.style.outline = "";

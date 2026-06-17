@@ -339,3 +339,20 @@ function drawExistingRedactions(overlay, pageRedactions, scale) {
         }
     });
 }
+
+// Jump to a lazy-rendered page element without a scroll animation. Pages start
+// at a placeholder height and grow to their true height once rasterized, which
+// shifts everything below them; so after jumping we re-align until the target
+// stops moving (capped) instead of animating through every page in between.
+window.scrollPageIntoView = function (el) {
+    if (!el) return;
+    var tries = 0;
+    (function settle() {
+        var before = el.getBoundingClientRect().top;
+        el.scrollIntoView({ block: 'start' });
+        var after = el.getBoundingClientRect().top;
+        if (++tries < 10 && Math.abs(after - before) > 2) {
+            setTimeout(settle, 90);
+        }
+    })();
+};
