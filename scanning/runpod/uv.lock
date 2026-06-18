@@ -326,7 +326,7 @@ wheels = [
 
 [[package]]
 name = "blackletter"
-version = "0.0.12"
+version = "0.0.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ocrmypdf" },
@@ -336,9 +336,9 @@ dependencies = [
     { name = "python-doctr" },
     { name = "ultralytics" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bf/c9/1643ed5497e8f0b09aafe8970f68ec12f279dc75d093bea960610288819a/blackletter-0.0.12.tar.gz", hash = "sha256:0c4657e657139f5ec52bb438c4fdd9da16ffca4038fb1755ffcabf3b3c765c24", size = 68864708, upload-time = "2026-05-29T15:54:15.56Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5b/e7/dfdbf2a8d7fd2a3dba1031f269f6f496ca2cd8ee9475919ef2bff4bacf41/blackletter-0.0.13.tar.gz", hash = "sha256:79bad647267c84963dcd4290e5e23a105f15d301bff04e2ac64030ee34213523", size = 68865677, upload-time = "2026-06-18T19:47:07.262Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cf/5c/778ae9ab21f17590651327e7bfbd04cb77ed612c1285d2c06860cbb64504/blackletter-0.0.12-py3-none-any.whl", hash = "sha256:14917339898e21a4bd60eba5084825855059e858bcaebb6a8fd2de2276593d34", size = 68854838, upload-time = "2026-05-29T15:54:11.636Z" },
+    { url = "https://files.pythonhosted.org/packages/ff/bc/a16ae28fb766f11ab1d508fd3fd6e96adb91e3003a172be2484c902a0f8a/blackletter-0.0.13-py3-none-any.whl", hash = "sha256:497d33390e4be423ce5509154467ceecea7974006a745ba1afbfd6c00fd3e776", size = 68855039, upload-time = "2026-06-18T19:47:03.77Z" },
 ]
 
 [[package]]
