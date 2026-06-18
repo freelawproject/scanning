@@ -140,7 +140,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         else:
             step = 1
 
-    issues = scan.issues.all()
+    issues = list(scan.issues.all())
     inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
 
     page_map = scan.page_map
@@ -153,13 +153,43 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
 
     # Map pdf_index → logical page number for navigation
     idx_to_logical = {}
+    logical_to_indices: dict[int, list[int]] = {}
     for entry in page_map:
         if entry.get("type") == "pdf_page":
             idx_to_logical[entry["pdf_index"]] = entry["logical_number"]
+            logical_to_indices.setdefault(entry["logical_number"], []).append(
+                entry["pdf_index"]
+            )
 
-    flagged_pages = sorted(
-        set(i.page_number for i in issues if i.page_number is not None)
-    )
+    # The viewer highlights flagged pages by pdf_index (a page's physical
+    # position), which is unique. An issue's ``page_number`` means a physical
+    # PDF page for some checks and a logical/printed page number for others;
+    # logical numbers can repeat when unnumbered front matter borrows numbers
+    # from the real pages (issue #90), so they must be resolved through the
+    # page_map rather than matched directly.
+    physical_page_checks = {
+        CheckName.NO_PAGE_NUMBER,
+        CheckName.SUSPICIOUS_READING,
+        CheckName.AUTO_CORRECTED,
+        CheckName.BLANK_PAGE,
+        CheckName.ORIENTATION,
+    }
+    flagged_indices: set[int] = set()
+    for i in issues:
+        # Resolve each issue to PDF page indices (unique physical positions),
+        # used both for the red-border highlight and for click-to-navigate.
+        # ``nav_pdf_index`` is the first resolved index, or None when the issue
+        # has no page (or points at a missing page absent from the page_map).
+        i.nav_pdf_index = None
+        if i.page_number is None:
+            continue
+        if i.check_name in physical_page_checks:
+            indices = [i.page_number - 1]
+        else:
+            indices = logical_to_indices.get(i.page_number, [])
+        flagged_indices.update(indices)
+        if indices:
+            i.nav_pdf_index = indices[0]
 
     ocr_results = scan.ocr_results
     ocr_by_page = {}
@@ -201,15 +231,17 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         ).values_list("page_index", flat=True)
     )
 
-    # Attach image_pages (logical page numbers) to each opinion
+    # Attach image_pages to each opinion. Each entry carries the logical
+    # number to display (``num``) and the pdf_index to navigate to (``idx``);
+    # logical numbers can repeat (#90), so navigation must use the index.
     for op in opinions:
         cp = op.get("caption_page", 0)
         ep = op.get("page_end", op.get("key_page", cp))
-        op["image_pages"] = sorted(
-            idx_to_logical.get(idx, idx + 1)
+        op["image_pages"] = [
+            {"num": idx_to_logical.get(idx, idx + 1), "idx": idx}
             for idx in range(cp, ep + 1)
             if idx in image_page_indices
-        )
+        ]
 
     has_redaction_rects = bool(scan.redaction_rects)
 
@@ -238,11 +270,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     for op in opinions:
         cp = op.get("caption_page", 0)
         ep = op.get("page_end", op.get("key_page", cp))
-        op["uncovered_headnote_pages"] = sorted(
-            idx_to_logical.get(idx, idx + 1)
+        op["uncovered_headnote_pages"] = [
+            {"num": idx_to_logical.get(idx, idx + 1), "idx": idx}
             for idx in range(cp, ep + 1)
             if idx in uncovered_hn_pages
-        )
+        ]
 
     opinion_scans = []
     if step == 3:
@@ -359,7 +391,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "issues": issues,
             "page_map_json": json.dumps(page_map),
             "missing_pages": missing_pages,
-            "flagged_pages_json": json.dumps(flagged_pages),
+            "flagged_indices_json": json.dumps(sorted(flagged_indices)),
             "ocr_results": ocr_results,
             "ocr_by_page_json": json.dumps(ocr_by_page),
             "has_pending_changes": has_pending_changes,

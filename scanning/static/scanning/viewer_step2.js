@@ -19,7 +19,7 @@ document.addEventListener('DOMContentLoaded', function () {
     var viewOnly = container.dataset.viewOnly === 'true';
     var opinionEditMode = container.dataset.opinionEdit === 'true';
     var pageMap = JSON.parse(container.dataset.pageMap || '[]');
-    var flaggedPages = JSON.parse(container.dataset.flaggedPages || '[]');
+    var flaggedIndices = JSON.parse(container.dataset.flaggedIndices || '[]');
     var ocrByPage = JSON.parse(container.dataset.ocrByPage || '{}');
 
     // Map page_index → logical_number from pageMap (display only)
@@ -63,6 +63,23 @@ document.addEventListener('DOMContentLoaded', function () {
     // Detection overlay state
     var allDetections = null; // loaded once from API
     var detectionsVisible = {}; // { pdfIndex: true/false }
+
+    // Per-page detection index so each page render doesn't scan the whole
+    // detection list. Rebuilt when allDetections is reassigned or grows.
+    var _detIndex = null, _detIndexSrc = null, _detIndexLen = -1;
+    function _detectionsForPage(pageIdx) {
+        if (!allDetections) return [];
+        if (_detIndexSrc !== allDetections || _detIndexLen !== allDetections.length) {
+            _detIndex = {};
+            for (var i = 0; i < allDetections.length; i++) {
+                var d = allDetections[i];
+                (_detIndex[d.page_index] || (_detIndex[d.page_index] = [])).push(d);
+            }
+            _detIndexSrc = allDetections;
+            _detIndexLen = allDetections.length;
+        }
+        return _detIndex[pageIdx] || [];
+    }
     var cachedImgW = 0, cachedImgH = 0; // persist image dimensions across reloads
 
     // Draw detection mode state
@@ -205,8 +222,9 @@ document.addEventListener('DOMContentLoaded', function () {
         div.dataset.pdfIndex = entry.pdf_index;
         div.dataset.pageNum = pageNum;
 
-        // Flagged?
-        if (flaggedPages.indexOf(pageNum) !== -1) {
+        // Flagged? (match by pdf_index: logical numbers can repeat, e.g.
+        // unnumbered front matter borrowing the real pages' numbers)
+        if (flaggedIndices.indexOf(entry.pdf_index) !== -1) {
             div.classList.add('flagged');
         }
         // Duplicate?
@@ -507,7 +525,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         drawRedactionOverlaysForPage(pdfIndex);
                     }
                     if (marginsVisible && marginRects) {
-                        drawMarginOverlays();
+                        drawMarginsForPage(pdfIndex);
                     }
                     if (overlayMode === 'bounds' && _boundsPageOwners) {
                         _drawBoundsForPage(pageDiv);
@@ -522,8 +540,8 @@ document.addEventListener('DOMContentLoaded', function () {
             // Overlay original PDF crops for IMAGE detections
             if (allDetections && !_viewingOpinion) {
                 var pageIdx = parseInt(pageDiv.dataset.pdfIndex);
-                var imgDets = allDetections.filter(function(d) {
-                    return d.page_index === pageIdx && d.label === 'IMAGE';
+                var imgDets = _detectionsForPage(pageIdx).filter(function(d) {
+                    return d.label === 'IMAGE';
                 });
                 if (imgDets.length > 0) {
                     var canvasW = viewport.width;
@@ -832,8 +850,8 @@ document.addEventListener('DOMContentLoaded', function () {
             CASE_SEQUENCE: true, HEADNOTE: true, CASE_METADATA: true,
             FOOTNOTES: true, IMAGE: true,
         };
-        var pageDets = allDetections.filter(function (d) {
-            return d.page_index === pdfIndex && (d.manual || USED_LABELS[d.label]);
+        var pageDets = _detectionsForPage(pdfIndex).filter(function (d) {
+            return d.manual || USED_LABELS[d.label];
         });
         if (!pageDets.length) return;
 
@@ -1412,25 +1430,40 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     };
 
-    function drawMarginOverlays() {
-        clearOverlaysByClass('margin-overlay-box');
-        if (!marginRects || !marginsVisible) return;
+    // Per-page margin index so each render looks up its page in O(1) instead
+    // of scanning marginRects. Rebuilt when marginRects is reassigned or grows.
+    var _marginIndex = null, _marginIndexSrc = null, _marginIndexLen = -1;
+    function _marginsForPage(pageIndex) {
+        if (!marginRects) return null;
+        if (_marginIndexSrc !== marginRects || _marginIndexLen !== marginRects.length) {
+            _marginIndex = {};
+            for (var i = 0; i < marginRects.length; i++) {
+                _marginIndex[marginRects[i].page_index] = marginRects[i];
+            }
+            _marginIndexSrc = marginRects;
+            _marginIndexLen = marginRects.length;
+        }
+        return _marginIndex[pageIndex] || null;
+    }
 
-        marginRects.forEach(function(pageData) {
-            var pageEl = _pageDivForIndex(pageData.page_index);
-            if (!pageEl) return;
-            var wrapper = pageEl.querySelector('.canvas-wrapper');
-            var canvas = pageEl.querySelector('.pdf-canvas');
-            if (!wrapper || !canvas) return;
+    // Draw the margin boxes for a single page's data. Clears only that page's
+    // boxes so it can be called per-render without touching other pages.
+    function _drawMarginsForPageData(pageData) {
+        var pageEl = _pageDivForIndex(pageData.page_index);
+        if (!pageEl) return;
+        var wrapper = pageEl.querySelector('.canvas-wrapper');
+        var canvas = pageEl.querySelector('.pdf-canvas');
+        if (!wrapper || !canvas) return;
+        wrapper.querySelectorAll('.margin-overlay-box').forEach(function (el) { el.remove(); });
 
-            // Margin rects are in PDF points — scale via viewport
-            var pdfPage = pdfPages[pageData.page_index];
-            if (!pdfPage) return;
-            var vp = pdfPage.getViewport({scale: 1});
-            var msx = canvas.offsetWidth / vp.width;
-            var msy = canvas.offsetHeight / vp.height;
+        // Margin rects are in PDF points — scale via viewport
+        var pdfPage = pdfPages[pageData.page_index];
+        if (!pdfPage) return;
+        var vp = pdfPage.getViewport({scale: 1});
+        var msx = canvas.offsetWidth / vp.width;
+        var msy = canvas.offsetHeight / vp.height;
 
-            pageData.rects.forEach(function(r) {
+        pageData.rects.forEach(function(r) {
                 var div = document.createElement('div');
                 div.className = 'margin-overlay-box';
                 div.style.position = 'absolute';
@@ -1455,7 +1488,30 @@ document.addEventListener('DOMContentLoaded', function () {
 
                 wrapper.appendChild(div);
             });
-        });
+    }
+
+    // Redraw the whole document's margin overlays (used when toggling on).
+    function drawMarginOverlays() {
+        clearOverlaysByClass('margin-overlay-box');
+        if (!marginRects || !marginsVisible) return;
+        marginRects.forEach(_drawMarginsForPageData);
+    }
+
+    // Redraw margins for a single page (used on each lazy page render so we
+    // don't re-clear and re-draw the entire document's margins per page).
+    function drawMarginsForPage(pageIndex) {
+        if (!marginRects || !marginsVisible) return;
+        var pageData = _marginsForPage(pageIndex);
+        if (pageData) {
+            _drawMarginsForPageData(pageData);
+            return;
+        }
+        // No margins on this page: clear any stale boxes left on it.
+        var pageEl = _pageDivForIndex(pageIndex);
+        if (pageEl) {
+            var w = pageEl.querySelector('.canvas-wrapper');
+            if (w) w.querySelectorAll('.margin-overlay-box').forEach(function (el) { el.remove(); });
+        }
     }
 
     // ── Redaction overlay ──
@@ -2218,10 +2274,11 @@ document.addEventListener('DOMContentLoaded', function () {
 
         _highlightedOpinion = {start: captionPage, end: keyPage};
         _currentViewPage = captionPage;
-        if (redactionsVisible) drawRedactionOverlays();
-        if (marginsVisible) drawMarginOverlays();
+        // Redaction/margin overlays are already drawn per page at render time
+        // and don't change when selecting an opinion. Redrawing the whole
+        // document here forced a ~1.4s reflow (layout thrash) on every click.
         var startEl = _pageDivForIndex(captionPage);
-        if (startEl) startEl.scrollIntoView({behavior: 'smooth', block: 'start'});
+        if (startEl) window.scrollPageIntoView(startEl);
     };
 
     // Click on viewer background to clear opinion highlight
@@ -2232,8 +2289,6 @@ document.addEventListener('DOMContentLoaded', function () {
             _highlightedOpinion = null;
             _currentOpIndex = -1;
             document.querySelectorAll('.opinion-card').forEach(function(c) { c.classList.remove('selected'); });
-            if (redactionsVisible) drawRedactionOverlays();
-            if (marginsVisible) drawMarginOverlays();
         }
     });
 

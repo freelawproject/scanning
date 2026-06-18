@@ -259,12 +259,28 @@ var _opinions = [];
 // --- Global functions (called from template onclick handlers) ---
 
 function goToPage(elOrNum) {
+    // Opinion image/headnote badges carry data-pdf-index: resolve to that
+    // exact page. Logical page numbers can repeat (e.g. unnumbered front
+    // matter borrowing the real pages' numbers), so pdf_index is unambiguous.
+    if (typeof elOrNum === "object" && elOrNum.dataset.pdfIndex !== undefined) {
+        var pel = document.querySelector(
+            '.lazy-page[data-pdf-index="' + elOrNum.dataset.pdfIndex + '"]'
+        );
+        if (pel) {
+            window.scrollPageIntoView(pel);
+            pel.style.outline = "3px solid #2563eb";
+            setTimeout(function () {
+                pel.style.outline = "";
+            }, 2000);
+        }
+        return;
+    }
     var pageNum = (typeof elOrNum === "object") ? elOrNum.dataset.page : elOrNum;
     var el =
         document.getElementById("pv-page-" + pageNum) ||
         document.getElementById("page-" + pageNum);
     if (el) {
-        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        window.scrollPageIntoView(el);
         el.style.outline = "3px solid #2563eb";
         setTimeout(function () {
             el.style.outline = "";
@@ -287,7 +303,7 @@ function highlightDetection(el) {
         '.lazy-page[data-pdf-index="' + d.pageIndex + '"]'
     );
     if (!container) return;
-    container.scrollIntoView({ behavior: "smooth", block: "start" });
+    window.scrollPageIntoView(container);
     container.style.outline = "3px solid #2563eb";
     setTimeout(function () {
         container.style.outline = "";

@@ -80,9 +80,9 @@
             html +=
                 '<div class="rounded px-2 py-0.5 mb-0.5 cursor-pointer text-xs flex items-center justify-between ' +
                 bg +
-                "\" onclick=\"goToPage(" +
-                r.pdf_page +
-                ')\">';
+                "\" data-pdf-index=\"" +
+                (r.pdf_page - 1) +
+                "\" onclick=\"goToPage(this)\">";
             html +=
                 '<span><span class="font-medium text-gray-500">' +
                 r.pdf_page +

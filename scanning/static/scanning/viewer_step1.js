@@ -9,7 +9,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     const pdfUrl = container.dataset.pdfUrl;
     const pageMap = JSON.parse(container.dataset.pageMap || '[]');
-    const flaggedPages = JSON.parse(container.dataset.flaggedPages || '[]');
+    const flaggedIndices = JSON.parse(container.dataset.flaggedIndices || '[]');
     const redactions = JSON.parse(container.dataset.redactions || '{}');
     const ocrByPage = JSON.parse(container.dataset.ocrByPage || '{}');
     const documentId = container.dataset.documentId;
@@ -58,7 +58,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function createPdfPlaceholder(entry) {
         var pageDiv = createPageContainer(entry.logical_number, entry.pdf_index);
-        var isFlagged = flaggedPages.indexOf(entry.logical_number) !== -1;
+        var isFlagged = flaggedIndices.indexOf(entry.pdf_index) !== -1;
         if (isFlagged) {
             pageDiv.classList.add('flagged');
         }
@@ -703,14 +703,24 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // --- Scroll to page ---
     window.goToPage = function (elOrNum) {
-        // Accepts an element (with data-page) or a number.
-        // Issues pass logical page numbers; PDF containers store data-logical-number.
-        // OCR panel passes pdf_page (= pdf_index+1) so the ID fallback covers that case.
-        var pageNumber = (typeof elOrNum === 'object') ? elOrNum.dataset.page : elOrNum;
-        var el = container.querySelector('[data-logical-number="' + pageNumber + '"]')
+        // Accepts an element or a number.
+        //  - OCR "Pages" list items carry data-pdf-index: jump to that exact
+        //    PDF page. Unambiguous even when logical page numbers repeat (e.g.
+        //    unnumbered front matter borrowing the real pages' numbers, #90).
+        //  - Issue cards / image badges carry data-page (a logical page
+        //    number), resolved via data-logical-number with a page-<n> fallback.
+        var el;
+        if (typeof elOrNum === 'object' && elOrNum.dataset.pdfIndex !== undefined) {
+            el = container.querySelector(
+                '[data-pdf-index="' + elOrNum.dataset.pdfIndex + '"]'
+            );
+        } else {
+            var pageNumber = (typeof elOrNum === 'object') ? elOrNum.dataset.page : elOrNum;
+            el = container.querySelector('[data-logical-number="' + pageNumber + '"]')
                  || document.getElementById('page-' + pageNumber);
+        }
         if (el) {
-            el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            window.scrollPageIntoView(el);
             el.classList.add('highlight');
             setTimeout(function () { el.classList.remove('highlight'); }, 2000);
         }
