@@ -1769,3 +1769,135 @@ class TestProcessActionsFragment(ScanningTestCase):
         self.assertIn(
             reverse("reprocess", kwargs={"pk": self.scan.pk}), body["html"]
         )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestAssignPage(ScanningTestCase):
+    """Manual page-number edits validate input, support clearing, and
+    rebuild the page_map so duplicate flags stay in sync with the edit."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user,
+            status=Status.PENDING_REVIEW,
+            page_count=3,
+            ocr_results=[
+                {
+                    "pdf_page": 1,
+                    "detected": "5",
+                    "type": "single",
+                    "zone": "yolo-pn",
+                },
+                {"pdf_page": 2, "detected": None, "type": None, "zone": None},
+                {
+                    "pdf_page": 3,
+                    "detected": "9",
+                    "type": "single",
+                    "zone": "yolo-pn",
+                },
+            ],
+        )
+
+    def _post(self, pdf_page, page_number):
+        return self.client.post(
+            reverse("assign_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps(
+                {"pdf_page": pdf_page, "page_number": page_number}
+            ),
+            content_type="application/json",
+        )
+
+    def test_rejects_zero(self):
+        """0 is not a valid page number and leaves the value unchanged."""
+        response = self._post(1, "0")
+        self.assertEqual(response.status_code, 400)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.ocr_results[0]["detected"], "5")
+
+    def test_rejects_negative(self):
+        """Negative numbers are rejected."""
+        self.assertEqual(self._post(1, "-3").status_code, 400)
+
+    def test_rejects_non_numeric(self):
+        """Non-numeric input is rejected."""
+        self.assertEqual(self._post(1, "abc").status_code, 400)
+
+    def test_unknown_page_returns_404(self):
+        """Assigning to a PDF page not in ocr_results is a 404."""
+        self.assertEqual(self._post(99, "5").status_code, 404)
+
+    def test_missing_page_number_key_rejected(self):
+        """Omitting page_number is a 400, not a silent clear (clearing is
+        explicit via null/empty)."""
+        response = self.client.post(
+            reverse("assign_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"pdf_page": 1}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.ocr_results[0]["detected"], "5")
+
+    def test_missing_pdf_page_rejected(self):
+        """Omitting pdf_page is a 400 rather than a server error."""
+        response = self.client.post(
+            reverse("assign_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"page_number": "5"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_sets_valid_number(self):
+        """A positive number is stored and marked manual."""
+        response = self._post(3, "7")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content)["detected"], "7")
+        self.scan.refresh_from_db()
+        r = self.scan.ocr_results[2]
+        self.assertEqual(r["detected"], "7")
+        self.assertEqual(r["type"], "single")
+        self.assertEqual(r["zone"], "manual")
+
+    def test_blank_clears_number(self):
+        """A blank value clears the page number (marks it unnumbered)."""
+        response = self._post(1, "")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(json.loads(response.content)["detected"])
+        self.scan.refresh_from_db()
+        r = self.scan.ocr_results[0]
+        self.assertIsNone(r["detected"])
+        self.assertEqual(r["zone"], "manual")
+
+    def test_null_clears_number(self):
+        """A null value also clears the page number."""
+        response = self._post(1, None)
+        self.assertEqual(response.status_code, 200)
+        self.scan.refresh_from_db()
+        self.assertIsNone(self.scan.ocr_results[0]["detected"])
+
+    def test_edit_creating_duplicate_flags_page_map(self):
+        """Assigning a number that already exists flags the page (and only
+        the later copy) as a duplicate in the rebuilt page_map."""
+        response = self._post(3, "5")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(json.loads(response.content)["duplicate"])
+        self.scan.refresh_from_db()
+        flagged = {
+            e["pdf_index"] for e in self.scan.page_map if e.get("duplicate")
+        }
+        self.assertIn(2, flagged)  # pdf_page 3 -> index 2 (second "5")
+        self.assertNotIn(0, flagged)  # the first "5" stays canonical
+
+    def test_clearing_duplicate_unflags_page_map(self):
+        """Clearing a duplicated number removes the duplicate flag."""
+        self._post(3, "5")
+        self.scan.refresh_from_db()
+        self.assertTrue(any(e.get("duplicate") for e in self.scan.page_map))
+        self._post(3, "")
+        self.scan.refresh_from_db()
+        flagged = {
+            e["pdf_index"] for e in self.scan.page_map if e.get("duplicate")
+        }
+        self.assertNotIn(2, flagged)

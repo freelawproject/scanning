@@ -746,35 +746,89 @@ def reprocess(request: HttpRequest, pk: int) -> HttpResponse:
 @login_required
 @require_POST
 def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
-    """Manually assign a page number to a PDF page.
+    """Manually set or clear a PDF page's detected page number.
 
-    :param request: The HTTP request (JSON body with pdf_page and
-        page_number).
+    A blank/empty ``page_number`` clears the number, marking the page as
+    having none (e.g. front matter the model mis-tagged). Any other value
+    must be a positive integer. After updating, the page_map is rebuilt so
+    duplicate flags stay in sync with the change.
+
+    :param request: The HTTP request (JSON body with ``pdf_page`` and
+        ``page_number``; ``page_number`` may be null/empty to clear).
     :param pk: Scan primary key.
-    :return: JSON response confirming the assignment.
+    :return: JSON response with the stored value and duplicate flag.
     """
     scan = get_object_or_404(Scan, pk=pk)
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-    pdf_page = data["pdf_page"]
-    page_number = data["page_number"]
+    pdf_page = data.get("pdf_page")
+    if pdf_page is None:
+        return JsonResponse({"error": "pdf_page is required."}, status=400)
+    if "page_number" not in data:
+        return JsonResponse(
+            {"error": 'page_number is required (send null or "" to clear).'},
+            status=400,
+        )
+    raw = data["page_number"]
+
+    clear = raw is None or (isinstance(raw, str) and not raw.strip())
+    page_value = None
+    if not clear:
+        try:
+            number = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return JsonResponse(
+                {"error": "Page number must be a positive whole number."},
+                status=400,
+            )
+        if number < 1:
+            return JsonResponse(
+                {"error": "Page number must be a positive whole number."},
+                status=400,
+            )
+        page_value = str(number)
+
     ocr_results = scan.ocr_results
+    if not any(r["pdf_page"] == pdf_page for r in ocr_results):
+        return JsonResponse({"error": "Unknown PDF page."}, status=404)
     for r in ocr_results:
         if r["pdf_page"] == pdf_page:
-            r["detected"] = page_number
-            r["type"] = "single"
+            if clear:
+                r["detected"] = None
+                r["type"] = None
+                r["score"] = None
+            else:
+                r["detected"] = page_value
+                r["type"] = "single"
+                r["score"] = 1.0
             r["zone"] = "manual"
-            r["score"] = 1.0
             r["ocr"] = "manual"
             break
     scan.ocr_results = ocr_results
+
+    # Clear the page's no-page-number flag; the rebuild does not touch Issue
+    # rows, so a full Recheck re-derives the issue list (and any new flag).
     scan.issues.filter(
         check_name=CheckName.NO_PAGE_NUMBER, page_number=pdf_page
     ).delete()
-    scan.save()
-    return JsonResponse({"status": "ok"})
+
+    # Rebuild page_map so the viewer/sidebar duplicate flags reflect the edit
+    # immediately (saves the scan, including the updated ocr_results).
+    from scanning import services
+
+    services.rebuild_page_map(scan)
+
+    duplicate = any(
+        e.get("type") == "pdf_page"
+        and e.get("pdf_index") == pdf_page - 1
+        and e.get("duplicate")
+        for e in scan.page_map
+    )
+    return JsonResponse(
+        {"status": "ok", "detected": page_value, "duplicate": duplicate}
+    )
 
 
 @login_required
