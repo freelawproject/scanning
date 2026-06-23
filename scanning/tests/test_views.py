@@ -1769,3 +1769,53 @@ class TestProcessActionsFragment(ScanningTestCase):
         self.assertIn(
             reverse("reprocess", kwargs={"pk": self.scan.pk}), body["html"]
         )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestSidebarDuplicateMarkers(ScanningTestCase):
+    """The step-1 sidebar page list marks duplicates from the same
+    page_map data the PDF viewer uses, so the two views agree even when
+    the duplicate copies are not consecutive (the old consecutive-only
+    check missed those, leaving the viewer and sidebar inconsistent)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        # Page 5's number repeats on pdf pages 1 and 3, separated by an
+        # undetected page so the sequence check resets and never sees the
+        # two "5"s as consecutive. Only the page_map carries the duplicate.
+        self.scan = ScanFactory(
+            uploaded_by=self.user,
+            status=Status.PENDING_REVIEW,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "5", "type": "single"},
+                {"pdf_page": 2, "detected": None, "type": None},
+                {"pdf_page": 3, "detected": "5", "type": "single"},
+                {"pdf_page": 4, "detected": "6", "type": "single"},
+            ],
+            page_map=[
+                {"type": "pdf_page", "pdf_index": 0, "logical_number": 5},
+                {"type": "pdf_page", "pdf_index": 1, "logical_number": 2},
+                {
+                    "type": "pdf_page",
+                    "pdf_index": 2,
+                    "logical_number": 5,
+                    "duplicate": True,
+                },
+                {"type": "pdf_page", "pdf_index": 3, "logical_number": 6},
+            ],
+        )
+
+    def test_page_map_duplicate_is_marked_in_sidebar(self):
+        """A page_map duplicate gets a DUP badge even when its copies are
+        not consecutive in the numbering sequence."""
+        response = self.client.get(
+            reverse("scan_process", kwargs={"pk": self.scan.pk}) + "?step=1"
+        )
+        self.assertEqual(response.status_code, 200)
+        html = response.content.decode()
+        # Exactly one duplicate (pdf page 3) is flagged, matching the single
+        # page_map duplicate, not zero (the old consecutive check) nor more.
+        self.assertEqual(html.count(">DUP<"), 1)
+        self.assertEqual(html.count("bg-orange-100"), 1)
