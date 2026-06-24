@@ -2,6 +2,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import tempfile
 from datetime import timedelta
@@ -1815,7 +1816,27 @@ class TestSidebarDuplicateMarkers(ScanningTestCase):
         )
         self.assertEqual(response.status_code, 200)
         html = response.content.decode()
-        # Exactly one duplicate (pdf page 3) is flagged, matching the single
+        # Exactly one DUP badge is rendered (the consecutive-check divider was
+        # removed, so the badge is the only ">DUP<" left), matching the single
         # page_map duplicate, not zero (the old consecutive check) nor more.
         self.assertEqual(html.count(">DUP<"), 1)
-        self.assertEqual(html.count("bg-orange-100"), 1)
+        # The orange duplicate highlight must land on the right row. Each page
+        # row carries its classes next to a unique ``data-pdf-index``; scope
+        # the check to those rows so an unrelated bg-orange-100 elsewhere on
+        # the page can neither satisfy nor mask the assertion. pdf page 3 is
+        # pdf_index 2.
+        row_classes = {
+            int(idx): classes
+            for classes, idx in re.findall(
+                r'class="([^"]*)"\s+data-pdf-index="(\d+)"', html
+            )
+        }
+        self.assertIn("bg-orange-100", row_classes[2])
+        self.assertEqual(
+            [
+                idx
+                for idx, cls in row_classes.items()
+                if "bg-orange-100" in cls
+            ],
+            [2],
+        )
