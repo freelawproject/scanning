@@ -161,6 +161,18 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 entry["pdf_index"]
             )
 
+    # PDF page indices the page_map flags as duplicates (a detected page
+    # number that already appeared on an earlier page). The PDF viewer marks
+    # these with a DUPLICATE badge; the sidebar page list mirrors the same set
+    # so the two views stay consistent. Unlike a consecutive-only check this
+    # also catches duplicates whose copies are far apart (e.g. the same
+    # printed "page 1" appearing on several pages).
+    duplicate_indices = {
+        entry["pdf_index"]
+        for entry in page_map
+        if entry.get("type") == "pdf_page" and entry.get("duplicate")
+    }
+
     # The viewer highlights flagged pages by pdf_index (a page's physical
     # position), which is unique. An issue's ``page_number`` means a physical
     # PDF page for some checks and a logical/printed page number for others;
@@ -196,10 +208,13 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     for r in ocr_results:
         ocr_by_page[r["pdf_page"]] = r
 
-    # Annotate sequence issues for the sidebar page list
+    # Annotate sequence issues for the sidebar page list. Duplicates are taken
+    # from ``duplicate_indices`` (the same page_map data the viewer uses);
+    # ``seq_issue`` only covers ordering anomalies (backward / gap).
     prev_num = None
     for r in ocr_results:
         r["seq_issue"] = ""
+        r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
         if not r.get("detected") or r.get("type") == "range":
             prev_num = None
             continue
@@ -210,9 +225,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             continue
         if prev_num is not None:
             diff = num - prev_num
-            if diff == 0:
-                r["seq_issue"] = "duplicate"
-            elif diff < 0:
+            if diff < 0:
                 r["seq_issue"] = "backward"
             elif diff > 2:
                 r["seq_issue"] = "gap"

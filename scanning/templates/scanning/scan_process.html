@@ -129,27 +129,22 @@
           <span class="text-[9px] text-red-600 dark:text-red-400 font-bold whitespace-nowrap">ORDER</span>
           <div class="flex-1 border-t-2 border-dashed border-red-400"></div>
         </div>
-        {% elif r.seq_issue == 'duplicate' %}
-        <div class="flex items-center gap-1 my-1">
-          <div class="flex-1 border-t-2 border-dashed border-orange-400"></div>
-          <span class="text-[9px] text-orange-600 dark:text-orange-400 font-bold whitespace-nowrap">DUP</span>
-          <div class="flex-1 border-t-2 border-dashed border-orange-400"></div>
-        </div>
         {% endif %}
       <div class="rounded px-2 py-0.5 mb-0.5 cursor-pointer text-xs flex items-center justify-between
            {% if not r.detected %}bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800
            {% elif r.seq_issue == 'backward' %}bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700
-           {% elif r.seq_issue == 'duplicate' %}bg-orange-100 dark:bg-orange-900/30 border border-orange-300 dark:border-orange-700
+           {% elif r.is_duplicate %}bg-orange-100 dark:bg-orange-900/30 border border-orange-300 dark:border-orange-700
            {% elif r.seq_issue == 'gap' %}bg-yellow-100 dark:bg-yellow-900/30 border border-yellow-300 dark:border-yellow-700
            {% else %}bg-green-50 dark:bg-green-900/20{% endif %}"
            data-pdf-index="{{ r.pdf_page|add:'-1' }}" onclick="goToPage(this)">
         <span>
           <span class="font-medium text-gray-500">{{ r.pdf_page }}</span>
           {% if r.detected %}
-          <span class="{% if r.seq_issue == 'backward' %}text-red-700 dark:text-red-300{% elif r.seq_issue == 'duplicate' %}text-orange-700 dark:text-orange-300{% elif r.seq_issue == 'gap' %}text-yellow-700 dark:text-yellow-300{% else %}text-green-700 dark:text-green-300{% endif %} font-semibold ml-1">#{{ r.detected }}</span>
+          <span class="{% if r.seq_issue == 'backward' %}text-red-700 dark:text-red-300{% elif r.is_duplicate %}text-orange-700 dark:text-orange-300{% elif r.seq_issue == 'gap' %}text-yellow-700 dark:text-yellow-300{% else %}text-green-700 dark:text-green-300{% endif %} font-semibold ml-1">#{{ r.detected }}</span>
           {% else %}
           <span class="text-red-600 dark:text-red-400 ml-1">—</span>
           {% endif %}
+          {% if r.is_duplicate %}<span class="text-[9px] font-bold text-orange-600 dark:text-orange-400 ml-1">DUP</span>{% endif %}
         </span>
         {% if r.type == 'range' %}<span class="text-[9px] text-blue-500">range</span>{% endif %}
         {% if r.zone == 'manual' %}<span class="text-[9px] text-purple-500">manual</span>{% endif %}
