@@ -373,6 +373,19 @@ document.addEventListener('DOMContentLoaded', function () {
                         editBtn.className = 'ocr-tag miss editable-page';
                         editBtn.innerHTML = '[no page # found — click to assign]';
                     }
+                    // The server already rebuilt page_map, but the rendered
+                    // duplicate/missing badges and the issue cards are now stale.
+                    // Surface the pending banner so the user can click Recheck to
+                    // refresh them (a cheap recalculate, no RunPod rebuild needed).
+                    var banner = document.getElementById('pending-banner');
+                    if (banner) {
+                        banner.textContent =
+                            'Page numbers changed. Click Recheck to refresh ' +
+                            'duplicate flags and issues.';
+                        banner.hidden = false;
+                    }
+                    var badge = document.getElementById('pending-badge');
+                    if (badge) badge.hidden = false;
                 });
             });
         }

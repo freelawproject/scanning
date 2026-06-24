@@ -273,21 +273,42 @@ document.addEventListener('DOMContentLoaded', function () {
                 (function (btn, pp) {
                     btn.addEventListener('click', function () {
                         var current = ocr && ocr.detected ? ocr.detected : '';
-                        var num = prompt('Enter the correct page number for PDF page ' + pp + ':', current);
-                        if (num !== null && num.trim()) {
-                            fetch('/scans/' + documentId + '/assign-page/', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
-                                body: JSON.stringify({ pdf_page: pp, page_number: num.trim() }),
-                            })
-                            .then(function (r) { return r.json(); })
-                            .then(function (data) {
-                                if (data.status === 'ok') {
-                                    btn.className = 'ocr-tag editable-page';
-                                    btn.innerHTML = '#' + num.trim() + ' <small>(manual)</small>';
-                                }
-                            });
+                        var num = prompt(
+                            'Page number for PDF page ' + pp +
+                            ' (leave blank if this page has no number):',
+                            current
+                        );
+                        if (num === null) return; // cancelled
+                        var trimmed = num.trim();
+                        if (trimmed && (!/^\d+$/.test(trimmed) || parseInt(trimmed, 10) < 1)) {
+                            alert('Page number must be a positive whole number, or blank for none.');
+                            return;
                         }
+                        fetch('/scans/' + documentId + '/assign-page/', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+                            body: JSON.stringify({
+                                pdf_page: pp,
+                                page_number: trimmed === '' ? null : trimmed,
+                            }),
+                        })
+                        .then(function (r) {
+                            return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+                        })
+                        .then(function (res) {
+                            if (!res.ok || res.data.status !== 'ok') {
+                                alert((res.data && res.data.error) || 'Could not update the page number.');
+                                return;
+                            }
+                            ocr.detected = res.data.detected;
+                            if (res.data.detected) {
+                                btn.className = 'ocr-tag editable-page';
+                                btn.innerHTML = '#' + res.data.detected + ' <small>(manual)</small>';
+                            } else {
+                                btn.className = 'ocr-tag miss editable-page';
+                                btn.innerHTML = '[no page # found]';
+                            }
+                        });
                     });
                 })(editBtn, pdfPage);
             }
