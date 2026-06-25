@@ -402,7 +402,7 @@ class TestQueueUploadXhr(ScanningTestCase):
         with (
             patch("scanning.views.has_s3_credentials", return_value=True),
             patch(
-                "scanning.s3_sync.upload_file_to_s3", return_value=True
+                "scanning.s3_sync.upload_fileobj_to_s3", return_value=True
             ) as mock_upload,
         ):
             response = self.client.post(
@@ -415,6 +415,13 @@ class TestQueueUploadXhr(ScanningTestCase):
         mock_upload.assert_called_once()
         scan = Scan.objects.get(volume_obj=self.volume)
         self.assertTrue(scan.original_pdf.name)
+        # The prod path streams straight to S3; it must not write a
+        # local copy of the original PDF (issue #94).
+        out_dir = pathlib.Path(scan.output_dir)
+        self.assertFalse(
+            out_dir.exists() and list(out_dir.glob("*.original.pdf")),
+            "prod upload must not write a local original PDF",
+        )
 
     @override_settings(DEVELOPMENT=False)
     def test_xhr_prod_upload_without_credentials_returns_json_redirect(self):

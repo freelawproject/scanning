@@ -17,6 +17,7 @@ behavior as prod.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import boto3
@@ -253,6 +254,53 @@ def upload_file_to_s3(scan: Scan, relative_path: str) -> bool:
         scan.pk,
         bucket,
         key,
+    )
+    return True
+
+
+def upload_fileobj_to_s3(scan: Scan, upload, relative_path: str) -> bool:
+    """Stream an uploaded file straight to S3 without a local copy.
+
+    Used by the upload view in prod so the bytes Django already spooled
+    go to S3 in a single pass, with no wasted local disk write. Prefers
+    the temp-file path boto3 can read directly (Django spools large
+    uploads to a ``TemporaryUploadedFile``) and falls back to the file
+    object for small in-memory uploads.
+
+    :param scan: The scan the file belongs to.
+    :type scan: Scan
+    :param upload: The uploaded file (a Django ``UploadedFile``).
+    :param relative_path: Path relative to the scan's output dir, used
+        as the S3 key suffix.
+    :type relative_path: str
+    :returns: True if uploaded, False if S3 is disabled.
+    :rtype: bool
+    """
+    if not _s3_enabled():
+        return False
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    key = f"{s3_processing_prefix(scan)}{relative_path}"
+    extra_args = {"ContentType": "application/pdf"}
+    s3 = boto3.client("s3")
+
+    start = time.monotonic()
+    temp_path = getattr(upload, "temporary_file_path", None)
+    if callable(temp_path):
+        s3.upload_file(temp_path(), bucket, key, ExtraArgs=extra_args)
+    else:
+        upload.seek(0)
+        s3.upload_fileobj(upload, bucket, key, ExtraArgs=extra_args)
+    elapsed = time.monotonic() - start
+
+    size_mb = (getattr(upload, "size", 0) or 0) / (1024 * 1024)
+    logger.info(
+        "Streamed %.1f MB to s3://%s/%s for scan %s in %.1fs",
+        size_mb,
+        bucket,
+        key,
+        scan.pk,
+        elapsed,
     )
     return True
 

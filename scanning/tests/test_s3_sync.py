@@ -5,6 +5,7 @@ import pathlib
 import tempfile
 from unittest.mock import MagicMock, patch
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from scanning import s3_sync
@@ -246,6 +247,61 @@ class TestSyncHelpersWithCredentials(TestCase):
         _, bucket, key = mock_s3.upload_file.call_args.args
         self.assertEqual(bucket, "test-bucket")
         self.assertEqual(key, f"processing/{scan.pk}/tc/164/1/detections.json")
+
+    def test_upload_fileobj_to_s3_streams_small_file(self):
+        scan = _reporter_scan()
+        scan.status = Status.PENDING_REVIEW
+        scan.save(update_fields=["status"])
+        upload = SimpleUploadedFile(
+            "x.original.pdf",
+            b"%PDF-1.4 body",
+            content_type="application/pdf",
+        )
+
+        mock_s3 = MagicMock()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            ok = s3_sync.upload_fileobj_to_s3(scan, upload, "x.original.pdf")
+
+        self.assertTrue(ok)
+        # Small in-memory upload has no temp path, so it streams the
+        # file object directly. No local file is touched.
+        mock_s3.upload_fileobj.assert_called_once()
+        mock_s3.upload_file.assert_not_called()
+        _, bucket, key = mock_s3.upload_fileobj.call_args.args
+        self.assertEqual(bucket, "test-bucket")
+        self.assertEqual(key, f"processing/{scan.pk}/tc/164/1/x.original.pdf")
+        self.assertEqual(
+            mock_s3.upload_fileobj.call_args.kwargs["ExtraArgs"],
+            {"ContentType": "application/pdf"},
+        )
+
+    def test_upload_fileobj_to_s3_uses_temporary_file_path(self):
+        scan = _reporter_scan()
+        scan.status = Status.PENDING_REVIEW
+        scan.save(update_fields=["status"])
+        # Large uploads spool to a TemporaryUploadedFile exposing
+        # temporary_file_path(); boto3 reads that path directly.
+        upload = MagicMock()
+        upload.temporary_file_path.return_value = "/tmp/spool.pdf"
+        upload.size = 2048
+
+        mock_s3 = MagicMock()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            ok = s3_sync.upload_fileobj_to_s3(scan, upload, "x.original.pdf")
+
+        self.assertTrue(ok)
+        mock_s3.upload_file.assert_called_once()
+        mock_s3.upload_fileobj.assert_not_called()
+        path_arg, bucket, key = mock_s3.upload_file.call_args.args
+        self.assertEqual(path_arg, "/tmp/spool.pdf")
+        self.assertEqual(bucket, "test-bucket")
+        self.assertEqual(key, f"processing/{scan.pk}/tc/164/1/x.original.pdf")
+        self.assertEqual(
+            mock_s3.upload_file.call_args.kwargs["ExtraArgs"],
+            {"ContentType": "application/pdf"},
+        )
 
 
 class TestS3EnabledBranches(SimpleTestCase):

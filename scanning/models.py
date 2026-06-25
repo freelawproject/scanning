@@ -650,8 +650,8 @@ class Scan(AbstractDateTimeModel):
 
         Resolution order:
 
-        1. ``output_dir/<name>.original.pdf`` (present after upload or
-           after pulling from S3).
+        1. ``output_dir/<name>.original.pdf`` (present in DEV after
+           upload, or in prod after pulling from S3).
         2. Django ``FileField.path`` if the file actually exists on disk
            (covers DEV and tests where the FileField was written to
            MEDIA_ROOT).

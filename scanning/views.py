@@ -511,9 +511,7 @@ def queue_upload(request, reporter_slug, vol):
     scan.status = Status.UPLOADED
     scan.save()  # Save first to get a PK
 
-    # Create processing directory and save original PDF there
     output_dir = Path(scan.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     original_name = (
         f"{volume.reporter.short_name}.{volume.volume_number}"
@@ -521,23 +519,22 @@ def queue_upload(request, reporter_slug, vol):
         f".original.pdf"
     )
 
-    # Keep a local copy in output_dir for the processing pipeline. In
-    # prod this is /tmp/scanning/{pk}/...; in DEV it is under MEDIA_ROOT.
-    local_path = output_dir / original_name
-    with open(local_path, "wb") as f:
-        for chunk in pdf.chunks():
-            f.write(chunk)
-
     if settings.DEVELOPMENT:
-        # DEV: store via Django FileField (MEDIA_ROOT/original_scans/...)
-        # so the shared mount makes the file available to the daemon.
+        # DEV: keep a local copy in output_dir (under MEDIA_ROOT, shared
+        # with the daemon) and store it via the Django FileField.
+        output_dir.mkdir(parents=True, exist_ok=True)
+        local_path = output_dir / original_name
+        with open(local_path, "wb") as f:
+            for chunk in pdf.chunks():
+                f.write(chunk)
         pdf.seek(0)
         scan.original_pdf.save(original_name, pdf, save=False)
         scan.save(update_fields=["original_pdf"])
     else:
-        # PROD: push to S3 under processing/{pk}/... so the daemon can
-        # pull it (containers don't share /tmp/). Skip the FileField
-        # write so MEDIA_ROOT stays empty.
+        # PROD: stream the uploaded file straight to S3 under
+        # processing/{pk}/... in a single pass so the daemon can pull it
+        # (containers don't share /tmp/). No local copy is written here;
+        # the daemon recreates one when it downloads from S3.
         from scanning import s3_sync
 
         if not has_s3_credentials():
@@ -553,7 +550,7 @@ def queue_upload(request, reporter_slug, vol):
             return _upload_redirect(request, queue_url)
 
         try:
-            uploaded = s3_sync.upload_file_to_s3(scan, original_name)
+            uploaded = s3_sync.upload_fileobj_to_s3(scan, pdf, original_name)
         except Exception:
             logger.exception(
                 "Failed to upload original PDF to S3 for scan %s", scan.pk
