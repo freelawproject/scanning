@@ -745,6 +745,9 @@ document.addEventListener('DOMContentLoaded', function () {
             var card = btn.closest('.issue-card');
             if (card) card.remove();
             refreshIssuesCount();
+            if (typeof window.refreshProcessActionBar === 'function') {
+                window.refreshProcessActionBar();
+            }
         })
         .catch(function () {
             alert('Could not dismiss issue. Please try again.');
