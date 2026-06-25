@@ -1091,7 +1091,7 @@ class TestQueueUploadS3(ScanningTestCase):
     def test_dev_writes_filefield_and_skips_s3(self):
         from unittest.mock import patch
 
-        with patch("scanning.s3_sync.upload_file_to_s3") as mock_s3:
+        with patch("scanning.s3_sync.upload_fileobj_to_s3") as mock_s3:
             response, _ = self._post_upload()
 
         self.assertEqual(response.status_code, 302)
@@ -1111,7 +1111,7 @@ class TestQueueUploadS3(ScanningTestCase):
         with (
             patch("scanning.views.has_s3_credentials", return_value=True),
             patch(
-                "scanning.s3_sync.upload_file_to_s3", return_value=True
+                "scanning.s3_sync.upload_fileobj_to_s3", return_value=True
             ) as mock_s3,
         ):
             response, _ = self._post_upload()
@@ -1132,7 +1132,7 @@ class TestQueueUploadS3(ScanningTestCase):
         with (
             patch("scanning.views.has_s3_credentials", return_value=True),
             patch(
-                "scanning.s3_sync.upload_file_to_s3",
+                "scanning.s3_sync.upload_fileobj_to_s3",
                 side_effect=RuntimeError("boom"),
             ),
             self.assertLogs("scanning.views", level="ERROR") as cm,
@@ -1151,7 +1151,7 @@ class TestQueueUploadS3(ScanningTestCase):
 
         with (
             patch("scanning.views.has_s3_credentials", return_value=False),
-            patch("scanning.s3_sync.upload_file_to_s3") as mock_s3,
+            patch("scanning.s3_sync.upload_fileobj_to_s3") as mock_s3,
             self.assertLogs("scanning.views", level="ERROR") as cm,
         ):
             response, _ = self._post_upload()
@@ -1165,11 +1165,11 @@ class TestQueueUploadS3(ScanningTestCase):
     def test_prod_upload_returning_false_deletes_scan(self):
         from unittest.mock import patch
 
-        # upload_file_to_s3 returning False (e.g. the helper's own
+        # upload_fileobj_to_s3 returning False (e.g. the helper's own
         # short-circuit) should be treated as a failure by the view.
         with (
             patch("scanning.views.has_s3_credentials", return_value=True),
-            patch("scanning.s3_sync.upload_file_to_s3", return_value=False),
+            patch("scanning.s3_sync.upload_fileobj_to_s3", return_value=False),
         ):
             response, _ = self._post_upload()
 
