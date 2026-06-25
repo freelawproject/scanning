@@ -377,8 +377,12 @@ document.addEventListener('DOMContentLoaded', function () {
                     // duplicate/missing badges and the issue cards are now stale.
                     // Surface the pending banner so the user can click Recheck to
                     // refresh them (a cheap recalculate, no RunPod rebuild needed).
+                    // Only set the edit-specific wording when nothing was pending
+                    // yet (banner hidden). If a page insert/deletion is already
+                    // pending, leave its "rebuild to apply" text: Recheck is hidden
+                    // in that state and Rebuild & Validate handles both.
                     var banner = document.getElementById('pending-banner');
-                    if (banner) {
+                    if (banner && banner.hidden) {
                         banner.textContent =
                             'Page numbers changed. Click Recheck to refresh ' +
                             'duplicate flags and issues.';
