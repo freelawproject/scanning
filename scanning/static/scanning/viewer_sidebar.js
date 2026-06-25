@@ -436,29 +436,6 @@ function deleteDuplicates(btn) {
     });
 }
 
-function dismissIssue(btn, issueId) {
-    var cfg = window.SCAN_CONFIG;
-    fetch("/scans/" + cfg.docId + "/dismiss-issue/", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            "X-CSRFToken": cfg.csrfToken,
-        },
-        body: JSON.stringify({ issue_id: issueId }),
-    })
-        .then(function (r) {
-            return r.json();
-        })
-        .then(function (data) {
-            if (data.status === "ok") {
-                btn.closest(".issue-card").style.opacity = "0.3";
-                btn.closest(".issue-card").style.pointerEvents = "none";
-            } else {
-                alert(data.message || "Cannot dismiss");
-            }
-        });
-}
-
 function pairOpinions() {
     var cfg = window.SCAN_CONFIG;
     if (cfg.step < 2) return;

@@ -738,25 +738,33 @@ document.addEventListener('DOMContentLoaded', function () {
         })
         .then(function (r) { return r.json(); })
         .then(function (data) {
-            if (data.status === 'ok') {
-                var card = btn.closest('.issue-card');
-                card.style.opacity = '0.3';
-                card.style.pointerEvents = 'none';
-                // Check if all issues are dismissed
-                var remaining = document.querySelectorAll('.issue-card:not([style*="opacity"])');
-                if (remaining.length === 0) {
-                    var issuesPanel = document.querySelector('.issues-panel');
-                    var allClear = document.querySelector('.all-clear');
-                    if (!allClear) {
-                        var div = document.createElement('div');
-                        div.className = 'all-clear';
-                        div.textContent = 'All Clear — no issues found';
-                        issuesPanel.appendChild(div);
-                    }
-                }
+            if (data.status !== 'ok') {
+                alert(data.message || data.error || 'Could not dismiss issue.');
+                return;
             }
+            var card = btn.closest('.issue-card');
+            if (card) card.remove();
+            refreshIssuesCount();
+        })
+        .catch(function () {
+            alert('Could not dismiss issue. Please try again.');
         });
     };
+
+    // Update the "Issues (N)" heading after a dismissal and swap in the
+    // "all clear" state once the last issue is gone.
+    function refreshIssuesCount() {
+        var section = document.getElementById('issues-section');
+        if (!section) return;
+        var remaining = section.querySelectorAll('.issue-card').length;
+        var countEl = document.getElementById('issues-count');
+        if (countEl) countEl.textContent = remaining;
+        if (remaining === 0) {
+            section.hidden = true;
+            var allClear = document.getElementById('issues-all-clear');
+            if (allClear) allClear.hidden = false;
+        }
+    }
 
     // --- Delete duplicate pages ---
     window.deleteDuplicates = function (btn) {
