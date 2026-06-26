@@ -335,24 +335,62 @@ document.addEventListener('DOMContentLoaded', function () {
         if (editBtn) {
             editBtn.addEventListener('click', function () {
                 var current = ocr && ocr.detected ? ocr.detected : '';
-                var num = prompt('Enter the correct page number for PDF page ' + pdfPage + ':', current);
-                if (num !== null && num.trim()) {
-                    fetch('/scans/' + documentId + '/assign-page/', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'X-CSRFToken': csrfToken,
-                        },
-                        body: JSON.stringify({ pdf_page: pdfPage, page_number: num.trim() }),
-                    })
-                    .then(function (r) { return r.json(); })
-                    .then(function (data) {
-                        if (data.status === 'ok') {
-                            editBtn.className = 'ocr-tag editable-page';
-                            editBtn.innerHTML = '#' + num.trim() + ' <small>(manual)</small>';
-                        }
-                    });
+                var num = prompt(
+                    'Page number for PDF page ' + pdfPage +
+                    ' (leave blank if this page has no number):',
+                    current
+                );
+                if (num === null) return; // cancelled
+                var trimmed = num.trim();
+                if (trimmed && (!/^\d+$/.test(trimmed) || parseInt(trimmed, 10) < 1)) {
+                    alert('Page number must be a positive whole number, or blank for none.');
+                    return;
                 }
+                fetch('/scans/' + documentId + '/assign-page/', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': csrfToken,
+                    },
+                    body: JSON.stringify({
+                        pdf_page: pdfPage,
+                        page_number: trimmed === '' ? null : trimmed,
+                    }),
+                })
+                .then(function (r) {
+                    return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+                })
+                .then(function (res) {
+                    if (!res.ok || res.data.status !== 'ok') {
+                        alert((res.data && res.data.error) || 'Could not update the page number.');
+                        return;
+                    }
+                    ocr.detected = res.data.detected;
+                    if (res.data.detected) {
+                        editBtn.className = 'ocr-tag editable-page';
+                        editBtn.innerHTML = '#' + res.data.detected + ' <small>(manual)</small>';
+                    } else {
+                        editBtn.className = 'ocr-tag miss editable-page';
+                        editBtn.innerHTML = '[no page # found — click to assign]';
+                    }
+                    // The server already rebuilt page_map, but the rendered
+                    // duplicate/missing badges and the issue cards are now stale.
+                    // Surface the pending banner so the user can click Recheck to
+                    // refresh them (a cheap recalculate, no RunPod rebuild needed).
+                    // Only set the edit-specific wording when nothing was pending
+                    // yet (banner hidden). If a page insert/deletion is already
+                    // pending, leave its "rebuild to apply" text: Recheck is hidden
+                    // in that state and Rebuild & Validate handles both.
+                    var banner = document.getElementById('pending-banner');
+                    if (banner && banner.hidden) {
+                        banner.textContent =
+                            'Page numbers changed. Click Recheck to refresh ' +
+                            'duplicate flags and issues.';
+                        banner.hidden = false;
+                    }
+                    var badge = document.getElementById('pending-badge');
+                    if (badge) badge.hidden = false;
+                });
             });
         }
 

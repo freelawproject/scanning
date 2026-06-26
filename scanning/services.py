@@ -1405,6 +1405,126 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _split_detected(
+    ocr_results: list, exp_start: int | None, exp_end: int | None
+) -> tuple[list, dict]:
+    """Partition detected single page numbers into out-of-range and in-range.
+
+    A detected number is out of range when it is below 1 or, when an expected
+    range is known, falls more than 5 outside it. Range pages and pages
+    without a detected number are skipped.
+
+    :param ocr_results: Per-page OCR results.
+    :param exp_start: Expected first page number, or None.
+    :param exp_end: Expected last page number, or None.
+    :returns: ``(out_of_range, seen_nums)`` where ``seen_nums`` maps each
+        in-range number to the list of PDF pages it appears on.
+    :rtype: tuple[list, dict]
+    """
+    out_of_range: list = []
+    seen_nums: dict = {}
+    for r in ocr_results:
+        if not r["detected"] or r.get("type") == "range":
+            continue
+        try:
+            num = int(r["detected"])
+        except (ValueError, TypeError):
+            continue
+        if num < 1:
+            out_of_range.append(r)
+        elif exp_start is not None and (
+            num < exp_start - 5 or num > exp_end + 5
+        ):
+            out_of_range.append(r)
+        else:
+            seen_nums.setdefault(num, []).append(r["pdf_page"])
+    return out_of_range, seen_nums
+
+
+def _build_analysis(
+    ocr_results: list, exp_start: int | None, exp_end: int | None
+) -> dict:
+    """Analyze ocr_results into the structure ``_build_issues`` expects.
+
+    Computes out-of-range, duplicate, sequence, and missing-page data from
+    the current page numbers without re-running OCR or opening the PDF.
+
+    :param ocr_results: Per-page OCR results (already finalized).
+    :param exp_start: Expected first page number, or None.
+    :param exp_end: Expected last page number, or None.
+    :returns: The analysis dict consumed by ``_build_issues``.
+    :rtype: dict
+    """
+    out_of_range, seen_nums = _split_detected(ocr_results, exp_start, exp_end)
+    out_of_range_pages = {r["pdf_page"] for r in out_of_range}
+    all_nums = sorted(seen_nums.keys())
+    duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
+    seq_issues = _detect_sequence_issues(ocr_results, out_of_range_pages)
+
+    range_re = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
+    range_pages = set()
+    ranges_found = [r for r in ocr_results if r.get("type") == "range"]
+    for r in ranges_found:
+        m = range_re.match(r["detected"].replace("–", "-"))
+        if m:
+            for pg in range(int(m.group(1)), int(m.group(2)) + 1):
+                range_pages.add(pg)
+
+    if exp_start is not None and all_nums:
+        missing_pages = sorted(
+            (set(range(exp_start, exp_end + 1)) - set(all_nums))
+            - range_pages
+            - {0}
+        )
+    elif all_nums:
+        missing_pages = sorted(
+            (set(range(all_nums[0], all_nums[-1] + 1)) - set(all_nums))
+            - range_pages
+            - {0}
+        )
+    else:
+        missing_pages = []
+
+    return {
+        "results": ocr_results,
+        "seq_issues": seq_issues,
+        "duplicates": duplicates,
+        "seen_nums": seen_nums,
+        "all_nums": all_nums,
+        "missing_pages": missing_pages,
+        "ranges_found": ranges_found,
+        "not_detected": [r for r in ocr_results if not r["detected"]],
+        "out_of_range": out_of_range,
+    }
+
+
+def rebuild_page_map(scan: "Scan") -> None:
+    """Rebuild ``page_map`` and ``missing_pages`` from current ocr_results.
+
+    Recomputes the page-sequence projection (duplicate flags and
+    missing-page placeholders) without re-running OCR, opening the PDF, or
+    touching Issue records, so dismissed issues are preserved. Used after a
+    manual page-number edit so the viewer reflects the change immediately;
+    Issue cards are refreshed separately by a full Recheck.
+
+    :param scan: The Scan whose page_map to rebuild.
+    """
+    ocr_results = scan.ocr_results
+    if not ocr_results:
+        return
+    try:
+        exp_start, exp_end = _parse_expected_range(scan.pdf_path)
+    except FileNotFoundError:
+        exp_start, exp_end = _parse_expected_range(scan.original_pdf.name)
+    analysis = _build_analysis(ocr_results, exp_start, exp_end)
+    result = _build_issues(
+        analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
+    )
+    scan.page_map = result["page_map"]
+    scan.missing_pages = result["missing_pages"]
+    scan.save()
+
+
 def recalculate_issues(scan: "Scan") -> None:
     """Rebuild issues from scan.ocr_results without re-running OCR.
 
@@ -1417,26 +1537,7 @@ def recalculate_issues(scan: "Scan") -> None:
 
     exp_start, exp_end = _parse_expected_range(scan.pdf_path)
 
-    def _split(results):
-        oor, s = [], {}
-        for r in results:
-            if not r["detected"] or r.get("type") == "range":
-                continue
-            try:
-                num = int(r["detected"])
-            except ValueError:
-                continue
-            if num < 1:
-                oor.append(r)
-            elif exp_start is not None and (
-                num < exp_start - 5 or num > exp_end + 5
-            ):
-                oor.append(r)
-            else:
-                s.setdefault(num, []).append(r["pdf_page"])
-        return oor, s
-
-    out_of_range, seen_nums = _split(ocr_results)
+    out_of_range, seen_nums = _split_detected(ocr_results, exp_start, exp_end)
 
     auto_corrected = []
     if out_of_range and seen_nums:
@@ -1484,49 +1585,8 @@ def recalculate_issues(scan: "Scan") -> None:
                     new_results.append(r)
                 ocr_results = new_results
                 scan.ocr_results = ocr_results
-                out_of_range, seen_nums = _split(ocr_results)
 
-    out_of_range_pages = {r["pdf_page"] for r in out_of_range}
-    all_nums = sorted(seen_nums.keys())
-    duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
-
-    seq_issues = _detect_sequence_issues(ocr_results, out_of_range_pages)
-
-    range_re = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
-    range_pages = set()
-    ranges_found = [r for r in ocr_results if r.get("type") == "range"]
-    for r in ranges_found:
-        m = range_re.match(r["detected"].replace("\u2013", "-"))
-        if m:
-            for pg in range(int(m.group(1)), int(m.group(2)) + 1):
-                range_pages.add(pg)
-
-    if exp_start is not None and all_nums:
-        missing_pages = sorted(
-            (set(range(exp_start, exp_end + 1)) - set(all_nums))
-            - range_pages
-            - {0}
-        )
-    elif all_nums:
-        missing_pages = sorted(
-            (set(range(all_nums[0], all_nums[-1] + 1)) - set(all_nums))
-            - range_pages
-            - {0}
-        )
-    else:
-        missing_pages = []
-
-    analysis = {
-        "results": ocr_results,
-        "seq_issues": seq_issues,
-        "duplicates": duplicates,
-        "seen_nums": seen_nums,
-        "all_nums": all_nums,
-        "missing_pages": missing_pages,
-        "ranges_found": ranges_found,
-        "not_detected": [r for r in ocr_results if not r["detected"]],
-        "out_of_range": out_of_range,
-    }
+    analysis = _build_analysis(ocr_results, exp_start, exp_end)
 
     result = _build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
