@@ -97,11 +97,11 @@ def compute_coverage_gaps(
     """Compute contiguous page runs not covered by any paired opinion.
 
     A page in ``[start_page, end_page]`` is covered if it falls within
-    an opinion's ``caption_page`` through ``key_page + page_count - 1``
-    span (opinion page indices are offset by ``start_page``).
+    an opinion's ``caption_page`` through ``page_end`` (or ``key_page``)
+    span, inclusive (opinion page indices are offset by ``start_page``).
 
-    :param opinions: List of opinion dicts with caption_page, key_page,
-        and page_count.
+    :param opinions: List of opinion dicts with caption_page and
+        page_end or key_page.
     :param start_page: First page in the scan's expected range.
     :param end_page: Last page in the scan's expected range.
     :returns: List of ``(start, end, count)`` tuples, one per gap run.
@@ -112,14 +112,9 @@ def compute_coverage_gaps(
 
     covered: set[int] = set()
     for op in opinions:
-        cp = op.get("caption_page", 0) + (start_page or 1)
-        kp = (
-            op.get("key_page", 0)
-            + (start_page or 1)
-            + op.get("page_count", 1)
-            - 1
-        )
-        for p in range(cp, kp + 1):
+        cp = op.get("caption_page", 0)
+        ep = op.get("page_end", op.get("key_page", cp))
+        for p in range(cp + start_page, ep + start_page + 1):
             covered.add(p)
     expected = set(range(start_page, end_page + 1))
     missing = sorted(expected - covered)
