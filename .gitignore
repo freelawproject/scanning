@@ -11,6 +11,9 @@
 *~
 *.iml
 
+# Locally-built blackletter wheel staged into the RunPod build context
+scanning/runpod/*.whl
+
 # Node
 node_modules/
 
