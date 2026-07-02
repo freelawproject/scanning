@@ -312,7 +312,12 @@ def _run_ocr(
     volume: str,
     first_page: int,
 ) -> str:
-    """Run Tesseract OCR via blackletter.
+    """Run OCR via runpod_client and return the local OCR'd PDF path.
+
+    Uses PaddleOCR on the GPU worker when ``RUNPOD_ENABLED`` is set,
+    otherwise falls back to in-process Tesseract. blackletter's
+    ``api.ocr`` builds the text layer and reports per-page progress, so
+    the previous local ``_ocr`` copy is no longer needed.
 
     :param scan_pk: Primary key of the scan (for progress updates).
     :param bitonal_path: Path to the bitonal PDF.
@@ -322,145 +327,33 @@ def _run_ocr(
     :param first_page: First logical page number in the PDF.
     :return: Path to the OCR'd PDF.
     """
+    from scanning import runpod_client
+
     with fitz.open(bitonal_path) as pdf:
         total_pages = pdf.page_count
     _update_progress(
         scan_pk,
-        f"Running Tesseract OCR (0/{total_pages} pages)...",
+        f"Running OCR (0/{total_pages} pages)...",
         current=0,
         total=total_pages,
     )
-    ocr_path = _ocr(
-        scan_pk,
+    scan = Scan.objects.get(pk=scan_pk)
+    ocr_path = runpod_client.ocr(
+        scan,
         bitonal_path,
         output_dir,
         reporter=reporter,
         volume=volume,
         first_page=first_page,
-        total_pages=total_pages,
+        progress_callback=lambda c, t, m: _update_progress(
+            scan_pk, m, current=c, total=t
+        ),
     )
-    # Persist the OCR PDF as soon as it exists (see _ensure_bitonal).
-    _push_generated_file_to_s3(scan_pk, Path(ocr_path).name)
+    # In remote mode the worker already uploaded the result to S3 via a
+    # presigned PUT; only the local fallback needs an explicit push.
+    if not settings.RUNPOD_ENABLED:
+        _push_generated_file_to_s3(scan_pk, Path(ocr_path).name)
     return ocr_path
-
-
-def _ocr(
-    scan_pk: int,
-    pdf_path: str | Path,
-    output_dir: str | Path,
-    reporter: str = "",
-    volume: str = "",
-    first_page: int = 1,
-    total_pages: int = 0,
-    language: str = "eng",
-) -> Path:
-    """OCR a PDF (add text layer via ocrmypdf/Tesseract).
-
-    Temporary local copy of blackletter's ``ocr`` function with
-    progress callback support. Will be moved to blackletter once
-    validated.
-
-    :param scan_pk: Primary key of the scan (for progress updates).
-    :param pdf_path: Path to the input PDF.
-    :param output_dir: Directory to write the OCR'd PDF into.
-    :param reporter: Reporter short name (e.g. "f3d").
-    :param volume: Volume number as a string.
-    :param first_page: First logical page number in the PDF.
-    :param total_pages: Total page count (for progress messages).
-    :param language: Tesseract language code.
-    :return: Path to the OCR'd PDF.
-    """
-    import logging
-    import time
-
-    import ocrmypdf
-    from ocrmypdf import hookimpl
-    from ocrmypdf._plugin_manager import get_plugin_manager
-
-    pdf_path = Path(pdf_path)
-    output_dir = Path(output_dir)
-
-    # Build output filename
-    last_page = first_page + total_pages - 1
-    parts = [
-        p
-        for p in [reporter, str(volume), str(first_page), str(last_page)]
-        if p
-    ]
-    scan_name = ".".join(parts) if parts else pdf_path.stem
-    output_path = output_dir / f"{scan_name}.pdf"
-
-    # Suppress noisy loggers
-    for name in (
-        "pikepdf",
-        "fontTools",
-        "fontTools.subset",
-        "fontTools.ttLib",
-        "ocrmypdf",
-    ):
-        logging.getLogger(name).setLevel(logging.ERROR)
-    for _n in list(logging.root.manager.loggerDict):
-        if _n.startswith("ocrmypdf"):
-            logging.getLogger(_n).setLevel(logging.ERROR)
-
-    # Progress bar class that updates the scan record per page
-    class _ScanProgressBar:
-        def __init__(
-            self, *, total=None, desc=None, unit=None, disable=False, **kw
-        ):
-            self._total = total or total_pages
-            self._unit = unit
-            self._desc = desc
-            self._current = 0
-            print(
-                f"  [progress] unit={unit!r} desc={desc!r} total={total}",
-                flush=True,
-            )
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def update(self, n=1, *, completed=None):
-            self._current += n
-            if self._unit == "page" and (
-                self._current % 10 == 0 or self._current == self._total
-            ):
-                _update_progress(
-                    scan_pk,
-                    f"Tesseract OCR: {self._current}/{self._total} pages...",
-                    current=self._current,
-                    total=self._total,
-                )
-
-    class _ScanProgressPlugin:
-        @hookimpl
-        def get_progressbar_class(self):
-            return _ScanProgressBar
-
-    pm = get_plugin_manager()
-    pm._pm.register(_ScanProgressPlugin())
-
-    print(
-        f"  OCR {total_pages} pages... ({os.cpu_count() or 1} CPUs)",
-        flush=True,
-    )
-    t0 = time.time()
-    ocrmypdf.ocr(
-        str(pdf_path),
-        str(output_path),
-        pdf_renderer="auto",
-        optimize=1,
-        output_type="pdf",
-        language=[language],
-        tesseract_timeout=120,
-        progress_bar=True,
-        plugin_manager=pm,
-    )
-    print(f"  OCR done ({time.time() - t0:.0f}s)", flush=True)
-    return output_path
 
 
 def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:

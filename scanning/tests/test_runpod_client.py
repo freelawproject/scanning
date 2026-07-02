@@ -329,18 +329,17 @@ class TestPoll(TestCase):
     def _poll(
         self,
         status_responses,
-        deadline_offset: float = 600.0,
+        exec_timeout: float = 600.0,
+        queue_timeout: float = 600.0,
     ):
         """Run ``_poll`` against a stubbed ``requests.get``.
 
         :param status_responses: List of (status_code, body_dict)
             tuples returned in order by requests.get.
-        :param deadline_offset: Seconds the deadline is in the future
-            from ``time.monotonic()``.
+        :param exec_timeout: Seconds the handler may run once IN_PROGRESS.
+        :param queue_timeout: Seconds to wait for a worker before giving up.
         :returns: The return value of _poll (or raises).
         """
-        import time as _time
-
         mocks = [_mock_response(c, b) for c, b in status_responses]
         with (
             patch("scanning.runpod_client.requests.get", side_effect=mocks),
@@ -355,7 +354,8 @@ class TestPoll(TestCase):
                 headers={},
                 job_id="job-1",
                 action="detect",
-                deadline=_time.monotonic() + deadline_offset,
+                exec_timeout=exec_timeout,
+                queue_timeout=queue_timeout,
                 progress_callback=None,
             )
 
@@ -448,29 +448,68 @@ class TestPoll(TestCase):
         with self.assertRaises(runpod_client.RunpodError):
             self._poll([(200, {"status": "COMPLETED", "output": "a string"})])
 
-    def test_deadline_exceeded_raises_and_cancels(self):
-        """When monotonic > deadline, _poll calls /cancel and raises."""
-        import time as _time
+    def test_queue_deadline_exceeded_requeues_and_cancels(self):
+        """Queue-wait budget exceeded before start -> cancel + transient.
 
-        # Don't use the _poll helper here: it adds its own patches
-        # that shadow the requests.post mock we need to inspect.
+        A job that never gets a worker must be re-queued (RunpodTransientError),
+        not permanently failed, and the queue wait must not be charged as
+        execution time.
+        """
         with (
+            patch(
+                "scanning.runpod_client.requests.get",
+                return_value=_mock_response(200, {"status": "IN_QUEUE"}),
+            ),
             patch(
                 "scanning.runpod_client.requests.post",
                 return_value=_mock_response(200, {}),
             ) as mock_post,
             patch("scanning.runpod_client.time.sleep", return_value=None),
         ):
-            with self.assertRaises(runpod_client.RunpodError):
+            with self.assertRaises(runpod_client.RunpodTransientError):
                 runpod_client._poll(
                     base_url="https://api/run/endpoint",
                     headers={},
                     job_id="job-1",
                     action="detect",
-                    deadline=_time.monotonic() - 1.0,
+                    exec_timeout=600,
+                    queue_timeout=-1.0,
                     progress_callback=None,
                 )
-            # At least one POST to /cancel/{job_id}.
+            called_urls = [c.args[0] for c in mock_post.call_args_list]
+            self.assertTrue(any("/cancel/" in u for u in called_urls))
+
+    def test_execution_deadline_exceeded_raises_and_cancels(self):
+        """Execution budget exceeded after IN_PROGRESS -> cancel + RunpodError.
+
+        Once the job starts running, overrunning the execution budget is a
+        hard failure (re-running would just time out again), so it raises the
+        base RunpodError, not the transient subclass.
+        """
+        with (
+            patch(
+                "scanning.runpod_client.requests.get",
+                return_value=_mock_response(200, {"status": "IN_PROGRESS"}),
+            ),
+            patch(
+                "scanning.runpod_client.requests.post",
+                return_value=_mock_response(200, {}),
+            ) as mock_post,
+            patch("scanning.runpod_client.time.sleep", return_value=None),
+        ):
+            with self.assertRaises(runpod_client.RunpodError) as ctx:
+                runpod_client._poll(
+                    base_url="https://api/run/endpoint",
+                    headers={},
+                    job_id="job-1",
+                    action="detect",
+                    exec_timeout=-1.0,
+                    queue_timeout=600,
+                    progress_callback=None,
+                )
+            self.assertNotIsInstance(
+                ctx.exception, runpod_client.RunpodTransientError
+            )
             called_urls = [c.args[0] for c in mock_post.call_args_list]
             self.assertTrue(any("/cancel/" in u for u in called_urls))
 

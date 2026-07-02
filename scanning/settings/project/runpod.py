@@ -20,10 +20,18 @@ RUNPOD_ENDPOINT_ID = env.str("RUNPOD_ENDPOINT_ID", default="")
 # RunPod API key. Treat as a secret; never log.
 RUNPOD_API_KEY = env.str("RUNPOD_API_KEY", default="")
 
-# Hard wall-clock ceiling (seconds) for the combined submit + poll
-# loop. Includes cold start + queue + execution. Client cancels the
-# job and raises if exceeded.
-RUNPOD_REQUEST_TIMEOUT = env.int("RUNPOD_REQUEST_TIMEOUT", default=1800)
+# Ceiling (seconds) on how long the handler may *run* once a worker picks
+# up the job (status IN_PROGRESS). Does not include the queue wait, which is
+# bounded separately by RUNPOD_QUEUE_TIMEOUT, so a serverless cold start
+# never eats into execution time. Client cancels the job and raises if
+# exceeded.
+RUNPOD_REQUEST_TIMEOUT = env.int("RUNPOD_REQUEST_TIMEOUT", default=3600)
+
+# Ceiling (seconds) on how long to wait for a worker to pick the job up
+# (status IN_QUEUE) before giving up. Serverless cold starts with no warm
+# workers can take several minutes; exceeding this re-queues the scan
+# (transient) rather than failing it.
+RUNPOD_QUEUE_TIMEOUT = env.int("RUNPOD_QUEUE_TIMEOUT", default=1200)
 
 # Retries on transport errors when submitting a job (network blips,
 # 5xx from the RunPod API). Terminal job failures are NOT retried.

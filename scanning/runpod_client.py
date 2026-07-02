@@ -203,6 +203,83 @@ def analyze(
     return {"results": result["results"]}
 
 
+def ocr(
+    scan: Scan,
+    pdf_path: str | Path,
+    output_dir: str | Path,
+    reporter: str = "",
+    volume: str = "",
+    first_page: int = 1,
+    language: str = "eng",
+    progress_callback: ProgressCallback | None = None,
+) -> str:
+    """Add a text layer to a PDF, remotely (PaddleOCR/GPU) or locally.
+
+    In remote mode the input PDF is uploaded to S3 (if needed), OCR'd on
+    the GPU worker with PaddleOCR, and the worker uploads the result back
+    to the scan's processing prefix via a presigned PUT; this function
+    then downloads it into *output_dir*. In local mode it falls back to
+    in-process Tesseract OCR (PaddleOCR on CPU is unreliable; the GPU
+    worker is the supported PaddleOCR path).
+
+    :param scan: The Scan owning this job.
+    :param pdf_path: Local path to the input (bitonal) PDF.
+    :param output_dir: Directory the OCR'd PDF is written into.
+    :param reporter: Reporter short name (for the output filename).
+    :param volume: Volume number (for the output filename).
+    :param first_page: First logical page number (for the filename).
+    :param language: OCR language code.
+    :param progress_callback: Optional ``callable(current, total, msg)``.
+        Remote mode emits only coarse ``(None, None, status)`` events.
+    :returns: Local filesystem path to the OCR'd PDF.
+    :rtype: str
+    :raises RunpodError: On terminal remote failure.
+    """
+    import fitz
+
+    output_dir = Path(output_dir)
+    with fitz.open(str(pdf_path)) as doc:
+        pages = doc.page_count
+    last_page = first_page + pages - 1
+    parts = [
+        p
+        for p in [reporter, str(volume), str(first_page), str(last_page)]
+        if p
+    ]
+    stem = ".".join(parts) if parts else Path(pdf_path).stem
+    output_name = f"{stem}.pdf"
+
+    if not _remote_enabled():
+        return _ocr_local(
+            pdf_path,
+            output_dir,
+            reporter,
+            volume,
+            first_page,
+            language,
+            progress_callback,
+        )
+
+    pdf_url = _ensure_presigned_url(scan, pdf_path)
+    output_url, output_key = _presigned_put_url(scan, output_name)
+    _invoke(
+        action="ocr",
+        scan=scan,
+        payload={
+            "pdf_url": pdf_url,
+            "output_url": output_url,
+            "language": language,
+        },
+        progress_callback=progress_callback,
+    )
+    # The worker uploaded the OCR'd PDF to output_key; pull it down so
+    # downstream pipeline steps (pairing, redaction) can open it locally.
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    dest = output_dir / output_name
+    boto3.client("s3").download_file(bucket, output_key, str(dest))
+    return str(dest)
+
+
 # ── Local fallback ──────────────────────────────────────────────────
 def _remote_enabled() -> bool:
     """Return True if remote RunPod dispatch should be used.
@@ -271,6 +348,45 @@ def _analyze_local(
     return {"results": result["results"]}
 
 
+def _ocr_local(
+    pdf_path: str | Path,
+    output_dir: Path,
+    reporter: str,
+    volume: str,
+    first_page: int,
+    language: str,
+    progress_callback: ProgressCallback | None,
+) -> str:
+    """In-process fallback for :func:`ocr` (Tesseract; no GPU needed).
+
+    Uses Tesseract rather than PaddleOCR: PaddleOCR on CPU is unreliable
+    (oneDNN crash), and the GPU worker is the supported Paddle path.
+
+    :param pdf_path: Local input PDF path.
+    :param output_dir: Directory the OCR'd PDF is written into.
+    :param reporter: Reporter short name (for the output filename).
+    :param volume: Volume number (for the output filename).
+    :param first_page: First logical page number (for the filename).
+    :param language: OCR language code.
+    :param progress_callback: Optional per-page callback.
+    :returns: Local filesystem path to the OCR'd PDF.
+    :rtype: str
+    """
+    from blackletter.api import ocr as bl_ocr
+
+    out = bl_ocr(
+        str(pdf_path),
+        str(output_dir),
+        reporter=reporter,
+        volume=volume,
+        first_page=first_page,
+        language=language,
+        engine="tesseract",
+        progress_callback=progress_callback,
+    )
+    return str(out)
+
+
 # ── Remote: S3 presigning ───────────────────────────────────────────
 def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
     """Upload ``pdf_path`` to the scan's S3 processing prefix if
@@ -334,6 +450,44 @@ def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
     )
 
 
+def _presigned_put_url(scan: Scan, output_name: str) -> tuple[str, str]:
+    """Return a presigned PUT URL + key for an output under the scan's
+    S3 processing prefix.
+
+    The worker uploads the OCR'd PDF to this URL (it has no AWS
+    credentials of its own). The Content-Type is pinned to
+    ``application/pdf`` and must match the worker's PUT header.
+
+    :param scan: The Scan owning the file.
+    :param output_name: Basename for the output object.
+    :returns: ``(presigned_put_url, s3_key)``.
+    :rtype: tuple[str, str]
+    :raises RunpodError: If S3 credentials are missing.
+    """
+    from scanning import s3_sync
+    from scanning.utils import has_s3_credentials
+
+    if not has_s3_credentials():
+        raise RunpodError(
+            "RUNPOD_ENABLED is true but no AWS credentials are configured; "
+            "cannot presign an upload URL for the worker."
+        )
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    key = f"{s3_sync.s3_processing_prefix(scan)}{output_name}"
+    ttl = int(settings.RUNPOD_PRESIGNED_TTL)
+    url = boto3.client("s3").generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": bucket,
+            "Key": key,
+            "ContentType": "application/pdf",
+        },
+        ExpiresIn=ttl,
+    )
+    return url, key
+
+
 # ── Remote: invocation + polling ────────────────────────────────────
 def _invoke(
     action: str,
@@ -365,14 +519,25 @@ def _invoke(
         "input": {"action": action, "scan_pk": scan.pk, **payload},
     }
 
-    deadline = time.monotonic() + int(settings.RUNPOD_REQUEST_TIMEOUT)
+    # RUNPOD_REQUEST_TIMEOUT bounds how long the handler may *run*. Waiting
+    # for a serverless worker to spin up (a cold start with no warm workers)
+    # can take several minutes and must not eat into that execution budget,
+    # so the queue wait is bounded separately by RUNPOD_QUEUE_TIMEOUT.
+    exec_timeout = int(settings.RUNPOD_REQUEST_TIMEOUT)
+    queue_timeout = int(settings.RUNPOD_QUEUE_TIMEOUT)
     max_retries = int(settings.RUNPOD_MAX_RETRIES)
 
     job_id = _submit(
         base_url, headers, body, action, max_retries, progress_callback
     )
     return _poll(
-        base_url, headers, job_id, action, deadline, progress_callback
+        base_url,
+        headers,
+        job_id,
+        action,
+        exec_timeout,
+        queue_timeout,
+        progress_callback,
     )
 
 
@@ -442,25 +607,33 @@ def _poll(
     headers: dict[str, str],
     job_id: str,
     action: str,
-    deadline: float,
+    exec_timeout: int,
+    queue_timeout: int,
     progress_callback: ProgressCallback | None,
 ) -> dict:
     """Poll ``/status/{job_id}`` until terminal, with backoff.
 
     Poll cadence starts at 1 s, doubles each idle tick, capped at 15 s.
-    Exceeding ``deadline`` triggers ``/cancel/{job_id}`` and raises.
+
+    The deadline is two-phase: while the job is still waiting for a worker
+    it is bounded by ``queue_timeout``; the moment it transitions to
+    IN_PROGRESS the clock is reset to ``exec_timeout``, so a long serverless
+    cold-start queue wait never consumes the handler's execution budget.
+    Exceeding either deadline triggers ``/cancel/{job_id}`` and raises.
 
     Every poll logs at DEBUG (enable with ``SCANNING_LOG_LEVEL=DEBUG``);
     status transitions log at INFO.
 
+    :param exec_timeout: Seconds the handler may run once IN_PROGRESS.
+    :param queue_timeout: Seconds to wait for a worker before giving up.
     :returns: The handler's ``output`` dict on COMPLETED.
     :rtype: dict
-    :raises RunpodError: On FAILED / TIMED_OUT / CANCELLED / deadline
-        exceeded / malformed output.
-    :raises RunpodTransientError: On HTTP 404 from ``/status`` (the
-        job was either aged out of RunPod's retention window or
-        discarded after internal retries; the inputs are still on S3
-        so a fresh submit will re-run the work).
+    :raises RunpodError: On FAILED / TIMED_OUT / CANCELLED / execution
+        deadline exceeded / malformed output.
+    :raises RunpodTransientError: On HTTP 404 from ``/status`` (the job
+        aged out or was discarded), or if the queue-wait deadline is
+        exceeded before the job starts (no worker became available); the
+        inputs are still on S3 so a fresh submit re-runs the work.
     """
     # Happy-path cadence: 1 s, 2 s, 4 s, 8 s, 15 s, 15 s, ... Advances
     # on every successful poll that returns a non-terminal status.
@@ -472,11 +645,23 @@ def _poll(
     last_status: str | None = None
     label = _ACTION_LABELS.get(action, action)
 
+    # Phase 1: waiting for a worker. Reset to the execution budget once the
+    # job starts running (see the IN_PROGRESS handling below).
+    started = False
+    deadline = time.monotonic() + queue_timeout
+
     while True:
         if time.monotonic() > deadline:
             _cancel(base_url, headers, job_id)
-            raise RunpodError(
-                f"RunPod job {job_id} exceeded RUNPOD_REQUEST_TIMEOUT"
+            if started:
+                raise RunpodError(
+                    f"RunPod job {job_id} exceeded execution budget "
+                    f"(RUNPOD_REQUEST_TIMEOUT={exec_timeout}s)"
+                )
+            raise RunpodTransientError(
+                f"RunPod job {job_id} waited longer than "
+                f"RUNPOD_QUEUE_TIMEOUT={queue_timeout}s without starting "
+                "(no worker available); re-queueing for the next tick."
             )
 
         try:
@@ -518,6 +703,18 @@ def _poll(
 
         status = body.get("status")
         logger.debug("poll runpod job %s -> %s", job_id, status)
+
+        # First time the worker picks up the job, switch from the queue-wait
+        # budget to the execution budget so cold-start time isn't charged
+        # against the handler's run time.
+        if status == "IN_PROGRESS" and not started:
+            started = True
+            deadline = time.monotonic() + exec_timeout
+            logger.info(
+                "runpod job %s running; execution budget %ds",
+                job_id,
+                exec_timeout,
+            )
 
         if status == "COMPLETED":
             output = body.get("output")
