@@ -2,9 +2,10 @@
 #
 # GPU worker image for RunPod Serverless.
 #
-# Runs the blackletter detect and analyze_pdf steps only. No Django,
-# no AWS credentials, no DB client. Weights (YOLO small/medium/large
-# + PaddleOCR PP-OCRv5) are baked in so cold start skips the network.
+# Runs the blackletter detect, analyze, and OCR (PaddleOCR text-layer)
+# steps. No Django, no AWS credentials, no DB client. Weights (YOLO
+# small/medium/large + PaddleOCR PP-OCRv5) are baked in so cold start
+# skips the network.
 #
 # Build from the scanning/runpod/ directory:
 #     docker build -t blackletter-gpu-worker:local scanning/runpod/
@@ -87,6 +88,28 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-cache
 
+# ── Local blackletter wheel (provides the native PaddleOCR engine) ──
+# Overlay the locally-built blackletter wheel (staged into this build
+# context as blackletter-*.whl) on top of the resolved deps, so the
+# worker runs in-progress blackletter changes, including
+# blackletter/paddle_ocr.py (the engine="paddle" OCR engine). --no-deps
+# leaves the already-resolved dependency set (paddleocr,
+# paddlepaddle-gpu, ocrmypdf) untouched. Rebuild the wheel
+# (`uv build --wheel` in the blackletter repo) and re-stage it here to
+# pick up new changes. The engine reuses the PP-OCRv5_server models
+# baked below, so there is no model download at runtime.
+COPY blackletter-*.whl /tmp/
+RUN uv pip install --python /opt/venv/bin/python --no-deps --force-reinstall \
+      /tmp/blackletter-*.whl \
+ && rm /tmp/blackletter-*.whl
+
+# Fail the build early if `paddle` is not the CUDA build (e.g. a stray CPU
+# `paddlepaddle` reinstall clobbered `paddlepaddle-gpu`). This is what
+# caused the runtime CPU/oneDNN crash before --no-deps was added above.
+RUN python -c "import paddle, sys; ok = paddle.is_compiled_with_cuda(); \
+print('paddle.is_compiled_with_cuda() =', ok); \
+sys.exit(0 if ok else 'ERROR: paddlepaddle is not CUDA-enabled (CPU build clobbered paddlepaddle-gpu)')"
+
 # ── Bake YOLO large.pt into the image ───────────────────────────────
 # ``ensure_weights`` resolves bundled small/medium and downloads large
 # from HuggingFace. Retries 3 times so a flaky HF doesn't fail the
@@ -106,7 +129,10 @@ from ultralytics import YOLO; YOLO(str(p)); \
 print(f'large.pt OK: {p.stat().st_size // 1024 // 1024} MB')"
 
 # ── Bake PaddleOCR PP-OCRv5 weights ─────────────────────────────────
-# First instantiation downloads det + rec models into /opt/paddlex.
+# Both analyze (page numbers) and the OCR text layer use the server
+# detector + server recognizer, so one instantiation downloads
+# server_det + server_rec into /opt/paddlex and nothing is fetched at
+# runtime.
 RUN python -c "\
 from paddleocr import PaddleOCR; \
 PaddleOCR(text_detection_model_name='PP-OCRv5_server_det', \
@@ -117,6 +143,14 @@ PaddleOCR(text_detection_model_name='PP-OCRv5_server_det', \
           enable_mkldnn=False); \
 print('PaddleOCR warmup OK')" \
  && find /opt/paddlex -name '*.pdiparams' | head -5
+
+# Put /usr/sbin on PATH for the RUNTIME so the NVIDIA container entrypoint's
+# `ldconfig` can run and register the driver libs RunPod bind-mounts at start.
+# Without it the entrypoint logs "ldconfig: command not found" / "NVIDIA
+# Driver was not detected", the build-time libcuda stub is never replaced in
+# the linker cache, and paddlepaddle-gpu silently falls back to CPU (0% GPU
+# use). Set late so the heavy cached layers above are not invalidated.
+ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 COPY handler.py .
 

@@ -679,9 +679,96 @@ def _action_analyze(inputs: dict, tmp_dir: Path) -> dict:
     }
 
 
+def _upload_pdf(url: str, path: Path) -> None:
+    """PUT a local PDF to a presigned S3 URL.
+
+    :param url: Presigned ``put_object`` URL (Content-Type
+        ``application/pdf``).
+    :param path: Local PDF file to upload.
+    """
+    with open(path, "rb") as fh:
+        resp = requests.put(
+            url,
+            data=fh,
+            headers={"Content-Type": "application/pdf"},
+            timeout=DOWNLOAD_TIMEOUT,
+        )
+    resp.raise_for_status()
+
+
+def _action_ocr(inputs: dict, tmp_dir: Path) -> dict:
+    """Add a text layer with PaddleOCR (GPU) and upload the result.
+
+    Runs ``blackletter.api.ocr`` with ``engine="paddle"`` (blackletter's
+    native PaddleOCR engine, which caches the model, uses the baked
+    PP-OCRv5 server models, and auto-detects the GPU), then uploads the
+    OCR'd PDF to the caller's presigned PUT URL. The worker holds no AWS
+    credentials, so output goes back via the presigned URL only.
+
+    :param inputs: Handler input payload. Required: ``pdf_url``
+        (presigned GET of the input PDF) and ``output_url`` (presigned
+        PUT for the OCR'd PDF). Optional: ``language`` (default "eng").
+    :param tmp_dir: Per-job scratch directory.
+    :returns: ``{"page_count": int, "duration_ms": int}``.
+    :rtype: dict
+    """
+    from blackletter.api import ocr as bl_ocr
+
+    pdf_url = inputs["pdf_url"]
+    output_url = inputs["output_url"]
+    language = inputs.get("language", "eng")
+
+    # Log whether PaddleOCR can see the GPU (CPU fallback is slow).
+    try:
+        import paddle
+
+        logger.info(
+            "paddle GPU: compiled_with_cuda=%s device_count=%s",
+            paddle.device.is_compiled_with_cuda(),
+            paddle.device.cuda.device_count(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("paddle GPU check failed: %s", exc)
+
+    pdf_path = tmp_dir / "input.pdf"
+    _download_pdf(pdf_url, pdf_path)
+
+    pages = _validate_pdf(pdf_path)
+    if pages > MAX_PAGES:
+        raise ValueError(
+            f"PDF has {pages} pages, exceeds MAX_PAGES={MAX_PAGES}"
+        )
+
+    out_dir = tmp_dir / "out"
+    out_dir.mkdir()
+
+    def _log_progress(current, total, message):
+        logger.info("ocr progress: %s/%s pages", current, total)
+
+    t0 = time.monotonic()
+    ocr_path = bl_ocr(
+        pdf_path,
+        out_dir,
+        language=language,
+        engine="paddle",
+        progress_callback=_log_progress,
+    )
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    _upload_pdf(output_url, Path(ocr_path))
+    logger.info(
+        "ocr OK: %d pages in %d ms, uploaded %s",
+        pages,
+        duration_ms,
+        Path(ocr_path).name,
+    )
+    return {"page_count": pages, "duration_ms": duration_ms}
+
+
 _ACTIONS = {
     "detect": _action_detect,
     "analyze": _action_analyze,
+    "ocr": _action_ocr,
 }
 
 
