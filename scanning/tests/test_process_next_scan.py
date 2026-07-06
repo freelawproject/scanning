@@ -33,7 +33,10 @@ class TestProcessNextScanRetry(TestCase):
             patch.object(
                 Command,
                 "_recover_stale",
-                side_effect=[OperationalError("SSL error: unexpected eof"), None],
+                side_effect=[
+                    OperationalError("SSL error: unexpected eof"),
+                    None,
+                ],
             ),
             patch(
                 "scanning.management.commands.process_next_scan.time.sleep"

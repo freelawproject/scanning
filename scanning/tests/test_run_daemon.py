@@ -98,9 +98,7 @@ class TestRunDaemonSchedule(TestCase):
         # have logged at ERROR) mentioning the transient DB error.
         self.assertTrue(cmd.shutdown)
         self.assertGreaterEqual(len(logs.records), 1)
-        self.assertTrue(
-            all(r.levelname == "WARNING" for r in logs.records)
-        )
+        self.assertTrue(all(r.levelname == "WARNING" for r in logs.records))
         self.assertTrue(
             all("transient DB error" in r.getMessage() for r in logs.records)
         )
