@@ -37,13 +37,17 @@ class UvicornWorker(BaseUvicornWorker):
         every signal to ``SIG_DFL`` here and only re-installs SIGUSR1, so under
         this worker class SIGABRT would otherwise kill the process with no
         Python running and nothing sent to Sentry. Restore a handler that
-        captures the current stacks first. Best-effort: it runs on the main
-        thread and needs the GIL, so a worker fully wedged in GIL-holding C
-        code may die before it runs — but in practice fitz/MuPDF releases the
-        GIL during heavy work, so the handler usually gets a slice to report.
+        captures the current stacks first. The Python handler is best-effort:
+        it runs on the main thread and needs the GIL, so a worker fully wedged
+        in GIL-holding C code may die before it runs. To cover that case we
+        also re-arm faulthandler for SIGABRT with ``chain=True``: its C-level
+        handler dumps all thread stacks to stderr (pod logs) *without* the GIL,
+        then chains to the Python ``handle_abort`` for the Sentry report once
+        the GIL is available.
         """
         super().init_signals()
         signal.signal(signal.SIGABRT, self.handle_abort)
+        faulthandler.register(signal.SIGABRT, chain=True)
 
     def handle_abort(self, sig: int, frame: Any) -> None:
         self._report_timeout_to_sentry()
@@ -67,7 +71,11 @@ class UvicornWorker(BaseUvicornWorker):
                     "gunicorn WORKER TIMEOUT: worker aborted after --timeout",
                     level="fatal",
                 )
-            sentry_sdk.flush(timeout=2.0)
+            # gunicorn's arbiter escalates SIGABRT to SIGKILL on its next
+            # murder-loop cycle (~1s later). Keep the flush sub-second so the
+            # event has a chance to ship before SIGKILL and so it doesn't stall
+            # the graceful exit (worker_abort + sys.exit(1)) in handle_abort.
+            sentry_sdk.flush(timeout=0.7)
         except Exception:
             # Never let reporting crash the abort/exit path, but don't swallow
             # silently: print to stderr (pod logs), which is signal-safe unlike
