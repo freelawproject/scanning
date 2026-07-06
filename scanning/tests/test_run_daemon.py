@@ -2,6 +2,7 @@
 
 from unittest.mock import patch
 
+from django.db import OperationalError
 from django.test import TestCase, override_settings
 
 from scanning.factories import ScanFactory
@@ -64,6 +65,44 @@ class TestRunDaemonSchedule(TestCase):
         self.assertGreaterEqual(len(calls), 1)
         self.assertIn(
             calls[0], {"process_next_scan", "cleanup_processing_tmp"}
+        )
+
+    def test_transient_db_error_logged_as_warning_not_exception(self):
+        """A transient OperationalError from a task is a WARNING, not an error.
+
+        Downgrading it keeps a self-recovering DB blip out of Sentry's error
+        stream while the loop continues ticking (issue #116).
+        """
+        cmd = Command()
+        cmd.shutdown = False
+
+        def failing_call_command(name, *a, **kw):
+            cmd.shutdown = True
+            raise OperationalError("SSL error: unexpected eof while reading")
+
+        with (
+            patch(
+                "scanning.management.commands.run_daemon.call_command",
+                side_effect=failing_call_command,
+            ),
+            patch("scanning.management.commands.run_daemon.signal.signal"),
+            patch("scanning.management.commands.run_daemon.time.sleep"),
+            self.assertLogs(
+                "scanning.management.commands.run_daemon", level="WARNING"
+            ) as logs,
+        ):
+            cmd.handle()
+
+        # Both scheduled tasks are due on the first tick, so one warning per
+        # task; the point is every record is a WARNING (logger.exception would
+        # have logged at ERROR) mentioning the transient DB error.
+        self.assertTrue(cmd.shutdown)
+        self.assertGreaterEqual(len(logs.records), 1)
+        self.assertTrue(
+            all(r.levelname == "WARNING" for r in logs.records)
+        )
+        self.assertTrue(
+            all("transient DB error" in r.getMessage() for r in logs.records)
         )
 
 
