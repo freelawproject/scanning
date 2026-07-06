@@ -37,17 +37,20 @@ class UvicornWorker(BaseUvicornWorker):
         every signal to ``SIG_DFL`` here and only re-installs SIGUSR1, so under
         this worker class SIGABRT would otherwise kill the process with no
         Python running and nothing sent to Sentry. Restore a handler that
-        captures the current stacks first. The Python handler is best-effort:
-        it runs on the main thread and needs the GIL, so a worker fully wedged
-        in GIL-holding C code may die before it runs. To cover that case we
-        also re-arm faulthandler for SIGABRT with ``chain=True``: its C-level
-        handler dumps all thread stacks to stderr (pod logs) *without* the GIL,
-        then chains to the Python ``handle_abort`` for the Sentry report once
-        the GIL is available.
+        captures the current stacks first. Best-effort: it runs on the main
+        thread and needs the GIL, so a worker fully wedged in GIL-holding C
+        code may die before it runs — but in practice fitz/MuPDF releases the
+        GIL during heavy work, so the handler usually gets a slice to report.
+
+        We can't hand SIGABRT to faulthandler for a GIL-free fallback:
+        ``faulthandler.register`` rejects the fatal signals (SIGABRT included)
+        with a RuntimeError, and ``faulthandler.enable`` (see init_process)
+        only dumps and re-raises to SIG_DFL with no chained Python callback.
+        A fully GIL-wedged worker therefore loses the Sentry event, matching
+        the existing SIGSEGV/SIGBUS story where only the stderr dump survives.
         """
         super().init_signals()
         signal.signal(signal.SIGABRT, self.handle_abort)
-        faulthandler.register(signal.SIGABRT, chain=True)
 
     def handle_abort(self, sig: int, frame: Any) -> None:
         self._report_timeout_to_sentry()
