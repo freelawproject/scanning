@@ -26,8 +26,9 @@ jobs:
           push: false
           tags: scanning:latest
           outputs: type=docker,dest=/tmp/scanning.tar
-          build-args: |
-            BUILD_ENV=dev
+          # Test the dev stage: the suite runs with DEVELOPMENT=True, which
+          # pulls in dev-only apps (django_extensions, ...) absent from prod.
+          target: dev
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
