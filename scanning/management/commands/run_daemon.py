@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
+from django.db import OperationalError
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,16 @@ class Command(BaseCommand):
                     continue
                 try:
                     call_command(task.name)
+                except OperationalError as exc:
+                    # Transient DB blip (e.g. a lost TLS handshake on a
+                    # fresh connection). Self-recovering; log at WARNING so
+                    # it stays a breadcrumb and doesn't create a Sentry
+                    # error event. See issue #116.
+                    logger.warning(
+                        "Scheduled task %s hit a transient DB error: %s",
+                        task.name,
+                        exc,
+                    )
                 except Exception:
                     logger.exception("Scheduled task %s failed", task.name)
                 task.mark_ran(time.monotonic())
