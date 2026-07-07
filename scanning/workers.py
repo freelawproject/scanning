@@ -26,6 +26,11 @@ class UvicornWorker(BaseUvicornWorker):
         SIGABRT handler wired up in init_signals().
         """
         faulthandler.enable()
+        # Launch the in-flight-request and concurrency monitor thread (issue
+        # #115). Post-fork so it lives in the worker, not the preloaded master.
+        from scanning.observability import start_monitor
+
+        start_monitor()
         super().init_process()
 
     def init_signals(self) -> None:
