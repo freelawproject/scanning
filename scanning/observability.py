@@ -90,6 +90,40 @@ def _snapshot_registry() -> list[tuple[int, InFlightRequest]]:
         return list(_registry.items())
 
 
+def snapshot_for_report(now: float | None = None) -> list[dict]:
+    """Return a JSON-serializable snapshot of in-flight requests for Sentry.
+
+    Called from :meth:`scanning.workers.UvicornWorker._report_timeout_to_sentry`
+    (which runs in the SIGABRT handler on the *main* thread) to attach the
+    wedging request's endpoint, ``scan_pk`` and user to the WORKER TIMEOUT
+    event. Sentry breadcrumbs are per-thread, so the monitor thread's warnings
+    never reach that event; the registry is a lock-guarded module global, so
+    reading it directly from the main thread is the one way this attribution
+    lands in Sentry rather than only in the pod logs.
+
+    Only reads the lock-guarded registry — never request/DB state — so it is
+    safe to call from any thread. The main thread never holds ``_registry_lock``
+    (only request/monitor threads do, briefly), so this cannot self-deadlock in
+    the signal handler. ``now`` defaults to ``time.monotonic()``; the newest
+    (longest-running) request is listed first.
+    """
+    if now is None:
+        now = time.monotonic()
+    snapshot = [
+        {
+            "thread": ident,
+            "method": entry.method,
+            "path": entry.path,
+            "scan_pk": entry.scan_pk,
+            "user": entry.user,
+            "elapsed_s": round(now - entry.start, 1),
+        }
+        for ident, entry in _snapshot_registry()
+    ]
+    snapshot.sort(key=lambda item: item["elapsed_s"], reverse=True)
+    return snapshot
+
+
 # ---------------------------------------------------------------------------
 # The monitor
 # ---------------------------------------------------------------------------

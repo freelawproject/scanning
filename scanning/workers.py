@@ -67,14 +67,25 @@ class UvicornWorker(BaseUvicornWorker):
         try:
             import sentry_sdk
 
+            from scanning import observability
+
             dump = []
             for thread_id, thread_frame in sys._current_frames().items():
                 dump.append(f"Thread {thread_id}:")
                 dump.append("".join(traceback.format_stack(thread_frame)))
             stacks = "\n".join(dump)
 
+            # Attribution for *which* request wedged the worker. The monitor
+            # thread's hung-request warnings can't reach this event — Sentry
+            # breadcrumbs are per-thread and this runs on the main thread — but
+            # the in-flight registry is a lock-guarded module global we can read
+            # directly here. Without this the endpoint/scan_pk/user only ever
+            # appear in the pod logs (issue #115).
+            in_flight = observability.snapshot_for_report()
+
             with sentry_sdk.new_scope() as scope:
                 scope.set_extra("all_thread_stacks", stacks)
+                scope.set_extra("in_flight_requests", in_flight)
                 sentry_sdk.capture_message(
                     "gunicorn WORKER TIMEOUT: worker aborted after --timeout",
                     level="fatal",
