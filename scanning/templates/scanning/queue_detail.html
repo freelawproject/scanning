@@ -82,7 +82,12 @@
 <!-- Upload form -->
 <div class="card mb-6">
   <h2 class="text-sm font-bold mb-3">Upload a scan</h2>
-  <form id="upload-form" method="post" action="{% url 'queue_upload' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}" enctype="multipart/form-data">
+  <form id="upload-form" method="post"
+        action="{% url 'queue_upload' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}"
+        data-presign-url="{% url 'presign_scan_upload' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}"
+        data-confirm-url="{% url 'confirm_scan_upload' reporter_slug=volume.reporter.short_name vol=volume.volume_number %}"
+        data-direct-upload="{% if direct_upload_enabled %}1{% else %}0{% endif %}"
+        enctype="multipart/form-data">
     {% csrf_token %}
     <input type="hidden" name="new_scan" value="1">
     <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
@@ -210,22 +215,38 @@
     setButtonsDisabled(false);
   }
 
-  form.addEventListener('submit', function (e) {
-    e.preventDefault();
+  function setProgress(pct) {
+    progressBar.style.width = pct + '%';
+    progressPct.textContent = pct + '%';
+  }
 
-    var formData = new FormData(form);
-    var submitter = e.submitter || lastClickedButton;
-    if (submitter && submitter.name) {
-      formData.append(submitter.name, submitter.value);
-    }
-
+  function startProgress() {
     errorEl.classList.add('hidden');
     progressLabel.textContent = 'Uploading…';
-    progressBar.style.width = '0%';
-    progressPct.textContent = '0%';
+    setProgress(0);
     progressWrap.classList.remove('hidden');
     setButtonsDisabled(true);
     uploading = true;
+  }
+
+  function csrfToken() {
+    var input = form.querySelector('[name=csrfmiddlewaretoken]');
+    return input ? input.value : '';
+  }
+
+  function submitterField(e) {
+    var submitter = e.submitter || lastClickedButton;
+    if (submitter && submitter.name) {
+      return { name: submitter.name, value: submitter.value };
+    }
+    return { name: 'action', value: 'upload_only' };
+  }
+
+  // Classic path: stream the file through Django (local dev, or when
+  // S3 direct upload is disabled). The server saves it before responding.
+  function classicUpload(e, action) {
+    var formData = new FormData(form);
+    formData.append(action.name, action.value);
 
     var xhr = new XMLHttpRequest();
     // form.action would resolve to the submit buttons (name="action"),
@@ -236,12 +257,10 @@
 
     xhr.upload.addEventListener('progress', function (ev) {
       if (!ev.lengthComputable) return;
-      var pct = Math.round((ev.loaded / ev.total) * 100);
-      progressBar.style.width = pct + '%';
-      progressPct.textContent = pct + '%';
-      if (pct >= 100) {
+      setProgress(Math.round((ev.loaded / ev.total) * 100));
+      if (ev.loaded >= ev.total) {
         // The browser is done sending; the server is still saving the
-        // file (and pushing it to S3 in prod) before it responds.
+        // file before it responds.
         progressLabel.textContent = 'Processing upload, this may take a while…';
       }
     });
@@ -254,12 +273,97 @@
         showError('Upload failed (status ' + xhr.status + '). Please try again.');
       }
     });
-
     xhr.addEventListener('error', function () {
       showError('Upload failed: network error. Please check your connection and try again.');
     });
-
     xhr.send(formData);
+  }
+
+  // Direct path: presign -> upload straight to S3 -> confirm. Keeps the
+  // (up to 2 GB) file off the Django request path.
+  function directUpload(e, action, file) {
+    // Step 1: ask Django for a presigned POST. Reuse the form fields
+    // (scan metadata) but swap the file itself for its metadata.
+    var meta = new FormData(form);
+    meta.delete('original_pdf');
+    meta.append('filename', file.name);
+    meta.append('content_type', file.type || 'application/pdf');
+    meta.append('size', file.size);
+
+    fetch(form.dataset.presignUrl, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+      body: meta,
+    }).then(function (r) {
+      return r.json().then(function (data) {
+        if (!r.ok) throw new Error(data.error || ('status ' + r.status));
+        return data;
+      });
+    }).then(function (data) {
+      // Step 2: upload the bytes straight to S3 with the presigned policy.
+      var fd = new FormData();
+      Object.keys(data.presigned.fields).forEach(function (k) {
+        fd.append(k, data.presigned.fields[k]);
+      });
+      fd.append('file', file); // must be last
+
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', data.presigned.url);
+      xhr.upload.addEventListener('progress', function (ev) {
+        if (!ev.lengthComputable) return;
+        setProgress(Math.round((ev.loaded / ev.total) * 100));
+        if (ev.loaded >= ev.total) {
+          progressLabel.textContent = 'Verifying upload…';
+        }
+      });
+      xhr.addEventListener('load', function () {
+        if (xhr.status < 200 || xhr.status >= 300) {
+          showError('Upload to storage failed (status ' + xhr.status + '). Please try again.');
+          return;
+        }
+        // Step 3: confirm with Django so it attaches the file and queues.
+        var confirmData = new FormData();
+        confirmData.append('csrfmiddlewaretoken', csrfToken());
+        confirmData.append('pending_id', data.pending_id);
+        confirmData.append(action.name, action.value);
+        fetch(form.dataset.confirmUrl, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          body: confirmData,
+        }).then(function (r) {
+          return r.json().then(function (c) {
+            if (!r.ok) throw new Error(c.error || ('status ' + r.status));
+            return c;
+          });
+        }).then(function (c) {
+          uploading = false;
+          window.location.assign(c.redirect);
+        }).catch(function (err) {
+          showError('Could not finish upload: ' + err.message);
+        });
+      });
+      xhr.addEventListener('error', function () {
+        showError('Upload failed: network error. Please check your connection and try again.');
+      });
+      xhr.send(fd);
+    }).catch(function (err) {
+      showError('Could not start upload: ' + err.message);
+    });
+  }
+
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var action = submitterField(e);
+    startProgress();
+
+    var fileInput = form.querySelector('input[type=file]');
+    var file = fileInput && fileInput.files ? fileInput.files[0] : null;
+
+    if (form.dataset.directUpload === '1' && file) {
+      directUpload(e, action, file);
+    } else {
+      classicUpload(e, action);
+    }
   });
 })();
 </script>

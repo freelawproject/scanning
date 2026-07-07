@@ -6,6 +6,7 @@ from django.urls import include, path
 from scanning.monitoring import health_check, heartbeat, sentry_fail
 from scanning.views import (
     claim_scan,
+    confirm_scan_upload,
     login_view,
     logout_view,
     opinion_detail,
@@ -13,6 +14,7 @@ from scanning.views import (
     opinion_upload,
     page_detail,
     password_change,
+    presign_scan_upload,
     profile,
     queue_detail_view,
     queue_upload,
@@ -88,6 +90,16 @@ urlpatterns = [
         "queue/<str:reporter_slug>/<int:vol>/upload/",
         queue_upload,
         name="queue_upload",
+    ),
+    path(
+        "queue/<str:reporter_slug>/<int:vol>/upload/presign/",
+        presign_scan_upload,
+        name="presign_scan_upload",
+    ),
+    path(
+        "queue/<str:reporter_slug>/<int:vol>/upload/confirm/",
+        confirm_scan_upload,
+        name="confirm_scan_upload",
     ),
     path(
         "queue/<str:reporter_slug>/<int:vol>/claim/",

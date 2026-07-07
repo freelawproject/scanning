@@ -58,6 +58,11 @@ class Command(BaseCommand):
         :param options: Parsed command options.
         :return: None.
         """
+        # DB cleanup of abandoned direct-to-S3 uploads runs in every
+        # environment (it's independent of the /tmp/ sweep below, which
+        # is a DEVELOPMENT no-op).
+        self._sweep_pending_uploads()
+
         if settings.DEVELOPMENT:
             self.stdout.write(
                 "DEVELOPMENT=True: skipping /tmp/ processing cleanup."
@@ -94,4 +99,46 @@ class Command(BaseCommand):
                 "cleanup_processing_tmp: removed %d stale dir(s) under %s",
                 removed,
                 tmp_root,
+            )
+
+    def _sweep_pending_uploads(self):
+        """Delete unconfirmed direct-to-S3 uploads (and orphaned scans).
+
+        A ``PendingUpload`` older than ``PENDING_UPLOAD_TTL_HOURS`` means
+        the browser requested a presigned POST but never confirmed (tab
+        closed, upload abandoned). Delete the row; if its scan never got
+        an original PDF attached (a fresh scan created just for this
+        upload), delete the scan too. Scans that already have a file
+        (e.g. a re-upload of an existing scan) are left untouched.
+
+        :return: None.
+        """
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from scanning.models import PendingUpload
+
+        ttl_hours = getattr(settings, "PENDING_UPLOAD_TTL_HOURS", 24.0)
+        cutoff = timezone.now() - timedelta(hours=ttl_hours)
+        stale = PendingUpload.objects.filter(
+            date_created__lt=cutoff
+        ).select_related("scan")
+
+        pending_removed = 0
+        scans_removed = 0
+        for pending in stale:
+            scan = pending.scan
+            pending.delete()
+            pending_removed += 1
+            if scan and not scan.original_pdf.name:
+                scan.delete()
+                scans_removed += 1
+
+        if pending_removed:
+            logger.info(
+                "cleanup_processing_tmp: removed %d stale pending upload(s) "
+                "and %d orphaned scan(s)",
+                pending_removed,
+                scans_removed,
             )

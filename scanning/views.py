@@ -18,6 +18,7 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
+from scanning import s3_sync
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
@@ -27,6 +28,7 @@ from scanning.models import (
     OpinionScan,
     OpinionStatus,
     Page,
+    PendingUpload,
     Priority,
     QueuedAction,
     QueueStatus,
@@ -39,6 +41,12 @@ from scanning.models import (
 )
 from scanning.services import refresh_volume_queue_status_for_scan
 from scanning.utils import get_volume, has_s3_credentials
+
+# Max size for a direct-to-S3 original upload. Enforced by the presigned
+# POST policy (see s3_sync.generate_presigned_post) so S3 rejects anything
+# larger before it lands, and pre-checked in the presign view for a fast
+# client-facing error.
+MAX_ORIGINAL_UPLOAD_SIZE = 2 * 1024**3  # 2 GB
 
 logger = logging.getLogger(__name__)
 
@@ -381,6 +389,7 @@ def queue_detail_view(
             "volume": volume,
             "scans": scans,
             "queue_statuses": QueueStatus.choices,
+            "direct_upload_enabled": s3_sync.direct_upload_enabled(),
         },
     )
 
@@ -451,22 +460,22 @@ def _upload_redirect(request: HttpRequest, url: str) -> HttpResponse:
     return redirect(url)
 
 
-@login_required
-@require_POST
-def queue_upload(request, reporter_slug, vol):
-    """Upload a PDF for a specific scan within a volume.
+def _prepare_scan_from_request(request, volume):
+    """Create or fetch the Scan an upload targets and stamp its metadata.
 
-    :param request: The HTTP request.
-    :param reporter_slug: Short-name slug identifying the reporter.
-    :param vol: Volume number within the reporter.
-    :return: Redirect to queue detail or scan processing page.
+    Shared by the classic through-Django upload (``queue_upload``) and
+    the presigned direct-to-S3 flow (``presign_scan_upload``). A
+    ``new_scan`` request builds a fresh row; otherwise ``scan_pk`` must
+    name an existing scan in this volume. Page range, state-abbrev flag,
+    uploader, and status are applied and the row is saved (so it has a
+    PK for building the S3 key).
+
+    :param request: The HTTP request carrying the upload form fields.
+    :param volume: The Volume the scan belongs to.
+    :returns: ``(scan, error_message)``. On success ``error_message`` is
+        None; on a missing ``scan_pk`` the scan is None.
+    :rtype: tuple[Scan | None, str | None]
     """
-    volume = get_volume(reporter_slug, vol)
-    queue_url = reverse(
-        "queue_detail",
-        kwargs={"reporter_slug": reporter_slug, "vol": vol},
-    )
-
     if request.POST.get("new_scan") == "1":
         # Create a new scan under this volume
         scan = Scan(
@@ -480,9 +489,97 @@ def queue_upload(request, reporter_slug, vol):
     else:
         scan_pk = request.POST.get("scan_pk")
         if not scan_pk:
-            messages.error(request, "No scan specified.")
-            return _upload_redirect(request, queue_url)
+            return None, "No scan specified."
         scan = get_object_or_404(Scan, pk=scan_pk, volume_obj=volume)
+
+    # Update page range if provided
+    first_page = request.POST.get("first_page", "").strip()
+    last_page = request.POST.get("last_page", "").strip()
+    if first_page.isdigit():
+        scan.start_page = int(first_page)
+    if last_page.isdigit():
+        scan.end_page = int(last_page)
+
+    scan.has_state_abbrev = "has_state_abbrev" in request.POST
+    scan.uploaded_by = request.user
+    scan.status = Status.UPLOADED
+    scan.save()  # Save first to get a PK
+    return scan, None
+
+
+def _original_pdf_name(scan, volume):
+    """Return the canonical ``*.original.pdf`` filename for a scan.
+
+    Used as both the FileField name and the S3 key suffix so the
+    daemon's ``download_processing_files`` finds the file at the
+    expected key.
+
+    :param scan: The scan the file belongs to.
+    :param volume: The scan's volume (source of reporter/volume number).
+    :return: e.g. ``a3d.214.1.95.original.pdf``.
+    :rtype: str
+    """
+    return (
+        f"{volume.reporter.short_name}.{volume.volume_number}"
+        f".{scan.start_page or 1}.{scan.end_page or 0}"
+        f".original.pdf"
+    )
+
+
+def _finalize_uploaded_scan(request, scan):
+    """Apply the requested post-upload action and return the destination.
+
+    Shared tail of both upload paths, run once the original PDF is
+    stored. ``upload_validate`` queues the full pipeline and sends the
+    user to the process viewer; ``upload_only`` just records success.
+
+    :param request: The HTTP request (source of the ``action`` field).
+    :param scan: The scan whose original PDF is now stored.
+    :return: The URL to redirect the browser to.
+    :rtype: str
+    """
+    action = request.POST.get("action", "upload_only")
+    if action == "upload_validate":
+        scan.status = Status.QUEUED
+        scan.stage = Stage.VALIDATE
+        scan.queued_action = QueuedAction.FULL_PIPELINE
+        scan.progress_message = "Queued for processing..."
+        scan.save()
+        refresh_volume_queue_status_for_scan(scan)
+        return reverse("scan_process", kwargs={"pk": scan.pk})
+
+    refresh_volume_queue_status_for_scan(scan)
+    messages.success(request, "PDF uploaded successfully.")
+    return reverse(
+        "queue_detail",
+        kwargs={
+            "reporter_slug": scan.reporter.short_name,
+            "vol": scan.volume,
+        },
+    )
+
+
+@login_required
+@require_POST
+def queue_upload(request, reporter_slug, vol):
+    """Upload a PDF through Django (fallback when direct-to-S3 is off).
+
+    Used when ``s3_sync`` direct upload is disabled (local dev without
+    RunPod, or missing credentials). When direct upload is enabled the
+    browser talks to ``presign_scan_upload``/``confirm_scan_upload``
+    instead and the file never flows through this view.
+
+    :param request: The HTTP request.
+    :param reporter_slug: Short-name slug identifying the reporter.
+    :param vol: Volume number within the reporter.
+    :return: Redirect to queue detail or scan processing page.
+    """
+    volume = get_volume(reporter_slug, vol)
+    queue_url = reverse(
+        "queue_detail",
+        kwargs={"reporter_slug": reporter_slug, "vol": vol},
+    )
+
     pdf = request.FILES.get("original_pdf")
     if not pdf:
         messages.error(request, "No PDF file provided.")
@@ -498,26 +595,13 @@ def queue_upload(request, reporter_slug, vol):
         messages.error(request, "The uploaded file is not a valid PDF.")
         return _upload_redirect(request, queue_url)
 
-    # Update page range if provided
-    first_page = request.POST.get("first_page", "").strip()
-    last_page = request.POST.get("last_page", "").strip()
-    if first_page.isdigit():
-        scan.start_page = int(first_page)
-    if last_page.isdigit():
-        scan.end_page = int(last_page)
-
-    scan.has_state_abbrev = "has_state_abbrev" in request.POST
-    scan.uploaded_by = request.user
-    scan.status = Status.UPLOADED
-    scan.save()  # Save first to get a PK
+    scan, error = _prepare_scan_from_request(request, volume)
+    if error:
+        messages.error(request, error)
+        return _upload_redirect(request, queue_url)
 
     output_dir = Path(scan.output_dir)
-
-    original_name = (
-        f"{volume.reporter.short_name}.{volume.volume_number}"
-        f".{scan.start_page or 1}.{scan.end_page or 0}"
-        f".original.pdf"
-    )
+    original_name = _original_pdf_name(scan, volume)
 
     if settings.DEVELOPMENT:
         # DEV: keep a local copy in output_dir (under MEDIA_ROOT, shared
@@ -535,8 +619,6 @@ def queue_upload(request, reporter_slug, vol):
         # processing/{pk}/... in a single pass so the daemon can pull it
         # (containers don't share /tmp/). No local copy is written here;
         # the daemon recreates one when it downloads from S3.
-        from scanning import s3_sync
-
         if not has_s3_credentials():
             logger.error(
                 "Prod upload attempted without AWS credentials for scan %s",
@@ -566,21 +648,125 @@ def queue_upload(request, reporter_slug, vol):
         scan.original_pdf.name = original_name
         scan.save(update_fields=["original_pdf"])
 
-    action = request.POST.get("action", "upload_only")
-    if action == "upload_validate":
-        scan.status = Status.QUEUED
-        scan.stage = Stage.VALIDATE
-        scan.queued_action = QueuedAction.FULL_PIPELINE
-        scan.progress_message = "Queued for processing..."
-        scan.save()
-        refresh_volume_queue_status_for_scan(scan)
-        return _upload_redirect(
-            request, reverse("scan_process", kwargs={"pk": scan.pk})
+    return _upload_redirect(request, _finalize_uploaded_scan(request, scan))
+
+
+@login_required
+@require_POST
+def presign_scan_upload(request, reporter_slug, vol):
+    """Authorize a direct browser->S3 upload of a scan's original PDF.
+
+    Creates/updates the target scan, then returns a presigned POST the
+    browser uses to upload the (up to 2 GB) PDF straight to the scan's
+    S3 processing prefix -- keeping those bytes off the Django request
+    path. A ``PendingUpload`` row records the authorization until
+    ``confirm_scan_upload`` verifies the object landed.
+
+    :param request: The HTTP request with upload metadata (filename,
+        content_type, size) plus the usual scan form fields.
+    :param reporter_slug: Short-name slug identifying the reporter.
+    :param vol: Volume number within the reporter.
+    :return: JSON ``{"presigned": ..., "pending_id": ...}`` or an error.
+    """
+    volume = get_volume(reporter_slug, vol)
+
+    filename = request.POST.get("filename", "")
+    content_type = request.POST.get("content_type", "") or "application/pdf"
+    try:
+        size = int(request.POST.get("size", "0"))
+    except (TypeError, ValueError):
+        size = 0
+
+    if not filename.lower().endswith(".pdf"):
+        return JsonResponse(
+            {"error": "Only PDF files are accepted."}, status=400
+        )
+    if size <= 0 or size > MAX_ORIGINAL_UPLOAD_SIZE:
+        return JsonResponse(
+            {"error": "File is empty or exceeds the 2 GB limit."}, status=400
         )
 
-    refresh_volume_queue_status_for_scan(scan)
-    messages.success(request, "PDF uploaded successfully.")
-    return _upload_redirect(request, queue_url)
+    if not has_s3_credentials():
+        logger.error(
+            "Presign requested without AWS credentials for %s vol %s",
+            reporter_slug,
+            vol,
+        )
+        return JsonResponse(
+            {"error": "Storage is not configured; contact an administrator."},
+            status=503,
+        )
+
+    scan, error = _prepare_scan_from_request(request, volume)
+    if error:
+        return JsonResponse({"error": error}, status=400)
+
+    original_name = _original_pdf_name(scan, volume)
+    presigned = s3_sync.generate_presigned_post(
+        scan, original_name, content_type, MAX_ORIGINAL_UPLOAD_SIZE
+    )
+    if not presigned:
+        # Only reachable if S3 sync is disabled despite credentials being
+        # present; clean up the freshly-created scan so it isn't orphaned.
+        if not scan.original_pdf.name:
+            scan.delete()
+        return JsonResponse(
+            {"error": "Could not initialize upload. Please try again."},
+            status=503,
+        )
+
+    pending = PendingUpload.objects.create(
+        scan=scan,
+        s3_key=f"{s3_sync.s3_processing_prefix(scan)}{original_name}",
+        expected_size=size,
+        content_type=content_type,
+        created_by=request.user,
+    )
+    return JsonResponse(
+        {"presigned": presigned, "pending_id": str(pending.id)}
+    )
+
+
+@login_required
+@require_POST
+def confirm_scan_upload(request, reporter_slug, vol):
+    """Confirm a direct-to-S3 upload and queue the scan.
+
+    Called by the browser once the presigned POST completes. Verifies
+    the object actually landed in S3 (and is a real PDF), attaches it to
+    the scan, applies the requested action, and deletes the
+    ``PendingUpload``. On a failed verification the pending row is
+    removed and a freshly-created (fileless) scan is cleaned up.
+
+    :param request: The HTTP request carrying ``pending_id`` and the
+        ``action`` field.
+    :param reporter_slug: Short-name slug identifying the reporter.
+    :param vol: Volume number within the reporter.
+    :return: JSON ``{"redirect": ...}`` on success or ``{"error": ...}``.
+    """
+    get_volume(reporter_slug, vol)  # 404s on a bad reporter/volume
+    pending = get_object_or_404(
+        PendingUpload,
+        id=request.POST.get("pending_id"),
+        created_by=request.user,
+    )
+    scan = pending.scan
+    original_name = Path(pending.s3_key).name
+
+    if not s3_sync.verify_uploaded_object(scan, original_name):
+        pending.delete()
+        if not scan.original_pdf.name:
+            scan.delete()
+        return JsonResponse(
+            {"error": "Upload could not be verified. Please try again."},
+            status=400,
+        )
+
+    scan.original_pdf.name = original_name
+    scan.save(update_fields=["original_pdf"])
+    pending.delete()
+
+    return JsonResponse({"redirect": _finalize_uploaded_scan(request, scan)})
 
 
 @login_required

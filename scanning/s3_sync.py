@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 import boto3
+from botocore.exceptions import ClientError
 from django.conf import settings
 
 from scanning.models import Scan
@@ -53,6 +54,20 @@ def _s3_enabled() -> bool:
     if settings.DEVELOPMENT and not settings.RUNPOD_ENABLED:
         return False
     return has_s3_credentials()
+
+
+def direct_upload_enabled() -> bool:
+    """Return True when the browser can upload straight to S3.
+
+    Mirrors ``_s3_enabled()`` -- the same gate ``generate_presigned_post``
+    and ``verify_uploaded_object`` use -- so the upload view and template
+    agree on whether to offer the presigned direct-to-S3 path or fall
+    back to the through-Django ``queue_upload``.
+
+    :returns: Whether presigned direct-to-S3 uploads are available.
+    :rtype: bool
+    """
+    return _s3_enabled()
 
 
 def _scan_path_parts(scan: Scan) -> tuple[str, str, str]:
@@ -302,6 +317,97 @@ def upload_fileobj_to_s3(scan: Scan, upload, relative_path: str) -> bool:
         scan.pk,
         elapsed,
     )
+    return True
+
+
+def generate_presigned_post(
+    scan: Scan,
+    relative_path: str,
+    content_type: str,
+    max_size: int,
+) -> dict | None:
+    """Build a presigned POST so the browser uploads straight to S3.
+
+    Keeps the (potentially multi-GB) original PDF off the Django
+    request path: the view returns this policy, the browser POSTs the
+    file directly to S3, and the daemon later pulls it from the same
+    key via ``download_processing_files``. The ``content-length-range``
+    condition lets S3 itself reject anything larger than ``max_size``,
+    so an oversized upload never reaches the bucket.
+
+    :param scan: The scan the file belongs to.
+    :param relative_path: Path relative to the scan's processing prefix,
+        used as the S3 key suffix (e.g. the ``*.original.pdf`` name).
+    :param content_type: MIME type the browser must send; pinned by the
+        policy so the stored object's type can't be spoofed.
+    :param max_size: Maximum accepted size in bytes.
+    :returns: The ``{"url": ..., "fields": {...}}`` dict from boto3, or
+        None when S3 sync is disabled.
+    :rtype: dict | None
+    """
+    if not _s3_enabled():
+        return None
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    key = f"{s3_processing_prefix(scan)}{relative_path}"
+    ttl = int(getattr(settings, "S3_UPLOAD_PRESIGNED_TTL", 3600))
+    s3 = boto3.client("s3")
+    return s3.generate_presigned_post(
+        Bucket=bucket,
+        Key=key,
+        Fields={"Content-Type": content_type},
+        Conditions=[
+            ["content-length-range", 1, max_size],
+            {"Content-Type": content_type},
+        ],
+        ExpiresIn=ttl,
+    )
+
+
+def verify_uploaded_object(scan: Scan, relative_path: str) -> bool:
+    """Confirm a direct-to-S3 upload landed and is a real PDF.
+
+    Called from ``confirm_scan_upload`` once the browser reports the
+    direct upload finished. Since the bytes never flowed through Django,
+    this replaces the in-request ``%PDF-`` header check: a ``head_object``
+    proves the object exists, then a 5-byte ranged GET verifies the
+    magic bytes without pulling the whole (multi-GB) file.
+
+    :param scan: The scan the file belongs to.
+    :param relative_path: Path relative to the scan's processing prefix.
+    :returns: True if the object exists and starts with ``%PDF-``.
+    :rtype: bool
+    """
+    if not _s3_enabled():
+        return False
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    key = f"{s3_processing_prefix(scan)}{relative_path}"
+    s3 = boto3.client("s3")
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        obj = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-4")
+        header = obj["Body"].read(5)
+    except ClientError:
+        logger.warning(
+            "verify_uploaded_object: no valid object at s3://%s/%s "
+            "for scan %s",
+            bucket,
+            key,
+            scan.pk,
+        )
+        return False
+
+    if header != b"%PDF-":
+        logger.warning(
+            "verify_uploaded_object: s3://%s/%s for scan %s is not a PDF "
+            "(header %r)",
+            bucket,
+            key,
+            scan.pk,
+            header,
+        )
+        return False
     return True
 
 

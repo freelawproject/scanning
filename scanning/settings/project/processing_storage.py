@@ -14,3 +14,9 @@ PROCESSING_TMP_DIR = env("PROCESSING_TMP_DIR", default="/tmp/scanning")
 PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS = env.int(
     "PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS", default=900
 )
+
+# How long a presigned direct-to-S3 upload (PendingUpload) may sit
+# unconfirmed before cleanup_processing_tmp deletes it -- and, if the
+# upload never landed, its fileless scan. Covers users who close the tab
+# mid-upload.
+PENDING_UPLOAD_TTL_HOURS = env.float("PENDING_UPLOAD_TTL_HOURS", default=24.0)
