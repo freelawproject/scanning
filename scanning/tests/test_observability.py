@@ -39,12 +39,13 @@ class InFlightMiddlewareTest(RegistryTestMixin, SimpleTestCase):
             return HttpResponse("ok")
 
         middleware = InFlightRequestMiddleware(get_response)
-        request = self.factory.get("/scan/42/")
+        # Query string included: register_request uses get_full_path().
+        request = self.factory.get("/scan/42/?page=3&dpi=300")
         middleware(request)
 
         self.assertEqual(len(seen), 1)
         (entry,) = seen.values()
-        self.assertEqual(entry.path, "/scan/42/")
+        self.assertEqual(entry.path, "/scan/42/?page=3&dpi=300")
         self.assertEqual(entry.method, "GET")
         # Cleared on completion.
         self.assertEqual(observability._registry, {})
@@ -119,3 +120,38 @@ class WebMonitorTest(RegistryTestMixin, SimpleTestCase):
         with self.assertLogs("scanning.observability", level="INFO") as logs:
             monitor.run_checks(now=100.0)  # elapsed 5s < 30s
         self.assertNotIn("hung request", "\n".join(logs.output))
+
+
+class SnapshotForReportTest(RegistryTestMixin, SimpleTestCase):
+    """The snapshot attached to the WORKER TIMEOUT Sentry event (issue #115)."""
+
+    def test_empty_registry_returns_empty_list(self) -> None:
+        self.assertEqual(observability.snapshot_for_report(now=100.0), [])
+
+    def test_computes_elapsed_and_orders_longest_first(self) -> None:
+        observability._registry[1] = InFlightRequest(
+            path="/scans/7/original-crop/?page=15&dpi=300",
+            method="GET",
+            start=40.0,  # elapsed 60s
+            scan_pk="7",
+            user="alice",
+        )
+        observability._registry[2] = InFlightRequest(
+            path="/scans/9/process/",
+            method="POST",
+            start=95.0,  # elapsed 5s
+            scan_pk="9",
+            user="bob",
+        )
+
+        snapshot = observability.snapshot_for_report(now=100.0)
+
+        # Longest-running request first, with a JSON-serializable payload.
+        self.assertEqual([item["scan_pk"] for item in snapshot], ["7", "9"])
+        self.assertEqual(snapshot[0]["elapsed_s"], 60.0)
+        self.assertEqual(snapshot[0]["method"], "GET")
+        self.assertEqual(
+            snapshot[0]["path"], "/scans/7/original-crop/?page=15&dpi=300"
+        )
+        self.assertEqual(snapshot[0]["user"], "alice")
+        self.assertEqual(snapshot[1]["elapsed_s"], 5.0)
