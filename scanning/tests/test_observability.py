@@ -39,12 +39,13 @@ class InFlightMiddlewareTest(RegistryTestMixin, SimpleTestCase):
             return HttpResponse("ok")
 
         middleware = InFlightRequestMiddleware(get_response)
-        request = self.factory.get("/scan/42/")
+        # Query string included: register_request uses get_full_path().
+        request = self.factory.get("/scan/42/?page=3&dpi=300")
         middleware(request)
 
         self.assertEqual(len(seen), 1)
         (entry,) = seen.values()
-        self.assertEqual(entry.path, "/scan/42/")
+        self.assertEqual(entry.path, "/scan/42/?page=3&dpi=300")
         self.assertEqual(entry.method, "GET")
         # Cleared on completion.
         self.assertEqual(observability._registry, {})

@@ -28,7 +28,12 @@ class InFlightRequestMiddleware:
 
     def __call__(self, request: HttpRequest) -> HttpResponse:
         ident = threading.get_ident()
-        observability.register_request(ident, request.path, request.method)
+        # get_full_path() (not request.path) so the query string is captured —
+        # the params (e.g. ?page=15&dpi=300 on a crop render, ?step=) are exactly
+        # what attributes a heavy request when it wedges a worker.
+        observability.register_request(
+            ident, request.get_full_path(), request.method
+        )
         try:
             return self.get_response(request)
         finally:
