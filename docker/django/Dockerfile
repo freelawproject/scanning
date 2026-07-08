@@ -136,11 +136,14 @@ WORKDIR /opt/scanning
 COPY --from=deps-prod /opt/venv /opt/venv
 
 # App source (build context excludes node_modules and built static via
-# .dockerignore) plus the compiled Tailwind CSS from the static stage.
+# .dockerignore) plus the full compiled static-global tree from the static
+# stage. That tree (Tailwind CSS + FontAwesome CSS + webfonts) is gitignored,
+# so it is absent from a fresh checkout's build context and must come from the
+# builder, or collectstatic silently ships an image missing those assets.
 COPY . .
 COPY --from=static-builder \
-     /opt/scanning/scanning/assets/static-global/css/tailwind_styles.css \
-     /opt/scanning/scanning/assets/static-global/css/tailwind_styles.css
+     /opt/scanning/scanning/assets/static-global/ \
+     /opt/scanning/scanning/assets/static-global/
 
 # Create directories for collectstatic output and uploaded/processed files
 RUN mkdir -p /opt/scanning/scanning/assets/static/ \
