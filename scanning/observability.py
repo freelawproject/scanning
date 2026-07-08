@@ -104,7 +104,7 @@ def snapshot_for_report(now: float | None = None) -> list[dict]:
     Only reads the lock-guarded registry — never request/DB state — so it is
     safe to call from any thread. The main thread never holds ``_registry_lock``
     (only request/monitor threads do, briefly), so this cannot self-deadlock in
-    the signal handler. ``now`` defaults to ``time.monotonic()``; the newest
+    the signal handler. ``now`` defaults to ``time.monotonic()``; the oldest
     (longest-running) request is listed first.
     """
     if now is None:
