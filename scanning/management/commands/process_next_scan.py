@@ -86,6 +86,12 @@ class Command(BaseCommand):
     def _recover_stale(self):
         """Reset scans stuck in PROCESSING past the timeout back to QUEUED.
 
+        A scan is usually stale because the daemon was killed (SIGKILL/OOM,
+        which never runs the SIGTERM re-queue handler) mid-pipeline, so this
+        path bumps ``interruption_count`` and flags chronic offenders
+        ERROR_INTERRUPTED just like the signal handler does, bounding the
+        otherwise-unbounded re-queue loop (issue #124).
+
         :return: None.
         """
         from datetime import timedelta
@@ -107,10 +113,10 @@ class Command(BaseCommand):
                 f"Recovering stale scan {scan.pk} "
                 f"(processing since {scan.processed_at})"
             )
-            Scan.objects.filter(pk=scan.pk).update(
-                status=Status.QUEUED,
-                progress_message="Re-queued (previous attempt timed out)",
-            )
+        Scan.requeue_or_flag_interrupted(
+            stale,
+            requeue_message="Re-queued (previous attempt timed out)",
+        )
 
     def _claim_next(self):
         """Atomically claim the next queued scan and mark it PROCESSING.

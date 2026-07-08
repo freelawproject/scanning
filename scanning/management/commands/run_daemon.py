@@ -158,9 +158,13 @@ class Command(BaseCommand):
             # (in _handle_pipeline_exception) consume the retry budget,
             # so a stream of deploys can't push a scan to ERROR_MAX_RETRIES
             # without a single real GPU/runpod failure.
-            requeued = Scan.objects.filter(status=Status.PROCESSING).update(
-                status=Status.QUEUED,
-                progress_message=(
+            #
+            # We do bump interruption_count so a scan can't be re-queued
+            # forever by a churning daemon pod: past DAEMON_MAX_INTERRUPTIONS
+            # it is flagged ERROR_INTERRUPTED for review instead (issue #124).
+            requeued, flagged = Scan.requeue_or_flag_interrupted(
+                Scan.objects.filter(status=Status.PROCESSING),
+                requeue_message=(
                     f"Daemon received signal {signum} mid-pipeline, "
                     "re-queued for next tick."
                 ),
@@ -169,6 +173,12 @@ class Command(BaseCommand):
                 logger.info(
                     "Re-queued %d in-flight scan(s) before shutdown.",
                     requeued,
+                )
+            if flagged:
+                logger.warning(
+                    "Flagged %d scan(s) as ERROR_INTERRUPTED after too many "
+                    "daemon interruptions.",
+                    flagged,
                 )
         except Exception:
             logger.exception("Failed to re-queue in-flight scans on shutdown")

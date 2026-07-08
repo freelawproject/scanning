@@ -1,17 +1,19 @@
 """Tests for the process_next_scan daemon tick, focused on the transient
 DB-connection retry behavior added for issue #116 (SCANNING-20)."""
 
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.db import OperationalError
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from django.utils import timezone
 
 from scanning.factories import ScanFactory
 from scanning.management.commands.process_next_scan import (
     MAX_DB_RETRIES,
     Command,
 )
-from scanning.models import Status
+from scanning.models import Scan, Status
 
 
 class TestProcessNextScanRetry(TestCase):
@@ -96,3 +98,53 @@ class TestProcessNextScanRetry(TestCase):
             cmd.handle()
 
         mock_pipeline.assert_not_called()
+
+
+@override_settings(DAEMON_PROCESSING_TIMEOUT=3600)
+class TestRecoverStale(TestCase):
+    """_recover_stale re-queues timed-out scans and bounds the retry loop.
+
+    A scan usually goes stale because the daemon was killed (SIGKILL/OOM,
+    which never runs the SIGTERM handler) mid-pipeline, so this path bumps
+    interruption_count and flags chronic offenders just like the signal
+    handler does (issue #124).
+    """
+
+    def _stale(self, **kwargs):
+        """Create a PROCESSING scan whose processed_at is past the timeout."""
+        old = timezone.now() - timedelta(seconds=7200)
+        scan = ScanFactory(status=Status.PROCESSING, **kwargs)
+        # processed_at is set by the pipeline, not the factory; force it old.
+        Scan.objects.filter(pk=scan.pk).update(processed_at=old)
+        return scan
+
+    def test_stale_scan_requeued_and_interruption_bumped(self):
+        scan = self._stale(interruption_count=0)
+
+        Command()._recover_stale()
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.interruption_count, 1)
+
+    @override_settings(DAEMON_MAX_INTERRUPTIONS=3)
+    def test_stale_scan_flagged_after_max_interruptions(self):
+        scan = self._stale(interruption_count=3)
+
+        Command()._recover_stale()
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.ERROR_INTERRUPTED)
+        self.assertEqual(scan.interruption_count, 4)
+        self.assertEqual(scan.retry_count, 0)
+
+    def test_fresh_processing_scan_is_left_alone(self):
+        """A PROCESSING scan within the timeout is not touched."""
+        scan = ScanFactory(status=Status.PROCESSING, interruption_count=0)
+        Scan.objects.filter(pk=scan.pk).update(processed_at=timezone.now())
+
+        Command()._recover_stale()
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PROCESSING)
+        self.assertEqual(scan.interruption_count, 0)

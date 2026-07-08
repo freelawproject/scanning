@@ -135,3 +135,48 @@ class TestHandleSignal(TestCase):
         self.assertTrue(cmd.shutdown)
         self.assertEqual(Scan.objects.filter(status=Status.QUEUED).count(), 0)
         mock_capture.assert_called_once()
+
+    def test_signal_bumps_interruption_count(self):
+        """Each SIGTERM re-queue increments interruption_count (issue #124)."""
+        cmd = Command()
+        scan = ScanFactory(status=Status.PROCESSING, interruption_count=0)
+
+        with patch("sentry_sdk.capture_message"):
+            cmd._handle_signal(15, None)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.interruption_count, 1)
+
+    @override_settings(DAEMON_MAX_INTERRUPTIONS=3)
+    def test_signal_flags_scan_after_max_interruptions(self):
+        """Past the interruption ceiling the scan is flagged, not re-queued.
+
+        Guards against a churning daemon pod re-queueing the same scan
+        forever without ever consuming its RunPod retry budget (issue #124).
+        """
+        cmd = Command()
+        # Already interrupted at the ceiling; this signal is the one over.
+        scan = ScanFactory(status=Status.PROCESSING, interruption_count=3)
+
+        with patch("sentry_sdk.capture_message"):
+            cmd._handle_signal(15, None)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.ERROR_INTERRUPTED)
+        self.assertEqual(scan.interruption_count, 4)
+        # retry_count is untouched: interruptions are not scan failures.
+        self.assertEqual(scan.retry_count, 0)
+
+    @override_settings(DAEMON_MAX_INTERRUPTIONS=3)
+    def test_signal_requeues_up_to_the_ceiling(self):
+        """A scan just below the ceiling is still re-queued, not flagged."""
+        cmd = Command()
+        scan = ScanFactory(status=Status.PROCESSING, interruption_count=2)
+
+        with patch("sentry_sdk.capture_message"):
+            cmd._handle_signal(15, None)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.interruption_count, 3)
