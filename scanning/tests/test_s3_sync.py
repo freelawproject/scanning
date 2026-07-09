@@ -75,6 +75,9 @@ class TestSyncHelpersWithCredentials(TestCase):
     """With creds and DEV=False, helpers should hit boto3."""
 
     def setUp(self):
+        # _s3_client() is lru_cached; drop any client cached under a prior
+        # test's boto3 patch so this test's mock is the one that's used.
+        s3_sync._s3_client.cache_clear()
         # has_s3_credentials reads os.environ, not Django settings.
         self._env_patch = patch.dict(
             os.environ,

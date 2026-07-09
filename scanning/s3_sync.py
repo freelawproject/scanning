@@ -16,6 +16,7 @@ behavior as prod.
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from pathlib import Path
@@ -28,6 +29,23 @@ from scanning.models import Scan
 from scanning.utils import has_s3_credentials
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _s3_client():
+    """Return a shared, lazily-built S3 client.
+
+    ``boto3.client("s3")`` loads the service model and runs the
+    credential-provider chain on every call, which is wasted work when a
+    request triggers several S3 operations (or when many requests hit the
+    same worker). boto3 clients are thread-safe for making calls, so we
+    build one and reuse it. Cached on first use, not at import, so
+    credential resolution happens once the app is actually serving.
+
+    :returns: A process-wide boto3 S3 client.
+    """
+    return boto3.client("s3")
+
 
 # File relative-path prefixes considered deliverables. When a scan is
 # approved, every file under one of these subdirs gets server-side
@@ -170,7 +188,7 @@ def upload_processing_files(scan: Scan) -> int:
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     prefix = s3_processing_prefix(scan)
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
 
     count = 0
     for path in _iter_files_to_sync(local_root):
@@ -207,7 +225,7 @@ def download_processing_files(scan: Scan) -> Path | None:
     local_root = tmp_output_dir(scan)
     local_root.mkdir(parents=True, exist_ok=True)
 
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     downloaded = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -262,7 +280,7 @@ def upload_file_to_s3(scan: Scan, relative_path: str) -> bool:
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     key = f"{s3_processing_prefix(scan)}{relative_path}"
-    boto3.client("s3").upload_file(str(local_path), bucket, key)
+    _s3_client().upload_file(str(local_path), bucket, key)
     logger.info(
         "Uploaded %s for scan %s to s3://%s/%s",
         relative_path,
@@ -297,7 +315,7 @@ def upload_fileobj_to_s3(scan: Scan, upload, relative_path: str) -> bool:
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     key = f"{s3_processing_prefix(scan)}{relative_path}"
     extra_args = {"ContentType": "application/pdf"}
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
 
     start = time.monotonic()
     temp_path = getattr(upload, "temporary_file_path", None)
@@ -351,7 +369,7 @@ def generate_presigned_post(
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     key = f"{s3_processing_prefix(scan)}{relative_path}"
     ttl = int(getattr(settings, "S3_UPLOAD_PRESIGNED_TTL", 3600))
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
     return s3.generate_presigned_post(
         Bucket=bucket,
         Key=key,
@@ -383,7 +401,7 @@ def verify_uploaded_object(scan: Scan, relative_path: str) -> bool:
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     key = f"{s3_processing_prefix(scan)}{relative_path}"
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
     try:
         s3.head_object(Bucket=bucket, Key=key)
         obj = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-4")
@@ -441,7 +459,7 @@ def copy_processing_to_approved(scan: Scan) -> tuple[str, int]:
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     src_prefix = s3_processing_prefix(scan)
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
     paginator = s3.get_paginator("list_objects_v2")
 
     count = 0

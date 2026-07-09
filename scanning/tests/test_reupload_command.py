@@ -8,6 +8,7 @@ from unittest.mock import patch
 from django.core.management import CommandError, call_command
 from django.test import TestCase, override_settings
 
+from scanning import s3_sync
 from scanning.factories import ReporterFactory, ScanFactory
 
 MEDIA_ROOT = tempfile.mkdtemp()
@@ -31,6 +32,11 @@ def _reporter_scan(**kwargs):
 
 class TestReuploadScanFiles(TestCase):
     """Exercise the reupload_scan_files command with mocked boto3."""
+
+    def setUp(self):
+        # _s3_client() is lru_cached; drop any client cached under a prior
+        # test's boto3 patch so this test's mock is the one that's used.
+        s3_sync._s3_client.cache_clear()
 
     def test_missing_scan_raises(self):
         with self.assertRaises(CommandError):
