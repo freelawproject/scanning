@@ -105,18 +105,14 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
     is_processing = scan.status in (Status.PROCESSING, Status.QUEUED)
 
-    # Always attempt the S3 pull. The helper is size-based idempotent
-    # and no-ops in DEV/TESTING, so calling it during QUEUED/PROCESSING
-    # is cheap. This ensures the web container's /tmp/ stays current
-    # with files the daemon pushed to S3 (e.g. after Generate Files).
-    try:
-        from scanning import s3_sync
-
-        s3_sync.download_processing_files(scan)
-    except Exception:
-        logger.exception(
-            "Failed to pull processing files from S3 for scan %s", scan.pk
-        )
+    # No eager S3 pull here: this page renders entirely from the DB
+    # (page_map, ocr_results, opinions_json, detections, redaction_rects),
+    # so it never reads the processing files off disk. Pulling them here
+    # blocked the response on I/O it doesn't need -- worst right after a
+    # fresh upload, when the only object in the prefix is the multi-GB
+    # original and the download took minutes. The PDF and crop assets are
+    # streamed by serve_scan_pdf / serve_original_crop, which lazily pull
+    # from S3 on demand.
 
     try:
         step = int(request.GET.get("step", 0))
