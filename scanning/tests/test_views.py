@@ -1466,7 +1466,7 @@ class TestServeOpinionPdfCaching(ScanningTestCase):
 
 
 class TestServeScanPdfLazyPull(ScanningTestCase):
-    """serve_scan_pdf falls back to S3 pull when /tmp/ is stale."""
+    """serve_scan_pdf serves only the preview PDF, pulling it lazily."""
 
     def test_lazy_pull_when_local_dir_missing(self):
         """When output_dir doesn't exist locally, pull from S3 and serve."""
@@ -1496,7 +1496,7 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch(
-                "scanning.s3_sync.download_processing_files",
+                "scanning.s3_sync.download_preview_pdf",
                 side_effect=_fake_download,
             ) as mock_pull,
         ):
@@ -1507,13 +1507,8 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         mock_pull.assert_called_once()
 
-    def test_processed_pdf_preferred_over_local_original(self):
-        """A local original must not pre-empt a bitonal fetchable from S3.
-
-        Regression: the original being on disk used to short-circuit the
-        response before the S3 pull ran, so the viewer streamed the huge
-        original even though a tiny bitonal existed in S3.
-        """
+    def test_serves_bitonal_even_with_local_original(self):
+        """A local original must not pre-empt the pulled bitonal preview."""
         user = self.make_user()
         self.client.force_login(user)
 
@@ -1522,8 +1517,7 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         scan = ScanFactory(
             reporter=reporter, volume=12, start_page=1, end_page=2
         )
-        # The original is resolvable locally via the FileField, so without
-        # the fix _try_local would serve it and skip the pull entirely.
+        # The original is resolvable locally via the FileField.
         self.assertTrue(os.path.exists(scan.original_pdf.path))
 
         bitonal_bytes = b"%PDF-1.4 pulled bitonal"
@@ -1540,7 +1534,7 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch(
-                "scanning.s3_sync.download_processing_files",
+                "scanning.s3_sync.download_preview_pdf",
                 side_effect=_fake_download,
             ) as mock_pull,
         ):
@@ -1554,18 +1548,13 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         served = b"".join(response.streaming_content)
         self.assertEqual(served, bitonal_bytes)
 
-    def test_returns_404_when_nothing_available(self):
-        """When local is empty and S3 pull yields nothing, return 404."""
+    def test_not_ready_returns_202_when_no_preview(self):
+        """With no preview anywhere, return 202 'still processing'."""
         user = self.make_user()
         self.client.force_login(user)
 
         tmp_root = tempfile.mkdtemp()
-        scan = ScanFactory(start_page=1, end_page=2)
-        # Delete the local FileField file so scan.pdf_path can't resolve
-        # to the original upload either.
-        original_path = scan.original_pdf.path
-        if os.path.exists(original_path):
-            os.remove(original_path)
+        scan = ScanFactory(start_page=1, end_page=2, status=Status.PROCESSING)
 
         with (
             override_settings(
@@ -1573,13 +1562,43 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 TESTING=False,
                 PROCESSING_TMP_DIR=tmp_root,
             ),
-            patch("scanning.s3_sync.download_processing_files"),
+            patch("scanning.s3_sync.download_preview_pdf"),
         ):
             response = self.client.get(
                 reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
             )
 
-        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.status_code, 202)
+        data = response.json()
+        self.assertEqual(data["status"], "not_ready")
+        self.assertEqual(data["scan_status"], Status.PROCESSING)
+        self.assertIn("processing", data["message"].lower())
+
+    def test_original_is_never_served(self):
+        """Even with a local original and no preview, never stream it."""
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        scan = ScanFactory(start_page=1, end_page=2, status=Status.QUEUED)
+        # The original PDF is resolvable locally; the endpoint must still
+        # refuse to serve it (it's the multi-GB file we never stream).
+        self.assertTrue(os.path.exists(scan.original_pdf.path))
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch("scanning.s3_sync.download_preview_pdf"),
+        ):
+            response = self.client.get(
+                reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "not_ready")
 
 
 class TestRunFullPipelinePullsFromS3(ScanningTestCase):

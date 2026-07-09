@@ -255,6 +255,82 @@ def download_processing_files(scan: Scan) -> Path | None:
     return local_root
 
 
+def _is_preview_pdf(rel: str) -> bool:
+    """Return True if a processing-prefix relative key is a preview PDF.
+
+    A "preview" is the small, browser-viewable PDF the process viewer
+    shows: the OCR PDF if present, else ``bitonal.pdf``. This mirrors the
+    exclusion rules in ``utils.find_ocr_pdf`` and adds ``bitonal.pdf``.
+    Deliberately excludes the multi-GB ``*.original.pdf`` and anything
+    under a subdirectory (``images/``, ``redacted/``, etc.).
+
+    :param rel: Object key relative to the scan's processing prefix.
+    :returns: Whether the key is the bitonal or OCR preview PDF.
+    :rtype: bool
+    """
+    if "/" in rel or not rel.endswith(".pdf"):
+        return False
+    if rel == "bitonal.pdf":
+        return True
+    if rel in ("stamped.pdf",):
+        return False
+    if rel.endswith((".redacted.pdf", ".original.pdf")):
+        return False
+    return "redacted" not in rel and "bitonal" not in rel
+
+
+def download_preview_pdf(scan: Scan) -> Path | None:
+    """Download only the small preview PDF(s) from S3 to /tmp/.
+
+    Pulls the bitonal and/or OCR PDF -- the reviewable previews -- and
+    skips the multi-GB original and the ``images/`` tree. Used by the PDF
+    viewer endpoint so opening a scan never drags the whole processing
+    prefix (or the original) across the network, which blew past the
+    gunicorn worker timeout for large scans.
+
+    Idempotent: skips files whose local size matches the S3 object's.
+
+    :param scan: Scan to pull the preview PDF for.
+    :returns: The local tmp path, or None if sync is disabled.
+    :rtype: Path | None
+    """
+    if not _s3_enabled():
+        return None
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    prefix = s3_processing_prefix(scan)
+    local_root = tmp_output_dir(scan)
+    local_root.mkdir(parents=True, exist_ok=True)
+
+    s3 = _s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    downloaded = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            rel = key[len(prefix) :]
+            if not rel or not _is_preview_pdf(rel):
+                continue
+            local_path = local_root / rel
+            if local_path.is_file() and local_path.stat().st_size == obj.get(
+                "Size", -1
+            ):
+                continue
+            s3.download_file(bucket, key, str(local_path))
+            downloaded += 1
+
+    local_root.touch(exist_ok=True)
+    if downloaded:
+        logger.info(
+            "Downloaded %d preview PDF(s) for scan %s from s3://%s/%s",
+            downloaded,
+            scan.pk,
+            bucket,
+            prefix,
+        )
+    return local_root
+
+
 def upload_file_to_s3(scan: Scan, relative_path: str) -> bool:
     """Upload a single file (relative to the scan's local root) to S3.
 

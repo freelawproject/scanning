@@ -27,13 +27,19 @@ document.addEventListener('DOMContentLoaded', function () {
     pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
 
-    pdfjsLib.getDocument(pdfUrl).promise.then(function (pdf) {
-        pdfDoc = pdf;
-        container.innerHTML = '';
-        createAllPlaceholders();
-        setupLazyLoading();
-    }).catch(function (err) {
-        container.innerHTML = '<div class="viewer-loading">Error loading PDF: ' + err.message + '</div>';
+    loadPreviewPdf(pdfUrl, {
+        onReady: function (pdf) {
+            pdfDoc = pdf;
+            container.innerHTML = '';
+            createAllPlaceholders();
+            setupLazyLoading();
+        },
+        onNotReady: function (message) {
+            showViewerMessage(container, message);
+        },
+        onError: function (err) {
+            showViewerMessage(container, 'Error loading PDF: ' + err.message);
+        },
     });
 
     // --- Step 1: Create lightweight placeholder divs for every page ---

@@ -158,36 +158,35 @@ document.addEventListener('DOMContentLoaded', function () {
         })();
     }
 
+    var _pdfLoadHandle = null;
+
     function loadPdf(url) {
         if (url === currentUrl && url.indexOf('?t=') === -1) return;
         currentUrl = url;
 
+        if (_pdfLoadHandle) { _pdfLoadHandle.cancel(); _pdfLoadHandle = null; }
         if (observer) { observer.disconnect(); observer = null; }
         renderedPages = {};
         pdfDoc = null;
         redactions = {};
-        container.innerHTML = '<div class="viewer-loading">Loading PDF...</div>';
+        showViewerMessage(container, 'Loading PDF...');
 
-        _attemptLoadPdf(url, 3);
-    }
-
-    function _attemptLoadPdf(url, retriesLeft) {
-        pdfjsLib.getDocument(url).promise.then(function (pdf) {
-            if (url !== currentUrl) return;
-            pdfDoc = pdf;
-            container.innerHTML = '';
-            createPlaceholders(pdf.numPages);
-            setupLazyLoading();
-        }).catch(function (err) {
-            if (url !== currentUrl) return;
-            var isMissing = err && (err.name === 'MissingPDFException' || /Missing PDF/i.test(err.message || ''));
-            if (isMissing && retriesLeft > 0) {
-                var attempt = 4 - retriesLeft;
-                container.innerHTML = '<div class="viewer-loading">Loading PDF (retrying ' + attempt + '/3)...</div>';
-                setTimeout(function () { _attemptLoadPdf(url, retriesLeft - 1); }, attempt * 1000);
-                return;
-            }
-            container.innerHTML = '<div class="viewer-loading">Error loading PDF: ' + err.message + '</div>';
+        _pdfLoadHandle = loadPreviewPdf(url, {
+            // Abort if a newer loadPdf() switched URLs (e.g. opinion tabs),
+            // so a slow/pending load never renders over the current one.
+            isCurrent: function () { return url === currentUrl; },
+            onReady: function (pdf) {
+                pdfDoc = pdf;
+                container.innerHTML = '';
+                createPlaceholders(pdf.numPages);
+                setupLazyLoading();
+            },
+            onNotReady: function (message) {
+                showViewerMessage(container, message);
+            },
+            onError: function (err) {
+                showViewerMessage(container, 'Error loading PDF: ' + err.message);
+            },
         });
     }
 
