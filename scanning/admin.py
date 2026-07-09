@@ -11,6 +11,7 @@ from scanning.models import (
     Page,
     PageDeletion,
     PageInsert,
+    PendingUpload,
     Reporter,
     Scan,
     Status,
@@ -382,6 +383,20 @@ class PageDeletionAdmin(admin.ModelAdmin):
     list_display = ["scan", "pdf_page", "date_created"]
     raw_id_fields = ["scan"]
     readonly_fields = ["date_created", "date_modified"]
+
+
+@admin.register(PendingUpload)
+class PendingUploadAdmin(admin.ModelAdmin):
+    list_display = [
+        "id",
+        "scan",
+        "created_by",
+        "expected_size",
+        "date_created",
+    ]
+    search_fields = ["id", "s3_key", "scan__id"]
+    raw_id_fields = ["scan", "created_by"]
+    readonly_fields = ["id", "date_created", "date_modified"]
 
 
 @admin.register(Page)
