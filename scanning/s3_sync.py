@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 
 
 @functools.lru_cache(maxsize=1)
+def _cached_s3_client():
+    """Build and memoize a single S3 client (see :func:`_s3_client`)."""
+    return boto3.client("s3")
+
+
 def _s3_client():
     """Return a shared, lazily-built S3 client.
 
@@ -42,9 +47,17 @@ def _s3_client():
     build one and reuse it. Cached on first use, not at import, so
     credential resolution happens once the app is actually serving.
 
-    :returns: A process-wide boto3 S3 client.
+    Under ``TESTING`` the cache is bypassed and a fresh client is built
+    each call, so tests that patch ``scanning.s3_sync.boto3`` always see
+    their own mock -- a cached client from an earlier test can't silently
+    defeat the patch. (Tests that flip ``TESTING=False`` to exercise the
+    real S3 path still call ``_cached_s3_client.cache_clear()`` in setUp.)
+
+    :returns: A boto3 S3 client (process-wide outside tests).
     """
-    return boto3.client("s3")
+    if getattr(settings, "TESTING", False):
+        return boto3.client("s3")
+    return _cached_s3_client()
 
 
 # File relative-path prefixes considered deliverables. When a scan is
@@ -463,9 +476,9 @@ def verify_uploaded_object(scan: Scan, relative_path: str) -> bool:
 
     Called from ``confirm_scan_upload`` once the browser reports the
     direct upload finished. Since the bytes never flowed through Django,
-    this replaces the in-request ``%PDF-`` header check: a ``head_object``
-    proves the object exists, then a 5-byte ranged GET verifies the
-    magic bytes without pulling the whole (multi-GB) file.
+    this replaces the in-request ``%PDF-`` header check: a 5-byte ranged
+    GET both proves the object exists (a missing key raises ``ClientError``)
+    and verifies the magic bytes, without pulling the whole (multi-GB) file.
 
     :param scan: The scan the file belongs to.
     :param relative_path: Path relative to the scan's processing prefix.
@@ -479,7 +492,6 @@ def verify_uploaded_object(scan: Scan, relative_path: str) -> bool:
     key = f"{s3_processing_prefix(scan)}{relative_path}"
     s3 = _s3_client()
     try:
-        s3.head_object(Bucket=bucket, Key=key)
         obj = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-4")
         header = obj["Body"].read(5)
     except ClientError:

@@ -55,10 +55,21 @@ function loadPreviewPdf(url, cb) {
             .then(function (resp) {
                 if (!current()) return null;
                 if (resp.status === 202) {
+                    // Transient: a preview is still being produced. Show the
+                    // message and poll again.
                     return resp.json().then(function (d) {
                         if (!current()) return null;
                         cb.onNotReady((d && d.message) || 'Still processing…');
                         timer = setTimeout(attempt, pollMs);
+                        return null;
+                    });
+                }
+                if (resp.status === 409) {
+                    // Terminal: no preview will ever appear (errored/
+                    // unavailable). Show the message and stop -- do not poll.
+                    return resp.json().then(function (d) {
+                        if (!current()) return null;
+                        cb.onNotReady((d && d.message) || 'No preview available.');
                         return null;
                     });
                 }

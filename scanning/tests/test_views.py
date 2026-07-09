@@ -609,6 +609,54 @@ class TestPresignedUpload(ScanningTestCase):
         )
         self.assertEqual(response.status_code, 404)
 
+    def test_confirm_rejects_pending_from_other_volume(self):
+        # A pending whose scan lives in a different volume can't be
+        # confirmed through this volume's endpoint, even by its owner.
+        other_volume = VolumeFactory()
+        scan = ScanFactory(
+            volume_obj=other_volume,
+            reporter=other_volume.reporter,
+            volume=other_volume.volume_number,
+        )
+        pending = PendingUpload.objects.create(
+            scan=scan,
+            s3_key="processing/x/x.original.pdf",
+            expected_size=1024,
+            created_by=self.user,
+        )
+        response = self.client.post(
+            self.confirm_url,  # built from self.volume, not other_volume
+            {"pending_id": str(pending.id), "action": "upload_only"},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_presign_cleans_up_scan_on_error(self):
+        # A boto/network error during presign must not leave an orphaned,
+        # fileless scan: with no PendingUpload row the TTL sweep can't
+        # reclaim it, so the view deletes it inline.
+        data = {
+            "new_scan": "1",
+            "filename": "scan.pdf",
+            "content_type": "application/pdf",
+            "size": "1024",
+        }
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.generate_presigned_post",
+                side_effect=Exception("boom"),
+            ),
+        ):
+            response = self.client.post(
+                self.presign_url,
+                data,
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
+        self.assertFalse(PendingUpload.objects.exists())
+
 
 class TestQueueView(ScanningTestCase):
     """The queue page renders and paginates volumes."""
@@ -1599,6 +1647,31 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
 
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["status"], "not_ready")
+
+    def test_terminal_status_returns_409_not_202(self):
+        """An errored scan is terminal: 409 so the viewer stops polling."""
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        scan = ScanFactory(start_page=1, end_page=2, status=Status.ERROR)
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch("scanning.s3_sync.download_preview_pdf"),
+        ):
+            response = self.client.get(
+                reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 409)
+        data = response.json()
+        self.assertEqual(data["status"], "unavailable")
+        self.assertEqual(data["scan_status"], Status.ERROR)
 
 
 class TestRunFullPipelinePullsFromS3(ScanningTestCase):

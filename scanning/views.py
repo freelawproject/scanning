@@ -702,12 +702,19 @@ def presign_scan_upload(request, reporter_slug, vol):
         return JsonResponse({"error": error}, status=400)
 
     original_name = _original_pdf_name(scan, volume)
-    presigned = s3_sync.generate_presigned_post(
-        scan, original_name, content_type, MAX_ORIGINAL_UPLOAD_SIZE
-    )
+    try:
+        presigned = s3_sync.generate_presigned_post(
+            scan, original_name, content_type, MAX_ORIGINAL_UPLOAD_SIZE
+        )
+    except Exception:
+        logger.exception("generate_presigned_post failed for scan %s", scan.pk)
+        presigned = None
+
     if not presigned:
-        # Only reachable if S3 sync is disabled despite credentials being
-        # present; clean up the freshly-created scan so it isn't orphaned.
+        # S3 sync disabled, or the presign call errored. Clean up the
+        # freshly-created, fileless scan here: with no PendingUpload row it
+        # would otherwise be orphaned (the TTL sweep only reclaims scans
+        # reachable through a stale pending row).
         if not scan.original_pdf.name:
             scan.delete()
         return JsonResponse(
@@ -744,11 +751,14 @@ def confirm_scan_upload(request, reporter_slug, vol):
     :param vol: Volume number within the reporter.
     :return: JSON ``{"redirect": ...}`` on success or ``{"error": ...}``.
     """
-    get_volume(reporter_slug, vol)  # 404s on a bad reporter/volume
+    volume = get_volume(reporter_slug, vol)  # 404s on a bad reporter/volume
+    # Scope the pending row to the URL's volume as well as its owner, so a
+    # pending can only be confirmed through its own volume's endpoint.
     pending = get_object_or_404(
         PendingUpload,
         id=request.POST.get("pending_id"),
         created_by=request.user,
+        scan__volume_obj=volume,
     )
     scan = pending.scan
     original_name = Path(pending.s3_key).name

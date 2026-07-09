@@ -1107,8 +1107,11 @@ class PendingUpload(AbstractDateTimeModel):
     :ivar scan: The scan the upload belongs to. Deleted with the scan.
     :ivar s3_key: The full S3 key the presigned POST targets (the scan's
         processing prefix + original filename).
-    :ivar expected_size: Size in bytes the browser reported, used for
-        the presigned POST ``content-length-range`` condition.
+    :ivar expected_size: Size in bytes the browser reported at presign
+        time, recorded for diagnostics/auditing (also shown in admin).
+        The size ceiling is enforced separately: the presign view rejects
+        anything over ``MAX_ORIGINAL_UPLOAD_SIZE`` and the presigned POST
+        ``content-length-range`` condition caps the object at that limit.
     :ivar content_type: MIME type the browser reported.
     :ivar created_by: The user who initiated the upload.
     """

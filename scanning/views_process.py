@@ -505,26 +505,37 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     if response is not None:
         return response
 
-    # 3. No preview PDF anywhere yet: tell the viewer it's not ready.
+    # 3. No preview PDF anywhere. Distinguish transient states (still
+    #    producing a preview -- the viewer should poll) from terminal ones
+    #    (a preview will never appear -- the viewer should show the message
+    #    and stop). 202 means "retry"; 409 means "give up".
     if scan.status in (Status.UPLOADED, Status.QUEUED, Status.PROCESSING):
-        message = (
-            "We're still processing this file. The preview will appear "
-            "here automatically once it's ready."
+        return JsonResponse(
+            {
+                "status": "not_ready",
+                "scan_status": scan.status,
+                "message": (
+                    "We're still processing this file. The preview will "
+                    "appear here automatically once it's ready."
+                ),
+            },
+            status=202,
         )
-    elif scan.status in (Status.ERROR, Status.ERROR_MAX_RETRIES):
+
+    if scan.status in (Status.ERROR, Status.ERROR_MAX_RETRIES):
         message = (
             "This scan hit an error during processing, so there's no "
             "preview to show."
         )
     else:
-        message = "No preview is available for this scan yet."
+        message = "No preview is available for this scan."
     return JsonResponse(
         {
-            "status": "not_ready",
+            "status": "unavailable",
             "scan_status": scan.status,
             "message": message,
         },
-        status=202,
+        status=409,
     )
 
 
