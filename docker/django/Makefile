@@ -27,6 +27,6 @@ protects against arm64 builds being accidentally deployed to the server (which u
 		exit 1; \
 	fi
 
-	    echo "Architecture is OK. Pushing."; \
-	    docker push $(REPO):$(DOCKER_TAG_WEB); \
+	    echo "Architecture is OK. Pushing." && \
+	    docker push $(REPO):$(DOCKER_TAG_WEB) && \
 	    docker push $(REPO):$(DOCKER_TAG_DAEMON);
