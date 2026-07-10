@@ -101,6 +101,8 @@ TEMPLATES = [
 ]
 
 MIDDLEWARE = [
+    # Outermost, so the in-flight start time covers the whole request lifetime.
+    "scanning.middleware.InFlightRequestMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",

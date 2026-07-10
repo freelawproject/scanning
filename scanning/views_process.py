@@ -103,6 +103,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     """
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
     is_processing = scan.status in (Status.PROCESSING, Status.QUEUED)
+    # Breadcrumb for the web-pod observability trail (issue #115): this view
+    # does an S3 pull plus a render over potentially large detection sets, so a
+    # hang/OOM here should leave a marker in the pod logs and Sentry.
+    logger.info(
+        "scan_process_view: rendering scan=%s status=%s", scan.pk, scan.status
+    )
 
     # No eager S3 pull here: this page renders entirely from the DB
     # (page_map, ocr_results, opinions_json, detections, redaction_rects),
@@ -472,6 +478,9 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
         response when no preview is available yet.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    # Breadcrumb (issue #115): serving may pull from S3 and stream a multi-GB
+    # original; mark the start so a stall here is attributable in the trail.
+    logger.info("serve_scan_pdf: resolving pdf for scan=%s", scan.pk)
 
     def _processed_local() -> FileResponse | None:
         """Return the OCR pdf, else ``bitonal.pdf``, from ``output_dir``."""
@@ -558,6 +567,15 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     except ValueError:
         return HttpResponse(status=400)
 
+    # Breadcrumb (issue #115): the pixmap render below is the clearest
+    # per-request memory spike in the web pod (5-20 MB at dpi=300), so log it
+    # with its scale before allocating.
+    logger.info(
+        "serve_original_crop: rendering scan=%s page=%s dpi=%s",
+        scan.pk,
+        page,
+        dpi,
+    )
     try:
         doc = fitz.open(scan.pdf_path)
     except FileNotFoundError:
@@ -765,6 +783,9 @@ def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
         return redirect("scan_process", pk=pk)
     from scanning import services
 
+    # Breadcrumb (issue #115): recalculation runs synchronously on the request
+    # thread over the scan's OCR results.
+    logger.info("recalculate: recomputing issues for scan=%s", scan.pk)
     services.recalculate_issues(scan)
     return redirect("scan_process", pk=pk)
 

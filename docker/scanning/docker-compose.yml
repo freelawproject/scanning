@@ -42,8 +42,7 @@ services:
     build:
       context: "${SCANNING_BASE_DIR:-../../}"
       dockerfile: "./docker/django/Dockerfile"
-      args:
-        BUILD_ENV: dev
+      target: dev
     command: run_daemon
     depends_on:
       scanning-postgres:
@@ -69,8 +68,7 @@ services:
     build:
       context: "${SCANNING_BASE_DIR:-../../}"
       dockerfile: "./docker/django/Dockerfile"
-      args:
-        BUILD_ENV: dev
+      target: dev
     command: web-dev
     depends_on:
       scanning-postgres:
