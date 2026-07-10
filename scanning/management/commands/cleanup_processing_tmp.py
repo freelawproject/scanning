@@ -130,15 +130,22 @@ class Command(BaseCommand):
         scans_removed = 0
         for pending in stale:
             scan = pending.scan
-            # Reclaim the S3 object too: the browser may have completed the
-            # (up to 2 GB) presigned POST but never confirmed, leaving the
-            # object stranded. Best-effort; a missing key is a no-op.
-            s3_sync.delete_uploaded_object(pending.s3_key)
-            pending.delete()
-            pending_removed += 1
             if scan and not scan.original_pdf.name:
+                # Genuinely abandoned fresh upload: reclaim the stranded S3
+                # object (browser completed the up-to-2 GB POST but never
+                # confirmed) along with the fileless scan. Best-effort; a
+                # missing key is a no-op.
+                #
+                # Only do this when the scan has no file. A re-upload of an
+                # existing scan reuses the SAME deterministic s3_key as the
+                # confirmed original, so deleting it here would destroy the
+                # live original while scan.original_pdf.name still points at
+                # it -- the "re-upload scans left untouched" contract above.
+                s3_sync.delete_uploaded_object(pending.s3_key)
                 scan.delete()
                 scans_removed += 1
+            pending.delete()
+            pending_removed += 1
 
         if pending_removed:
             logger.info(

@@ -768,12 +768,14 @@ def confirm_scan_upload(request, reporter_slug, vol):
     original_name = Path(pending.s3_key).name
 
     if not s3_sync.verify_uploaded_object(scan, original_name):
-        # The rejected object (e.g. a non-PDF that still landed via the
-        # presigned POST) would otherwise be stranded in the bucket.
-        s3_sync.delete_uploaded_object(pending.s3_key)
-        pending.delete()
         if not scan.original_pdf.name:
+            # Fresh, fileless scan: reclaim the rejected object (e.g. a
+            # non-PDF that still landed via the presigned POST) and the scan.
+            # For a re-upload the scan already has a confirmed original at
+            # this same key, so don't delete it out from under a live scan.
+            s3_sync.delete_uploaded_object(pending.s3_key)
             scan.delete()
+        pending.delete()
         return JsonResponse(
             {"error": "Upload could not be verified. Please try again."},
             status=400,

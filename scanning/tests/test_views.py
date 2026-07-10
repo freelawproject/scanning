@@ -598,6 +598,36 @@ class TestPresignedUpload(ScanningTestCase):
         self.assertTrue(Scan.objects.filter(pk=scan.pk).exists())
         self.assertFalse(PendingUpload.objects.filter(pk=pending.id).exists())
 
+    def test_confirm_failure_reupload_keeps_s3_object(self):
+        # A re-upload's s3_key is the confirmed original's key, so a failed
+        # verification must not delete the object out from under the scan.
+        scan = ScanFactory(
+            volume_obj=self.volume,
+            reporter=self.volume.reporter,
+            volume=self.volume.volume_number,
+        )
+        self.assertTrue(scan.original_pdf.name)
+        pending = PendingUpload.objects.create(
+            scan=scan,
+            s3_key="processing/x/x.original.pdf",
+            expected_size=1024,
+            created_by=self.user,
+        )
+        with (
+            patch(
+                "scanning.s3_sync.verify_uploaded_object", return_value=False
+            ),
+            patch("scanning.s3_sync.delete_uploaded_object") as mock_delete,
+        ):
+            response = self.client.post(
+                self.confirm_url,
+                {"pending_id": str(pending.id), "action": "upload_only"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 400)
+        mock_delete.assert_not_called()
+        self.assertTrue(Scan.objects.filter(pk=scan.pk).exists())
+
     def test_confirm_rejects_other_users_pending(self):
         pending_id = self._presign()[0].json()["pending_id"]
         other = self.make_user(username="intruder")
