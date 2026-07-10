@@ -734,6 +734,33 @@ class TestPresignedUpload(ScanningTestCase):
         pending = PendingUpload.objects.get(pk=resp.json()["pending_id"])
         self.assertEqual(pending.action, "upload_only")
 
+    def test_presign_rejects_reupload_of_scan_with_file(self):
+        # A scan_pk upload onto a scan that already has a confirmed original
+        # would overwrite it in S3 (same deterministic key). Refuse it.
+        scan = ScanFactory(
+            volume_obj=self.volume,
+            reporter=self.volume.reporter,
+            volume=self.volume.volume_number,
+        )
+        self.assertTrue(scan.original_pdf.name)
+        with patch("scanning.views.has_s3_credentials", return_value=True):
+            response = self.client.post(
+                self.presign_url,
+                {"scan_pk": str(scan.pk), "filename": "x.pdf", "size": "1024"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(PendingUpload.objects.exists())
+
+    def test_confirm_rejects_invalid_pending_id(self):
+        # A non-UUID pending_id must return a clean 400, not a 500.
+        response = self.client.post(
+            self.confirm_url,
+            {"pending_id": "not-a-uuid", "action": "upload_only"},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 400)
+
     def test_confirm_failure_deletes_s3_object(self):
         pending_id = self._presign()[0].json()["pending_id"]
         pending = PendingUpload.objects.get(pk=pending_id)

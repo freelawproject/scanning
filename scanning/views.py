@@ -1,6 +1,7 @@
 """Auth, scan CRUD, opinion, and queue views."""
 
 import logging
+import uuid
 from pathlib import Path
 
 from django.conf import settings
@@ -490,6 +491,13 @@ def _prepare_scan_from_request(request, volume):
         if not scan_pk:
             return None, "No scan specified."
         scan = get_object_or_404(Scan, pk=scan_pk, volume_obj=volume)
+        # Refuse to re-upload onto a scan that already has a confirmed
+        # original. Its S3 key is deterministic on the scan's identity, so a
+        # new upload would overwrite the live original in S3 before it's even
+        # verified. The UI only ever creates new scans (new_scan=1); this
+        # guards the crafted-POST path until re-upload gets a staged key.
+        if scan.original_pdf.name:
+            return None, "This scan already has an uploaded original."
 
     # Update page range if provided
     first_page = request.POST.get("first_page", "").strip()
@@ -755,11 +763,18 @@ def confirm_scan_upload(request, reporter_slug, vol):
     :return: JSON ``{"redirect": ...}`` on success or ``{"error": ...}``.
     """
     volume = get_volume(reporter_slug, vol)  # 404s on a bad reporter/volume
+    # Validate the UUID up front: a non-UUID id would make the UUIDField raise
+    # ValidationError at query-prep time, which get_object_or_404 doesn't catch
+    # (a 500 instead of a clean 400).
+    try:
+        pending_id = uuid.UUID(str(request.POST.get("pending_id") or ""))
+    except ValueError:
+        return JsonResponse({"error": "Invalid pending_id."}, status=400)
     # Scope the pending row to the URL's volume as well as its owner, so a
     # pending can only be confirmed through its own volume's endpoint.
     pending = get_object_or_404(
         PendingUpload,
-        id=request.POST.get("pending_id"),
+        id=pending_id,
         created_by=request.user,
         scan__volume_obj=volume,
     )

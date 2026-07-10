@@ -31,7 +31,8 @@ function loadPreviewPdf(url, cb) {
     var cancelled = false;
     var timer = null;
     var pollMs = cb.pollMs || 4000;
-    var errorRetriesLeft = cb.errorRetries == null ? 3 : cb.errorRetries;
+    var maxErrorRetries = cb.errorRetries == null ? 3 : cb.errorRetries;
+    var errorRetriesLeft = maxErrorRetries;
 
     function current() {
         return !cancelled && (!cb.isCurrent || cb.isCurrent());
@@ -40,7 +41,7 @@ function loadPreviewPdf(url, cb) {
     function onTransientError(err) {
         if (!current()) return;
         if (errorRetriesLeft > 0) {
-            var n = (cb.errorRetries == null ? 3 : cb.errorRetries) - errorRetriesLeft + 1;
+            var n = maxErrorRetries - errorRetriesLeft + 1;
             errorRetriesLeft--;
             cb.onNotReady('Loading PDF (retrying ' + n + ')...');
             timer = setTimeout(attempt, n * 1000);
@@ -55,8 +56,12 @@ function loadPreviewPdf(url, cb) {
             .then(function (resp) {
                 if (!current()) return null;
                 if (resp.status === 202) {
-                    // Transient: a preview is still being produced. Show the
+                    // Transient: a preview is still being produced. A healthy
+                    // poll response resets the retry budget so it caps
+                    // *consecutive* transient errors, not total errors across
+                    // a long (minutes-long) poll session. Then show the
                     // message and poll again.
+                    errorRetriesLeft = maxErrorRetries;
                     return resp.json().then(function (d) {
                         if (!current()) return null;
                         cb.onNotReady((d && d.message) || 'Still processing…');
