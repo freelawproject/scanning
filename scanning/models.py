@@ -96,6 +96,17 @@ class QueuedAction(models.TextChoices):
     GENERATE_FILES = "generate_files", "Generate Files"
 
 
+class UploadAction(models.TextChoices):
+    """What to do with a scan once its original PDF is stored.
+
+    Chosen by the uploader (which submit button) and applied by
+    ``_finalize_uploaded_scan`` / the recovery command.
+    """
+
+    UPLOAD_ONLY = "upload_only", "Upload only"
+    UPLOAD_VALIDATE = "upload_validate", "Upload and validate"
+
+
 class Priority(models.TextChoices):
     CRITICAL = "critical", "Critical"
     HIGH = "high", "High"
@@ -1113,6 +1124,9 @@ class PendingUpload(AbstractDateTimeModel):
         anything over ``MAX_ORIGINAL_UPLOAD_SIZE`` and the presigned POST
         ``content-length-range`` condition caps the object at that limit.
     :ivar content_type: MIME type the browser reported.
+    :ivar action: The post-upload action the uploader chose
+        (``upload_only`` or ``upload_validate``), stored so recovery can
+        replay the original intent if ``confirm_scan_upload`` never ran.
     :ivar created_by: The user who initiated the upload.
     """
 
@@ -1125,6 +1139,11 @@ class PendingUpload(AbstractDateTimeModel):
     s3_key = models.CharField(max_length=1024)
     expected_size = models.PositiveBigIntegerField()
     content_type = models.CharField(max_length=100, blank=True)
+    action = models.CharField(
+        max_length=32,
+        choices=UploadAction.choices,
+        default=UploadAction.UPLOAD_ONLY,
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,

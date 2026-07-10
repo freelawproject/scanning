@@ -135,6 +135,24 @@ class TestPendingUploadSweep(TestCase):
         mock_delete.assert_called_once_with(pending.s3_key)
 
     @override_settings(DEVELOPMENT=False)
+    def test_sweep_recovers_instead_of_deleting(self):
+        # A stale pending whose object actually landed in S3 is recovered
+        # (linked to the scan), never deleted.
+        scan = ScanFactory(original_pdf="")
+        pending = self._make_pending(scan, hours_old=48)
+        with (
+            patch(
+                "scanning.s3_sync.verify_uploaded_object", return_value=True
+            ),
+            patch("scanning.s3_sync.delete_uploaded_object") as mock_delete,
+        ):
+            call_command("cleanup_processing_tmp")
+        mock_delete.assert_not_called()
+        self.assertFalse(PendingUpload.objects.filter(pk=pending.pk).exists())
+        scan.refresh_from_db()
+        self.assertTrue(scan.original_pdf.name)
+
+    @override_settings(DEVELOPMENT=False)
     def test_sweep_keeps_s3_object_for_reupload_scan(self):
         # A re-upload's pending reuses the confirmed original's s3_key, so the
         # sweep must NOT delete the object when the scan still has a file.

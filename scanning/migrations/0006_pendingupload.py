@@ -23,6 +23,7 @@ class Migration(migrations.Migration):
                 ('s3_key', models.CharField(max_length=1024)),
                 ('expected_size', models.PositiveBigIntegerField()),
                 ('content_type', models.CharField(blank=True, max_length=100)),
+                ('action', models.CharField(choices=[('upload_only', 'Upload only'), ('upload_validate', 'Upload and validate')], default='upload_only', max_length=32)),
                 ('created_by', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to=settings.AUTH_USER_MODEL)),
                 ('scan', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='pending_uploads', to='scanning.scan')),
             ],

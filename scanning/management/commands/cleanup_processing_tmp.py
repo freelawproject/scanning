@@ -102,14 +102,19 @@ class Command(BaseCommand):
             )
 
     def _sweep_pending_uploads(self):
-        """Delete unconfirmed direct-to-S3 uploads (and orphaned scans).
+        """Recover or delete unconfirmed direct-to-S3 uploads.
 
-        A ``PendingUpload`` older than ``PENDING_UPLOAD_TTL_HOURS`` means
-        the browser requested a presigned POST but never confirmed (tab
-        closed, upload abandoned). Delete the row; if its scan never got
-        an original PDF attached (a fresh scan created just for this
-        upload), delete the scan too. Scans that already have a file
-        (e.g. a re-upload of an existing scan) are left untouched.
+        A ``PendingUpload`` older than ``PENDING_UPLOAD_TTL_HOURS`` never
+        reached ``confirm_scan_upload``. Two outcomes:
+
+        - The object actually landed in S3 (the POST finished, only confirm
+          was lost). Recover it: attach it to the scan and replay the stored
+          action, exactly as confirm would have. Never destroy a good file.
+        - The object isn't there (truly abandoned before the upload
+          finished). Delete the pending row, and if its scan never got a
+          file attached (a fresh scan created just for this upload), delete
+          the scan and any stray object too. Scans that already have a file
+          (a re-upload of an existing scan) are left untouched.
 
         :return: None.
         """
@@ -117,7 +122,7 @@ class Command(BaseCommand):
 
         from django.utils import timezone
 
-        from scanning import s3_sync
+        from scanning import s3_sync, services
         from scanning.models import PendingUpload
 
         ttl_hours = getattr(settings, "PENDING_UPLOAD_TTL_HOURS", 24.0)
@@ -126,31 +131,33 @@ class Command(BaseCommand):
             date_created__lt=cutoff
         ).select_related("scan")
 
+        recovered = 0
         pending_removed = 0
         scans_removed = 0
         for pending in stale:
+            # Recover first: if the object is in S3 and valid, link it rather
+            # than delete it. recover_pending_upload deletes the row on success.
+            if services.recover_pending_upload(pending):
+                recovered += 1
+                continue
             scan = pending.scan
             if scan and not scan.original_pdf.name:
-                # Genuinely abandoned fresh upload: reclaim the stranded S3
-                # object (browser completed the up-to-2 GB POST but never
-                # confirmed) along with the fileless scan. Best-effort; a
-                # missing key is a no-op.
-                #
-                # Only do this when the scan has no file. A re-upload of an
-                # existing scan reuses the SAME deterministic s3_key as the
-                # confirmed original, so deleting it here would destroy the
-                # live original while scan.original_pdf.name still points at
-                # it -- the "re-upload scans left untouched" contract above.
+                # Truly abandoned fresh upload: reclaim any stray S3 object
+                # (best-effort; a missing key is a no-op) and the fileless
+                # scan. Guarded to the fileless case: a re-upload reuses the
+                # confirmed original's s3_key, so deleting it here would
+                # destroy the live original.
                 s3_sync.delete_uploaded_object(pending.s3_key)
                 scan.delete()
                 scans_removed += 1
             pending.delete()
             pending_removed += 1
 
-        if pending_removed:
+        if pending_removed or recovered:
             logger.info(
-                "cleanup_processing_tmp: removed %d stale pending upload(s) "
-                "and %d orphaned scan(s)",
+                "cleanup_processing_tmp: recovered %d unconfirmed upload(s), "
+                "removed %d stale pending upload(s) and %d orphaned scan(s)",
+                recovered,
                 pending_removed,
                 scans_removed,
             )

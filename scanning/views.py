@@ -30,16 +30,15 @@ from scanning.models import (
     Page,
     PendingUpload,
     Priority,
-    QueuedAction,
     QueueStatus,
     Reporter,
     Scan,
     Source,
-    Stage,
     Status,
+    UploadAction,
     Volume,
 )
-from scanning.services import refresh_volume_queue_status_for_scan
+from scanning.services import apply_upload_action
 from scanning.utils import get_volume, has_s3_credentials
 
 # Max size for a direct-to-S3 original upload. Enforced by the presigned
@@ -538,17 +537,11 @@ def _finalize_uploaded_scan(request, scan):
     :return: The URL to redirect the browser to.
     :rtype: str
     """
-    action = request.POST.get("action", "upload_only")
-    if action == "upload_validate":
-        scan.status = Status.QUEUED
-        scan.stage = Stage.VALIDATE
-        scan.queued_action = QueuedAction.FULL_PIPELINE
-        scan.progress_message = "Queued for processing..."
-        scan.save()
-        refresh_volume_queue_status_for_scan(scan)
+    action = request.POST.get("action", UploadAction.UPLOAD_ONLY)
+    apply_upload_action(scan, action)
+    if action == UploadAction.UPLOAD_VALIDATE:
         return reverse("scan_process", kwargs={"pk": scan.pk})
 
-    refresh_volume_queue_status_for_scan(scan)
     messages.success(request, "PDF uploaded successfully.")
     return reverse(
         "queue_detail",
@@ -676,6 +669,11 @@ def presign_scan_upload(request, reporter_slug, vol):
     # trusting the browser -- a client-supplied MIME would otherwise be
     # baked into the S3 policy and stored on the object.
     content_type = "application/pdf"
+    # Store the chosen action now so recovery can replay it if the browser
+    # never reaches confirm_scan_upload (container died, tab closed, etc.).
+    action = request.POST.get("action", UploadAction.UPLOAD_ONLY)
+    if action not in UploadAction.values:
+        action = UploadAction.UPLOAD_ONLY
     try:
         size = int(request.POST.get("size", "0"))
     except (TypeError, ValueError):
@@ -718,6 +716,7 @@ def presign_scan_upload(request, reporter_slug, vol):
             s3_key=f"{s3_sync.s3_processing_prefix(scan)}{original_name}",
             expected_size=size,
             content_type=content_type,
+            action=action,
             created_by=request.user,
         )
     except Exception:

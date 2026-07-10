@@ -392,6 +392,7 @@ class PendingUploadAdmin(admin.ModelAdmin):
         "scan",
         "created_by",
         "expected_size",
+        "action",
         "date_created",
     ]
     search_fields = ["id", "s3_key", "scan__id"]

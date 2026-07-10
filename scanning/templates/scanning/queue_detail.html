@@ -289,6 +289,9 @@
     meta.append('filename', file.name);
     meta.append('content_type', file.type || 'application/pdf');
     meta.append('size', file.size);
+    // Send the chosen action now too, so it's stored on the PendingUpload
+    // and recovery can replay it if confirm never runs.
+    meta.append(action.name, action.value);
 
     fetch(form.dataset.presignUrl, {
       method: 'POST',

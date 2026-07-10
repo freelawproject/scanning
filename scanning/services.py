@@ -149,6 +149,67 @@ def refresh_volume_queue_status_for_scan(scan: Scan) -> None:
     refresh_volume_queue_status(volume)
 
 
+def apply_upload_action(scan: Scan, action: str) -> None:
+    """Apply the uploader's post-upload action to a stored scan.
+
+    Request-free core shared by the web confirm flow
+    (``_finalize_uploaded_scan``) and the recovery path. ``upload_validate``
+    queues the full pipeline; ``upload_only`` (or anything else) just
+    records the upload. Always refreshes the parent volume's queue status.
+
+    :param scan: The scan whose original PDF is now stored.
+    :param action: The chosen ``UploadAction`` value.
+    :return: None.
+    """
+    from scanning.models import QueuedAction, Stage, Status, UploadAction
+
+    if action == UploadAction.UPLOAD_VALIDATE:
+        scan.status = Status.QUEUED
+        scan.stage = Stage.VALIDATE
+        scan.queued_action = QueuedAction.FULL_PIPELINE
+        scan.progress_message = "Queued for processing..."
+        scan.save()
+    refresh_volume_queue_status_for_scan(scan)
+
+
+def recover_pending_upload(pending) -> bool:
+    """Recover a completed-but-unconfirmed direct-to-S3 upload.
+
+    A ``PendingUpload`` whose object landed in S3 (the presigned POST
+    finished) but was never confirmed -- ``confirm_scan_upload`` never ran
+    because the container died, the tab closed, or the request 500'd. If
+    the object exists and is a valid PDF, do what confirm would have done:
+    attach it to the fileless scan, replay the stored action, and delete
+    the pending row.
+
+    :param pending: The ``PendingUpload`` to try to recover.
+    :returns: True if recovered; False if there's nothing to recover (the
+        object is missing/invalid, or the scan is already linked -- e.g. a
+        re-upload whose object belongs to the confirmed original).
+    :rtype: bool
+    """
+    from scanning import s3_sync
+
+    scan = pending.scan
+    if scan is None or scan.original_pdf.name:
+        return False
+
+    original_name = Path(pending.s3_key).name
+    if not s3_sync.verify_uploaded_object(scan, original_name):
+        return False
+
+    scan.original_pdf.name = original_name
+    scan.save(update_fields=["original_pdf"])
+    apply_upload_action(scan, pending.action)
+    pending.delete()
+    logger.info(
+        "Recovered unconfirmed upload for scan %s from s3 key %s",
+        scan.pk,
+        pending.s3_key,
+    )
+    return True
+
+
 def _update_progress(
     scan_pk: int,
     message: str,

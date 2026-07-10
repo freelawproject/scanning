@@ -723,6 +723,17 @@ class TestPresignedUpload(ScanningTestCase):
         _, mock_presign = self._presign(content_type="text/html")
         self.assertEqual(mock_presign.call_args.args[2], "application/pdf")
 
+    def test_presign_stores_action(self):
+        # The chosen action is persisted so recovery can replay it.
+        resp, _ = self._presign(action="upload_validate")
+        pending = PendingUpload.objects.get(pk=resp.json()["pending_id"])
+        self.assertEqual(pending.action, "upload_validate")
+
+    def test_presign_defaults_action_to_upload_only(self):
+        resp, _ = self._presign()
+        pending = PendingUpload.objects.get(pk=resp.json()["pending_id"])
+        self.assertEqual(pending.action, "upload_only")
+
     def test_confirm_failure_deletes_s3_object(self):
         pending_id = self._presign()[0].json()["pending_id"]
         pending = PendingUpload.objects.get(pk=pending_id)
