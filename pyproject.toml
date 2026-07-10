@@ -33,7 +33,7 @@ dependencies = [
   # validation and OCR — no torch/paddle. The heavy in-process inference stack
   # lives in the `local-ml` extra so the web/daemon images stay lean whenever
   # detection is offloaded to RunPod (RUNPOD_ENABLED=True).
-  "blackletter>=0.0.10",
+  "blackletter>=0.1.0",
   "ocrmypdf>=17",
   "pdfplumber>=0.11",
   "pymupdf>=1.25",
@@ -58,7 +58,7 @@ dev = [
 # wherever detection runs locally instead of on RunPod: local dev, CI, the
 # offline daemon, and the RunPod worker image. Excluded from the lean web image.
 local-ml = [
-  "blackletter[detect,analyze]>=0.0.10",
+  "blackletter[detect,analyze]>=0.1.0",
   "torch",
   "torchvision",
   "ultralytics>=8.3",
@@ -111,7 +111,7 @@ python_files = ["tests.py", "test_*.py"]
 # same OpenCV release means the same cv2 ABI, so whichever wheel writes
 # `site-packages/cv2/` last, `import cv2` stays consistent. `opencv-python-headless`
 # is listed defensively in case a transitive dep reintroduces it. Base blackletter
-# no longer pulls headless as of blackletter #61 / 0.0.14.
+# no longer pulls headless as of blackletter #61 / 0.1.0.
 override-dependencies = [
   "opencv-python==4.10.0.84",
   "opencv-contrib-python==4.10.0.84",
@@ -122,10 +122,6 @@ override-dependencies = [
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 paddlepaddle = { index = "paddle-cpu" }
-# TEMPORARY: track the blackletter extras-split branch until it is released.
-# Once blackletter 0.0.14 is on PyPI, drop this source line and bump the
-# blackletter specifiers below to >=0.0.14 so the build resolves from PyPI.
-blackletter = { git = "https://github.com/freelawproject/blackletter.git", branch = "split-heavy-deps-into-extras" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

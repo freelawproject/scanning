@@ -45,10 +45,6 @@ WORKDIR /opt/scanning
 #   deps-web  lean base only         -> web image (detection offloaded)        #
 #   deps-ml   base + local-ml extra  -> daemon image + offline/local detection #
 #   deps-dev  everything incl. dev   -> local dev (docker-compose)             #
-#                                                                             #
-# blackletter currently resolves from a git branch (see pyproject             #
-# [tool.uv.sources]) until 0.0.14 is published; git is available in           #
-# build-base, so uv sync can clone it during the build.                        #
 ##############################################################################
 FROM build-base AS deps-web
 
@@ -116,15 +112,16 @@ ENTRYPOINT ["/bin/sh", "/opt/scanning/docker/django/docker-entrypoint.sh"]
 ##############################################################################
 # prod-web: slim runtime for the web tier (the deployment that scales and     #
 # churns). Carries only the LEAN venv, app source, and compiled CSS. No       #
-# torch/paddle/ultralytics and — because blackletter uses opencv headless      #
-# here — no libgl1. Requires detection offloaded (RUNPOD_ENABLED=True).        #
+# torch/paddle/ultralytics. Base blackletter uses non-headless opencv-python   #
+# (>=0.1.0), so libgl1 is required here. Requires detection offloaded          #
+# (RUNPOD_ENABLED=True).                                                       #
 ##############################################################################
 FROM python:3.12-slim AS prod-web
 
 # Runtime-only apt libs for the lean tier:
-#   libpq5           - PostgreSQL client library
-#   tesseract-ocr*   - OCR engine + English data (pytesseract / ocrmypdf)
-#   libglib2.0-0     - required by opencv-python-headless (cv2)
+#   libpq5              - PostgreSQL client library
+#   tesseract-ocr*      - OCR engine + English data (pytesseract / ocrmypdf)
+#   libgl1, libglib2.0-0 - required by opencv-python (cv2) in base blackletter
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update --quiet=2 && \
@@ -134,7 +131,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --quiet=2 \
     libpq5 \
     tesseract-ocr tesseract-ocr-eng \
-    libglib2.0-0
+    libgl1 libglib2.0-0
 
 ENV PYTHONUNBUFFERED=1
 ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
