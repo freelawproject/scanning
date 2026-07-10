@@ -62,7 +62,9 @@ local-ml = [
   "torch",
   "torchvision",
   "ultralytics>=8.3",
-  "opencv-python==4.10.0.84",
+  # cv2 comes in transitively (ultralytics, python-doctr, paddlex); its version
+  # is pinned once in [tool.uv] override-dependencies to keep every cv2 variant
+  # on one OpenCV ABI.
   "paddlepaddle",
   "paddleocr>=3.4.0",
 ]
@@ -99,6 +101,22 @@ lint.ignore = [
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "scanning.settings"
 python_files = ["tests.py", "test_*.py"]
+
+[tool.uv]
+# Keep every cv2-providing distribution on one OpenCV version. The daemon
+# (local-ml) tree pulls two variants that both own the top-level `cv2` package
+# and cannot be deduplicated (paddleocr -> paddlex needs `opencv-contrib-python`;
+# ultralytics, python-doctr and base blackletter need `opencv-python`). uv can't
+# rename one into the other, so the best we can do is force a matching version:
+# same OpenCV release means the same cv2 ABI, so whichever wheel writes
+# `site-packages/cv2/` last, `import cv2` stays consistent. `opencv-python-headless`
+# is listed defensively in case a transitive dep reintroduces it. Base blackletter
+# no longer pulls headless as of blackletter #61 / 0.0.14.
+override-dependencies = [
+  "opencv-python==4.10.0.84",
+  "opencv-contrib-python==4.10.0.84",
+  "opencv-python-headless==4.10.0.84",
+]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
