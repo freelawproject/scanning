@@ -9,11 +9,15 @@ endif
 .PHONY: build-image push-image
 
 REPO ?= freelawproject/scanning
-DOCKER_TAG_PROD = $(VERSION)-prod
+# One repo, two variant tags: a lean web image (prod-web target) and the heavy
+# daemon image (prod-ml target, also used offline / as the RunPod-adjacent base).
+DOCKER_TAG_WEB = $(VERSION)-web
+DOCKER_TAG_DAEMON = $(VERSION)-daemon
 UNAME := $(shell uname -m)
 
 build-image:
-	docker build -t $(REPO):$(DOCKER_TAG_PROD) --build-arg GIT_SHA=$(VERSION) --file docker/django/Dockerfile .
+	docker build --target prod-web -t $(REPO):$(DOCKER_TAG_WEB) --build-arg GIT_SHA=$(VERSION) --file docker/django/Dockerfile .
+	docker build --target prod-ml -t $(REPO):$(DOCKER_TAG_DAEMON) --build-arg GIT_SHA=$(VERSION) --file docker/django/Dockerfile .
 
 push-image: build-image
 	$(info Checking if valid architecture)
@@ -24,4 +28,5 @@ protects against arm64 builds being accidentally deployed to the server (which u
 	fi
 
 	    echo "Architecture is OK. Pushing."; \
-	    docker push $(REPO):$(DOCKER_TAG_PROD);
+	    docker push $(REPO):$(DOCKER_TAG_WEB); \
+	    docker push $(REPO):$(DOCKER_TAG_DAEMON);
