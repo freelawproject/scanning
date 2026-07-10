@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 from django.conf import settings
@@ -8,6 +9,8 @@ from django.utils import timezone
 from django.utils.deconstruct import deconstructible
 
 from scanning.storage import LocalProcessingStorage
+
+logger = logging.getLogger(__name__)
 
 _local_storage = LocalProcessingStorage()
 
@@ -655,10 +658,31 @@ class Scan(AbstractDateTimeModel):
             ),
         )
 
-        flagged = Scan.objects.filter(
-            pk__in=pks, status=Status.ERROR_INTERRUPTED
-        ).count()
-        return len(pks) - flagged, flagged
+        flagged_pks = list(
+            Scan.objects.filter(
+                pk__in=pks, status=Status.ERROR_INTERRUPTED
+            ).values_list("pk", flat=True)
+        )
+        requeued = len(pks) - len(flagged_pks)
+
+        if requeued:
+            # INFO so a routine re-queue lands as a Sentry breadcrumb (not an
+            # event) and we can see how often scans get interrupted.
+            logger.info(
+                "Re-queued %d interrupted scan(s) for the next daemon tick.",
+                requeued,
+            )
+        if flagged_pks:
+            # ERROR so hitting the interruption ceiling raises a Sentry event:
+            # the scan won't self-heal and needs a human to re-queue it.
+            logger.error(
+                "Flagged %d scan(s) as ERROR_INTERRUPTED after exceeding %d "
+                "interruptions; needs manual re-queue: %s",
+                len(flagged_pks),
+                max_interruptions,
+                flagged_pks,
+            )
+        return requeued, len(flagged_pks)
 
     def clean(self):
         """Validate page range and page count consistency.

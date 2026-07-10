@@ -121,22 +121,34 @@ class TestRecoverStale(TestCase):
     def test_stale_scan_requeued_and_interruption_bumped(self):
         scan = self._stale(interruption_count=0)
 
-        Command()._recover_stale()
+        with self.assertLogs("scanning.models", level="INFO") as logs:
+            Command()._recover_stale()
 
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.QUEUED)
         self.assertEqual(scan.interruption_count, 1)
+        # Re-queue is an INFO breadcrumb, not a Sentry error event.
+        self.assertTrue(
+            any(
+                r.levelname == "INFO" and "Re-queued" in r.getMessage()
+                for r in logs.records
+            )
+        )
 
     @override_settings(DAEMON_MAX_INTERRUPTIONS=3)
     def test_stale_scan_flagged_after_max_interruptions(self):
         scan = self._stale(interruption_count=3)
 
-        Command()._recover_stale()
+        with self.assertLogs("scanning.models", level="ERROR") as logs:
+            Command()._recover_stale()
 
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.ERROR_INTERRUPTED)
         self.assertEqual(scan.interruption_count, 4)
         self.assertEqual(scan.retry_count, 0)
+        # Flagging raises a Sentry error event so a human notices.
+        self.assertEqual(logs.records[0].levelname, "ERROR")
+        self.assertIn("ERROR_INTERRUPTED", logs.records[0].getMessage())
 
     def test_fresh_processing_scan_is_left_alone(self):
         """A PROCESSING scan within the timeout is not touched."""
