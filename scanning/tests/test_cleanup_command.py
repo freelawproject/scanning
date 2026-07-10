@@ -5,6 +5,7 @@ import tempfile
 import time
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from django.core.management import call_command
 from django.test import TestCase, override_settings
@@ -122,3 +123,13 @@ class TestPendingUploadSweep(TestCase):
         pending = self._make_pending(scan, hours_old=48)
         call_command("cleanup_processing_tmp")
         self.assertFalse(PendingUpload.objects.filter(pk=pending.pk).exists())
+
+    @override_settings(DEVELOPMENT=False)
+    def test_sweep_deletes_abandoned_s3_object(self):
+        # The stranded S3 object (browser POSTed but never confirmed) is
+        # reclaimed, not just the DB rows.
+        scan = ScanFactory(original_pdf="")
+        pending = self._make_pending(scan, hours_old=48)
+        with patch("scanning.s3_sync.delete_uploaded_object") as mock_delete:
+            call_command("cleanup_processing_tmp")
+        mock_delete.assert_called_once_with(pending.s3_key)

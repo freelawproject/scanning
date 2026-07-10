@@ -671,7 +671,11 @@ def presign_scan_upload(request, reporter_slug, vol):
     volume = get_volume(reporter_slug, vol)
 
     filename = request.POST.get("filename", "")
-    content_type = request.POST.get("content_type", "") or "application/pdf"
+    # This endpoint is PDF-only (filename must end in .pdf and the object is
+    # PDF-verified on confirm), so pin the stored Content-Type rather than
+    # trusting the browser -- a client-supplied MIME would otherwise be
+    # baked into the S3 policy and stored on the object.
+    content_type = "application/pdf"
     try:
         size = int(request.POST.get("size", "0"))
     except (TypeError, ValueError):
@@ -706,15 +710,22 @@ def presign_scan_upload(request, reporter_slug, vol):
         presigned = s3_sync.generate_presigned_post(
             scan, original_name, content_type, MAX_ORIGINAL_UPLOAD_SIZE
         )
+        if not presigned:
+            # S3 sync disabled despite credentials being present.
+            raise RuntimeError("presign unavailable")
+        pending = PendingUpload.objects.create(
+            scan=scan,
+            s3_key=f"{s3_sync.s3_processing_prefix(scan)}{original_name}",
+            expected_size=size,
+            content_type=content_type,
+            created_by=request.user,
+        )
     except Exception:
-        logger.exception("generate_presigned_post failed for scan %s", scan.pk)
-        presigned = None
-
-    if not presigned:
-        # S3 sync disabled, or the presign call errored. Clean up the
-        # freshly-created, fileless scan here: with no PendingUpload row it
-        # would otherwise be orphaned (the TTL sweep only reclaims scans
-        # reachable through a stale pending row).
+        # Presign disabled/errored, or the pending-row insert failed. Either
+        # way the scan is fileless with no PendingUpload row, so the TTL sweep
+        # can't reclaim it (it only follows stale pending rows) -- delete it
+        # inline.
+        logger.exception("Presign setup failed for scan %s", scan.pk)
         if not scan.original_pdf.name:
             scan.delete()
         return JsonResponse(
@@ -722,13 +733,6 @@ def presign_scan_upload(request, reporter_slug, vol):
             status=503,
         )
 
-    pending = PendingUpload.objects.create(
-        scan=scan,
-        s3_key=f"{s3_sync.s3_processing_prefix(scan)}{original_name}",
-        expected_size=size,
-        content_type=content_type,
-        created_by=request.user,
-    )
     return JsonResponse(
         {"presigned": presigned, "pending_id": str(pending.id)}
     )
@@ -764,6 +768,9 @@ def confirm_scan_upload(request, reporter_slug, vol):
     original_name = Path(pending.s3_key).name
 
     if not s3_sync.verify_uploaded_object(scan, original_name):
+        # The rejected object (e.g. a non-PDF that still landed via the
+        # presigned POST) would otherwise be stranded in the bucket.
+        s3_sync.delete_uploaded_object(pending.s3_key)
         pending.delete()
         if not scan.original_pdf.name:
             scan.delete()

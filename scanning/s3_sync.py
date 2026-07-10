@@ -292,18 +292,30 @@ def _is_preview_pdf(rel: str) -> bool:
     return "redacted" not in rel and "bitonal" not in rel
 
 
-def download_preview_pdf(scan: Scan) -> Path | None:
-    """Download only the small preview PDF(s) from S3 to /tmp/.
+def _is_original_pdf(rel: str) -> bool:
+    """Return True if a processing-prefix relative key is the original PDF.
 
-    Pulls the bitonal and/or OCR PDF -- the reviewable previews -- and
-    skips the multi-GB original and the ``images/`` tree. Used by the PDF
-    viewer endpoint so opening a scan never drags the whole processing
-    prefix (or the original) across the network, which blew past the
-    gunicorn worker timeout for large scans.
+    The (up to 2 GB) ``*.original.pdf`` at the top of the prefix. Used to
+    pull only the original -- not the ``images/`` tree -- for the crop
+    endpoint, which renders high-res crops from the non-bitonal original.
 
-    Idempotent: skips files whose local size matches the S3 object's.
+    :param rel: Object key relative to the scan's processing prefix.
+    :returns: Whether the key is the top-level original PDF.
+    :rtype: bool
+    """
+    return "/" not in rel and rel.endswith(".original.pdf")
 
-    :param scan: Scan to pull the preview PDF for.
+
+def _download_matching(scan: Scan, predicate, kind: str) -> Path | None:
+    """Download processing-prefix objects whose relative key matches.
+
+    Shared machinery for the targeted pulls. Idempotent: skips files
+    whose local size already matches the S3 object's. Touches the tmp
+    dir's mtime so the TTL sweep treats it as recently active.
+
+    :param scan: Scan whose processing prefix to pull from.
+    :param predicate: ``rel -> bool`` selecting which keys to download.
+    :param kind: Human label for the log line (e.g. ``"preview PDF"``).
     :returns: The local tmp path, or None if sync is disabled.
     :rtype: Path | None
     """
@@ -322,7 +334,7 @@ def download_preview_pdf(scan: Scan) -> Path | None:
         for obj in page.get("Contents", []):
             key = obj["Key"]
             rel = key[len(prefix) :]
-            if not rel or not _is_preview_pdf(rel):
+            if not rel or not predicate(rel):
                 continue
             local_path = local_root / rel
             if local_path.is_file() and local_path.stat().st_size == obj.get(
@@ -335,13 +347,44 @@ def download_preview_pdf(scan: Scan) -> Path | None:
     local_root.touch(exist_ok=True)
     if downloaded:
         logger.info(
-            "Downloaded %d preview PDF(s) for scan %s from s3://%s/%s",
+            "Downloaded %d %s(s) for scan %s from s3://%s/%s",
             downloaded,
+            kind,
             scan.pk,
             bucket,
             prefix,
         )
     return local_root
+
+
+def download_preview_pdf(scan: Scan) -> Path | None:
+    """Download only the small preview PDF(s) from S3 to /tmp/.
+
+    Pulls the bitonal and/or OCR PDF -- the reviewable previews -- and
+    skips the multi-GB original and the ``images/`` tree. Used by the PDF
+    viewer endpoint so opening a scan never drags the whole processing
+    prefix (or the original) across the network, which blew past the
+    gunicorn worker timeout for large scans.
+
+    :param scan: Scan to pull the preview PDF for.
+    :returns: The local tmp path, or None if sync is disabled.
+    :rtype: Path | None
+    """
+    return _download_matching(scan, _is_preview_pdf, "preview PDF")
+
+
+def download_original_pdf(scan: Scan) -> Path | None:
+    """Download only the original PDF from S3 to /tmp/.
+
+    Used by the crop endpoint, which needs the (large, non-bitonal)
+    original locally to render high-res crops. Pulls just the original,
+    not the ``images/`` tree, so it stays as small as the feature allows.
+
+    :param scan: Scan to pull the original PDF for.
+    :returns: The local tmp path, or None if sync is disabled.
+    :rtype: Path | None
+    """
+    return _download_matching(scan, _is_original_pdf, "original PDF")
 
 
 def upload_file_to_s3(scan: Scan, relative_path: str) -> bool:
@@ -424,6 +467,33 @@ def upload_fileobj_to_s3(scan: Scan, upload, relative_path: str) -> bool:
         scan.pk,
         elapsed,
     )
+    return True
+
+
+def delete_uploaded_object(key: str) -> bool:
+    """Best-effort delete of a single S3 object by full key.
+
+    Used to reclaim the object left behind by an abandoned or rejected
+    direct-to-S3 upload (browser POSTed the bytes but never confirmed, or
+    the object failed PDF verification). Deleting a key that doesn't exist
+    is a no-op success in S3, so this is safe to call unconditionally.
+
+    :param key: The full S3 object key (e.g. a ``PendingUpload.s3_key``).
+    :returns: True if the delete was issued, False if S3 is disabled,
+        the key is empty, or the call errored.
+    :rtype: bool
+    """
+    if not _s3_enabled() or not key:
+        return False
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    try:
+        _s3_client().delete_object(Bucket=bucket, Key=key)
+    except ClientError:
+        logger.warning(
+            "Could not delete abandoned upload s3://%s/%s", bucket, key
+        )
+        return False
     return True
 
 

@@ -117,6 +117,7 @@ class Command(BaseCommand):
 
         from django.utils import timezone
 
+        from scanning import s3_sync
         from scanning.models import PendingUpload
 
         ttl_hours = getattr(settings, "PENDING_UPLOAD_TTL_HOURS", 24.0)
@@ -129,6 +130,10 @@ class Command(BaseCommand):
         scans_removed = 0
         for pending in stale:
             scan = pending.scan
+            # Reclaim the S3 object too: the browser may have completed the
+            # (up to 2 GB) presigned POST but never confirmed, leaving the
+            # object stranded. Best-effort; a missing key is a no-op.
+            s3_sync.delete_uploaded_object(pending.s3_key)
             pending.delete()
             pending_removed += 1
             if scan and not scan.original_pdf.name:

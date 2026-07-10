@@ -266,6 +266,22 @@ class TestSyncHelpersWithCredentials(TestCase):
             {f"{prefix}bitonal.pdf", f"{prefix}a.164.1.pdf"},
         )
 
+    def test_delete_uploaded_object(self):
+        mock_s3 = MagicMock()
+        key = "processing/9/tc/164/1/x.original.pdf"
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            result = s3_sync.delete_uploaded_object(key)
+        self.assertTrue(result)
+        mock_s3.delete_object.assert_called_once()
+        self.assertEqual(mock_s3.delete_object.call_args.kwargs["Key"], key)
+
+    def test_delete_uploaded_object_empty_key_noop(self):
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            result = s3_sync.delete_uploaded_object("")
+        self.assertFalse(result)
+        mock_boto3.client.assert_not_called()
+
     def test_upload_file_to_s3_missing_local_file(self):
         scan = _reporter_scan()
         with patch("scanning.s3_sync.boto3") as mock_boto3:

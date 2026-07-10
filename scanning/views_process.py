@@ -558,7 +558,27 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     except ValueError:
         return HttpResponse(status=400)
 
-    with fitz.open(scan.pdf_path) as doc:
+    try:
+        doc = fitz.open(scan.pdf_path)
+    except FileNotFoundError:
+        # Prod: the original lives only in S3 (direct-to-S3 upload, and the
+        # classic prod path streams straight to S3 too). The process view no
+        # longer eagerly lands it locally, and download_preview_pdf excludes
+        # the original, so pull just the original here and retry.
+        try:
+            from scanning import s3_sync
+
+            s3_sync.download_original_pdf(scan)
+        except Exception:
+            logger.exception(
+                "Lazy S3 original pull failed for scan %s", scan.pk
+            )
+        try:
+            doc = fitz.open(scan.pdf_path)
+        except FileNotFoundError:
+            return HttpResponse(status=404)
+
+    with doc:
         if page < 0 or page >= doc.page_count:
             return HttpResponse(status=404)
         clip = fitz.Rect(x0, y0, x1, y1)
