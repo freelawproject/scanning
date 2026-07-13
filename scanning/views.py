@@ -106,6 +106,9 @@ def scan_list(request: HttpRequest) -> HttpResponse:
     retry_cap_count = Scan.objects.filter(
         status=Status.ERROR_MAX_RETRIES,
     ).count()
+    interrupted_count = Scan.objects.filter(
+        status=Status.ERROR_INTERRUPTED,
+    ).count()
 
     return render(
         request,
@@ -123,6 +126,7 @@ def scan_list(request: HttpRequest) -> HttpResponse:
             "current_source": source_filter or "",
             "current_volume": volume_filter or "",
             "retry_cap_count": retry_cap_count,
+            "interrupted_count": interrupted_count,
         },
     )
 
