@@ -13,6 +13,8 @@ module.exports = {
     'badge-approved',
     'badge-extracted',
     'badge-error',
+    'badge-error_max_retries',
+    'badge-error_interrupted',
     'badge-cancelled',
     // Queue status badges (rendered via badge-{{ volume.queue_status }})
     'badge-needs_scanning',

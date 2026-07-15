@@ -1,4 +1,5 @@
 import uuid
+import logging
 from pathlib import Path
 
 from django.conf import settings
@@ -9,6 +10,8 @@ from django.utils import timezone
 from django.utils.deconstruct import deconstructible
 
 from scanning.storage import LocalProcessingStorage
+
+logger = logging.getLogger(__name__)
 
 _local_storage = LocalProcessingStorage()
 
@@ -79,6 +82,7 @@ class Status(models.TextChoices):
     EXTRACTED = "extracted", "Extracted"
     ERROR = "error", "Error"
     ERROR_MAX_RETRIES = "error_max_retries", "Error (retry cap hit)"
+    ERROR_INTERRUPTED = "error_interrupted", "Error (interrupted too often)"
     CANCELLED = "cancelled", "Cancelled"
 
 
@@ -524,6 +528,14 @@ class Scan(AbstractDateTimeModel):
         default=0,
         help_text="Number of transient RunPod failures before the current run.",
     )
+    interruption_count = models.PositiveIntegerField(
+        default=0,
+        help_text=(
+            "Times the daemon was killed or timed out while this scan was "
+            "PROCESSING and re-queued it. Distinct from retry_count: these "
+            "are infra interruptions (deploys, evictions), not scan failures."
+        ),
+    )
     ocr_results = models.JSONField(
         default=list,
         blank=True,
@@ -591,6 +603,98 @@ class Scan(AbstractDateTimeModel):
         ]
         constraints = []
         ordering = ["-date_created"]
+
+    @staticmethod
+    def requeue_or_flag_interrupted(
+        queryset, requeue_message, max_interruptions=None
+    ):
+        """Re-queue interrupted PROCESSING scans, flagging chronic offenders.
+
+        The daemon re-queues an in-flight scan (``PROCESSING -> QUEUED``)
+        without consuming its RunPod retry budget whenever it is killed
+        (SIGTERM) or the scan times out mid-pipeline. That is deliberate so a
+        deploy or eviction can't burn a scan's retries, but it means a scan
+        can be re-queued forever if the daemon pod churns, silently redoing
+        GPU work and never surfacing (issue #124).
+
+        This bounds that loop: each call increments ``interruption_count`` and
+        re-queues the scan, unless it has now been interrupted more than
+        ``max_interruptions`` times, in which case it moves to
+        ``ERROR_INTERRUPTED`` so a human is prompted to look instead.
+
+        :param queryset: Scans to act on; only rows still in ``PROCESSING``
+            are touched (the status guard avoids stomping a scan another
+            replica or an admin action has already moved).
+        :param requeue_message: ``progress_message`` for re-queued scans.
+        :param max_interruptions: Interruption ceiling; defaults to
+            ``settings.DAEMON_MAX_INTERRUPTIONS``.
+        :return: ``(requeued, flagged)`` counts.
+        :rtype: tuple[int, int]
+        """
+        if max_interruptions is None:
+            max_interruptions = settings.DAEMON_MAX_INTERRUPTIONS
+
+        pks = list(
+            queryset.filter(status=Status.PROCESSING).values_list(
+                "pk", flat=True
+            )
+        )
+        if not pks:
+            return 0, 0
+
+        flag_message = (
+            f"Interrupted {max_interruptions}+ times without completing "
+            "(daemon killed or timed out mid-pipeline). Flagged for review."
+        )
+
+        # Single atomic UPDATE: increment interruption_count and branch on the
+        # PRE-increment value via CASE/WHEN (no read-then-write race). A
+        # pre-increment `>= max` is a post-increment `> max`, so a scan is
+        # allowed `max_interruptions` re-queues before it is flagged. The
+        # PROCESSING guard means we never stomp a scan already moved on.
+        Scan.objects.filter(pk__in=pks, status=Status.PROCESSING).update(
+            interruption_count=models.F("interruption_count") + 1,
+            status=models.Case(
+                models.When(
+                    interruption_count__gte=max_interruptions,
+                    then=models.Value(Status.ERROR_INTERRUPTED),
+                ),
+                default=models.Value(Status.QUEUED),
+            ),
+            progress_message=models.Case(
+                models.When(
+                    interruption_count__gte=max_interruptions,
+                    then=models.Value(flag_message),
+                ),
+                default=models.Value(requeue_message),
+            ),
+        )
+
+        flagged_pks = list(
+            Scan.objects.filter(
+                pk__in=pks, status=Status.ERROR_INTERRUPTED
+            ).values_list("pk", flat=True)
+        )
+        requeued = len(pks) - len(flagged_pks)
+
+        if requeued:
+            # INFO so a routine re-queue lands as a Sentry breadcrumb (not an
+            # event) and we can see how often scans get interrupted.
+            logger.info(
+                "Re-queued %d interrupted scan(s) for the next daemon tick.",
+                requeued,
+            )
+        if flagged_pks:
+            # ERROR so hitting the interruption ceiling raises a Sentry event:
+            # the scan won't self-heal and needs a human to re-queue it.
+            logger.error(
+                "Flagged %d scan(s) as ERROR_INTERRUPTED after exceeding %d "
+                "interruptions; needs manual re-queue: %s",
+                len(flagged_pks),
+                max_interruptions,
+                flagged_pks,
+            )
+        return requeued, len(flagged_pks)
 
     def clean(self):
         """Validate page range and page count consistency.

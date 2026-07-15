@@ -208,4 +208,11 @@
     @apply badge bg-red-100 text-red-800
            dark:bg-red-900/50 dark:text-red-300;
   }
+
+  /* Terminal error states share the red error styling. */
+  .badge-error_max_retries,
+  .badge-error_interrupted {
+    @apply badge bg-red-100 text-red-800
+           dark:bg-red-900/50 dark:text-red-300;
+  }
 }

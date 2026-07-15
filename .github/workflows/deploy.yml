@@ -87,12 +87,12 @@ jobs:
 
       - name: Launch Temporary Pod
         run: |
-          kubectl run temp-pod-${{ steps.vars.outputs.sha_short }} -n ${{ env.EKS_NAMESPACE }} --image=freelawproject/scanning:${{ steps.vars.outputs.sha_short }}-prod --restart Never --pod-running-timeout=120s --overrides='
+          kubectl run temp-pod-${{ steps.vars.outputs.sha_short }} -n ${{ env.EKS_NAMESPACE }} --image=freelawproject/scanning:${{ steps.vars.outputs.sha_short }}-web --restart Never --pod-running-timeout=120s --overrides='
           {
               "spec": {
               "containers": [{
                   "name": "temp-pod",
-                  "image": "freelawproject/scanning:${{ steps.vars.outputs.sha_short }}-prod",
+                  "image": "freelawproject/scanning:${{ steps.vars.outputs.sha_short }}-web",
                   "command": ["/bin/sh", "-c", "trap : TERM INT; sleep 259200 & wait"],
                   "envFrom": [{
                   "secretRef": {
@@ -140,7 +140,7 @@ jobs:
         run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
 
       - name: Rollout scanning-web
-        run: kubectl set image -n ${{ env.EKS_NAMESPACE }} deployment/scanning-web web=freelawproject/scanning:${{ needs.setup-deploy.outputs.sha_short }}-prod
+        run: kubectl set image -n ${{ env.EKS_NAMESPACE }} deployment/scanning-web web=freelawproject/scanning:${{ needs.setup-deploy.outputs.sha_short }}-web
       - name: Watch scanning-web rollout status
         run: kubectl rollout status -n ${{ env.EKS_NAMESPACE }} deployment/scanning-web
 
@@ -159,7 +159,7 @@ jobs:
         run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
 
       - name: Rollout scanning-daemon
-        run: kubectl set image -n ${{ env.EKS_NAMESPACE }} deployment/scanning-daemon scanning-daemon=freelawproject/scanning:${{ needs.setup-deploy.outputs.sha_short }}-prod
+        run: kubectl set image -n ${{ env.EKS_NAMESPACE }} deployment/scanning-daemon scanning-daemon=freelawproject/scanning:${{ needs.setup-deploy.outputs.sha_short }}-daemon
       - name: Watch scanning-daemon rollout status
         run: kubectl rollout status -n ${{ env.EKS_NAMESPACE }} deployment/scanning-daemon
 

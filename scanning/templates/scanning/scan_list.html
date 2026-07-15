@@ -22,6 +22,20 @@
 </div>
 {% endif %}
 
+{% if interrupted_count %}
+<div class="alert-warning mb-4" role="alert">
+  {{ interrupted_count }} scan{{ interrupted_count|pluralize }} stopped after being interrupted too many times (daemon killed or timed out mid-pipeline).
+  {% if request.user.is_superuser %}
+  <a href="{% url 'admin:scanning_scan_changelist' %}?interrupted=1"
+     class="font-semibold underline hover:no-underline ml-1">
+    Review and re-queue in admin.
+  </a>
+  {% else %}
+  Please notify an admin to re-queue them.
+  {% endif %}
+</div>
+{% endif %}
+
 <!-- Filters -->
 <div class="card mb-6">
   <form method="get">

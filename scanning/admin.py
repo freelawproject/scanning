@@ -51,6 +51,34 @@ class RetryCapFilter(admin.SimpleListFilter):
         return queryset
 
 
+class InterruptedFilter(admin.SimpleListFilter):
+    """Filter scans flagged after too many daemon interruptions (issue #124)."""
+
+    title = "interrupted too often"
+    parameter_name = "interrupted"
+
+    def lookups(self, request, model_admin):
+        """Return the filter choices.
+
+        :param request: The admin HTTP request.
+        :param model_admin: The ModelAdmin instance.
+        :returns: Iterable of (value, label) tuples.
+        :rtype: list[tuple]
+        """
+        return [("1", "Yes")]
+
+    def queryset(self, request, queryset):
+        """Apply the filter to the queryset.
+
+        :param request: The admin HTTP request.
+        :param queryset: The base queryset.
+        :returns: Filtered queryset.
+        """
+        if self.value() == "1":
+            return queryset.filter(status=Status.ERROR_INTERRUPTED)
+        return queryset
+
+
 @admin.register(Reporter)
 class ReporterAdmin(admin.ModelAdmin):
     list_display = ["short_name", "full_name", "date_created"]
@@ -67,10 +95,17 @@ class ScanAdmin(admin.ModelAdmin):
         "number_of_pages",
         "status",
         "retry_count",
+        "interruption_count",
         "uploaded_by",
         "date_created",
     ]
-    list_filter = ["status", "reporter", "source", RetryCapFilter]
+    list_filter = [
+        "status",
+        "reporter",
+        "source",
+        RetryCapFilter,
+        InterruptedFilter,
+    ]
     search_fields = [
         "volume",
         "reporter__full_name",
@@ -98,7 +133,11 @@ class ScanAdmin(admin.ModelAdmin):
         "process_output",
     ]
     date_hierarchy = "date_created"
-    actions = ["reset_to_queued", "requeue_retry_cap_scans"]
+    actions = [
+        "reset_to_queued",
+        "requeue_retry_cap_scans",
+        "requeue_interrupted_scans",
+    ]
 
     @staticmethod
     def _admin_change_link(obj):
@@ -304,6 +343,38 @@ class ScanAdmin(admin.ModelAdmin):
         self.message_user(
             request,
             f"Re-queued {updated} scan(s) with retry_count reset. "
+            "The daemon will try them again on the next tick.",
+            level=messages.SUCCESS,
+        )
+
+    @admin.action(
+        description=(
+            "Re-queue selected scans flagged as interrupted too often "
+            "(resets interruption_count so the daemon will try again)"
+        )
+    )
+    def requeue_interrupted_scans(self, request, queryset):
+        """Re-queue scans flagged ERROR_INTERRUPTED by the daemon guard.
+
+        Resets ``status``, ``interruption_count``, and ``progress_message``
+        so the daemon picks them up again. Use once the underlying pod churn
+        (deploys, evictions, OOM) that interrupted them has settled (issue
+        #124).
+
+        :param request: The admin HTTP request.
+        :param queryset: Selected Scan queryset.
+        :return: None.
+        """
+        updated = queryset.filter(status=Status.ERROR_INTERRUPTED).update(
+            status=Status.QUEUED,
+            interruption_count=0,
+            progress_message="Re-queued via admin (interruption cap reset)",
+            progress_current=0,
+            progress_total=0,
+        )
+        self.message_user(
+            request,
+            f"Re-queued {updated} scan(s) with interruption_count reset. "
             "The daemon will try them again on the next tick.",
             level=messages.SUCCESS,
         )
