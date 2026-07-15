@@ -26,7 +26,7 @@ dependencies = [
     "runpod>=1.9,<2",
     "sentry-sdk>=2,<3",
 
-    "blackletter>=0.0.9",
+    "blackletter>=0.1.1",
 ]
 
 # This project is an application (handler.py), not a library. Tell uv

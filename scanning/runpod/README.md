@@ -37,12 +37,11 @@ Full design rationale, payload-size math, and tradeoffs are in
 - Python 3.12 (system python, no venv managers at runtime).
 - PyTorch 2.6 cu126 + paddlepaddle-gpu 3.1.0 cu126 (aligned on one
   CUDA minor version).
-- `blackletter[analyze]` pinned to a git branch (see the TODO in
-  `pyproject.toml`); flipped to a PyPI pin once released.
+- `blackletter` pinned to PyPI (`>=0.1.1`).
 - Pre-baked weights so cold start skips the network:
-  - YOLO `small.pt`, `medium.pt` (ship with blackletter), `large.pt`
-    (downloaded at build from the public HF repo
-    `flooie/blackletter-large`).
+  - YOLO `small.pt`, `medium.pt`, `large.pt` (blackletter >=0.1.1
+    bundles none; all three are downloaded at build from the public
+    HF repo `freelawproject/blackletter-weights`).
   - PaddleOCR PP-OCRv5 server det + rec weights in `/opt/paddlex`.
 - A `libcuda.so.1` stub from the CUDA `-devel-` variant so
   `import paddle` succeeds during `docker build`; the host's real
@@ -693,7 +692,7 @@ over the wire (keeps responses well under RunPod's ~20 MB cap).
 
 - Open-source code: blackletter, paddleocr, ultralytics, torch, etc.
 - Publicly-distributed model weights: blackletter YOLO (HF
-  `flooie/blackletter-large`), PaddleOCR PP-OCRv5.
+  `freelawproject/blackletter-weights`), PaddleOCR PP-OCRv5.
 - No secrets. No AWS keys. No DB credentials. No Django `SECRET_KEY`.
   No Sentry DSN (read from env at runtime).
 
@@ -777,9 +776,9 @@ image versions don't match. Make sure the `FROM` and the
 3.1.0+. Confirm `uv.lock` pins 3.1.0 against the
 `https://www.paddlepaddle.org.cn/packages/stable/cu126/` index.
 
-**`Model ... large.pt not found, skipping`** — the HF download at
+**`Model ... .pt not found, skipping`** — the HF download at
 build time failed silently on all three retries. Rebuild. Consider
-mirroring `large.pt` to a private S3 and swapping the HF URL in
+mirroring the weights to a private S3 and swapping the HF URL in
 `ensure_weights` if HF reliability becomes an issue.
 
 **Runs on CPU instead of GPU at runtime** — RunPod endpoint isn't
