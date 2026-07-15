@@ -2344,8 +2344,9 @@ class TestAssignPage(ScanningTestCase):
         self.assertIsNone(self.scan.ocr_results[0]["detected"])
 
     def test_edit_creating_duplicate_flags_page_map(self):
-        """Assigning a number that already exists flags the page (and only
-        the later copy) as a duplicate in the rebuilt page_map."""
+        """Assigning a number that already exists flags every copy of that
+        number as a duplicate in the rebuilt page_map (blackletter #55 flags
+        all copies, not just the later one)."""
         response = self._post(3, "5")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(json.loads(response.content)["duplicate"])
@@ -2353,8 +2354,8 @@ class TestAssignPage(ScanningTestCase):
         flagged = {
             e["pdf_index"] for e in self.scan.page_map if e.get("duplicate")
         }
-        self.assertIn(2, flagged)  # pdf_page 3 -> index 2 (second "5")
-        self.assertNotIn(0, flagged)  # the first "5" stays canonical
+        self.assertIn(2, flagged)  # pdf_page 3 -> index 2 (newly-created "5")
+        self.assertIn(0, flagged)  # the pre-existing "5" is flagged too
 
     def test_clearing_duplicate_unflags_page_map(self):
         """Clearing a duplicated number removes the duplicate flag."""
