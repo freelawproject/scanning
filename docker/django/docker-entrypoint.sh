@@ -35,8 +35,6 @@ case "$1" in
         --preload \
         --no-control-socket \
         --timeout 180 \
-        --max-requests ${MAX_REQUESTS:-500} \
-        --max-requests-jitter 100 \
         --bind 0.0.0.0:8000
     ;;
 *)
