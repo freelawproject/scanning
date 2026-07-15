@@ -1,5 +1,5 @@
-import uuid
 import logging
+import uuid
 from pathlib import Path
 
 from django.conf import settings
