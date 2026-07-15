@@ -52,13 +52,10 @@ COPY pyproject.toml uv.lock ./
 # Base deps only. The only opt-in extras are `dev` and `local-ml`; plain sync
 # excludes both, so no torch/paddle/ultralytics lands here. Detection is
 # offloaded to RunPod, so the web tier never runs a model in-process.
-#
-# blackletter bundles the small/medium YOLO weights (~72 MB) as package data.
-# The web tier never runs detection, so drop them here — they stay in the
-# daemon image (deps-ml keeps them for local/offline detection).
+# blackletter >=0.1.1 ships no YOLO weights in the wheel, so nothing to
+# strip here; the daemon image (deps-ml) bakes the weights it needs.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync && \
-    rm -f /opt/venv/lib/python*/site-packages/blackletter/weights/*.pt
+    uv sync
 
 FROM build-base AS deps-ml
 
@@ -67,6 +64,35 @@ COPY pyproject.toml uv.lock ./
 # detection (offline daemon, or RUNPOD_ENABLED=False). No dev tooling.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --extra local-ml
+
+# Bake all three YOLO weights into the venv. blackletter >=0.1.1 ships
+# no weights in the wheel; ensure_weights() downloads missing ones from
+# Hugging Face into site-packages/blackletter/weights/. That must happen
+# here at build time: local detection (RUNPOD_ENABLED=False) requests
+# small+medium+large, detect() downloads any missing weight instead of
+# skipping it, and prod-ml runs as www-data with a root-owned /opt/venv,
+# so a first-use download would raise PermissionError. The offline
+# daemon needs the weights on disk anyway. Weights already on disk
+# resolve without touching the network, so this makes ensure_weights a
+# noop at runtime. Retry so a flaky HF doesn't fail the build; then
+# assert the files landed and smoke-load each with YOLO(...) to catch
+# truncated or corrupted downloads.
+RUN set -e; \
+    for i in 1 2 3; do \
+      python -c "from blackletter.api import ensure_weights; ensure_weights(['small', 'medium', 'large'])" \
+        && break; \
+      echo "ensure_weights attempt $i failed; sleeping 10s"; \
+      sleep 10; \
+    done \
+ && python -c "\
+import blackletter, pathlib; \
+from ultralytics import YOLO; \
+wd = pathlib.Path(blackletter.__file__).resolve().parent / 'weights'; \
+sizes = {'small.pt': 15_000_000, 'medium.pt': 40_000_000, 'large.pt': 100_000_000}; \
+missing = [n for n, s in sizes.items() if not (wd / n).is_file() or (wd / n).stat().st_size < s]; \
+assert not missing, f'weights missing or truncated: {missing}'; \
+[YOLO(str(wd / n)) for n in sizes]; \
+print('baked weights OK:', {n: (wd / n).stat().st_size // 1024 // 1024 for n in sizes})"
 
 FROM build-base AS deps-dev
 

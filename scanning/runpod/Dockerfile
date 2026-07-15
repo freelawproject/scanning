@@ -87,23 +87,28 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-cache
 
-# ── Bake YOLO large.pt into the image ───────────────────────────────
-# ``ensure_weights`` resolves bundled small/medium and downloads large
-# from HuggingFace. Retries 3 times so a flaky HF doesn't fail the
-# build. Then smoke-loads it with YOLO(...) to catch truncated files.
+# ── Bake all three YOLO weights into the image ──────────────────────
+# blackletter >=0.1.1 bundles no weights in the wheel; ``ensure_weights``
+# downloads small/medium/large from HuggingFace (weights already on disk
+# resolve without network, so cold start stays offline). Retries 3 times
+# so a flaky HF doesn't fail the build. Then smoke-loads each with
+# YOLO(...) to catch truncated files.
 RUN set -e; \
     for i in 1 2 3; do \
-      python -c "from blackletter.api import ensure_weights; ensure_weights(['large'])" \
+      python -c "from blackletter.api import ensure_weights; ensure_weights(['small', 'medium', 'large'])" \
         && break; \
       echo "ensure_weights attempt $i failed; sleeping 10s"; \
       sleep 10; \
     done \
  && python -c "\
 import blackletter, pathlib; \
-p = pathlib.Path(blackletter.__file__).resolve().parent / 'weights' / 'large.pt'; \
-assert p.is_file() and p.stat().st_size > 50_000_000, f'large.pt missing or truncated: {p}'; \
-from ultralytics import YOLO; YOLO(str(p)); \
-print(f'large.pt OK: {p.stat().st_size // 1024 // 1024} MB')"
+from ultralytics import YOLO; \
+wd = pathlib.Path(blackletter.__file__).resolve().parent / 'weights'; \
+sizes = {'small.pt': 15_000_000, 'medium.pt': 40_000_000, 'large.pt': 100_000_000}; \
+missing = [n for n, s in sizes.items() if not (wd / n).is_file() or (wd / n).stat().st_size < s]; \
+assert not missing, f'weights missing or truncated: {missing}'; \
+[YOLO(str(wd / n)) for n in sizes]; \
+print('weights OK:', {n: (wd / n).stat().st_size // 1024 // 1024 for n in sizes})"
 
 # ── Bake PaddleOCR PP-OCRv5 weights ─────────────────────────────────
 # First instantiation downloads det + rec models into /opt/paddlex.

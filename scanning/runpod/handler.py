@@ -576,14 +576,16 @@ def _action_detect(inputs: dict, tmp_dir: Path) -> dict:
         only for models that actually ran, as parsed from stdout.
     :rtype: dict
     """
-    from blackletter.api import detect, ensure_weights
+    from blackletter.api import detect
 
     pdf_url = inputs["pdf_url"]
     models = inputs.get("models") or ["small", "medium", "large"]
     confidence = float(inputs.get("confidence", 0.20))
 
-    # Defensive: if image was built without large.pt, fetch it now.
-    ensure_weights([m for m in models if m == "large"])
+    # No ensure_weights() call needed here: as of blackletter 0.1.1,
+    # detect() ensures every requested weight itself (downloading from
+    # HF if the baked ones are somehow absent) instead of silently
+    # skipping missing models.
 
     pdf_path = tmp_dir / "input.pdf"
     _download_pdf(pdf_url, pdf_path)
