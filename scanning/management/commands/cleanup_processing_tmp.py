@@ -125,7 +125,7 @@ class Command(BaseCommand):
         from scanning import s3_sync, services
         from scanning.models import PendingUpload
 
-        ttl_hours = getattr(settings, "PENDING_UPLOAD_TTL_HOURS", 24.0)
+        ttl_hours = getattr(settings, "PENDING_UPLOAD_TTL_HOURS", 6.0)
         cutoff = timezone.now() - timedelta(hours=ttl_hours)
         stale = PendingUpload.objects.filter(
             date_created__lt=cutoff

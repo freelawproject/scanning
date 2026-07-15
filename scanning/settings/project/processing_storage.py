@@ -18,5 +18,10 @@ PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS = env.int(
 # How long a presigned direct-to-S3 upload (PendingUpload) may sit
 # unconfirmed before cleanup_processing_tmp deletes it -- and, if the
 # upload never landed, its fileless scan. Covers users who close the tab
-# mid-upload.
-PENDING_UPLOAD_TTL_HOURS = env.float("PENDING_UPLOAD_TTL_HOURS", default=24.0)
+# mid-upload. Deliberately longer than S3_UPLOAD_PRESIGNED_TTL: that TTL
+# only bounds when the browser may *start* the POST (which happens
+# seconds after presign); S3 lets an in-flight upload run past policy
+# expiry, so the real bound is transfer time -- a 2 GB file on a slow
+# uplink (~0.8 Mbps) needs about 6 hours. Sweeping sooner would delete
+# the pending row and fileless scan out from under a live upload.
+PENDING_UPLOAD_TTL_HOURS = env.float("PENDING_UPLOAD_TTL_HOURS", default=6.0)

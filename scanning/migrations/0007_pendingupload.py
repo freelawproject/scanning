@@ -9,7 +9,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('scanning', '0005_page'),
+        ('scanning', '0006_scan_interruption_count_alter_scan_status'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
