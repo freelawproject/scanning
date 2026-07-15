@@ -1,4 +1,5 @@
 import logging
+import uuid
 from pathlib import Path
 
 from django.conf import settings
@@ -97,6 +98,17 @@ class QueuedAction(models.TextChoices):
     DETECT = "detect", "Detect"
     REPROCESS = "reprocess", "Reprocess"
     GENERATE_FILES = "generate_files", "Generate Files"
+
+
+class UploadAction(models.TextChoices):
+    """What to do with a scan once its original PDF is stored.
+
+    Chosen by the uploader (which submit button) and applied by
+    ``_finalize_uploaded_scan`` / the recovery command.
+    """
+
+    UPLOAD_ONLY = "upload_only", "Upload only"
+    UPLOAD_VALIDATE = "upload_validate", "Upload and validate"
 
 
 class Priority(models.TextChoices):
@@ -1192,3 +1204,54 @@ class Page(AbstractDateTimeModel):
 
     def __str__(self):
         return f"scan {self.scan_id} p{self.page_index:04d}"
+
+
+class PendingUpload(AbstractDateTimeModel):
+    """Tracks an authorized-but-unconfirmed direct-to-S3 upload.
+
+    Created when the browser requests a presigned POST for a scan's
+    original PDF (see ``presign_scan_upload``). The browser uploads the
+    bytes straight to S3, then calls ``confirm_scan_upload`` which
+    verifies the object landed, attaches it to the scan, and deletes
+    this row. Rows that are never confirmed (the user closed the tab
+    mid-upload) are swept — along with their fileless scans — by the
+    ``cleanup_processing_tmp`` daemon task.
+
+    :ivar id: UUID primary key, also handed to the browser so
+        ``confirm_scan_upload`` can look the row up.
+    :ivar scan: The scan the upload belongs to. Deleted with the scan.
+    :ivar s3_key: The full S3 key the presigned POST targets (the scan's
+        processing prefix + original filename).
+    :ivar expected_size: Size in bytes the browser reported at presign
+        time, recorded for diagnostics/auditing (also shown in admin).
+        The size ceiling is enforced separately: the presign view rejects
+        anything over ``MAX_ORIGINAL_UPLOAD_SIZE`` and the presigned POST
+        ``content-length-range`` condition caps the object at that limit.
+    :ivar content_type: MIME type the browser reported.
+    :ivar action: The post-upload action the uploader chose
+        (``upload_only`` or ``upload_validate``), stored so recovery can
+        replay the original intent if ``confirm_scan_upload`` never ran.
+    :ivar created_by: The user who initiated the upload.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="pending_uploads",
+    )
+    s3_key = models.CharField(max_length=1024)
+    expected_size = models.PositiveBigIntegerField()
+    content_type = models.CharField(max_length=100, blank=True)
+    action = models.CharField(
+        max_length=32,
+        choices=UploadAction.choices,
+        default=UploadAction.UPLOAD_ONLY,
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+    )
+
+    def __str__(self):
+        return f"pending upload for scan {self.scan_id} ({self.s3_key})"

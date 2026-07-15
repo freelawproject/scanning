@@ -28,6 +28,7 @@ from scanning.models import (
     OpinionScan,
     OpinionStatus,
     PageDeletion,
+    PendingUpload,
     QueuedAction,
     QueueStatus,
     Scan,
@@ -438,6 +439,419 @@ class TestQueueUploadXhr(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["redirect"], self.queue_url)
         self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
+
+
+class TestPresignedUpload(ScanningTestCase):
+    """Presigned direct-to-S3 upload: presign + confirm endpoints."""
+
+    def setUp(self):
+        super().setUp()
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.volume = VolumeFactory()
+        kwargs = {
+            "reporter_slug": self.volume.reporter.short_name,
+            "vol": self.volume.volume_number,
+        }
+        self.presign_url = reverse("presign_scan_upload", kwargs=kwargs)
+        self.confirm_url = reverse("confirm_scan_upload", kwargs=kwargs)
+        self.queue_url = reverse("queue_detail", kwargs=kwargs)
+
+    def _presign(self, **extra):
+        """Hit the presign endpoint with S3 stubbed; return (response, mock)."""
+        data = {
+            "new_scan": "1",
+            "filename": "scan.pdf",
+            "content_type": "application/pdf",
+            "size": "1024",
+        }
+        data.update(extra)
+        fake = {"url": "https://s3.example/bucket", "fields": {"key": "k"}}
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.generate_presigned_post", return_value=fake
+            ) as mock_presign,
+        ):
+            response = self.client.post(
+                self.presign_url,
+                data,
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        return response, mock_presign
+
+    def test_presign_creates_scan_and_pending(self):
+        response, mock_presign = self._presign()
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("presigned", body)
+        scan = Scan.objects.get(volume_obj=self.volume)
+        self.assertEqual(scan.status, Status.UPLOADED)
+        # The original bytes must NOT flow through Django here.
+        self.assertFalse(scan.original_pdf.name)
+        pending = PendingUpload.objects.get(pk=body["pending_id"])
+        self.assertEqual(pending.scan_id, scan.pk)
+        self.assertTrue(pending.s3_key.endswith(".original.pdf"))
+        mock_presign.assert_called_once()
+
+    def test_presign_rejects_non_pdf(self):
+        response, _ = self._presign(filename="notes.txt")
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
+        self.assertFalse(PendingUpload.objects.exists())
+
+    def test_presign_rejects_oversized(self):
+        response, _ = self._presign(size=str(3 * 1024**3))
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
+
+    def test_presign_without_credentials(self):
+        with patch("scanning.views.has_s3_credentials", return_value=False):
+            response = self.client.post(
+                self.presign_url,
+                {
+                    "new_scan": "1",
+                    "filename": "scan.pdf",
+                    "content_type": "application/pdf",
+                    "size": "1024",
+                },
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
+
+    def test_confirm_attaches_and_queues(self):
+        pending_id = self._presign()[0].json()["pending_id"]
+        with patch(
+            "scanning.s3_sync.verify_uploaded_object", return_value=True
+        ):
+            response = self.client.post(
+                self.confirm_url,
+                {"pending_id": pending_id, "action": "upload_validate"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 200)
+        scan = Scan.objects.get(volume_obj=self.volume)
+        self.assertTrue(scan.original_pdf.name)
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.queued_action, QueuedAction.FULL_PIPELINE)
+        self.assertEqual(
+            response.json()["redirect"],
+            reverse("scan_process", kwargs={"pk": scan.pk}),
+        )
+        self.assertFalse(PendingUpload.objects.filter(pk=pending_id).exists())
+
+    def test_confirm_upload_only_stays_uploaded(self):
+        pending_id = self._presign()[0].json()["pending_id"]
+        with patch(
+            "scanning.s3_sync.verify_uploaded_object", return_value=True
+        ):
+            response = self.client.post(
+                self.confirm_url,
+                {"pending_id": pending_id, "action": "upload_only"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["redirect"], self.queue_url)
+        scan = Scan.objects.get(volume_obj=self.volume)
+        self.assertEqual(scan.status, Status.UPLOADED)
+
+    def test_confirm_failure_deletes_orphan_scan(self):
+        pending_id = self._presign()[0].json()["pending_id"]
+        with patch(
+            "scanning.s3_sync.verify_uploaded_object", return_value=False
+        ):
+            response = self.client.post(
+                self.confirm_url,
+                {"pending_id": pending_id, "action": "upload_validate"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 400)
+        # Fresh, fileless scan gets cleaned up along with the pending row.
+        self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
+        self.assertFalse(PendingUpload.objects.filter(pk=pending_id).exists())
+
+    def test_confirm_failure_keeps_scan_that_has_a_file(self):
+        # Re-upload of an existing scan: a failed verification must not
+        # delete the scan (it still has its previous original PDF).
+        scan = ScanFactory(
+            volume_obj=self.volume,
+            reporter=self.volume.reporter,
+            volume=self.volume.volume_number,
+        )
+        self.assertTrue(scan.original_pdf.name)
+        pending = PendingUpload.objects.create(
+            scan=scan,
+            s3_key="processing/x/x.original.pdf",
+            expected_size=1024,
+            created_by=self.user,
+        )
+        with patch(
+            "scanning.s3_sync.verify_uploaded_object", return_value=False
+        ):
+            response = self.client.post(
+                self.confirm_url,
+                {"pending_id": str(pending.id), "action": "upload_only"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(Scan.objects.filter(pk=scan.pk).exists())
+        self.assertFalse(PendingUpload.objects.filter(pk=pending.id).exists())
+
+    def test_confirm_failure_reupload_keeps_s3_object(self):
+        # A re-upload's s3_key is the confirmed original's key, so a failed
+        # verification must not delete the object out from under the scan.
+        scan = ScanFactory(
+            volume_obj=self.volume,
+            reporter=self.volume.reporter,
+            volume=self.volume.volume_number,
+        )
+        self.assertTrue(scan.original_pdf.name)
+        pending = PendingUpload.objects.create(
+            scan=scan,
+            s3_key="processing/x/x.original.pdf",
+            expected_size=1024,
+            created_by=self.user,
+        )
+        with (
+            patch(
+                "scanning.s3_sync.verify_uploaded_object", return_value=False
+            ),
+            patch("scanning.s3_sync.delete_uploaded_object") as mock_delete,
+        ):
+            response = self.client.post(
+                self.confirm_url,
+                {"pending_id": str(pending.id), "action": "upload_only"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 400)
+        mock_delete.assert_not_called()
+        self.assertTrue(Scan.objects.filter(pk=scan.pk).exists())
+
+    def test_confirm_rejects_other_users_pending(self):
+        pending_id = self._presign()[0].json()["pending_id"]
+        other = self.make_user(username="intruder")
+        self.client.force_login(other)
+        response = self.client.post(
+            self.confirm_url,
+            {"pending_id": pending_id, "action": "upload_only"},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_confirm_rejects_pending_from_other_volume(self):
+        # A pending whose scan lives in a different volume can't be
+        # confirmed through this volume's endpoint, even by its owner.
+        other_volume = VolumeFactory()
+        scan = ScanFactory(
+            volume_obj=other_volume,
+            reporter=other_volume.reporter,
+            volume=other_volume.volume_number,
+        )
+        pending = PendingUpload.objects.create(
+            scan=scan,
+            s3_key="processing/x/x.original.pdf",
+            expected_size=1024,
+            created_by=self.user,
+        )
+        response = self.client.post(
+            self.confirm_url,  # built from self.volume, not other_volume
+            {"pending_id": str(pending.id), "action": "upload_only"},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_presign_cleans_up_scan_on_error(self):
+        # A boto/network error during presign must not leave an orphaned,
+        # fileless scan: with no PendingUpload row the TTL sweep can't
+        # reclaim it, so the view deletes it inline.
+        data = {
+            "new_scan": "1",
+            "filename": "scan.pdf",
+            "content_type": "application/pdf",
+            "size": "1024",
+        }
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.generate_presigned_post",
+                side_effect=Exception("boom"),
+            ),
+        ):
+            response = self.client.post(
+                self.presign_url,
+                data,
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
+        self.assertFalse(PendingUpload.objects.exists())
+
+    def test_presign_cleans_up_when_pending_create_fails(self):
+        # If the PendingUpload insert fails after a successful presign, the
+        # fileless scan must still be cleaned up (no pending row => the TTL
+        # sweep can't find it).
+        data = {
+            "new_scan": "1",
+            "filename": "scan.pdf",
+            "content_type": "application/pdf",
+            "size": "1024",
+        }
+        fake = {"url": "https://s3.example/bucket", "fields": {"key": "k"}}
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.generate_presigned_post", return_value=fake
+            ),
+            patch(
+                "scanning.views.PendingUpload.objects.create",
+                side_effect=Exception("db blip"),
+            ),
+        ):
+            response = self.client.post(
+                self.presign_url,
+                data,
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
+        self.assertFalse(PendingUpload.objects.exists())
+
+    def test_presign_pins_pdf_content_type(self):
+        # The stored Content-Type must be pinned to application/pdf, never
+        # the browser-supplied value.
+        _, mock_presign = self._presign(content_type="text/html")
+        self.assertEqual(mock_presign.call_args.args[2], "application/pdf")
+
+    def test_presign_stores_action(self):
+        # The chosen action is persisted so recovery can replay it.
+        resp, _ = self._presign(action="upload_validate")
+        pending = PendingUpload.objects.get(pk=resp.json()["pending_id"])
+        self.assertEqual(pending.action, "upload_validate")
+
+    def test_presign_defaults_action_to_upload_only(self):
+        resp, _ = self._presign()
+        pending = PendingUpload.objects.get(pk=resp.json()["pending_id"])
+        self.assertEqual(pending.action, "upload_only")
+
+    def test_presign_rejects_reupload_of_scan_with_file(self):
+        # A scan_pk upload onto a scan that already has a confirmed original
+        # would overwrite it in S3 (same deterministic key). Refuse it.
+        scan = ScanFactory(
+            volume_obj=self.volume,
+            reporter=self.volume.reporter,
+            volume=self.volume.volume_number,
+        )
+        self.assertTrue(scan.original_pdf.name)
+        with patch("scanning.views.has_s3_credentials", return_value=True):
+            response = self.client.post(
+                self.presign_url,
+                {"scan_pk": str(scan.pk), "filename": "x.pdf", "size": "1024"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(PendingUpload.objects.exists())
+
+    def test_confirm_rejects_invalid_pending_id(self):
+        # A non-UUID pending_id must return a clean 400, not a 500.
+        response = self.client.post(
+            self.confirm_url,
+            {"pending_id": "not-a-uuid", "action": "upload_only"},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_confirm_failure_deletes_s3_object(self):
+        pending_id = self._presign()[0].json()["pending_id"]
+        pending = PendingUpload.objects.get(pk=pending_id)
+        with (
+            patch(
+                "scanning.s3_sync.verify_uploaded_object", return_value=False
+            ),
+            patch("scanning.s3_sync.delete_uploaded_object") as mock_delete,
+        ):
+            response = self.client.post(
+                self.confirm_url,
+                {"pending_id": pending_id, "action": "upload_validate"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 400)
+        mock_delete.assert_called_once_with(pending.s3_key)
+
+
+class TestServeOriginalCrop(ScanningTestCase):
+    """serve_original_crop lazily pulls the original PDF from S3."""
+
+    def _crop_url(self, pk):
+        return (
+            reverse("serve_original_crop", kwargs={"pk": pk})
+            + "?page=0&x0=0&y0=0&x1=100&y1=100&dpi=72"
+        )
+
+    def test_lazy_pulls_original_when_missing(self):
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        reporter = ReporterFactory(short_name="oc2d")
+        scan = ScanFactory(
+            reporter=reporter, volume=5, start_page=1, end_page=2
+        )
+        # No local original resolvable (prod: it lives only in S3).
+        original_path = scan.original_pdf.path
+        if os.path.exists(original_path):
+            os.remove(original_path)
+
+        fixture = (
+            pathlib.Path(__file__).resolve().parent
+            / "fixtures"
+            / "a3d.332.1.1.pdf"
+        )
+
+        def _fake_pull(scan_arg):
+            output = pathlib.Path(scan_arg.output_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            name = pathlib.Path(scan_arg.original_pdf.name).name
+            (output / name).write_bytes(fixture.read_bytes())
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch(
+                "scanning.s3_sync.download_original_pdf",
+                side_effect=_fake_pull,
+            ) as mock_pull,
+        ):
+            response = self.client.get(self._crop_url(scan.pk))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "image/png")
+        mock_pull.assert_called_once()
+
+    def test_returns_404_when_original_unavailable(self):
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        scan = ScanFactory(start_page=1, end_page=2)
+        original_path = scan.original_pdf.path
+        if os.path.exists(original_path):
+            os.remove(original_path)
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch("scanning.s3_sync.download_original_pdf"),
+        ):
+            response = self.client.get(self._crop_url(scan.pk))
+
+        self.assertEqual(response.status_code, 404)
 
 
 class TestQueueView(ScanningTestCase):
@@ -1296,7 +1710,7 @@ class TestServeOpinionPdfCaching(ScanningTestCase):
 
 
 class TestServeScanPdfLazyPull(ScanningTestCase):
-    """serve_scan_pdf falls back to S3 pull when /tmp/ is stale."""
+    """serve_scan_pdf serves only the preview PDF, pulling it lazily."""
 
     def test_lazy_pull_when_local_dir_missing(self):
         """When output_dir doesn't exist locally, pull from S3 and serve."""
@@ -1326,7 +1740,7 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch(
-                "scanning.s3_sync.download_processing_files",
+                "scanning.s3_sync.download_preview_pdf",
                 side_effect=_fake_download,
             ) as mock_pull,
         ):
@@ -1337,13 +1751,8 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         mock_pull.assert_called_once()
 
-    def test_processed_pdf_preferred_over_local_original(self):
-        """A local original must not pre-empt a bitonal fetchable from S3.
-
-        Regression: the original being on disk used to short-circuit the
-        response before the S3 pull ran, so the viewer streamed the huge
-        original even though a tiny bitonal existed in S3.
-        """
+    def test_serves_bitonal_even_with_local_original(self):
+        """A local original must not pre-empt the pulled bitonal preview."""
         user = self.make_user()
         self.client.force_login(user)
 
@@ -1352,8 +1761,7 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         scan = ScanFactory(
             reporter=reporter, volume=12, start_page=1, end_page=2
         )
-        # The original is resolvable locally via the FileField, so without
-        # the fix _try_local would serve it and skip the pull entirely.
+        # The original is resolvable locally via the FileField.
         self.assertTrue(os.path.exists(scan.original_pdf.path))
 
         bitonal_bytes = b"%PDF-1.4 pulled bitonal"
@@ -1370,7 +1778,7 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch(
-                "scanning.s3_sync.download_processing_files",
+                "scanning.s3_sync.download_preview_pdf",
                 side_effect=_fake_download,
             ) as mock_pull,
         ):
@@ -1384,18 +1792,13 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         served = b"".join(response.streaming_content)
         self.assertEqual(served, bitonal_bytes)
 
-    def test_returns_404_when_nothing_available(self):
-        """When local is empty and S3 pull yields nothing, return 404."""
+    def test_not_ready_returns_202_when_no_preview(self):
+        """With no preview anywhere, return 202 'still processing'."""
         user = self.make_user()
         self.client.force_login(user)
 
         tmp_root = tempfile.mkdtemp()
-        scan = ScanFactory(start_page=1, end_page=2)
-        # Delete the local FileField file so scan.pdf_path can't resolve
-        # to the original upload either.
-        original_path = scan.original_pdf.path
-        if os.path.exists(original_path):
-            os.remove(original_path)
+        scan = ScanFactory(start_page=1, end_page=2, status=Status.PROCESSING)
 
         with (
             override_settings(
@@ -1403,13 +1806,68 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 TESTING=False,
                 PROCESSING_TMP_DIR=tmp_root,
             ),
-            patch("scanning.s3_sync.download_processing_files"),
+            patch("scanning.s3_sync.download_preview_pdf"),
         ):
             response = self.client.get(
                 reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
             )
 
-        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.status_code, 202)
+        data = response.json()
+        self.assertEqual(data["status"], "not_ready")
+        self.assertEqual(data["scan_status"], Status.PROCESSING)
+        self.assertIn("processing", data["message"].lower())
+
+    def test_original_is_never_served(self):
+        """Even with a local original and no preview, never stream it."""
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        scan = ScanFactory(start_page=1, end_page=2, status=Status.QUEUED)
+        # The original PDF is resolvable locally; the endpoint must still
+        # refuse to serve it (it's the multi-GB file we never stream).
+        self.assertTrue(os.path.exists(scan.original_pdf.path))
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch("scanning.s3_sync.download_preview_pdf"),
+        ):
+            response = self.client.get(
+                reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "not_ready")
+
+    def test_terminal_status_returns_409_not_202(self):
+        """An errored scan is terminal: 409 so the viewer stops polling."""
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        scan = ScanFactory(start_page=1, end_page=2, status=Status.ERROR)
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch("scanning.s3_sync.download_preview_pdf"),
+        ):
+            response = self.client.get(
+                reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 409)
+        data = response.json()
+        self.assertEqual(data["status"], "unavailable")
+        self.assertEqual(data["scan_status"], Status.ERROR)
 
 
 class TestRunFullPipelinePullsFromS3(ScanningTestCase):

@@ -16,17 +16,49 @@ behavior as prod.
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from pathlib import Path
 
 import boto3
+from botocore.exceptions import ClientError
 from django.conf import settings
 
 from scanning.models import Scan
 from scanning.utils import has_s3_credentials
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _cached_s3_client():
+    """Build and memoize a single S3 client (see :func:`_s3_client`)."""
+    return boto3.client("s3")
+
+
+def _s3_client():
+    """Return a shared, lazily-built S3 client.
+
+    ``boto3.client("s3")`` loads the service model and runs the
+    credential-provider chain on every call, which is wasted work when a
+    request triggers several S3 operations (or when many requests hit the
+    same worker). boto3 clients are thread-safe for making calls, so we
+    build one and reuse it. Cached on first use, not at import, so
+    credential resolution happens once the app is actually serving.
+
+    Under ``TESTING`` the cache is bypassed and a fresh client is built
+    each call, so tests that patch ``scanning.s3_sync.boto3`` always see
+    their own mock -- a cached client from an earlier test can't silently
+    defeat the patch. (Tests that flip ``TESTING=False`` to exercise the
+    real S3 path still call ``_cached_s3_client.cache_clear()`` in setUp.)
+
+    :returns: A boto3 S3 client (process-wide outside tests).
+    """
+    if getattr(settings, "TESTING", False):
+        return boto3.client("s3")
+    return _cached_s3_client()
+
 
 # File relative-path prefixes considered deliverables. When a scan is
 # approved, every file under one of these subdirs gets server-side
@@ -53,6 +85,20 @@ def _s3_enabled() -> bool:
     if settings.DEVELOPMENT and not settings.RUNPOD_ENABLED:
         return False
     return has_s3_credentials()
+
+
+def direct_upload_enabled() -> bool:
+    """Return True when the browser can upload straight to S3.
+
+    Mirrors ``_s3_enabled()`` -- the same gate ``generate_presigned_post``
+    and ``verify_uploaded_object`` use -- so the upload view and template
+    agree on whether to offer the presigned direct-to-S3 path or fall
+    back to the through-Django ``queue_upload``.
+
+    :returns: Whether presigned direct-to-S3 uploads are available.
+    :rtype: bool
+    """
+    return _s3_enabled()
 
 
 def _scan_path_parts(scan: Scan) -> tuple[str, str, str]:
@@ -155,7 +201,7 @@ def upload_processing_files(scan: Scan) -> int:
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     prefix = s3_processing_prefix(scan)
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
 
     count = 0
     for path in _iter_files_to_sync(local_root):
@@ -192,7 +238,7 @@ def download_processing_files(scan: Scan) -> Path | None:
     local_root = tmp_output_dir(scan)
     local_root.mkdir(parents=True, exist_ok=True)
 
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
     paginator = s3.get_paginator("list_objects_v2")
     downloaded = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -222,6 +268,125 @@ def download_processing_files(scan: Scan) -> Path | None:
     return local_root
 
 
+def _is_preview_pdf(rel: str) -> bool:
+    """Return True if a processing-prefix relative key is a preview PDF.
+
+    A "preview" is the small, browser-viewable PDF the process viewer
+    shows: the OCR PDF if present, else ``bitonal.pdf``. This mirrors the
+    exclusion rules in ``utils.find_ocr_pdf`` and adds ``bitonal.pdf``.
+    Deliberately excludes the multi-GB ``*.original.pdf`` and anything
+    under a subdirectory (``images/``, ``redacted/``, etc.).
+
+    :param rel: Object key relative to the scan's processing prefix.
+    :returns: Whether the key is the bitonal or OCR preview PDF.
+    :rtype: bool
+    """
+    if "/" in rel or not rel.endswith(".pdf"):
+        return False
+    if rel == "bitonal.pdf":
+        return True
+    if rel in ("stamped.pdf",):
+        return False
+    if rel.endswith((".redacted.pdf", ".original.pdf")):
+        return False
+    return "redacted" not in rel and "bitonal" not in rel
+
+
+def _is_original_pdf(rel: str) -> bool:
+    """Return True if a processing-prefix relative key is the original PDF.
+
+    The (up to 2 GB) ``*.original.pdf`` at the top of the prefix. Used to
+    pull only the original -- not the ``images/`` tree -- for the crop
+    endpoint, which renders high-res crops from the non-bitonal original.
+
+    :param rel: Object key relative to the scan's processing prefix.
+    :returns: Whether the key is the top-level original PDF.
+    :rtype: bool
+    """
+    return "/" not in rel and rel.endswith(".original.pdf")
+
+
+def _download_matching(scan: Scan, predicate, kind: str) -> Path | None:
+    """Download processing-prefix objects whose relative key matches.
+
+    Shared machinery for the targeted pulls. Idempotent: skips files
+    whose local size already matches the S3 object's. Touches the tmp
+    dir's mtime so the TTL sweep treats it as recently active.
+
+    :param scan: Scan whose processing prefix to pull from.
+    :param predicate: ``rel -> bool`` selecting which keys to download.
+    :param kind: Human label for the log line (e.g. ``"preview PDF"``).
+    :returns: The local tmp path, or None if sync is disabled.
+    :rtype: Path | None
+    """
+    if not _s3_enabled():
+        return None
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    prefix = s3_processing_prefix(scan)
+    local_root = tmp_output_dir(scan)
+    local_root.mkdir(parents=True, exist_ok=True)
+
+    s3 = _s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    downloaded = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            rel = key[len(prefix) :]
+            if not rel or not predicate(rel):
+                continue
+            local_path = local_root / rel
+            if local_path.is_file() and local_path.stat().st_size == obj.get(
+                "Size", -1
+            ):
+                continue
+            s3.download_file(bucket, key, str(local_path))
+            downloaded += 1
+
+    local_root.touch(exist_ok=True)
+    if downloaded:
+        logger.info(
+            "Downloaded %d %s(s) for scan %s from s3://%s/%s",
+            downloaded,
+            kind,
+            scan.pk,
+            bucket,
+            prefix,
+        )
+    return local_root
+
+
+def download_preview_pdf(scan: Scan) -> Path | None:
+    """Download only the small preview PDF(s) from S3 to /tmp/.
+
+    Pulls the bitonal and/or OCR PDF -- the reviewable previews -- and
+    skips the multi-GB original and the ``images/`` tree. Used by the PDF
+    viewer endpoint so opening a scan never drags the whole processing
+    prefix (or the original) across the network, which blew past the
+    gunicorn worker timeout for large scans.
+
+    :param scan: Scan to pull the preview PDF for.
+    :returns: The local tmp path, or None if sync is disabled.
+    :rtype: Path | None
+    """
+    return _download_matching(scan, _is_preview_pdf, "preview PDF")
+
+
+def download_original_pdf(scan: Scan) -> Path | None:
+    """Download only the original PDF from S3 to /tmp/.
+
+    Used by the crop endpoint, which needs the (large, non-bitonal)
+    original locally to render high-res crops. Pulls just the original,
+    not the ``images/`` tree, so it stays as small as the feature allows.
+
+    :param scan: Scan to pull the original PDF for.
+    :returns: The local tmp path, or None if sync is disabled.
+    :rtype: Path | None
+    """
+    return _download_matching(scan, _is_original_pdf, "original PDF")
+
+
 def upload_file_to_s3(scan: Scan, relative_path: str) -> bool:
     """Upload a single file (relative to the scan's local root) to S3.
 
@@ -247,7 +412,7 @@ def upload_file_to_s3(scan: Scan, relative_path: str) -> bool:
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     key = f"{s3_processing_prefix(scan)}{relative_path}"
-    boto3.client("s3").upload_file(str(local_path), bucket, key)
+    _s3_client().upload_file(str(local_path), bucket, key)
     logger.info(
         "Uploaded %s for scan %s to s3://%s/%s",
         relative_path,
@@ -282,7 +447,7 @@ def upload_fileobj_to_s3(scan: Scan, upload, relative_path: str) -> bool:
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     key = f"{s3_processing_prefix(scan)}{relative_path}"
     extra_args = {"ContentType": "application/pdf"}
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
 
     start = time.monotonic()
     temp_path = getattr(upload, "temporary_file_path", None)
@@ -302,6 +467,123 @@ def upload_fileobj_to_s3(scan: Scan, upload, relative_path: str) -> bool:
         scan.pk,
         elapsed,
     )
+    return True
+
+
+def delete_uploaded_object(key: str) -> bool:
+    """Best-effort delete of a single S3 object by full key.
+
+    Used to reclaim the object left behind by an abandoned or rejected
+    direct-to-S3 upload (browser POSTed the bytes but never confirmed, or
+    the object failed PDF verification). Deleting a key that doesn't exist
+    is a no-op success in S3, so this is safe to call unconditionally.
+
+    :param key: The full S3 object key (e.g. a ``PendingUpload.s3_key``).
+    :returns: True if the delete was issued, False if S3 is disabled,
+        the key is empty, or the call errored.
+    :rtype: bool
+    """
+    if not _s3_enabled() or not key:
+        return False
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    try:
+        _s3_client().delete_object(Bucket=bucket, Key=key)
+    except ClientError:
+        logger.warning(
+            "Could not delete abandoned upload s3://%s/%s", bucket, key
+        )
+        return False
+    return True
+
+
+def generate_presigned_post(
+    scan: Scan,
+    relative_path: str,
+    content_type: str,
+    max_size: int,
+) -> dict | None:
+    """Build a presigned POST so the browser uploads straight to S3.
+
+    Keeps the (potentially multi-GB) original PDF off the Django
+    request path: the view returns this policy, the browser POSTs the
+    file directly to S3, and the daemon later pulls it from the same
+    key via ``download_processing_files``. The ``content-length-range``
+    condition lets S3 itself reject anything larger than ``max_size``,
+    so an oversized upload never reaches the bucket.
+
+    :param scan: The scan the file belongs to.
+    :param relative_path: Path relative to the scan's processing prefix,
+        used as the S3 key suffix (e.g. the ``*.original.pdf`` name).
+    :param content_type: MIME type the browser must send; pinned by the
+        policy so the stored object's type can't be spoofed.
+    :param max_size: Maximum accepted size in bytes.
+    :returns: The ``{"url": ..., "fields": {...}}`` dict from boto3, or
+        None when S3 sync is disabled.
+    :rtype: dict | None
+    """
+    if not _s3_enabled():
+        return None
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    key = f"{s3_processing_prefix(scan)}{relative_path}"
+    ttl = int(getattr(settings, "S3_UPLOAD_PRESIGNED_TTL", 3600))
+    s3 = _s3_client()
+    return s3.generate_presigned_post(
+        Bucket=bucket,
+        Key=key,
+        Fields={"Content-Type": content_type},
+        Conditions=[
+            ["content-length-range", 1, max_size],
+            {"Content-Type": content_type},
+        ],
+        ExpiresIn=ttl,
+    )
+
+
+def verify_uploaded_object(scan: Scan, relative_path: str) -> bool:
+    """Confirm a direct-to-S3 upload landed and is a real PDF.
+
+    Called from ``confirm_scan_upload`` once the browser reports the
+    direct upload finished. Since the bytes never flowed through Django,
+    this replaces the in-request ``%PDF-`` header check: a 5-byte ranged
+    GET both proves the object exists (a missing key raises ``ClientError``)
+    and verifies the magic bytes, without pulling the whole (multi-GB) file.
+
+    :param scan: The scan the file belongs to.
+    :param relative_path: Path relative to the scan's processing prefix.
+    :returns: True if the object exists and starts with ``%PDF-``.
+    :rtype: bool
+    """
+    if not _s3_enabled():
+        return False
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    key = f"{s3_processing_prefix(scan)}{relative_path}"
+    s3 = _s3_client()
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-4")
+        header = obj["Body"].read(5)
+    except ClientError:
+        logger.warning(
+            "verify_uploaded_object: no valid object at s3://%s/%s "
+            "for scan %s",
+            bucket,
+            key,
+            scan.pk,
+        )
+        return False
+
+    if header != b"%PDF-":
+        logger.warning(
+            "verify_uploaded_object: s3://%s/%s for scan %s is not a PDF "
+            "(header %r)",
+            bucket,
+            key,
+            scan.pk,
+            header,
+        )
+        return False
     return True
 
 
@@ -335,7 +617,7 @@ def copy_processing_to_approved(scan: Scan) -> tuple[str, int]:
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     src_prefix = s3_processing_prefix(scan)
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
     paginator = s3.get_paginator("list_objects_v2")
 
     count = 0

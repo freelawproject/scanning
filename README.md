@@ -200,6 +200,30 @@ For the **private uploads bucket**:
 - **Block all public access** (files are served via signed URLs)
 - Suggested bucket policy: grant the IAM user `s3:GetObject`, `s3:PutObject`,
   `s3:DeleteObject`, and `s3:ListBucket`
+- **A CORS rule is required.** Uploads go straight from the browser to the
+  bucket via a presigned POST, which is a cross-origin request. Without CORS
+  the object still lands in S3, but the browser can't read the response, so
+  the user sees an "Upload to storage failed" error and the scan is only
+  linked later by `recover_pending_uploads` / the cleanup sweep. Allow the
+  app origin(s) to `POST` (see the CORS example below).
+
+##### CORS configuration (private uploads bucket)
+
+```json
+[
+  {
+    "AllowedMethods": ["POST"],
+    "AllowedOrigins": ["https://scanning.courtlistener.com"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000
+  }
+]
+```
+
+Use `http://localhost:8002` as the origin for local development. List every
+origin that serves the app; the value must be the scheme + host only (no
+trailing slash or path).
 
 ##### IAM policy example
 

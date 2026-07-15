@@ -3,10 +3,16 @@
 import os
 import tempfile
 import time
+from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from django.core.management import call_command
 from django.test import TestCase, override_settings
+from django.utils import timezone
+
+from scanning.factories import ScanFactory, UserFactory
+from scanning.models import PendingUpload, Scan
 
 
 class TestCleanupProcessingTmp(TestCase):
@@ -62,3 +68,98 @@ class TestCleanupProcessingTmp(TestCase):
             PROCESSING_TMP_TTL_HOURS=1.0,
         ):
             call_command("cleanup_processing_tmp")
+
+
+@override_settings(PENDING_UPLOAD_TTL_HOURS=24.0)
+class TestPendingUploadSweep(TestCase):
+    """The DB sweep removes abandoned direct-to-S3 uploads.
+
+    String ``original_pdf`` overrides set the FileField name without
+    writing a real file, so no MEDIA_ROOT juggling is needed here.
+    """
+
+    def _make_pending(self, scan, hours_old):
+        pending = PendingUpload.objects.create(
+            scan=scan,
+            s3_key="processing/x/x.original.pdf",
+            expected_size=1024,
+            created_by=UserFactory(),
+        )
+        # date_created is auto_now_add, so back-date it via update().
+        old = timezone.now() - timedelta(hours=hours_old)
+        PendingUpload.objects.filter(pk=pending.pk).update(date_created=old)
+        return pending
+
+    @override_settings(DEVELOPMENT=False)
+    def test_sweeps_stale_pending_and_orphan_scan(self):
+        scan = ScanFactory(original_pdf="")
+        self.assertFalse(scan.original_pdf.name)
+        pending = self._make_pending(scan, hours_old=48)
+        call_command("cleanup_processing_tmp")
+        self.assertFalse(PendingUpload.objects.filter(pk=pending.pk).exists())
+        self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
+
+    @override_settings(DEVELOPMENT=False)
+    def test_keeps_fresh_pending(self):
+        scan = ScanFactory(original_pdf="")
+        pending = self._make_pending(scan, hours_old=1)
+        call_command("cleanup_processing_tmp")
+        self.assertTrue(PendingUpload.objects.filter(pk=pending.pk).exists())
+        self.assertTrue(Scan.objects.filter(pk=scan.pk).exists())
+
+    @override_settings(DEVELOPMENT=False)
+    def test_stale_pending_keeps_scan_that_has_a_file(self):
+        scan = ScanFactory(original_pdf="original_scans/x.original.pdf")
+        self.assertTrue(scan.original_pdf.name)
+        pending = self._make_pending(scan, hours_old=48)
+        call_command("cleanup_processing_tmp")
+        self.assertFalse(PendingUpload.objects.filter(pk=pending.pk).exists())
+        self.assertTrue(Scan.objects.filter(pk=scan.pk).exists())
+
+    @override_settings(DEVELOPMENT=True)
+    def test_db_sweep_runs_even_in_development(self):
+        # The /tmp/ sweep is a DEV no-op, but the DB sweep still runs.
+        scan = ScanFactory(original_pdf="")
+        pending = self._make_pending(scan, hours_old=48)
+        call_command("cleanup_processing_tmp")
+        self.assertFalse(PendingUpload.objects.filter(pk=pending.pk).exists())
+
+    @override_settings(DEVELOPMENT=False)
+    def test_sweep_deletes_abandoned_s3_object(self):
+        # The stranded S3 object (browser POSTed but never confirmed) is
+        # reclaimed, not just the DB rows.
+        scan = ScanFactory(original_pdf="")
+        pending = self._make_pending(scan, hours_old=48)
+        with patch("scanning.s3_sync.delete_uploaded_object") as mock_delete:
+            call_command("cleanup_processing_tmp")
+        mock_delete.assert_called_once_with(pending.s3_key)
+
+    @override_settings(DEVELOPMENT=False)
+    def test_sweep_recovers_instead_of_deleting(self):
+        # A stale pending whose object actually landed in S3 is recovered
+        # (linked to the scan), never deleted.
+        scan = ScanFactory(original_pdf="")
+        pending = self._make_pending(scan, hours_old=48)
+        with (
+            patch(
+                "scanning.s3_sync.verify_uploaded_object", return_value=True
+            ),
+            patch("scanning.s3_sync.delete_uploaded_object") as mock_delete,
+        ):
+            call_command("cleanup_processing_tmp")
+        mock_delete.assert_not_called()
+        self.assertFalse(PendingUpload.objects.filter(pk=pending.pk).exists())
+        scan.refresh_from_db()
+        self.assertTrue(scan.original_pdf.name)
+
+    @override_settings(DEVELOPMENT=False)
+    def test_sweep_keeps_s3_object_for_reupload_scan(self):
+        # A re-upload's pending reuses the confirmed original's s3_key, so the
+        # sweep must NOT delete the object when the scan still has a file.
+        scan = ScanFactory(original_pdf="original_scans/x.original.pdf")
+        self.assertTrue(scan.original_pdf.name)
+        self._make_pending(scan, hours_old=48)
+        with patch("scanning.s3_sync.delete_uploaded_object") as mock_delete:
+            call_command("cleanup_processing_tmp")
+        mock_delete.assert_not_called()
+        self.assertTrue(Scan.objects.filter(pk=scan.pk).exists())

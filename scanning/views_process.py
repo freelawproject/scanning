@@ -10,7 +10,6 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.http import (
     FileResponse,
-    Http404,
     HttpRequest,
     HttpResponse,
     JsonResponse,
@@ -111,18 +110,14 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         "scan_process_view: rendering scan=%s status=%s", scan.pk, scan.status
     )
 
-    # Always attempt the S3 pull. The helper is size-based idempotent
-    # and no-ops in DEV/TESTING, so calling it during QUEUED/PROCESSING
-    # is cheap. This ensures the web container's /tmp/ stays current
-    # with files the daemon pushed to S3 (e.g. after Generate Files).
-    try:
-        from scanning import s3_sync
-
-        s3_sync.download_processing_files(scan)
-    except Exception:
-        logger.exception(
-            "Failed to pull processing files from S3 for scan %s", scan.pk
-        )
+    # No eager S3 pull here: this page renders entirely from the DB
+    # (page_map, ocr_results, opinions_json, detections, redaction_rects),
+    # so it never reads the processing files off disk. Pulling them here
+    # blocked the response on I/O it doesn't need -- worst right after a
+    # fresh upload, when the only object in the prefix is the multi-GB
+    # original and the download took minutes. The PDF and crop assets are
+    # streamed by serve_scan_pdf / serve_original_crop, which lazily pull
+    # from S3 on demand.
 
     try:
         step = int(request.GET.get("step", 0))
@@ -455,30 +450,32 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
 
 
 @login_required
-def serve_scan_pdf(request: HttpRequest, pk: int) -> FileResponse:
-    """Serve the best available PDF for a scan (OCR, bitonal, or original).
+def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
+    """Serve the small processed PDF (OCR text layer, else bitonal).
 
-    Prefers the small processed PDF (OCR text layer, else bitonal) over
-    the original, which for multi-GB scans is an order of magnitude
-    larger. The order is load-bearing: serving the original whenever it
-    happens to be on disk would short-circuit before the S3 pull that
-    fetches the processed PDF, so the viewer would keep streaming the
-    huge original even though a tiny bitonal exists in S3.
+    The viewer only ever gets the small, browser-viewable preview. The
+    multi-GB original is never streamed here: it blows past the gunicorn
+    worker timeout (the connection dies mid-stream, so the browser sees a
+    truncated body and reports ERR_CONTENT_LENGTH_MISMATCH) and pdf.js
+    can't handle a file that large anyway. The original stays reachable
+    only for server-side crops (``serve_original_crop``).
 
     Resolution:
 
     1. Serve the processed PDF (OCR > bitonal) if it is already local.
-    2. Otherwise pull the scan's processing files from S3 and look
-       again. This covers prod, where the daemon and web run in
-       separate containers with separate ephemeral ``/tmp/`` volumes, so
-       the web side typically only holds the original (or nothing).
-    3. Only if no processed PDF can be found locally or in S3 do we fall
-       back to the original.
+    2. Otherwise pull *only* the preview PDF(s) from S3 and look again.
+       This covers prod, where the daemon and web run in separate
+       containers with separate ephemeral ``/tmp/`` volumes. The targeted
+       pull skips the original and images/, so opening a scan never drags
+       gigabytes across the network.
+    3. If no preview PDF exists yet (scan still processing, or errored),
+       return HTTP 202 with a status message so the viewer can show a
+       "still processing" state instead of a hard error.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: File response streaming the PDF.
-    :raises Http404: When no PDF exists locally and S3 has nothing to pull.
+    :return: File response streaming the preview PDF, or a 202 JSON
+        response when no preview is available yet.
     """
     scan = get_object_or_404(Scan, pk=pk)
     # Breadcrumb (issue #115): serving may pull from S3 and stream a multi-GB
@@ -500,41 +497,55 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> FileResponse:
             )
         return None
 
-    def _original_local() -> FileResponse | None:
-        """Return the original PDF if a local copy is resolvable."""
-        try:
-            return FileResponse(
-                Path(scan.pdf_path).open("rb"),
-                content_type="application/pdf",
-            )
-        except FileNotFoundError:
-            return None
-
     # 1. Prefer the small processed PDF if it is already on disk.
     response = _processed_local()
     if response is not None:
         return response
 
-    # 2. Not local: pull processing files from S3 (also lands the
-    #    original for the fallback below) and re-check for the processed
-    #    PDF. Runs even when the original is already local, so the big
-    #    original never pre-empts a fetchable bitonal.
+    # 2. Not local: pull only the preview PDF(s) from S3 and re-check.
     try:
         from scanning import s3_sync
 
-        s3_sync.download_processing_files(scan)
+        s3_sync.download_preview_pdf(scan)
     except Exception:
-        logger.exception("Lazy S3 pull failed for scan %s", scan.pk)
+        logger.exception("Lazy S3 preview pull failed for scan %s", scan.pk)
 
     response = _processed_local()
     if response is not None:
         return response
 
-    # 3. No processed PDF anywhere: fall back to the original.
-    response = _original_local()
-    if response is not None:
-        return response
-    raise Http404
+    # 3. No preview PDF anywhere. Distinguish transient states (still
+    #    producing a preview -- the viewer should poll) from terminal ones
+    #    (a preview will never appear -- the viewer should show the message
+    #    and stop). 202 means "retry"; 409 means "give up".
+    if scan.status in (Status.UPLOADED, Status.QUEUED, Status.PROCESSING):
+        return JsonResponse(
+            {
+                "status": "not_ready",
+                "scan_status": scan.status,
+                "message": (
+                    "We're still processing this file. The preview will "
+                    "appear here automatically once it's ready."
+                ),
+            },
+            status=202,
+        )
+
+    if scan.status in (Status.ERROR, Status.ERROR_MAX_RETRIES):
+        message = (
+            "This scan hit an error during processing, so there's no "
+            "preview to show."
+        )
+    else:
+        message = "No preview is available for this scan."
+    return JsonResponse(
+        {
+            "status": "unavailable",
+            "scan_status": scan.status,
+            "message": message,
+        },
+        status=409,
+    )
 
 
 @login_required
@@ -565,7 +576,27 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
         page,
         dpi,
     )
-    with fitz.open(scan.pdf_path) as doc:
+    try:
+        doc = fitz.open(scan.pdf_path)
+    except FileNotFoundError:
+        # Prod: the original lives only in S3 (direct-to-S3 upload, and the
+        # classic prod path streams straight to S3 too). The process view no
+        # longer eagerly lands it locally, and download_preview_pdf excludes
+        # the original, so pull just the original here and retry.
+        try:
+            from scanning import s3_sync
+
+            s3_sync.download_original_pdf(scan)
+        except Exception:
+            logger.exception(
+                "Lazy S3 original pull failed for scan %s", scan.pk
+            )
+        try:
+            doc = fitz.open(scan.pdf_path)
+        except FileNotFoundError:
+            return HttpResponse(status=404)
+
+    with doc:
         if page < 0 or page >= doc.page_count:
             return HttpResponse(status=404)
         clip = fitz.Rect(x0, y0, x1, y1)

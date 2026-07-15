@@ -75,6 +75,9 @@ class TestSyncHelpersWithCredentials(TestCase):
     """With creds and DEV=False, helpers should hit boto3."""
 
     def setUp(self):
+        # _s3_client() is lru_cached; drop any client cached under a prior
+        # test's boto3 patch so this test's mock is the one that's used.
+        s3_sync._cached_s3_client.cache_clear()
         # has_s3_credentials reads os.environ, not Django settings.
         self._env_patch = patch.dict(
             os.environ,
@@ -220,6 +223,64 @@ class TestSyncHelpersWithCredentials(TestCase):
             mock_s3.download_file.call_args.args[1],
             f"{prefix}bitonal.pdf",
         )
+
+    def test_download_preview_pdf_skips_original_and_images(self):
+        """Only the bitonal/OCR preview is pulled, not original or images."""
+        scan = _reporter_scan()
+        scan.status = Status.PENDING_REVIEW
+        scan.save(update_fields=["status"])
+
+        prefix = s3_sync.s3_processing_prefix(scan)
+        mock_s3 = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": f"{prefix}bitonal.pdf", "Size": 5},
+                    {"Key": f"{prefix}a.164.1.pdf", "Size": 5},  # OCR pdf
+                    {"Key": f"{prefix}a.164.1.original.pdf", "Size": 5},
+                    {"Key": f"{prefix}stamped.pdf", "Size": 5},
+                    {"Key": f"{prefix}images/p1.png", "Size": 5},
+                    {"Key": f"{prefix}redacted/op1.pdf", "Size": 5},
+                    {"Key": f"{prefix}detections.json", "Size": 5},
+                ]
+            }
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        def _fake_download(bucket, key, dest):
+            pathlib.Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(dest).write_bytes(b"12345")
+
+        mock_s3.download_file.side_effect = _fake_download
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            s3_sync.download_preview_pdf(scan)
+
+        pulled = {
+            call.args[1] for call in mock_s3.download_file.call_args_list
+        }
+        self.assertEqual(
+            pulled,
+            {f"{prefix}bitonal.pdf", f"{prefix}a.164.1.pdf"},
+        )
+
+    def test_delete_uploaded_object(self):
+        mock_s3 = MagicMock()
+        key = "processing/9/tc/164/1/x.original.pdf"
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            result = s3_sync.delete_uploaded_object(key)
+        self.assertTrue(result)
+        mock_s3.delete_object.assert_called_once()
+        self.assertEqual(mock_s3.delete_object.call_args.kwargs["Key"], key)
+
+    def test_delete_uploaded_object_empty_key_noop(self):
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            result = s3_sync.delete_uploaded_object("")
+        self.assertFalse(result)
+        mock_boto3.client.assert_not_called()
 
     def test_upload_file_to_s3_missing_local_file(self):
         scan = _reporter_scan()

@@ -12,6 +12,7 @@ from unittest.mock import patch
 from django.db.models import F
 from django.test import TestCase, override_settings
 
+from scanning import s3_sync
 from scanning.factories import (
     ReporterFactory,
     ScanFactory,
@@ -766,6 +767,11 @@ class TestSmartEditEndToEnd(TestCase):
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestUploadApprovedFiles(TestCase):
     """Test the upload_approved_files helper."""
+
+    def setUp(self):
+        # _s3_client() is lru_cached; drop any client cached under a prior
+        # test's boto3 patch so this test's mock is the one that's used.
+        s3_sync._cached_s3_client.cache_clear()
 
     def _make_scan_with_generated_files(self):
         """Create a scan that has been through file generation."""

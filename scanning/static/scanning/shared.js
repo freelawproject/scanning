@@ -6,6 +6,114 @@
  */
 
 /**
+ * Load a scan preview PDF, handling the "still processing" (HTTP 202) state.
+ *
+ * Fetches the URL instead of handing it straight to pdf.js so a non-PDF
+ * "not ready" response becomes a friendly message rather than a hard error.
+ * When the server says the preview isn't ready yet, it shows the message and
+ * quietly re-checks on an interval until the PDF appears, then renders it.
+ * The server only ever serves the small bitonal/OCR preview here, so loading
+ * the whole file into memory is fine.
+ *
+ * @param {string} url - The scan PDF endpoint URL.
+ * @param {Object} cb - Callbacks.
+ * @param {Function} cb.onReady - (pdfDoc) => void, the loaded pdf.js document.
+ * @param {Function} cb.onNotReady - (message) => void, shown while processing.
+ * @param {Function} cb.onError - (error) => void, on a real failure.
+ * @param {Function} [cb.isCurrent] - () => bool; return false to abort (e.g.
+ *   the viewer switched to a different URL). Aborted work renders nothing.
+ * @param {number} [cb.pollMs=4000] - Re-check interval while not ready.
+ * @param {number} [cb.errorRetries=3] - Transient-error retries before giving
+ *   up (covers e.g. an opinion PDF briefly 404ing right after generation).
+ * @returns {{cancel: Function}} Handle; call cancel() to stop polling.
+ */
+function loadPreviewPdf(url, cb) {
+    var cancelled = false;
+    var timer = null;
+    var pollMs = cb.pollMs || 4000;
+    var maxErrorRetries = cb.errorRetries == null ? 3 : cb.errorRetries;
+    var errorRetriesLeft = maxErrorRetries;
+
+    function current() {
+        return !cancelled && (!cb.isCurrent || cb.isCurrent());
+    }
+
+    function onTransientError(err) {
+        if (!current()) return;
+        if (errorRetriesLeft > 0) {
+            var n = maxErrorRetries - errorRetriesLeft + 1;
+            errorRetriesLeft--;
+            cb.onNotReady('Loading PDF (retrying ' + n + ')...');
+            timer = setTimeout(attempt, n * 1000);
+            return;
+        }
+        cb.onError(err);
+    }
+
+    function attempt() {
+        if (!current()) return;
+        fetch(url, { headers: { Accept: 'application/pdf' } })
+            .then(function (resp) {
+                if (!current()) return null;
+                if (resp.status === 202) {
+                    // Transient: a preview is still being produced. A healthy
+                    // poll response resets the retry budget so it caps
+                    // *consecutive* transient errors, not total errors across
+                    // a long (minutes-long) poll session. Then show the
+                    // message and poll again.
+                    errorRetriesLeft = maxErrorRetries;
+                    return resp.json().then(function (d) {
+                        if (!current()) return null;
+                        cb.onNotReady((d && d.message) || 'Still processing…');
+                        timer = setTimeout(attempt, pollMs);
+                        return null;
+                    });
+                }
+                if (resp.status === 409) {
+                    // Terminal: no preview will ever appear (errored/
+                    // unavailable). Show the message and stop -- do not poll.
+                    return resp.json().then(function (d) {
+                        if (!current()) return null;
+                        cb.onNotReady((d && d.message) || 'No preview available.');
+                        return null;
+                    });
+                }
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                return resp.arrayBuffer();
+            })
+            .then(function (buf) {
+                if (buf === null || !current()) return null;
+                return pdfjsLib.getDocument({ data: buf }).promise.then(
+                    function (pdf) { if (current()) cb.onReady(pdf); }
+                );
+            })
+            .catch(onTransientError);
+    }
+
+    attempt();
+    return {
+        cancel: function () {
+            cancelled = true;
+            if (timer) { clearTimeout(timer); timer = null; }
+        },
+    };
+}
+
+/**
+ * Replace an element's contents with a single centered status message,
+ * inserting the text safely (no HTML interpretation).
+ *
+ * @param {HTMLElement} container - The element to fill.
+ * @param {string} message - The status text to show.
+ */
+function showViewerMessage(container, message) {
+    var div = document.createElement('div');
+    div.className = 'viewer-loading';
+    div.textContent = message;
+    container.replaceChildren(div);
+}
+
+/**
  * Mark a PDF page for deletion during reprocessing.
  * Shows a confirmation dialog before proceeding.
  *
