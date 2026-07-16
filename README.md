@@ -264,7 +264,6 @@ trailing slash or path).
 | `MEDIA_ROOT` | Local media root (only used when `DEVELOPMENT=True`) | `scanning/assets/media/` |
 | `STATIC_URL` | Static file URL prefix | `static/` |
 | `NUM_WORKERS` | Gunicorn worker count | `4` |
-| `MAX_REQUESTS` | Gunicorn max requests before worker restart | `2500` |
 
 
 ### Step 2: Build the Docker Image
@@ -341,7 +340,6 @@ docker run -d \
 This starts Gunicorn with Uvicorn workers (ASGI). Configuration:
 - **Workers**: `NUM_WORKERS` env var (default: 4)
 - **Timeout**: 180 seconds
-- **Max requests**: `MAX_REQUESTS` env var (default: 2500, with 100 jitter)
 - **Bind**: `0.0.0.0:8000`
 
 
@@ -406,7 +404,6 @@ SENTRY_DSN=https://examplePublicKey@o0.ingest.sentry.io/0
 
 # Workers
 NUM_WORKERS=4
-MAX_REQUESTS=2500
 ```
 
 
