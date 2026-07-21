@@ -501,7 +501,7 @@ class TestPresignedUpload(ScanningTestCase):
         self.assertFalse(PendingUpload.objects.exists())
 
     def test_presign_rejects_oversized(self):
-        response, _ = self._presign(size=str(3 * 1024**3))
+        response, _ = self._presign(size=str(4 * 1024**3))
         self.assertEqual(response.status_code, 400)
         self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
 

@@ -280,7 +280,7 @@
   }
 
   // Direct path: presign -> upload straight to S3 -> confirm. Keeps the
-  // (up to 2 GB) file off the Django request path.
+  // (up to 3 GB) file off the Django request path.
   function directUpload(e, action, file) {
     // Step 1: ask Django for a presigned POST. Reuse the form fields
     // (scan metadata) but swap the file itself for its metadata.
