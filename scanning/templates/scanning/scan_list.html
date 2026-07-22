@@ -36,6 +36,20 @@
 </div>
 {% endif %}
 
+{% if error_count %}
+<div class="alert-warning mb-4" role="alert">
+  {{ error_count }} scan{{ error_count|pluralize }} errored (likely a RunPod timeout or processing failure).
+  {% if request.user.is_superuser %}
+  <a href="{% url 'admin:scanning_scan_changelist' %}?status__exact=error"
+     class="font-semibold underline hover:no-underline ml-1">
+    Review and re-queue in admin.
+  </a>
+  {% else %}
+  Please notify an admin to re-queue them.
+  {% endif %}
+</div>
+{% endif %}
+
 <!-- Filters -->
 <div class="card mb-6">
   <form method="get">

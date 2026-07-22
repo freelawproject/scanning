@@ -179,6 +179,22 @@ class TestScanList(ScanningTestCase):
         response = self.client.get(reverse("scan_list"), {"page": 2})
         self.assertEqual(len(response.context["page_obj"]), 5)
 
+    def test_error_banner_counts_only_plain_error_scans(self):
+        """The error banner counts ERROR scans, not the ERROR_MAX_RETRIES /
+        ERROR_INTERRUPTED buckets which have their own banners."""
+        user = self.make_user(is_superuser=True, is_staff=True)
+        self.client.force_login(user)
+        ScanFactory(uploaded_by=user, status=Status.ERROR)
+        ScanFactory(uploaded_by=user, status=Status.ERROR)
+        ScanFactory(uploaded_by=user, status=Status.ERROR_MAX_RETRIES)
+        ScanFactory(uploaded_by=user, status=Status.ERROR_INTERRUPTED)
+        response = self.client.get(reverse("scan_list"))
+        self.assertEqual(response.context["error_count"], 2)
+        self.assertEqual(response.context["retry_cap_count"], 1)
+        self.assertEqual(response.context["interrupted_count"], 1)
+        # Superuser sees the admin re-queue link filtered to ERROR scans.
+        self.assertContains(response, "status__exact=error")
+
 
 class TestScanDetail(ScanningTestCase):
     """The legacy scan detail URL redirects to the process view."""
