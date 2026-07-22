@@ -16,14 +16,17 @@ Covers:
 - Public ``detect`` / ``analyze`` local fallback + remote dispatch.
 """
 
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import requests
 from botocore.exceptions import ClientError
 from django.test import TestCase, override_settings
+from django.utils import timezone
 
 from scanning import runpod_client
 from scanning.factories import ScanFactory
+from scanning.models import Scan
 
 
 def _mock_response(status_code: int, body: dict | None = None):
@@ -672,3 +675,283 @@ class TestAnalyzeRemote(TestCase):
             )
         # analyze() returns {"results": [...]} discarding extras.
         self.assertEqual(result, {"results": worker_output["results"]})
+
+
+# ── Persist / clear job id (issue #127) ─────────────────────────────
+@override_settings(
+    RUNPOD_ENABLED=True,
+    RUNPOD_ENDPOINT_ID="ep-abc",
+    RUNPOD_API_KEY="apikey",
+    RUNPOD_REQUEST_TIMEOUT=900,
+    RUNPOD_MAX_RETRIES=0,
+)
+class TestPersistAndClearJobId(TestCase):
+    """The in-flight RunPod job id is persisted on submit and cleared on
+    any terminal outcome, so a killed daemon leaves the id behind to reattach."""
+
+    def test_persist_helper_sets_fields(self):
+        scan = ScanFactory()
+        runpod_client._persist_job_id(scan.pk, "job-1", "detect")
+        scan.refresh_from_db()
+        self.assertEqual(scan.runpod_job_id, "job-1")
+        self.assertEqual(scan.runpod_job_action, "detect")
+        self.assertIsNotNone(scan.runpod_job_submitted_at)
+
+    def test_clear_helper_only_clears_matching_job(self):
+        scan = ScanFactory(
+            runpod_job_id="job-1",
+            runpod_job_action="detect",
+            runpod_job_submitted_at=timezone.now(),
+        )
+        # Guard: a stale clear for a different id must not wipe the row.
+        runpod_client._clear_job_id(scan.pk, "other")
+        scan.refresh_from_db()
+        self.assertEqual(scan.runpod_job_id, "job-1")
+
+        runpod_client._clear_job_id(scan.pk, "job-1")
+        scan.refresh_from_db()
+        self.assertEqual(scan.runpod_job_id, "")
+        self.assertEqual(scan.runpod_job_action, "")
+        self.assertIsNone(scan.runpod_job_submitted_at)
+
+    def test_invoke_persists_before_poll_then_clears(self):
+        scan = ScanFactory()
+        seen = {}
+
+        def fake_poll(
+            base_url, headers, job_id, action, deadline, progress_callback
+        ):
+            # Snapshot what is persisted while the job is "in flight".
+            row = Scan.objects.get(pk=scan.pk)
+            seen["job_id"] = row.runpod_job_id
+            seen["action"] = row.runpod_job_action
+            return {"detections": []}
+
+        with (
+            patch(
+                "scanning.runpod_client.requests.post",
+                return_value=_mock_response(200, {"id": "job-xyz"}),
+            ),
+            patch("scanning.runpod_client._poll", side_effect=fake_poll),
+            patch("scanning.runpod_client.time.sleep", return_value=None),
+        ):
+            runpod_client._invoke(
+                action="detect",
+                scan=scan,
+                payload={"pdf_url": "x"},
+                progress_callback=None,
+            )
+
+        # Persisted before poll ran...
+        self.assertEqual(seen["job_id"], "job-xyz")
+        self.assertEqual(seen["action"], "detect")
+        # ...and cleared in the finally once poll returned.
+        scan.refresh_from_db()
+        self.assertEqual(scan.runpod_job_id, "")
+
+    def test_invoke_clears_on_terminal_error(self):
+        scan = ScanFactory()
+        with (
+            patch(
+                "scanning.runpod_client.requests.post",
+                return_value=_mock_response(200, {"id": "job-err"}),
+            ),
+            patch(
+                "scanning.runpod_client.requests.get",
+                return_value=_mock_response(200, {"status": "TIMED_OUT"}),
+            ),
+            patch("scanning.runpod_client.time.sleep", return_value=None),
+        ):
+            with self.assertRaises(runpod_client.RunpodError):
+                runpod_client._invoke(
+                    action="detect",
+                    scan=scan,
+                    payload={"pdf_url": "x"},
+                    progress_callback=None,
+                )
+        scan.refresh_from_db()
+        self.assertEqual(scan.runpod_job_id, "")
+
+
+# ── Reattach vs fresh submit (issue #127) ───────────────────────────
+@override_settings(
+    RUNPOD_ENABLED=True,
+    RUNPOD_ENDPOINT_ID="ep-abc",
+    RUNPOD_API_KEY="apikey",
+    RUNPOD_REQUEST_TIMEOUT=900,
+    RUNPOD_MAX_RETRIES=0,
+)
+class TestResumeOrSubmit(TestCase):
+    """``_invoke`` reattaches to a persisted in-flight job when one is fresh,
+    otherwise submits a new one."""
+
+    _OUTPUT = {"detections": [], "duration_ms": 1}
+
+    def _run(self, scan, get_responses):
+        with (
+            patch(
+                "scanning.runpod_client.requests.post",
+                return_value=_mock_response(200, {"id": "fresh-job"}),
+            ) as mock_post,
+            patch(
+                "scanning.runpod_client.requests.get",
+                side_effect=get_responses,
+            ),
+            patch("scanning.runpod_client.time.sleep", return_value=None),
+        ):
+            result = runpod_client._invoke(
+                action="detect",
+                scan=scan,
+                payload={"pdf_url": "x"},
+                progress_callback=None,
+            )
+        return result, mock_post
+
+    @staticmethod
+    def _completed():
+        return _mock_response(
+            200, {"status": "COMPLETED", "output": TestResumeOrSubmit._OUTPUT}
+        )
+
+    def _assert_submitted_fresh(self, mock_post):
+        self.assertTrue(mock_post.called)
+        urls = [c.args[0] for c in mock_post.call_args_list]
+        self.assertTrue(any(u.endswith("/run") for u in urls))
+
+    def test_no_persisted_id_submits_fresh(self):
+        scan = ScanFactory()
+        result, mock_post = self._run(scan, [self._completed()])
+        self.assertEqual(result, self._OUTPUT)
+        self._assert_submitted_fresh(mock_post)
+
+    def test_reattaches_to_completed_job_without_submitting(self):
+        scan = ScanFactory(
+            runpod_job_id="job-old",
+            runpod_job_action="detect",
+            runpod_job_submitted_at=timezone.now(),
+        )
+        result, mock_post = self._run(scan, [self._completed()])
+        self.assertEqual(result, self._OUTPUT)
+        mock_post.assert_not_called()  # no duplicate /run
+
+    def test_reattaches_in_progress_then_completed(self):
+        scan = ScanFactory(
+            runpod_job_id="job-old",
+            runpod_job_action="detect",
+            runpod_job_submitted_at=timezone.now(),
+        )
+        result, mock_post = self._run(
+            scan,
+            [
+                _mock_response(200, {"status": "IN_PROGRESS"}),
+                self._completed(),
+            ],
+        )
+        self.assertEqual(result, self._OUTPUT)
+        mock_post.assert_not_called()
+
+    def test_wrong_action_submits_fresh(self):
+        scan = ScanFactory(
+            runpod_job_id="job-old",
+            runpod_job_action="analyze",  # different stage
+            runpod_job_submitted_at=timezone.now(),
+        )
+        result, mock_post = self._run(scan, [self._completed()])
+        self.assertEqual(result, self._OUTPUT)
+        self._assert_submitted_fresh(mock_post)
+
+    def test_past_window_submits_fresh(self):
+        scan = ScanFactory(
+            runpod_job_id="job-old",
+            runpod_job_action="detect",
+            runpod_job_submitted_at=timezone.now() - timedelta(hours=25),
+        )
+        result, mock_post = self._run(scan, [self._completed()])
+        self.assertEqual(result, self._OUTPUT)
+        self._assert_submitted_fresh(mock_post)
+
+    def test_404_on_reattach_raises_transient_and_clears(self):
+        scan = ScanFactory(
+            runpod_job_id="job-old",
+            runpod_job_action="detect",
+            runpod_job_submitted_at=timezone.now(),
+        )
+        with (
+            patch(
+                "scanning.runpod_client.requests.post",
+                return_value=_mock_response(200, {"id": "unused"}),
+            ) as mock_post,
+            patch(
+                "scanning.runpod_client.requests.get",
+                return_value=_mock_response(404, None),
+            ),
+            patch("scanning.runpod_client.time.sleep", return_value=None),
+        ):
+            with self.assertRaises(runpod_client.RunpodTransientError):
+                runpod_client._invoke(
+                    action="detect",
+                    scan=scan,
+                    payload={"pdf_url": "x"},
+                    progress_callback=None,
+                )
+        mock_post.assert_not_called()  # reattached, never submitted
+        scan.refresh_from_db()
+        self.assertEqual(scan.runpod_job_id, "")  # cleared for fresh next tick
+
+
+# ── cancel_job wrapper (issue #127) ─────────────────────────────────
+class TestCancelJob(TestCase):
+    """``cancel_job`` wires the endpoint from settings and no-ops when
+    RunPod is not configured."""
+
+    @override_settings(
+        RUNPOD_ENABLED=True,
+        RUNPOD_ENDPOINT_ID="ep-abc",
+        RUNPOD_API_KEY="apikey",
+    )
+    def test_posts_to_cancel(self):
+        with patch(
+            "scanning.runpod_client.requests.post",
+            return_value=_mock_response(200, {}),
+        ) as mock_post:
+            runpod_client.cancel_job("job-9")
+        self.assertTrue(mock_post.called)
+        self.assertIn("/cancel/job-9", mock_post.call_args.args[0])
+
+    @override_settings(RUNPOD_ENDPOINT_ID="", RUNPOD_API_KEY="")
+    def test_noop_without_config(self):
+        with patch("scanning.runpod_client.requests.post") as mock_post:
+            runpod_client.cancel_job("job-9")
+        mock_post.assert_not_called()
+
+    @override_settings(
+        RUNPOD_ENABLED=True,
+        RUNPOD_ENDPOINT_ID="ep-abc",
+        RUNPOD_API_KEY="apikey",
+    )
+    def test_noop_empty_job_id(self):
+        with patch("scanning.runpod_client.requests.post") as mock_post:
+            runpod_client.cancel_job("")
+        mock_post.assert_not_called()
+
+
+# ── Page-aware request timeout (issue #127) ─────────────────────────
+class TestRequestTimeoutForScan(TestCase):
+    """The wall-clock ceiling scales with page count so large volumes are
+    not cut off against a base tuned for small scans."""
+
+    @override_settings(
+        RUNPOD_REQUEST_TIMEOUT=1800, RUNPOD_REQUEST_TIMEOUT_PER_PAGE=2
+    )
+    def test_scales_with_page_count(self):
+        scan = ScanFactory(page_count=1303)
+        self.assertEqual(
+            runpod_client._request_timeout_for(scan), 1800 + 2 * 1303
+        )
+
+    @override_settings(
+        RUNPOD_REQUEST_TIMEOUT=1800, RUNPOD_REQUEST_TIMEOUT_PER_PAGE=2
+    )
+    def test_falls_back_to_base_without_page_count(self):
+        scan = ScanFactory(page_count=0)
+        self.assertEqual(runpod_client._request_timeout_for(scan), 1800)
