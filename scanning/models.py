@@ -536,6 +536,35 @@ class Scan(AbstractDateTimeModel):
             "are infra interruptions (deploys, evictions), not scan failures."
         ),
     )
+    runpod_job_id = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        help_text=(
+            "Id of the RunPod job currently in flight for this scan. Set when "
+            "a job is submitted, cleared when it reaches a terminal state. "
+            "Persisted so that if the daemon is killed mid-poll, the next tick "
+            "can reattach to the running job instead of submitting a duplicate "
+            "(issue #127)."
+        ),
+    )
+    runpod_job_action = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        help_text=(
+            "Action the in-flight RunPod job is running (detect or analyze), "
+            "so reattach knows which pipeline stage the job id belongs to."
+        ),
+    )
+    runpod_job_submitted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the in-flight RunPod job was submitted. Used to skip reattach "
+            "once the job is past RunPod's retention window."
+        ),
+    )
     ocr_results = models.JSONField(
         default=list,
         blank=True,
