@@ -513,8 +513,8 @@ def _ocr(
             self._unit = unit
             self._desc = desc
             self._current = 0
-            logger.debug(
-                "progress bar: unit=%r desc=%r total=%s", unit, desc, total
+            logger.info(
+                "[progress] unit=%r desc=%r total=%s", unit, desc, total
             )
 
         def __enter__(self):
