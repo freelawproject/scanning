@@ -601,6 +601,11 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     # preserve that here so ``_import_detections_from_json`` (and any
     # other disk consumers) still see the file.
     (Path(output_dir) / "detections.json").write_text(json.dumps(detections))
+    # Persist to S3 as soon as detection finishes (mirroring bitonal), so an
+    # interruption during a later stage doesn't force detection to re-run:
+    # the next pipeline pass pulls detections.json back and skips _run_yolo
+    # (issue #127).
+    _push_generated_file_to_s3(scan_pk, "detections.json")
     _update_progress(scan_pk, f"YOLO: {len(detections)} detections")
 
 
@@ -1760,8 +1765,13 @@ def run_full_pipeline(scan_pk: int) -> None:
                 first_page=scan.start_page or 1,
             )
 
-        # 4. YOLO detection (all 3 models on bitonal)
-        _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
+        # 4. YOLO detection (all 3 models on bitonal). Skip if a prior run
+        # already produced detections.json (restored from S3 on a resume),
+        # so an interruption during a later stage doesn't redo detection.
+        # Mirrors the OCR-PDF guard above; _import_detections_from_json below
+        # replaces DB rows from the file either way, so re-import is safe.
+        if not (Path(output_dir) / "detections.json").exists():
+            _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
 
         # 5. Import detections into DB
         _update_progress(scan_pk, "Importing detections...")

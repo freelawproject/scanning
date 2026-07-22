@@ -1154,3 +1154,71 @@ class TestImmediateS3PushOnGeneration(TestCase):
             )
 
         push.assert_called_once_with(scan.pk, "rep.1.1.2.pdf")
+
+    def test_run_yolo_pushes_detections_json(self):
+        """detections.json is uploaded immediately after detection finishes,
+        so a later-stage interruption can skip re-running YOLO (issue #127)."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=2)
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+
+        with (
+            patch("scanning.runpod_client.detect", return_value=[]),
+            patch.object(services, "_push_generated_file_to_s3") as push,
+        ):
+            services._run_yolo(scan.pk, "in.pdf", str(output))
+
+        push.assert_called_once_with(scan.pk, "detections.json")
+        self.assertTrue((output / "detections.json").exists())
+
+
+class TestFullPipelineDetectStageSkip(TestCase):
+    """run_full_pipeline reuses a prior detections.json instead of re-running
+    YOLO, so an interruption during a later stage doesn't redo detection
+    (issue #127)."""
+
+    def _run(self, output_dir):
+        from scanning import services
+
+        scan = ScanFactory(status=Status.PROCESSING)
+        with (
+            # close_all() would kill the test transaction; patch it out.
+            patch("django.db.connections.close_all"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(
+                services, "ensure_output_dir", return_value=output_dir
+            ),
+            patch.object(
+                services,
+                "_ensure_bitonal",
+                return_value=output_dir / "bitonal.pdf",
+            ),
+            patch.object(
+                services, "find_ocr_pdf", return_value=output_dir / "ocr.pdf"
+            ),
+            patch.object(services, "_run_yolo") as run_yolo,
+            patch.object(
+                services, "_import_detections_from_json", return_value=[]
+            ),
+            patch.object(services, "run_paddleocr_validation"),
+            patch.object(services, "_re_pair_opinions", return_value=[]),
+            patch.object(services, "_compute_and_save_redaction_rects"),
+            patch.object(services, "_push_processing_files_to_s3"),
+        ):
+            services.run_full_pipeline(scan.pk)
+        return run_yolo
+
+    def test_skips_detection_when_detections_json_exists(self):
+        output = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, output, ignore_errors=True)
+        (output / "detections.json").write_text("[]")
+        run_yolo = self._run(output)
+        run_yolo.assert_not_called()
+
+    def test_runs_detection_when_no_detections_json(self):
+        output = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, output, ignore_errors=True)
+        run_yolo = self._run(output)
+        run_yolo.assert_called_once()
