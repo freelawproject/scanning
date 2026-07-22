@@ -311,7 +311,7 @@ class TestSubmit(TestCase):
             ),
             patch("scanning.runpod_client.time.sleep"),
         ):
-            with self.assertRaises(runpod_client.RunpodError):
+            with self.assertRaises(runpod_client.RunpodError) as ctx:
                 runpod_client._submit(
                     base_url="https://api/run/endpoint",
                     headers={},
@@ -320,6 +320,84 @@ class TestSubmit(TestCase):
                     max_retries=1,
                     progress_callback=None,
                 )
+        # A transport error carries no response, so it stays terminal.
+        self.assertNotIsInstance(
+            ctx.exception, runpod_client.RunpodTransientError
+        )
+
+    def test_endpoint_paused_409_raises_transient(self):
+        """A 409 ENDPOINT_PAUSED re-queues the scan rather than failing."""
+        body = {
+            "status": 409,
+            "title": "Conflict",
+            "detail": (
+                "Endpoint is paused (max_workers=0). "
+                "Set max_workers > 0 to accept work."
+            ),
+            "code": "ENDPOINT_PAUSED",
+        }
+        with (
+            patch(
+                "scanning.runpod_client.requests.post",
+                return_value=_mock_response(409, body),
+            ),
+            patch("scanning.runpod_client.time.sleep"),
+        ):
+            with self.assertRaises(runpod_client.RunpodTransientError):
+                runpod_client._submit(
+                    base_url="https://api/run/endpoint",
+                    headers={},
+                    body={"input": {}},
+                    action="detect",
+                    max_retries=1,
+                    progress_callback=None,
+                )
+
+    def test_non_409_http_error_stays_terminal(self):
+        """A non-409 HTTP error is terminal, not a re-queue."""
+        with (
+            patch(
+                "scanning.runpod_client.requests.post",
+                return_value=_mock_response(400, {"code": "BAD_INPUT"}),
+            ),
+            patch("scanning.runpod_client.time.sleep"),
+        ):
+            with self.assertRaises(runpod_client.RunpodError) as ctx:
+                runpod_client._submit(
+                    base_url="https://api/run/endpoint",
+                    headers={},
+                    body={"input": {}},
+                    action="detect",
+                    max_retries=1,
+                    progress_callback=None,
+                )
+        self.assertNotIsInstance(
+            ctx.exception, runpod_client.RunpodTransientError
+        )
+
+    def test_logs_response_body_on_failure(self):
+        """The RunPod error body is logged, not swallowed by raise_for_status."""
+        body = {"code": "ENDPOINT_PAUSED", "detail": "Endpoint is paused"}
+        with (
+            patch(
+                "scanning.runpod_client.requests.post",
+                return_value=_mock_response(409, body),
+            ),
+            patch("scanning.runpod_client.time.sleep"),
+            self.assertLogs("scanning.runpod_client", level="WARNING") as logs,
+        ):
+            with self.assertRaises(runpod_client.RunpodError):
+                runpod_client._submit(
+                    base_url="https://api/run/endpoint",
+                    headers={},
+                    body={"input": {}},
+                    action="detect",
+                    max_retries=0,
+                    progress_callback=None,
+                )
+        self.assertTrue(
+            any("Endpoint is paused" in line for line in logs.output)
+        )
 
 
 # ── _poll ───────────────────────────────────────────────────────────
