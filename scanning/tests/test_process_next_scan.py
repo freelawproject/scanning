@@ -150,6 +150,24 @@ class TestRecoverStale(TestCase):
         self.assertEqual(logs.records[0].levelname, "ERROR")
         self.assertIn("ERROR_INTERRUPTED", logs.records[0].getMessage())
 
+    @override_settings(DAEMON_MAX_INTERRUPTIONS=3)
+    def test_flagged_scan_job_is_cancelled_requeued_is_not(self):
+        """Stale recovery cancels the RunPod job of a scan it flags terminal
+        (won't reattach), but leaves a re-queued scan's job running so it can
+        reattach next tick (issue #127)."""
+        flagged = self._stale(interruption_count=3, runpod_job_id="job-flag")
+        requeued = self._stale(interruption_count=0, runpod_job_id="job-keep")
+
+        with patch("scanning.runpod_client.cancel_job") as mock_cancel:
+            Command()._recover_stale()
+
+        flagged.refresh_from_db()
+        requeued.refresh_from_db()
+        self.assertEqual(flagged.status, Status.ERROR_INTERRUPTED)
+        self.assertEqual(requeued.status, Status.QUEUED)
+        mock_cancel.assert_called_once_with("job-flag")
+        self.assertEqual(requeued.runpod_job_id, "job-keep")
+
     def test_fresh_processing_scan_is_left_alone(self):
         """A PROCESSING scan within the timeout is not touched."""
         scan = ScanFactory(status=Status.PROCESSING, interruption_count=0)

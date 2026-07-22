@@ -126,6 +126,7 @@ class Command(BaseCommand):
         """
         from django.utils import timezone
 
+        from scanning import runpod_client
         from scanning.models import Scan, Status
 
         now = timezone.now()
@@ -145,10 +146,16 @@ class Command(BaseCommand):
                 f"Recovering stale scan {scan.pk} "
                 f"(processing since {scan.processed_at})"
             )
-        Scan.requeue_or_flag_interrupted(
+        _, _, flagged_job_ids = Scan.requeue_or_flag_interrupted(
             Scan.objects.filter(pk__in=[scan.pk for scan in stale]),
             requeue_message="Re-queued (previous attempt timed out)",
         )
+        # Flagged scans are terminal and will never reattach, so cancel their
+        # in-flight RunPod jobs to stop billing (mirrors the SIGTERM handler in
+        # run_daemon). SIGKILL/OOM kills bypass that handler and surface here
+        # instead, so this is where those orphans get cancelled (issue #127).
+        for job_id in flagged_job_ids:
+            runpod_client.cancel_job(job_id)
 
     def _claim_next(self):
         """Atomically claim the next queued scan and mark it PROCESSING.
