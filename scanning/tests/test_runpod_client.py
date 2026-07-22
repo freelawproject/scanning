@@ -353,6 +353,46 @@ class TestSubmit(TestCase):
                     progress_callback=None,
                 )
 
+    def test_409_without_known_code_still_transient(self):
+        """Any 409 re-queues, even without an ENDPOINT_PAUSED code."""
+        with (
+            patch(
+                "scanning.runpod_client.requests.post",
+                return_value=_mock_response(409, {"title": "Conflict"}),
+            ),
+            patch("scanning.runpod_client.time.sleep"),
+        ):
+            with self.assertRaises(runpod_client.RunpodTransientError):
+                runpod_client._submit(
+                    base_url="https://api/run/endpoint",
+                    headers={},
+                    body={"input": {}},
+                    action="detect",
+                    max_retries=1,
+                    progress_callback=None,
+                )
+
+    def test_paused_endpoint_short_circuits_without_retrying(self):
+        """A 409 raises immediately instead of burning the retry budget."""
+        with (
+            patch(
+                "scanning.runpod_client.requests.post",
+                return_value=_mock_response(409, {"code": "ENDPOINT_PAUSED"}),
+            ) as mock_post,
+            patch("scanning.runpod_client.time.sleep") as mock_sleep,
+        ):
+            with self.assertRaises(runpod_client.RunpodTransientError):
+                runpod_client._submit(
+                    base_url="https://api/run/endpoint",
+                    headers={},
+                    body={"input": {}},
+                    action="detect",
+                    max_retries=2,
+                    progress_callback=None,
+                )
+        self.assertEqual(mock_post.call_count, 1)
+        mock_sleep.assert_not_called()
+
     def test_non_409_http_error_stays_terminal(self):
         """A non-409 HTTP error is terminal, not a re-queue."""
         with (

@@ -462,37 +462,40 @@ def _submit(
             return job_id
         except Exception as exc:
             last_exc = exc
+            status_code, err_code, text = _submit_error_detail(exc)
+            body_note = (
+                f" (HTTP {status_code} body: {text[:500]})" if text else ""
+            )
+
+            # A paused / 409 endpoint won't start accepting work within
+            # the in-call backoff window, so don't burn the remaining
+            # attempts: raise transient immediately and let the daemon
+            # re-queue the scan on a later tick.
+            if status_code == 409 or err_code in _TRANSIENT_SUBMIT_CODES:
+                logger.warning(
+                    "runpod submit failed: %s%s; endpoint not accepting "
+                    "work, re-queueing",
+                    exc,
+                    body_note,
+                )
+                raise RunpodTransientError(
+                    f"RunPod endpoint not accepting work (HTTP "
+                    f"{status_code}): {exc}"
+                ) from exc
+
             sleep_for = 2**attempt
-            status_code, _, text = _submit_error_detail(exc)
-            if text:
-                logger.warning(
-                    "runpod submit attempt %d/%d failed: %s "
-                    "(HTTP %s body: %s); sleeping %ds",
-                    attempt + 1,
-                    max_retries + 1,
-                    exc,
-                    status_code,
-                    text[:500],
-                    sleep_for,
-                )
-            else:
-                logger.warning(
-                    "runpod submit attempt %d/%d failed: %s; sleeping %ds",
-                    attempt + 1,
-                    max_retries + 1,
-                    exc,
-                    sleep_for,
-                )
+            logger.warning(
+                "runpod submit attempt %d/%d failed: %s%s; sleeping %ds",
+                attempt + 1,
+                max_retries + 1,
+                exc,
+                body_note,
+                sleep_for,
+            )
             if attempt < max_retries:
                 time.sleep(sleep_for)
 
-    status_code, err_code, _ = _submit_error_detail(last_exc)
-    exc_cls = (
-        RunpodTransientError
-        if status_code == 409 or err_code in _TRANSIENT_SUBMIT_CODES
-        else RunpodError
-    )
-    raise exc_cls(
+    raise RunpodError(
         f"failed to submit RunPod job after {max_retries + 1} attempts: {last_exc}"
     )
 
