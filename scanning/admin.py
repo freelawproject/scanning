@@ -134,7 +134,7 @@ class ScanAdmin(admin.ModelAdmin):
     ]
     date_hierarchy = "date_created"
     actions = [
-        "reset_to_queued",
+        "requeue_scans",
         "requeue_retry_cap_scans",
         "requeue_interrupted_scans",
     ]
@@ -284,50 +284,82 @@ class ScanAdmin(admin.ModelAdmin):
         for volume in Volume.objects.filter(pk__in=volume_ids):
             refresh_volume_queue_status(volume)
 
+    # Statuses a scan can be re-queued FROM: any error flavor, plus a
+    # scan stuck in PROCESSING after its daemon was killed. Anything
+    # else (QUEUED, PENDING_REVIEW, DONE, ...) is left alone.
+    _REQUEUEABLE_STATUSES = (
+        Status.ERROR,
+        Status.ERROR_MAX_RETRIES,
+        Status.ERROR_INTERRUPTED,
+        Status.PROCESSING,
+    )
+
     @admin.action(
         description=(
-            "Reset selected scans to QUEUED "
-            "(recover scans stuck in PROCESSING)"
+            "Re-queue selected scans (any Error / stuck Processing) "
+            "-- the general recovery action; resets retry & "
+            "interruption counters"
         )
     )
-    def reset_to_queued(self, request, queryset):
-        """Flip selected scans back to QUEUED so the daemon re-runs them.
+    def requeue_scans(self, request, queryset):
+        """Re-queue selected scans regardless of which error flavor.
 
-        Use this to recover a scan whose daemon process was killed (OOM,
-        pod restart, SIGKILL, etc.) and which remained stuck in
-        ``PROCESSING`` with a frozen progress message. Waiting for
-        ``_recover_stale()`` to pick it up takes up to
-        ``DAEMON_PROCESSING_TIMEOUT`` (default 3600s); this action is
-        the manual shortcut.
+        This is the general-purpose recovery action: use it whenever you
+        just want an errored scan to run again and don't care which cap
+        it hit. It re-queues scans in any error status (plain ``ERROR``,
+        ``ERROR_MAX_RETRIES``, ``ERROR_INTERRUPTED``) or stuck in
+        ``PROCESSING`` after a killed daemon (OOM, pod restart, SIGKILL),
+        and resets both ``retry_count`` and ``interruption_count`` so
+        they start fresh.
+
+        Selected scans not in an error/processing state (QUEUED,
+        PENDING_REVIEW, DONE, ...) are skipped and reported, so a stray
+        selection is never silently reset. For surgically re-queuing only
+        one error flavor, use the retry-cap / interrupted actions instead.
 
         :param request: The admin HTTP request.
         :param queryset: Selected Scan queryset.
         :return: None.
         """
-        updated = queryset.update(
+        updated = queryset.filter(
+            status__in=self._REQUEUEABLE_STATUSES
+        ).update(
             status=Status.QUEUED,
+            retry_count=0,
+            interruption_count=0,
             progress_message="Re-queued via admin",
             progress_current=0,
             progress_total=0,
         )
+        skipped = queryset.count() - updated
+        message = (
+            f"Re-queued {updated} scan(s) and reset retry/interruption "
+            "counters. The daemon will pick them up on the next tick."
+        )
+        if skipped:
+            message += (
+                f" Skipped {skipped} scan(s) not in an Error or "
+                "Processing state."
+            )
         self.message_user(
             request,
-            f"Re-queued {updated} scan(s). The daemon will pick them up "
-            "on the next tick.",
-            level=messages.SUCCESS,
+            message,
+            level=messages.SUCCESS if updated else messages.WARNING,
         )
 
     @admin.action(
         description=(
-            "Re-queue selected scans that hit the retry cap "
-            "(resets retry_count so the daemon will try again)"
+            "Re-queue: retry cap hit only "
+            "(status 'Error (retry cap hit)'; resets retry_count)"
         )
     )
     def requeue_retry_cap_scans(self, request, queryset):
-        """Re-queue scans stopped after hitting the transient retry cap.
+        """Re-queue only scans stopped after hitting the transient retry cap.
 
-        Resets ``status``, ``retry_count``, and ``progress_message`` so
-        the daemon will pick them up and attempt processing again.
+        Narrower than ``requeue_scans``: touches only
+        ``ERROR_MAX_RETRIES`` scans and resets just ``retry_count``. Warns
+        (rather than silently reporting 0) when the selection contains no
+        such scan, pointing at the general action.
 
         :param request: The admin HTTP request.
         :param queryset: Selected Scan queryset.
@@ -340,26 +372,37 @@ class ScanAdmin(admin.ModelAdmin):
             progress_current=0,
             progress_total=0,
         )
-        self.message_user(
-            request,
-            f"Re-queued {updated} scan(s) with retry_count reset. "
-            "The daemon will try them again on the next tick.",
-            level=messages.SUCCESS,
-        )
+        if updated:
+            self.message_user(
+                request,
+                f"Re-queued {updated} scan(s) with retry_count reset. "
+                "The daemon will try them again on the next tick.",
+                level=messages.SUCCESS,
+            )
+        else:
+            self.message_user(
+                request,
+                "None of the selected scans were in 'Error (retry cap "
+                "hit)'. For a plain 'Error' scan, use 'Re-queue selected "
+                "scans (any Error / stuck Processing)'.",
+                level=messages.WARNING,
+            )
 
     @admin.action(
         description=(
-            "Re-queue selected scans flagged as interrupted too often "
-            "(resets interruption_count so the daemon will try again)"
+            "Re-queue: interrupted too often only "
+            "(status 'Error (interrupted too often)'; "
+            "resets interruption_count)"
         )
     )
     def requeue_interrupted_scans(self, request, queryset):
-        """Re-queue scans flagged ERROR_INTERRUPTED by the daemon guard.
+        """Re-queue only scans flagged ERROR_INTERRUPTED by the daemon guard.
 
-        Resets ``status``, ``interruption_count``, and ``progress_message``
-        so the daemon picks them up again. Use once the underlying pod churn
-        (deploys, evictions, OOM) that interrupted them has settled (issue
-        #124).
+        Narrower than ``requeue_scans``: touches only
+        ``ERROR_INTERRUPTED`` scans and resets just ``interruption_count``.
+        Use once the underlying pod churn (deploys, evictions, OOM) that
+        interrupted them has settled (issue #124). Warns when the
+        selection contains no such scan.
 
         :param request: The admin HTTP request.
         :param queryset: Selected Scan queryset.
@@ -372,12 +415,21 @@ class ScanAdmin(admin.ModelAdmin):
             progress_current=0,
             progress_total=0,
         )
-        self.message_user(
-            request,
-            f"Re-queued {updated} scan(s) with interruption_count reset. "
-            "The daemon will try them again on the next tick.",
-            level=messages.SUCCESS,
-        )
+        if updated:
+            self.message_user(
+                request,
+                f"Re-queued {updated} scan(s) with interruption_count "
+                "reset. The daemon will try them again on the next tick.",
+                level=messages.SUCCESS,
+            )
+        else:
+            self.message_user(
+                request,
+                "None of the selected scans were in 'Error (interrupted "
+                "too often)'. For a plain 'Error' scan, use 'Re-queue "
+                "selected scans (any Error / stuck Processing)'.",
+                level=messages.WARNING,
+            )
 
 
 @admin.register(OpinionScan)
