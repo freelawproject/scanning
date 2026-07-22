@@ -94,11 +94,11 @@ def _log_stage(label: str, detail: str = ""):
         append (after ", ") to the completion line, e.g. an output size.
     """
     logger.info("%s...", f"{label} {detail}".rstrip())
-    t0 = time.time()
+    t0 = time.monotonic()
     stage = _StageLog()
     yield stage
     suffix = f", {stage.done_detail}" if stage.done_detail else ""
-    logger.info("%s done (%.0fs%s)", label, time.time() - t0, suffix)
+    logger.info("%s done (%.1fs%s)", label, time.monotonic() - t0, suffix)
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +358,7 @@ def _handle_pipeline_exception(
             )
         return
 
-    traceback.print_exc()
-    print(f"[{context}] ERROR: {exc}", flush=True)
+    logger.exception("[%s] scan %s failed: %s", context, scan_pk, exc)
     updated = Scan.objects.filter(pk=scan_pk, status=Status.PROCESSING).update(
         status=Status.ERROR,
         progress_message=str(exc)[:255],
@@ -514,9 +513,8 @@ def _ocr(
             self._unit = unit
             self._desc = desc
             self._current = 0
-            print(
-                f"  [progress] unit={unit!r} desc={desc!r} total={total}",
-                flush=True,
+            logger.debug(
+                "progress bar: unit=%r desc=%r total=%s", unit, desc, total
             )
 
         def __enter__(self):
