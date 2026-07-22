@@ -83,8 +83,33 @@ class Command(BaseCommand):
                 time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
         return None
 
+    @staticmethod
+    def _stale_timeout_for(scan) -> float:
+        """Seconds a scan may sit in PROCESSING before it is considered stale.
+
+        The floor is ``DAEMON_PROCESSING_TIMEOUT``, but a large volume
+        legitimately runs longer: a full pipeline makes up to two RunPod calls
+        (detect and analyze), each with a page-aware ceiling
+        (``RUNPOD_REQUEST_TIMEOUT + RUNPOD_REQUEST_TIMEOUT_PER_PAGE *
+        page_count``). Keeping the stale cutoff at least their combined worst
+        case means raising the page-aware request ceiling can't leave stale
+        recovery cutting off a job that is still legitimately running, i.e. the
+        two cutoffs can't drift apart (issue #127).
+
+        :param scan: The PROCESSING scan being evaluated.
+        :return: The stale threshold in seconds.
+        :rtype: float
+        """
+        from django.conf import settings
+
+        request_ceiling = (
+            settings.RUNPOD_REQUEST_TIMEOUT
+            + settings.RUNPOD_REQUEST_TIMEOUT_PER_PAGE * (scan.page_count or 0)
+        )
+        return max(settings.DAEMON_PROCESSING_TIMEOUT, 2 * request_ceiling)
+
     def _recover_stale(self):
-        """Reset scans stuck in PROCESSING past the timeout back to QUEUED.
+        """Reset scans stuck in PROCESSING past their timeout back to QUEUED.
 
         A scan is usually stale because the daemon was killed (SIGKILL/OOM,
         which never runs the SIGTERM re-queue handler) mid-pipeline, so this
@@ -92,29 +117,36 @@ class Command(BaseCommand):
         ERROR_INTERRUPTED just like the signal handler does, bounding the
         otherwise-unbounded re-queue loop (issue #124).
 
+        The threshold is per-scan (see :meth:`_stale_timeout_for`) so a large
+        volume that is legitimately still running is not recovered early. The
+        PROCESSING set is tiny (one scan per daemon), so each candidate's
+        cutoff is evaluated in Python rather than as one global SQL cutoff.
+
         :return: None.
         """
-        from datetime import timedelta
-
-        from django.conf import settings
         from django.utils import timezone
 
         from scanning.models import Scan, Status
 
-        cutoff = timezone.now() - timedelta(
-            seconds=settings.DAEMON_PROCESSING_TIMEOUT
-        )
-        stale = Scan.objects.filter(
-            status=Status.PROCESSING,
-            processed_at__lt=cutoff,
-        )
+        now = timezone.now()
+        candidates = Scan.objects.filter(
+            status=Status.PROCESSING, processed_at__isnull=False
+        ).only("pk", "processed_at", "page_count")
+        stale = [
+            scan
+            for scan in candidates
+            if (now - scan.processed_at).total_seconds()
+            > self._stale_timeout_for(scan)
+        ]
+        if not stale:
+            return
         for scan in stale:
             self.stdout.write(
                 f"Recovering stale scan {scan.pk} "
                 f"(processing since {scan.processed_at})"
             )
         Scan.requeue_or_flag_interrupted(
-            stale,
+            Scan.objects.filter(pk__in=[scan.pk for scan in stale]),
             requeue_message="Re-queued (previous attempt timed out)",
         )
 

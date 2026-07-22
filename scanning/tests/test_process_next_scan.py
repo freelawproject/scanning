@@ -160,3 +160,58 @@ class TestRecoverStale(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.PROCESSING)
         self.assertEqual(scan.interruption_count, 0)
+
+    @override_settings(
+        DAEMON_PROCESSING_TIMEOUT=3600,
+        RUNPOD_REQUEST_TIMEOUT=1800,
+        RUNPOD_REQUEST_TIMEOUT_PER_PAGE=2,
+    )
+    def test_stale_timeout_scales_with_page_count(self):
+        """The cutoff is the larger of the daemon floor and twice the
+        page-aware request ceiling (detect + analyze) (issue #127)."""
+        # max(3600, 2 * (1800 + 2 * 2000)) = 11600
+        self.assertEqual(
+            Command._stale_timeout_for(ScanFactory(page_count=2000)), 11600
+        )
+        # Small scan falls back to the daemon floor: max(3600, 2*1800).
+        self.assertEqual(
+            Command._stale_timeout_for(ScanFactory(page_count=0)), 3600
+        )
+
+    @override_settings(
+        DAEMON_PROCESSING_TIMEOUT=3600,
+        RUNPOD_REQUEST_TIMEOUT=1800,
+        RUNPOD_REQUEST_TIMEOUT_PER_PAGE=2,
+    )
+    def test_large_scan_within_page_aware_ceiling_not_recovered(self):
+        """A big volume past the daemon floor but within its own page-aware
+        ceiling is left running, not recovered out from under its job."""
+        scan = ScanFactory(status=Status.PROCESSING, page_count=2000)
+        # 2h old: past DAEMON_PROCESSING_TIMEOUT (3600) but under 11600.
+        Scan.objects.filter(pk=scan.pk).update(
+            processed_at=timezone.now() - timedelta(seconds=7200)
+        )
+
+        Command()._recover_stale()
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PROCESSING)
+
+    @override_settings(
+        DAEMON_PROCESSING_TIMEOUT=3600,
+        RUNPOD_REQUEST_TIMEOUT=1800,
+        RUNPOD_REQUEST_TIMEOUT_PER_PAGE=2,
+    )
+    def test_large_scan_past_page_aware_ceiling_is_recovered(self):
+        """Once even the page-aware ceiling is exceeded, it is recovered."""
+        scan = ScanFactory(
+            status=Status.PROCESSING, page_count=2000, interruption_count=0
+        )
+        Scan.objects.filter(pk=scan.pk).update(
+            processed_at=timezone.now() - timedelta(seconds=12000)
+        )
+
+        Command()._recover_stale()
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.QUEUED)
