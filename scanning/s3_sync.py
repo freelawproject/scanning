@@ -295,7 +295,7 @@ def _is_preview_pdf(rel: str) -> bool:
 def _is_original_pdf(rel: str) -> bool:
     """Return True if a processing-prefix relative key is the original PDF.
 
-    The (up to 2 GB) ``*.original.pdf`` at the top of the prefix. Used to
+    The (up to 3 GB) ``*.original.pdf`` at the top of the prefix. Used to
     pull only the original -- not the ``images/`` tree -- for the crop
     endpoint, which renders high-res crops from the non-bitonal original.
 

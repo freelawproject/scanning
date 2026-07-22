@@ -42,12 +42,6 @@ from scanning.models import (
 from scanning.services import apply_upload_action
 from scanning.utils import get_volume, has_s3_credentials
 
-# Max size for a direct-to-S3 original upload. Enforced by the presigned
-# POST policy (see s3_sync.generate_presigned_post) so S3 rejects anything
-# larger before it lands, and pre-checked in the presign view for a fast
-# client-facing error.
-MAX_ORIGINAL_UPLOAD_SIZE = 2 * 1024**3  # 2 GB
-
 logger = logging.getLogger(__name__)
 
 
@@ -662,7 +656,7 @@ def presign_scan_upload(request, reporter_slug, vol):
     """Authorize a direct browser->S3 upload of a scan's original PDF.
 
     Creates/updates the target scan, then returns a presigned POST the
-    browser uses to upload the (up to 2 GB) PDF straight to the scan's
+    browser uses to upload the (up to 3 GB) PDF straight to the scan's
     S3 processing prefix -- keeping those bytes off the Django request
     path. A ``PendingUpload`` row records the authorization until
     ``confirm_scan_upload`` verifies the object landed.
@@ -695,9 +689,11 @@ def presign_scan_upload(request, reporter_slug, vol):
         return JsonResponse(
             {"error": "Only PDF files are accepted."}, status=400
         )
-    if size <= 0 or size > MAX_ORIGINAL_UPLOAD_SIZE:
+    if size <= 0 or size > settings.MAX_ORIGINAL_UPLOAD_SIZE:
+        limit_gb = settings.MAX_ORIGINAL_UPLOAD_SIZE // 1024**3
         return JsonResponse(
-            {"error": "File is empty or exceeds the 2 GB limit."}, status=400
+            {"error": f"File is empty or exceeds the {limit_gb} GB limit."},
+            status=400,
         )
 
     if not has_s3_credentials():
@@ -718,7 +714,10 @@ def presign_scan_upload(request, reporter_slug, vol):
     original_name = _original_pdf_name(scan, volume)
     try:
         presigned = s3_sync.generate_presigned_post(
-            scan, original_name, content_type, MAX_ORIGINAL_UPLOAD_SIZE
+            scan,
+            original_name,
+            content_type,
+            settings.MAX_ORIGINAL_UPLOAD_SIZE,
         )
         if not presigned:
             # S3 sync disabled despite credentials being present.
