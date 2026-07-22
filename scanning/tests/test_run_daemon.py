@@ -180,3 +180,38 @@ class TestHandleSignal(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.QUEUED)
         self.assertEqual(scan.interruption_count, 3)
+
+    @override_settings(DAEMON_MAX_INTERRUPTIONS=3)
+    def test_signal_cancels_jobs_only_for_flagged_scans(self):
+        """Re-queued scans keep their RunPod job (to reattach); scans flagged
+        ERROR_INTERRUPTED are terminal, so their in-flight jobs are cancelled
+        to stop billing (issue #127)."""
+        cmd = Command()
+        # Below ceiling -> re-queued, job left running to reattach next tick.
+        requeued = ScanFactory(
+            status=Status.PROCESSING,
+            interruption_count=1,
+            runpod_job_id="job-keep",
+        )
+        # At ceiling -> flagged terminal, its job must be cancelled.
+        flagged = ScanFactory(
+            status=Status.PROCESSING,
+            interruption_count=3,
+            runpod_job_id="job-flag",
+        )
+
+        with (
+            patch("sentry_sdk.capture_message"),
+            patch("scanning.runpod_client.cancel_job") as mock_cancel,
+        ):
+            cmd._handle_signal(15, None)
+
+        requeued.refresh_from_db()
+        flagged.refresh_from_db()
+        self.assertEqual(requeued.status, Status.QUEUED)
+        self.assertEqual(flagged.status, Status.ERROR_INTERRUPTED)
+        mock_cancel.assert_called_once_with("job-flag")
+        # Re-queued scan keeps its handle so it can reattach next tick;
+        # the flagged (terminal) scan drops it so a re-queue starts fresh.
+        self.assertEqual(requeued.runpod_job_id, "job-keep")
+        self.assertEqual(flagged.runpod_job_id, "")

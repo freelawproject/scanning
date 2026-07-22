@@ -151,6 +151,7 @@ class Command(BaseCommand):
         self.shutdown = True
 
         try:
+            from scanning import runpod_client
             from scanning.models import Scan, Status
 
             # Don't bump retry_count: the scan didn't fail, the daemon
@@ -165,13 +166,19 @@ class Command(BaseCommand):
             # The helper logs the re-queue (INFO breadcrumb) and flag (ERROR
             # event) itself, so both this path and stale-recovery report to
             # Sentry consistently.
-            Scan.requeue_or_flag_interrupted(
+            _, _, flagged_job_ids = Scan.requeue_or_flag_interrupted(
                 Scan.objects.filter(status=Status.PROCESSING),
                 requeue_message=(
                     f"Daemon received signal {signum} mid-pipeline, "
                     "re-queued for next tick."
                 ),
             )
+            # Re-queued scans keep their RunPod job id and reattach on the
+            # next tick, so we leave those jobs running. Scans flagged
+            # ERROR_INTERRUPTED are terminal and will never reattach, so
+            # cancel their in-flight jobs to stop billing (issue #127).
+            for job_id in flagged_job_ids:
+                runpod_client.cancel_job(job_id)
         except Exception:
             logger.exception("Failed to re-queue in-flight scans on shutdown")
 

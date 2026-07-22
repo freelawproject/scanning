@@ -657,8 +657,13 @@ class Scan(AbstractDateTimeModel):
         :param requeue_message: ``progress_message`` for re-queued scans.
         :param max_interruptions: Interruption ceiling; defaults to
             ``settings.DAEMON_MAX_INTERRUPTIONS``.
-        :return: ``(requeued, flagged)`` counts.
-        :rtype: tuple[int, int]
+        :return: ``(requeued, flagged, flagged_job_ids)`` where the first two
+            are counts and ``flagged_job_ids`` is the list of in-flight RunPod
+            job ids on the scans just flagged ``ERROR_INTERRUPTED``. Those
+            scans will never be reattached, so the caller can cancel their
+            jobs to stop billing (issue #127). Re-queued scans are omitted:
+            they keep their id and reattach on the next tick.
+        :rtype: tuple[int, int, list[str]]
         """
         if max_interruptions is None:
             max_interruptions = settings.DAEMON_MAX_INTERRUPTIONS
@@ -669,7 +674,7 @@ class Scan(AbstractDateTimeModel):
             )
         )
         if not pks:
-            return 0, 0
+            return 0, 0, []
 
         flag_message = (
             f"Interrupted {max_interruptions}+ times without completing "
@@ -699,12 +704,30 @@ class Scan(AbstractDateTimeModel):
             ),
         )
 
-        flagged_pks = list(
+        # Re-read which scans became ERROR_INTERRUPTED, along with any in-flight
+        # RunPod job id: those jobs won't be reattached (the scan is terminal),
+        # so the caller can cancel them to stop billing.
+        flagged = list(
             Scan.objects.filter(
                 pk__in=pks, status=Status.ERROR_INTERRUPTED
-            ).values_list("pk", flat=True)
+            ).values_list("pk", "runpod_job_id")
         )
+        flagged_pks = [pk for pk, _ in flagged]
+        flagged_job_ids = [job_id for _, job_id in flagged if job_id]
         requeued = len(pks) - len(flagged_pks)
+
+        if flagged_pks:
+            # A flagged scan is terminal and will never be reattached, so drop
+            # its persisted RunPod handle: on a manual re-queue (or any later
+            # regenerate action) the pipeline must submit a fresh job rather
+            # than reattach to this dead one, whose job the shutdown handler
+            # also cancels. Re-queued scans keep their handle so they *can*
+            # reattach on the next tick (issue #127).
+            Scan.objects.filter(pk__in=flagged_pks).update(
+                runpod_job_id="",
+                runpod_job_action="",
+                runpod_job_submitted_at=None,
+            )
 
         if requeued:
             # INFO so a routine re-queue lands as a Sentry breadcrumb (not an
@@ -723,7 +746,7 @@ class Scan(AbstractDateTimeModel):
                 max_interruptions,
                 flagged_pks,
             )
-        return requeued, len(flagged_pks)
+        return requeued, len(flagged_pks), flagged_job_ids
 
     def clean(self):
         """Validate page range and page count consistency.
