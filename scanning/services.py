@@ -65,6 +65,18 @@ from scanning.utils import ensure_output_dir, find_ocr_pdf, has_s3_credentials
 logger = logging.getLogger(__name__)
 
 
+class _StageLog:
+    """Handle yielded by :func:`_log_stage`.
+
+    Set ``done_detail`` inside the ``with`` block to append extra
+    context (e.g. an output file size) after the elapsed time on the
+    stage's completion line.
+    """
+
+    def __init__(self):
+        self.done_detail = ""
+
+
 @contextlib.contextmanager
 def _log_stage(label: str, detail: str = ""):
     """Log a processing stage's start and elapsed time at INFO level.
@@ -78,11 +90,15 @@ def _log_stage(label: str, detail: str = ""):
     :param label: Short stage name, reused verbatim in the "done" line.
     :param detail: Optional extra context for the start line (e.g. a
         page count), omitted from the "done" line to keep it terse.
+    :yields: A :class:`_StageLog` whose ``done_detail`` can be set to
+        append (after ", ") to the completion line, e.g. an output size.
     """
     logger.info("%s...", f"{label} {detail}".rstrip())
     t0 = time.time()
-    yield
-    logger.info("%s done (%.0fs)", label, time.time() - t0)
+    stage = _StageLog()
+    yield stage
+    suffix = f", {stage.done_detail}" if stage.done_detail else ""
+    logger.info("%s done (%.0fs%s)", label, time.time() - t0, suffix)
 
 
 # ---------------------------------------------------------------------------
@@ -373,12 +389,14 @@ def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
         def _bitonal_progress(current, total, message):
             _update_progress(scan.pk, message, current=current, total=total)
 
-        with _log_stage("Bitonal conversion"):
+        with _log_stage("Bitonal conversion") as stage:
             bl_bitonal(
                 scan.pdf_path,
                 str(output_dir),
                 progress_callback=_bitonal_progress,
             )
+            size_mb = bitonal_path.stat().st_size / 1024 / 1024
+            stage.done_detail = f"{size_mb:.1f} MB"
         # Persist as soon as it exists so a later crash, or a reprocess
         # that skips the end-of-pipeline push, still leaves it in S3.
         _push_generated_file_to_s3(scan.pk, "bitonal.pdf")
