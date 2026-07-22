@@ -5,11 +5,13 @@ daemon process.  They must NOT import Django HTTP machinery
 (HttpResponse, render, redirect, etc.).
 """
 
+import contextlib
 import json
 import logging
 import os
 import re
 import shutil
+import time
 import traceback
 from collections import Counter
 from pathlib import Path
@@ -61,6 +63,27 @@ from scanning.models import (
 from scanning.utils import ensure_output_dir, find_ocr_pdf, has_s3_credentials
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _log_stage(label: str, detail: str = ""):
+    """Log a processing stage's start and elapsed time at INFO level.
+
+    Emits ``"<label> <detail>..."`` on entry and ``"<label> done
+    (<n>s)"`` on successful exit, giving every heavy pipeline stage the
+    same timed log line the OCR step already had. The ``done`` line is
+    skipped if the wrapped block raises, matching the original OCR
+    behavior (elapsed time is only reported for a stage that finished).
+
+    :param label: Short stage name, reused verbatim in the "done" line.
+    :param detail: Optional extra context for the start line (e.g. a
+        page count), omitted from the "done" line to keep it terse.
+    """
+    logger.info("%s...", f"{label} {detail}".rstrip())
+    t0 = time.time()
+    yield
+    logger.info("%s done (%.0fs)", label, time.time() - t0)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -350,11 +373,12 @@ def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
         def _bitonal_progress(current, total, message):
             _update_progress(scan.pk, message, current=current, total=total)
 
-        bl_bitonal(
-            scan.pdf_path,
-            str(output_dir),
-            progress_callback=_bitonal_progress,
-        )
+        with _log_stage("Bitonal conversion"):
+            bl_bitonal(
+                scan.pdf_path,
+                str(output_dir),
+                progress_callback=_bitonal_progress,
+            )
         # Persist as soon as it exists so a later crash, or a reprocess
         # that skips the end-of-pipeline push, still leaves it in S3.
         _push_generated_file_to_s3(scan.pk, "bitonal.pdf")
@@ -432,7 +456,6 @@ def _ocr(
     :return: Path to the OCR'd PDF.
     """
     import logging
-    import time
 
     import ocrmypdf
     from ocrmypdf import hookimpl
@@ -504,23 +527,20 @@ def _ocr(
     pm = get_plugin_manager()
     pm._pm.register(_ScanProgressPlugin())
 
-    print(
-        f"  OCR {total_pages} pages... ({os.cpu_count() or 1} CPUs)",
-        flush=True,
-    )
-    t0 = time.time()
-    ocrmypdf.ocr(
-        str(pdf_path),
-        str(output_path),
-        pdf_renderer="auto",
-        optimize=1,
-        output_type="pdf",
-        language=[language],
-        tesseract_timeout=120,
-        progress_bar=True,
-        plugin_manager=pm,
-    )
-    print(f"  OCR done ({time.time() - t0:.0f}s)", flush=True)
+    with _log_stage(
+        "OCR", f"{total_pages} pages ({os.cpu_count() or 1} CPUs)"
+    ):
+        ocrmypdf.ocr(
+            str(pdf_path),
+            str(output_path),
+            pdf_renderer="auto",
+            optimize=1,
+            output_type="pdf",
+            language=[language],
+            tesseract_timeout=120,
+            progress_bar=True,
+            plugin_manager=pm,
+        )
     return output_path
 
 
@@ -586,16 +606,17 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     def _remote_progress(current, total, message):
         _update_progress(scan_pk, message)
 
-    sys.stdout = _ProgressWriter()
-    try:
-        detections = runpod_client.detect(
-            scan,
-            pdf_path,
-            models=["small", "medium", "large"],
-            progress_callback=_remote_progress,
-        )
-    finally:
-        sys.stdout = real_stdout
+    with _log_stage("YOLO detection"):
+        sys.stdout = _ProgressWriter()
+        try:
+            detections = runpod_client.detect(
+                scan,
+                pdf_path,
+                models=["small", "medium", "large"],
+                progress_callback=_remote_progress,
+            )
+        finally:
+            sys.stdout = real_stdout
 
     # ``bl_detect`` used to write detections.json as a side effect;
     # preserve that here so ``_import_detections_from_json`` (and any
@@ -981,9 +1002,10 @@ def _compute_and_save_redaction_rects(scan_pk: int, pdf_path: str) -> list:
     if not det_data:
         return []
 
-    document = _build_document_from_detections(scan, det_data, pdf_path)
-    opinions = _pair_opinions(document)
-    rects = compute_redaction_rects(document, opinions, skip_doctr=True)
+    with _log_stage("Redaction rects"):
+        document = _build_document_from_detections(scan, det_data, pdf_path)
+        opinions = _pair_opinions(document)
+        rects = compute_redaction_rects(document, opinions, skip_doctr=True)
 
     # Snap headnote rect x-bounds to TEXT_COLUMN detections for consistency.
     # Only snap to a TEXT_COLUMN on the same side of the page midpoint —
@@ -1203,10 +1225,11 @@ def _build_combined_redactions(scan_pk: int) -> Path:
     out_path = output_dir / "redactions.json"
     out_path.write_text(json.dumps(combined))
     n_rects = sum(len(v) for v in pages.values())
-    print(
-        f"  Combined redactions: {len(pages)} pages, "
-        f"{n_rects} rects, {len(opinions)} opinions",
-        flush=True,
+    logger.info(
+        "Combined redactions: %s pages, %s rects, %s opinions",
+        len(pages),
+        n_rects,
+        len(opinions),
     )
     return out_path
 
@@ -1313,13 +1336,14 @@ def _re_pair_opinions(scan_pk: int) -> list:
         return []
 
     pdf_path = find_ocr_pdf(scan.output_dir) or scan.pdf_path
-    opinions = bl_pair(
-        det_data,
-        str(pdf_path),
-        reporter=scan.reporter.short_name or "",
-        volume=str(scan.volume) or "",
-        first_page=scan.start_page or 1,
-    )
+    with _log_stage("Opinion pairing"):
+        opinions = bl_pair(
+            det_data,
+            str(pdf_path),
+            reporter=scan.reporter.short_name or "",
+            volume=str(scan.volume) or "",
+            first_page=scan.start_page or 1,
+        )
     Scan.objects.filter(pk=scan_pk).update(
         opinions_json=opinions,
     )
@@ -1396,7 +1420,10 @@ def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
     :param scan_pk: Primary key of the scan to validate.
     :param pdf_path: Path to the PDF to run validation on.
     """
-    all_results = _dispatch_analyze(scan_pk, pdf_path, stream_partial=False)
+    with _log_stage("PaddleOCR validation"):
+        all_results = _dispatch_analyze(
+            scan_pk, pdf_path, stream_partial=False
+        )
     Scan.objects.filter(pk=scan_pk).update(ocr_results=all_results)
     _rebuild_issues_from_results(scan_pk, all_results)
 
@@ -1706,9 +1733,7 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
         return
 
     try:
-        print(
-            f"[validate] scan {scan_pk} pdf_path={scan.pdf_path}", flush=True
-        )
+        logger.info("[validate] scan %s pdf_path=%s", scan_pk, scan.pdf_path)
         output_dir = ensure_output_dir(scan)
         bitonal_path = _ensure_bitonal(scan, output_dir)
         run_incremental_validation(scan_pk, str(bitonal_path))
