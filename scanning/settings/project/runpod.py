@@ -20,10 +20,22 @@ RUNPOD_ENDPOINT_ID = env.str("RUNPOD_ENDPOINT_ID", default="")
 # RunPod API key. Treat as a secret; never log.
 RUNPOD_API_KEY = env.str("RUNPOD_API_KEY", default="")
 
-# Hard wall-clock ceiling (seconds) for the combined submit + poll
-# loop. Includes cold start + queue + execution. Client cancels the
-# job and raises if exceeded.
+# Base wall-clock allowance (seconds) for the combined submit + poll
+# loop. Covers cold start + queue + the per-job fixed cost. The actual
+# ceiling is this base plus RUNPOD_REQUEST_TIMEOUT_PER_PAGE * page_count
+# (see below), so a large volume gets proportionally longer. Client
+# cancels the job and raises if the ceiling is exceeded.
 RUNPOD_REQUEST_TIMEOUT = env.int("RUNPOD_REQUEST_TIMEOUT", default=1800)
+
+# Per-page allowance (seconds) added to RUNPOD_REQUEST_TIMEOUT to form
+# the wall-clock ceiling, so a large volume (e.g. a 1300-page scan run
+# through 3 detect models) does not false-timeout against the flat base.
+# Ceiling = RUNPOD_REQUEST_TIMEOUT + RUNPOD_REQUEST_TIMEOUT_PER_PAGE *
+# page_count. A genuine timeout stays terminal (no auto-retry); this
+# only stops legitimately large jobs from being cut off early.
+RUNPOD_REQUEST_TIMEOUT_PER_PAGE = env.int(
+    "RUNPOD_REQUEST_TIMEOUT_PER_PAGE", default=2
+)
 
 # Retries on transport errors when submitting a job (network blips,
 # 5xx from the RunPod API). Terminal job failures are NOT retried.

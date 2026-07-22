@@ -73,6 +73,13 @@ _ACTION_LABELS = {
 }
 
 
+# How long after submit a persisted job id is still worth reattaching to.
+# RunPod deletes async jobs 24h after submission (queue time included), so
+# past this window the id is guaranteed gone and we submit a fresh job
+# instead of probing a job that no longer exists (issue #127).
+_REATTACH_WINDOW_S = 24 * 60 * 60
+
+
 def _redact_pdf_url(body: dict[str, Any]) -> dict[str, Any]:
     """Return a shallow copy of the RunPod submit body with any
     ``pdf_url`` under ``input`` replaced by ``***``.
@@ -335,6 +342,25 @@ def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
 
 
 # ── Remote: invocation + polling ────────────────────────────────────
+def _request_timeout_for(scan: Scan) -> int:
+    """Wall-clock ceiling (seconds) for this scan's RunPod job.
+
+    Scales the flat base by page count so a large volume (e.g. a
+    1300-page scan run through 3 detect models) is not cut off early
+    against a ceiling tuned for small scans. A genuine timeout is still
+    terminal - this only widens the window for legitimately large work.
+
+    :param scan: The scan whose job is being run.
+    :returns: ``RUNPOD_REQUEST_TIMEOUT + RUNPOD_REQUEST_TIMEOUT_PER_PAGE
+        * page_count``.
+    :rtype: int
+    """
+    base = int(settings.RUNPOD_REQUEST_TIMEOUT)
+    per_page = int(settings.RUNPOD_REQUEST_TIMEOUT_PER_PAGE)
+    pages = scan.page_count or 0
+    return base + per_page * pages
+
+
 def _invoke(
     action: str,
     scan: Scan,
@@ -365,14 +391,148 @@ def _invoke(
         "input": {"action": action, "scan_pk": scan.pk, **payload},
     }
 
-    deadline = time.monotonic() + int(settings.RUNPOD_REQUEST_TIMEOUT)
+    deadline = time.monotonic() + _request_timeout_for(scan)
     max_retries = int(settings.RUNPOD_MAX_RETRIES)
+
+    job_id = _resume_or_submit(
+        action, scan, base_url, headers, body, max_retries, progress_callback
+    )
+    try:
+        return _poll(
+            base_url, headers, job_id, action, deadline, progress_callback
+        )
+    finally:
+        # Clear the persisted handle on any terminal outcome (COMPLETED, or a
+        # raised RunpodError / RunpodTransientError). If the process is killed
+        # mid-poll this never runs, so the id stays on the row and the next
+        # daemon tick reattaches instead of submitting a duplicate (issue
+        # #127). Guarded on the matching id so a slow clear can't wipe a
+        # newer job's handle.
+        _clear_job_id(scan.pk, job_id)
+
+
+def _resume_or_submit(
+    action: str,
+    scan: Scan,
+    base_url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    max_retries: int,
+    progress_callback: ProgressCallback | None,
+) -> str:
+    """Reattach to an in-flight RunPod job if one is persisted, else submit.
+
+    If the scan carries a persisted job id for this ``action`` that is still
+    within RunPod's retention window, return it so :func:`_poll` reattaches to
+    the running job: it picks up an ``IN_QUEUE`` / ``IN_PROGRESS`` job without
+    submitting a duplicate, or skips the GPU work entirely if the job already
+    ``COMPLETED``. Otherwise submit a fresh job and persist its id.
+
+    A persisted job that has aged out of RunPod surfaces as an HTTP 404 in
+    :func:`_poll`, which re-queues the scan so the next tick submits fresh, so
+    we don't need to probe ``/status`` here.
+
+    :returns: The RunPod job id to poll.
+    :rtype: str
+    :raises RunpodError: If a fresh submit fails after retries.
+    """
+    resumable = _resumable_job_id(scan.pk, action)
+    if resumable:
+        logger.info(
+            "reattaching to in-flight runpod %s job %s for scan %s",
+            action,
+            resumable,
+            scan.pk,
+        )
+        if progress_callback:
+            label = _ACTION_LABELS.get(action, action)
+            progress_callback(
+                None,
+                None,
+                f"{label}: reattaching to RunPod job {resumable}",
+            )
+        return resumable
 
     job_id = _submit(
         base_url, headers, body, action, max_retries, progress_callback
     )
-    return _poll(
-        base_url, headers, job_id, action, deadline, progress_callback
+    _persist_job_id(scan.pk, job_id, action)
+    return job_id
+
+
+def _resumable_job_id(scan_pk: int, action: str) -> str | None:
+    """Return a persisted, still-fresh RunPod job id to reattach to, or None.
+
+    Reattach only when the scan has a persisted id for this same ``action``
+    submitted within :data:`_REATTACH_WINDOW_S`. A job past that window is
+    guaranteed gone from RunPod, so skip it and let the caller submit fresh.
+
+    :param scan_pk: Primary key of the scan.
+    :param action: The action being run (``"detect"`` / ``"analyze"``); the
+        persisted job must match, since a scan runs both in one pipeline.
+    :returns: The job id to reattach to, or ``None`` to submit fresh.
+    :rtype: str | None
+    """
+    from django.utils import timezone
+
+    from scanning.models import Scan
+
+    row = (
+        Scan.objects.filter(pk=scan_pk)
+        .values(
+            "runpod_job_id", "runpod_job_action", "runpod_job_submitted_at"
+        )
+        .first()
+    )
+    if not row or not row["runpod_job_id"]:
+        return None
+    if row["runpod_job_action"] != action:
+        return None
+    submitted_at = row["runpod_job_submitted_at"]
+    if submitted_at is None:
+        return None
+    if (timezone.now() - submitted_at).total_seconds() > _REATTACH_WINDOW_S:
+        return None
+    return row["runpod_job_id"]
+
+
+def _persist_job_id(scan_pk: int, job_id: str, action: str) -> None:
+    """Persist the in-flight RunPod job handle on the scan row.
+
+    Filtered by pk only (not guarded by ``status``): a concurrent shutdown may
+    have already re-queued the scan to ``QUEUED``, and we specifically want the
+    id recorded on that row so the re-queued scan can reattach (issue #127).
+
+    :param scan_pk: Primary key of the scan.
+    :param job_id: The RunPod job id to persist.
+    :param action: The action the job is running.
+    """
+    from django.utils import timezone
+
+    from scanning.models import Scan
+
+    Scan.objects.filter(pk=scan_pk).update(
+        runpod_job_id=job_id,
+        runpod_job_action=action,
+        runpod_job_submitted_at=timezone.now(),
+    )
+
+
+def _clear_job_id(scan_pk: int, job_id: str) -> None:
+    """Clear the persisted RunPod job handle once the job is terminal.
+
+    Guarded on the matching ``job_id`` so a slow clear can never wipe a newer
+    job's handle written by a subsequent submit.
+
+    :param scan_pk: Primary key of the scan.
+    :param job_id: The job id that just reached a terminal state.
+    """
+    from scanning.models import Scan
+
+    Scan.objects.filter(pk=scan_pk, runpod_job_id=job_id).update(
+        runpod_job_id="",
+        runpod_job_action="",
+        runpod_job_submitted_at=None,
     )
 
 
@@ -608,3 +768,22 @@ def _cancel(base_url: str, headers: dict[str, str], job_id: str) -> None:
         logger.info("runpod job %s cancelled", job_id)
     except Exception:
         logger.warning("runpod job %s cancel failed", job_id, exc_info=True)
+
+
+def cancel_job(job_id: str) -> None:
+    """Best-effort cancel of a RunPod job by id, wiring the endpoint from
+    settings.
+
+    For callers that hold only a job id (e.g. the daemon shutdown handler
+    cancelling jobs on scans it is flagging terminal, which will never be
+    reattached). No-op when RunPod is not configured or ``job_id`` is empty.
+
+    :param job_id: RunPod job id to cancel.
+    """
+    endpoint = settings.RUNPOD_ENDPOINT_ID
+    api_key = settings.RUNPOD_API_KEY
+    if not endpoint or not api_key or not job_id:
+        return
+    base_url = f"https://api.runpod.ai/v2/{endpoint}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    _cancel(base_url, headers, job_id)
