@@ -42,13 +42,6 @@ from scanning.models import (
 from scanning.services import apply_upload_action
 from scanning.utils import get_volume, has_s3_credentials
 
-# Max size for a direct-to-S3 original upload. Enforced by the presigned
-# POST policy (see s3_sync.generate_presigned_post) so S3 rejects anything
-# larger before it lands, and pre-checked in the presign view for a fast
-# client-facing error. Configurable via the MAX_UPLOAD_SIZE_GB env var
-# (default 3 GB); see settings.project.processing_storage.
-MAX_ORIGINAL_UPLOAD_SIZE = settings.MAX_ORIGINAL_UPLOAD_SIZE
-
 logger = logging.getLogger(__name__)
 
 
@@ -696,8 +689,8 @@ def presign_scan_upload(request, reporter_slug, vol):
         return JsonResponse(
             {"error": "Only PDF files are accepted."}, status=400
         )
-    if size <= 0 or size > MAX_ORIGINAL_UPLOAD_SIZE:
-        limit_gb = MAX_ORIGINAL_UPLOAD_SIZE // 1024**3
+    if size <= 0 or size > settings.MAX_ORIGINAL_UPLOAD_SIZE:
+        limit_gb = settings.MAX_ORIGINAL_UPLOAD_SIZE // 1024**3
         return JsonResponse(
             {"error": f"File is empty or exceeds the {limit_gb} GB limit."},
             status=400,
@@ -721,7 +714,10 @@ def presign_scan_upload(request, reporter_slug, vol):
     original_name = _original_pdf_name(scan, volume)
     try:
         presigned = s3_sync.generate_presigned_post(
-            scan, original_name, content_type, MAX_ORIGINAL_UPLOAD_SIZE
+            scan,
+            original_name,
+            content_type,
+            settings.MAX_ORIGINAL_UPLOAD_SIZE,
         )
         if not presigned:
             # S3 sync disabled despite credentials being present.

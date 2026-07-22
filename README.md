@@ -264,6 +264,7 @@ trailing slash or path).
 | `MEDIA_ROOT` | Local media root (only used when `DEVELOPMENT=True`) | `scanning/assets/media/` |
 | `STATIC_URL` | Static file URL prefix | `static/` |
 | `NUM_WORKERS` | Gunicorn worker count | `4` |
+| `MAX_UPLOAD_SIZE_GB` | Max size (whole GB) for a direct-to-S3 original PDF upload. Enforced by the presigned POST policy so S3 rejects anything larger. | `3` |
 
 
 ### Step 2: Build the Docker Image
