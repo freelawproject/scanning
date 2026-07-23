@@ -79,9 +79,13 @@ class ScanAdminRequeueActionTests(TestCase):
             Scan.objects.filter(pk__in=pks, status=Status.QUEUED).count(), 4
         )
 
-    def test_requeue_scans_skips_non_error_and_reports(self):
+    def test_requeue_scans_skips_non_error_leaves_it_untouched(self):
         err = ScanFactory(status=Status.ERROR)
-        done = ScanFactory(status=Status.PENDING_REVIEW)
+        done = ScanFactory(
+            status=Status.PENDING_REVIEW,
+            retry_count=2,
+            interruption_count=1,
+        )
         msgs = self._run(
             "requeue_scans",
             Scan.objects.filter(pk__in=[err.pk, done.pk]),
@@ -89,14 +93,37 @@ class ScanAdminRequeueActionTests(TestCase):
         err.refresh_from_db()
         done.refresh_from_db()
         self.assertEqual(err.status, Status.QUEUED)
+        # The skipped scan keeps its status AND its counters.
         self.assertEqual(done.status, Status.PENDING_REVIEW)
+        self.assertEqual(done.retry_count, 2)
+        self.assertEqual(done.interruption_count, 1)
+        # A partial run warns and reports the skip.
+        self.assertEqual(msgs[0].level, messages.WARNING)
         self.assertIn("Skipped 1", msgs[0].message)
+
+    def test_requeue_scans_resets_progress_fields(self):
+        scan = ScanFactory(
+            status=Status.ERROR,
+            progress_message="frozen mid-OCR",
+            progress_current=137,
+            progress_total=943,
+        )
+        self._run("requeue_scans", Scan.objects.filter(pk=scan.pk))
+        scan.refresh_from_db()
+        self.assertEqual(scan.progress_message, "Re-queued via admin")
+        self.assertEqual(scan.progress_current, 0)
+        self.assertEqual(scan.progress_total, 0)
 
     def test_requeue_scans_warns_when_nothing_matched(self):
         scan = ScanFactory(status=Status.PENDING_REVIEW)
         msgs = self._run("requeue_scans", Scan.objects.filter(pk=scan.pk))
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.PENDING_REVIEW)
+        self.assertEqual(msgs[0].level, messages.WARNING)
+        self.assertIn("nothing re-queued", msgs[0].message)
+
+    def test_requeue_scans_empty_selection_warns(self):
+        msgs = self._run("requeue_scans", Scan.objects.none())
         self.assertEqual(msgs[0].level, messages.WARNING)
 
     # ── requeue_retry_cap_scans (scoped) ─────────────────────────────
@@ -109,6 +136,22 @@ class ScanAdminRequeueActionTests(TestCase):
         self.assertEqual(scan.status, Status.QUEUED)
         self.assertEqual(scan.retry_count, 0)
         self.assertEqual(msgs[0].level, messages.SUCCESS)
+
+    def test_retry_cap_action_leaves_non_matching_untouched(self):
+        cap = ScanFactory(status=Status.ERROR_MAX_RETRIES, retry_count=5)
+        plain = ScanFactory(status=Status.ERROR, retry_count=1)
+        msgs = self._run(
+            "requeue_retry_cap_scans",
+            Scan.objects.filter(pk__in=[cap.pk, plain.pk]),
+        )
+        cap.refresh_from_db()
+        plain.refresh_from_db()
+        # Only the retry-cap scan is touched; the plain Error is left as-is.
+        self.assertEqual(cap.status, Status.QUEUED)
+        self.assertEqual(plain.status, Status.ERROR)
+        self.assertEqual(plain.retry_count, 1)
+        self.assertEqual(msgs[0].level, messages.WARNING)
+        self.assertIn("Left 1", msgs[0].message)
 
     def test_retry_cap_action_warns_on_plain_error(self):
         scan = ScanFactory(status=Status.ERROR)

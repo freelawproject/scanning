@@ -331,6 +331,14 @@ class ScanAdmin(admin.ModelAdmin):
             progress_current=0,
             progress_total=0,
         )
+        if not updated:
+            self.message_user(
+                request,
+                "None of the selected scans were in an Error or Processing "
+                "state; nothing re-queued.",
+                level=messages.WARNING,
+            )
+            return
         skipped = queryset.count() - updated
         message = (
             f"Re-queued {updated} scan(s) and reset retry/interruption "
@@ -344,7 +352,9 @@ class ScanAdmin(admin.ModelAdmin):
         self.message_user(
             request,
             message,
-            level=messages.SUCCESS if updated else messages.WARNING,
+            # Skipped scans are exactly the surprise this action exists to
+            # surface, so a partial run warns rather than reads as clean.
+            level=messages.WARNING if skipped else messages.SUCCESS,
         )
 
     @admin.action(
@@ -372,14 +382,7 @@ class ScanAdmin(admin.ModelAdmin):
             progress_current=0,
             progress_total=0,
         )
-        if updated:
-            self.message_user(
-                request,
-                f"Re-queued {updated} scan(s) with retry_count reset. "
-                "The daemon will try them again on the next tick.",
-                level=messages.SUCCESS,
-            )
-        else:
+        if not updated:
             self.message_user(
                 request,
                 "None of the selected scans were in 'Error (retry cap "
@@ -387,6 +390,22 @@ class ScanAdmin(admin.ModelAdmin):
                 "scans (any Error / stuck Processing)'.",
                 level=messages.WARNING,
             )
+            return
+        skipped = queryset.count() - updated
+        message = (
+            f"Re-queued {updated} scan(s) with retry_count reset. "
+            "The daemon will try them again on the next tick."
+        )
+        if skipped:
+            message += (
+                f" Left {skipped} other selected scan(s) untouched (not "
+                "'Error (retry cap hit)')."
+            )
+        self.message_user(
+            request,
+            message,
+            level=messages.WARNING if skipped else messages.SUCCESS,
+        )
 
     @admin.action(
         description=(
@@ -415,14 +434,7 @@ class ScanAdmin(admin.ModelAdmin):
             progress_current=0,
             progress_total=0,
         )
-        if updated:
-            self.message_user(
-                request,
-                f"Re-queued {updated} scan(s) with interruption_count "
-                "reset. The daemon will try them again on the next tick.",
-                level=messages.SUCCESS,
-            )
-        else:
+        if not updated:
             self.message_user(
                 request,
                 "None of the selected scans were in 'Error (interrupted "
@@ -430,6 +442,22 @@ class ScanAdmin(admin.ModelAdmin):
                 "selected scans (any Error / stuck Processing)'.",
                 level=messages.WARNING,
             )
+            return
+        skipped = queryset.count() - updated
+        message = (
+            f"Re-queued {updated} scan(s) with interruption_count reset. "
+            "The daemon will try them again on the next tick."
+        )
+        if skipped:
+            message += (
+                f" Left {skipped} other selected scan(s) untouched (not "
+                "'Error (interrupted too often)')."
+            )
+        self.message_user(
+            request,
+            message,
+            level=messages.WARNING if skipped else messages.SUCCESS,
+        )
 
 
 @admin.register(OpinionScan)
