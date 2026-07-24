@@ -294,6 +294,64 @@ class ScanAdmin(admin.ModelAdmin):
         Status.PROCESSING,
     )
 
+    def _requeue(
+        self,
+        request,
+        queryset,
+        *,
+        statuses,
+        counter_resets,
+        progress_message,
+        no_match_message,
+        success_message,
+        skipped_message,
+    ):
+        """Re-queue the selected scans whose status is in ``statuses``.
+
+        Shared body of the three re-queue actions: filter the selection to
+        the statuses this action owns, reset the relevant counters and the
+        progress fields, then report. Reporting is deliberately never a
+        silent success: with nothing matched it warns and stops, and a
+        partial match warns with the skipped count appended, because a
+        selection the action ignored is exactly the surprise an operator
+        needs to see.
+
+        :param request: The admin HTTP request.
+        :param queryset: Selected Scan queryset.
+        :param statuses: Statuses this action re-queues from.
+        :param counter_resets: Extra ``update()`` kwargs zeroing whichever
+            counters this action owns.
+        :param progress_message: Value for the scan's ``progress_message``.
+        :param no_match_message: Warning shown when nothing matched.
+        :param success_message: Message template taking ``updated``.
+        :param skipped_message: Message template taking ``skipped``,
+            appended when part of the selection was left alone.
+        :return: None.
+        """
+        updated = queryset.filter(status__in=statuses).update(
+            status=Status.QUEUED,
+            progress_message=progress_message,
+            progress_current=0,
+            progress_total=0,
+            **counter_resets,
+        )
+        if not updated:
+            self.message_user(
+                request, no_match_message, level=messages.WARNING
+            )
+            return
+        # ``queryset`` is re-evaluated here, so this counts the original
+        # selection, not the post-update rows.
+        skipped = queryset.count() - updated
+        message = success_message.format(updated=updated)
+        if skipped:
+            message += " " + skipped_message.format(skipped=skipped)
+        self.message_user(
+            request,
+            message,
+            level=messages.WARNING if skipped else messages.SUCCESS,
+        )
+
     @admin.action(
         description=(
             "Re-queue selected scans (any Error / stuck Processing) "
@@ -321,40 +379,24 @@ class ScanAdmin(admin.ModelAdmin):
         :param queryset: Selected Scan queryset.
         :return: None.
         """
-        updated = queryset.filter(
-            status__in=self._REQUEUEABLE_STATUSES
-        ).update(
-            status=Status.QUEUED,
-            retry_count=0,
-            interruption_count=0,
-            progress_message="Re-queued via admin",
-            progress_current=0,
-            progress_total=0,
-        )
-        if not updated:
-            self.message_user(
-                request,
-                "None of the selected scans were in an Error or Processing "
-                "state; nothing re-queued.",
-                level=messages.WARNING,
-            )
-            return
-        skipped = queryset.count() - updated
-        message = (
-            f"Re-queued {updated} scan(s) and reset retry/interruption "
-            "counters. The daemon will pick them up on the next tick."
-        )
-        if skipped:
-            message += (
-                f" Skipped {skipped} scan(s) not in an Error or "
-                "Processing state."
-            )
-        self.message_user(
+        self._requeue(
             request,
-            message,
-            # Skipped scans are exactly the surprise this action exists to
-            # surface, so a partial run warns rather than reads as clean.
-            level=messages.WARNING if skipped else messages.SUCCESS,
+            queryset,
+            statuses=self._REQUEUEABLE_STATUSES,
+            counter_resets={"retry_count": 0, "interruption_count": 0},
+            progress_message="Re-queued via admin",
+            no_match_message=(
+                "None of the selected scans were in an Error or Processing "
+                "state; nothing re-queued."
+            ),
+            success_message=(
+                "Re-queued {updated} scan(s) and reset retry/interruption "
+                "counters. The daemon will pick them up on the next tick."
+            ),
+            skipped_message=(
+                "Skipped {skipped} scan(s) not in an Error or Processing "
+                "state."
+            ),
         )
 
     @admin.action(
@@ -375,36 +417,25 @@ class ScanAdmin(admin.ModelAdmin):
         :param queryset: Selected Scan queryset.
         :return: None.
         """
-        updated = queryset.filter(status=Status.ERROR_MAX_RETRIES).update(
-            status=Status.QUEUED,
-            retry_count=0,
+        self._requeue(
+            request,
+            queryset,
+            statuses=[Status.ERROR_MAX_RETRIES],
+            counter_resets={"retry_count": 0},
             progress_message="Re-queued via admin (retry cap reset)",
-            progress_current=0,
-            progress_total=0,
-        )
-        if not updated:
-            self.message_user(
-                request,
+            no_match_message=(
                 "None of the selected scans were in 'Error (retry cap "
                 "hit)'. For a plain 'Error' scan, use 'Re-queue selected "
-                "scans (any Error / stuck Processing)'.",
-                level=messages.WARNING,
-            )
-            return
-        skipped = queryset.count() - updated
-        message = (
-            f"Re-queued {updated} scan(s) with retry_count reset. "
-            "The daemon will try them again on the next tick."
-        )
-        if skipped:
-            message += (
-                f" Left {skipped} other selected scan(s) untouched (not "
+                "scans (any Error / stuck Processing)'."
+            ),
+            success_message=(
+                "Re-queued {updated} scan(s) with retry_count reset. "
+                "The daemon will try them again on the next tick."
+            ),
+            skipped_message=(
+                "Left {skipped} other selected scan(s) untouched (not "
                 "'Error (retry cap hit)')."
-            )
-        self.message_user(
-            request,
-            message,
-            level=messages.WARNING if skipped else messages.SUCCESS,
+            ),
         )
 
     @admin.action(
@@ -427,36 +458,25 @@ class ScanAdmin(admin.ModelAdmin):
         :param queryset: Selected Scan queryset.
         :return: None.
         """
-        updated = queryset.filter(status=Status.ERROR_INTERRUPTED).update(
-            status=Status.QUEUED,
-            interruption_count=0,
+        self._requeue(
+            request,
+            queryset,
+            statuses=[Status.ERROR_INTERRUPTED],
+            counter_resets={"interruption_count": 0},
             progress_message="Re-queued via admin (interruption cap reset)",
-            progress_current=0,
-            progress_total=0,
-        )
-        if not updated:
-            self.message_user(
-                request,
+            no_match_message=(
                 "None of the selected scans were in 'Error (interrupted "
                 "too often)'. For a plain 'Error' scan, use 'Re-queue "
-                "selected scans (any Error / stuck Processing)'.",
-                level=messages.WARNING,
-            )
-            return
-        skipped = queryset.count() - updated
-        message = (
-            f"Re-queued {updated} scan(s) with interruption_count reset. "
-            "The daemon will try them again on the next tick."
-        )
-        if skipped:
-            message += (
-                f" Left {skipped} other selected scan(s) untouched (not "
+                "selected scans (any Error / stuck Processing)'."
+            ),
+            success_message=(
+                "Re-queued {updated} scan(s) with interruption_count "
+                "reset. The daemon will try them again on the next tick."
+            ),
+            skipped_message=(
+                "Left {skipped} other selected scan(s) untouched (not "
                 "'Error (interrupted too often)')."
-            )
-        self.message_user(
-            request,
-            message,
-            level=messages.WARNING if skipped else messages.SUCCESS,
+            ),
         )
 
 
