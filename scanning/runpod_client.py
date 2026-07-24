@@ -63,6 +63,15 @@ class RunpodTransientError(RunpodError):
 # ``RunpodTransientError`` (retry) rather than ``RunpodError`` (fail).
 _TRANSIENT_ERROR_CODES = {"NO_GPU"}
 
+# RunPod ``/run`` submit-time error codes that mean "the endpoint can't
+# take work right now" rather than "this job is bad" -- e.g. the
+# endpoint is scaled to zero (``max_workers=0``), which RunPod reports
+# as HTTP 409 ``ENDPOINT_PAUSED``. Classified (along with any 409) as a
+# ``RunpodTransientError`` so the scan re-queues instead of failing
+# outright; the daemon's ``retry_count`` cap still escalates to
+# ``ERROR_MAX_RETRIES`` if the endpoint stays down.
+_TRANSIENT_SUBMIT_CODES = {"ENDPOINT_PAUSED"}
+
 
 # Friendly labels for progress-callback strings shown in the UI. The
 # raw action names (``detect`` / ``analyze``) are what the client
@@ -376,6 +385,34 @@ def _invoke(
     )
 
 
+def _submit_error_detail(exc: Exception) -> tuple[int | None, str, str]:
+    """Pull the HTTP status and body out of a failed ``/run`` request.
+
+    RunPod error responses carry a JSON body such as
+    ``{"status":409,"title":"Conflict","detail":"Endpoint is paused
+    (max_workers=0)...","code":"ENDPOINT_PAUSED"}``. ``_submit`` logs
+    that body (otherwise ``raise_for_status`` discards it) and uses the
+    ``code`` / status to classify the failure.
+
+    :param exc: The exception raised by ``requests`` / ``_submit``.
+    :returns: ``(status_code, runpod_code, body_text)``. Transport-level
+        failures (no response attached) return ``(None, "", "")``.
+    :rtype: tuple[int | None, str, str]
+    """
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None, "", ""
+    text = resp.text or ""
+    code = ""
+    try:
+        parsed = resp.json()
+        if isinstance(parsed, dict):
+            code = parsed.get("code") or ""
+    except ValueError:
+        pass
+    return resp.status_code, code, text
+
+
 def _submit(
     base_url: str,
     headers: dict[str, str],
@@ -388,7 +425,11 @@ def _submit(
 
     :returns: The RunPod job id.
     :rtype: str
-    :raises RunpodError: If all retries fail or the response is malformed.
+    :raises RunpodTransientError: If the endpoint reports it cannot
+        accept work (HTTP 409 / ``ENDPOINT_PAUSED``), so the scan
+        re-queues rather than failing.
+    :raises RunpodError: If all retries fail for any other reason or the
+        response is malformed.
     """
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
@@ -421,12 +462,34 @@ def _submit(
             return job_id
         except Exception as exc:
             last_exc = exc
+            status_code, err_code, text = _submit_error_detail(exc)
+            body_note = (
+                f" (HTTP {status_code} body: {text[:500]})" if text else ""
+            )
+
+            # A paused / 409 endpoint won't start accepting work within
+            # the in-call backoff window, so don't burn the remaining
+            # attempts: raise transient immediately and let the daemon
+            # re-queue the scan on a later tick.
+            if status_code == 409 or err_code in _TRANSIENT_SUBMIT_CODES:
+                logger.warning(
+                    "runpod submit failed: %s%s; endpoint not accepting "
+                    "work, re-queueing",
+                    exc,
+                    body_note,
+                )
+                raise RunpodTransientError(
+                    f"RunPod endpoint not accepting work (HTTP "
+                    f"{status_code}): {exc}"
+                ) from exc
+
             sleep_for = 2**attempt
             logger.warning(
-                "runpod submit attempt %d/%d failed: %s; sleeping %ds",
+                "runpod submit attempt %d/%d failed: %s%s; sleeping %ds",
                 attempt + 1,
                 max_retries + 1,
                 exc,
+                body_note,
                 sleep_for,
             )
             if attempt < max_retries:
