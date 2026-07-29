@@ -50,6 +50,10 @@ services:
     user: root
     volumes:
       - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
+      # The pipeline runs here, so this is the mount that matters when
+      # iterating on blackletter. The entrypoint installs it editable
+      # whenever the directory is present.
+      - ${BLACKLETTER_DIR:-../../../blackletter}:/opt/blackletter
     networks:
       - scanning_net
     env_file:
@@ -78,7 +82,7 @@ services:
     user: root
     volumes:
       - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
-    #      - ${BLACKLETTER_DIR:-../../../blackletter}:/opt/blackletter
+      - ${BLACKLETTER_DIR:-../../../blackletter}:/opt/blackletter
     networks:
       - scanning_net
     env_file:
