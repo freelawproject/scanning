@@ -9,8 +9,9 @@ import shutil
 import tempfile
 from unittest.mock import patch
 
+import fitz
 from django.db.models import F
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from scanning import s3_sync
 from scanning.factories import (
@@ -26,6 +27,17 @@ from scanning.models import (
     Status,
 )
 from scanning.services import refresh_volume_queue_status
+from scanning.tests.pdf_fixtures import (
+    COLUMN_LEFT,
+    COLUMN_RIGHT,
+    CONTENT,
+    HEADER_LINE_Y,
+    PAGE_H,
+    PAGE_W,
+    write_bitonal_page,
+    write_text_page,
+    write_two_column_page,
+)
 
 FIXTURE_DIR = pathlib.Path(__file__).parent / "fixtures"
 PDF_PATH = FIXTURE_DIR / "a3d.332.1.1.pdf"
@@ -1129,28 +1141,498 @@ class TestImmediateS3PushOnGeneration(TestCase):
         bitonal.assert_not_called()
         push.assert_not_called()
 
-    def test_run_ocr_pushes_generated_pdf(self):
-        """The OCR PDF is uploaded immediately after it's produced."""
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestGenerateFilesWithoutOcrPdf(TestCase):
+    """``run_generate_files`` works from ``bitonal.pdf`` alone.
+
+    The pipeline no longer produces an OCR'd PDF, so generation has to
+    build on the processing PDF instead of refusing to run.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+
+    def test_generates_from_bitonal(self):
         from scanning import services
 
-        scan = ScanFactory(start_page=1, end_page=2)
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
         output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        ocr_pdf = output / "rep.1.1.2.pdf"
+        bitonal = output / "bitonal.pdf"
+        shutil.copy2(PDF_PATH, bitonal)
+        scan.opinions_json = [
+            {
+                "caption_page": 0,
+                "key_page": 0,
+                "end_page": 0,
+                "page_count": 1,
+                "first_page_number": 1,
+                "last_page_number": 1,
+            }
+        ]
+        scan.save(update_fields=["opinions_json"])
 
         with (
-            patch.object(services, "_ocr", return_value=ocr_pdf),
-            patch.object(services, "_push_generated_file_to_s3") as push,
-            patch.object(services.fitz, "open") as fitz_open,
+            # close_all() resets connections for daemon-process forking;
+            # in tests it kills the test transaction -- patch it out.
+            patch("django.db.connections.close_all"),
+            patch("blackletter.api.generate") as generate,
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(services, "_pull_processing_files_from_s3"),
         ):
-            fitz_open.return_value.__enter__.return_value.page_count = 2
-            services._run_ocr(
-                scan.pk,
-                "in.pdf",
-                str(output),
-                reporter="rep",
-                volume="1",
-                first_page=1,
-            )
+            generate.return_value = {
+                "opinion_count": 1,
+                "full_redacted": "",
+                "redacted_dir": str(output / "redacted"),
+            }
+            services.run_generate_files(scan.pk)
 
-        push.assert_called_once_with(scan.pk, "rep.1.1.2.pdf")
+        generate.assert_called_once()
+        gen_pdf = pathlib.Path(generate.call_args.kwargs["pdf_path"])
+        # Generation runs on a stamped *copy* of the bitonal, never on
+        # the bitonal itself.
+        self.assertEqual(gen_pdf.name, "stamped.pdf")
+        self.assertEqual(gen_pdf.read_bytes(), bitonal.read_bytes())
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.stage, Stage.APPROVED)
+        self.assertEqual(scan.status, Status.PENDING_REVIEW)
+
+    def test_computes_margins_when_absent(self):
+        """Whiteouts must not depend on the viewer having asked for them.
+
+        Margin rects are computed on demand elsewhere, so a scan taken
+        straight from review to Generate used to ship with no whiteouts at
+        all -- platen bands, fold shadows and corner bleed left in the
+        deliverable.
+        """
+        from scanning import services
+
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        output = pathlib.Path(scan.output_dir)
+        shutil.copy2(PDF_PATH, output / "bitonal.pdf")
+        self.assertFalse(scan.margin_rects)
+
+        with (
+            patch("django.db.connections.close_all"),
+            patch("blackletter.api.generate") as generate,
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+        ):
+            generate.return_value = {
+                "opinion_count": 0,
+                "full_redacted": "",
+                "redacted_dir": str(output / "redacted"),
+            }
+            services.run_generate_files(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertTrue(scan.margin_rects, "no margin rects computed")
+        self.assertTrue(
+            any(e["rects"] for e in scan.margin_rects),
+            "margin rects are all empty",
+        )
+
+    def test_raises_without_any_processing_pdf(self):
+        """An empty output dir is still an error, just a clearer one."""
+        from scanning import services
+
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        with (
+            patch("django.db.connections.close_all"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(services, "_handle_pipeline_exception") as handler,
+        ):
+            services.run_generate_files(scan.pk)
+
+        handler.assert_called_once()
+        self.assertIn("bitonal.pdf", str(handler.call_args.args[1]))
+
+
+class TestInkTextGeometry(SimpleTestCase):
+    """``services._ink_text_geometry`` on text-less PDFs.
+
+    ``blackletter.process.compute_redaction_rects`` clamps every headnote
+    rect's bottom edge with ``_text_bottom``, which returns ``clip.y0``
+    when a page has no words. The rect then collapses and is dropped, so a
+    text-less ``bitonal.pdf`` produced *no* headnote rects at all while
+    every other rect type came out unchanged.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = pathlib.Path(self._tmp.name)
+
+    def test_bottom_clamp_collapses_without_the_patch(self):
+        """The upstream behavior this exists to work around."""
+        from blackletter import process as bl_process
+
+        pdf = self.tmp / "bitonal.pdf"
+        write_bitonal_page(pdf)
+        clip = fitz.Rect(CONTENT.x0, CONTENT.y0, CONTENT.x1, PAGE_H)
+        with fitz.open(str(pdf)) as doc:
+            unpatched = bl_process._text_bottom(doc[0], clip)
+        self.assertEqual(unpatched, clip.y0)
+
+    def test_patch_measures_the_bottom_from_ink(self):
+        from blackletter import process as bl_process
+
+        from scanning.services import _ink_text_geometry
+
+        pdf = self.tmp / "bitonal.pdf"
+        write_bitonal_page(pdf, bottom_bar=True)
+        clip = fitz.Rect(CONTENT.x0, CONTENT.y0, CONTENT.x1, PAGE_H)
+        with _ink_text_geometry(str(pdf)):
+            with fitz.open(str(pdf)) as doc:
+                bottom = bl_process._text_bottom(doc[0], clip)
+        # The last line of text, not the page-edge band below it.
+        self.assertAlmostEqual(bottom, CONTENT.y1, delta=6.0)
+
+    def test_patch_tightens_to_ink(self):
+        """A rect wider than the text shrinks onto it.
+
+        Without this a headnote block starts at the top of its column
+        instead of its first line, and the split-at-HEADNOTE pass then
+        carves the white gap above that line into an empty black box.
+        """
+        from blackletter import process as bl_process
+
+        from scanning.services import _ink_text_geometry
+
+        pdf = self.tmp / "bitonal.pdf"
+        write_bitonal_page(pdf)
+        clip = fitz.Rect(50, 50, 560, 750)
+        with _ink_text_geometry(str(pdf)):
+            with fitz.open(str(pdf)) as doc:
+                tight = bl_process._tighten_to_text(doc[0], clip)
+        self.assertIsNotNone(tight)
+        self.assertAlmostEqual(tight.y0, CONTENT.y0, delta=6.0)
+        self.assertAlmostEqual(tight.y1, CONTENT.y1, delta=6.0)
+
+    def test_patch_keeps_side_bounds(self):
+        """Side bounds stay with the caller; TEXT_COLUMN snapping owns them."""
+        from blackletter import process as bl_process
+
+        from scanning.services import _ink_text_geometry
+
+        pdf = self.tmp / "bitonal.pdf"
+        write_bitonal_page(pdf)
+        clip = fitz.Rect(50, 50, 560, 750)
+        with _ink_text_geometry(str(pdf)):
+            with fitz.open(str(pdf)) as doc:
+                self.assertEqual(
+                    bl_process._text_x_bounds(doc[0], clip),
+                    (clip.x0, clip.x1),
+                )
+
+    def test_blank_region_collapses_the_rect(self):
+        """A rect over white space is dropped rather than painted black.
+
+        The gap between a running head and the first headnote line is the
+        case that produced small empty boxes in the viewer.
+        """
+        from blackletter import process as bl_process
+
+        from scanning.services import _ink_text_geometry
+
+        pdf = self.tmp / "bitonal.pdf"
+        write_bitonal_page(pdf, header_line=True)
+        # The blank gap between the running head and the body block: inside
+        # the content box, so measurable, and empty.
+        clip = fitz.Rect(CONTENT.x0, HEADER_LINE_Y + 4, CONTENT.x1, CONTENT.y0)
+        with _ink_text_geometry(str(pdf)):
+            with fitz.open(str(pdf)) as doc:
+                bottom = bl_process._text_bottom(doc[0], clip)
+        self.assertEqual(bottom, clip.y0, "empty rect not collapsed")
+
+    def test_unmeasurable_region_is_not_clamped(self):
+        """Outside the content box the ink says nothing, so nothing shrinks.
+
+        Collapsing here would drop rects that ink simply cannot measure,
+        which is how the text-layer version emptied every headnote rect.
+        """
+        from blackletter import process as bl_process
+
+        from scanning.services import _ink_text_geometry
+
+        pdf = self.tmp / "bitonal.pdf"
+        write_bitonal_page(pdf)
+        clip = fitz.Rect(0, PAGE_H - 30, 40, PAGE_H)
+        with _ink_text_geometry(str(pdf)):
+            with fitz.open(str(pdf)) as doc:
+                bottom = bl_process._text_bottom(doc[0], clip)
+        self.assertEqual(bottom, clip.y1)
+
+    def test_restores_helpers_after_use(self):
+        from blackletter import process as bl_process
+
+        from scanning.services import _ink_text_geometry
+
+        pdf = self.tmp / "bitonal.pdf"
+        write_bitonal_page(pdf)
+        before = (
+            bl_process._text_bottom,
+            bl_process._text_x_bounds,
+            bl_process._tighten_to_text,
+        )
+        with _ink_text_geometry(str(pdf)):
+            self.assertIsNot(bl_process._text_bottom, before[0])
+        self.assertEqual(
+            (
+                bl_process._text_bottom,
+                bl_process._text_x_bounds,
+                bl_process._tighten_to_text,
+            ),
+            before,
+        )
+
+    def test_no_op_when_the_pdf_has_text(self):
+        """Scans that still have their OCR PDF keep the word-based path."""
+        from blackletter import process as bl_process
+
+        from scanning.services import _ink_text_geometry
+
+        pdf = self.tmp / "text.pdf"
+        write_text_page(pdf)
+        original = bl_process._text_bottom
+        with _ink_text_geometry(str(pdf)):
+            self.assertIs(bl_process._text_bottom, original)
+
+
+class TestFlattenRedactionEdges(SimpleTestCase):
+    """``_flatten_redaction_edges`` removes redaction hairlines.
+
+    ``apply_redactions`` paints each rect with a fill *and* a 1pt stroke
+    straddling its edge, and the strokes land after the fills, so where a
+    black rect meets a white one the outer half of the black stroke
+    survives as a thin line in the deliverable. The fixture reproduces
+    that ordering directly: white fill first, then a stroked black rect
+    whose stroke leaks over it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = pathlib.Path(self._tmp.name)
+
+    BLACK = (100.0, 50.0, 200.0, 350.0)
+    WHITE = (200.0, 50.0, 300.0, 350.0)
+
+    @staticmethod
+    def _dark_pixels(page, clip):
+        """Count dark pixels inside a region, rendered at 400 dpi."""
+        import numpy as np
+
+        pix = page.get_pixmap(dpi=400, colorspace=fitz.csGRAY, clip=clip)
+        grey = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.stride
+        )[:, : pix.width]
+        return int((grey < 200).sum())
+
+    def _make_pdf(self, path):
+        """A white page, a white rect, then a stroked black rect over it."""
+        with fitz.open() as doc:
+            page = doc.new_page(width=300, height=400)
+            page.draw_rect(
+                fitz.Rect(*self.WHITE), color=None, fill=(1, 1, 1), width=0
+            )
+            # width=1 puts half the stroke outside the rect, over the white.
+            page.draw_rect(
+                fitz.Rect(*self.BLACK),
+                color=(0, 0, 0),
+                fill=(0, 0, 0),
+                width=1,
+            )
+            doc.save(str(path))
+
+    def _redactions(self, path):
+        """redactions.json describing the two rects, blacks before whites."""
+        path.write_text(
+            json.dumps(
+                {
+                    "pages": {
+                        "0": [
+                            {
+                                "x0": self.BLACK[0],
+                                "y0": self.BLACK[1],
+                                "x1": self.BLACK[2],
+                                "y1": self.BLACK[3],
+                                "fill": "black",
+                                "type": "headnote",
+                            },
+                            {
+                                "x0": self.WHITE[0],
+                                "y0": self.WHITE[1],
+                                "x1": self.WHITE[2],
+                                "y1": self.WHITE[3],
+                                "fill": "white",
+                                "type": "PAGE_HEADER",
+                            },
+                        ]
+                    },
+                    "opinions": [{"caption_page": 0, "outside_rects": []}],
+                }
+            )
+        )
+        return path
+
+    def test_hairline_is_repainted_away(self):
+        from scanning.services import _flatten_redaction_edges
+
+        pdf = self.tmp / "redacted" / "op.pdf"
+        pdf.parent.mkdir(parents=True)
+        self._make_pdf(pdf)
+
+        # A sliver just outside the black rect's right edge, over the white.
+        sliver = fitz.Rect(
+            self.BLACK[2] + 0.1,
+            self.BLACK[1] + 10,
+            self.BLACK[2] + 0.5,
+            self.BLACK[3] - 10,
+        )
+        with fitz.open(str(pdf)) as doc:
+            before = self._dark_pixels(doc[0], sliver)
+        self.assertGreater(before, 0, "fixture produced no hairline")
+
+        written = _flatten_redaction_edges(
+            self._redactions(self.tmp / "redactions.json"),
+            "",
+            pdf.parent,
+            [pdf.name],
+        )
+        self.assertEqual(written, 1)
+
+        with fitz.open(str(pdf)) as doc:
+            page = doc[0]
+            after = self._dark_pixels(page, sliver)
+            # ...and the black rect itself still covers what it should.
+            inside = self._dark_pixels(
+                page,
+                fitz.Rect(
+                    self.BLACK[0] + 5,
+                    self.BLACK[1] + 5,
+                    self.BLACK[2] - 5,
+                    self.BLACK[3] - 5,
+                ),
+            )
+        self.assertEqual(after, 0, "hairline survived")
+        self.assertGreater(inside, 0, "black rect lost its fill")
+
+    def test_missing_files_are_skipped(self):
+        from scanning.services import _flatten_redaction_edges
+
+        redactions = self.tmp / "redactions.json"
+        redactions.write_text(json.dumps({"pages": {}, "opinions": []}))
+        self.assertEqual(
+            _flatten_redaction_edges(
+                redactions, "", self.tmp / "nope", ["ghost.pdf"]
+            ),
+            0,
+        )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestSnapTextColumnsToInk(TestCase):
+    """``_snap_text_columns_to_ink`` corrects the column boxes at the source.
+
+    YOLO's ``TEXT_COLUMN`` boxes land slightly inside the printed text, and
+    three consumers depend on them: headnote rects snap their x-bounds to
+    these boxes, margin strips take them as the text band, and the
+    outside-opinion masks white out whole columns with them. Widening the
+    boxes once means none of those has to compensate.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.pdf = pathlib.Path(self._tmp.name) / "two_col.pdf"
+        write_two_column_page(self.pdf)
+        self.scan = ScanFactory(reporter=ReporterFactory(short_name="a3d"))
+
+    def _column(self, x0, x1, y0=100.0, y1=700.0):
+        """A TEXT_COLUMN detection, in image pixels == PDF points."""
+        return Detection.objects.create(
+            scan=self.scan,
+            page_index=0,
+            label="TEXT_COLUMN",
+            label_id=16,
+            confidence=0.97,
+            x0=x0,
+            y0=y0,
+            x1=x1,
+            y1=y1,
+            img_width=PAGE_W,
+            img_height=PAGE_H,
+        )
+
+    def test_widens_a_narrow_box_to_the_text(self):
+        from scanning.services import _snap_text_columns_to_ink
+
+        det = self._column(COLUMN_LEFT.x0 + 6, COLUMN_LEFT.x1 - 6)
+        changed = _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        det.refresh_from_db()
+        self.assertEqual(changed, 1)
+        self.assertAlmostEqual(det.x0, COLUMN_LEFT.x0, delta=2.0)
+        self.assertAlmostEqual(det.x1, COLUMN_LEFT.x1, delta=2.0)
+
+    def test_leaves_the_vertical_bounds_alone(self):
+        """Only x is consumed; y feeds nothing and must not move."""
+        from scanning.services import _snap_text_columns_to_ink
+
+        det = self._column(COLUMN_LEFT.x0 + 6, COLUMN_LEFT.x1 - 6, 150, 650)
+        _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        det.refresh_from_db()
+        self.assertEqual((det.y0, det.y1), (150, 650))
+
+    def test_does_not_cross_the_gutter(self):
+        """A box may not grow into its neighbour's column."""
+        from scanning.services import _snap_text_columns_to_ink
+
+        left = self._column(COLUMN_LEFT.x0, COLUMN_LEFT.x1)
+        right = self._column(COLUMN_RIGHT.x0, COLUMN_RIGHT.x1)
+        _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        left.refresh_from_db()
+        right.refresh_from_db()
+        self.assertLessEqual(
+            left.x1, right.x0, f"columns overlap: {left.x1} > {right.x0}"
+        )
+
+    def test_is_idempotent(self):
+        from scanning.services import _snap_text_columns_to_ink
+
+        self._column(COLUMN_LEFT.x0 + 6, COLUMN_LEFT.x1 - 6)
+        self._column(COLUMN_RIGHT.x0 + 6, COLUMN_RIGHT.x1 - 6)
+        first = _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        second = _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        self.assertEqual(first, 2)
+        self.assertEqual(second, 0, "snapping moved the boxes twice")
+
+    def test_leaves_an_inconclusive_edge_alone(self):
+        """An edge that never finds the end of the ink is not moved.
+
+        A one-column detection over a full-width table would otherwise
+        slide out by the growth limit on every run, never settling.
+        """
+        from scanning.services import _snap_text_columns_to_ink
+
+        # Inset far enough on both sides that growth runs to its limit.
+        det = self._column(COLUMN_RIGHT.x0 + 40, COLUMN_RIGHT.x1 - 40)
+        before = (det.x0, det.x1)
+        changed = _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        det.refresh_from_db()
+        self.assertEqual(changed, 0)
+        self.assertEqual((det.x0, det.x1), before)
+
+    def test_no_columns_is_a_no_op(self):
+        from scanning.services import _snap_text_columns_to_ink
+
+        self.assertEqual(
+            _snap_text_columns_to_ink(self.scan.pk, str(self.pdf)), 0
+        )

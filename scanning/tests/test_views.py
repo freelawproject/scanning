@@ -1643,9 +1643,9 @@ class TestServeOpinionPdfLazyPull(ScanningTestCase):
         opinion.redacted_pdf.name = "redacted/op.pdf"
         opinion.save(update_fields=["redacted_pdf"])
 
-        def _fake_download(scan_arg):
+        def _fake_download(scan_arg, rel_key):
             # Simulate the pull writing the file to the scan's output dir.
-            target = pathlib.Path(scan_arg.output_dir) / "redacted" / "op.pdf"
+            target = pathlib.Path(scan_arg.output_dir) / rel_key
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(b"%PDF-1.4 pulled")
 
@@ -1656,9 +1656,10 @@ class TestServeOpinionPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch(
-                "scanning.s3_sync.download_processing_files",
+                "scanning.s3_sync.download_processing_file",
                 side_effect=_fake_download,
             ) as mock_pull,
+            patch("scanning.s3_sync.download_processing_files") as mock_all,
         ):
             response = self.client.get(
                 reverse(
@@ -1668,7 +1669,11 @@ class TestServeOpinionPdfLazyPull(ScanningTestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        mock_pull.assert_called_once()
+        # Only the requested file is pulled. Pulling the whole prefix here
+        # meant gigabytes for one opinion, and because sync views share a
+        # single executor under ASGI it stalled every other request.
+        mock_pull.assert_called_once_with(scan, "redacted/op.pdf")
+        mock_all.assert_not_called()
 
 
 class TestServeOpinionPdfCaching(ScanningTestCase):

@@ -41,7 +41,8 @@ from scanning.models import (
 from scanning.utils import (
     compute_coverage_gaps,
     find_json_file,
-    find_ocr_pdf,
+    find_processing_pdf,
+    processing_pdf_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,14 +132,20 @@ def serve_margin_rects(request: HttpRequest, pk: int) -> JsonResponse:
     if scan.margin_rects:
         return JsonResponse(scan.margin_rects, safe=False)
     output_base = Path(scan.output_dir)
-    ocr_pdf = find_ocr_pdf(output_base) if output_base.is_dir() else None
-    if not ocr_pdf:
+    base_pdf = (
+        find_processing_pdf(output_base) if output_base.is_dir() else None
+    )
+    if not base_pdf:
         return JsonResponse([], safe=False)
-    from blackletter.margins import compute_margin_rects
+    from scanning.margins import compute_margin_rects
+    from scanning.services import (
+        _adjust_margins_for_detections,
+        _load_detections,
+    )
 
-    from scanning.services import _adjust_margins_for_detections
-
-    rects = compute_margin_rects(ocr_pdf)
+    rects = compute_margin_rects(
+        base_pdf, detections=_load_detections(output_base)
+    )
     rects = _adjust_margins_for_detections(rects, output_base)
     Scan.objects.filter(pk=pk).update(margin_rects=rects)
     return JsonResponse(rects, safe=False)
@@ -350,7 +357,7 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
     if not scan.opinions_json:
         return JsonResponse({"error": "No opinions paired yet"}, status=400)
     output_dir = scan.output_dir
-    pdf_path = find_ocr_pdf(output_dir) or scan.pdf_path
+    pdf_path = processing_pdf_path(scan)
     try:
         rects = _compute_and_save_redaction_rects(pk, pdf_path)
         _compute_and_save_margin_rects(pk, pdf_path, output_dir)
@@ -452,7 +459,9 @@ def _resolve_opinion_pdf(
             try:
                 from scanning import s3_sync
 
-                s3_sync.download_processing_files(opinion.scan)
+                # Just this file: see s3_sync.download_processing_file for
+                # why pulling the whole prefix here hangs the process.
+                s3_sync.download_processing_file(opinion.scan, field.name)
             except Exception:
                 logger.exception(
                     "Lazy S3 pull failed for opinion %s", opinion.pk
@@ -542,7 +551,8 @@ def serve_page_pdf(request: HttpRequest, pk: int) -> FileResponse:
     try:
         from scanning import s3_sync
 
-        s3_sync.download_processing_files(page.scan)
+        # Just this page's file, not the scan's whole prefix.
+        s3_sync.download_processing_file(page.scan, page.pdf_path)
     except Exception:
         logger.exception("Lazy S3 pull failed for page %s", page.pk)
     if candidate.is_file():
@@ -647,19 +657,28 @@ def serve_redacted_pdf(
             content_type="application/pdf",
         )
 
-    # 2. Fall back to the OCR PDF (for preview before generation)
+    # 2. Fall back to the processing PDF (for preview before generation)
     output = Path(scan.output_dir)
     if output.is_dir():
-        ocr = find_ocr_pdf(output)
-        if ocr:
-            return FileResponse(ocr.open("rb"), content_type="application/pdf")
+        base_pdf = find_processing_pdf(output)
+        if base_pdf:
+            return FileResponse(
+                base_pdf.open("rb"), content_type="application/pdf"
+            )
 
     # 3. Lazy S3 pull + retry: handles the case where the daemon just
-    # finished Generate Files and the web container's /tmp/ is stale.
+    # finished Generate Files and this container's /tmp/ is stale. Pull only
+    # the file being served -- the whole prefix runs to gigabytes on a full
+    # volume, and every sync view shares one executor under ASGI.
     try:
         from scanning import s3_sync
 
-        s3_sync.download_processing_files(scan)
+        if scan.redacted_pdf_path:
+            s3_sync.download_processing_file(
+                scan, os.path.basename(scan.redacted_pdf_path)
+            )
+        else:
+            s3_sync.download_preview_pdf(scan)
     except Exception:
         logger.exception("Lazy S3 pull failed for scan %s", scan.pk)
     if scan.redacted_pdf_path and os.path.isfile(scan.redacted_pdf_path):
@@ -668,9 +687,11 @@ def serve_redacted_pdf(
             content_type="application/pdf",
         )
     if output.is_dir():
-        ocr = find_ocr_pdf(output)
-        if ocr:
-            return FileResponse(ocr.open("rb"), content_type="application/pdf")
+        base_pdf = find_processing_pdf(output)
+        if base_pdf:
+            return FileResponse(
+                base_pdf.open("rb"), content_type="application/pdf"
+            )
 
     return HttpResponse("No PDF available", status=404)
 

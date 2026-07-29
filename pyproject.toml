@@ -34,6 +34,9 @@ dependencies = [
   # lives in the `local-ml` extra so the web/daemon images stay lean whenever
   # detection is offloaded to RunPod (RUNPOD_ENABLED=True).
   "blackletter>=0.1.1",
+  # Used directly by scanning.margins (ink-based content box) and the
+  # blank-body coverage check; also a transitive dep of blackletter.
+  "numpy>=2",
   "ocrmypdf>=17",
   "pdfplumber>=0.11",
   "pymupdf>=1.25",

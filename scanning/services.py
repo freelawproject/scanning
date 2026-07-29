@@ -10,20 +10,21 @@ import logging
 import os
 import re
 import shutil
+import threading
 import traceback
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 
 import django
 import fitz
-import pdfplumber
+import numpy as np
 from blackletter.api import (
     bitonal as bl_bitonal,
 )
 from blackletter.api import (
     pair as bl_pair,
 )
-from blackletter.margins import compute_margin_rects
 from blackletter.models import (
     BBox,
     Label,
@@ -46,6 +47,14 @@ from blackletter.validate import (
 from django.conf import settings
 from django.db.models import Case, F, Value, When
 
+from scanning.ink import (
+    GROW_MARGIN_X,
+    content_clip,
+    grow_to_ink,
+    has_text_layer,
+    ink_bbox,
+)
+from scanning.margins import compute_margin_rects
 from scanning.models import (
     CheckName,
     Detection,
@@ -58,9 +67,18 @@ from scanning.models import (
     Status,
     Volume,
 )
-from scanning.utils import ensure_output_dir, find_ocr_pdf, has_s3_credentials
+from scanning.utils import (
+    ensure_output_dir,
+    find_ocr_pdf,
+    find_processing_pdf,
+    has_s3_credentials,
+    processing_pdf_path,
+)
 
 logger = logging.getLogger(__name__)
+
+# Guards the module-global patching in ``_ink_text_geometry``.
+_INK_GEOMETRY_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -365,165 +383,6 @@ def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
     return bitonal_path
 
 
-def _run_ocr(
-    scan_pk: int,
-    bitonal_path: str,
-    output_dir: str,
-    reporter: str,
-    volume: str,
-    first_page: int,
-) -> str:
-    """Run Tesseract OCR via blackletter.
-
-    :param scan_pk: Primary key of the scan (for progress updates).
-    :param bitonal_path: Path to the bitonal PDF.
-    :param output_dir: Directory to write the OCR'd PDF into.
-    :param reporter: Reporter short name (e.g. "f3d").
-    :param volume: Volume number as a string.
-    :param first_page: First logical page number in the PDF.
-    :return: Path to the OCR'd PDF.
-    """
-    with fitz.open(bitonal_path) as pdf:
-        total_pages = pdf.page_count
-    _update_progress(
-        scan_pk,
-        f"Running Tesseract OCR (0/{total_pages} pages)...",
-        current=0,
-        total=total_pages,
-    )
-    ocr_path = _ocr(
-        scan_pk,
-        bitonal_path,
-        output_dir,
-        reporter=reporter,
-        volume=volume,
-        first_page=first_page,
-        total_pages=total_pages,
-    )
-    # Persist the OCR PDF as soon as it exists (see _ensure_bitonal).
-    _push_generated_file_to_s3(scan_pk, Path(ocr_path).name)
-    return ocr_path
-
-
-def _ocr(
-    scan_pk: int,
-    pdf_path: str | Path,
-    output_dir: str | Path,
-    reporter: str = "",
-    volume: str = "",
-    first_page: int = 1,
-    total_pages: int = 0,
-    language: str = "eng",
-) -> Path:
-    """OCR a PDF (add text layer via ocrmypdf/Tesseract).
-
-    Temporary local copy of blackletter's ``ocr`` function with
-    progress callback support. Will be moved to blackletter once
-    validated.
-
-    :param scan_pk: Primary key of the scan (for progress updates).
-    :param pdf_path: Path to the input PDF.
-    :param output_dir: Directory to write the OCR'd PDF into.
-    :param reporter: Reporter short name (e.g. "f3d").
-    :param volume: Volume number as a string.
-    :param first_page: First logical page number in the PDF.
-    :param total_pages: Total page count (for progress messages).
-    :param language: Tesseract language code.
-    :return: Path to the OCR'd PDF.
-    """
-    import logging
-    import time
-
-    import ocrmypdf
-    from ocrmypdf import hookimpl
-    from ocrmypdf._plugin_manager import get_plugin_manager
-
-    pdf_path = Path(pdf_path)
-    output_dir = Path(output_dir)
-
-    # Build output filename
-    last_page = first_page + total_pages - 1
-    parts = [
-        p
-        for p in [reporter, str(volume), str(first_page), str(last_page)]
-        if p
-    ]
-    scan_name = ".".join(parts) if parts else pdf_path.stem
-    output_path = output_dir / f"{scan_name}.pdf"
-
-    # Suppress noisy loggers
-    for name in (
-        "pikepdf",
-        "fontTools",
-        "fontTools.subset",
-        "fontTools.ttLib",
-        "ocrmypdf",
-    ):
-        logging.getLogger(name).setLevel(logging.ERROR)
-    for _n in list(logging.root.manager.loggerDict):
-        if _n.startswith("ocrmypdf"):
-            logging.getLogger(_n).setLevel(logging.ERROR)
-
-    # Progress bar class that updates the scan record per page
-    class _ScanProgressBar:
-        def __init__(
-            self, *, total=None, desc=None, unit=None, disable=False, **kw
-        ):
-            self._total = total or total_pages
-            self._unit = unit
-            self._desc = desc
-            self._current = 0
-            print(
-                f"  [progress] unit={unit!r} desc={desc!r} total={total}",
-                flush=True,
-            )
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def update(self, n=1, *, completed=None):
-            self._current += n
-            if self._unit == "page" and (
-                self._current % 10 == 0 or self._current == self._total
-            ):
-                _update_progress(
-                    scan_pk,
-                    f"Tesseract OCR: {self._current}/{self._total} pages...",
-                    current=self._current,
-                    total=self._total,
-                )
-
-    class _ScanProgressPlugin:
-        @hookimpl
-        def get_progressbar_class(self):
-            return _ScanProgressBar
-
-    pm = get_plugin_manager()
-    pm._pm.register(_ScanProgressPlugin())
-
-    print(
-        f"  OCR {total_pages} pages... ({os.cpu_count() or 1} CPUs)",
-        flush=True,
-    )
-    t0 = time.time()
-    ocrmypdf.ocr(
-        str(pdf_path),
-        str(output_path),
-        pdf_renderer="auto",
-        optimize=1,
-        output_type="pdf",
-        language=[language],
-        tesseract_timeout=120,
-        progress_bar=True,
-        plugin_manager=pm,
-    )
-    print(f"  OCR done ({time.time() - t0:.0f}s)", flush=True)
-    return output_path
-
-
 def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     """Run YOLO detection via runpod_client (local or remote).
 
@@ -602,6 +461,93 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     # other disk consumers) still see the file.
     (Path(output_dir) / "detections.json").write_text(json.dumps(detections))
     _update_progress(scan_pk, f"YOLO: {len(detections)} detections")
+
+
+def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
+    """Widen ``TEXT_COLUMN`` detections onto the text their boxes clip.
+
+    YOLO's column boxes land a little inside the printed text -- median
+    0.4 pt on this reporter's scans, but up to ~7 pt, which is more than a
+    character. Three consumers depend on them and each used to pay for it
+    separately: headnote rects snap their x-bounds to these boxes, the
+    margin strips take them as the text band, and
+    ``scanner._outside_opinion_rects`` masks whole columns with them, so a
+    box a few points narrow left the first or last character of every line
+    unredacted. Correcting the boxes once, here, fixes all three.
+
+    Only the x-bounds move. ``scanner._column_bounds_pdf`` reads nothing
+    else off these detections, and ``_margin_bounds`` does not read them at
+    all, so leaving y alone keeps header/footer geometry untouched.
+
+    :param scan_pk: Primary key of the scan.
+    :param pdf_path: The PDF the detections were measured against.
+    :return: Number of detections widened.
+    """
+    by_page: dict[int, list] = {}
+    for det in Detection.objects.filter(
+        scan_id=scan_pk, active=True, label="TEXT_COLUMN"
+    ).order_by("page_index", "x0"):
+        by_page.setdefault(det.page_index, []).append(det)
+    if not by_page:
+        return 0
+
+    changed = []
+    with fitz.open(str(pdf_path)) as doc:
+        for page_index, columns in sorted(by_page.items()):
+            if page_index >= doc.page_count:
+                continue
+            page = doc[page_index]
+            img_w = columns[0].img_width or 1
+            img_h = columns[0].img_height or 1
+            sx = page.rect.width / img_w
+            sy = page.rect.height / img_h
+
+            # Each column may claim up to the middle of the gutter it
+            # shares with its neighbour, measured before anything moves.
+            # Growth normally stops in the gutter's white space well short
+            # of that, but on a tightly set page the gutter can be thinner
+            # than a rendered pixel, and without this the two columns take
+            # turns claiming it on every run.
+            limits = []
+            for i, det in enumerate(columns):
+                low = (
+                    (columns[i - 1].x1 + det.x0) / 2 * sx
+                    if i > 0
+                    else float("-inf")
+                )
+                high = (
+                    (det.x1 + columns[i + 1].x0) / 2 * sx
+                    if i + 1 < len(columns)
+                    else float("inf")
+                )
+                limits.append((low, high))
+
+            for det, (low, high) in zip(columns, limits):
+                rect = fitz.Rect(
+                    det.x0 * sx, det.y0 * sy, det.x1 * sx, det.y1 * sy
+                )
+                box = grow_to_ink(page, rect, margin_y=0.0)
+                # An edge that ran the whole way to the growth limit never
+                # found the end of the ink, so the measurement says nothing
+                # about where this column really stops -- a full-width table
+                # under a one-column detection does this. Leave such an edge
+                # where the detector put it rather than sliding it out by
+                # the limit on every run.
+                if rect.x0 - box.x0 >= GROW_MARGIN_X - 1:
+                    box.x0 = rect.x0
+                if box.x1 - rect.x1 >= GROW_MARGIN_X - 1:
+                    box.x1 = rect.x1
+                new_x0 = round(max(box.x0, low) / sx, 1)
+                new_x1 = round(min(box.x1, high) / sx, 1)
+                if abs(new_x0 - det.x0) < 1 and abs(new_x1 - det.x1) < 1:
+                    continue
+                det.x0 = new_x0
+                det.x1 = new_x1
+                changed.append(det)
+
+    if changed:
+        Detection.objects.bulk_update(changed, ["x0", "x1"])
+    return len(changed)
 
 
 def _import_detections_from_json(scan_pk: int, output_dir: str) -> list:
@@ -909,6 +855,133 @@ def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
     return det_data
 
 
+def _ink_text_bottom(fitz_page, clip: "fitz.Rect") -> float:
+    """Ink-based stand-in for ``blackletter.scanner._text_bottom``.
+
+    Three cases, and the distinction between the last two is what keeps
+    this safe. Ink inside the region gives the bottom of the last line. No
+    ink means the region really is blank, so ``clip.y0`` is returned and
+    the caller drops the rect, which is right: an empty rect paints a
+    black box over white space. But when the region lies outside the
+    page's content box the ink cannot say anything about it, so nothing is
+    clamped rather than guessing it is empty.
+
+    :param fitz_page: Page to measure.
+    :param clip: Region of interest, in PDF points.
+    :return: Bottom of the ink, ``clip.y0`` for a blank region, or
+        ``clip.y1`` when the region cannot be measured.
+    """
+    if content_clip(fitz_page, clip) is None:
+        return clip.y1
+    box = ink_bbox(fitz_page, clip)
+    return clip.y0 if box is None else box[3]
+
+
+def _no_text_x_bounds(
+    fitz_page, clip: "fitz.Rect", padding: float = 2.0
+) -> tuple[float, float]:
+    """Keep a rect's own x-bounds instead of shrinking them to text.
+
+    Shrinking horizontally is the unsafe direction for a headnote rect:
+    too narrow leaves headnote text in the deliverable, while too wide
+    only blacks out margin the cleanup pass whites out anyway. The app
+    snaps headnote x-bounds to ``TEXT_COLUMN`` detections right after
+    this, which is a firmer source than either text or ink.
+
+    :param fitz_page: Unused; matches the signature being replaced.
+    :param clip: Region of interest, in PDF points.
+    :param padding: Unused; matches the signature being replaced.
+    :return: The clip's own ``(x0, x1)``.
+    """
+    del fitz_page, padding
+    return clip.x0, clip.x1
+
+
+def _ink_tighten_to_text(
+    fitz_page, rect: "fitz.Rect", padding: float = 2.0, skip: bool = False
+) -> "fitz.Rect | None":
+    """Ink-based stand-in for ``blackletter.scanner._tighten_to_text``.
+
+    Without this a headnote block starts at the top of its column rather
+    than at its first line, and the app's split-at-HEADNOTE-boundaries
+    pass then carves the white gap above that line into a rect of its own:
+    a small black box with nothing in it.
+
+    :param fitz_page: Page to measure.
+    :param rect: Rect to shrink, in PDF points.
+    :param padding: Points of slack left around the ink, matching the
+        text-based version, so glyph edges are never clipped.
+    :param skip: When True, decline to tighten (caller keeps its rect).
+    :return: The tightened rect, or None when there is no ink to tighten
+        to.
+    """
+    if skip:
+        return None
+    box = ink_bbox(fitz_page, rect)
+    if box is None:
+        return None
+    return fitz.Rect(
+        box[0] - padding,
+        box[1] - padding,
+        box[2] + padding,
+        box[3] + padding,
+    )
+
+
+@contextmanager
+def _ink_text_geometry(pdf_path: str):
+    """Make blackletter's text-bound helpers work on a text-less PDF.
+
+    ``compute_redaction_rects`` derives each headnote rect's x-bounds and
+    bottom edge from the PDF text layer
+    (``blackletter/process.py:371-380``). Unlike the generate-time path,
+    which consults ``Document.ocr_applied`` before tightening, this one
+    always reads text, and ``_text_bottom`` returns ``clip.y0`` when a
+    page has no words. The rect then collapses to zero height and is
+    dropped, so a text-less ``bitonal.pdf`` yields **no headnote rects at
+    all** while every other rect type is unaffected.
+
+    Both edges that matter are measured from the page's ink instead of its
+    words: the bottom, without which a headnote block runs to the foot of
+    its column, and the top, without which it starts above its first line
+    and leaves an empty black box behind. Side bounds are left to the
+    caller's rect, since the app snaps headnote x-bounds to
+    ``TEXT_COLUMN`` detections immediately afterwards, which is a firmer
+    source than either text or ink.
+
+    Patches are swapped in only for text-less PDFs and only for the
+    duration of the call, so a scan that still has its OCR PDF keeps the
+    word-based behavior. Serialized because module attributes are
+    process-global.
+
+    Belongs upstream in blackletter (the ``ocr_applied`` flag already
+    exists for exactly this distinction, ``compute_redaction_rects`` just
+    doesn't consult it); until then it lives here so the pipeline is not
+    blocked on a blackletter release.
+
+    :param pdf_path: The PDF the rects are being computed against.
+    """
+    if has_text_layer(pdf_path):
+        yield
+        return
+
+    from blackletter import process as bl_process
+
+    with _INK_GEOMETRY_LOCK:
+        originals = {
+            name: getattr(bl_process, name)
+            for name in ("_text_bottom", "_text_x_bounds", "_tighten_to_text")
+        }
+        bl_process._text_bottom = _ink_text_bottom
+        bl_process._text_x_bounds = _no_text_x_bounds
+        bl_process._tighten_to_text = _ink_tighten_to_text
+        try:
+            yield
+        finally:
+            for name, fn in originals.items():
+                setattr(bl_process, name, fn)
+
+
 def _build_document_from_detections(
     scan: "Scan", det_data: list, pdf_path: str
 ) -> "BLDoc":
@@ -983,7 +1056,8 @@ def _compute_and_save_redaction_rects(scan_pk: int, pdf_path: str) -> list:
 
     document = _build_document_from_detections(scan, det_data, pdf_path)
     opinions = _pair_opinions(document)
-    rects = compute_redaction_rects(document, opinions, skip_doctr=True)
+    with _ink_text_geometry(pdf_path):
+        rects = compute_redaction_rects(document, opinions, skip_doctr=True)
 
     # Snap headnote rect x-bounds to TEXT_COLUMN detections for consistency.
     # Only snap to a TEXT_COLUMN on the same side of the page midpoint —
@@ -1071,10 +1145,83 @@ def _compute_and_save_redaction_rects(scan_pk: int, pdf_path: str) -> list:
             )
         page_entry["rects"] = new_page_rects
 
+    _grow_headnote_rects_to_ink(rects, det_data, pdf_path)
+
     Scan.objects.filter(pk=scan_pk).update(
         redaction_rects=rects,
     )
     return rects
+
+
+def _grow_headnote_rects_to_ink(
+    rects: list, det_data: list, pdf_path: str
+) -> None:
+    """Widen headnote rects that cut through printed characters.
+
+    Every edge of a headnote rect comes from detection geometry: the block
+    bounds from ``Page.col_*`` and the x-bounds from the ``TEXT_COLUMN``
+    snapping above, both of which are YOLO boxes that can sit a few points
+    inside the printed text. The block splits add horizontal boundaries of
+    their own. Any of those can clip a glyph: the first character of every
+    line in a column, or the tail of the line a boundary lands on.
+
+    The text-layer path used to absorb this, because
+    ``scanner._words_in_rect`` returns every word *overlapping* a rect, so
+    a straddling word pulled the bounds outward. Ink measured inside a rect
+    cannot, so the same slack is restored here, growing each edge over
+    contiguous ink only (see ``ink.grow_to_ink``).
+
+    Modifies ``rects`` in place. Coordinates stay in image pixels.
+
+    :param rects: Per-page rect entries from ``compute_redaction_rects``.
+    :param det_data: Detection dicts, for each page's image dimensions.
+    :param pdf_path: The PDF the rects were computed against.
+    """
+    img_dims: dict[int, tuple[int, int]] = {}
+    for d in det_data:
+        pi = d["page_index"]
+        if pi not in img_dims:
+            img_dims[pi] = (d.get("img_width") or 1, d.get("img_height") or 1)
+
+    with fitz.open(str(pdf_path)) as doc:
+        for page_entry in rects:
+            pi = page_entry["page_index"]
+            headnotes = [
+                r for r in page_entry["rects"] if r.get("type") == "headnote"
+            ]
+            if not headnotes or pi >= doc.page_count or pi not in img_dims:
+                continue
+            page = doc[pi]
+            img_w, img_h = img_dims[pi]
+            sx = page.rect.width / img_w
+            sy = page.rect.height / img_h
+            for r in headnotes:
+                grown = grow_to_ink(
+                    page,
+                    fitz.Rect(
+                        r["x0"] * sx, r["y0"] * sy, r["x1"] * sx, r["y1"] * sy
+                    ),
+                )
+                r["x0"] = round(grown.x0 / sx, 1)
+                r["y0"] = round(grown.y0 / sy, 1)
+                r["x1"] = round(grown.x1 / sx, 1)
+                r["y1"] = round(grown.y1 / sy, 1)
+
+
+def _load_detections(output_dir: str | Path) -> list:
+    """Read ``detections.json`` from a scan's output dir.
+
+    :param output_dir: The scan's output directory.
+    :return: The detection list, or an empty list when absent/unreadable.
+    """
+    det_path = Path(output_dir) / "detections.json"
+    if not det_path.exists():
+        return []
+    try:
+        return json.loads(det_path.read_text())
+    except (OSError, ValueError):
+        logger.exception("Unreadable detections.json in %s", output_dir)
+        return []
 
 
 def _compute_and_save_margin_rects(
@@ -1095,12 +1242,55 @@ def _compute_and_save_margin_rects(
     if scan.margin_rects:
         return scan.margin_rects
     output_dir = Path(output_dir)
-    margin_rects = compute_margin_rects(str(pdf_path))
+    detections = _load_detections(output_dir)
+    margin_rects = compute_margin_rects(str(pdf_path), detections=detections)
     margin_rects = _adjust_margins_for_detections(margin_rects, output_dir)
     Scan.objects.filter(pk=scan_pk).update(
         margin_rects=margin_rects,
     )
     return margin_rects
+
+
+def _grow_outside_rects_to_ink(opinions: list, pdf_path: str) -> None:
+    """Widen each opinion's outside-opinion masks over clipped characters.
+
+    When several opinions share a page, every opinion's PDF whites out the
+    others' columns. Those masks come from ``TEXT_COLUMN`` bounds
+    (``scanner._outside_opinion_rects``), the same boxes that can sit a few
+    points inside the printed text, so the first or last character of every
+    masked line survives in the gutter as a column of stray marks.
+
+    Grown horizontally only: the vertical edges are the caption and key
+    positions, which mean something, while the side edges are just the
+    column geometry.
+
+    Modifies ``opinions`` in place. Coordinates are PDF points.
+
+    :param opinions: Opinion dicts carrying ``outside_rects``.
+    :param pdf_path: The PDF the rects were computed against.
+    """
+    by_page: dict[int, list[dict]] = {}
+    for op in opinions:
+        for rect in op.get("outside_rects", []):
+            pi = rect.get("page_index")
+            if pi is not None:
+                by_page.setdefault(pi, []).append(rect)
+    if not by_page:
+        return
+
+    with fitz.open(str(pdf_path)) as doc:
+        for pi, rects in sorted(by_page.items()):
+            if pi >= doc.page_count:
+                continue
+            page = doc[pi]
+            for rect in rects:
+                grown = grow_to_ink(
+                    page,
+                    fitz.Rect(rect["x0"], rect["y0"], rect["x1"], rect["y1"]),
+                    margin_y=0.0,
+                )
+                rect["x0"] = round(grown.x0, 1)
+                rect["x1"] = round(grown.x1, 1)
 
 
 def _build_combined_redactions(scan_pk: int) -> Path:
@@ -1140,7 +1330,7 @@ def _build_combined_redactions(scan_pk: int) -> Path:
                 img_dims[pi] = (d.get("img_width", 1), d.get("img_height", 1))
 
     # PDF page dims
-    pdf_path = find_ocr_pdf(scan.output_dir) or scan.pdf_path
+    pdf_path = processing_pdf_path(scan)
     pdf_dims = {}
     with fitz.open(str(pdf_path)) as src:
         for i in range(src.page_count):
@@ -1194,6 +1384,8 @@ def _build_combined_redactions(scan_pk: int) -> Path:
                     "type": r["type"],
                 }
             )
+
+    _grow_outside_rects_to_ink(opinions, pdf_path)
 
     combined = {
         "opinions": opinions,
@@ -1257,10 +1449,16 @@ def _adjust_margins_for_detections(
         if not img_w or not img_h:
             continue
 
-        # Determine PDF page size from the margin rects themselves
-        # (full-width rects span x0=0 to x1=page_width, etc.)
-        pdf_w = max(r["x1"] for r in page_entry["rects"])
-        pdf_h = max(r["y1"] for r in page_entry["rects"])
+        # Page size comes from the entry when available. Inferring it from
+        # the rects only works while some rect reaches each far edge, which
+        # stopped being true once the side strips were trimmed to the text
+        # body instead of running the full page height.
+        pdf_w = page_entry.get("page_width") or max(
+            r["x1"] for r in page_entry["rects"]
+        )
+        pdf_h = page_entry.get("page_height") or max(
+            r["y1"] for r in page_entry["rects"]
+        )
         sx = pdf_w / img_w
         sy = pdf_h / img_h
 
@@ -1280,22 +1478,19 @@ def _adjust_margins_for_detections(
                     and dy0 < rect["y1"]
                     and dy1 > rect["y0"]
                 ):
-                    # Shrink the rect edge that intrudes on the detection
-                    # Bottom margin (rect covers lower portion of page)
-                    if rect["y0"] > 0 and rect["y1"] >= pdf_h - 1:
-                        rect["y0"] = max(rect["y0"], dy1 + padding)
-                    # Top margin (rect covers upper portion of page)
-                    if rect["y0"] <= 1 and rect["y1"] < pdf_h - 1:
+                    # Shrink the edge that intrudes on the detection.
+                    # Which edge that is follows from the page edge the
+                    # strip is anchored to, so this holds for both the
+                    # full-height side strips of older scans and the
+                    # body-only ones computed now.
+                    full_width = rect["x0"] <= 1 and rect["x1"] >= pdf_w - 1
+                    if full_width and rect["y0"] <= 1:
                         rect["y1"] = min(rect["y1"], dy0 - padding)
-                    # Left margin (rect covers left portion of page)
-                    if rect["x0"] <= 1 and rect["x1"] < pdf_w - 1:
+                    elif full_width and rect["y1"] >= pdf_h - 1:
+                        rect["y0"] = max(rect["y0"], dy1 + padding)
+                    elif rect["x0"] <= 1:
                         rect["x1"] = min(rect["x1"], dx0 - padding)
-                    # Right margin (rect covers right portion of page)
-                    if (
-                        rect["x0"] > 0
-                        and rect["y0"] <= 1
-                        and rect["y1"] >= pdf_h - 1
-                    ):
+                    elif rect["x1"] >= pdf_w - 1:
                         rect["x0"] = max(rect["x0"], dx1 + padding)
 
     return margin_rects
@@ -1312,7 +1507,7 @@ def _re_pair_opinions(scan_pk: int) -> list:
     if not det_data:
         return []
 
-    pdf_path = find_ocr_pdf(scan.output_dir) or scan.pdf_path
+    pdf_path = processing_pdf_path(scan)
     opinions = bl_pair(
         det_data,
         str(pdf_path),
@@ -1451,6 +1646,7 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
             )
     if all_detections:
         Detection.objects.bulk_create(all_detections)
+        _snap_text_columns_to_ink(scan_pk, pdf_path)
 
     Scan.objects.filter(pk=scan_pk).update(
         ocr_results=all_results,
@@ -1724,10 +1920,16 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
 
 
 def run_full_pipeline(scan_pk: int) -> None:
-    """Run the full processing pipeline: bitonal → OCR → YOLO → validate → pair → rects.
+    """Run the full processing pipeline: bitonal → YOLO → validate → pair → rects.
 
     Designed to run in the daemon process. After this completes, the scan
     is ready for review -- the user only needs to approve and generate.
+
+    No text layer is embedded here. The ocrmypdf/Tesseract pass used to
+    run between bitonal conversion and detection and dominated the
+    pipeline's wall clock, while nothing in steps 1 and 2 reads the text
+    it produced; ``bitonal.pdf`` is now the processing PDF end to end
+    (see ``utils.find_processing_pdf``).
 
     :param scan_pk: Primary key of the scan to process.
     """
@@ -1747,41 +1949,28 @@ def run_full_pipeline(scan_pk: int) -> None:
         # 2. Bitonal conversion
         bitonal_path = _ensure_bitonal(scan, output_dir)
 
-        # 3. Tesseract OCR (on bitonal)
-        scan.refresh_from_db()
-        ocr_pdf = find_ocr_pdf(str(output_dir))
-        if not ocr_pdf:
-            ocr_pdf = _run_ocr(
-                scan_pk,
-                str(bitonal_path),
-                str(output_dir),
-                reporter=scan.reporter.short_name or "",
-                volume=str(scan.volume) or "",
-                first_page=scan.start_page or 1,
-            )
-
-        # 4. YOLO detection (all 3 models on bitonal)
+        # 3. YOLO detection (all 3 models on bitonal)
         _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
 
-        # 5. Import detections into DB
+        # 4. Import detections into DB
         _update_progress(scan_pk, "Importing detections...")
         dets = _import_detections_from_json(scan_pk, str(output_dir))
+        _snap_text_columns_to_ink(scan_pk, str(bitonal_path))
 
-        # 6. PaddleOCR validation (on original PDF for better OCR)
+        # 5. PaddleOCR validation (on original PDF for better OCR)
         _update_progress(
             scan_pk,
             f"{len(dets)} detections imported. Running page number validation...",
         )
         run_paddleocr_validation(scan_pk, scan.pdf_path)
 
-        # 7. Pair opinions
+        # 6. Pair opinions
         _update_progress(scan_pk, "Pairing opinions...")
         opinions = _re_pair_opinions(scan_pk)
 
-        # 8. Compute redaction rects (margin rects computed lazily when viewer requests them)
+        # 7. Compute redaction rects (margin rects computed lazily when viewer requests them)
         _update_progress(scan_pk, "Computing redaction rects...")
-        pdf_path = str(ocr_pdf) if ocr_pdf else scan.pdf_path
-        _compute_and_save_redaction_rects(scan_pk, pdf_path)
+        _compute_and_save_redaction_rects(scan_pk, str(bitonal_path))
 
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.PENDING_REVIEW,
@@ -1969,7 +2158,7 @@ def run_reprocess(scan_pk: int) -> None:
         _re_pair_opinions(scan_pk)
 
         if output_dir:
-            pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
+            pdf_path = processing_pdf_path(scan)
             Scan.objects.filter(pk=scan_pk).update(
                 margin_rects="", redaction_rects=""
             )
@@ -1995,9 +2184,10 @@ def run_reprocess(scan_pk: int) -> None:
 def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
     """Delete a single page and patch detections/validation in place.
 
-    Removes the page from the original PDF, bitonal PDF, and OCR PDF;
-    deletes detections on that page; shifts subsequent detection
-    page_index values down by 1; re-runs PaddleOCR validation and re-pairs.
+    Removes the page from every PDF the scan keeps on disk (the original,
+    ``bitonal.pdf``, and a legacy OCR PDF if one is still there); deletes
+    detections on that page; shifts subsequent detection page_index
+    values down by 1; re-runs PaddleOCR validation and re-pairs.
 
     :param scan_pk: Primary key of the scan to edit.
     :param pdf_page: 1-based PDF page number to delete.
@@ -2021,53 +2211,7 @@ def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
     _re_pair_opinions(scan_pk)
 
     if output_dir:
-        pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
-        _compute_and_save_redaction_rects(scan_pk, pdf_path)
-
-
-def _ocr_single_page(ocr_pdf_path: str, page_idx: int) -> None:
-    """Run Tesseract OCR on a single page of a PDF to add a text layer.
-
-    Extracts the page to a temp file, OCRs it, then replaces the page
-    in the original PDF with the OCR'd version.
-
-    :param ocr_pdf_path: Path to the OCR PDF to update.
-    :param page_idx: Zero-based page index to OCR.
-    """
-    import tempfile
-
-    import ocrmypdf
-
-    ocr_pdf_path = str(ocr_pdf_path)
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        # Extract the single page
-        single_path = tmp / "page.pdf"
-        with fitz.open(ocr_pdf_path) as doc:
-            with fitz.open() as single:
-                single.insert_pdf(doc, from_page=page_idx, to_page=page_idx)
-                single.save(str(single_path))
-
-            # OCR it
-            ocrd_path = tmp / "page_ocr.pdf"
-            ocrmypdf.ocr(
-                str(single_path),
-                str(ocrd_path),
-                pdf_renderer="auto",
-                optimize=1,
-                output_type="pdf",
-                language=["eng"],
-                tesseract_timeout=120,
-                progress_bar=False,
-            )
-
-            # Replace the page in the OCR PDF
-            with fitz.open(str(ocrd_path)) as ocrd_doc:
-                doc.delete_page(page_idx)
-                doc.insert_pdf(
-                    ocrd_doc, from_page=0, to_page=0, start_at=page_idx
-                )
-                doc.saveIncr()
+        _compute_and_save_redaction_rects(scan_pk, processing_pdf_path(scan))
 
 
 def run_smart_insert(
@@ -2075,9 +2219,10 @@ def run_smart_insert(
 ) -> None:
     """Insert a page and run detection/validation on just that page.
 
-    Inserts the page image into the original PDF, bitonal PDF, and OCR PDF
-    at the correct position; shifts subsequent detection page_index values up
-    by 1; re-validates and re-pairs.
+    Inserts the page image into every PDF the scan keeps on disk (the
+    original, ``bitonal.pdf``, and a legacy OCR PDF if one is still
+    there) at the correct position; shifts subsequent detection
+    page_index values up by 1; re-validates and re-pairs.
 
     :param scan_pk: Primary key of the scan to edit.
     :param logical_page_number: The logical page number to insert at.
@@ -2118,12 +2263,6 @@ def run_smart_insert(
                 new_page.insert_image(new_page.rect, filename=str(image_path))
             doc.saveIncr()
 
-    # OCR the inserted page in the OCR PDF so it gets a text layer
-    if output_dir:
-        ocr_pdf_path = find_ocr_pdf(str(output_dir))
-        if ocr_pdf_path:
-            _ocr_single_page(ocr_pdf_path, insert_idx)
-
     # Shift subsequent detections up
     Detection.objects.filter(
         scan_id=scan_pk, page_index__gte=insert_idx
@@ -2140,18 +2279,16 @@ def run_smart_insert(
 
     # Re-validate, re-pair, recompute rects
     scan.refresh_from_db()
-    pdf_path = find_ocr_pdf(str(output_dir)) if output_dir else scan.pdf_path
-    run_incremental_validation(scan_pk, pdf_path or scan.pdf_path)
+    pdf_path = processing_pdf_path(scan)
+    run_incremental_validation(scan_pk, pdf_path)
     _re_pair_opinions(scan_pk)
 
     if output_dir:
         Scan.objects.filter(pk=scan_pk).update(
             margin_rects="", redaction_rects=""
         )
-        _compute_and_save_margin_rects(
-            scan_pk, pdf_path or scan.pdf_path, str(output_dir)
-        )
-        _compute_and_save_redaction_rects(scan_pk, pdf_path or scan.pdf_path)
+        _compute_and_save_margin_rects(scan_pk, pdf_path, str(output_dir))
+        _compute_and_save_redaction_rects(scan_pk, pdf_path)
 
 
 def _collect_pdf_paths(scan: "Scan", output_dir: str | None) -> list[Path]:
@@ -2178,21 +2315,22 @@ def _collect_pdf_paths(scan: "Scan", output_dir: str | None) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
-    """Overlay original-quality image regions onto a *copy* of the OCR'd PDF.
+def _stamp_original_images(scan: "Scan", base_pdf_path: str) -> str:
+    """Overlay original-quality image regions onto a *copy* of the base PDF.
 
     For each active IMAGE detection, renders the bounding box from the
-    original scan PDF and inserts it into a copy of the OCR'd PDF at the
-    same position.  This preserves full-quality photographs/illustrations
-    that would otherwise be degraded by bitonal conversion.
+    original scan PDF and inserts it into a copy of the processing PDF
+    (normally ``bitonal.pdf``) at the same position. This preserves
+    full-quality photographs/illustrations that would otherwise be
+    degraded by bitonal conversion.
 
     :param scan: The Scan instance with the original PDF path.
-    :param ocr_pdf_path: Path to the OCR'd PDF to stamp onto.
-    :return: Path to the stamped copy, or the original path if no
-        images needed stamping (so the OCR PDF is never modified).
+    :param base_pdf_path: Path to the processing PDF to stamp onto.
+    :return: Path to the stamped copy. Always a copy, so the processing
+        PDF is never modified by downstream steps.
     """
 
-    stamped_path = os.path.join(os.path.dirname(ocr_pdf_path), "stamped.pdf")
+    stamped_path = os.path.join(os.path.dirname(base_pdf_path), "stamped.pdf")
 
     image_dets = list(
         Detection.objects.filter(scan=scan, label="IMAGE", active=True)
@@ -2202,30 +2340,30 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
         )
     )
     if not image_dets:
-        # Always copy so the OCR PDF is never modified by downstream steps
-        shutil.copy2(ocr_pdf_path, stamped_path)
+        # Always copy so the processing PDF is never modified downstream
+        shutil.copy2(base_pdf_path, stamped_path)
         return stamped_path
 
     # Save extracted images to images/ directory
-    images_dir = Path(os.path.dirname(ocr_pdf_path)) / "images"
+    images_dir = Path(os.path.dirname(base_pdf_path)) / "images"
     images_dir.mkdir(exist_ok=True)
     page_numbers = _page_number_lookup(scan)
     img_count_by_page: dict[int, int] = {}
 
     with (
         fitz.open(scan.pdf_path) as original_doc,
-        fitz.open(ocr_pdf_path) as ocr_doc,
+        fitz.open(base_pdf_path) as base_doc,
     ):
         for det in image_dets:
             page_idx = det["page_index"]
             if (
                 page_idx >= original_doc.page_count
-                or page_idx >= ocr_doc.page_count
+                or page_idx >= base_doc.page_count
             ):
                 continue
 
             orig_page = original_doc[page_idx]
-            ocr_page = ocr_doc[page_idx]
+            base_page = base_doc[page_idx]
 
             # Convert image-pixel bbox to PDF points
             page_rect = orig_page.rect
@@ -2245,8 +2383,8 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
             pix = orig_page.get_pixmap(clip=pdf_rect, dpi=150)
             png_bytes = pix.tobytes("png")
 
-            # Stamp onto the OCR'd PDF
-            ocr_page.insert_image(pdf_rect, stream=png_bytes)
+            # Stamp onto the processing PDF copy
+            base_page.insert_image(pdf_rect, stream=png_bytes)
 
             # Save image to images/ directory
             pn = page_numbers.get(page_idx)
@@ -2257,8 +2395,78 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
             img_name = f"{page_num}-{img_count_by_page[page_idx]:03d}.png"
             (images_dir / img_name).write_bytes(png_bytes)
 
-        ocr_doc.save(stamped_path, garbage=3, deflate=True)
+        base_doc.save(stamped_path, garbage=3, deflate=True)
     return stamped_path
+
+
+def _flatten_redaction_edges(
+    redactions_path: Path,
+    full_redacted: str,
+    redacted_dir: Path,
+    filenames: list[str],
+) -> int:
+    """Repaint every applied rect without a stroke, to kill hairlines.
+
+    PyMuPDF's ``apply_redactions`` paints each rect with a fill *and* a 1pt
+    stroke straddling its edge, so wherever a black rect meets a white one
+    the outer half of the black stroke survives as a thin vertical line in
+    the deliverable. blackletter's own CLI path compensates by overdrawing
+    ("cover 1pt stroke from apply_redactions"); the ``generate`` API it
+    calls here does not, so the same overdraw happens afterwards: same
+    rects, same order, fill only, drawn last.
+
+    :param redactions_path: The ``redactions.json`` handed to ``generate``.
+    :param full_redacted: Path to the full redacted PDF, if produced.
+    :param redacted_dir: Directory of per-opinion redacted PDFs.
+    :param filenames: Generated opinion filenames, in the same order as the
+        opinions in ``redactions.json`` (``generate`` can rename duplicates,
+        so the names on disk are the authority).
+    :return: Number of PDFs rewritten.
+    """
+    data = json.loads(Path(redactions_path).read_text())
+    pages_rects: dict = data.get("pages", {}) or {}
+    opinions: list = data.get("opinions", []) or []
+
+    def _paint(page, src_idx: int, outside: list) -> None:
+        """Repaint one page's rects, whites after blacks as generate does."""
+        for r in pages_rects.get(str(src_idx), []):
+            white = r.get("type") == "margin" or r.get("fill") == "white"
+            page.draw_rect(
+                fitz.Rect(r["x0"], r["y0"], r["x1"], r["y1"]),
+                color=None,
+                fill=(1, 1, 1) if white else (0, 0, 0),
+                width=0,
+            )
+        for orect in outside:
+            if orect.get("page_index") != src_idx:
+                continue
+            page.draw_rect(
+                fitz.Rect(orect["x0"], orect["y0"], orect["x1"], orect["y1"]),
+                color=None,
+                fill=(1, 1, 1),
+                width=0,
+            )
+
+    written = 0
+    if full_redacted and os.path.isfile(full_redacted):
+        with fitz.open(full_redacted) as doc:
+            for idx in range(doc.page_count):
+                _paint(doc[idx], idx, [])
+            doc.saveIncr()
+        written += 1
+
+    for i, filename in enumerate(filenames):
+        path = Path(redacted_dir) / filename
+        if not path.is_file() or i >= len(opinions):
+            continue
+        start = opinions[i].get("caption_page", 0) or 0
+        outside = opinions[i].get("outside_rects", []) or []
+        with fitz.open(str(path)) as doc:
+            for local_idx in range(doc.page_count):
+                _paint(doc[local_idx], start + local_idx, outside)
+            doc.saveIncr()
+        written += 1
+    return written
 
 
 def run_generate_files(scan_pk: int) -> None:
@@ -2279,18 +2487,29 @@ def run_generate_files(scan_pk: int) -> None:
         )
 
         output = Path(scan.output_dir)
-        ocr_pdf = find_ocr_pdf(str(output))
-        if not ocr_pdf:
-            raise ValueError("No OCR'd PDF found in output directory")
+        base_pdf = find_processing_pdf(str(output))
+        if not base_pdf:
+            raise ValueError(
+                "No processing PDF (bitonal.pdf) found in output directory"
+            )
 
-        # Stamp original-quality images into a copy, leaves OCR PDF untouched
-        gen_pdf = _stamp_original_images(scan, str(ocr_pdf))
+        # Stamp original-quality images into a copy, leaves base PDF untouched
+        gen_pdf = _stamp_original_images(scan, str(base_pdf))
 
         # Write current DB detections -> detections.json (includes page numbers)
         det_data = _sync_detections_to_disk(scan_pk)
         Scan.objects.filter(pk=scan_pk).update(
             progress_message=f"Generating files ({len(det_data or [])} detections)..."
         )
+
+        # Margin rects are otherwise only computed on demand, by the viewer
+        # asking for them or by a reprocess. A scan taken straight from
+        # review to Generate without the margins overlay ever being switched
+        # on therefore shipped with no whiteouts at all: the platen bands,
+        # fold shadows and corner bleed stayed in the deliverable. Computing
+        # them here makes the output independent of what the reviewer
+        # happened to look at; it no-ops when they already exist.
+        _compute_and_save_margin_rects(scan_pk, str(base_pdf), str(output))
 
         # Build combined redactions.json (margins + redaction rects + opinions)
         Scan.objects.filter(pk=scan_pk).update(
@@ -2317,11 +2536,21 @@ def run_generate_files(scan_pk: int) -> None:
         opinion_count = result.get("opinion_count", 0)
         full_redacted = result.get("full_redacted", "")
         redacted_dir = Path(result.get("redacted_dir", output / "redacted"))
+
         unredacted_dir = output / "unredacted"
 
         redacted_files = (
             sorted(redacted_dir.glob("*.pdf")) if redacted_dir.is_dir() else []
         )
+
+        _update_progress(scan_pk, "Cleaning redaction edges...")
+        n_flattened = _flatten_redaction_edges(
+            redactions_path,
+            str(full_redacted),
+            redacted_dir,
+            [f.name for f in redacted_files],
+        )
+        print(f"  Flattened redaction edges in {n_flattened} PDFs", flush=True)
 
         scan.refresh_from_db()
         existing_opinions = scan.opinions_json
@@ -2425,37 +2654,76 @@ def _page_has_headnote(redactions_pages: dict, page_index: int) -> bool:
     )
 
 
-def _page_body_textless(
+def _page_body_covered(
+    redactions_pages: dict,
+    page_index: int,
     pdf_path: Path,
     header_height_pts: float = 60.0,
-    text_floor: int = 5,
+    min_coverage: float = 0.9,
+    cell_pts: float = 2.0,
 ) -> bool:
-    """Return True when the rendered page has no text below the header.
+    """Return True when rects cover essentially all of a page's body.
 
-    The per-page PDFs handed to the LLM are post-redaction, so a body
-    entirely covered by ``headnote`` rects extracts to nothing. Used as
-    the boundary-case confirmation for the sandwich rule: when only
-    one neighbor of a page has headnotes (the page is the leading or
-    trailing edge of a multi-page block), we verify the redaction
-    actually wiped the body text before calling the page blank.
+    Boundary-case confirmation for the sandwich rule: when only one
+    neighbor of a page has headnotes (the page is the leading or trailing
+    edge of a multi-page block), we check that the redaction geometry
+    actually wipes the whole body before calling the page blank.
 
-    Returns False on any exception so a corrupt PDF doesn't mis-flag
+    Measured from the rect geometry rather than from the generated PDF's
+    text. The pipeline no longer embeds a text layer, so the previous
+    ``pdfplumber.extract_text`` probe would report *every* page as empty
+    and flag live body pages as blank. Every rect counts, not just
+    headnotes: margin strips cover the page edges the headnote rects
+    never reach, and any other redaction on the page removes content
+    too, so "the body is entirely made of rects" is the same statement
+    the text probe was making.
+
+    Returns False on any exception so an unreadable PDF cannot mis-flag
     a page as blank.
 
-    :param pdf_path: Filesystem path to the per-page PDF.
+    :param redactions_pages: ``redactions["pages"]`` — dict keyed by
+        stringified page_index, each value a list of rect dicts with
+        ``x0``/``y0``/``x1``/``y1`` in PDF points.
+    :param page_index: 0-based PDF page index.
+    :param pdf_path: Filesystem path to the per-page PDF, used only to
+        read the page size.
     :param header_height_pts: PDF-point band at the top of the page
-        treated as "header" and excluded from the text check. The
-        printed page number lives here.
-    :param text_floor: Chars of body text below which the page is
-        considered effectively empty.
-    :return: True if the cropped body extracts to fewer than
-        ``text_floor`` chars.
+        treated as "header" and excluded. The printed page number lives
+        there and is deliberately never redacted.
+    :param min_coverage: Fraction of the body that must be covered.
+    :param cell_pts: Resolution of the coverage grid, in PDF points.
+    :return: True if at least ``min_coverage`` of the body is covered.
     """
+    rects = redactions_pages.get(str(page_index), [])
+    if not rects:
+        return False
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            pg = pdf.pages[0]
-            body = pg.crop((0, header_height_pts, pg.width, pg.height))
-            return len((body.extract_text() or "").strip()) < text_floor
+        with fitz.open(str(pdf_path)) as doc:
+            page_rect = doc[0].rect
+        width, height = page_rect.width, page_rect.height
+        body_top = min(header_height_pts, height)
+        if width <= 0 or height - body_top <= 0:
+            return False
+
+        cols = max(1, int(width / cell_pts))
+        rows = max(1, int((height - body_top) / cell_pts))
+        covered = np.zeros((rows, cols), dtype=bool)
+        for r in rects:
+            x0 = max(0.0, min(float(r["x0"]), width))
+            x1 = max(0.0, min(float(r["x1"]), width))
+            y0 = max(body_top, min(float(r["y0"]), height))
+            y1 = max(body_top, min(float(r["y1"]), height))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            c0 = int(x0 / width * cols)
+            c1 = max(c0 + 1, int(round(x1 / width * cols)))
+            r0 = int((y0 - body_top) / (height - body_top) * rows)
+            r1 = max(
+                r0 + 1,
+                int(round((y1 - body_top) / (height - body_top) * rows)),
+            )
+            covered[r0:r1, c0:c1] = True
+        return bool(covered.mean() >= min_coverage)
     except Exception:
         return False
 
@@ -2498,9 +2766,9 @@ def _is_blank_via_sandwich(
         fires directly.
       * **Boundary sandwich** — only one neighbor has headnotes
         (this page is the leading or trailing edge of the block).
-        Confirm with a text-extraction check on the rendered PDF;
-        since the per-page PDFs are post-redaction, an actually-empty
-        body extracts to nothing.
+        Confirm by measuring how much of the body the page's rects
+        cover, since a body made entirely of redaction rects has
+        nothing left to extract.
 
     :param page_index: 0-based PDF page index.
     :param opinions: ``scan.opinions_json`` — the curated opinion
@@ -2510,9 +2778,9 @@ def _is_blank_via_sandwich(
         list keyed by stringified page_index.
     :param page_detections: All YOLO detections on this page (used
         only to check for ``FOOTNOTES``).
-    :param pdf_path: Path to the per-page PDF, used for the boundary
-        text-extraction check. If omitted, the boundary case can't
-        fire and only strict sandwich pages are flagged.
+    :param pdf_path: Path to the per-page PDF, read for its page size
+        by the boundary coverage check. If omitted, the boundary case
+        can't fire and only strict sandwich pages are flagged.
     :return: True iff the page's body is effectively blank under the
         rule above.
     """
@@ -2531,11 +2799,11 @@ def _is_blank_via_sandwich(
         next_hn = _page_has_headnote(redactions_pages, page_index + 1)
         if prev_hn and next_hn:
             return True
-        # Boundary case: only one side has headnotes. Confirm via the
-        # rendered PDF — if the body is genuinely empty (post-redaction),
-        # it really is a blank page even though sandwich doesn't fire.
+        # Boundary case: only one side has headnotes. Confirm from the
+        # rect geometry — if the whole body is redacted away, it really
+        # is a blank page even though sandwich doesn't fire.
         if (prev_hn or next_hn) and pdf_path is not None:
-            if _page_body_textless(pdf_path):
+            if _page_body_covered(redactions_pages, page_index, pdf_path):
                 return True
     return False
 
@@ -2692,22 +2960,11 @@ def run_detect(scan_pk: int) -> None:
     try:
         output_dir = Path(scan.output_dir)
         bitonal = output_dir / "bitonal.pdf"
-
-        # OCR if needed (no existing OCR PDF)
-        if not find_ocr_pdf(str(output_dir)) and bitonal.exists():
-            _run_ocr(
-                scan_pk,
-                str(bitonal),
-                str(output_dir),
-                reporter=scan.reporter.short_name or "",
-                volume=str(scan.volume) or "",
-                first_page=scan.start_page or 1,
-            )
-
         pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
 
         _run_yolo(scan_pk, pdf_path, str(output_dir))
         dets = _import_detections_from_json(scan_pk, str(output_dir))
+        _snap_text_columns_to_ink(scan_pk, pdf_path)
 
         _update_progress(
             scan_pk,

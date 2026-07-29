@@ -31,7 +31,7 @@ from scanning.models import (
     Stage,
     Status,
 )
-from scanning.utils import compute_coverage_gaps, find_ocr_pdf
+from scanning.utils import compute_coverage_gaps, find_processing_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -483,17 +483,14 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     logger.info("serve_scan_pdf: resolving pdf for scan=%s", scan.pk)
 
     def _processed_local() -> FileResponse | None:
-        """Return the OCR pdf, else ``bitonal.pdf``, from ``output_dir``."""
+        """Return ``bitonal.pdf`` (or a legacy OCR pdf) from ``output_dir``."""
         output = Path(scan.output_dir)
         if not output.is_dir():
             return None
-        ocr = find_ocr_pdf(scan.output_dir)
-        if ocr:
-            return FileResponse(ocr.open("rb"), content_type="application/pdf")
-        bitonal = output / "bitonal.pdf"
-        if bitonal.exists():
+        base_pdf = find_processing_pdf(scan.output_dir)
+        if base_pdf:
             return FileResponse(
-                bitonal.open("rb"), content_type="application/pdf"
+                base_pdf.open("rb"), content_type="application/pdf"
             )
         return None
 

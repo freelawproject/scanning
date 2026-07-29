@@ -45,6 +45,11 @@ def find_json_file(output_base: Path, filename: str) -> Path | None:
 def find_ocr_pdf(output_dir: str | Path) -> Path | None:
     """Find the OCR PDF in output_dir (excludes bitonal, redacted, original).
 
+    The pipeline no longer produces one: the ocrmypdf/Tesseract text-layer
+    pass was dropped from ``run_full_pipeline``. Only scans processed
+    before that change still have this file, so callers that just want a
+    workable PDF should use :func:`find_processing_pdf` instead.
+
     :param output_dir: The directory to search for the OCR PDF.
     :return: The Path if found, or None.
     """
@@ -58,6 +63,49 @@ def find_ocr_pdf(output_dir: str | Path) -> Path | None:
         ):
             return f
     return None
+
+
+def find_processing_pdf(output_dir: str | Path) -> Path | None:
+    """Find the small PDF the pipeline works on.
+
+    ``bitonal.pdf`` is the canonical one: it has the exact page geometry
+    of the original (``_render_bitonal_page`` creates each page from the
+    source page's rect) at a fraction of the size, so anything that only
+    needs page dimensions, detection coordinates, or a preview can use it.
+
+    Scans processed before the Tesseract text-layer pass was dropped from
+    the pipeline also carry an OCR'd PDF in the same directory. It is
+    preferred when present: same geometry, plus a text layer that still
+    gives tighter margin bounds.
+
+    :param output_dir: The scan's output directory.
+    :return: The OCR'd PDF, else ``bitonal.pdf``, else None.
+    """
+    ocr_pdf = find_ocr_pdf(output_dir)
+    if ocr_pdf:
+        return ocr_pdf
+    bitonal = Path(output_dir) / "bitonal.pdf"
+    return bitonal if bitonal.exists() else None
+
+
+def processing_pdf_path(scan: Scan) -> str:
+    """Resolve the PDF path pipeline steps should read for a scan.
+
+    Prefers the small processing PDF (see :func:`find_processing_pdf`) and
+    falls back to the multi-GB original only when no processing PDF exists
+    locally, which in production means an S3 pull, so callers should treat
+    that as the slow path rather than the normal one.
+
+    :param scan: The scan to resolve a PDF for.
+    :return: Filesystem path to the best available PDF.
+    :raises FileNotFoundError: If neither a processing PDF nor a local
+        copy of the original exists (raised by ``Scan.pdf_path``).
+    """
+    if scan.output_dir:
+        found = find_processing_pdf(scan.output_dir)
+        if found:
+            return str(found)
+    return scan.pdf_path
 
 
 def has_s3_credentials() -> bool:

@@ -1,8 +1,17 @@
 """Tests for scanning.utils helpers."""
 
-from django.test import TestCase
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
-from scanning.utils import compute_coverage_gaps
+from django.test import SimpleTestCase, TestCase
+
+from scanning.utils import (
+    compute_coverage_gaps,
+    find_ocr_pdf,
+    find_processing_pdf,
+    processing_pdf_path,
+)
 
 
 def _op(caption_page, key_page, **extra):
@@ -71,3 +80,70 @@ class TestComputeCoverageGaps(TestCase):
         self.assertEqual(compute_coverage_gaps([], 1, 10), [])
         self.assertEqual(compute_coverage_gaps([_op(0, 3)], None, 10), [])
         self.assertEqual(compute_coverage_gaps([_op(0, 3)], 1, None), [])
+
+
+class TestFindProcessingPdf(SimpleTestCase):
+    """Tests for ``find_processing_pdf``."""
+
+    def test_returns_bitonal_when_no_ocr_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bitonal = Path(tmp) / "bitonal.pdf"
+            bitonal.write_bytes(b"%PDF-1.4")
+            self.assertEqual(find_processing_pdf(tmp), bitonal)
+
+    def test_prefers_legacy_ocr_pdf_over_bitonal(self):
+        """Scans processed before the text layer was dropped keep it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "bitonal.pdf").write_bytes(b"%PDF-1.4")
+            ocr = Path(tmp) / "a3d.164.1.10.pdf"
+            ocr.write_bytes(b"%PDF-1.4")
+            self.assertEqual(find_ocr_pdf(tmp), ocr)
+            self.assertEqual(find_processing_pdf(tmp), ocr)
+
+    def test_ignores_originals_and_derived_pdfs(self):
+        """The multi-GB original and generated output are not candidates."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in (
+                "a3d.164.1.10.original.pdf",
+                "a3d.164.1.10.redacted.pdf",
+                "stamped.pdf",
+            ):
+                (Path(tmp) / name).write_bytes(b"%PDF-1.4")
+            self.assertIsNone(find_processing_pdf(tmp))
+
+    def test_returns_none_for_empty_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(find_processing_pdf(tmp))
+
+
+class TestProcessingPdfPath(SimpleTestCase):
+    """Tests for ``processing_pdf_path``."""
+
+    class _FakeScan:
+        """Stand-in exposing only what the resolver reads."""
+
+        def __init__(self, output_dir, pdf_path="/orig/scan.original.pdf"):
+            self.output_dir = output_dir
+            self.pdf_path = pdf_path
+
+    def test_prefers_processing_pdf_over_original(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bitonal = Path(tmp) / "bitonal.pdf"
+            bitonal.write_bytes(b"%PDF-1.4")
+            scan = self._FakeScan(tmp)
+            self.assertEqual(processing_pdf_path(scan), str(bitonal))
+
+    def test_falls_back_to_original(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scan = self._FakeScan(tmp)
+            self.assertEqual(
+                processing_pdf_path(scan), "/orig/scan.original.pdf"
+            )
+
+    def test_falls_back_to_original_without_output_dir(self):
+        scan = self._FakeScan("")
+        with patch("scanning.utils.find_processing_pdf") as find:
+            self.assertEqual(
+                processing_pdf_path(scan), "/orig/scan.original.pdf"
+            )
+        find.assert_not_called()
