@@ -30,16 +30,28 @@ dependencies = [
   "pillow",
   "psycopg[binary,pool]",
   # Base blackletter only: pairing, redaction (skip_doctr=True), margins,
-  # validation and OCR — no torch/paddle. The heavy in-process inference stack
-  # lives in the `local-ml` extra so the web/daemon images stay lean whenever
-  # detection is offloaded to RunPod (RUNPOD_ENABLED=True).
+  # validation and the ink geometry — no torch/paddle. The heavy in-process
+  # inference stack lives in the `local-ml` extra so the web/daemon images stay
+  # lean whenever detection is offloaded to RunPod (RUNPOD_ENABLED=True).
+  # This app needs the ink geometry (blackletter #68), which is unreleased: the
+  # version floor stays at the last release and [tool.uv.sources] pins the
+  # branch. Both are corrected together when 0.2.0 ships.
   "blackletter>=0.1.1",
+  # No longer called directly: the pipeline embeds no text layer. Declared
+  # so LLM_PAGE_TEXT_LAYER (blackletter's add_text_layer) has an engine, and
+  # because base blackletter requires it anyway.
   "ocrmypdf>=17",
+  # Used by ai.user_prompt to crop text off the generated LLM pages. Those
+  # crops only return anything when LLM_PAGE_TEXT_LAYER is on; the pipeline
+  # itself measures geometry from the page ink and needs no text.
   "pdfplumber>=0.11",
   "pymupdf>=1.25",
   "sentry-sdk[django]",
   "time-machine",
   "uvicorn[standard]",
+  # Load-bearing despite nothing here importing it: blackletter.analyze uses
+  # it as a per-crop digit fallback when PaddleOCR cannot read a page number,
+  # and blackletter does not declare it itself.
   "pytesseract>=0.3.13",
 ]
 
@@ -119,6 +131,10 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
+# TEMPORARY: the ink geometry this app depends on is unreleased. Drop this entry
+# and raise the version floor to 0.2.0 once blackletter has been tagged.
+# See https://github.com/freelawproject/blackletter/pull/69.
+blackletter = { git = "https://github.com/freelawproject/blackletter", branch = "68-make-the-tesseract-text-layer-pass-optional-and-usable-after-redaction" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 paddlepaddle = { index = "paddle-cpu" }
