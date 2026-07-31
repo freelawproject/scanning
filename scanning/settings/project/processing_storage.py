@@ -33,3 +33,13 @@ MAX_ORIGINAL_UPLOAD_SIZE = env.int("MAX_UPLOAD_SIZE_GB", default=3) * 1024**3
 # 9 hours. Sweeping sooner would delete the pending row and fileless scan
 # out from under a live upload.
 PENDING_UPLOAD_TTL_HOURS = env.float("PENDING_UPLOAD_TTL_HOURS", default=9.0)
+
+# Whether Generate Files adds a Tesseract text layer to the per-page PDFs in
+# ``llm/``. Off by default: the pipeline no longer embeds one anywhere (see
+# scanning #145), and the model that reads these pages reads the page image
+# itself. Turn it on to restore the text crops ``ai.user_prompt`` layers on
+# top of the roadmap (caption first lines, column-top continuations,
+# footnote snippets), at the cost of an OCR pass over every page of the
+# volume. It runs after redaction, so it never OCRs content that a rect is
+# about to cover.
+LLM_PAGE_TEXT_LAYER = env.bool("LLM_PAGE_TEXT_LAYER", default=False)
