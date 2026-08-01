@@ -1595,7 +1595,7 @@ class TestBuildCombinedRedactionsStaleRects(TestCase):
             with self.assertRaises(RuntimeError) as caught:
                 services._build_combined_redactions(scan.pk)
             self.assertIn(
-                "Recompute the redaction rects", str(caught.exception)
+                "Re-add a detection on that page", str(caught.exception)
             )
 
 

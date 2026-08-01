@@ -2526,3 +2526,70 @@ class TestLazyPullsFetchOneFile(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         one.assert_called_once_with(scan, "tp.8.redacted.pdf")
         everything.assert_not_called()
+
+
+class TestDeleteDetectionPrunesStaleRects(ScanningTestCase):
+    """Deleting a page's last detection must not strand its saved rects.
+
+    ``redaction_rects`` is a snapshot in image pixels, and the scale that
+    places it comes from that page's detections. Leaving rects behind for a
+    page that has none makes Generate Files fail on every retry, with no
+    reachable way for a reviewer to clear it.
+    """
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(reporter=ReporterFactory(short_name="tp"))
+        self.scan.redaction_rects = [
+            {"page_index": 0, "rects": [{"x0": 1, "y0": 2, "x1": 3, "y1": 4}]},
+            {"page_index": 1, "rects": [{"x0": 5, "y0": 6, "x1": 7, "y1": 8}]},
+        ]
+        self.scan.save(update_fields=["redaction_rects"])
+
+    def _detection(self, page_index):
+        return Detection.objects.create(
+            scan=self.scan,
+            page_index=page_index,
+            label="HEADNOTE",
+            label_id=3,
+            confidence=0.9,
+            x0=10,
+            y0=20,
+            x1=30,
+            y1=40,
+            img_width=1700,
+            img_height=2200,
+        )
+
+    def _delete(self, detection):
+        return self.client.post(
+            reverse("delete_detection", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"detection_id": detection.pk}),
+            content_type="application/json",
+        )
+
+    def test_the_last_detection_on_a_page_takes_its_rects_with_it(self):
+        only_one = self._detection(0)
+        self._detection(1)
+
+        response = self._delete(only_one)
+
+        self.assertEqual(response.status_code, 200)
+        self.scan.refresh_from_db()
+        self.assertEqual(
+            [e["page_index"] for e in self.scan.redaction_rects],
+            [1],
+            "page 0's rects should have gone with its last detection",
+        )
+
+    def test_rects_survive_while_the_page_still_has_a_detection(self):
+        one_of_two = self._detection(0)
+        self._detection(0)
+
+        self._delete(one_of_two)
+
+        self.scan.refresh_from_db()
+        self.assertEqual(
+            [e["page_index"] for e in self.scan.redaction_rects], [0, 1]
+        )

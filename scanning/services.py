@@ -1085,14 +1085,18 @@ def _build_combined_redactions(scan_pk: int) -> Path:
         )
     except KeyError as exc:
         # The rects are a saved snapshot and the pages come from the live
-        # detections, so deactivating the last detection on a page that still
-        # has rects leaves a page blackletter cannot scale. Refusing is right,
-        # since guessing the scale would put the rect in the wrong place, but
-        # say what to do about it.
+        # detections, so a page with rects but no detections left cannot be
+        # scaled. Deleting the last detection prunes that page's rects (see
+        # ``views_api._drop_orphaned_redaction_rects``), so reaching this
+        # means something else desynchronised them. Refusing is right --
+        # guessing the scale would put a blackout in the wrong place -- but
+        # name recovery a reviewer can actually carry out.
         raise RuntimeError(
             f"scan {scan_pk}: saved redaction rects reference a page with no "
             f"detections left, so their pixel coordinates cannot be converted "
-            f"to points. Recompute the redaction rects and try again. ({exc})"
+            f"to points. Re-add a detection on that page, or delete the "
+            f"leftover rect from the redaction overlay, then generate again. "
+            f"({exc})"
         ) from exc
 
     out_path = output_dir / "redactions.json"

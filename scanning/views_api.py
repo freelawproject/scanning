@@ -787,6 +787,11 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     if isinstance(data, JsonResponse):
         return data
     detection_id = data["detection_id"]
+    page_index = (
+        Detection.objects.filter(pk=detection_id, scan=scan)
+        .values_list("page_index", flat=True)
+        .first()
+    )
     count = Detection.objects.filter(pk=detection_id, scan=scan).update(
         active=False
     )
@@ -794,10 +799,48 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
+    _drop_orphaned_redaction_rects(scan, page_index)
     output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _sync_detections_to_disk(scan.pk)
     return JsonResponse({"status": "ok", "deleted": count})
+
+
+def _drop_orphaned_redaction_rects(scan: Scan, page_index: int | None) -> None:
+    """Forget a page's saved rects once its last detection is gone.
+
+    ``redaction_rects`` is a snapshot in image pixels, and the scale that
+    converts it to points comes from the page's own detections. Deleting the
+    last one on a page leaves rects that cannot be placed, which stops
+    Generate Files outright, and nothing in the review UI recomputes them.
+
+    Dropping them loses nothing: a page with no detections left has nothing
+    on it to redact, and the reviewer saying so is what deleting the last
+    detection means. Rects on every other page, including any the reviewer
+    adjusted by hand, are untouched.
+
+    :param scan: The scan whose rects to prune.
+    :param page_index: Page the deleted detection was on, if known.
+    """
+    if page_index is None or not scan.redaction_rects:
+        return
+    if Detection.objects.filter(
+        scan=scan, page_index=page_index, active=True
+    ).exists():
+        return
+    remaining = [
+        entry
+        for entry in scan.redaction_rects
+        if entry.get("page_index") != page_index
+    ]
+    if len(remaining) != len(scan.redaction_rects):
+        logger.info(
+            "Dropped saved redaction rects for scan %s page %s: "
+            "no active detections left on it",
+            scan.pk,
+            page_index,
+        )
+        Scan.objects.filter(pk=scan.pk).update(redaction_rects=remaining)
 
 
 @login_required
