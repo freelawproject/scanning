@@ -142,7 +142,7 @@ wheels = [
 [[package]]
 name = "blackletter"
 version = "0.1.1"
-source = { git = "https://github.com/freelawproject/blackletter?branch=68-make-the-tesseract-text-layer-pass-optional-and-usable-after-redaction#8ab02a2871deaa2321ad75ce8e30c52467959a4f" }
+source = { git = "https://github.com/freelawproject/blackletter?branch=68-make-the-tesseract-text-layer-pass-optional-and-usable-after-redaction#00daa3267c34222a39886061817306bb4de5feaf" }
 dependencies = [
     { name = "numpy" },
     { name = "ocrmypdf" },
