@@ -31,7 +31,11 @@ from scanning.models import (
     Stage,
     Status,
 )
-from scanning.utils import compute_coverage_gaps, find_ocr_pdf
+from scanning.utils import (
+    compute_coverage_gaps,
+    find_ocr_pdf,
+    local_original_pdf,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -576,27 +580,15 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
         page,
         dpi,
     )
-    try:
-        doc = fitz.open(scan.pdf_path)
-    except FileNotFoundError:
-        # Prod: the original lives only in S3 (direct-to-S3 upload, and the
-        # classic prod path streams straight to S3 too). The process view no
-        # longer eagerly lands it locally, and download_preview_pdf excludes
-        # the original, so pull just the original here and retry.
-        try:
-            from scanning import s3_sync
+    # Prod: the original lives only in S3 (direct-to-S3 upload, and the
+    # classic prod path streams straight to S3 too). The process view no
+    # longer eagerly lands it locally, and download_preview_pdf excludes
+    # the original, so this pulls just the original when it is missing.
+    original = local_original_pdf(scan)
+    if not original:
+        return HttpResponse(status=404)
 
-            s3_sync.download_original_pdf(scan)
-        except Exception:
-            logger.exception(
-                "Lazy S3 original pull failed for scan %s", scan.pk
-            )
-        try:
-            doc = fitz.open(scan.pdf_path)
-        except FileNotFoundError:
-            return HttpResponse(status=404)
-
-    with doc:
+    with fitz.open(original) as doc:
         if page < 0 or page >= doc.page_count:
             return HttpResponse(status=404)
         clip = fitz.Rect(x0, y0, x1, y1)

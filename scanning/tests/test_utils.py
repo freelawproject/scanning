@@ -1,8 +1,15 @@
 """Tests for scanning.utils helpers."""
 
-from django.test import TestCase
+import pathlib
+import tempfile
+from unittest.mock import patch
 
-from scanning.utils import compute_coverage_gaps
+from django.test import TestCase, override_settings
+
+from scanning.factories import ScanFactory
+from scanning.utils import compute_coverage_gaps, local_original_pdf
+
+MEDIA_ROOT = tempfile.mkdtemp()
 
 
 def _op(caption_page, key_page, **extra):
@@ -71,3 +78,61 @@ class TestComputeCoverageGaps(TestCase):
         self.assertEqual(compute_coverage_gaps([], 1, 10), [])
         self.assertEqual(compute_coverage_gaps([_op(0, 3)], None, 10), [])
         self.assertEqual(compute_coverage_gaps([_op(0, 3)], 1, None), [])
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestLocalOriginalPdf(TestCase):
+    """Resolving the original PDF falls back to a targeted S3 pull.
+
+    Production keeps the (multi-GB) original in S3 only, so request
+    handlers that need it must tolerate a pod that never downloaded it
+    rather than raising FileNotFoundError (SCANNING-1S).
+    """
+
+    def _make_scan(self):
+        """Create a scan whose original PDF is absent locally, as in prod."""
+        scan = ScanFactory()
+        pathlib.Path(scan.original_pdf.path).unlink()
+        return scan
+
+    def test_returns_path_when_present(self):
+        """With a local copy the path is returned without touching S3."""
+        scan = ScanFactory()
+        with patch("scanning.s3_sync.download_original_pdf") as download:
+            self.assertEqual(local_original_pdf(scan), scan.original_pdf.path)
+        download.assert_not_called()
+
+    def test_pulls_from_s3_when_missing(self):
+        """A missing original triggers a pull and the retried path wins."""
+        scan = self._make_scan()
+        landed = (
+            pathlib.Path(scan.output_dir)
+            / pathlib.Path(scan.original_pdf.name).name
+        )
+
+        def _land(_scan):
+            landed.parent.mkdir(parents=True, exist_ok=True)
+            landed.write_bytes(b"%PDF-1.4 pulled")
+
+        with patch(
+            "scanning.s3_sync.download_original_pdf", side_effect=_land
+        ) as download:
+            self.assertEqual(local_original_pdf(scan), str(landed))
+        download.assert_called_once_with(scan)
+
+    def test_returns_none_when_pull_finds_nothing(self):
+        """A pull that lands no file yields None, not an exception."""
+        scan = self._make_scan()
+        with patch(
+            "scanning.s3_sync.download_original_pdf", return_value=None
+        ):
+            self.assertIsNone(local_original_pdf(scan))
+
+    def test_returns_none_when_pull_raises(self):
+        """An S3 error is logged and reported as None, not propagated."""
+        scan = self._make_scan()
+        with patch(
+            "scanning.s3_sync.download_original_pdf",
+            side_effect=OSError("s3 down"),
+        ):
+            self.assertIsNone(local_original_pdf(scan))

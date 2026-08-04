@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import os
 from pathlib import Path
 
 from django.shortcuts import get_object_or_404
 
 from scanning.models import Scan, Volume
+
+logger = logging.getLogger(__name__)
 
 
 def get_volume(reporter_slug: str, vol: int) -> Volume:
@@ -87,6 +90,38 @@ def ensure_output_dir(scan: Scan) -> Path:
     output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def local_original_pdf(scan: Scan) -> str | None:
+    """Return a local path to the scan's original PDF, pulling it if needed.
+
+    In production the original lives only in S3: uploads stream straight
+    there, and the targeted syncs skip it because it can be 3 GB
+    (``download_preview_pdf`` fetches only the bitonal/OCR previews). A
+    request handler that genuinely needs the original therefore cannot
+    rely on ``Scan.pdf_path`` alone, which raises ``FileNotFoundError``
+    on a pod that never pulled the file. This resolves the path, falling
+    back to a one-off S3 pull of just the original.
+
+    :param scan: The scan whose original PDF is needed.
+    :returns: The local filesystem path, or ``None`` when no local copy
+        can be made available.
+    :rtype: str | None
+    """
+    try:
+        return scan.pdf_path
+    except FileNotFoundError:
+        pass
+    try:
+        from scanning import s3_sync
+
+        s3_sync.download_original_pdf(scan)
+    except Exception:
+        logger.exception("Lazy S3 original pull failed for scan %s", scan.pk)
+    try:
+        return scan.pdf_path
+    except FileNotFoundError:
+        return None
 
 
 def compute_coverage_gaps(
