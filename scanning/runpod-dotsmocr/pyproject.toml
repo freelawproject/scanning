@@ -1,0 +1,53 @@
+[project]
+name = "dotsmocr-gpu-worker"
+version = "0.0.1"
+description = "RunPod Serverless handler for dots.mocr document parsing (vLLM-backed)."
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    # Upstream client code (prompts, page rendering, bbox rescaling,
+    # markdown conversion, vLLM OpenAI-client wrapper). Pinned to a
+    # commit via [tool.uv.sources]; bump deliberately.
+    "dots-mocr",
+
+    # Direct deps of the dots_mocr modules the handler imports. The
+    # package's own requirements.txt is demo-oriented, so the runtime
+    # essentials are declared here explicitly.
+    "openai>=1.5",
+    "pillow>=10",
+    "pymupdf>=1.25",
+    "numpy",
+    "pydantic>=2",
+    "tqdm",
+    # svg_utils imports cairosvg at module scope and is pulled in by
+    # dots_mocr's package __init__, even though this worker never
+    # generates SVG. Needs libcairo2 from apt at runtime.
+    "cairosvg",
+
+    # RunPod plumbing
+    "requests>=2.33,<3",
+    "runpod>=1.9,<2",
+    "sentry-sdk>=2,<3",
+]
+
+# This project is an application (handler.py), not a library. Tell uv
+# not to try to build it as an installable package.
+[tool.uv]
+package = false
+# dots_mocr's requirements.txt drags in the HF-transformers inference
+# path (transformers, accelerate, qwen_vl_utils, huggingface_hub) and
+# demo-only tooling (gradio, modelscope). This worker only uses the
+# vLLM client path, where all of those are dead weight — worse, the
+# transformers pin would fight the vLLM base image. The impossible
+# marker (python_version < '0' is provably always false, so uv drops
+# the package from the lock entirely) removes each one.
+override-dependencies = [
+    "gradio; python_version < '0'",
+    "modelscope; python_version < '0'",
+    "transformers; python_version < '0'",
+    "accelerate; python_version < '0'",
+    "qwen-vl-utils; python_version < '0'",
+    "huggingface-hub; python_version < '0'",
+]
+
+[tool.uv.sources]
+dots-mocr = { git = "https://github.com/rednote-hilab/dots.mocr.git", rev = "23f3e5612fb8066d4034d5ecfc8f33a9243533eb" }

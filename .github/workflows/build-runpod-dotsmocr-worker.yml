@@ -1,0 +1,73 @@
+name: Build and Push RunPod dots.mocr Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scanning/runpod-dotsmocr/**'
+  workflow_dispatch:
+
+jobs:
+  build-runpod-dotsmocr-worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # The vLLM base image plus baked model weights extract to well
+      # over 25 GB; the stock runner doesn't have that much headroom.
+      # Dropping the preinstalled toolchains we never use frees ~25 GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Get short SHA
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          context: scanning/runpod-dotsmocr
+          push: true
+          tags: |
+            freelawproject/dotsmocr-gpu-worker:${{ steps.vars.outputs.sha_short }}
+            freelawproject/dotsmocr-gpu-worker:latest
+          cache-from: type=registry,ref=freelawproject/dotsmocr-gpu-worker:cache
+          cache-to: type=registry,ref=freelawproject/dotsmocr-gpu-worker:cache,mode=max
+
+      - name: Update RunPod template image
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_TEMPLATE_ID: ${{ secrets.RUNPOD_DOTSMOCR_TEMPLATE_ID }}
+          IMAGE: freelawproject/dotsmocr-gpu-worker:${{ steps.vars.outputs.sha_short }}
+        run: |
+          set -euo pipefail
+          # Sends only `imageName`. RunPod's partial PATCH preserves other
+          # fields, but if env vars are later added to the template,
+          # re-verify they survive or switch to read-modify-write.
+          payload=$(jq -nc --arg img "$IMAGE" '{imageName: $img}')
+          response=$(curl -sS -w "\n%{http_code}" -X PATCH \
+            -H "Authorization: Bearer $RUNPOD_API_KEY" \
+            -H "Content-Type: application/json" \
+            --data "$payload" \
+            "https://rest.runpod.io/v1/templates/$RUNPOD_TEMPLATE_ID")
+          body=$(printf '%s\n' "$response" | sed '$d')
+          status=$(printf '%s\n' "$response" | tail -n1)
+          echo "HTTP $status"
+          echo "$body"
+          if [ "$status" -ge 400 ]; then
+            echo "::error::RunPod template update failed (HTTP $status)"
+            exit 1
+          fi
