@@ -42,7 +42,6 @@ from blackletter.scanner import _pair_opinions
 from blackletter.validate import (
     _auto_correct,
     _build_issues,
-    _parse_expected_range,
     _split_in_out_of_range,
 )
 from django.conf import settings
@@ -1509,6 +1508,29 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _expected_range(scan: "Scan") -> tuple[int | None, int | None]:
+    """Return the expected first/last printed page numbers for a scan.
+
+    Uses the scanner-entered ``start_page``/``end_page`` fields, the same
+    source the validate stage uses, so a recheck sees the same range the
+    original run did. Deriving it from the uploaded filename instead is
+    both unreliable (the ``.original.pdf`` suffix defeats the
+    reporter.volume.first.last parser) and needs a local copy of the PDF,
+    which production does not keep around between requests.
+
+    Both values are returned together or not at all: every downstream
+    range check needs the pair.
+
+    :param scan: The Scan to read the range from.
+    :returns: ``(exp_start, exp_end)``, or ``(None, None)`` when the scan
+        has no end page recorded.
+    :rtype: tuple[int | None, int | None]
+    """
+    if not scan.end_page:
+        return None, None
+    return scan.start_page or 1, scan.end_page
+
+
 def _split_detected(
     ocr_results: list, exp_start: int | None, exp_end: int | None
 ) -> tuple[list, dict]:
@@ -1536,8 +1558,10 @@ def _split_detected(
             continue
         if num < 1:
             out_of_range.append(r)
-        elif exp_start is not None and (
-            num < exp_start - 5 or num > exp_end + 5
+        elif (
+            exp_start is not None
+            and exp_end is not None
+            and (num < exp_start - 5 or num > exp_end + 5)
         ):
             out_of_range.append(r)
         else:
@@ -1574,7 +1598,7 @@ def _build_analysis(
             for pg in range(int(m.group(1)), int(m.group(2)) + 1):
                 range_pages.add(pg)
 
-    if exp_start is not None and all_nums:
+    if exp_start is not None and exp_end is not None and all_nums:
         missing_pages = sorted(
             (set(range(exp_start, exp_end + 1)) - set(all_nums))
             - range_pages
@@ -1616,10 +1640,7 @@ def rebuild_page_map(scan: "Scan") -> None:
     ocr_results = scan.ocr_results
     if not ocr_results:
         return
-    try:
-        exp_start, exp_end = _parse_expected_range(scan.pdf_path)
-    except FileNotFoundError:
-        exp_start, exp_end = _parse_expected_range(scan.original_pdf.name)
+    exp_start, exp_end = _expected_range(scan)
     analysis = _build_analysis(ocr_results, exp_start, exp_end)
     result = _build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
@@ -1632,6 +1653,9 @@ def rebuild_page_map(scan: "Scan") -> None:
 def recalculate_issues(scan: "Scan") -> None:
     """Rebuild issues from scan.ocr_results without re-running OCR.
 
+    Runs off stored data only, so it works on a web pod that never
+    downloaded the scan's processing files from S3.
+
     :param scan: The Scan instance to recalculate issues for.
     """
 
@@ -1639,7 +1663,7 @@ def recalculate_issues(scan: "Scan") -> None:
     if not ocr_results:
         return
 
-    exp_start, exp_end = _parse_expected_range(scan.pdf_path)
+    exp_start, exp_end = _expected_range(scan)
 
     out_of_range, seen_nums = _split_detected(ocr_results, exp_start, exp_end)
 
@@ -1710,8 +1734,16 @@ def recalculate_issues(scan: "Scan") -> None:
             }
         )
 
-    with fitz.open(scan.pdf_path) as pdf_fitz:
-        scan.page_count = len(pdf_fitz)
+    # Refresh page_count opportunistically: the PDF has not changed since
+    # validation, and in production the local copy is usually absent
+    # because rechecks run on a web pod that never pulled it from S3.
+    try:
+        pdf_path = scan.pdf_path
+    except FileNotFoundError:
+        pdf_path = None
+    if pdf_path:
+        with fitz.open(pdf_path) as pdf_fitz:
+            scan.page_count = len(pdf_fitz)
 
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]

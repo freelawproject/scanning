@@ -1154,3 +1154,152 @@ class TestImmediateS3PushOnGeneration(TestCase):
             )
 
         push.assert_called_once_with(scan.pk, "rep.1.1.2.pdf")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestRecalculateIssues(TestCase):
+    """Recheck rebuilds issues from stored data.
+
+    It must not need a local copy of the PDF (production web pods never
+    download one, SCANNING-1S), and the expected page range comes from
+    the scan's start_page/end_page, the same source the validate stage
+    uses, rather than from the uploaded filename.
+    """
+
+    def _make_scan(self, **kwargs):
+        """Create a scan whose original PDF is absent locally, as in prod."""
+        scan = ScanFactory(status=Status.PENDING_REVIEW, **kwargs)
+        pathlib.Path(scan.original_pdf.path).unlink()
+        return scan
+
+    def test_no_local_pdf(self):
+        """Rechecking a scan with no local PDF rebuilds issues instead of
+        raising FileNotFoundError."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=3,
+            page_count=3,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": None, "type": None},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+            ],
+        )
+        with self.assertRaises(FileNotFoundError):
+            scan.pdf_path
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PENDING_REVIEW)
+        self.assertEqual(scan.page_count, 3)
+        self.assertEqual(
+            [e["pdf_index"] for e in scan.page_map if "pdf_index" in e],
+            [0, 1, 2],
+        )
+        self.assertTrue(
+            scan.issues.filter(check_name="no_page_number").exists()
+        )
+
+    def test_missing_pages_use_scan_page_range(self):
+        """Pages the volume should contain but OCR never saw are reported,
+        even when they fall past the last detected number."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=5,
+            page_count=3,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [4, 5])
+
+    def test_out_of_range_reading_flagged(self):
+        """A number far outside the volume's range is flagged as a stray
+        reading rather than accepted as a real page number."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=5,
+            page_count=1,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "999", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertTrue(
+            scan.issues.filter(check_name="suspicious_reading").exists()
+        )
+
+    def test_no_end_page_falls_back_to_detected_numbers(self):
+        """Without an end_page there is no expected range, so missing
+        pages are derived from the detected numbers alone."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=None,
+            number_of_pages=None,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "4", "type": "single"},
+                {"pdf_page": 2, "detected": "6", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [5])
+
+    def test_page_count_refreshed_when_pdf_available(self):
+        """When the PDF is on disk, page_count is re-read from it."""
+        from scanning import services
+
+        _require_fixture(self)
+        scan = _make_scan_with_output(
+            status=Status.PENDING_REVIEW,
+            ocr_results=[{"pdf_page": 1, "detected": "1", "type": "single"}],
+        )
+        scan.page_count = 99
+        scan.save(update_fields=["page_count"])
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.page_count, 1)
+
+    def test_rebuild_page_map_without_local_pdf(self):
+        """rebuild_page_map (manual page edits) also runs off stored data
+        and applies the scan's page range."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=4,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+            ],
+        )
+
+        services.rebuild_page_map(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [3, 4])
+        self.assertFalse(scan.issues.exists())

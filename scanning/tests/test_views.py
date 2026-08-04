@@ -2201,6 +2201,53 @@ class TestPendingChangesGuard(ScanningTestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestRecalculateView(ScanningTestCase):
+    """Recheck works on a web pod that never pulled the scan's files from
+    S3, so clicking it in step 1 does not 500 (SCANNING-1S)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user,
+            status=Status.PENDING_REVIEW,
+            start_page=1,
+            end_page=2,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+            ],
+        )
+        # Production keeps the PDF in S3 only; the request thread has no
+        # local copy.
+        pathlib.Path(self.scan.original_pdf.path).unlink()
+
+    def test_recheck_without_local_pdf(self):
+        """The Recheck POST redirects back to the viewer and rebuilds the
+        page_map from stored OCR results."""
+        response = self.client.post(
+            reverse("recalculate", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.page_count, 2)
+        self.assertTrue(self.scan.page_map)
+
+    def test_recheck_without_ocr_results_is_a_noop(self):
+        """With nothing to recompute the view redirects without touching
+        the scan."""
+        self.scan.ocr_results = []
+        self.scan.save(update_fields=["ocr_results"])
+        response = self.client.post(
+            reverse("recalculate", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.page_map, [])
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestProcessActionsFragment(ScanningTestCase):
     """The process_actions endpoint renders the step action bar so the
     viewer can refresh it in place after a deletion/undo."""
