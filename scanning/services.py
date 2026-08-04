@@ -1911,8 +1911,13 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
     out_of_range, seen_nums = _split_in_out_of_range(
         all_results, exp_start, exp_end
     )
+    # Hand-entered numbers outrank the offset heuristic, and blackletter's
+    # _auto_correct does not know about them, so withhold them here. This
+    # keeps a rebuild from clobbering what a recheck preserves.
     all_results, corrections = _auto_correct(
-        all_results, out_of_range, seen_nums
+        all_results,
+        [r for r in out_of_range if not _is_manual_read(r)],
+        seen_nums,
     )
     if corrections:
         out_of_range, seen_nums = _split_in_out_of_range(

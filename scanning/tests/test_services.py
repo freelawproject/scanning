@@ -1157,6 +1157,48 @@ class TestImmediateS3PushOnGeneration(TestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestRebuildIssuesFromResults(TestCase):
+    """The daemon rebuild behind 'Rebuild & Validate' auto-corrects stray
+    OCR readings but leaves hand-entered page numbers alone, matching
+    Recheck. run_reprocess never re-OCRs existing pages, so a manual entry
+    reaches this path with its ``manual`` markers intact.
+    """
+
+    def _results(self, last, **extra):
+        """Three good pages plus a fourth reading, optionally manual."""
+        return [
+            {"pdf_page": 1, "detected": "1", "type": "single"},
+            {"pdf_page": 2, "detected": "2", "type": "single"},
+            {"pdf_page": 3, "detected": "3", "type": "single"},
+            {"pdf_page": 4, "detected": last, "type": "single", **extra},
+        ]
+
+    def test_auto_corrects_stray_ocr_reading(self):
+        """An out-of-range OCR reading is interpolated from its neighbours."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=4, page_count=4)
+        results = self._results("999")
+
+        services._rebuild_issues_from_results(scan.pk, results)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "4")
+
+    def test_manual_page_number_preserved(self):
+        """A curator's typed number survives the rebuild untouched."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=4, page_count=4)
+        results = self._results("999", zone="manual", ocr="manual")
+
+        services._rebuild_issues_from_results(scan.pk, results)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "999")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestRecalculateIssues(TestCase):
     """Recheck rebuilds issues from stored data.
 
