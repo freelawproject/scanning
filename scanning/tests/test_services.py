@@ -1283,6 +1283,103 @@ class TestRecalculateIssues(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.page_count, 1)
 
+    def test_auto_corrects_stray_ocr_reading(self):
+        """A stray OCR reading that sits at a consistent offset from its
+        neighbours is corrected to the number the sequence implies."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=4,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+                {"pdf_page": 4, "detected": "999", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "4")
+        self.assertTrue(
+            scan.issues.filter(check_name="auto_corrected").exists()
+        )
+
+    def test_manual_page_number_not_auto_corrected(self):
+        """A page number a curator typed is left alone even when it falls
+        outside the volume's range: it is flagged, not overwritten."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=4,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+                {
+                    "pdf_page": 4,
+                    "detected": "999",
+                    "type": "single",
+                    "zone": "manual",
+                    "ocr": "manual",
+                },
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "999")
+        self.assertFalse(
+            scan.issues.filter(check_name="auto_corrected").exists()
+        )
+        self.assertTrue(
+            scan.issues.filter(check_name="suspicious_reading").exists()
+        )
+
+    def test_keeps_suppressed_detection_issues(self):
+        """Recheck rebuilds page-number issues but leaves detection
+        suppressions, which are curator decisions, in place."""
+        from scanning import services
+        from scanning.models import CheckName, Issue
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=2,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": None, "type": None},
+            ],
+        )
+        Issue.objects.create(
+            scan=scan,
+            check_name=CheckName.SUPPRESS_DETECTION,
+            severity="info",
+            message="detection 42 suppressed",
+        )
+        stale = Issue.objects.create(
+            scan=scan,
+            check_name=CheckName.NO_PAGE_NUMBER,
+            page_number=1,
+            severity="info",
+            message="stale",
+        )
+
+        services.recalculate_issues(scan)
+
+        self.assertTrue(
+            scan.issues.filter(
+                check_name=CheckName.SUPPRESS_DETECTION
+            ).exists()
+        )
+        self.assertFalse(Issue.objects.filter(pk=stale.pk).exists())
+
     def test_rebuild_page_map_without_local_pdf(self):
         """rebuild_page_map (manual page edits) also runs off stored data
         and applies the scan's page range."""

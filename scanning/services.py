@@ -1531,6 +1531,19 @@ def _expected_range(scan: "Scan") -> tuple[int | None, int | None]:
     return scan.start_page or 1, scan.end_page
 
 
+def _is_manual_read(result: dict) -> bool:
+    """Return whether a per-page page number was entered by hand.
+
+    ``assign_page`` stamps ``zone`` and ``ocr`` with ``"manual"`` when a
+    curator types a page number in step 1.
+
+    :param result: One per-page entry from ``Scan.ocr_results``.
+    :returns: ``True`` when the number came from a person, not a model.
+    :rtype: bool
+    """
+    return "manual" in (result.get("ocr"), result.get("zone"))
+
+
 def _split_detected(
     ocr_results: list, exp_start: int | None, exp_end: int | None
 ) -> tuple[list, dict]:
@@ -1675,6 +1688,11 @@ def recalculate_issues(scan: "Scan") -> None:
         in_range_sorted = sorted(in_range_by_page.items())
         offsets = {}
         for r in out_of_range:
+            if _is_manual_read(r):
+                # A curator typed this number, so it outranks the
+                # offset heuristic. It is still reported as an
+                # out-of-range reading below, just not overwritten.
+                continue
             p, detected = r["pdf_page"], int(r["detected"])
             before = [(pp, n) for pp, n in in_range_sorted if pp < p]
             after = [(pp, n) for pp, n in in_range_sorted if pp > p]
@@ -1753,7 +1771,10 @@ def recalculate_issues(scan: "Scan") -> None:
     scan.progress_message = "Done"
     scan.save()
 
-    scan.issues.all().delete()
+    # Suppression flags are curator decisions stored as Issue rows, not
+    # derived from the page numbers, so a recheck keeps them (same
+    # exclusion the daemon rebuild uses).
+    scan.issues.exclude(check_name=CheckName.SUPPRESS_DETECTION).delete()
     Issue.objects.bulk_create(
         [Issue(scan=scan, **i) for i in result["issues"]]
     )
