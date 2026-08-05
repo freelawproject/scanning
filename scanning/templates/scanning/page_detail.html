@@ -4,16 +4,16 @@
 
 {% block content %}
 <div class="mb-4 text-sm text-gray-500 dark:text-gray-400">
-  <a href="{% url 'scan_list' %}" class="hover:text-primary-600">Scans</a>
+  <a href="{% url 'scan_list' %}" class="hover:text-primary-600 dark:hover:text-primary-400">Scans</a>
   <span class="mx-1 text-gray-300 dark:text-gray-600">/</span>
-  <a href="{% url 'scan_pages_list' pk=scan.pk %}" class="hover:text-primary-600">{{ scan.reporter.short_name }} vol. {{ scan.volume }} pages</a>
+  <a href="{% url 'scan_pages_list' pk=scan.pk %}" class="hover:text-primary-600 dark:hover:text-primary-400">{{ scan.reporter.short_name }} vol. {{ scan.volume }} pages</a>
   <span class="mx-1 text-gray-300 dark:text-gray-600">/</span>
   <span>Page {{ page.page_index|add:1 }}</span>
 </div>
 
 <div class="flex items-center justify-between mb-4">
   <div>
-    <h1 class="text-xl font-bold">Page {{ page.page_index|add:1 }}{% if page.book_page %} <span class="text-gray-500 dark:text-gray-400 text-base font-normal">(book page {{ page.book_page }})</span>{% endif %}{% if page.is_blank %} <span class="text-gray-400 text-base font-normal">— blank</span>{% endif %}</h1>
+    <h1 class="text-xl font-bold">Page {{ page.page_index|add:1 }}{% if page.book_page %} <span class="text-gray-500 dark:text-gray-400 text-base font-normal">(book page {{ page.book_page }})</span>{% endif %}{% if page.is_blank %} <span class="text-gray-500 dark:text-gray-400 text-base font-normal">— blank</span>{% endif %}</h1>
     <p class="text-sm text-gray-500 dark:text-gray-400">
       Status: {{ page.get_status_display }}
       {% if page.extracted_by %} · Extracted by: {{ page.get_extracted_by_display }}{% endif %}
@@ -40,7 +40,7 @@
   <div class="space-y-4">
     <div class="card">
       <h2 class="font-semibold text-sm mb-2">User prompt
-        {% if page.user_prompt_id %}<a href="{% url 'admin:ai_prompt_change' page.user_prompt_id %}" class="text-xs text-gray-400 hover:text-primary-600">edit in admin</a>{% endif %}
+        {% if page.user_prompt_id %}<a href="{% url 'admin:ai_prompt_change' page.user_prompt_id %}" class="text-xs text-gray-500 dark:text-gray-400 hover:text-primary-600 dark:hover:text-primary-400">edit in admin</a>{% endif %}
       </h2>
       {% if page.user_prompt %}
         <pre class="text-xs whitespace-pre-wrap bg-gray-50 dark:bg-gray-900 p-3 rounded max-h-96 overflow-auto">{{ page.user_prompt.text }}</pre>
@@ -59,11 +59,11 @@
     <div class="card text-xs">
       <h2 class="font-semibold text-sm mb-2">Metadata</h2>
       <dl class="grid grid-cols-2 gap-y-1">
-        <dt class="text-gray-500">PDF path</dt><dd>{{ page.pdf_path|default:"—" }}</dd>
-        <dt class="text-gray-500">Page index (0-based)</dt><dd>{{ page.page_index }}</dd>
-        <dt class="text-gray-500">Book page</dt><dd>{{ page.book_page|default:"—" }}</dd>
-        <dt class="text-gray-500">Opinion starts/ends</dt><dd>{{ page.expected_opinion_starts }} / {{ page.expected_opinion_ends }}</dd>
-        <dt class="text-gray-500">Blank</dt><dd>{{ page.is_blank|yesno:"yes,no" }}</dd>
+        <dt class="text-gray-500 dark:text-gray-400">PDF path</dt><dd>{{ page.pdf_path|default:"—" }}</dd>
+        <dt class="text-gray-500 dark:text-gray-400">Page index (0-based)</dt><dd>{{ page.page_index }}</dd>
+        <dt class="text-gray-500 dark:text-gray-400">Book page</dt><dd>{{ page.book_page|default:"—" }}</dd>
+        <dt class="text-gray-500 dark:text-gray-400">Opinion starts/ends</dt><dd>{{ page.expected_opinion_starts }} / {{ page.expected_opinion_ends }}</dd>
+        <dt class="text-gray-500 dark:text-gray-400">Blank</dt><dd>{{ page.is_blank|yesno:"yes,no" }}</dd>
       </dl>
     </div>
   </div>

@@ -50,7 +50,6 @@ from blackletter.validate import (
     _split_in_out_of_range,
     build_analysis,
     build_issues,
-    parse_expected_range,
 )
 from django.conf import settings
 from django.db.models import Case, F, Value, When
@@ -1282,6 +1281,42 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _expected_range(scan: "Scan") -> tuple[int | None, int | None]:
+    """Return the expected first/last printed page numbers for a scan.
+
+    Uses the scanner-entered ``start_page``/``end_page`` fields, the same
+    source the validate stage uses, so a recheck sees the same range the
+    original run did. Deriving it from the uploaded filename instead is
+    both unreliable (the ``.original.pdf`` suffix defeats the
+    reporter.volume.first.last parser) and needs a local copy of the PDF,
+    which production does not keep around between requests.
+
+    Both values are returned together or not at all: every downstream
+    range check needs the pair.
+
+    :param scan: The Scan to read the range from.
+    :returns: ``(exp_start, exp_end)``, or ``(None, None)`` when the scan
+        has no end page recorded.
+    :rtype: tuple[int | None, int | None]
+    """
+    if not scan.end_page:
+        return None, None
+    return scan.start_page or 1, scan.end_page
+
+
+def _is_manual_read(result: dict) -> bool:
+    """Return whether a per-page page number was entered by hand.
+
+    ``assign_page`` stamps ``zone`` and ``ocr`` with ``"manual"`` when a
+    curator types a page number in step 1.
+
+    :param result: One per-page entry from ``Scan.ocr_results``.
+    :returns: ``True`` when the number came from a person, not a model.
+    :rtype: bool
+    """
+    return "manual" in (result.get("ocr"), result.get("zone"))
+
+
 def rebuild_page_map(scan: "Scan") -> None:
     """Rebuild ``page_map`` and ``missing_pages`` from current ocr_results.
 
@@ -1296,10 +1331,7 @@ def rebuild_page_map(scan: "Scan") -> None:
     ocr_results = scan.ocr_results
     if not ocr_results:
         return
-    try:
-        exp_start, exp_end = parse_expected_range(scan.pdf_path)
-    except FileNotFoundError:
-        exp_start, exp_end = parse_expected_range(scan.original_pdf.name)
+    exp_start, exp_end = _expected_range(scan)
     analysis = build_analysis(ocr_results, exp_start, exp_end)
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
@@ -1312,6 +1344,9 @@ def rebuild_page_map(scan: "Scan") -> None:
 def recalculate_issues(scan: "Scan") -> None:
     """Rebuild issues from scan.ocr_results without re-running OCR.
 
+    Runs off stored data only, so it works on a web pod that never
+    downloaded the scan's processing files from S3.
+
     :param scan: The Scan instance to recalculate issues for.
     """
 
@@ -1319,7 +1354,7 @@ def recalculate_issues(scan: "Scan") -> None:
     if not ocr_results:
         return
 
-    exp_start, exp_end = parse_expected_range(scan.pdf_path)
+    exp_start, exp_end = _expected_range(scan)
 
     out_of_range, seen_nums = _split_in_out_of_range(
         ocr_results, exp_start, exp_end
@@ -1333,6 +1368,11 @@ def recalculate_issues(scan: "Scan") -> None:
         in_range_sorted = sorted(in_range_by_page.items())
         offsets = {}
         for r in out_of_range:
+            if _is_manual_read(r):
+                # A curator typed this number, so it outranks the
+                # offset heuristic. It is still reported as an
+                # out-of-range reading below, just not overwritten.
+                continue
             p, detected = r["pdf_page"], int(r["detected"])
             before = [(pp, n) for pp, n in in_range_sorted if pp < p]
             after = [(pp, n) for pp, n in in_range_sorted if pp > p]
@@ -1392,8 +1432,16 @@ def recalculate_issues(scan: "Scan") -> None:
             }
         )
 
-    with fitz.open(scan.pdf_path) as pdf_fitz:
-        scan.page_count = len(pdf_fitz)
+    # Refresh page_count opportunistically: the PDF has not changed since
+    # validation, and in production the local copy is usually absent
+    # because rechecks run on a web pod that never pulled it from S3.
+    try:
+        pdf_path = scan.pdf_path
+    except FileNotFoundError:
+        pdf_path = None
+    if pdf_path:
+        with fitz.open(pdf_path) as pdf_fitz:
+            scan.page_count = len(pdf_fitz)
 
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
@@ -1403,7 +1451,10 @@ def recalculate_issues(scan: "Scan") -> None:
     scan.progress_message = "Done"
     scan.save()
 
-    scan.issues.all().delete()
+    # Suppression flags are curator decisions stored as Issue rows, not
+    # derived from the page numbers, so a recheck keeps them (same
+    # exclusion the daemon rebuild uses).
+    scan.issues.exclude(check_name=CheckName.SUPPRESS_DETECTION).delete()
     Issue.objects.bulk_create(
         [Issue(scan=scan, **i) for i in result["issues"]]
     )
@@ -1545,8 +1596,13 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
     out_of_range, seen_nums = _split_in_out_of_range(
         all_results, exp_start, exp_end
     )
+    # Hand-entered numbers outrank the offset heuristic, and blackletter's
+    # _auto_correct does not know about them, so withhold them here. This
+    # keeps a rebuild from clobbering what a recheck preserves.
     all_results, corrections = _auto_correct(
-        all_results, out_of_range, seen_nums
+        all_results,
+        [r for r in out_of_range if not _is_manual_read(r)],
+        seen_nums,
     )
     if corrections:
         out_of_range, seen_nums = _split_in_out_of_range(
