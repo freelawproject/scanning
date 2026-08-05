@@ -2201,6 +2201,115 @@ class TestPendingChangesGuard(ScanningTestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestViewsWithoutLocalOriginal(ScanningTestCase):
+    """Endpoints that need the original PDF degrade gracefully when it is
+    S3-only and cannot be pulled, instead of raising FileNotFoundError
+    from Scan.pdf_path (SCANNING-1S). The crop endpoint's own lazy pull
+    is covered by TestServeOriginalCrop."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user,
+            status=Status.PENDING_REVIEW,
+            page_count=1,
+            opinions_json=[{"dummy": True}],
+        )
+        pathlib.Path(self.scan.original_pdf.path).unlink()
+        # An output dir with no bitonal/OCR PDF in it: the API views get
+        # past their "no output directory" guard and fall through to the
+        # original.
+        pathlib.Path(self.scan.output_dir).mkdir(parents=True, exist_ok=True)
+        patcher = patch(
+            "scanning.s3_sync.download_original_pdf", return_value=None
+        )
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_export_pdf_returns_404(self):
+        """Export gives a 404 rather than a 500."""
+        response = self.client.get(
+            reverse("export_pdf", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_compute_redactions_returns_json_error(self):
+        """Redaction computation reports a JSON error, not a traceback."""
+        response = self.client.post(
+            reverse("compute_redactions_api", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"], "No PDF available")
+
+    def test_pair_opinions_returns_json_error(self):
+        """Opinion pairing reports a JSON error, not a traceback."""
+        Detection.objects.create(
+            scan=self.scan,
+            page_index=0,
+            label="CAPTION",
+            label_id=1,
+            confidence=0.9,
+            x0=0,
+            y0=0,
+            x1=1,
+            y1=1,
+        )
+        response = self.client.post(
+            reverse("pair_opinions_api", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"], "No PDF available")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestRecalculateView(ScanningTestCase):
+    """Recheck works on a web pod that never pulled the scan's files from
+    S3, so clicking it in step 1 does not 500 (SCANNING-1S)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user,
+            status=Status.PENDING_REVIEW,
+            start_page=1,
+            end_page=2,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+            ],
+        )
+        # Production keeps the PDF in S3 only; the request thread has no
+        # local copy.
+        pathlib.Path(self.scan.original_pdf.path).unlink()
+
+    def test_recheck_without_local_pdf(self):
+        """The Recheck POST redirects back to the viewer and rebuilds the
+        page_map from stored OCR results."""
+        response = self.client.post(
+            reverse("recalculate", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.page_count, 2)
+        self.assertTrue(self.scan.page_map)
+
+    def test_recheck_without_ocr_results_is_a_noop(self):
+        """With nothing to recompute the view redirects without touching
+        the scan."""
+        self.scan.ocr_results = []
+        self.scan.save(update_fields=["ocr_results"])
+        response = self.client.post(
+            reverse("recalculate", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.page_map, [])
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestProcessActionsFragment(ScanningTestCase):
     """The process_actions endpoint renders the step action bar so the
     viewer can refresh it in place after a deletion/undo."""

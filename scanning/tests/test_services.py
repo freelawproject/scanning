@@ -1154,3 +1154,291 @@ class TestImmediateS3PushOnGeneration(TestCase):
             )
 
         push.assert_called_once_with(scan.pk, "rep.1.1.2.pdf")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestRebuildIssuesFromResults(TestCase):
+    """The daemon rebuild behind 'Rebuild & Validate' auto-corrects stray
+    OCR readings but leaves hand-entered page numbers alone, matching
+    Recheck. run_reprocess never re-OCRs existing pages, so a manual entry
+    reaches this path with its ``manual`` markers intact.
+    """
+
+    def _results(self, last, **extra):
+        """Three good pages plus a fourth reading, optionally manual."""
+        return [
+            {"pdf_page": 1, "detected": "1", "type": "single"},
+            {"pdf_page": 2, "detected": "2", "type": "single"},
+            {"pdf_page": 3, "detected": "3", "type": "single"},
+            {"pdf_page": 4, "detected": last, "type": "single", **extra},
+        ]
+
+    def test_auto_corrects_stray_ocr_reading(self):
+        """An out-of-range OCR reading is interpolated from its neighbours."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=4, page_count=4)
+        results = self._results("999")
+
+        services._rebuild_issues_from_results(scan.pk, results)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "4")
+
+    def test_manual_page_number_preserved(self):
+        """A curator's typed number survives the rebuild untouched."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=4, page_count=4)
+        results = self._results("999", zone="manual", ocr="manual")
+
+        services._rebuild_issues_from_results(scan.pk, results)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "999")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestRecalculateIssues(TestCase):
+    """Recheck rebuilds issues from stored data.
+
+    It must not need a local copy of the PDF (production web pods never
+    download one, SCANNING-1S), and the expected page range comes from
+    the scan's start_page/end_page, the same source the validate stage
+    uses, rather than from the uploaded filename.
+    """
+
+    def _make_scan(self, **kwargs):
+        """Create a scan whose original PDF is absent locally, as in prod."""
+        scan = ScanFactory(status=Status.PENDING_REVIEW, **kwargs)
+        pathlib.Path(scan.original_pdf.path).unlink()
+        return scan
+
+    def test_no_local_pdf(self):
+        """Rechecking a scan with no local PDF rebuilds issues instead of
+        raising FileNotFoundError."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=3,
+            page_count=3,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": None, "type": None},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+            ],
+        )
+        with self.assertRaises(FileNotFoundError):
+            scan.pdf_path
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PENDING_REVIEW)
+        self.assertEqual(scan.page_count, 3)
+        self.assertEqual(
+            [e["pdf_index"] for e in scan.page_map if "pdf_index" in e],
+            [0, 1, 2],
+        )
+        self.assertTrue(
+            scan.issues.filter(check_name="no_page_number").exists()
+        )
+
+    def test_missing_pages_use_scan_page_range(self):
+        """Pages the volume should contain but OCR never saw are reported,
+        even when they fall past the last detected number."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=5,
+            page_count=3,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [4, 5])
+
+    def test_out_of_range_reading_flagged(self):
+        """A number far outside the volume's range is flagged as a stray
+        reading rather than accepted as a real page number."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=5,
+            page_count=1,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "999", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertTrue(
+            scan.issues.filter(check_name="suspicious_reading").exists()
+        )
+
+    def test_no_end_page_falls_back_to_detected_numbers(self):
+        """Without an end_page there is no expected range, so missing
+        pages are derived from the detected numbers alone."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=None,
+            number_of_pages=None,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "4", "type": "single"},
+                {"pdf_page": 2, "detected": "6", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [5])
+
+    def test_page_count_refreshed_when_pdf_available(self):
+        """When the PDF is on disk, page_count is re-read from it."""
+        from scanning import services
+
+        _require_fixture(self)
+        scan = _make_scan_with_output(
+            status=Status.PENDING_REVIEW,
+            ocr_results=[{"pdf_page": 1, "detected": "1", "type": "single"}],
+        )
+        scan.page_count = 99
+        scan.save(update_fields=["page_count"])
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.page_count, 1)
+
+    def test_auto_corrects_stray_ocr_reading(self):
+        """A stray OCR reading that sits at a consistent offset from its
+        neighbours is corrected to the number the sequence implies."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=4,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+                {"pdf_page": 4, "detected": "999", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "4")
+        self.assertTrue(
+            scan.issues.filter(check_name="auto_corrected").exists()
+        )
+
+    def test_manual_page_number_not_auto_corrected(self):
+        """A page number a curator typed is left alone even when it falls
+        outside the volume's range: it is flagged, not overwritten."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=4,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+                {
+                    "pdf_page": 4,
+                    "detected": "999",
+                    "type": "single",
+                    "zone": "manual",
+                    "ocr": "manual",
+                },
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "999")
+        self.assertFalse(
+            scan.issues.filter(check_name="auto_corrected").exists()
+        )
+        self.assertTrue(
+            scan.issues.filter(check_name="suspicious_reading").exists()
+        )
+
+    def test_keeps_suppressed_detection_issues(self):
+        """Recheck rebuilds page-number issues but leaves detection
+        suppressions, which are curator decisions, in place."""
+        from scanning import services
+        from scanning.models import CheckName, Issue
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=2,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": None, "type": None},
+            ],
+        )
+        Issue.objects.create(
+            scan=scan,
+            check_name=CheckName.SUPPRESS_DETECTION,
+            severity="info",
+            message="detection 42 suppressed",
+        )
+        stale = Issue.objects.create(
+            scan=scan,
+            check_name=CheckName.NO_PAGE_NUMBER,
+            page_number=1,
+            severity="info",
+            message="stale",
+        )
+
+        services.recalculate_issues(scan)
+
+        self.assertTrue(
+            scan.issues.filter(
+                check_name=CheckName.SUPPRESS_DETECTION
+            ).exists()
+        )
+        self.assertFalse(Issue.objects.filter(pk=stale.pk).exists())
+
+    def test_rebuild_page_map_without_local_pdf(self):
+        """rebuild_page_map (manual page edits) also runs off stored data
+        and applies the scan's page range."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=4,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+            ],
+        )
+
+        services.rebuild_page_map(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [3, 4])
+        self.assertFalse(scan.issues.exists())

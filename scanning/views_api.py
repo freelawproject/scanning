@@ -42,6 +42,7 @@ from scanning.utils import (
     compute_coverage_gaps,
     find_json_file,
     find_ocr_pdf,
+    local_original_pdf,
 )
 
 logger = logging.getLogger(__name__)
@@ -302,7 +303,9 @@ def pair_opinions_api(request: HttpRequest, pk: int) -> JsonResponse:
     if not det_data:
         return JsonResponse({"error": "No detections found"}, status=400)
     bitonal = output_dir / "bitonal.pdf"
-    pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
+    pdf_path = str(bitonal) if bitonal.exists() else local_original_pdf(scan)
+    if not pdf_path:
+        return JsonResponse({"error": "No PDF available"}, status=500)
     try:
         from blackletter.api import pair as bl_pair
 
@@ -350,7 +353,9 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
     if not scan.opinions_json:
         return JsonResponse({"error": "No opinions paired yet"}, status=400)
     output_dir = scan.output_dir
-    pdf_path = find_ocr_pdf(output_dir) or scan.pdf_path
+    pdf_path = find_ocr_pdf(output_dir) or local_original_pdf(scan)
+    if not pdf_path:
+        return JsonResponse({"error": "No PDF available"}, status=500)
     try:
         rects = _compute_and_save_redaction_rects(pk, pdf_path)
         _compute_and_save_margin_rects(pk, pdf_path, output_dir)
@@ -949,19 +954,27 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
 
 
 @login_required
-def export_pdf(request: HttpRequest, pk: int) -> StreamingHttpResponse:
+def export_pdf(
+    request: HttpRequest, pk: int
+) -> StreamingHttpResponse | HttpResponse:
     """Export a corrected PDF with deletions and inserts applied.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: PDF file download response.
+    :return: PDF file download response, or a 404 when the original PDF
+        cannot be made available locally.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    # Resolve the source PDF before the temp file exists, so a missing
+    # original is a clean 404 rather than a leaked temp file.
+    original = local_original_pdf(scan)
+    if not original:
+        return HttpResponse(status=404)
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp.close()
     tmp_path = tmp.name
     try:
-        with fitz.open(scan.pdf_path) as pdf_doc:
+        with fitz.open(original) as pdf_doc:
             page_map = scan.page_map
             deleted_pages = set(d.pdf_page for d in scan.deletions.all())
             for pdf_page in sorted(deleted_pages, reverse=True):
