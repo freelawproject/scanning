@@ -972,11 +972,13 @@ def _pages_for_geometry(
     :param pdf_path: The PDF the detections were measured against.
     :param output_dir: The scan's output directory, for the JSON fallback.
     :param snap: Correct the ``TEXT_COLUMN`` boxes against the page ink.
-        The pipeline already persisted corrected boxes, and the correction
-        converges, so this changes nothing unless a box reached the DB
-        uncorrected, which a hand-added column detection does. It is not
-        free: it renders every page at 100 dpi, so pass ``False`` where the
-        column boxes are not read (see :func:`_build_combined_redactions`).
+        Boxes reach the DB uncorrected: nothing on the upload path snaps
+        them (that would be a full-volume render review 1 does not need),
+        and a hand-added column detection is stored exactly as drawn. The
+        correction converges, so this is a no-op once ``run_generate_files``
+        has persisted it, but it is not free before then: it renders every
+        page at 100 dpi, so pass ``False`` where the column boxes are not
+        read (see :func:`_build_combined_redactions`).
     :return: ``Page`` objects, empty when the scan has no detections yet.
     """
     det_data = _detections_for_geometry(scan.pk, output_dir)
@@ -1502,7 +1504,7 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
 
 
 def run_full_pipeline(scan_pk: int) -> None:
-    """Run the full processing pipeline: bitonal → YOLO → validate → pair → rects.
+    """Run the full processing pipeline: bitonal → YOLO → validate → pair.
 
     Designed to run in the daemon process. After this completes, the scan
     is ready for review -- the user only needs to approve and generate.
@@ -1512,6 +1514,14 @@ def run_full_pipeline(scan_pk: int) -> None:
     pipeline's wall clock, while nothing in steps 1 and 2 reads the text
     it produced; ``bitonal.pdf`` is now the processing PDF end to end
     (see ``utils.find_processing_pdf``).
+
+    No redaction geometry is computed here either, for the same reason.
+    The column correction and the redaction rects cost three full-volume
+    renders at 100 dpi between them, and review 1 reads neither: it asks
+    whether the volume is complete and shows no detection overlay. Both
+    now run in :func:`run_generate_files`, where the geometry is actually
+    read, so a scanner waits for detection and pairing only. The step 2
+    overlay still gets rects on demand through ``compute_redactions_api``.
 
     :param scan_pk: Primary key of the scan to process.
     """
@@ -1537,7 +1547,6 @@ def run_full_pipeline(scan_pk: int) -> None:
         # 4. Import detections into DB
         _update_progress(scan_pk, "Importing detections...")
         dets = _import_detections_from_json(scan_pk, str(output_dir))
-        _snap_text_columns_to_ink(scan_pk, str(bitonal_path))
 
         # 5. PaddleOCR validation (on original PDF for better OCR)
         _update_progress(
@@ -1550,9 +1559,8 @@ def run_full_pipeline(scan_pk: int) -> None:
         _update_progress(scan_pk, "Pairing opinions...")
         opinions = _re_pair_opinions(scan_pk)
 
-        # 7. Compute redaction rects (margin rects computed lazily when viewer requests them)
-        _update_progress(scan_pk, "Computing redaction rects...")
-        _compute_and_save_redaction_rects(scan_pk, str(bitonal_path))
+        # Redaction and margin geometry is deliberately not computed here;
+        # Generate Files does it. See this function's docstring.
 
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.PENDING_REVIEW,
@@ -2004,6 +2012,15 @@ def run_generate_files(scan_pk: int) -> None:
         # Stamp original-quality images into a copy, leaves base PDF untouched
         gen_pdf = _stamp_original_images(scan, str(base_pdf))
 
+        # Correct the TEXT_COLUMN boxes against the page ink before anything
+        # reads them. The upload path used to do this so that step 2 showed
+        # corrected boxes, but review 1 has no detection overlay to show them
+        # in, so it was a full-volume render nobody was waiting on. Here it
+        # runs before the detections are written out, which is what the
+        # geometry below and the pairing are measured from.
+        _update_progress(scan_pk, "Correcting column boxes...")
+        _snap_text_columns_to_ink(scan_pk, str(base_pdf))
+
         # Write current DB detections -> detections.json (includes page numbers)
         det_data = _sync_detections_to_disk(scan_pk)
         Scan.objects.filter(pk=scan_pk).update(
@@ -2018,6 +2035,17 @@ def run_generate_files(scan_pk: int) -> None:
         # them here makes the output independent of what the reviewer
         # happened to look at; it no-ops when they already exist.
         _compute_and_save_margin_rects(scan_pk, str(base_pdf), str(output))
+
+        # Redaction rects, same story: off the upload path, computed here
+        # unless something already produced them. That "something" is either
+        # the step 2 overlay asking for them or a reprocess, and in the step 2
+        # case a reviewer may since have moved or deleted individual rects
+        # through ``save_redaction_rect``. Recomputing would discard those
+        # edits, so the stored set wins whenever there is one.
+        scan.refresh_from_db()
+        if not scan.redaction_rects:
+            _update_progress(scan_pk, "Computing redaction rects...")
+            _compute_and_save_redaction_rects(scan_pk, str(base_pdf))
 
         # Build combined redactions.json (margins + redaction rects + opinions)
         Scan.objects.filter(pk=scan_pk).update(

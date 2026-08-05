@@ -1380,6 +1380,118 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
             "margin rects are all empty",
         )
 
+    def test_computes_redaction_rects_when_absent(self):
+        """Generate is self-sufficient now that the upload path skips rects.
+
+        ``run_full_pipeline`` no longer computes them, and the step 2
+        overlay only asks for them if a reviewer opens it, so Generate
+        cannot assume they exist.
+        """
+        from scanning import services
+
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        output = pathlib.Path(scan.output_dir)
+        _write_bitonal_copy(output / "bitonal.pdf")
+        self.assertFalse(scan.redaction_rects)
+
+        with (
+            patch("django.db.connections.close_all"),
+            patch("blackletter.api.generate") as generate,
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(
+                services, "_snap_text_columns_to_ink", return_value=0
+            ) as snap,
+            patch.object(
+                services, "_compute_and_save_redaction_rects", return_value=[]
+            ) as rects,
+        ):
+            generate.return_value = {
+                "opinion_count": 0,
+                "full_redacted": "",
+                "redacted_dir": str(output / "redacted"),
+            }
+            services.run_generate_files(scan.pk)
+
+        rects.assert_called_once()
+        self.assertEqual(rects.call_args.args[1], str(output / "bitonal.pdf"))
+        # The columns are corrected first: the rects and the margin strips
+        # are both measured against them.
+        snap.assert_called_once()
+        self.assertEqual(snap.call_args.args[1], str(output / "bitonal.pdf"))
+
+    def test_keeps_redaction_rects_a_reviewer_edited(self):
+        """Stored rects win, because a reviewer may have moved them.
+
+        ``save_redaction_rect`` writes straight into ``redaction_rects``,
+        so recomputing here would throw away every drag, delete and
+        hand-added box from step 3.
+        """
+        from scanning import services
+
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        output = pathlib.Path(scan.output_dir)
+        _write_bitonal_copy(output / "bitonal.pdf")
+        edited = [
+            {
+                "page_index": 0,
+                "rects": [
+                    {
+                        "x0": 10,
+                        "y0": 20,
+                        "x1": 30,
+                        "y1": 40,
+                        "fill": "black",
+                        "type": "headnote",
+                    }
+                ],
+            }
+        ]
+        scan.redaction_rects = edited
+        scan.save(update_fields=["redaction_rects"])
+        # The rects are stored in image pixels, so the page they name has to
+        # still have a detection to scale them by.
+        Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="TEXT_COLUMN",
+            label_id=16,
+            confidence=0.95,
+            x0=100,
+            y0=200,
+            x1=1600,
+            y1=2000,
+            img_width=1700,
+            img_height=2200,
+        )
+
+        with (
+            patch("django.db.connections.close_all"),
+            patch("blackletter.api.generate") as generate,
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(
+                services, "_snap_text_columns_to_ink", return_value=0
+            ),
+            patch.object(
+                services, "_compute_and_save_redaction_rects"
+            ) as rects,
+        ):
+            generate.return_value = {
+                "opinion_count": 0,
+                "full_redacted": "",
+                "redacted_dir": str(output / "redacted"),
+            }
+            services.run_generate_files(scan.pk)
+
+        rects.assert_not_called()
+        scan.refresh_from_db()
+        self.assertEqual(scan.redaction_rects, edited)
+
     def test_raises_without_any_processing_pdf(self):
         """An empty output dir is still an error, just a clearer one."""
         from scanning import services
@@ -1884,12 +1996,14 @@ class TestPagesForGeometry(TestCase):
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestPipelineCorrectsColumnsAfterDetecting(TestCase):
-    """Every path that imports detections must correct the column boxes.
+    """``run_detect`` corrects the column boxes it just imported.
 
-    The correction is persisted once, right after import, and everything
-    downstream reads the corrected rows. A path that imports without it
-    leaves boxes a few points inside the printed text, and the first or last
-    character of every masked line survives in the deliverable.
+    Re-detect is an explicit request for new geometry, and the reviewer is
+    watching one scan rather than waiting on an upload, so it persists the
+    correction rather than deferring it the way ``run_full_pipeline`` does.
+    Boxes left uncorrected sit a few points inside the printed text, and the
+    first or last character of every masked line survives in the
+    deliverable.
     """
 
     def setUp(self):
@@ -1922,6 +2036,58 @@ class TestPipelineCorrectsColumnsAfterDetecting(TestCase):
             self.assertEqual(
                 snap.call_args.args[1], str(output / "bitonal.pdf")
             )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestUploadPathSkipsRedactionGeometry(TestCase):
+    """The upload path stops at "is this volume complete?".
+
+    Review 1 asks nothing about redaction: no detection overlay, no rects.
+    Measuring either here cost three full-volume renders at 100 dpi that a
+    scanner sat through before the scan even reached PENDING_REVIEW, which
+    is most of what dropping the Tesseract pass was meant to give back.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+
+    def test_run_full_pipeline_defers_both(self):
+        from scanning import services
+
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        output = pathlib.Path(scan.output_dir)
+        bitonal = output / "bitonal.pdf"
+        _write_bitonal_copy(bitonal)
+
+        with (
+            patch("django.db.connections.close_all"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(services, "_ensure_bitonal", return_value=bitonal),
+            patch.object(services, "_run_yolo"),
+            patch.object(
+                services, "_import_detections_from_json", return_value=[]
+            ),
+            patch.object(services, "run_paddleocr_validation"),
+            patch.object(services, "_re_pair_opinions", return_value=[]),
+            patch.object(services, "_snap_text_columns_to_ink") as snap,
+            patch.object(
+                services, "_compute_and_save_redaction_rects"
+            ) as rects,
+            patch.object(
+                services, "_compute_and_save_margin_rects"
+            ) as margins,
+        ):
+            services.run_full_pipeline(scan.pk)
+
+        snap.assert_not_called()
+        rects.assert_not_called()
+        margins.assert_not_called()
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PENDING_REVIEW)
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
