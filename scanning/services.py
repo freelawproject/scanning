@@ -546,7 +546,11 @@ def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
             ]
             if not snap_text_columns_to_ink(fitz_page, page):
                 continue
-            for det, snapped in zip(columns, page.detections):
+            # strict: the snap rewrites boxes in place and must hand back
+            # one per column. A length change would mean it reordered or
+            # dropped one, and pairing the survivors by position would
+            # silently write a column's new bounds onto its neighbour.
+            for det, snapped in zip(columns, page.detections, strict=True):
                 new_x0 = round(snapped.bbox.x1, 1)
                 new_x1 = round(snapped.bbox.x2, 1)
                 if abs(new_x0 - det.x0) < 1 and abs(new_x1 - det.x1) < 1:
@@ -1047,7 +1051,7 @@ def _add_llm_page_text_layer(scan_pk: int, llm_dir: Path) -> int:
 
     _update_progress(scan_pk, "Adding a text layer to the LLM pages...")
     added = add_text_layer(llm_dir)
-    print(f"  Text layer added to {len(added)} LLM pages", flush=True)
+    logger.info("Text layer added to %s LLM pages", len(added))
     return len(added)
 
 
