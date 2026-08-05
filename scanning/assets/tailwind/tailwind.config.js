@@ -46,6 +46,9 @@ module.exports = {
 
       /* JS files that could contain Tailwind CSS classes */
       '../static-global/js/**/*.js',
+
+      /* App JS that builds markup at runtime (the process page viewer) */
+      '../../static/**/*.js',
     ],
   },
   theme: {

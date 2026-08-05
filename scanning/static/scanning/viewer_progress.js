@@ -84,7 +84,7 @@
                 (r.pdf_page - 1) +
                 "\" onclick=\"goToPage(this)\">";
             html +=
-                '<span><span class="font-medium text-gray-500">' +
+                '<span><span class="font-medium text-gray-500 dark:text-gray-400">' +
                 r.pdf_page +
                 "</span>";
             if (r.detected) {

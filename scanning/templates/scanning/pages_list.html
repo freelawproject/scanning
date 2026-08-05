@@ -4,9 +4,9 @@
 
 {% block content %}
 <div class="mb-4">
-  <a href="{% url 'scan_list' %}" class="text-sm text-gray-500 dark:text-gray-400 hover:text-primary-600">&laquo; Back to scans</a>
+  <a href="{% url 'scan_list' %}" class="text-sm text-gray-500 dark:text-gray-400 hover:text-primary-600 dark:hover:text-primary-400">&laquo; Back to scans</a>
   <span class="text-gray-300 dark:text-gray-600 mx-1">·</span>
-  <a href="{% url 'scan_process' pk=scan.pk %}?step=3" class="text-sm text-gray-500 dark:text-gray-400 hover:text-primary-600">Process viewer</a>
+  <a href="{% url 'scan_process' pk=scan.pk %}?step=3" class="text-sm text-gray-500 dark:text-gray-400 hover:text-primary-600 dark:hover:text-primary-400">Process viewer</a>
 </div>
 
 <h1 class="text-xl font-bold mb-1">{{ scan.reporter }} vol. {{ scan.volume }} · pages</h1>
@@ -57,15 +57,15 @@
       {% for p in pages %}
       <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50">
         <td class="px-3 py-2">
-          <a href="{% url 'page_detail' pk=p.pk %}" class="text-primary-600 hover:underline">{{ p.page_index|add:1 }}</a>
+          <a href="{% url 'page_detail' pk=p.pk %}" class="text-primary-600 dark:text-primary-400 hover:underline">{{ p.page_index|add:1 }}</a>
         </td>
-        <td class="px-3 py-2">{{ p.book_page|default:"—" }}{% if p.is_blank %} <span class="text-gray-400">(blank)</span>{% endif %}</td>
+        <td class="px-3 py-2">{{ p.book_page|default:"—" }}{% if p.is_blank %} <span class="text-gray-500 dark:text-gray-400">(blank)</span>{% endif %}</td>
         <td class="px-3 py-2">{{ p.get_status_display }}</td>
         <td class="px-3 py-2">{{ p.get_extracted_by_display|default:"—" }}</td>
         <td class="px-3 py-2">{% if p.needs_review %}<span class="text-amber-600 font-medium">review</span>{% else %}—{% endif %}</td>
         <td class="px-3 py-2">{% if p.xml_content %}✓{% else %}—{% endif %}</td>
-        <td class="px-3 py-2">{% if p.user_prompt_id %}<a href="{% url 'admin:ai_prompt_change' p.user_prompt_id %}" class="text-primary-600 hover:underline">#{{ p.user_prompt_id }}</a>{% else %}—{% endif %}</td>
-        <td class="px-3 py-2 text-gray-500">{{ p.expected_opinion_starts }} / {{ p.expected_opinion_ends }}</td>
+        <td class="px-3 py-2">{% if p.user_prompt_id %}<a href="{% url 'admin:ai_prompt_change' p.user_prompt_id %}" class="text-primary-600 dark:text-primary-400 hover:underline">#{{ p.user_prompt_id }}</a>{% else %}—{% endif %}</td>
+        <td class="px-3 py-2 text-gray-500 dark:text-gray-400">{{ p.expected_opinion_starts }} / {{ p.expected_opinion_ends }}</td>
         <td class="px-3 py-2 text-right">
           {% if p.pdf_path %}
             <a href="{% url 'serve_page_pdf' pk=p.pk %}" target="_blank" rel="noopener" class="btn-outline text-xs px-2 py-1">PDF</a>
@@ -78,7 +78,7 @@
 </div>
 {% else %}
 <div class="card text-center text-gray-500 dark:text-gray-400">
-  No pages yet. Run <a href="{% url 'scan_process' pk=scan.pk %}?step=3" class="text-primary-600 hover:underline">Generate Files</a> to populate them.
+  No pages yet. Run <a href="{% url 'scan_process' pk=scan.pk %}?step=3" class="text-primary-600 dark:text-primary-400 hover:underline">Generate Files</a> to populate them.
 </div>
 {% endif %}
 {% endblock %}
