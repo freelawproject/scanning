@@ -141,14 +141,18 @@ wheels = [
 
 [[package]]
 name = "blackletter"
-version = "0.1.1"
-source = { git = "https://github.com/freelawproject/blackletter?branch=68-make-the-tesseract-text-layer-pass-optional-and-usable-after-redaction#00daa3267c34222a39886061817306bb4de5feaf" }
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "ocrmypdf" },
     { name = "opencv-python" },
     { name = "pillow" },
     { name = "pymupdf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/8a/a744ed3dbe5b00716a91f9b8b9933b125d7aa0b54710ebf4428621bcbf5e/blackletter-0.2.0.tar.gz", hash = "sha256:85a0d08edda53567f92b39bb1d2bc8378ed5a979882cb1a44a7fb1a0b01c01be", size = 170941, upload-time = "2026-08-05T01:36:06.898Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/19/61/db2868191379fadb08cea86cc8a6f3b2b897a045cb35a00b27147ad63ed9/blackletter-0.2.0-py3-none-any.whl", hash = "sha256:e909a0f2b96807de7287470874e75dbf1500ae7a7081196c3938c52d1b4f90b5", size = 130766, upload-time = "2026-08-05T01:36:05.595Z" },
 ]
 
 [package.optional-dependencies]
@@ -2355,8 +2359,8 @@ local-ml = [
 
 [package.metadata]
 requires-dist = [
-    { name = "blackletter", git = "https://github.com/freelawproject/blackletter?branch=68-make-the-tesseract-text-layer-pass-optional-and-usable-after-redaction" },
-    { name = "blackletter", extras = ["detect", "analyze"], marker = "extra == 'local-ml'", git = "https://github.com/freelawproject/blackletter?branch=68-make-the-tesseract-text-layer-pass-optional-and-usable-after-redaction" },
+    { name = "blackletter", specifier = ">=0.2.0" },
+    { name = "blackletter", extras = ["detect", "analyze"], marker = "extra == 'local-ml'", specifier = ">=0.2.0" },
     { name = "boto3" },
     { name = "daphne" },
     { name = "django", specifier = ">=6.0,<6.1" },

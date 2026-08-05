@@ -33,10 +33,9 @@ dependencies = [
   # validation and the ink geometry — no torch/paddle. The heavy in-process
   # inference stack lives in the `local-ml` extra so the web/daemon images stay
   # lean whenever detection is offloaded to RunPod (RUNPOD_ENABLED=True).
-  # This app needs the ink geometry (blackletter #68), which is unreleased: the
-  # version floor stays at the last release and [tool.uv.sources] pins the
-  # branch. Both are corrected together when 0.2.0 ships.
-  "blackletter>=0.1.1",
+  # 0.2.0 is the floor: it is the release that carries the ink geometry
+  # (blackletter #68/#69) this app reads instead of measuring it here.
+  "blackletter>=0.2.0",
   # No longer called directly: the pipeline embeds no text layer. Declared
   # so LLM_PAGE_TEXT_LAYER (blackletter's add_text_layer) has an engine, and
   # because base blackletter requires it anyway.
@@ -70,7 +69,7 @@ dev = [
 # wherever detection runs locally instead of on RunPod: local dev, CI, the
 # offline daemon, and the RunPod worker image. Excluded from the lean web image.
 local-ml = [
-  "blackletter[detect,analyze]>=0.1.1",
+  "blackletter[detect,analyze]>=0.2.0",
   "torch",
   "torchvision",
   "ultralytics>=8.3",
@@ -131,10 +130,6 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
-# TEMPORARY: the ink geometry this app depends on is unreleased. Drop this entry
-# and raise the version floor to 0.2.0 once blackletter has been tagged.
-# See https://github.com/freelawproject/blackletter/pull/69.
-blackletter = { git = "https://github.com/freelawproject/blackletter", branch = "68-make-the-tesseract-text-layer-pass-optional-and-usable-after-redaction" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 paddlepaddle = { index = "paddle-cpu" }
