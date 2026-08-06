@@ -7,8 +7,19 @@ Dispatches on ``job["input"]["action"]`` to run one of:
 - ``analyze``: PaddleOCR + YOLO page-number analysis. Returns the
   per-page results list.
 
-Returns JSON inline in the RunPod HTTP response. Does not write to
-S3, does not need AWS credentials.
+Result delivery has two modes, picked per job by the daemon:
+
+- **S3** (``result_url`` present in the input): the payload is written
+  to S3 with a single PUT against a presigned URL, and the response
+  carries only the key, size, digest and timings. This is the path
+  that lifts the ~20 MB inline response cap and outlives RunPod's
+  result-retention window.
+- **Inline** (``result_url`` absent): the payload comes back in the
+  job response exactly as it always has. Keeps dev / CI and older
+  daemons working.
+
+Either way the worker needs no AWS credentials: a presigned PUT is a
+capability handed in with the job, scoped to one key and one method.
 
 Models are preloaded at module import time so cold start pays the
 load cost once; subsequent warm invocations reuse in-process caches.
@@ -16,7 +27,9 @@ load cost once; subsequent warm invocations reuse in-process caches.
 
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import logging
 import os
 import random
@@ -85,11 +98,38 @@ DOWNLOAD_BACKOFF_CAP = int(
     os.environ.get("HANDLER_DOWNLOAD_BACKOFF_CAP", "30")
 )
 
+# Result-upload budget. The GPU work is already paid for by the time we
+# PUT, so a network blip must not cost a re-run: retry generously.
+RESULT_UPLOAD_MAX_ATTEMPTS = int(
+    os.environ.get("HANDLER_RESULT_UPLOAD_MAX_ATTEMPTS", "5")
+)
+RESULT_UPLOAD_TIMEOUT = int(
+    os.environ.get("HANDLER_RESULT_UPLOAD_TIMEOUT", "300")
+)
+RESULT_UPLOAD_CONNECT_TIMEOUT = int(
+    os.environ.get("HANDLER_RESULT_UPLOAD_CONNECT_TIMEOUT", "10")
+)
+RESULT_UPLOAD_BACKOFF_CAP = int(
+    os.environ.get("HANDLER_RESULT_UPLOAD_BACKOFF_CAP", "30")
+)
+
+# Version of the JSON envelope written to S3. Bump when the envelope's
+# shape changes incompatibly; the daemon refuses versions it doesn't
+# know rather than consuming a payload it may misread.
+RESULT_SCHEMA_VERSION = 1
+
+# Content type sent on the result PUT. The daemon signs this exact
+# value into the presigned URL (``_presign_result_put``), so the two
+# must stay in lockstep: S3 answers SignatureDoesNotMatch if the header
+# it verifies differs from the one that was signed.
+RESULT_CONTENT_TYPE = "application/json"
+
 # Stream errors that mean "the connection died mid-transfer" — safe to
-# reconnect and resume from the last byte written. Anything else (a 4xx
-# other than the handled 403/416, a 5xx, a malformed URL) is not in here
-# and propagates so the daemon can re-queue or fail the scan.
-_TRANSIENT_DOWNLOAD_ERRORS = (
+# reconnect (resuming from the last byte written on a download, or
+# re-PUTting the whole object on an upload). Anything else (a 4xx other
+# than the handled 403/416, a 5xx, a malformed URL) is not in here and
+# propagates so the daemon can re-queue or fail the scan.
+_TRANSIENT_TRANSFER_ERRORS = (
     requests.exceptions.ChunkedEncodingError,
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
@@ -394,7 +434,7 @@ def _download_pdf(url: str, dest: Path) -> None:
                             offset += len(chunk)
             # Stream drained without raising: this attempt finished.
             break
-        except _TRANSIENT_DOWNLOAD_ERRORS as exc:
+        except _TRANSIENT_TRANSFER_ERRORS as exc:
             # Re-derive the offset from disk: a partial write may have
             # landed bytes the in-memory counter didn't account for.
             offset = dest.stat().st_size if dest.exists() else 0
@@ -507,6 +547,206 @@ def _validate_pdf(pdf_path: Path) -> int:
     if page_count < 1:
         raise ValueError(f"downloaded PDF has no pages: {pdf_path}")
     return page_count
+
+
+# ── Result delivery ─────────────────────────────────────────────────
+class ResultUploadError(RuntimeError):
+    """The result object could not be written to S3.
+
+    Surfaces to the daemon as ``error_code=RESULT_UPLOAD_FAILED``,
+    which it classifies as transient: the job is resubmitted with a
+    fresh presigned URL. The GPU run is lost, which is why
+    :func:`_put_result` retries hard before raising this.
+    """
+
+    error_code = "RESULT_UPLOAD_FAILED"
+
+
+class ResultUploadRejectedError(ResultUploadError):
+    """S3 refused the write for a reason a re-run can't fix.
+
+    Anything that isn't a 403 or a retryable 5xx/429: a wrong region in
+    the signature, a bucket policy that demands a header we don't send,
+    a malformed request. Surfaces as ``RESULT_UPLOAD_REJECTED``, which
+    the daemon treats as **terminal**. That distinction is worth its
+    keep -- these are configuration errors, and classifying them
+    transient means the scan re-runs the GPU work (and pays for it)
+    once per retry before failing with the same message anyway.
+    """
+
+    error_code = "RESULT_UPLOAD_REJECTED"
+
+
+class ResultUrlExpiredError(ResultUploadError):
+    """The presigned PUT URL is no longer valid (HTTP 403).
+
+    Distinct from a generic upload failure because retrying the *same*
+    URL can never succeed: the signature is dead. Mirrors how
+    :func:`_download_pdf` treats a 403 on the input URL. Still
+    transient daemon-side, since resubmitting mints a new signature.
+    """
+
+    error_code = "RESULT_URL_EXPIRED"
+
+
+def _put_result(url: str, body: bytes) -> None:
+    """Upload ``body`` to a presigned PUT URL, retrying transient errors.
+
+    One PUT, one object: no multipart. A single PUT is atomic in S3, so
+    the object only becomes gettable once every byte has landed. That is
+    what lets the daemon treat "the object exists" as "the result is
+    complete" when it recovers a job whose ``/status`` record is gone.
+
+    Only accepts ``http(s)`` URLs, for the same defensive reason
+    :func:`_download_pdf` does.
+
+    :param url: Presigned S3 PUT URL covering exactly one key.
+    :param body: Encoded JSON envelope.
+    :raises ResultUrlExpiredError: On HTTP 403 (dead signature).
+    :raises ResultUploadError: On any other non-2xx, or once the
+        retries are exhausted.
+    """
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        raise ResultUploadError(
+            f"refusing to upload result to non-http(s) URL: {url!r}"
+        )
+
+    timeout = (RESULT_UPLOAD_CONNECT_TIMEOUT, RESULT_UPLOAD_TIMEOUT)
+    last_error = ""
+
+    for attempt in range(RESULT_UPLOAD_MAX_ATTEMPTS):
+        try:
+            r = requests.put(
+                url,
+                data=body,
+                headers={"Content-Type": RESULT_CONTENT_TYPE},
+                timeout=timeout,
+            )
+            # Expired or otherwise invalid signature. Retrying the same
+            # URL is pointless; fail fast so the daemon re-signs.
+            #
+            # A bucket policy that rejects the PUT (a required
+            # encryption header, say) also answers 403, and no amount
+            # of re-signing fixes that -- it just burns the daemon's
+            # transient retries, one paid GPU run each. S3's reason is
+            # in the body, so log it rather than assuming expiry.
+            if r.status_code == 403:
+                raise ResultUrlExpiredError(
+                    "presigned PUT rejected with HTTP 403 (expired "
+                    "signature, or the bucket refused the write): "
+                    f"{r.text[:300]}"
+                )
+            if r.status_code < 300:
+                return
+            # 5xx / 429 are S3 hiccups worth another attempt; anything
+            # else is a configuration error that fails identically on
+            # every retry, so stop and say so terminally.
+            if r.status_code != 429 and r.status_code < 500:
+                raise ResultUploadRejectedError(
+                    f"result upload rejected with HTTP {r.status_code}: "
+                    f"{r.text[:300]}"
+                )
+            last_error = f"HTTP {r.status_code}"
+        except _TRANSIENT_TRANSFER_ERRORS as exc:
+            last_error = str(exc)
+
+        if attempt == RESULT_UPLOAD_MAX_ATTEMPTS - 1:
+            break
+        backoff = min(2**attempt, RESULT_UPLOAD_BACKOFF_CAP)
+        backoff += random.uniform(0, backoff / 2)  # jitter
+        logger.warning(
+            "result upload attempt %d/%d failed (%s); retrying in %.1fs",
+            attempt + 1,
+            RESULT_UPLOAD_MAX_ATTEMPTS,
+            last_error,
+            backoff,
+        )
+        time.sleep(backoff)
+
+    raise ResultUploadError(
+        f"result upload failed after {RESULT_UPLOAD_MAX_ATTEMPTS} "
+        f"attempts: {last_error}"
+    )
+
+
+def _result_envelope(
+    result: dict, action: str, scan_pk: Any, job_id: Any
+) -> dict:
+    """Wrap an action's result in the self-describing S3 envelope.
+
+    The envelope exists so a consumer can tell *what* it just read
+    without trusting the key it read it from: schema version, which
+    action produced it, and which scan and job it belongs to. The
+    daemon checks all of that before using the payload.
+
+    :param result: The action's return dict.
+    :param action: Handler action that produced it.
+    :param scan_pk: Scan the job belongs to.
+    :param job_id: RunPod job id, i.e. which run generated this object.
+    :returns: The envelope to serialise.
+    :rtype: dict
+    """
+    return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "action": action,
+        "scan_pk": scan_pk,
+        "job_id": job_id,
+        "payload": result,
+    }
+
+
+def _deliver_result(
+    result: dict, inputs: dict, action: str, job: dict
+) -> dict:
+    """PUT the result to S3 and return the slim job response.
+
+    Nothing is written to the worker's disk: the envelope is
+    serialised in memory and streamed straight to S3.
+
+    The response deliberately carries no copy of the payload. An
+    inline fallback would reinstate the size cap this exists to escape
+    and leave two sources of truth for one result. What's left is what
+    the daemon needs to find the object and log how the run went.
+
+    :param result: The action's return dict.
+    :param inputs: Handler input payload (``result_url`` /
+        ``result_key``).
+    :param action: Handler action that produced ``result``.
+    :param job: RunPod job dict, for the job id.
+    :returns: ``{"status": "succeed", "action", "result_key", "bytes",
+        "sha256", "upload_ms", ...timings}``.
+    :rtype: dict
+    :raises ResultUploadError: If the upload fails (see
+        :func:`_put_result`).
+    """
+    envelope = _result_envelope(
+        result, action, inputs.get("scan_pk"), job.get("id")
+    )
+    body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+
+    t0 = time.monotonic()
+    _put_result(inputs["result_url"], body)
+    upload_ms = int((time.monotonic() - t0) * 1000)
+
+    result_key = inputs.get("result_key")
+    logger.info(
+        "result uploaded: %d bytes in %d ms (action=%s key=%s)",
+        len(body),
+        upload_ms,
+        action,
+        result_key,
+    )
+    return {
+        "status": "succeed",
+        "action": action,
+        "result_key": result_key,
+        "bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "upload_ms": upload_ms,
+        "duration_ms": result.get("duration_ms"),
+        "model_durations_ms": result.get("model_durations_ms"),
+        "page_count": result.get("page_count"),
+    }
 
 
 # ── Actions ─────────────────────────────────────────────────────────
@@ -693,7 +933,10 @@ def handler(job: dict) -> dict:
 
     :param job: RunPod job dict. ``job["input"]`` must carry an
         ``action`` ("detect" | "analyze") and action-specific args.
-        An optional ``scan_pk`` is used to tag Sentry events.
+        An optional ``scan_pk`` is used to tag Sentry events. When
+        ``result_url`` (presigned PUT) and ``result_key`` are present
+        the payload goes to S3 and the response carries only the key,
+        size, digest and timings; otherwise it comes back inline.
     :returns: Action-specific result dict. Every successful return
         (and every structured error) also carries ``worker_boot_ms``
         (cold-start cost of this worker process, constant per
@@ -754,7 +997,27 @@ def handler(job: dict) -> dict:
     tmp_dir = Path(tempfile.mkdtemp(prefix="runpod-"))
     try:
         result = fn(inputs, tmp_dir)
-        return _with_worker_meta(result)
+        if not inputs.get("result_url"):
+            # No presigned PUT in the input: answer inline, as always.
+            return _with_worker_meta(result)
+        return _with_worker_meta(_deliver_result(result, inputs, action, job))
+    except ResultUploadError as exc:
+        # The compute succeeded and the delivery didn't, so this is
+        # worth a Sentry event: the job will be re-run and re-billed.
+        # Returned as a structured error rather than raised so the
+        # daemon can read ``error_code`` and classify it as transient.
+        if sentry_sdk is not None:
+            sentry_sdk.capture_exception(exc)
+        logger.error(
+            "result delivery failed: action=%s scan_pk=%s key=%s: %s",
+            action,
+            scan_pk,
+            inputs.get("result_key"),
+            exc,
+        )
+        return _with_worker_meta(
+            {"error": str(exc), "error_code": exc.error_code}
+        )
     except Exception as exc:
         if sentry_sdk is not None:
             sentry_sdk.capture_exception(exc)
