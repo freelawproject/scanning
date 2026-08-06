@@ -128,6 +128,61 @@ class TestSyncHelpersWithCredentials(TestCase):
             },
         )
 
+    def test_job_result_key_is_per_scan_and_stage(self):
+        scan = _reporter_scan()
+        key = s3_sync.s3_job_result_key(scan, "detect")
+        self.assertEqual(
+            key,
+            f"processing/{scan.pk}/tc/164/1/jobs/detect/result.json",
+        )
+
+    def test_upload_processing_files_skips_job_results(self):
+        # GPU job results are wire artifacts the daemon consumes into
+        # Postgres. If one ever lands in the local tree it must not be
+        # pushed back up with the deliverables.
+        scan = _reporter_scan()
+        local_root = pathlib.Path(scan.output_dir)
+        (local_root / "jobs" / "detect").mkdir(parents=True)
+        (local_root / "jobs" / "detect" / "result.json").write_text("{}")
+        (local_root / "bitonal.pdf").write_bytes(b"pdf")
+
+        mock_s3 = MagicMock()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            count = s3_sync.upload_processing_files(scan)
+
+        self.assertEqual(count, 1)
+        uploaded_keys = {
+            call.args[2] for call in mock_s3.upload_file.call_args_list
+        }
+        prefix = f"processing/{scan.pk}/tc/164/1/"
+        self.assertEqual(uploaded_keys, {f"{prefix}bitonal.pdf"})
+
+    def test_download_processing_files_skips_job_results(self):
+        scan = _reporter_scan()
+        prefix = s3_sync.s3_processing_prefix(scan)
+        mock_s3 = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": f"{prefix}bitonal.pdf", "Size": 5},
+                    {
+                        "Key": f"{prefix}jobs/detect/result.json",
+                        "Size": 9,
+                    },
+                ]
+            }
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            s3_sync.download_processing_files(scan)
+
+        downloaded = {c.args[1] for c in mock_s3.download_file.call_args_list}
+        self.assertEqual(downloaded, {f"{prefix}bitonal.pdf"})
+
     def test_is_approved_deliverable(self):
         self.assertTrue(s3_sync._is_approved_deliverable("redacted/foo.pdf"))
         self.assertTrue(s3_sync._is_approved_deliverable("images/1-001.png"))
@@ -393,3 +448,30 @@ class TestS3EnabledBranches(SimpleTestCase):
                 "scanning.s3_sync.has_s3_credentials", return_value=True
             ):
                 self.assertFalse(s3_sync._s3_enabled())
+
+
+class TestS3ClientRegion(SimpleTestCase):
+    """The shared client signs for the bucket's region, not the ambient one.
+
+    ``generate_presigned_post`` signs with SigV4, which folds the region
+    into the credential scope, so a client left on boto3's ``us-east-1``
+    default hands the browser an upload policy S3 rejects.
+    """
+
+    @override_settings(AWS_S3_REGION_NAME="us-west-2", TESTING=True)
+    def test_client_is_built_with_the_configured_region(self):
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            s3_sync._s3_client()
+        mock_boto3.client.assert_called_once_with(
+            "s3", region_name="us-west-2"
+        )
+
+    @override_settings(AWS_S3_REGION_NAME="us-west-2", TESTING=False)
+    def test_cached_client_is_built_with_the_configured_region(self):
+        s3_sync._cached_s3_client.cache_clear()
+        self.addCleanup(s3_sync._cached_s3_client.cache_clear)
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            s3_sync._s3_client()
+        mock_boto3.client.assert_called_once_with(
+            "s3", region_name="us-west-2"
+        )

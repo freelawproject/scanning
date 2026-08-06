@@ -21,11 +21,18 @@ in RunPod endpoint env vars, never in the image.
 │                     │  POST  │                      │
 │ runpod_client.py    ├───────▶│ handler.py           │
 │  - upload PDF to S3 │  /run  │  - download PDF via  │
-│  - presign GET URL  │        │    presigned URL     │
+│  - presign GET + PUT│        │    presigned GET     │
 │  - submit job       │        │  - blackletter.api   │
 │  - poll /status     │◀───────│    .detect / analyze │
-│  - return result    │        │  - return JSON       │
-└─────────────────────┘  JSON  └──────────────────────┘
+│  - read result key  │  key   │  - PUT result to S3  │
+│  - fetch from S3    │        │  - return the key    │
+└─────────────────────┘        └──────────────────────┘
+          │                               │
+          │        ┌──────────────┐       │
+          └───────▶│      S3      │◀──────┘
+             GET   │  PDF in,     │  PUT
+                   │  result out  │
+                   └──────────────┘
 ```
 
 Full design rationale, payload-size math, and tradeoffs are in
@@ -433,8 +440,10 @@ pod, the lowest-friction option is #3 — no code changes required.
 ## Result retention
 
 RunPod purges job records after a short window. You **must** poll
-`/status` and persist the output before this window expires, or the
-result is lost.
+`/status` before it expires to learn a job's fate. The *payload*
+survives longer than that when the worker writes it to S3 (see
+[Result delivery](#result-delivery)); only the job record itself is
+subject to the retention below.
 
 | Submission path | Result retention |
 |---|---|
@@ -455,9 +464,23 @@ committed locally, RunPod's retention window no longer matters.
 If the daemon crashes between submission and completion, the in-
 flight job ID is lost. The scan sits in `PROCESSING` until the stale-
 recovery timeout (`DAEMON_PROCESSING_TIMEOUT`, default 3600 s)
-re-queues it. A follow-up improvement would be persisting the job ID
-on the `Scan` so the daemon can resume polling after a crash; not
-implemented yet.
+re-queues it. Persisting the job ID and result key on a job row, so a
+restarted daemon can resume polling or harvest the object instead of
+re-running the work, is issue #150.
+
+Result objects live only in S3, under each scan's
+`processing/{pk}/.../jobs/` prefix. Neither side writes them to disk:
+the worker serialises the envelope in memory and PUTs it, and the
+daemon reads it back into memory and parses it. They're also excluded
+from the processing-file sync in both directions, so nothing lands in
+the `/tmp` tree that `cleanup_processing_tmp` sweeps, and nothing is
+copied into `approved/`.
+
+On S3 the footprint is bounded: one object per scan and action, which
+a re-run overwrites. The consumed data lives in Postgres, so the
+objects left behind by finished scans are dead weight — a lifecycle
+expiry rule on the prefix is the intended cleanup (not yet
+configured).
 
 ## Using this image from the scanning daemon
 
@@ -509,12 +532,13 @@ RUNPOD_API_KEY=<runpod-api-key>
 # reason to change them.
 RUNPOD_REQUEST_TIMEOUT=1800       # wall-clock deadline for submit+poll
 RUNPOD_MAX_RETRIES=2              # transport-error retries on /run
-RUNPOD_PRESIGNED_TTL=86400        # presigned GET URL lifetime, in seconds
+RUNPOD_PRESIGNED_TTL=86400        # presigned URL lifetime, in seconds
 ```
 
 Caveat: remote mode uploads the PDF to S3 under the scan's
 processing prefix and generates a presigned GET URL the worker uses
-to fetch it, so AWS credentials
+to fetch it, plus a presigned PUT the worker writes its result to, so
+AWS credentials
 (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
 `AWS_STORAGE_BUCKET_NAME`) must also be set locally. Without those
 you'll get `RunpodError: RUNPOD_ENABLED is true but no AWS
@@ -535,10 +559,23 @@ RUNPOD_API_KEY=<runpod-api-key>          # keep secret; never log
 # Optional tuning (defaults shown)
 RUNPOD_REQUEST_TIMEOUT=1800              # wall-clock cap on submit+poll
 RUNPOD_MAX_RETRIES=2                     # transport-error retries on /run
-RUNPOD_PRESIGNED_TTL=86400               # presigned GET URL lifetime, seconds
+RUNPOD_PRESIGNED_TTL=86400               # presigned URL lifetime, seconds
 ```
 
-Plus the AWS credentials the rest of the app already uses.
+`RUNPOD_PRESIGNED_TTL` has to outlive queue time plus execution,
+because it now signs the **result upload** as well as the input
+download: a job that finishes after its signature dies can't deliver
+what it computed. The default (1 day) leaves the 30-minute
+`RUNPOD_REQUEST_TIMEOUT` deadline well inside it, so we cancel a
+wedged job long before that becomes possible.
+
+Plus the AWS credentials the rest of the app already uses, and
+`AWS_S3_REGION_NAME` if the buckets aren't in the `us-west-2` default.
+That one is newly load-bearing: presigned URLs are now SigV4, which
+signs the region into the credential scope, so a mismatch fails with
+`AuthorizationQueryParametersError` rather than being silently
+redirected. Confirm with
+`aws s3api get-bucket-location --bucket <name>`.
 
 Env vars that belong on the **RunPod endpoint** (not the daemon):
 `SENTRY_DSN_GPU`, `SENTRY_ENV`, `GIT_SHA`, `HANDLER_MAX_PAGES`,
@@ -589,11 +626,32 @@ INFO runpod detect job 63b2d3f6-...-u2 submitted
 
 RunPod purges job records 30 minutes after completion (async path).
 If the daemon misses the retention window (long pause, crash, etc.),
-`GET /status/{id}` returns 404. The client treats this as a
-**transient** error: the scan goes back to `QUEUED` and the next
-daemon tick submits a fresh job with a new presigned URL. The input
-files on S3 are untouched, so no work is lost beyond the one
-discarded GPU run.
+`GET /status/{id}` returns 404. That used to throw the run away. Now
+the result object outlives the job record, and the client holds the
+key in memory for the duration of the poll, so it checks S3 first:
+
+1. `/status` says COMPLETED — read the object at `result_key`.
+2. `/status` returns 404 — `head_object` on `result_key`. An object
+   written after this job was submitted means the worker finished and
+   uploaded before RunPod dropped the record, so harvest it. Nothing
+   there, or something older, means this run produced nothing:
+   re-queue and resubmit as before.
+3. `/status` says FAILED — the existing retry path, unchanged.
+
+Presence is sufficient evidence of completeness because a single PUT
+is atomic: a partial upload never becomes a gettable object. The
+write-time check is what makes step 2 safe on a key that gets reused
+across runs.
+
+The key only lives in the daemon's memory, so this covers a job that
+outlives RunPod's retention, not a daemon that restarts mid-flight.
+That needs the key persisted on a job row (#150), which is also what
+turns the blocking poll into a sweep.
+
+Polling S3 alone would never be enough either: a failed job also
+writes nothing, so absence can't distinguish "still queued" from
+"failed". Job status stays the authority; S3 is only ever consulted
+after it.
 
 ## Development workflow
 
@@ -610,7 +668,79 @@ discarded GPU run.
 
 ## Handler contract
 
-`handler(job)` dispatches on `job["input"]["action"]`:
+`handler(job)` dispatches on `job["input"]["action"]`.
+
+### Result delivery
+
+Every action supports two ways of returning its payload, picked per
+job by whether the daemon put a `result_url` in the input:
+
+| Input field  | Meaning |
+|---|---|
+| `result_url` | Presigned S3 **PUT**, covering exactly one object. Its presence switches the worker to S3 delivery. |
+| `result_key` | The key that URL signs — `processing/{pk}/.../jobs/{action}/result.json`. Echoed back in the response; the worker never derives it. |
+
+The key is per scan and action, not per run, so a re-run overwrites
+its predecessor instead of leaving orphans nobody will read. The
+daemon never reads an object without first checking (via
+`head_object`) that it was written after the reading job was
+submitted, which is what stops a reused key from serving a previous
+attempt's output.
+
+With `result_url` present, the worker writes one JSON object with a
+single PUT and answers with the key plus timings only:
+
+```json
+{
+  "status": "succeed",
+  "action": "detect",
+  "result_key": "processing/123/f2d/12/1/jobs/detect/result.json",
+  "bytes": 4823910,
+  "sha256": "9f2c...",
+  "upload_ms": 1840,
+  "duration_ms": 47300,
+  "model_durations_ms": {"small": 12000, "medium": 15000, "large": 20300},
+  "page_count": 312,
+  "worker_boot_ms": 42150,
+  "worker_uptime_ms": 128,
+  "gpu_available": true
+}
+```
+
+Nothing touches the worker's disk on the way out: the envelope is
+serialised in memory and streamed to S3.
+
+The object itself is a self-describing envelope, so a consumer can
+tell what it read without trusting where it read it from:
+
+```json
+{
+  "schema_version": 1,
+  "action": "detect",
+  "scan_pk": 123,
+  "job_id": "abc-123",
+  "payload": {"detections": [...], "page_count": 312, "duration_ms": 47300}
+}
+```
+
+The daemon checks every one of those fields before using the payload,
+so an object from another run, another action, or a future schema
+fails loudly instead of being consumed as this job's result.
+
+Why bother: an inline response is capped at ~20 MB (the reason we
+can't return per-word bounding boxes) and evaporates with RunPod's
+retention window. An S3 object has neither limit. There is
+deliberately **no inline fallback** when `result_url` is present:
+carrying the payload in the response "just in case" would reinstate
+the cap and create two sources of truth.
+
+Without `result_url` the worker returns the payload inline, exactly
+as the sections below describe. That is what happens in dev / CI
+without AWS credentials, and with daemons predating this contract.
+It's also the rollback: redeploying a worker image from before this
+contract reverts result delivery to inline with no daemon change,
+because the daemon accepts an inline response even when it sent a
+`result_url`.
 
 ### `detect`
 
@@ -676,6 +806,23 @@ on the following conditions:
 | `NO_GPU`        | Worker scheduled without a GPU              | Re-queue the scan (transient) |
 | `BAD_INPUT`     | `action` missing/wrong type                 | Mark scan ERROR    |
 | `UNKNOWN_ACTION`| `action` not in `{"detect", "analyze"}`     | Mark scan ERROR    |
+| `RESULT_UPLOAD_FAILED` | The PUT to S3 failed after retries (5xx, 429, dropped connections) | Re-queue the scan (transient) |
+| `RESULT_URL_EXPIRED`   | The presigned PUT is dead (HTTP 403)  | Re-queue the scan; resubmitting mints a fresh signature, and the dead URL is never reused |
+| `RESULT_UPLOAD_REJECTED` | S3 refused the write for a reason a re-run can't fix: a signature scoped to the wrong region, a bucket policy demanding a header we don't send, a malformed request | Mark scan ERROR |
+
+The result codes only ever fire *after* the GPU work succeeded, so
+they cost a run. `_put_result` retries hard (5 attempts, exponential
+backoff with jitter) on the transient shapes, and skips the retries
+for 403 and other 4xx because neither improves by being asked twice.
+
+`RESULT_UPLOAD_REJECTED` is terminal on purpose. It means the
+deployment is misconfigured, so re-queueing would re-run the GPU work
+— and re-bill it — up to `RUNPOD_MAX_TRANSIENT_RETRIES` times before
+failing with the same message. S3's XML explanation is included in the
+error, which is usually enough to fix it outright.
+
+A job that fails any of these ways never writes its object, so nothing
+stale is left behind for the retry to trip over.
 
 Real exceptions inside the action (network failure during download,
 ValueError from the handler, CUDA OOM) propagate up and turn into
@@ -718,6 +865,20 @@ holds `RUNPOD_API_KEY`, so only the daemon can submit jobs." If that
 ever changes, tighten the handler by validating the URL scheme
 (`https` only), optionally pinning a host allowlist, and rejecting
 suspicious redirects.
+
+### The presigned PUT is a write capability
+
+`result_url` hands a third-party GPU host the ability to write to our
+bucket. It stays deliberately narrow: one key, one method, and a
+bounded TTL (`RUNPOD_PRESIGNED_TTL`). The key is under the scan's own
+`jobs/` subtree, so even a leaked or misused URL can only create one
+object the daemon already expected, at a path nothing else reads.
+
+The alternative -- scoped temporary credentials via STS -- would be
+more flexible but would put an AWS credential in the worker's
+environment, giving up the property this image deliberately has: no
+AWS credentials anywhere in it. Both the GET and the PUT are
+capabilities handed in per job and expiring on their own.
 
 ### Container root user
 
