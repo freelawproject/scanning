@@ -68,6 +68,13 @@ def _s3_client():
 APPROVED_SUBDIR_PREFIXES = ("redacted/", "images/")
 APPROVED_FILE_SUFFIXES = (".original.pdf", ".redacted.pdf")
 
+# Subdirectory under a scan's processing prefix where GPU workers PUT
+# their job results (see ``scanning/runpod_client.py``). Deliberately
+# excluded from the processing-file sync in both directions: these are
+# wire artifacts the daemon consumes once and writes to Postgres, not
+# files the viewer or the pipeline ever reads off disk.
+JOB_RESULTS_SUBDIR = "jobs/"
+
 
 def _s3_enabled() -> bool:
     """Return True when we should actually use S3.
@@ -123,6 +130,38 @@ def s3_processing_prefix(scan: Scan) -> str:
     """
     reporter_slug, volume, start_page = _scan_path_parts(scan)
     return f"processing/{scan.pk}/{reporter_slug}/{volume}/{start_page}/"
+
+
+def s3_job_result_key(scan: Scan, stage: str) -> str:
+    """Return the S3 key a GPU worker PUTs one job's result to.
+
+    One object per scan and stage: a re-run overwrites the previous
+    attempt's output instead of leaving an orphan behind. Nothing
+    reads the object without first checking it was written after the
+    job that's reading it was submitted, so an overwritten-in-place
+    key can't be mistaken for a stale one (see
+    ``runpod_client._result_object_is_fresh``).
+
+    :param scan: The scan the job belongs to.
+    :param stage: Pipeline stage / handler action (``detect`` /
+        ``analyze``).
+    :returns: Key of the form
+        ``{processing_prefix}jobs/{stage}/result.json``.
+    :rtype: str
+    """
+    return (
+        f"{s3_processing_prefix(scan)}{JOB_RESULTS_SUBDIR}{stage}/result.json"
+    )
+
+
+def _is_job_result(rel: str) -> bool:
+    """Return True if a processing-prefix relative key is a job result.
+
+    :param rel: Object key relative to the scan's processing prefix.
+    :returns: Whether the key lives under the ``jobs/`` subtree.
+    :rtype: bool
+    """
+    return rel.startswith(JOB_RESULTS_SUBDIR)
 
 
 def tmp_output_dir(scan: Scan) -> Path:
@@ -206,6 +245,8 @@ def upload_processing_files(scan: Scan) -> int:
     count = 0
     for path in _iter_files_to_sync(local_root):
         rel = path.relative_to(local_root).as_posix()
+        if _is_job_result(rel):
+            continue
         s3.upload_file(str(path), bucket, f"{prefix}{rel}")
         count += 1
 
@@ -245,7 +286,7 @@ def download_processing_files(scan: Scan) -> Path | None:
         for obj in page.get("Contents", []):
             key = obj["Key"]
             rel = key[len(prefix) :]
-            if not rel:
+            if not rel or _is_job_result(rel):
                 continue
             local_path = local_root / rel
             if local_path.is_file() and local_path.stat().st_size == obj.get(
