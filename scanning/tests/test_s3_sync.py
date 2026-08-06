@@ -15,6 +15,25 @@ from scanning.models import Status
 MEDIA_ROOT = tempfile.mkdtemp()
 
 
+def _fake_download(bucket, key, dest):
+    """Stand in for ``boto3``'s ``download_file``, including its temp file.
+
+    s3transfer writes to ``<dest>.<random>`` in the destination's own
+    directory and renames it into place, so downloading into a directory
+    that does not exist yet fails on that temp name. Creating the parent
+    here instead would make every caller look correct.
+
+    :param bucket: Unused; matches the signature being faked.
+    :param key: Unused; matches the signature being faked.
+    :param dest: Local path to write to.
+    """
+    del bucket, key
+    dest = pathlib.Path(dest)
+    tmp = dest.with_suffix(dest.suffix + ".abc12345")
+    tmp.write_bytes(b"12345")
+    tmp.replace(dest)
+
+
 def _reporter_scan(**kwargs):
     """Build a scan with a reporter for predictable S3 prefixes.
 
@@ -262,9 +281,6 @@ class TestSyncHelpersWithCredentials(TestCase):
         ]
         mock_s3.get_paginator.return_value = mock_paginator
 
-        def _fake_download(bucket, key, dest):
-            pathlib.Path(dest).write_bytes(b"12345")
-
         mock_s3.download_file.side_effect = _fake_download
 
         with patch("scanning.s3_sync.boto3") as mock_boto3:
@@ -278,6 +294,52 @@ class TestSyncHelpersWithCredentials(TestCase):
             mock_s3.download_file.call_args.args[1],
             f"{prefix}bitonal.pdf",
         )
+
+    def test_download_processing_file_pulls_only_that_key(self):
+        """Serving one generated file must not drag the whole prefix.
+
+        A full volume's prefix runs to gigabytes (the original, every
+        opinion, every LLM page), and under ASGI one long sync pull stalls
+        every other request in the process.
+        """
+        scan = _reporter_scan()
+        scan.status = Status.PENDING_REVIEW
+        scan.save(update_fields=["status"])
+
+        prefix = s3_sync.s3_processing_prefix(scan)
+        wanted = "redacted/a.164.0001-0027.pdf"
+        mock_s3 = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": f"{prefix}{wanted}", "Size": 5},
+                    {
+                        "Key": f"{prefix}redacted/a.164.0028-0031.pdf",
+                        "Size": 5,
+                    },
+                    {"Key": f"{prefix}a.164.1.31.original.pdf", "Size": 9999},
+                    {"Key": f"{prefix}llm/page_0001.pdf", "Size": 5},
+                ]
+            }
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        mock_s3.download_file.side_effect = _fake_download
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            result = s3_sync.download_processing_file(scan, wanted)
+
+        self.assertEqual(mock_s3.download_file.call_count, 1)
+        self.assertEqual(
+            mock_s3.download_file.call_args.args[1], f"{prefix}{wanted}"
+        )
+        # The deliverables live in subdirectories, and nothing has created
+        # them on a machine that only ever served this one file, so the
+        # pull has to. Without it the download fails on its own temp file
+        # and the request 404s with the object sitting in S3.
+        self.assertTrue((pathlib.Path(result) / wanted).is_file())
 
     def test_download_preview_pdf_skips_original_and_images(self):
         """Only the bitonal/OCR preview is pulled, not original or images."""
@@ -302,10 +364,6 @@ class TestSyncHelpersWithCredentials(TestCase):
             }
         ]
         mock_s3.get_paginator.return_value = mock_paginator
-
-        def _fake_download(bucket, key, dest):
-            pathlib.Path(dest).parent.mkdir(parents=True, exist_ok=True)
-            pathlib.Path(dest).write_bytes(b"12345")
 
         mock_s3.download_file.side_effect = _fake_download
 

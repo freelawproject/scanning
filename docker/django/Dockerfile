@@ -146,7 +146,9 @@ FROM python:3.12-slim AS prod-web
 
 # Runtime-only apt libs for the lean tier:
 #   libpq5              - PostgreSQL client library
-#   tesseract-ocr*      - OCR engine + English data (pytesseract / ocrmypdf)
+#   tesseract-ocr*      - OCR engine + English data. blackletter.analyze
+#                         reads page-number crops with it; ocrmypdf only
+#                         runs when LLM_PAGE_TEXT_LAYER is on.
 #   libgl1, libglib2.0-0 - required by opencv-python (cv2) in base blackletter
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -206,7 +208,9 @@ FROM python:3.12-slim AS prod-ml
 
 # Runtime-only apt libs for the heavy tier:
 #   libpq5           - PostgreSQL client library
-#   tesseract-ocr*   - OCR engine + English data (pytesseract / ocrmypdf)
+#   tesseract-ocr*   - OCR engine + English data. blackletter.analyze reads
+#                      page-number crops with it; ocrmypdf only runs when
+#                      LLM_PAGE_TEXT_LAYER is on.
 #   libgl1, libglib2 - OpenCV (full) / PaddleOCR shared libs
 #   libgomp1         - OpenMP runtime for torch / paddle CPU kernels
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \

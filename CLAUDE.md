@@ -33,7 +33,7 @@ uv sync --all-extras
 ## Testing
 
 - Use `django.test.TestCase`, NOT pytest style classes
-- All tests live in `scanning/tests.py`
+- Tests live in the `scanning/tests/` package, one module per area (`test_services.py`, `test_views.py`, ...). Shared synthetic-PDF builders are in `scanning/tests/pdf_fixtures.py`
 - Test classes inherit from `ScanningTestCase` which provides `make_user()`, `make_staff_user()`, `make_pdf()`, `make_image()` helpers
 - Use `ScanFactory` and `UserFactory` from `scanning/factories.py` for test data
 - Factory docstrings describe default declarations as a prose list, not `:param:` entries (they are class attributes, not `__init__` parameters)

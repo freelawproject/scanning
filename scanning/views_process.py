@@ -33,7 +33,7 @@ from scanning.models import (
 )
 from scanning.utils import (
     compute_coverage_gaps,
-    find_ocr_pdf,
+    find_processing_pdf,
     local_original_pdf,
 )
 
@@ -455,7 +455,7 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
 
 @login_required
 def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
-    """Serve the small processed PDF (OCR text layer, else bitonal).
+    """Serve the small processed PDF (``bitonal.pdf``).
 
     The viewer only ever gets the small, browser-viewable preview. The
     multi-GB original is never streamed here: it blows past the gunicorn
@@ -466,7 +466,7 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
 
     Resolution:
 
-    1. Serve the processed PDF (OCR > bitonal) if it is already local.
+    1. Serve the processed PDF if it is already local.
     2. Otherwise pull *only* the preview PDF(s) from S3 and look again.
        This covers prod, where the daemon and web run in separate
        containers with separate ephemeral ``/tmp/`` volumes. The targeted
@@ -487,17 +487,14 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     logger.info("serve_scan_pdf: resolving pdf for scan=%s", scan.pk)
 
     def _processed_local() -> FileResponse | None:
-        """Return the OCR pdf, else ``bitonal.pdf``, from ``output_dir``."""
+        """Return ``bitonal.pdf`` (or a legacy OCR pdf) from ``output_dir``."""
         output = Path(scan.output_dir)
         if not output.is_dir():
             return None
-        ocr = find_ocr_pdf(scan.output_dir)
-        if ocr:
-            return FileResponse(ocr.open("rb"), content_type="application/pdf")
-        bitonal = output / "bitonal.pdf"
-        if bitonal.exists():
+        base_pdf = find_processing_pdf(scan.output_dir)
+        if base_pdf:
             return FileResponse(
-                bitonal.open("rb"), content_type="application/pdf"
+                base_pdf.open("rb"), content_type="application/pdf"
             )
         return None
 

@@ -1,7 +1,7 @@
 """Sync intermediate processing files between MEDIA_ROOT, S3, and /tmp/.
 
-Files produced by the scanning pipeline (bitonal PDF, OCR PDF,
-detections.json, stamped PDF, page images, original PDF) are small
+Files produced by the scanning pipeline (bitonal PDF, detections.json,
+stamped PDF, page images, original PDF) are small
 enough that re-running the pipeline to regenerate them is expensive.
 Pushing them to S3 lets us recover after pod redeploys without a full
 re-run. Pulling them to /tmp/ when the viewer opens gives editing
@@ -321,13 +321,13 @@ def _is_preview_pdf(rel: str) -> bool:
     """Return True if a processing-prefix relative key is a preview PDF.
 
     A "preview" is the small, browser-viewable PDF the process viewer
-    shows: the OCR PDF if present, else ``bitonal.pdf``. This mirrors the
+    shows: ``bitonal.pdf``, or a legacy OCR PDF beside it. This mirrors the
     exclusion rules in ``utils.find_ocr_pdf`` and adds ``bitonal.pdf``.
     Deliberately excludes the multi-GB ``*.original.pdf`` and anything
     under a subdirectory (``images/``, ``redacted/``, etc.).
 
     :param rel: Object key relative to the scan's processing prefix.
-    :returns: Whether the key is the bitonal or OCR preview PDF.
+    :returns: Whether the key is a preview PDF.
     :rtype: bool
     """
     if "/" in rel or not rel.endswith(".pdf"):
@@ -390,6 +390,11 @@ def _download_matching(scan: Scan, predicate, kind: str) -> Path | None:
                 "Size", -1
             ):
                 continue
+            # Keys can be nested (``redacted/<opinion>.pdf``), and
+            # ``download_file`` writes through a temp file in the target's
+            # own directory, so a missing parent fails as a
+            # FileNotFoundError on that temp name rather than on the key.
+            local_path.parent.mkdir(parents=True, exist_ok=True)
             s3.download_file(bucket, key, str(local_path))
             downloaded += 1
 
@@ -409,8 +414,8 @@ def _download_matching(scan: Scan, predicate, kind: str) -> Path | None:
 def download_preview_pdf(scan: Scan) -> Path | None:
     """Download only the small preview PDF(s) from S3 to /tmp/.
 
-    Pulls the bitonal and/or OCR PDF -- the reviewable previews -- and
-    skips the multi-GB original and the ``images/`` tree. Used by the PDF
+    Pulls ``bitonal.pdf`` -- the reviewable preview, plus a legacy OCR PDF
+    on scans processed before scanning #145 -- and skips the multi-GB original and the ``images/`` tree. Used by the PDF
     viewer endpoint so opening a scan never drags the whole processing
     prefix (or the original) across the network, which blew past the
     gunicorn worker timeout for large scans.
@@ -420,6 +425,29 @@ def download_preview_pdf(scan: Scan) -> Path | None:
     :rtype: Path | None
     """
     return _download_matching(scan, _is_preview_pdf, "preview PDF")
+
+
+def download_processing_file(scan: Scan, rel_key: str) -> Path | None:
+    """Download one named object from a scan's processing prefix.
+
+    For serving a single generated file (an opinion PDF, an LLM page) when
+    it is not on this machine. ``download_processing_files`` would fetch
+    the whole prefix instead: for a 1292-page volume that is the multi-GB
+    original plus every opinion, LLM page and crop, gigabytes to serve one
+    file. Worse, under ASGI all sync views share one thread-sensitive
+    executor, so a pull that long stalls every other request in the
+    process, which looks like the whole portal hanging.
+
+    :param scan: Scan whose processing prefix to pull from.
+    :param rel_key: Object key relative to that prefix, which is also the
+        path relative to the scan's output dir (e.g.
+        ``"redacted/a3d.222.0001-0027.pdf"``).
+    :returns: The local tmp path, or None if sync is disabled.
+    :rtype: Path | None
+    """
+    return _download_matching(
+        scan, lambda rel: rel == rel_key, f"file {rel_key}"
+    )
 
 
 def download_original_pdf(scan: Scan) -> Path | None:

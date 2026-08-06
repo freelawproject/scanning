@@ -1,19 +1,30 @@
 """Unit tests for the per-page sync helpers in ``scanning.services``.
 
 Focus is the sandwich-rule blank-page detector
-(``_is_blank_via_sandwich``) and its boundary text-extraction
-fallback. The helper is a pure function over data structures plus
+(``_is_blank_via_sandwich``) and its boundary rect-coverage
+confirmation. The helper is a pure function over data structures plus
 an optional PDF path; we exercise it directly without touching the
 DB.
 """
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
+import fitz
 from django.test import SimpleTestCase
 
-from scanning.services import _is_blank_via_sandwich
+from scanning.services import _is_blank_via_sandwich, _page_body_covered
+
+PAGE_W, PAGE_H = 612.0, 792.0
+HEADER_PTS = 60.0
+
+
+def _rect(x0, y0, x1, y1, rtype="headnote"):
+    """Build a redaction rect dict in PDF points."""
+    return {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "type": rtype}
 
 
 def _hn(page_index: int) -> dict:
@@ -66,19 +77,18 @@ class IsBlankViaSandwichTests(SimpleTestCase):
             )
         )
 
-    def test_last_page_of_block_fires_when_pdf_body_is_textless(self):
+    def test_last_page_of_block_fires_when_body_is_covered(self):
         """Boundary case — only the previous neighbor has headnotes
-        (this is the trailing edge of a headnote block) AND the
-        rendered PDF's body extracts to nothing → blank.
+        (this is the trailing edge of a headnote block) AND the page's
+        rects cover the whole body → blank.
 
-        The per-page PDFs are post-redaction, so an actually-empty
-        body extracts to no text. We mock the PDF check so the test
-        doesn't need a real file on disk.
+        We mock the coverage check so the test doesn't need a real file
+        on disk.
         """
         pages = {"4": [_hn(4)], "5": [_hn(5)]}  # no 6 — block ends here
         with patch(
-            "scanning.services._page_body_textless", return_value=True
-        ) as mock_textless:
+            "scanning.services._page_body_covered", return_value=True
+        ) as mock_covered:
             result = _is_blank_via_sandwich(
                 page_index=5,
                 opinions=[self.OPINION],
@@ -87,17 +97,15 @@ class IsBlankViaSandwichTests(SimpleTestCase):
                 pdf_path="/fake/page_0006.pdf",
             )
         self.assertTrue(result)
-        mock_textless.assert_called_once()
+        mock_covered.assert_called_once()
 
-    def test_last_page_of_block_does_not_fire_when_body_has_text(self):
+    def test_last_page_of_block_does_not_fire_when_body_uncovered(self):
         """Boundary case — only the previous neighbor has headnotes,
-        but the rendered PDF still has body text (headnote block ended
+        but part of the body is left unredacted (the headnote block ended
         partway down the page and body picks up below) → not blank.
         """
         pages = {"4": [_hn(4)], "5": [_hn(5)]}
-        with patch(
-            "scanning.services._page_body_textless", return_value=False
-        ):
+        with patch("scanning.services._page_body_covered", return_value=False):
             result = _is_blank_via_sandwich(
                 page_index=5,
                 opinions=[self.OPINION],
@@ -107,13 +115,13 @@ class IsBlankViaSandwichTests(SimpleTestCase):
             )
         self.assertFalse(result)
 
-    def test_first_page_of_block_fires_when_pdf_body_is_textless(self):
+    def test_first_page_of_block_fires_when_body_is_covered(self):
         """Boundary case — only the NEXT neighbor has headnotes (this
         is the leading edge of a block, just after the caption page).
-        Same text-extraction confirmation as the trailing-edge case.
+        Same coverage confirmation as the trailing-edge case.
         """
         pages = {"5": [_hn(5)], "6": [_hn(6)]}  # no 4 — block starts here
-        with patch("scanning.services._page_body_textless", return_value=True):
+        with patch("scanning.services._page_body_covered", return_value=True):
             result = _is_blank_via_sandwich(
                 page_index=5,
                 opinions=[self.OPINION],
@@ -185,3 +193,57 @@ class IsBlankViaSandwichTests(SimpleTestCase):
                 page_detections=[],
             )
         )
+
+
+class PageBodyCoveredTests(SimpleTestCase):
+    """Tests for ``_page_body_covered``.
+
+    Replaces the old text-extraction probe: the generated per-page PDFs
+    no longer carry a text layer, so body emptiness is measured from the
+    redaction geometry instead.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.pdf_path = Path(self._tmp.name) / "page_0006.pdf"
+        with fitz.open() as doc:
+            doc.new_page(width=PAGE_W, height=PAGE_H)
+            doc.save(str(self.pdf_path))
+
+    def test_fully_covered_body_is_blank(self):
+        pages = {"5": [_rect(0, HEADER_PTS, PAGE_W, PAGE_H)]}
+        self.assertTrue(_page_body_covered(pages, 5, self.pdf_path))
+
+    def test_header_band_does_not_need_covering(self):
+        """The printed page number lives above the body and is kept."""
+        pages = {"5": [_rect(0, HEADER_PTS, PAGE_W, PAGE_H)]}
+        self.assertTrue(_page_body_covered(pages, 5, self.pdf_path))
+        # A rect that starts below the header leaves body uncovered.
+        pages = {"5": [_rect(0, 400, PAGE_W, PAGE_H)]}
+        self.assertFalse(_page_body_covered(pages, 5, self.pdf_path))
+
+    def test_margins_plus_headnotes_count_together(self):
+        """Headnote rects never reach the page edges; margins do."""
+        pages = {
+            "5": [
+                _rect(0, 0, 72, PAGE_H, "margin"),
+                _rect(540, 0, PAGE_W, PAGE_H, "margin"),
+                _rect(72, HEADER_PTS, 540, PAGE_H),
+            ]
+        }
+        self.assertTrue(_page_body_covered(pages, 5, self.pdf_path))
+
+    def test_partly_covered_body_is_not_blank(self):
+        """A headnote block ending mid-page leaves live text below."""
+        pages = {"5": [_rect(72, HEADER_PTS, 540, 400)]}
+        self.assertFalse(_page_body_covered(pages, 5, self.pdf_path))
+
+    def test_no_rects_is_not_blank(self):
+        self.assertFalse(_page_body_covered({}, 5, self.pdf_path))
+
+    def test_unreadable_pdf_is_not_blank(self):
+        """Never flag a page blank when the check itself failed."""
+        pages = {"5": [_rect(0, HEADER_PTS, PAGE_W, PAGE_H)]}
+        missing = Path(self._tmp.name) / "does_not_exist.pdf"
+        self.assertFalse(_page_body_covered(pages, 5, missing))
