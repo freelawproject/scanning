@@ -27,9 +27,10 @@ AWS_PRIVATE_STORAGE_BUCKET_NAME = env(
 # so a mismatch is a hard ``AuthorizationQueryParametersError`` -- and
 # without this set, boto3 falls back to ``us-east-1``.
 #
-# Also read by django-storages, which is deliberate: one region for
-# every S3 client in the app rather than two ways to be wrong. Both
-# buckets must be in it; check with
+# Read by django-storages under this exact name, which is why it's
+# named for the library rather than for us, and passed explicitly by
+# the two clients we build ourselves (``s3_sync._s3_client`` and
+# ``runpod_client._s3``). Both buckets must be in it; check with
 # ``aws s3api get-bucket-location --bucket <name>``.
 AWS_S3_REGION_NAME = env("AWS_S3_REGION_NAME", default="us-west-2")
 

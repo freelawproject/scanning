@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 @functools.lru_cache(maxsize=1)
 def _cached_s3_client():
     """Build and memoize a single S3 client (see :func:`_s3_client`)."""
-    return boto3.client("s3")
+    return boto3.client("s3", region_name=settings.AWS_S3_REGION_NAME)
 
 
 def _s3_client():
@@ -47,6 +47,14 @@ def _s3_client():
     build one and reuse it. Cached on first use, not at import, so
     credential resolution happens once the app is actually serving.
 
+    The region is pinned rather than left to boto3's ambient resolution.
+    ``generate_presigned_post`` signs with SigV4, which folds the region
+    into the credential scope, so a client that guessed ``us-east-1``
+    for a ``us-west-2`` bucket would hand the browser an upload policy
+    S3 rejects. Same failure the GPU worker's result PUT hit; the
+    signature version is deliberately *not* pinned here, since nothing
+    on this path depends on which one is used.
+
     Under ``TESTING`` the cache is bypassed and a fresh client is built
     each call, so tests that patch ``scanning.s3_sync.boto3`` always see
     their own mock -- a cached client from an earlier test can't silently
@@ -56,7 +64,7 @@ def _s3_client():
     :returns: A boto3 S3 client (process-wide outside tests).
     """
     if getattr(settings, "TESTING", False):
-        return boto3.client("s3")
+        return boto3.client("s3", region_name=settings.AWS_S3_REGION_NAME)
     return _cached_s3_client()
 
 

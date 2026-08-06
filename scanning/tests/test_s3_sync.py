@@ -448,3 +448,30 @@ class TestS3EnabledBranches(SimpleTestCase):
                 "scanning.s3_sync.has_s3_credentials", return_value=True
             ):
                 self.assertFalse(s3_sync._s3_enabled())
+
+
+class TestS3ClientRegion(SimpleTestCase):
+    """The shared client signs for the bucket's region, not the ambient one.
+
+    ``generate_presigned_post`` signs with SigV4, which folds the region
+    into the credential scope, so a client left on boto3's ``us-east-1``
+    default hands the browser an upload policy S3 rejects.
+    """
+
+    @override_settings(AWS_S3_REGION_NAME="us-west-2", TESTING=True)
+    def test_client_is_built_with_the_configured_region(self):
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            s3_sync._s3_client()
+        mock_boto3.client.assert_called_once_with(
+            "s3", region_name="us-west-2"
+        )
+
+    @override_settings(AWS_S3_REGION_NAME="us-west-2", TESTING=False)
+    def test_cached_client_is_built_with_the_configured_region(self):
+        s3_sync._cached_s3_client.cache_clear()
+        self.addCleanup(s3_sync._cached_s3_client.cache_clear)
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            s3_sync._s3_client()
+        mock_boto3.client.assert_called_once_with(
+            "s3", region_name="us-west-2"
+        )
