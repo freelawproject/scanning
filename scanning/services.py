@@ -499,6 +499,67 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     _update_progress(scan_pk, f"YOLO: {len(detections)} detections")
 
 
+def _reuse_detect_result(scan: "Scan", output_dir: str) -> bool:
+    """Rehydrate detections.json from a finished detect job, if there is one.
+
+    The resume path for step 3. A daemon killed mid-pipeline re-queues
+    the scan and ``run_full_pipeline`` restarts at step 1, so a detect
+    that already completed would otherwise be re-submitted: another
+    ~200 s of GPU time to recompute detections that are already on S3,
+    overwriting the result object with an identical one.
+
+    Only ``run_full_pipeline`` calls this. :func:`run_detect` goes
+    straight to :func:`_run_yolo`, because re-running detection is the
+    whole point of invoking it; :func:`run_reprocess` likewise leaves
+    ``reuse`` off when it re-validates.
+
+    :param scan: The Scan being processed.
+    :param output_dir: Directory where detections.json is written.
+    :returns: Whether detections.json now holds a reusable result.
+    :rtype: bool
+    """
+    from scanning import runpod_client, s3_sync
+
+    payload = runpod_client.reusable_result(
+        scan, "detect", s3_sync.PIPELINE_INPUT_NAME
+    )
+    if payload is None:
+        return False
+
+    detections = payload.get("detections")
+    if not isinstance(detections, list):
+        return False
+
+    # Backstop on the timestamp check. That comparison only notices an
+    # edited input if the edit changed the object's size, so confirm the
+    # result describes a PDF with this many pages. ``_ensure_bitonal``
+    # has just refreshed ``page_count`` off the current file, and a page
+    # insert or delete moves it.
+    page_count = scan.page_count or 0
+    if page_count and any(
+        d.get("page_index", 0) >= page_count for d in detections
+    ):
+        logger.warning(
+            "stored detect result for scan %s references pages past the "
+            "current %d-page PDF; re-running detection",
+            scan.pk,
+            page_count,
+        )
+        return False
+
+    (Path(output_dir) / "detections.json").write_text(json.dumps(detections))
+    _update_progress(
+        scan.pk,
+        f"YOLO: reused {len(detections)} detections from the last run",
+    )
+    logger.info(
+        "Reused %d detections for scan %s; skipped the detect job",
+        len(detections),
+        scan.pk,
+    )
+    return True
+
+
 def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
     """Widen this scan's ``TEXT_COLUMN`` detections onto the text they clip.
 
@@ -1200,7 +1261,9 @@ def _dispatch_analyze(
     return all_results
 
 
-def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
+def run_paddleocr_validation(
+    scan_pk: int, pdf_path: str, reuse: bool = False
+) -> None:
     """Validate page numbers using the runpod_client analyze action.
 
     In local mode (``RUNPOD_ENABLED=False``) this calls
@@ -1212,11 +1275,38 @@ def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
 
     :param scan_pk: Primary key of the scan to validate.
     :param pdf_path: Path to the PDF to run validation on.
+    :param reuse: When True, consume a finished analyze job's stored
+        result instead of submitting a new one, if the stored result was
+        written after the current ``pdf_path`` reached S3. Off by
+        default so every caller that means "analyze this again" keeps
+        doing exactly that; only the resume path in
+        :func:`run_full_pipeline` sets it.
     """
-    with _log_stage("PaddleOCR validation"):
-        all_results = _dispatch_analyze(
-            scan_pk, pdf_path, stream_partial=False
+    from scanning import runpod_client
+
+    all_results = None
+    if reuse:
+        payload = runpod_client.reusable_result(
+            Scan.objects.get(pk=scan_pk), "analyze", Path(pdf_path).name
         )
+        if payload is not None and isinstance(payload.get("results"), list):
+            all_results = payload["results"]
+            _update_progress(
+                scan_pk,
+                f"Page numbers: reused {len(all_results)} page result(s) "
+                "from the last run",
+            )
+            logger.info(
+                "Reused %d analyze result(s) for scan %s; skipped the job",
+                len(all_results),
+                scan_pk,
+            )
+
+    if all_results is None:
+        with _log_stage("PaddleOCR validation"):
+            all_results = _dispatch_analyze(
+                scan_pk, pdf_path, stream_partial=False
+            )
     Scan.objects.filter(pk=scan_pk).update(ocr_results=all_results)
     _rebuild_issues_from_results(scan_pk, all_results)
 
@@ -1503,11 +1593,24 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_full_pipeline(scan_pk: int) -> None:
+def run_full_pipeline(scan_pk: int, force: bool = False) -> None:
     """Run the full processing pipeline: bitonal → YOLO → validate → pair.
 
     Designed to run in the daemon process. After this completes, the scan
     is ready for review -- the user only needs to approve and generate.
+
+    Resumable across a daemon restart. There is no stage bookkeeping: each
+    step decides for itself whether its output already exists and is still
+    valid for the current input, so a re-queued scan skips what finished
+    rather than restarting at step 1. That matters because the daemon takes
+    a SIGTERM on every deploy and re-queues whatever was mid-flight, and
+    steps 3 and 5 are GPU jobs measured in minutes. See
+    :func:`_reuse_detect_result` and ``runpod_client.reusable_result``.
+
+    ``force`` is the "I meant to re-run this" switch: it re-runs both GPU
+    stages and overwrites their stored results. Staff wanting a genuine
+    re-detect on one scan usually want :func:`run_detect` instead, which
+    always re-runs and skips the rest of the pipeline.
 
     No text layer is embedded here. The ocrmypdf/Tesseract pass used to
     run between bitonal conversion and detection and dominated the
@@ -1524,6 +1627,8 @@ def run_full_pipeline(scan_pk: int) -> None:
     overlay still gets rects on demand through ``compute_redactions_api``.
 
     :param scan_pk: Primary key of the scan to process.
+    :param force: Re-run the GPU stages even when a reusable result is
+        stored, overwriting it. Default False, which is the resume path.
     """
     django.db.connections.close_all()
     _pull_processing_files_from_s3(scan_pk)
@@ -1542,7 +1647,8 @@ def run_full_pipeline(scan_pk: int) -> None:
         bitonal_path = _ensure_bitonal(scan, output_dir)
 
         # 3. YOLO detection (all 3 models on bitonal)
-        _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
+        if force or not _reuse_detect_result(scan, str(output_dir)):
+            _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
 
         # 4. Import detections into DB
         _update_progress(scan_pk, "Importing detections...")
@@ -1553,7 +1659,7 @@ def run_full_pipeline(scan_pk: int) -> None:
             scan_pk,
             f"{len(dets)} detections imported. Running page number validation...",
         )
-        run_paddleocr_validation(scan_pk, scan.pdf_path)
+        run_paddleocr_validation(scan_pk, scan.pdf_path, reuse=not force)
 
         # 6. Pair opinions
         _update_progress(scan_pk, "Pairing opinions...")
