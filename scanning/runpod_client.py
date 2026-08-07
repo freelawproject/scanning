@@ -113,6 +113,33 @@ RESULT_SCHEMA_VERSION = 1
 # of the minutes between a job and its retry.
 _RESULT_CLOCK_SKEW = timedelta(seconds=60)
 
+# ``Error.Code`` values S3 uses for "that object isn't there". Plain AWS
+# answers a HEAD on a missing key with ``404`` (HEAD carries no body, so
+# botocore synthesises the code from the status); ``NoSuchKey`` is the
+# GET spelling, and ``NotFound`` is what several S3-compatible backends
+# send. Every call site here has to tell this apart from a real S3
+# problem, so the list lives in one place: see
+# :func:`_is_missing_object_error`.
+_MISSING_OBJECT_CODES = ("404", "NoSuchKey", "NotFound")
+
+
+def _is_missing_object_error(exc: ClientError) -> bool:
+    """Return True if ``exc`` means the object simply isn't there.
+
+    The distinction every ``head_object`` caller in this module needs:
+    "nothing has been written yet" is routine and has a fallback, while
+    access denied, a wrong region or throttling is a misconfiguration
+    that must surface rather than be read as absence.
+
+    :param exc: The error raised by the S3 call.
+    :returns: Whether it reports a missing object.
+    :rtype: bool
+    """
+    return (
+        exc.response.get("Error", {}).get("Code", "") in _MISSING_OBJECT_CODES
+    )
+
+
 # RunPod ``/run`` submit-time error codes that mean "the endpoint can't
 # take work right now" rather than "this job is bad" -- e.g. the
 # endpoint is scaled to zero (``max_workers=0``), which RunPod reports
@@ -408,8 +435,7 @@ def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
     try:
         s3.head_object(Bucket=bucket, Key=key)
     except ClientError as exc:
-        err_code = exc.response.get("Error", {}).get("Code", "")
-        if err_code not in ("404", "NoSuchKey"):
+        if not _is_missing_object_error(exc):
             raise
         local = Path(pdf_path)
         if not local.is_file():
@@ -523,8 +549,7 @@ def _result_object_is_fresh(key: str, submitted_at: datetime) -> bool:
     try:
         head = _s3().head_object(Bucket=bucket, Key=key)
     except ClientError as exc:
-        err_code = exc.response.get("Error", {}).get("Code", "")
-        if err_code in ("404", "NoSuchKey", "NotFound"):
+        if _is_missing_object_error(exc):
             return False
         # Anything else (access denied, wrong region) is a real S3
         # problem: don't report it as "the worker produced nothing".
@@ -633,8 +658,7 @@ def reusable_result(scan: Scan, action: str, input_rel: str) -> dict | None:
             "LastModified"
         )
     except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code not in ("404", "NoSuchKey", "NotFound"):
+        if not _is_missing_object_error(exc):
             # A missing object is the common case on a first run. Anything
             # else -- AccessDenied, wrong region, throttling -- is a real
             # S3 problem, and the fallback silently pays for a duplicate

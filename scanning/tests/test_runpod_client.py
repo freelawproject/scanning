@@ -233,6 +233,28 @@ class TestEnsurePresignedUrl(TestCase):
                 p.stop()
         s3.upload_file.assert_called_once()
 
+    def test_not_found_also_triggers_upload(self):
+        """Several S3-compatible backends spell absence ``NotFound``.
+
+        This site used to check only ``("404", "NoSuchKey")`` while the
+        two result-object checks also accepted ``NotFound``, so the same
+        response meant "upload it" in one place and "S3 is broken" here.
+        """
+        scan = ScanFactory()
+        s3 = self._setup_s3(head_result=_client_error("NotFound"))
+        patches = self._patch(s3)
+        for p in patches:
+            p.start()
+        try:
+            with patch(
+                "scanning.runpod_client.Path.is_file", return_value=True
+            ):
+                runpod_client._ensure_presigned_url(scan, "/tmp/x.pdf")
+        finally:
+            for p in patches:
+                p.stop()
+        s3.upload_file.assert_called_once()
+
     def test_access_denied_re_raises(self):
         """Any ClientError other than 404/NoSuchKey must surface."""
         scan = ScanFactory()
