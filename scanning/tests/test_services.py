@@ -2181,6 +2181,27 @@ class TestPipelineResumesInsteadOfRerunningGpuStages(TestCase):
         _, _, validation = self._run(None)
         self.assertTrue(validation.call_args.kwargs["reuse"])
 
+    def test_ensure_bitonal_leaves_page_count_readable_on_the_instance(self):
+        """The page-count backstop reads the attribute, not the row.
+
+        ``_ensure_bitonal`` persists the count with a queryset
+        ``.update()``, which is a bare SQL write and leaves the caller's
+        instance holding whatever it loaded. ``run_full_pipeline`` hands
+        that same instance straight to ``_reuse_detect_result`` three
+        lines later, so the two have to stay in step.
+        """
+        from scanning import services
+
+        with fitz.open(str(self.bitonal)) as pdf:
+            real_pages = pdf.page_count
+        self.scan.page_count = real_pages + 99
+
+        services._ensure_bitonal(self.scan, pathlib.Path(self.scan.output_dir))
+
+        self.assertEqual(self.scan.page_count, real_pages)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.page_count, real_pages)
+
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestPaddleocrValidationReuse(TestCase):

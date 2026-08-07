@@ -415,6 +415,11 @@ def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
     with fitz.open(str(bitonal_path)) as pdf:
         page_count = pdf.page_count
     Scan.objects.filter(pk=scan.pk).update(page_count=page_count)
+    # ``.update()`` is a bare SQL write: it refreshes the row and leaves
+    # the caller's instance holding whatever it loaded. Keep the two in
+    # step, because callers read ``scan.page_count`` straight after this
+    # returns and would otherwise silently get the pre-conversion value.
+    scan.page_count = page_count
     return bitonal_path
 
 
