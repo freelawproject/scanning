@@ -243,6 +243,40 @@ class TestSyncHelpersWithCredentials(TestCase):
 
         self.assertEqual(count, 1)
 
+    def test_invalidate_job_results_drops_both_stages(self):
+        # The escape hatch for "re-run this even though the pages are the
+        # same": the timestamp check can't express that, so the caller
+        # removes the objects instead.
+        scan = _reporter_scan()
+        mock_s3 = MagicMock()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            s3_sync.invalidate_job_results(scan)
+
+        prefix = f"processing/{scan.pk}/tc/164/1/"
+        self.assertEqual(
+            {c.kwargs["Key"] for c in mock_s3.delete_object.call_args_list},
+            {
+                f"{prefix}jobs/detect/result.json",
+                f"{prefix}jobs/analyze/result.json",
+            },
+        )
+
+    def test_invalidate_job_results_survives_a_failed_delete(self):
+        # Best effort: it runs inside a request and an admin action, and
+        # a leftover object costs only a wasted reuse.
+        scan = _reporter_scan()
+        mock_s3 = MagicMock()
+        mock_s3.delete_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}},
+            "DeleteObject",
+        )
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            s3_sync.invalidate_job_results(scan)
+
+        self.assertEqual(mock_s3.delete_object.call_count, 2)
+
     def test_download_processing_files_skips_job_results(self):
         scan = _reporter_scan()
         prefix = s3_sync.s3_processing_prefix(scan)

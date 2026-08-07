@@ -282,6 +282,47 @@ def _size_matches_s3(s3, bucket: str, key: str, path: Path) -> bool:
     return head.get("ContentLength") == path.stat().st_size
 
 
+def invalidate_job_results(scan: Scan) -> None:
+    """Delete a scan's stored GPU job results so the next run recomputes.
+
+    The counterpart to ``runpod_client.reusable_result``. That check is
+    keyed on the stage input's timestamp, which answers "have the pages
+    changed?" and nothing else, so a caller who means "re-run this even
+    though the pages are the same" has to say so by removing the objects.
+
+    Call it from the paths that express that intent. Today that is the
+    Re-validate action alone, which warns about GPU cost before it
+    queues. Deliberately not the admin re-queue: that one documents
+    itself as recovery for a scan stuck behind a killed daemon, which is
+    the resume case reuse exists to make cheap.
+
+    Best effort. A failed delete leaves a reusable result behind, which
+    costs correctness only for the caller that asked for freshness, so it
+    is logged rather than raised into a request or an admin action.
+
+    :param scan: Scan whose stored results to drop.
+    :return: None.
+    """
+    if not _s3_enabled():
+        return
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    s3 = _s3_client()
+    for stage in ("detect", "analyze"):
+        key = s3_job_result_key(scan, stage)
+        try:
+            s3.delete_object(Bucket=bucket, Key=key)
+        except (BotoCoreError, ClientError):
+            logger.warning(
+                "Could not drop the stored %s result for scan %s at %s; "
+                "the next run may reuse it",
+                stage,
+                scan.pk,
+                key,
+                exc_info=True,
+            )
+
+
 def upload_processing_files(scan: Scan) -> int:
     """Upload processing files from MEDIA_ROOT to S3.
 

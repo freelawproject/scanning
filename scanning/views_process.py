@@ -680,14 +680,25 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
 def start_validate(request: HttpRequest, pk: int) -> HttpResponse:
     """Queue a scan for validation (first step of the full pipeline).
 
+    Drops any stored GPU job results first. ``run_full_pipeline`` resumes
+    by default, reusing a finished detect/analyze whose input PDF hasn't
+    changed, which is what makes a re-queue after a deploy cheap. This
+    button means the opposite: it is labelled "re-run the full pipeline
+    from scratch", warns about GPU cost, and sits behind a confirm
+    dialog. Without the invalidation it would silently reuse and the
+    scan would come back with exactly the detections it already had.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
+    from scanning import s3_sync
+
     scan = get_object_or_404(Scan, pk=pk)
     guard = _block_if_pending_changes(request, scan)
     if guard:
         return guard
+    s3_sync.invalidate_job_results(scan)
     scan.status = Status.QUEUED
     scan.stage = Stage.VALIDATE
     scan.queued_action = QueuedAction.FULL_PIPELINE
