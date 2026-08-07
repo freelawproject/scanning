@@ -2110,11 +2110,10 @@ class TestPipelineResumesInsteadOfRerunningGpuStages(TestCase):
         self.bitonal = pathlib.Path(self.scan.output_dir) / "bitonal.pdf"
         _write_bitonal_copy(self.bitonal)
 
-    def _run(self, reusable, force=False):
+    def _run(self, reusable):
         """Run the pipeline with ``reusable_result`` stubbed.
 
         :param reusable: Return value for every ``reusable_result`` call.
-        :param force: Passed through to ``run_full_pipeline``.
         :returns: ``(reuse_mock, yolo_mock, validation_mock)``.
         """
         from scanning import services
@@ -2137,7 +2136,7 @@ class TestPipelineResumesInsteadOfRerunningGpuStages(TestCase):
                 return_value=reusable,
             ) as reuse,
         ):
-            services.run_full_pipeline(self.scan.pk, force=force)
+            services.run_full_pipeline(self.scan.pk)
         return reuse, yolo, validation
 
     def test_finished_detect_is_reused_not_resubmitted(self):
@@ -2176,19 +2175,11 @@ class TestPipelineResumesInsteadOfRerunningGpuStages(TestCase):
         _, yolo, _ = self._run({"detections": [{"page_index": 7}]})
         yolo.assert_not_called()
 
-    def test_force_re_runs_detection_despite_a_stored_result(self):
-        reuse, yolo, _ = self._run({"detections": []}, force=True)
-
-        yolo.assert_called_once()
-        # force means "I meant to re-run this", so don't even look.
-        reuse.assert_not_called()
-
-    def test_validation_reuses_by_default_and_not_under_force(self):
+    def test_validation_is_asked_to_reuse(self):
+        # Step 5 is the other GPU stage; the pipeline is the only caller
+        # that opts it into reuse.
         _, _, validation = self._run(None)
         self.assertTrue(validation.call_args.kwargs["reuse"])
-
-        _, _, validation = self._run(None, force=True)
-        self.assertFalse(validation.call_args.kwargs["reuse"])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

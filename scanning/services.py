@@ -1593,7 +1593,7 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_full_pipeline(scan_pk: int, force: bool = False) -> None:
+def run_full_pipeline(scan_pk: int) -> None:
     """Run the full processing pipeline: bitonal → YOLO → validate → pair.
 
     Designed to run in the daemon process. After this completes, the scan
@@ -1607,10 +1607,12 @@ def run_full_pipeline(scan_pk: int, force: bool = False) -> None:
     steps 3 and 5 are GPU jobs measured in minutes. See
     :func:`_reuse_detect_result` and ``runpod_client.reusable_result``.
 
-    ``force`` is the "I meant to re-run this" switch: it re-runs both GPU
-    stages and overwrites their stored results. Staff wanting a genuine
-    re-detect on one scan usually want :func:`run_detect` instead, which
-    always re-runs and skips the rest of the pipeline.
+    There is no "re-run anyway" argument here on purpose. The daemon
+    dispatches this by name with only a pk, so a caller wanting fresh
+    results has nowhere to put one; it says so by deleting the stored
+    results instead (``s3_sync.invalidate_job_results``, which is what
+    the Re-validate action does). That survives the hand-off through the
+    queue, which a parameter could not.
 
     No text layer is embedded here. The ocrmypdf/Tesseract pass used to
     run between bitonal conversion and detection and dominated the
@@ -1627,8 +1629,6 @@ def run_full_pipeline(scan_pk: int, force: bool = False) -> None:
     overlay still gets rects on demand through ``compute_redactions_api``.
 
     :param scan_pk: Primary key of the scan to process.
-    :param force: Re-run the GPU stages even when a reusable result is
-        stored, overwriting it. Default False, which is the resume path.
     """
     django.db.connections.close_all()
     _pull_processing_files_from_s3(scan_pk)
@@ -1647,7 +1647,7 @@ def run_full_pipeline(scan_pk: int, force: bool = False) -> None:
         bitonal_path = _ensure_bitonal(scan, output_dir)
 
         # 3. YOLO detection (all 3 models on bitonal)
-        if force or not _reuse_detect_result(scan, str(output_dir)):
+        if not _reuse_detect_result(scan, str(output_dir)):
             _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
 
         # 4. Import detections into DB
@@ -1659,7 +1659,7 @@ def run_full_pipeline(scan_pk: int, force: bool = False) -> None:
             scan_pk,
             f"{len(dets)} detections imported. Running page number validation...",
         )
-        run_paddleocr_validation(scan_pk, scan.pdf_path, reuse=not force)
+        run_paddleocr_validation(scan_pk, scan.pdf_path, reuse=True)
 
         # 6. Pair opinions
         _update_progress(scan_pk, "Pairing opinions...")
