@@ -1424,3 +1424,171 @@ class TestInvokeWithResultsToS3(TestCase):
             )
         self.assertEqual(result, output)
         s3.get_object.assert_not_called()
+
+
+# ── reusable_result ─────────────────────────────────────────────────
+@override_settings(
+    RUNPOD_ENABLED=True,
+    AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket",
+)
+class TestReusableResult(TestCase):
+    """Reusing a finished job's result when the input hasn't changed.
+
+    The resume path for a daemon killed mid-pipeline. Every negative
+    answer here has the same consequence -- the caller runs the stage --
+    so the bar is that nothing raises and nothing accepts an object that
+    predates the current input.
+    """
+
+    def setUp(self):
+        self.scan = ScanFactory()
+        self.input_at = datetime.now(UTC) - timedelta(hours=1)
+
+    def _s3(self, result_at, envelope=None, input_at=None):
+        """Build an S3 client whose two heads answer result then input.
+
+        :param result_at: ``LastModified`` for the result object.
+        :param envelope: Envelope ``get_object`` should return.
+        :param input_at: ``LastModified`` for the input PDF.
+        :returns: The mock client.
+        :rtype: MagicMock
+        """
+        s3 = MagicMock()
+        s3.head_object.side_effect = [
+            {"LastModified": result_at},
+            {"LastModified": input_at or self.input_at},
+        ]
+        if envelope is not None:
+            s3.get_object.return_value = _body_stub(
+                json.dumps(envelope).encode()
+            )
+        return s3
+
+    def _call(self, s3, action="detect", creds=True):
+        """Invoke ``reusable_result`` against a mocked S3."""
+        with (
+            patch("scanning.runpod_client._s3", return_value=s3),
+            patch("scanning.utils.has_s3_credentials", return_value=creds),
+        ):
+            return runpod_client.reusable_result(
+                self.scan, action, "bitonal.pdf"
+            )
+
+    def test_result_newer_than_input_is_reused(self):
+        envelope = _envelope(
+            scan_pk=self.scan.pk,
+            payload={"detections": [{"page_index": 1}]},
+        )
+        s3 = self._s3(datetime.now(UTC), envelope=envelope)
+        self.assertEqual(self._call(s3), {"detections": [{"page_index": 1}]})
+
+    def test_heads_the_result_key_then_the_input_key(self):
+        # Both keys are built here, and every other test in this class
+        # stubs head_object positionally -- so without this one, a key
+        # pointing outside the scan's processing prefix would go unnoticed.
+        from scanning import s3_sync
+
+        envelope = _envelope(scan_pk=self.scan.pk)
+        s3 = self._s3(datetime.now(UTC), envelope=envelope)
+        self._call(s3)
+
+        prefix = s3_sync.s3_processing_prefix(self.scan)
+        self.assertEqual(
+            [c.kwargs["Key"] for c in s3.head_object.call_args_list],
+            [f"{prefix}jobs/detect/result.json", f"{prefix}bitonal.pdf"],
+        )
+        self.assertEqual(
+            s3.get_object.call_args.kwargs["Key"],
+            f"{prefix}jobs/detect/result.json",
+        )
+
+    def test_analyze_heads_the_original_pdf_as_its_input(self):
+        # The analyze stage runs against the original, not the bitonal, so
+        # its freshness reference is a different object.
+        from scanning import s3_sync
+
+        envelope = _envelope(action="analyze", scan_pk=self.scan.pk)
+        s3 = self._s3(datetime.now(UTC), envelope=envelope)
+        with (
+            patch("scanning.runpod_client._s3", return_value=s3),
+            patch("scanning.utils.has_s3_credentials", return_value=True),
+        ):
+            runpod_client.reusable_result(
+                self.scan, "analyze", "a3d.1.1.2.original.pdf"
+            )
+
+        prefix = s3_sync.s3_processing_prefix(self.scan)
+        self.assertEqual(
+            [c.kwargs["Key"] for c in s3.head_object.call_args_list],
+            [
+                f"{prefix}jobs/analyze/result.json",
+                f"{prefix}a3d.1.1.2.original.pdf",
+            ],
+        )
+
+    def test_result_older_than_input_is_rejected(self):
+        # The page-editing paths rewrite bitonal.pdf and re-upload it, so
+        # a result from before that edit describes pages that no longer
+        # exist. Re-run rather than reuse.
+        s3 = self._s3(self.input_at - timedelta(minutes=5))
+        self.assertIsNone(self._call(s3))
+        s3.get_object.assert_not_called()
+
+    def test_foreign_job_id_is_still_reusable(self):
+        # The deliberate inversion of _validate_envelope: we are knowingly
+        # reading the *previous* run's object, so its job_id never matches
+        # and must not disqualify it.
+        envelope = _envelope(
+            scan_pk=self.scan.pk,
+            payload={"detections": []},
+            job_id="some-earlier-job",
+        )
+        s3 = self._s3(datetime.now(UTC), envelope=envelope)
+        self.assertEqual(self._call(s3), {"detections": []})
+
+    def test_envelope_for_another_scan_is_rejected(self):
+        envelope = _envelope(scan_pk=self.scan.pk + 1000)
+        s3 = self._s3(datetime.now(UTC), envelope=envelope)
+        self.assertIsNone(self._call(s3))
+
+    def test_envelope_for_another_action_is_rejected(self):
+        envelope = _envelope(action="analyze", scan_pk=self.scan.pk)
+        s3 = self._s3(datetime.now(UTC), envelope=envelope)
+        self.assertIsNone(self._call(s3))
+
+    def test_future_schema_version_is_rejected(self):
+        envelope = _envelope(
+            scan_pk=self.scan.pk,
+            schema_version=runpod_client.RESULT_SCHEMA_VERSION + 1,
+        )
+        s3 = self._s3(datetime.now(UTC), envelope=envelope)
+        self.assertIsNone(self._call(s3))
+
+    def test_missing_result_object_is_not_an_error(self):
+        s3 = MagicMock()
+        s3.head_object.side_effect = _client_error("404")
+        self.assertIsNone(self._call(s3))
+
+    def test_unparseable_body_is_swallowed(self):
+        s3 = self._s3(datetime.now(UTC))
+        s3.get_object.return_value = _body_stub(b"not json")
+        self.assertIsNone(self._call(s3))
+
+    def test_payload_missing_is_rejected(self):
+        envelope = _envelope(scan_pk=self.scan.pk)
+        del envelope["payload"]
+        s3 = self._s3(datetime.now(UTC), envelope=envelope)
+        self.assertIsNone(self._call(s3))
+
+    @override_settings(RUNPOD_ENABLED=False)
+    def test_local_mode_never_heads(self):
+        # Local mode writes no result object, so the two round trips
+        # would only ever confirm there is nothing there.
+        s3 = MagicMock()
+        self.assertIsNone(self._call(s3))
+        s3.head_object.assert_not_called()
+
+    def test_missing_credentials_never_heads(self):
+        s3 = MagicMock()
+        self.assertIsNone(self._call(s3, creds=False))
+        s3.head_object.assert_not_called()

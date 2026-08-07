@@ -574,6 +574,133 @@ def _result_survived_the_job(
         return False
 
 
+def reusable_result(scan: Scan, action: str, input_rel: str) -> dict | None:
+    """Return a stored job result still valid for ``input_rel``, else None.
+
+    Lets an interrupted pipeline pick up a stage that already finished
+    instead of paying for the GPU job again. The daemon is killed
+    mid-pipeline on every deploy, and ``run_full_pipeline`` restarts at
+    step 1, so without this a completed 3-model detect is re-submitted
+    and its result object overwritten with an identical one.
+
+    "Still valid" is a timestamp comparison against the input PDF. Result
+    keys are per scan and action, not per run or per input, so the object
+    at one can predate an edit: the page-editing paths rewrite
+    ``bitonal.pdf`` in place and re-upload it, which pushes its
+    ``LastModified`` past the result's and correctly reads as stale. That
+    only holds because ``s3_sync.upload_processing_files`` refuses to
+    re-upload an unchanged input; see ``s3_sync.PIPELINE_INPUT_NAME``.
+
+    Deliberately the reverse of :func:`_validate_envelope`'s ``job_id``
+    check. There the question is "did *this* run write it?" and a foreign
+    job id is disqualifying; here we are knowingly reading an earlier
+    run's output, so only ``schema_version`` / ``action`` / ``scan_pk``
+    have to match.
+
+    Every failure answers None, including a malformed or unreadable
+    object. The caller's fallback is to run the stage, which is the
+    status quo and always correct, so nothing here should be able to
+    fail a pipeline that would otherwise have succeeded.
+
+    :param scan: The Scan owning the job.
+    :param action: Handler action / pipeline stage (``detect`` /
+        ``analyze``).
+    :param input_rel: Path of the stage's input PDF relative to the
+        scan's processing prefix (normally
+        ``s3_sync.PIPELINE_INPUT_NAME``).
+    :returns: The stored payload dict, or None if there isn't a usable
+        one.
+    :rtype: dict | None
+    """
+    from scanning import s3_sync
+    from scanning.utils import has_s3_credentials
+
+    # Local mode never writes a result object, so there is nothing to
+    # reuse and the heads would only cost two round trips to find out.
+    if not _remote_enabled() or not has_s3_credentials():
+        return None
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    result_key = s3_sync.s3_job_result_key(scan, action)
+    input_key = f"{s3_sync.s3_processing_prefix(scan)}{input_rel}"
+
+    try:
+        s3 = _s3()
+        result_at = s3.head_object(Bucket=bucket, Key=result_key).get(
+            "LastModified"
+        )
+        input_at = s3.head_object(Bucket=bucket, Key=input_key).get(
+            "LastModified"
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code not in ("404", "NoSuchKey", "NotFound"):
+            # A missing object is the common case on a first run. Anything
+            # else -- AccessDenied, wrong region, throttling -- is a real
+            # S3 problem, and the fallback silently pays for a duplicate
+            # GPU job, so it must not be invisible.
+            logger.warning(
+                "could not check for a reusable %s result for scan %s; "
+                "running the stage: %s",
+                action,
+                scan.pk,
+                exc,
+            )
+        return None
+    except BotoCoreError:
+        logger.warning(
+            "could not check for a reusable %s result for scan %s; "
+            "running the stage",
+            action,
+            scan.pk,
+            exc_info=True,
+        )
+        return None
+
+    if result_at is None or input_at is None or result_at < input_at:
+        return None
+
+    try:
+        body = s3.get_object(Bucket=bucket, Key=result_key)["Body"].read()
+        envelope = json.loads(body)
+    except (BotoCoreError, ClientError, ValueError):
+        logger.warning(
+            "unreadable %s result at %s; re-running the stage",
+            action,
+            result_key,
+            exc_info=True,
+        )
+        return None
+
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("schema_version") != RESULT_SCHEMA_VERSION
+        or envelope.get("action") != action
+        or envelope.get("scan_pk") != scan.pk
+    ):
+        logger.warning(
+            "stored %s result at %s does not describe this scan and action; "
+            "re-running the stage",
+            action,
+            result_key,
+        )
+        return None
+
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    logger.info(
+        "reusing %s result for scan %s from s3 key=%s (written %s, input %s)",
+        action,
+        scan.pk,
+        result_key,
+        result_at.isoformat(),
+        input_at.isoformat(),
+    )
+    return payload
+
+
 def _fetch_result(key: str, submitted_at: datetime) -> dict:
     """Read and parse the JSON envelope the worker wrote.
 
