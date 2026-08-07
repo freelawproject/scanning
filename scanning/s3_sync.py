@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 
 from scanning.models import Scan
@@ -82,6 +82,11 @@ APPROVED_FILE_SUFFIXES = (".original.pdf", ".redacted.pdf")
 # wire artifacts the daemon consumes once and writes to Postgres, not
 # files the viewer or the pipeline ever reads off disk.
 JOB_RESULTS_SUBDIR = "jobs/"
+
+# The bitonal PDF the detect stage runs against. Named because its S3
+# ``LastModified`` is a reference timestamp, not just a filename: see
+# :func:`_is_stage_input`.
+PIPELINE_INPUT_NAME = "bitonal.pdf"
 
 
 def _s3_enabled() -> bool:
@@ -224,11 +229,68 @@ def _is_approved_deliverable(relative_path: str) -> bool:
     return False
 
 
+def _is_stage_input(rel: str) -> bool:
+    """Return True if a relative key is a GPU stage's input PDF.
+
+    ``bitonal.pdf`` feeds detect; the top-level ``*.original.pdf`` feeds
+    analyze, which runs against the greyscale original because the page
+    numbers OCR better there. Both live in the scan's output dir, so both
+    are in ``upload_processing_files``' path.
+
+    These two objects' ``LastModified`` are what
+    ``runpod_client.reusable_result`` compares a stored job result
+    against to decide whether it was computed from the current pages.
+    Re-uploading identical bytes would advance the timestamp and make
+    every stored result look stale, so they are the files worth a
+    ``head_object`` to skip.
+
+    :param rel: Object key relative to the scan's processing prefix.
+    :returns: Whether the key is a stage input.
+    :rtype: bool
+    """
+    return rel == PIPELINE_INPUT_NAME or _is_original_pdf(rel)
+
+
+def _size_matches_s3(s3, bucket: str, key: str, path: Path) -> bool:
+    """Return True if ``key`` already holds an object of ``path``'s size.
+
+    A size comparison, not a hash: one ``head_object`` against reading
+    and digesting a 60+ MB PDF on every pipeline that ends. It is only
+    ever used to skip a *re-upload of a file we ourselves just wrote*, so
+    the question is whether the local copy was edited, not whether an
+    arbitrary object collides. Page inserts and deletes rewrite the PDF
+    structure, so a same-size edit isn't a realistic outcome.
+
+    Any S3 error answers False: re-uploading is the status quo and always
+    correct, where wrongly skipping would leave S3 stale.
+
+    :param s3: The S3 client to use.
+    :param bucket: Bucket holding the object.
+    :param key: Full object key.
+    :param path: Local file to compare against.
+    :returns: Whether the remote object already matches in size.
+    :rtype: bool
+    """
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+    except (BotoCoreError, ClientError):
+        # Includes the transport failures (connect timeout, endpoint
+        # resolution, credential refresh) that aren't ClientError. Letting
+        # one escape would abort the whole end-of-pipeline push partway
+        # through the walk while the pipeline still reported success.
+        return False
+    return head.get("ContentLength") == path.stat().st_size
+
+
 def upload_processing_files(scan: Scan) -> int:
     """Upload processing files from MEDIA_ROOT to S3.
 
-    Overwrites existing S3 objects; no hash check. Intended to run at
-    the end of a pipeline that leaves the scan in a viewable state.
+    Overwrites existing S3 objects with no hash check, with one
+    exception: a stage input (see :func:`_is_stage_input`) is skipped
+    when the object already there is the same size, so its
+    ``LastModified`` keeps meaning "when the pages last changed".
+    Intended to run at the end of a pipeline that leaves the scan in a
+    viewable state.
 
     :param scan: Scan whose output dir to upload.
     :returns: Number of files uploaded (0 if disabled or nothing found).
@@ -254,6 +316,10 @@ def upload_processing_files(scan: Scan) -> int:
     for path in _iter_files_to_sync(local_root):
         rel = path.relative_to(local_root).as_posix()
         if _is_job_result(rel):
+            continue
+        if _is_stage_input(rel) and _size_matches_s3(
+            s3, bucket, f"{prefix}{rel}", path
+        ):
             continue
         s3.upload_file(str(path), bucket, f"{prefix}{rel}")
         count += 1
