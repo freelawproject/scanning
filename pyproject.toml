@@ -33,9 +33,12 @@ dependencies = [
   # validation and the ink geometry — no torch/paddle. The heavy in-process
   # inference stack lives in the `local-ml` extra so the web/daemon images stay
   # lean whenever detection is offloaded to RunPod (RUNPOD_ENABLED=True).
-  # 0.2.0 is the floor: it is the release that carries the ink geometry
-  # (blackletter #68/#69) this app reads instead of measuring it here.
-  "blackletter>=0.2.0",
+  # Pinned to a commit rather than a release: the daemon passes `workers` to
+  # `api.bitonal` (blackletter #71 / PR 72), which no published version
+  # accepts. Move this back to a `>=` release floor once that lands and a
+  # version is tagged. The commit is on the PR branch, so it stays reachable
+  # only while that branch does; re-pin promptly.
+  "blackletter @ git+https://github.com/freelawproject/blackletter@9fcc1f4088cb5d9e170d71d18e305fe7ce29817f",
   # No longer called directly: the pipeline embeds no text layer. Declared
   # so LLM_PAGE_TEXT_LAYER (blackletter's add_text_layer) has an engine, and
   # because base blackletter requires it anyway.
@@ -69,7 +72,8 @@ dev = [
 # wherever detection runs locally instead of on RunPod: local dev, CI, the
 # offline daemon, and the RunPod worker image. Excluded from the lean web image.
 local-ml = [
-  "blackletter[detect,analyze]>=0.2.0",
+  # Same commit as the base pin above; both must move together.
+  "blackletter[detect,analyze] @ git+https://github.com/freelawproject/blackletter@9fcc1f4088cb5d9e170d71d18e305fe7ce29817f",
   "torch",
   "torchvision",
   "ultralytics>=8.3",
