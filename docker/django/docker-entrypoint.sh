@@ -5,6 +5,7 @@ case "$1" in
 'web-dev')
     # Install blackletter from local mount if available
     if [ -d /opt/blackletter ]; then
+        echo "Installing local blackletter..."
         uv pip install -e /opt/blackletter 2>/dev/null || pip install -e /opt/blackletter 2>/dev/null || true
     fi
     python manage.py migrate
@@ -19,6 +20,7 @@ case "$1" in
 'run_daemon')
     # Install blackletter from local mount if available
     if [ -d /opt/blackletter ]; then
+        echo "Installing local blackletter..."
         uv pip install -e /opt/blackletter 2>/dev/null || pip install -e /opt/blackletter 2>/dev/null || true
     fi
     exec python manage.py run_daemon
