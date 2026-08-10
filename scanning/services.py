@@ -401,10 +401,15 @@ def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
             _update_progress(scan.pk, message, current=current, total=total)
 
         with _log_stage("Bitonal conversion") as stage:
+            # blackletter defaults to converting inline; the worker count is
+            # ours to choose because only this side knows what the pod was
+            # given. Above 1 the progress callback fires once per finished
+            # page range rather than per page, so the bar steps.
             bl_bitonal(
                 scan.pdf_path,
                 str(output_dir),
                 progress_callback=_bitonal_progress,
+                workers=settings.BITONAL_WORKERS,
             )
             size_mb = bitonal_path.stat().st_size / 1024 / 1024
             stage.done_detail = f"{size_mb:.1f} MB"

@@ -1236,7 +1236,7 @@ class TestImmediateS3PushOnGeneration(TestCase):
         output = pathlib.Path(scan.output_dir)
         output.mkdir(parents=True, exist_ok=True)
 
-        def _fake_bitonal(src, out, progress_callback=None):
+        def _fake_bitonal(src, out, progress_callback=None, workers=1):
             (pathlib.Path(out) / "bitonal.pdf").write_bytes(b"%PDF-1.4 bw")
 
         with (
@@ -1248,6 +1248,49 @@ class TestImmediateS3PushOnGeneration(TestCase):
             services._ensure_bitonal(scan, output)
 
         push.assert_called_once_with(scan.pk, "bitonal.pdf")
+
+    def test_ensure_bitonal_passes_configured_worker_count(self):
+        """The pod's worker count reaches blackletter.
+
+        blackletter converts inline unless told otherwise, so a dropped
+        kwarg here costs the whole speedup without failing anything.
+        """
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=2)
+        output = pathlib.Path(scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+
+        def _fake_bitonal(src, out, progress_callback=None, workers=1):
+            (pathlib.Path(out) / "bitonal.pdf").write_bytes(b"%PDF-1.4 bw")
+
+        with (
+            patch.object(
+                services, "bl_bitonal", side_effect=_fake_bitonal
+            ) as bitonal,
+            patch.object(services, "_push_generated_file_to_s3"),
+            patch.object(services.fitz, "open") as fitz_open,
+            self.settings(BITONAL_WORKERS=6),
+        ):
+            fitz_open.return_value.__enter__.return_value.page_count = 2
+            services._ensure_bitonal(scan, output)
+
+        assert bitonal.call_args.kwargs["workers"] == 6
+
+    def test_bitonal_worker_default_leaves_the_pod_headroom(self):
+        """The derived default never claims every core, nor fewer than one."""
+        from scanning.settings.project.processing_storage import (
+            BITONAL_CPU_FRACTION,
+            _available_cpus,
+        )
+
+        cpus = _available_cpus()
+        derived = max(1, int(cpus * BITONAL_CPU_FRACTION))
+
+        assert cpus >= 1
+        assert 1 <= derived <= cpus
+        if cpus >= 5:
+            assert derived < cpus, "should leave the pod at least one core"
 
     def test_ensure_bitonal_skips_push_when_already_present(self):
         """An existing bitonal is neither reconverted nor re-uploaded."""

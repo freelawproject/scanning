@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import environ
 
 env = environ.FileAwareEnv()
@@ -43,3 +46,62 @@ PENDING_UPLOAD_TTL_HOURS = env.float("PENDING_UPLOAD_TTL_HOURS", default=9.0)
 # volume. It runs after redaction, so it never OCRs content that a rect is
 # about to cover.
 LLM_PAGE_TEXT_LAYER = env.bool("LLM_PAGE_TEXT_LAYER", default=False)
+
+
+def _cgroup_cpu_quota() -> float | None:
+    """CPU quota this container was granted, in cores, or None if unlimited.
+
+    Reads cgroup v2 first (``cpu.max``, "<quota> <period>" or "max <period>"),
+    then falls back to the v1 pair. Anything unreadable means we are not
+    constrained by a cgroup we can see.
+    """
+    v2 = Path("/sys/fs/cgroup/cpu.max")
+    try:
+        quota, period = v2.read_text().split()
+        return None if quota == "max" else float(quota) / float(period)
+    except (OSError, ValueError):
+        pass
+
+    try:
+        quota = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+        period = float(
+            Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text()
+        )
+    except (OSError, ValueError):
+        return None
+    return quota / period if quota > 0 else None
+
+
+def _available_cpus() -> int:
+    """Cores this process may actually use.
+
+    ``os.cpu_count()`` reports the *host's* cores, which inside a pod is
+    whatever the node happens to have rather than what the pod was granted,
+    so using it directly oversubscribes badly. Affinity and the cgroup quota
+    are the numbers that bound us.
+    """
+    try:
+        usable = len(os.sched_getaffinity(0))
+    except AttributeError:  # non-POSIX
+        usable = os.cpu_count() or 1
+
+    quota = _cgroup_cpu_quota()
+    if quota:
+        usable = min(usable, int(quota))
+    return max(1, usable)
+
+
+# Share of the pod's CPUs bitonal conversion may occupy when BITONAL_WORKERS
+# is not set explicitly. Deliberately below 1.0: the daemon has other work to
+# do while a conversion runs, and throughput flattens out well before one
+# worker per core anyway (rasterisation is memory-bandwidth bound, not CPU
+# bound), so the last 20% of the cores buys little.
+BITONAL_CPU_FRACTION = 0.8
+
+# Worker processes blackletter splits bitonal conversion across. Set
+# BITONAL_WORKERS to pin it; leave it unset to derive it from the cores this
+# pod actually has. 1 converts inline, which is what blackletter does by
+# default and what the tests want.
+BITONAL_WORKERS = env.int("BITONAL_WORKERS", default=0) or max(
+    1, int(_available_cpus() * BITONAL_CPU_FRACTION)
+)
