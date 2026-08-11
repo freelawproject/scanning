@@ -6,6 +6,7 @@ from django.utils.text import capfirst
 
 from scanning.models import (
     Detection,
+    ExternalJob,
     Issue,
     OpinionScan,
     Page,
@@ -623,3 +624,52 @@ class PageAdmin(admin.ModelAdmin):
     def has_xml(self, obj):
         """Whether the page has extracted XML content."""
         return bool(obj.xml_content)
+
+
+@admin.register(ExternalJob)
+class ExternalJobAdmin(admin.ModelAdmin):
+    # Left editable: a job row carries operational state (status, retry
+    # budget, deadline) an operator may legitimately need to nudge. The
+    # provenance fields are the exception, since a page range means
+    # nothing except against the digest it was computed for, so editing
+    # one by hand would leave the check passing against other bytes.
+    list_display = [
+        "scan",
+        "opinion",
+        "stage",
+        "engine",
+        "provider",
+        "run",
+        "attempt",
+        "shard_label",
+        "status",
+        "retry_count",
+        "deadline",
+        "date_modified",
+    ]
+    list_filter = ["status", "stage", "engine", "provider"]
+    search_fields = [
+        "scan__id",
+        "opinion__id",
+        "external_id",
+        "result_key",
+        "error_message",
+    ]
+    raw_id_fields = ["scan", "opinion"]
+    readonly_fields = [
+        "source_digest",
+        "input_key",
+        "date_created",
+        "date_modified",
+    ]
+    date_hierarchy = "date_created"
+    ordering = ["-date_created"]
+    # An extract changelist is one row per opinion per engine, so the
+    # opinion join has to be eager or the page issues hundreds of
+    # queries rendering its own list_display.
+    list_select_related = ["scan", "opinion"]
+
+    @admin.display(description="Shard")
+    def shard_label(self, obj):
+        """Render the job's position in its target's fan-out."""
+        return f"{obj.shard_index + 1}/{obj.shard_count}"

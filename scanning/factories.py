@@ -2,6 +2,11 @@ import factory
 from django.contrib.auth.models import User
 
 from scanning.models import (
+    ExternalJob,
+    JobEngine,
+    JobProvider,
+    JobStage,
+    JobStatus,
     OpinionScan,
     OpinionStatus,
     Reporter,
@@ -112,6 +117,39 @@ class ScanFactory(factory.django.DjangoModelFactory):
     )
     uploaded_by = factory.SubFactory(UserFactory)
     status = Status.UPLOADED
+
+
+class ExternalJobFactory(factory.django.DjangoModelFactory):
+    """Factory for creating ExternalJob instances.
+
+    Defaults to a volume-level job, since that shape needs no opinion.
+    For an opinion-level stage pass both ``stage`` and ``opinion``, which
+    the ``job_opinion_matches_stage`` constraint requires together.
+
+    Default declarations:
+
+    - ``scan``: auto-created via ``ScanFactory``.
+    - ``opinion``: None (volume-level work).
+    - ``stage``: ``JobStage.DETECT``.
+    - ``engine``: ``JobEngine.BLACKLETTER``.
+    - ``provider``: ``JobProvider.RUNPOD``.
+    - ``status``: ``JobStatus.PENDING``.
+    - ``run``: 1.
+    - ``shard_index``: 0, ``shard_count``: 1.
+    """
+
+    class Meta:
+        model = ExternalJob
+
+    scan = factory.SubFactory(ScanFactory)
+    opinion = None
+    stage = JobStage.DETECT
+    engine = JobEngine.BLACKLETTER
+    provider = JobProvider.RUNPOD
+    status = JobStatus.PENDING
+    run = 1
+    shard_index = 0
+    shard_count = 1
 
 
 class OpinionScanFactory(factory.django.DjangoModelFactory):
