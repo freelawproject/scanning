@@ -100,6 +100,17 @@ def _write_bitonal_copy(dest):
         fh.write(b"\n% bitonal\n")
 
 
+def _fake_bitonal(src, out, progress_callback=None, workers=1):
+    """Stand in for ``blackletter.api.bitonal``, writing only the output file.
+
+    The signature has to track the real one: it is patched in with
+    ``side_effect``, so a kwarg the caller passes that this does not accept
+    raises ``TypeError`` rather than being ignored.
+    """
+    del src, progress_callback, workers
+    (pathlib.Path(out) / "bitonal.pdf").write_bytes(b"%PDF-1.4 bw")
+
+
 def _run_detect_on_fixture(tmpdir):
     """Run YOLO detect on the fixture PDF, return detections list."""
     from blackletter.api import detect
@@ -1236,9 +1247,6 @@ class TestImmediateS3PushOnGeneration(TestCase):
         output = pathlib.Path(scan.output_dir)
         output.mkdir(parents=True, exist_ok=True)
 
-        def _fake_bitonal(src, out, progress_callback=None, workers=1):
-            (pathlib.Path(out) / "bitonal.pdf").write_bytes(b"%PDF-1.4 bw")
-
         with (
             patch.object(services, "bl_bitonal", side_effect=_fake_bitonal),
             patch.object(services, "_push_generated_file_to_s3") as push,
@@ -1260,9 +1268,6 @@ class TestImmediateS3PushOnGeneration(TestCase):
         scan = ScanFactory(start_page=1, end_page=2)
         output = pathlib.Path(scan.output_dir)
         output.mkdir(parents=True, exist_ok=True)
-
-        def _fake_bitonal(src, out, progress_callback=None, workers=1):
-            (pathlib.Path(out) / "bitonal.pdf").write_bytes(b"%PDF-1.4 bw")
 
         with (
             patch.object(

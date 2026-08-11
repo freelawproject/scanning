@@ -1,13 +1,20 @@
 #!/bin/sh
 set -e
 
-case "$1" in
-'web-dev')
-    # Install blackletter from local mount if available
+# Install blackletter from the local mount when one is present, so a
+# developer iterating on the library sees their checkout instead of the
+# version pinned in pyproject.toml. The log line matters: without it there
+# is no way to tell from the logs which of the two a container is running.
+install_local_blackletter() {
     if [ -d /opt/blackletter ]; then
         echo "Installing local blackletter..."
         uv pip install -e /opt/blackletter 2>/dev/null || pip install -e /opt/blackletter 2>/dev/null || true
     fi
+}
+
+case "$1" in
+'web-dev')
+    install_local_blackletter
     python manage.py migrate
     python manage.py loaddata reporters
     python manage.py make_dev_data
@@ -18,11 +25,7 @@ case "$1" in
     exec python manage.py runserver 0.0.0.0:8000
     ;;
 'run_daemon')
-    # Install blackletter from local mount if available
-    if [ -d /opt/blackletter ]; then
-        echo "Installing local blackletter..."
-        uv pip install -e /opt/blackletter 2>/dev/null || pip install -e /opt/blackletter 2>/dev/null || true
-    fi
+    install_local_blackletter
     exec python manage.py run_daemon
     ;;
 'web-prod')
