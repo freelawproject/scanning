@@ -142,7 +142,7 @@ wheels = [
 [[package]]
 name = "blackletter"
 version = "0.2.0"
-source = { git = "https://github.com/freelawproject/blackletter?rev=9fcc1f4088cb5d9e170d71d18e305fe7ce29817f#9fcc1f4088cb5d9e170d71d18e305fe7ce29817f" }
+source = { git = "https://github.com/freelawproject/blackletter?rev=a6e905fcb585b624a970fef2d178aeca89241f38#a6e905fcb585b624a970fef2d178aeca89241f38" }
 dependencies = [
     { name = "numpy" },
     { name = "ocrmypdf" },
@@ -2355,8 +2355,8 @@ local-ml = [
 
 [package.metadata]
 requires-dist = [
-    { name = "blackletter", git = "https://github.com/freelawproject/blackletter?rev=9fcc1f4088cb5d9e170d71d18e305fe7ce29817f" },
-    { name = "blackletter", extras = ["detect", "analyze"], marker = "extra == 'local-ml'", git = "https://github.com/freelawproject/blackletter?rev=9fcc1f4088cb5d9e170d71d18e305fe7ce29817f" },
+    { name = "blackletter", git = "https://github.com/freelawproject/blackletter?rev=a6e905fcb585b624a970fef2d178aeca89241f38" },
+    { name = "blackletter", extras = ["detect", "analyze"], marker = "extra == 'local-ml'", git = "https://github.com/freelawproject/blackletter?rev=a6e905fcb585b624a970fef2d178aeca89241f38" },
     { name = "boto3" },
     { name = "daphne" },
     { name = "django", specifier = ">=6.0,<6.1" },

@@ -38,7 +38,7 @@ dependencies = [
   # accepts. Move this back to a `>=` release floor once that lands and a
   # version is tagged. The commit is on the PR branch, so it stays reachable
   # only while that branch does; re-pin promptly.
-  "blackletter @ git+https://github.com/freelawproject/blackletter@9fcc1f4088cb5d9e170d71d18e305fe7ce29817f",
+  "blackletter @ git+https://github.com/freelawproject/blackletter@a6e905fcb585b624a970fef2d178aeca89241f38",
   # No longer called directly: the pipeline embeds no text layer. Declared
   # so LLM_PAGE_TEXT_LAYER (blackletter's add_text_layer) has an engine, and
   # because base blackletter requires it anyway.
@@ -73,7 +73,7 @@ dev = [
 # offline daemon, and the RunPod worker image. Excluded from the lean web image.
 local-ml = [
   # Same commit as the base pin above; both must move together.
-  "blackletter[detect,analyze] @ git+https://github.com/freelawproject/blackletter@9fcc1f4088cb5d9e170d71d18e305fe7ce29817f",
+  "blackletter[detect,analyze] @ git+https://github.com/freelawproject/blackletter@a6e905fcb585b624a970fef2d178aeca89241f38",
   "torch",
   "torchvision",
   "ultralytics>=8.3",
