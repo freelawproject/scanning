@@ -2252,6 +2252,32 @@ class TestPendingChangesGuard(ScanningTestCase):
         self.assertEqual(self.scan.status, Status.QUEUED)
         self.assertEqual(self.scan.queued_action, QueuedAction.FULL_PIPELINE)
 
+    def test_start_validate_drops_stored_gpu_results(self):
+        """Re-validate means re-run, so the resume cache must be cleared.
+
+        ``run_full_pipeline`` reuses a finished detect/analyze whose input
+        PDF hasn't changed, which is what makes a re-queue after a deploy
+        cheap. This button says "re-run from scratch" and warns about GPU
+        cost; without the invalidation it would hand back exactly the
+        detections the scan already had.
+        """
+        self.scan.deletions.all().delete()
+        with patch("scanning.s3_sync.invalidate_job_results") as invalidate:
+            self.client.post(
+                reverse("start_validate", kwargs={"pk": self.scan.pk})
+            )
+        invalidate.assert_called_once()
+        self.assertEqual(invalidate.call_args.args[0].pk, self.scan.pk)
+
+    def test_blocked_start_validate_leaves_stored_results_alone(self):
+        """A refused action must not throw away a reusable result."""
+        PageDeletion.objects.create(scan=self.scan, pdf_page=3)
+        with patch("scanning.s3_sync.invalidate_job_results") as invalidate:
+            self.client.post(
+                reverse("start_validate", kwargs={"pk": self.scan.pk})
+            )
+        invalidate.assert_not_called()
+
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestViewsWithoutLocalOriginal(ScanningTestCase):
