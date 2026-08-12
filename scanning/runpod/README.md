@@ -10,6 +10,7 @@ database client, no AWS credentials. All sensitive configuration lives
 in RunPod endpoint env vars, never in the image.
 
 [RunPod Serverless]: https://docs.runpod.io/serverless/overview
+[blackletter#73]: https://github.com/freelawproject/blackletter/pull/73
 
 ## How it fits
 
@@ -44,11 +45,17 @@ Full design rationale, payload-size math, and tradeoffs are in
 - Python 3.12 (system python, no venv managers at runtime).
 - PyTorch 2.6 cu126 + paddlepaddle-gpu 3.1.0 cu126 (aligned on one
   CUDA minor version).
-- `blackletter` pinned to PyPI (`>=0.1.1`).
+- `blackletter` pinned to a git rev of the unmerged bl-warm branch
+  ([blackletter#73]) rather than PyPI, because the released versions
+  have no bl_warm adapter and no bl_warm weight source. See the
+  `[tool.uv.sources]` comment in `pyproject.toml`; this goes back to a
+  plain PyPI pin once #73 ships.
 - Pre-baked weights so cold start skips the network:
-  - YOLO `small.pt`, `medium.pt`, `large.pt` (blackletter >=0.1.1
-    bundles none; all three are downloaded at build from the public
-    HF repo `freelawproject/blackletter-weights`).
+  - YOLO `bl_warm.pt` (the detect default) plus the legacy `small.pt`,
+    `medium.pt`, `large.pt` trio, kept so `YOLO_DETECT_MODELS` can roll
+    back without a rebuild. blackletter bundles no weights; all four
+    are downloaded at build from the public HF repo
+    `freelawproject/blackletter-weights`.
   - PaddleOCR PP-OCRv5 server det + rec weights in `/opt/paddlex`.
 - A `libcuda.so.1` stub from the CUDA `-devel-` variant so
   `import paddle` succeeds during `docker build`; the host's real

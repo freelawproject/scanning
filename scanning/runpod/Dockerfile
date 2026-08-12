@@ -3,8 +3,9 @@
 # GPU worker image for RunPod Serverless.
 #
 # Runs the blackletter detect and analyze_pdf steps only. No Django,
-# no AWS credentials, no DB client. Weights (YOLO small/medium/large
-# + PaddleOCR PP-OCRv5) are baked in so cold start skips the network.
+# no AWS credentials, no DB client. Weights (YOLO bl_warm +
+# small/medium/large, PaddleOCR PP-OCRv5) are baked in so cold start
+# skips the network.
 #
 # Build from the scanning/runpod/ directory:
 #     docker build -t blackletter-gpu-worker:local scanning/runpod/
@@ -87,15 +88,19 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-cache
 
-# ── Bake all three YOLO weights into the image ──────────────────────
+# ── Bake the YOLO weights into the image ────────────────────────────
 # blackletter >=0.1.1 bundles no weights in the wheel; ``ensure_weights``
-# downloads small/medium/large from HuggingFace (weights already on disk
-# resolve without network, so cold start stays offline). Retries 3 times
-# so a flaky HF doesn't fail the build. Then smoke-loads each with
-# YOLO(...) to catch truncated files.
+# downloads them from HuggingFace (weights already on disk resolve
+# without network, so cold start stays offline). Retries 3 times so a
+# flaky HF doesn't fail the build. Then smoke-loads each with YOLO(...)
+# to catch truncated files.
+#
+# bl_warm is the single-model replacement the detect step now defaults
+# to (YOLO_DETECT_MODELS). The legacy small/medium/large trio stays
+# baked so flipping that env var back is a rollback and not a rebuild.
 RUN set -e; \
     for i in 1 2 3; do \
-      python -c "from blackletter.api import ensure_weights; ensure_weights(['small', 'medium', 'large'])" \
+      python -c "from blackletter.api import ensure_weights; ensure_weights(['small', 'medium', 'large', 'bl_warm'])" \
         && break; \
       echo "ensure_weights attempt $i failed; sleeping 10s"; \
       sleep 10; \
@@ -104,7 +109,7 @@ RUN set -e; \
 import blackletter, pathlib; \
 from ultralytics import YOLO; \
 wd = pathlib.Path(blackletter.__file__).resolve().parent / 'weights'; \
-sizes = {'small.pt': 15_000_000, 'medium.pt': 40_000_000, 'large.pt': 100_000_000}; \
+sizes = {'small.pt': 15_000_000, 'medium.pt': 40_000_000, 'large.pt': 100_000_000, 'bl_warm.pt': 45_000_000}; \
 missing = [n for n, s in sizes.items() if not (wd / n).is_file() or (wd / n).stat().st_size < s]; \
 assert not missing, f'weights missing or truncated: {missing}'; \
 [YOLO(str(wd / n)) for n in sizes]; \
