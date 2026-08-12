@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}bl-warm comparison{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
+</head>
+<body>
+  <header class="site-header">
+    <nav>
+      <a class="brand" href="/">bl-warm comparison</a>
+      <a class="nav-link {% if page == 'classes' %}active{% endif %}"
+         href="/">Classes</a>
+      <a class="nav-link {% if page == 'redaction' %}active{% endif %}"
+         href="/redaction">Redaction (full volumes)</a>
+      <div class="nav-right">
+        <span class="muted small">legacy 3-model ensemble vs bl-warm</span>
+      </div>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

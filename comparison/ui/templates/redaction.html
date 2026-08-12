@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Redaction · bl-warm comparison{% endblock %}
+{% block content %}
+
+{% if not have_data %}
+<div class="card center-note">
+  <p>No data found — unzip the shared data package so that data/
+    sits next to app.py, then reload.</p>
+</div>
+{% else %}
+
+<div class="card" style="margin-bottom: 8px; padding: 8px 10px;">
+  <div class="filters" style="margin-bottom: 0;">
+    <strong>Redaction:</strong>
+    <select id="vol-select" class="inline" aria-label="Volume">
+      {% for vol, v in volumes.items() %}
+      <option value="{{ vol }}">{{ vol }} ({{ v.split }},
+        {{ v.pages }} pages)</option>
+      {% endfor %}
+    </select>
+    <button class="btn-outline" type="button" id="page-prev"
+            title="Previous page ([)">‹</button>
+    <input type="number" id="page-input" class="inline" min="1"
+           style="width: 90px;" aria-label="PDF page">
+    <span class="muted small" id="page-total"></span>
+    <button class="btn-outline" type="button" id="page-next"
+            title="Next page (])">›</button>
+    <button class="btn-outline" type="button" id="golden-next"
+            title="Next golden (annotated) page (})">✦ golden ›</button>
+    <span class="muted small" id="golden-mark"></span>
+    <button class="btn-outline" type="button" id="boxes-btn"
+            title="Overlay each model's redaction-class detections (b)">
+      redaction classes</button>
+    <span class="toolbar-spacer"></span>
+    <button class="btn-outline" type="button" id="zoom-out"
+            aria-label="Zoom out">−</button>
+    <button class="btn-outline" type="button" id="zoom-fit">Fit</button>
+    <button class="btn-outline" type="button" id="zoom-in"
+            aria-label="Zoom in">+</button>
+    <span class="muted small" id="zoom-level"></span>
+  </div>
+  <input type="range" id="page-slider" min="1" value="1"
+         style="width: 100%; margin-top: 6px;"
+         aria-label="Page position">
+</div>
+
+<div class="card stage-card e2e-card">
+  <div class="e2e-panes" id="e2e-panes">
+    {% for v in versions %}
+    <div class="e2e-pane">
+      <div class="muted small" style="padding: 2px 4px 4px;">
+        {{ version_titles[v] }}</div>
+      <div class="stage panel-scroll ann-stage e2e-stage"
+           data-version="{{ v }}">
+        <div class="stage-inner">
+          <img id="img-{{ v }}" alt="{{ version_titles[v] }}">
+          <svg id="svg-{{ v }}"></svg>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+
+<script id="data" type="application/json">{{ {
+  "volumes": volumes,
+  "versions": versions,
+  "label_colors": label_colors,
+} | tojson }}</script>
+<script src="/static/js/redaction.js?v={{ asset_v }}"></script>
+{% endif %}
+{% endblock %}

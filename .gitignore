@@ -44,3 +44,6 @@ scanning/settings/*private.py
 /scanning/assets/media/processed/
 /scanning/assets/media/original_scans/
 /scanning/assets/media/page_inserts/
+
+# bl-warm comparison viewer data (shared separately as a zip)
+comparison/data/
