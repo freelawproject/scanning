@@ -199,7 +199,9 @@ class ScanAdmin(admin.ModelAdmin):
 
         model_count: dict[str, int] = {}
         # Every cascade table needs listing here by hand, since replacing
-        # the default collector is what loses its automatic discovery.
+        # the default collector is what loses its automatic discovery. So
+        # this list has to be extended whenever a new model cascades from
+        # Scan, or the confirmation page understates the blast radius.
         # ExternalJob in practice only contributes its volume-level rows:
         # an opinion-level job requires an opinion, and an opinion blocks
         # the delete outright via the PROTECT above.
@@ -210,6 +212,7 @@ class ScanAdmin(admin.ModelAdmin):
             Issue,
             PageInsert,
             PageDeletion,
+            PendingUpload,
             ExternalJob,
         ):
             field = "pk" if model is Scan else "scan_id"

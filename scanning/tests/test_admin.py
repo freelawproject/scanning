@@ -23,8 +23,8 @@ from django.contrib.sessions.middleware import SessionMiddleware
 from django.test import RequestFactory, TestCase
 
 from scanning.admin import ScanAdmin
-from scanning.factories import ExternalJobFactory, ScanFactory
-from scanning.models import JobStage, Scan, Status
+from scanning.factories import ExternalJobFactory, ScanFactory, UserFactory
+from scanning.models import JobStage, PendingUpload, Scan, Status
 
 
 def _request_with_messages():
@@ -210,6 +210,22 @@ class ScanAdminDeleteSummaryTests(TestCase):
 
         self.assertEqual(model_count.get("external jobs"), 2)
 
+    def test_summary_counts_pending_uploads(self):
+        """A pre-existing cascade that the summary used to leave out."""
+        scan = ScanFactory()
+        PendingUpload.objects.create(
+            scan=scan,
+            s3_key=f"processing/{scan.pk}/x/1/1.original.pdf",
+            expected_size=1024,
+            created_by=UserFactory(),
+        )
+
+        _, model_count, _, _ = self.admin.get_deleted_objects(
+            [scan], _request_with_messages()
+        )
+
+        self.assertEqual(model_count.get("pending uploads"), 1)
+
     def test_summary_omits_tables_with_nothing_to_delete(self):
         scan = ScanFactory()
 
@@ -218,3 +234,4 @@ class ScanAdminDeleteSummaryTests(TestCase):
         )
 
         self.assertNotIn("external jobs", model_count)
+        self.assertNotIn("pending uploads", model_count)
