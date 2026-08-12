@@ -45,6 +45,11 @@ dependencies = [
   # itself measures geometry from the page ink and needs no text.
   "pdfplumber>=0.11",
   "pymupdf>=1.25",
+  # runpod_client imports it directly to talk to the RunPod API. Declared
+  # because until now it arrived only as a transitive dependency of the
+  # `local-ml` extra (ultralytics/paddleocr), so a plain `uv sync` -- what
+  # the lean web image builds from -- resolved no requests at all.
+  "requests>=2.32",
   "sentry-sdk[django]",
   "time-machine",
   "uvicorn[standard]",

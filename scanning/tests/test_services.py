@@ -23,6 +23,7 @@ from scanning.factories import (
 from scanning.models import (
     Detection,
     QueueStatus,
+    Scan,
     Stage,
     Status,
 )
@@ -2088,6 +2089,173 @@ class TestUploadPathSkipsRedactionGeometry(TestCase):
 
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.PENDING_REVIEW)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestPipelineResumesInsteadOfRerunningGpuStages(TestCase):
+    """A re-queued scan picks up finished stages instead of paying twice.
+
+    The daemon takes a SIGTERM on every deploy and re-queues whatever was
+    mid-pipeline, and ``run_full_pipeline`` restarts at step 1. Before
+    this, a detect that had already completed was re-submitted: another
+    ~200 s of GPU time to recompute detections already sitting on S3, and
+    its result object overwritten with an identical one.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+        self.scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        self.bitonal = pathlib.Path(self.scan.output_dir) / "bitonal.pdf"
+        _write_bitonal_copy(self.bitonal)
+
+    def _run(self, reusable):
+        """Run the pipeline with ``reusable_result`` stubbed.
+
+        :param reusable: Return value for every ``reusable_result`` call.
+        :returns: ``(reuse_mock, yolo_mock, validation_mock)``.
+        """
+        from scanning import services
+
+        with (
+            patch("django.db.connections.close_all"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(
+                services, "_ensure_bitonal", return_value=self.bitonal
+            ),
+            patch.object(services, "_run_yolo") as yolo,
+            patch.object(
+                services, "_import_detections_from_json", return_value=[]
+            ),
+            patch.object(services, "run_paddleocr_validation") as validation,
+            patch.object(services, "_re_pair_opinions", return_value=[]),
+            patch(
+                "scanning.runpod_client.reusable_result",
+                return_value=reusable,
+            ) as reuse,
+        ):
+            services.run_full_pipeline(self.scan.pk)
+        return reuse, yolo, validation
+
+    def test_finished_detect_is_reused_not_resubmitted(self):
+        detections = [{"page_index": 0, "label_id": 1}]
+        _, yolo, _ = self._run({"detections": detections})
+
+        yolo.assert_not_called()
+        written = json.loads(
+            (
+                pathlib.Path(self.scan.output_dir) / "detections.json"
+            ).read_text()
+        )
+        self.assertEqual(written, detections)
+
+    def test_no_stored_result_runs_detection(self):
+        _, yolo, _ = self._run(None)
+        yolo.assert_called_once()
+
+    def test_payload_without_detections_runs_detection(self):
+        # A result whose shape we don't recognise is not a reason to
+        # skip the stage; it is a reason to run it.
+        _, yolo, _ = self._run({"page_count": 12})
+        yolo.assert_called_once()
+
+    def test_result_referencing_pages_past_the_end_is_rejected(self):
+        # Backstop on the timestamp check, which only notices an edited
+        # input if the edit changed the object's size. A detection on a
+        # page this PDF no longer has means the result predates a page
+        # deletion, whatever the timestamps say.
+        Scan.objects.filter(pk=self.scan.pk).update(page_count=2)
+        _, yolo, _ = self._run({"detections": [{"page_index": 7}]})
+        yolo.assert_called_once()
+
+    def test_result_within_the_page_count_is_still_reused(self):
+        Scan.objects.filter(pk=self.scan.pk).update(page_count=8)
+        _, yolo, _ = self._run({"detections": [{"page_index": 7}]})
+        yolo.assert_not_called()
+
+    def test_validation_is_asked_to_reuse(self):
+        # Step 5 is the other GPU stage; the pipeline is the only caller
+        # that opts it into reuse.
+        _, _, validation = self._run(None)
+        self.assertTrue(validation.call_args.kwargs["reuse"])
+
+    def test_ensure_bitonal_leaves_page_count_readable_on_the_instance(self):
+        """The page-count backstop reads the attribute, not the row.
+
+        ``_ensure_bitonal`` persists the count with a queryset
+        ``.update()``, which is a bare SQL write and leaves the caller's
+        instance holding whatever it loaded. ``run_full_pipeline`` hands
+        that same instance straight to ``_reuse_detect_result`` three
+        lines later, so the two have to stay in step.
+        """
+        from scanning import services
+
+        with fitz.open(str(self.bitonal)) as pdf:
+            real_pages = pdf.page_count
+        self.scan.page_count = real_pages + 99
+
+        services._ensure_bitonal(self.scan, pathlib.Path(self.scan.output_dir))
+
+        self.assertEqual(self.scan.page_count, real_pages)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.page_count, real_pages)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestPaddleocrValidationReuse(TestCase):
+    """``run_paddleocr_validation`` only reuses when asked to."""
+
+    def setUp(self):
+        self.scan = ScanFactory(start_page=1, end_page=2)
+
+    def _run(self, reuse, stored):
+        """Run validation with the stored-result lookup stubbed.
+
+        :param reuse: Value for the ``reuse`` argument.
+        :param stored: Return value for ``reusable_result``.
+        :returns: The ``_dispatch_analyze`` mock.
+        """
+        from scanning import services
+
+        with (
+            patch.object(
+                services, "_dispatch_analyze", return_value=[{"pdf_page": 9}]
+            ) as dispatch,
+            patch.object(services, "_rebuild_issues_from_results"),
+            patch(
+                "scanning.runpod_client.reusable_result", return_value=stored
+            ),
+        ):
+            services.run_paddleocr_validation(
+                self.scan.pk, "some.original.pdf", reuse=reuse
+            )
+        return dispatch
+
+    def test_stored_result_skips_the_job(self):
+        results = [{"pdf_page": 1, "detected": "1"}]
+        dispatch = self._run(reuse=True, stored={"results": results})
+
+        dispatch.assert_not_called()
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.ocr_results, results)
+
+    def test_reuse_off_always_dispatches(self):
+        # Every caller that means "analyze this again" keeps doing that,
+        # even with a perfectly good stored result sitting there.
+        dispatch = self._run(reuse=False, stored={"results": [{"a": 1}]})
+
+        dispatch.assert_called_once()
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.ocr_results, [{"pdf_page": 9}])
+
+    def test_missing_stored_result_falls_through_to_the_job(self):
+        dispatch = self._run(reuse=True, stored=None)
+
+        dispatch.assert_called_once()
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.ocr_results, [{"pdf_page": 9}])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
