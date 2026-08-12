@@ -486,7 +486,7 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
             detections = runpod_client.detect(
                 scan,
                 pdf_path,
-                models=["small", "medium", "large"],
+                models=settings.YOLO_DETECT_MODELS,
                 progress_callback=_remote_progress,
             )
         finally:
@@ -1541,8 +1541,14 @@ def run_full_pipeline(scan_pk: int) -> None:
         # 2. Bitonal conversion
         bitonal_path = _ensure_bitonal(scan, output_dir)
 
-        # 3. YOLO detection (all 3 models on bitonal)
-        _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
+        # 3. YOLO detection (configured models; bitonal input only
+        # when the configured models were trained for it)
+        yolo_input = (
+            str(bitonal_path)
+            if settings.YOLO_DETECT_ON_BITONAL
+            else scan.pdf_path
+        )
+        _run_yolo(scan_pk, yolo_input, str(output_dir))
 
         # 4. Import detections into DB
         _update_progress(scan_pk, "Importing detections...")
@@ -2453,11 +2459,17 @@ def run_detect(scan_pk: int) -> None:
     try:
         output_dir = Path(scan.output_dir)
         bitonal = output_dir / "bitonal.pdf"
-        pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
+        # Ink geometry always measures the bitonal processing copy
+        # (the PDF the redactions are stamped onto);
+        # YOLO_DETECT_ON_BITONAL only selects the detection input.
+        geometry_pdf = str(bitonal) if bitonal.exists() else scan.pdf_path
+        detect_pdf = (
+            geometry_pdf if settings.YOLO_DETECT_ON_BITONAL else scan.pdf_path
+        )
 
-        _run_yolo(scan_pk, pdf_path, str(output_dir))
+        _run_yolo(scan_pk, detect_pdf, str(output_dir))
         dets = _import_detections_from_json(scan_pk, str(output_dir))
-        _snap_text_columns_to_ink(scan_pk, pdf_path)
+        _snap_text_columns_to_ink(scan_pk, geometry_pdf)
 
         _update_progress(
             scan_pk,

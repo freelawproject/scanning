@@ -44,3 +44,16 @@ RUNPOD_PRESIGNED_TTL = env.int("RUNPOD_PRESIGNED_TTL", default=86400)
 RUNPOD_MAX_TRANSIENT_RETRIES = env.int(
     "RUNPOD_MAX_TRANSIENT_RETRIES", default=5
 )
+
+# YOLO models the detection step runs (blackletter weight names).
+# The legacy trio is ["small", "medium", "large"]; ["bl_warm"] is the
+# single replacement model (requires a blackletter version with the
+# bl_warm adapter).
+YOLO_DETECT_MODELS = env.list("YOLO_DETECT_MODELS", default=["bl_warm"])
+
+# Whether detection reads the bitonal processing copy or the original
+# upload. The legacy trio was trained on bitonal-like input; bl-warm
+# was trained on grayscale renders and must detect on the original —
+# its large region classes collapse on 1-bit pages. Bitonal remains in
+# use either way for tesseract OCR and the output PDFs.
+YOLO_DETECT_ON_BITONAL = env.bool("YOLO_DETECT_ON_BITONAL", default=False)
