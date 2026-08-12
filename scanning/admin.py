@@ -198,7 +198,20 @@ class ScanAdmin(admin.ModelAdmin):
         ]
 
         model_count: dict[str, int] = {}
-        for model in (Scan, Page, Detection, Issue, PageInsert, PageDeletion):
+        # Every cascade table needs listing here by hand, since replacing
+        # the default collector is what loses its automatic discovery.
+        # ExternalJob in practice only contributes its volume-level rows:
+        # an opinion-level job requires an opinion, and an opinion blocks
+        # the delete outright via the PROTECT above.
+        for model in (
+            Scan,
+            Page,
+            Detection,
+            Issue,
+            PageInsert,
+            PageDeletion,
+            ExternalJob,
+        ):
             field = "pk" if model is Scan else "scan_id"
             count = model.objects.filter(**{f"{field}__in": scan_ids}).count()
             if count:
@@ -630,9 +643,11 @@ class PageAdmin(admin.ModelAdmin):
 class ExternalJobAdmin(admin.ModelAdmin):
     # Left editable: a job row carries operational state (status, retry
     # budget, deadline) an operator may legitimately need to nudge. The
-    # provenance fields are the exception, since a page range means
-    # nothing except against the digest it was computed for, so editing
-    # one by hand would leave the check passing against other bytes.
+    # provenance pair is the exception. ``input_key`` is not
+    # self-verifying, since re-pairing renames an opinion PDF, and
+    # ``source_digest`` is what makes the claim checkable, so editing
+    # either by hand leaves the digest describing different bytes than
+    # the ones the job actually read.
     list_display = [
         "scan",
         "opinion",
@@ -664,10 +679,13 @@ class ExternalJobAdmin(admin.ModelAdmin):
     ]
     date_hierarchy = "date_created"
     ordering = ["-date_created"]
-    # An extract changelist is one row per opinion per engine, so the
-    # opinion join has to be eager or the page issues hundreds of
-    # queries rendering its own list_display.
-    list_select_related = ["scan", "opinion"]
+    # An extract changelist is one row per opinion per engine, so these
+    # joins have to be eager or the page issues hundreds of queries
+    # rendering its own list_display. Joined through to the reporter
+    # because both ``Scan.__str__`` and ``OpinionScan.__str__``
+    # dereference it, so stopping at the FK itself would still cost a
+    # query per row per column.
+    list_select_related = ["scan__reporter", "opinion__reporter"]
 
     @admin.display(description="Shard")
     def shard_label(self, obj):
