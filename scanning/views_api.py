@@ -100,6 +100,11 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
             "img_width": d.img_width,
             "img_height": d.img_height,
             "model_count": d.model_count,
+            # The viewer draws hand-added detections dashed, and shows them
+            # whatever their label. It set this flag itself when the reviewer
+            # drew the box, so until it came from here a hand-added box lost
+            # both on the next page load.
+            "manual": d.model_name == Detection.ModelName.MANUAL,
         }
         for d in dets
     ]
