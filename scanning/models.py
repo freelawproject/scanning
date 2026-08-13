@@ -1261,30 +1261,34 @@ class PendingUpload(AbstractDateTimeModel):
 
 
 class JobProvider(models.TextChoices):
-    """Who runs a job, meaning how it is submitted and polled.
+    """Who runs a job: how it is submitted and how progress is polled.
 
-    Deliberately separate from :class:`JobEngine`. The provider decides
-    the transport and, more importantly, how progress is discovered:
-    RunPod hands back a job id and answers ``GET /status``, while a
-    hosted API answers on its own endpoint in its own shape. Keeping
-    this apart from the engine means the several models we run on RunPod
-    share one polling implementation, and moving one of them elsewhere
-    is a value change rather than a new branch at every call site.
+    Separate from :class:`JobEngine` because one provider serves
+    several engines. RunPod hands back a job id and answers ``GET
+    /status``; Mistral and doctor each answer on their own endpoint in
+    their own shape. Keeping the two apart means the models we run on
+    RunPod share one polling implementation, and moving one of them
+    elsewhere is a value change rather than a new branch at every call
+    site.
     """
 
     RUNPOD = "runpod", "RunPod Serverless"
     MISTRAL = "mistral", "Mistral API"
+    DOCTOR = "doctor", "Doctor"
 
 
 class JobEngine(models.TextChoices):
     """What a job actually does: the model or program that runs.
 
-    Bitonal conversion is deliberately absent. It runs in-process via
-    blackletter, which fans out over local workers by itself, so it is
-    not an external job and owns no row here.
+    ``BLACKLETTER`` runs the detection and page-analysis passes over a
+    volume; the OCR engines read opinion PDFs. ``BITONAL`` is not a
+    model but the 1-bit conversion pass, which gets rows here because
+    it runs on doctor rather than on the portal host (#158), where it
+    is ~7 minutes of CPU per volume competing with the web process.
     """
 
     BLACKLETTER = "blackletter", "blackletter (YOLO + PaddleOCR)"
+    BITONAL = "bitonal", "Bitonal conversion"
     DOTS_MOCR = "dots_mocr", "dots.mocr"
     MISTRAL_OCR = "mistral_ocr", "Mistral OCR"
     SURYA = "surya", "Surya"
@@ -1301,19 +1305,18 @@ class JobStage(models.TextChoices):
     key, since otherwise two engines collide on the same target.
 
     Stages come in two shapes, which is what ``opinion`` on the job
-    expresses. ``DETECT`` and ``ANALYZE`` run once over the whole
-    volume, before review. ``EXTRACT`` and ``TIEBREAK`` run after file
-    generation, once per opinion PDF, so a volume with 300 opinions
-    read by three engines is 900 rows.
+    expresses. ``CONVERT``, ``DETECT``, and ``ANALYZE`` run once over
+    the whole volume, before review. ``EXTRACT`` and ``TIEBREAK`` run
+    after file generation, once per opinion PDF, so a volume with 300
+    opinions read by three engines is 900 rows.
 
     Two properties the daemon has to respect. Steps that run locally
-    (bitonal, reconciling two engines' text, pairing, rect computation,
-    the file generation that produces the opinion PDFs in the first
-    place) own no rows at all and sit between these stages. And a stage
-    whose work turns out to be empty is satisfied by zero rows: when the
-    extract engines agree on an opinion, no ``TIEBREAK`` job is ever
-    created for it, and that has to advance the pipeline rather than
-    stall it.
+    (reconciling two engines' text, pairing, rect computation, the file
+    generation that produces the opinion PDFs in the first place) own
+    no rows at all and sit between these stages. And a stage whose work
+    turns out to be empty is satisfied by zero rows: when the extract
+    engines agree on an opinion, no ``TIEBREAK`` job is ever created
+    for it, and that has to advance the pipeline rather than stall it.
 
     Declared in the order they run today. Nothing reads that order:
     what runs next will be an explicit pipeline definition, because
@@ -1321,6 +1324,7 @@ class JobStage(models.TextChoices):
     enum walk.
     """
 
+    CONVERT = "convert", "Convert to bitonal"
     DETECT = "detect", "Detect (YOLO)"
     ANALYZE = "analyze", "Analyze (page numbers)"
     EXTRACT = "extract", "Extract text"
@@ -1459,9 +1463,8 @@ class ExternalJob(AbstractDateTimeModel):
     (which preserves the previous provider handle) before overwriting
     anything.
 
-    Only work that leaves the process gets a row. Local steps own none,
-    which is why bitonal conversion is absent even though it is the
-    heaviest CPU step in the pipeline.
+    Only work that leaves the process gets a row. The local steps
+    between stages own none.
     """
 
     scan = models.ForeignKey(
@@ -1559,15 +1562,20 @@ class ExternalJob(AbstractDateTimeModel):
         default=0,
         help_text=(
             "Position of this job within its target's fan-out, and part "
-            "of the unique key. Zero of one for the normal case, since "
-            "an opinion PDF is read whole; the split exists so a "
-            "document too large for one request can be divided without "
-            "a schema change."
+            "of the unique key. Splitting a volume into page ranges and "
+            "running them at once is how we make a slow full-volume "
+            "pass finish quickly, and it is the normal case for bitonal "
+            "and dots.mocr rather than an escape hatch for oversized "
+            "documents. Zero of one when the target is read whole, as "
+            "an opinion PDF is."
         ),
     )
     shard_count = models.PositiveIntegerField(
         default=1,
-        help_text="How many jobs this target's fan-out was split into.",
+        help_text=(
+            "How many jobs this target's fan-out was split into; one "
+            "when the target is read whole."
+        ),
     )
     input_key = models.CharField(
         max_length=1024,
@@ -1575,20 +1583,19 @@ class ExternalJob(AbstractDateTimeModel):
         default="",
         help_text=(
             "S3 key of the exact bytes sent: an opinion PDF for the "
-            "post-generation stages, the volume for the earlier ones. "
-            "Recorded because opinion PDFs are regenerated and renamed "
-            "when pairing changes, so the FK alone does not say which "
-            "file version was actually read."
+            "post-generation stages, the volume or one of its shards "
+            "for the earlier ones. Recorded because opinion PDFs are "
+            "regenerated and renamed when pairing changes, so the FK "
+            "alone does not say which file version was read."
         ),
     )
-    source_digest = models.CharField(
+    input_hash = models.CharField(
         max_length=64,
         blank=True,
         default="",
         help_text=(
-            "Digest of the document at ``input_key`` when it was sent. "
-            "Provenance rather than a reference, so it answers the "
-            "question the FK cannot: whether an extraction still "
+            "Hash of the document at ``input_key`` when it was sent. "
+            "Answers what the FK cannot: whether an extraction still "
             "describes the current file, or the opinion has been "
             "regenerated underneath it and has to be read again."
         ),
@@ -1597,9 +1604,13 @@ class ExternalJob(AbstractDateTimeModel):
         default=dict,
         blank=True,
         help_text=(
-            "Provider-shaped description of the work when a page range "
-            "is not enough: the list of boxes for a tiebreak read, "
-            "per-job tuning overrides."
+            "Provider-shaped description of the work, for jobs an "
+            "input key does not fully describe. A tiebreak read is a "
+            "list of regions rather than a whole document:\n\n"
+            '{"crops": [{"key": "page_0007_84_132_1620_230", '
+            '"page_index": 7, "bbox": [84, 132, 1620, 230]}]}\n\n'
+            "and any job may carry per-job tuning overrides, such as "
+            '{"dpi": 400}.'
         ),
     )
 

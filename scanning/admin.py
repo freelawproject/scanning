@@ -648,8 +648,8 @@ class ExternalJobAdmin(admin.ModelAdmin):
     # budget, deadline) an operator may legitimately need to nudge. The
     # provenance pair is the exception. ``input_key`` is not
     # self-verifying, since re-pairing renames an opinion PDF, and
-    # ``source_digest`` is what makes the claim checkable, so editing
-    # either by hand leaves the digest describing different bytes than
+    # ``input_hash`` is what makes the claim checkable, so editing
+    # either by hand leaves the hash describing different bytes than
     # the ones the job actually read.
     list_display = [
         "scan",
@@ -675,7 +675,7 @@ class ExternalJobAdmin(admin.ModelAdmin):
     ]
     raw_id_fields = ["scan", "opinion"]
     readonly_fields = [
-        "source_digest",
+        "input_hash",
         "input_key",
         "date_created",
         "date_modified",

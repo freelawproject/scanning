@@ -28,7 +28,7 @@ from scanning.tests.test_views import ScanningTestCase
 
 
 class TestVolumeLevelJobs(ScanningTestCase):
-    """DETECT and ANALYZE, which run once over the whole volume."""
+    """CONVERT, DETECT and ANALYZE, which run once over the whole volume."""
 
     def test_volume_job_needs_no_opinion(self):
         job = ExternalJobFactory(stage=JobStage.DETECT)
@@ -37,14 +37,58 @@ class TestVolumeLevelJobs(ScanningTestCase):
         self.assertEqual(job.shard_count, 1)
 
     def test_volume_job_may_not_name_an_opinion(self):
-        """A detect job predates every opinion, so it cannot target one."""
+        """A volume stage predates every opinion, so it cannot target one."""
         scan = ScanFactory()
         opinion = OpinionScanFactory(scan=scan)
+
+        for stage in [JobStage.CONVERT, JobStage.DETECT, JobStage.ANALYZE]:
+            with self.subTest(stage=stage):
+                with self.assertRaises(IntegrityError):
+                    with transaction.atomic():
+                        ExternalJobFactory(
+                            scan=scan, opinion=opinion, stage=stage
+                        )
+
+    def test_a_volume_pass_fans_out_into_shards(self):
+        """Sharding is how a slow full-volume pass is made fast.
+
+        Bitonal on doctor and dots.mocr on RunPod both split the volume
+        into page ranges and run them at once, so the shards differ only
+        by ``shard_index`` and all of them have to fit under one key.
+        """
+        scan = ScanFactory()
+        for index in range(4):
+            ExternalJobFactory(
+                scan=scan,
+                stage=JobStage.CONVERT,
+                engine=JobEngine.BITONAL,
+                provider=JobProvider.DOCTOR,
+                shard_index=index,
+                shard_count=4,
+            )
+
+        self.assertEqual(scan.jobs.filter(stage=JobStage.CONVERT).count(), 4)
+
+    def test_two_shards_may_not_share_an_index(self):
+        scan = ScanFactory()
+        ExternalJobFactory(
+            scan=scan,
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            shard_index=1,
+            shard_count=4,
+        )
 
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 ExternalJobFactory(
-                    scan=scan, opinion=opinion, stage=JobStage.DETECT
+                    scan=scan,
+                    stage=JobStage.CONVERT,
+                    engine=JobEngine.BITONAL,
+                    provider=JobProvider.DOCTOR,
+                    shard_index=1,
+                    shard_count=4,
                 )
 
     def test_one_row_per_stage_engine_and_run(self):
@@ -261,11 +305,11 @@ class TestOpinionLevelJobs(ScanningTestCase):
             stage=JobStage.EXTRACT,
             engine=JobEngine.DOTS_MOCR,
             input_key="opinions/a/218/redacted/a.218.0001-0010.pdf",
-            source_digest="deadbeef",
+            input_hash="deadbeef",
         )
 
         self.assertTrue(job.input_key)
-        self.assertEqual(job.source_digest, "deadbeef")
+        self.assertEqual(job.input_hash, "deadbeef")
 
 
 class TestExternalJobRuns(ScanningTestCase):
