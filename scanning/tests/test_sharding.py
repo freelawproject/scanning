@@ -232,6 +232,36 @@ class TestEnsureShards(TestCase):
         with self.assertRaisesRegex(sharding.ShardingError, "no original PDF"):
             sharding.ensure_shards(scan)
 
+    def test_upload_failure_leaves_no_manifest(self):
+        # A partial S3 upload must not leave a fingerprint-matching
+        # local manifest behind: a same-pod retry would trust it and
+        # report a shard set S3 never got (PR #169 review).
+        scan = self._scan_with_volume(pages=2)
+        with patch(
+            "scanning.s3_sync.upload_shards",
+            side_effect=RuntimeError("S3 blew up mid-upload"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "mid-upload"):
+                sharding.ensure_shards(scan)
+        self.assertFalse((Path(scan.output_dir) / "shards").exists())
+        # The re-queued scan starts clean and succeeds.
+        manifest = sharding.ensure_shards(scan)
+        self.assertEqual(len(manifest["shards"]), 2)
+
+    def test_local_manifest_ignored_when_s3_is_authoritative(self):
+        # With S3 sync active, "no manifest in S3" means no committed
+        # shard set; a leftover local manifest must not be trusted.
+        scan = self._scan_with_volume(pages=2)
+        sharding.ensure_shards(scan)  # writes a valid local manifest
+        shards_dir = Path(scan.output_dir) / "shards"
+        with (
+            patch("scanning.s3_sync._s3_enabled", return_value=True),
+            patch("scanning.s3_sync.fetch_shard_manifest", return_value=None),
+        ):
+            self.assertIsNone(sharding._existing_manifest(scan, shards_dir))
+        # Without S3 (DEVELOPMENT), the local file is all there is.
+        self.assertIsNotNone(sharding._existing_manifest(scan, shards_dir))
+
     def test_failure_leaves_no_manifest_or_shards(self):
         scan = self._scan_with_volume(pages=4)
         with patch(

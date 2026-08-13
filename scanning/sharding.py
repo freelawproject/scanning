@@ -45,7 +45,6 @@ from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-MANIFEST_NAME = "manifest.json"
 MANIFEST_VERSION = 1
 
 # Warn (don't fail) when a shard lands this far over the byte target.
@@ -322,7 +321,14 @@ def _existing_manifest(scan, shards_dir: Path) -> dict | None:
     if manifest is not None:
         return manifest
 
-    local = shards_dir / MANIFEST_NAME
+    if s3_sync._s3_enabled():
+        # S3 answered "no manifest", so there is no committed shard set.
+        # A local manifest here is at best a leftover from a run that
+        # died before its upload committed; trusting it would report a
+        # shard set S3 never got.
+        return None
+
+    local = shards_dir / s3_sync.SHARD_MANIFEST_NAME
     if local.is_file():
         try:
             return json.loads(local.read_text())
@@ -409,17 +415,22 @@ def ensure_shards(scan) -> dict | None:
         t0 = time.monotonic()
         verify_shards(source_path, shards_dir, manifest)
         manifest["timings"]["verify_seconds"] = round(time.monotonic() - t0, 3)
+        # The manifest hits disk only after verification passed, and S3
+        # only after every shard PDF is up (upload_shards sends it last).
+        (shards_dir / s3_sync.SHARD_MANIFEST_NAME).write_text(
+            json.dumps(manifest, indent=2)
+        )
+        uploaded = s3_sync.upload_shards(scan, shards_dir)
     except Exception:
         # Shards are a byte-for-byte copy of the original: recomputing is
         # cheap and deterministic, so reclaim the disk instead of leaving
-        # a broken multi-GB set behind for the TTL sweep.
+        # a broken multi-GB set behind for the TTL sweep. Removing the
+        # tree also drops any just-written local manifest, keeping the
+        # "no manifest survives a failure" guarantee when the *upload*
+        # is what failed (S3 got shard PDFs but never the manifest).
         shutil.rmtree(shards_dir, ignore_errors=True)
         raise
 
-    # The manifest hits disk only after verification passed, and S3 only
-    # after every shard PDF is up (upload_shards sends it last).
-    (shards_dir / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
-    uploaded = s3_sync.upload_shards(scan, shards_dir)
     if uploaded:
         for entry in manifest["shards"]:
             (shards_dir / entry["name"]).unlink(missing_ok=True)
