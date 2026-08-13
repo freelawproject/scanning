@@ -1656,7 +1656,17 @@ class ExternalJob(AbstractDateTimeModel):
     objects = ExternalJobQuerySet.as_manager()
 
     class Meta:
-        ordering = ["scan", "stage", "run", "engine", "opinion", "shard_index"]
+        # By id, not by the relation: ordering on ``scan``/``opinion``
+        # inherits their own Meta.ordering and joins both tables into
+        # every query of this one.
+        ordering = [
+            "scan_id",
+            "stage",
+            "run",
+            "engine",
+            "opinion_id",
+            "shard_index",
+        ]
         constraints = [
             # Two uniqueness rules, because the two stage shapes have
             # different targets. Conditional rather than one constraint
