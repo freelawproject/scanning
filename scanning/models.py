@@ -1255,3 +1255,621 @@ class PendingUpload(AbstractDateTimeModel):
 
     def __str__(self):
         return f"pending upload for scan {self.scan_id} ({self.s3_key})"
+
+
+# ── External compute: one row per submitted job ───────────────────────
+
+
+class JobProvider(models.TextChoices):
+    """Who runs a job: how it is submitted and how progress is polled.
+
+    Separate from :class:`JobEngine` because one provider serves
+    several engines. RunPod hands back a job id and answers ``GET
+    /status``; Mistral and doctor answer on their own endpoints in
+    their own shapes. The split keeps polling written once per
+    provider, and makes moving an engine elsewhere a value change.
+    """
+
+    RUNPOD = "runpod", "RunPod Serverless"
+    MISTRAL = "mistral", "Mistral API"
+    DOCTOR = "doctor", "Doctor"
+
+
+class JobEngine(models.TextChoices):
+    """What a job actually does: the model or program that runs.
+
+    ``BLACKLETTER`` runs detection and page analysis over a volume; the
+    OCR engines read opinion PDFs. ``BITONAL`` is not a model but the
+    1-bit conversion pass, which gets rows because it runs on doctor
+    rather than on the portal host (#158).
+    """
+
+    BLACKLETTER = "blackletter", "blackletter (YOLO + PaddleOCR)"
+    BITONAL = "bitonal", "Bitonal conversion"
+    DOTS_MOCR = "dots_mocr", "dots.mocr"
+    MISTRAL_OCR = "mistral_ocr", "Mistral OCR"
+    SURYA = "surya", "Surya"
+    LIGHTON_OCR = "lighton_ocr", "LightOnOCR"
+
+
+class JobStage(models.TextChoices):
+    """Which pipeline step a job belongs to.
+
+    A stage is a barrier, not a synonym for an engine: ``EXTRACT``
+    holds the several engines reading the same document at once, and
+    the next step starts when every job in the stage is CONSUMED.
+    ``engine`` is therefore part of the unique key, or two engines
+    would collide on one target.
+
+    Stages come in two shapes, which is what ``opinion`` on the job
+    expresses. ``CONVERT``, ``DETECT`` and ``ANALYZE`` run once over
+    the volume, before review. ``EXTRACT`` and ``TIEBREAK`` run after
+    file generation, once per opinion PDF, so 300 opinions read by
+    three engines is 900 rows.
+
+    Two things the daemon has to respect. Local steps own no rows and
+    sit between stages: reconciling two engines' text, pairing, rect
+    computation, and the file generation that produces the opinion
+    PDFs. And an empty stage is satisfied by zero rows, since engines
+    that agree on an opinion produce no ``TIEBREAK`` job for it.
+
+    Declared in run order, but nothing reads that order. Local steps
+    and empty stages make the sequence more than an enum walk, so what
+    runs next will be an explicit pipeline definition.
+    """
+
+    CONVERT = "convert", "Convert to bitonal"
+    DETECT = "detect", "Detect (YOLO)"
+    ANALYZE = "analyze", "Analyze (page numbers)"
+    EXTRACT = "extract", "Extract text"
+    TIEBREAK = "tiebreak", "Tiebreak disputed reads"
+
+
+#: Stages whose unit of work is one opinion PDF rather than the volume.
+#: A tuple, not a frozenset: it is embedded in a database constraint,
+#: and an unordered container rewrites the migration every time the
+#: interpreter hashes it differently.
+OPINION_LEVEL_STAGES = (JobStage.EXTRACT, JobStage.TIEBREAK)
+
+
+class JobStatus(models.TextChoices):
+    """Normalized job lifecycle; provider states are mapped onto it.
+
+    ``COMPLETED`` means the provider reports the work is done;
+    ``CONSUMED`` means we have read the result and applied it. Only a
+    CONSUMED job is safe from a provider's result purge. Mirrors the
+    SUCCEEDED / FINISHED split in ``ai.LLMTaskStatusChoices``.
+
+    ``EXPIRED`` is data loss rather than failure: the provider
+    finished, and neither its status call nor the result object says
+    what it produced. Separate from FAILED so it reads as a bug in our
+    polling rather than a bad job.
+    """
+
+    PENDING = "pending", "Pending submit"
+    SUBMITTED = "submitted", "Submitted"
+    IN_QUEUE = "in_queue", "In queue"
+    IN_PROGRESS = "in_progress", "In progress"
+    COMPLETED = "completed", "Completed (result not yet applied)"
+    CONSUMED = "consumed", "Result applied"
+    FAILED = "failed", "Failed"
+    CANCELLED = "cancelled", "Cancelled"
+    EXPIRED = "expired", "Expired (result lost)"
+
+
+#: Jobs the provider is still working on, so worth polling.
+IN_FLIGHT_JOB_STATUSES = frozenset(
+    {
+        JobStatus.SUBMITTED,
+        JobStatus.IN_QUEUE,
+        JobStatus.IN_PROGRESS,
+    }
+)
+
+#: Jobs the daemon still has work to do on. COMPLETED belongs here and
+#: not with the terminal states: the provider is finished but we have
+#: not applied the result, and calling that done loses the output.
+OPEN_JOB_STATUSES = frozenset(
+    {JobStatus.PENDING, JobStatus.COMPLETED} | IN_FLIGHT_JOB_STATUSES
+)
+
+#: Jobs nothing will happen to again without an explicit retry.
+TERMINAL_JOB_STATUSES = frozenset(
+    {
+        JobStatus.CONSUMED,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+        JobStatus.EXPIRED,
+    }
+)
+
+
+class ExternalJobQuerySet(AutoNowQuerySet):
+    """Queries the daemon runs to decide what to do next.
+
+    Subclasses :class:`AutoNowQuerySet` so bulk writes through these
+    still stamp ``date_modified``.
+    """
+
+    def open(self):
+        """Return jobs the daemon still has work to do on.
+
+        :returns: Jobs awaiting submit, in flight, or completed but not
+            yet applied.
+        :rtype: ExternalJobQuerySet
+        """
+        return self.filter(status__in=OPEN_JOB_STATUSES)
+
+    def in_flight(self):
+        """Return jobs the provider is still working on.
+
+        :returns: Jobs worth polling for a status change.
+        :rtype: ExternalJobQuerySet
+        """
+        return self.filter(status__in=IN_FLIGHT_JOB_STATUSES)
+
+    def terminal(self):
+        """Return jobs that will not change without an explicit retry.
+
+        :returns: Consumed, failed, cancelled, and expired jobs.
+        :rtype: ExternalJobQuerySet
+        """
+        return self.filter(status__in=TERMINAL_JOB_STATUSES)
+
+    def overdue(self, now=None):
+        """Return in-flight jobs whose deadline has passed.
+
+        Per job rather than per scan: once a stage fans out, one wedged
+        shard has to be cancellable and resubmittable without touching
+        its siblings.
+
+        :param now: Comparison time; defaults to ``timezone.now()``.
+        :returns: In-flight jobs past their deadline.
+        :rtype: ExternalJobQuerySet
+        """
+        if now is None:
+            now = timezone.now()
+        return self.in_flight().filter(
+            deadline__isnull=False, deadline__lt=now
+        )
+
+
+class ExternalJob(AbstractDateTimeModel):
+    """One unit of work handed to an external compute provider.
+
+    Supersedes tracking a single provider job on ``Scan``: a scan has
+    many jobs, and a fanned-out stage has several in flight at once
+    across providers. The daemon keeps no in-memory job state and
+    recomputes what to submit, poll, harvest, or cancel from these rows
+    every tick, which is what makes an interrupted daemon resumable.
+    Nothing about "what runs next" may live in a Python call stack.
+
+    Retries mutate the row rather than inserting one per attempt, the
+    opposite of the ``ai.LLMTask`` idiom, because the daemon asks
+    "latest state per shard" every tick and a stable unique key keeps
+    that a plain filter. The cost: the row is the only copy of its own
+    state, so a resubmission must bump ``attempt`` (which re-addresses
+    the result object) and call :meth:`push_attempt` (which preserves
+    the previous provider handle) before overwriting anything.
+
+    Only work that leaves the process gets a row. The local steps
+    between stages own none.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="jobs",
+        help_text=(
+            "The volume this work belongs to, set even when the target "
+            "is a single opinion. Denormalized so 'has this scan "
+            "anything in flight', the daemon's most frequent question, "
+            "needs no join, and so the cascade is rooted at the scan."
+        ),
+    )
+    opinion = models.ForeignKey(
+        OpinionScan,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="jobs",
+        help_text=(
+            "The opinion PDF this job read, for the post-generation "
+            "stages. Null for the volume-level stages, which run before "
+            "any opinion exists. Must belong to ``scan``.\n\n"
+            "CASCADE rather than SET_NULL: an orphaned extract row "
+            "would break the invariant that an opinion-level stage has "
+            "an opinion, and would leave the stage barrier counting a "
+            "row with no target. The consequence is that "
+            "``run_generate_files`` deletes and recreates a scan's "
+            "OpinionScan rows, so regenerating files discards every "
+            "extraction job with them. Right when the opinion changed, "
+            "wasteful when it did not, which is why preserving "
+            "unchanged opinion rows (issue #165) has to land before we "
+            "pay for hundreds of jobs a volume."
+        ),
+    )
+    stage = models.CharField(
+        max_length=20,
+        choices=JobStage.choices,
+    )
+    engine = models.CharField(
+        max_length=32,
+        choices=JobEngine.choices,
+    )
+    provider = models.CharField(
+        max_length=20,
+        choices=JobProvider.choices,
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=JobStatus.choices,
+        default=JobStatus.PENDING,
+    )
+    run = models.PositiveSmallIntegerField(
+        default=1,
+        help_text=(
+            "Stage-run generation. Re-running a stage (a re-validate, a "
+            "reprocess) creates rows at the next run number and keeps "
+            "the previous run as history; retrying a single shard "
+            "mutates its row instead. Scoped per engine, not per stage: "
+            "an engine's live jobs are its rows at its own max(run), "
+            "and a stage's are the union of those, so re-running one "
+            "engine of a multi-engine stage cannot hide another "
+            "engine's rows from the barrier."
+        ),
+    )
+    attempt = models.PositiveSmallIntegerField(
+        default=1,
+        help_text=(
+            "Which submission of this row is in flight, incremented on "
+            "every resubmission whatever the reason, and carried in "
+            "``result_key`` so two attempts of one shard never write to "
+            "the same object. Not derived from retry_count, which "
+            "accounts for why a job was resubmitted and can stay flat "
+            "across one (a daemon restart). A key reused across "
+            "attempts lets an abandoned worker's late upload be "
+            "harvested as the current attempt's output."
+        ),
+    )
+    external_id = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        help_text=(
+            "The provider's job id, set on submit and kept after the "
+            "terminal state for auditing and billing lookups. Lets a "
+            "restarted daemon reattach to a job that is still running "
+            "instead of paying for it twice."
+        ),
+    )
+
+    # ── what this job covers ─────────────────────────────────────────
+    shard_index = models.PositiveIntegerField(
+        default=0,
+        help_text=(
+            "Position of this job in its target's split, counting from "
+            "zero, and part of the unique key. Volume passes are split "
+            "into page ranges that run at once to finish faster "
+            "(bitonal, dots.mocr). An opinion PDF is read whole, so it "
+            "stays 0."
+        ),
+    )
+    shard_count = models.PositiveIntegerField(
+        default=1,
+        help_text="How many jobs the target was split into; 1 if read whole.",
+    )
+    input_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the exact bytes sent: an opinion PDF for the "
+            "post-generation stages, the volume or one of its shards "
+            "for the earlier ones. Recorded because opinion PDFs are "
+            "regenerated and renamed when pairing changes, so the FK "
+            "alone does not say which file version was read."
+        ),
+    )
+    input_hash = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "Hash of the document at ``input_key`` when it was sent. "
+            "Answers what the FK cannot: whether an extraction still "
+            "describes the current file, or the opinion has been "
+            "regenerated underneath it and has to be read again."
+        ),
+    )
+    input_manifest = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Provider-shaped description of the work, for jobs an "
+            "input key does not fully describe. A tiebreak read is a "
+            "list of regions rather than a whole document:\n\n"
+            '{"crops": [{"key": "page_0007_84_132_1620_230", '
+            '"page_index": 7, "bbox": [84, 132, 1620, 230]}]}\n\n'
+            "and any job may carry per-job tuning overrides, such as "
+            '{"dpi": 400}.'
+        ),
+    )
+
+    # ── result ───────────────────────────────────────────────────────
+    result_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key the worker uploads its output to, assigned by us at "
+            "submit time and handed over as a presigned PUT. Scoped to "
+            "run, shard, and attempt, and never overwritten: that makes "
+            "a lost status response recoverable with a head_object, and "
+            "stops the probe harvesting another run's or another "
+            "attempt's output."
+        ),
+    )
+
+    # ── lifecycle ────────────────────────────────────────────────────
+    submitted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the job was handed to the provider. Also the "
+            "reference point for deciding whether an object at "
+            "``result_key`` belongs to this attempt."
+        ),
+    )
+    completed_at = models.DateTimeField(null=True, blank=True)
+    consumed_at = models.DateTimeField(null=True, blank=True)
+    last_polled_at = models.DateTimeField(null=True, blank=True)
+    deadline = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Wall-clock ceiling stamped at submit: a base timeout plus "
+            "an allowance for this job's pages. Per job rather than per "
+            "scan so one wedged shard is cancelled and resubmitted "
+            "without stalling its siblings."
+        ),
+    )
+
+    # ── failure accounting ───────────────────────────────────────────
+    retry_count = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Transient failures retried for this job.",
+    )
+    error_code = models.CharField(max_length=64, blank=True, default="")
+    error_message = models.TextField(blank=True, default="")
+    provider_meta = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Diagnostic rather than structural: which endpoint served "
+            "it, worker metadata, timings, sizes, cost, and an "
+            "append-only ``attempts`` list of prior attempts so "
+            "mutating this row on retry still keeps its history."
+        ),
+    )
+
+    objects = ExternalJobQuerySet.as_manager()
+
+    class Meta:
+        # By id, not by the relation: ordering on ``scan``/``opinion``
+        # inherits their own Meta.ordering and joins both tables into
+        # every query of this one.
+        ordering = [
+            "scan_id",
+            "stage",
+            "run",
+            "engine",
+            "opinion_id",
+            "shard_index",
+        ]
+        constraints = [
+            # Two uniqueness rules, because the two stage shapes have
+            # different targets. Conditional rather than one constraint
+            # over both columns: Postgres treats NULLs as distinct, so
+            # a single key including ``opinion`` would place no limit
+            # at all on volume-level rows.
+            models.UniqueConstraint(
+                fields=["scan", "stage", "engine", "run", "shard_index"],
+                condition=models.Q(opinion__isnull=True),
+                name="unique_volume_job_per_engine_run",
+            ),
+            models.UniqueConstraint(
+                fields=["opinion", "stage", "engine", "run", "shard_index"],
+                condition=models.Q(opinion__isnull=False),
+                name="unique_opinion_job_per_engine_run",
+            ),
+            # A stage's shape decides whether an opinion is required.
+            # An extract row without one attributes a single opinion's
+            # work to the whole volume and collides with its siblings;
+            # a detect row with one claims a target that did not exist
+            # when it ran.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        stage__in=OPINION_LEVEL_STAGES, opinion__isnull=False
+                    )
+                    | (
+                        ~models.Q(stage__in=OPINION_LEVEL_STAGES)
+                        & models.Q(opinion__isnull=True)
+                    )
+                ),
+                name="job_opinion_matches_stage",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(shard_index__lt=models.F("shard_count")),
+                name="job_shard_index_within_count",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(run__gte=1),
+                name="job_run_positive",
+            ),
+        ]
+        indexes = [
+            # The daemon's hot query: everything still open, and which
+            # of those is past its deadline.
+            models.Index(
+                fields=["status", "deadline"],
+                name="idx_job_status_deadline",
+            ),
+            models.Index(
+                fields=["scan", "stage", "run"],
+                name="idx_job_scan_stage_run",
+            ),
+            models.Index(
+                fields=["scan", "status"],
+                name="idx_job_scan_status",
+            ),
+            # "What is left to do for this opinion", the per-opinion view
+            # of a stage that can hold hundreds of them.
+            models.Index(
+                fields=["opinion", "stage", "status"],
+                name="idx_job_opinion_stage",
+            ),
+            models.Index(fields=["external_id"], name="idx_job_external_id"),
+        ]
+
+    @classmethod
+    def next_run(cls, scan, stage, engine, opinion=None):
+        """Return the run number a fresh submission should use.
+
+        Re-running takes the next run rather than reusing the current
+        one, keeping the previous run's rows and result objects
+        addressable instead of overwritten.
+
+        Scoped per engine because a stage holds several. Per-stage
+        scoping would land two engines submitted one after another on
+        different runs (the second call sees the first's row), and
+        would let a single-engine re-run raise max(run) so the barrier
+        stopped seeing the other engine's live rows.
+
+        Scoped per opinion for the same reason one level down:
+        re-reading one opinion of three hundred must not renumber the
+        other 299, which is what makes "re-extract just this opinion"
+        a supported operation rather than a whole-volume rerun.
+
+        :param scan: The Scan, or its pk.
+        :param stage: A :class:`JobStage` value.
+        :param engine: A :class:`JobEngine` value.
+        :param opinion: The OpinionScan (or its pk) for an
+            opinion-level stage; omit for the volume-level stages.
+        :returns: ``max(run) + 1`` for that target, or 1 if it has
+            never run.
+        :rtype: int
+        """
+        current = cls.objects.filter(
+            scan=scan, stage=stage, engine=engine, opinion=opinion
+        ).aggregate(models.Max("run"))["run__max"]
+        return (current or 0) + 1
+
+    def clean(self):
+        """Validate that an opinion-level job targets its own scan's opinion.
+
+        The database can enforce that an opinion is present or absent
+        for the stage, but not that it belongs to the right volume, so
+        this covers the hand-edit path.
+
+        :raises ValidationError: If ``opinion`` belongs to another scan.
+        """
+        super().clean()
+        if (
+            self.opinion_id
+            and self.scan_id
+            and self.opinion.scan_id != self.scan_id
+        ):
+            raise ValidationError(
+                {
+                    "opinion": (
+                        "Opinion belongs to scan "
+                        f"{self.opinion.scan_id}, not {self.scan_id}."
+                    )
+                }
+            )
+
+    @property
+    def is_open(self):
+        """Whether the daemon still has work to do on this job.
+
+        :returns: True while the job is pending, in flight, or completed
+            but not yet applied.
+        :rtype: bool
+        """
+        return self.status in OPEN_JOB_STATUSES
+
+    @property
+    def is_terminal(self):
+        """Whether this job is finished for good, absent an explicit retry.
+
+        :returns: True for consumed, failed, cancelled, and expired.
+        :rtype: bool
+        """
+        return self.status in TERMINAL_JOB_STATUSES
+
+    def is_overdue(self, now=None):
+        """Whether an in-flight job has run past its deadline.
+
+        :param now: Comparison time; defaults to ``timezone.now()``.
+        :returns: True if the job is in flight and past its deadline.
+        :rtype: bool
+        """
+        if self.deadline is None or self.status not in IN_FLIGHT_JOB_STATUSES:
+            return False
+        return self.deadline < (now or timezone.now())
+
+    def push_attempt(self, save=True):
+        """Record the current attempt in ``provider_meta["attempts"]``.
+
+        Called before a retry mutates the row. Since a retry reuses the
+        row (see the class docstring), this list is the only place an
+        earlier provider id, failure, or result key survives.
+
+        :param save: Whether to persist ``provider_meta`` immediately.
+        :returns: The attempts list after appending.
+        :rtype: list
+        """
+        if not isinstance(self.provider_meta, dict):
+            self.provider_meta = {}
+        attempts = self.provider_meta.setdefault("attempts", [])
+        attempts.append(
+            {
+                "attempt": self.attempt,
+                "external_id": self.external_id,
+                "status": self.status,
+                "error_code": self.error_code,
+                "error_message": self.error_message,
+                "result_key": self.result_key,
+                "submitted_at": (
+                    self.submitted_at.isoformat()
+                    if self.submitted_at
+                    else None
+                ),
+                "completed_at": (
+                    self.completed_at.isoformat()
+                    if self.completed_at
+                    else None
+                ),
+            }
+        )
+        if save:
+            self.save(update_fields=["provider_meta"])
+        return attempts
+
+    def __str__(self):
+        target = (
+            f"opinion {self.opinion_id}"
+            if self.opinion_id
+            else f"scan {self.scan_id}"
+        )
+        shard = (
+            ""
+            if self.shard_count == 1
+            else f" shard {self.shard_index + 1}/{self.shard_count}"
+        )
+        return (
+            f"{target} {self.stage}/{self.engine}{shard} "
+            f"({self.get_status_display()})"
+        )
