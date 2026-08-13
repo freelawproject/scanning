@@ -1548,21 +1548,16 @@ class ExternalJob(AbstractDateTimeModel):
     shard_index = models.PositiveIntegerField(
         default=0,
         help_text=(
-            "Position of this job within its target's fan-out, and part "
-            "of the unique key. Splitting a volume into page ranges and "
-            "running them at once is how we make a slow full-volume "
-            "pass finish quickly, and it is the normal case for bitonal "
-            "and dots.mocr rather than an escape hatch for oversized "
-            "documents. Zero of one when the target is read whole, as "
-            "an opinion PDF is."
+            "Position of this job in its target's split, counting from "
+            "zero, and part of the unique key. Volume passes are split "
+            "into page ranges that run at once to finish faster "
+            "(bitonal, dots.mocr). An opinion PDF is read whole, so it "
+            "stays 0."
         ),
     )
     shard_count = models.PositiveIntegerField(
         default=1,
-        help_text=(
-            "How many jobs this target's fan-out was split into; one "
-            "when the target is read whole."
-        ),
+        help_text="How many jobs the target was split into; 1 if read whole.",
     )
     input_key = models.CharField(
         max_length=1024,
