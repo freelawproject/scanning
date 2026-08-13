@@ -178,6 +178,105 @@ class TestSyncHelpersWithCredentials(TestCase):
         prefix = f"processing/{scan.pk}/tc/164/1/"
         self.assertEqual(uploaded_keys, {f"{prefix}bitonal.pdf"})
 
+    def test_unchanged_stage_inputs_are_not_re_uploaded(self):
+        # A stage input's LastModified is the reference timestamp for GPU
+        # job-result reuse. Re-uploading identical bytes would advance it
+        # and make every stored result read as stale, so a pipeline that
+        # merely finished must leave both inputs untouched.
+        scan = _reporter_scan()
+        local_root = pathlib.Path(scan.output_dir)
+        local_root.mkdir(parents=True, exist_ok=True)
+        (local_root / "bitonal.pdf").write_bytes(b"pdf")
+        (local_root / "tc.164.1.2.original.pdf").write_bytes(b"original")
+        (local_root / "detections.json").write_text("[]")
+
+        mock_s3 = MagicMock()
+        mock_s3.head_object.side_effect = lambda Bucket, Key: {
+            "ContentLength": 8 if Key.endswith(".original.pdf") else 3
+        }
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            count = s3_sync.upload_processing_files(scan)
+
+        self.assertEqual(count, 1)
+        uploaded_keys = {
+            call.args[2] for call in mock_s3.upload_file.call_args_list
+        }
+        prefix = f"processing/{scan.pk}/tc/164/1/"
+        self.assertEqual(uploaded_keys, {f"{prefix}detections.json"})
+
+    def test_edited_stage_input_is_re_uploaded(self):
+        # Page edits rewrite bitonal.pdf in place. A different size means
+        # the pages changed, so it must go up and its timestamp must move.
+        scan = _reporter_scan()
+        local_root = pathlib.Path(scan.output_dir)
+        local_root.mkdir(parents=True, exist_ok=True)
+        (local_root / "bitonal.pdf").write_bytes(b"much longer pdf now")
+
+        mock_s3 = MagicMock()
+        mock_s3.head_object.return_value = {"ContentLength": 3}
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            count = s3_sync.upload_processing_files(scan)
+
+        self.assertEqual(count, 1)
+        prefix = f"processing/{scan.pk}/tc/164/1/"
+        self.assertEqual(
+            {call.args[2] for call in mock_s3.upload_file.call_args_list},
+            {f"{prefix}bitonal.pdf"},
+        )
+
+    def test_missing_remote_stage_input_is_uploaded(self):
+        # Nothing there to compare against: upload, don't skip.
+        scan = _reporter_scan()
+        local_root = pathlib.Path(scan.output_dir)
+        local_root.mkdir(parents=True, exist_ok=True)
+        (local_root / "bitonal.pdf").write_bytes(b"pdf")
+
+        mock_s3 = MagicMock()
+        mock_s3.head_object.side_effect = ClientError(
+            {"Error": {"Code": "404", "Message": "404"}}, "HeadObject"
+        )
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            count = s3_sync.upload_processing_files(scan)
+
+        self.assertEqual(count, 1)
+
+    def test_invalidate_job_results_drops_both_stages(self):
+        # The escape hatch for "re-run this even though the pages are the
+        # same": the timestamp check can't express that, so the caller
+        # removes the objects instead.
+        scan = _reporter_scan()
+        mock_s3 = MagicMock()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            s3_sync.invalidate_job_results(scan)
+
+        prefix = f"processing/{scan.pk}/tc/164/1/"
+        self.assertEqual(
+            {c.kwargs["Key"] for c in mock_s3.delete_object.call_args_list},
+            {
+                f"{prefix}jobs/detect/result.json",
+                f"{prefix}jobs/analyze/result.json",
+            },
+        )
+
+    def test_invalidate_job_results_survives_a_failed_delete(self):
+        # Best effort: it runs inside a request and an admin action, and
+        # a leftover object costs only a wasted reuse.
+        scan = _reporter_scan()
+        mock_s3 = MagicMock()
+        mock_s3.delete_object.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}},
+            "DeleteObject",
+        )
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            s3_sync.invalidate_job_results(scan)
+
+        self.assertEqual(mock_s3.delete_object.call_count, 2)
+
     def test_download_processing_files_skips_job_results(self):
         scan = _reporter_scan()
         prefix = s3_sync.s3_processing_prefix(scan)
