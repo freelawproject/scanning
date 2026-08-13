@@ -383,6 +383,22 @@ def _handle_pipeline_exception(
         )
 
 
+def _ensure_shards(scan: "Scan") -> None:
+    """Compute (or reuse) the scan's shard set, with stage logging.
+
+    Failures propagate to the caller's ``_handle_pipeline_exception``
+    like any other pipeline stage. ``ensure_shards`` leaves no manifest
+    behind on failure, so a re-queued scan retries the sharding.
+
+    :param scan: The scan to shard.
+    :return: None.
+    """
+    from scanning import sharding
+
+    with _log_stage("Sharding"):
+        sharding.ensure_shards(scan)
+
+
 def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
     """Convert to bitonal if needed, returning the bitonal PDF path.
 
@@ -1538,24 +1554,30 @@ def run_full_pipeline(scan_pk: int) -> None:
         # 1. Ensure output directory exists
         output_dir = ensure_output_dir(scan)
 
-        # 2. Bitonal conversion
+        # 2. Shard the original for external job execution (#164).
+        # Runs first so dots.mocr/bitonal jobs can fan out over the
+        # shards as soon as possible after upload.
+        _update_progress(scan_pk, "Sharding original PDF...")
+        _ensure_shards(scan)
+
+        # 3. Bitonal conversion
         bitonal_path = _ensure_bitonal(scan, output_dir)
 
-        # 3. YOLO detection (all 3 models on bitonal)
+        # 4. YOLO detection (all 3 models on bitonal)
         _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
 
-        # 4. Import detections into DB
+        # 5. Import detections into DB
         _update_progress(scan_pk, "Importing detections...")
         dets = _import_detections_from_json(scan_pk, str(output_dir))
 
-        # 5. PaddleOCR validation (on original PDF for better OCR)
+        # 6. PaddleOCR validation (on original PDF for better OCR)
         _update_progress(
             scan_pk,
             f"{len(dets)} detections imported. Running page number validation...",
         )
         run_paddleocr_validation(scan_pk, scan.pdf_path)
 
-        # 6. Pair opinions
+        # 7. Pair opinions
         _update_progress(scan_pk, "Pairing opinions...")
         opinions = _re_pair_opinions(scan_pk)
 

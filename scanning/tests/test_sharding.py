@@ -18,8 +18,9 @@ import fitz
 from django.test import SimpleTestCase, TestCase, override_settings
 from PIL import Image
 
-from scanning import sharding
+from scanning import services, sharding
 from scanning.factories import ReporterFactory, ScanFactory
+from scanning.models import Status
 
 MEDIA_ROOT = tempfile.mkdtemp()
 
@@ -241,3 +242,42 @@ class TestEnsureShards(TestCase):
                 sharding.ensure_shards(scan)
         # No half-written multi-GB set left behind; the next run retries.
         self.assertFalse((Path(scan.output_dir) / "shards").exists())
+
+    def test_pipeline_wrapper_propagates_failures(self):
+        # Sharding is a regular pipeline stage: a failure must reach
+        # _handle_pipeline_exception (which marks the scan ERROR), not
+        # be swallowed.
+        scan = self._scan_with_volume(pages=2)
+        with patch(
+            "scanning.sharding.ensure_shards",
+            side_effect=RuntimeError("boom"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                services._ensure_shards(scan)
+
+    def test_full_pipeline_runs_the_sharding_stage(self):
+        """Pin the call site: run_full_pipeline shards before bitonal."""
+        scan = self._scan_with_volume(pages=2)
+        bitonal = Path(scan.output_dir) / "bitonal.pdf"
+        with (
+            patch("scanning.services._ensure_shards") as mock_shards,
+            patch("scanning.services._ensure_bitonal", return_value=bitonal),
+            patch("scanning.services._run_yolo"),
+            patch(
+                "scanning.services._import_detections_from_json",
+                return_value=[],
+            ),
+            patch("scanning.services.run_paddleocr_validation"),
+            patch("scanning.services._re_pair_opinions", return_value=[]),
+            # run_full_pipeline drops DB connections for the daemon; a
+            # real close inside the test transaction would wreck it.
+            patch("django.db.connections.close_all"),
+        ):
+            services.run_full_pipeline(scan.pk)
+
+        mock_shards.assert_called_once()
+        self.assertEqual(mock_shards.call_args.args[0].pk, scan.pk)
+        scan.refresh_from_db()
+        # PENDING_REVIEW proves the pipeline ran to completion; an
+        # exception anywhere would have left the scan in ERROR instead.
+        self.assertEqual(scan.status, Status.PENDING_REVIEW)
