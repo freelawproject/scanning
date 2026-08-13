@@ -30,13 +30,23 @@ class TestRunDaemonSchedule(TestCase):
 
     @override_settings(
         DAEMON_POLL_INTERVAL=5,
+        DAEMON_COLLECT_INTERVAL=15,
         PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS=900,
     )
-    def test_build_schedule_has_both_tasks(self):
+    def test_build_schedule_has_every_task(self):
         cmd = Command()
         names = [t.name for t in cmd._build_schedule()]
         self.assertIn("process_next_scan", names)
+        self.assertIn("collect_external_jobs", names)
         self.assertIn("cleanup_processing_tmp", names)
+
+    @override_settings(DAEMON_POLL_INTERVAL=5, DAEMON_COLLECT_INTERVAL=15)
+    def test_collect_runs_on_its_own_interval(self):
+        # The jobs it watches take minutes, so sweeping them as often as
+        # the queue is checked would only add status calls.
+        cmd = Command()
+        by_name = {t.name: t for t in cmd._build_schedule()}
+        self.assertEqual(by_name["collect_external_jobs"].interval_seconds, 15)
 
     def test_handle_invokes_due_tasks_and_shuts_down(self):
         """The scheduler should call_command each due task then exit on signal."""

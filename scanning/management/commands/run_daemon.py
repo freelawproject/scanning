@@ -8,6 +8,8 @@ Adding a new periodic job means adding another entry to
 Current schedule:
 
 - ``process_next_scan`` every ``DAEMON_POLL_INTERVAL`` seconds (default 5s)
+- ``collect_external_jobs`` every ``DAEMON_COLLECT_INTERVAL`` seconds
+  (default 15s)
 - ``cleanup_processing_tmp`` every ``PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS``
   seconds (default 900s)
 
@@ -68,8 +70,9 @@ class ScheduledTask:
 
 class Command(BaseCommand):
     help = (
-        "Run the scanning daemon. Invokes process_next_scan and "
-        "cleanup_processing_tmp on their configured intervals."
+        "Run the scanning daemon. Invokes process_next_scan, "
+        "collect_external_jobs and cleanup_processing_tmp on their "
+        "configured intervals."
     )
 
     def __init__(self, *args, **kwargs):
@@ -86,6 +89,10 @@ class Command(BaseCommand):
             ScheduledTask(
                 name="process_next_scan",
                 interval_seconds=float(settings.DAEMON_POLL_INTERVAL),
+            ),
+            ScheduledTask(
+                name="collect_external_jobs",
+                interval_seconds=float(settings.DAEMON_COLLECT_INTERVAL),
             ),
             ScheduledTask(
                 name="cleanup_processing_tmp",
