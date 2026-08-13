@@ -5,6 +5,7 @@ import pathlib
 import tempfile
 from unittest.mock import MagicMock, patch
 
+from botocore.exceptions import ClientError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase, TestCase, override_settings
 
@@ -201,6 +202,145 @@ class TestSyncHelpersWithCredentials(TestCase):
 
         downloaded = {c.args[1] for c in mock_s3.download_file.call_args_list}
         self.assertEqual(downloaded, {f"{prefix}bitonal.pdf"})
+
+    def test_upload_processing_files_skips_shards(self):
+        # The shard set duplicates the original's bytes and is pushed
+        # once by sharding.ensure_shards; the end-of-pipeline push must
+        # not re-upload gigabytes of it (there is no hash check).
+        scan = _reporter_scan()
+        local_root = pathlib.Path(scan.output_dir)
+        (local_root / "shards").mkdir(parents=True)
+        (local_root / "shards" / "0001.pdf").write_bytes(b"pdf")
+        (local_root / "shards" / "manifest.json").write_text("{}")
+        (local_root / "bitonal.pdf").write_bytes(b"pdf")
+
+        mock_s3 = MagicMock()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            count = s3_sync.upload_processing_files(scan)
+
+        self.assertEqual(count, 1)
+        uploaded_keys = {
+            call.args[2] for call in mock_s3.upload_file.call_args_list
+        }
+        prefix = f"processing/{scan.pk}/tc/164/1/"
+        self.assertEqual(uploaded_keys, {f"{prefix}bitonal.pdf"})
+
+    def test_download_processing_files_skips_shards(self):
+        scan = _reporter_scan()
+        prefix = s3_sync.s3_processing_prefix(scan)
+        mock_s3 = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": f"{prefix}bitonal.pdf", "Size": 5},
+                    {"Key": f"{prefix}shards/0001.pdf", "Size": 9},
+                    {"Key": f"{prefix}shards/manifest.json", "Size": 2},
+                ]
+            }
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+        mock_s3.download_file.side_effect = _fake_download
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            s3_sync.download_processing_files(scan)
+
+        downloaded = {c.args[1] for c in mock_s3.download_file.call_args_list}
+        self.assertEqual(downloaded, {f"{prefix}bitonal.pdf"})
+
+    def test_shards_prefix(self):
+        scan = _reporter_scan()
+        self.assertEqual(
+            s3_sync.shards_prefix(scan),
+            f"processing/{scan.pk}/tc/164/1/shards/",
+        )
+
+    def test_fetch_shard_manifest_parses_json(self):
+        scan = _reporter_scan()
+        mock_s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = b'{"version": 1, "shards": []}'
+        mock_s3.get_object.return_value = {"Body": body}
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            manifest = s3_sync.fetch_shard_manifest(scan)
+
+        self.assertEqual(manifest, {"version": 1, "shards": []})
+        self.assertEqual(
+            mock_s3.get_object.call_args.kwargs["Key"],
+            f"processing/{scan.pk}/tc/164/1/shards/manifest.json",
+        )
+
+    def test_fetch_shard_manifest_missing_returns_none(self):
+        scan = _reporter_scan()
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+        )
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            self.assertIsNone(s3_sync.fetch_shard_manifest(scan))
+
+    def test_upload_shards_sends_manifest_last(self):
+        # The manifest is the commit marker: a reader that finds it can
+        # trust every shard it lists is already in the bucket.
+        scan = _reporter_scan()
+        shard_dir = pathlib.Path(scan.output_dir) / "shards"
+        shard_dir.mkdir(parents=True)
+        (shard_dir / "0002.pdf").write_bytes(b"pdf2")
+        (shard_dir / "0001.pdf").write_bytes(b"pdf1")
+        (shard_dir / "manifest.json").write_text("{}")
+
+        mock_s3 = MagicMock()
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            count = s3_sync.upload_shards(scan, shard_dir)
+
+        self.assertEqual(count, 3)
+        prefix = f"processing/{scan.pk}/tc/164/1/shards/"
+        keys = [c.args[2] for c in mock_s3.upload_file.call_args_list]
+        self.assertEqual(
+            keys,
+            [
+                f"{prefix}0001.pdf",
+                f"{prefix}0002.pdf",
+                f"{prefix}manifest.json",
+            ],
+        )
+
+    def test_delete_shard_objects_sweeps_the_prefix(self):
+        scan = _reporter_scan()
+        prefix = f"processing/{scan.pk}/tc/164/1/shards/"
+        mock_s3 = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                "Contents": [
+                    {"Key": f"{prefix}0001.pdf"},
+                    {"Key": f"{prefix}manifest.json"},
+                ]
+            }
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            deleted = s3_sync.delete_shard_objects(scan)
+
+        self.assertEqual(deleted, 2)
+        mock_s3.delete_objects.assert_called_once_with(
+            Bucket="test-bucket",
+            Delete={
+                "Objects": [
+                    {"Key": f"{prefix}0001.pdf"},
+                    {"Key": f"{prefix}manifest.json"},
+                ]
+            },
+        )
 
     def test_is_approved_deliverable(self):
         self.assertTrue(s3_sync._is_approved_deliverable("redacted/foo.pdf"))
