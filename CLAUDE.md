@@ -57,6 +57,17 @@ YOLO models detect elements on each page (captions, key icons, headnotes, etc.) 
 
 Detections are stored both in the DB (`Detection` model) and on disk (`detections.json`). Both are kept in sync by `_sync_detections_to_disk()`. The JSON file is used by blackletter for opinion pairing and file generation.
 
+## PDF Sharding
+
+The full pipeline cuts the original PDF into ~`SHARD_TARGET_BYTES` shards (`scanning/sharding.py`, issue #164) so external workers (bitonal on doctor, dots.mocr on RunPod) can process page ranges in parallel. Key invariants:
+
+- Shards live under `shards/` in the scan's S3 processing prefix, next to a `manifest.json` that maps each shard to its page range. The manifest is uploaded **last**: its presence guarantees every shard it lists is in the bucket.
+- `sharding.ensure_shards(scan)` is idempotent — a no-op while the manifest's source fingerprint (size + page count) matches the original. On a mismatch the whole set is re-cut (~3s split). Retuning `SHARD_TARGET_BYTES` does NOT re-shard existing volumes.
+- Shards are a cache for **full-volume jobs only**. Smart page inserts/deletes do NOT refresh them: all page processing is page-level, so an edited page is processed individually and merged into the volume-level artifacts (bitonal.pdf, detections, ocr_results), as the smart-edit paths already do. The stored shard set goes stale against the edited original and just sits in S3 until the next full-volume job calls `ensure_shards`, which detects the stale fingerprint and replaces the set. Any future consumer must go through `ensure_shards` first — never read `shards/` directly.
+- `shards/` is excluded from the generic S3 processing sync in both directions (like `jobs/`) — the shards duplicate the original's bytes.
+- Verification compares per-page geometry and digests of the raw undecoded image streams, so any tool/version that silently recompresses scan data fails the run.
+- Sharding is a regular pipeline stage: failures propagate to `_handle_pipeline_exception` and mark the scan ERROR. `ensure_shards` writes no manifest on failure, so a re-queued scan retries the sharding.
+
 ## Tailwind CSS
 
 - Config: `scanning/assets/tailwind/tailwind.config.js`
