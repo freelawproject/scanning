@@ -645,12 +645,11 @@ class PageAdmin(admin.ModelAdmin):
 @admin.register(ExternalJob)
 class ExternalJobAdmin(admin.ModelAdmin):
     # Left editable: a job row carries operational state (status, retry
-    # budget, deadline) an operator may legitimately need to nudge. The
-    # provenance pair is the exception. ``input_key`` is not
-    # self-verifying, since re-pairing renames an opinion PDF, and
-    # ``input_hash`` is what makes the claim checkable, so editing
-    # either by hand leaves the hash describing different bytes than
-    # the ones the job actually read.
+    # budget, deadline) an operator may need to nudge. The provenance
+    # pair is the exception. ``input_key`` is not self-verifying, since
+    # re-pairing renames an opinion PDF, and ``input_hash`` is what
+    # makes the claim checkable, so editing either by hand leaves the
+    # hash describing different bytes than the job actually read.
     list_display = [
         "scan",
         "opinion",

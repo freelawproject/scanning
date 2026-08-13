@@ -1265,11 +1265,9 @@ class JobProvider(models.TextChoices):
 
     Separate from :class:`JobEngine` because one provider serves
     several engines. RunPod hands back a job id and answers ``GET
-    /status``; Mistral and doctor each answer on their own endpoint in
-    their own shape. Keeping the two apart means the models we run on
-    RunPod share one polling implementation, and moving one of them
-    elsewhere is a value change rather than a new branch at every call
-    site.
+    /status``; Mistral and doctor answer on their own endpoints in
+    their own shapes. The split keeps polling written once per
+    provider, and makes moving an engine elsewhere a value change.
     """
 
     RUNPOD = "runpod", "RunPod Serverless"
@@ -1280,11 +1278,10 @@ class JobProvider(models.TextChoices):
 class JobEngine(models.TextChoices):
     """What a job actually does: the model or program that runs.
 
-    ``BLACKLETTER`` runs the detection and page-analysis passes over a
-    volume; the OCR engines read opinion PDFs. ``BITONAL`` is not a
-    model but the 1-bit conversion pass, which gets rows here because
-    it runs on doctor rather than on the portal host (#158), where it
-    is ~7 minutes of CPU per volume competing with the web process.
+    ``BLACKLETTER`` runs detection and page analysis over a volume; the
+    OCR engines read opinion PDFs. ``BITONAL`` is not a model but the
+    1-bit conversion pass, which gets rows because it runs on doctor
+    rather than on the portal host (#158).
     """
 
     BLACKLETTER = "blackletter", "blackletter (YOLO + PaddleOCR)"
@@ -1298,30 +1295,27 @@ class JobEngine(models.TextChoices):
 class JobStage(models.TextChoices):
     """Which pipeline step a job belongs to.
 
-    A stage is a barrier, not a synonym for an engine: ``EXTRACT`` holds
-    the several engines that read the same document concurrently, and
-    the next step starts once every job in the stage is CONSUMED. That
-    is why ``engine`` rather than ``provider`` is part of the unique
-    key, since otherwise two engines collide on the same target.
+    A stage is a barrier, not a synonym for an engine: ``EXTRACT``
+    holds the several engines reading the same document at once, and
+    the next step starts when every job in the stage is CONSUMED.
+    ``engine`` is therefore part of the unique key, or two engines
+    would collide on one target.
 
     Stages come in two shapes, which is what ``opinion`` on the job
-    expresses. ``CONVERT``, ``DETECT``, and ``ANALYZE`` run once over
-    the whole volume, before review. ``EXTRACT`` and ``TIEBREAK`` run
-    after file generation, once per opinion PDF, so a volume with 300
-    opinions read by three engines is 900 rows.
+    expresses. ``CONVERT``, ``DETECT`` and ``ANALYZE`` run once over
+    the volume, before review. ``EXTRACT`` and ``TIEBREAK`` run after
+    file generation, once per opinion PDF, so 300 opinions read by
+    three engines is 900 rows.
 
-    Two properties the daemon has to respect. Steps that run locally
-    (reconciling two engines' text, pairing, rect computation, the file
-    generation that produces the opinion PDFs in the first place) own
-    no rows at all and sit between these stages. And a stage whose work
-    turns out to be empty is satisfied by zero rows: when the extract
-    engines agree on an opinion, no ``TIEBREAK`` job is ever created
-    for it, and that has to advance the pipeline rather than stall it.
+    Two things the daemon has to respect. Local steps own no rows and
+    sit between stages: reconciling two engines' text, pairing, rect
+    computation, and the file generation that produces the opinion
+    PDFs. And an empty stage is satisfied by zero rows, since engines
+    that agree on an opinion produce no ``TIEBREAK`` job for it.
 
-    Declared in the order they run today. Nothing reads that order:
-    what runs next will be an explicit pipeline definition, because
-    those local steps and empty stages are not expressible as a simple
-    enum walk.
+    Declared in run order, but nothing reads that order. Local steps
+    and empty stages make the sequence more than an enum walk, so what
+    runs next will be an explicit pipeline definition.
     """
 
     CONVERT = "convert", "Convert to bitonal"
@@ -1332,9 +1326,9 @@ class JobStage(models.TextChoices):
 
 
 #: Stages whose unit of work is one opinion PDF rather than the volume.
-#: A tuple rather than a frozenset because it is embedded in a database
-#: constraint, and an unordered container would rewrite the migration
-#: every time the interpreter hashed it differently.
+#: A tuple, not a frozenset: it is embedded in a database constraint,
+#: and an unordered container rewrites the migration every time the
+#: interpreter hashes it differently.
 OPINION_LEVEL_STAGES = (JobStage.EXTRACT, JobStage.TIEBREAK)
 
 
@@ -1342,16 +1336,14 @@ class JobStatus(models.TextChoices):
     """Normalized job lifecycle; provider states are mapped onto it.
 
     ``COMPLETED`` means the provider reports the work is done;
-    ``CONSUMED`` means we have read the result and applied it. That
-    split is what makes a provider's result-retention window
-    survivable, since only a CONSUMED job is safe from the purge, and
-    it mirrors the SUCCEEDED / FINISHED split in
-    ``ai.LLMTaskStatusChoices``.
+    ``CONSUMED`` means we have read the result and applied it. Only a
+    CONSUMED job is safe from a provider's result purge. Mirrors the
+    SUCCEEDED / FINISHED split in ``ai.LLMTaskStatusChoices``.
 
-    ``EXPIRED`` is the one state that is a data loss rather than a
-    failure: the provider finished, and neither its status call nor the
-    result object can tell us what it produced. It stays separate from
-    FAILED so it reads as a bug in our polling rather than a bad job.
+    ``EXPIRED`` is data loss rather than failure: the provider
+    finished, and neither its status call nor the result object says
+    what it produced. Separate from FAILED so it reads as a bug in our
+    polling rather than a bad job.
     """
 
     PENDING = "pending", "Pending submit"
@@ -1374,10 +1366,9 @@ IN_FLIGHT_JOB_STATUSES = frozenset(
     }
 )
 
-#: Jobs the daemon still has work to do on. COMPLETED belongs here, not
-#: with the terminal states: the provider is finished but we have not
-#: applied the result, and treating the row as done at that point is
-#: exactly how a finished job's output gets lost.
+#: Jobs the daemon still has work to do on. COMPLETED belongs here and
+#: not with the terminal states: the provider is finished but we have
+#: not applied the result, and calling that done loses the output.
 OPEN_JOB_STATUSES = frozenset(
     {JobStatus.PENDING, JobStatus.COMPLETED} | IN_FLIGHT_JOB_STATUSES
 )
@@ -1396,8 +1387,8 @@ TERMINAL_JOB_STATUSES = frozenset(
 class ExternalJobQuerySet(AutoNowQuerySet):
     """Queries the daemon runs to decide what to do next.
 
-    Subclasses :class:`AutoNowQuerySet` rather than ``models.QuerySet``
-    so bulk writes through these still stamp ``date_modified``.
+    Subclasses :class:`AutoNowQuerySet` so bulk writes through these
+    still stamp ``date_modified``.
     """
 
     def open(self):
@@ -1428,9 +1419,9 @@ class ExternalJobQuerySet(AutoNowQuerySet):
     def overdue(self, now=None):
         """Return in-flight jobs whose deadline has passed.
 
-        Per job rather than per scan on purpose: once a stage fans out,
-        one wedged shard has to be cancellable and resubmittable without
-        touching its siblings.
+        Per job rather than per scan: once a stage fans out, one wedged
+        shard has to be cancellable and resubmittable without touching
+        its siblings.
 
         :param now: Comparison time; defaults to ``timezone.now()``.
         :returns: In-flight jobs past their deadline.
@@ -1447,21 +1438,19 @@ class ExternalJob(AbstractDateTimeModel):
     """One unit of work handed to an external compute provider.
 
     Supersedes tracking a single provider job on ``Scan``: a scan has
-    many jobs, and once a stage fans out, several are in flight at once
-    across providers. The daemon keeps no in-memory job state, so every
-    tick it recomputes what to submit, poll, harvest, or cancel from
-    these rows alone. That is what makes an interrupted daemon resumable
-    rather than a special case, and it is why nothing about "what runs
-    next" may live in a Python call stack.
+    many jobs, and a fanned-out stage has several in flight at once
+    across providers. The daemon keeps no in-memory job state and
+    recomputes what to submit, poll, harvest, or cancel from these rows
+    every tick, which is what makes an interrupted daemon resumable.
+    Nothing about "what runs next" may live in a Python call stack.
 
-    Retries mutate the row instead of inserting one per attempt, which
-    is the opposite of the ``ai.LLMTask`` idiom, because the daemon asks
-    "latest state per shard" on every tick and a stable unique key keeps
-    that a plain filter. The cost is that the row is the only copy of
-    its own state, so a resubmission has to bump ``attempt`` (which
-    re-addresses the result object) and call :meth:`push_attempt`
-    (which preserves the previous provider handle) before overwriting
-    anything.
+    Retries mutate the row rather than inserting one per attempt, the
+    opposite of the ``ai.LLMTask`` idiom, because the daemon asks
+    "latest state per shard" every tick and a stable unique key keeps
+    that a plain filter. The cost: the row is the only copy of its own
+    state, so a resubmission must bump ``attempt`` (which re-addresses
+    the result object) and call :meth:`push_attempt` (which preserves
+    the previous provider handle) before overwriting anything.
 
     Only work that leaves the process gets a row. The local steps
     between stages own none.
@@ -1472,11 +1461,10 @@ class ExternalJob(AbstractDateTimeModel):
         on_delete=models.CASCADE,
         related_name="jobs",
         help_text=(
-            "The volume this work belongs to, set even on a job whose "
-            "target is a single opinion. Denormalized deliberately: "
-            "'has this scan anything in flight' is the daemon's most "
-            "frequent question and must not need a join, and it keeps "
-            "the cascade rooted at the scan."
+            "The volume this work belongs to, set even when the target "
+            "is a single opinion. Denormalized so 'has this scan "
+            "anything in flight', the daemon's most frequent question, "
+            "needs no join, and so the cascade is rooted at the scan."
         ),
     )
     opinion = models.ForeignKey(
@@ -1487,19 +1475,18 @@ class ExternalJob(AbstractDateTimeModel):
         related_name="jobs",
         help_text=(
             "The opinion PDF this job read, for the post-generation "
-            "stages. Null for the volume-level stages that run before "
-            "review, when no opinion exists yet. Must belong to "
-            "``scan``.\n\n"
-            "CASCADE, not SET_NULL, because an orphaned extract row "
+            "stages. Null for the volume-level stages, which run before "
+            "any opinion exists. Must belong to ``scan``.\n\n"
+            "CASCADE rather than SET_NULL: an orphaned extract row "
             "would break the invariant that an opinion-level stage has "
             "an opinion, and would leave the stage barrier counting a "
-            "row with no target. Note the consequence: "
+            "row with no target. The consequence is that "
             "``run_generate_files`` deletes and recreates a scan's "
             "OpinionScan rows, so regenerating files discards every "
-            "extraction job with them. That is right when the opinion "
-            "actually changed, and wasteful when it did not, which is "
-            "why preserving unchanged opinion rows (issue #165) has to "
-            "land before we pay for hundreds of jobs a volume."
+            "extraction job with them. Right when the opinion changed, "
+            "wasteful when it did not, which is why preserving "
+            "unchanged opinion rows (issue #165) has to land before we "
+            "pay for hundreds of jobs a volume."
         ),
     )
     stage = models.CharField(
@@ -1524,12 +1511,12 @@ class ExternalJob(AbstractDateTimeModel):
         help_text=(
             "Stage-run generation. Re-running a stage (a re-validate, a "
             "reprocess) creates rows at the next run number and keeps "
-            "the previous run as history, while retrying a single shard "
-            "mutates its row. Scoped per engine, not per stage: the "
-            "live jobs of one engine are its rows at that engine's "
-            "max(run), and a stage's live jobs are the union of those, "
-            "so re-running one engine of a multi-engine stage cannot "
-            "hide another engine's rows from the barrier."
+            "the previous run as history; retrying a single shard "
+            "mutates its row instead. Scoped per engine, not per stage: "
+            "an engine's live jobs are its rows at its own max(run), "
+            "and a stage's are the union of those, so re-running one "
+            "engine of a multi-engine stage cannot hide another "
+            "engine's rows from the barrier."
         ),
     )
     attempt = models.PositiveSmallIntegerField(
@@ -1538,11 +1525,11 @@ class ExternalJob(AbstractDateTimeModel):
             "Which submission of this row is in flight, incremented on "
             "every resubmission whatever the reason, and carried in "
             "``result_key`` so two attempts of one shard never write to "
-            "the same object. Deliberately not derived from "
-            "retry_count: that accounts for why a job was resubmitted "
-            "and can stay flat across one (a daemon restart), and a key "
-            "reused across attempts lets an abandoned worker's late "
-            "upload be harvested as the current attempt's output."
+            "the same object. Not derived from retry_count, which "
+            "accounts for why a job was resubmitted and can stay flat "
+            "across one (a daemon restart). A key reused across "
+            "attempts lets an abandoned worker's late upload be "
+            "harvested as the current attempt's output."
         ),
     )
     external_id = models.CharField(
@@ -1551,9 +1538,9 @@ class ExternalJob(AbstractDateTimeModel):
         default="",
         help_text=(
             "The provider's job id, set on submit and kept after the "
-            "terminal state for auditing and billing lookups. This is "
-            "what lets a restarted daemon reattach to a job that is "
-            "still running instead of paying for it twice."
+            "terminal state for auditing and billing lookups. Lets a "
+            "restarted daemon reattach to a job that is still running "
+            "instead of paying for it twice."
         ),
     )
 
@@ -1621,11 +1608,11 @@ class ExternalJob(AbstractDateTimeModel):
         default="",
         help_text=(
             "S3 key the worker uploads its output to, assigned by us at "
-            "submit time and handed over as a presigned PUT. Must be "
-            "scoped to run, shard, and attempt, and never overwritten: "
-            "that is what makes a lost status response recoverable with "
-            "a head_object, and what stops the probe from harvesting "
-            "another run's or another attempt's output."
+            "submit time and handed over as a presigned PUT. Scoped to "
+            "run, shard, and attempt, and never overwritten: that makes "
+            "a lost status response recoverable with a head_object, and "
+            "stops the probe harvesting another run's or another "
+            "attempt's output."
         ),
     )
 
@@ -1664,11 +1651,10 @@ class ExternalJob(AbstractDateTimeModel):
         default=dict,
         blank=True,
         help_text=(
-            "Everything about the run that is diagnostic rather than "
-            "structural: which endpoint served it, worker metadata, "
-            "timings, sizes, cost, and an append-only ``attempts`` list "
-            "of prior attempts so mutating this row on retry still "
-            "keeps its history."
+            "Diagnostic rather than structural: which endpoint served "
+            "it, worker metadata, timings, sizes, cost, and an "
+            "append-only ``attempts`` list of prior attempts so "
+            "mutating this row on retry still keeps its history."
         ),
     )
 
@@ -1678,10 +1664,10 @@ class ExternalJob(AbstractDateTimeModel):
         ordering = ["scan", "stage", "run", "engine", "opinion", "shard_index"]
         constraints = [
             # Two uniqueness rules, because the two stage shapes have
-            # different targets. They are conditional rather than one
-            # constraint over both columns: Postgres treats NULLs as
-            # distinct, so a single key including ``opinion`` would
-            # place no limit at all on volume-level rows.
+            # different targets. Conditional rather than one constraint
+            # over both columns: Postgres treats NULLs as distinct, so
+            # a single key including ``opinion`` would place no limit
+            # at all on volume-level rows.
             models.UniqueConstraint(
                 fields=["scan", "stage", "engine", "run", "shard_index"],
                 condition=models.Q(opinion__isnull=True),
@@ -1692,11 +1678,11 @@ class ExternalJob(AbstractDateTimeModel):
                 condition=models.Q(opinion__isnull=False),
                 name="unique_opinion_job_per_engine_run",
             ),
-            # A stage's shape decides whether an opinion is required. An
-            # extract row without one would attribute a single opinion's
-            # work to the whole volume and collide with its siblings; a
-            # detect row with one would claim a target that did not
-            # exist when it ran.
+            # A stage's shape decides whether an opinion is required.
+            # An extract row without one attributes a single opinion's
+            # work to the whole volume and collides with its siblings;
+            # a detect row with one claims a target that did not exist
+            # when it ran.
             models.CheckConstraint(
                 condition=(
                     models.Q(
@@ -1747,19 +1733,19 @@ class ExternalJob(AbstractDateTimeModel):
         """Return the run number a fresh submission should use.
 
         Re-running takes the next run rather than reusing the current
-        one, which is what keeps the previous run's rows and result
-        objects addressable instead of overwritten.
+        one, keeping the previous run's rows and result objects
+        addressable instead of overwritten.
 
-        Scoped per engine because a stage holds several. Scoping it per
-        stage instead would make two engines submitted one after another
-        land on different runs (the second call sees the first's row),
-        and would let a single-engine re-run raise max(run) so the
-        barrier stopped seeing the other engine's live rows.
+        Scoped per engine because a stage holds several. Per-stage
+        scoping would land two engines submitted one after another on
+        different runs (the second call sees the first's row), and
+        would let a single-engine re-run raise max(run) so the barrier
+        stopped seeing the other engine's live rows.
 
-        Scoped per opinion for the same reason, one level down:
+        Scoped per opinion for the same reason one level down:
         re-reading one opinion of three hundred must not renumber the
-        other 299, which is what makes "re-extract just this opinion" a
-        supported operation rather than a whole-volume rerun.
+        other 299, which is what makes "re-extract just this opinion"
+        a supported operation rather than a whole-volume rerun.
 
         :param scan: The Scan, or its pk.
         :param stage: A :class:`JobStage` value.
@@ -1832,9 +1818,9 @@ class ExternalJob(AbstractDateTimeModel):
     def push_attempt(self, save=True):
         """Record the current attempt in ``provider_meta["attempts"]``.
 
-        Called before a retry mutates the row. Because a retry reuses
-        the row (see the class docstring), this list is the only place
-        an earlier provider id, failure, or result key survives.
+        Called before a retry mutates the row. Since a retry reuses the
+        row (see the class docstring), this list is the only place an
+        earlier provider id, failure, or result key survives.
 
         :param save: Whether to persist ``provider_meta`` immediately.
         :returns: The attempts list after appending.
