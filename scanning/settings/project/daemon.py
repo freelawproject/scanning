@@ -34,3 +34,21 @@ DAEMON_SUBMIT_INTERVAL = env.int("DAEMON_SUBMIT_INTERVAL", default=5)
 # Slower than DAEMON_POLL_INTERVAL because the jobs it watches are
 # measured in minutes, not seconds (issue #156).
 DAEMON_COLLECT_INTERVAL = env.int("DAEMON_COLLECT_INTERVAL", default=15)
+
+# Master switch for the batch cycle (issue #156). With it off, every
+# GPU step blocks until it comes back, exactly as before: one scan in
+# flight per daemon. With it on, steps submit jobs and the daemon polls
+# them, so a batch of volumes runs at once. Off by default so the two
+# paths can be swapped deliberately rather than by deploy.
+DAEMON_BATCH_JOBS = env.bool("DAEMON_BATCH_JOBS", default=False)
+
+# How many queued scans one claim tick may take. 0 means every scan
+# queued at the moment of the snapshot; scans queued after it wait for
+# the next cycle, which is what makes "this cycle is done" answerable.
+# Only consulted when DAEMON_BATCH_JOBS is on -- claiming a batch while
+# steps still block would run them one after another anyway.
+DAEMON_BATCH_SIZE = env.int("DAEMON_BATCH_SIZE", default=0)
+
+# How often (in seconds) the daemon re-enters scans whose jobs have all
+# landed.
+DAEMON_ADVANCE_INTERVAL = env.int("DAEMON_ADVANCE_INTERVAL", default=10)

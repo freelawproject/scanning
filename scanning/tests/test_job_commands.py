@@ -1,8 +1,12 @@
-"""Tests for the submit and collect management commands.
+"""Tests for the daemon's job and scan commands.
 
-The sweeps themselves are covered in ``test_jobs``; these are the
-wrappers the daemon schedules -- their DB-blip retry and what they
-print.
+The sweeps and the pipeline itself are covered in ``test_jobs`` and
+``test_pipeline``; these are the wrappers the daemon schedules -- what
+they claim, their DB-blip retry, and what they print.
+
+Every command here calls ``connections.close_all()`` on each attempt,
+which would tear down the connection holding this TestCase's
+transaction. It is patched out throughout.
 """
 
 from io import StringIO
@@ -10,9 +14,11 @@ from unittest.mock import patch
 
 from django.core.management import call_command
 from django.db import OperationalError
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
+from scanning.factories import ExternalJobFactory, ScanFactory
 from scanning.jobs import CollectSummary, SubmitSummary
+from scanning.models import JobStatus, Scan, Status
 
 
 class TestCollectCommand(TestCase):
@@ -26,7 +32,10 @@ class TestCollectCommand(TestCase):
         :rtype: tuple
         """
         out = StringIO()
-        with patch("scanning.jobs.collect_once", **kwargs) as mock:
+        with (
+            patch("django.db.connections.close_all"),
+            patch("scanning.jobs.collect_once", **kwargs) as mock,
+        ):
             call_command("collect_external_jobs", stdout=out)
         return out.getvalue(), mock
 
@@ -70,7 +79,10 @@ class TestSubmitCommand(TestCase):
         :rtype: tuple
         """
         out = StringIO()
-        with patch("scanning.jobs.submit_pending", **kwargs) as mock:
+        with (
+            patch("django.db.connections.close_all"),
+            patch("scanning.jobs.submit_pending", **kwargs) as mock,
+        ):
             call_command("submit_external_jobs", *argv, stdout=out)
         return out.getvalue(), mock
 
@@ -101,3 +113,136 @@ class TestSubmitCommand(TestCase):
         )
         self.assertEqual(mock.call_count, 2)
         self.assertIn("submitted 1", output)
+
+
+class TestAdvanceScansCommand(TestCase):
+    """``advance_scans`` claims parked scans and re-enters them."""
+
+    def _run(self):
+        """Invoke the command with ``advance_scan`` stubbed.
+
+        :returns: ``(stdout, mock)``.
+        :rtype: tuple
+        """
+        out = StringIO()
+        with (
+            patch("django.db.connections.close_all"),
+            patch("scanning.pipeline.advance_scan") as mock,
+        ):
+            call_command("advance_scans", stdout=out)
+        return out.getvalue(), mock
+
+    def _awaiting_with(self, job_status):
+        """Create a parked scan with one job in ``job_status``.
+
+        :param job_status: The job's status.
+        :returns: The scan.
+        :rtype: Scan
+        """
+        scan = ScanFactory(status=Status.AWAITING)
+        ExternalJobFactory(scan=scan, status=job_status)
+        return scan
+
+    def test_a_ready_scan_is_claimed_and_advanced(self):
+        scan = self._awaiting_with(JobStatus.COMPLETED)
+
+        _, mock = self._run()
+
+        scan.refresh_from_db()
+        # Claimed into PROCESSING first: while the pipeline runs, a
+        # daemon really is holding the scan, so the process-death
+        # timeout should apply again.
+        self.assertEqual(scan.status, Status.PROCESSING)
+        mock.assert_called_once_with(scan.pk)
+
+    def test_a_scan_still_waiting_is_left_parked(self):
+        scan = self._awaiting_with(JobStatus.IN_PROGRESS)
+
+        _, mock = self._run()
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.AWAITING)
+        mock.assert_not_called()
+
+    def test_every_ready_scan_moves_on_one_tick(self):
+        for _ in range(3):
+            self._awaiting_with(JobStatus.COMPLETED)
+
+        _, mock = self._run()
+
+        self.assertEqual(mock.call_count, 3)
+
+    def test_a_db_blip_is_retried(self):
+        scan = self._awaiting_with(JobStatus.COMPLETED)
+        out = StringIO()
+        with (
+            patch("django.db.connections.close_all"),
+            patch("scanning.pipeline.advance_scan") as mock,
+            patch(
+                "scanning.pipeline.resumable_scans",
+                side_effect=[
+                    OperationalError("ssl closed"),
+                    Scan.objects.filter(pk=scan.pk),
+                ],
+            ),
+        ):
+            call_command("advance_scans", stdout=out)
+        mock.assert_called_once_with(scan.pk)
+
+
+class TestBatchClaim(TestCase):
+    """How wide a claim tick is depends on whether steps still block."""
+
+    def _claim(self, batch=False):
+        """Run one claim tick.
+
+        :param batch: Whether the batch cycle is enabled.
+        :returns: The scan pks claimed.
+        :rtype: list[int]
+        """
+        out = StringIO()
+        with (
+            patch("django.db.connections.close_all"),
+            patch("scanning.jobs.batch_enabled", return_value=batch),
+            patch("scanning.pipeline.advance_scan") as mock,
+        ):
+            call_command("process_next_scan", stdout=out)
+        return [c.args[0] for c in mock.call_args_list]
+
+    def test_blocking_mode_still_takes_one_scan(self):
+        # A claimed scan is worked to completion before the next
+        # starts, so claiming several would run them in series while
+        # holding the rest hostage.
+        for _ in range(3):
+            ScanFactory(status=Status.QUEUED)
+
+        self.assertEqual(len(self._claim(batch=False)), 1)
+
+    @override_settings(DAEMON_BATCH_SIZE=0)
+    def test_batch_mode_takes_the_whole_queue(self):
+        for _ in range(4):
+            ScanFactory(status=Status.QUEUED)
+
+        self.assertEqual(len(self._claim(batch=True)), 4)
+
+    @override_settings(DAEMON_BATCH_SIZE=2)
+    def test_the_batch_can_be_capped(self):
+        for _ in range(5):
+            ScanFactory(status=Status.QUEUED)
+
+        self.assertEqual(len(self._claim(batch=True)), 2)
+
+    @override_settings(DAEMON_BATCH_SIZE=0)
+    def test_claiming_marks_every_scan_processing(self):
+        scans = [ScanFactory(status=Status.QUEUED) for _ in range(3)]
+
+        self._claim(batch=True)
+
+        for scan in scans:
+            scan.refresh_from_db()
+            self.assertEqual(scan.status, Status.PROCESSING)
+            self.assertIsNotNone(scan.processed_at)
+
+    def test_an_empty_queue_claims_nothing(self):
+        ScanFactory(status=Status.PENDING_REVIEW)
+        self.assertEqual(self._claim(batch=True), [])

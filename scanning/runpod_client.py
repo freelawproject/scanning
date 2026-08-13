@@ -410,8 +410,27 @@ def _s3() -> Any:
 
 
 def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
-    """Upload ``pdf_path`` to the scan's S3 processing prefix if
-    missing, then return a presigned GET URL.
+    """Put ``pdf_path`` on S3 if needed, then return a presigned GET.
+
+    The synchronous path's one-shot: the file is uploaded and the URL
+    minted in the same breath, because the job goes out immediately
+    after. A batched job cannot do that -- it may wait out a long queue
+    before it is submitted -- so it keeps the two apart, storing the
+    key from :func:`ensure_input_key` and presigning it later.
+
+    :param scan: The Scan owning the file.
+    :param pdf_path: Local filesystem path.
+    :returns: Presigned GET URL.
+    :rtype: str
+    :raises FileNotFoundError: If the file isn't in S3 and isn't
+        present locally.
+    :raises RunpodError: If S3 credentials are missing.
+    """
+    return presign_input_get(ensure_input_key(scan, pdf_path))
+
+
+def ensure_input_key(scan: Scan, pdf_path: str | Path) -> str:
+    """Upload ``pdf_path`` to the scan's processing prefix if missing.
 
     Uses the PDF's basename as the S3 key suffix, so if the file is
     already under the scan's processing prefix (the common case for
@@ -420,7 +439,7 @@ def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
 
     :param scan: The Scan owning the file.
     :param pdf_path: Local filesystem path.
-    :returns: Presigned GET URL.
+    :returns: The S3 key the worker should read.
     :rtype: str
     :raises FileNotFoundError: If the file isn't in S3 and isn't
         present locally.
@@ -462,7 +481,7 @@ def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
         )
         s3.upload_file(str(local), bucket, key)
 
-    return presign_input_get(key)
+    return key
 
 
 def presign_input_get(key: str) -> str:

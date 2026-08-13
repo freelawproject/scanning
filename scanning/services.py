@@ -304,7 +304,16 @@ def _handle_pipeline_exception(
     :param context: Short label for log messages (e.g. ``"pipeline"``,
         ``"validate"``, ``"detect"``).
     """
+    from scanning.pipeline import Awaiting
     from scanning.runpod_client import RunpodTransientError
+
+    if isinstance(exc, Awaiting):
+        # Control flow, not failure: a batched step submitted its work
+        # and unwound. Re-raised from inside the caller's ``except``
+        # so it reaches ``pipeline.advance_scan``, which parks the scan
+        # instead of marking it ERROR. Handled here rather than in each
+        # pipeline function so none of them can forget.
+        raise exc
 
     if isinstance(exc, RunpodTransientError):
         max_retries = settings.RUNPOD_MAX_TRANSIENT_RETRIES
@@ -440,7 +449,7 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     import io
     import sys
 
-    from scanning import runpod_client
+    from scanning import jobs, pipeline, runpod_client
 
     _update_progress(scan_pk, "YOLO detection: loading models...")
     scan = Scan.objects.get(pk=scan_pk)
@@ -485,17 +494,23 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     def _remote_progress(current, total, message):
         _update_progress(scan_pk, message)
 
-    with _log_stage("YOLO detection"):
-        sys.stdout = _ProgressWriter()
-        try:
-            detections = runpod_client.detect(
-                scan,
-                pdf_path,
-                models=["small", "medium", "large"],
-                progress_callback=_remote_progress,
-            )
-        finally:
-            sys.stdout = real_stdout
+    if jobs.batch_enabled():
+        # Submits and unwinds rather than waiting. Raises Awaiting the
+        # first time through and returns the detections on the pass
+        # after the job lands; see ``scanning/pipeline.py``.
+        detections = pipeline.await_detect(scan, pdf_path)
+    else:
+        with _log_stage("YOLO detection"):
+            sys.stdout = _ProgressWriter()
+            try:
+                detections = runpod_client.detect(
+                    scan,
+                    pdf_path,
+                    models=["small", "medium", "large"],
+                    progress_callback=_remote_progress,
+                )
+            finally:
+                sys.stdout = real_stdout
 
     # ``bl_detect`` used to write detections.json as a side effect;
     # preserve that here so ``_import_detections_from_json`` (and any
@@ -1218,6 +1233,7 @@ def _dispatch_analyze(
     scan_pk: int,
     pdf_path: str,
     stream_partial: bool = False,
+    allow_batch: bool = True,
 ) -> list[dict]:
     """Shared scaffolding for submitting an analyze job via runpod_client.
 
@@ -1232,14 +1248,25 @@ def _dispatch_analyze(
         arrive (local mode only; remote mode emits ``current=None``
         so no partial writes happen there). If ``False``, only coarse
         submit/queued events fire.
+    :param allow_batch: Whether this call may submit a job and unwind
+        rather than waiting. Off for the in-place page-edit paths:
+        batching works by re-entering the pipeline from the top, and
+        re-entering a function that has already inserted pages into a
+        PDF would insert them twice.
     :returns: The ``results`` list from the analyze response.
     :rtype: list[dict]
     """
-    from scanning import runpod_client
+    from scanning import jobs, pipeline, runpod_client
 
     scan = Scan.objects.get(pk=scan_pk)
     exp_start = scan.start_page or 1
     exp_end = scan.end_page
+
+    if allow_batch and jobs.batch_enabled():
+        # Unwinds until the job lands, so the partial-results stream is
+        # gone here: there is no open call to emit per-page progress
+        # from. Progress comes off the job rows instead.
+        return pipeline.await_analyze(scan, pdf_path)
 
     all_results: list[dict] = []
 
@@ -1267,7 +1294,10 @@ def _dispatch_analyze(
 
 
 def run_paddleocr_validation(
-    scan_pk: int, pdf_path: str, reuse: bool = False
+    scan_pk: int,
+    pdf_path: str,
+    reuse: bool = False,
+    allow_batch: bool = True,
 ) -> None:
     """Validate page numbers using the runpod_client analyze action.
 
@@ -1286,6 +1316,8 @@ def run_paddleocr_validation(
         default so every caller that means "analyze this again" keeps
         doing exactly that; only the resume path in
         :func:`run_full_pipeline` sets it.
+    :param allow_batch: Whether this call may submit a job and unwind
+        rather than waiting. See :func:`_dispatch_analyze`.
     """
     from scanning import runpod_client
 
@@ -1310,13 +1342,18 @@ def run_paddleocr_validation(
     if all_results is None:
         with _log_stage("PaddleOCR validation"):
             all_results = _dispatch_analyze(
-                scan_pk, pdf_path, stream_partial=False
+                scan_pk,
+                pdf_path,
+                stream_partial=False,
+                allow_batch=allow_batch,
             )
     Scan.objects.filter(pk=scan_pk).update(ocr_results=all_results)
     _rebuild_issues_from_results(scan_pk, all_results)
 
 
-def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
+def run_incremental_validation(
+    scan_pk: int, pdf_path: str, allow_batch: bool = True
+) -> None:
     """Run YOLO + PaddleOCR on every page via the runpod_client.
 
     In local mode, ``blackletter.analyze.analyze_pdf`` is called with
@@ -1330,7 +1367,9 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
     :param scan_pk: Primary key of the scan to validate.
     :param pdf_path: Path to the PDF to run validation on.
     """
-    all_results = _dispatch_analyze(scan_pk, pdf_path, stream_partial=True)
+    all_results = _dispatch_analyze(
+        scan_pk, pdf_path, stream_partial=True, allow_batch=allow_batch
+    )
 
     # Save detections from each page result
     Detection.objects.filter(scan_id=scan_pk).delete()
@@ -1904,7 +1943,7 @@ def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
     if output_dir:
         _sync_detections_to_disk(scan_pk)
 
-    run_paddleocr_validation(scan_pk, scan.pdf_path)
+    run_paddleocr_validation(scan_pk, scan.pdf_path, allow_batch=False)
     _re_pair_opinions(scan_pk)
 
     if output_dir:
@@ -1977,7 +2016,7 @@ def run_smart_insert(
     # Re-validate, re-pair, recompute rects
     scan.refresh_from_db()
     pdf_path = processing_pdf_path(scan)
-    run_incremental_validation(scan_pk, pdf_path)
+    run_incremental_validation(scan_pk, pdf_path, allow_batch=False)
     _re_pair_opinions(scan_pk)
 
     if output_dir:

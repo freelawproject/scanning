@@ -44,6 +44,27 @@ from scanning.providers import get_provider
 logger = logging.getLogger(__name__)
 
 
+def batch_enabled() -> bool:
+    """Return True if GPU steps should submit jobs instead of blocking.
+
+    Three conditions, all necessary. The flag is the deliberate switch.
+    Remote mode has to be on or there is no provider to submit to. And
+    S3 credentials have to exist, because a batched result is delivered
+    by presigned PUT and read back on a later tick -- without them the
+    payload would come back inline with nowhere to survive the wait.
+
+    :returns: Whether the batch cycle is active.
+    :rtype: bool
+    """
+    from scanning.utils import has_s3_credentials
+
+    return bool(
+        getattr(settings, "DAEMON_BATCH_JOBS", False)
+        and settings.RUNPOD_ENABLED
+        and has_s3_credentials()
+    )
+
+
 @dataclass
 class SubmitSummary:
     """What one submit sweep did.

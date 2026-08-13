@@ -43,26 +43,22 @@ class Command(BaseCommand):
         :param options: Parsed command-line options.
         :return: None.
         """
-        claimed = self._claim_next_scan_with_retry()
-        if claimed is None:
-            return
-        scan, action = claimed
-        self._dispatch(scan, action)
+        for scan_pk in self._claim_with_retry():
+            self._dispatch(scan_pk)
 
-    def _claim_next_scan_with_retry(self):
-        """Recover stale rows and claim the next queued scan, retrying
+    def _claim_with_retry(self):
+        """Recover stale rows and claim this tick's scans, retrying
         transient DB connection failures.
 
         A fresh TCP+TLS connection is opened each attempt; a lost handshake
         (``OperationalError``) is retried with a short backoff. Both
-        ``_recover_stale`` and ``_claim_next`` are idempotent under re-run,
+        ``_recover_stale`` and ``_claim_batch`` are idempotent under re-run,
         so retrying the pair is safe. A blip that survives every attempt is
         logged at WARNING (not ERROR) so a recovered, self-healing tick
         doesn't create a Sentry error event.
 
-        :return: ``(scan, action)`` for the claimed scan, or ``None`` if
-            nothing was queued or the connection never recovered.
-        :rtype: tuple | None
+        :return: Primary keys of the scans claimed, possibly empty.
+        :rtype: list[int]
         """
         from django.db import OperationalError, connections
 
@@ -70,7 +66,7 @@ class Command(BaseCommand):
             connections.close_all()
             try:
                 self._recover_stale()
-                return self._claim_next()
+                return self._claim_batch()
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
                     logger.warning(
@@ -79,9 +75,9 @@ class Command(BaseCommand):
                         attempt + 1,
                         exc,
                     )
-                    return None
+                    return []
                 time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
-        return None
+        return []
 
     def _recover_stale(self):
         """Reset scans stuck in PROCESSING past the timeout back to QUEUED.
@@ -118,81 +114,67 @@ class Command(BaseCommand):
             requeue_message="Re-queued (previous attempt timed out)",
         )
 
-    def _claim_next(self):
-        """Atomically claim the next queued scan and mark it PROCESSING.
+    def _claim_batch(self):
+        """Atomically claim this tick's queued scans and mark them PROCESSING.
 
-        :return: ``(scan, action)`` for the claimed scan, or ``None`` if no
-            scan is queued.
-        :rtype: tuple | None
+        A closed batch: the scans queued at the moment of the snapshot
+        and no others. Anything queued while this cycle runs waits for
+        the next one, which is what makes "this cycle is finished" a
+        question with an answer rather than one a busy queue can keep
+        postponing.
+
+        How wide the snapshot is depends on whether steps still block.
+        With ``DAEMON_BATCH_JOBS`` off, a claimed scan is worked to
+        completion before the next one starts, so claiming several
+        would only run them in series while holding the rest hostage;
+        the batch is one scan, exactly as before. With it on, the whole
+        batch's jobs go out together and the endpoint's worker cap
+        decides how many run at once.
+
+        :return: Primary keys of the scans claimed, oldest first.
+        :rtype: list[int]
         """
+        from django.conf import settings
         from django.db import transaction
         from django.utils import timezone
 
+        from scanning import jobs
         from scanning.models import QueuedAction, Scan, Status
 
+        if jobs.batch_enabled():
+            size = int(settings.DAEMON_BATCH_SIZE) or None
+        else:
+            size = 1
+
         with transaction.atomic():
-            scan = (
+            queued = (
                 Scan.objects.select_for_update(skip_locked=True)
                 .filter(status=Status.QUEUED)
                 .order_by("date_created")
-                .first()
             )
-            if scan is None:
-                return None
+            batch = list(queued[:size] if size else queued)
+            if not batch:
+                return []
 
-            action = scan.queued_action or QueuedAction.FULL_PIPELINE
-            Scan.objects.filter(pk=scan.pk).update(
-                status=Status.PROCESSING,
-                processed_at=timezone.now(),
-                progress_message=f"Starting {action}...",
-                progress_current=0,
-                progress_total=0,
-            )
+            for scan in batch:
+                action = scan.queued_action or QueuedAction.FULL_PIPELINE
+                Scan.objects.filter(pk=scan.pk).update(
+                    status=Status.PROCESSING,
+                    processed_at=timezone.now(),
+                    progress_message=f"Starting {action}...",
+                    progress_current=0,
+                    progress_total=0,
+                )
 
-        return scan, action
+        return [scan.pk for scan in batch]
 
-    def _dispatch(self, scan, action):
+    def _dispatch(self, scan_pk):
         """Run the queued action for an already-claimed scan.
 
-        :param scan: The claimed Scan instance (status PROCESSING).
-        :param action: The QueuedAction to run.
+        :param scan_pk: Primary key of the claimed scan (PROCESSING).
         :return: None.
         """
-        from scanning import services
-        from scanning.models import QueuedAction, Scan, Status
+        from scanning.pipeline import advance_scan
 
-        self.stdout.write(f"Processing scan {scan.pk} ({action})")
-
-        dispatch = {
-            QueuedAction.FULL_PIPELINE: services.run_full_pipeline,
-            QueuedAction.VALIDATE: services.run_validate_with_bitonal,
-            QueuedAction.DETECT: services.run_detect,
-            QueuedAction.REPROCESS: services.run_reprocess,
-            QueuedAction.GENERATE_FILES: services.run_generate_files,
-        }
-
-        fn = dispatch.get(action)
-        if fn is None:
-            logger.error(
-                "Unknown queued_action %r for scan %s", action, scan.pk
-            )
-            Scan.objects.filter(pk=scan.pk).update(
-                status=Status.ERROR,
-                progress_message=f"Unknown action: {action}",
-            )
-            return
-
-        try:
-            fn(scan.pk)
-        except Exception:
-            logger.exception("Scan %s (%s) failed", scan.pk, action)
-            current = (
-                Scan.objects.filter(pk=scan.pk)
-                .values_list("status", flat=True)
-                .first()
-            )
-            if current == Status.PROCESSING:
-                Scan.objects.filter(pk=scan.pk).update(
-                    status=Status.ERROR,
-                    progress_message="Unexpected error (check logs)",
-                )
+        self.stdout.write(f"Processing scan {scan_pk}")
+        advance_scan(scan_pk)
