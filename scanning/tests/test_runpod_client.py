@@ -14,6 +14,9 @@ Covers:
   structured-error mapping, and the ``head_object`` check that salvages
   a finished job whose ``/status`` record has 404'd.
 - ``_invoke`` body construction and missing-credential guard.
+- ``submit_job`` / ``poll_once``, the two non-blocking halves the batch
+  daemon drives: that neither waits on the other, and how one
+  ``/status`` answer maps onto ``JobStatus``.
 - Result delivery via presigned PUT: key/URL minting, the freshness
   check that keeps a reused key from serving a previous attempt's
   output, envelope validation, and the inline path.
@@ -30,6 +33,7 @@ from django.test import TestCase, override_settings
 
 from scanning import runpod_client
 from scanning.factories import ScanFactory
+from scanning.models import JobStatus
 
 
 def _mock_response(status_code: int, body: dict | None = None):
@@ -1614,3 +1618,281 @@ class TestReusableResult(TestCase):
         s3 = MagicMock()
         self.assertIsNone(self._call(s3, creds=False))
         s3.head_object.assert_not_called()
+
+
+# ── Non-blocking submit + single-shot poll ──────────────────────────
+@override_settings(
+    RUNPOD_ENABLED=True,
+    RUNPOD_ENDPOINT_ID="ep-abc",
+    RUNPOD_API_KEY="apikey",
+    RUNPOD_MAX_RETRIES=0,
+    RUNPOD_PRESIGNED_TTL=3600,
+    AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket",
+)
+class TestSubmitJob(TestCase):
+    """``submit_job`` hands work over and returns without waiting."""
+
+    def _submit(self, s3=None, **kwargs):
+        """Submit against a stubbed ``/run`` and return the receipt and body.
+
+        :param s3: Stub S3 client, or None to run in inline mode.
+        :param kwargs: Extra arguments for ``submit_job``.
+        :returns: ``(receipt, submitted_body)``.
+        :rtype: tuple
+        """
+        captured = {}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            captured["body"] = json
+            return _mock_response(200, {"id": "job-xyz"})
+
+        with (
+            patch(
+                "scanning.runpod_client.requests.post", side_effect=fake_post
+            ),
+            patch(
+                "scanning.runpod_client._results_to_s3_enabled",
+                return_value=s3 is not None,
+            ),
+            patch(
+                "scanning.runpod_client.boto3.client",
+                return_value=s3 or MagicMock(),
+            ),
+        ):
+            receipt = runpod_client.submit_job(
+                action="detect",
+                scan=self.scan,
+                payload={"pdf_url": "https://x/y.pdf"},
+                **kwargs,
+            )
+        return receipt, captured["body"]
+
+    def setUp(self):
+        self.scan = ScanFactory()
+
+    def test_returns_the_job_id_without_polling(self):
+        with patch("scanning.runpod_client.requests.get") as mock_get:
+            receipt, _ = self._submit()
+        self.assertEqual(receipt.external_id, "job-xyz")
+        # The whole point: nothing waits on the job it just submitted.
+        mock_get.assert_not_called()
+
+    def test_receipt_timestamp_precedes_the_result_it_will_match(self):
+        # Taken before the POST so a slow /run can only widen the window
+        # a result object is allowed to land in, never miss one.
+        before = datetime.now(UTC)
+        receipt, _ = self._submit()
+        self.assertLessEqual(before, receipt.submitted_at)
+        self.assertLessEqual(receipt.submitted_at, datetime.now(UTC))
+
+    def test_inline_mode_presigns_nothing(self):
+        receipt, body = self._submit()
+        self.assertEqual(receipt.result_key, "")
+        self.assertNotIn("result_url", body["input"])
+        self.assertNotIn("result_key", body["input"])
+
+    def test_default_key_is_used_when_the_caller_names_none(self):
+        from scanning import s3_sync
+
+        receipt, body = self._submit(s3=_s3_stub())
+        expected = s3_sync.s3_job_result_key(self.scan, "detect")
+        self.assertEqual(receipt.result_key, expected)
+        self.assertEqual(body["input"]["result_key"], expected)
+
+    def test_callers_key_wins_so_concurrent_jobs_do_not_collide(self):
+        # Two live jobs for one scan (shards of a pass, or a retry
+        # racing the attempt it replaced) would otherwise presign the
+        # same object and the survivor would be whichever wrote last.
+        key = "processing/9/a/1/1/jobs/detect/run1-shard2-attempt1.json"
+        s3 = _s3_stub()
+        receipt, body = self._submit(s3=s3, result_key=key)
+
+        self.assertEqual(receipt.result_key, key)
+        self.assertEqual(body["input"]["result_key"], key)
+        _, kwargs = s3.generate_presigned_url.call_args
+        self.assertEqual(kwargs["Params"]["Key"], key)
+
+    @override_settings(RUNPOD_ENDPOINT_ID="")
+    def test_unconfigured_endpoint_raises(self):
+        with self.assertRaises(runpod_client.RunpodError):
+            runpod_client.submit_job(
+                action="detect", scan=self.scan, payload={}
+            )
+
+
+@override_settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket")
+class TestPollOnce(TestCase):
+    """``poll_once`` normalizes one ``/status`` answer onto JobStatus."""
+
+    KEY = "processing/1/x/1/1/jobs/detect/result.json"
+
+    def _poll_once(self, status_code, body, s3=None, **kwargs):
+        """Run ``poll_once`` against one stubbed ``/status`` response.
+
+        :param status_code: HTTP status the poll receives.
+        :param body: Parsed JSON body, or None for an unparseable one.
+        :param s3: Stub S3 client for the 404 salvage probe.
+        :param kwargs: Extra arguments for ``poll_once``.
+        :returns: The outcome.
+        :rtype: runpod_client.PollOutcome
+        """
+        with (
+            patch(
+                "scanning.runpod_client.requests.get",
+                return_value=_mock_response(status_code, body),
+            ),
+            patch(
+                "scanning.runpod_client.boto3.client",
+                return_value=s3 or MagicMock(),
+            ),
+        ):
+            return runpod_client.poll_once(
+                base_url="https://api/run/endpoint",
+                headers={},
+                job_id=_JOB_ID,
+                action="detect",
+                **kwargs,
+            )
+
+    def test_never_sleeps(self):
+        # Pacing belongs to the daemon's tick, not to one job's poll.
+        # A sleep in here would serialize the batch it is meant to
+        # let run at once.
+        with patch("scanning.runpod_client.time.sleep") as mock_sleep:
+            self._poll_once(200, {"status": "IN_QUEUE"})
+        mock_sleep.assert_not_called()
+
+    def test_in_queue(self):
+        outcome = self._poll_once(200, {"status": "IN_QUEUE"})
+        self.assertEqual(outcome.status, JobStatus.IN_QUEUE)
+        self.assertEqual(outcome.provider_status, "IN_QUEUE")
+        self.assertIsNone(outcome.output)
+
+    def test_in_progress(self):
+        outcome = self._poll_once(200, {"status": "IN_PROGRESS"})
+        self.assertEqual(outcome.status, JobStatus.IN_PROGRESS)
+
+    def test_unrecognised_status_reads_as_still_working(self):
+        # RunPod adding a state must not fail every job that is in it.
+        outcome = self._poll_once(200, {"status": "SOMETHING_NEW"})
+        self.assertEqual(outcome.status, JobStatus.IN_PROGRESS)
+        self.assertEqual(outcome.provider_status, "SOMETHING_NEW")
+
+    def test_completed_carries_the_output(self):
+        output = {"detections": [], "duration_ms": 12}
+        outcome = self._poll_once(
+            200, {"status": "COMPLETED", "output": output}
+        )
+        self.assertEqual(outcome.status, JobStatus.COMPLETED)
+        self.assertEqual(outcome.output, output)
+
+    def test_completed_with_unusable_output_is_terminal(self):
+        # Success with a body we cannot read. Resubmitting would
+        # produce the same shape, so it does not get a retry.
+        outcome = self._poll_once(
+            200, {"status": "COMPLETED", "output": "a string"}
+        )
+        self.assertEqual(outcome.status, JobStatus.FAILED)
+        self.assertEqual(outcome.error_code, "BAD_OUTPUT")
+        self.assertFalse(outcome.retriable)
+
+    def test_handler_error_codes_are_classified_by_cause(self):
+        cases = {
+            "NO_GPU": True,
+            "RESULT_UPLOAD_FAILED": True,
+            "RESULT_URL_EXPIRED": True,
+            "RESULT_UPLOAD_REJECTED": False,
+            "BAD_INPUT": False,
+        }
+        for code, retriable in cases.items():
+            with self.subTest(code=code):
+                outcome = self._poll_once(
+                    200,
+                    {
+                        "status": "FAILED",
+                        "error": "boom",
+                        "output": {"error_code": code},
+                    },
+                )
+                self.assertEqual(outcome.status, JobStatus.FAILED)
+                self.assertEqual(outcome.error_code, code)
+                self.assertEqual(outcome.retriable, retriable)
+
+    def test_failed_with_no_output_is_a_platform_failure(self):
+        # No error_code means RunPod itself failed the job (worker
+        # crash, internal retries exhausted), which another submit can
+        # plausibly get past.
+        outcome = self._poll_once(
+            200, {"status": "FAILED", "error": "job timed out after 1 retries"}
+        )
+        self.assertEqual(outcome.status, JobStatus.FAILED)
+        self.assertTrue(outcome.retriable)
+
+    def test_timed_out_and_cancelled_are_not_retriable(self):
+        for status, expected in (
+            ("TIMED_OUT", JobStatus.FAILED),
+            ("CANCELLED", JobStatus.CANCELLED),
+        ):
+            with self.subTest(status=status):
+                outcome = self._poll_once(
+                    200, {"status": status, "error": "boom"}
+                )
+                self.assertEqual(outcome.status, expected)
+                self.assertFalse(outcome.retriable)
+
+    def test_lost_job_with_a_result_on_s3_still_completes(self):
+        # The job record aged out but the worker's PUT outlived it.
+        outcome = self._poll_once(
+            404,
+            None,
+            s3=_s3_stub(last_modified=_FRESH),
+            result_key=self.KEY,
+            submitted_at=_SUBMITTED_AT,
+        )
+        self.assertEqual(outcome.status, JobStatus.COMPLETED)
+        self.assertEqual(outcome.output, {"result_key": self.KEY})
+
+    def test_lost_job_with_nothing_on_s3_expires(self):
+        outcome = self._poll_once(
+            404,
+            None,
+            s3=_s3_stub(head_error=_client_error("404")),
+            result_key=self.KEY,
+            submitted_at=_SUBMITTED_AT,
+        )
+        self.assertEqual(outcome.status, JobStatus.EXPIRED)
+        self.assertEqual(outcome.error_code, "JOB_NOT_FOUND")
+        # The inputs are still on S3, so a fresh submit re-runs the work.
+        self.assertTrue(outcome.retriable)
+
+    def test_stale_object_does_not_rescue_a_lost_job(self):
+        # An earlier attempt's leftover at the same key is not this
+        # attempt's output.
+        outcome = self._poll_once(
+            404,
+            None,
+            s3=_s3_stub(last_modified=_STALE),
+            result_key=self.KEY,
+            submitted_at=_SUBMITTED_AT,
+        )
+        self.assertEqual(outcome.status, JobStatus.EXPIRED)
+
+    def test_a_failed_poll_reports_no_status_rather_than_a_failure(self):
+        # We learned nothing about the job, which is not the same as
+        # learning it failed. The caller must leave the row alone.
+        with patch(
+            "scanning.runpod_client.requests.get",
+            side_effect=requests.ConnectionError("refused"),
+        ):
+            outcome = runpod_client.poll_once(
+                base_url="https://api/run/endpoint",
+                headers={},
+                job_id=_JOB_ID,
+                action="detect",
+            )
+        self.assertIsNone(outcome.status)
+        self.assertIn("refused", outcome.error_message)
+
+    def test_a_5xx_reports_no_status(self):
+        outcome = self._poll_once(503, {"error": "upstream"})
+        self.assertIsNone(outcome.status)

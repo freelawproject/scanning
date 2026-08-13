@@ -33,11 +33,20 @@ can't return per-word bounding boxes, and it discards the response
 entirely once the ~30 min retention window closes. An S3 object has
 neither limit and outlives both.
 
-Result keys are per scan and action rather than per run, so a re-run
-overwrites its predecessor instead of leaving orphans behind. Nothing
-is read without first checking the object was written after the
-reading job was submitted, which is what keeps a reused key from
-serving a previous attempt's output.
+The default result key is per scan and action rather than per run, so
+a re-run overwrites its predecessor instead of leaving orphans behind.
+Nothing is read without first checking the object was written after
+the reading job was submitted, which is what keeps a reused key from
+serving a previous attempt's output. A caller holding several live
+jobs for one scan passes its own key to :func:`submit_job` instead,
+since the default would have them all presign the same object.
+
+Step 4 comes apart for the batch daemon (#156), which holds many jobs
+at once and cannot block on any of them: :func:`submit_job` returns a
+receipt as soon as RunPod accepts the work, and :func:`poll_once` asks
+after one job and answers without sleeping. :func:`_invoke` is those
+two composed back into the blocking call, which local mode and the
+synchronous callers still use.
 
 Inline results remain supported and are still what a worker returns
 when ``result_url`` is absent from the input, which is the case in
@@ -53,6 +62,7 @@ import logging
 import tempfile
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -477,20 +487,8 @@ def _results_to_s3_enabled() -> bool:
     return has_s3_credentials()
 
 
-def _presign_result_put(scan: Scan, action: str) -> tuple[str, str]:
-    """Return the result key for this scan + action and a PUT for it.
-
-    The key is computed here, before submission, rather than discovered
-    afterwards: a presigned PUT covers exactly one object and a prefix
-    cannot be presigned, so it has to be known at submit time anyway.
-    That also means the daemon can find the object later by name --
-    ``head_object`` on a known key, not a search.
-
-    Deliberately not run-scoped. One object per scan and action means a
-    re-run overwrites its predecessor rather than accumulating orphans
-    nobody will ever read. The staleness that invites (reading an old
-    attempt's output) is handled by checking the object's write time
-    against this run's submission, in :func:`_result_object_is_fresh`.
+def _presign_put(key: str) -> str:
+    """Return a presigned PUT URL for exactly ``key``.
 
     The URL's TTL is ``RUNPOD_PRESIGNED_TTL`` (1 day by default), which
     has to outlive queue time plus execution; ``RUNPOD_REQUEST_TIMEOUT``
@@ -505,6 +503,39 @@ def _presign_result_put(scan: Scan, action: str) -> tuple[str, str]:
     mean the header and this constant must stay in lockstep, which is
     why the worker sends exactly ``_RESULT_CONTENT_TYPE``.
 
+    :param key: The object the worker may write, and only that one.
+    :returns: A presigned PUT URL.
+    :rtype: str
+    """
+    return _s3().generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": settings.AWS_PRIVATE_STORAGE_BUCKET_NAME,
+            "Key": key,
+            "ContentType": _RESULT_CONTENT_TYPE,
+        },
+        ExpiresIn=int(settings.RUNPOD_PRESIGNED_TTL),
+    )
+
+
+def _presign_result_put(scan: Scan, action: str) -> tuple[str, str]:
+    """Return the default result key for a scan + action, and a PUT for it.
+
+    The key is computed before submission rather than discovered
+    afterwards: a presigned PUT covers exactly one object and a prefix
+    cannot be presigned, so it has to be known at submit time anyway.
+    That also means the daemon can find the object later by name --
+    ``head_object`` on a known key, not a search.
+
+    One object per scan and action, so a re-run overwrites its
+    predecessor rather than accumulating orphans nobody will ever read.
+    That only holds while one job per scan and action is live at a
+    time. A caller running several at once -- shards of one pass,
+    or a resubmission racing the attempt it replaced -- must scope the
+    key itself and pass it to :func:`submit_job`, or two workers
+    presign the same object and the survivor is whichever finishes
+    last. ``ExternalJob.result_key`` is where a scoped key lives.
+
     :param scan: The Scan owning the job.
     :param action: Handler action / pipeline stage.
     :returns: ``(result_key, presigned_put_url)``.
@@ -512,18 +543,8 @@ def _presign_result_put(scan: Scan, action: str) -> tuple[str, str]:
     """
     from scanning import s3_sync
 
-    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     key = s3_sync.s3_job_result_key(scan, action)
-    url = _s3().generate_presigned_url(
-        "put_object",
-        Params={
-            "Bucket": bucket,
-            "Key": key,
-            "ContentType": _RESULT_CONTENT_TYPE,
-        },
-        ExpiresIn=int(settings.RUNPOD_PRESIGNED_TTL),
-    )
-    return key, url
+    return key, _presign_put(key)
 
 
 def _result_object_is_fresh(key: str, submitted_at: datetime) -> bool:
@@ -904,6 +925,332 @@ def _harvest(
     return {**output, **payload}
 
 
+# ── Remote: non-blocking submit and single-shot poll ────────────────
+#
+# The two halves the batch daemon drives (#156). It holds many jobs at
+# once, so neither may block: ``submit_job`` returns as soon as RunPod
+# accepts the work, and ``poll_once`` asks after one job and answers
+# with whatever it learned. Everything needed to poll a job later lives
+# in the receipt rather than in a call stack, which is what lets a
+# restarted daemon reattach to work it did not submit.
+#
+# ``_invoke`` below composes the two into the blocking call the
+# synchronous callers still use.
+
+
+def endpoint_config() -> tuple[str, dict[str, str]]:
+    """Return the RunPod base URL and auth header.
+
+    :returns: ``(base_url, headers)``.
+    :rtype: tuple[str, dict[str, str]]
+    :raises RunpodError: If the endpoint id or API key is unset.
+    """
+    endpoint = settings.RUNPOD_ENDPOINT_ID
+    api_key = settings.RUNPOD_API_KEY
+    if not endpoint or not api_key:
+        raise RunpodError("RUNPOD_ENDPOINT_ID / RUNPOD_API_KEY not configured")
+    return (
+        f"https://api.runpod.ai/v2/{endpoint}",
+        {"Authorization": f"Bearer {api_key}"},
+    )
+
+
+@dataclass(frozen=True)
+class SubmitReceipt:
+    """What a submitted job leaves behind so a later poll can find it.
+
+    Every field maps onto an ``ExternalJob`` column, because the daemon
+    that polls a job is generally not the process that submitted it.
+
+    :ivar external_id: RunPod's job id.
+    :ivar result_key: S3 key the worker was presigned to write to, or
+        ``""`` when we asked for an inline result.
+    :ivar submitted_at: Submission time (UTC). Compared against the
+        result object's ``LastModified`` to tell this attempt's output
+        from an earlier one's.
+    """
+
+    external_id: str
+    result_key: str
+    submitted_at: datetime
+
+
+def submit_job(
+    action: str,
+    scan: Scan,
+    payload: dict[str, Any],
+    result_key: str | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> SubmitReceipt:
+    """Hand a job to RunPod and return without waiting for it.
+
+    :param action: ``"detect"`` or ``"analyze"``.
+    :param scan: Scan owning the job (``scan.pk`` is passed through so
+        the handler can tag Sentry events).
+    :param payload: Remaining ``input`` fields (e.g. ``pdf_url``,
+        action args). Merged with ``action`` and ``scan_pk``.
+    :param result_key: Key to presign the worker's PUT against. Omit to
+        use the per-scan-and-action default; a caller holding an
+        ``ExternalJob`` passes that row's ``result_key`` so two live
+        attempts of one shard cannot presign the same object.
+    :param progress_callback: Optional coarse progress emitter.
+    :returns: The receipt needed to poll and harvest this job.
+    :rtype: SubmitReceipt
+    :raises RunpodError: If submission fails or the endpoint is
+        unconfigured.
+    :raises RunpodTransientError: If the endpoint cannot accept work.
+    """
+    base_url, headers = endpoint_config()
+    job_input: dict[str, Any] = {
+        "action": action,
+        "scan_pk": scan.pk,
+        **payload,
+    }
+
+    key = ""
+    if _results_to_s3_enabled():
+        if result_key:
+            key, result_url = result_key, _presign_put(result_key)
+        else:
+            key, result_url = _presign_result_put(scan, action)
+        job_input["result_key"] = key
+        job_input["result_url"] = result_url
+
+    # Wall clock, unlike a monotonic deadline: it's compared against an
+    # S3 object's ``LastModified`` to tell this run's result from an
+    # earlier attempt's. Taken before the submit so a slow /run call
+    # can only make the window wider, never miss a real result.
+    submitted_at = datetime.now(UTC)
+
+    job_id = _submit(
+        base_url,
+        headers,
+        {"input": job_input},
+        action,
+        int(settings.RUNPOD_MAX_RETRIES),
+        progress_callback,
+    )
+    return SubmitReceipt(
+        external_id=job_id, result_key=key, submitted_at=submitted_at
+    )
+
+
+@dataclass(frozen=True)
+class PollOutcome:
+    """One ``/status`` answer, normalized onto :class:`JobStatus`.
+
+    A value rather than an exception because the collect phase sweeps
+    every in-flight job on one tick, and one job's terminal failure
+    must not abort the sweep for the rest.
+
+    :ivar status: A ``JobStatus`` value, or ``None`` when the status
+        call itself failed and we learned nothing. ``None`` is not a
+        job state: it means ask again, and the job stays as it was.
+    :ivar provider_status: RunPod's own status string, kept for logs
+        and progress messages. Empty when there was no answer.
+    :ivar output: The handler's ``output`` dict on ``COMPLETED``.
+    :ivar error_code: Handler ``error_code``, or one this client
+        synthesised for a failure RunPod reported no code for.
+    :ivar error_message: Human-readable failure detail.
+    :ivar retriable: Whether resubmitting could plausibly succeed.
+        Orthogonal to whether ``status`` is terminal: ``EXPIRED`` is
+        both terminal and worth another submit, since the inputs are
+        still on S3 and only the job record is gone.
+    """
+
+    status: str | None
+    provider_status: str = ""
+    output: dict | None = None
+    error_code: str = ""
+    error_message: str = ""
+    retriable: bool = False
+
+
+def poll_once(
+    base_url: str,
+    headers: dict[str, str],
+    job_id: str,
+    action: str,
+    result_key: str | None = None,
+    submitted_at: datetime | None = None,
+) -> PollOutcome:
+    """Ask ``/status/{job_id}`` once and classify the answer.
+
+    Never sleeps and never raises: pacing belongs to the caller, which
+    for the daemon is the tick interval rather than a backoff inside a
+    single job's poll.
+
+    :param base_url: RunPod endpoint base URL.
+    :param headers: Authorization header dict.
+    :param job_id: The provider's job id.
+    :param action: The action submitted, for log lines.
+    :param result_key: Key the worker was told to PUT to, if any. Lets
+        the 404 branch check S3 before writing the job off.
+    :param submitted_at: When this attempt was submitted (UTC), used to
+        tell its result object from an earlier attempt's.
+    :returns: What this poll learned.
+    :rtype: PollOutcome
+    """
+    from scanning.models import JobStatus
+
+    try:
+        r = requests.get(
+            f"{base_url}/status/{job_id}", headers=headers, timeout=30
+        )
+        # 404 from /status means the job record is gone: either RunPod
+        # discarded it after exhausting their internal retries, or it
+        # aged past the retention window (30 min async).
+        #
+        # The work itself may still have finished. When the worker was
+        # given a presigned PUT, its output outlives the job record, so
+        # check the key before throwing away a run we already paid for.
+        # Only an object written after we submitted counts: an older
+        # one is a previous attempt's leftover.
+        if r.status_code == 404:
+            if _result_survived_the_job(result_key, submitted_at):
+                logger.info(
+                    "runpod job %s is gone (HTTP 404) but its result is on "
+                    "S3 (%s); harvesting instead of resubmitting",
+                    job_id,
+                    result_key,
+                )
+                return PollOutcome(
+                    status=JobStatus.COMPLETED,
+                    provider_status="COMPLETED",
+                    output={"result_key": result_key},
+                )
+            return PollOutcome(
+                status=JobStatus.EXPIRED,
+                provider_status="NOT_FOUND",
+                error_code="JOB_NOT_FOUND",
+                error_message=(
+                    f"RunPod job {job_id} not found (HTTP 404 from "
+                    "/status), and no result of its own on S3."
+                ),
+                retriable=True,
+            )
+        r.raise_for_status()
+        body = r.json()
+    except Exception as exc:
+        # A 5xx, a network blip, a read timeout: we learned nothing
+        # about the job, which is different from learning it failed.
+        logger.warning(
+            "runpod status poll for %s failed: %s; retrying", job_id, exc
+        )
+        return PollOutcome(status=None, error_message=str(exc))
+
+    status = body.get("status") or ""
+    logger.debug("poll runpod job %s -> %s", job_id, status)
+
+    if status == "COMPLETED":
+        return _completed_outcome(body, job_id, action)
+    if status in ("FAILED", "TIMED_OUT", "CANCELLED"):
+        return _failed_outcome(body, job_id, status)
+
+    # IN_QUEUE / IN_PROGRESS / anything unrecognised. An unknown status
+    # reads as "still working" rather than as a failure: RunPod adding
+    # a state must not fail jobs that are merely in it.
+    return PollOutcome(
+        status=(
+            JobStatus.IN_QUEUE
+            if status == "IN_QUEUE"
+            else JobStatus.IN_PROGRESS
+        ),
+        provider_status=status,
+    )
+
+
+def _completed_outcome(body: dict, job_id: str, action: str) -> PollOutcome:
+    """Classify a ``COMPLETED`` status body.
+
+    :param body: The parsed ``/status`` response.
+    :param job_id: The provider's job id.
+    :param action: The action submitted, for the log line.
+    :returns: A COMPLETED outcome, or a terminal failure if the job
+        reported success but returned something unusable.
+    :rtype: PollOutcome
+    """
+    from scanning.models import JobStatus
+
+    output = body.get("output")
+    if not isinstance(output, dict):
+        # Success with an unusable body. Terminal and not retriable:
+        # the same input would produce the same shape.
+        return PollOutcome(
+            status=JobStatus.FAILED,
+            provider_status="COMPLETED",
+            error_code="BAD_OUTPUT",
+            error_message=(
+                f"RunPod job {job_id} returned non-dict output: {output!r}"
+            ),
+        )
+
+    execution_ms = body.get("executionTime", "?")
+    detail_parts = [f"action={output.get('duration_ms', '?')}ms"]
+    model_durations = output.get("model_durations_ms")
+    if model_durations:
+        detail_parts += [f"{m}={ms}ms" for m, ms in model_durations.items()]
+    logger.info(
+        "runpod %s job %s COMPLETED in %sms (%s)",
+        action,
+        job_id,
+        execution_ms,
+        ", ".join(detail_parts),
+    )
+    return PollOutcome(
+        status=JobStatus.COMPLETED,
+        provider_status="COMPLETED",
+        output=output,
+    )
+
+
+def _failed_outcome(body: dict, job_id: str, status: str) -> PollOutcome:
+    """Classify a ``FAILED`` / ``TIMED_OUT`` / ``CANCELLED`` status body.
+
+    The RunPod SDK (``rp_job.py::run_job``) pops ``error`` from the
+    handler's return dict and places it at the top level of the result
+    payload before POSTing to RunPod. A handler returning::
+
+        {"error": "bad input", "error_code": "BAD_INPUT", ...}
+
+    becomes::
+
+        {"output": {"error_code": "BAD_INPUT", ...}, "error": "bad input"}
+
+    So ``error_code`` survives inside ``output`` and still separates a
+    transient failure from a terminal one. When ``output`` is absent
+    the failure is a RunPod platform error (worker crash, "job timed
+    out after 1 retries") rather than handler logic, which is
+    infrastructure and worth another submit.
+
+    :param body: The parsed ``/status`` response.
+    :param job_id: The provider's job id.
+    :param status: RunPod's terminal status string.
+    :returns: A terminal outcome carrying the failure detail.
+    :rtype: PollOutcome
+    """
+    from scanning.models import JobStatus
+
+    err = body.get("error") or ""
+    err_code = (body.get("output") or {}).get("error_code") or ""
+    if err_code:
+        retriable = err_code in _TRANSIENT_ERROR_CODES
+    else:
+        retriable = status == "FAILED"
+
+    return PollOutcome(
+        status=(
+            JobStatus.CANCELLED if status == "CANCELLED" else JobStatus.FAILED
+        ),
+        provider_status=status,
+        error_code=err_code,
+        error_message=(
+            f"RunPod job {job_id} {status}" + (f": {err}" if err else "")
+        ),
+        retriable=retriable,
+    )
+
+
 # ── Remote: invocation + polling ────────────────────────────────────
 def _invoke(
     action: str,
@@ -912,6 +1259,10 @@ def _invoke(
     progress_callback: ProgressCallback | None,
 ) -> dict:
     """Submit a RunPod job and poll until terminal state.
+
+    The blocking composition of :func:`submit_job` and :func:`_poll`,
+    kept for local mode and the callers that genuinely want to wait.
+    The batch daemon drives the two halves separately instead.
 
     :param action: ``"detect"`` or ``"analyze"``.
     :param scan: Scan owning the job (``scan.pk`` is passed through
@@ -925,50 +1276,32 @@ def _invoke(
     :raises RunpodError: On terminal failure, handler error, or
         exhausted retries.
     """
-    endpoint = settings.RUNPOD_ENDPOINT_ID
-    api_key = settings.RUNPOD_API_KEY
-    if not endpoint or not api_key:
-        raise RunpodError("RUNPOD_ENDPOINT_ID / RUNPOD_API_KEY not configured")
-
-    base_url = f"https://api.runpod.ai/v2/{endpoint}"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    job_input: dict[str, Any] = {
-        "action": action,
-        "scan_pk": scan.pk,
-        **payload,
-    }
-
-    result_key: str | None = None
-    if _results_to_s3_enabled():
-        result_key, result_url = _presign_result_put(scan, action)
-        job_input["result_key"] = result_key
-        job_input["result_url"] = result_url
-
-    body = {"input": job_input}
-
+    base_url, headers = endpoint_config()
     deadline = time.monotonic() + int(settings.RUNPOD_REQUEST_TIMEOUT)
-    max_retries = int(settings.RUNPOD_MAX_RETRIES)
 
-    # Wall clock, unlike ``deadline``: it's compared against an S3
-    # object's ``LastModified`` to tell this run's result from an
-    # earlier attempt's. Taken before the submit so a slow /run call
-    # can only make the window wider, never miss a real result.
-    submitted_at = datetime.now(UTC)
-
-    job_id = _submit(
-        base_url, headers, body, action, max_retries, progress_callback
+    receipt = submit_job(
+        action, scan, payload, progress_callback=progress_callback
     )
+    result_key = receipt.result_key or None
+
     output = _poll(
         base_url,
         headers,
-        job_id,
+        receipt.external_id,
         action,
         deadline,
         progress_callback,
         result_key=result_key,
-        submitted_at=submitted_at,
+        submitted_at=receipt.submitted_at,
     )
-    return _harvest(output, scan, action, result_key, submitted_at, job_id)
+    return _harvest(
+        output,
+        scan,
+        action,
+        result_key,
+        receipt.submitted_at,
+        receipt.external_id,
+    )
 
 
 def _submit_error_detail(exc: Exception) -> tuple[int | None, str, str]:
@@ -1098,8 +1431,11 @@ def _poll(
 ) -> dict:
     """Poll ``/status/{job_id}`` until terminal, with backoff.
 
-    Poll cadence starts at 1 s, doubles each idle tick, capped at 15 s.
-    Exceeding ``deadline`` triggers ``/cancel/{job_id}`` and raises.
+    The blocking wrapper around :func:`poll_once`: it supplies the
+    pacing and turns the normalized outcomes back into the exceptions
+    ``services.py`` classifies on. Poll cadence starts at 1 s, doubles
+    each idle tick, capped at 15 s. Exceeding ``deadline`` triggers
+    ``/cancel/{job_id}`` and raises.
 
     Every poll logs at DEBUG (enable with ``SCANNING_LOG_LEVEL=DEBUG``);
     status transitions log at INFO.
@@ -1114,11 +1450,14 @@ def _poll(
     :rtype: dict
     :raises RunpodError: On FAILED / TIMED_OUT / CANCELLED / deadline
         exceeded / malformed output.
-    :raises RunpodTransientError: On HTTP 404 from ``/status`` with no
-        result on S3 (the job aged out of RunPod's retention window or
-        was discarded after internal retries; the inputs are still on
-        S3 so a fresh submit will re-run the work).
+    :raises RunpodTransientError: On a retriable failure, including
+        HTTP 404 from ``/status`` with no result on S3 (the job aged
+        out of RunPod's retention window or was discarded after
+        internal retries; the inputs are still on S3 so a fresh submit
+        will re-run the work).
     """
+    from scanning.models import JobStatus
+
     # Happy-path cadence: 1 s, 2 s, 4 s, 8 s, 15 s, 15 s, ... Advances
     # on every successful poll that returns a non-terminal status.
     poll_sleep_s = 1.0
@@ -1136,47 +1475,19 @@ def _poll(
                 f"RunPod job {job_id} exceeded RUNPOD_REQUEST_TIMEOUT"
             )
 
-        try:
-            r = requests.get(
-                f"{base_url}/status/{job_id}", headers=headers, timeout=30
-            )
-            # 404 from /status means the job is gone: either RunPod
-            # discarded it after exhausting their internal retries, or
-            # the result aged past the retention window (30 min async).
-            #
-            # The work itself may still have finished. When the worker
-            # was given a presigned PUT, its output outlives the job
-            # record, so check the key before throwing away a run we
-            # already paid for. Only an object written after we
-            # submitted counts: the key is per scan and action, so an
-            # older one is a previous attempt's leftover.
-            if r.status_code == 404:
-                if _result_survived_the_job(result_key, submitted_at):
-                    logger.info(
-                        "runpod job %s is gone (HTTP 404) but its result "
-                        "is on S3 (%s); harvesting instead of resubmitting",
-                        job_id,
-                        result_key,
-                    )
-                    return {"result_key": result_key}
-                raise RunpodTransientError(
-                    f"RunPod job {job_id} not found (HTTP 404 from "
-                    "/status). Re-queueing so the next daemon tick "
-                    "submits a fresh job."
-                )
-            r.raise_for_status()
-            body = r.json()
-        except RunpodError:
-            # Don't swallow the 404-derived RunpodTransientError above.
-            raise
-        except Exception as exc:
-            # Transient status-poll error (5xx, network blip, timeout):
-            # keep trying until deadline. Uses its own backoff counter
-            # so happy-path poll cadence is unaffected once the blip
-            # resolves.
-            logger.warning(
-                "runpod status poll for %s failed: %s; retrying", job_id, exc
-            )
+        outcome = poll_once(
+            base_url,
+            headers,
+            job_id,
+            action,
+            result_key=result_key,
+            submitted_at=submitted_at,
+        )
+
+        if outcome.status is None:
+            # The poll itself failed and told us nothing about the job:
+            # keep trying until deadline, on a backoff of its own so
+            # happy-path cadence is unaffected once the blip resolves.
             time.sleep(min(error_sleep_s, 10))
             error_sleep_s = min(error_sleep_s * 2, 15)
             continue
@@ -1186,79 +1497,32 @@ def _poll(
         # previous escalation.
         error_sleep_s = 1.0
 
-        status = body.get("status")
-        logger.debug("poll runpod job %s -> %s", job_id, status)
+        if outcome.status == JobStatus.COMPLETED:
+            return outcome.output
 
-        if status == "COMPLETED":
-            output = body.get("output")
-            if not isinstance(output, dict):
-                raise RunpodError(
-                    f"RunPod job {job_id} returned non-dict output: {output!r}"
-                )
-            execution_ms = body.get("executionTime", "?")
-            action_ms = output.get("duration_ms", "?")
-            model_durations = output.get("model_durations_ms")
-            detail_parts = [f"action={action_ms}ms"]
-            if model_durations:
-                detail_parts += [
-                    f"{m}={ms}ms" for m, ms in model_durations.items()
-                ]
-            logger.info(
-                "runpod %s job %s COMPLETED in %sms (%s)",
-                action,
-                job_id,
-                execution_ms,
-                ", ".join(detail_parts),
-            )
-            return output
-
-        if status in ("FAILED", "TIMED_OUT", "CANCELLED"):
-            err = body.get("error") or ""
-            # The RunPod SDK (rp_job.py::run_job) pops ``error`` from
-            # the handler's return dict and places it at the top level
-            # of the result payload before POSTing to RunPod. For example,
-            # a handler returning:
-            #
-            #   {"error": "bad input", "error_code": "BAD_INPUT", ...}
-            #
-            # becomes:
-            #
-            #   {"output": {"error_code": "BAD_INPUT", ...}, "error": "bad input"}
-            #
-            # RunPod marks this FAILED with ``error`` at the top level.
-            # ``error_code`` survives inside ``output``, so we can still
-            # distinguish transient errors (re-queue) from terminal ones
-            # (mark scan ERROR).
-            #
-            # When ``output`` is absent the failure is a RunPod platform
-            # error (e.g. "job timed out after 1 retries", worker crash).
-            # Those are infrastructure problems, not handler logic failures,
-            # so re-queue rather than permanently failing the scan.
-            err_code = (body.get("output") or {}).get("error_code") or ""
-            if err_code:
-                exc_cls = (
-                    RunpodTransientError
-                    if err_code in _TRANSIENT_ERROR_CODES
-                    else RunpodError
-                )
-            elif status == "FAILED":
-                exc_cls = RunpodTransientError
-            else:
-                exc_cls = RunpodError
-            raise exc_cls(
-                f"RunPod job {job_id} {status}" + (f": {err}" if err else "")
+        if outcome.status == JobStatus.EXPIRED:
+            raise RunpodTransientError(
+                f"{outcome.error_message} Re-queueing so the next daemon "
+                "tick submits a fresh job."
             )
 
-        # IN_QUEUE / IN_PROGRESS / unknown — keep polling.
-        if status and status != last_status:
-            logger.info("runpod job %s -> %s", job_id, status)
+        if outcome.status in (JobStatus.FAILED, JobStatus.CANCELLED):
+            exc_cls = (
+                RunpodTransientError if outcome.retriable else RunpodError
+            )
+            raise exc_cls(outcome.error_message)
+
+        # IN_QUEUE / IN_PROGRESS — keep polling.
+        if outcome.provider_status and outcome.provider_status != last_status:
+            logger.info("runpod job %s -> %s", job_id, outcome.provider_status)
             if progress_callback:
                 progress_callback(
                     None,
                     None,
-                    f"{label}: {status} — RunPod job {job_id}",
+                    f"{label}: {outcome.provider_status} — "
+                    f"RunPod job {job_id}",
                 )
-            last_status = status
+            last_status = outcome.provider_status
 
         time.sleep(min(poll_sleep_s, 15))
         poll_sleep_s = min(poll_sleep_s * 2, 15)
