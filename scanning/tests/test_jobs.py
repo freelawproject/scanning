@@ -1,4 +1,4 @@
-"""Tests for ``scanning.jobs`` -- the collect half of the batch cycle.
+"""Tests for ``scanning.jobs`` -- the submit and collect halves.
 
 Providers are stubbed: what matters here is what the sweep writes to a
 row given an answer, not how any provider obtains one.
@@ -11,9 +11,15 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from scanning import jobs
-from scanning.factories import ExternalJobFactory
-from scanning.models import ExternalJob, JobStatus
-from scanning.providers import PollOutcome
+from scanning.factories import ExternalJobFactory, ScanFactory
+from scanning.models import (
+    ExternalJob,
+    JobEngine,
+    JobProvider,
+    JobStage,
+    JobStatus,
+)
+from scanning.providers import PollOutcome, SubmitReceipt
 
 _KEY = "processing/1/a/1/1/jobs/detect/r1-s0-a1.json"
 
@@ -396,3 +402,286 @@ class TestConcurrentWriters(CollectTestCase):
         job.refresh_from_db()
         self.assertEqual(job.status, JobStatus.CANCELLED)
         self.assertIsNone(job.completed_at)
+
+
+class TestEnsureJobs(CollectTestCase):
+    """``ensure_jobs`` is how a pipeline step says "this has to happen"."""
+
+    def test_creates_the_stage_pending(self):
+        scan = ScanFactory()
+        created = jobs.ensure_jobs(
+            scan,
+            JobStage.DETECT,
+            JobEngine.BLACKLETTER,
+            JobProvider.RUNPOD,
+            input_key="processing/1/a/1/1/bitonal.pdf",
+            manifest={"models": ["small"]},
+        )
+
+        self.assertEqual(len(created), 1)
+        job = created[0]
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.run, 1)
+        self.assertEqual(job.input_manifest, {"models": ["small"]})
+
+    def test_is_idempotent_across_passes(self):
+        # The pipeline is re-entered from the top on every resume, so
+        # asking a second time must find the same rows, not make more.
+        scan = ScanFactory()
+        args = (
+            scan,
+            JobStage.DETECT,
+            JobEngine.BLACKLETTER,
+            JobProvider.RUNPOD,
+        )
+        first = jobs.ensure_jobs(*args, input_key="k")
+        second = jobs.ensure_jobs(*args, input_key="k")
+
+        self.assertEqual([j.pk for j in first], [j.pk for j in second])
+        self.assertEqual(ExternalJob.objects.count(), 1)
+
+    def test_finds_a_finished_stage_rather_than_rerunning_it(self):
+        scan = ScanFactory()
+        args = (
+            scan,
+            JobStage.DETECT,
+            JobEngine.BLACKLETTER,
+            JobProvider.RUNPOD,
+        )
+        done = jobs.ensure_jobs(*args, input_key="k")[0]
+        ExternalJob.objects.filter(pk=done.pk).update(
+            status=JobStatus.CONSUMED
+        )
+
+        found = jobs.ensure_jobs(*args, input_key="k")
+
+        self.assertEqual([j.pk for j in found], [done.pk])
+
+    def test_fans_out_into_shards(self):
+        scan = ScanFactory()
+        created = jobs.ensure_jobs(
+            scan,
+            JobStage.DETECT,
+            JobEngine.BLACKLETTER,
+            JobProvider.RUNPOD,
+            input_key="k",
+            shard_count=4,
+        )
+
+        self.assertEqual([j.shard_index for j in created], [0, 1, 2, 3])
+        self.assertEqual({j.shard_count for j in created}, {4})
+
+    def test_a_second_engine_is_its_own_stage_run(self):
+        # A stage holds several engines reading the same document, and
+        # neither may hide the other's rows from the barrier.
+        scan = ScanFactory()
+        jobs.ensure_jobs(
+            scan,
+            JobStage.DETECT,
+            JobEngine.BLACKLETTER,
+            JobProvider.RUNPOD,
+            input_key="k",
+        )
+        other = jobs.ensure_jobs(
+            scan,
+            JobStage.DETECT,
+            JobEngine.DOTS_MOCR,
+            JobProvider.RUNPOD,
+            input_key="k",
+        )
+
+        self.assertEqual(other[0].run, 1)
+        self.assertEqual(ExternalJob.objects.count(), 2)
+
+
+@override_settings(
+    RUNPOD_REQUEST_TIMEOUT=1800,
+    DAEMON_JOB_SECONDS_PER_PAGE=1.0,
+)
+class TestSubmitPending(CollectTestCase):
+    """``submit_pending`` hands the batch over without waiting on it."""
+
+    def make_pending(self, **kwargs):
+        """Create a submittable pending job.
+
+        :param kwargs: Overrides for the factory.
+        :returns: The job.
+        :rtype: ExternalJob
+        """
+        defaults = {
+            "status": JobStatus.PENDING,
+            "input_key": "processing/1/a/1/1/bitonal.pdf",
+            "input_manifest": {"models": ["small"]},
+        }
+        return ExternalJobFactory(**{**defaults, **kwargs})
+
+    def submit(self, provider=None, **kwargs):
+        """Run one submit sweep against a stubbed provider.
+
+        :param provider: Stub provider.
+        :param kwargs: Passed to ``submit_pending``.
+        :returns: ``(summary, provider)``.
+        :rtype: tuple
+        """
+        provider = provider or MagicMock()
+        provider.submit.side_effect = lambda job, payload: SubmitReceipt(
+            external_id=f"job-{job.pk}",
+            result_key=job.result_key,
+            submitted_at=timezone.now(),
+        )
+        with (
+            patch("scanning.jobs.get_provider", return_value=provider),
+            patch(
+                "scanning.runpod_client.presign_input_get",
+                return_value="https://signed/get",
+            ),
+        ):
+            return jobs.submit_pending(**kwargs), provider
+
+    def test_submits_the_whole_batch_in_one_tick(self):
+        for _ in range(5):
+            self.make_pending()
+
+        summary, provider = self.submit()
+
+        self.assertEqual(summary.submitted, 5)
+        self.assertEqual(provider.submit.call_count, 5)
+
+    def test_records_what_a_later_poll_will_need(self):
+        job = self.make_pending()
+
+        self.submit()
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.SUBMITTED)
+        self.assertEqual(job.external_id, f"job-{job.pk}")
+        self.assertIsNotNone(job.submitted_at)
+        self.assertIsNotNone(job.deadline)
+        self.assertTrue(job.result_key)
+
+    def test_each_job_gets_its_own_result_key(self):
+        # Two shards presigning one object would leave whichever wrote
+        # last as the only surviving output.
+        scan = ScanFactory()
+        jobs.ensure_jobs(
+            scan,
+            JobStage.DETECT,
+            JobEngine.BLACKLETTER,
+            JobProvider.RUNPOD,
+            input_key="k",
+            shard_count=3,
+        )
+
+        self.submit()
+
+        keys = set(ExternalJob.objects.values_list("result_key", flat=True))
+        self.assertEqual(len(keys), 3)
+
+    def test_the_key_is_scoped_to_the_attempt(self):
+        job = self.make_pending(run=2, shard_index=1, shard_count=2, attempt=3)
+
+        self.submit()
+
+        job.refresh_from_db()
+        self.assertIn("r2-s1-a3", job.result_key)
+
+    def test_the_input_is_presigned_at_submit_not_at_creation(self):
+        # A job can sit pending behind a narrow worker pool for a long
+        # time; a signature minted when the row was written could have
+        # expired by the time it goes out.
+        job = self.make_pending()
+
+        _, provider = self.submit()
+
+        payload = provider.submit.call_args.args[1]
+        self.assertEqual(payload["pdf_url"], "https://signed/get")
+        self.assertEqual(payload["models"], ["small"])
+        self.assertEqual(job.input_key, "processing/1/a/1/1/bitonal.pdf")
+
+    def test_the_deadline_grows_with_the_pages(self):
+        small = self.make_pending(scan=ScanFactory(page_count=10))
+        big = self.make_pending(scan=ScanFactory(page_count=1400))
+
+        self.submit()
+
+        small.refresh_from_db()
+        big.refresh_from_db()
+        self.assertLess(small.deadline, big.deadline)
+
+    def test_a_paused_endpoint_defers_without_spending_the_budget(self):
+        # Not a failure of the work: the endpoint is scaled to zero and
+        # the next tick should simply try again.
+        from scanning.runpod_client import RunpodTransientError
+
+        job = self.make_pending()
+        provider = MagicMock()
+        provider.submit.side_effect = RunpodTransientError("paused")
+        with (
+            patch("scanning.jobs.get_provider", return_value=provider),
+            patch(
+                "scanning.runpod_client.presign_input_get",
+                return_value="https://signed/get",
+            ),
+        ):
+            summary = jobs.submit_pending()
+
+        job.refresh_from_db()
+        self.assertEqual(summary.deferred, 1)
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.retry_count, 0)
+
+    def test_a_broken_submit_fails_the_job(self):
+        job = self.make_pending()
+        provider = MagicMock()
+        provider.submit.side_effect = RuntimeError("bad request")
+        with (
+            patch("scanning.jobs.get_provider", return_value=provider),
+            patch(
+                "scanning.runpod_client.presign_input_get",
+                return_value="https://signed/get",
+            ),
+        ):
+            summary = jobs.submit_pending()
+
+        job.refresh_from_db()
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(job.error_code, "SUBMIT_FAILED")
+
+    def test_a_job_with_no_input_fails_rather_than_being_sent(self):
+        job = self.make_pending(input_key="")
+
+        summary, provider = self.submit()
+
+        job.refresh_from_db()
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(job.status, JobStatus.FAILED)
+        provider.submit.assert_not_called()
+
+    def test_one_broken_job_does_not_stop_the_batch(self):
+        self.make_pending(input_key="")
+        good = self.make_pending()
+
+        summary, _ = self.submit()
+
+        good.refresh_from_db()
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(summary.submitted, 1)
+        self.assertEqual(good.status, JobStatus.SUBMITTED)
+
+    def test_limit_caps_the_tick(self):
+        for _ in range(4):
+            self.make_pending()
+
+        summary, _ = self.submit(limit=2)
+
+        self.assertEqual(summary.submitted, 2)
+
+    def test_only_pending_jobs_go_out(self):
+        self.make_pending(status=JobStatus.SUBMITTED)
+        self.make_pending(status=JobStatus.CONSUMED)
+
+        summary, provider = self.submit()
+
+        self.assertEqual(summary.submitted, 0)
+        provider.submit.assert_not_called()

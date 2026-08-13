@@ -29,6 +29,7 @@ from django.views.decorators.clickjacking import xframe_options_sameorigin
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
+    BUSY_STATUSES,
     CheckName,
     Detection,
     Issue,
@@ -386,7 +387,7 @@ def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
     :return: Redirect to the scan processing page (step 4).
     """
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.status in (Status.PROCESSING, Status.QUEUED):
+    if scan.status in BUSY_STATUSES:
         return redirect(
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=3"
         )

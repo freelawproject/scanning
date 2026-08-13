@@ -167,6 +167,34 @@ def s3_job_result_key(scan: Scan, stage: str) -> str:
     )
 
 
+def s3_job_attempt_key(job) -> str:
+    """Return the S3 key one attempt of one job PUTs its result to.
+
+    The scoped counterpart to :func:`s3_job_result_key`, for the batch
+    daemon. That one names an object per scan and stage, which is
+    unambiguous only while a single job per scan and stage is live.
+    Once a stage fans out into shards and a retry can race the attempt
+    it replaces, several workers hold a presigned PUT at the same time,
+    and the fixed key would have them all write to one object.
+
+    Every component of the job's identity is in the key, ``attempt``
+    included: a resubmission must not be able to read the abandoned
+    worker's late upload as its own output.
+
+    :param job: The :class:`~scanning.models.ExternalJob` being
+        submitted.
+    :returns: Key of the form ``{processing_prefix}jobs/{stage}/
+        {engine}/[op{id}/]r{run}-s{shard}-a{attempt}.json``.
+    :rtype: str
+    """
+    target = f"op{job.opinion_id}/" if job.opinion_id else ""
+    return (
+        f"{s3_processing_prefix(job.scan)}{JOB_RESULTS_SUBDIR}"
+        f"{job.stage}/{job.engine}/{target}"
+        f"r{job.run}-s{job.shard_index}-a{job.attempt}.json"
+    )
+
+
 def _is_job_result(rel: str) -> bool:
     """Return True if a processing-prefix relative key is a job result.
 

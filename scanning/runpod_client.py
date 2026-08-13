@@ -462,11 +462,37 @@ def _ensure_presigned_url(scan: Scan, pdf_path: str | Path) -> str:
         )
         s3.upload_file(str(local), bucket, key)
 
-    ttl = int(settings.RUNPOD_PRESIGNED_TTL)
-    return s3.generate_presigned_url(
+    return presign_input_get(key)
+
+
+def presign_input_get(key: str) -> str:
+    """Return a presigned GET URL for an input already on S3.
+
+    The key-only counterpart to :func:`_ensure_presigned_url`, for the
+    batch daemon: a job row names its input by key, and the file was
+    put there by the pipeline step that created the job. Minted at
+    submit time rather than at job creation, so a job that waits out a
+    long queue is not handed a signature that expired while it waited.
+
+    :param key: Full S3 key of the input document.
+    :returns: Presigned GET URL.
+    :rtype: str
+    :raises RunpodError: If S3 credentials are missing.
+    """
+    from scanning.utils import has_s3_credentials
+
+    if not has_s3_credentials():
+        raise RunpodError(
+            "RUNPOD_ENABLED is true but no AWS credentials are configured; "
+            "cannot generate a presigned URL for the worker."
+        )
+    return _s3().generate_presigned_url(
         "get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=ttl,
+        Params={
+            "Bucket": settings.AWS_PRIVATE_STORAGE_BUCKET_NAME,
+            "Key": key,
+        },
+        ExpiresIn=int(settings.RUNPOD_PRESIGNED_TTL),
     )
 
 

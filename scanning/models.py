@@ -74,9 +74,27 @@ class AutoNowQuerySet(models.QuerySet):
 
 
 class Status(models.TextChoices):
+    """Where a scan is in its lifecycle.
+
+    ``PROCESSING`` and ``AWAITING`` are both "not finished", and the
+    difference is who to blame when it stops moving. ``PROCESSING``
+    means a daemon is running this scan's code right now, so a row
+    still in it after ``DAEMON_PROCESSING_TIMEOUT`` means the daemon
+    died and stale recovery should re-queue it. ``AWAITING`` means
+    nobody holds the scan at all: its work is on a GPU somewhere and
+    the only thing that can be late is a job, which carries its own
+    deadline (see :class:`ExternalJob`).
+
+    Keeping them apart is what lets a scan wait hours on a queued GPU
+    job without a timeout built for a dead process re-queueing it, and
+    lets ``PROCESSING`` stay short-lived enough for that timeout to
+    still mean something (issue #156).
+    """
+
     UPLOADED = "uploaded", "Uploaded"
     QUEUED = "queued", "Queued"
     PROCESSING = "processing", "Processing"
+    AWAITING = "awaiting", "Waiting on external jobs"
     PENDING_REVIEW = "pending_review", "Pending Review"
     APPROVED = "approved", "Approved"
     EXTRACTED = "extracted", "Extracted"
@@ -84,6 +102,12 @@ class Status(models.TextChoices):
     ERROR_MAX_RETRIES = "error_max_retries", "Error (retry cap hit)"
     ERROR_INTERRUPTED = "error_interrupted", "Error (interrupted too often)"
     CANCELLED = "cancelled", "Cancelled"
+
+
+#: Statuses meaning "the pipeline still owns this scan, don't start
+#: another one". Waiting on a GPU counts: the scan is mid-pipeline even
+#: though no process is holding it.
+BUSY_STATUSES = frozenset({Status.QUEUED, Status.PROCESSING, Status.AWAITING})
 
 
 class Stage(models.TextChoices):

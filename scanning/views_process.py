@@ -20,6 +20,7 @@ from django.urls import reverse
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
+    BUSY_STATUSES,
     CheckName,
     Detection,
     Issue,
@@ -106,7 +107,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     :return: Rendered processing page.
     """
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
-    is_processing = scan.status in (Status.PROCESSING, Status.QUEUED)
+    is_processing = scan.status in BUSY_STATUSES
     # Breadcrumb for the web-pod observability trail (issue #115): this view
     # does an S3 pull plus a render over potentially large detection sets, so a
     # hang/OOM here should leave a marker in the pod logs and Sentry.
@@ -519,7 +520,7 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     #    producing a preview -- the viewer should poll) from terminal ones
     #    (a preview will never appear -- the viewer should show the message
     #    and stop). 202 means "retry"; 409 means "give up".
-    if scan.status in (Status.UPLOADED, Status.QUEUED, Status.PROCESSING):
+    if scan.status == Status.UPLOADED or scan.status in BUSY_STATUSES:
         return JsonResponse(
             {
                 "status": "not_ready",
@@ -659,7 +660,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
     context = {
         "scan": scan,
         "step": step,
-        "is_processing": scan.status in (Status.PROCESSING, Status.QUEUED),
+        "is_processing": scan.status in BUSY_STATUSES,
         "has_pending_changes": has_pending_changes,
         "has_pending_inserts": has_pending_inserts,
         "issues": scan.issues.all(),

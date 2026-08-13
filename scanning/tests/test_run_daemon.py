@@ -30,6 +30,7 @@ class TestRunDaemonSchedule(TestCase):
 
     @override_settings(
         DAEMON_POLL_INTERVAL=5,
+        DAEMON_SUBMIT_INTERVAL=5,
         DAEMON_COLLECT_INTERVAL=15,
         PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS=900,
     )
@@ -37,10 +38,15 @@ class TestRunDaemonSchedule(TestCase):
         cmd = Command()
         names = [t.name for t in cmd._build_schedule()]
         self.assertIn("process_next_scan", names)
+        self.assertIn("submit_external_jobs", names)
         self.assertIn("collect_external_jobs", names)
         self.assertIn("cleanup_processing_tmp", names)
 
-    @override_settings(DAEMON_POLL_INTERVAL=5, DAEMON_COLLECT_INTERVAL=15)
+    @override_settings(
+        DAEMON_POLL_INTERVAL=5,
+        DAEMON_SUBMIT_INTERVAL=5,
+        DAEMON_COLLECT_INTERVAL=15,
+    )
     def test_collect_runs_on_its_own_interval(self):
         # The jobs it watches take minutes, so sweeping them as often as
         # the queue is checked would only add status calls.
