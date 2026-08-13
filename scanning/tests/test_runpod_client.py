@@ -1110,7 +1110,7 @@ class TestHarvest(TestCase):
     def _harvest(self, output, envelope=None, s3=None):
         s3 = s3 if s3 is not None else _s3_stub(envelope=envelope)
         with patch("scanning.runpod_client.boto3.client", return_value=s3):
-            return runpod_client._harvest(
+            return runpod_client.harvest(
                 output, self.scan, "detect", self.key, _SUBMITTED_AT, _JOB_ID
             )
 
@@ -1119,7 +1119,7 @@ class TestHarvest(TestCase):
         # payload is already in the response.
         output = {"detections": [{"page_index": 0}], "duration_ms": 5}
         with patch("scanning.runpod_client.boto3.client") as mock_client:
-            result = runpod_client._harvest(
+            result = runpod_client.harvest(
                 output, self.scan, "detect", None, _SUBMITTED_AT, _JOB_ID
             )
         self.assertEqual(result, output)
@@ -1131,7 +1131,7 @@ class TestHarvest(TestCase):
         s3 = _s3_stub(envelope=_envelope(scan_pk=self.scan.pk))
         with patch("scanning.runpod_client.boto3.client", return_value=s3):
             with self.assertRaises(runpod_client.RunpodError):
-                runpod_client._harvest(
+                runpod_client.harvest(
                     {"result_key": "someone/elses.json"},
                     self.scan,
                     "detect",

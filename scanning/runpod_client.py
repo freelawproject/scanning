@@ -62,7 +62,6 @@ import logging
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -72,6 +71,8 @@ import requests
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
+
+from scanning.providers import PollOutcome, SubmitReceipt
 
 if TYPE_CHECKING:
     from scanning.models import Scan
@@ -865,7 +866,7 @@ def _validate_envelope(
     return payload
 
 
-def _harvest(
+def harvest(
     output: dict,
     scan: Scan,
     action: str,
@@ -955,26 +956,6 @@ def endpoint_config() -> tuple[str, dict[str, str]]:
     )
 
 
-@dataclass(frozen=True)
-class SubmitReceipt:
-    """What a submitted job leaves behind so a later poll can find it.
-
-    Every field maps onto an ``ExternalJob`` column, because the daemon
-    that polls a job is generally not the process that submitted it.
-
-    :ivar external_id: RunPod's job id.
-    :ivar result_key: S3 key the worker was presigned to write to, or
-        ``""`` when we asked for an inline result.
-    :ivar submitted_at: Submission time (UTC). Compared against the
-        result object's ``LastModified`` to tell this attempt's output
-        from an earlier one's.
-    """
-
-    external_id: str
-    result_key: str
-    submitted_at: datetime
-
-
 def submit_job(
     action: str,
     scan: Scan,
@@ -1033,37 +1014,6 @@ def submit_job(
     return SubmitReceipt(
         external_id=job_id, result_key=key, submitted_at=submitted_at
     )
-
-
-@dataclass(frozen=True)
-class PollOutcome:
-    """One ``/status`` answer, normalized onto :class:`JobStatus`.
-
-    A value rather than an exception because the collect phase sweeps
-    every in-flight job on one tick, and one job's terminal failure
-    must not abort the sweep for the rest.
-
-    :ivar status: A ``JobStatus`` value, or ``None`` when the status
-        call itself failed and we learned nothing. ``None`` is not a
-        job state: it means ask again, and the job stays as it was.
-    :ivar provider_status: RunPod's own status string, kept for logs
-        and progress messages. Empty when there was no answer.
-    :ivar output: The handler's ``output`` dict on ``COMPLETED``.
-    :ivar error_code: Handler ``error_code``, or one this client
-        synthesised for a failure RunPod reported no code for.
-    :ivar error_message: Human-readable failure detail.
-    :ivar retriable: Whether resubmitting could plausibly succeed.
-        Orthogonal to whether ``status`` is terminal: ``EXPIRED`` is
-        both terminal and worth another submit, since the inputs are
-        still on S3 and only the job record is gone.
-    """
-
-    status: str | None
-    provider_status: str = ""
-    output: dict | None = None
-    error_code: str = ""
-    error_message: str = ""
-    retriable: bool = False
 
 
 def poll_once(
@@ -1294,7 +1244,7 @@ def _invoke(
         result_key=result_key,
         submitted_at=receipt.submitted_at,
     )
-    return _harvest(
+    return harvest(
         output,
         scan,
         action,
@@ -1470,7 +1420,7 @@ def _poll(
 
     while True:
         if time.monotonic() > deadline:
-            _cancel(base_url, headers, job_id)
+            cancel_job(base_url, headers, job_id)
             raise RunpodError(
                 f"RunPod job {job_id} exceeded RUNPOD_REQUEST_TIMEOUT"
             )
@@ -1528,7 +1478,7 @@ def _poll(
         poll_sleep_s = min(poll_sleep_s * 2, 15)
 
 
-def _cancel(base_url: str, headers: dict[str, str], job_id: str) -> None:
+def cancel_job(base_url: str, headers: dict[str, str], job_id: str) -> None:
     """Best-effort cancel so we stop paying for a wedged job.
 
     :param base_url: RunPod endpoint base URL.
