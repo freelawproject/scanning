@@ -54,16 +54,25 @@ class TestBatchEnabled(TestCase):
             self.assertFalse(jobs.batch_enabled())
 
 
+_INPUT_KEY = "processing/1/a/1/1/bitonal.pdf"
+
+
 class AwaitStageTestCase(TestCase):
-    """Shared plumbing for the stage barrier."""
+    """Shared plumbing for the stage barrier.
+
+    Fixture rows have to carry ``_INPUT_KEY``: ``ensure_jobs`` reuses a
+    run only while it still describes the work being asked for, so a row
+    built with a different input is not the row under test.
+    """
 
     def setUp(self):
         self.scan = ScanFactory()
 
-    def await_detect_stage(self, provider=None):
+    def await_detect_stage(self, provider=None, shard_count=1):
         """Call ``await_stage`` for a detect job on this scan.
 
         :param provider: Stub provider for result fetching.
+        :param shard_count: Fan-out to ask for.
         :returns: The payload list.
         :rtype: list[dict]
         """
@@ -74,8 +83,9 @@ class AwaitStageTestCase(TestCase):
                 JobStage.DETECT,
                 JobEngine.BLACKLETTER,
                 JobProvider.RUNPOD,
-                input_key="processing/1/a/1/1/bitonal.pdf",
+                input_key=_INPUT_KEY,
                 manifest={"models": ["small"]},
+                shard_count=shard_count,
             )
 
 
@@ -142,6 +152,7 @@ class TestAwaitStage(AwaitStageTestCase):
             stage=JobStage.DETECT,
             engine=JobEngine.BLACKLETTER,
             status=JobStatus.CONSUMED,
+            input_key=_INPUT_KEY,
             result_key="k.json",
         )
         provider = MagicMock()
@@ -161,6 +172,7 @@ class TestAwaitStage(AwaitStageTestCase):
             stage=JobStage.DETECT,
             engine=JobEngine.BLACKLETTER,
             status=JobStatus.FAILED,
+            input_key=_INPUT_KEY,
             error_code="BAD_INPUT",
             error_message="unreadable pdf",
         )
@@ -176,7 +188,7 @@ class TestAwaitStage(AwaitStageTestCase):
             JobStage.DETECT,
             JobEngine.BLACKLETTER,
             JobProvider.RUNPOD,
-            input_key="k",
+            input_key=_INPUT_KEY,
             shard_count=3,
         )
         ExternalJob.objects.filter(shard_index=0).update(
@@ -184,7 +196,7 @@ class TestAwaitStage(AwaitStageTestCase):
         )
 
         with self.assertRaises(pipeline.Awaiting) as ctx:
-            self.await_detect_stage()
+            self.await_detect_stage(shard_count=3)
         self.assertIn("2 of 3", str(ctx.exception))
 
 

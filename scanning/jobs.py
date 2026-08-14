@@ -101,9 +101,19 @@ def ensure_jobs(
 
     The pipeline's way of saying "this stage needs to happen" without
     knowing whether it already has. Called on every pass through a
-    step, it creates rows the first time and finds the same ones after,
-    which is what lets the pipeline be re-entered from the top rather
-    than resumed at a remembered offset.
+    step, it finds the same rows each time, which is what lets the
+    pipeline be re-entered from the top rather than resumed at a
+    remembered offset.
+
+    Reuse is not unconditional, and the distinction is the whole point
+    of ``run``. A re-entered pipeline must find the run it started; a
+    caller who means "compute this again" must not. The live run is
+    reused only when it still describes the work being asked for --
+    same input document, same fan-out. Anything else takes the next
+    run, leaving the old rows and their result objects addressable as
+    history. A caller wanting to recompute *identical* input says so by
+    dropping the rows first (``s3_sync.invalidate_job_results``), which
+    is what makes Re-validate mean re-validate.
 
     Rows are created ``PENDING``; :func:`submit_pending` hands them
     over on a later tick. Splitting creation from submission means a
@@ -130,8 +140,17 @@ def ensure_jobs(
         ).order_by("-run", "shard_index")
     )
     if existing:
-        live_run = existing[0].run
-        return [job for job in existing if job.run == live_run]
+        live = [job for job in existing if job.run == existing[0].run]
+        if _still_describes(live, input_key, shard_count):
+            return live
+        logger.info(
+            "scan %s %s/%s run %d no longer describes the work asked for; "
+            "starting a new run",
+            scan.pk,
+            stage,
+            engine,
+            live[0].run,
+        )
 
     run = ExternalJob.next_run(scan, stage, engine, opinion=opinion)
     with transaction.atomic():
@@ -162,6 +181,29 @@ def ensure_jobs(
         run,
     )
     return created
+
+
+def _still_describes(live, input_key, shard_count) -> bool:
+    """Return True if the live run is the work being asked for.
+
+    Compares what the row records about its target rather than hashing
+    the document: the pipeline calls this on every pass, and reading a
+    60 MB PDF to confirm a job it started two ticks ago is still the
+    same job would cost more than the check is worth. The cases it has
+    to catch are a different input document and a different fan-out,
+    both of which are visible in the columns.
+
+    :param live: The rows at the current run, in shard order.
+    :param input_key: The input the caller wants processed.
+    :param shard_count: The fan-out the caller wants.
+    :returns: Whether those rows already cover it.
+    :rtype: bool
+    """
+    return (
+        len(live) == shard_count
+        and live[0].shard_count == shard_count
+        and live[0].input_key == input_key
+    )
 
 
 def submit_pending(limit=None, now=None) -> SubmitSummary:

@@ -440,6 +440,64 @@ class TestEnsureJobs(CollectTestCase):
         self.assertEqual([j.pk for j in first], [j.pk for j in second])
         self.assertEqual(ExternalJob.objects.count(), 1)
 
+    def test_a_new_input_starts_a_new_run(self):
+        # Reuse is keyed on the work, not on the stage having happened
+        # once. A different document is different work.
+        scan = ScanFactory()
+        args = (
+            scan,
+            JobStage.DETECT,
+            JobEngine.BLACKLETTER,
+            JobProvider.RUNPOD,
+        )
+        first = jobs.ensure_jobs(*args, input_key="bitonal.pdf")[0]
+        ExternalJob.objects.filter(pk=first.pk).update(
+            status=JobStatus.CONSUMED
+        )
+
+        second = jobs.ensure_jobs(*args, input_key="rebuilt.pdf")
+
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0].run, 2)
+        self.assertEqual(second[0].status, JobStatus.PENDING)
+        # The previous run stays addressable as history.
+        self.assertEqual(ExternalJob.objects.count(), 2)
+
+    def test_a_new_fan_out_starts_a_new_run(self):
+        scan = ScanFactory()
+        args = (
+            scan,
+            JobStage.DETECT,
+            JobEngine.BLACKLETTER,
+            JobProvider.RUNPOD,
+        )
+        jobs.ensure_jobs(*args, input_key="k")
+        ExternalJob.objects.update(status=JobStatus.CONSUMED)
+
+        second = jobs.ensure_jobs(*args, input_key="k", shard_count=3)
+
+        self.assertEqual(len(second), 3)
+        self.assertEqual({j.run for j in second}, {2})
+
+    def test_dropping_the_rows_is_how_identical_input_reruns(self):
+        # Re-validate's contract. The input has not changed, so nothing
+        # about the work says "again"; the caller says it by deleting
+        # the rows (s3_sync.invalidate_job_results).
+        scan = ScanFactory()
+        args = (
+            scan,
+            JobStage.DETECT,
+            JobEngine.BLACKLETTER,
+            JobProvider.RUNPOD,
+        )
+        jobs.ensure_jobs(*args, input_key="k")
+        ExternalJob.objects.update(status=JobStatus.CONSUMED)
+        ExternalJob.objects.all().delete()
+
+        again = jobs.ensure_jobs(*args, input_key="k")
+
+        self.assertEqual(again[0].status, JobStatus.PENDING)
+
     def test_finds_a_finished_stage_rather_than_rerunning_it(self):
         scan = ScanFactory()
         args = (

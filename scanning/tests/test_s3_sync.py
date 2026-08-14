@@ -10,8 +10,13 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from scanning import s3_sync
-from scanning.factories import ReporterFactory, ScanFactory
-from scanning.models import Status
+from scanning.factories import (
+    ExternalJobFactory,
+    OpinionScanFactory,
+    ReporterFactory,
+    ScanFactory,
+)
+from scanning.models import JobStage, JobStatus, Status
 
 MEDIA_ROOT = tempfile.mkdtemp()
 
@@ -243,39 +248,95 @@ class TestSyncHelpersWithCredentials(TestCase):
 
         self.assertEqual(count, 1)
 
-    def test_invalidate_job_results_drops_both_stages(self):
-        # The escape hatch for "re-run this even though the pages are the
-        # same": the timestamp check can't express that, so the caller
-        # removes the objects instead.
-        scan = _reporter_scan()
+    def _invalidate(self, scan, keys=(), delete_error=None):
+        """Run ``invalidate_job_results`` against a stubbed S3.
+
+        :param scan: The scan to invalidate.
+        :param keys: Object keys the paginator should report.
+        :param delete_error: Error ``delete_objects`` should raise.
+        :returns: The stub S3 client.
+        :rtype: MagicMock
+        """
         mock_s3 = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"Contents": [{"Key": key} for key in keys]}
+        ]
+        mock_s3.get_paginator.return_value = paginator
+        if delete_error is not None:
+            mock_s3.delete_objects.side_effect = delete_error
         with patch("scanning.s3_sync.boto3") as mock_boto3:
             mock_boto3.client.return_value = mock_s3
             s3_sync.invalidate_job_results(scan)
+        return mock_s3
 
-        prefix = f"processing/{scan.pk}/tc/164/1/"
+    def test_invalidate_job_results_drops_the_whole_jobs_prefix(self):
+        # A prefix delete, not a list of known keys: a batched result is
+        # addressed per run, shard and attempt, so once the rows naming
+        # them are gone the names cannot be reconstructed.
+        scan = _reporter_scan()
+        prefix = f"processing/{scan.pk}/tc/164/1/jobs/"
+        batched = f"{prefix}detect/blackletter/r2-s0-a1.json"
+        legacy = f"{prefix}detect/result.json"
+
+        mock_s3 = self._invalidate(scan, keys=[batched, legacy])
+
         self.assertEqual(
-            {c.kwargs["Key"] for c in mock_s3.delete_object.call_args_list},
-            {
-                f"{prefix}jobs/detect/result.json",
-                f"{prefix}jobs/analyze/result.json",
-            },
+            mock_s3.get_paginator.return_value.paginate.call_args.kwargs[
+                "Prefix"
+            ],
+            prefix,
         )
+        deleted = {
+            obj["Key"]
+            for call in mock_s3.delete_objects.call_args_list
+            for obj in call.kwargs["Delete"]["Objects"]
+        }
+        self.assertEqual(deleted, {batched, legacy})
+
+    def test_invalidate_job_results_drops_the_volume_job_rows(self):
+        # The objects alone are not enough: ``ensure_jobs`` would find
+        # the CONSUMED rows and answer the next pass from them.
+        scan = _reporter_scan()
+        ExternalJobFactory(scan=scan, status=JobStatus.CONSUMED)
+
+        self._invalidate(scan)
+
+        self.assertEqual(scan.jobs.count(), 0)
+
+    def test_invalidate_job_results_keeps_opinion_level_rows(self):
+        # Re-validate does not offer to pay for re-reading every opinion.
+        scan = _reporter_scan()
+        opinion = OpinionScanFactory(scan=scan)
+        ExternalJobFactory(
+            scan=scan,
+            opinion=opinion,
+            stage=JobStage.EXTRACT,
+            status=JobStatus.CONSUMED,
+        )
+
+        self._invalidate(scan)
+
+        self.assertEqual(scan.jobs.count(), 1)
 
     def test_invalidate_job_results_survives_a_failed_delete(self):
-        # Best effort: it runs inside a request and an admin action, and
-        # a leftover object costs only a wasted reuse.
+        # Best effort on S3: it runs inside a request and an admin
+        # action, and a leftover object costs only a wasted reuse.
         scan = _reporter_scan()
-        mock_s3 = MagicMock()
-        mock_s3.delete_object.side_effect = ClientError(
-            {"Error": {"Code": "AccessDenied", "Message": "no"}},
-            "DeleteObject",
-        )
-        with patch("scanning.s3_sync.boto3") as mock_boto3:
-            mock_boto3.client.return_value = mock_s3
-            s3_sync.invalidate_job_results(scan)
+        ExternalJobFactory(scan=scan, status=JobStatus.CONSUMED)
 
-        self.assertEqual(mock_s3.delete_object.call_count, 2)
+        self._invalidate(
+            scan,
+            keys=["k.json"],
+            delete_error=ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "no"}},
+                "DeleteObjects",
+            ),
+        )
+
+        # The rows still go: leaving them would keep the stale objects
+        # addressable by name.
+        self.assertEqual(scan.jobs.count(), 0)
 
     def test_download_processing_files_skips_job_results(self):
         scan = _reporter_scan()

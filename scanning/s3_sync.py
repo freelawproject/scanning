@@ -311,12 +311,24 @@ def _size_matches_s3(s3, bucket: str, key: str, path: Path) -> bool:
 
 
 def invalidate_job_results(scan: Scan) -> None:
-    """Delete a scan's stored GPU job results so the next run recomputes.
+    """Drop a scan's stored GPU results so the next run recomputes.
 
-    The counterpart to ``runpod_client.reusable_result``. That check is
-    keyed on the stage input's timestamp, which answers "have the pages
-    changed?" and nothing else, so a caller who means "re-run this even
-    though the pages are the same" has to say so by removing the objects.
+    The way a caller says "re-run this even though the pages have not
+    changed". Everything that decides whether a stage can be skipped is
+    keyed on the input rather than on intent -- ``reusable_result``
+    compares timestamps, ``jobs.ensure_jobs`` compares the input key --
+    so identical input would otherwise always be answered from the last
+    run, and Re-validate would return the results it was asked to
+    replace.
+
+    Both stores have to go, because either one alone would still answer
+    the next pass: the objects under the scan's ``jobs/`` prefix, and
+    the ``ExternalJob`` rows pointing at them. The rows are deleted
+    rather than superseded. That loses their history, which is the
+    honest reading of an operation whose entire meaning is "throw away
+    what we computed"; a re-run that should *keep* the previous attempt
+    changes its input instead, and ``ensure_jobs`` gives it a new run
+    on its own.
 
     Call it from the paths that express that intent. Today that is the
     Re-validate action alone, which warns about GPU cost before it
@@ -324,31 +336,54 @@ def invalidate_job_results(scan: Scan) -> None:
     itself as recovery for a scan stuck behind a killed daemon, which is
     the resume case reuse exists to make cheap.
 
-    Best effort. A failed delete leaves a reusable result behind, which
-    costs correctness only for the caller that asked for freshness, so it
-    is logged rather than raised into a request or an admin action.
+    Best effort on S3. A failed delete leaves a reusable object behind,
+    which costs correctness only for the caller that asked for
+    freshness, so it is logged rather than raised into a request or an
+    admin action. The row delete is not best effort: without it the
+    stale objects stay addressable by name.
 
     :param scan: Scan whose stored results to drop.
     :return: None.
     """
+    # Volume-level rows only. The opinion-level stages are keyed to
+    # opinion PDFs that this action does not touch, and re-reading three
+    # hundred opinions is not what Re-validate offers to pay for.
+    dropped = scan.jobs.filter(opinion__isnull=True).delete()[0]
+    if dropped:
+        logger.info(
+            "Dropped %d job row(s) for scan %s so the next run recomputes",
+            dropped,
+            scan.pk,
+        )
+
     if not _s3_enabled():
         return
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     s3 = _s3_client()
-    for stage in ("detect", "analyze"):
-        key = s3_job_result_key(scan, stage)
-        try:
-            s3.delete_object(Bucket=bucket, Key=key)
-        except (BotoCoreError, ClientError):
-            logger.warning(
-                "Could not drop the stored %s result for scan %s at %s; "
-                "the next run may reuse it",
-                stage,
-                scan.pk,
-                key,
-                exc_info=True,
-            )
+    prefix = f"{s3_processing_prefix(scan)}{JOB_RESULTS_SUBDIR}"
+    try:
+        # A prefix delete rather than a list of known keys: batched
+        # results are addressed per run, shard and attempt, so the names
+        # are not reconstructable once the rows describing them are
+        # gone. This also sweeps up the pre-batch
+        # ``jobs/{stage}/result.json`` objects.
+        paginator = s3.get_paginator("list_objects_v2")
+        keys = [
+            {"Key": obj["Key"]}
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix)
+            for obj in page.get("Contents", [])
+        ]
+        for batch in (keys[i : i + 1000] for i in range(0, len(keys), 1000)):
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+    except (BotoCoreError, ClientError):
+        logger.warning(
+            "Could not drop the stored job results for scan %s under %s; "
+            "the next run may reuse one",
+            scan.pk,
+            prefix,
+            exc_info=True,
+        )
 
 
 def upload_processing_files(scan: Scan) -> int:
