@@ -743,3 +743,115 @@ class TestSubmitPending(CollectTestCase):
 
         self.assertEqual(summary.submitted, 0)
         provider.submit.assert_not_called()
+
+
+@override_settings(
+    RUNPOD_REQUEST_TIMEOUT=1800,
+    DAEMON_JOB_SECONDS_PER_PAGE=1.0,
+    DAEMON_JOB_MAX_QUEUE_SECONDS=21600,
+)
+class TestQueueVersusExecutionTime(CollectTestCase):
+    """Queue time and run time get separate budgets."""
+
+    def test_submitting_stamps_a_queue_ceiling_not_a_run_budget(self):
+        # Batching against a narrow worker pool means a long queue is
+        # the design working. Charging it to an execution budget would
+        # cancel the tail of every large batch.
+        scan = ScanFactory(page_count=10)
+        job = ExternalJobFactory(
+            scan=scan, status=JobStatus.PENDING, input_key="k"
+        )
+        provider = MagicMock()
+        provider.submit.side_effect = lambda j, p: SubmitReceipt(
+            external_id="x",
+            result_key=j.result_key,
+            submitted_at=timezone.now(),
+        )
+        with (
+            patch("scanning.jobs.get_provider", return_value=provider),
+            patch(
+                "scanning.runpod_client.presign_input_get",
+                return_value="https://signed/get",
+            ),
+        ):
+            jobs.submit_pending()
+
+        job.refresh_from_db()
+        waited = (job.deadline - job.submitted_at).total_seconds()
+        self.assertAlmostEqual(waited, 21600, delta=5)
+
+    def test_a_job_that_starts_running_gets_the_run_budget(self):
+        scan = ScanFactory(page_count=200)
+        job = self.make_job(
+            scan=scan,
+            status=JobStatus.IN_QUEUE,
+            deadline=timezone.now() + timedelta(hours=5),
+        )
+        provider = MagicMock()
+        provider.poll.return_value = _outcome(
+            JobStatus.IN_PROGRESS, provider_status="IN_PROGRESS"
+        )
+
+        before = timezone.now()
+        self.collect(provider)
+
+        job.refresh_from_db()
+        budget = (job.deadline - before).total_seconds()
+        self.assertAlmostEqual(budget, 1800 + 200, delta=5)
+
+    def test_a_long_queue_does_not_cancel_the_job(self):
+        # The regression this split exists for: an execution-sized
+        # timeout from submission would cancel the tail of a batch.
+        job = self.make_job(
+            status=JobStatus.IN_QUEUE,
+            submitted_at=timezone.now() - timedelta(hours=2),
+            deadline=timezone.now() + timedelta(hours=4),
+        )
+        provider = MagicMock()
+        provider.poll.return_value = _outcome(JobStatus.IN_QUEUE)
+
+        self.collect(provider)
+
+        provider.cancel.assert_not_called()
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.IN_QUEUE)
+
+    def test_the_run_budget_is_not_restamped_every_tick(self):
+        # Only the crossing into IN_PROGRESS moves it; otherwise a job
+        # that keeps reporting running would never time out.
+        job = self.make_job(status=JobStatus.IN_PROGRESS)
+        stamped = timezone.now() + timedelta(minutes=3)
+        ExternalJob.objects.filter(pk=job.pk).update(deadline=stamped)
+        provider = MagicMock()
+        provider.poll.return_value = _outcome(JobStatus.IN_PROGRESS)
+
+        self.collect(provider)
+
+        job.refresh_from_db()
+        self.assertAlmostEqual(
+            (job.deadline - stamped).total_seconds(), 0, delta=1
+        )
+
+    def test_a_job_that_never_gets_submitted_is_given_up_on(self):
+        # A paused endpoint defers forever and spends no retry budget,
+        # so without a ceiling its scan waits in AWAITING with nothing
+        # able to rescue it.
+        job = ExternalJobFactory(status=JobStatus.PENDING)
+        ExternalJob.objects.filter(pk=job.pk).update(
+            date_created=timezone.now() - timedelta(hours=7)
+        )
+
+        summary, _ = self.collect()
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(job.error_code, "NEVER_SUBMITTED")
+        self.assertEqual(summary.failed, 1)
+
+    def test_a_recently_created_pending_job_is_left_alone(self):
+        job = ExternalJobFactory(status=JobStatus.PENDING)
+
+        self.collect()
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.PENDING)

@@ -336,3 +336,35 @@ class TestAwaitingSurvivesTheErrorHandler(TestCase):
 
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.PROCESSING)
+
+
+class TestParkingIsGuarded(TestCase):
+    """Parking a scan must not resurrect one someone else moved."""
+
+    def test_a_scan_cancelled_mid_tick_stays_cancelled(self):
+        scan = ScanFactory(status=Status.PROCESSING)
+
+        def cancel_then_unwind(scan_pk):
+            Scan.objects.filter(pk=scan_pk).update(status=Status.CANCELLED)
+            raise pipeline.Awaiting("detect: still running", "detect")
+
+        with patch(
+            "scanning.services.run_full_pipeline",
+            side_effect=cancel_then_unwind,
+        ):
+            pipeline.advance_scan(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.CANCELLED)
+
+    def test_a_scan_still_processing_is_parked(self):
+        scan = ScanFactory(status=Status.PROCESSING)
+
+        with patch(
+            "scanning.services.run_full_pipeline",
+            side_effect=pipeline.Awaiting("detect: still running", "detect"),
+        ):
+            pipeline.advance_scan(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.AWAITING)

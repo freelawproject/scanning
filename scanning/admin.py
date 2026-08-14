@@ -304,11 +304,20 @@ class ScanAdmin(admin.ModelAdmin):
     # Statuses a scan can be re-queued FROM: any error flavor, plus a
     # scan stuck in PROCESSING after its daemon was killed. Anything
     # else (QUEUED, PENDING_REVIEW, DONE, ...) is left alone.
+    #
+    # AWAITING is here because it is the one state with no automatic
+    # rescue. A scan in PROCESSING is recovered by the stale sweep after
+    # DAEMON_PROCESSING_TIMEOUT; a scan waiting on external jobs is
+    # deliberately exempt from that, since nothing is holding it, and
+    # its jobs carry their own ceilings instead. Those ceilings are
+    # hours long by design, so an operator who can already see the job
+    # is not coming back needs a way to say so.
     _REQUEUEABLE_STATUSES = (
         Status.ERROR,
         Status.ERROR_MAX_RETRIES,
         Status.ERROR_INTERRUPTED,
         Status.PROCESSING,
+        Status.AWAITING,
     )
 
     def _requeue(

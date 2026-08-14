@@ -277,7 +277,7 @@ def _submit(job: ExternalJob, summary: SubmitSummary, now) -> None:
         external_id=receipt.external_id,
         result_key=receipt.result_key,
         submitted_at=receipt.submitted_at,
-        deadline=_deadline_for(job, receipt.submitted_at),
+        deadline=queue_deadline(receipt.submitted_at),
         last_polled_at=None,
         completed_at=None,
         error_code="",
@@ -315,19 +315,44 @@ def _build_payload(job: ExternalJob) -> dict:
     return payload
 
 
-def _deadline_for(job: ExternalJob, submitted_at):
-    """Return the wall-clock ceiling for one job.
+def queue_deadline(submitted_at):
+    """Return how long a job may wait before a worker picks it up.
 
-    A base timeout plus an allowance for the pages this job covers.
-    Per job rather than per scan, so one wedged shard is cancelled and
-    resubmitted without stalling the siblings it fanned out alongside.
+    Queue time is not execution time and must not be measured against
+    the same budget. Batching exists to be submitted against a
+    deliberately narrow worker pool -- that cap is the half of #156
+    that actually saves money -- so the tail of a batch sitting in the
+    provider's queue for hours is the design working, not a wedged job.
+    An execution-sized timeout applied from submission would cancel it,
+    resubmit it to the back of the same queue, and eventually fail a
+    scan for being popular.
 
-    :param job: The row being submitted.
-    :param submitted_at: When it was handed over.
+    A ceiling still exists, generously, so a job the provider silently
+    never starts cannot park its scan forever.
+
+    :param submitted_at: When the provider accepted the job.
+    :returns: When to give up waiting for it to start.
+    """
+    return submitted_at + timedelta(
+        seconds=int(settings.DAEMON_JOB_MAX_QUEUE_SECONDS)
+    )
+
+
+def execution_deadline(job: ExternalJob, started_at):
+    """Return how long a running job may run for.
+
+    Measured from the moment the provider reported the job actually
+    running, not from submission. A base timeout plus an allowance for
+    the pages this job covers. Per job rather than per scan, so one
+    wedged shard is cancelled and resubmitted without stalling the
+    siblings it fanned out alongside.
+
+    :param job: The row that has started.
+    :param started_at: When it began running.
     :returns: When to give up on it.
     """
     pages = (job.scan.page_count or 0) / max(job.shard_count, 1)
-    return submitted_at + timedelta(
+    return started_at + timedelta(
         seconds=int(settings.RUNPOD_REQUEST_TIMEOUT)
         + pages * float(settings.DAEMON_JOB_SECONDS_PER_PAGE)
     )
@@ -380,7 +405,7 @@ def collect_once(now=None) -> CollectSummary:
     now = now or timezone.now()
     summary = CollectSummary()
 
-    for job in ExternalJob.objects.in_flight():
+    for job in ExternalJob.objects.in_flight().select_related("scan"):
         _sweep(job, summary, now)
 
     # Re-queried, so anything the sweep above just finished is already
@@ -388,7 +413,52 @@ def collect_once(now=None) -> CollectSummary:
     for job in ExternalJob.objects.overdue(now):
         _time_out(job, summary, now)
 
+    _abandon_unsubmittable(summary, now)
     return summary
+
+
+def _abandon_unsubmittable(summary: CollectSummary, now) -> None:
+    """Fail jobs that have waited too long to be submitted at all.
+
+    A ``PENDING`` job has never reached a provider, so it has no
+    deadline and ``overdue()`` cannot see it. The submit sweep also
+    treats "the endpoint is not accepting work" as free -- it leaves the
+    row pending and spends no retry budget, which is right for a
+    deploy-length outage and wrong forever. Without this, an endpoint
+    scaled to zero parks its scans in AWAITING with no timeout,
+    no retry cap, and no admin action that reaches them.
+
+    Failing the job is what unwedges the scan: it becomes resumable,
+    the next advance pass raises through :func:`pipeline.await_stage`,
+    and the scan lands in ERROR with the reason on it.
+
+    :param summary: Counters to update.
+    :param now: The tick's timestamp.
+    """
+    cutoff = now - timedelta(
+        seconds=int(settings.DAEMON_JOB_MAX_QUEUE_SECONDS)
+    )
+    stale = ExternalJob.objects.filter(
+        status=JobStatus.PENDING, date_created__lt=cutoff
+    )
+    for job in stale:
+        logger.error(
+            "job %s was never submitted within %ss of being created; "
+            "giving up so its scan stops waiting",
+            job.pk,
+            settings.DAEMON_JOB_MAX_QUEUE_SECONDS,
+        )
+        if _write(
+            job,
+            status=JobStatus.FAILED,
+            completed_at=now,
+            error_code="NEVER_SUBMITTED",
+            error_message=(
+                "No provider accepted this job before the queue ceiling "
+                f"of {settings.DAEMON_JOB_MAX_QUEUE_SECONDS}s elapsed."
+            ),
+        ):
+            summary.failed += 1
 
 
 def _sweep(job: ExternalJob, summary: CollectSummary, now) -> None:
@@ -432,7 +502,18 @@ def _sweep(job: ExternalJob, summary: CollectSummary, now) -> None:
 
     # Still queued or running. Record the provider's own state so the
     # advance phase can show it without asking again.
-    if _write(job, status=outcome.status, last_polled_at=now):
+    #
+    # Crossing into IN_PROGRESS is also when the deadline stops being a
+    # queue ceiling and becomes an execution budget: until now the job
+    # was waiting behind the worker cap, which is free and expected.
+    fields = {"status": outcome.status, "last_polled_at": now}
+    if (
+        outcome.status == JobStatus.IN_PROGRESS
+        and job.status != JobStatus.IN_PROGRESS
+    ):
+        fields["deadline"] = execution_deadline(job, now)
+
+    if _write(job, **fields):
         logger.debug(
             "job %s -> %s (%s)",
             job.pk,

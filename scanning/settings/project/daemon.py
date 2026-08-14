@@ -23,6 +23,17 @@ DAEMON_JOB_SECONDS_PER_PAGE = env.float(
     "DAEMON_JOB_SECONDS_PER_PAGE", default=1.0
 )
 
+# How long a job may wait to start before it is written off. Covers both
+# a job queued behind the provider's worker cap and one that never left
+# our own PENDING state because the endpoint kept refusing work. Sized
+# for queue time, not execution: batching against a narrow pool means a
+# long queue is the design working, so this is deliberately generous and
+# exists only so a job the provider silently drops cannot park its scan
+# forever (issue #156).
+DAEMON_JOB_MAX_QUEUE_SECONDS = env.int(
+    "DAEMON_JOB_MAX_QUEUE_SECONDS", default=6 * 60 * 60
+)
+
 # How often (in seconds) the daemon submits jobs waiting to go out. Fast,
 # because submitting blocks on nothing: the cost of a tick is one HTTP
 # call per pending job.

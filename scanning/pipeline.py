@@ -242,11 +242,22 @@ def advance_scan(scan_pk: int) -> str:
         # timeout applies; the advance tick picks it up once its jobs
         # land.
         logger.info("scan %s is waiting on %s", scan_pk, exc.stage or "jobs")
-        Scan.objects.filter(pk=scan_pk).update(
+        # Guarded like every other transition here: a scan cancelled or
+        # re-queued while this tick was running has been moved on
+        # purpose, and parking it would resurrect it.
+        parked = Scan.objects.filter(
+            pk=scan_pk, status=Status.PROCESSING
+        ).update(
             status=Status.AWAITING,
             progress_message=str(exc)[:255],
         )
-        return Status.AWAITING
+        if not parked:
+            logger.info(
+                "scan %s moved out of PROCESSING while it ran; leaving it "
+                "to whoever moved it",
+                scan_pk,
+            )
+        return Status.AWAITING if parked else ""
     except Exception:
         # The action handles its own failures; this is the backstop for
         # one raised before it could. Guarded on PROCESSING so it never
