@@ -1,0 +1,25 @@
+[project]
+name = "lighton-gpu-worker"
+version = "0.0.1"
+description = "RunPod Serverless handler for LightOnOCR tiebreak reads (vLLM-backed)."
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    # vLLM OpenAI-compatible client. The GPU stack (vllm, torch) lives
+    # in the base image's own environment, not here.
+    "openai>=1.5",
+
+    # Page rendering and cropping. PyMuPDF rasterises the PDF; Pillow
+    # applies redactions, cuts crops and encodes PNG.
+    "pillow>=10",
+    "pymupdf>=1.25",
+
+    # RunPod plumbing
+    "requests>=2.33,<3",
+    "runpod>=1.9,<2",
+    "sentry-sdk>=2,<3",
+]
+
+# This project is an application (handler.py), not a library. Tell uv
+# not to try to build it as an installable package.
+[tool.uv]
+package = false
