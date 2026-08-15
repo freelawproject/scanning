@@ -39,6 +39,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from scanning.models import (
+    DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
     ExternalJob,
     JobStatus,
@@ -157,6 +158,11 @@ def ensure_jobs(
         )
 
     run = ExternalJob.next_run(scan, stage, engine, opinion=opinion)
+    # A row carries a ceiling from the moment it exists, not from the
+    # moment a provider takes it: waiting to be submitted is one of the
+    # two ways a job waits, and the scan parked behind it cannot tell
+    # them apart. :func:`_abandon_unsubmittable` reads this.
+    deadline = queue_deadline(timezone.now())
     with transaction.atomic():
         created = ExternalJob.objects.bulk_create(
             [
@@ -172,6 +178,7 @@ def ensure_jobs(
                     shard_count=shard_count,
                     input_key=input_key,
                     input_manifest=manifest or {},
+                    deadline=deadline,
                 )
                 for index in range(shard_count)
             ]
@@ -326,7 +333,7 @@ def _build_payload(job: ExternalJob) -> dict:
     return payload
 
 
-def queue_deadline(submitted_at):
+def queue_deadline(waiting_since):
     """Return how long a job may wait before a worker picks it up.
 
     Queue time is not execution time and must not be measured against
@@ -338,13 +345,19 @@ def queue_deadline(submitted_at):
     resubmit it to the back of the same queue, and eventually fail a
     scan for being popular.
 
-    A ceiling still exists, generously, so a job the provider silently
-    never starts cannot park its scan forever.
+    A ceiling still exists, generously, so a job nobody has started
+    cannot park its scan forever. It covers both waits a row can be
+    stuck in, since neither is distinguishable from the other by the
+    scan that is waiting: queued at the provider, and queued here
+    because the endpoint is not accepting work.
 
-    :param submitted_at: When the provider accepted the job.
+    :param waiting_since: When this row started waiting, which is when
+        it was created or last returned to ``PENDING`` for a row still
+        to be submitted, and when the provider accepted it for one
+        already in its queue.
     :returns: When to give up waiting for it to start.
     """
-    return submitted_at + timedelta(
+    return waiting_since + timedelta(
         seconds=int(settings.DAEMON_JOB_MAX_QUEUE_SECONDS)
     )
 
@@ -428,7 +441,7 @@ def collect_once(now=None) -> CollectSummary:
     return summary
 
 
-def abandon_open(scan, reason: str) -> int:
+def abandon_open(scan, reason: str, keep_completed=False) -> int:
     """Stop and close every job a scan still has outstanding.
 
     For the paths that end a scan's pipeline from outside it: a user
@@ -441,11 +454,19 @@ def abandon_open(scan, reason: str) -> int:
 
     :param scan: The Scan whose work is being abandoned.
     :param reason: Recorded on each row as its error message.
+    :param keep_completed: Leave finished-but-unapplied jobs alone.
+        ``COMPLETED`` counts as open because we have not read the
+        result yet, which is right for a user cancelling the scan
+        outright and wrong for a re-queue: the object is already paid
+        for and the next pass can still consume it.
     :returns: How many rows were closed.
     :rtype: int
     """
+    outstanding = scan.jobs.open()
+    if keep_completed:
+        outstanding = outstanding.exclude(status=JobStatus.COMPLETED)
     closed = 0
-    for job in scan.jobs.open().select_related("scan"):
+    for job in outstanding.select_related("scan"):
         if job.status in IN_FLIGHT_JOB_STATUSES and job.external_id:
             try:
                 get_provider(job.provider).cancel(job)
@@ -466,16 +487,83 @@ def abandon_open(scan, reason: str) -> int:
     return closed
 
 
+def reset_for_requeue(scan, reason: str) -> int:
+    """Clear the jobs standing between a re-queued scan and another run.
+
+    An operator re-queueing a scan means "run this again", but
+    :func:`ensure_jobs` reuses a stage's live run whenever it still
+    describes the same input, whatever became of it. So a scan whose
+    detect job failed would find those same rows on the next pass and
+    :func:`pipeline.await_stage` would raise on them again, landing it
+    straight back in ERROR without a single call to a provider. That
+    reuse is deliberate and has to stay -- minting a fresh run for a
+    dead one automatically is an unbounded resubmission loop, which is
+    what the retry budget exists to prevent -- so the operator's action
+    is what has to drop them.
+
+    Two rules, and the split is what keeps a re-queue cheap:
+
+    - Dead rows go for every re-queue. Nothing will move them and they
+      are the only thing between their stage and a fresh run.
+    - Open rows go only for a scan in AWAITING, cancelled with their
+      provider on the way out. That is the state whose whole meaning is
+      "waiting on a job", so re-queueing out of it is an operator
+      saying the job is not coming back. A scan re-queued from
+      PROCESSING is recovering from a killed daemon instead, and its
+      jobs may well still be running: cancelling those would pay for
+      the same GPU work twice.
+
+    Stages that finished keep their rows either way, so a re-queue
+    still resumes at the step that broke rather than at the top. The
+    dropped rows' result objects go with them, since deleting a row
+    frees its run number for the next job to mint.
+
+    :param scan: The Scan being re-queued, at its pre-requeue status.
+    :param reason: Recorded on any row cancelled on the way out.
+    :returns: How many rows were dropped.
+    :rtype: int
+    """
+    from scanning import s3_sync
+    from scanning.models import Status
+
+    if scan.status == Status.AWAITING:
+        abandon_open(scan, reason, keep_completed=True)
+
+    doomed = scan.jobs.filter(status__in=DEAD_JOB_STATUSES)
+    keys = list(doomed.values_list("result_key", flat=True))
+    dropped = doomed.delete()[0]
+    if dropped:
+        s3_sync.delete_job_results(keys)
+        logger.info(
+            "dropped %d job row(s) for scan %s so a re-queue can run "
+            "them again: %s",
+            dropped,
+            scan.pk,
+            reason,
+        )
+    return dropped
+
+
 def _abandon_unsubmittable(summary: CollectSummary, now) -> None:
     """Fail jobs that have waited too long to be submitted at all.
 
-    A ``PENDING`` job has never reached a provider, so it has no
-    deadline and ``overdue()`` cannot see it. The submit sweep also
-    treats "the endpoint is not accepting work" as free -- it leaves the
-    row pending and spends no retry budget, which is right for a
-    deploy-length outage and wrong forever. Without this, an endpoint
-    scaled to zero parks its scans in AWAITING with no timeout,
-    no retry cap, and no admin action that reaches them.
+    A ``PENDING`` job is not in flight, so ``overdue()`` cannot see it,
+    even though it carries the same queue ceiling every other waiting
+    row does. The submit sweep also treats "the endpoint is not
+    accepting work" as free -- it leaves the row pending and spends no
+    retry budget, which is right for a deploy-length outage and wrong
+    forever. Without this, an endpoint scaled to zero parks its scans
+    in AWAITING with no timeout, no retry cap, and no admin action that
+    reaches them.
+
+    The ceiling is read off ``deadline`` rather than measured from
+    ``date_created``, because a row reaches ``PENDING`` twice: once at
+    creation, and again on every retry, which restamps the deadline.
+    Timing a retried row from its creation would fail it the instant it
+    was re-queued -- a job that timed out after a six-hour queue is
+    already six hours old -- spending none of the retry budget the
+    resubmission exists to use, and blaming it on a provider that had
+    in fact accepted the job.
 
     Failing the job is what unwedges the scan: it becomes resumable,
     the next advance pass raises through :func:`pipeline.await_stage`,
@@ -484,15 +572,12 @@ def _abandon_unsubmittable(summary: CollectSummary, now) -> None:
     :param summary: Counters to update.
     :param now: The tick's timestamp.
     """
-    cutoff = now - timedelta(
-        seconds=int(settings.DAEMON_JOB_MAX_QUEUE_SECONDS)
-    )
     stale = ExternalJob.objects.filter(
-        status=JobStatus.PENDING, date_created__lt=cutoff
+        status=JobStatus.PENDING, deadline__isnull=False, deadline__lt=now
     )
     for job in stale:
         logger.error(
-            "job %s was never submitted within %ss of being created; "
+            "job %s was not submitted within %ss of joining the queue; "
             "giving up so its scan stops waiting",
             job.pk,
             settings.DAEMON_JOB_MAX_QUEUE_SECONDS,
@@ -741,7 +826,10 @@ def _retry_or_finish(
         result_key="",
         submitted_at=None,
         completed_at=None,
-        deadline=None,
+        # Back to a queue ceiling, restamped: the row is waiting to be
+        # submitted again, and the budget it spent on the attempt it is
+        # replacing is not this attempt's to answer for.
+        deadline=queue_deadline(now),
         last_polled_at=now,
         error_code=outcome.error_code,
         error_message=outcome.error_message,

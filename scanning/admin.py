@@ -4,6 +4,7 @@ from django.urls import NoReverseMatch, reverse
 from django.utils.html import format_html
 from django.utils.text import capfirst
 
+from scanning import jobs
 from scanning.models import (
     Detection,
     ExternalJob,
@@ -334,13 +335,20 @@ class ScanAdmin(admin.ModelAdmin):
     ):
         """Re-queue the selected scans whose status is in ``statuses``.
 
-        Shared body of the three re-queue actions: filter the selection to
-        the statuses this action owns, reset the relevant counters and the
-        progress fields, then report. Reporting is deliberately never a
+        Shared body of the three re-queue actions: clear whatever jobs
+        would survive the re-queue, filter the selection to the statuses
+        this action owns, reset the relevant counters and the progress
+        fields, then report. Reporting is deliberately never a
         silent success: with nothing matched it warns and stops, and a
         partial match warns with the skipped count appended, because a
         selection the action ignored is exactly the surprise an operator
         needs to see.
+
+        The jobs come first, and not as bookkeeping: a status flip alone
+        would have the next pass find the same rows and park or fail the
+        scan on them again, so what makes this action mean anything is
+        ``jobs.reset_for_requeue``, which decides per scan what a
+        re-queue may throw away.
 
         :param request: The admin HTTP request.
         :param queryset: Selected Scan queryset.
@@ -354,6 +362,9 @@ class ScanAdmin(admin.ModelAdmin):
             appended when part of the selection was left alone.
         :return: None.
         """
+        for scan in queryset.filter(status__in=statuses):
+            jobs.reset_for_requeue(scan, "Re-queued by an admin.")
+
         updated = queryset.filter(status__in=statuses).update(
             status=Status.QUEUED,
             progress_message=progress_message,

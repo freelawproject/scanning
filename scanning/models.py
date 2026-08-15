@@ -1397,15 +1397,20 @@ OPEN_JOB_STATUSES = frozenset(
     {JobStatus.PENDING, JobStatus.COMPLETED} | IN_FLIGHT_JOB_STATUSES
 )
 
-#: Jobs nothing will happen to again without an explicit retry.
-TERMINAL_JOB_STATUSES = frozenset(
+#: Jobs that stopped without producing anything to apply. The stage
+#: holding one cannot finish, and nothing in the daemon will move it,
+#: so re-queueing the scan has to clear them rather than find them
+#: again on the next pass.
+DEAD_JOB_STATUSES = frozenset(
     {
-        JobStatus.CONSUMED,
         JobStatus.FAILED,
         JobStatus.CANCELLED,
         JobStatus.EXPIRED,
     }
 )
+
+#: Jobs nothing will happen to again without an explicit retry.
+TERMINAL_JOB_STATUSES = frozenset({JobStatus.CONSUMED}) | DEAD_JOB_STATUSES
 
 
 class ExternalJobQuerySet(AutoNowQuerySet):
@@ -1652,10 +1657,12 @@ class ExternalJob(AbstractDateTimeModel):
         null=True,
         blank=True,
         help_text=(
-            "Wall-clock ceiling stamped at submit: a base timeout plus "
-            "an allowance for this job's pages. Per job rather than per "
-            "scan so one wedged shard is cancelled and resubmitted "
-            "without stalling its siblings."
+            "Wall-clock ceiling on the state the row is in, restamped "
+            "at each crossing: a queue ceiling while it waits to be "
+            "submitted or picked up, and once it is running, a base "
+            "timeout plus an allowance for this job's pages. Per job "
+            "rather than per scan so one wedged shard is cancelled and "
+            "resubmitted without stalling its siblings."
         ),
     )
 

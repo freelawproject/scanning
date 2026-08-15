@@ -338,6 +338,54 @@ class TestSyncHelpersWithCredentials(TestCase):
         # addressable by name.
         self.assertEqual(scan.jobs.count(), 0)
 
+    def _delete_job_results(self, keys, delete_error=None):
+        """Run ``delete_job_results`` against a stubbed S3.
+
+        :param keys: Keys to delete.
+        :param delete_error: Error ``delete_objects`` should raise.
+        :returns: ``(return value, stub S3 client)``.
+        :rtype: tuple
+        """
+        mock_s3 = MagicMock()
+        if delete_error is not None:
+            mock_s3.delete_objects.side_effect = delete_error
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            return s3_sync.delete_job_results(keys), mock_s3
+
+    def test_delete_job_results_deletes_only_what_it_was_given(self):
+        # The scoped counterpart to the prefix sweep: a re-queue drops
+        # some of a scan's rows and keeps the finished ones, whose
+        # results are re-read on every pass through their stage.
+        dropped = "processing/1/tc/164/1/jobs/detect/blackletter/r1-s0-a1.json"
+
+        count, mock_s3 = self._delete_job_results([dropped, "", dropped])
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            mock_s3.delete_objects.call_args.kwargs["Delete"]["Objects"],
+            [{"Key": dropped}],
+        )
+
+    def test_delete_job_results_ignores_an_empty_list(self):
+        count, mock_s3 = self._delete_job_results([""])
+
+        self.assertEqual(count, 0)
+        mock_s3.delete_objects.assert_not_called()
+
+    def test_delete_job_results_survives_a_failed_delete(self):
+        # Best effort, like the prefix sweep: it runs inside an admin
+        # action, and the row it belonged to is going either way.
+        count, _ = self._delete_job_results(
+            ["k.json"],
+            delete_error=ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "no"}},
+                "DeleteObjects",
+            ),
+        )
+
+        self.assertEqual(count, 0)
+
     def test_download_processing_files_skips_job_results(self):
         scan = _reporter_scan()
         prefix = s3_sync.s3_processing_prefix(scan)

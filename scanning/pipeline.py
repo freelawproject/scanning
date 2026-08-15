@@ -32,6 +32,7 @@ from django.utils import timezone
 
 from scanning import jobs
 from scanning.models import (
+    DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
     ExternalJob,
     JobEngine,
@@ -104,7 +105,7 @@ def await_stage(
         opinion=opinion,
     )
 
-    dead = [j for j in stage_jobs if j.status in _DEAD_STATUSES]
+    dead = [j for j in stage_jobs if j.status in DEAD_JOB_STATUSES]
     if dead:
         raise RuntimeError(
             f"{stage} failed for scan {scan.pk}: "
@@ -123,11 +124,6 @@ def await_stage(
 
     return [_payload_of(job) for job in stage_jobs]
 
-
-#: Statuses that mean this stage will not finish on its own.
-_DEAD_STATUSES = frozenset(
-    {JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.EXPIRED}
-)
 
 #: Statuses that mean the stage is still going.
 _OUTSTANDING_STATUSES = frozenset({JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES)

@@ -246,7 +246,18 @@ class TestRetryAndFailure(CollectTestCase):
         self.assertEqual(job.external_id, "")
         self.assertEqual(job.result_key, "")
         self.assertIsNone(job.submitted_at)
-        self.assertIsNone(job.deadline)
+
+    def test_a_retry_gets_a_fresh_queue_ceiling(self):
+        # The row is waiting to be submitted again, so its deadline is
+        # a queue ceiling once more -- restamped, or the sweep that
+        # abandons unsubmittable jobs would fail this one on the spot
+        # for a wait its previous attempt did.
+        job = self.make_job(deadline=timezone.now() - timedelta(minutes=1))
+
+        self._fail(job)
+
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertGreater(job.deadline, timezone.now())
 
     def test_a_retry_keeps_the_previous_attempt_as_history(self):
         # A retry mutates the row, so this list is the only place the
@@ -836,9 +847,9 @@ class TestQueueVersusExecutionTime(CollectTestCase):
         # A paused endpoint defers forever and spends no retry budget,
         # so without a ceiling its scan waits in AWAITING with nothing
         # able to rescue it.
-        job = ExternalJobFactory(status=JobStatus.PENDING)
-        ExternalJob.objects.filter(pk=job.pk).update(
-            date_created=timezone.now() - timedelta(hours=7)
+        job = ExternalJobFactory(
+            status=JobStatus.PENDING,
+            deadline=timezone.now() - timedelta(hours=1),
         )
 
         summary, _ = self.collect()
@@ -849,12 +860,42 @@ class TestQueueVersusExecutionTime(CollectTestCase):
         self.assertEqual(summary.failed, 1)
 
     def test_a_recently_created_pending_job_is_left_alone(self):
-        job = ExternalJobFactory(status=JobStatus.PENDING)
+        job = ExternalJobFactory(
+            status=JobStatus.PENDING,
+            deadline=timezone.now() + timedelta(hours=5),
+        )
 
         self.collect()
 
         job.refresh_from_db()
         self.assertEqual(job.status, JobStatus.PENDING)
+
+    def test_a_retried_job_is_not_mistaken_for_one_never_submitted(self):
+        # The regression: a job that queued out its ceiling and was
+        # retried is already older than that ceiling, so timing the
+        # retry from date_created failed it on the same tick, as
+        # NEVER_SUBMITTED, without spending any of its retry budget.
+        scan = ScanFactory(page_count=10)
+        job = self.make_job(
+            scan=scan,
+            status=JobStatus.IN_QUEUE,
+            submitted_at=timezone.now() - timedelta(hours=7),
+            deadline=timezone.now() - timedelta(hours=1),
+        )
+        ExternalJob.objects.filter(pk=job.pk).update(
+            date_created=timezone.now() - timedelta(hours=7)
+        )
+        provider = MagicMock()
+        provider.poll.return_value = _outcome(JobStatus.IN_QUEUE)
+
+        summary, _ = self.collect(provider)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.error_code, "DEADLINE_EXCEEDED")
+        self.assertEqual(job.retry_count, 1)
+        self.assertEqual(summary.retried, 1)
+        self.assertEqual(summary.failed, 0)
 
 
 class TestSubmitOrdering(CollectTestCase):

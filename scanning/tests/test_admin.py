@@ -14,7 +14,11 @@ Covers:
   the selection contains no matching scan.
 - ``get_deleted_objects``: the hand-rolled blast-radius summary, which
   has to name every cascade table explicitly.
+- What a re-queue does to the scan's jobs, which is what decides
+  whether the action means anything at all in batch mode.
 """
+
+from unittest.mock import MagicMock, patch
 
 from django.contrib import messages
 from django.contrib.admin.sites import AdminSite
@@ -24,7 +28,13 @@ from django.test import RequestFactory, TestCase
 
 from scanning.admin import ScanAdmin
 from scanning.factories import ExternalJobFactory, ScanFactory, UserFactory
-from scanning.models import JobStage, PendingUpload, Scan, Status
+from scanning.models import (
+    JobStage,
+    JobStatus,
+    PendingUpload,
+    Scan,
+    Status,
+)
 
 
 def _request_with_messages():
@@ -185,6 +195,97 @@ class ScanAdminRequeueActionTests(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.ERROR)
         self.assertEqual(msgs[0].level, messages.WARNING)
+
+
+class ScanAdminRequeueJobTests(TestCase):
+    """What a re-queue does to the scan's ``ExternalJob`` rows.
+
+    A status flip on its own is not a re-queue: ``ensure_jobs`` reuses a
+    stage's live run whenever it still describes the same input, so
+    rows left behind are found again on the next pass and park or fail
+    the scan on the very work the operator was trying to get past.
+    """
+
+    def setUp(self):
+        self.admin = ScanAdmin(Scan, AdminSite())
+        self.provider = MagicMock()
+        patcher = patch(
+            "scanning.jobs.get_provider", return_value=self.provider
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _requeue(self, scan):
+        """Run the general re-queue action over one scan."""
+        request = _request_with_messages()
+        self.admin.requeue_scans(request, Scan.objects.filter(pk=scan.pk))
+        scan.refresh_from_db()
+
+    def test_requeue_drops_a_dead_job(self):
+        scan = ScanFactory(status=Status.ERROR)
+        ExternalJobFactory(scan=scan, status=JobStatus.FAILED)
+
+        self._requeue(scan)
+
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.jobs.count(), 0)
+
+    def test_requeue_from_awaiting_cancels_and_drops_a_live_job(self):
+        # The state whose whole meaning is "waiting on a job": the
+        # operator re-queueing out of it is saying the job is not
+        # coming back.
+        scan = ScanFactory(status=Status.AWAITING)
+        ExternalJobFactory(
+            scan=scan, status=JobStatus.IN_PROGRESS, external_id="job-xyz"
+        )
+
+        self._requeue(scan)
+
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.jobs.count(), 0)
+        self.assertEqual(self.provider.cancel.call_count, 1)
+
+    def test_requeue_from_awaiting_keeps_a_finished_job(self):
+        # Its result is on S3 and already paid for, so the next pass
+        # consumes it instead of re-running the stage.
+        scan = ScanFactory(status=Status.AWAITING)
+        job = ExternalJobFactory(scan=scan, status=JobStatus.COMPLETED)
+
+        self._requeue(scan)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.COMPLETED)
+        self.provider.cancel.assert_not_called()
+
+    def test_requeue_from_processing_keeps_a_live_job(self):
+        # Recovery from a killed daemon, not from a wedged job. The
+        # work may still be running, and cancelling it would pay for
+        # the same GPU time twice.
+        scan = ScanFactory(status=Status.PROCESSING)
+        job = ExternalJobFactory(
+            scan=scan, status=JobStatus.IN_PROGRESS, external_id="job-xyz"
+        )
+
+        self._requeue(scan)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.IN_PROGRESS)
+        self.provider.cancel.assert_not_called()
+
+    def test_requeue_keeps_a_consumed_stage(self):
+        # What makes a re-queue cheap: it resumes at the step that
+        # broke rather than at the top.
+        scan = ScanFactory(status=Status.ERROR)
+        done = ExternalJobFactory(
+            scan=scan, stage=JobStage.DETECT, status=JobStatus.CONSUMED
+        )
+        ExternalJobFactory(
+            scan=scan, stage=JobStage.ANALYZE, status=JobStatus.FAILED
+        )
+
+        self._requeue(scan)
+
+        self.assertEqual([j.pk for j in scan.jobs.all()], [done.pk])
 
 
 class ScanAdminDeleteSummaryTests(TestCase):

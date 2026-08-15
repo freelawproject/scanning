@@ -386,6 +386,52 @@ def invalidate_job_results(scan: Scan) -> None:
         )
 
 
+def delete_job_results(keys) -> int:
+    """Best-effort delete of the result objects of specific jobs.
+
+    The scoped counterpart to :func:`invalidate_job_results`' prefix
+    sweep, for the callers that drop some of a scan's job rows and keep
+    the rest. A surviving row's result is re-read on every pass through
+    its stage, so a prefix delete here would take out exactly the
+    finished stages a re-queue exists to resume from.
+
+    Dropping the objects at all matters because a result key is unique
+    per run, shard and attempt, and deleting a row frees its run number
+    for the next job to mint. Left behind, the object would be sitting
+    at the key that job presigns, readable as its own output if its
+    worker reported success without uploading one.
+
+    :param keys: Full S3 keys to remove. Empty values are ignored.
+    :returns: How many keys were handed to S3, 0 if it is disabled.
+    :rtype: int
+    """
+    keys = sorted({key for key in keys if key})
+    if not keys or not _s3_enabled():
+        return 0
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    s3 = _s3_client()
+    try:
+        for start in range(0, len(keys), 1000):
+            s3.delete_objects(
+                Bucket=bucket,
+                Delete={
+                    "Objects": [
+                        {"Key": key} for key in keys[start : start + 1000]
+                    ]
+                },
+            )
+    except (BotoCoreError, ClientError):
+        logger.warning(
+            "Could not delete %d job result object(s); a later job may "
+            "find one at the key it writes to",
+            len(keys),
+            exc_info=True,
+        )
+        return 0
+    return len(keys)
+
+
 def upload_processing_files(scan: Scan) -> int:
     """Upload processing files from MEDIA_ROOT to S3.
 
