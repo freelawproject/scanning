@@ -792,7 +792,7 @@ def reusable_result(scan: Scan, action: str, input_rel: str) -> dict | None:
     return payload
 
 
-def _fetch_result(key: str, submitted_at: datetime) -> dict:
+def _fetch_result(key: str, submitted_at: datetime) -> tuple[dict, int]:
     """Read and parse the JSON envelope the worker wrote.
 
     Heads the object first: "the job reported success but left nothing
@@ -802,11 +802,16 @@ def _fetch_result(key: str, submitted_at: datetime) -> dict:
     parsed JSON we hand to the caller, so it never touches the daemon's
     disk or the ``/tmp`` tree the cleanup command sweeps.
 
+    Returns the size alongside the envelope because this is the only
+    place that sees the bytes. The alternative, the worker's own
+    self-reported count, is absent entirely when the result is fetched
+    on a later tick rather than from a live job response.
+
     :param key: The result key.
     :param submitted_at: When this job was submitted (UTC), used to
         reject an earlier attempt's leftover object.
-    :returns: The parsed envelope.
-    :rtype: dict
+    :returns: The parsed envelope and how many bytes it took.
+    :rtype: tuple[dict, int]
     :raises RunpodTransientError: If the object is missing, stale,
         unreadable or unparseable. Re-running the job is the only
         recovery, and the daemon's transient-retry cap still bounds
@@ -829,8 +834,8 @@ def _fetch_result(key: str, submitted_at: datetime) -> dict:
             f"s3://{bucket}/{key}"
         )
     try:
-        obj = _s3().get_object(Bucket=bucket, Key=key)
-        return json.loads(obj["Body"].read())
+        body = _s3().get_object(Bucket=bucket, Key=key)["Body"].read()
+        return json.loads(body), len(body)
     except (BotoCoreError, ClientError, ValueError) as exc:
         # BotoCoreError covers the streaming failures a mid-read
         # connection drop raises (ResponseStreamingError, ReadTimeout),
@@ -959,14 +964,13 @@ def harvest(
             f"presigned for {result_key!r}"
         )
 
-    payload = _validate_envelope(
-        _fetch_result(key, submitted_at), scan, action, key, job_id
-    )
+    envelope, size = _fetch_result(key, submitted_at)
+    payload = _validate_envelope(envelope, scan, action, key, job_id)
     logger.info(
-        "harvested %s result from s3 key=%s (%s bytes)",
+        "harvested %s result from s3 key=%s (%d bytes)",
         action,
         key,
-        output.get("bytes", "?"),
+        size,
     )
     return {**output, **payload}
 

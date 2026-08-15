@@ -1159,6 +1159,21 @@ class TestHarvest(TestCase):
         self.assertEqual(result["duration_ms"], 42)
         self.assertEqual(result["bytes"], 120)
 
+    def test_the_logged_size_is_the_object_we_read(self):
+        # Not the worker's self-reported count: the batch daemon fetches
+        # a result on a later tick from a synthesized {"result_key": ...}
+        # that carries no ``bytes`` at all, which used to log "? bytes".
+        envelope = _envelope(scan_pk=self.scan.pk, payload={"detections": []})
+        expected = len(json.dumps(envelope).encode())
+
+        with self.assertLogs("scanning.runpod_client", level="INFO") as logs:
+            self._harvest({"result_key": self.key}, envelope=envelope)
+
+        harvested = [m for m in logs.output if "harvested" in m]
+        self.assertEqual(len(harvested), 1)
+        self.assertIn(f"({expected} bytes)", harvested[0])
+        self.assertNotIn("? bytes", harvested[0])
+
     def test_unexpected_key_is_terminal(self):
         envelope = _envelope(scan_pk=self.scan.pk)
         with self.assertRaises(runpod_client.RunpodError) as ctx:
