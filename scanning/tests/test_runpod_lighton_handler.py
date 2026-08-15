@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 from pathlib import Path
 from unittest import mock
 
 import fitz
+import requests
 from django.test import SimpleTestCase
 from PIL import Image
 
@@ -141,6 +143,21 @@ class TestValidateRedactions(SimpleTestCase):
     def test_rejects_non_mapping(self):
         with self.assertRaises(ValueError):
             handler._validate_redactions([[1, 2, 3, 4]])
+
+    def test_rejects_a_non_numeric_bbox_as_bad_input(self):
+        # ValueError specifically, like _validate_crops: the handler
+        # maps that to a terminal BAD_INPUT, while the TypeError that
+        # int(None) would raise later falls through to a bare crash.
+        for rect in ([1, 2, None, 4], [1, 2, "x", 4]):
+            with self.subTest(rect=rect):
+                with self.assertRaisesMessage(ValueError, "non-numeric"):
+                    handler._validate_redactions({"0": [rect]})
+
+    def test_coerces_numeric_strings(self):
+        # Rejected before the download rather than mid-render, so the
+        # values reaching _apply_redactions are already numbers.
+        out = handler._validate_redactions({"0": [["1", "2", "3", "4"]]})
+        self.assertEqual(out, {0: [[1, 2, 3, 4]]})
 
 
 class TestTokenBudget(SimpleTestCase):
@@ -286,3 +303,101 @@ class TestHandlerDispatch(SimpleTestCase):
         self.assertIn("worker_boot_ms", out)
         self.assertIn("worker_uptime_ms", out)
         self.assertIn("gpu_available", out)
+
+
+class TestDownloadPdf(SimpleTestCase):
+    """The resumable download's status handling.
+
+    Only the branches this worker owns; the retry/backoff loop itself
+    is shared with ``scanning/runpod/handler.py``.
+    """
+
+    def _response(self, status, body=b"", headers=None):
+        """Build a stand-in for a streaming ``requests`` response.
+
+        :param status: HTTP status code.
+        :param body: Bytes the response streams.
+        :param headers: Response headers.
+        :returns: A context-manager mock.
+        """
+        resp = mock.MagicMock()
+        resp.status_code = status
+        resp.headers = headers or {}
+        resp.iter_content.return_value = [body] if body else []
+        resp.raise_for_status.side_effect = (
+            None
+            if status < 400
+            else requests.exceptions.HTTPError(f"{status}", response=resp)
+        )
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        return resp
+
+    def _download(self, responses, dest):
+        """Run ``_download_pdf`` against a scripted response sequence.
+
+        :param responses: Responses returned in order by requests.get.
+        :param dest: Path to download to.
+        :returns: The patched ``requests.get`` mock.
+        """
+        with (
+            mock.patch.object(
+                handler.requests, "get", side_effect=responses
+            ) as mock_get,
+            mock.patch.object(handler.time, "sleep"),
+        ):
+            handler._download_pdf("https://x/y.pdf", dest)
+        return mock_get
+
+    def test_a_rangeless_416_is_an_error_not_a_finished_download(self):
+        # 416 only means "already complete" as an answer to a Range we
+        # sent. On the first attempt none was sent, so treating it as
+        # success returns with no file on disk and the real cause shows
+        # up later as a confusing fitz error.
+        dest = Path(tempfile.mkdtemp()) / "input.pdf"
+        with self.assertRaises(Exception) as ctx:
+            self._download([self._response(416)] * 5, dest)
+
+        self.assertNotIsInstance(ctx.exception, AssertionError)
+        self.assertFalse(dest.exists())
+
+    def _dropped(self, written, total):
+        """A response that streams some bytes and then loses the connection.
+
+        :param written: Bytes delivered before the drop.
+        :param total: Value for the Content-Length header.
+        :returns: A response mock.
+        """
+
+        def chunks():
+            yield written
+            raise requests.exceptions.ConnectionError("reset")
+
+        resp = self._response(200, headers={"Content-Length": str(total)})
+        resp.iter_content.return_value = chunks()
+        return resp
+
+    def test_a_ranged_416_means_the_file_is_already_there(self):
+        dest = Path(tempfile.mkdtemp()) / "input.pdf"
+
+        # The first attempt writes some bytes and then drops, so the
+        # retry resumes with a Range header. A 416 answering *that* is
+        # the genuine "already complete" case.
+        self._download(
+            [self._dropped(b"partial data", 999), self._response(416)], dest
+        )
+
+        self.assertEqual(dest.read_bytes(), b"partial data")
+
+    def test_an_ignored_range_restarts_from_byte_zero(self):
+        dest = Path(tempfile.mkdtemp()) / "input.pdf"
+        dropped = self._dropped(b"stale partial", 99)
+        # The resume gets a 200 rather than a 206: the server ignored
+        # the Range and is resending the whole body.
+        resend = self._response(
+            200, body=b"whole file", headers={"Content-Length": "10"}
+        )
+        self._download([dropped, resend], dest)
+
+        # The stale bytes are gone, not appended to.
+        self.assertEqual(dest.read_bytes(), b"whole file")

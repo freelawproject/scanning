@@ -481,17 +481,23 @@ def _download_pdf(url: str, dest: Path) -> None:
                         "presigned URL rejected (403) -- expired or "
                         "invalid; re-submit with a fresh URL"
                     )
-                if r.status_code == 416:
+                # Only meaningful as an answer to a Range we actually
+                # sent. A 416 to the rangeless first GET is the server
+                # refusing the request, not telling us we already have
+                # the file, and returning here would leave no file for
+                # the caller to open.
+                if offset and r.status_code == 416:
                     logger.info("range past EOF; download already complete")
                     return
                 r.raise_for_status()
                 if offset and r.status_code == 200:
                     # Server ignored Range and is resending everything.
+                    # Resetting the offset is enough to start over: the
+                    # open below is then in "wb", which truncates.
                     logger.warning(
                         "server ignored Range; restarting from byte 0"
                     )
                     offset = 0
-                    dest.write_bytes(b"")
                 total = _expected_total(r) or total
                 mode = "ab" if offset else "wb"
                 with open(dest, mode) as fh:
@@ -750,12 +756,25 @@ def _validate_redactions(raw: Any) -> dict[int, list]:
             ) from exc
         if not isinstance(rects, list):
             raise ValueError(f"redactions[{k}] must be a list of bboxes")
+        coerced = []
         for r in rects:
             if not isinstance(r, (list, tuple)) or len(r) != 4:
                 raise ValueError(
                     f"redactions[{k}] holds a malformed bbox: {r!r}"
                 )
-        out[page_index] = [list(r) for r in rects]
+            # Coerced here rather than in _apply_redactions, for the
+            # same reason _validate_crops coerces its own bboxes: a
+            # non-numeric value found mid-render has already cost a
+            # download, and int(None) raises TypeError, which the
+            # handler's BAD_INPUT branch does not catch. Both failures
+            # go away if the value is rejected before either happens.
+            try:
+                coerced.append([int(v) for v in r])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"redactions[{k}] holds a non-numeric bbox: {r!r}"
+                ) from exc
+        out[page_index] = coerced
     return out
 
 
