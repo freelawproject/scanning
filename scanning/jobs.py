@@ -38,7 +38,11 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from scanning.models import ExternalJob, JobStatus
+from scanning.models import (
+    IN_FLIGHT_JOB_STATUSES,
+    ExternalJob,
+    JobStatus,
+)
 from scanning.providers import get_provider
 
 logger = logging.getLogger(__name__)
@@ -214,7 +218,8 @@ def submit_pending(limit=None, now=None) -> SubmitSummary:
     endpoint in the time one used to, and the endpoint's own worker cap
     decides how many run at once.
 
-    :param limit: Most jobs to submit this tick, or None for all.
+    :param limit: Most jobs to submit this tick, or None for all. Zero
+        means none, not all.
     :param now: Submission time; defaults to ``timezone.now()``.
     :returns: Counts for the tick.
     :rtype: SubmitSummary
@@ -222,10 +227,16 @@ def submit_pending(limit=None, now=None) -> SubmitSummary:
     now = now or timezone.now()
     summary = SubmitSummary()
 
-    pending = ExternalJob.objects.filter(
-        status=JobStatus.PENDING
-    ).select_related("scan")
-    if limit:
+    # Oldest first, and ordered at all: slicing an unordered queryset
+    # lets Postgres pick a different arbitrary subset each tick, so
+    # under a standing limit one job could be passed over indefinitely
+    # while newer ones went out ahead of it.
+    pending = (
+        ExternalJob.objects.filter(status=JobStatus.PENDING)
+        .select_related("scan")
+        .order_by("id")
+    )
+    if limit is not None:
         pending = pending[:limit]
 
     for job in pending:
@@ -415,6 +426,44 @@ def collect_once(now=None) -> CollectSummary:
 
     _abandon_unsubmittable(summary, now)
     return summary
+
+
+def abandon_open(scan, reason: str) -> int:
+    """Stop and close every job a scan still has outstanding.
+
+    For the paths that end a scan's pipeline from outside it: a user
+    cancelling, an operator re-queueing. Without this the rows stay
+    open, so the collect sweep keeps polling work whose output nobody
+    will read, and the provider keeps billing for it.
+
+    Cancellation with the provider is best effort; closing the row is
+    not. A row left open would make the scan look busy forever.
+
+    :param scan: The Scan whose work is being abandoned.
+    :param reason: Recorded on each row as its error message.
+    :returns: How many rows were closed.
+    :rtype: int
+    """
+    closed = 0
+    for job in scan.jobs.open().select_related("scan"):
+        if job.status in IN_FLIGHT_JOB_STATUSES and job.external_id:
+            try:
+                get_provider(job.provider).cancel(job)
+            except Exception:
+                logger.exception("cancelling job %s failed", job.pk)
+        closed += ExternalJob.objects.filter(
+            pk=job.pk, status=job.status
+        ).update(
+            status=JobStatus.CANCELLED,
+            completed_at=timezone.now(),
+            error_code="ABANDONED",
+            error_message=reason,
+        )
+    if closed:
+        logger.info(
+            "closed %d open job(s) for scan %s: %s", closed, scan.pk, reason
+        )
+    return closed
 
 
 def _abandon_unsubmittable(summary: CollectSummary, now) -> None:

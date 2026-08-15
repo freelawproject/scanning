@@ -5,12 +5,20 @@ action twice must pick up where the jobs got to, not start over and not
 double-apply.
 """
 
+import re
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
+from django.urls import reverse
 
+import scanning
 from scanning import jobs, pipeline
-from scanning.factories import ExternalJobFactory, ScanFactory
+from scanning.factories import (
+    ExternalJobFactory,
+    ScanFactory,
+    UserFactory,
+)
 from scanning.models import (
     ExternalJob,
     JobEngine,
@@ -19,6 +27,7 @@ from scanning.models import (
     JobStatus,
     QueuedAction,
     Scan,
+    Stage,
     Status,
 )
 
@@ -368,3 +377,83 @@ class TestParkingIsGuarded(TestCase):
 
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.AWAITING)
+
+
+class TestStatusBadgesExist(SimpleTestCase):
+    """Every scan status needs a badge rule to render as a pill."""
+
+    def test_every_status_has_a_badge_class(self):
+        # scan_list, queue and queue_detail all render the status as
+        # ``badge-{{ scan.status }}``, so a Status value added without a
+        # matching rule renders as bare unstyled text.
+        css = (
+            Path(scanning.__file__).parent
+            / "assets"
+            / "tailwind"
+            / "input.css"
+        ).read_text()
+
+        # Anchored on a word boundary so a grouped selector
+        # (".badge-a,\n.badge-b {") counts, with the lookahead stopping
+        # .badge-error from satisfying .badge-error_max_retries.
+        missing = [
+            value
+            for value in Status.values
+            if not re.search(rf"\.badge-{value}\b(?![-_])", css)
+        ]
+        self.assertEqual(missing, [])
+
+
+class TestCancelProcessing(TestCase):
+    """Cancelling has to reach the state a batched scan waits in."""
+
+    def setUp(self):
+        self.user = UserFactory()
+        self.client.force_login(self.user)
+
+    def _cancel(self, scan):
+        """POST the cancel endpoint for ``scan``.
+
+        :param scan: The scan to cancel.
+        :returns: The stub provider used for job cancellation.
+        :rtype: MagicMock
+        """
+        provider = MagicMock()
+        with patch("scanning.jobs.get_provider", return_value=provider):
+            self.client.post(
+                reverse("cancel_processing", kwargs={"pk": scan.pk})
+            )
+        return provider
+
+    def test_a_scan_waiting_on_jobs_can_be_cancelled(self):
+        # The state a batched scan spends most of its life in. Testing
+        # PROCESSING alone made this button a silent no-op.
+        scan = ScanFactory(status=Status.AWAITING, stage=Stage.VALIDATE)
+
+        self._cancel(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.CANCELLED)
+
+    def test_cancelling_stops_paying_for_the_jobs(self):
+        scan = ScanFactory(status=Status.AWAITING, stage=Stage.VALIDATE)
+        job = ExternalJobFactory(
+            scan=scan, status=JobStatus.IN_PROGRESS, external_id="job-1"
+        )
+
+        provider = self._cancel(scan)
+
+        provider.cancel.assert_called_once()
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.CANCELLED)
+
+    def test_a_scan_nobody_is_working_is_left_alone(self):
+        scan = ScanFactory(status=Status.PENDING_REVIEW)
+        job = ExternalJobFactory(scan=scan, status=JobStatus.IN_PROGRESS)
+
+        self._cancel(scan)
+
+        scan.refresh_from_db()
+        job.refresh_from_db()
+        self.assertEqual(scan.status, Status.PENDING_REVIEW)
+        self.assertEqual(job.status, JobStatus.IN_PROGRESS)

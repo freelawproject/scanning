@@ -19,6 +19,7 @@ from django.template.loader import render_to_string
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
+from scanning import jobs
 from scanning.models import (
     BUSY_STATUSES,
     CheckName,
@@ -744,12 +745,22 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
 def cancel_processing(request: HttpRequest, pk: int) -> HttpResponse:
     """Cancel an in-progress scan processing task.
 
+    Covers AWAITING as well as PROCESSING. Under the batch cycle a scan
+    spends most of its life waiting on external jobs with no process
+    holding it, so testing PROCESSING alone would silently do nothing
+    for the state the button is most likely to be pressed in.
+
+    Cancelling also closes the scan's outstanding jobs. Leaving them
+    open would keep the collect sweep polling work nobody will read,
+    and keep the provider billing for it.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.status == Status.PROCESSING:
+    if scan.status in (Status.PROCESSING, Status.AWAITING):
+        jobs.abandon_open(scan, "Cancelled by user.")
         if scan.stage == Stage.PROCESS:
             Scan.objects.filter(pk=pk).update(
                 status=Status.PENDING_REVIEW,

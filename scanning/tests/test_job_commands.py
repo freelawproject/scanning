@@ -246,3 +246,71 @@ class TestBatchClaim(TestCase):
     def test_an_empty_queue_claims_nothing(self):
         ScanFactory(status=Status.PENDING_REVIEW)
         self.assertEqual(self._claim(batch=True), [])
+
+
+class TestClaimWindow(TestCase):
+    """A snapshotted scan is claimed at its turn, not up front."""
+
+    def _run(self, batch=True):
+        """Run one claim tick with the pipeline stubbed.
+
+        :param batch: Whether the batch cycle is enabled.
+        :returns: The mock standing in for ``advance_scan``.
+        :rtype: MagicMock
+        """
+        out = StringIO()
+        with (
+            patch("django.db.connections.close_all"),
+            patch("scanning.jobs.batch_enabled", return_value=batch),
+            patch("scanning.pipeline.advance_scan") as mock,
+        ):
+            call_command("process_next_scan", stdout=out)
+        return mock
+
+    @override_settings(DAEMON_BATCH_SIZE=0)
+    def test_the_tail_of_a_batch_stays_queued_until_its_turn(self):
+        # Marking the whole batch PROCESSING up front would leave the
+        # tail in it for as long as the head takes, which a second
+        # replica's stale sweep would read as a dead daemon.
+        scans = [ScanFactory(status=Status.QUEUED) for _ in range(3)]
+        seen = []
+
+        def record_statuses(scan_pk):
+            seen.append(dict(Scan.objects.values_list("pk", "status")))
+
+        out = StringIO()
+        with (
+            patch("django.db.connections.close_all"),
+            patch("scanning.jobs.batch_enabled", return_value=True),
+            patch(
+                "scanning.pipeline.advance_scan",
+                side_effect=record_statuses,
+            ),
+        ):
+            call_command("process_next_scan", stdout=out)
+
+        # While the first scan is being worked, the others are still
+        # queued rather than sitting in PROCESSING waiting their turn.
+        self.assertEqual(seen[0][scans[0].pk], Status.PROCESSING)
+        self.assertEqual(seen[0][scans[1].pk], Status.QUEUED)
+        self.assertEqual(seen[0][scans[2].pk], Status.QUEUED)
+
+    @override_settings(DAEMON_BATCH_SIZE=0)
+    def test_a_scan_taken_by_someone_else_is_skipped(self):
+        mine = ScanFactory(status=Status.QUEUED)
+        theirs = ScanFactory(status=Status.QUEUED)
+        # Another replica claimed it between the snapshot and its turn.
+        Scan.objects.filter(pk=theirs.pk).update(status=Status.PROCESSING)
+
+        mock = self._run()
+
+        self.assertEqual([c.args[0] for c in mock.call_args_list], [mine.pk])
+
+    @override_settings(DAEMON_BATCH_SIZE=0)
+    def test_a_scan_cancelled_before_its_turn_is_skipped(self):
+        scan = ScanFactory(status=Status.QUEUED)
+        Scan.objects.filter(pk=scan.pk).update(status=Status.CANCELLED)
+
+        mock = self._run()
+
+        mock.assert_not_called()

@@ -44,7 +44,8 @@ class Command(BaseCommand):
         :return: None.
         """
         for scan_pk in self._claim_with_retry():
-            self._dispatch(scan_pk)
+            if self._take(scan_pk):
+                self._dispatch(scan_pk)
 
     def _claim_with_retry(self):
         """Recover stale rows and claim this tick's scans, retrying
@@ -115,7 +116,7 @@ class Command(BaseCommand):
         )
 
     def _claim_batch(self):
-        """Atomically claim this tick's queued scans and mark them PROCESSING.
+        """Snapshot the scans this cycle will work, oldest first.
 
         A closed batch: the scans queued at the moment of the snapshot
         and no others. Anything queued while this cycle runs waits for
@@ -131,15 +132,24 @@ class Command(BaseCommand):
         batch's jobs go out together and the endpoint's worker cap
         decides how many run at once.
 
-        :return: Primary keys of the scans claimed, oldest first.
+        The snapshot only *chooses*; it does not claim. Marking the
+        whole batch PROCESSING here would leave the tail sitting in it
+        for as long as the head takes to work -- and each scan's turn
+        includes a bitonal conversion measured in minutes, so a wide
+        batch would push the tail past ``DAEMON_PROCESSING_TIMEOUT``
+        before it was ever dispatched. A second replica's stale sweep
+        would then re-queue those rows, charge them an interruption,
+        and run them alongside this one. :meth:`_take` claims each scan
+        at its turn instead, so the window stays one scan wide.
+
+        :return: Primary keys of the scans to work, oldest first.
         :rtype: list[int]
         """
         from django.conf import settings
         from django.db import transaction
-        from django.utils import timezone
 
         from scanning import jobs
-        from scanning.models import QueuedAction, Scan, Status
+        from scanning.models import Scan, Status
 
         if jobs.batch_enabled():
             size = int(settings.DAEMON_BATCH_SIZE) or None
@@ -151,22 +161,43 @@ class Command(BaseCommand):
                 Scan.objects.select_for_update(skip_locked=True)
                 .filter(status=Status.QUEUED)
                 .order_by("date_created")
+                .values_list("pk", flat=True)
             )
-            batch = list(queued[:size] if size else queued)
-            if not batch:
-                return []
+            return list(queued[:size] if size else queued)
 
-            for scan in batch:
-                action = scan.queued_action or QueuedAction.FULL_PIPELINE
-                Scan.objects.filter(pk=scan.pk).update(
-                    status=Status.PROCESSING,
-                    processed_at=timezone.now(),
-                    progress_message=f"Starting {action}...",
-                    progress_current=0,
-                    progress_total=0,
-                )
+    def _take(self, scan_pk):
+        """Claim one snapshotted scan, if it is still there to claim.
 
-        return [scan.pk for scan in batch]
+        Guarded on QUEUED, so a scan another replica took first, or one
+        a user cancelled between the snapshot and now, is skipped
+        rather than run twice.
+
+        :param scan_pk: Primary key of the scan to claim.
+        :return: Whether this process got it.
+        :rtype: bool
+        """
+        from django.utils import timezone
+
+        from scanning.models import QueuedAction, Scan, Status
+
+        action = (
+            Scan.objects.filter(pk=scan_pk)
+            .values_list("queued_action", flat=True)
+            .first()
+        ) or QueuedAction.FULL_PIPELINE
+
+        taken = Scan.objects.filter(pk=scan_pk, status=Status.QUEUED).update(
+            status=Status.PROCESSING,
+            processed_at=timezone.now(),
+            progress_message=f"Starting {action}...",
+            progress_current=0,
+            progress_total=0,
+        )
+        if not taken:
+            logger.info(
+                "scan %s left the queue before its turn; skipping", scan_pk
+            )
+        return bool(taken)
 
     def _dispatch(self, scan_pk):
         """Run the queued action for an already-claimed scan.

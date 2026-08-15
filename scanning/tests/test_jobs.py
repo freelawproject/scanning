@@ -855,3 +855,109 @@ class TestQueueVersusExecutionTime(CollectTestCase):
 
         job.refresh_from_db()
         self.assertEqual(job.status, JobStatus.PENDING)
+
+
+class TestSubmitOrdering(CollectTestCase):
+    """Which pending jobs a capped tick picks, and in what order."""
+
+    def submit(self, **kwargs):
+        """Run a submit sweep against a stubbed provider.
+
+        :param kwargs: Passed to ``submit_pending``.
+        :returns: The jobs handed over, in call order.
+        :rtype: list
+        """
+        sent = []
+        provider = MagicMock()
+
+        def record(job, payload):
+            sent.append(job.pk)
+            return SubmitReceipt(
+                external_id="x",
+                result_key=job.result_key,
+                submitted_at=timezone.now(),
+            )
+
+        provider.submit.side_effect = record
+        with (
+            patch("scanning.jobs.get_provider", return_value=provider),
+            patch(
+                "scanning.runpod_client.presign_input_get",
+                return_value="https://signed/get",
+            ),
+        ):
+            jobs.submit_pending(**kwargs)
+        return sent
+
+    def test_a_capped_tick_takes_the_oldest(self):
+        # Slicing an unordered queryset lets Postgres pick a different
+        # arbitrary subset each tick, which under a standing limit can
+        # pass over the same job indefinitely.
+        pks = [
+            ExternalJobFactory(status=JobStatus.PENDING, input_key="k").pk
+            for _ in range(4)
+        ]
+
+        self.assertEqual(self.submit(limit=2), pks[:2])
+
+    def test_limit_zero_submits_nothing(self):
+        ExternalJobFactory(status=JobStatus.PENDING, input_key="k")
+
+        self.assertEqual(self.submit(limit=0), [])
+
+    def test_no_limit_submits_everything(self):
+        for _ in range(3):
+            ExternalJobFactory(status=JobStatus.PENDING, input_key="k")
+
+        self.assertEqual(len(self.submit()), 3)
+
+
+class TestAbandonOpen(CollectTestCase):
+    """Ending a scan's pipeline from outside has to close its jobs."""
+
+    def test_open_jobs_are_cancelled_with_the_provider(self):
+        job = self.make_job(status=JobStatus.IN_PROGRESS)
+        provider = MagicMock()
+
+        with patch("scanning.jobs.get_provider", return_value=provider):
+            closed = jobs.abandon_open(job.scan, "Cancelled by user.")
+
+        provider.cancel.assert_called_once()
+        job.refresh_from_db()
+        self.assertEqual(closed, 1)
+        self.assertEqual(job.status, JobStatus.CANCELLED)
+        self.assertEqual(job.error_code, "ABANDONED")
+
+    def test_a_pending_job_closes_without_a_provider_call(self):
+        # Never submitted, so there is nothing to cancel.
+        job = ExternalJobFactory(status=JobStatus.PENDING, external_id="")
+        provider = MagicMock()
+
+        with patch("scanning.jobs.get_provider", return_value=provider):
+            jobs.abandon_open(job.scan, "gone")
+
+        provider.cancel.assert_not_called()
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.CANCELLED)
+
+    def test_terminal_jobs_are_left_alone(self):
+        job = self.make_job(status=JobStatus.CONSUMED)
+
+        with patch("scanning.jobs.get_provider", return_value=MagicMock()):
+            closed = jobs.abandon_open(job.scan, "gone")
+
+        job.refresh_from_db()
+        self.assertEqual(closed, 0)
+        self.assertEqual(job.status, JobStatus.CONSUMED)
+
+    def test_a_failing_cancel_still_closes_the_row(self):
+        # An open row would leave the scan looking busy forever.
+        job = self.make_job(status=JobStatus.IN_PROGRESS)
+        provider = MagicMock()
+        provider.cancel.side_effect = RuntimeError("network down")
+
+        with patch("scanning.jobs.get_provider", return_value=provider):
+            jobs.abandon_open(job.scan, "gone")
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.CANCELLED)
