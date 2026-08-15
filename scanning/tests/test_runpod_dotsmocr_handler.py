@@ -183,6 +183,56 @@ class TestParseInputValidation(SimpleTestCase):
         with self.assertRaisesMessage(ValueError, "non-http(s)"):
             self._call_parse({"pdf_url": "file:///etc/passwd"})
 
+    def test_string_pixel_bounds_are_range_checked(self):
+        # A JSON-encoded number has to fail the same way a real one
+        # does. Before these were coerced, the check passed on the
+        # string and the bad value only surfaced deep inside every
+        # page's fetch_image call.
+        for field, value in (
+            ("min_pixels", "100"),
+            ("max_pixels", "99999999999"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesMessage(ValueError, field):
+                    self._call_parse(
+                        {"pdf_url": "https://x/y.pdf", field: value}
+                    )
+
+    def test_string_pixel_bounds_reach_the_renderer_as_numbers(self):
+        # Passing the range check is not enough. Both values are handed
+        # to fetch_image, which does arithmetic on them, so a string
+        # that survives validation fails inside every page instead and
+        # surfaces as "all N pages failed".
+        stubs = _stub_dots_mocr_modules()
+        fetch_image = stubs["dots_mocr.utils.image_utils"].fetch_image
+        # ``_action_parse`` imports fitz itself, so it has to be stubbed
+        # in sys.modules rather than patched onto the handler.
+        stubs["fitz"] = mock.MagicMock()
+
+        with (
+            mock.patch.dict(sys.modules, stubs),
+            mock.patch.object(handler, "_download_pdf"),
+            mock.patch.object(handler, "_validate_pdf", return_value=1),
+        ):
+            # Every page fails once inference is reached, which is fine:
+            # fetch_image has already been called by then.
+            with self.assertRaises(RuntimeError):
+                handler._action_parse(
+                    {"id": "job-1"},
+                    {
+                        "pdf_url": "https://x/y.pdf",
+                        "min_pixels": "4096",
+                        "max_pixels": "1000000",
+                    },
+                    Path("/nonexistent"),
+                )
+
+        kwargs = fetch_image.call_args.kwargs
+        self.assertEqual(kwargs["min_pixels"], 4096)
+        self.assertEqual(kwargs["max_pixels"], 1000000)
+        self.assertIsInstance(kwargs["min_pixels"], int)
+        self.assertIsInstance(kwargs["max_pixels"], int)
+
 
 class TestStripDataUris(SimpleTestCase):
     """Base64 picture crops are stripped from markdown by default."""

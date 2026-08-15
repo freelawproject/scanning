@@ -785,12 +785,21 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     max_completion_tokens = int(
         inputs.get("max_completion_tokens", DEFAULT_MAX_COMPLETION_TOKENS)
     )
+    # Coerced, not just range-checked. These two are handed straight to
+    # ``fetch_image`` / ``post_process_output``, which do arithmetic on
+    # them; a JSON-encoded string would pass the check below and then
+    # fail inside every page, surfacing as "all N pages failed" rather
+    # than as the input error it is.
     min_pixels = inputs.get("min_pixels")
     max_pixels = inputs.get("max_pixels")
-    if min_pixels is not None and int(min_pixels) < MIN_PIXELS:
-        raise ValueError(f"min_pixels must be >= {MIN_PIXELS}")
-    if max_pixels is not None and int(max_pixels) > MAX_PIXELS:
-        raise ValueError(f"max_pixels must be <= {MAX_PIXELS}")
+    if min_pixels is not None:
+        min_pixels = int(min_pixels)
+        if min_pixels < MIN_PIXELS:
+            raise ValueError(f"min_pixels must be >= {MIN_PIXELS}")
+    if max_pixels is not None:
+        max_pixels = int(max_pixels)
+        if max_pixels > MAX_PIXELS:
+            raise ValueError(f"max_pixels must be <= {MAX_PIXELS}")
     max_pages = int(inputs.get("max_pages", MAX_PAGES))
     include_pictures = bool(inputs.get("include_pictures", False))
     prompt = dict_promptmode_to_prompt[prompt_mode]
