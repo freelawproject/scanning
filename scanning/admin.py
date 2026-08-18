@@ -8,6 +8,7 @@ from django.utils.text import capfirst
 
 from scanning.models import (
     Detection,
+    ExternalJob,
     Issue,
     OpinionScan,
     Page,
@@ -224,7 +225,23 @@ class ScanAdmin(admin.ModelAdmin):
         ]
 
         model_count: dict[str, int] = {}
-        for model in (Scan, Page, Detection, Issue, PageInsert, PageDeletion):
+        # Every cascade table needs listing here by hand, since replacing
+        # the default collector is what loses its automatic discovery. So
+        # this list has to be extended whenever a new model cascades from
+        # Scan, or the confirmation page understates the blast radius.
+        # ExternalJob in practice only contributes its volume-level rows:
+        # an opinion-level job requires an opinion, and an opinion blocks
+        # the delete outright via the PROTECT above.
+        for model in (
+            Scan,
+            Page,
+            Detection,
+            Issue,
+            PageInsert,
+            PageDeletion,
+            PendingUpload,
+            ExternalJob,
+        ):
             field = "pk" if model is Scan else "scan_id"
             count = model.objects.filter(**{f"{field}__in": scan_ids}).count()
             if count:
@@ -658,3 +675,56 @@ class PageAdmin(admin.ModelAdmin):
     def has_xml(self, obj):
         """Whether the page has extracted XML content."""
         return bool(obj.xml_content)
+
+
+@admin.register(ExternalJob)
+class ExternalJobAdmin(admin.ModelAdmin):
+    # Left editable: a job row carries operational state (status, retry
+    # budget, deadline) an operator may need to nudge. The provenance
+    # pair is the exception. ``input_key`` is not self-verifying, since
+    # re-pairing renames an opinion PDF, and ``input_hash`` is what
+    # makes the claim checkable, so editing either by hand leaves the
+    # hash describing different bytes than the job actually read.
+    list_display = [
+        "scan",
+        "opinion",
+        "stage",
+        "engine",
+        "provider",
+        "run",
+        "attempt",
+        "shard_label",
+        "status",
+        "retry_count",
+        "deadline",
+        "date_modified",
+    ]
+    list_filter = ["status", "stage", "engine", "provider"]
+    search_fields = [
+        "scan__id",
+        "opinion__id",
+        "external_id",
+        "result_key",
+        "error_message",
+    ]
+    raw_id_fields = ["scan", "opinion"]
+    readonly_fields = [
+        "input_hash",
+        "input_key",
+        "date_created",
+        "date_modified",
+    ]
+    date_hierarchy = "date_created"
+    ordering = ["-date_created"]
+    # An extract changelist is one row per opinion per engine, so these
+    # joins have to be eager or the page issues hundreds of queries
+    # rendering its own list_display. Joined through to the reporter
+    # because both ``Scan.__str__`` and ``OpinionScan.__str__``
+    # dereference it, so stopping at the FK itself would still cost a
+    # query per row per column.
+    list_select_related = ["scan__reporter", "opinion__reporter"]
+
+    @admin.display(description="Shard")
+    def shard_label(self, obj):
+        """Render the job's position in its target's fan-out."""
+        return f"{obj.shard_index + 1}/{obj.shard_count}"

@@ -12,6 +12,8 @@ Covers:
 - ``requeue_retry_cap_scans`` / ``requeue_interrupted_scans``: narrow
   status-scoped variants that warn (rather than silently succeed) when
   the selection contains no matching scan.
+- ``get_deleted_objects``: the hand-rolled blast-radius summary, which
+  has to name every cascade table explicitly.
 """
 
 from unittest.mock import patch
@@ -24,8 +26,8 @@ from django.contrib.sessions.middleware import SessionMiddleware
 from django.test import RequestFactory, TestCase
 
 from scanning.admin import ScanAdmin
-from scanning.factories import ScanFactory
-from scanning.models import Scan, Status
+from scanning.factories import ExternalJobFactory, ScanFactory, UserFactory
+from scanning.models import JobStage, PendingUpload, Scan, Status
 
 
 def _request_with_messages():
@@ -230,3 +232,53 @@ class ScanAdminDeleteShardSweepTests(TestCase):
         ):
             self.admin.delete_model(_request_with_messages(), scan)
         self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
+
+
+class ScanAdminDeleteSummaryTests(TestCase):
+    """``ScanAdmin.get_deleted_objects``.
+
+    The default collector is replaced so a processed scan's cascade does
+    not exhaust memory, and the cost of that is losing Django's
+    automatic discovery: a cascade table missing from the hand-written
+    list is deleted without the operator being told.
+    """
+
+    def setUp(self):
+        self.admin = ScanAdmin(Scan, AdminSite())
+
+    def test_summary_counts_external_jobs(self):
+        scan = ScanFactory()
+        ExternalJobFactory(scan=scan, stage=JobStage.DETECT)
+        ExternalJobFactory(scan=scan, stage=JobStage.ANALYZE)
+
+        _, model_count, _, _ = self.admin.get_deleted_objects(
+            [scan], _request_with_messages()
+        )
+
+        self.assertEqual(model_count.get("external jobs"), 2)
+
+    def test_summary_counts_pending_uploads(self):
+        """A pre-existing cascade that the summary used to leave out."""
+        scan = ScanFactory()
+        PendingUpload.objects.create(
+            scan=scan,
+            s3_key=f"processing/{scan.pk}/x/1/1.original.pdf",
+            expected_size=1024,
+            created_by=UserFactory(),
+        )
+
+        _, model_count, _, _ = self.admin.get_deleted_objects(
+            [scan], _request_with_messages()
+        )
+
+        self.assertEqual(model_count.get("pending uploads"), 1)
+
+    def test_summary_omits_tables_with_nothing_to_delete(self):
+        scan = ScanFactory()
+
+        _, model_count, _, _ = self.admin.get_deleted_objects(
+            [scan], _request_with_messages()
+        )
+
+        self.assertNotIn("external jobs", model_count)
+        self.assertNotIn("pending uploads", model_count)
