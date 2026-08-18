@@ -16,6 +16,9 @@ Covers:
   has to name every cascade table explicitly.
 """
 
+from unittest.mock import patch
+
+from botocore.exceptions import ClientError
 from django.contrib import messages
 from django.contrib.admin.sites import AdminSite
 from django.contrib.messages.storage.fallback import FallbackStorage
@@ -185,6 +188,50 @@ class ScanAdminRequeueActionTests(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.ERROR)
         self.assertEqual(msgs[0].level, messages.WARNING)
+
+
+class ScanAdminDeleteShardSweepTests(TestCase):
+    """Scan deletion sweeps the S3 shard set (PR #169 review).
+
+    The shard PDFs duplicate the original's bytes, so they are the
+    largest objects a deleted scan would otherwise orphan under its
+    processing prefix.
+    """
+
+    def setUp(self):
+        self.admin = ScanAdmin(Scan, AdminSite())
+
+    def test_delete_model_sweeps_shard_objects(self):
+        scan = ScanFactory()
+        with patch("scanning.s3_sync.delete_shard_objects") as mock_delete:
+            self.admin.delete_model(_request_with_messages(), scan)
+        mock_delete.assert_called_once()
+        self.assertEqual(mock_delete.call_args.args[0].pk, scan.pk)
+        self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
+
+    def test_delete_queryset_sweeps_each_scan(self):
+        scans = [ScanFactory(), ScanFactory()]
+        queryset = Scan.objects.filter(pk__in=[s.pk for s in scans])
+        with patch("scanning.s3_sync.delete_shard_objects") as mock_delete:
+            self.admin.delete_queryset(_request_with_messages(), queryset)
+        self.assertEqual(mock_delete.call_count, 2)
+        self.assertEqual(
+            sorted(c.args[0].pk for c in mock_delete.call_args_list),
+            sorted(s.pk for s in scans),
+        )
+        self.assertFalse(queryset.exists())
+
+    def test_delete_survives_an_s3_failure(self):
+        # Best effort: an S3 hiccup must not block the admin delete.
+        scan = ScanFactory()
+        with patch(
+            "scanning.s3_sync.delete_shard_objects",
+            side_effect=ClientError(
+                {"Error": {"Code": "SlowDown"}}, "DeleteObjects"
+            ),
+        ):
+            self.admin.delete_model(_request_with_messages(), scan)
+        self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
 
 
 class ScanAdminDeleteSummaryTests(TestCase):

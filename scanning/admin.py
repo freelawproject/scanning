@@ -1,3 +1,5 @@
+import logging
+
 from django.contrib import admin, messages
 from django.contrib.admin.utils import quote
 from django.urls import NoReverseMatch, reverse
@@ -22,6 +24,31 @@ from scanning.services import (
     refresh_volume_queue_status,
     refresh_volume_queue_status_for_scan,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _delete_scan_shard_objects(scan):
+    """Best-effort sweep of a scan's shard set from S3 before deletion.
+
+    The shard PDFs duplicate the original's bytes, so they are the
+    largest objects a deleted scan would otherwise orphan under its
+    processing prefix. Best effort: an S3 hiccup must not block the
+    admin delete, an orphaned prefix is the pre-existing status quo.
+
+    :param scan: The scan about to be deleted.
+    """
+    from scanning import s3_sync
+
+    try:
+        s3_sync.delete_shard_objects(scan)
+    except Exception:
+        logger.warning(
+            "Could not delete S3 shard objects for scan %s; they are "
+            "orphaned now that the scan row is gone",
+            scan.pk,
+            exc_info=True,
+        )
 
 
 class RetryCapFilter(admin.SimpleListFilter):
@@ -276,18 +303,24 @@ class ScanAdmin(admin.ModelAdmin):
         """Delete a Scan and refresh its parent Volume's queue_status.
 
         Without this, the volume can drift (e.g. stay at COMPLETE after
-        its only approved scan is deleted from the admin).
+        its only approved scan is deleted from the admin). The scan's S3
+        shard set is swept too (best effort, before the row goes away):
+        it duplicates the original's bytes and nothing else removes it.
 
         :param request: The admin HTTP request.
         :param obj: The Scan to delete.
         """
         volume = obj.volume_obj
+        _delete_scan_shard_objects(obj)
         super().delete_model(request, obj)
         if volume is not None:
             refresh_volume_queue_status(volume)
 
     def delete_queryset(self, request, queryset):
         """Bulk-delete Scans and refresh affected Volumes.
+
+        Sweeps each scan's S3 shard set first, same as
+        :meth:`delete_model`.
 
         :param request: The admin HTTP request.
         :param queryset: Scans selected for deletion.
@@ -297,6 +330,8 @@ class ScanAdmin(admin.ModelAdmin):
             .values_list("volume_obj_id", flat=True)
             .distinct()
         )
+        for scan in queryset:
+            _delete_scan_shard_objects(scan)
         super().delete_queryset(request, queryset)
         for volume in Volume.objects.filter(pk__in=volume_ids):
             refresh_volume_queue_status(volume)

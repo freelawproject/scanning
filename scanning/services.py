@@ -383,6 +383,40 @@ def _handle_pipeline_exception(
         )
 
 
+def _ensure_shards(scan: "Scan") -> None:
+    """Compute (or reuse) the scan's shard set, with stage logging.
+
+    Failures propagate to the caller's ``_handle_pipeline_exception``
+    like any other pipeline stage. ``ensure_shards`` leaves no manifest
+    behind on failure, so a re-queued scan retries the sharding.
+
+    S3 and transport errors are re-raised as ``RunpodTransientError``:
+    this stage is the pipeline's only bulk multi-GB upload, and a
+    connection reset or a 503 partway through is exactly as retriable as
+    a RunPod worker dying, so it gets the same retry-and-re-queue
+    treatment instead of an immediate ERROR that needs a manual
+    re-queue. Sharding's own failures (``ShardingError``) stay terminal.
+
+    :param scan: The scan to shard.
+    :return: None.
+    :raises RunpodTransientError: On an S3/transport failure, so the
+        caller re-queues the scan instead of marking it ERROR.
+    """
+    from boto3.exceptions import Boto3Error
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    from scanning import sharding
+    from scanning.runpod_client import RunpodTransientError
+
+    with _log_stage("Sharding"):
+        try:
+            sharding.ensure_shards(scan)
+        except (BotoCoreError, Boto3Error, ClientError) as exc:
+            raise RunpodTransientError(
+                f"S3 error while sharding scan {scan.pk}: {exc}"
+            ) from exc
+
+
 def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
     """Convert to bitonal if needed, returning the bitonal PDF path.
 
@@ -507,7 +541,7 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
 def _reuse_detect_result(scan: "Scan", output_dir: str) -> bool:
     """Rehydrate detections.json from a finished detect job, if there is one.
 
-    The resume path for step 3. A daemon killed mid-pipeline re-queues
+    The resume path for step 4. A daemon killed mid-pipeline re-queues
     the scan and ``run_full_pipeline`` restarts at step 1, so a detect
     that already completed would otherwise be re-submitted: another
     ~200 s of GPU time to recompute detections that are already on S3,
@@ -1609,8 +1643,10 @@ def run_full_pipeline(scan_pk: int) -> None:
     valid for the current input, so a re-queued scan skips what finished
     rather than restarting at step 1. That matters because the daemon takes
     a SIGTERM on every deploy and re-queues whatever was mid-flight, and
-    steps 3 and 5 are GPU jobs measured in minutes. See
+    steps 4 and 6 are GPU jobs measured in minutes. See
     :func:`_reuse_detect_result` and ``runpod_client.reusable_result``.
+    Sharding (step 2) follows the same contract through its manifest's
+    source fingerprint (``sharding.ensure_shards``).
 
     There is no "re-run anyway" argument here on purpose. The daemon
     dispatches this by name with only a pk, so a caller wanting fresh
@@ -1648,25 +1684,31 @@ def run_full_pipeline(scan_pk: int) -> None:
         # 1. Ensure output directory exists
         output_dir = ensure_output_dir(scan)
 
-        # 2. Bitonal conversion
+        # 2. Shard the original for external job execution (#164).
+        # Runs first so dots.mocr/bitonal jobs can fan out over the
+        # shards as soon as possible after upload.
+        _update_progress(scan_pk, "Sharding original PDF...")
+        _ensure_shards(scan)
+
+        # 3. Bitonal conversion
         bitonal_path = _ensure_bitonal(scan, output_dir)
 
-        # 3. YOLO detection (all 3 models on bitonal)
+        # 4. YOLO detection (all 3 models on bitonal)
         if not _reuse_detect_result(scan, str(output_dir)):
             _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
 
-        # 4. Import detections into DB
+        # 5. Import detections into DB
         _update_progress(scan_pk, "Importing detections...")
         dets = _import_detections_from_json(scan_pk, str(output_dir))
 
-        # 5. PaddleOCR validation (on original PDF for better OCR)
+        # 6. PaddleOCR validation (on original PDF for better OCR)
         _update_progress(
             scan_pk,
             f"{len(dets)} detections imported. Running page number validation...",
         )
         run_paddleocr_validation(scan_pk, scan.pdf_path, reuse=True)
 
-        # 6. Pair opinions
+        # 7. Pair opinions
         _update_progress(scan_pk, "Pairing opinions...")
         opinions = _re_pair_opinions(scan_pk)
 

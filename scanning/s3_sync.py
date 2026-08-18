@@ -17,6 +17,7 @@ behavior as prod.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import time
 from pathlib import Path
@@ -82,6 +83,17 @@ APPROVED_FILE_SUFFIXES = (".original.pdf", ".redacted.pdf")
 # wire artifacts the daemon consumes once and writes to Postgres, not
 # files the viewer or the pipeline ever reads off disk.
 JOB_RESULTS_SUBDIR = "jobs/"
+
+# Subdirectory under a scan's processing prefix holding the shard set
+# cut from the original PDF (see ``scanning/sharding.py``). Also
+# excluded from the generic sync in both directions: the shards
+# duplicate the original's bytes, so syncing them alongside every
+# viewer pull or end-of-pipeline push would move gigabytes for
+# nothing. They are uploaded once by ``sharding.ensure_shards`` and
+# fetched individually (presigned GET) by the external workers that
+# consume them.
+SHARDS_SUBDIR = "shards/"
+SHARD_MANIFEST_NAME = "manifest.json"
 
 # The bitonal PDF the detect stage runs against. Named because its S3
 # ``LastModified`` is a reference timestamp, not just a filename: see
@@ -175,6 +187,19 @@ def _is_job_result(rel: str) -> bool:
     :rtype: bool
     """
     return rel.startswith(JOB_RESULTS_SUBDIR)
+
+
+def _is_synced_by_default(rel: str) -> bool:
+    """Return True if the generic processing sync should carry this key.
+
+    Job results and the shard set are both excluded -- see the comments
+    on ``JOB_RESULTS_SUBDIR`` and ``SHARDS_SUBDIR``.
+
+    :param rel: Object key relative to the scan's processing prefix.
+    :returns: Whether the generic up/down sync should include the key.
+    :rtype: bool
+    """
+    return not _is_job_result(rel) and not rel.startswith(SHARDS_SUBDIR)
 
 
 def tmp_output_dir(scan: Scan) -> Path:
@@ -356,7 +381,7 @@ def upload_processing_files(scan: Scan) -> int:
     count = 0
     for path in _iter_files_to_sync(local_root):
         rel = path.relative_to(local_root).as_posix()
-        if _is_job_result(rel):
+        if not _is_synced_by_default(rel):
             continue
         if _is_stage_input(rel) and _size_matches_s3(
             s3, bucket, f"{prefix}{rel}", path
@@ -401,7 +426,7 @@ def download_processing_files(scan: Scan) -> Path | None:
         for obj in page.get("Contents", []):
             key = obj["Key"]
             rel = key[len(prefix) :]
-            if not rel or _is_job_result(rel):
+            if not rel or not _is_synced_by_default(rel):
                 continue
             local_path = local_root / rel
             if local_path.is_file() and local_path.stat().st_size == obj.get(
@@ -569,6 +594,171 @@ def download_original_pdf(scan: Scan) -> Path | None:
     :rtype: Path | None
     """
     return _download_matching(scan, _is_original_pdf, "original PDF")
+
+
+def shards_prefix(scan: Scan) -> str:
+    """Return the S3 key prefix for a scan's shard set.
+
+    :param scan: The scan to build the prefix for.
+    :returns: Prefix of the form ``{processing_prefix}shards/``.
+    :rtype: str
+    """
+    return f"{s3_processing_prefix(scan)}{SHARDS_SUBDIR}"
+
+
+def fetch_shard_manifest(scan: Scan) -> dict | None:
+    """Fetch and parse a scan's shard manifest from S3.
+
+    The manifest is uploaded last by :func:`upload_shards`, so its
+    presence implies every shard object it lists is in place -- which is
+    why ``sharding.ensure_shards`` treats the S3 copy as the authority
+    when S3 sync is active.
+
+    :param scan: The scan to look up.
+    :returns: The parsed manifest, or None when S3 sync is disabled,
+        the object is missing, or it fails to parse.
+    :rtype: dict | None
+    :raises ClientError: On any S3 error other than a missing object.
+        Only "the manifest is not there" may map to None: a throttle or
+        permission error must not read as "no committed shard set", or
+        ``ensure_shards`` would delete and re-cut a healthy set.
+    """
+    if not _s3_enabled():
+        return None
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    key = f"{shards_prefix(scan)}{SHARD_MANIFEST_NAME}"
+    try:
+        obj = _s3_client().get_object(Bucket=bucket, Key=key)
+        manifest = json.loads(obj["Body"].read())
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in ("NoSuchKey", "NoSuchBucket", "404"):
+            return None
+        raise
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning(
+            "Unparseable shard manifest for scan %s at s3://%s/%s",
+            scan.pk,
+            bucket,
+            key,
+        )
+        return None
+    if not isinstance(manifest, dict):
+        # Parseable JSON that isn't a manifest ('[]', '"x"', ...) gets
+        # the same treatment as unparseable bytes: warn and let
+        # ensure_shards re-cut, instead of crashing on it downstream.
+        logger.warning(
+            "Malformed shard manifest for scan %s at s3://%s/%s: "
+            "expected an object, got %s",
+            scan.pk,
+            bucket,
+            key,
+            type(manifest).__name__,
+        )
+        return None
+    return manifest
+
+
+def upload_shards(scan: Scan, shard_dir: Path) -> int:
+    """Upload a scan's shard set to S3, manifest last.
+
+    The manifest is the commit marker: a reader that finds it can trust
+    every shard it lists is already in the bucket. Timing is logged
+    because shard upload cost is one of the numbers #164 asks us to
+    track.
+
+    :param scan: The scan the shards belong to.
+    :param shard_dir: Local directory holding ``NNNN.pdf`` shards and
+        ``manifest.json``.
+    :returns: Number of files uploaded (0 when S3 sync is disabled).
+    :rtype: int
+    """
+    if not _s3_enabled():
+        return 0
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    prefix = shards_prefix(scan)
+    s3 = _s3_client()
+
+    start = time.monotonic()
+    total_bytes = 0
+    count = 0
+    for path in sorted(Path(shard_dir).glob("*.pdf")):
+        s3.upload_file(
+            str(path),
+            bucket,
+            f"{prefix}{path.name}",
+            ExtraArgs={"ContentType": "application/pdf"},
+        )
+        total_bytes += path.stat().st_size
+        count += 1
+
+    manifest_path = Path(shard_dir) / SHARD_MANIFEST_NAME
+    if manifest_path.is_file():
+        s3.upload_file(
+            str(manifest_path),
+            bucket,
+            f"{prefix}{SHARD_MANIFEST_NAME}",
+            ExtraArgs={"ContentType": "application/json"},
+        )
+        count += 1
+
+    elapsed = time.monotonic() - start
+    size_mb = total_bytes / 1024 / 1024
+    logger.info(
+        "Uploaded %d shard file(s) (%.1f MB) for scan %s to s3://%s/%s "
+        "in %.1fs (%.0f MB/s)",
+        count,
+        size_mb,
+        scan.pk,
+        bucket,
+        prefix,
+        elapsed,
+        size_mb / elapsed if elapsed > 0 else 0.0,
+    )
+    return count
+
+
+def delete_shard_objects(scan: Scan) -> int:
+    """Delete every object under a scan's ``shards/`` prefix.
+
+    Called before a shard set is recomputed (the source PDF changed):
+    page ranges shift, so a leftover shard from a larger previous set
+    must not survive next to the new manifest. The manifest is included
+    in the sweep, so a reader can never observe a manifest without its
+    shards.
+
+    :param scan: The scan whose shard objects to delete.
+    :returns: Number of objects deleted (0 when S3 sync is disabled or
+        the prefix is empty).
+    :rtype: int
+    """
+    if not _s3_enabled():
+        return 0
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    prefix = shards_prefix(scan)
+    s3 = _s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+
+    deleted = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        keys = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+        if not keys:
+            continue
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+        deleted += len(keys)
+
+    if deleted:
+        logger.info(
+            "Deleted %d stale shard object(s) for scan %s under s3://%s/%s",
+            deleted,
+            scan.pk,
+            bucket,
+            prefix,
+        )
+    return deleted
 
 
 def upload_file_to_s3(scan: Scan, relative_path: str) -> bool:
