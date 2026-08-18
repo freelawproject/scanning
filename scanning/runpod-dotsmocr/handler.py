@@ -115,7 +115,11 @@ DEFAULT_DPI = int(os.environ.get("HANDLER_DPI", "200"))
 # server continuously batches, so this bounds client-side memory
 # (rendered pages), not GPU batch size.
 DEFAULT_NUM_THREADS = int(os.environ.get("HANDLER_NUM_THREADS", "16"))
-DEFAULT_TEMPERATURE = 0.1
+# 0.0 (greedy), matching the ai-research extraction_align runners the
+# experiments were validated with — NOT upstream DotsOCRParser's 0.1.
+# Greedy decoding keeps output deterministic per page (modulo vLLM
+# batch-composition numerics), which the alignment pipeline relies on.
+DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_MAX_COMPLETION_TOKENS = 16384
 # Per-page attempts when the vLLM call returns nothing (upstream's

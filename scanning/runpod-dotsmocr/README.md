@@ -143,7 +143,7 @@ is `parse`:
     "prompt_mode": "prompt_layout_all_en",
     "dpi": 200,
     "num_threads": 16,
-    "temperature": 0.1,
+    "temperature": 0.0,
     "top_p": 1.0,
     "max_completion_tokens": 16384,
     "include_pictures": false
