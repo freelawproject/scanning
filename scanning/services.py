@@ -491,7 +491,7 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
             detections = runpod_client.detect(
                 scan,
                 pdf_path,
-                models=["small", "medium", "large"],
+                models=settings.YOLO_DETECT_MODELS,
                 progress_callback=_remote_progress,
             )
         finally:
@@ -504,7 +504,9 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     _update_progress(scan_pk, f"YOLO: {len(detections)} detections")
 
 
-def _reuse_detect_result(scan: "Scan", output_dir: str) -> bool:
+def _reuse_detect_result(
+    scan: "Scan", output_dir: str, input_rel: str | None = None
+) -> bool:
     """Rehydrate detections.json from a finished detect job, if there is one.
 
     The resume path for step 3. A daemon killed mid-pipeline re-queues
@@ -520,13 +522,21 @@ def _reuse_detect_result(scan: "Scan", output_dir: str) -> bool:
 
     :param scan: The Scan being processed.
     :param output_dir: Directory where detections.json is written.
+    :param input_rel: Name of the PDF detection reads, relative to the
+        scan's processing prefix. The freshness check has to name the
+        file the stage actually consumed, which
+        ``YOLO_DETECT_ON_BITONAL`` chooses: the bitonal copy for the
+        legacy trio, the original upload for bl-warm. Both are inputs
+        ``s3_sync.upload_processing_files`` leaves alone while unchanged,
+        which is what makes the timestamp comparison mean anything.
+        Defaults to the bitonal copy.
     :returns: Whether detections.json now holds a reusable result.
     :rtype: bool
     """
     from scanning import runpod_client, s3_sync
 
     payload = runpod_client.reusable_result(
-        scan, "detect", s3_sync.PIPELINE_INPUT_NAME
+        scan, "detect", input_rel or s3_sync.PIPELINE_INPUT_NAME
     )
     if payload is None:
         return False
@@ -1651,9 +1661,17 @@ def run_full_pipeline(scan_pk: int) -> None:
         # 2. Bitonal conversion
         bitonal_path = _ensure_bitonal(scan, output_dir)
 
-        # 3. YOLO detection (all 3 models on bitonal)
-        if not _reuse_detect_result(scan, str(output_dir)):
-            _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
+        # 3. YOLO detection (configured models; bitonal input only
+        # when the configured models were trained for it)
+        yolo_input = (
+            str(bitonal_path)
+            if settings.YOLO_DETECT_ON_BITONAL
+            else scan.pdf_path
+        )
+        if not _reuse_detect_result(
+            scan, str(output_dir), Path(yolo_input).name
+        ):
+            _run_yolo(scan_pk, yolo_input, str(output_dir))
 
         # 4. Import detections into DB
         _update_progress(scan_pk, "Importing detections...")
@@ -2564,11 +2582,17 @@ def run_detect(scan_pk: int) -> None:
     try:
         output_dir = Path(scan.output_dir)
         bitonal = output_dir / "bitonal.pdf"
-        pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
+        # Ink geometry always measures the bitonal processing copy
+        # (the PDF the redactions are stamped onto);
+        # YOLO_DETECT_ON_BITONAL only selects the detection input.
+        geometry_pdf = str(bitonal) if bitonal.exists() else scan.pdf_path
+        detect_pdf = (
+            geometry_pdf if settings.YOLO_DETECT_ON_BITONAL else scan.pdf_path
+        )
 
-        _run_yolo(scan_pk, pdf_path, str(output_dir))
+        _run_yolo(scan_pk, detect_pdf, str(output_dir))
         dets = _import_detections_from_json(scan_pk, str(output_dir))
-        _snap_text_columns_to_ink(scan_pk, pdf_path)
+        _snap_text_columns_to_ink(scan_pk, geometry_pdf)
 
         _update_progress(
             scan_pk,

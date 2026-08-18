@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Classes · bl-warm comparison{% endblock %}
+{% block content %}
+
+{% if not have_data %}
+<div class="card center-note">
+  <p>No data found — unzip the shared data package so that data/
+    sits next to app.py, then reload.</p>
+</div>
+{% else %}
+
+<div class="card" style="margin-bottom: 8px; padding: 8px 10px;">
+  <div class="filters" style="margin-bottom: 4px;">
+    <strong>Classes:</strong>
+    <span class="muted small">golden ground truth vs model
+      detections on the held-out golden pages</span>
+    <span class="toolbar-spacer"></span>
+    <button class="btn-outline" type="button" id="boxes-btn"
+            title="Toggle box overlays (b)">boxes</button>
+    <button class="btn-outline" type="button" id="tags-btn"
+            title="Toggle class + confidence labels (l)">labels</button>
+    <button class="btn-outline" type="button" id="redaction-btn"
+            title="Show/hide redaction classes (solid boxes)">redaction</button>
+    <button class="btn-outline" type="button" id="container-btn"
+            title="Show/hide layout containers (dashed boxes)">containers</button>
+    <label class="small">min conf
+      <input type="range" id="conf-slider" min="0.2" max="0.95"
+             step="0.05" value="0.2" style="width: 140px;
+             vertical-align: middle;">
+      <span id="conf-val">0.20</span>
+    </label>
+  </div>
+  <div class="chips" id="class-chips">
+    {% for t in taxonomy %}
+    <button class="chip{% if t.container %} chip-container{% endif %}"
+            type="button" data-cls="{{ t.name }}" aria-pressed="true"
+            style="--chip-color: {{ t.color }}"
+            {% if t.container %}title="layout container (dashed box)"
+            {% endif %}>
+      <span class="dot"></span>{{ t.name }}
+    </button>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="workbench workbench-e2e">
+  <aside class="card rail-card">
+    <div class="rail-filters">
+      <div class="rail-selects">
+        <select id="f-reporter" class="inline"
+                aria-label="Filter by split">
+          <option value="">All pages</option>
+          <option value="val">val</option>
+          <option value="test">test</option>
+        </select>
+        <select id="f-flag" class="inline"
+                aria-label="Filter by flagged">
+          <option value="">All pages</option>
+          <option value="flagged">flagged only</option>
+          <option value="noted">with notes</option>
+        </select>
+      </div>
+      <div class="muted small" id="rail-count"></div>
+    </div>
+    <ul class="rail panel-scroll" id="rail" role="listbox"
+        aria-label="Golden pages"></ul>
+  </aside>
+
+  <section class="card stage-card e2e-card">
+    <div class="ann-toolbar e2e-toolbar" style="box-shadow: none; margin: 0;">
+      <strong id="stage-title" class="stage-title">—</strong>
+      <span class="muted small" id="stage-meta"></span>
+      <label class="small toolbar-check">
+        <input type="checkbox" id="page-flag"> flag
+      </label>
+      <input type="text" id="page-note" placeholder="finding on this page…"
+             aria-label="Note for this page">
+      <span class="muted small" id="note-state" role="status"
+            aria-live="polite"></span>
+      <span class="toolbar-spacer"></span>
+      <button class="btn-outline" type="button" id="zoom-out"
+              aria-label="Zoom out">−</button>
+      <button class="btn-outline" type="button" id="zoom-fit">Fit</button>
+      <button class="btn-outline" type="button" id="zoom-in"
+              aria-label="Zoom in">+</button>
+      <span class="muted small" id="zoom-level"></span>
+    </div>
+    <div class="e2e-panes" id="e2e-panes">
+      {% for pane in ("a", "b", "c") %}
+      <div class="e2e-pane">
+        <select id="pane-{{ pane }}-src" class="inline"
+                aria-label="Pane source">
+          {% for s in sources %}
+          <option value="{{ s }}">{{ source_titles[s] }}</option>
+          {% endfor %}
+        </select>
+        <div class="stage panel-scroll ann-stage e2e-stage"
+             data-pane="{{ pane }}">
+          <div class="stage-inner">
+            <img id="img-{{ pane }}" alt="">
+            <svg id="svg-{{ pane }}"></svg>
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+
+<script id="data" type="application/json">{{ {
+  "sample": sample,
+  "notes": notes,
+  "sources": sources,
+  "taxonomy": taxonomy,
+} | tojson }}</script>
+<script src="/static/js/classes.js?v={{ asset_v }}"></script>
+{% endif %}
+{% endblock %}

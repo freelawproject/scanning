@@ -779,6 +779,54 @@ class TestPresignedUpload(ScanningTestCase):
         mock_delete.assert_called_once_with(pending.s3_key)
 
 
+class TestServeDetections(ScanningTestCase):
+    """serve_detections feeds the process viewer's detection overlay."""
+
+    def _detections(self, scan):
+        self.client.force_login(self.make_user())
+        response = self.client.get(
+            reverse("serve_detections", kwargs={"pk": scan.pk})
+        )
+        self.assertEqual(response.status_code, 200)
+        return json.loads(response.content)
+
+    def _detection(self, scan, **kwargs):
+        defaults = {
+            "scan": scan,
+            "page_index": 0,
+            "label": "HEADNOTE",
+            "label_id": 11,
+            "confidence": 1.0,
+            "x0": 10,
+            "y0": 10,
+            "x1": 50,
+            "y1": 20,
+            "img_width": 100,
+            "img_height": 100,
+        }
+        return Detection.objects.create(**{**defaults, **kwargs})
+
+    def test_a_hand_added_detection_is_flagged_manual(self):
+        """The viewer draws these dashed and shows them whatever their label,
+        so the flag has to survive a page load."""
+        scan = ScanFactory()
+        self._detection(scan, model_name=Detection.ModelName.MANUAL)
+        self.assertEqual([d["manual"] for d in self._detections(scan)], [True])
+
+    def test_a_model_detection_is_not_flagged_manual(self):
+        scan = ScanFactory()
+        self._detection(scan, model_name="bl_warm")
+        self.assertEqual(
+            [d["manual"] for d in self._detections(scan)], [False]
+        )
+
+    def test_inactive_detections_are_left_out(self):
+        scan = ScanFactory()
+        self._detection(scan, model_name="bl_warm")
+        self._detection(scan, model_name="bl_warm", active=False)
+        self.assertEqual(len(self._detections(scan)), 1)
+
+
 class TestServeOriginalCrop(ScanningTestCase):
     """serve_original_crop lazily pulls the original PDF from S3."""
 

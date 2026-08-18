@@ -42,6 +42,15 @@ package = false
 torch = { index = "pytorch-gpu" }
 torchvision = { index = "pytorch-gpu" }
 paddlepaddle-gpu = { index = "paddle-gpu" }
+# TEMPORARY: bl-warm (freelawproject/blackletter#73) is unmerged and
+# unreleased, so the PyPI blackletter has neither the bl_warm adapter
+# nor a bl_warm entry in its Hugging Face weight table. Detection with
+# YOLO_DETECT_MODELS=["bl_warm"] fails on a PyPI-pinned worker with
+# "Weight .../bl_warm.pt is missing and has no Hugging Face source."
+# Pinned to a rev, not the branch: the PR head lives on a fork and can
+# be force-pushed. Drop this source and go back to the PyPI pin once
+# #73 merges and ships a release.
+blackletter = { git = "https://github.com/rachlllg/blackletter.git", rev = "b87b794c2da56e89d833bf5fa6dcbc327253e877" }
 
 [[tool.uv.index]]
 name = "pytorch-gpu"

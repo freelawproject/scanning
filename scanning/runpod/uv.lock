@@ -317,17 +317,14 @@ wheels = [
 
 [[package]]
 name = "blackletter"
-version = "0.1.1"
-source = { registry = "https://pypi.org/simple" }
+version = "0.2.0"
+source = { git = "https://github.com/rachlllg/blackletter.git?rev=b87b794c2da56e89d833bf5fa6dcbc327253e877#b87b794c2da56e89d833bf5fa6dcbc327253e877" }
 dependencies = [
+    { name = "numpy" },
     { name = "ocrmypdf" },
     { name = "opencv-python" },
     { name = "pillow" },
     { name = "pymupdf" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/aa/f5/0ffcffef51356c9bc6bf43ab933b3aab7badaf769a8a96a007fadf4a2cfa/blackletter-0.1.1.tar.gz", hash = "sha256:a7357cc1fdfd1622659ff6fecf0c4afd87b912bbf74f40529ce726e1ef03236b", size = 114927, upload-time = "2026-07-15T19:21:22.769Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/98/2a/1792865ca059a20bffac9cb51f21cf6fc8ce309c610b6963bbd044a7dbd8/blackletter-0.1.1-py3-none-any.whl", hash = "sha256:8fe7857ceb5af4f7fc74e2e33583b692c288c3e9b35a5129ffac1b10486e335c", size = 102622, upload-time = "2026-07-15T19:21:21.393Z" },
 ]
 
 [[package]]
@@ -356,7 +353,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "blackletter", specifier = ">=0.1.1" },
+    { name = "blackletter", git = "https://github.com/rachlllg/blackletter.git?rev=b87b794c2da56e89d833bf5fa6dcbc327253e877" },
     { name = "huggingface-hub", specifier = ">=0.20.0" },
     { name = "ocrmypdf", specifier = ">=17" },
     { name = "opencv-python", specifier = "==4.10.0.84" },
