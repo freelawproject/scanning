@@ -8,11 +8,15 @@ lightweight stubs into ``sys.modules`` before importing the module from
 its file path, and patches ``shutil.which`` so ``_preload()`` sees no
 GPU and returns before trying to spawn a vLLM server.
 
-The resumable-download code is byte-for-byte the one in
-``scanning/runpod/handler.py`` and keeps its coverage in
-``test_runpod_handler.py``; these tests cover what is new here: the
-dispatch/error-code surface, the vLLM fitness gating, the input
-validation of the ``parse`` action, and the markdown picture
+The handler imports the shared transfer code as a top-level
+``runpod_common`` module (the Dockerfile copies it next to handler.py),
+so the loader aliases the real ``scanning.runpod_common`` under that
+name; its download/validation behaviour is covered in
+``test_runpod_common.py``. These tests cover what is specific to this
+worker: the dispatch/error-code surface, the vLLM fitness gating, the
+input validation of the ``parse`` action, the per-page inference
+behaviour (empty-response retry, ``finish_reason='length'`` as a page
+failure, the 72-dpi render-fallback flag), and the markdown picture
 stripping.
 """
 
@@ -21,9 +25,12 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from django.test import SimpleTestCase
+
+from scanning import runpod_common
 
 _HANDLER_PATH = (
     Path(__file__).resolve().parent.parent / "runpod-dotsmocr" / "handler.py"
@@ -36,7 +43,12 @@ def _load_handler():
     # The fitness-check decorator must return the function it wraps so
     # the tests can call the real ``_require_vllm``.
     stub_runpod.serverless.register_fitness_check.side_effect = lambda f: f
-    stubs = {"runpod": stub_runpod}
+    stubs = {
+        "runpod": stub_runpod,
+        # The real shared module, under the top-level name the worker
+        # image gives it.
+        "runpod_common": runpod_common,
+    }
     # ``shutil.which("nvidia-smi")`` -> None makes ``_preload()`` take
     # the no-GPU path regardless of the machine running the tests.
     with (
@@ -94,6 +106,37 @@ def _stub_dots_mocr_modules():
     }
 
 
+def _renderer_stubs(origin_size=(1700, 2200)):
+    """Stubs configured so ``_parse_page`` runs on real numbers.
+
+    ``_parse_page`` compares the rendered size against what the page
+    rect should produce at the requested dpi (the 72-dpi fallback
+    check), so the fitz page and the rendered image need concrete
+    dimensions: US Letter (612x792 pt), which at the default dpi=200
+    renders to 1700x2200 — the default ``origin_size``. Pass a
+    different ``origin_size`` to simulate upstream's silent 72-dpi
+    re-render. ``_action_parse`` imports fitz itself, so it is stubbed
+    in sys.modules rather than patched onto the handler.
+    """
+    stubs = _stub_dots_mocr_modules()
+    page = mock.MagicMock()
+    page.rect.width = 612.0
+    page.rect.height = 792.0
+    fitz = mock.MagicMock()
+    fitz.open.return_value.__getitem__.return_value = page
+    stubs["fitz"] = fitz
+    stubs[
+        "dots_mocr.utils.doc_utils"
+    ].fitz_doc_to_image.return_value = SimpleNamespace(
+        width=origin_size[0], height=origin_size[1]
+    )
+    stubs["dots_mocr.utils.image_utils"].smart_resize.return_value = (
+        2212,
+        1708,
+    )
+    return stubs
+
+
 class TestDispatch(SimpleTestCase):
     """The handler's error-code surface, before any real work."""
 
@@ -113,6 +156,9 @@ class TestDispatch(SimpleTestCase):
             {"input": {"action": "parse", "pdf_url": "https://x/y.pdf"}}
         )
         self.assertEqual(out["error_code"], "NO_GPU")
+        # A CPU-only worker never grows a GPU: the SDK must terminate
+        # it after the response instead of keeping it warm.
+        self.assertIs(out["refresh_worker"], True)
 
     def test_gpu_but_vllm_down_returns_vllm_unhealthy(self):
         with mock.patch.object(handler, "_GPU_AVAILABLE", True):
@@ -120,6 +166,45 @@ class TestDispatch(SimpleTestCase):
                 {"input": {"action": "parse", "pdf_url": "https://x/y.pdf"}}
             )
         self.assertEqual(out["error_code"], "VLLM_UNHEALTHY")
+        # A crashed vLLM never restarts; without this flag the warm
+        # worker bounces every re-queued job in a livelock.
+        self.assertIs(out["refresh_worker"], True)
+
+    def test_missing_pdf_url_returns_bad_input(self):
+        # Through the full dispatch: _action_parse raises ValueError,
+        # handler() converts it to a structured BAD_INPUT so the daemon
+        # can classify it as terminal (a bare KeyError traceback would
+        # carry no error_code).
+        with (
+            mock.patch.object(handler, "_GPU_AVAILABLE", True),
+            mock.patch.object(handler, "_VLLM_READY", True),
+            mock.patch.object(handler, "_vllm_healthy", return_value=True),
+            mock.patch.dict(sys.modules, _stub_dots_mocr_modules()),
+        ):
+            out = handler.handler({"input": {"action": "parse"}})
+        self.assertEqual(out["error_code"], "BAD_INPUT")
+        self.assertIn("pdf_url", out["error"])
+
+    def test_validation_errors_become_bad_input(self):
+        # Any ValueError out of the action (bad prompt_mode here) must
+        # come back structured, not as a raised traceback.
+        with (
+            mock.patch.object(handler, "_GPU_AVAILABLE", True),
+            mock.patch.object(handler, "_VLLM_READY", True),
+            mock.patch.object(handler, "_vllm_healthy", return_value=True),
+            mock.patch.dict(sys.modules, _stub_dots_mocr_modules()),
+        ):
+            out = handler.handler(
+                {
+                    "input": {
+                        "action": "parse",
+                        "pdf_url": "https://x/y.pdf",
+                        "prompt_mode": "prompt_image_to_svg",
+                    }
+                }
+            )
+        self.assertEqual(out["error_code"], "BAD_INPUT")
+        self.assertIn("prompt_mode", out["error"])
 
     def test_unknown_action(self):
         with (
@@ -198,21 +283,36 @@ class TestParseInputValidation(SimpleTestCase):
                         {"pdf_url": "https://x/y.pdf", field: value}
                     )
 
+    def test_over_max_pages_raises(self):
+        # The env-level hard guard. There is deliberately no per-job
+        # max_pages knob (see the tunables comment in handler.py), so
+        # the only limit is MAX_PAGES — and crossing it is a ValueError
+        # that handler() turns into a structured BAD_INPUT.
+        with (
+            mock.patch.dict(sys.modules, _stub_dots_mocr_modules()),
+            mock.patch.object(handler, "download_pdf"),
+            mock.patch.object(handler, "validate_pdf", return_value=5),
+            mock.patch.object(handler, "MAX_PAGES", 3),
+        ):
+            with self.assertRaisesMessage(ValueError, "exceeds MAX_PAGES=3"):
+                handler._action_parse(
+                    {"id": "job-1"},
+                    {"pdf_url": "https://x/y.pdf"},
+                    Path("/nonexistent"),
+                )
+
     def test_string_pixel_bounds_reach_the_renderer_as_numbers(self):
         # Passing the range check is not enough. Both values are handed
         # to fetch_image, which does arithmetic on them, so a string
         # that survives validation fails inside every page instead and
         # surfaces as "all N pages failed".
-        stubs = _stub_dots_mocr_modules()
+        stubs = _renderer_stubs()
         fetch_image = stubs["dots_mocr.utils.image_utils"].fetch_image
-        # ``_action_parse`` imports fitz itself, so it has to be stubbed
-        # in sys.modules rather than patched onto the handler.
-        stubs["fitz"] = mock.MagicMock()
 
         with (
             mock.patch.dict(sys.modules, stubs),
-            mock.patch.object(handler, "_download_pdf"),
-            mock.patch.object(handler, "_validate_pdf", return_value=1),
+            mock.patch.object(handler, "download_pdf"),
+            mock.patch.object(handler, "validate_pdf", return_value=1),
         ):
             # Every page fails once inference is reached, which is fine:
             # fetch_image has already been called by then.
@@ -232,6 +332,86 @@ class TestParseInputValidation(SimpleTestCase):
         self.assertEqual(kwargs["max_pixels"], 1000000)
         self.assertIsInstance(kwargs["min_pixels"], int)
         self.assertIsInstance(kwargs["max_pixels"], int)
+
+
+class TestParsePageInference(SimpleTestCase):
+    """Per-page inference behaviour: retries, truncation, render flag.
+
+    Uses ``prompt_ocr`` (no layout post-processing) and a single
+    worker thread so a ``side_effect`` list maps to pages in order.
+    """
+
+    def _run(self, vllm_side_effect, pages=1, origin_size=(1700, 2200)):
+        with (
+            mock.patch.dict(sys.modules, _renderer_stubs(origin_size)),
+            mock.patch.object(handler, "download_pdf"),
+            mock.patch.object(handler, "validate_pdf", return_value=pages),
+            mock.patch.object(
+                handler, "_vllm_inference", side_effect=vllm_side_effect
+            ) as infer,
+        ):
+            result = handler._action_parse(
+                {"id": "job-1"},
+                {
+                    "pdf_url": "https://x/y.pdf",
+                    "prompt_mode": "prompt_ocr",
+                    "num_threads": 1,
+                },
+                Path("/nonexistent"),
+            )
+        return result, infer
+
+    def test_page_carries_dims_and_token_count(self):
+        result, _ = self._run([("some text", "stop", 42)])
+        page = result["pages"][0]
+        self.assertEqual(page["md"], "some text")
+        self.assertEqual(page["completion_tokens"], 42)
+        self.assertEqual(page["origin_width"], 1700)
+        self.assertEqual(page["origin_height"], 2200)
+        self.assertEqual(page["input_width"], 1708)
+        self.assertEqual(page["input_height"], 2212)
+        self.assertNotIn("render_fallback", page)
+        self.assertEqual(result["failed_pages"], [])
+
+    def test_empty_response_retries_then_succeeds(self):
+        # "" used to slip through the ``is not None`` check and come
+        # back as a successful page with md="".
+        result, infer = self._run([("", "stop", 0), ("text!", "stop", 7)])
+        self.assertEqual(infer.call_count, 2)
+        page = result["pages"][0]
+        self.assertEqual(page["md"], "text!")
+        self.assertEqual(result["failed_pages"], [])
+
+    def test_persistently_empty_response_fails_the_page(self):
+        empties = [("", "stop", 0)] * handler.INFERENCE_ATTEMPTS
+        result, _ = self._run(empties + [("ok", "stop", 1)], pages=2)
+        self.assertEqual(result["failed_pages"], [0])
+        self.assertIn("empty response", result["pages"][0]["error"])
+        self.assertEqual(result["pages"][1]["md"], "ok")
+
+    def test_truncated_output_is_a_page_failure(self):
+        # finish_reason='length' means the cap cut the generation — in
+        # practice a repetition loop. It must land in failed_pages, not
+        # silently degrade into a "successful" page.
+        result, infer = self._run(
+            [("x" * 50, "length", 16384), ("ok", "stop", 3)], pages=2
+        )
+        self.assertEqual(result["failed_pages"], [0])
+        self.assertIn("truncated at 16384 tokens", result["pages"][0]["error"])
+        self.assertEqual(result["pages"][1]["md"], "ok")
+        # No retry on truncation: same input, same loop.
+        self.assertEqual(infer.call_count, 2)
+
+    def test_silent_72dpi_rerender_is_flagged(self):
+        # Upstream re-renders any page over 4500 px at 72 dpi with no
+        # signal; the page must carry the actual render dims and the
+        # fallback flag so downstream can rescale its bboxes.
+        result, _ = self._run([("ok", "stop", 1)], origin_size=(612, 792))
+        page = result["pages"][0]
+        self.assertIs(page["render_fallback"], True)
+        self.assertEqual(page["origin_width"], 612)
+        self.assertEqual(page["origin_height"], 792)
+        self.assertEqual(result["failed_pages"], [])
 
 
 class TestStripDataUris(SimpleTestCase):

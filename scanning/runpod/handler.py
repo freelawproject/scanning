@@ -7,8 +7,19 @@ Dispatches on ``job["input"]["action"]`` to run one of:
 - ``analyze``: PaddleOCR + YOLO page-number analysis. Returns the
   per-page results list.
 
-Returns JSON inline in the RunPod HTTP response. Does not write to
-S3, does not need AWS credentials.
+Result delivery has two modes, picked per job by the daemon:
+
+- **S3** (``result_url`` present in the input): the payload is written
+  to S3 with a single PUT against a presigned URL, and the response
+  carries only the key, size, digest and timings. This is the path
+  that lifts the ~20 MB inline response cap and outlives RunPod's
+  result-retention window.
+- **Inline** (``result_url`` absent): the payload comes back in the
+  job response exactly as it always has. Keeps dev / CI and older
+  daemons working.
+
+Either way the worker needs no AWS credentials: a presigned PUT is a
+capability handed in with the job, scoped to one key and one method.
 
 Models are preloaded at module import time so cold start pays the
 load cost once; subsequent warm invocations reuse in-process caches.
@@ -16,7 +27,9 @@ load cost once; subsequent warm invocations reuse in-process caches.
 
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import logging
 import os
 import random
@@ -30,7 +43,11 @@ from typing import Any
 
 import requests
 import runpod
-from urllib3.exceptions import IncompleteRead, ProtocolError
+from runpod_common import (
+    TRANSIENT_TRANSFER_ERRORS,
+    download_pdf,
+    validate_pdf,
+)
 
 # Capture worker boot start as early as possible so ``_WORKER_BOOT_MS``
 # covers the full cold-start cost (module imports + model preload).
@@ -67,35 +84,33 @@ if sentry_sdk is not None and _SENTRY_DSN:
 
 # ── Tunables ────────────────────────────────────────────────────────
 MAX_PAGES = int(os.environ.get("HANDLER_MAX_PAGES", "5000"))
-# Read timeout: max seconds to wait for the next chunk of body. A single
-# value would also bound connect; we split connect/read so a stalled
-# socket mid-download raises a ReadTimeout promptly and triggers a
-# resume instead of hanging for the whole budget.
-DOWNLOAD_TIMEOUT = int(os.environ.get("HANDLER_DOWNLOAD_TIMEOUT", "300"))
-DOWNLOAD_CONNECT_TIMEOUT = int(
-    os.environ.get("HANDLER_DOWNLOAD_CONNECT_TIMEOUT", "10")
+# Download tunables (HANDLER_DOWNLOAD_*) live in runpod_common.
+
+# Result-upload budget. The GPU work is already paid for by the time we
+# PUT, so a network blip must not cost a re-run: retry generously.
+RESULT_UPLOAD_MAX_ATTEMPTS = int(
+    os.environ.get("HANDLER_RESULT_UPLOAD_MAX_ATTEMPTS", "5")
 )
-# How many times to (re)issue the GET before giving up. Each retry
-# resumes from the last byte written via a Range request.
-DOWNLOAD_MAX_ATTEMPTS = int(
-    os.environ.get("HANDLER_DOWNLOAD_MAX_ATTEMPTS", "5")
+RESULT_UPLOAD_TIMEOUT = int(
+    os.environ.get("HANDLER_RESULT_UPLOAD_TIMEOUT", "300")
 )
-# Upper bound (seconds) on the exponential backoff between retries.
-DOWNLOAD_BACKOFF_CAP = int(
-    os.environ.get("HANDLER_DOWNLOAD_BACKOFF_CAP", "30")
+RESULT_UPLOAD_CONNECT_TIMEOUT = int(
+    os.environ.get("HANDLER_RESULT_UPLOAD_CONNECT_TIMEOUT", "10")
+)
+RESULT_UPLOAD_BACKOFF_CAP = int(
+    os.environ.get("HANDLER_RESULT_UPLOAD_BACKOFF_CAP", "30")
 )
 
-# Stream errors that mean "the connection died mid-transfer" — safe to
-# reconnect and resume from the last byte written. Anything else (a 4xx
-# other than the handled 403/416, a 5xx, a malformed URL) is not in here
-# and propagates so the daemon can re-queue or fail the scan.
-_TRANSIENT_DOWNLOAD_ERRORS = (
-    requests.exceptions.ChunkedEncodingError,
-    requests.exceptions.ConnectionError,
-    requests.exceptions.Timeout,
-    ProtocolError,
-    IncompleteRead,
-)
+# Version of the JSON envelope written to S3. Bump when the envelope's
+# shape changes incompatibly; the daemon refuses versions it doesn't
+# know rather than consuming a payload it may misread.
+RESULT_SCHEMA_VERSION = 1
+
+# Content type sent on the result PUT. The daemon signs this exact
+# value into the presigned URL (``_presign_result_put``), so the two
+# must stay in lockstep: S3 answers SignatureDoesNotMatch if the header
+# it verifies differs from the one that was signed.
+RESULT_CONTENT_TYPE = "application/json"
 
 
 # ── Cold-start preload ──────────────────────────────────────────────
@@ -264,249 +279,218 @@ def _tag_sentry(job: dict, action: str, scan_pk: Any) -> None:
     sentry_sdk.set_tag("gpu_available", str(_CUDA_AVAILABLE))
     sentry_sdk.set_tag("worker_boot_ms", str(_WORKER_BOOT_MS))
     sentry_sdk.set_tag("worker_uptime_ms", str(_worker_uptime_ms()))
+    # Set unconditionally: tags live on the global scope, which a warm
+    # worker reuses across jobs. Skipping the set when the value is
+    # absent would leave the *previous* job's scan_pk/job id on every
+    # event this job captures, misattributing its failures.
+    scan_tag = "unknown"
     if scan_pk is not None:
         try:
-            sentry_sdk.set_tag("scan_pk", str(int(scan_pk)))
+            scan_tag = str(int(scan_pk))
         except (TypeError, ValueError):
             logger.warning("ignoring non-integer scan_pk: %r", scan_pk)
-    job_id = job.get("id")
-    if job_id:
-        sentry_sdk.set_tag("runpod_job_id", str(job_id))
+    sentry_sdk.set_tag("scan_pk", scan_tag)
+    sentry_sdk.set_tag("runpod_job_id", str(job.get("id") or "unknown"))
 
 
-def _expected_total(resp: requests.Response) -> int | None:
-    """Best-effort total file size, in bytes, from a download response.
+# ── Result delivery ─────────────────────────────────────────────────
+class ResultUploadError(RuntimeError):
+    """The result object could not be written to S3.
 
-    On a ``206 Partial Content`` the ``Content-Length`` header is only
-    the size of *this* chunk, so the full size has to come from the
-    ``Content-Range`` total (the value after the slash in
-    ``bytes 0-1023/2048`` -> ``2048``). On a plain ``200 OK`` the
-    ``Content-Length`` is the full size.
-
-    :param resp: A streamed download response.
-    :returns: Total size in bytes, or ``None`` if no header is present
-        or parseable (in which case the caller skips the completeness
-        check rather than failing a download that may be fine).
-    :rtype: int | None
+    Surfaces to the daemon as ``error_code=RESULT_UPLOAD_FAILED``,
+    which it classifies as transient: the job is resubmitted with a
+    fresh presigned URL. The GPU run is lost, which is why
+    :func:`_put_result` retries hard before raising this.
     """
-    content_range = resp.headers.get("Content-Range")
-    if content_range and "/" in content_range:
-        total = content_range.rsplit("/", 1)[1].strip()
-        if total.isdigit():
-            return int(total)
-    content_length = resp.headers.get("Content-Length")
-    if content_length and content_length.strip().isdigit():
-        return int(content_length)
-    return None
+
+    error_code = "RESULT_UPLOAD_FAILED"
 
 
-def _download_pdf(url: str, dest: Path) -> None:
-    """Download a PDF from a presigned GET URL to ``dest``, resuming
-    across dropped connections.
+class ResultUploadRejectedError(ResultUploadError):
+    """S3 refused the write for a reason a re-run can't fix.
 
-    Large scans (multi-GB, 1000+ pages) take long enough that a single
-    streamed GET routinely dies mid-transfer: the socket stalls, S3
-    resets the connection, or urllib3 raises ``IncompleteRead``. Rather
-    than restart the whole transfer (or fail the job) on every blip,
-    this retries with an HTTP ``Range`` request and appends to the
-    partial file from the last byte written, with exponential backoff
-    between attempts.
+    Anything that isn't a 403 or a retryable 5xx/429: a wrong region in
+    the signature, a bucket policy that demands a header we don't send,
+    a malformed request. Surfaces as ``RESULT_UPLOAD_REJECTED``, which
+    the daemon treats as **terminal**. That distinction is worth its
+    keep -- these are configuration errors, and classifying them
+    transient means the scan re-runs the GPU work (and pays for it)
+    once per retry before failing with the same message anyway.
+    """
 
-    Range-response handling:
+    error_code = "RESULT_UPLOAD_REJECTED"
 
-    - **206 Partial Content** — server honoured ``Range``; append.
-    - **200 OK** (on a resume) — server ignored ``Range`` and is
-      resending the whole body; truncate and restart from byte 0.
-      Appending here would write a second copy of the head and corrupt
-      the PDF, so this guard is load-bearing.
-    - **416 Range Not Satisfiable** — our offset is at/past EOF, i.e.
-      we already hold the whole file; treat as complete.
-    - **403 Forbidden** — the presigned URL has expired or is invalid.
-      Not retryable here (the URL is dead): raise so RunPod marks the
-      job FAILED and the daemon re-queues the scan with a fresh URL.
 
-    Only accepts ``http://`` or ``https://`` URLs. Rejects everything
-    else (``file://``, ``gopher://``, bare paths, etc.) defensively:
-    today the trust boundary is "only the daemon holds the RunPod API
-    key, so only the daemon can submit jobs," but a scheme check
-    costs nothing and eliminates the obvious SSRF / local-file-read
-    class of bugs if that boundary ever weakens.
+class ResultUrlExpiredError(ResultUploadError):
+    """The presigned PUT URL is no longer valid (HTTP 403).
 
-    :param url: PDF URL (typically a presigned S3 GET URL).
-    :param dest: Local filesystem target.
-    :raises ValueError: If ``url`` is not http(s).
-    :raises requests.HTTPError: On a non-2xx response other than the
-        handled 403/416 cases.
-    :raises RuntimeError: If the presigned URL is expired (403), or if
-        the file on disk is still short of the expected size after
-        ``DOWNLOAD_MAX_ATTEMPTS`` attempts.
+    Distinct from a generic upload failure because retrying the *same*
+    URL can never succeed: the signature is dead. Mirrors how
+    ``download_pdf`` treats a 403 on the input URL. Still
+    transient daemon-side, since resubmitting mints a new signature.
+    """
+
+    error_code = "RESULT_URL_EXPIRED"
+
+
+def _put_result(url: str, body: bytes) -> None:
+    """Upload ``body`` to a presigned PUT URL, retrying transient errors.
+
+    One PUT, one object: no multipart. A single PUT is atomic in S3, so
+    the object only becomes gettable once every byte has landed. That is
+    what lets the daemon treat "the object exists" as "the result is
+    complete" when it recovers a job whose ``/status`` record is gone.
+
+    Only accepts ``http(s)`` URLs, for the same defensive reason
+    ``download_pdf`` does.
+
+    :param url: Presigned S3 PUT URL covering exactly one key.
+    :param body: Encoded JSON envelope.
+    :raises ResultUrlExpiredError: On HTTP 403 (dead signature).
+    :raises ResultUploadError: On any other non-2xx, or once the
+        retries are exhausted.
     """
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        raise ValueError(
-            f"refusing to download PDF from non-http(s) URL: {url!r}"
+        raise ResultUploadError(
+            f"refusing to upload result to non-http(s) URL: {url!r}"
         )
 
-    timeout = (DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_TIMEOUT)
-    offset = 0
-    total: int | None = None
+    timeout = (RESULT_UPLOAD_CONNECT_TIMEOUT, RESULT_UPLOAD_TIMEOUT)
+    last_error = ""
 
-    for attempt in range(DOWNLOAD_MAX_ATTEMPTS):
-        headers = {"Range": f"bytes={offset}-"} if offset else {}
+    for attempt in range(RESULT_UPLOAD_MAX_ATTEMPTS):
         try:
-            with requests.get(
-                url, headers=headers, stream=True, timeout=timeout
-            ) as r:
-                # Expired/invalid presigned URL. Retrying the same URL is
-                # pointless; raise so the daemon re-signs and re-queues.
-                if r.status_code == 403:
-                    raise RuntimeError(
-                        "presigned URL expired or invalid (HTTP 403); "
-                        "daemon will re-queue with a fresh URL"
-                    )
-                # We asked to resume past EOF -> already have it all.
-                if offset and r.status_code == 416:
-                    logger.info(
-                        "resume at byte %d returned 416; file already "
-                        "complete",
-                        offset,
-                    )
-                    break
-                # Server ignored Range and is resending from the start.
-                # Discard the partial file and restart, or we'd append a
-                # second copy of the head and corrupt the PDF.
-                if offset and r.status_code == 200:
-                    logger.warning(
-                        "server ignored Range (HTTP 200); restarting "
-                        "download from byte 0"
-                    )
-                    offset = 0
-                    total = None
-                r.raise_for_status()
+            r = requests.put(
+                url,
+                data=body,
+                headers={"Content-Type": RESULT_CONTENT_TYPE},
+                timeout=timeout,
+            )
+            # Expired or otherwise invalid signature. Retrying the same
+            # URL is pointless; fail fast so the daemon re-signs.
+            #
+            # A bucket policy that rejects the PUT (a required
+            # encryption header, say) also answers 403, and no amount
+            # of re-signing fixes that -- it just burns the daemon's
+            # transient retries, one paid GPU run each. S3's reason is
+            # in the body, so log it rather than assuming expiry.
+            if r.status_code == 403:
+                raise ResultUrlExpiredError(
+                    "presigned PUT rejected with HTTP 403 (expired "
+                    "signature, or the bucket refused the write): "
+                    f"{r.text[:300]}"
+                )
+            if r.status_code < 300:
+                return
+            # 5xx / 429 are S3 hiccups worth another attempt; anything
+            # else is a configuration error that fails identically on
+            # every retry, so stop and say so terminally.
+            if r.status_code != 429 and r.status_code < 500:
+                raise ResultUploadRejectedError(
+                    f"result upload rejected with HTTP {r.status_code}: "
+                    f"{r.text[:300]}"
+                )
+            last_error = f"HTTP {r.status_code}"
+        except TRANSIENT_TRANSFER_ERRORS as exc:
+            last_error = str(exc)
 
-                if total is None:
-                    total = _expected_total(r)
-
-                mode = "ab" if offset else "wb"
-                with dest.open(mode) as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                            offset += len(chunk)
-            # Stream drained without raising: this attempt finished.
+        if attempt == RESULT_UPLOAD_MAX_ATTEMPTS - 1:
             break
-        except _TRANSIENT_DOWNLOAD_ERRORS as exc:
-            # Re-derive the offset from disk: a partial write may have
-            # landed bytes the in-memory counter didn't account for.
-            offset = dest.stat().st_size if dest.exists() else 0
-            if attempt == DOWNLOAD_MAX_ATTEMPTS - 1:
-                logger.error(
-                    "download failed after %d attempts at byte %d: %s",
-                    DOWNLOAD_MAX_ATTEMPTS,
-                    offset,
-                    exc,
-                )
-                raise
-            backoff = min(2**attempt, DOWNLOAD_BACKOFF_CAP)
-            backoff += random.uniform(0, backoff / 2)  # jitter
-            logger.warning(
-                "download interrupted at byte %d (attempt %d/%d): %s; "
-                "resuming in %.1fs",
-                offset,
-                attempt + 1,
-                DOWNLOAD_MAX_ATTEMPTS,
-                exc,
-                backoff,
-            )
-            time.sleep(backoff)
+        backoff = min(2**attempt, RESULT_UPLOAD_BACKOFF_CAP)
+        backoff += random.uniform(0, backoff / 2)  # jitter
+        logger.warning(
+            "result upload attempt %d/%d failed (%s); retrying in %.1fs",
+            attempt + 1,
+            RESULT_UPLOAD_MAX_ATTEMPTS,
+            last_error,
+            backoff,
+        )
+        time.sleep(backoff)
 
-    # Hand analyze_pdf/detect a complete file or nothing: a truncated PDF
-    # silently produces wrong page counts and detections. Raising re-queues.
-    if total is not None:
-        actual = dest.stat().st_size if dest.exists() else 0
-        if actual != total:
-            raise RuntimeError(
-                f"incomplete download: {actual}/{total} bytes after "
-                f"{DOWNLOAD_MAX_ATTEMPTS} attempts"
-            )
+    raise ResultUploadError(
+        f"result upload failed after {RESULT_UPLOAD_MAX_ATTEMPTS} "
+        f"attempts: {last_error}"
+    )
 
 
-# Trailer window scanned for the %%EOF marker. A conforming PDF ends with
-# %%EOF (optionally followed by whitespace); incrementally-updated files
-# carry several, and only the last one matters. 2 KB comfortably covers
-# trailing newlines and a final cross-reference stream.
-_PDF_EOF_WINDOW = 2048
+def _result_envelope(
+    result: dict, action: str, scan_pk: Any, job_id: Any
+) -> dict:
+    """Wrap an action's result in the self-describing S3 envelope.
 
+    The envelope exists so a consumer can tell *what* it just read
+    without trusting the key it read it from: schema version, which
+    action produced it, and which scan and job it belongs to. The
+    daemon checks all of that before using the payload.
 
-def _validate_pdf(pdf_path: Path) -> int:
-    """Validate that ``pdf_path`` is a complete, openable PDF and return
-    its page count.
-
-    Defense-in-depth against a truncated download slipping through: the
-    resumable ``_download_pdf`` already checks the byte count against the
-    server's advertised size, but that only fires when the server sends a
-    size. The real hazard is a partial PDF that PyMuPDF can still *open*
-    by rebuilding a broken xref, reporting far fewer pages than the real
-    document — which would then silently produce wrong detections / page
-    analysis. Checking the header and the ``%%EOF`` trailer turns that
-    silent corruption into a hard failure.
-
-    A raised error propagates out of the action and (via ``handler()``)
-    marks the RunPod job FAILED with no ``error_code``; the daemon treats
-    a bare FAILED as transient and re-queues the scan with a freshly
-    signed URL. So a truncated download is re-fetched automatically; a
-    genuinely corrupt source PDF loops until the daemon's retry ceiling
-    and then surfaces as an error.
-
-    Checks run cheapest-first so a bad file fails before the fitz open.
-
-    :param pdf_path: Path to the downloaded PDF on disk.
-    :returns: Page count.
-    :rtype: int
-    :raises ValueError: If the file is empty, lacks a ``%PDF-`` header or
-        an ``%%EOF`` trailer, or cannot be opened as a PDF with at least
-        one page.
+    :param result: The action's return dict.
+    :param action: Handler action that produced it.
+    :param scan_pk: Scan the job belongs to.
+    :param job_id: RunPod job id, i.e. which run generated this object.
+    :returns: The envelope to serialise.
+    :rtype: dict
     """
-    import fitz
+    return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "action": action,
+        "scan_pk": scan_pk,
+        "job_id": job_id,
+        "payload": result,
+    }
 
-    size = pdf_path.stat().st_size if pdf_path.exists() else 0
-    if size == 0:
-        raise ValueError(f"downloaded PDF is empty: {pdf_path}")
 
-    with pdf_path.open("rb") as f:
-        header = f.read(1024)
-        f.seek(max(0, size - _PDF_EOF_WINDOW))
-        trailer = f.read()
+def _deliver_result(
+    result: dict, inputs: dict, action: str, job: dict
+) -> dict:
+    """PUT the result to S3 and return the slim job response.
 
-    if b"%PDF-" not in header:
-        raise ValueError(
-            f"downloaded file is not a PDF (no %PDF- header): {pdf_path}"
-        )
-    if b"%%EOF" not in trailer:
-        raise ValueError(
-            "downloaded PDF is truncated (no %%EOF trailer in last "
-            f"{_PDF_EOF_WINDOW} bytes): {pdf_path}"
-        )
+    Nothing is written to the worker's disk: the envelope is
+    serialised in memory and streamed straight to S3.
 
-    try:
-        with fitz.open(str(pdf_path)) as doc:
-            page_count = doc.page_count
-            # A rebuilt xref usually means damage; the %%EOF check above
-            # catches the common (truncation) cause, so this is just a
-            # breadcrumb rather than a hard failure.
-            if getattr(doc, "is_repaired", False):
-                logger.warning(
-                    "PyMuPDF repaired %s on open; proceeding", pdf_path
-                )
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError(
-            f"downloaded file could not be opened as a PDF: {exc}"
-        ) from exc
+    The response deliberately carries no copy of the payload. An
+    inline fallback would reinstate the size cap this exists to escape
+    and leave two sources of truth for one result. What's left is what
+    the daemon needs to find the object and log how the run went.
 
-    if page_count < 1:
-        raise ValueError(f"downloaded PDF has no pages: {pdf_path}")
-    return page_count
+    :param result: The action's return dict.
+    :param inputs: Handler input payload (``result_url`` /
+        ``result_key``).
+    :param action: Handler action that produced ``result``.
+    :param job: RunPod job dict, for the job id.
+    :returns: ``{"status": "succeed", "action", "result_key", "bytes",
+        "sha256", "upload_ms", ...timings}``.
+    :rtype: dict
+    :raises ResultUploadError: If the upload fails (see
+        :func:`_put_result`).
+    """
+    envelope = _result_envelope(
+        result, action, inputs.get("scan_pk"), job.get("id")
+    )
+    body = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+
+    t0 = time.monotonic()
+    _put_result(inputs["result_url"], body)
+    upload_ms = int((time.monotonic() - t0) * 1000)
+
+    result_key = inputs.get("result_key")
+    logger.info(
+        "result uploaded: %d bytes in %d ms (action=%s key=%s)",
+        len(body),
+        upload_ms,
+        action,
+        result_key,
+    )
+    return {
+        "status": "succeed",
+        "action": action,
+        "result_key": result_key,
+        "bytes": len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "upload_ms": upload_ms,
+        "duration_ms": result.get("duration_ms"),
+        "model_durations_ms": result.get("model_durations_ms"),
+        "page_count": result.get("page_count"),
+    }
 
 
 # ── Actions ─────────────────────────────────────────────────────────
@@ -588,9 +572,9 @@ def _action_detect(inputs: dict, tmp_dir: Path) -> dict:
     # skipping missing models.
 
     pdf_path = tmp_dir / "input.pdf"
-    _download_pdf(pdf_url, pdf_path)
+    download_pdf(pdf_url, pdf_path)
 
-    pages = _validate_pdf(pdf_path)
+    pages = validate_pdf(pdf_path)
     if pages > MAX_PAGES:
         raise ValueError(
             f"PDF has {pages} pages, exceeds MAX_PAGES={MAX_PAGES}"
@@ -645,9 +629,9 @@ def _action_analyze(inputs: dict, tmp_dir: Path) -> dict:
     ensure_weights(["large"])
 
     pdf_path = tmp_dir / "input.pdf"
-    _download_pdf(pdf_url, pdf_path)
+    download_pdf(pdf_url, pdf_path)
 
-    pages = _validate_pdf(pdf_path)
+    pages = validate_pdf(pdf_path)
     if pages > MAX_PAGES:
         raise ValueError(
             f"PDF has {pages} pages, exceeds MAX_PAGES={MAX_PAGES}"
@@ -693,7 +677,10 @@ def handler(job: dict) -> dict:
 
     :param job: RunPod job dict. ``job["input"]`` must carry an
         ``action`` ("detect" | "analyze") and action-specific args.
-        An optional ``scan_pk`` is used to tag Sentry events.
+        An optional ``scan_pk`` is used to tag Sentry events. When
+        ``result_url`` (presigned PUT) and ``result_key`` are present
+        the payload goes to S3 and the response carries only the key,
+        size, digest and timings; otherwise it comes back inline.
     :returns: Action-specific result dict. Every successful return
         (and every structured error) also carries ``worker_boot_ms``
         (cold-start cost of this worker process, constant per
@@ -754,7 +741,27 @@ def handler(job: dict) -> dict:
     tmp_dir = Path(tempfile.mkdtemp(prefix="runpod-"))
     try:
         result = fn(inputs, tmp_dir)
-        return _with_worker_meta(result)
+        if not inputs.get("result_url"):
+            # No presigned PUT in the input: answer inline, as always.
+            return _with_worker_meta(result)
+        return _with_worker_meta(_deliver_result(result, inputs, action, job))
+    except ResultUploadError as exc:
+        # The compute succeeded and the delivery didn't, so this is
+        # worth a Sentry event: the job will be re-run and re-billed.
+        # Returned as a structured error rather than raised so the
+        # daemon can read ``error_code`` and classify it as transient.
+        if sentry_sdk is not None:
+            sentry_sdk.capture_exception(exc)
+        logger.error(
+            "result delivery failed: action=%s scan_pk=%s key=%s: %s",
+            action,
+            scan_pk,
+            inputs.get("result_key"),
+            exc,
+        )
+        return _with_worker_meta(
+            {"error": str(exc), "error_code": exc.error_code}
+        )
     except Exception as exc:
         if sentry_sdk is not None:
             sentry_sdk.capture_exception(exc)

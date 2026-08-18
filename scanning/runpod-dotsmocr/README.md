@@ -143,7 +143,6 @@ is `parse`:
     "prompt_mode": "prompt_layout_all_en",
     "dpi": 200,
     "num_threads": 16,
-    "max_pages": 5000,
     "temperature": 0.1,
     "top_p": 1.0,
     "max_completion_tokens": 16384,
@@ -152,7 +151,11 @@ is `parse`:
 }
 ```
 
-Everything but `pdf_url` is optional. `prompt_mode` is one of:
+Everything but `pdf_url` is optional. There is deliberately no
+`max_pages` input: elsewhere in the repo that name means "truncate to
+the first N pages", and a partial parse returned as a success is worse
+than a failure here. PDFs over the env-level `HANDLER_MAX_PAGES` are
+rejected with `error_code=BAD_INPUT`. `prompt_mode` is one of:
 
 | Mode | Output per page |
 |---|---|
@@ -169,6 +172,9 @@ Returns:
       "page_no": 0,
       "input_width": 1708,
       "input_height": 2212,
+      "origin_width": 1700,
+      "origin_height": 2200,
+      "completion_tokens": 2481,
       "filtered": false,
       "cells": [
         {"bbox": [84, 132, 1620, 230], "category": "Section-header", "text": "OPINION"}
@@ -188,16 +194,26 @@ Returns:
 
 Notes on the page dicts:
 
-- `cells` bboxes are in **original page-image pixel space** (the
-  render at `dpi`), already rescaled from model-input space by
-  upstream's `post_process_output`. `input_width`/`input_height` are
-  the model-input dims, kept for debugging.
+- `cells` bboxes are in **rendered page-image pixel space** —
+  `origin_width` × `origin_height`, normally the render at `dpi` —
+  already rescaled from model-input space by upstream's
+  `post_process_output`. `input_width`/`input_height` are the
+  model-input dims, kept for debugging. If the pinned upstream's
+  silent 4500 px fallback re-rendered the page at 72 dpi, the page
+  carries `render_fallback: true`: bboxes are still consistent with
+  `origin_width`/`origin_height`, just not with the requested `dpi`.
+- `completion_tokens` is the generated token count for the page (from
+  vLLM's usage block) — watch its distribution to see how close pages
+  get to `max_completion_tokens`.
 - `filtered: true` means the model's output wasn't parseable JSON and
   `md` holds upstream's cleaned-text fallback (`cells` is null).
 - A page that fails all retries appears as
   `{"page_no": N, "error": "..."}` and is listed in `failed_pages`;
-  one bad page doesn't sink the job. If *every* page fails, the job
-  raises and RunPod marks it FAILED.
+  one bad page doesn't sink the job. A generation cut at
+  `max_completion_tokens` (`finish_reason='length'`, in practice a
+  repetition loop) is treated as a page failure, not silently
+  degraded to `filtered: true`. If *every* page fails, the job raises
+  and RunPod marks it FAILED.
 - Markdown from `Picture` cells is stripped by default (upstream
   inlines them as base64 data URIs, which can blow RunPod's ~20 MB
   response cap); pass `include_pictures: true` to keep them.
@@ -208,12 +224,17 @@ Notes on the page dicts:
 |---|---|---|
 | `NO_GPU` | Worker scheduled without a GPU | Re-queue (transient) |
 | `VLLM_UNHEALTHY` | vLLM server died on this worker | Re-queue (transient) |
-| `BAD_INPUT` | `action` missing/wrong type | Terminal |
+| `BAD_INPUT` | Invalid input: `action`/`pdf_url` missing or wrong type, bad `prompt_mode`, out-of-range pixel bounds, page count over `HANDLER_MAX_PAGES` | Terminal |
 | `UNKNOWN_ACTION` | `action` not `"parse"` | Terminal |
 
-Real exceptions inside the action (download failure, bad prompt_mode,
-page-count over limit) propagate and turn into RunPod `FAILED` status
-with the traceback in the status response's `error` field.
+`NO_GPU` and `VLLM_UNHEALTHY` also set `refresh_worker: true`, which
+tells the RunPod SDK to terminate this worker after the response — a
+worker in either state never heals on its own, and keeping it warm
+would let it keep swallowing re-queued jobs.
+
+Real exceptions inside the action (download failure, all pages
+failing) propagate and turn into RunPod `FAILED` status with the
+traceback in the status response's `error` field.
 
 ## Manual testing with `curl`
 

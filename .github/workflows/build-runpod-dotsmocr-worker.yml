@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - 'scanning/runpod-dotsmocr/**'
+      - 'scanning/runpod_common.py'
+      - '.github/workflows/build-runpod-dotsmocr-worker.yml'
   workflow_dispatch:
 
 jobs:
@@ -39,7 +41,10 @@ jobs:
       - name: Build and Push
         uses: docker/build-push-action@v6
         with:
-          context: scanning/runpod-dotsmocr
+          # scanning/ as context so the build can COPY the shared
+          # runpod_common.py next to handler.py.
+          context: scanning
+          file: scanning/runpod-dotsmocr/Dockerfile
           push: true
           tags: |
             freelawproject/dotsmocr-gpu-worker:${{ steps.vars.outputs.sha_short }}

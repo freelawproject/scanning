@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - 'scanning/runpod/**'
+      - 'scanning/runpod_common.py'
+      - '.github/workflows/build-runpod-worker.yml'
   workflow_dispatch:
 
 jobs:
@@ -30,7 +32,10 @@ jobs:
       - name: Build and Push
         uses: docker/build-push-action@v6
         with:
-          context: scanning/runpod
+          # scanning/ as context so the build can COPY the shared
+          # runpod_common.py next to handler.py.
+          context: scanning
+          file: scanning/runpod/Dockerfile
           push: true
           tags: |
             freelawproject/blackletter-gpu-worker:${{ steps.vars.outputs.sha_short }}

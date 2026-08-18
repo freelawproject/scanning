@@ -6,8 +6,10 @@
 # no AWS credentials, no DB client. Weights (YOLO small/medium/large
 # + PaddleOCR PP-OCRv5) are baked in so cold start skips the network.
 #
-# Build from the scanning/runpod/ directory:
-#     docker build -t blackletter-gpu-worker:local scanning/runpod/
+# Build with the scanning/ directory as context (handler.py imports the
+# shared runpod_common.py that lives there):
+#     docker build -t blackletter-gpu-worker:local \
+#         -f scanning/runpod/Dockerfile scanning/
 #
 # Run locally (requires --gpus all + nvidia-container-toolkit):
 #     docker run --rm --gpus all blackletter-gpu-worker:local
@@ -77,7 +79,7 @@ WORKDIR /app
 # required dep; they use whatever ``paddle`` Python module is
 # importable. Our explicit paddlepaddle-gpu==3.1.0 pin satisfies
 # that, so there is no CPU/GPU paddle swap needed.
-COPY pyproject.toml uv.lock ./
+COPY runpod/pyproject.toml runpod/uv.lock ./
 # --mount=type=cache keeps uv's wheel cache outside the image layer
 # (shared across builds instead of baked into the final image). Without
 # it, the multi-GB torch + paddlepaddle-gpu wheels live in both
@@ -123,7 +125,7 @@ PaddleOCR(text_detection_model_name='PP-OCRv5_server_det', \
 print('PaddleOCR warmup OK')" \
  && find /opt/paddlex -name '*.pdiparams' | head -5
 
-COPY handler.py .
+COPY runpod_common.py runpod/handler.py ./
 
 # RunPod's serverless runtime imports handler.py; running it directly
 # (via `runpod.serverless.start`) works for both local smoke-testing

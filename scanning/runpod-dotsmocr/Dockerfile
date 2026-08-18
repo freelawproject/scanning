@@ -7,8 +7,10 @@
 # credentials, no DB client. Model weights are baked in so cold start
 # skips the network.
 #
-# Build from the scanning/runpod-dotsmocr/ directory:
-#     docker build -t dotsmocr-gpu-worker:local scanning/runpod-dotsmocr/
+# Build with the scanning/ directory as context (handler.py imports the
+# shared runpod_common.py that lives there):
+#     docker build -t dotsmocr-gpu-worker:local \
+#         -f scanning/runpod-dotsmocr/Dockerfile scanning/
 #
 # Run locally (requires --gpus all + nvidia-container-toolkit):
 #     docker run --rm --gpus all dotsmocr-gpu-worker:local
@@ -42,22 +44,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git libcairo2 \
  && rm -rf /var/lib/apt/lists/*
 
-# Install uv (same tag as the other worker images for parity).
+# Install uv (same tag as the other worker images for parity). The
+# vLLM base image pip-installs its own uv into /usr/local/bin, which
+# precedes /bin on PATH and would silently shadow this pin — so the
+# sync below invokes /bin/uv by absolute path.
 COPY --from=ghcr.io/astral-sh/uv:0.9.22 /uv /uvx /bin/
 
 WORKDIR /app
-
-# ── Handler venv ─────────────────────────────────────────────────────
-# pyproject.toml declares the handler deps; uv.lock pins them
-# (including dots_mocr at an exact upstream commit). ``uv sync
-# --frozen`` installs exactly the locked versions into /opt/venv and
-# errors out if the lock is stale vs. pyproject.toml.
-# --mount=type=cache keeps uv's wheel cache outside the image layer;
-# --no-cache tells uv not to keep its own hash-addressed cache next to
-# the installed site-packages either.
-COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-cache --python python3
 
 # ── Bake model weights ───────────────────────────────────────────────
 # Downloads the full HF snapshot (~6 GB safetensors + processor code)
@@ -65,6 +58,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # so a flaky HF doesn't fail the build, then verifies the snapshot
 # actually contains the weights (a truncated download would otherwise
 # surface as a cryptic vLLM load error at runtime).
+#
+# Deliberately ordered BEFORE the handler venv: the weights only need
+# the base image, so a dependency bump in pyproject/uv.lock rebuilds
+# the (small) venv layer without re-downloading ~6 GB of weights.
 ARG DOTSMOCR_MODEL=rednote-hilab/dots.mocr
 ENV DOTSMOCR_MODEL=${DOTSMOCR_MODEL}
 RUN set -e; \
@@ -87,7 +84,20 @@ print(f'weights OK: {total // 1024 // 1024} MB in {len(files)} files')"
 # unsetting HF_HUB_OFFLINE on the endpoint.)
 ENV HF_HUB_OFFLINE=1
 
-COPY handler.py .
+# ── Handler venv ─────────────────────────────────────────────────────
+# pyproject.toml declares the handler deps; uv.lock pins them
+# (including dots_mocr at an exact upstream commit). ``uv sync
+# --frozen`` installs exactly the locked versions into /opt/venv and
+# errors out if the lock is stale vs. pyproject.toml.
+# --mount=type=cache keeps uv's wheel cache outside the image layer
+# and reuses it across builds (which is why there is no --no-cache
+# here: it would tell uv to bypass that mounted cache entirely).
+# /bin/uv by absolute path: see the pin comment above.
+COPY runpod-dotsmocr/pyproject.toml runpod-dotsmocr/uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    /bin/uv sync --frozen --python python3
+
+COPY runpod_common.py runpod-dotsmocr/handler.py ./
 
 # The base image's entrypoint launches the vLLM API server directly;
 # this worker instead boots the RunPod handler, which spawns and

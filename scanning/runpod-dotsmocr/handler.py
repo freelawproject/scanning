@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import logging
 import os
-import random
 import re
 import shlex
 import shutil
@@ -37,7 +36,7 @@ from typing import Any
 
 import requests
 import runpod
-from urllib3.exceptions import IncompleteRead, ProtocolError
+from runpod_common import download_pdf, validate_pdf
 
 # Capture worker boot start as early as possible so ``_WORKER_BOOT_MS``
 # covers the full cold-start cost (module imports + vLLM startup).
@@ -75,24 +74,14 @@ if sentry_sdk is not None and _SENTRY_DSN:
 
 
 # ── Tunables ────────────────────────────────────────────────────────
+# Hard sanity guard on input size, worker-side. Deliberately NOT a
+# caller-tunable "process at most N pages" knob: the established
+# ``max_pages`` contract (``runpod_client.py``, the blackletter worker)
+# means *truncate*, and a rejection threshold under the same name would
+# invite silent contract confusion. Volumes arrive sharded (#164), so
+# a shard exceeding this is a pipeline bug, not a big scan.
 MAX_PAGES = int(os.environ.get("HANDLER_MAX_PAGES", "5000"))
-# Read timeout: max seconds to wait for the next chunk of body. A single
-# value would also bound connect; we split connect/read so a stalled
-# socket mid-download raises a ReadTimeout promptly and triggers a
-# resume instead of hanging for the whole budget.
-DOWNLOAD_TIMEOUT = int(os.environ.get("HANDLER_DOWNLOAD_TIMEOUT", "300"))
-DOWNLOAD_CONNECT_TIMEOUT = int(
-    os.environ.get("HANDLER_DOWNLOAD_CONNECT_TIMEOUT", "10")
-)
-# How many times to (re)issue the GET before giving up. Each retry
-# resumes from the last byte written via a Range request.
-DOWNLOAD_MAX_ATTEMPTS = int(
-    os.environ.get("HANDLER_DOWNLOAD_MAX_ATTEMPTS", "5")
-)
-# Upper bound (seconds) on the exponential backoff between retries.
-DOWNLOAD_BACKOFF_CAP = int(
-    os.environ.get("HANDLER_DOWNLOAD_BACKOFF_CAP", "30")
-)
+# Download tunables (HANDLER_DOWNLOAD_*) live in runpod_common.
 
 # ── vLLM server tunables ────────────────────────────────────────────
 # The model lives in the baked HF cache (HF_HOME=/opt/hf, offline).
@@ -101,7 +90,13 @@ DOTSMOCR_MODEL = os.environ.get("DOTSMOCR_MODEL", "rednote-hilab/dots.mocr")
 # same alias so their client code works unmodified.
 SERVED_MODEL_NAME = "model"
 VLLM_HOST = "127.0.0.1"
-VLLM_PORT = int(os.environ.get("VLLM_PORT", "8000"))
+# HANDLER_-prefixed on purpose: ``VLLM_PORT`` itself is a *reserved*
+# vLLM env var (v0.17's envs.py hands it out as the first port for
+# internal distributed services), and the spawned ``vllm serve``
+# inherits our environment. Exposing the API port under that name
+# would make the server bind internal sockets on the same port it
+# serves the API on — bind conflict, worker never becomes healthy.
+VLLM_PORT = int(os.environ.get("HANDLER_VLLM_PORT", "8000"))
 VLLM_GPU_MEMORY_UTILIZATION = os.environ.get(
     "VLLM_GPU_MEMORY_UTILIZATION", "0.9"
 )
@@ -134,18 +129,6 @@ _ALLOWED_PROMPT_MODES = (
     "prompt_layout_all_en",
     "prompt_layout_only_en",
     "prompt_ocr",
-)
-
-# Stream errors that mean "the connection died mid-transfer" — safe to
-# reconnect and resume from the last byte written. Anything else (a 4xx
-# other than the handled 403/416, a 5xx, a malformed URL) is not in here
-# and propagates so the daemon can re-queue or fail the scan.
-_TRANSIENT_DOWNLOAD_ERRORS = (
-    requests.exceptions.ChunkedEncodingError,
-    requests.exceptions.ConnectionError,
-    requests.exceptions.Timeout,
-    ProtocolError,
-    IncompleteRead,
 )
 
 
@@ -204,7 +187,12 @@ def _start_vllm() -> subprocess.Popen:
         "--trust-remote-code",
     ] + shlex.split(VLLM_EXTRA_ARGS)
     logger.info("starting vLLM: %s", " ".join(cmd))
-    return subprocess.Popen(cmd)
+    # Belt-and-suspenders next to the HANDLER_VLLM_PORT rename above:
+    # never let a stray VLLM_PORT reach the server, where vLLM treats
+    # it as the base port for internal service sockets and collides
+    # with the --port the API listens on.
+    env = {k: v for k, v in os.environ.items() if k != "VLLM_PORT"}
+    return subprocess.Popen(cmd, env=env)
 
 
 def _vllm_healthy(timeout: float = 5.0) -> bool:
@@ -375,242 +363,18 @@ def _tag_sentry(job: dict, action: str, scan_pk: Any) -> None:
     sentry_sdk.set_tag("gpu_available", str(_GPU_AVAILABLE))
     sentry_sdk.set_tag("worker_boot_ms", str(_WORKER_BOOT_MS))
     sentry_sdk.set_tag("worker_uptime_ms", str(_worker_uptime_ms()))
+    # Set unconditionally: tags live on the global scope, which a warm
+    # worker reuses across jobs. Skipping the set when the value is
+    # absent would leave the *previous* job's scan_pk/job id on every
+    # event this job captures, misattributing its failures.
+    scan_tag = "unknown"
     if scan_pk is not None:
         try:
-            sentry_sdk.set_tag("scan_pk", str(int(scan_pk)))
+            scan_tag = str(int(scan_pk))
         except (TypeError, ValueError):
             logger.warning("ignoring non-integer scan_pk: %r", scan_pk)
-    job_id = job.get("id")
-    if job_id:
-        sentry_sdk.set_tag("runpod_job_id", str(job_id))
-
-
-def _expected_total(resp: requests.Response) -> int | None:
-    """Best-effort total file size, in bytes, from a download response.
-
-    On a ``206 Partial Content`` the ``Content-Length`` header is only
-    the size of *this* chunk, so the full size has to come from the
-    ``Content-Range`` total (the value after the slash in
-    ``bytes 0-1023/2048`` -> ``2048``). On a plain ``200 OK`` the
-    ``Content-Length`` is the full size.
-
-    :param resp: A streamed download response.
-    :returns: Total size in bytes, or ``None`` if no header is present
-        or parseable (in which case the caller skips the completeness
-        check rather than failing a download that may be fine).
-    :rtype: int | None
-    """
-    content_range = resp.headers.get("Content-Range")
-    if content_range and "/" in content_range:
-        total = content_range.rsplit("/", 1)[1].strip()
-        if total.isdigit():
-            return int(total)
-    content_length = resp.headers.get("Content-Length")
-    if content_length and content_length.strip().isdigit():
-        return int(content_length)
-    return None
-
-
-def _download_pdf(url: str, dest: Path) -> None:
-    """Download a PDF from a presigned GET URL to ``dest``, resuming
-    across dropped connections.
-
-    Large scans (multi-GB, 1000+ pages) take long enough that a single
-    streamed GET routinely dies mid-transfer: the socket stalls, S3
-    resets the connection, or urllib3 raises ``IncompleteRead``. Rather
-    than restart the whole transfer (or fail the job) on every blip,
-    this retries with an HTTP ``Range`` request and appends to the
-    partial file from the last byte written, with exponential backoff
-    between attempts.
-
-    Range-response handling:
-
-    - **206 Partial Content** — server honoured ``Range``; append.
-    - **200 OK** (on a resume) — server ignored ``Range`` and is
-      resending the whole body; truncate and restart from byte 0.
-      Appending here would write a second copy of the head and corrupt
-      the PDF, so this guard is load-bearing.
-    - **416 Range Not Satisfiable** — our offset is at/past EOF, i.e.
-      we already hold the whole file; treat as complete.
-    - **403 Forbidden** — the presigned URL has expired or is invalid.
-      Not retryable here (the URL is dead): raise so RunPod marks the
-      job FAILED and the daemon re-queues the scan with a fresh URL.
-
-    Only accepts ``http://`` or ``https://`` URLs. Rejects everything
-    else (``file://``, ``gopher://``, bare paths, etc.) defensively:
-    today the trust boundary is "only the daemon holds the RunPod API
-    key, so only the daemon can submit jobs," but a scheme check
-    costs nothing and eliminates the obvious SSRF / local-file-read
-    class of bugs if that boundary ever weakens.
-
-    :param url: PDF URL (typically a presigned S3 GET URL).
-    :param dest: Local filesystem target.
-    :raises ValueError: If ``url`` is not http(s).
-    :raises requests.HTTPError: On a non-2xx response other than the
-        handled 403/416 cases.
-    :raises RuntimeError: If the presigned URL is expired (403), or if
-        the file on disk is still short of the expected size after
-        ``DOWNLOAD_MAX_ATTEMPTS`` attempts.
-    """
-    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        raise ValueError(
-            f"refusing to download PDF from non-http(s) URL: {url!r}"
-        )
-
-    timeout = (DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_TIMEOUT)
-    offset = 0
-    total: int | None = None
-
-    for attempt in range(DOWNLOAD_MAX_ATTEMPTS):
-        headers = {"Range": f"bytes={offset}-"} if offset else {}
-        try:
-            with requests.get(
-                url, headers=headers, stream=True, timeout=timeout
-            ) as r:
-                # Expired/invalid presigned URL. Retrying the same URL is
-                # pointless; raise so the daemon re-signs and re-queues.
-                if r.status_code == 403:
-                    raise RuntimeError(
-                        "presigned URL expired or invalid (HTTP 403); "
-                        "daemon will re-queue with a fresh URL"
-                    )
-                # We asked to resume past EOF -> already have it all.
-                if offset and r.status_code == 416:
-                    logger.info(
-                        "resume at byte %d returned 416; file already "
-                        "complete",
-                        offset,
-                    )
-                    break
-                # Server ignored Range and is resending from the start.
-                # Discard the partial file and restart, or we'd append a
-                # second copy of the head and corrupt the PDF.
-                if offset and r.status_code == 200:
-                    logger.warning(
-                        "server ignored Range (HTTP 200); restarting "
-                        "download from byte 0"
-                    )
-                    offset = 0
-                    total = None
-                r.raise_for_status()
-
-                if total is None:
-                    total = _expected_total(r)
-
-                mode = "ab" if offset else "wb"
-                with dest.open(mode) as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                            offset += len(chunk)
-            # Stream drained without raising: this attempt finished.
-            break
-        except _TRANSIENT_DOWNLOAD_ERRORS as exc:
-            # Re-derive the offset from disk: a partial write may have
-            # landed bytes the in-memory counter didn't account for.
-            offset = dest.stat().st_size if dest.exists() else 0
-            if attempt == DOWNLOAD_MAX_ATTEMPTS - 1:
-                logger.error(
-                    "download failed after %d attempts at byte %d: %s",
-                    DOWNLOAD_MAX_ATTEMPTS,
-                    offset,
-                    exc,
-                )
-                raise
-            backoff = min(2**attempt, DOWNLOAD_BACKOFF_CAP)
-            backoff += random.uniform(0, backoff / 2)  # jitter
-            logger.warning(
-                "download interrupted at byte %d (attempt %d/%d): %s; "
-                "resuming in %.1fs",
-                offset,
-                attempt + 1,
-                DOWNLOAD_MAX_ATTEMPTS,
-                exc,
-                backoff,
-            )
-            time.sleep(backoff)
-
-    # Hand the parser a complete file or nothing: a truncated PDF
-    # silently produces wrong page counts and text. Raising re-queues.
-    if total is not None:
-        actual = dest.stat().st_size if dest.exists() else 0
-        if actual != total:
-            raise RuntimeError(
-                f"incomplete download: {actual}/{total} bytes after "
-                f"{DOWNLOAD_MAX_ATTEMPTS} attempts"
-            )
-
-
-# Trailer window scanned for the %%EOF marker. A conforming PDF ends with
-# %%EOF (optionally followed by whitespace); incrementally-updated files
-# carry several, and only the last one matters. 2 KB comfortably covers
-# trailing newlines and a final cross-reference stream.
-_PDF_EOF_WINDOW = 2048
-
-
-def _validate_pdf(pdf_path: Path) -> int:
-    """Validate that ``pdf_path`` is a complete, openable PDF and return
-    its page count.
-
-    Defense-in-depth against a truncated download slipping through: the
-    resumable ``_download_pdf`` already checks the byte count against the
-    server's advertised size, but that only fires when the server sends a
-    size. The real hazard is a partial PDF that PyMuPDF can still *open*
-    by rebuilding a broken xref, reporting far fewer pages than the real
-    document — which would then silently OCR a fraction of the volume.
-    Checking the header and the ``%%EOF`` trailer turns that silent
-    corruption into a hard failure.
-
-    Checks run cheapest-first so a bad file fails before the fitz open.
-
-    :param pdf_path: Path to the downloaded PDF on disk.
-    :returns: Page count.
-    :rtype: int
-    :raises ValueError: If the file is empty, lacks a ``%PDF-`` header or
-        an ``%%EOF`` trailer, or cannot be opened as a PDF with at least
-        one page.
-    """
-    import fitz
-
-    size = pdf_path.stat().st_size if pdf_path.exists() else 0
-    if size == 0:
-        raise ValueError(f"downloaded PDF is empty: {pdf_path}")
-
-    with pdf_path.open("rb") as f:
-        header = f.read(1024)
-        f.seek(max(0, size - _PDF_EOF_WINDOW))
-        trailer = f.read()
-
-    if b"%PDF-" not in header:
-        raise ValueError(
-            f"downloaded file is not a PDF (no %PDF- header): {pdf_path}"
-        )
-    if b"%%EOF" not in trailer:
-        raise ValueError(
-            "downloaded PDF is truncated (no %%EOF trailer in last "
-            f"{_PDF_EOF_WINDOW} bytes): {pdf_path}"
-        )
-
-    try:
-        with fitz.open(str(pdf_path)) as doc:
-            page_count = doc.page_count
-            # A rebuilt xref usually means damage; the %%EOF check above
-            # catches the common (truncation) cause, so this is just a
-            # breadcrumb rather than a hard failure.
-            if getattr(doc, "is_repaired", False):
-                logger.warning(
-                    "PyMuPDF repaired %s on open; proceeding", pdf_path
-                )
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError(
-            f"downloaded file could not be opened as a PDF: {exc}"
-        ) from exc
-
-    if page_count < 1:
-        raise ValueError(f"downloaded PDF has no pages: {pdf_path}")
-    return page_count
+    sentry_sdk.set_tag("scan_pk", scan_tag)
+    sentry_sdk.set_tag("runpod_job_id", str(job.get("id") or "unknown"))
 
 
 # ── dots_mocr import shim + vLLM client ─────────────────────────────
@@ -664,7 +428,7 @@ def _vllm_inference(
     temperature: float,
     top_p: float,
     max_completion_tokens: int,
-) -> str | None:
+) -> tuple[str | None, str | None, int | None]:
     """Run one chat completion against the local vLLM server.
 
     Adapted from upstream ``dots_mocr/model/inference.py`` (MIT),
@@ -680,9 +444,14 @@ def _vllm_inference(
     :param image: PIL image of the page, already sized as the model
         should see it.
     :param prompt: The prompt-mode text.
-    :returns: The model's text response (may be ``None`` if the server
-        returns an empty choice).
-    :rtype: str | None
+    :returns: ``(content, finish_reason, completion_tokens)``.
+        ``content`` may be ``None`` if the server returns an empty
+        choice. ``finish_reason == "length"`` means the output was cut
+        at ``max_completion_tokens`` — the caller must not treat that
+        text as a complete page. ``completion_tokens`` is the generated
+        token count from the response's usage block (``None`` if the
+        server omitted it), recorded per page for observability.
+    :rtype: tuple[str | None, str | None, int | None]
     """
     from dots_mocr.utils.image_utils import PILimage_to_base64
 
@@ -707,7 +476,10 @@ def _vllm_inference(
         temperature=temperature,
         top_p=top_p,
     )
-    return response.choices[0].message.content
+    choice = response.choices[0]
+    usage = getattr(response, "usage", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    return choice.message.content, choice.finish_reason, completion_tokens
 
 
 # ── Markdown post-processing ────────────────────────────────────────
@@ -747,17 +519,27 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         Optional: ``prompt_mode`` (default ``prompt_layout_all_en``),
         ``dpi`` (default 200), ``num_threads``, ``temperature``,
         ``top_p``, ``max_completion_tokens``, ``min_pixels``,
-        ``max_pixels``, ``max_pages``, ``include_pictures`` (default
-        False: strip base64 picture crops from the markdown).
+        ``max_pixels``, ``include_pictures`` (default False: strip
+        base64 picture crops from the markdown). There is deliberately
+        no ``max_pages`` input: that name means "truncate to the first
+        N pages" elsewhere in the repo, and a partial parse silently
+        merged as a full volume is worse than a failure. Inputs over
+        the env-level ``MAX_PAGES`` are rejected.
     :param tmp_dir: Per-job scratch directory.
     :returns: ``{"pages": list[dict], "page_count": int,
         "failed_pages": list[int], "duration_ms": int}``. Each page
         dict carries ``page_no``, ``input_width``/``input_height``
-        (model-input dims for interpreting bboxes), ``duration_ms``,
-        and either ``cells`` (layout JSON) + ``md`` (markdown), or
-        ``error``. ``filtered: true`` marks pages where the model
-        output wasn't valid JSON and ``md`` holds the cleaned text
-        fallback.
+        (model-input dims for interpreting bboxes),
+        ``origin_width``/``origin_height`` (actual render dims — the
+        pixel space ``cells`` bboxes are rescaled into), a
+        ``completion_tokens`` count, ``duration_ms``, and either
+        ``cells`` (layout JSON) + ``md`` (markdown), or ``error``.
+        ``filtered: true`` marks pages where the model output wasn't
+        valid JSON and ``md`` holds the cleaned text fallback.
+        ``render_fallback: true`` flags pages the pinned upstream
+        silently re-rendered at 72 dpi (any dimension over 4500 px at
+        the requested dpi): bboxes are still consistent with
+        ``origin_width``/``origin_height``, just not with ``dpi``.
     :rtype: dict
     """
     import fitz
@@ -771,7 +553,12 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     from dots_mocr.utils.layout_utils import post_process_output
     from dots_mocr.utils.prompts import dict_promptmode_to_prompt
 
-    pdf_url = inputs["pdf_url"]
+    # ``.get`` + explicit raise, not ``inputs["pdf_url"]``: a KeyError
+    # would surface as a raw traceback with no error_code, which the
+    # daemon can't classify. handler() turns ValueError into BAD_INPUT.
+    pdf_url = inputs.get("pdf_url")
+    if not pdf_url:
+        raise ValueError("missing required input: pdf_url")
     prompt_mode = inputs.get("prompt_mode", DEFAULT_PROMPT_MODE)
     if prompt_mode not in _ALLOWED_PROMPT_MODES:
         raise ValueError(
@@ -800,18 +587,16 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         max_pixels = int(max_pixels)
         if max_pixels > MAX_PIXELS:
             raise ValueError(f"max_pixels must be <= {MAX_PIXELS}")
-    max_pages = int(inputs.get("max_pages", MAX_PAGES))
     include_pictures = bool(inputs.get("include_pictures", False))
     prompt = dict_promptmode_to_prompt[prompt_mode]
 
     pdf_path = tmp_dir / "input.pdf"
-    _download_pdf(pdf_url, pdf_path)
+    download_pdf(pdf_url, pdf_path)
 
-    pages = _validate_pdf(pdf_path)
-    if pages > min(max_pages, MAX_PAGES):
+    pages = validate_pdf(pdf_path)
+    if pages > MAX_PAGES:
         raise ValueError(
-            f"PDF has {pages} pages, exceeds max_pages="
-            f"{min(max_pages, MAX_PAGES)}"
+            f"PDF has {pages} pages, exceeds MAX_PAGES={MAX_PAGES}"
         )
 
     # One client for all threads: the OpenAI SDK is thread-safe and a
@@ -845,18 +630,45 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
 
     def _parse_page(page_idx: int) -> dict:
         t0 = time.monotonic()
-        origin_image = fitz_doc_to_image(_doc()[page_idx], target_dpi=dpi)
+        page = _doc()[page_idx]
+        origin_image = fitz_doc_to_image(page, target_dpi=dpi)
         if origin_image is None:
             return {"page_no": page_idx, "error": "page rendered empty"}
+        # The pinned upstream silently re-renders any page over 4500 px
+        # at 72 dpi with no signal, which puts that page's bboxes in a
+        # different pixel space than every other page's. Detect it by
+        # comparing against the size the requested dpi should produce,
+        # and flag the page so downstream can rescale instead of
+        # misplacing every box.
+        expected_w = page.rect.width * dpi / 72
+        render_fallback = bool(
+            expected_w
+            and abs(origin_image.width - expected_w)
+            > max(2, 0.01 * expected_w)
+        )
+        if render_fallback:
+            logger.warning(
+                "page %d: rendered %dx%d, expected ~%dx%d at dpi=%d "
+                "(upstream 4500px fallback); bboxes are in the rendered "
+                "space",
+                page_idx,
+                origin_image.width,
+                origin_image.height,
+                round(expected_w),
+                round(page.rect.height * dpi / 72),
+                dpi,
+            )
         image = fetch_image(
             origin_image, min_pixels=min_pixels, max_pixels=max_pixels
         )
         input_height, input_width = smart_resize(image.height, image.width)
 
         response = None
+        finish_reason = None
+        completion_tokens = None
         for attempt in range(INFERENCE_ATTEMPTS):
             try:
-                response = _vllm_inference(
+                response, finish_reason, completion_tokens = _vllm_inference(
                     client,
                     image,
                     prompt,
@@ -875,7 +687,9 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                     exc,
                 )
                 continue
-            if response is not None:
+            # Truthiness, not ``is not None``: an empty-string response
+            # (immediate EOS) is exactly the case this retry exists for.
+            if response:
                 break
             logger.warning(
                 "page %d: empty vLLM response (attempt %d/%d)",
@@ -883,14 +697,30 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 attempt + 1,
                 INFERENCE_ATTEMPTS,
             )
-        if response is None:
-            raise RuntimeError("no response from vLLM")
+        if not response:
+            raise RuntimeError("empty response from vLLM")
+        # A generation cut at max_completion_tokens is almost never
+        # dense content (the cap is ~2x the worst realistic page) — it
+        # is a repetition loop, and its output was garbage before the
+        # cut. Fail the page loudly instead of letting the truncated
+        # JSON degrade into filtered=true, indistinguishable from
+        # genuine model garbage.
+        if finish_reason == "length":
+            raise RuntimeError(
+                f"output truncated at {completion_tokens} tokens "
+                "(finish_reason='length'); likely a repetition loop"
+            )
 
         result = {
             "page_no": page_idx,
             "input_width": input_width,
             "input_height": input_height,
+            "origin_width": origin_image.width,
+            "origin_height": origin_image.height,
+            "completion_tokens": completion_tokens,
         }
+        if render_fallback:
+            result["render_fallback"] = True
         if prompt_mode in ("prompt_layout_all_en", "prompt_layout_only_en"):
             cells, filtered = post_process_output(
                 response,
@@ -1026,10 +856,15 @@ def handler(job: dict) -> dict:
             action,
             scan_pk,
         )
+        # refresh_worker: the pinned runpod SDK pops this from the
+        # return dict, delivers the result, then terminates the worker
+        # (stopPod). A CPU-only worker never grows a GPU, so keeping it
+        # warm would let it keep swallowing re-queued jobs.
         return _with_worker_meta(
             {
                 "error": "GPU unavailable on this worker",
                 "error_code": "NO_GPU",
+                "refresh_worker": True,
             }
         )
 
@@ -1044,10 +879,18 @@ def handler(job: dict) -> dict:
             action,
             scan_pk,
         )
+        # refresh_worker is load-bearing here: a crashed vLLM engine
+        # never restarts, but the worker stays warm and "completes"
+        # every job in milliseconds, so the scheduler keeps routing
+        # re-queued jobs straight back to it — and the retry traffic
+        # itself resets the idle timeout that would otherwise reap it.
+        # Flagging the worker for termination breaks that livelock at
+        # the cost of one cold boot.
         return _with_worker_meta(
             {
                 "error": "vLLM server not healthy on this worker",
                 "error_code": "VLLM_UNHEALTHY",
+                "refresh_worker": True,
             }
         )
 
@@ -1064,6 +907,19 @@ def handler(job: dict) -> dict:
     try:
         result = fn(job, inputs, tmp_dir)
         return _with_worker_meta(result)
+    except ValueError as exc:
+        # Input validation (missing/invalid pdf_url, bad prompt_mode,
+        # out-of-range pixel bounds, over-MAX_PAGES input). Returned as
+        # a structured error, not raised: a raw traceback carries no
+        # error_code, so the daemon couldn't tell this terminal input
+        # error from a transient failure and would re-queue it to fail
+        # identically forever.
+        logger.warning(
+            "bad input: action=%s scan_pk=%s: %s", action, scan_pk, exc
+        )
+        return _with_worker_meta(
+            {"error": str(exc), "error_code": "BAD_INPUT"}
+        )
     except Exception as exc:
         if sentry_sdk is not None:
             sentry_sdk.capture_exception(exc)
