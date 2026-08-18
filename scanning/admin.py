@@ -1,3 +1,5 @@
+import logging
+
 from django.contrib import admin, messages
 from django.contrib.admin.utils import quote
 from django.urls import NoReverseMatch, reverse
@@ -6,6 +8,7 @@ from django.utils.text import capfirst
 
 from scanning.models import (
     Detection,
+    ExternalJob,
     Issue,
     OpinionScan,
     Page,
@@ -21,6 +24,31 @@ from scanning.services import (
     refresh_volume_queue_status,
     refresh_volume_queue_status_for_scan,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _delete_scan_shard_objects(scan):
+    """Best-effort sweep of a scan's shard set from S3 before deletion.
+
+    The shard PDFs duplicate the original's bytes, so they are the
+    largest objects a deleted scan would otherwise orphan under its
+    processing prefix. Best effort: an S3 hiccup must not block the
+    admin delete, an orphaned prefix is the pre-existing status quo.
+
+    :param scan: The scan about to be deleted.
+    """
+    from scanning import s3_sync
+
+    try:
+        s3_sync.delete_shard_objects(scan)
+    except Exception:
+        logger.warning(
+            "Could not delete S3 shard objects for scan %s; they are "
+            "orphaned now that the scan row is gone",
+            scan.pk,
+            exc_info=True,
+        )
 
 
 class RetryCapFilter(admin.SimpleListFilter):
@@ -197,7 +225,23 @@ class ScanAdmin(admin.ModelAdmin):
         ]
 
         model_count: dict[str, int] = {}
-        for model in (Scan, Page, Detection, Issue, PageInsert, PageDeletion):
+        # Every cascade table needs listing here by hand, since replacing
+        # the default collector is what loses its automatic discovery. So
+        # this list has to be extended whenever a new model cascades from
+        # Scan, or the confirmation page understates the blast radius.
+        # ExternalJob in practice only contributes its volume-level rows:
+        # an opinion-level job requires an opinion, and an opinion blocks
+        # the delete outright via the PROTECT above.
+        for model in (
+            Scan,
+            Page,
+            Detection,
+            Issue,
+            PageInsert,
+            PageDeletion,
+            PendingUpload,
+            ExternalJob,
+        ):
             field = "pk" if model is Scan else "scan_id"
             count = model.objects.filter(**{f"{field}__in": scan_ids}).count()
             if count:
@@ -259,18 +303,24 @@ class ScanAdmin(admin.ModelAdmin):
         """Delete a Scan and refresh its parent Volume's queue_status.
 
         Without this, the volume can drift (e.g. stay at COMPLETE after
-        its only approved scan is deleted from the admin).
+        its only approved scan is deleted from the admin). The scan's S3
+        shard set is swept too (best effort, before the row goes away):
+        it duplicates the original's bytes and nothing else removes it.
 
         :param request: The admin HTTP request.
         :param obj: The Scan to delete.
         """
         volume = obj.volume_obj
+        _delete_scan_shard_objects(obj)
         super().delete_model(request, obj)
         if volume is not None:
             refresh_volume_queue_status(volume)
 
     def delete_queryset(self, request, queryset):
         """Bulk-delete Scans and refresh affected Volumes.
+
+        Sweeps each scan's S3 shard set first, same as
+        :meth:`delete_model`.
 
         :param request: The admin HTTP request.
         :param queryset: Scans selected for deletion.
@@ -280,6 +330,8 @@ class ScanAdmin(admin.ModelAdmin):
             .values_list("volume_obj_id", flat=True)
             .distinct()
         )
+        for scan in queryset:
+            _delete_scan_shard_objects(scan)
         super().delete_queryset(request, queryset)
         for volume in Volume.objects.filter(pk__in=volume_ids):
             refresh_volume_queue_status(volume)
@@ -623,3 +675,56 @@ class PageAdmin(admin.ModelAdmin):
     def has_xml(self, obj):
         """Whether the page has extracted XML content."""
         return bool(obj.xml_content)
+
+
+@admin.register(ExternalJob)
+class ExternalJobAdmin(admin.ModelAdmin):
+    # Left editable: a job row carries operational state (status, retry
+    # budget, deadline) an operator may need to nudge. The provenance
+    # pair is the exception. ``input_key`` is not self-verifying, since
+    # re-pairing renames an opinion PDF, and ``input_hash`` is what
+    # makes the claim checkable, so editing either by hand leaves the
+    # hash describing different bytes than the job actually read.
+    list_display = [
+        "scan",
+        "opinion",
+        "stage",
+        "engine",
+        "provider",
+        "run",
+        "attempt",
+        "shard_label",
+        "status",
+        "retry_count",
+        "deadline",
+        "date_modified",
+    ]
+    list_filter = ["status", "stage", "engine", "provider"]
+    search_fields = [
+        "scan__id",
+        "opinion__id",
+        "external_id",
+        "result_key",
+        "error_message",
+    ]
+    raw_id_fields = ["scan", "opinion"]
+    readonly_fields = [
+        "input_hash",
+        "input_key",
+        "date_created",
+        "date_modified",
+    ]
+    date_hierarchy = "date_created"
+    ordering = ["-date_created"]
+    # An extract changelist is one row per opinion per engine, so these
+    # joins have to be eager or the page issues hundreds of queries
+    # rendering its own list_display. Joined through to the reporter
+    # because both ``Scan.__str__`` and ``OpinionScan.__str__``
+    # dereference it, so stopping at the FK itself would still cost a
+    # query per row per column.
+    list_select_related = ["scan__reporter", "opinion__reporter"]
+
+    @admin.display(description="Shard")
+    def shard_label(self, obj):
+        """Render the job's position in its target's fan-out."""
+        return f"{obj.shard_index + 1}/{obj.shard_count}"

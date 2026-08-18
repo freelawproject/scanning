@@ -18,9 +18,11 @@ from pathlib import Path
 
 import django
 import fitz
-import pdfplumber
 from blackletter.api import (
     bitonal as bl_bitonal,
+)
+from blackletter.api import (
+    build_redactions as bl_build_redactions,
 )
 from blackletter.api import (
     pair as bl_pair,
@@ -37,13 +39,17 @@ from blackletter.models import (
 from blackletter.models import (
     Document as BLDoc,
 )
-from blackletter.process import compute_redaction_rects
-from blackletter.scanner import _pair_opinions
+from blackletter.process import compute_redaction_rects, page_body_covered
+from blackletter.scanner import (
+    _pair_opinions,
+    snap_document_columns,
+    snap_text_columns_to_ink,
+)
 from blackletter.validate import (
     _auto_correct,
-    _build_issues,
-    _parse_expected_range,
     _split_in_out_of_range,
+    build_analysis,
+    build_issues,
 )
 from django.conf import settings
 from django.db.models import Case, F, Value, When
@@ -60,7 +66,13 @@ from scanning.models import (
     Status,
     Volume,
 )
-from scanning.utils import ensure_output_dir, find_ocr_pdf, has_s3_credentials
+from scanning.utils import (
+    ensure_output_dir,
+    find_ocr_pdf,
+    find_processing_pdf,
+    has_s3_credentials,
+    processing_pdf_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +383,40 @@ def _handle_pipeline_exception(
         )
 
 
+def _ensure_shards(scan: "Scan") -> None:
+    """Compute (or reuse) the scan's shard set, with stage logging.
+
+    Failures propagate to the caller's ``_handle_pipeline_exception``
+    like any other pipeline stage. ``ensure_shards`` leaves no manifest
+    behind on failure, so a re-queued scan retries the sharding.
+
+    S3 and transport errors are re-raised as ``RunpodTransientError``:
+    this stage is the pipeline's only bulk multi-GB upload, and a
+    connection reset or a 503 partway through is exactly as retriable as
+    a RunPod worker dying, so it gets the same retry-and-re-queue
+    treatment instead of an immediate ERROR that needs a manual
+    re-queue. Sharding's own failures (``ShardingError``) stay terminal.
+
+    :param scan: The scan to shard.
+    :return: None.
+    :raises RunpodTransientError: On an S3/transport failure, so the
+        caller re-queues the scan instead of marking it ERROR.
+    """
+    from boto3.exceptions import Boto3Error
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    from scanning import sharding
+    from scanning.runpod_client import RunpodTransientError
+
+    with _log_stage("Sharding"):
+        try:
+            sharding.ensure_shards(scan)
+        except (BotoCoreError, Boto3Error, ClientError) as exc:
+            raise RunpodTransientError(
+                f"S3 error while sharding scan {scan.pk}: {exc}"
+            ) from exc
+
+
 def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
     """Convert to bitonal if needed, returning the bitonal PDF path.
 
@@ -403,161 +449,12 @@ def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
     with fitz.open(str(bitonal_path)) as pdf:
         page_count = pdf.page_count
     Scan.objects.filter(pk=scan.pk).update(page_count=page_count)
+    # ``.update()`` is a bare SQL write: it refreshes the row and leaves
+    # the caller's instance holding whatever it loaded. Keep the two in
+    # step, because callers read ``scan.page_count`` straight after this
+    # returns and would otherwise silently get the pre-conversion value.
+    scan.page_count = page_count
     return bitonal_path
-
-
-def _run_ocr(
-    scan_pk: int,
-    bitonal_path: str,
-    output_dir: str,
-    reporter: str,
-    volume: str,
-    first_page: int,
-) -> str:
-    """Run Tesseract OCR via blackletter.
-
-    :param scan_pk: Primary key of the scan (for progress updates).
-    :param bitonal_path: Path to the bitonal PDF.
-    :param output_dir: Directory to write the OCR'd PDF into.
-    :param reporter: Reporter short name (e.g. "f3d").
-    :param volume: Volume number as a string.
-    :param first_page: First logical page number in the PDF.
-    :return: Path to the OCR'd PDF.
-    """
-    with fitz.open(bitonal_path) as pdf:
-        total_pages = pdf.page_count
-    _update_progress(
-        scan_pk,
-        f"Running Tesseract OCR (0/{total_pages} pages)...",
-        current=0,
-        total=total_pages,
-    )
-    ocr_path = _ocr(
-        scan_pk,
-        bitonal_path,
-        output_dir,
-        reporter=reporter,
-        volume=volume,
-        first_page=first_page,
-        total_pages=total_pages,
-    )
-    # Persist the OCR PDF as soon as it exists (see _ensure_bitonal).
-    _push_generated_file_to_s3(scan_pk, Path(ocr_path).name)
-    return ocr_path
-
-
-def _ocr(
-    scan_pk: int,
-    pdf_path: str | Path,
-    output_dir: str | Path,
-    reporter: str = "",
-    volume: str = "",
-    first_page: int = 1,
-    total_pages: int = 0,
-    language: str = "eng",
-) -> Path:
-    """OCR a PDF (add text layer via ocrmypdf/Tesseract).
-
-    Temporary local copy of blackletter's ``ocr`` function with
-    progress callback support. Will be moved to blackletter once
-    validated.
-
-    :param scan_pk: Primary key of the scan (for progress updates).
-    :param pdf_path: Path to the input PDF.
-    :param output_dir: Directory to write the OCR'd PDF into.
-    :param reporter: Reporter short name (e.g. "f3d").
-    :param volume: Volume number as a string.
-    :param first_page: First logical page number in the PDF.
-    :param total_pages: Total page count (for progress messages).
-    :param language: Tesseract language code.
-    :return: Path to the OCR'd PDF.
-    """
-    import logging
-
-    import ocrmypdf
-    from ocrmypdf import hookimpl
-    from ocrmypdf._plugin_manager import get_plugin_manager
-
-    pdf_path = Path(pdf_path)
-    output_dir = Path(output_dir)
-
-    # Build output filename
-    last_page = first_page + total_pages - 1
-    parts = [
-        p
-        for p in [reporter, str(volume), str(first_page), str(last_page)]
-        if p
-    ]
-    scan_name = ".".join(parts) if parts else pdf_path.stem
-    output_path = output_dir / f"{scan_name}.pdf"
-
-    # Suppress noisy loggers
-    for name in (
-        "pikepdf",
-        "fontTools",
-        "fontTools.subset",
-        "fontTools.ttLib",
-        "ocrmypdf",
-    ):
-        logging.getLogger(name).setLevel(logging.ERROR)
-    for _n in list(logging.root.manager.loggerDict):
-        if _n.startswith("ocrmypdf"):
-            logging.getLogger(_n).setLevel(logging.ERROR)
-
-    # Progress bar class that updates the scan record per page
-    class _ScanProgressBar:
-        def __init__(
-            self, *, total=None, desc=None, unit=None, disable=False, **kw
-        ):
-            self._total = total or total_pages
-            self._unit = unit
-            self._desc = desc
-            self._current = 0
-            logger.info(
-                "[progress] unit=%r desc=%r total=%s", unit, desc, total
-            )
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def update(self, n=1, *, completed=None):
-            self._current += n
-            if self._unit == "page" and (
-                self._current % 10 == 0 or self._current == self._total
-            ):
-                _update_progress(
-                    scan_pk,
-                    f"Tesseract OCR: {self._current}/{self._total} pages...",
-                    current=self._current,
-                    total=self._total,
-                )
-
-    class _ScanProgressPlugin:
-        @hookimpl
-        def get_progressbar_class(self):
-            return _ScanProgressBar
-
-    pm = get_plugin_manager()
-    pm._pm.register(_ScanProgressPlugin())
-
-    with _log_stage(
-        "OCR", f"{total_pages} pages ({os.cpu_count() or 1} CPUs)"
-    ):
-        ocrmypdf.ocr(
-            str(pdf_path),
-            str(output_path),
-            pdf_renderer="auto",
-            optimize=1,
-            output_type="pdf",
-            language=[language],
-            tesseract_timeout=120,
-            progress_bar=True,
-            plugin_manager=pm,
-        )
-    return output_path
 
 
 def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
@@ -641,6 +538,132 @@ def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
     _update_progress(scan_pk, f"YOLO: {len(detections)} detections")
 
 
+def _reuse_detect_result(scan: "Scan", output_dir: str) -> bool:
+    """Rehydrate detections.json from a finished detect job, if there is one.
+
+    The resume path for step 4. A daemon killed mid-pipeline re-queues
+    the scan and ``run_full_pipeline`` restarts at step 1, so a detect
+    that already completed would otherwise be re-submitted: another
+    ~200 s of GPU time to recompute detections that are already on S3,
+    overwriting the result object with an identical one.
+
+    Only ``run_full_pipeline`` calls this. :func:`run_detect` goes
+    straight to :func:`_run_yolo`, because re-running detection is the
+    whole point of invoking it; :func:`run_reprocess` likewise leaves
+    ``reuse`` off when it re-validates.
+
+    :param scan: The Scan being processed.
+    :param output_dir: Directory where detections.json is written.
+    :returns: Whether detections.json now holds a reusable result.
+    :rtype: bool
+    """
+    from scanning import runpod_client, s3_sync
+
+    payload = runpod_client.reusable_result(
+        scan, "detect", s3_sync.PIPELINE_INPUT_NAME
+    )
+    if payload is None:
+        return False
+
+    detections = payload.get("detections")
+    if not isinstance(detections, list):
+        return False
+
+    # Backstop on the timestamp check. That comparison only notices an
+    # edited input if the edit changed the object's size, so confirm the
+    # result describes a PDF with this many pages. ``_ensure_bitonal``
+    # has just refreshed ``page_count`` off the current file, and a page
+    # insert or delete moves it.
+    page_count = scan.page_count or 0
+    if page_count and any(
+        d.get("page_index", 0) >= page_count for d in detections
+    ):
+        logger.warning(
+            "stored detect result for scan %s references pages past the "
+            "current %d-page PDF; re-running detection",
+            scan.pk,
+            page_count,
+        )
+        return False
+
+    (Path(output_dir) / "detections.json").write_text(json.dumps(detections))
+    _update_progress(
+        scan.pk,
+        f"YOLO: reused {len(detections)} detections from the last run",
+    )
+    logger.info(
+        "Reused %d detections for scan %s; skipped the detect job",
+        len(detections),
+        scan.pk,
+    )
+    return True
+
+
+def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
+    """Widen this scan's ``TEXT_COLUMN`` detections onto the text they clip.
+
+    Thin wrapper over :func:`blackletter.scanner.snap_text_columns_to_ink`,
+    which does the measuring. What is app-specific is the persistence: the
+    corrected boxes are written back to the ``Detection`` rows, so the
+    viewer overlay and ``detections.json`` show what the geometry actually
+    used, and no later step has to re-measure the ink to agree with it.
+
+    Only the x-bounds move, so header and footer geometry is untouched.
+
+    :param scan_pk: Primary key of the scan.
+    :param pdf_path: The PDF the detections were measured against.
+    :return: Number of detections widened.
+    """
+    by_page: dict[int, list] = {}
+    for det in Detection.objects.filter(
+        scan_id=scan_pk, active=True, label="TEXT_COLUMN"
+    ).order_by("page_index", "x0"):
+        by_page.setdefault(det.page_index, []).append(det)
+    if not by_page:
+        return 0
+
+    changed = []
+    with fitz.open(str(pdf_path)) as doc:
+        for page_index, columns in sorted(by_page.items()):
+            if page_index >= doc.page_count:
+                continue
+            fitz_page = doc[page_index]
+            page = Page(
+                index=page_index,
+                pdf_width=fitz_page.rect.width,
+                pdf_height=fitz_page.rect.height,
+                img_width=columns[0].img_width or 1,
+                img_height=columns[0].img_height or 1,
+            )
+            page.detections = [
+                BLDetection(
+                    bbox=BBox(x1=d.x0, y1=d.y0, x2=d.x1, y2=d.y1),
+                    label=Label.TEXT_COLUMN,
+                    confidence=d.confidence,
+                    page_index=page_index,
+                )
+                for d in columns
+            ]
+            if not snap_text_columns_to_ink(fitz_page, page):
+                continue
+            # strict: the snap rewrites boxes in place and must hand back
+            # one per column. A length change would mean it reordered or
+            # dropped one, and pairing the survivors by position would
+            # silently write a column's new bounds onto its neighbour.
+            for det, snapped in zip(columns, page.detections, strict=True):
+                new_x0 = round(snapped.bbox.x1, 1)
+                new_x1 = round(snapped.bbox.x2, 1)
+                if abs(new_x0 - det.x0) < 1 and abs(new_x1 - det.x1) < 1:
+                    continue
+                det.x0 = new_x0
+                det.x1 = new_x1
+                changed.append(det)
+
+    if changed:
+        Detection.objects.bulk_update(changed, ["x0", "x1"])
+    return len(changed)
+
+
 def _import_detections_from_json(scan_pk: int, output_dir: str) -> list:
     """Load detections.json from disk into Detection model.
 
@@ -713,61 +736,6 @@ def _delete_page_and_detections(
     )
 
 
-def _detect_sequence_issues(
-    ocr_results: list, out_of_range_pages: set
-) -> list[tuple]:
-    """Classify duplicate / backward / gap page-number runs.
-
-    Walks ocr_results in order, tracks the previous detected page number,
-    and yields an issue tuple whenever the difference between consecutive
-    pages is 0 (duplicate), negative (backward), or > 2 (gap).
-
-    :param ocr_results: List of per-page OCR result dicts.
-    :param out_of_range_pages: PDF page numbers already flagged as
-        out-of-range; these are skipped so they don't anchor the
-        prev_num chain.
-    :returns: List of issue tuples. GAP tuples include a trailing list
-        of missing page numbers; others have 5 elements.
-    :rtype: list[tuple]
-    """
-    seq_issues: list[tuple] = []
-    prev_num = prev_pdf = None
-    for r in ocr_results:
-        if not r["detected"] or r.get("type") == "range":
-            prev_num = None
-            continue
-        try:
-            num = int(r["detected"])
-        except ValueError:
-            continue
-        if r["pdf_page"] in out_of_range_pages:
-            continue
-        if prev_num is not None:
-            diff = num - prev_num
-            if diff == 0:
-                seq_issues.append(
-                    ("DUPLICATE", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff < 0:
-                seq_issues.append(
-                    ("BACKWARD", r["pdf_page"], num, prev_pdf, prev_num)
-                )
-            elif diff > 2:
-                seq_issues.append(
-                    (
-                        "GAP",
-                        r["pdf_page"],
-                        num,
-                        prev_pdf,
-                        prev_num,
-                        list(range(prev_num + 1, num)),
-                    )
-                )
-        prev_num = num
-        prev_pdf = r["pdf_page"]
-    return seq_issues
-
-
 def _page_number_lookup(scan: "Scan") -> dict:
     """Build {page_index: (page_number, page_number_end)} from ocr_results.
 
@@ -834,7 +802,7 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
 def _push_generated_file_to_s3(scan_pk: int, relative_path: str) -> None:
     """Upload a single just-generated processing file to S3 immediately.
 
-    Persists derived artifacts (``bitonal.pdf``, the OCR PDF) the moment
+    Persists derived artifacts (``bitonal.pdf``) the moment
     they are produced rather than only at the end-of-pipeline push, so a
     later crash, or a ``reprocess`` run that never does the full push,
     still leaves them in S3. Mirrors the credential guard in
@@ -1020,94 +988,22 @@ def _compute_and_save_redaction_rects(scan_pk: int, pdf_path: str) -> list:
 
     with _log_stage("Redaction rects"):
         document = _build_document_from_detections(scan, det_data, pdf_path)
+        # Every blackletter entry point corrects the column boxes before
+        # reading them, and the margin strips of this same scan are computed
+        # from corrected ones. Skipping it here is how a hand-added
+        # TEXT_COLUMN (which reaches the DB exactly as the reviewer drew it)
+        # would give the headnote rects a different column to the margins on
+        # the same page.
+        snap_document_columns(document)
         opinions = _pair_opinions(document)
+        # ``ocr_applied`` is set on the Document, so blackletter measures
+        # this geometry from the page ink itself (see
+        # ``scanner._measure_from_ink``), and finishes each headnote rect
+        # against the page detections: snapped to its column box, cut at the
+        # headnote boundaries inside it, then grown onto adjoining ink. The
+        # app ran those three passes itself until blackletter #68 moved them
+        # where every consumer gets them.
         rects = compute_redaction_rects(document, opinions, skip_doctr=True)
-
-    # Snap headnote rect x-bounds to TEXT_COLUMN detections for consistency.
-    # Only snap to a TEXT_COLUMN on the same side of the page midpoint —
-    # otherwise a missing left TEXT_COLUMN causes the left rect to be
-    # snapped to the right column, destroying it.
-    tc_by_page = {}
-    for d in Detection.objects.filter(scan=scan, active=True, label_id=16):
-        tc_by_page.setdefault(d.page_index, []).append(d)
-    img_mid = document.pages[0].img_width / 2 if document.pages else 850
-    for page_entry in rects:
-        pi = page_entry["page_index"]
-        cols = tc_by_page.get(pi, [])
-        if not cols:
-            continue
-        for r in page_entry["rects"]:
-            if r.get("type") != "headnote":
-                continue
-            cx = (r["x0"] + r["x1"]) / 2
-            # Only consider TEXT_COLUMNs on the same side of the midpoint
-            same_side = (
-                [c for c in cols if (c.x0 + c.x1) / 2 < img_mid]
-                if cx < img_mid
-                else [c for c in cols if (c.x0 + c.x1) / 2 >= img_mid]
-            )
-            if not same_side:
-                continue
-            best = min(same_side, key=lambda c: abs((c.x0 + c.x1) / 2 - cx))
-            r["x0"] = round(best.x0, 1)
-            r["x1"] = round(best.x1, 1)
-
-    # Split headnote blocks at HEADNOTE detection boundaries
-    _GAP = 6
-    hn_dets_by_page = {}
-    for d in Detection.objects.filter(
-        scan=scan, active=True, label="HEADNOTE"
-    ):
-        hn_dets_by_page.setdefault(d.page_index, []).append(d)
-    for page_entry in rects:
-        pi = page_entry["page_index"]
-        if pi not in hn_dets_by_page:
-            continue
-        hn_dets = sorted(hn_dets_by_page[pi], key=lambda d: d.y0)
-        new_page_rects = []
-        for r in page_entry["rects"]:
-            if r.get("type") != "headnote":
-                new_page_rects.append(r)
-                continue
-            col_dets = sorted(
-                (
-                    d
-                    for d in hn_dets
-                    if r["y0"] + _GAP < d.y0 < r["y1"] - _GAP
-                    and d.x0 < r["x1"]
-                    and d.x1 > r["x0"]
-                ),
-                key=lambda d: d.y0,
-            )
-            merged = []
-            for d in col_dets:
-                if merged and d.y0 < merged[-1][1]:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], d.y1))
-                else:
-                    merged.append((d.y0, d.y1))
-            splits = [m[0] for m in merged]
-            if not splits:
-                new_page_rects.append(r)
-                continue
-            prev_y = r["y0"]
-            for sp in splits:
-                if sp - _GAP / 2 > prev_y:
-                    new_page_rects.append(
-                        {
-                            **r,
-                            "y0": round(prev_y, 1),
-                            "y1": round(sp - _GAP / 2, 1),
-                        }
-                    )
-                prev_y = sp + _GAP / 2
-            new_page_rects.append(
-                {
-                    **r,
-                    "y0": round(prev_y, 1),
-                    "y1": round(r["y1"], 1),
-                }
-            )
-        page_entry["rects"] = new_page_rects
 
     Scan.objects.filter(pk=scan_pk).update(
         redaction_rects=rects,
@@ -1115,14 +1011,94 @@ def _compute_and_save_redaction_rects(scan_pk: int, pdf_path: str) -> list:
     return rects
 
 
+def _load_detections(output_dir: str | Path) -> list:
+    """Read ``detections.json`` from a scan's output dir.
+
+    :param output_dir: The scan's output directory.
+    :return: The detection list, or an empty list when absent/unreadable.
+    """
+    det_path = Path(output_dir) / "detections.json"
+    if not det_path.exists():
+        return []
+    try:
+        return json.loads(det_path.read_text())
+    except (OSError, ValueError):
+        logger.exception("Unreadable detections.json in %s", output_dir)
+        return []
+
+
+def _detections_for_geometry(scan_pk: int, output_dir: str | Path) -> list:
+    """Detection dicts for the geometry helpers, DB first.
+
+    ``detections.json`` is written by whichever process ran the pipeline, so
+    another one may not have it yet: ``/tmp`` is per-container in dev and
+    per-pod in production. Reading the DB avoids depending on that, and the
+    DB is the source of truth anyway once a reviewer starts editing
+    detections. The file is only a fallback, for a scan whose rows have not
+    been imported.
+
+    :param scan_pk: Primary key of the scan.
+    :param output_dir: The scan's output directory, for the fallback.
+    :return: Detection dicts shaped as ``detections.json`` stores them.
+    """
+    rows = Detection.objects.filter(scan_id=scan_pk, active=True).order_by(
+        "page_index", "y0"
+    )
+    dets = [
+        {
+            "page_index": d.page_index,
+            "label": d.label,
+            "label_id": d.label_id,
+            "confidence": d.confidence,
+            "bbox": [d.x0, d.y0, d.x1, d.y1],
+            "img_width": d.img_width,
+            "img_height": d.img_height,
+        }
+        for d in rows
+    ]
+    return dets or _load_detections(output_dir)
+
+
+def _pages_for_geometry(
+    scan: "Scan", pdf_path: str, output_dir: str | Path, snap: bool = True
+) -> list:
+    """The detected pages blackletter's geometry should be measured against.
+
+    Wraps the detection lookup and the column correction that every
+    geometry consumer needs, so the rects and the margin strips of one scan
+    cannot be computed from differently-corrected boxes.
+
+    :param scan: The scan being processed.
+    :param pdf_path: The PDF the detections were measured against.
+    :param output_dir: The scan's output directory, for the JSON fallback.
+    :param snap: Correct the ``TEXT_COLUMN`` boxes against the page ink.
+        Boxes reach the DB uncorrected: nothing on the upload path snaps
+        them (that would be a full-volume render review 1 does not need),
+        and a hand-added column detection is stored exactly as drawn. The
+        correction converges, so this is a no-op once ``run_generate_files``
+        has persisted it, but it is not free before then: it renders every
+        page at 100 dpi, so pass ``False`` where the column boxes are not
+        read (see :func:`_build_combined_redactions`).
+    :return: ``Page`` objects, empty when the scan has no detections yet.
+    """
+    det_data = _detections_for_geometry(scan.pk, output_dir)
+    if not det_data:
+        return []
+    document = _build_document_from_detections(scan, det_data, pdf_path)
+    if snap:
+        snap_document_columns(document)
+    return document.pages
+
+
 def _compute_and_save_margin_rects(
     scan_pk: int, pdf_path: str, output_dir: str
 ) -> list:
-    """Compute margin rects, adjust for detections, and save to the Scan model.
+    """Compute margin rects and save them to the Scan model.
 
-    After computing raw margins from the PDF, shrink any margin rect
-    that overlaps with an active detection so that key icons, captions,
-    and other content near page edges are not masked.
+    The strips are pulled back off any real detection they would cover, so
+    key icons, captions and other content near a page edge survive. That
+    happens inside :func:`blackletter.margins.compute_margin_rects`, which
+    also uses the detections to tighten the content box.
 
     :param scan_pk: Primary key of the scan.
     :param pdf_path: Path to the PDF to compute margins for.
@@ -1132,13 +1108,53 @@ def _compute_and_save_margin_rects(
     scan = Scan.objects.get(pk=scan_pk)
     if scan.margin_rects:
         return scan.margin_rects
-    output_dir = Path(output_dir)
-    margin_rects = compute_margin_rects(str(pdf_path))
-    margin_rects = _adjust_margins_for_detections(margin_rects, output_dir)
+    pages = _pages_for_geometry(scan, pdf_path, Path(output_dir))
+    if not pages:
+        # Without detections the bounds would come from the page's marks
+        # alone, so bleed-through at a page edge suppresses that page's top
+        # strip: a worse answer than none, and one that must not be cached or
+        # it never gets recomputed once the detections land. Refuse before
+        # measuring rather than after. The viewer asks for these on a sync
+        # request and does not cache the reply, so computing them here would
+        # render the whole volume at 100 dpi on every poll.
+        logger.warning(
+            "No margin rects for scan %s: no detections yet", scan_pk
+        )
+        return []
+    margin_rects = compute_margin_rects(str(pdf_path), pages=pages)
     Scan.objects.filter(pk=scan_pk).update(
         margin_rects=margin_rects,
     )
     return margin_rects
+
+
+def _add_llm_page_text_layer(scan_pk: int, llm_dir: Path) -> int:
+    """Optionally make the per-page LLM PDFs searchable.
+
+    ``ai.user_prompt`` crops three text snippets off each page (the caption's
+    first line, a column-top continuation, the footnote band) and layers them
+    on top of the structural roadmap it builds from the detections. Those
+    crops need a text layer, and since scanning #145 nothing in the pipeline
+    produces one, so they come back empty and the roadmap ships without them.
+
+    Rather than reinstate the pass for the whole pipeline, this adds it here
+    only, over pages that have already been redacted and masked, and only
+    when ``LLM_PAGE_TEXT_LAYER`` is set. It is off by default because the
+    model reads the page image anyway and the pass costs an OCR run over
+    every page of the volume.
+
+    :param scan_pk: Primary key of the scan, for progress reporting.
+    :param llm_dir: The ``llm/`` directory of per-page PDFs.
+    :return: Number of files given a text layer.
+    """
+    if not settings.LLM_PAGE_TEXT_LAYER or not llm_dir.is_dir():
+        return 0
+    from blackletter.api import add_text_layer
+
+    _update_progress(scan_pk, "Adding a text layer to the LLM pages...")
+    added = add_text_layer(llm_dir)
+    logger.info("Text layer added to %s LLM pages", len(added))
+    return len(added)
 
 
 def _build_combined_redactions(scan_pk: int) -> Path:
@@ -1147,197 +1163,58 @@ def _build_combined_redactions(scan_pk: int) -> Path:
     All coordinates in the output are in PDF points. This file is passed
     to blackletter's ``generate`` API as the single source of redaction data.
 
+    The merging, the pixel-to-point conversion and the opinion filenames all
+    come from :func:`blackletter.api.build_redactions`, so the payload
+    ``generate`` reads is built by the same library that consumes it.
+
     :param scan_pk: Primary key of the scan.
     :return: Path to the generated redactions.json.
     """
     scan = Scan.objects.get(pk=scan_pk)
     output_dir = Path(scan.output_dir)
+    pdf_path = processing_pdf_path(scan)
 
-    det_path = output_dir / "detections.json"
+    # ``snap=False``: this step reads only each page's dimensions and scale,
+    # never its column boxes, so correcting them would render the whole
+    # volume at 100 dpi to change nothing.
+    pages = _pages_for_geometry(scan, pdf_path, output_dir, snap=False)
 
-    margins_data = scan.margin_rects
-    rects_data = scan.redaction_rects
-    opinions = scan.opinions_json
-
-    # Add filenames based on reporter, volume, and page numbers
-    reporter = scan.reporter.short_name or ""
-    volume = str(scan.volume) or ""
-    prefix = f"{reporter}.{volume}" if reporter and volume else ""
-    for op in opinions:
-        if prefix:
-            first = op.get("first_page_number", 0)
-            last = op.get("last_page_number", first)
-            op["filename"] = f"{prefix}.{first:04d}-{last:04d}.pdf"
-
-    # Image dims for pixel→PDF conversion
-    img_dims = {}
-    if det_path.exists():
-        for d in json.loads(det_path.read_text()):
-            pi = d["page_index"]
-            if pi not in img_dims:
-                img_dims[pi] = (d.get("img_width", 1), d.get("img_height", 1))
-
-    # PDF page dims
-    pdf_path = find_ocr_pdf(scan.output_dir) or scan.pdf_path
-    pdf_dims = {}
-    with fitz.open(str(pdf_path)) as src:
-        for i in range(src.page_count):
-            r = src[i].rect
-            pdf_dims[i] = (r.width, r.height)
-
-    pages: dict[int, list] = {}
-
-    # Margin rects (already in PDF points)
-    for entry in margins_data:
-        pi = entry["page_index"]
-        if pi not in pages:
-            pages[pi] = []
-        for r in entry.get("rects", []):
-            pages[pi].append(
-                {
-                    "x0": round(r["x0"], 1),
-                    "y0": round(r["y0"], 1),
-                    "x1": round(r["x1"], 1),
-                    "y1": round(r["y1"], 1),
-                    "fill": "white",
-                    "type": "margin",
-                }
-            )
-
-    # Redaction rects (pixels → PDF points)
-    for entry in rects_data:
-        pi = entry["page_index"]
-        if pi not in pages:
-            pages[pi] = []
-
-        iw, ih = img_dims.get(pi, (1, 1))
-        pdf_w, pdf_h = pdf_dims.get(pi, (612.0, 792.0))
-        to_x = pdf_w / iw if iw > 1 else 1.0
-        to_y = pdf_h / ih if ih > 1 else 1.0
-
-        for r in entry.get("rects", []):
-            x0 = r["x0"] * to_x
-            y0 = r["y0"] * to_y
-            x1 = r["x1"] * to_x
-            y1 = r["y1"] * to_y
-            if x0 >= x1 or y0 >= y1:
-                continue
-            pages[pi].append(
-                {
-                    "x0": round(x0, 1),
-                    "y0": round(y0, 1),
-                    "x1": round(x1, 1),
-                    "y1": round(y1, 1),
-                    "fill": r["fill"],
-                    "type": r["type"],
-                }
-            )
-
-    combined = {
-        "opinions": opinions,
-        "pages": {str(k): v for k, v in sorted(pages.items())},
-    }
+    try:
+        combined = bl_build_redactions(
+            pages,
+            scan.redaction_rects,
+            scan.margin_rects,
+            scan.opinions_json,
+            reporter=scan.reporter.short_name or "",
+            volume=str(scan.volume) or "",
+        )
+    except KeyError as exc:
+        # The rects are a saved snapshot and the pages come from the live
+        # detections, so a page with rects but no detections left cannot be
+        # scaled. Deleting the last detection prunes that page's rects (see
+        # ``views_api._drop_orphaned_redaction_rects``), so reaching this
+        # means something else desynchronised them. Refusing is right --
+        # guessing the scale would put a blackout in the wrong place -- but
+        # name recovery a reviewer can actually carry out.
+        raise RuntimeError(
+            f"scan {scan_pk}: saved redaction rects reference a page with no "
+            f"detections left, so their pixel coordinates cannot be converted "
+            f"to points. Re-add a detection on that page, or delete the "
+            f"leftover rect from the redaction overlay, then generate again. "
+            f"({exc})"
+        ) from exc
 
     out_path = output_dir / "redactions.json"
     out_path.write_text(json.dumps(combined))
+    pages = combined["pages"]
     n_rects = sum(len(v) for v in pages.values())
     logger.info(
         "Combined redactions: %s pages, %s rects, %s opinions",
         len(pages),
         n_rects,
-        len(opinions),
+        len(combined["opinions"]),
     )
     return out_path
-
-
-def _adjust_margins_for_detections(
-    margin_rects: list, output_dir: Path
-) -> list:
-    """Shrink margin rects that overlap with active detections.
-
-    For each page, convert detection bboxes from image coords to PDF
-    coords and push back the edge of any margin rect that would cover
-    a detection.
-
-    :param margin_rects: List of ``{"page_index": int, "rects": [...]}``
-        dicts from ``compute_margin_rects``.
-    :param output_dir: Output directory containing detections.json.
-    :return: The adjusted margin rects list (modified in place).
-    """
-    det_path = output_dir / "detections.json"
-    if not det_path.exists():
-        return margin_rects
-
-    detections = json.loads(det_path.read_text())
-
-    # Labels that should not push back margins (noisy edge detections)
-    ignore_labels = {"PAGE_NUMBER", "PAGE_HEADER", "STATE_ABBREVIATION"}
-
-    # Group detections by page_index, skipping ignored labels
-    dets_by_page: dict[int, list] = {}
-    for d in detections:
-        if d.get("label", "") in ignore_labels:
-            continue
-        dets_by_page.setdefault(d["page_index"], []).append(d)
-
-    padding = 0.0  # extra PDF-pt clearance around detections
-
-    for page_entry in margin_rects:
-        if not page_entry["rects"]:
-            continue
-        page_idx = page_entry["page_index"]
-        page_dets = dets_by_page.get(page_idx)
-        if not page_dets:
-            continue
-
-        # Get image dimensions from the first detection on this page
-        img_w = page_dets[0].get("img_width", 1)
-        img_h = page_dets[0].get("img_height", 1)
-        if not img_w or not img_h:
-            continue
-
-        # Determine PDF page size from the margin rects themselves
-        # (full-width rects span x0=0 to x1=page_width, etc.)
-        pdf_w = max(r["x1"] for r in page_entry["rects"])
-        pdf_h = max(r["y1"] for r in page_entry["rects"])
-        sx = pdf_w / img_w
-        sy = pdf_h / img_h
-
-        # Convert detection bboxes to PDF coords
-        pdf_dets = []
-        for d in page_dets:
-            bb = d["bbox"]
-            pdf_dets.append((bb[0] * sx, bb[1] * sy, bb[2] * sx, bb[3] * sy))
-
-        # Adjust each margin rect
-        for rect in page_entry["rects"]:
-            for dx0, dy0, dx1, dy1 in pdf_dets:
-                # Check if detection overlaps this rect
-                if (
-                    dx0 < rect["x1"]
-                    and dx1 > rect["x0"]
-                    and dy0 < rect["y1"]
-                    and dy1 > rect["y0"]
-                ):
-                    # Shrink the rect edge that intrudes on the detection
-                    # Bottom margin (rect covers lower portion of page)
-                    if rect["y0"] > 0 and rect["y1"] >= pdf_h - 1:
-                        rect["y0"] = max(rect["y0"], dy1 + padding)
-                    # Top margin (rect covers upper portion of page)
-                    if rect["y0"] <= 1 and rect["y1"] < pdf_h - 1:
-                        rect["y1"] = min(rect["y1"], dy0 - padding)
-                    # Left margin (rect covers left portion of page)
-                    if rect["x0"] <= 1 and rect["x1"] < pdf_w - 1:
-                        rect["x1"] = min(rect["x1"], dx0 - padding)
-                    # Right margin (rect covers right portion of page)
-                    if (
-                        rect["x0"] > 0
-                        and rect["y0"] <= 1
-                        and rect["y1"] >= pdf_h - 1
-                    ):
-                        rect["x0"] = max(rect["x0"], dx1 + padding)
-
-    return margin_rects
 
 
 def _re_pair_opinions(scan_pk: int) -> list:
@@ -1351,7 +1228,7 @@ def _re_pair_opinions(scan_pk: int) -> list:
     if not det_data:
         return []
 
-    pdf_path = find_ocr_pdf(scan.output_dir) or scan.pdf_path
+    pdf_path = processing_pdf_path(scan)
     with _log_stage("Opinion pairing"):
         opinions = bl_pair(
             det_data,
@@ -1423,7 +1300,9 @@ def _dispatch_analyze(
     return all_results
 
 
-def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
+def run_paddleocr_validation(
+    scan_pk: int, pdf_path: str, reuse: bool = False
+) -> None:
     """Validate page numbers using the runpod_client analyze action.
 
     In local mode (``RUNPOD_ENABLED=False``) this calls
@@ -1435,11 +1314,38 @@ def run_paddleocr_validation(scan_pk: int, pdf_path: str) -> None:
 
     :param scan_pk: Primary key of the scan to validate.
     :param pdf_path: Path to the PDF to run validation on.
+    :param reuse: When True, consume a finished analyze job's stored
+        result instead of submitting a new one, if the stored result was
+        written after the current ``pdf_path`` reached S3. Off by
+        default so every caller that means "analyze this again" keeps
+        doing exactly that; only the resume path in
+        :func:`run_full_pipeline` sets it.
     """
-    with _log_stage("PaddleOCR validation"):
-        all_results = _dispatch_analyze(
-            scan_pk, pdf_path, stream_partial=False
+    from scanning import runpod_client
+
+    all_results = None
+    if reuse:
+        payload = runpod_client.reusable_result(
+            Scan.objects.get(pk=scan_pk), "analyze", Path(pdf_path).name
         )
+        if payload is not None and isinstance(payload.get("results"), list):
+            all_results = payload["results"]
+            _update_progress(
+                scan_pk,
+                f"Page numbers: reused {len(all_results)} page result(s) "
+                "from the last run",
+            )
+            logger.info(
+                "Reused %d analyze result(s) for scan %s; skipped the job",
+                len(all_results),
+                scan_pk,
+            )
+
+    if all_results is None:
+        with _log_stage("PaddleOCR validation"):
+            all_results = _dispatch_analyze(
+                scan_pk, pdf_path, stream_partial=False
+            )
     Scan.objects.filter(pk=scan_pk).update(ocr_results=all_results)
     _rebuild_issues_from_results(scan_pk, all_results)
 
@@ -1494,6 +1400,7 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
             )
     if all_detections:
         Detection.objects.bulk_create(all_detections)
+        _snap_text_columns_to_ink(scan_pk, pdf_path)
 
     Scan.objects.filter(pk=scan_pk).update(
         ocr_results=all_results,
@@ -1509,97 +1416,40 @@ def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _split_detected(
-    ocr_results: list, exp_start: int | None, exp_end: int | None
-) -> tuple[list, dict]:
-    """Partition detected single page numbers into out-of-range and in-range.
+def _expected_range(scan: "Scan") -> tuple[int | None, int | None]:
+    """Return the expected first/last printed page numbers for a scan.
 
-    A detected number is out of range when it is below 1 or, when an expected
-    range is known, falls more than 5 outside it. Range pages and pages
-    without a detected number are skipped.
+    Uses the scanner-entered ``start_page``/``end_page`` fields, the same
+    source the validate stage uses, so a recheck sees the same range the
+    original run did. Deriving it from the uploaded filename instead is
+    both unreliable (the ``.original.pdf`` suffix defeats the
+    reporter.volume.first.last parser) and needs a local copy of the PDF,
+    which production does not keep around between requests.
 
-    :param ocr_results: Per-page OCR results.
-    :param exp_start: Expected first page number, or None.
-    :param exp_end: Expected last page number, or None.
-    :returns: ``(out_of_range, seen_nums)`` where ``seen_nums`` maps each
-        in-range number to the list of PDF pages it appears on.
-    :rtype: tuple[list, dict]
+    Both values are returned together or not at all: every downstream
+    range check needs the pair.
+
+    :param scan: The Scan to read the range from.
+    :returns: ``(exp_start, exp_end)``, or ``(None, None)`` when the scan
+        has no end page recorded.
+    :rtype: tuple[int | None, int | None]
     """
-    out_of_range: list = []
-    seen_nums: dict = {}
-    for r in ocr_results:
-        if not r["detected"] or r.get("type") == "range":
-            continue
-        try:
-            num = int(r["detected"])
-        except (ValueError, TypeError):
-            continue
-        if num < 1:
-            out_of_range.append(r)
-        elif exp_start is not None and (
-            num < exp_start - 5 or num > exp_end + 5
-        ):
-            out_of_range.append(r)
-        else:
-            seen_nums.setdefault(num, []).append(r["pdf_page"])
-    return out_of_range, seen_nums
+    if not scan.end_page:
+        return None, None
+    return scan.start_page or 1, scan.end_page
 
 
-def _build_analysis(
-    ocr_results: list, exp_start: int | None, exp_end: int | None
-) -> dict:
-    """Analyze ocr_results into the structure ``_build_issues`` expects.
+def _is_manual_read(result: dict) -> bool:
+    """Return whether a per-page page number was entered by hand.
 
-    Computes out-of-range, duplicate, sequence, and missing-page data from
-    the current page numbers without re-running OCR or opening the PDF.
+    ``assign_page`` stamps ``zone`` and ``ocr`` with ``"manual"`` when a
+    curator types a page number in step 1.
 
-    :param ocr_results: Per-page OCR results (already finalized).
-    :param exp_start: Expected first page number, or None.
-    :param exp_end: Expected last page number, or None.
-    :returns: The analysis dict consumed by ``_build_issues``.
-    :rtype: dict
+    :param result: One per-page entry from ``Scan.ocr_results``.
+    :returns: ``True`` when the number came from a person, not a model.
+    :rtype: bool
     """
-    out_of_range, seen_nums = _split_detected(ocr_results, exp_start, exp_end)
-    out_of_range_pages = {r["pdf_page"] for r in out_of_range}
-    all_nums = sorted(seen_nums.keys())
-    duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
-    seq_issues = _detect_sequence_issues(ocr_results, out_of_range_pages)
-
-    range_re = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
-    range_pages = set()
-    ranges_found = [r for r in ocr_results if r.get("type") == "range"]
-    for r in ranges_found:
-        m = range_re.match(r["detected"].replace("–", "-"))
-        if m:
-            for pg in range(int(m.group(1)), int(m.group(2)) + 1):
-                range_pages.add(pg)
-
-    if exp_start is not None and all_nums:
-        missing_pages = sorted(
-            (set(range(exp_start, exp_end + 1)) - set(all_nums))
-            - range_pages
-            - {0}
-        )
-    elif all_nums:
-        missing_pages = sorted(
-            (set(range(all_nums[0], all_nums[-1] + 1)) - set(all_nums))
-            - range_pages
-            - {0}
-        )
-    else:
-        missing_pages = []
-
-    return {
-        "results": ocr_results,
-        "seq_issues": seq_issues,
-        "duplicates": duplicates,
-        "seen_nums": seen_nums,
-        "all_nums": all_nums,
-        "missing_pages": missing_pages,
-        "ranges_found": ranges_found,
-        "not_detected": [r for r in ocr_results if not r["detected"]],
-        "out_of_range": out_of_range,
-    }
+    return "manual" in (result.get("ocr"), result.get("zone"))
 
 
 def rebuild_page_map(scan: "Scan") -> None:
@@ -1616,12 +1466,9 @@ def rebuild_page_map(scan: "Scan") -> None:
     ocr_results = scan.ocr_results
     if not ocr_results:
         return
-    try:
-        exp_start, exp_end = _parse_expected_range(scan.pdf_path)
-    except FileNotFoundError:
-        exp_start, exp_end = _parse_expected_range(scan.original_pdf.name)
-    analysis = _build_analysis(ocr_results, exp_start, exp_end)
-    result = _build_issues(
+    exp_start, exp_end = _expected_range(scan)
+    analysis = build_analysis(ocr_results, exp_start, exp_end)
+    result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
     scan.page_map = result["page_map"]
@@ -1632,6 +1479,9 @@ def rebuild_page_map(scan: "Scan") -> None:
 def recalculate_issues(scan: "Scan") -> None:
     """Rebuild issues from scan.ocr_results without re-running OCR.
 
+    Runs off stored data only, so it works on a web pod that never
+    downloaded the scan's processing files from S3.
+
     :param scan: The Scan instance to recalculate issues for.
     """
 
@@ -1639,9 +1489,11 @@ def recalculate_issues(scan: "Scan") -> None:
     if not ocr_results:
         return
 
-    exp_start, exp_end = _parse_expected_range(scan.pdf_path)
+    exp_start, exp_end = _expected_range(scan)
 
-    out_of_range, seen_nums = _split_detected(ocr_results, exp_start, exp_end)
+    out_of_range, seen_nums = _split_in_out_of_range(
+        ocr_results, exp_start, exp_end
+    )
 
     auto_corrected = []
     if out_of_range and seen_nums:
@@ -1651,6 +1503,11 @@ def recalculate_issues(scan: "Scan") -> None:
         in_range_sorted = sorted(in_range_by_page.items())
         offsets = {}
         for r in out_of_range:
+            if _is_manual_read(r):
+                # A curator typed this number, so it outranks the
+                # offset heuristic. It is still reported as an
+                # out-of-range reading below, just not overwritten.
+                continue
             p, detected = r["pdf_page"], int(r["detected"])
             before = [(pp, n) for pp, n in in_range_sorted if pp < p]
             after = [(pp, n) for pp, n in in_range_sorted if pp > p]
@@ -1690,9 +1547,9 @@ def recalculate_issues(scan: "Scan") -> None:
                 ocr_results = new_results
                 scan.ocr_results = ocr_results
 
-    analysis = _build_analysis(ocr_results, exp_start, exp_end)
+    analysis = build_analysis(ocr_results, exp_start, exp_end)
 
-    result = _build_issues(
+    result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
 
@@ -1710,8 +1567,16 @@ def recalculate_issues(scan: "Scan") -> None:
             }
         )
 
-    with fitz.open(scan.pdf_path) as pdf_fitz:
-        scan.page_count = len(pdf_fitz)
+    # Refresh page_count opportunistically: the PDF has not changed since
+    # validation, and in production the local copy is usually absent
+    # because rechecks run on a web pod that never pulled it from S3.
+    try:
+        pdf_path = scan.pdf_path
+    except FileNotFoundError:
+        pdf_path = None
+    if pdf_path:
+        with fitz.open(pdf_path) as pdf_fitz:
+            scan.page_count = len(pdf_fitz)
 
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
@@ -1721,7 +1586,10 @@ def recalculate_issues(scan: "Scan") -> None:
     scan.progress_message = "Done"
     scan.save()
 
-    scan.issues.all().delete()
+    # Suppression flags are curator decisions stored as Issue rows, not
+    # derived from the page numbers, so a recheck keeps them (same
+    # exclusion the daemon rebuild uses).
+    scan.issues.exclude(check_name=CheckName.SUPPRESS_DETECTION).delete()
     Issue.objects.bulk_create(
         [Issue(scan=scan, **i) for i in result["issues"]]
     )
@@ -1765,10 +1633,41 @@ def run_validate_with_bitonal(scan_pk: int) -> None:
 
 
 def run_full_pipeline(scan_pk: int) -> None:
-    """Run the full processing pipeline: bitonal → OCR → YOLO → validate → pair → rects.
+    """Run the full processing pipeline: bitonal → YOLO → validate → pair.
 
     Designed to run in the daemon process. After this completes, the scan
     is ready for review -- the user only needs to approve and generate.
+
+    Resumable across a daemon restart. There is no stage bookkeeping: each
+    step decides for itself whether its output already exists and is still
+    valid for the current input, so a re-queued scan skips what finished
+    rather than restarting at step 1. That matters because the daemon takes
+    a SIGTERM on every deploy and re-queues whatever was mid-flight, and
+    steps 4 and 6 are GPU jobs measured in minutes. See
+    :func:`_reuse_detect_result` and ``runpod_client.reusable_result``.
+    Sharding (step 2) follows the same contract through its manifest's
+    source fingerprint (``sharding.ensure_shards``).
+
+    There is no "re-run anyway" argument here on purpose. The daemon
+    dispatches this by name with only a pk, so a caller wanting fresh
+    results has nowhere to put one; it says so by deleting the stored
+    results instead (``s3_sync.invalidate_job_results``, which is what
+    the Re-validate action does). That survives the hand-off through the
+    queue, which a parameter could not.
+
+    No text layer is embedded here. The ocrmypdf/Tesseract pass used to
+    run between bitonal conversion and detection and dominated the
+    pipeline's wall clock, while nothing in steps 1 and 2 reads the text
+    it produced; ``bitonal.pdf`` is now the processing PDF end to end
+    (see ``utils.find_processing_pdf``).
+
+    No redaction geometry is computed here either, for the same reason.
+    The column correction and the redaction rects cost three full-volume
+    renders at 100 dpi between them, and review 1 reads neither: it asks
+    whether the volume is complete and shows no detection overlay. Both
+    now run in :func:`run_generate_files`, where the geometry is actually
+    read, so a scanner waits for detection and pairing only. The step 2
+    overlay still gets rects on demand through ``compute_redactions_api``.
 
     :param scan_pk: Primary key of the scan to process.
     """
@@ -1785,24 +1684,18 @@ def run_full_pipeline(scan_pk: int) -> None:
         # 1. Ensure output directory exists
         output_dir = ensure_output_dir(scan)
 
-        # 2. Bitonal conversion
+        # 2. Shard the original for external job execution (#164).
+        # Runs first so dots.mocr/bitonal jobs can fan out over the
+        # shards as soon as possible after upload.
+        _update_progress(scan_pk, "Sharding original PDF...")
+        _ensure_shards(scan)
+
+        # 3. Bitonal conversion
         bitonal_path = _ensure_bitonal(scan, output_dir)
 
-        # 3. Tesseract OCR (on bitonal)
-        scan.refresh_from_db()
-        ocr_pdf = find_ocr_pdf(str(output_dir))
-        if not ocr_pdf:
-            ocr_pdf = _run_ocr(
-                scan_pk,
-                str(bitonal_path),
-                str(output_dir),
-                reporter=scan.reporter.short_name or "",
-                volume=str(scan.volume) or "",
-                first_page=scan.start_page or 1,
-            )
-
         # 4. YOLO detection (all 3 models on bitonal)
-        _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
+        if not _reuse_detect_result(scan, str(output_dir)):
+            _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
 
         # 5. Import detections into DB
         _update_progress(scan_pk, "Importing detections...")
@@ -1813,16 +1706,14 @@ def run_full_pipeline(scan_pk: int) -> None:
             scan_pk,
             f"{len(dets)} detections imported. Running page number validation...",
         )
-        run_paddleocr_validation(scan_pk, scan.pdf_path)
+        run_paddleocr_validation(scan_pk, scan.pdf_path, reuse=True)
 
         # 7. Pair opinions
         _update_progress(scan_pk, "Pairing opinions...")
         opinions = _re_pair_opinions(scan_pk)
 
-        # 8. Compute redaction rects (margin rects computed lazily when viewer requests them)
-        _update_progress(scan_pk, "Computing redaction rects...")
-        pdf_path = str(ocr_pdf) if ocr_pdf else scan.pdf_path
-        _compute_and_save_redaction_rects(scan_pk, pdf_path)
+        # Redaction and margin geometry is deliberately not computed here;
+        # Generate Files does it. See this function's docstring.
 
         Scan.objects.filter(pk=scan_pk).update(
             status=Status.PENDING_REVIEW,
@@ -1837,7 +1728,7 @@ def run_full_pipeline(scan_pk: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Reprocess (apply fixes, re-bitonal, re-OCR, re-validate)
+# Reprocess (apply fixes, re-bitonal, re-detect, re-validate)
 # ---------------------------------------------------------------------------
 
 
@@ -1846,6 +1737,18 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
 
     Preserves the actual OCR results (including manual assignments) but
     recalculates sequence issues, missing pages, duplicates, etc.
+
+    The analysis now comes from :func:`blackletter.validate.build_analysis`
+    rather than being assembled here, which makes this path agree with
+    ``recalculate_issues`` and ``rebuild_page_map`` where it used to differ
+    in three ways, all of them this path being wrong:
+
+    - a page printed as a range ("677-685") now accounts for every number it
+      covers, so those no longer show up as missing
+    - out-of-range readings now reach ``build_issues``, which both reports
+      them and stops them anchoring duplicate detection
+    - a scan with no ``end_page`` now gets missing-page findings across the
+      span it actually detected, instead of none at all
 
     :param scan_pk: Primary key of the scan to rebuild issues for.
     :param all_results: List of per-page OCR result dicts.
@@ -1858,43 +1761,26 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
     out_of_range, seen_nums = _split_in_out_of_range(
         all_results, exp_start, exp_end
     )
+    # Hand-entered numbers outrank the offset heuristic, and blackletter's
+    # _auto_correct does not know about them, so withhold them here. This
+    # keeps a rebuild from clobbering what a recheck preserves.
     all_results, corrections = _auto_correct(
-        all_results, out_of_range, seen_nums
+        all_results,
+        [r for r in out_of_range if not _is_manual_read(r)],
+        seen_nums,
     )
     if corrections:
         out_of_range, seen_nums = _split_in_out_of_range(
             all_results, exp_start, exp_end
         )
 
-    all_nums = sorted(seen_nums.keys())
-    duplicates = {k: v for k, v in seen_nums.items() if len(v) > 1}
-    not_detected = [x for x in all_results if not x["detected"]]
-    out_of_range_pages = {r["pdf_page"] for r in out_of_range}
+    # Auto-correction can move a page in or out of range, so the split done
+    # above is the one that applies and blackletter must not recompute it.
+    analysis = build_analysis(
+        all_results, exp_start, exp_end, out_of_range=out_of_range
+    )
 
-    seq_issues = _detect_sequence_issues(all_results, out_of_range_pages)
-
-    if exp_start is not None and exp_end is not None:
-        expected = set(range(exp_start, exp_end + 1))
-        found = {n for n in seen_nums if exp_start <= n <= exp_end}
-        missing_pages = sorted(expected - found)
-    else:
-        missing_pages = []
-
-    ranges_found = [r for r in all_results if r.get("type") == "range"]
-
-    analysis = {
-        "total_pages": total,
-        "results": all_results,
-        "seen_nums": seen_nums,
-        "all_nums": all_nums,
-        "duplicates": duplicates,
-        "not_detected": not_detected,
-        "seq_issues": seq_issues,
-        "missing_pages": missing_pages,
-        "ranges_found": ranges_found,
-    }
-
-    result = _build_issues(analysis, total, exp_start, exp_end)
+    result = build_issues(analysis, total, exp_start, exp_end)
 
     scan.refresh_from_db()
     scan.page_count = total
@@ -1918,7 +1804,8 @@ def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
 def run_reprocess(scan_pk: int) -> None:
     """Apply PDF fixes (inserts/deletions) using smart edits.
 
-    Only OCRs newly inserted pages. Deleted pages are removed from
+    Reads page numbers off newly inserted pages only. Deleted pages are
+    removed from
     ocr_results. Manual page assignments are preserved.
 
     Designed to run in the daemon process.
@@ -1998,7 +1885,7 @@ def run_reprocess(scan_pk: int) -> None:
 
             scan.inserts.all().delete()
 
-        # run_smart_insert already handled OCR, detection, validation,
+        # run_smart_insert already handled detection, validation,
         # re-pairing, and rect computation for each insert. Reload the
         # final state from the DB.
         scan.refresh_from_db()
@@ -2010,7 +1897,7 @@ def run_reprocess(scan_pk: int) -> None:
         _re_pair_opinions(scan_pk)
 
         if output_dir:
-            pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
+            pdf_path = processing_pdf_path(scan)
             Scan.objects.filter(pk=scan_pk).update(
                 margin_rects="", redaction_rects=""
             )
@@ -2036,9 +1923,10 @@ def run_reprocess(scan_pk: int) -> None:
 def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
     """Delete a single page and patch detections/validation in place.
 
-    Removes the page from the original PDF, bitonal PDF, and OCR PDF;
-    deletes detections on that page; shifts subsequent detection
-    page_index values down by 1; re-runs PaddleOCR validation and re-pairs.
+    Removes the page from every PDF the scan keeps on disk (the original,
+    ``bitonal.pdf``, and a legacy OCR PDF if one is still there); deletes
+    detections on that page; shifts subsequent detection page_index
+    values down by 1; re-runs PaddleOCR validation and re-pairs.
 
     :param scan_pk: Primary key of the scan to edit.
     :param pdf_page: 1-based PDF page number to delete.
@@ -2062,53 +1950,7 @@ def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
     _re_pair_opinions(scan_pk)
 
     if output_dir:
-        pdf_path = find_ocr_pdf(str(output_dir)) or scan.pdf_path
-        _compute_and_save_redaction_rects(scan_pk, pdf_path)
-
-
-def _ocr_single_page(ocr_pdf_path: str, page_idx: int) -> None:
-    """Run Tesseract OCR on a single page of a PDF to add a text layer.
-
-    Extracts the page to a temp file, OCRs it, then replaces the page
-    in the original PDF with the OCR'd version.
-
-    :param ocr_pdf_path: Path to the OCR PDF to update.
-    :param page_idx: Zero-based page index to OCR.
-    """
-    import tempfile
-
-    import ocrmypdf
-
-    ocr_pdf_path = str(ocr_pdf_path)
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        # Extract the single page
-        single_path = tmp / "page.pdf"
-        with fitz.open(ocr_pdf_path) as doc:
-            with fitz.open() as single:
-                single.insert_pdf(doc, from_page=page_idx, to_page=page_idx)
-                single.save(str(single_path))
-
-            # OCR it
-            ocrd_path = tmp / "page_ocr.pdf"
-            ocrmypdf.ocr(
-                str(single_path),
-                str(ocrd_path),
-                pdf_renderer="auto",
-                optimize=1,
-                output_type="pdf",
-                language=["eng"],
-                tesseract_timeout=120,
-                progress_bar=False,
-            )
-
-            # Replace the page in the OCR PDF
-            with fitz.open(str(ocrd_path)) as ocrd_doc:
-                doc.delete_page(page_idx)
-                doc.insert_pdf(
-                    ocrd_doc, from_page=0, to_page=0, start_at=page_idx
-                )
-                doc.saveIncr()
+        _compute_and_save_redaction_rects(scan_pk, processing_pdf_path(scan))
 
 
 def run_smart_insert(
@@ -2116,9 +1958,10 @@ def run_smart_insert(
 ) -> None:
     """Insert a page and run detection/validation on just that page.
 
-    Inserts the page image into the original PDF, bitonal PDF, and OCR PDF
-    at the correct position; shifts subsequent detection page_index values up
-    by 1; re-validates and re-pairs.
+    Inserts the page image into every PDF the scan keeps on disk (the
+    original, ``bitonal.pdf``, and a legacy OCR PDF if one is still
+    there) at the correct position; shifts subsequent detection
+    page_index values up by 1; re-validates and re-pairs.
 
     :param scan_pk: Primary key of the scan to edit.
     :param logical_page_number: The logical page number to insert at.
@@ -2159,12 +2002,6 @@ def run_smart_insert(
                 new_page.insert_image(new_page.rect, filename=str(image_path))
             doc.saveIncr()
 
-    # OCR the inserted page in the OCR PDF so it gets a text layer
-    if output_dir:
-        ocr_pdf_path = find_ocr_pdf(str(output_dir))
-        if ocr_pdf_path:
-            _ocr_single_page(ocr_pdf_path, insert_idx)
-
     # Shift subsequent detections up
     Detection.objects.filter(
         scan_id=scan_pk, page_index__gte=insert_idx
@@ -2181,18 +2018,16 @@ def run_smart_insert(
 
     # Re-validate, re-pair, recompute rects
     scan.refresh_from_db()
-    pdf_path = find_ocr_pdf(str(output_dir)) if output_dir else scan.pdf_path
-    run_incremental_validation(scan_pk, pdf_path or scan.pdf_path)
+    pdf_path = processing_pdf_path(scan)
+    run_incremental_validation(scan_pk, pdf_path)
     _re_pair_opinions(scan_pk)
 
     if output_dir:
         Scan.objects.filter(pk=scan_pk).update(
             margin_rects="", redaction_rects=""
         )
-        _compute_and_save_margin_rects(
-            scan_pk, pdf_path or scan.pdf_path, str(output_dir)
-        )
-        _compute_and_save_redaction_rects(scan_pk, pdf_path or scan.pdf_path)
+        _compute_and_save_margin_rects(scan_pk, pdf_path, str(output_dir))
+        _compute_and_save_redaction_rects(scan_pk, pdf_path)
 
 
 def _collect_pdf_paths(scan: "Scan", output_dir: str | None) -> list[Path]:
@@ -2219,21 +2054,22 @@ def _collect_pdf_paths(scan: "Scan", output_dir: str | None) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
-    """Overlay original-quality image regions onto a *copy* of the OCR'd PDF.
+def _stamp_original_images(scan: "Scan", base_pdf_path: str) -> str:
+    """Overlay original-quality image regions onto a *copy* of the base PDF.
 
     For each active IMAGE detection, renders the bounding box from the
-    original scan PDF and inserts it into a copy of the OCR'd PDF at the
-    same position.  This preserves full-quality photographs/illustrations
-    that would otherwise be degraded by bitonal conversion.
+    original scan PDF and inserts it into a copy of the processing PDF
+    (normally ``bitonal.pdf``) at the same position. This preserves
+    full-quality photographs/illustrations that would otherwise be
+    degraded by bitonal conversion.
 
     :param scan: The Scan instance with the original PDF path.
-    :param ocr_pdf_path: Path to the OCR'd PDF to stamp onto.
-    :return: Path to the stamped copy, or the original path if no
-        images needed stamping (so the OCR PDF is never modified).
+    :param base_pdf_path: Path to the processing PDF to stamp onto.
+    :return: Path to the stamped copy. Always a copy, so the processing
+        PDF is never modified by downstream steps.
     """
 
-    stamped_path = os.path.join(os.path.dirname(ocr_pdf_path), "stamped.pdf")
+    stamped_path = os.path.join(os.path.dirname(base_pdf_path), "stamped.pdf")
 
     image_dets = list(
         Detection.objects.filter(scan=scan, label="IMAGE", active=True)
@@ -2243,30 +2079,30 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
         )
     )
     if not image_dets:
-        # Always copy so the OCR PDF is never modified by downstream steps
-        shutil.copy2(ocr_pdf_path, stamped_path)
+        # Always copy so the processing PDF is never modified downstream
+        shutil.copy2(base_pdf_path, stamped_path)
         return stamped_path
 
     # Save extracted images to images/ directory
-    images_dir = Path(os.path.dirname(ocr_pdf_path)) / "images"
+    images_dir = Path(os.path.dirname(base_pdf_path)) / "images"
     images_dir.mkdir(exist_ok=True)
     page_numbers = _page_number_lookup(scan)
     img_count_by_page: dict[int, int] = {}
 
     with (
         fitz.open(scan.pdf_path) as original_doc,
-        fitz.open(ocr_pdf_path) as ocr_doc,
+        fitz.open(base_pdf_path) as base_doc,
     ):
         for det in image_dets:
             page_idx = det["page_index"]
             if (
                 page_idx >= original_doc.page_count
-                or page_idx >= ocr_doc.page_count
+                or page_idx >= base_doc.page_count
             ):
                 continue
 
             orig_page = original_doc[page_idx]
-            ocr_page = ocr_doc[page_idx]
+            base_page = base_doc[page_idx]
 
             # Convert image-pixel bbox to PDF points
             page_rect = orig_page.rect
@@ -2286,8 +2122,8 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
             pix = orig_page.get_pixmap(clip=pdf_rect, dpi=150)
             png_bytes = pix.tobytes("png")
 
-            # Stamp onto the OCR'd PDF
-            ocr_page.insert_image(pdf_rect, stream=png_bytes)
+            # Stamp onto the processing PDF copy
+            base_page.insert_image(pdf_rect, stream=png_bytes)
 
             # Save image to images/ directory
             pn = page_numbers.get(page_idx)
@@ -2298,7 +2134,7 @@ def _stamp_original_images(scan: "Scan", ocr_pdf_path: str) -> str:
             img_name = f"{page_num}-{img_count_by_page[page_idx]:03d}.png"
             (images_dir / img_name).write_bytes(png_bytes)
 
-        ocr_doc.save(stamped_path, garbage=3, deflate=True)
+        base_doc.save(stamped_path, garbage=3, deflate=True)
     return stamped_path
 
 
@@ -2320,18 +2156,49 @@ def run_generate_files(scan_pk: int) -> None:
         )
 
         output = Path(scan.output_dir)
-        ocr_pdf = find_ocr_pdf(str(output))
-        if not ocr_pdf:
-            raise ValueError("No OCR'd PDF found in output directory")
+        base_pdf = find_processing_pdf(str(output))
+        if not base_pdf:
+            raise ValueError(
+                "No processing PDF (bitonal.pdf) found in output directory"
+            )
 
-        # Stamp original-quality images into a copy, leaves OCR PDF untouched
-        gen_pdf = _stamp_original_images(scan, str(ocr_pdf))
+        # Stamp original-quality images into a copy, leaves base PDF untouched
+        gen_pdf = _stamp_original_images(scan, str(base_pdf))
+
+        # Correct the TEXT_COLUMN boxes against the page ink before anything
+        # reads them. The upload path used to do this so that step 2 showed
+        # corrected boxes, but review 1 has no detection overlay to show them
+        # in, so it was a full-volume render nobody was waiting on. Here it
+        # runs before the detections are written out, which is what the
+        # geometry below and the pairing are measured from.
+        _update_progress(scan_pk, "Correcting column boxes...")
+        _snap_text_columns_to_ink(scan_pk, str(base_pdf))
 
         # Write current DB detections -> detections.json (includes page numbers)
         det_data = _sync_detections_to_disk(scan_pk)
         Scan.objects.filter(pk=scan_pk).update(
             progress_message=f"Generating files ({len(det_data or [])} detections)..."
         )
+
+        # Margin rects are otherwise only computed on demand, by the viewer
+        # asking for them or by a reprocess. A scan taken straight from
+        # review to Generate without the margins overlay ever being switched
+        # on therefore shipped with no whiteouts at all: the platen bands,
+        # fold shadows and corner bleed stayed in the deliverable. Computing
+        # them here makes the output independent of what the reviewer
+        # happened to look at; it no-ops when they already exist.
+        _compute_and_save_margin_rects(scan_pk, str(base_pdf), str(output))
+
+        # Redaction rects, same story: off the upload path, computed here
+        # unless something already produced them. That "something" is either
+        # the step 2 overlay asking for them or a reprocess, and in the step 2
+        # case a reviewer may since have moved or deleted individual rects
+        # through ``save_redaction_rect``. Recomputing would discard those
+        # edits, so the stored set wins whenever there is one.
+        scan.refresh_from_db()
+        if not scan.redaction_rects:
+            _update_progress(scan_pk, "Computing redaction rects...")
+            _compute_and_save_redaction_rects(scan_pk, str(base_pdf))
 
         # Build combined redactions.json (margins + redaction rects + opinions)
         Scan.objects.filter(pk=scan_pk).update(
@@ -2355,9 +2222,12 @@ def run_generate_files(scan_pk: int) -> None:
             llm=True,
         )
 
+        _add_llm_page_text_layer(scan_pk, output / "llm")
+
         opinion_count = result.get("opinion_count", 0)
         full_redacted = result.get("full_redacted", "")
         redacted_dir = Path(result.get("redacted_dir", output / "redacted"))
+
         unredacted_dir = output / "unredacted"
 
         redacted_files = (
@@ -2466,37 +2336,40 @@ def _page_has_headnote(redactions_pages: dict, page_index: int) -> bool:
     )
 
 
-def _page_body_textless(
+def _page_body_covered(
+    redactions_pages: dict,
+    page_index: int,
     pdf_path: Path,
-    header_height_pts: float = 60.0,
-    text_floor: int = 5,
 ) -> bool:
-    """Return True when the rendered page has no text below the header.
+    """Return True when rects cover essentially all of a page's body.
 
-    The per-page PDFs handed to the LLM are post-redaction, so a body
-    entirely covered by ``headnote`` rects extracts to nothing. Used as
-    the boundary-case confirmation for the sandwich rule: when only
-    one neighbor of a page has headnotes (the page is the leading or
-    trailing edge of a multi-page block), we verify the redaction
-    actually wiped the body text before calling the page blank.
+    Boundary-case confirmation for the sandwich rule: when only one
+    neighbor of a page has headnotes (the page is the leading or trailing
+    edge of a multi-page block), we check that the redaction geometry
+    actually wipes the whole body before calling the page blank.
 
-    Returns False on any exception so a corrupt PDF doesn't mis-flag
+    The measurement is :func:`blackletter.process.page_body_covered`; what
+    is app-specific is looking the page's rects up in ``redactions.json``
+    and reading the page size off the generated PDF.
+
+    Returns False on any exception so an unreadable PDF cannot mis-flag
     a page as blank.
 
-    :param pdf_path: Filesystem path to the per-page PDF.
-    :param header_height_pts: PDF-point band at the top of the page
-        treated as "header" and excluded from the text check. The
-        printed page number lives here.
-    :param text_floor: Chars of body text below which the page is
-        considered effectively empty.
-    :return: True if the cropped body extracts to fewer than
-        ``text_floor`` chars.
+    :param redactions_pages: ``redactions["pages"]`` -- dict keyed by
+        stringified page_index, each value a list of rect dicts with
+        ``x0``/``y0``/``x1``/``y1`` in PDF points.
+    :param page_index: 0-based PDF page index.
+    :param pdf_path: Filesystem path to the per-page PDF, used only to
+        read the page size.
+    :return: True if essentially all of the body is covered.
     """
+    rects = redactions_pages.get(str(page_index), [])
+    if not rects:
+        return False
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            pg = pdf.pages[0]
-            body = pg.crop((0, header_height_pts, pg.width, pg.height))
-            return len((body.extract_text() or "").strip()) < text_floor
+        with fitz.open(str(pdf_path)) as doc:
+            page_rect = doc[0].rect
+        return page_body_covered(rects, page_rect.width, page_rect.height)
     except Exception:
         return False
 
@@ -2539,9 +2412,9 @@ def _is_blank_via_sandwich(
         fires directly.
       * **Boundary sandwich** — only one neighbor has headnotes
         (this page is the leading or trailing edge of the block).
-        Confirm with a text-extraction check on the rendered PDF;
-        since the per-page PDFs are post-redaction, an actually-empty
-        body extracts to nothing.
+        Confirm by measuring how much of the body the page's rects
+        cover, since a body made entirely of redaction rects has
+        nothing left to extract.
 
     :param page_index: 0-based PDF page index.
     :param opinions: ``scan.opinions_json`` — the curated opinion
@@ -2551,9 +2424,9 @@ def _is_blank_via_sandwich(
         list keyed by stringified page_index.
     :param page_detections: All YOLO detections on this page (used
         only to check for ``FOOTNOTES``).
-    :param pdf_path: Path to the per-page PDF, used for the boundary
-        text-extraction check. If omitted, the boundary case can't
-        fire and only strict sandwich pages are flagged.
+    :param pdf_path: Path to the per-page PDF, read for its page size
+        by the boundary coverage check. If omitted, the boundary case
+        can't fire and only strict sandwich pages are flagged.
     :return: True iff the page's body is effectively blank under the
         rule above.
     """
@@ -2572,11 +2445,11 @@ def _is_blank_via_sandwich(
         next_hn = _page_has_headnote(redactions_pages, page_index + 1)
         if prev_hn and next_hn:
             return True
-        # Boundary case: only one side has headnotes. Confirm via the
-        # rendered PDF — if the body is genuinely empty (post-redaction),
-        # it really is a blank page even though sandwich doesn't fire.
+        # Boundary case: only one side has headnotes. Confirm from the
+        # rect geometry — if the whole body is redacted away, it really
+        # is a blank page even though sandwich doesn't fire.
         if (prev_hn or next_hn) and pdf_path is not None:
-            if _page_body_textless(pdf_path):
+            if _page_body_covered(redactions_pages, page_index, pdf_path):
                 return True
     return False
 
@@ -2733,22 +2606,11 @@ def run_detect(scan_pk: int) -> None:
     try:
         output_dir = Path(scan.output_dir)
         bitonal = output_dir / "bitonal.pdf"
-
-        # OCR if needed (no existing OCR PDF)
-        if not find_ocr_pdf(str(output_dir)) and bitonal.exists():
-            _run_ocr(
-                scan_pk,
-                str(bitonal),
-                str(output_dir),
-                reporter=scan.reporter.short_name or "",
-                volume=str(scan.volume) or "",
-                first_page=scan.start_page or 1,
-            )
-
         pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
 
         _run_yolo(scan_pk, pdf_path, str(output_dir))
         dets = _import_detections_from_json(scan_pk, str(output_dir))
+        _snap_text_columns_to_ink(scan_pk, pdf_path)
 
         _update_progress(
             scan_pk,

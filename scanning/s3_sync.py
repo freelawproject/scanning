@@ -1,7 +1,7 @@
 """Sync intermediate processing files between MEDIA_ROOT, S3, and /tmp/.
 
-Files produced by the scanning pipeline (bitonal PDF, OCR PDF,
-detections.json, stamped PDF, page images, original PDF) are small
+Files produced by the scanning pipeline (bitonal PDF, detections.json,
+stamped PDF, page images, original PDF) are small
 enough that re-running the pipeline to regenerate them is expensive.
 Pushing them to S3 lets us recover after pod redeploys without a full
 re-run. Pulling them to /tmp/ when the viewer opens gives editing
@@ -17,12 +17,13 @@ behavior as prod.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import time
 from pathlib import Path
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 
 from scanning.models import Scan
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 @functools.lru_cache(maxsize=1)
 def _cached_s3_client():
     """Build and memoize a single S3 client (see :func:`_s3_client`)."""
-    return boto3.client("s3")
+    return boto3.client("s3", region_name=settings.AWS_S3_REGION_NAME)
 
 
 def _s3_client():
@@ -47,6 +48,14 @@ def _s3_client():
     build one and reuse it. Cached on first use, not at import, so
     credential resolution happens once the app is actually serving.
 
+    The region is pinned rather than left to boto3's ambient resolution.
+    ``generate_presigned_post`` signs with SigV4, which folds the region
+    into the credential scope, so a client that guessed ``us-east-1``
+    for a ``us-west-2`` bucket would hand the browser an upload policy
+    S3 rejects. Same failure the GPU worker's result PUT hit; the
+    signature version is deliberately *not* pinned here, since nothing
+    on this path depends on which one is used.
+
     Under ``TESTING`` the cache is bypassed and a fresh client is built
     each call, so tests that patch ``scanning.s3_sync.boto3`` always see
     their own mock -- a cached client from an earlier test can't silently
@@ -56,7 +65,7 @@ def _s3_client():
     :returns: A boto3 S3 client (process-wide outside tests).
     """
     if getattr(settings, "TESTING", False):
-        return boto3.client("s3")
+        return boto3.client("s3", region_name=settings.AWS_S3_REGION_NAME)
     return _cached_s3_client()
 
 
@@ -67,6 +76,29 @@ def _s3_client():
 # stamped, etc.) stays only under processing/.
 APPROVED_SUBDIR_PREFIXES = ("redacted/", "images/")
 APPROVED_FILE_SUFFIXES = (".original.pdf", ".redacted.pdf")
+
+# Subdirectory under a scan's processing prefix where GPU workers PUT
+# their job results (see ``scanning/runpod_client.py``). Deliberately
+# excluded from the processing-file sync in both directions: these are
+# wire artifacts the daemon consumes once and writes to Postgres, not
+# files the viewer or the pipeline ever reads off disk.
+JOB_RESULTS_SUBDIR = "jobs/"
+
+# Subdirectory under a scan's processing prefix holding the shard set
+# cut from the original PDF (see ``scanning/sharding.py``). Also
+# excluded from the generic sync in both directions: the shards
+# duplicate the original's bytes, so syncing them alongside every
+# viewer pull or end-of-pipeline push would move gigabytes for
+# nothing. They are uploaded once by ``sharding.ensure_shards`` and
+# fetched individually (presigned GET) by the external workers that
+# consume them.
+SHARDS_SUBDIR = "shards/"
+SHARD_MANIFEST_NAME = "manifest.json"
+
+# The bitonal PDF the detect stage runs against. Named because its S3
+# ``LastModified`` is a reference timestamp, not just a filename: see
+# :func:`_is_stage_input`.
+PIPELINE_INPUT_NAME = "bitonal.pdf"
 
 
 def _s3_enabled() -> bool:
@@ -125,6 +157,51 @@ def s3_processing_prefix(scan: Scan) -> str:
     return f"processing/{scan.pk}/{reporter_slug}/{volume}/{start_page}/"
 
 
+def s3_job_result_key(scan: Scan, stage: str) -> str:
+    """Return the S3 key a GPU worker PUTs one job's result to.
+
+    One object per scan and stage: a re-run overwrites the previous
+    attempt's output instead of leaving an orphan behind. Nothing
+    reads the object without first checking it was written after the
+    job that's reading it was submitted, so an overwritten-in-place
+    key can't be mistaken for a stale one (see
+    ``runpod_client._result_object_is_fresh``).
+
+    :param scan: The scan the job belongs to.
+    :param stage: Pipeline stage / handler action (``detect`` /
+        ``analyze``).
+    :returns: Key of the form
+        ``{processing_prefix}jobs/{stage}/result.json``.
+    :rtype: str
+    """
+    return (
+        f"{s3_processing_prefix(scan)}{JOB_RESULTS_SUBDIR}{stage}/result.json"
+    )
+
+
+def _is_job_result(rel: str) -> bool:
+    """Return True if a processing-prefix relative key is a job result.
+
+    :param rel: Object key relative to the scan's processing prefix.
+    :returns: Whether the key lives under the ``jobs/`` subtree.
+    :rtype: bool
+    """
+    return rel.startswith(JOB_RESULTS_SUBDIR)
+
+
+def _is_synced_by_default(rel: str) -> bool:
+    """Return True if the generic processing sync should carry this key.
+
+    Job results and the shard set are both excluded -- see the comments
+    on ``JOB_RESULTS_SUBDIR`` and ``SHARDS_SUBDIR``.
+
+    :param rel: Object key relative to the scan's processing prefix.
+    :returns: Whether the generic up/down sync should include the key.
+    :rtype: bool
+    """
+    return not _is_job_result(rel) and not rel.startswith(SHARDS_SUBDIR)
+
+
 def tmp_output_dir(scan: Scan) -> Path:
     """Return the /tmp/ path for a scan's downloaded processing files.
 
@@ -177,11 +254,109 @@ def _is_approved_deliverable(relative_path: str) -> bool:
     return False
 
 
+def _is_stage_input(rel: str) -> bool:
+    """Return True if a relative key is a GPU stage's input PDF.
+
+    ``bitonal.pdf`` feeds detect; the top-level ``*.original.pdf`` feeds
+    analyze, which runs against the greyscale original because the page
+    numbers OCR better there. Both live in the scan's output dir, so both
+    are in ``upload_processing_files``' path.
+
+    These two objects' ``LastModified`` are what
+    ``runpod_client.reusable_result`` compares a stored job result
+    against to decide whether it was computed from the current pages.
+    Re-uploading identical bytes would advance the timestamp and make
+    every stored result look stale, so they are the files worth a
+    ``head_object`` to skip.
+
+    :param rel: Object key relative to the scan's processing prefix.
+    :returns: Whether the key is a stage input.
+    :rtype: bool
+    """
+    return rel == PIPELINE_INPUT_NAME or _is_original_pdf(rel)
+
+
+def _size_matches_s3(s3, bucket: str, key: str, path: Path) -> bool:
+    """Return True if ``key`` already holds an object of ``path``'s size.
+
+    A size comparison, not a hash: one ``head_object`` against reading
+    and digesting a 60+ MB PDF on every pipeline that ends. It is only
+    ever used to skip a *re-upload of a file we ourselves just wrote*, so
+    the question is whether the local copy was edited, not whether an
+    arbitrary object collides. Page inserts and deletes rewrite the PDF
+    structure, so a same-size edit isn't a realistic outcome.
+
+    Any S3 error answers False: re-uploading is the status quo and always
+    correct, where wrongly skipping would leave S3 stale.
+
+    :param s3: The S3 client to use.
+    :param bucket: Bucket holding the object.
+    :param key: Full object key.
+    :param path: Local file to compare against.
+    :returns: Whether the remote object already matches in size.
+    :rtype: bool
+    """
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+    except (BotoCoreError, ClientError):
+        # Includes the transport failures (connect timeout, endpoint
+        # resolution, credential refresh) that aren't ClientError. Letting
+        # one escape would abort the whole end-of-pipeline push partway
+        # through the walk while the pipeline still reported success.
+        return False
+    return head.get("ContentLength") == path.stat().st_size
+
+
+def invalidate_job_results(scan: Scan) -> None:
+    """Delete a scan's stored GPU job results so the next run recomputes.
+
+    The counterpart to ``runpod_client.reusable_result``. That check is
+    keyed on the stage input's timestamp, which answers "have the pages
+    changed?" and nothing else, so a caller who means "re-run this even
+    though the pages are the same" has to say so by removing the objects.
+
+    Call it from the paths that express that intent. Today that is the
+    Re-validate action alone, which warns about GPU cost before it
+    queues. Deliberately not the admin re-queue: that one documents
+    itself as recovery for a scan stuck behind a killed daemon, which is
+    the resume case reuse exists to make cheap.
+
+    Best effort. A failed delete leaves a reusable result behind, which
+    costs correctness only for the caller that asked for freshness, so it
+    is logged rather than raised into a request or an admin action.
+
+    :param scan: Scan whose stored results to drop.
+    :return: None.
+    """
+    if not _s3_enabled():
+        return
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    s3 = _s3_client()
+    for stage in ("detect", "analyze"):
+        key = s3_job_result_key(scan, stage)
+        try:
+            s3.delete_object(Bucket=bucket, Key=key)
+        except (BotoCoreError, ClientError):
+            logger.warning(
+                "Could not drop the stored %s result for scan %s at %s; "
+                "the next run may reuse it",
+                stage,
+                scan.pk,
+                key,
+                exc_info=True,
+            )
+
+
 def upload_processing_files(scan: Scan) -> int:
     """Upload processing files from MEDIA_ROOT to S3.
 
-    Overwrites existing S3 objects; no hash check. Intended to run at
-    the end of a pipeline that leaves the scan in a viewable state.
+    Overwrites existing S3 objects with no hash check, with one
+    exception: a stage input (see :func:`_is_stage_input`) is skipped
+    when the object already there is the same size, so its
+    ``LastModified`` keeps meaning "when the pages last changed".
+    Intended to run at the end of a pipeline that leaves the scan in a
+    viewable state.
 
     :param scan: Scan whose output dir to upload.
     :returns: Number of files uploaded (0 if disabled or nothing found).
@@ -206,6 +381,12 @@ def upload_processing_files(scan: Scan) -> int:
     count = 0
     for path in _iter_files_to_sync(local_root):
         rel = path.relative_to(local_root).as_posix()
+        if not _is_synced_by_default(rel):
+            continue
+        if _is_stage_input(rel) and _size_matches_s3(
+            s3, bucket, f"{prefix}{rel}", path
+        ):
+            continue
         s3.upload_file(str(path), bucket, f"{prefix}{rel}")
         count += 1
 
@@ -245,7 +426,7 @@ def download_processing_files(scan: Scan) -> Path | None:
         for obj in page.get("Contents", []):
             key = obj["Key"]
             rel = key[len(prefix) :]
-            if not rel:
+            if not rel or not _is_synced_by_default(rel):
                 continue
             local_path = local_root / rel
             if local_path.is_file() and local_path.stat().st_size == obj.get(
@@ -272,13 +453,13 @@ def _is_preview_pdf(rel: str) -> bool:
     """Return True if a processing-prefix relative key is a preview PDF.
 
     A "preview" is the small, browser-viewable PDF the process viewer
-    shows: the OCR PDF if present, else ``bitonal.pdf``. This mirrors the
+    shows: ``bitonal.pdf``, or a legacy OCR PDF beside it. This mirrors the
     exclusion rules in ``utils.find_ocr_pdf`` and adds ``bitonal.pdf``.
     Deliberately excludes the multi-GB ``*.original.pdf`` and anything
     under a subdirectory (``images/``, ``redacted/``, etc.).
 
     :param rel: Object key relative to the scan's processing prefix.
-    :returns: Whether the key is the bitonal or OCR preview PDF.
+    :returns: Whether the key is a preview PDF.
     :rtype: bool
     """
     if "/" in rel or not rel.endswith(".pdf"):
@@ -341,6 +522,11 @@ def _download_matching(scan: Scan, predicate, kind: str) -> Path | None:
                 "Size", -1
             ):
                 continue
+            # Keys can be nested (``redacted/<opinion>.pdf``), and
+            # ``download_file`` writes through a temp file in the target's
+            # own directory, so a missing parent fails as a
+            # FileNotFoundError on that temp name rather than on the key.
+            local_path.parent.mkdir(parents=True, exist_ok=True)
             s3.download_file(bucket, key, str(local_path))
             downloaded += 1
 
@@ -360,8 +546,8 @@ def _download_matching(scan: Scan, predicate, kind: str) -> Path | None:
 def download_preview_pdf(scan: Scan) -> Path | None:
     """Download only the small preview PDF(s) from S3 to /tmp/.
 
-    Pulls the bitonal and/or OCR PDF -- the reviewable previews -- and
-    skips the multi-GB original and the ``images/`` tree. Used by the PDF
+    Pulls ``bitonal.pdf`` -- the reviewable preview, plus a legacy OCR PDF
+    on scans processed before scanning #145 -- and skips the multi-GB original and the ``images/`` tree. Used by the PDF
     viewer endpoint so opening a scan never drags the whole processing
     prefix (or the original) across the network, which blew past the
     gunicorn worker timeout for large scans.
@@ -371,6 +557,29 @@ def download_preview_pdf(scan: Scan) -> Path | None:
     :rtype: Path | None
     """
     return _download_matching(scan, _is_preview_pdf, "preview PDF")
+
+
+def download_processing_file(scan: Scan, rel_key: str) -> Path | None:
+    """Download one named object from a scan's processing prefix.
+
+    For serving a single generated file (an opinion PDF, an LLM page) when
+    it is not on this machine. ``download_processing_files`` would fetch
+    the whole prefix instead: for a 1292-page volume that is the multi-GB
+    original plus every opinion, LLM page and crop, gigabytes to serve one
+    file. Worse, under ASGI all sync views share one thread-sensitive
+    executor, so a pull that long stalls every other request in the
+    process, which looks like the whole portal hanging.
+
+    :param scan: Scan whose processing prefix to pull from.
+    :param rel_key: Object key relative to that prefix, which is also the
+        path relative to the scan's output dir (e.g.
+        ``"redacted/a3d.222.0001-0027.pdf"``).
+    :returns: The local tmp path, or None if sync is disabled.
+    :rtype: Path | None
+    """
+    return _download_matching(
+        scan, lambda rel: rel == rel_key, f"file {rel_key}"
+    )
 
 
 def download_original_pdf(scan: Scan) -> Path | None:
@@ -385,6 +594,171 @@ def download_original_pdf(scan: Scan) -> Path | None:
     :rtype: Path | None
     """
     return _download_matching(scan, _is_original_pdf, "original PDF")
+
+
+def shards_prefix(scan: Scan) -> str:
+    """Return the S3 key prefix for a scan's shard set.
+
+    :param scan: The scan to build the prefix for.
+    :returns: Prefix of the form ``{processing_prefix}shards/``.
+    :rtype: str
+    """
+    return f"{s3_processing_prefix(scan)}{SHARDS_SUBDIR}"
+
+
+def fetch_shard_manifest(scan: Scan) -> dict | None:
+    """Fetch and parse a scan's shard manifest from S3.
+
+    The manifest is uploaded last by :func:`upload_shards`, so its
+    presence implies every shard object it lists is in place -- which is
+    why ``sharding.ensure_shards`` treats the S3 copy as the authority
+    when S3 sync is active.
+
+    :param scan: The scan to look up.
+    :returns: The parsed manifest, or None when S3 sync is disabled,
+        the object is missing, or it fails to parse.
+    :rtype: dict | None
+    :raises ClientError: On any S3 error other than a missing object.
+        Only "the manifest is not there" may map to None: a throttle or
+        permission error must not read as "no committed shard set", or
+        ``ensure_shards`` would delete and re-cut a healthy set.
+    """
+    if not _s3_enabled():
+        return None
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    key = f"{shards_prefix(scan)}{SHARD_MANIFEST_NAME}"
+    try:
+        obj = _s3_client().get_object(Bucket=bucket, Key=key)
+        manifest = json.loads(obj["Body"].read())
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in ("NoSuchKey", "NoSuchBucket", "404"):
+            return None
+        raise
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning(
+            "Unparseable shard manifest for scan %s at s3://%s/%s",
+            scan.pk,
+            bucket,
+            key,
+        )
+        return None
+    if not isinstance(manifest, dict):
+        # Parseable JSON that isn't a manifest ('[]', '"x"', ...) gets
+        # the same treatment as unparseable bytes: warn and let
+        # ensure_shards re-cut, instead of crashing on it downstream.
+        logger.warning(
+            "Malformed shard manifest for scan %s at s3://%s/%s: "
+            "expected an object, got %s",
+            scan.pk,
+            bucket,
+            key,
+            type(manifest).__name__,
+        )
+        return None
+    return manifest
+
+
+def upload_shards(scan: Scan, shard_dir: Path) -> int:
+    """Upload a scan's shard set to S3, manifest last.
+
+    The manifest is the commit marker: a reader that finds it can trust
+    every shard it lists is already in the bucket. Timing is logged
+    because shard upload cost is one of the numbers #164 asks us to
+    track.
+
+    :param scan: The scan the shards belong to.
+    :param shard_dir: Local directory holding ``NNNN.pdf`` shards and
+        ``manifest.json``.
+    :returns: Number of files uploaded (0 when S3 sync is disabled).
+    :rtype: int
+    """
+    if not _s3_enabled():
+        return 0
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    prefix = shards_prefix(scan)
+    s3 = _s3_client()
+
+    start = time.monotonic()
+    total_bytes = 0
+    count = 0
+    for path in sorted(Path(shard_dir).glob("*.pdf")):
+        s3.upload_file(
+            str(path),
+            bucket,
+            f"{prefix}{path.name}",
+            ExtraArgs={"ContentType": "application/pdf"},
+        )
+        total_bytes += path.stat().st_size
+        count += 1
+
+    manifest_path = Path(shard_dir) / SHARD_MANIFEST_NAME
+    if manifest_path.is_file():
+        s3.upload_file(
+            str(manifest_path),
+            bucket,
+            f"{prefix}{SHARD_MANIFEST_NAME}",
+            ExtraArgs={"ContentType": "application/json"},
+        )
+        count += 1
+
+    elapsed = time.monotonic() - start
+    size_mb = total_bytes / 1024 / 1024
+    logger.info(
+        "Uploaded %d shard file(s) (%.1f MB) for scan %s to s3://%s/%s "
+        "in %.1fs (%.0f MB/s)",
+        count,
+        size_mb,
+        scan.pk,
+        bucket,
+        prefix,
+        elapsed,
+        size_mb / elapsed if elapsed > 0 else 0.0,
+    )
+    return count
+
+
+def delete_shard_objects(scan: Scan) -> int:
+    """Delete every object under a scan's ``shards/`` prefix.
+
+    Called before a shard set is recomputed (the source PDF changed):
+    page ranges shift, so a leftover shard from a larger previous set
+    must not survive next to the new manifest. The manifest is included
+    in the sweep, so a reader can never observe a manifest without its
+    shards.
+
+    :param scan: The scan whose shard objects to delete.
+    :returns: Number of objects deleted (0 when S3 sync is disabled or
+        the prefix is empty).
+    :rtype: int
+    """
+    if not _s3_enabled():
+        return 0
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    prefix = shards_prefix(scan)
+    s3 = _s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+
+    deleted = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        keys = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+        if not keys:
+            continue
+        s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+        deleted += len(keys)
+
+    if deleted:
+        logger.info(
+            "Deleted %d stale shard object(s) for scan %s under s3://%s/%s",
+            deleted,
+            scan.pk,
+            bucket,
+            prefix,
+        )
+    return deleted
 
 
 def upload_file_to_s3(scan: Scan, relative_path: str) -> bool:

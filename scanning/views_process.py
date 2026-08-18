@@ -31,7 +31,11 @@ from scanning.models import (
     Stage,
     Status,
 )
-from scanning.utils import compute_coverage_gaps, find_ocr_pdf
+from scanning.utils import (
+    compute_coverage_gaps,
+    find_processing_pdf,
+    local_original_pdf,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -451,7 +455,7 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
 
 @login_required
 def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
-    """Serve the small processed PDF (OCR text layer, else bitonal).
+    """Serve the small processed PDF (``bitonal.pdf``).
 
     The viewer only ever gets the small, browser-viewable preview. The
     multi-GB original is never streamed here: it blows past the gunicorn
@@ -462,7 +466,7 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
 
     Resolution:
 
-    1. Serve the processed PDF (OCR > bitonal) if it is already local.
+    1. Serve the processed PDF if it is already local.
     2. Otherwise pull *only* the preview PDF(s) from S3 and look again.
        This covers prod, where the daemon and web run in separate
        containers with separate ephemeral ``/tmp/`` volumes. The targeted
@@ -483,17 +487,14 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     logger.info("serve_scan_pdf: resolving pdf for scan=%s", scan.pk)
 
     def _processed_local() -> FileResponse | None:
-        """Return the OCR pdf, else ``bitonal.pdf``, from ``output_dir``."""
+        """Return ``bitonal.pdf`` (or a legacy OCR pdf) from ``output_dir``."""
         output = Path(scan.output_dir)
         if not output.is_dir():
             return None
-        ocr = find_ocr_pdf(scan.output_dir)
-        if ocr:
-            return FileResponse(ocr.open("rb"), content_type="application/pdf")
-        bitonal = output / "bitonal.pdf"
-        if bitonal.exists():
+        base_pdf = find_processing_pdf(scan.output_dir)
+        if base_pdf:
             return FileResponse(
-                bitonal.open("rb"), content_type="application/pdf"
+                base_pdf.open("rb"), content_type="application/pdf"
             )
         return None
 
@@ -576,27 +577,15 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
         page,
         dpi,
     )
-    try:
-        doc = fitz.open(scan.pdf_path)
-    except FileNotFoundError:
-        # Prod: the original lives only in S3 (direct-to-S3 upload, and the
-        # classic prod path streams straight to S3 too). The process view no
-        # longer eagerly lands it locally, and download_preview_pdf excludes
-        # the original, so pull just the original here and retry.
-        try:
-            from scanning import s3_sync
+    # Prod: the original lives only in S3 (direct-to-S3 upload, and the
+    # classic prod path streams straight to S3 too). The process view no
+    # longer eagerly lands it locally, and download_preview_pdf excludes
+    # the original, so this pulls just the original when it is missing.
+    original = local_original_pdf(scan)
+    if not original:
+        return HttpResponse(status=404)
 
-            s3_sync.download_original_pdf(scan)
-        except Exception:
-            logger.exception(
-                "Lazy S3 original pull failed for scan %s", scan.pk
-            )
-        try:
-            doc = fitz.open(scan.pdf_path)
-        except FileNotFoundError:
-            return HttpResponse(status=404)
-
-    with doc:
+    with fitz.open(original) as doc:
         if page < 0 or page >= doc.page_count:
             return HttpResponse(status=404)
         clip = fitz.Rect(x0, y0, x1, y1)
@@ -691,14 +680,25 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
 def start_validate(request: HttpRequest, pk: int) -> HttpResponse:
     """Queue a scan for validation (first step of the full pipeline).
 
+    Drops any stored GPU job results first. ``run_full_pipeline`` resumes
+    by default, reusing a finished detect/analyze whose input PDF hasn't
+    changed, which is what makes a re-queue after a deploy cheap. This
+    button means the opposite: it is labelled "re-run the full pipeline
+    from scratch", warns about GPU cost, and sits behind a confirm
+    dialog. Without the invalidation it would silently reuse and the
+    scan would come back with exactly the detections it already had.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
+    from scanning import s3_sync
+
     scan = get_object_or_404(Scan, pk=pk)
     guard = _block_if_pending_changes(request, scan)
     if guard:
         return guard
+    s3_sync.invalidate_job_results(scan)
     scan.status = Status.QUEUED
     scan.stage = Stage.VALIDATE
     scan.queued_action = QueuedAction.FULL_PIPELINE

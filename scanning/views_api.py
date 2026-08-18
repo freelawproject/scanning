@@ -41,7 +41,8 @@ from scanning.models import (
 from scanning.utils import (
     compute_coverage_gaps,
     find_json_file,
-    find_ocr_pdf,
+    find_processing_pdf,
+    local_original_pdf,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,16 +132,18 @@ def serve_margin_rects(request: HttpRequest, pk: int) -> JsonResponse:
     if scan.margin_rects:
         return JsonResponse(scan.margin_rects, safe=False)
     output_base = Path(scan.output_dir)
-    ocr_pdf = find_ocr_pdf(output_base) if output_base.is_dir() else None
-    if not ocr_pdf:
+    base_pdf = (
+        find_processing_pdf(output_base) if output_base.is_dir() else None
+    )
+    if not base_pdf:
         return JsonResponse([], safe=False)
-    from blackletter.margins import compute_margin_rects
+    # Shared with the pipeline rather than reimplemented: computing these
+    # here with its own detection lookup is how a viewer request that
+    # arrived before this machine had detections.json cached margins with
+    # no top strips, permanently.
+    from scanning.services import _compute_and_save_margin_rects
 
-    from scanning.services import _adjust_margins_for_detections
-
-    rects = compute_margin_rects(ocr_pdf)
-    rects = _adjust_margins_for_detections(rects, output_base)
-    Scan.objects.filter(pk=pk).update(margin_rects=rects)
+    rects = _compute_and_save_margin_rects(pk, str(base_pdf), str(output_base))
     return JsonResponse(rects, safe=False)
 
 
@@ -302,7 +305,9 @@ def pair_opinions_api(request: HttpRequest, pk: int) -> JsonResponse:
     if not det_data:
         return JsonResponse({"error": "No detections found"}, status=400)
     bitonal = output_dir / "bitonal.pdf"
-    pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
+    pdf_path = str(bitonal) if bitonal.exists() else local_original_pdf(scan)
+    if not pdf_path:
+        return JsonResponse({"error": "No PDF available"}, status=500)
     try:
         from blackletter.api import pair as bl_pair
 
@@ -350,7 +355,12 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
     if not scan.opinions_json:
         return JsonResponse({"error": "No opinions paired yet"}, status=400)
     output_dir = scan.output_dir
-    pdf_path = find_ocr_pdf(output_dir) or scan.pdf_path
+    processing_pdf = find_processing_pdf(output_dir)
+    pdf_path = (
+        str(processing_pdf) if processing_pdf else local_original_pdf(scan)
+    )
+    if not pdf_path:
+        return JsonResponse({"error": "No PDF available"}, status=500)
     try:
         rects = _compute_and_save_redaction_rects(pk, pdf_path)
         _compute_and_save_margin_rects(pk, pdf_path, output_dir)
@@ -452,7 +462,9 @@ def _resolve_opinion_pdf(
             try:
                 from scanning import s3_sync
 
-                s3_sync.download_processing_files(opinion.scan)
+                # Just this file: see s3_sync.download_processing_file for
+                # why pulling the whole prefix here hangs the process.
+                s3_sync.download_processing_file(opinion.scan, field.name)
             except Exception:
                 logger.exception(
                     "Lazy S3 pull failed for opinion %s", opinion.pk
@@ -542,7 +554,8 @@ def serve_page_pdf(request: HttpRequest, pk: int) -> FileResponse:
     try:
         from scanning import s3_sync
 
-        s3_sync.download_processing_files(page.scan)
+        # Just this page's file, not the scan's whole prefix.
+        s3_sync.download_processing_file(page.scan, page.pdf_path)
     except Exception:
         logger.exception("Lazy S3 pull failed for page %s", page.pk)
     if candidate.is_file():
@@ -631,7 +644,7 @@ def serve_redacted_pdf(
 ) -> FileResponse | HttpResponse:
     """Serve the redacted PDF for a scan.
 
-    Falls back to the OCR PDF if the redacted version hasn't been
+    Falls back to the processing PDF if the redacted version hasn't been
     generated yet, so the viewer has something to display.
 
     :param request: The HTTP request.
@@ -647,19 +660,28 @@ def serve_redacted_pdf(
             content_type="application/pdf",
         )
 
-    # 2. Fall back to the OCR PDF (for preview before generation)
+    # 2. Fall back to the processing PDF (for preview before generation)
     output = Path(scan.output_dir)
     if output.is_dir():
-        ocr = find_ocr_pdf(output)
-        if ocr:
-            return FileResponse(ocr.open("rb"), content_type="application/pdf")
+        base_pdf = find_processing_pdf(output)
+        if base_pdf:
+            return FileResponse(
+                base_pdf.open("rb"), content_type="application/pdf"
+            )
 
     # 3. Lazy S3 pull + retry: handles the case where the daemon just
-    # finished Generate Files and the web container's /tmp/ is stale.
+    # finished Generate Files and this container's /tmp/ is stale. Pull only
+    # the file being served -- the whole prefix runs to gigabytes on a full
+    # volume, and every sync view shares one executor under ASGI.
     try:
         from scanning import s3_sync
 
-        s3_sync.download_processing_files(scan)
+        if scan.redacted_pdf_path:
+            s3_sync.download_processing_file(
+                scan, os.path.basename(scan.redacted_pdf_path)
+            )
+        else:
+            s3_sync.download_preview_pdf(scan)
     except Exception:
         logger.exception("Lazy S3 pull failed for scan %s", scan.pk)
     if scan.redacted_pdf_path and os.path.isfile(scan.redacted_pdf_path):
@@ -668,9 +690,11 @@ def serve_redacted_pdf(
             content_type="application/pdf",
         )
     if output.is_dir():
-        ocr = find_ocr_pdf(output)
-        if ocr:
-            return FileResponse(ocr.open("rb"), content_type="application/pdf")
+        base_pdf = find_processing_pdf(output)
+        if base_pdf:
+            return FileResponse(
+                base_pdf.open("rb"), content_type="application/pdf"
+            )
 
     return HttpResponse("No PDF available", status=404)
 
@@ -770,6 +794,11 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     if isinstance(data, JsonResponse):
         return data
     detection_id = data["detection_id"]
+    page_index = (
+        Detection.objects.filter(pk=detection_id, scan=scan)
+        .values_list("page_index", flat=True)
+        .first()
+    )
     count = Detection.objects.filter(pk=detection_id, scan=scan).update(
         active=False
     )
@@ -777,10 +806,48 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
+    _drop_orphaned_redaction_rects(scan, page_index)
     output_dir = Path(scan.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _sync_detections_to_disk(scan.pk)
     return JsonResponse({"status": "ok", "deleted": count})
+
+
+def _drop_orphaned_redaction_rects(scan: Scan, page_index: int | None) -> None:
+    """Forget a page's saved rects once its last detection is gone.
+
+    ``redaction_rects`` is a snapshot in image pixels, and the scale that
+    converts it to points comes from the page's own detections. Deleting the
+    last one on a page leaves rects that cannot be placed, which stops
+    Generate Files outright, and nothing in the review UI recomputes them.
+
+    Dropping them loses nothing: a page with no detections left has nothing
+    on it to redact, and the reviewer saying so is what deleting the last
+    detection means. Rects on every other page, including any the reviewer
+    adjusted by hand, are untouched.
+
+    :param scan: The scan whose rects to prune.
+    :param page_index: Page the deleted detection was on, if known.
+    """
+    if page_index is None or not scan.redaction_rects:
+        return
+    if Detection.objects.filter(
+        scan=scan, page_index=page_index, active=True
+    ).exists():
+        return
+    remaining = [
+        entry
+        for entry in scan.redaction_rects
+        if entry.get("page_index") != page_index
+    ]
+    if len(remaining) != len(scan.redaction_rects):
+        logger.info(
+            "Dropped saved redaction rects for scan %s page %s: "
+            "no active detections left on it",
+            scan.pk,
+            page_index,
+        )
+        Scan.objects.filter(pk=scan.pk).update(redaction_rects=remaining)
 
 
 @login_required
@@ -949,19 +1016,27 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
 
 
 @login_required
-def export_pdf(request: HttpRequest, pk: int) -> StreamingHttpResponse:
+def export_pdf(
+    request: HttpRequest, pk: int
+) -> StreamingHttpResponse | HttpResponse:
     """Export a corrected PDF with deletions and inserts applied.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: PDF file download response.
+    :return: PDF file download response, or a 404 when the original PDF
+        cannot be made available locally.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    # Resolve the source PDF before the temp file exists, so a missing
+    # original is a clean 404 rather than a leaked temp file.
+    original = local_original_pdf(scan)
+    if not original:
+        return HttpResponse(status=404)
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     tmp.close()
     tmp_path = tmp.name
     try:
-        with fitz.open(scan.pdf_path) as pdf_doc:
+        with fitz.open(original) as pdf_doc:
             page_map = scan.page_map
             deleted_pages = set(d.pdf_page for d in scan.deletions.all())
             for pdf_page in sorted(deleted_pages, reverse=True):

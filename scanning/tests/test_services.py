@@ -9,8 +9,9 @@ import shutil
 import tempfile
 from unittest.mock import patch
 
+import fitz
 from django.db.models import F
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from scanning import s3_sync
 from scanning.factories import (
@@ -22,10 +23,22 @@ from scanning.factories import (
 from scanning.models import (
     Detection,
     QueueStatus,
+    Scan,
     Stage,
     Status,
 )
 from scanning.services import refresh_volume_queue_status
+from scanning.tests.pdf_fixtures import (
+    BOTTOM_BAR,
+    COLUMN_LEFT,
+    COLUMN_RIGHT,
+    CONTENT,
+    PAGE_H,
+    PAGE_W,
+    write_bitonal_page,
+    write_text_page,
+    write_two_column_page,
+)
 
 FIXTURE_DIR = pathlib.Path(__file__).parent / "fixtures"
 PDF_PATH = FIXTURE_DIR / "a3d.332.1.1.pdf"
@@ -69,9 +82,23 @@ def _make_scan_with_output(tmpdir=None, **kwargs):
 
     # If a tmpdir was provided, copy fixture files there too
     if tmpdir:
-        shutil.copy2(PDF_PATH, pathlib.Path(tmpdir) / "bitonal.pdf")
-        shutil.copy2(PDF_PATH, output / "bitonal.pdf")
+        _write_bitonal_copy(pathlib.Path(tmpdir) / "bitonal.pdf")
+        _write_bitonal_copy(output / "bitonal.pdf")
     return scan
+
+
+def _write_bitonal_copy(dest):
+    """Copy the fixture as ``bitonal.pdf``, distinguishable from the original.
+
+    The processing PDF and the original are the same fixture, so a step that
+    reads the multi-GB original where it should read the small processing
+    copy produces byte-identical output and no test can tell. A trailing
+    comment (ignored by every PDF reader, since it sits after ``%%EOF``)
+    makes "which PDF did this read" assertable.
+    """
+    shutil.copy2(PDF_PATH, dest)
+    with open(dest, "ab") as fh:
+        fh.write(b"\n% bitonal\n")
 
 
 def _run_detect_on_fixture(tmpdir):
@@ -266,6 +293,32 @@ class TestComputeAndSaveRedactionRects(TestCase):
             scan.refresh_from_db()
             self.assertTrue(scan.redaction_rects)
 
+    def test_corrects_the_column_boxes_before_measuring(self):
+        """The rects and the margins must read the same column boxes.
+
+        Margin strips are computed from ink-corrected columns. A reviewer
+        who hand-draws a missed ``TEXT_COLUMN`` puts it in the DB exactly as
+        drawn, so without this the headnote rects on that page would snap to
+        the raw box while the margins used the corrected one.
+        """
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            _run_detect_on_fixture(tmpdir)
+            services._import_detections_from_json(scan.pk, tmpdir)
+
+            with patch.object(services, "snap_document_columns") as snap:
+                services._compute_and_save_redaction_rects(
+                    scan.pk, str(PDF_PATH)
+                )
+            snap.assert_called_once()
+            document = snap.call_args.args[0]
+            self.assertTrue(document.pages, "snapped an empty document")
+
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestComputeAndSaveMarginRects(TestCase):
@@ -273,6 +326,23 @@ class TestComputeAndSaveMarginRects(TestCase):
 
     def setUp(self):
         _require_fixture(self)
+
+    @staticmethod
+    def _with_column(scan):
+        """Give a scan the one detection the margin bounds need."""
+        Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="TEXT_COLUMN",
+            label_id=16,
+            confidence=0.95,
+            x0=100,
+            y0=200,
+            x1=1600,
+            y1=2000,
+            img_width=1700,
+            img_height=2200,
+        )
 
     def test_writes_margin_rects_to_model(self):
         from scanning.services import _compute_and_save_margin_rects
@@ -282,6 +352,7 @@ class TestComputeAndSaveMarginRects(TestCase):
                 tmpdir,
                 reporter=ReporterFactory(short_name="a3d"),
             )
+            self._with_column(scan)
             rects = _compute_and_save_margin_rects(
                 scan.pk, str(PDF_PATH), tmpdir
             )
@@ -298,6 +369,7 @@ class TestComputeAndSaveMarginRects(TestCase):
                 tmpdir,
                 reporter=ReporterFactory(short_name="a3d"),
             )
+            self._with_column(scan)
             first = _compute_and_save_margin_rects(
                 scan.pk, str(PDF_PATH), tmpdir
             )
@@ -305,6 +377,75 @@ class TestComputeAndSaveMarginRects(TestCase):
                 scan.pk, str(PDF_PATH), tmpdir
             )
             self.assertEqual(first, second)
+
+    def test_does_not_cache_a_result_computed_without_detections(self):
+        """Margins measured from marks alone lose a page's top strip.
+
+        detections.json belongs to whichever process ran the pipeline, and
+        ``/tmp`` is per-container in dev and per-pod in production, so a
+        viewer request can arrive before this machine has it. Caching that
+        answer means it is never recomputed once the detections land.
+        """
+        from scanning.services import _compute_and_save_margin_rects
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            rects = _compute_and_save_margin_rects(
+                scan.pk, str(PDF_PATH), tmpdir
+            )
+            self.assertIsNotNone(rects)
+
+            scan.refresh_from_db()
+            self.assertFalse(scan.margin_rects, "cached a detection-less run")
+
+            # ...and once the detections exist, the next call caches.
+            self._with_column(scan)
+            _compute_and_save_margin_rects(scan.pk, str(PDF_PATH), tmpdir)
+            scan.refresh_from_db()
+            self.assertTrue(scan.margin_rects)
+
+    def test_reads_detections_from_the_db_not_the_file(self):
+        """The DB is the source of truth, and is always reachable."""
+        from scanning.services import _detections_for_geometry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            self._with_column(scan)
+            # No detections.json anywhere near this scan.
+            self.assertFalse(
+                (pathlib.Path(scan.output_dir) / "detections.json").exists()
+            )
+            dets = _detections_for_geometry(scan.pk, scan.output_dir)
+            self.assertEqual([d["label"] for d in dets], ["TEXT_COLUMN"])
+            self.assertEqual(dets[0]["bbox"], [100, 200, 1600, 2000])
+
+    def test_does_not_measure_anything_without_detections(self):
+        """Refuse before rendering, not after.
+
+        The viewer asks for these on a sync request and does not cache the
+        reply, so measuring a result that is then thrown away un-cached
+        renders the whole volume at 100 dpi on every poll, in the executor
+        every other sync view shares.
+        """
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            with patch.object(services, "compute_margin_rects") as measure:
+                rects = services._compute_and_save_margin_rects(
+                    scan.pk, str(PDF_PATH), tmpdir
+                )
+            measure.assert_not_called()
+            self.assertEqual(rects, [])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -1129,28 +1270,1372 @@ class TestImmediateS3PushOnGeneration(TestCase):
         bitonal.assert_not_called()
         push.assert_not_called()
 
-    def test_run_ocr_pushes_generated_pdf(self):
-        """The OCR PDF is uploaded immediately after it's produced."""
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestGenerateFilesWithoutOcrPdf(TestCase):
+    """``run_generate_files`` works from ``bitonal.pdf`` alone.
+
+    The pipeline no longer produces an OCR'd PDF, so generation has to
+    build on the processing PDF instead of refusing to run.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+
+    def test_generates_from_bitonal(self):
         from scanning import services
 
-        scan = ScanFactory(start_page=1, end_page=2)
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
         output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        ocr_pdf = output / "rep.1.1.2.pdf"
+        bitonal = output / "bitonal.pdf"
+        _write_bitonal_copy(bitonal)
+        scan.opinions_json = [
+            {
+                "caption_page": 0,
+                "key_page": 0,
+                "end_page": 0,
+                "page_count": 1,
+                "first_page_number": 1,
+                "last_page_number": 1,
+            }
+        ]
+        scan.save(update_fields=["opinions_json"])
 
         with (
-            patch.object(services, "_ocr", return_value=ocr_pdf),
-            patch.object(services, "_push_generated_file_to_s3") as push,
-            patch.object(services.fitz, "open") as fitz_open,
+            # close_all() resets connections for daemon-process forking;
+            # in tests it kills the test transaction -- patch it out.
+            patch("django.db.connections.close_all"),
+            patch("blackletter.api.generate") as generate,
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(services, "_pull_processing_files_from_s3"),
         ):
-            fitz_open.return_value.__enter__.return_value.page_count = 2
-            services._run_ocr(
-                scan.pk,
-                "in.pdf",
-                str(output),
-                reporter="rep",
-                volume="1",
-                first_page=1,
+            generate.return_value = {
+                "opinion_count": 1,
+                "full_redacted": "",
+                "redacted_dir": str(output / "redacted"),
+            }
+            services.run_generate_files(scan.pk)
+
+        generate.assert_called_once()
+        gen_pdf = pathlib.Path(generate.call_args.kwargs["pdf_path"])
+        # Generation runs on a stamped *copy* of the bitonal, never on
+        # the bitonal itself.
+        self.assertEqual(gen_pdf.name, "stamped.pdf")
+        self.assertEqual(gen_pdf.read_bytes(), bitonal.read_bytes())
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.stage, Stage.APPROVED)
+        self.assertEqual(scan.status, Status.PENDING_REVIEW)
+
+    def test_computes_margins_when_absent(self):
+        """Whiteouts must not depend on the viewer having asked for them.
+
+        Margin rects are computed on demand elsewhere, so a scan taken
+        straight from review to Generate used to ship with no whiteouts at
+        all -- platen bands, fold shadows and corner bleed left in the
+        deliverable.
+        """
+        from scanning import services
+
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        output = pathlib.Path(scan.output_dir)
+        shutil.copy2(PDF_PATH, output / "bitonal.pdf")
+        self.assertFalse(scan.margin_rects)
+        # A scan reaching Generate has been detected, and the margin bounds
+        # are only cached once detections back them up.
+        Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="TEXT_COLUMN",
+            label_id=16,
+            confidence=0.95,
+            x0=100,
+            y0=200,
+            x1=1600,
+            y1=2000,
+            img_width=1700,
+            img_height=2200,
+        )
+
+        with (
+            patch("django.db.connections.close_all"),
+            patch("blackletter.api.generate") as generate,
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+        ):
+            generate.return_value = {
+                "opinion_count": 0,
+                "full_redacted": "",
+                "redacted_dir": str(output / "redacted"),
+            }
+            services.run_generate_files(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertTrue(scan.margin_rects, "no margin rects computed")
+        self.assertTrue(
+            any(e["rects"] for e in scan.margin_rects),
+            "margin rects are all empty",
+        )
+
+    def test_computes_redaction_rects_when_absent(self):
+        """Generate is self-sufficient now that the upload path skips rects.
+
+        ``run_full_pipeline`` no longer computes them, and the step 2
+        overlay only asks for them if a reviewer opens it, so Generate
+        cannot assume they exist.
+        """
+        from scanning import services
+
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        output = pathlib.Path(scan.output_dir)
+        _write_bitonal_copy(output / "bitonal.pdf")
+        self.assertFalse(scan.redaction_rects)
+
+        with (
+            patch("django.db.connections.close_all"),
+            patch("blackletter.api.generate") as generate,
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(
+                services, "_snap_text_columns_to_ink", return_value=0
+            ) as snap,
+            patch.object(
+                services, "_compute_and_save_redaction_rects", return_value=[]
+            ) as rects,
+        ):
+            generate.return_value = {
+                "opinion_count": 0,
+                "full_redacted": "",
+                "redacted_dir": str(output / "redacted"),
+            }
+            services.run_generate_files(scan.pk)
+
+        rects.assert_called_once()
+        self.assertEqual(rects.call_args.args[1], str(output / "bitonal.pdf"))
+        # The columns are corrected first: the rects and the margin strips
+        # are both measured against them.
+        snap.assert_called_once()
+        self.assertEqual(snap.call_args.args[1], str(output / "bitonal.pdf"))
+
+    def test_keeps_redaction_rects_a_reviewer_edited(self):
+        """Stored rects win, because a reviewer may have moved them.
+
+        ``save_redaction_rect`` writes straight into ``redaction_rects``,
+        so recomputing here would throw away every drag, delete and
+        hand-added box from step 3.
+        """
+        from scanning import services
+
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        output = pathlib.Path(scan.output_dir)
+        _write_bitonal_copy(output / "bitonal.pdf")
+        edited = [
+            {
+                "page_index": 0,
+                "rects": [
+                    {
+                        "x0": 10,
+                        "y0": 20,
+                        "x1": 30,
+                        "y1": 40,
+                        "fill": "black",
+                        "type": "headnote",
+                    }
+                ],
+            }
+        ]
+        scan.redaction_rects = edited
+        scan.save(update_fields=["redaction_rects"])
+        # The rects are stored in image pixels, so the page they name has to
+        # still have a detection to scale them by.
+        Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="TEXT_COLUMN",
+            label_id=16,
+            confidence=0.95,
+            x0=100,
+            y0=200,
+            x1=1600,
+            y1=2000,
+            img_width=1700,
+            img_height=2200,
+        )
+
+        with (
+            patch("django.db.connections.close_all"),
+            patch("blackletter.api.generate") as generate,
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(
+                services, "_snap_text_columns_to_ink", return_value=0
+            ),
+            patch.object(
+                services, "_compute_and_save_redaction_rects"
+            ) as rects,
+        ):
+            generate.return_value = {
+                "opinion_count": 0,
+                "full_redacted": "",
+                "redacted_dir": str(output / "redacted"),
+            }
+            services.run_generate_files(scan.pk)
+
+        rects.assert_not_called()
+        scan.refresh_from_db()
+        self.assertEqual(scan.redaction_rects, edited)
+
+    def test_raises_without_any_processing_pdf(self):
+        """An empty output dir is still an error, just a clearer one."""
+        from scanning import services
+
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        with (
+            patch("django.db.connections.close_all"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(services, "_handle_pipeline_exception") as handler,
+        ):
+            services.run_generate_files(scan.pk)
+
+        handler.assert_called_once()
+        self.assertIn("bitonal.pdf", str(handler.call_args.args[1]))
+
+
+class TestRedactionGeometryFromInk(SimpleTestCase):
+    """The library contract this app now depends on for headnote rects.
+
+    The app used to patch ``blackletter.process``'s text-bound helpers from
+    here, because ``_text_bottom`` returned ``clip.y0`` on a page with no
+    words, which collapsed every headnote rect and dropped it: a text-less
+    ``bitonal.pdf`` produced *no* headnote rects while every other rect type
+    came out unchanged. blackletter measures ink itself now (#68), keyed off
+    ``Document.ocr_applied``, which ``_build_document_from_detections``
+    always sets. These tests pin that contract, so a library release that
+    regressed it would fail here rather than silently ship empty redactions.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = pathlib.Path(self._tmp.name)
+
+    def test_bottom_comes_from_the_ink_without_a_text_layer(self):
+        from blackletter.scanner import _text_bottom
+
+        pdf = self.tmp / "bitonal.pdf"
+        write_bitonal_page(pdf)
+        clip = fitz.Rect(CONTENT.x0, CONTENT.y0, CONTENT.x1, PAGE_H)
+        with fitz.open(str(pdf)) as doc:
+            bottom = _text_bottom(doc[0], clip)
+        self.assertGreater(bottom, clip.y0, "headnote rects would collapse")
+        self.assertAlmostEqual(bottom, CONTENT.y1, delta=8.0)
+
+    def test_ocr_applied_prefers_ink_over_our_own_word_boxes(self):
+        """Documents are built with ``ocr_applied=True``, which selects ink."""
+        from blackletter.scanner import _tighten_to_text
+
+        pdf = self.tmp / "text.pdf"
+        write_text_page(pdf, bottom_bar=True)
+        rect = fitz.Rect(0, 0, PAGE_W, PAGE_H)
+        with fitz.open(str(pdf)) as doc:
+            tight = _tighten_to_text(doc[0], rect, ocr_applied=True)
+        self.assertIsNotNone(tight)
+        # The platen band at the page foot is outside the content box, so
+        # ink measurement stops at the last line of text instead.
+        self.assertLess(tight.y1, BOTTOM_BAR.y0)
+
+    def test_side_bounds_are_not_narrowed_from_ink(self):
+        """Shrinking a headnote rect horizontally is the unsafe direction."""
+        from blackletter.scanner import _text_x_bounds
+
+        pdf = self.tmp / "bitonal.pdf"
+        write_bitonal_page(pdf)
+        clip = fitz.Rect(CONTENT.x0 - 20, 200, CONTENT.x1 + 20, 400)
+        with fitz.open(str(pdf)) as doc:
+            left, right = _text_x_bounds(doc[0], clip)
+        self.assertEqual((left, right), (clip.x0, clip.x1))
+
+
+class TestSnapTextColumnsToInk(TestCase):
+    """``_snap_text_columns_to_ink`` corrects the column boxes at the source.
+
+    YOLO's ``TEXT_COLUMN`` boxes land slightly inside the printed text, and
+    three consumers depend on them: headnote rects snap their x-bounds to
+    these boxes, margin strips take them as the text band, and the
+    outside-opinion masks white out whole columns with them. Widening the
+    boxes once means none of those has to compensate.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.pdf = pathlib.Path(self._tmp.name) / "two_col.pdf"
+        write_two_column_page(self.pdf)
+        self.scan = ScanFactory(reporter=ReporterFactory(short_name="a3d"))
+
+    def _column(self, x0, x1, y0=100.0, y1=700.0):
+        """A TEXT_COLUMN detection, in image pixels == PDF points."""
+        return Detection.objects.create(
+            scan=self.scan,
+            page_index=0,
+            label="TEXT_COLUMN",
+            label_id=16,
+            confidence=0.97,
+            x0=x0,
+            y0=y0,
+            x1=x1,
+            y1=y1,
+            img_width=PAGE_W,
+            img_height=PAGE_H,
+        )
+
+    def test_widens_a_narrow_box_to_the_text(self):
+        from scanning.services import _snap_text_columns_to_ink
+
+        det = self._column(COLUMN_LEFT.x0 + 6, COLUMN_LEFT.x1 - 6)
+        changed = _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        det.refresh_from_db()
+        self.assertEqual(changed, 1)
+        self.assertAlmostEqual(det.x0, COLUMN_LEFT.x0, delta=2.0)
+        self.assertAlmostEqual(det.x1, COLUMN_LEFT.x1, delta=2.0)
+
+    def test_leaves_the_vertical_bounds_alone(self):
+        """Only x is consumed; y feeds nothing and must not move."""
+        from scanning.services import _snap_text_columns_to_ink
+
+        det = self._column(COLUMN_LEFT.x0 + 6, COLUMN_LEFT.x1 - 6, 150, 650)
+        _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        det.refresh_from_db()
+        self.assertEqual((det.y0, det.y1), (150, 650))
+
+    def test_does_not_cross_the_gutter(self):
+        """A box may not grow into its neighbour's column."""
+        from scanning.services import _snap_text_columns_to_ink
+
+        left = self._column(COLUMN_LEFT.x0, COLUMN_LEFT.x1)
+        right = self._column(COLUMN_RIGHT.x0, COLUMN_RIGHT.x1)
+        _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        left.refresh_from_db()
+        right.refresh_from_db()
+        self.assertLessEqual(
+            left.x1, right.x0, f"columns overlap: {left.x1} > {right.x0}"
+        )
+
+    def test_is_idempotent(self):
+        from scanning.services import _snap_text_columns_to_ink
+
+        self._column(COLUMN_LEFT.x0 + 6, COLUMN_LEFT.x1 - 6)
+        self._column(COLUMN_RIGHT.x0 + 6, COLUMN_RIGHT.x1 - 6)
+        first = _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        second = _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        self.assertEqual(first, 2)
+        self.assertEqual(second, 0, "snapping moved the boxes twice")
+
+    def test_leaves_an_inconclusive_edge_alone(self):
+        """An edge that never finds the end of the ink is not moved.
+
+        A one-column detection over a full-width table would otherwise
+        slide out by the growth limit on every run, never settling.
+        """
+        from scanning.services import _snap_text_columns_to_ink
+
+        # Inset far enough on both sides that growth runs to its limit.
+        det = self._column(COLUMN_RIGHT.x0 + 40, COLUMN_RIGHT.x1 - 40)
+        before = (det.x0, det.x1)
+        changed = _snap_text_columns_to_ink(self.scan.pk, str(self.pdf))
+        det.refresh_from_db()
+        self.assertEqual(changed, 0)
+        self.assertEqual((det.x0, det.x1), before)
+
+    def test_no_columns_is_a_no_op(self):
+        from scanning.services import _snap_text_columns_to_ink
+
+        self.assertEqual(
+            _snap_text_columns_to_ink(self.scan.pk, str(self.pdf)), 0
+        )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestBuildCombinedRedactionsStaleRects(TestCase):
+    """Saved rects and live detections can disagree about which pages exist.
+
+    ``redaction_rects`` is a snapshot on the Scan; the pages come from the
+    detections as they stand now. Deactivating the last detection on a page
+    that a multi-page headnote block still has rects for leaves a page whose
+    pixel coordinates cannot be scaled to points.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+
+    def test_says_what_to_do_about_it(self):
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            shutil.copy2(PDF_PATH, pathlib.Path(tmpdir) / "bitonal.pdf")
+            # Rects for page 0, and no detection anywhere to scale them by.
+            scan.redaction_rects = [
+                {
+                    "page_index": 0,
+                    "rects": [
+                        {
+                            "x0": 100,
+                            "y0": 200,
+                            "x1": 800,
+                            "y1": 400,
+                            "fill": "black",
+                            "type": "headnote",
+                        }
+                    ],
+                }
+            ]
+            scan.save(update_fields=["redaction_rects"])
+
+            with self.assertRaises(RuntimeError) as caught:
+                services._build_combined_redactions(scan.pk)
+            self.assertIn(
+                "Re-add a detection on that page", str(caught.exception)
             )
 
-        push.assert_called_once_with(scan.pk, "rep.1.1.2.pdf")
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestLlmPageTextLayer(TestCase):
+    """The post-redaction text layer is opt-in and never implicit.
+
+    Dropping the Tesseract pre-pass is the point of scanning #145, so
+    Generate Files must not quietly reintroduce an OCR run over every page.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.llm = pathlib.Path(self._tmp.name) / "llm"
+        self.llm.mkdir()
+        (self.llm / "page_0001.pdf").write_bytes(b"%PDF-1.4\n")
+        self.scan = ScanFactory(reporter=ReporterFactory(short_name="a3d"))
+
+    def test_off_by_default(self):
+        from scanning.services import _add_llm_page_text_layer
+
+        with patch("blackletter.api.add_text_layer") as ocr:
+            added = _add_llm_page_text_layer(self.scan.pk, self.llm)
+        ocr.assert_not_called()
+        self.assertEqual(added, 0)
+
+    @override_settings(LLM_PAGE_TEXT_LAYER=True)
+    def test_runs_over_the_llm_pages_when_switched_on(self):
+        from scanning.services import _add_llm_page_text_layer
+
+        with patch("blackletter.api.add_text_layer") as ocr:
+            ocr.return_value = [self.llm / "page_0001.pdf"]
+            added = _add_llm_page_text_layer(self.scan.pk, self.llm)
+        ocr.assert_called_once_with(self.llm)
+        self.assertEqual(added, 1)
+
+    @override_settings(LLM_PAGE_TEXT_LAYER=True)
+    def test_skips_a_scan_with_no_llm_directory(self):
+        from scanning.services import _add_llm_page_text_layer
+
+        with patch("blackletter.api.add_text_layer") as ocr:
+            added = _add_llm_page_text_layer(
+                self.scan.pk, self.llm / "missing"
+            )
+        ocr.assert_not_called()
+        self.assertEqual(added, 0)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestBuildCombinedRedactionsPayload(TestCase):
+    """The payload ``generate`` reads mixes two coordinate spaces.
+
+    Redaction rects are stored in image pixels and margin rects in PDF
+    points, and both come out of this step in points. Getting that backwards
+    puts every blackout in the wrong place, and nothing downstream notices.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+
+    def test_pixel_rects_are_scaled_and_point_rects_are_not(self):
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            output = pathlib.Path(scan.output_dir)
+            with fitz.open(str(output / "bitonal.pdf")) as doc:
+                page_w = doc[0].rect.width
+            # An image twice the page's width in points, so the scale is 1:2
+            # and a mistake cannot hide behind a factor of one.
+            Detection.objects.create(
+                scan=scan,
+                page_index=0,
+                label="TEXT_COLUMN",
+                label_id=16,
+                confidence=0.95,
+                x0=100,
+                y0=200,
+                x1=800,
+                y1=400,
+                img_width=int(page_w * 2),
+                img_height=2200,
+            )
+            scan.redaction_rects = [
+                {
+                    "page_index": 0,
+                    "rects": [
+                        {
+                            "x0": 100,
+                            "y0": 200,
+                            "x1": 800,
+                            "y1": 400,
+                            "fill": "black",
+                            "type": "headnote",
+                        }
+                    ],
+                }
+            ]
+            scan.margin_rects = [
+                {
+                    "page_index": 0,
+                    "rects": [{"x0": 0.0, "y0": 0.0, "x1": 20.0, "y1": 50.0}],
+                }
+            ]
+            scan.save(update_fields=["redaction_rects", "margin_rects"])
+
+            payload = json.loads(
+                services._build_combined_redactions(scan.pk).read_text()
+            )
+            page_rects = payload["pages"]["0"]
+
+            headnote = next(r for r in page_rects if r["type"] == "headnote")
+            self.assertAlmostEqual(headnote["x0"], 50.0, delta=0.2)
+            self.assertAlmostEqual(headnote["x1"], 400.0, delta=0.2)
+
+            margin = next(r for r in page_rects if r["type"] == "margin")
+            self.assertEqual(
+                margin["x1"], 20.0, "margin rects are already points"
+            )
+            self.assertEqual(margin["fill"], "white")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestServeMarginRectsView(TestCase):
+    """The endpoint the margin work exists for.
+
+    It must go through the service helper rather than measuring on its own:
+    computing here with a separate detection lookup is how the viewer once
+    cached margins with no top strips, permanently.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+        self.user = UserFactory()
+        self.client.force_login(self.user)
+
+    def test_computes_through_the_service_helper(self):
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                uploaded_by=self.user,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            output = pathlib.Path(scan.output_dir)
+            with patch.object(
+                services, "_compute_and_save_margin_rects", return_value=[]
+            ) as compute:
+                response = self.client.get(f"/scans/{scan.pk}/margin-rects/")
+            self.assertEqual(response.status_code, 200)
+            compute.assert_called_once_with(
+                scan.pk, str(output / "bitonal.pdf"), str(output)
+            )
+
+    def test_a_detection_less_scan_is_not_cached(self):
+        """It must stay recomputable once the detections land."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                uploaded_by=self.user,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            response = self.client.get(f"/scans/{scan.pk}/margin-rects/")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), [])
+            scan.refresh_from_db()
+            self.assertFalse(scan.margin_rects)
+
+    def test_returns_empty_without_a_processing_pdf(self):
+        scan = ScanFactory(uploaded_by=self.user)
+        response = self.client.get(f"/scans/{scan.pk}/margin-rects/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [])
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestMarginRectsUseTheDetections(TestCase):
+    """The detected pages must reach the measurement.
+
+    They are what intersects the ink content box with the text band and the
+    header row: without them one bleed-through blob in a corner drags the
+    box out to the page edge and that page's top strip collapses.
+    blackletter owns that behaviour and tests it; what this app has to get
+    right is handing the pages over, corrected, rather than measuring bare.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+
+    def test_passes_the_detected_pages_to_the_measurement(self):
+        from blackletter.models import Label
+
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            Detection.objects.create(
+                scan=scan,
+                page_index=0,
+                label="TEXT_COLUMN",
+                label_id=16,
+                confidence=0.95,
+                x0=100,
+                y0=200,
+                x1=1600,
+                y1=2000,
+                img_width=1700,
+                img_height=2200,
+            )
+            with patch.object(
+                services, "compute_margin_rects", return_value=[]
+            ) as measure:
+                services._compute_and_save_margin_rects(
+                    scan.pk, str(PDF_PATH), tmpdir
+                )
+            pages = measure.call_args.kwargs["pages"]
+            self.assertTrue(pages, "measured with no detected pages")
+            self.assertIn(
+                Label.TEXT_COLUMN,
+                [d.label for d in pages[0].detections],
+            )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestPagesForGeometry(TestCase):
+    """The correction is applied in memory and never written back here.
+
+    ``_snap_text_columns_to_ink`` owns persistence. This helper exists for
+    boxes that reached the DB uncorrected, which is what a reviewer's
+    hand-drawn column is, and it must leave the row alone.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = pathlib.Path(self._tmp.name)
+        self.scan = ScanFactory(reporter=ReporterFactory(short_name="a3d"))
+        output = pathlib.Path(self.scan.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        self.pdf = output / "bitonal.pdf"
+        write_two_column_page(self.pdf, tmp_dir=self.tmp)
+        self.det = Detection.objects.create(
+            scan=self.scan,
+            page_index=0,
+            label="TEXT_COLUMN",
+            label_id=16,
+            confidence=0.95,
+            x0=COLUMN_LEFT.x0 + 6,
+            y0=COLUMN_LEFT.y0,
+            x1=COLUMN_LEFT.x1 - 6,
+            y1=COLUMN_LEFT.y1,
+            img_width=PAGE_W,
+            img_height=PAGE_H,
+        )
+
+    def test_widens_an_uncorrected_box_without_persisting_it(self):
+        from scanning.services import _pages_for_geometry
+
+        pages = _pages_for_geometry(
+            self.scan, str(self.pdf), self.scan.output_dir
+        )
+        box = pages[0].detections[0].bbox
+        self.assertAlmostEqual(box.x1, COLUMN_LEFT.x0, delta=2.0)
+        self.assertAlmostEqual(box.x2, COLUMN_LEFT.x1, delta=2.0)
+
+        self.det.refresh_from_db()
+        self.assertEqual(self.det.x0, COLUMN_LEFT.x0 + 6, "persisted the snap")
+
+    def test_snap_false_leaves_the_box_as_stored(self):
+        """The steps that never read a column box must not pay to fix one."""
+        from scanning.services import _pages_for_geometry
+
+        pages = _pages_for_geometry(
+            self.scan, str(self.pdf), self.scan.output_dir, snap=False
+        )
+        self.assertEqual(pages[0].detections[0].bbox.x1, COLUMN_LEFT.x0 + 6)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestPipelineCorrectsColumnsAfterDetecting(TestCase):
+    """``run_detect`` corrects the column boxes it just imported.
+
+    Re-detect is an explicit request for new geometry, and the reviewer is
+    watching one scan rather than waiting on an upload, so it persists the
+    correction rather than deferring it the way ``run_full_pipeline`` does.
+    Boxes left uncorrected sit a few points inside the printed text, and the
+    first or last character of every masked line survives in the
+    deliverable.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+
+    def test_run_detect_snaps_after_importing(self):
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            output = pathlib.Path(scan.output_dir)
+            _run_detect_on_fixture(str(output))
+
+            with (
+                patch("django.db.connections.close_all"),
+                patch.object(services, "_run_yolo"),
+                patch.object(services, "_re_pair_opinions"),
+                patch.object(services, "_pull_processing_files_from_s3"),
+                patch.object(services, "_push_processing_files_to_s3"),
+                patch.object(
+                    services, "_snap_text_columns_to_ink", return_value=0
+                ) as snap,
+            ):
+                services.run_detect(scan.pk)
+
+            snap.assert_called_once()
+            self.assertEqual(
+                snap.call_args.args[1], str(output / "bitonal.pdf")
+            )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestUploadPathSkipsRedactionGeometry(TestCase):
+    """The upload path stops at "is this volume complete?".
+
+    Review 1 asks nothing about redaction: no detection overlay, no rects.
+    Measuring either here cost three full-volume renders at 100 dpi that a
+    scanner sat through before the scan even reached PENDING_REVIEW, which
+    is most of what dropping the Tesseract pass was meant to give back.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+
+    def test_run_full_pipeline_defers_both(self):
+        from scanning import services
+
+        scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        output = pathlib.Path(scan.output_dir)
+        bitonal = output / "bitonal.pdf"
+        _write_bitonal_copy(bitonal)
+
+        with (
+            patch("django.db.connections.close_all"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(services, "_ensure_bitonal", return_value=bitonal),
+            patch.object(services, "_run_yolo"),
+            patch.object(
+                services, "_import_detections_from_json", return_value=[]
+            ),
+            patch.object(services, "run_paddleocr_validation"),
+            patch.object(services, "_re_pair_opinions", return_value=[]),
+            patch.object(services, "_snap_text_columns_to_ink") as snap,
+            patch.object(
+                services, "_compute_and_save_redaction_rects"
+            ) as rects,
+            patch.object(
+                services, "_compute_and_save_margin_rects"
+            ) as margins,
+        ):
+            services.run_full_pipeline(scan.pk)
+
+        snap.assert_not_called()
+        rects.assert_not_called()
+        margins.assert_not_called()
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PENDING_REVIEW)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestPipelineResumesInsteadOfRerunningGpuStages(TestCase):
+    """A re-queued scan picks up finished stages instead of paying twice.
+
+    The daemon takes a SIGTERM on every deploy and re-queues whatever was
+    mid-pipeline, and ``run_full_pipeline`` restarts at step 1. Before
+    this, a detect that had already completed was re-submitted: another
+    ~200 s of GPU time to recompute detections already sitting on S3, and
+    its result object overwritten with an identical one.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+        self.scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d"),
+        )
+        self.bitonal = pathlib.Path(self.scan.output_dir) / "bitonal.pdf"
+        _write_bitonal_copy(self.bitonal)
+
+    def _run(self, reusable):
+        """Run the pipeline with ``reusable_result`` stubbed.
+
+        :param reusable: Return value for every ``reusable_result`` call.
+        :returns: ``(reuse_mock, yolo_mock, validation_mock)``.
+        """
+        from scanning import services
+
+        with (
+            patch("django.db.connections.close_all"),
+            patch.object(services, "_pull_processing_files_from_s3"),
+            patch.object(services, "_push_processing_files_to_s3"),
+            patch.object(
+                services, "_ensure_bitonal", return_value=self.bitonal
+            ),
+            patch.object(services, "_run_yolo") as yolo,
+            patch.object(
+                services, "_import_detections_from_json", return_value=[]
+            ),
+            patch.object(services, "run_paddleocr_validation") as validation,
+            patch.object(services, "_re_pair_opinions", return_value=[]),
+            patch(
+                "scanning.runpod_client.reusable_result",
+                return_value=reusable,
+            ) as reuse,
+        ):
+            services.run_full_pipeline(self.scan.pk)
+        return reuse, yolo, validation
+
+    def test_finished_detect_is_reused_not_resubmitted(self):
+        detections = [{"page_index": 0, "label_id": 1}]
+        _, yolo, _ = self._run({"detections": detections})
+
+        yolo.assert_not_called()
+        written = json.loads(
+            (
+                pathlib.Path(self.scan.output_dir) / "detections.json"
+            ).read_text()
+        )
+        self.assertEqual(written, detections)
+
+    def test_no_stored_result_runs_detection(self):
+        _, yolo, _ = self._run(None)
+        yolo.assert_called_once()
+
+    def test_payload_without_detections_runs_detection(self):
+        # A result whose shape we don't recognise is not a reason to
+        # skip the stage; it is a reason to run it.
+        _, yolo, _ = self._run({"page_count": 12})
+        yolo.assert_called_once()
+
+    def test_result_referencing_pages_past_the_end_is_rejected(self):
+        # Backstop on the timestamp check, which only notices an edited
+        # input if the edit changed the object's size. A detection on a
+        # page this PDF no longer has means the result predates a page
+        # deletion, whatever the timestamps say.
+        Scan.objects.filter(pk=self.scan.pk).update(page_count=2)
+        _, yolo, _ = self._run({"detections": [{"page_index": 7}]})
+        yolo.assert_called_once()
+
+    def test_result_within_the_page_count_is_still_reused(self):
+        Scan.objects.filter(pk=self.scan.pk).update(page_count=8)
+        _, yolo, _ = self._run({"detections": [{"page_index": 7}]})
+        yolo.assert_not_called()
+
+    def test_validation_is_asked_to_reuse(self):
+        # Step 5 is the other GPU stage; the pipeline is the only caller
+        # that opts it into reuse.
+        _, _, validation = self._run(None)
+        self.assertTrue(validation.call_args.kwargs["reuse"])
+
+    def test_ensure_bitonal_leaves_page_count_readable_on_the_instance(self):
+        """The page-count backstop reads the attribute, not the row.
+
+        ``_ensure_bitonal`` persists the count with a queryset
+        ``.update()``, which is a bare SQL write and leaves the caller's
+        instance holding whatever it loaded. ``run_full_pipeline`` hands
+        that same instance straight to ``_reuse_detect_result`` three
+        lines later, so the two have to stay in step.
+        """
+        from scanning import services
+
+        with fitz.open(str(self.bitonal)) as pdf:
+            real_pages = pdf.page_count
+        self.scan.page_count = real_pages + 99
+
+        services._ensure_bitonal(self.scan, pathlib.Path(self.scan.output_dir))
+
+        self.assertEqual(self.scan.page_count, real_pages)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.page_count, real_pages)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestPaddleocrValidationReuse(TestCase):
+    """``run_paddleocr_validation`` only reuses when asked to."""
+
+    def setUp(self):
+        self.scan = ScanFactory(start_page=1, end_page=2)
+
+    def _run(self, reuse, stored):
+        """Run validation with the stored-result lookup stubbed.
+
+        :param reuse: Value for the ``reuse`` argument.
+        :param stored: Return value for ``reusable_result``.
+        :returns: The ``_dispatch_analyze`` mock.
+        """
+        from scanning import services
+
+        with (
+            patch.object(
+                services, "_dispatch_analyze", return_value=[{"pdf_page": 9}]
+            ) as dispatch,
+            patch.object(services, "_rebuild_issues_from_results"),
+            patch(
+                "scanning.runpod_client.reusable_result", return_value=stored
+            ),
+        ):
+            services.run_paddleocr_validation(
+                self.scan.pk, "some.original.pdf", reuse=reuse
+            )
+        return dispatch
+
+    def test_stored_result_skips_the_job(self):
+        results = [{"pdf_page": 1, "detected": "1"}]
+        dispatch = self._run(reuse=True, stored={"results": results})
+
+        dispatch.assert_not_called()
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.ocr_results, results)
+
+    def test_reuse_off_always_dispatches(self):
+        # Every caller that means "analyze this again" keeps doing that,
+        # even with a perfectly good stored result sitting there.
+        dispatch = self._run(reuse=False, stored={"results": [{"a": 1}]})
+
+        dispatch.assert_called_once()
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.ocr_results, [{"pdf_page": 9}])
+
+    def test_missing_stored_result_falls_through_to_the_job(self):
+        dispatch = self._run(reuse=True, stored=None)
+
+        dispatch.assert_called_once()
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.ocr_results, [{"pdf_page": 9}])
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestSnapIgnoresDetectionsPastTheEnd(TestCase):
+    """A detection can outlive the page it was found on.
+
+    Deleting a page shifts the rows after it down, and a stale row can end
+    up pointing past the end of the PDF. Indexing that page raises, and it
+    would take the whole pipeline step down with it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = pathlib.Path(self._tmp.name)
+        self.pdf = self.tmp / "two_col.pdf"
+        write_two_column_page(self.pdf, tmp_dir=self.tmp)
+        self.scan = ScanFactory(reporter=ReporterFactory(short_name="a3d"))
+
+    def _column(self, page_index, x0, x1):
+        return Detection.objects.create(
+            scan=self.scan,
+            page_index=page_index,
+            label="TEXT_COLUMN",
+            label_id=16,
+            confidence=0.97,
+            x0=x0,
+            y0=100.0,
+            x1=x1,
+            y1=700.0,
+            img_width=PAGE_W,
+            img_height=PAGE_H,
+        )
+
+    def test_a_detection_past_the_last_page_is_skipped(self):
+        from scanning.services import _snap_text_columns_to_ink
+
+        self._column(0, COLUMN_LEFT.x0 + 6, COLUMN_LEFT.x1 - 6)
+        ghost = self._column(5, COLUMN_LEFT.x0 + 6, COLUMN_LEFT.x1 - 6)
+
+        self.assertEqual(
+            _snap_text_columns_to_ink(self.scan.pk, str(self.pdf)), 1
+        )
+        ghost.refresh_from_db()
+        self.assertEqual(ghost.x0, COLUMN_LEFT.x0 + 6, "moved a ghost box")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestRebuildIssuesUsesTheCorrectedSplit(TestCase):
+    """Auto-correction decides which pages are out of range.
+
+    ``_auto_correct`` can pull a misread page number back into range, so the
+    in/out split computed after it is the one that applies. Letting
+    ``build_analysis`` recompute the split from scratch would be reading the
+    same results a second time and reaching a different answer.
+    """
+
+    def test_the_split_is_handed_over_not_recomputed(self):
+        from scanning import services
+
+        scan = ScanFactory(start_page=100, end_page=110, page_count=3)
+        results = [
+            {"pdf_page": 1, "detected": "100", "type": "single"},
+            {"pdf_page": 2, "detected": "101", "type": "single"},
+            {"pdf_page": 3, "detected": "102", "type": "single"},
+        ]
+        with patch.object(
+            services, "build_analysis", wraps=services.build_analysis
+        ) as analyse:
+            services._rebuild_issues_from_results(scan.pk, results)
+
+        self.assertIn("out_of_range", analyse.call_args.kwargs)
+        self.assertEqual(
+            analyse.call_args.kwargs["out_of_range"],
+            [],
+            "every reading is in range, so nothing should be flagged",
+        )
+
+    def test_a_scan_without_an_end_page_still_reports_gaps(self):
+        """The old hand-built analysis returned no missing pages at all."""
+        from scanning import services
+        from scanning.models import Issue
+
+        scan = ScanFactory(start_page=10, end_page=None, page_count=4)
+        results = [
+            {"pdf_page": 1, "detected": "10", "type": "single"},
+            {"pdf_page": 2, "detected": "11", "type": "single"},
+            {"pdf_page": 3, "detected": "15", "type": "single"},
+            {"pdf_page": 4, "detected": "16", "type": "single"},
+        ]
+        services._rebuild_issues_from_results(scan.pk, results)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [12, 13, 14])
+        self.assertTrue(Issue.objects.filter(scan=scan).exists())
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestRebuildIssuesFromResults(TestCase):
+    """The daemon rebuild behind 'Rebuild & Validate' auto-corrects stray
+    OCR readings but leaves hand-entered page numbers alone, matching
+    Recheck. run_reprocess never re-OCRs existing pages, so a manual entry
+    reaches this path with its ``manual`` markers intact.
+    """
+
+    def _results(self, last, **extra):
+        """Three good pages plus a fourth reading, optionally manual."""
+        return [
+            {"pdf_page": 1, "detected": "1", "type": "single"},
+            {"pdf_page": 2, "detected": "2", "type": "single"},
+            {"pdf_page": 3, "detected": "3", "type": "single"},
+            {"pdf_page": 4, "detected": last, "type": "single", **extra},
+        ]
+
+    def test_auto_corrects_stray_ocr_reading(self):
+        """An out-of-range OCR reading is interpolated from its neighbours."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=4, page_count=4)
+        results = self._results("999")
+
+        services._rebuild_issues_from_results(scan.pk, results)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "4")
+
+    def test_manual_page_number_preserved(self):
+        """A curator's typed number survives the rebuild untouched."""
+        from scanning import services
+
+        scan = ScanFactory(start_page=1, end_page=4, page_count=4)
+        results = self._results("999", zone="manual", ocr="manual")
+
+        services._rebuild_issues_from_results(scan.pk, results)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "999")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestRecalculateIssues(TestCase):
+    """Recheck rebuilds issues from stored data.
+
+    It must not need a local copy of the PDF (production web pods never
+    download one, SCANNING-1S), and the expected page range comes from
+    the scan's start_page/end_page, the same source the validate stage
+    uses, rather than from the uploaded filename.
+    """
+
+    def _make_scan(self, **kwargs):
+        """Create a scan whose original PDF is absent locally, as in prod."""
+        scan = ScanFactory(status=Status.PENDING_REVIEW, **kwargs)
+        pathlib.Path(scan.original_pdf.path).unlink()
+        return scan
+
+    def test_no_local_pdf(self):
+        """Rechecking a scan with no local PDF rebuilds issues instead of
+        raising FileNotFoundError."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=3,
+            page_count=3,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": None, "type": None},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+            ],
+        )
+        with self.assertRaises(FileNotFoundError):
+            scan.pdf_path
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PENDING_REVIEW)
+        self.assertEqual(scan.page_count, 3)
+        self.assertEqual(
+            [e["pdf_index"] for e in scan.page_map if "pdf_index" in e],
+            [0, 1, 2],
+        )
+        self.assertTrue(
+            scan.issues.filter(check_name="no_page_number").exists()
+        )
+
+    def test_missing_pages_use_scan_page_range(self):
+        """Pages the volume should contain but OCR never saw are reported,
+        even when they fall past the last detected number."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=5,
+            page_count=3,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [4, 5])
+
+    def test_out_of_range_reading_flagged(self):
+        """A number far outside the volume's range is flagged as a stray
+        reading rather than accepted as a real page number."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=5,
+            page_count=1,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "999", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertTrue(
+            scan.issues.filter(check_name="suspicious_reading").exists()
+        )
+
+    def test_no_end_page_falls_back_to_detected_numbers(self):
+        """Without an end_page there is no expected range, so missing
+        pages are derived from the detected numbers alone."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=None,
+            number_of_pages=None,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "4", "type": "single"},
+                {"pdf_page": 2, "detected": "6", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [5])
+
+    def test_page_count_refreshed_when_pdf_available(self):
+        """When the PDF is on disk, page_count is re-read from it."""
+        from scanning import services
+
+        _require_fixture(self)
+        scan = _make_scan_with_output(
+            status=Status.PENDING_REVIEW,
+            ocr_results=[{"pdf_page": 1, "detected": "1", "type": "single"}],
+        )
+        scan.page_count = 99
+        scan.save(update_fields=["page_count"])
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.page_count, 1)
+
+    def test_auto_corrects_stray_ocr_reading(self):
+        """A stray OCR reading that sits at a consistent offset from its
+        neighbours is corrected to the number the sequence implies."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=4,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+                {"pdf_page": 4, "detected": "999", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "4")
+        self.assertTrue(
+            scan.issues.filter(check_name="auto_corrected").exists()
+        )
+
+    def test_manual_page_number_not_auto_corrected(self):
+        """A page number a curator typed is left alone even when it falls
+        outside the volume's range: it is flagged, not overwritten."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=4,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+                {"pdf_page": 3, "detected": "3", "type": "single"},
+                {
+                    "pdf_page": 4,
+                    "detected": "999",
+                    "type": "single",
+                    "zone": "manual",
+                    "ocr": "manual",
+                },
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[3]["detected"], "999")
+        self.assertFalse(
+            scan.issues.filter(check_name="auto_corrected").exists()
+        )
+        self.assertTrue(
+            scan.issues.filter(check_name="suspicious_reading").exists()
+        )
+
+    def test_keeps_suppressed_detection_issues(self):
+        """Recheck rebuilds page-number issues but leaves detection
+        suppressions, which are curator decisions, in place."""
+        from scanning import services
+        from scanning.models import CheckName, Issue
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=2,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": None, "type": None},
+            ],
+        )
+        Issue.objects.create(
+            scan=scan,
+            check_name=CheckName.SUPPRESS_DETECTION,
+            severity="info",
+            message="detection 42 suppressed",
+        )
+        stale = Issue.objects.create(
+            scan=scan,
+            check_name=CheckName.NO_PAGE_NUMBER,
+            page_number=1,
+            severity="info",
+            message="stale",
+        )
+
+        services.recalculate_issues(scan)
+
+        self.assertTrue(
+            scan.issues.filter(
+                check_name=CheckName.SUPPRESS_DETECTION
+            ).exists()
+        )
+        self.assertFalse(Issue.objects.filter(pk=stale.pk).exists())
+
+    def test_rebuild_page_map_without_local_pdf(self):
+        """rebuild_page_map (manual page edits) also runs off stored data
+        and applies the scan's page range."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=1,
+            end_page=4,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+            ],
+        )
+
+        services.rebuild_page_map(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [3, 4])
+        self.assertFalse(scan.issues.exists())

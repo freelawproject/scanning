@@ -40,6 +40,62 @@ document.addEventListener('DOMContentLoaded', function () {
         return container.querySelector('.lazy-page[data-pdf-index="' + pdfIndex + '"]');
     }
 
+    // Stamp an overlay box with a stable, human-readable identity so a box
+    // that looks wrong can be reported (and found in the DB) without
+    // measuring pixels: hover shows it, devtools shows it, and
+    // `data-box-id` is greppable in a screenshot or a bug report.
+    //
+    // The page number matches the on-screen "PDF p.N" label (1-based);
+    // `data-pdf-index` carries the 0-based index used by
+    // scan.redaction_rects / margin_rects / detections.
+    function _boxSlug(value) {
+        return String(value || 'box').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    }
+
+    function _tagOverlayBox(el, kind, type, pdfIndex, seq, rect, units) {
+        var pdfPage = pdfIndex + 1;
+        var slug = _boxSlug(type);
+        var boxId = kind + (slug ? '-' + slug : '') + '-p' + pdfPage + '-' + seq;
+        el.dataset.boxId = boxId;
+        el.dataset.kind = kind;
+        el.dataset.type = type || '';
+        el.dataset.pdfPage = pdfPage;
+        el.dataset.pdfIndex = pdfIndex;
+        el.dataset.seq = seq;
+        var coords = '';
+        if (rect) {
+            coords = [rect.x0, rect.y0, rect.x1, rect.y1]
+                .map(function (v) { return Math.round(v); })
+                .join(',');
+            el.dataset.rect = coords;
+            // Redaction and detection rects are stored in image pixels,
+            // margin rects in PDF points; say which so a reported number
+            // can be matched against the JSON without guessing.
+            el.dataset.units = units || 'px';
+        }
+        return boxId + (coords ? '  [' + coords + ' ' + (units || 'px') + ']' : '');
+    }
+
+    // Console helper for the review loop: given a box id read off a
+    // tooltip, scroll to that box and outline it. Pages render lazily, so a
+    // box only exists once its page has been in view and its overlay is on.
+    window.findBox = function (boxId) {
+        var el = container.querySelector('[data-box-id="' + boxId + '"]');
+        if (!el) {
+            console.warn(
+                'No box "' + boxId + '" is rendered. Scroll its page into ' +
+                'view with the overlay enabled, then try again.'
+            );
+            return null;
+        }
+        if (window.scrollPageIntoView) window.scrollPageIntoView(el);
+        var previous = el.style.outline;
+        el.style.outline = '3px solid #f59e0b';
+        setTimeout(function () { el.style.outline = previous; }, 4000);
+        console.log(boxId, Object.assign({}, el.dataset));
+        return el;
+    };
+
     var viewerPanel = container.closest('.viewer-panel') || container.parentElement;
     var viewerHeight = viewerPanel ? viewerPanel.clientHeight : (window.innerHeight - 200);
     // Scale so one full page (792pt letter height) fits within the viewer, never bigger
@@ -886,6 +942,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var sx = canvasW / imgW;
         var sy = canvasH / imgH;
 
+        var detSeq = {};
         pageDets.forEach(function (d) {
             var box = document.createElement('div');
             box.className = 'detection-box';
@@ -899,7 +956,12 @@ document.addEventListener('DOMContentLoaded', function () {
             box.dataset.imgWidth = imgW;
             box.dataset.imgHeight = imgH;
             box.style.borderColor = color;
-            box.title = d.label + ' (' + d.confidence + ')';
+            detSeq[d.label] = (detSeq[d.label] || 0) + 1;
+            var detTag = _tagOverlayBox(
+                box, 'detection', d.label, pdfIndex, detSeq[d.label],
+                {x0: d.bbox[0], y0: d.bbox[1], x1: d.bbox[2], y1: d.bbox[3]}
+            );
+            box.title = d.label + ' (' + d.confidence + ')\n' + detTag;
 
             if (d.manual) box.classList.add('manual');
 
@@ -1466,6 +1528,79 @@ document.addEventListener('DOMContentLoaded', function () {
         return _marginIndex[pageIndex] || null;
     }
 
+    // Image-pixel dimensions for a page, read off its detections, with a
+    // document-wide fallback cache. Redaction rects are stored in those
+    // pixels, so this is what scales them onto the canvas.
+    function _imgDimsForPage(pdfIndex) {
+        var imgW = cachedImgW || 1, imgH = cachedImgH || 1;
+        if (allDetections) {
+            for (var di = 0; di < allDetections.length; di++) {
+                if (allDetections[di].page_index === pdfIndex) {
+                    imgW = allDetections[di].img_width || imgW;
+                    imgH = allDetections[di].img_height || imgH;
+                    break;
+                }
+            }
+            if (imgW <= 1 && allDetections.length > 0) {
+                imgW = allDetections[0].img_width || 1;
+                imgH = allDetections[0].img_height || 1;
+            }
+            if (imgW > 1) { cachedImgW = imgW; cachedImgH = imgH; }
+        }
+        return [imgW, imgH];
+    }
+
+    // Build one redaction / whiteout overlay box.
+    //
+    // Both draw paths go through here -- the whole document on toggle and a
+    // single page on lazy render -- because they were near-duplicates that
+    // had already drifted: the lazily drawn boxes carried no tooltip and no
+    // data-fill, so hovering a box showed nothing on the path users
+    // actually hit while scrolling.
+    //
+    // `seqs` accumulates a per-type counter for the page being drawn, which
+    // becomes the box id's ordinal.
+    function _makeRedactionBox(r, pdfIndex, dsx, dsy, seqs) {
+        var div = document.createElement('div');
+        div.className = 'redaction-overlay-box';
+        div.dataset.fill = r.fill || 'black';
+        div.style.position = 'absolute';
+        div.style.left = (r.x0 * dsx) + 'px';
+        div.style.top = (r.y0 * dsy) + 'px';
+        div.style.width = ((r.x1 - r.x0) * dsx) + 'px';
+        div.style.height = ((r.y1 - r.y0) * dsy) + 'px';
+        var solid = (overlayMode === 'solid');
+        if (r.fill === 'black') {
+            div.style.background = solid ? 'rgba(0, 0, 0, 1)' : 'rgba(0, 0, 0, 0.4)';
+            div.style.border = solid ? 'none' : '1px solid rgba(0, 0, 0, 0.7)';
+        } else {
+            div.style.background = solid ? 'rgba(255, 255, 255, 1)' : 'rgba(255, 255, 255, 0.5)';
+            div.style.border = solid ? 'none' : '1px solid rgba(200, 200, 200, 0.8)';
+        }
+        div.style.pointerEvents = 'auto';
+        div.style.cursor = 'pointer';
+        div.style.zIndex = '6';
+
+        var kind = (r.fill === 'white') ? 'whiteout' : 'redaction';
+        seqs[r.type] = (seqs[r.type] || 0) + 1;
+        div.title = (r.type || r.fill) + '\n' + _tagOverlayBox(
+            div, kind, r.type, pdfIndex, seqs[r.type], r
+        );
+
+        // Type label, hidden in solid mode so the preview stays faithful.
+        var label = document.createElement('span');
+        label.style.cssText = 'position:absolute;top:0;left:0;font-size:9px;padding:1px 3px;color:black;background:rgba(255,255,255,0.7);pointer-events:none;';
+        label.textContent = r.type || r.fill;
+        if (solid) label.style.display = 'none';
+        div.appendChild(label);
+
+        div.addEventListener('dblclick', function(e) {
+            e.stopPropagation();
+            _selectRedactionBox(div, pdfIndex, r, dsx, dsy);
+        });
+        return div;
+    }
+
     // Draw the margin boxes for a single page's data. Clears only that page's
     // boxes so it can be called per-render without touching other pages.
     function _drawMarginsForPageData(pageData) {
@@ -1483,9 +1618,15 @@ document.addEventListener('DOMContentLoaded', function () {
         var msx = canvas.offsetWidth / vp.width;
         var msy = canvas.offsetHeight / vp.height;
 
+        var marginSeq = 0;
         pageData.rects.forEach(function(r) {
                 var div = document.createElement('div');
                 div.className = 'margin-overlay-box';
+                marginSeq += 1;
+                div.title = 'margin whiteout\n' + _tagOverlayBox(
+                    div, 'whiteout', 'margin', pageData.page_index,
+                    marginSeq, r, 'pt'
+                );
                 div.style.position = 'absolute';
                 div.style.left = (r.x0 * msx) + 'px';
                 div.style.top = (r.y0 * msy) + 'px';
@@ -1584,55 +1725,15 @@ document.addEventListener('DOMContentLoaded', function () {
             if (!canvas.width || canvas.width < 10) return;
 
             // Rects are in image pixel coords — same scaling as detection overlay
-            var imgW = cachedImgW || 1, imgH = cachedImgH || 1;
-            if (allDetections) {
-                for (var di = 0; di < allDetections.length; di++) {
-                    if (allDetections[di].page_index === pageData.page_index) {
-                        imgW = allDetections[di].img_width || imgW;
-                        imgH = allDetections[di].img_height || imgH;
-                        break;
-                    }
-                }
-                if (imgW <= 1 && allDetections.length > 0) {
-                    imgW = allDetections[0].img_width || 1;
-                    imgH = allDetections[0].img_height || 1;
-                }
-                // Update cache
-                if (imgW > 1) { cachedImgW = imgW; cachedImgH = imgH; }
-            }
-            var dsx = canvas.offsetWidth / imgW;
-            var dsy = canvas.offsetHeight / imgH;
+            var dims = _imgDimsForPage(pageData.page_index);
+            var dsx = canvas.offsetWidth / dims[0];
+            var dsy = canvas.offsetHeight / dims[1];
 
+            var seqs = {};
             pageData.rects.forEach(function(r) {
-                var div = document.createElement('div');
-                div.className = 'redaction-overlay-box';
-                div.dataset.fill = r.fill || 'black';
-                div.style.position = 'absolute';
-                div.style.left = (r.x0 * dsx) + 'px';
-                div.style.top = (r.y0 * dsy) + 'px';
-                div.style.width = ((r.x1 - r.x0) * dsx) + 'px';
-                div.style.height = ((r.y1 - r.y0) * dsy) + 'px';
-                var solid = (overlayMode === 'solid');
-                if (r.fill === 'black') {
-                    div.style.background = solid ? 'rgba(0, 0, 0, 1)' : 'rgba(0, 0, 0, 0.4)';
-                    div.style.border = solid ? 'none' : '1px solid rgba(0, 0, 0, 0.7)';
-                } else {
-                    div.style.background = solid ? 'rgba(255, 255, 255, 1)' : 'rgba(255, 255, 255, 0.5)';
-                    div.style.border = solid ? 'none' : '1px solid rgba(200, 200, 200, 0.8)';
-                }
-                div.style.pointerEvents = 'auto';
-                div.style.cursor = 'pointer';
-                div.style.zIndex = '6';
-                // Show label only on hover
-                div.title = r.type || r.fill;
-
-                // Double-click to select for editing
-                div.addEventListener('dblclick', function(e) {
-                    e.stopPropagation();
-                    _selectRedactionBox(div, pageData.page_index, r, dsx, dsy);
-                });
-
-                wrapper.appendChild(div);
+                wrapper.appendChild(
+                    _makeRedactionBox(r, pageData.page_index, dsx, dsy, seqs)
+                );
             });
         });
     }
@@ -1861,53 +1962,15 @@ document.addEventListener('DOMContentLoaded', function () {
         // Remove existing boxes for this page
         wrapper.querySelectorAll('.redaction-overlay-box').forEach(function(el) { el.remove(); });
 
-        var imgW = cachedImgW || 1, imgH = cachedImgH || 1;
-        if (allDetections) {
-            for (var di = 0; di < allDetections.length; di++) {
-                if (allDetections[di].page_index === pdfIndex) {
-                    imgW = allDetections[di].img_width || imgW;
-                    imgH = allDetections[di].img_height || imgH;
-                    break;
-                }
-            }
-            if (imgW <= 1 && allDetections.length > 0) {
-                imgW = allDetections[0].img_width || 1;
-                imgH = allDetections[0].img_height || 1;
-            }
-            if (imgW > 1) { cachedImgW = imgW; cachedImgH = imgH; }
-        }
-        var dsx = canvas.offsetWidth / imgW;
-        var dsy = canvas.offsetHeight / imgH;
+        var dims = _imgDimsForPage(pdfIndex);
+        var dsx = canvas.offsetWidth / dims[0];
+        var dsy = canvas.offsetHeight / dims[1];
 
+        var seqs = {};
         pageData.rects.forEach(function(r) {
-            var div = document.createElement('div');
-            div.className = 'redaction-overlay-box';
-            div.style.position = 'absolute';
-            div.style.left = (r.x0 * dsx) + 'px';
-            div.style.top = (r.y0 * dsy) + 'px';
-            div.style.width = ((r.x1 - r.x0) * dsx) + 'px';
-            div.style.height = ((r.y1 - r.y0) * dsy) + 'px';
-            var solid = (overlayMode === 'solid');
-            if (r.fill === 'black') {
-                div.style.background = solid ? 'rgba(0, 0, 0, 1)' : 'rgba(0, 0, 0, 0.4)';
-                div.style.border = solid ? 'none' : '1px solid rgba(0, 0, 0, 0.7)';
-            } else {
-                div.style.background = solid ? 'rgba(255, 255, 255, 1)' : 'rgba(255, 255, 255, 0.5)';
-                div.style.border = solid ? 'none' : '1px solid rgba(200, 200, 200, 0.8)';
-            }
-            div.style.pointerEvents = 'auto';
-            div.style.cursor = 'pointer';
-            div.style.zIndex = '6';
-            var label = document.createElement('span');
-            label.style.cssText = 'position:absolute;top:0;left:0;font-size:9px;padding:1px 3px;color:black;background:rgba(255,255,255,0.7);pointer-events:none;';
-            label.textContent = r.type || r.fill;
-            if (solid) label.style.display = 'none';
-            div.appendChild(label);
-            div.addEventListener('dblclick', function(e) {
-                e.stopPropagation();
-                _selectRedactionBox(div, pdfIndex, r, dsx, dsy);
-            });
-            wrapper.appendChild(div);
+            wrapper.appendChild(
+                _makeRedactionBox(r, pdfIndex, dsx, dsy, seqs)
+            );
         });
     }
 

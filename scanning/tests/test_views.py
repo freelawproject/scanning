@@ -1643,9 +1643,9 @@ class TestServeOpinionPdfLazyPull(ScanningTestCase):
         opinion.redacted_pdf.name = "redacted/op.pdf"
         opinion.save(update_fields=["redacted_pdf"])
 
-        def _fake_download(scan_arg):
+        def _fake_download(scan_arg, rel_key):
             # Simulate the pull writing the file to the scan's output dir.
-            target = pathlib.Path(scan_arg.output_dir) / "redacted" / "op.pdf"
+            target = pathlib.Path(scan_arg.output_dir) / rel_key
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(b"%PDF-1.4 pulled")
 
@@ -1656,9 +1656,10 @@ class TestServeOpinionPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch(
-                "scanning.s3_sync.download_processing_files",
+                "scanning.s3_sync.download_processing_file",
                 side_effect=_fake_download,
             ) as mock_pull,
+            patch("scanning.s3_sync.download_processing_files") as mock_all,
         ):
             response = self.client.get(
                 reverse(
@@ -1668,7 +1669,11 @@ class TestServeOpinionPdfLazyPull(ScanningTestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        mock_pull.assert_called_once()
+        # Only the requested file is pulled. Pulling the whole prefix here
+        # meant gigabytes for one opinion, and because sync views share a
+        # single executor under ASGI it stalled every other request.
+        mock_pull.assert_called_once_with(scan, "redacted/op.pdf")
+        mock_all.assert_not_called()
 
 
 class TestServeOpinionPdfCaching(ScanningTestCase):
@@ -2199,6 +2204,141 @@ class TestPendingChangesGuard(ScanningTestCase):
         self.assertEqual(self.scan.status, Status.QUEUED)
         self.assertEqual(self.scan.queued_action, QueuedAction.FULL_PIPELINE)
 
+    def test_start_validate_drops_stored_gpu_results(self):
+        """Re-validate means re-run, so the resume cache must be cleared.
+
+        ``run_full_pipeline`` reuses a finished detect/analyze whose input
+        PDF hasn't changed, which is what makes a re-queue after a deploy
+        cheap. This button says "re-run from scratch" and warns about GPU
+        cost; without the invalidation it would hand back exactly the
+        detections the scan already had.
+        """
+        self.scan.deletions.all().delete()
+        with patch("scanning.s3_sync.invalidate_job_results") as invalidate:
+            self.client.post(
+                reverse("start_validate", kwargs={"pk": self.scan.pk})
+            )
+        invalidate.assert_called_once()
+        self.assertEqual(invalidate.call_args.args[0].pk, self.scan.pk)
+
+    def test_blocked_start_validate_leaves_stored_results_alone(self):
+        """A refused action must not throw away a reusable result."""
+        PageDeletion.objects.create(scan=self.scan, pdf_page=3)
+        with patch("scanning.s3_sync.invalidate_job_results") as invalidate:
+            self.client.post(
+                reverse("start_validate", kwargs={"pk": self.scan.pk})
+            )
+        invalidate.assert_not_called()
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestViewsWithoutLocalOriginal(ScanningTestCase):
+    """Endpoints that need the original PDF degrade gracefully when it is
+    S3-only and cannot be pulled, instead of raising FileNotFoundError
+    from Scan.pdf_path (SCANNING-1S). The crop endpoint's own lazy pull
+    is covered by TestServeOriginalCrop."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user,
+            status=Status.PENDING_REVIEW,
+            page_count=1,
+            opinions_json=[{"dummy": True}],
+        )
+        pathlib.Path(self.scan.original_pdf.path).unlink()
+        # An output dir with no bitonal/OCR PDF in it: the API views get
+        # past their "no output directory" guard and fall through to the
+        # original.
+        pathlib.Path(self.scan.output_dir).mkdir(parents=True, exist_ok=True)
+        patcher = patch(
+            "scanning.s3_sync.download_original_pdf", return_value=None
+        )
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_export_pdf_returns_404(self):
+        """Export gives a 404 rather than a 500."""
+        response = self.client.get(
+            reverse("export_pdf", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_compute_redactions_returns_json_error(self):
+        """Redaction computation reports a JSON error, not a traceback."""
+        response = self.client.post(
+            reverse("compute_redactions_api", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"], "No PDF available")
+
+    def test_pair_opinions_returns_json_error(self):
+        """Opinion pairing reports a JSON error, not a traceback."""
+        Detection.objects.create(
+            scan=self.scan,
+            page_index=0,
+            label="CAPTION",
+            label_id=1,
+            confidence=0.9,
+            x0=0,
+            y0=0,
+            x1=1,
+            y1=1,
+        )
+        response = self.client.post(
+            reverse("pair_opinions_api", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["error"], "No PDF available")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestRecalculateView(ScanningTestCase):
+    """Recheck works on a web pod that never pulled the scan's files from
+    S3, so clicking it in step 1 does not 500 (SCANNING-1S)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user,
+            status=Status.PENDING_REVIEW,
+            start_page=1,
+            end_page=2,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": "2", "type": "single"},
+            ],
+        )
+        # Production keeps the PDF in S3 only; the request thread has no
+        # local copy.
+        pathlib.Path(self.scan.original_pdf.path).unlink()
+
+    def test_recheck_without_local_pdf(self):
+        """The Recheck POST redirects back to the viewer and rebuilds the
+        page_map from stored OCR results."""
+        response = self.client.post(
+            reverse("recalculate", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.page_count, 2)
+        self.assertTrue(self.scan.page_map)
+
+    def test_recheck_without_ocr_results_is_a_noop(self):
+        """With nothing to recompute the view redirects without touching
+        the scan."""
+        self.scan.ocr_results = []
+        self.scan.save(update_fields=["ocr_results"])
+        response = self.client.post(
+            reverse("recalculate", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.page_map, [])
+
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestProcessActionsFragment(ScanningTestCase):
@@ -2437,4 +2577,154 @@ class TestSidebarDuplicateMarkers(ScanningTestCase):
                 if "bg-orange-100" in cls
             ],
             [2],
+        )
+
+
+class TestLazyPullsFetchOneFile(ScanningTestCase):
+    """A stale /tmp/ must cost one object, not the whole prefix.
+
+    Both of these views used to call ``download_processing_files``, which
+    pulls every object under the scan's processing prefix: gigabytes for one
+    page on a full volume, and because the sync views share a single
+    executor under ASGI, it stalled every other request while it ran.
+    """
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.tmp_root = tempfile.mkdtemp()
+
+    @staticmethod
+    def _writes_the_file(rel_key_of):
+        """A download_processing_file stub that materialises the file."""
+
+        def _fake(scan_arg, rel_key):
+            target = pathlib.Path(scan_arg.output_dir) / rel_key_of(rel_key)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"%PDF-1.4 pulled")
+
+        return _fake
+
+    def test_serve_page_pdf_pulls_only_that_page(self):
+        from scanning.models import Page
+
+        scan = ScanFactory(reporter=ReporterFactory(short_name="tp"), volume=7)
+        page = Page.objects.create(
+            scan=scan, page_index=0, pdf_path="llm/page_0001.pdf"
+        )
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=self.tmp_root,
+            ),
+            patch(
+                "scanning.s3_sync.download_processing_file",
+                side_effect=self._writes_the_file(lambda key: key),
+            ) as one,
+            patch("scanning.s3_sync.download_processing_files") as everything,
+        ):
+            response = self.client.get(
+                reverse("serve_page_pdf", kwargs={"pk": page.pk})
+            )
+
+        self.assertEqual(response.status_code, 200)
+        one.assert_called_once_with(scan, "llm/page_0001.pdf")
+        everything.assert_not_called()
+
+    def test_serve_redacted_pdf_pulls_only_the_redacted_file(self):
+        scan = ScanFactory(reporter=ReporterFactory(short_name="tp"), volume=8)
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=self.tmp_root,
+            ),
+            patch(
+                "scanning.s3_sync.download_processing_file",
+                side_effect=self._writes_the_file(lambda key: key),
+            ) as one,
+            patch("scanning.s3_sync.download_processing_files") as everything,
+        ):
+            # output_dir is derived from PROCESSING_TMP_DIR, so this has to
+            # be set under the override, not before it.
+            scan.redacted_pdf_path = str(
+                pathlib.Path(scan.output_dir) / "tp.8.redacted.pdf"
+            )
+            scan.save(update_fields=["redacted_pdf_path"])
+            response = self.client.get(
+                reverse("serve_redacted_pdf", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 200)
+        one.assert_called_once_with(scan, "tp.8.redacted.pdf")
+        everything.assert_not_called()
+
+
+class TestDeleteDetectionPrunesStaleRects(ScanningTestCase):
+    """Deleting a page's last detection must not strand its saved rects.
+
+    ``redaction_rects`` is a snapshot in image pixels, and the scale that
+    places it comes from that page's detections. Leaving rects behind for a
+    page that has none makes Generate Files fail on every retry, with no
+    reachable way for a reviewer to clear it.
+    """
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(reporter=ReporterFactory(short_name="tp"))
+        self.scan.redaction_rects = [
+            {"page_index": 0, "rects": [{"x0": 1, "y0": 2, "x1": 3, "y1": 4}]},
+            {"page_index": 1, "rects": [{"x0": 5, "y0": 6, "x1": 7, "y1": 8}]},
+        ]
+        self.scan.save(update_fields=["redaction_rects"])
+
+    def _detection(self, page_index):
+        return Detection.objects.create(
+            scan=self.scan,
+            page_index=page_index,
+            label="HEADNOTE",
+            label_id=3,
+            confidence=0.9,
+            x0=10,
+            y0=20,
+            x1=30,
+            y1=40,
+            img_width=1700,
+            img_height=2200,
+        )
+
+    def _delete(self, detection):
+        return self.client.post(
+            reverse("delete_detection", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"detection_id": detection.pk}),
+            content_type="application/json",
+        )
+
+    def test_the_last_detection_on_a_page_takes_its_rects_with_it(self):
+        only_one = self._detection(0)
+        self._detection(1)
+
+        response = self._delete(only_one)
+
+        self.assertEqual(response.status_code, 200)
+        self.scan.refresh_from_db()
+        self.assertEqual(
+            [e["page_index"] for e in self.scan.redaction_rects],
+            [1],
+            "page 0's rects should have gone with its last detection",
+        )
+
+    def test_rects_survive_while_the_page_still_has_a_detection(self):
+        one_of_two = self._detection(0)
+        self._detection(0)
+
+        self._delete(one_of_two)
+
+        self.scan.refresh_from_db()
+        self.assertEqual(
+            [e["page_index"] for e in self.scan.redaction_rects], [0, 1]
         )
