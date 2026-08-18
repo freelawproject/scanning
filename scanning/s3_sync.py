@@ -618,6 +618,10 @@ def fetch_shard_manifest(scan: Scan) -> dict | None:
     :returns: The parsed manifest, or None when S3 sync is disabled,
         the object is missing, or it fails to parse.
     :rtype: dict | None
+    :raises ClientError: On any S3 error other than a missing object.
+        Only "the manifest is not there" may map to None: a throttle or
+        permission error must not read as "no committed shard set", or
+        ``ensure_shards`` would delete and re-cut a healthy set.
     """
     if not _s3_enabled():
         return None
@@ -626,9 +630,12 @@ def fetch_shard_manifest(scan: Scan) -> dict | None:
     key = f"{shards_prefix(scan)}{SHARD_MANIFEST_NAME}"
     try:
         obj = _s3_client().get_object(Bucket=bucket, Key=key)
-        return json.loads(obj["Body"].read())
-    except ClientError:
-        return None
+        manifest = json.loads(obj["Body"].read())
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in ("NoSuchKey", "NoSuchBucket", "404"):
+            return None
+        raise
     except (json.JSONDecodeError, UnicodeDecodeError):
         logger.warning(
             "Unparseable shard manifest for scan %s at s3://%s/%s",
@@ -637,6 +644,20 @@ def fetch_shard_manifest(scan: Scan) -> dict | None:
             key,
         )
         return None
+    if not isinstance(manifest, dict):
+        # Parseable JSON that isn't a manifest ('[]', '"x"', ...) gets
+        # the same treatment as unparseable bytes: warn and let
+        # ensure_shards re-cut, instead of crashing on it downstream.
+        logger.warning(
+            "Malformed shard manifest for scan %s at s3://%s/%s: "
+            "expected an object, got %s",
+            scan.pk,
+            bucket,
+            key,
+            type(manifest).__name__,
+        )
+        return None
+    return manifest
 
 
 def upload_shards(scan: Scan, shard_dir: Path) -> int:

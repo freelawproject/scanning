@@ -112,18 +112,24 @@ def _page_image_digests(doc: fitz.Document, page_index: int) -> list[str]:
     The digests are taken over the compressed bytes exactly as stored in
     the PDF (``xref_stream_raw``), so any tool or version that silently
     recompresses the scan data changes them. This is the one check in
-    the #164 benchmark that catches that failure mode.
+    the #164 benchmark that catches that failure mode. Soft masks are
+    digested too: an /SMask stream is scan data like any other (MRC-style
+    layered scans), and a tool that recompresses only the mask would
+    otherwise slip through on matching base-image digests.
 
     :param doc: The open document.
     :param page_index: 0-based page index within ``doc``.
-    :returns: Sorted hex digests of every image stream on the page.
+    :returns: Sorted hex digests of every image stream on the page,
+        soft-mask streams included.
     :rtype: list[str]
     """
     digests = []
     for img in doc[page_index].get_images(full=True):
-        xref = img[0]
-        raw = doc.xref_stream_raw(xref)
-        digests.append(hashlib.sha256(raw or b"").hexdigest())
+        for xref in (img[0], img[1]):  # base image, then its smask (0 = none)
+            if not xref:
+                continue
+            raw = doc.xref_stream_raw(xref)
+            digests.append(hashlib.sha256(raw or b"").hexdigest())
     return sorted(digests)
 
 
@@ -280,24 +286,38 @@ def _source_fingerprint(source_path: Path) -> dict:
     }
 
 
-def _manifest_matches(manifest: dict | None, fingerprint: dict) -> bool:
+def _manifest_matches(manifest: object, fingerprint: dict) -> bool:
     """Return True when an existing manifest describes this exact source.
 
-    Matches on size and page count only. The shard byte target is
-    deliberately not part of the identity: retuning
-    ``SHARD_TARGET_BYTES`` must not silently re-shard every volume in
-    the corpus ("once computed, never recompute").
+    Matches on manifest version plus source size and page count. The
+    version check means bumping ``MANIFEST_VERSION`` forces a cheap
+    re-cut instead of handing consumers a manifest in a layout they no
+    longer read. The shard byte target is deliberately not part of the
+    identity: retuning ``SHARD_TARGET_BYTES`` must not silently re-shard
+    every volume in the corpus ("once computed, never recompute").
 
-    :param manifest: A previously stored manifest, or None.
+    A manifest that is structurally broken (not a dict, no source dict,
+    no non-empty shard list) never matches: it flows into the re-shard
+    path, which deletes it and cuts a fresh set, rather than crashing
+    the pipeline on every retry.
+
+    :param manifest: A previously stored manifest -- any parsed-JSON
+        value is tolerated, matching what a corrupt store can hold.
     :param fingerprint: Current source fingerprint.
     :returns: Whether the manifest is still valid for this source.
     :rtype: bool
     """
-    if not manifest:
+    if not isinstance(manifest, dict):
         return False
-    source = manifest.get("source", {})
+    source = manifest.get("source")
+    if not isinstance(source, dict):
+        return False
+    shards = manifest.get("shards")
+    if not isinstance(shards, list) or not shards:
+        return False
     return (
-        source.get("size_bytes") == fingerprint["size_bytes"]
+        manifest.get("version") == MANIFEST_VERSION
+        and source.get("size_bytes") == fingerprint["size_bytes"]
         and source.get("page_count") == fingerprint["page_count"]
     )
 
@@ -331,12 +351,22 @@ def _existing_manifest(scan, shards_dir: Path) -> dict | None:
     local = shards_dir / s3_sync.SHARD_MANIFEST_NAME
     if local.is_file():
         try:
-            return json.loads(local.read_text())
-        except (OSError, json.JSONDecodeError):
+            manifest = json.loads(local.read_text())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             logger.warning(
                 "Unreadable local shard manifest for scan %s at %s",
                 scan.pk,
                 local,
+            )
+        else:
+            if isinstance(manifest, dict):
+                return manifest
+            logger.warning(
+                "Malformed local shard manifest for scan %s at %s: "
+                "expected an object, got %s",
+                scan.pk,
+                local,
+                type(manifest).__name__,
             )
     return None
 
@@ -366,10 +396,25 @@ def ensure_shards(scan) -> dict | None:
         failure, so the next pipeline run retries naturally.
     """
     from scanning import s3_sync
-    from scanning.utils import local_original_pdf
+    from scanning.utils import has_s3_credentials, local_original_pdf
 
     if not settings.SHARDING_ENABLED:
         return None
+
+    # Same loud misconfig signal as _push_processing_files_to_s3: without
+    # creds every S3 helper below silently no-ops, the shard PDFs pile up
+    # on ephemeral disk, and external jobs find an empty shards/ prefix
+    # with nothing in Sentry pointing at the root cause.
+    if (
+        not settings.DEVELOPMENT
+        and not getattr(settings, "TESTING", False)
+        and not has_s3_credentials()
+    ):
+        logger.error(
+            "Sharding scan %s without AWS credentials: shards will stay "
+            "on local disk and never reach S3",
+            scan.pk,
+        )
 
     source = local_original_pdf(scan)
     if source is None:
@@ -391,12 +436,19 @@ def ensure_shards(scan) -> dict | None:
                 fingerprint["size_bytes"],
             )
             return existing
+        # .get chains, not indexing: a structurally broken manifest (the
+        # other way _manifest_matches says no) may have no source dict at
+        # all, and this log line must not crash ahead of the cleanup that
+        # would remove the bad manifest.
+        old_source = existing.get("source")
+        if not isinstance(old_source, dict):
+            old_source = {}
         logger.info(
             "Shard manifest for scan %s is stale (source was %s bytes / "
             "%s pages, now %d / %d); re-sharding",
             scan.pk,
-            existing["source"].get("size_bytes"),
-            existing["source"].get("page_count"),
+            old_source.get("size_bytes"),
+            old_source.get("page_count"),
             fingerprint["size_bytes"],
             fingerprint["page_count"],
         )

@@ -148,6 +148,82 @@ class TestShardPdfAndVerify(SimpleTestCase):
         with self.assertRaisesRegex(sharding.ShardingError, "not contiguous"):
             sharding.verify_shards(self.source, self.shard_dir, manifest)
 
+    def test_image_digests_include_soft_masks(self):
+        # An image with alpha is stored as a base image plus an /SMask
+        # stream. Both must be digested, or a tool that recompresses
+        # only the mask (MRC-style layered scans) would pass
+        # verification on matching base-image digests alone.
+        path = self.tmp / "smask.pdf"
+        img = Image.new("RGBA", (60, 80), color=(255, 0, 0, 255))
+        for x in range(60):
+            img.putpixel((x, x % 80), (255, 0, 0, 0))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        doc = fitz.open()
+        page = doc.new_page(width=612, height=792)
+        page.insert_image(fitz.Rect(72, 100, 540, 700), stream=buf.getvalue())
+        doc.save(str(path))
+        doc.close()
+
+        with fitz.open(str(path)) as doc:
+            images = doc[0].get_images(full=True)
+            self.assertEqual(len(images), 1)
+            self.assertNotEqual(images[0][1], 0)  # the smask xref exists
+            digests = sharding._page_image_digests(doc, 0)
+        # One base stream plus one smask stream.
+        self.assertEqual(len(digests), 2)
+
+
+class TestManifestMatches(SimpleTestCase):
+    FINGERPRINT = {"size_bytes": 100, "page_count": 4}
+
+    def _manifest(self, **overrides):
+        manifest = {
+            "version": sharding.MANIFEST_VERSION,
+            "source": {"size_bytes": 100, "page_count": 4},
+            "shards": [{"name": "0001.pdf"}],
+        }
+        manifest.update(overrides)
+        return manifest
+
+    def test_matching_manifest(self):
+        self.assertTrue(
+            sharding._manifest_matches(self._manifest(), self.FINGERPRINT)
+        )
+
+    def test_fingerprint_mismatch(self):
+        stale = self._manifest(source={"size_bytes": 99, "page_count": 4})
+        self.assertFalse(
+            sharding._manifest_matches(stale, self.FINGERPRINT)
+        )
+
+    def test_version_mismatch_never_matches(self):
+        # A MANIFEST_VERSION bump must force a re-cut even when the
+        # source fingerprint still matches, or consumers get a manifest
+        # in a layout they no longer read.
+        outdated = self._manifest(version=sharding.MANIFEST_VERSION + 1)
+        self.assertFalse(
+            sharding._manifest_matches(outdated, self.FINGERPRINT)
+        )
+
+    def test_structurally_broken_manifests_never_match(self):
+        # Corrupt-but-parseable manifests must flow into the re-shard
+        # path (which deletes them), not crash ensure_shards before its
+        # cleanup and wedge the scan in a permanent ERROR loop.
+        for broken in (
+            None,
+            [],
+            "not a dict",
+            {},
+            self._manifest(source="not a dict"),
+            self._manifest(shards=[]),
+            self._manifest(shards="not a list"),
+        ):
+            with self.subTest(broken=broken):
+                self.assertFalse(
+                    sharding._manifest_matches(broken, self.FINGERPRINT)
+                )
+
 
 @override_settings(
     MEDIA_ROOT=MEDIA_ROOT,
@@ -273,6 +349,45 @@ class TestEnsureShards(TestCase):
         # No half-written multi-GB set left behind; the next run retries.
         self.assertFalse((Path(scan.output_dir) / "shards").exists())
 
+    def test_corrupt_stored_manifest_is_replaced_not_fatal(self):
+        # A corrupt-but-parseable manifest ('{}') must flow into the
+        # re-shard path, which deletes it and cuts a fresh set, instead
+        # of crashing ensure_shards ahead of its cleanup and wedging the
+        # scan in a permanent ERROR loop (PR #169 review).
+        scan = self._scan_with_volume(pages=2)
+        sharding.ensure_shards(scan)
+        shards_dir = Path(scan.output_dir) / "shards"
+        (shards_dir / "manifest.json").write_text("{}")
+
+        manifest = sharding.ensure_shards(scan)
+        self.assertEqual(len(manifest["shards"]), 2)
+        stored = json.loads((shards_dir / "manifest.json").read_text())
+        self.assertEqual(stored["source"], manifest["source"])
+
+    def test_version_bump_forces_reshard(self):
+        scan = self._scan_with_volume(pages=2)
+        first = sharding.ensure_shards(scan)
+        shards_dir = Path(scan.output_dir) / "shards"
+        outdated = dict(first, version=sharding.MANIFEST_VERSION + 1)
+        (shards_dir / "manifest.json").write_text(json.dumps(outdated))
+
+        with patch(
+            "scanning.sharding.shard_pdf", wraps=sharding.shard_pdf
+        ) as mock_shard:
+            second = sharding.ensure_shards(scan)
+        mock_shard.assert_called_once()
+        self.assertEqual(second["version"], sharding.MANIFEST_VERSION)
+
+    def test_undecodable_local_manifest_is_ignored(self):
+        # Non-UTF-8 bytes (partial write, disk corruption) must read as
+        # "no manifest", not raise UnicodeDecodeError out of the
+        # pipeline on every retry.
+        scan = self._scan_with_volume(pages=2)
+        shards_dir = Path(scan.output_dir) / "shards"
+        shards_dir.mkdir(parents=True, exist_ok=True)
+        (shards_dir / "manifest.json").write_bytes(b"\xff\xfe\x00broken")
+        self.assertIsNone(sharding._existing_manifest(scan, shards_dir))
+
     def test_pipeline_wrapper_propagates_failures(self):
         # Sharding is a regular pipeline stage: a failure must reach
         # _handle_pipeline_exception (which marks the scan ERROR), not
@@ -283,6 +398,24 @@ class TestEnsureShards(TestCase):
             side_effect=RuntimeError("boom"),
         ):
             with self.assertRaisesRegex(RuntimeError, "boom"):
+                services._ensure_shards(scan)
+
+    def test_pipeline_wrapper_marks_s3_errors_transient(self):
+        # The sharding stage is the pipeline's only bulk multi-GB
+        # upload; an S3/transport blip there must re-queue the scan like
+        # a RunPod transient, not mark it ERROR for a manual re-queue.
+        from botocore.exceptions import ClientError
+
+        from scanning.runpod_client import RunpodTransientError
+
+        scan = self._scan_with_volume(pages=2)
+        with patch(
+            "scanning.sharding.ensure_shards",
+            side_effect=ClientError(
+                {"Error": {"Code": "SlowDown"}}, "PutObject"
+            ),
+        ):
+            with self.assertRaisesRegex(RunpodTransientError, "SlowDown"):
                 services._ensure_shards(scan)
 
     def test_full_pipeline_runs_the_sharding_stage(self):

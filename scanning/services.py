@@ -390,13 +390,31 @@ def _ensure_shards(scan: "Scan") -> None:
     like any other pipeline stage. ``ensure_shards`` leaves no manifest
     behind on failure, so a re-queued scan retries the sharding.
 
+    S3 and transport errors are re-raised as ``RunpodTransientError``:
+    this stage is the pipeline's only bulk multi-GB upload, and a
+    connection reset or a 503 partway through is exactly as retriable as
+    a RunPod worker dying, so it gets the same retry-and-re-queue
+    treatment instead of an immediate ERROR that needs a manual
+    re-queue. Sharding's own failures (``ShardingError``) stay terminal.
+
     :param scan: The scan to shard.
     :return: None.
+    :raises RunpodTransientError: On an S3/transport failure, so the
+        caller re-queues the scan instead of marking it ERROR.
     """
+    from boto3.exceptions import Boto3Error
+    from botocore.exceptions import BotoCoreError, ClientError
+
     from scanning import sharding
+    from scanning.runpod_client import RunpodTransientError
 
     with _log_stage("Sharding"):
-        sharding.ensure_shards(scan)
+        try:
+            sharding.ensure_shards(scan)
+        except (BotoCoreError, Boto3Error, ClientError) as exc:
+            raise RunpodTransientError(
+                f"S3 error while sharding scan {scan.pk}: {exc}"
+            ) from exc
 
 
 def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:

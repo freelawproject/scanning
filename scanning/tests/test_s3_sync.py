@@ -384,6 +384,36 @@ class TestSyncHelpersWithCredentials(TestCase):
             mock_boto3.client.return_value = mock_s3
             self.assertIsNone(s3_sync.fetch_shard_manifest(scan))
 
+    def test_fetch_shard_manifest_reraises_unexpected_s3_errors(self):
+        # Only "the manifest is not there" may map to None: a throttle
+        # or IAM error must not read as "no committed shard set", or
+        # ensure_shards would delete and re-cut a healthy multi-GB set
+        # (PR #169 review).
+        scan = _reporter_scan()
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "SlowDown"}}, "GetObject"
+        )
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            with self.assertRaises(ClientError):
+                s3_sync.fetch_shard_manifest(scan)
+
+    def test_fetch_shard_manifest_rejects_non_object_json(self):
+        # Parseable JSON that isn't a manifest gets the unparseable
+        # treatment: None, so ensure_shards re-cuts instead of crashing
+        # on it downstream.
+        scan = _reporter_scan()
+        mock_s3 = MagicMock()
+        body = MagicMock()
+        body.read.return_value = b'["not", "a", "manifest"]'
+        mock_s3.get_object.return_value = {"Body": body}
+
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            mock_boto3.client.return_value = mock_s3
+            self.assertIsNone(s3_sync.fetch_shard_manifest(scan))
+
     def test_upload_shards_sends_manifest_last(self):
         # The manifest is the commit marker: a reader that finds it can
         # trust every shard it lists is already in the bucket.
