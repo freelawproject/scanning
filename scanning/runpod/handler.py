@@ -43,7 +43,11 @@ from typing import Any
 
 import requests
 import runpod
-from urllib3.exceptions import IncompleteRead, ProtocolError
+from runpod_common import (
+    TRANSIENT_TRANSFER_ERRORS,
+    download_pdf,
+    validate_pdf,
+)
 
 # Capture worker boot start as early as possible so ``_WORKER_BOOT_MS``
 # covers the full cold-start cost (module imports + model preload).
@@ -80,23 +84,7 @@ if sentry_sdk is not None and _SENTRY_DSN:
 
 # ── Tunables ────────────────────────────────────────────────────────
 MAX_PAGES = int(os.environ.get("HANDLER_MAX_PAGES", "5000"))
-# Read timeout: max seconds to wait for the next chunk of body. A single
-# value would also bound connect; we split connect/read so a stalled
-# socket mid-download raises a ReadTimeout promptly and triggers a
-# resume instead of hanging for the whole budget.
-DOWNLOAD_TIMEOUT = int(os.environ.get("HANDLER_DOWNLOAD_TIMEOUT", "300"))
-DOWNLOAD_CONNECT_TIMEOUT = int(
-    os.environ.get("HANDLER_DOWNLOAD_CONNECT_TIMEOUT", "10")
-)
-# How many times to (re)issue the GET before giving up. Each retry
-# resumes from the last byte written via a Range request.
-DOWNLOAD_MAX_ATTEMPTS = int(
-    os.environ.get("HANDLER_DOWNLOAD_MAX_ATTEMPTS", "5")
-)
-# Upper bound (seconds) on the exponential backoff between retries.
-DOWNLOAD_BACKOFF_CAP = int(
-    os.environ.get("HANDLER_DOWNLOAD_BACKOFF_CAP", "30")
-)
+# Download tunables (HANDLER_DOWNLOAD_*) live in runpod_common.
 
 # Result-upload budget. The GPU work is already paid for by the time we
 # PUT, so a network blip must not cost a re-run: retry generously.
@@ -123,19 +111,6 @@ RESULT_SCHEMA_VERSION = 1
 # must stay in lockstep: S3 answers SignatureDoesNotMatch if the header
 # it verifies differs from the one that was signed.
 RESULT_CONTENT_TYPE = "application/json"
-
-# Stream errors that mean "the connection died mid-transfer" — safe to
-# reconnect (resuming from the last byte written on a download, or
-# re-PUTting the whole object on an upload). Anything else (a 4xx other
-# than the handled 403/416, a 5xx, a malformed URL) is not in here and
-# propagates so the daemon can re-queue or fail the scan.
-_TRANSIENT_TRANSFER_ERRORS = (
-    requests.exceptions.ChunkedEncodingError,
-    requests.exceptions.ConnectionError,
-    requests.exceptions.Timeout,
-    ProtocolError,
-    IncompleteRead,
-)
 
 
 # ── Cold-start preload ──────────────────────────────────────────────
@@ -304,249 +279,18 @@ def _tag_sentry(job: dict, action: str, scan_pk: Any) -> None:
     sentry_sdk.set_tag("gpu_available", str(_CUDA_AVAILABLE))
     sentry_sdk.set_tag("worker_boot_ms", str(_WORKER_BOOT_MS))
     sentry_sdk.set_tag("worker_uptime_ms", str(_worker_uptime_ms()))
+    # Set unconditionally: tags live on the global scope, which a warm
+    # worker reuses across jobs. Skipping the set when the value is
+    # absent would leave the *previous* job's scan_pk/job id on every
+    # event this job captures, misattributing its failures.
+    scan_tag = "unknown"
     if scan_pk is not None:
         try:
-            sentry_sdk.set_tag("scan_pk", str(int(scan_pk)))
+            scan_tag = str(int(scan_pk))
         except (TypeError, ValueError):
             logger.warning("ignoring non-integer scan_pk: %r", scan_pk)
-    job_id = job.get("id")
-    if job_id:
-        sentry_sdk.set_tag("runpod_job_id", str(job_id))
-
-
-def _expected_total(resp: requests.Response) -> int | None:
-    """Best-effort total file size, in bytes, from a download response.
-
-    On a ``206 Partial Content`` the ``Content-Length`` header is only
-    the size of *this* chunk, so the full size has to come from the
-    ``Content-Range`` total (the value after the slash in
-    ``bytes 0-1023/2048`` -> ``2048``). On a plain ``200 OK`` the
-    ``Content-Length`` is the full size.
-
-    :param resp: A streamed download response.
-    :returns: Total size in bytes, or ``None`` if no header is present
-        or parseable (in which case the caller skips the completeness
-        check rather than failing a download that may be fine).
-    :rtype: int | None
-    """
-    content_range = resp.headers.get("Content-Range")
-    if content_range and "/" in content_range:
-        total = content_range.rsplit("/", 1)[1].strip()
-        if total.isdigit():
-            return int(total)
-    content_length = resp.headers.get("Content-Length")
-    if content_length and content_length.strip().isdigit():
-        return int(content_length)
-    return None
-
-
-def _download_pdf(url: str, dest: Path) -> None:
-    """Download a PDF from a presigned GET URL to ``dest``, resuming
-    across dropped connections.
-
-    Large scans (multi-GB, 1000+ pages) take long enough that a single
-    streamed GET routinely dies mid-transfer: the socket stalls, S3
-    resets the connection, or urllib3 raises ``IncompleteRead``. Rather
-    than restart the whole transfer (or fail the job) on every blip,
-    this retries with an HTTP ``Range`` request and appends to the
-    partial file from the last byte written, with exponential backoff
-    between attempts.
-
-    Range-response handling:
-
-    - **206 Partial Content** — server honoured ``Range``; append.
-    - **200 OK** (on a resume) — server ignored ``Range`` and is
-      resending the whole body; truncate and restart from byte 0.
-      Appending here would write a second copy of the head and corrupt
-      the PDF, so this guard is load-bearing.
-    - **416 Range Not Satisfiable** — our offset is at/past EOF, i.e.
-      we already hold the whole file; treat as complete.
-    - **403 Forbidden** — the presigned URL has expired or is invalid.
-      Not retryable here (the URL is dead): raise so RunPod marks the
-      job FAILED and the daemon re-queues the scan with a fresh URL.
-
-    Only accepts ``http://`` or ``https://`` URLs. Rejects everything
-    else (``file://``, ``gopher://``, bare paths, etc.) defensively:
-    today the trust boundary is "only the daemon holds the RunPod API
-    key, so only the daemon can submit jobs," but a scheme check
-    costs nothing and eliminates the obvious SSRF / local-file-read
-    class of bugs if that boundary ever weakens.
-
-    :param url: PDF URL (typically a presigned S3 GET URL).
-    :param dest: Local filesystem target.
-    :raises ValueError: If ``url`` is not http(s).
-    :raises requests.HTTPError: On a non-2xx response other than the
-        handled 403/416 cases.
-    :raises RuntimeError: If the presigned URL is expired (403), or if
-        the file on disk is still short of the expected size after
-        ``DOWNLOAD_MAX_ATTEMPTS`` attempts.
-    """
-    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        raise ValueError(
-            f"refusing to download PDF from non-http(s) URL: {url!r}"
-        )
-
-    timeout = (DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_TIMEOUT)
-    offset = 0
-    total: int | None = None
-
-    for attempt in range(DOWNLOAD_MAX_ATTEMPTS):
-        headers = {"Range": f"bytes={offset}-"} if offset else {}
-        try:
-            with requests.get(
-                url, headers=headers, stream=True, timeout=timeout
-            ) as r:
-                # Expired/invalid presigned URL. Retrying the same URL is
-                # pointless; raise so the daemon re-signs and re-queues.
-                if r.status_code == 403:
-                    raise RuntimeError(
-                        "presigned URL expired or invalid (HTTP 403); "
-                        "daemon will re-queue with a fresh URL"
-                    )
-                # We asked to resume past EOF -> already have it all.
-                if offset and r.status_code == 416:
-                    logger.info(
-                        "resume at byte %d returned 416; file already "
-                        "complete",
-                        offset,
-                    )
-                    break
-                # Server ignored Range and is resending from the start.
-                # Discard the partial file and restart, or we'd append a
-                # second copy of the head and corrupt the PDF.
-                if offset and r.status_code == 200:
-                    logger.warning(
-                        "server ignored Range (HTTP 200); restarting "
-                        "download from byte 0"
-                    )
-                    offset = 0
-                    total = None
-                r.raise_for_status()
-
-                if total is None:
-                    total = _expected_total(r)
-
-                mode = "ab" if offset else "wb"
-                with dest.open(mode) as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                            offset += len(chunk)
-            # Stream drained without raising: this attempt finished.
-            break
-        except _TRANSIENT_TRANSFER_ERRORS as exc:
-            # Re-derive the offset from disk: a partial write may have
-            # landed bytes the in-memory counter didn't account for.
-            offset = dest.stat().st_size if dest.exists() else 0
-            if attempt == DOWNLOAD_MAX_ATTEMPTS - 1:
-                logger.error(
-                    "download failed after %d attempts at byte %d: %s",
-                    DOWNLOAD_MAX_ATTEMPTS,
-                    offset,
-                    exc,
-                )
-                raise
-            backoff = min(2**attempt, DOWNLOAD_BACKOFF_CAP)
-            backoff += random.uniform(0, backoff / 2)  # jitter
-            logger.warning(
-                "download interrupted at byte %d (attempt %d/%d): %s; "
-                "resuming in %.1fs",
-                offset,
-                attempt + 1,
-                DOWNLOAD_MAX_ATTEMPTS,
-                exc,
-                backoff,
-            )
-            time.sleep(backoff)
-
-    # Hand analyze_pdf/detect a complete file or nothing: a truncated PDF
-    # silently produces wrong page counts and detections. Raising re-queues.
-    if total is not None:
-        actual = dest.stat().st_size if dest.exists() else 0
-        if actual != total:
-            raise RuntimeError(
-                f"incomplete download: {actual}/{total} bytes after "
-                f"{DOWNLOAD_MAX_ATTEMPTS} attempts"
-            )
-
-
-# Trailer window scanned for the %%EOF marker. A conforming PDF ends with
-# %%EOF (optionally followed by whitespace); incrementally-updated files
-# carry several, and only the last one matters. 2 KB comfortably covers
-# trailing newlines and a final cross-reference stream.
-_PDF_EOF_WINDOW = 2048
-
-
-def _validate_pdf(pdf_path: Path) -> int:
-    """Validate that ``pdf_path`` is a complete, openable PDF and return
-    its page count.
-
-    Defense-in-depth against a truncated download slipping through: the
-    resumable ``_download_pdf`` already checks the byte count against the
-    server's advertised size, but that only fires when the server sends a
-    size. The real hazard is a partial PDF that PyMuPDF can still *open*
-    by rebuilding a broken xref, reporting far fewer pages than the real
-    document — which would then silently produce wrong detections / page
-    analysis. Checking the header and the ``%%EOF`` trailer turns that
-    silent corruption into a hard failure.
-
-    A raised error propagates out of the action and (via ``handler()``)
-    marks the RunPod job FAILED with no ``error_code``; the daemon treats
-    a bare FAILED as transient and re-queues the scan with a freshly
-    signed URL. So a truncated download is re-fetched automatically; a
-    genuinely corrupt source PDF loops until the daemon's retry ceiling
-    and then surfaces as an error.
-
-    Checks run cheapest-first so a bad file fails before the fitz open.
-
-    :param pdf_path: Path to the downloaded PDF on disk.
-    :returns: Page count.
-    :rtype: int
-    :raises ValueError: If the file is empty, lacks a ``%PDF-`` header or
-        an ``%%EOF`` trailer, or cannot be opened as a PDF with at least
-        one page.
-    """
-    import fitz
-
-    size = pdf_path.stat().st_size if pdf_path.exists() else 0
-    if size == 0:
-        raise ValueError(f"downloaded PDF is empty: {pdf_path}")
-
-    with pdf_path.open("rb") as f:
-        header = f.read(1024)
-        f.seek(max(0, size - _PDF_EOF_WINDOW))
-        trailer = f.read()
-
-    if b"%PDF-" not in header:
-        raise ValueError(
-            f"downloaded file is not a PDF (no %PDF- header): {pdf_path}"
-        )
-    if b"%%EOF" not in trailer:
-        raise ValueError(
-            "downloaded PDF is truncated (no %%EOF trailer in last "
-            f"{_PDF_EOF_WINDOW} bytes): {pdf_path}"
-        )
-
-    try:
-        with fitz.open(str(pdf_path)) as doc:
-            page_count = doc.page_count
-            # A rebuilt xref usually means damage; the %%EOF check above
-            # catches the common (truncation) cause, so this is just a
-            # breadcrumb rather than a hard failure.
-            if getattr(doc, "is_repaired", False):
-                logger.warning(
-                    "PyMuPDF repaired %s on open; proceeding", pdf_path
-                )
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError(
-            f"downloaded file could not be opened as a PDF: {exc}"
-        ) from exc
-
-    if page_count < 1:
-        raise ValueError(f"downloaded PDF has no pages: {pdf_path}")
-    return page_count
+    sentry_sdk.set_tag("scan_pk", scan_tag)
+    sentry_sdk.set_tag("runpod_job_id", str(job.get("id") or "unknown"))
 
 
 # ── Result delivery ─────────────────────────────────────────────────
@@ -582,7 +326,7 @@ class ResultUrlExpiredError(ResultUploadError):
 
     Distinct from a generic upload failure because retrying the *same*
     URL can never succeed: the signature is dead. Mirrors how
-    :func:`_download_pdf` treats a 403 on the input URL. Still
+    ``download_pdf`` treats a 403 on the input URL. Still
     transient daemon-side, since resubmitting mints a new signature.
     """
 
@@ -598,7 +342,7 @@ def _put_result(url: str, body: bytes) -> None:
     complete" when it recovers a job whose ``/status`` record is gone.
 
     Only accepts ``http(s)`` URLs, for the same defensive reason
-    :func:`_download_pdf` does.
+    ``download_pdf`` does.
 
     :param url: Presigned S3 PUT URL covering exactly one key.
     :param body: Encoded JSON envelope.
@@ -647,7 +391,7 @@ def _put_result(url: str, body: bytes) -> None:
                     f"{r.text[:300]}"
                 )
             last_error = f"HTTP {r.status_code}"
-        except _TRANSIENT_TRANSFER_ERRORS as exc:
+        except TRANSIENT_TRANSFER_ERRORS as exc:
             last_error = str(exc)
 
         if attempt == RESULT_UPLOAD_MAX_ATTEMPTS - 1:
@@ -828,9 +572,9 @@ def _action_detect(inputs: dict, tmp_dir: Path) -> dict:
     # skipping missing models.
 
     pdf_path = tmp_dir / "input.pdf"
-    _download_pdf(pdf_url, pdf_path)
+    download_pdf(pdf_url, pdf_path)
 
-    pages = _validate_pdf(pdf_path)
+    pages = validate_pdf(pdf_path)
     if pages > MAX_PAGES:
         raise ValueError(
             f"PDF has {pages} pages, exceeds MAX_PAGES={MAX_PAGES}"
@@ -885,9 +629,9 @@ def _action_analyze(inputs: dict, tmp_dir: Path) -> dict:
     ensure_weights(["large"])
 
     pdf_path = tmp_dir / "input.pdf"
-    _download_pdf(pdf_url, pdf_path)
+    download_pdf(pdf_url, pdf_path)
 
-    pages = _validate_pdf(pdf_path)
+    pages = validate_pdf(pdf_path)
     if pages > MAX_PAGES:
         raise ValueError(
             f"PDF has {pages} pages, exceeds MAX_PAGES={MAX_PAGES}"

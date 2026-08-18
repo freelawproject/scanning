@@ -1,20 +1,29 @@
-name: Build and Push RunPod Worker
+name: Build and Push RunPod dots.mocr Worker
 
 on:
   push:
     branches:
       - main
     paths:
-      - 'scanning/runpod/**'
+      - 'scanning/runpod-dotsmocr/**'
       - 'scanning/runpod_common.py'
-      - '.github/workflows/build-runpod-worker.yml'
+      - '.github/workflows/build-runpod-dotsmocr-worker.yml'
   workflow_dispatch:
 
 jobs:
-  build-runpod-worker:
+  build-runpod-dotsmocr-worker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      # The vLLM base image plus baked model weights extract to well
+      # over 25 GB; the stock runner doesn't have that much headroom.
+      # Dropping the preinstalled toolchains we never use frees ~25 GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -35,19 +44,19 @@ jobs:
           # scanning/ as context so the build can COPY the shared
           # runpod_common.py next to handler.py.
           context: scanning
-          file: scanning/runpod/Dockerfile
+          file: scanning/runpod-dotsmocr/Dockerfile
           push: true
           tags: |
-            freelawproject/blackletter-gpu-worker:${{ steps.vars.outputs.sha_short }}
-            freelawproject/blackletter-gpu-worker:latest
-          cache-from: type=registry,ref=freelawproject/blackletter-gpu-worker:cache
-          cache-to: type=registry,ref=freelawproject/blackletter-gpu-worker:cache,mode=max
+            freelawproject/dotsmocr-gpu-worker:${{ steps.vars.outputs.sha_short }}
+            freelawproject/dotsmocr-gpu-worker:latest
+          cache-from: type=registry,ref=freelawproject/dotsmocr-gpu-worker:cache
+          cache-to: type=registry,ref=freelawproject/dotsmocr-gpu-worker:cache,mode=max
 
       - name: Update RunPod template image
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          RUNPOD_TEMPLATE_ID: ${{ secrets.RUNPOD_TEMPLATE_ID }}
-          IMAGE: freelawproject/blackletter-gpu-worker:${{ steps.vars.outputs.sha_short }}
+          RUNPOD_TEMPLATE_ID: ${{ secrets.RUNPOD_DOTSMOCR_TEMPLATE_ID }}
+          IMAGE: freelawproject/dotsmocr-gpu-worker:${{ steps.vars.outputs.sha_short }}
         run: |
           set -euo pipefail
           # Sends only `imageName`. RunPod's partial PATCH preserves other

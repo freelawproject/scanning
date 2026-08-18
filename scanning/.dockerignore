@@ -1,0 +1,31 @@
+# Context for the RunPod worker images (scanning/runpod*/Dockerfile,
+# built with scanning/ as context so they can COPY the shared
+# runpod_common.py). Keep the upload tiny and predictable: only the
+# files explicitly `COPY`d by a worker Dockerfile should ever be in it.
+
+# Anything Python-build-local
+.venv
+__pycache__
+*.pyc
+*.pyo
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# Editor / VCS noise
+.idea
+.vscode
+.DS_Store
+
+# The Django app around the workers — never COPYd into a worker image.
+assets/
+templates/
+tests/
+migrations/
+settings/
+static/
+management/
+
+# Docs / notes (the READMEs are still available in the repo; no need
+# to ship them to the build daemon)
+*.md
