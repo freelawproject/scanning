@@ -193,9 +193,7 @@ class TestManifestMatches(SimpleTestCase):
 
     def test_fingerprint_mismatch(self):
         stale = self._manifest(source={"size_bytes": 99, "page_count": 4})
-        self.assertFalse(
-            sharding._manifest_matches(stale, self.FINGERPRINT)
-        )
+        self.assertFalse(sharding._manifest_matches(stale, self.FINGERPRINT))
 
     def test_version_mismatch_never_matches(self):
         # A MANIFEST_VERSION bump must force a re-cut even when the
