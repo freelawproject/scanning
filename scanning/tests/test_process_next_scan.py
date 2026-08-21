@@ -160,3 +160,48 @@ class TestRecoverStale(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.PROCESSING)
         self.assertEqual(scan.interruption_count, 0)
+
+
+class TestLegacyQueuedActionsPark(TestCase):
+    """Legacy queued actions are parked, not run or errored (issue #173).
+
+    The views that queued validate/detect/reprocess/generate_files now
+    refuse with the pipeline-paused message, so only a row from before
+    the cutover can still carry one. The daemon must neither dispatch a
+    deleted pipeline nor mark the scan ERROR: it parks the scan back in
+    PENDING_REVIEW with the unified message.
+    """
+
+    def _dispatch(self, action):
+        scan = ScanFactory(status=Status.QUEUED, queued_action=action)
+        cmd = Command()
+        with (
+            patch("django.db.connections.close_all"),
+            patch("scanning.services.run_full_pipeline") as mock_pipeline,
+        ):
+            cmd.handle()
+        mock_pipeline.assert_not_called()
+        scan.refresh_from_db()
+        return scan
+
+    def test_each_legacy_action_parks_the_scan(self):
+        from scanning.models import QueuedAction
+        from scanning.utils import PIPELINE_PAUSED_MESSAGE
+
+        for action in (
+            QueuedAction.VALIDATE,
+            QueuedAction.DETECT,
+            QueuedAction.REPROCESS,
+            QueuedAction.GENERATE_FILES,
+        ):
+            with self.subTest(action=action):
+                scan = self._dispatch(action)
+                self.assertEqual(scan.status, Status.PENDING_REVIEW)
+                self.assertEqual(
+                    scan.progress_message, PIPELINE_PAUSED_MESSAGE
+                )
+                # Park the row for real, or the next tick would claim it
+                # again and loop forever.
+                self.assertFalse(
+                    Scan.objects.filter(status=Status.QUEUED).exists()
+                )

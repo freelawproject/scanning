@@ -10,11 +10,10 @@ repos:
     rev: v6.0.0
     hooks:
      - id: check-added-large-files
-       # The GPU workers' uv.lock files are intentionally large (locked
-       # deps: torch cu126 + paddlepaddle-gpu + blackletter for runpod,
-       # the vLLM client stack + dots_mocr for runpod-dotsmocr, plus
-       # their transitives). Reproducible builds require tracking them.
-       exclude: ^scanning/runpod(-dotsmocr)?/uv\.lock$
+       # The GPU worker's uv.lock is intentionally large (locked deps:
+       # the vLLM client stack + dots_mocr plus their transitives).
+       # Reproducible builds require tracking it.
+       exclude: ^scanning/runpod-dotsmocr/uv\.lock$
      - id: check-ast
      - id: check-json
      - id: check-merge-conflict

@@ -131,7 +131,8 @@
 
                 if (
                     data.status === "approved" ||
-                    data.status === "pending_review"
+                    data.status === "pending_review" ||
+                    data.status === "awaiting_validation"
                 ) {
                     window.location.reload();
                 } else if (data.status === "error") {

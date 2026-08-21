@@ -9,9 +9,11 @@ import environ
 
 env = environ.FileAwareEnv()
 
-# Master switch. When False, runpod_client.detect / analyze fall
-# through to the in-process blackletter calls. Default False so dev
-# and CI keep working without RunPod credentials.
+# Master switch: whether GPU jobs are dispatched to RunPod at all.
+# There is no local execution fallback anymore (the in-process
+# blackletter calls left with the legacy pipeline, issue #173), so
+# with this off an environment can upload and browse but not process.
+# Default False so dev and CI never need RunPod credentials.
 RUNPOD_ENABLED = env.bool("RUNPOD_ENABLED", default=False)
 
 # RunPod serverless endpoint id (from the RunPod console).

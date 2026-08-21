@@ -1,12 +1,17 @@
 """RunPod Serverless client for offloading GPU steps.
 
-Two public entry points: :func:`detect` and :func:`analyze`. Both take
-a local ``pdf_path`` and, when ``settings.RUNPOD_ENABLED`` is true,
-ship the work out to a RunPod Serverless endpoint; otherwise they
-fall back to calling blackletter in-process so dev / tests / staging
-keep working without RunPod credentials.
+The legacy ``detect`` (YOLO) and ``analyze`` (PaddleOCR) entry points
+-- and their in-process blackletter fallbacks for
+``RUNPOD_ENABLED=False`` -- were removed with the legacy pipeline
+(issue #173). What remains is the transport every future engine client
+(dots.mocr first, see #147) builds on: presigned S3 URLs in, submit,
+poll, harvest the result envelope from S3, and the
+``reusable_result`` resume path. ``settings.RUNPOD_ENABLED`` gates
+whether jobs are dispatched at all; there is no local execution path
+anymore, so an environment without RunPod credentials uploads and
+browses but does not process.
 
-Remote mode flow:
+Job flow:
 
 1. Upload the PDF to S3 under the scan's processing prefix if it's
    not already there (idempotent via ``head_object``).
@@ -50,7 +55,6 @@ from __future__ import annotations
 
 import json
 import logging
-import tempfile
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -103,8 +107,11 @@ _TRANSIENT_ERROR_CODES = {
     "RESULT_URL_EXPIRED",
 }
 
-# Version of the result envelope this client understands. Must match
-# ``RESULT_SCHEMA_VERSION`` in ``scanning/runpod/handler.py``.
+# Version of the result envelope this client understands. Any worker
+# that adopts the write-result-to-S3 contract must stamp the same
+# number into its envelope's ``schema_version`` (the retired
+# blackletter-gpu-worker did; the dots.mocr worker returns shard-sized
+# results inline and doesn't use the envelope).
 RESULT_SCHEMA_VERSION = 1
 
 # Slack allowed between our clock and S3's when deciding whether a
@@ -151,12 +158,11 @@ _TRANSIENT_SUBMIT_CODES = {"ENDPOINT_PAUSED"}
 
 
 # Friendly labels for progress-callback strings shown in the UI. The
-# raw action names (``detect`` / ``analyze``) are what the client
-# sends on the wire; the labels here are what scanners see.
-_ACTION_LABELS = {
-    "detect": "YOLO (detect)",
-    "analyze": "OCR (analyze)",
-}
+# raw action names are what the client sends on the wire; the labels
+# here are what scanners see. Empty since the legacy ``detect`` /
+# ``analyze`` actions were retired (#173); the dots.mocr client adds
+# its own entry when its dispatch lands (#147).
+_ACTION_LABELS: dict[str, str] = {}
 
 # Input fields holding a presigned URL. Masked before logging.
 _SIGNED_URL_FIELDS = ("pdf_url", "result_url")
@@ -186,186 +192,12 @@ def _redact_urls(body: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
-# ── Public API ──────────────────────────────────────────────────────
+# Signature every engine client's progress callback follows:
+# ``callable(current, total, message)``.
 ProgressCallback = Callable[[int | None, int | None, str], None]
 
 
-def detect(
-    scan: Scan,
-    pdf_path: str | Path,
-    models: list[str] | None = None,
-    confidence: float = 0.20,
-    progress_callback: ProgressCallback | None = None,
-) -> list[dict]:
-    """Run YOLO detection on a PDF, remotely or in-process.
-
-    :param scan: The Scan owning this job (used for S3 pathing and
-        Sentry tagging on the worker side).
-    :param pdf_path: Local filesystem path to the input PDF. In
-        remote mode the file is uploaded to S3 under the scan's
-        processing prefix if it's not already there.
-    :param models: YOLO model sizes to run. Defaults to all three.
-    :param confidence: Minimum confidence threshold.
-    :param progress_callback: Optional
-        ``callable(current, total, message)`` for progress updates.
-        Remote mode emits ``(None, None, status)`` for a handful of
-        coarse events (submit / queued / state). Local mode doesn't
-        fire the callback (``blackletter.api.detect`` has no callback
-        parameter; its progress is printed to stdout, where the
-        caller can capture it if needed).
-    :returns: Merged detection list (same shape as
-        ``blackletter.api.detect``'s return value).
-    :rtype: list[dict]
-    :raises RunpodError: On terminal remote failure.
-    """
-    models = models or ["small", "medium", "large"]
-
-    if not _remote_enabled():
-        return _detect_local(pdf_path, models, confidence)
-
-    pdf_url = _ensure_presigned_url(scan, pdf_path)
-    result = _invoke(
-        action="detect",
-        scan=scan,
-        payload={
-            "pdf_url": pdf_url,
-            "models": models,
-            "confidence": confidence,
-        },
-        progress_callback=progress_callback,
-    )
-    return result["detections"]
-
-
-def analyze(
-    scan: Scan,
-    pdf_path: str | Path,
-    exp_start: int | None,
-    exp_end: int | None,
-    max_pages: int = 9999,
-    num_workers: int | None = None,
-    progress_callback: ProgressCallback | None = None,
-) -> dict:
-    """Run PaddleOCR + YOLO page-number analysis on a PDF.
-
-    Always returns ``{"results": [...]}`` regardless of mode; the
-    daemon recomputes ``seq_issues`` / ``duplicates`` /
-    ``missing_pages`` from ``results`` via
-    ``_rebuild_issues_from_results``, so the extra fields aren't
-    needed over the wire.
-
-    :param scan: The Scan owning this job.
-    :param pdf_path: Local filesystem path to the input PDF.
-    :param exp_start: Expected first page number (or ``None``).
-    :param exp_end: Expected last page number (or ``None``).
-    :param max_pages: Upper bound on pages to process.
-    :param num_workers: ``multiprocessing.Pool`` size for local mode.
-        Ignored in remote mode (the worker always runs with
-        ``num_workers=1`` to avoid the paddle+fork segfault).
-    :param progress_callback: Optional
-        ``callable(current, total, message)``. In local mode the
-        callback is passed through to blackletter and fires once per
-        page; in remote mode only coarse ``(None, None, status)``
-        events fire (submit / queued / state) because there's no
-        per-page stream across the HTTP boundary.
-    :returns: ``{"results": list[dict]}``.
-    :rtype: dict
-    :raises RunpodError: On terminal remote failure.
-    """
-    if not _remote_enabled():
-        return _analyze_local(
-            pdf_path,
-            exp_start,
-            exp_end,
-            max_pages,
-            num_workers=num_workers,
-            progress_callback=progress_callback,
-        )
-
-    pdf_url = _ensure_presigned_url(scan, pdf_path)
-    result = _invoke(
-        action="analyze",
-        scan=scan,
-        payload={
-            "pdf_url": pdf_url,
-            "exp_start": exp_start,
-            "exp_end": exp_end,
-            "max_pages": max_pages,
-        },
-        progress_callback=progress_callback,
-    )
-    return {"results": result["results"]}
-
-
-# ── Local fallback ──────────────────────────────────────────────────
-def _remote_enabled() -> bool:
-    """Return True if remote RunPod dispatch should be used.
-
-    :returns: Whether the remote path is active.
-    :rtype: bool
-    """
-    return bool(settings.RUNPOD_ENABLED)
-
-
-def _detect_local(
-    pdf_path: str | Path, models: list[str], confidence: float
-) -> list[dict]:
-    """In-process fallback for :func:`detect`.
-
-    Uses a scratch ``TemporaryDirectory`` for blackletter's
-    ``detections.json`` side-effect; the caller gets the return value
-    only, so the tmp directory is disposed after.
-
-    :param pdf_path: Local PDF path.
-    :param models: YOLO model sizes.
-    :param confidence: Confidence threshold.
-    :returns: Detection list.
-    :rtype: list[dict]
-    """
-    from blackletter.api import detect as bl_detect
-
-    with tempfile.TemporaryDirectory(prefix="detect-local-") as tmp:
-        return bl_detect(
-            str(pdf_path), tmp, models=models, confidence=confidence
-        )
-
-
-def _analyze_local(
-    pdf_path: str | Path,
-    exp_start: int | None,
-    exp_end: int | None,
-    max_pages: int,
-    num_workers: int | None,
-    progress_callback: ProgressCallback | None,
-) -> dict:
-    """In-process fallback for :func:`analyze`.
-
-    :param pdf_path: Local PDF path.
-    :param exp_start: Expected first page number.
-    :param exp_end: Expected last page number.
-    :param max_pages: Upper bound on pages to process.
-    :param num_workers: Pool size (passed through to blackletter).
-    :param progress_callback: Per-page callback (passed through).
-    :returns: ``{"results": list[dict]}``.
-    :rtype: dict
-    """
-    from blackletter.analyze import analyze_pdf as bl_analyze_pdf
-
-    kwargs: dict[str, Any] = {
-        "exp_start": exp_start,
-        "exp_end": exp_end,
-        "max_pages": max_pages,
-    }
-    if num_workers is not None:
-        kwargs["num_workers"] = num_workers
-    if progress_callback is not None:
-        kwargs["progress_callback"] = progress_callback
-
-    result = bl_analyze_pdf(str(pdf_path), **kwargs)
-    return {"results": result["results"]}
-
-
-# ── Remote: S3 presigning ───────────────────────────────────────────
+# ── S3 presigning ───────────────────────────────────────────────────
 # Content type the worker PUTs its result with. Signed into the URL,
 # so the two must agree exactly -- see :func:`_presign_result_put`.
 _RESULT_CONTENT_TYPE = "application/json"
@@ -640,9 +472,10 @@ def reusable_result(scan: Scan, action: str, input_rel: str) -> dict | None:
     from scanning import s3_sync
     from scanning.utils import has_s3_credentials
 
-    # Local mode never writes a result object, so there is nothing to
-    # reuse and the heads would only cost two round trips to find out.
-    if not _remote_enabled() or not has_s3_credentials():
+    # Nothing dispatches (and so nothing writes a result object) unless
+    # RunPod is enabled and S3 is reachable; the heads would only cost
+    # two round trips to find out.
+    if not settings.RUNPOD_ENABLED or not has_s3_credentials():
         return None
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME

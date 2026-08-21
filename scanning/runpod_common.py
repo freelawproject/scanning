@@ -7,10 +7,12 @@ runpod_common``). Nothing here may depend on Django, the scanning app,
 or anything not installed in every worker venv — only ``requests``,
 PyMuPDF (imported lazily), and the stdlib.
 
-Extracted from the previously byte-for-byte duplicated copies in
-``scanning/runpod/handler.py`` and ``scanning/runpod-dotsmocr/handler.py``
-so a fix to the resume/validation logic lands in every worker at once.
-Tested in ``scanning/tests/test_runpod_common.py``.
+Extracted from the previously byte-for-byte duplicated copies in the
+worker handlers so a fix to the resume/validation logic lands in every
+worker at once. The only worker left is ``scanning/runpod-dotsmocr/``
+(the legacy blackletter-gpu-worker went with the legacy pipeline,
+issue #173), but the next engine image (#147) starts from this module
+too. Tested in ``scanning/tests/test_runpod_common.py``.
 """
 
 from __future__ import annotations

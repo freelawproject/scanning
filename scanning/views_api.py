@@ -22,7 +22,6 @@ from django.http import (
     StreamingHttpResponse,
 )
 from django.shortcuts import get_object_or_404, redirect
-from django.urls import reverse
 from django.utils.cache import get_conditional_response
 from django.utils.http import http_date
 from django.views.decorators.clickjacking import xframe_options_sameorigin
@@ -33,12 +32,12 @@ from scanning.models import (
     Detection,
     Issue,
     OpinionScan,
-    QueuedAction,
     Scan,
     Stage,
     Status,
 )
 from scanning.utils import (
+    PIPELINE_PAUSED_MESSAGE,
     compute_coverage_gaps,
     find_json_file,
     find_processing_pdf,
@@ -379,26 +378,20 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
 @login_required
 @require_POST
 def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
-    """Queue a scan for opinion file generation (step 4).
+    """Refuse to generate opinion files while the pipeline is paused.
+
+    File generation is post-review-1 processing, which issue #173
+    stops until the new OCR stack reaches that stage. The generation
+    code (``services.run_generate_files``) is kept, but nothing queues
+    it; this view fails with the unified pipeline-paused message.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: Redirect to the scan processing page (step 4).
+    :return: Redirect to the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.status in (Status.PROCESSING, Status.QUEUED):
-        return redirect(
-            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=3"
-        )
-    scan.stage = Stage.PROCESS
-    scan.status = Status.QUEUED
-    scan.queued_action = QueuedAction.GENERATE_FILES
-    scan.s3_uploaded = False
-    scan.progress_message = "Queued for file generation..."
-    scan.save()
-    return redirect(
-        reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=3"
-    )
+    messages.warning(request, PIPELINE_PAUSED_MESSAGE)
+    return redirect("scan_process", pk=scan.pk)
 
 
 @login_required

@@ -417,19 +417,10 @@ class TestEnsureShards(TestCase):
                 services._ensure_shards(scan)
 
     def test_full_pipeline_runs_the_sharding_stage(self):
-        """Pin the call site: run_full_pipeline shards before bitonal."""
+        """Pin the call site: the interim pipeline shards, then parks."""
         scan = self._scan_with_volume(pages=2)
-        bitonal = Path(scan.output_dir) / "bitonal.pdf"
         with (
             patch("scanning.services._ensure_shards") as mock_shards,
-            patch("scanning.services._ensure_bitonal", return_value=bitonal),
-            patch("scanning.services._run_yolo"),
-            patch(
-                "scanning.services._import_detections_from_json",
-                return_value=[],
-            ),
-            patch("scanning.services.run_paddleocr_validation"),
-            patch("scanning.services._re_pair_opinions", return_value=[]),
             # run_full_pipeline drops DB connections for the daemon; a
             # real close inside the test transaction would wreck it.
             patch("django.db.connections.close_all"),
@@ -439,6 +430,8 @@ class TestEnsureShards(TestCase):
         mock_shards.assert_called_once()
         self.assertEqual(mock_shards.call_args.args[0].pk, scan.pk)
         scan.refresh_from_db()
-        # PENDING_REVIEW proves the pipeline ran to completion; an
+        # AWAITING_VALIDATION proves the pipeline ran to completion; an
         # exception anywhere would have left the scan in ERROR instead.
-        self.assertEqual(scan.status, Status.PENDING_REVIEW)
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertEqual(scan.page_count, 2)
+        self.assertIn("temporarily disabled", scan.progress_message)
