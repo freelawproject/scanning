@@ -58,20 +58,34 @@ class ShardingError(Exception):
 
 
 def plan_shards(
-    page_count: int, size_bytes: int, target_bytes: int
+    page_count: int,
+    size_bytes: int,
+    target_bytes: int,
+    max_pages: int | None = None,
 ) -> list[tuple[int, int]]:
     """Split ``page_count`` pages into contiguous byte-targeted ranges.
 
-    The shard count comes from the byte size (``ceil(size / target)``),
-    then pages are spread across the shards as evenly as possible.
-    Balanced ranges rather than fixed pages-per-shard, so there is never
-    a tiny tail shard. Assumes roughly uniform bytes per page, which
-    holds for our scanned volumes (KB/page varies ~1.3x across the whole
-    corpus and far less within one volume).
+    The shard count is the larger of two demands -- ``ceil(size /
+    target)`` and ``ceil(pages / max_pages)`` -- and pages are then
+    spread as evenly as possible. Balanced ranges rather than fixed
+    pages-per-shard, so there is never a tiny tail shard. Assumes
+    roughly uniform bytes per page, which holds for our volumes (KB/page
+    varies ~1.3x across the corpus and far less within one volume).
+
+    Both bounds are needed because the consumers cost differently: the
+    byte target guards a reader's download and ephemeral disk, the page
+    ceiling guards conversion time, which is per page whatever those
+    pages weigh. Heavy colour volumes stay byte-bound and compact
+    bitonal ones become page-bound, so shard *duration* comes out
+    uniform either way -- which is what the job deadline and doctor's
+    pod termination grace both depend on.
 
     :param page_count: Number of pages in the source PDF.
     :param size_bytes: Byte size of the source PDF.
     :param target_bytes: Target byte size per shard.
+    :param max_pages: Ceiling on pages per shard. ``None`` (or any
+        non-positive value) applies no page ceiling, leaving the split
+        purely byte-driven.
     :returns: List of 0-based inclusive ``(from_page, to_page)`` ranges,
         contiguous and covering every page exactly once.
     :rtype: list[tuple[int, int]]
@@ -84,7 +98,9 @@ def plan_shards(
             f"target_bytes={target_bytes}"
         )
 
-    n_shards = min(page_count, max(1, math.ceil(size_bytes / target_bytes)))
+    by_bytes = math.ceil(size_bytes / target_bytes)
+    by_pages = math.ceil(page_count / max_pages) if max_pages else 1
+    n_shards = min(page_count, max(1, by_bytes, by_pages))
     base, remainder = divmod(page_count, n_shards)
 
     ranges = []
@@ -134,9 +150,12 @@ def _page_image_digests(doc: fitz.Document, page_index: int) -> list[str]:
 
 
 def shard_pdf(
-    source_path: str | Path, dest_dir: str | Path, target_bytes: int
+    source_path: str | Path,
+    dest_dir: str | Path,
+    target_bytes: int,
+    max_pages: int | None = None,
 ) -> dict:
-    """Split ``source_path`` into byte-targeted shards under ``dest_dir``.
+    """Split ``source_path`` into byte- and page-bounded shards.
 
     Shards are named ``0001.pdf``, ``0002.pdf``, ... in page order. The
     returned manifest is complete except that it has not been written to
@@ -147,6 +166,8 @@ def shard_pdf(
     :param dest_dir: Directory to write the shard PDFs into (created if
         missing).
     :param target_bytes: Target byte size per shard.
+    :param max_pages: Ceiling on pages per shard; see
+        :func:`plan_shards`.
     :returns: The manifest dict describing the shard set.
     :rtype: dict
     """
@@ -158,7 +179,9 @@ def shard_pdf(
     t0 = time.monotonic()
     shards = []
     with fitz.open(str(source_path)) as src:
-        ranges = plan_shards(src.page_count, size_bytes, target_bytes)
+        ranges = plan_shards(
+            src.page_count, size_bytes, target_bytes, max_pages
+        )
         for i, (from_page, to_page) in enumerate(ranges):
             name = f"{i + 1:04d}.pdf"
             out_path = dest_dir / name
@@ -196,7 +219,11 @@ def shard_pdf(
             "size_bytes": size_bytes,
             "page_count": page_count,
         },
+        # Provenance only: neither bound is part of the manifest
+        # identity (see _manifest_matches), so retuning either never
+        # re-shards a committed volume.
         "target_bytes": target_bytes,
+        "max_pages": max_pages,
         "tool": {"name": "pymupdf", "version": fitz.version[0]},
         "shards": shards,
         "timings": {"split_seconds": round(split_seconds, 3)},
@@ -462,7 +489,10 @@ def ensure_shards(scan) -> dict | None:
 
     try:
         manifest = shard_pdf(
-            source_path, shards_dir, settings.SHARD_TARGET_BYTES
+            source_path,
+            shards_dir,
+            settings.SHARD_TARGET_BYTES,
+            settings.SHARD_MAX_PAGES,
         )
         t0 = time.monotonic()
         verify_shards(source_path, shards_dir, manifest)

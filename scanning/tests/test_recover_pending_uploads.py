@@ -45,7 +45,14 @@ class TestRecoverPendingUpload(TestCase):
         self.assertEqual(scan.status, Status.QUEUED)
         self.assertFalse(PendingUpload.objects.filter(pk=pending.pk).exists())
 
-    def test_recovers_upload_only_stays_uploaded(self):
+    def test_recovers_upload_only_and_queues_it(self):
+        """An upload-only volume is queued too, for shard + convert.
+
+        It used to stay UPLOADED, which meant it was never claimed and
+        so never got a ``bitonal.pdf`` (#176). What the pipeline does
+        today needs doing whatever the uploader chose; only the message
+        distinguishes the two actions while validation is disconnected.
+        """
         scan = ScanFactory(original_pdf="", status=Status.UPLOADED)
         pending = _make_pending(scan, action=UploadAction.UPLOAD_ONLY)
 
@@ -57,7 +64,8 @@ class TestRecoverPendingUpload(TestCase):
         self.assertTrue(recovered)
         scan.refresh_from_db()
         self.assertTrue(scan.original_pdf.name)
-        self.assertEqual(scan.status, Status.UPLOADED)
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertIn("conversion", scan.progress_message)
 
     def test_no_recover_when_object_missing(self):
         scan = ScanFactory(original_pdf="", status=Status.UPLOADED)

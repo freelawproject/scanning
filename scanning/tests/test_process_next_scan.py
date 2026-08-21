@@ -161,6 +161,27 @@ class TestRecoverStale(TestCase):
         self.assertEqual(scan.status, Status.PROCESSING)
         self.assertEqual(scan.interruption_count, 0)
 
+    def test_an_awaiting_scan_is_never_swept(self):
+        """Waiting on external jobs is not the same as being stuck.
+
+        AWAITING (#176) means nothing of ours is running and the job
+        rows carry their own deadlines. Sweeping it would charge an
+        interruption for waiting and re-run work already paid for --
+        which is why it is a separate status from PROCESSING.
+        """
+        from datetime import timedelta
+
+        scan = ScanFactory(status=Status.AWAITING, interruption_count=0)
+        Scan.objects.filter(pk=scan.pk).update(
+            processed_at=timezone.now() - timedelta(days=1)
+        )
+
+        Command()._recover_stale()
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.AWAITING)
+        self.assertEqual(scan.interruption_count, 0)
+
 
 class TestLegacyQueuedActionsPark(TestCase):
     """Legacy queued actions are parked, not run or errored (issue #173).

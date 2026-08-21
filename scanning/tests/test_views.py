@@ -541,7 +541,14 @@ class TestPresignedUpload(ScanningTestCase):
         )
         self.assertFalse(PendingUpload.objects.filter(pk=pending_id).exists())
 
-    def test_confirm_upload_only_stays_uploaded(self):
+    def test_confirm_upload_only_queues_for_conversion(self):
+        """Upload-only still redirects to the queue, but is processed.
+
+        The redirect is the visible difference between the two actions;
+        the scan itself is queued either way, because sharding and
+        bitonal conversion (#176) are needed for any volume to have a
+        preview at all.
+        """
         pending_id = self._presign()[0].json()["pending_id"]
         with patch(
             "scanning.s3_sync.verify_uploaded_object", return_value=True
@@ -554,7 +561,8 @@ class TestPresignedUpload(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["redirect"], self.queue_url)
         scan = Scan.objects.get(volume_obj=self.volume)
-        self.assertEqual(scan.status, Status.UPLOADED)
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.queued_action, QueuedAction.FULL_PIPELINE)
 
     def test_confirm_failure_deletes_orphan_scan(self):
         pending_id = self._presign()[0].json()["pending_id"]
@@ -1861,6 +1869,31 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         served = b"".join(response.streaming_content)
         self.assertEqual(served, original_bytes)
 
+    def test_awaiting_is_transient_so_the_viewer_keeps_polling(self):
+        """A scan waiting on doctor will get a preview (issue #176)."""
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        scan = ScanFactory(start_page=1, end_page=2, status=Status.AWAITING)
+        os.remove(scan.original_pdf.path)
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch("scanning.s3_sync.download_preview_pdf"),
+            patch("scanning.s3_sync.download_original_pdf"),
+        ):
+            response = self.client.get(
+                reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["scan_status"], Status.AWAITING)
+
     def test_terminal_status_returns_409_not_202(self):
         """An errored scan is terminal: 409 so the viewer stops polling."""
         user = self.make_user()
@@ -2765,3 +2798,61 @@ class TestDeleteDetectionPrunesStaleRects(ScanningTestCase):
         self.assertEqual(
             [e["page_index"] for e in self.scan.redaction_rects], [0, 1]
         )
+
+
+class TestCancelProcessing(ScanningTestCase):
+    """``cancel_processing`` covers both busy states (issue #176)."""
+
+    def setUp(self):
+        self.client.force_login(self.make_user())
+
+    def _cancel(self, scan):
+        return self.client.post(
+            reverse("cancel_processing", kwargs={"pk": scan.pk})
+        )
+
+    def test_a_processing_scan_is_cancelled(self):
+        scan = ScanFactory(status=Status.PROCESSING, stage=Stage.VALIDATE)
+
+        self._cancel(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.CANCELLED)
+
+    def test_an_awaiting_scan_is_cancelled_with_its_jobs(self):
+        """A scan spends its whole conversion in AWAITING.
+
+        Ignoring that status would make cancel a silent no-op for the
+        longest part of the run, and would leave job rows open whose
+        outcome would land on a scan the user stopped.
+        """
+        from scanning.factories import ExternalJobFactory
+        from scanning.models import JobStage, JobStatus
+
+        scan = ScanFactory(status=Status.AWAITING, stage=Stage.VALIDATE)
+        job = ExternalJobFactory(
+            scan=scan, stage=JobStage.CONVERT, status=JobStatus.SUBMITTED
+        )
+
+        self._cancel(scan)
+
+        scan.refresh_from_db()
+        job.refresh_from_db()
+        self.assertEqual(scan.status, Status.CANCELLED)
+        self.assertEqual(job.status, JobStatus.CANCELLED)
+
+    def test_a_reviewed_scan_is_left_alone(self):
+        from scanning.factories import ExternalJobFactory
+        from scanning.models import JobStage, JobStatus
+
+        scan = ScanFactory(status=Status.PENDING_REVIEW)
+        job = ExternalJobFactory(
+            scan=scan, stage=JobStage.CONVERT, status=JobStatus.SUBMITTED
+        )
+
+        self._cancel(scan)
+
+        scan.refresh_from_db()
+        job.refresh_from_db()
+        self.assertEqual(scan.status, Status.PENDING_REVIEW)
+        self.assertEqual(job.status, JobStatus.SUBMITTED)

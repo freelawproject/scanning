@@ -8,8 +8,20 @@ Adding a new periodic job means adding another entry to
 Current schedule:
 
 - ``process_next_scan`` every ``DAEMON_POLL_INTERVAL`` seconds (default 5s)
+- ``submit_external_jobs`` every ``DAEMON_SUBMIT_INTERVAL`` seconds
+  (default 5s)
+- ``collect_external_jobs`` every ``DAEMON_COLLECT_INTERVAL`` seconds
+  (default 15s)
 - ``cleanup_processing_tmp`` every ``PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS``
   seconds (default 900s)
+
+Known limitation: the loop is serial, so a long task delays the others
+by however long it runs -- a submit wave blocks scan claiming for the
+length of its slowest request, and a multi-minute pipeline run blocks
+job confirmation. Splitting the loop is issue #156; it needs
+``_handle_signal`` scoped first, since that re-queues every PROCESSING
+scan globally and a second daemon process would re-queue the first
+one's work on every restart.
 
 Examples:
 
@@ -68,7 +80,8 @@ class ScheduledTask:
 
 class Command(BaseCommand):
     help = (
-        "Run the scanning daemon. Invokes process_next_scan and "
+        "Run the scanning daemon. Invokes process_next_scan, "
+        "submit_external_jobs, collect_external_jobs and "
         "cleanup_processing_tmp on their configured intervals."
     )
 
@@ -86,6 +99,14 @@ class Command(BaseCommand):
             ScheduledTask(
                 name="process_next_scan",
                 interval_seconds=float(settings.DAEMON_POLL_INTERVAL),
+            ),
+            ScheduledTask(
+                name="submit_external_jobs",
+                interval_seconds=float(settings.DAEMON_SUBMIT_INTERVAL),
+            ),
+            ScheduledTask(
+                name="collect_external_jobs",
+                interval_seconds=float(settings.DAEMON_COLLECT_INTERVAL),
             ),
             ScheduledTask(
                 name="cleanup_processing_tmp",

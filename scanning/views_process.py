@@ -20,6 +20,7 @@ from django.urls import reverse
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
+    BUSY_STATUSES,
     CheckName,
     Detection,
     Issue,
@@ -106,7 +107,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     :return: Rendered processing page.
     """
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
-    is_processing = scan.status in (Status.PROCESSING, Status.QUEUED)
+    is_processing = scan.status in BUSY_STATUSES
     # Breadcrumb for the web-pod observability trail (issue #115): this view
     # does an S3 pull plus a render over potentially large detection sets, so a
     # hang/OOM here should leave a marker in the pod logs and Sentry.
@@ -540,14 +541,17 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     #    producing a preview -- the viewer should poll) from terminal ones
     #    (a preview will never appear -- the viewer should show the message
     #    and stop). 202 means "retry"; 409 means "give up".
-    #    AWAITING_VALIDATION is transient here: those scans never get a
-    #    bitonal (#173), so reaching this branch means the step-3 pull of
-    #    the original just failed -- the original is durably in S3 and the
-    #    next poll will very likely serve it.
+    #    AWAITING means a bitonal is being made right now (#176), so
+    #    polling gets one. AWAITING_VALIDATION is transient for the
+    #    opposite reason: a scan parks there either converted (so we
+    #    never reach step 4) or deliberately unconverted, and then
+    #    reaching here means the step-3 pull of the original failed --
+    #    it is durably in S3, so the next poll will likely serve it.
     if scan.status in (
         Status.UPLOADED,
         Status.QUEUED,
         Status.PROCESSING,
+        Status.AWAITING,
         Status.AWAITING_VALIDATION,
     ):
         return JsonResponse(
@@ -689,7 +693,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
     context = {
         "scan": scan,
         "step": step,
-        "is_processing": scan.status in (Status.PROCESSING, Status.QUEUED),
+        "is_processing": scan.status in BUSY_STATUSES,
         "has_pending_changes": has_pending_changes,
         "has_pending_inserts": has_pending_inserts,
         "issues": scan.issues.all(),
@@ -759,12 +763,22 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
 def cancel_processing(request: HttpRequest, pk: int) -> HttpResponse:
     """Cancel an in-progress scan processing task.
 
+    AWAITING counts as in progress: a scan spends its whole conversion
+    there (#176) and the viewer shows it as busy, so ignoring it would
+    make cancel a silent no-op for the longest part of the run. The job
+    rows go with it, or a finished shard's outcome would land on a scan
+    the user stopped.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
+    from scanning import jobs
+
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.status == Status.PROCESSING:
+    if scan.status in (Status.PROCESSING, Status.AWAITING):
+        if scan.status == Status.AWAITING:
+            jobs.abandon_open(scan, "Cancelled by user")
         if scan.stage == Stage.PROCESS:
             Scan.objects.filter(pk=pk).update(
                 status=Status.PENDING_REVIEW,

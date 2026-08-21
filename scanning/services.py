@@ -51,6 +51,7 @@ from scanning.models import (
     CheckName,
     Detection,
     Issue,
+    JobStatus,
     OpinionScan,
     OpinionStatus,
     QueueStatus,
@@ -196,9 +197,15 @@ def apply_upload_action(scan: Scan, action: str) -> None:
     """Apply the uploader's post-upload action to a stored scan.
 
     Request-free core shared by the web confirm flow
-    (``_finalize_uploaded_scan``) and the recovery path. ``upload_validate``
-    queues the full pipeline; ``upload_only`` (or anything else) just
-    records the upload. Always refreshes the parent volume's queue status.
+    (``_finalize_uploaded_scan``) and the recovery path. Always refreshes
+    the parent volume's queue status.
+
+    Both actions queue the pipeline, because the stage the choice used
+    to select -- page-number validation -- is disconnected (#173). What
+    the pipeline does today is shard and convert, and an ``upload_only``
+    volume needs both as much as any other: without them it has no
+    preview and the viewer streams the multi-GB original. Only the
+    message differs until validation returns (#149).
 
     :param scan: The scan whose original PDF is now stored.
     :param action: The chosen ``UploadAction`` value.
@@ -206,12 +213,15 @@ def apply_upload_action(scan: Scan, action: str) -> None:
     """
     from scanning.models import QueuedAction, Stage, Status, UploadAction
 
-    if action == UploadAction.UPLOAD_VALIDATE:
-        scan.status = Status.QUEUED
-        scan.stage = Stage.VALIDATE
-        scan.queued_action = QueuedAction.FULL_PIPELINE
-        scan.progress_message = "Queued for processing..."
-        scan.save()
+    scan.status = Status.QUEUED
+    scan.stage = Stage.VALIDATE
+    scan.queued_action = QueuedAction.FULL_PIPELINE
+    scan.progress_message = (
+        "Queued for processing..."
+        if action == UploadAction.UPLOAD_VALIDATE
+        else "Queued for conversion..."
+    )
+    scan.save()
     refresh_volume_queue_status_for_scan(scan)
 
 
@@ -375,7 +385,7 @@ def _handle_pipeline_exception(
         )
 
 
-def _ensure_shards(scan: "Scan") -> None:
+def _ensure_shards(scan: "Scan") -> dict | None:
     """Compute (or reuse) the scan's shard set, with stage logging.
 
     Failures propagate to the caller's ``_handle_pipeline_exception``
@@ -390,7 +400,10 @@ def _ensure_shards(scan: "Scan") -> None:
     re-queue. Sharding's own failures (``ShardingError``) stay terminal.
 
     :param scan: The scan to shard.
-    :return: None.
+    :return: The manifest describing the committed shard set, or None
+        when sharding is disabled -- in which case there are no shards
+        for an external job to read, so the caller must not create any.
+    :rtype: dict | None
     :raises RunpodTransientError: On an S3/transport failure, so the
         caller re-queues the scan instead of marking it ERROR.
     """
@@ -402,7 +415,7 @@ def _ensure_shards(scan: "Scan") -> None:
 
     with _log_stage("Sharding"):
         try:
-            sharding.ensure_shards(scan)
+            return sharding.ensure_shards(scan)
         except (BotoCoreError, Boto3Error, ClientError) as exc:
             raise RunpodTransientError(
                 f"S3 error while sharding scan {scan.pk}: {exc}"
@@ -1103,28 +1116,34 @@ def recalculate_issues(scan: "Scan") -> None:
 
 
 def run_full_pipeline(scan_pk: int) -> None:
-    """Run the interim upload pipeline: shard the original, then park.
+    """Run the upload pipeline: shard the original, then hand it to doctor.
 
     Designed to run in the daemon process.
 
-    The legacy stages that used to follow the sharding -- bitonal
-    conversion, YOLO detection, PaddleOCR page-number validation and
-    opinion pairing -- were disconnected when the pipeline moved to the
-    new OCR stack (issue #173). Until the dots.mocr page-number adapter
-    (#149) replaces the retired PaddleOCR path, a scan is done as soon
-    as its shard set is committed: it parks in
-    ``Status.AWAITING_VALIDATION`` with a progress message telling
-    scanners that validation is temporarily disabled. The dots.mocr
-    dispatch will slot in between the sharding and the park once its
-    client wiring (#147) lands.
+    Two stages of the rebuilt pipeline exist so far. This runs the first
+    (sharding, #164) and *starts* the second (conversion, #176): it
+    creates one ``ExternalJob`` row per shard and parks the scan in
+    ``Status.AWAITING``. It does not wait -- submitting, confirming and
+    merging belong to the ``submit_external_jobs`` /
+    ``collect_external_jobs`` ticks, which read those rows. Nothing
+    about what runs next may live in a call stack, or a killed daemon
+    loses it.
 
-    Still resumable across a daemon restart: ``ensure_shards`` is
-    idempotent through its manifest's source fingerprint, so a
-    re-queued scan verifies the committed set and moves on rather than
-    re-cutting it.
+    A volume that cannot or need not be converted parks straight in
+    ``Status.AWAITING_VALIDATION``, #173's interim state, and
+    ``serve_scan_pdf`` serves its original -- exactly what every
+    post-#173 upload already does. See :func:`_can_convert` and
+    ``bitonal.source_is_bitonal``.
+
+    Resumable across a daemon restart: ``ensure_shards`` is idempotent
+    through its manifest fingerprint and ``ensure_convert_jobs`` through
+    the shard identity its rows carry, so a re-queued scan verifies both
+    and moves on rather than redoing them.
 
     :param scan_pk: Primary key of the scan to process.
     """
+    from scanning import bitonal, jobs
+
     django.db.connections.close_all()
     _pull_processing_files_from_s3(scan_pk)
 
@@ -1137,32 +1156,159 @@ def run_full_pipeline(scan_pk: int) -> None:
     try:
         ensure_output_dir(scan)
 
-        # Shard the original for external job execution (#164), so
-        # dots.mocr jobs can fan out over the shards as soon as the
-        # dispatch for them exists.
+        # Shard for external execution (#164): the bitonal jobs below
+        # fan out over the shards, and dots.mocr will too.
         _update_progress(scan_pk, "Sharding original PDF...")
-        _ensure_shards(scan)
+        manifest = _ensure_shards(scan)
 
-        # ``page_count`` used to be refreshed off ``bitonal.pdf`` by the
-        # retired conversion stage; read it off the original instead so
-        # the list and detail pages keep showing it for new uploads.
+        # Read off the original, not the conversion output: the merge
+        # deliberately does not write it, so this stays its only writer.
         with fitz.open(scan.pdf_path) as pdf:
             page_count = pdf.page_count
 
-        Scan.objects.filter(pk=scan_pk).update(
-            status=Status.AWAITING_VALIDATION,
-            page_count=page_count,
-            progress_message=(
+        if not _can_convert(scan_pk, manifest):
+            _park_unconverted(
+                scan_pk,
+                page_count,
                 "Uploaded and sharded. Page-number validation is "
                 "temporarily disabled while the pipeline is rebuilt on "
                 "the new OCR stack; this scan will be processed once "
-                "that lands."
-            ),
-        )
+                "that lands.",
+            )
+        elif bitonal.source_is_bitonal(scan.pdf_path):
+            logger.info(
+                "Scan %s is already bitonal; skipping conversion", scan_pk
+            )
+            _park_unconverted(scan_pk, page_count, bitonal.SKIPPED_MESSAGE)
+        else:
+            created = jobs.ensure_convert_jobs(scan, manifest)
+            if all(job.status == JobStatus.CONSUMED for job in created):
+                # Converted and merged on an earlier run of a shard set
+                # that has not changed. A re-queue must neither convert
+                # it again nor re-merge: the results are deleted once
+                # merged, so there is nothing left to read.
+                logger.info(
+                    "Scan %s is already converted; skipping the stage",
+                    scan_pk,
+                )
+                _park_unconverted(
+                    scan_pk, page_count, bitonal.CONVERTED_MESSAGE
+                )
+            else:
+                handed_over = _advance_scan(
+                    scan_pk,
+                    Status.AWAITING,
+                    page_count,
+                    f"Converting {len(created)} shard(s) to bitonal...",
+                    progress_total=len(created),
+                )
+                if not handed_over:
+                    # The scan left PROCESSING while we sharded (a
+                    # cancel, an admin action). Its rows exist but
+                    # nothing watches them now, so hand them back
+                    # rather than convert a volume somebody stopped.
+                    jobs.abandon_open(
+                        scan,
+                        "Scan left PROCESSING before its conversion started",
+                    )
+
         _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
         _handle_pipeline_exception(scan_pk, exc, context="pipeline")
+
+
+def _can_convert(scan_pk: int, manifest: dict | None) -> bool:
+    """Return whether this environment can hand shards to doctor.
+
+    Checked before any row exists, because a row created where it
+    cannot be submitted does not merely fail: it parks its scan in
+    AWAITING until the queue deadline expires hours later. Parking
+    unconverted instead is what every post-#173 upload already did.
+
+    - a committed shard set, or there is nothing for a job to read;
+    - doctor configured, since no in-process converter is left;
+    - S3 active, because doctor fetches the shard through a presigned
+      GET. Under ``TESTING`` and in dev without credentials the shards
+      never left local disk, so every request would 404 on its input.
+
+    :param scan_pk: Primary key of the scan, for the log line.
+    :param manifest: The shard manifest, or None when sharding is off.
+    :returns: Whether to create conversion jobs for this scan.
+    :rtype: bool
+    """
+    from scanning import doctor_client, s3_sync
+
+    if manifest is None:
+        logger.info("Scan %s has no shard set; skipping conversion", scan_pk)
+        return False
+    if not doctor_client.enabled():
+        logger.info(
+            "Scan %s: doctor is not configured; skipping conversion", scan_pk
+        )
+        return False
+    if not s3_sync.s3_active():
+        logger.info(
+            "Scan %s: S3 is inactive, so its shards are not readable by "
+            "doctor; skipping conversion",
+            scan_pk,
+        )
+        return False
+    return True
+
+
+def _park_unconverted(scan_pk: int, page_count: int, message: str) -> bool:
+    """Park a scan that will not be converted in the interim state.
+
+    :param scan_pk: Primary key of the scan.
+    :param page_count: Page count read off the original.
+    :param message: Progress message explaining why.
+    :returns: Whether the scan was still ours to move.
+    :rtype: bool
+    """
+    return _advance_scan(
+        scan_pk, Status.AWAITING_VALIDATION, page_count, message
+    )
+
+
+def _advance_scan(
+    scan_pk: int,
+    status: str,
+    page_count: int,
+    message: str,
+    progress_total: int = 0,
+) -> bool:
+    """Move a scan out of PROCESSING at the end of the pipeline.
+
+    Guarded on PROCESSING like every other status write here: the daemon
+    claims a scan by moving it there, so anything else means somebody
+    took it away (a cancel, an admin action, a second replica) and their
+    decision outranks ours. That matters more than it used to -- the
+    AWAITING transition starts external work, so a resurrected scan
+    would spend real capacity on a volume that was stopped.
+
+    :param scan_pk: Primary key of the scan.
+    :param status: Status to write.
+    :param page_count: Page count read off the original.
+    :param message: Progress message.
+    :param progress_total: Steps the new state is waiting on, if any.
+    :returns: Whether this writer moved the scan.
+    :rtype: bool
+    """
+    updated = Scan.objects.filter(pk=scan_pk, status=Status.PROCESSING).update(
+        status=status,
+        page_count=page_count,
+        progress_message=message[:255],
+        progress_current=0,
+        progress_total=progress_total,
+    )
+    if not updated:
+        logger.warning(
+            "Scan %s left PROCESSING during the pipeline; not writing %s",
+            scan_pk,
+            status,
+        )
+    return bool(updated)
 
 
 # ---------------------------------------------------------------------------

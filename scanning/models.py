@@ -74,9 +74,29 @@ class AutoNowQuerySet(models.QuerySet):
 
 
 class Status(models.TextChoices):
+    """Where a scan is in the pipeline.
+
+    Three of these mean "busy" (see :data:`BUSY_STATUSES`), and they
+    differ in who is to blame when a scan stops moving:
+
+    - ``QUEUED``: waiting for the daemon to claim it.
+    - ``PROCESSING``: a daemon thread is in the pipeline right now.
+      Both the stale-row sweep and the SIGTERM handler re-queue these
+      and charge an interruption, assuming no daemon is on them.
+    - ``AWAITING``: nothing of ours is running; external jobs are. A
+      scan may sit here as long as its jobs' own deadlines allow, so it
+      must *not* be swept -- that would charge an interruption for
+      waiting and redo work already paid for.
+    """
+
     UPLOADED = "uploaded", "Uploaded"
     QUEUED = "queued", "Queued"
     PROCESSING = "processing", "Processing"
+    # Parked out of PROCESSING while external jobs run (issue #176):
+    # the shards are with doctor, and later RunPod. Progress lives on
+    # the ExternalJob rows rather than in a call stack, which is what
+    # lets a killed daemon resume by reading them.
+    AWAITING = "awaiting", "Waiting on external jobs"
     # Interim parking state (issue #173): the upload-side pipeline
     # (sharding, and soon the dots.mocr raw run) finished, but
     # page-number validation is disabled until the dots.mocr adapter
@@ -92,6 +112,13 @@ class Status(models.TextChoices):
     ERROR_MAX_RETRIES = "error_max_retries", "Error (retry cap hit)"
     ERROR_INTERRUPTED = "error_interrupted", "Error (interrupted too often)"
     CANCELLED = "cancelled", "Cancelled"
+
+
+#: Statuses meaning "work on this scan is under way" -- queued,
+#: running, or waiting on a provider. The viewer polls for these.
+#: Deliberately not a substitute for the narrower ``status=PROCESSING``
+#: guards: only PROCESSING may be swept as stale.
+BUSY_STATUSES = frozenset({Status.QUEUED, Status.PROCESSING, Status.AWAITING})
 
 
 class Stage(models.TextChoices):
@@ -1381,15 +1408,20 @@ OPEN_JOB_STATUSES = frozenset(
     {JobStatus.PENDING, JobStatus.COMPLETED} | IN_FLIGHT_JOB_STATUSES
 )
 
-#: Jobs nothing will happen to again without an explicit retry.
-TERMINAL_JOB_STATUSES = frozenset(
+#: Jobs that ended without their work being applied. Separate from the
+#: terminal set below because a run holding one can never finish -- it
+#: will not complete and cannot be merged -- so it has to be replaced
+#: by a fresh run rather than picked back up.
+DEAD_JOB_STATUSES = frozenset(
     {
-        JobStatus.CONSUMED,
         JobStatus.FAILED,
         JobStatus.CANCELLED,
         JobStatus.EXPIRED,
     }
 )
+
+#: Jobs nothing will happen to again without an explicit retry.
+TERMINAL_JOB_STATUSES = frozenset({JobStatus.CONSUMED}) | DEAD_JOB_STATUSES
 
 
 class ExternalJobQuerySet(AutoNowQuerySet):

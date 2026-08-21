@@ -1862,3 +1862,358 @@ class TestRecalculateIssues(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.missing_pages, [3, 4])
         self.assertFalse(scan.issues.exists())
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT, DEVELOPMENT=True)
+class TestFullPipelineConvertBranches(TestCase):
+    """Where ``run_full_pipeline`` leaves a scan (issue #176).
+
+    Four outcomes, and which one a volume gets is the whole decision
+    this stage makes: hand the shards to doctor, or park because there
+    is nothing to convert with, nothing worth converting, or no shards.
+    """
+
+    def _scan(self, pages=2):
+        """Build a QUEUED scan whose original PDF exists on disk."""
+        scan = ScanFactory(
+            reporter=ReporterFactory(short_name="tc"),
+            volume=176,
+            start_page=1,
+            end_page=pages,
+            status=Status.PROCESSING,
+        )
+        output_dir = pathlib.Path(scan.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        original = output_dir / pathlib.Path(scan.original_pdf.name).name
+        doc = fitz.open()
+        for _ in range(pages):
+            doc.new_page(width=PAGE_W, height=PAGE_H)
+        doc.save(str(original))
+        doc.close()
+        return scan
+
+    def _run(self, scan, manifest, is_bitonal=False, doctor=True):
+        """Run the pipeline with sharding and the skip check stubbed."""
+        from scanning import services
+
+        with (
+            patch("scanning.services._ensure_shards", return_value=manifest),
+            patch(
+                "scanning.bitonal.source_is_bitonal",
+                return_value=is_bitonal,
+            ),
+            patch("scanning.doctor_client.enabled", return_value=doctor),
+            # S3 is inert under TESTING, and the pipeline refuses to
+            # create jobs whose shards doctor could not fetch.
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("django.db.connections.close_all"),
+        ):
+            services.run_full_pipeline(scan.pk)
+        scan.refresh_from_db()
+        return scan
+
+    @staticmethod
+    def _manifest(shard_count=3, pages_per_shard=1):
+        from scanning.tests.test_jobs import make_manifest
+
+        return make_manifest(shard_count, pages_per_shard)
+
+    def test_a_convertible_volume_waits_on_its_jobs(self):
+        from scanning.models import ExternalJob, JobStage, JobStatus
+
+        scan = self._scan(pages=3)
+
+        scan = self._run(scan, self._manifest(shard_count=3))
+
+        self.assertEqual(scan.status, Status.AWAITING)
+        self.assertEqual(scan.page_count, 3)
+        self.assertEqual(scan.progress_total, 3)
+        self.assertIn("Converting 3 shard", scan.progress_message)
+        rows = ExternalJob.objects.filter(scan=scan, stage=JobStage.CONVERT)
+        self.assertEqual(rows.count(), 3)
+        self.assertEqual({row.status for row in rows}, {JobStatus.PENDING})
+
+    def test_an_already_bitonal_volume_skips_the_stage(self):
+        """Converting it would cost a full raster pass to save ~11%."""
+        from scanning.models import ExternalJob
+
+        scan = self._scan(pages=2)
+
+        scan = self._run(scan, self._manifest(), is_bitonal=True)
+
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertEqual(scan.page_count, 2)
+        self.assertIn("already bitonal", scan.progress_message)
+        self.assertFalse(ExternalJob.objects.filter(scan=scan).exists())
+
+    def test_without_doctor_the_scan_parks_as_before(self):
+        """No in-process fallback exists, so this is the #173 behaviour."""
+        from scanning.models import ExternalJob
+
+        scan = self._scan(pages=2)
+
+        scan = self._run(scan, self._manifest(), doctor=False)
+
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertIn("temporarily disabled", scan.progress_message)
+        self.assertFalse(ExternalJob.objects.filter(scan=scan).exists())
+
+    def test_without_s3_no_jobs_are_created(self):
+        """Doctor fetches shards from S3, so no S3 means no conversion.
+
+        This is what makes DOCTOR_ENABLED=True safe as a default:
+        TESTING and a dev environment without credentials never uploaded
+        the shards, so a job created there could never be submitted and
+        would park its scan in AWAITING until its queue deadline expired
+        hours later. Parking it unconverted is the honest outcome.
+        """
+        from scanning import services
+        from scanning.models import ExternalJob
+
+        scan = self._scan(pages=2)
+
+        with (
+            patch(
+                "scanning.services._ensure_shards",
+                return_value=self._manifest(),
+            ),
+            patch("scanning.doctor_client.enabled", return_value=True),
+            patch("scanning.s3_sync.s3_active", return_value=False),
+            patch("django.db.connections.close_all"),
+        ):
+            services.run_full_pipeline(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertFalse(ExternalJob.objects.filter(scan=scan).exists())
+
+    def test_without_shards_no_jobs_are_created(self):
+        """Sharding disabled means there is nothing for a job to read."""
+        from scanning.models import ExternalJob
+
+        scan = self._scan(pages=2)
+
+        scan = self._run(scan, None)
+
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertFalse(ExternalJob.objects.filter(scan=scan).exists())
+
+    def test_a_second_run_reuses_the_jobs(self):
+        """The re-queue path must not pay for the conversion twice."""
+        from scanning.models import ExternalJob
+
+        scan = self._scan(pages=3)
+        manifest = self._manifest(shard_count=3)
+
+        self._run(scan, manifest)
+        first = set(
+            ExternalJob.objects.filter(scan=scan).values_list("pk", flat=True)
+        )
+        Scan = type(scan)
+        Scan.objects.filter(pk=scan.pk).update(status=Status.PROCESSING)
+        self._run(scan, manifest)
+
+        self.assertEqual(
+            set(
+                ExternalJob.objects.filter(scan=scan).values_list(
+                    "pk", flat=True
+                )
+            ),
+            first,
+        )
+
+
+class TestApplyUploadAction(TestCase):
+    """Both upload actions queue the pipeline (issue #176)."""
+
+    def test_upload_validate_queues_for_processing(self):
+        from scanning.models import QueuedAction, UploadAction
+        from scanning.services import apply_upload_action
+
+        scan = ScanFactory(status=Status.UPLOADED)
+
+        apply_upload_action(scan, UploadAction.UPLOAD_VALIDATE)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.stage, Stage.VALIDATE)
+        self.assertEqual(scan.queued_action, QueuedAction.FULL_PIPELINE)
+        self.assertIn("processing", scan.progress_message)
+
+    def test_upload_only_is_queued_too(self):
+        """It used to stay UPLOADED, so it never got a preview at all."""
+        from scanning.models import QueuedAction, UploadAction
+        from scanning.services import apply_upload_action
+
+        scan = ScanFactory(status=Status.UPLOADED)
+
+        apply_upload_action(scan, UploadAction.UPLOAD_ONLY)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.queued_action, QueuedAction.FULL_PIPELINE)
+        self.assertIn("conversion", scan.progress_message)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT, DEVELOPMENT=True)
+class TestFullPipelineRequeue(TestCase):
+    """Re-queueing a scan that has already been through the stage."""
+
+    def _scan_with_jobs(self, statuses):
+        """Build a PROCESSING scan whose convert run has these statuses."""
+        from scanning import jobs
+        from scanning.models import ExternalJob
+        from scanning.tests.test_jobs import make_manifest
+
+        scan = ScanFactory(
+            reporter=ReporterFactory(short_name="tc"),
+            volume=176,
+            start_page=1,
+            end_page=len(statuses),
+            status=Status.PROCESSING,
+        )
+        output_dir = pathlib.Path(scan.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        original = output_dir / pathlib.Path(scan.original_pdf.name).name
+        doc = fitz.open()
+        for _ in statuses:
+            doc.new_page(width=PAGE_W, height=PAGE_H)
+        doc.save(str(original))
+        doc.close()
+
+        manifest = make_manifest(len(statuses), 1)
+        rows = jobs.ensure_convert_jobs(scan, manifest)
+        for job, status in zip(rows, statuses, strict=True):
+            ExternalJob.objects.filter(pk=job.pk).update(status=status)
+        return scan, manifest
+
+    def _run(self, scan, manifest):
+        from scanning import services
+
+        with (
+            patch("scanning.services._ensure_shards", return_value=manifest),
+            patch("scanning.bitonal.source_is_bitonal", return_value=False),
+            patch("scanning.doctor_client.enabled", return_value=True),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("django.db.connections.close_all"),
+        ):
+            services.run_full_pipeline(scan.pk)
+        scan.refresh_from_db()
+        return scan
+
+    def test_an_already_converted_volume_is_not_converted_again(self):
+        """Its shard results are deleted, so a re-merge would fail too."""
+        from scanning.models import ExternalJob, JobStatus
+
+        scan, manifest = self._scan_with_jobs(
+            [JobStatus.CONSUMED, JobStatus.CONSUMED]
+        )
+
+        scan = self._run(scan, manifest)
+
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertEqual(
+            ExternalJob.objects.filter(scan=scan).count(),
+            2,
+            "no second run should have been created",
+        )
+
+    def test_a_cancelled_run_is_started_over(self):
+        """The admin re-queue path: abandoned rows must not park a scan."""
+        from scanning.models import ExternalJob, JobStatus
+
+        scan, manifest = self._scan_with_jobs(
+            [JobStatus.CANCELLED, JobStatus.CANCELLED]
+        )
+
+        scan = self._run(scan, manifest)
+
+        self.assertEqual(scan.status, Status.AWAITING)
+        pending = ExternalJob.objects.filter(
+            scan=scan, status=JobStatus.PENDING
+        )
+        self.assertEqual(pending.count(), 2)
+        self.assertEqual({job.run for job in pending}, {2})
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT, DEVELOPMENT=True)
+class TestFullPipelineStatusGuard(TestCase):
+    """The pipeline only moves a scan it still owns (issue #176).
+
+    The daemon claims a scan by moving it to PROCESSING, so anything
+    else means somebody took it away -- and writing AWAITING anyway
+    would start real external work on a volume that was stopped.
+    """
+
+    def _scan(self, status):
+        scan = ScanFactory(
+            reporter=ReporterFactory(short_name="tc"),
+            volume=176,
+            start_page=1,
+            end_page=2,
+            status=status,
+        )
+        output_dir = pathlib.Path(scan.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        original = output_dir / pathlib.Path(scan.original_pdf.name).name
+        doc = fitz.open()
+        doc.new_page(width=PAGE_W, height=PAGE_H)
+        doc.new_page(width=PAGE_W, height=PAGE_H)
+        doc.save(str(original))
+        doc.close()
+        return scan
+
+    def _run(self, scan, cancel_midway=False):
+        from scanning import services
+        from scanning.models import Scan as ScanModel
+        from scanning.tests.test_jobs import make_manifest
+
+        def _shard(inner_scan):
+            if cancel_midway:
+                ScanModel.objects.filter(pk=inner_scan.pk).update(
+                    status=Status.CANCELLED
+                )
+            return make_manifest(shard_count=2, pages_per_shard=1)
+
+        with (
+            patch("scanning.services._ensure_shards", side_effect=_shard),
+            patch("scanning.bitonal.source_is_bitonal", return_value=False),
+            patch("scanning.doctor_client.enabled", return_value=True),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("django.db.connections.close_all"),
+        ):
+            services.run_full_pipeline(scan.pk)
+        scan.refresh_from_db()
+        return scan
+
+    def test_a_scan_cancelled_mid_shard_is_not_resurrected(self):
+        from scanning.models import ExternalJob, JobStatus
+
+        scan = self._scan(Status.PROCESSING)
+
+        with self.assertLogs("scanning.services", level="WARNING"):
+            scan = self._run(scan, cancel_midway=True)
+
+        self.assertEqual(scan.status, Status.CANCELLED)
+        # Its rows were created before the status write failed, so they
+        # are handed back rather than left for a wave to convert.
+        self.assertEqual(
+            set(
+                ExternalJob.objects.filter(scan=scan).values_list(
+                    "status", flat=True
+                )
+            ),
+            {JobStatus.CANCELLED},
+        )
+
+    def test_the_park_paths_are_guarded_too(self):
+        from scanning import services
+
+        scan = self._scan(Status.CANCELLED)
+
+        with self.assertLogs("scanning.services", level="WARNING"):
+            services._park_unconverted(scan.pk, 2, "parked")
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.CANCELLED)
+        self.assertNotEqual(scan.progress_message, "parked")

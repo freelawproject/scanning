@@ -1,5 +1,6 @@
 from .django import *
 from .project.daemon import *
+from .project.doctor import *
 from .project.logging import *
 from .project.observability import *
 from .project.processing_storage import *
