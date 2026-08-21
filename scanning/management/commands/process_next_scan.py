@@ -3,8 +3,11 @@
 Recovers any PROCESSING rows whose ``processed_at`` is older than
 ``DAEMON_PROCESSING_TIMEOUT`` back to QUEUED, then atomically claims
 one QUEUED scan (via ``SELECT ... FOR UPDATE SKIP LOCKED``) and
-dispatches the queued action (full pipeline, validate, detect,
-reprocess, or generate_files).
+dispatches the queued action. Only the full (now interim: shard and
+park) pipeline is dispatchable; the legacy actions (validate, detect,
+reprocess, generate_files) were disconnected by issue #173 and rows
+still carrying one are parked back to PENDING_REVIEW with the unified
+pipeline-paused message.
 
 Examples:
 
@@ -160,16 +163,38 @@ class Command(BaseCommand):
         """
         from scanning import services
         from scanning.models import QueuedAction, Scan, Status
+        from scanning.utils import PIPELINE_PAUSED_MESSAGE
 
         self.stdout.write(f"Processing scan {scan.pk} ({action})")
 
         dispatch = {
             QueuedAction.FULL_PIPELINE: services.run_full_pipeline,
-            QueuedAction.VALIDATE: services.run_validate_with_bitonal,
-            QueuedAction.DETECT: services.run_detect,
-            QueuedAction.REPROCESS: services.run_reprocess,
-            QueuedAction.GENERATE_FILES: services.run_generate_files,
         }
+
+        # Legacy actions whose pipelines were disconnected (issue #173).
+        # The views that queued them now refuse with the same message, so
+        # a row can only carry one from before the cutover (or an admin
+        # re-queue that kept a stale ``queued_action``). Park it back in
+        # PENDING_REVIEW -- these scans all passed the old pipeline once,
+        # so that is where they came from -- rather than ERROR: nothing
+        # is wrong with the scan, the action just no longer exists.
+        legacy = {
+            QueuedAction.VALIDATE,
+            QueuedAction.DETECT,
+            QueuedAction.REPROCESS,
+            QueuedAction.GENERATE_FILES,
+        }
+        if action in legacy:
+            logger.warning(
+                "Scan %s queued legacy action %r; parking it (issue #173)",
+                scan.pk,
+                action,
+            )
+            Scan.objects.filter(pk=scan.pk).update(
+                status=Status.PENDING_REVIEW,
+                progress_message=PIPELINE_PAUSED_MESSAGE,
+            )
+            return
 
         fn = dispatch.get(action)
         if fn is None:

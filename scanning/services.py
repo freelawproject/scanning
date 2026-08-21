@@ -19,13 +19,7 @@ from pathlib import Path
 import django
 import fitz
 from blackletter.api import (
-    bitonal as bl_bitonal,
-)
-from blackletter.api import (
     build_redactions as bl_build_redactions,
-)
-from blackletter.api import (
-    pair as bl_pair,
 )
 from blackletter.margins import compute_margin_rects
 from blackletter.models import (
@@ -46,7 +40,6 @@ from blackletter.scanner import (
     snap_text_columns_to_ink,
 )
 from blackletter.validate import (
-    _auto_correct,
     _split_in_out_of_range,
     build_analysis,
     build_issues,
@@ -68,7 +61,6 @@ from scanning.models import (
 )
 from scanning.utils import (
     ensure_output_dir,
-    find_ocr_pdf,
     find_processing_pdf,
     has_s3_credentials,
     processing_pdf_path,
@@ -417,188 +409,6 @@ def _ensure_shards(scan: "Scan") -> None:
             ) from exc
 
 
-def _ensure_bitonal(scan: "Scan", output_dir: Path) -> Path:
-    """Convert to bitonal if needed, returning the bitonal PDF path.
-
-    Skips conversion if ``bitonal.pdf`` already exists. Updates the
-    scan's ``page_count`` after conversion.
-
-    :param scan: The Scan instance.
-    :param output_dir: Directory where ``bitonal.pdf`` is stored.
-    :return: Path to the bitonal PDF.
-    :rtype: Path
-    """
-    bitonal_path = output_dir / "bitonal.pdf"
-    if not bitonal_path.exists():
-
-        def _bitonal_progress(current, total, message):
-            _update_progress(scan.pk, message, current=current, total=total)
-
-        with _log_stage("Bitonal conversion") as stage:
-            bl_bitonal(
-                scan.pdf_path,
-                str(output_dir),
-                progress_callback=_bitonal_progress,
-            )
-            size_mb = bitonal_path.stat().st_size / 1024 / 1024
-            stage.done_detail = f"{size_mb:.1f} MB"
-        # Persist as soon as it exists so a later crash, or a reprocess
-        # that skips the end-of-pipeline push, still leaves it in S3.
-        _push_generated_file_to_s3(scan.pk, "bitonal.pdf")
-
-    with fitz.open(str(bitonal_path)) as pdf:
-        page_count = pdf.page_count
-    Scan.objects.filter(pk=scan.pk).update(page_count=page_count)
-    # ``.update()`` is a bare SQL write: it refreshes the row and leaves
-    # the caller's instance holding whatever it loaded. Keep the two in
-    # step, because callers read ``scan.page_count`` straight after this
-    # returns and would otherwise silently get the pre-conversion value.
-    scan.page_count = page_count
-    return bitonal_path
-
-
-def _run_yolo(scan_pk: int, pdf_path: str, output_dir: str) -> None:
-    """Run YOLO detection via runpod_client (local or remote).
-
-    In local mode (``RUNPOD_ENABLED=False``) the client calls
-    ``bl_detect`` in-process; its per-model and per-batch progress is
-    printed to stdout, which ``_ProgressWriter`` captures and relays
-    to the scan's progress fields. In remote mode the client's own
-    coarse events (``_remote_progress``) drive progress instead, and
-    the stdout capture simply sees no blackletter output.
-
-    :param scan_pk: Primary key of the scan (for progress updates).
-    :param pdf_path: Path to the PDF to run detection on.
-    :param output_dir: Directory where detections.json will be saved.
-    """
-    import io
-    import sys
-
-    from scanning import runpod_client
-
-    _update_progress(scan_pk, "YOLO detection: loading models...")
-    scan = Scan.objects.get(pk=scan_pk)
-
-    real_stdout = sys.stdout
-
-    class _ProgressWriter(io.TextIOBase):
-        """Intercept bl_detect stdout and relay to _update_progress."""
-
-        def __init__(self):
-            self._buf = ""
-
-        def write(self, s):
-            real_stdout.write(s)
-            real_stdout.flush()
-            self._buf += s
-            while "\n" in self._buf:
-                line, self._buf = self._buf.split("\n", 1)
-                self._handle_line(line.strip())
-            return len(s)
-
-        def flush(self):
-            real_stdout.flush()
-
-        def _handle_line(self, line):
-            if not line:
-                return
-            # "Detecting with small..."
-            if line.startswith("Detecting with"):
-                model = line.replace("Detecting with", "").strip().rstrip(".")
-                _update_progress(scan_pk, f"YOLO detection: {model}...")
-            # "  23/23 pages"
-            elif "/" in line and "pages" in line:
-                _update_progress(scan_pk, f"YOLO detection: {line}")
-            # "  small done (2s)"
-            elif "done" in line:
-                _update_progress(scan_pk, f"YOLO: {line}")
-            # "363 detections (786 raw from 3 models)"
-            elif "detections" in line:
-                _update_progress(scan_pk, f"YOLO: {line}")
-
-    def _remote_progress(current, total, message):
-        _update_progress(scan_pk, message)
-
-    with _log_stage("YOLO detection"):
-        sys.stdout = _ProgressWriter()
-        try:
-            detections = runpod_client.detect(
-                scan,
-                pdf_path,
-                models=["small", "medium", "large"],
-                progress_callback=_remote_progress,
-            )
-        finally:
-            sys.stdout = real_stdout
-
-    # ``bl_detect`` used to write detections.json as a side effect;
-    # preserve that here so ``_import_detections_from_json`` (and any
-    # other disk consumers) still see the file.
-    (Path(output_dir) / "detections.json").write_text(json.dumps(detections))
-    _update_progress(scan_pk, f"YOLO: {len(detections)} detections")
-
-
-def _reuse_detect_result(scan: "Scan", output_dir: str) -> bool:
-    """Rehydrate detections.json from a finished detect job, if there is one.
-
-    The resume path for step 4. A daemon killed mid-pipeline re-queues
-    the scan and ``run_full_pipeline`` restarts at step 1, so a detect
-    that already completed would otherwise be re-submitted: another
-    ~200 s of GPU time to recompute detections that are already on S3,
-    overwriting the result object with an identical one.
-
-    Only ``run_full_pipeline`` calls this. :func:`run_detect` goes
-    straight to :func:`_run_yolo`, because re-running detection is the
-    whole point of invoking it; :func:`run_reprocess` likewise leaves
-    ``reuse`` off when it re-validates.
-
-    :param scan: The Scan being processed.
-    :param output_dir: Directory where detections.json is written.
-    :returns: Whether detections.json now holds a reusable result.
-    :rtype: bool
-    """
-    from scanning import runpod_client, s3_sync
-
-    payload = runpod_client.reusable_result(
-        scan, "detect", s3_sync.PIPELINE_INPUT_NAME
-    )
-    if payload is None:
-        return False
-
-    detections = payload.get("detections")
-    if not isinstance(detections, list):
-        return False
-
-    # Backstop on the timestamp check. That comparison only notices an
-    # edited input if the edit changed the object's size, so confirm the
-    # result describes a PDF with this many pages. ``_ensure_bitonal``
-    # has just refreshed ``page_count`` off the current file, and a page
-    # insert or delete moves it.
-    page_count = scan.page_count or 0
-    if page_count and any(
-        d.get("page_index", 0) >= page_count for d in detections
-    ):
-        logger.warning(
-            "stored detect result for scan %s references pages past the "
-            "current %d-page PDF; re-running detection",
-            scan.pk,
-            page_count,
-        )
-        return False
-
-    (Path(output_dir) / "detections.json").write_text(json.dumps(detections))
-    _update_progress(
-        scan.pk,
-        f"YOLO: reused {len(detections)} detections from the last run",
-    )
-    logger.info(
-        "Reused %d detections for scan %s; skipped the detect job",
-        len(detections),
-        scan.pk,
-    )
-    return True
-
-
 def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
     """Widen this scan's ``TEXT_COLUMN`` detections onto the text they clip.
 
@@ -664,78 +474,6 @@ def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
     return len(changed)
 
 
-def _import_detections_from_json(scan_pk: int, output_dir: str) -> list:
-    """Load detections.json from disk into Detection model.
-
-    Clears existing detections first.
-
-    :param scan_pk: Primary key of the scan to import detections for.
-    :param output_dir: Directory containing detections.json.
-    :return: The raw detection list from the JSON file.
-    """
-    det_path = Path(output_dir) / "detections.json"
-    dets = json.loads(det_path.read_text())
-
-    Detection.objects.filter(scan_id=scan_pk).delete()
-    det_objects = []
-    for d in dets:
-        try:
-            label_name = Label(d["label_id"]).name
-        except (ValueError, KeyError):
-            label_name = d.get("label", "UNKNOWN")
-        det_objects.append(
-            Detection(
-                scan_id=scan_pk,
-                page_index=d["page_index"],
-                label=label_name,
-                label_id=d["label_id"],
-                confidence=d["confidence"],
-                x0=d["bbox"][0],
-                y0=d["bbox"][1],
-                x1=d["bbox"][2],
-                y1=d["bbox"][3],
-                img_width=d.get("img_width", 0),
-                img_height=d.get("img_height", 0),
-                model_name=d.get("found_by", [{}])[0].get("model", ""),
-                model_count=d.get("model_count", 1),
-                found_by=d.get("found_by", []),
-            )
-        )
-    Detection.objects.bulk_create(det_objects)
-    return dets
-
-
-def _delete_page_and_detections(
-    scan: "Scan",
-    scan_pk: int,
-    page_idx: int,
-    output_dir: Path | None,
-) -> None:
-    """Remove a page from all PDFs, then delete/shift its detections.
-
-    For each PDF in ``_collect_pdf_paths(scan, output_dir)``, deletes
-    the page at ``page_idx`` (if in bounds) and saves incrementally.
-    Then deletes Detection rows on that page and shifts the
-    ``page_index`` of subsequent detections down by 1.
-
-    :param scan: The Scan instance.
-    :param scan_pk: Primary key of the scan.
-    :param page_idx: Zero-based index of the page to delete.
-    :param output_dir: Output directory (passed to
-        ``_collect_pdf_paths``).
-    """
-    for pdf_path in _collect_pdf_paths(scan, output_dir):
-        with fitz.open(str(pdf_path)) as doc:
-            if 0 <= page_idx < doc.page_count:
-                doc.delete_page(page_idx)
-                doc.saveIncr()
-
-    Detection.objects.filter(scan_id=scan_pk, page_index=page_idx).delete()
-    Detection.objects.filter(scan_id=scan_pk, page_index__gt=page_idx).update(
-        page_index=F("page_index") - 1
-    )
-
-
 def _page_number_lookup(scan: "Scan") -> dict:
     """Build {page_index: (page_number, page_number_end)} from ocr_results.
 
@@ -796,48 +534,6 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
     except Exception:
         logger.exception(
             "Failed to push processing files to S3 for scan %s", scan_pk
-        )
-
-
-def _push_generated_file_to_s3(scan_pk: int, relative_path: str) -> None:
-    """Upload a single just-generated processing file to S3 immediately.
-
-    Persists derived artifacts (``bitonal.pdf``) the moment
-    they are produced rather than only at the end-of-pipeline push, so a
-    later crash, or a ``reprocess`` run that never does the full push,
-    still leaves them in S3. Mirrors the credential guard in
-    ``_push_processing_files_to_s3`` so a missing-creds misconfiguration
-    in prod surfaces a distinct Sentry error.
-
-    Prod-only in practice: in local dev ``upload_file_to_s3`` is a no-op
-    (S3 disabled), and the file is already on disk under ``output_dir``,
-    so it is served locally without any upload.
-
-    :param scan_pk: Primary key of the scan the file belongs to.
-    :param relative_path: Path relative to the scan's output dir.
-    :return: None.
-    """
-    from scanning import s3_sync
-    from scanning.utils import has_s3_credentials
-
-    if (
-        not settings.DEVELOPMENT
-        and not getattr(settings, "TESTING", False)
-        and not has_s3_credentials()
-    ):
-        logger.error(
-            "Skipping S3 push of %s for scan %s: AWS credentials not "
-            "configured",
-            relative_path,
-            scan_pk,
-        )
-        return
-    try:
-        scan = Scan.objects.get(pk=scan_pk)
-        s3_sync.upload_file_to_s3(scan, relative_path)
-    except Exception:
-        logger.exception(
-            "Failed to push %s to S3 for scan %s", relative_path, scan_pk
         )
 
 
@@ -1217,200 +913,6 @@ def _build_combined_redactions(scan_pk: int) -> Path:
     return out_path
 
 
-def _re_pair_opinions(scan_pk: int) -> list:
-    """Re-pair opinions from current DB detections.
-
-    :param scan_pk: Primary key of the scan to re-pair.
-    :return: The list of paired opinion dicts.
-    """
-    scan = Scan.objects.get(pk=scan_pk)
-    det_data = _sync_detections_to_disk(scan_pk)
-    if not det_data:
-        return []
-
-    pdf_path = processing_pdf_path(scan)
-    with _log_stage("Opinion pairing"):
-        opinions = bl_pair(
-            det_data,
-            str(pdf_path),
-            reporter=scan.reporter.short_name or "",
-            volume=str(scan.volume) or "",
-            first_page=scan.start_page or 1,
-        )
-    Scan.objects.filter(pk=scan_pk).update(
-        opinions_json=opinions,
-    )
-    return opinions
-
-
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
-
-def _dispatch_analyze(
-    scan_pk: int,
-    pdf_path: str,
-    stream_partial: bool = False,
-) -> list[dict]:
-    """Shared scaffolding for submitting an analyze job via runpod_client.
-
-    Fetches the scan, builds ``exp_start`` / ``exp_end``, wires up a
-    progress callback (with optional live partial writes), calls
-    ``runpod_client.analyze``, and returns the raw results list.
-
-    :param scan_pk: Primary key of the scan to analyze.
-    :param pdf_path: Path to the PDF to run analysis on.
-    :param stream_partial: If ``True``, the progress callback writes
-        per-page partial results to ``Scan.ocr_results`` as pages
-        arrive (local mode only; remote mode emits ``current=None``
-        so no partial writes happen there). If ``False``, only coarse
-        submit/queued events fire.
-    :returns: The ``results`` list from the analyze response.
-    :rtype: list[dict]
-    """
-    from scanning import runpod_client
-
-    scan = Scan.objects.get(pk=scan_pk)
-    exp_start = scan.start_page or 1
-    exp_end = scan.end_page
-
-    all_results: list[dict] = []
-
-    def _progress(current, total, message):
-        _update_progress(scan_pk, message, current=current, total=total)
-        if (
-            stream_partial
-            and current is not None
-            and current <= len(all_results)
-        ):
-            Scan.objects.filter(pk=scan_pk).update(
-                ocr_results=all_results[:current],
-            )
-
-    result = runpod_client.analyze(
-        scan,
-        pdf_path,
-        exp_start=exp_start,
-        exp_end=exp_end,
-        num_workers=1,
-        progress_callback=_progress,
-    )
-    all_results = result["results"]
-    return all_results
-
-
-def run_paddleocr_validation(
-    scan_pk: int, pdf_path: str, reuse: bool = False
-) -> None:
-    """Validate page numbers using the runpod_client analyze action.
-
-    In local mode (``RUNPOD_ENABLED=False``) this calls
-    ``blackletter.analyze.analyze_pdf`` in-process with the same
-    ``num_workers=1`` the previous implementation used. In remote
-    mode the analysis runs on a RunPod Serverless GPU worker and
-    only coarse ``(None, None, status)`` progress events fire
-    (per-page partial results are lost).
-
-    :param scan_pk: Primary key of the scan to validate.
-    :param pdf_path: Path to the PDF to run validation on.
-    :param reuse: When True, consume a finished analyze job's stored
-        result instead of submitting a new one, if the stored result was
-        written after the current ``pdf_path`` reached S3. Off by
-        default so every caller that means "analyze this again" keeps
-        doing exactly that; only the resume path in
-        :func:`run_full_pipeline` sets it.
-    """
-    from scanning import runpod_client
-
-    all_results = None
-    if reuse:
-        payload = runpod_client.reusable_result(
-            Scan.objects.get(pk=scan_pk), "analyze", Path(pdf_path).name
-        )
-        if payload is not None and isinstance(payload.get("results"), list):
-            all_results = payload["results"]
-            _update_progress(
-                scan_pk,
-                f"Page numbers: reused {len(all_results)} page result(s) "
-                "from the last run",
-            )
-            logger.info(
-                "Reused %d analyze result(s) for scan %s; skipped the job",
-                len(all_results),
-                scan_pk,
-            )
-
-    if all_results is None:
-        with _log_stage("PaddleOCR validation"):
-            all_results = _dispatch_analyze(
-                scan_pk, pdf_path, stream_partial=False
-            )
-    Scan.objects.filter(pk=scan_pk).update(ocr_results=all_results)
-    _rebuild_issues_from_results(scan_pk, all_results)
-
-
-def run_incremental_validation(scan_pk: int, pdf_path: str) -> None:
-    """Run YOLO + PaddleOCR on every page via the runpod_client.
-
-    In local mode, ``blackletter.analyze.analyze_pdf`` is called with
-    its default parallelism and the per-page progress callback drives
-    live partial results into ``ocr_results`` so the frontend can
-    render the sidebar incrementally. In remote mode, the entire run
-    happens on the GPU worker and only coarse progress events fire;
-    the live partial display is skipped because ``current`` is
-    ``None`` until the final return value arrives.
-
-    :param scan_pk: Primary key of the scan to validate.
-    :param pdf_path: Path to the PDF to run validation on.
-    """
-    all_results = _dispatch_analyze(scan_pk, pdf_path, stream_partial=True)
-
-    # Save detections from each page result
-    Detection.objects.filter(scan_id=scan_pk).delete()
-    all_detections = []
-    for r in all_results:
-        page_idx = r["pdf_page"] - 1
-        img_w = r.get("img_width", 0)
-        img_h = r.get("img_height", 0)
-        for d in r.get("detections", []):
-            try:
-                label_name = Label(d["label_id"]).name
-            except (ValueError, KeyError):
-                continue
-            all_detections.append(
-                Detection(
-                    scan_id=scan_pk,
-                    page_index=page_idx,
-                    label=label_name,
-                    label_id=d["label_id"],
-                    confidence=d["confidence"],
-                    x0=d["bbox"][0],
-                    y0=d["bbox"][1],
-                    x1=d["bbox"][2],
-                    y1=d["bbox"][3],
-                    img_width=img_w,
-                    img_height=img_h,
-                    model_name=Detection.ModelName.LARGE,
-                    model_count=1,
-                    found_by=[
-                        {"model": "large", "confidence": d["confidence"]}
-                    ],
-                )
-            )
-    if all_detections:
-        Detection.objects.bulk_create(all_detections)
-        _snap_text_columns_to_ink(scan_pk, pdf_path)
-
-    Scan.objects.filter(pk=scan_pk).update(
-        ocr_results=all_results,
-    )
-
-    _sync_detections_to_disk(scan_pk)
-
-    _rebuild_issues_from_results(scan_pk, all_results)
-
-
 # ---------------------------------------------------------------------------
 # Recalculate (rebuild issues without re-running OCR)
 # ---------------------------------------------------------------------------
@@ -1596,78 +1098,30 @@ def recalculate_issues(scan: "Scan") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Validate with bitonal (shared by queue_upload and start_validate)
-# ---------------------------------------------------------------------------
-
-
-def run_validate_with_bitonal(scan_pk: int) -> None:
-    """Convert to bitonal (if needed) then run incremental validation.
-
-    Designed to run in the daemon process.
-
-    :param scan_pk: Primary key of the scan to validate.
-    """
-    django.db.connections.close_all()
-    _pull_processing_files_from_s3(scan_pk)
-
-    try:
-        scan = Scan.objects.get(pk=scan_pk)
-    except Exception:
-        traceback.print_exc()
-        return
-
-    try:
-        logger.info("[validate] scan %s pdf_path=%s", scan_pk, scan.pdf_path)
-        output_dir = ensure_output_dir(scan)
-        bitonal_path = _ensure_bitonal(scan, output_dir)
-        run_incremental_validation(scan_pk, str(bitonal_path))
-        _push_processing_files_to_s3(scan_pk)
-
-    except Exception as exc:
-        _handle_pipeline_exception(scan_pk, exc, context="validate")
-
-
-# ---------------------------------------------------------------------------
 # Full pipeline (upload and walk away)
 # ---------------------------------------------------------------------------
 
 
 def run_full_pipeline(scan_pk: int) -> None:
-    """Run the full processing pipeline: bitonal → YOLO → validate → pair.
+    """Run the interim upload pipeline: shard the original, then park.
 
-    Designed to run in the daemon process. After this completes, the scan
-    is ready for review -- the user only needs to approve and generate.
+    Designed to run in the daemon process.
 
-    Resumable across a daemon restart. There is no stage bookkeeping: each
-    step decides for itself whether its output already exists and is still
-    valid for the current input, so a re-queued scan skips what finished
-    rather than restarting at step 1. That matters because the daemon takes
-    a SIGTERM on every deploy and re-queues whatever was mid-flight, and
-    steps 4 and 6 are GPU jobs measured in minutes. See
-    :func:`_reuse_detect_result` and ``runpod_client.reusable_result``.
-    Sharding (step 2) follows the same contract through its manifest's
-    source fingerprint (``sharding.ensure_shards``).
+    The legacy stages that used to follow the sharding -- bitonal
+    conversion, YOLO detection, PaddleOCR page-number validation and
+    opinion pairing -- were disconnected when the pipeline moved to the
+    new OCR stack (issue #173). Until the dots.mocr page-number adapter
+    (#149) replaces the retired PaddleOCR path, a scan is done as soon
+    as its shard set is committed: it parks in
+    ``Status.AWAITING_VALIDATION`` with a progress message telling
+    scanners that validation is temporarily disabled. The dots.mocr
+    dispatch will slot in between the sharding and the park once its
+    client wiring (#147) lands.
 
-    There is no "re-run anyway" argument here on purpose. The daemon
-    dispatches this by name with only a pk, so a caller wanting fresh
-    results has nowhere to put one; it says so by deleting the stored
-    results instead (``s3_sync.invalidate_job_results``, which is what
-    the Re-validate action does). That survives the hand-off through the
-    queue, which a parameter could not.
-
-    No text layer is embedded here. The ocrmypdf/Tesseract pass used to
-    run between bitonal conversion and detection and dominated the
-    pipeline's wall clock, while nothing in steps 1 and 2 reads the text
-    it produced; ``bitonal.pdf`` is now the processing PDF end to end
-    (see ``utils.find_processing_pdf``).
-
-    No redaction geometry is computed here either, for the same reason.
-    The column correction and the redaction rects cost three full-volume
-    renders at 100 dpi between them, and review 1 reads neither: it asks
-    whether the volume is complete and shows no detection overlay. Both
-    now run in :func:`run_generate_files`, where the geometry is actually
-    read, so a scanner waits for detection and pairing only. The step 2
-    overlay still gets rects on demand through ``compute_redactions_api``.
+    Still resumable across a daemon restart: ``ensure_shards`` is
+    idempotent through its manifest's source fingerprint, so a
+    re-queued scan verifies the committed set and moves on rather than
+    re-cutting it.
 
     :param scan_pk: Primary key of the scan to process.
     """
@@ -1681,372 +1135,34 @@ def run_full_pipeline(scan_pk: int) -> None:
         return
 
     try:
-        # 1. Ensure output directory exists
-        output_dir = ensure_output_dir(scan)
+        ensure_output_dir(scan)
 
-        # 2. Shard the original for external job execution (#164).
-        # Runs first so dots.mocr/bitonal jobs can fan out over the
-        # shards as soon as possible after upload.
+        # Shard the original for external job execution (#164), so
+        # dots.mocr jobs can fan out over the shards as soon as the
+        # dispatch for them exists.
         _update_progress(scan_pk, "Sharding original PDF...")
         _ensure_shards(scan)
 
-        # 3. Bitonal conversion
-        bitonal_path = _ensure_bitonal(scan, output_dir)
-
-        # 4. YOLO detection (all 3 models on bitonal)
-        if not _reuse_detect_result(scan, str(output_dir)):
-            _run_yolo(scan_pk, str(bitonal_path), str(output_dir))
-
-        # 5. Import detections into DB
-        _update_progress(scan_pk, "Importing detections...")
-        dets = _import_detections_from_json(scan_pk, str(output_dir))
-
-        # 6. PaddleOCR validation (on original PDF for better OCR)
-        _update_progress(
-            scan_pk,
-            f"{len(dets)} detections imported. Running page number validation...",
-        )
-        run_paddleocr_validation(scan_pk, scan.pdf_path, reuse=True)
-
-        # 7. Pair opinions
-        _update_progress(scan_pk, "Pairing opinions...")
-        opinions = _re_pair_opinions(scan_pk)
-
-        # Redaction and margin geometry is deliberately not computed here;
-        # Generate Files does it. See this function's docstring.
+        # ``page_count`` used to be refreshed off ``bitonal.pdf`` by the
+        # retired conversion stage; read it off the original instead so
+        # the list and detail pages keep showing it for new uploads.
+        with fitz.open(scan.pdf_path) as pdf:
+            page_count = pdf.page_count
 
         Scan.objects.filter(pk=scan_pk).update(
-            status=Status.PENDING_REVIEW,
+            status=Status.AWAITING_VALIDATION,
+            page_count=page_count,
             progress_message=(
-                f"Done, {len(dets)} detections, {len(opinions)} opinions"
+                "Uploaded and sharded. Page-number validation is "
+                "temporarily disabled while the pipeline is rebuilt on "
+                "the new OCR stack; this scan will be processed once "
+                "that lands."
             ),
         )
         _push_processing_files_to_s3(scan_pk)
 
     except Exception as exc:
         _handle_pipeline_exception(scan_pk, exc, context="pipeline")
-
-
-# ---------------------------------------------------------------------------
-# Reprocess (apply fixes, re-bitonal, re-detect, re-validate)
-# ---------------------------------------------------------------------------
-
-
-def _rebuild_issues_from_results(scan_pk: int, all_results: list) -> None:
-    """Re-analyze ocr_results and rebuild issues/page_map without re-running OCR.
-
-    Preserves the actual OCR results (including manual assignments) but
-    recalculates sequence issues, missing pages, duplicates, etc.
-
-    The analysis now comes from :func:`blackletter.validate.build_analysis`
-    rather than being assembled here, which makes this path agree with
-    ``recalculate_issues`` and ``rebuild_page_map`` where it used to differ
-    in three ways, all of them this path being wrong:
-
-    - a page printed as a range ("677-685") now accounts for every number it
-      covers, so those no longer show up as missing
-    - out-of-range readings now reach ``build_issues``, which both reports
-      them and stops them anchoring duplicate detection
-    - a scan with no ``end_page`` now gets missing-page findings across the
-      span it actually detected, instead of none at all
-
-    :param scan_pk: Primary key of the scan to rebuild issues for.
-    :param all_results: List of per-page OCR result dicts.
-    """
-    scan = Scan.objects.get(pk=scan_pk)
-    total = len(all_results)
-    exp_start = scan.start_page or 1
-    exp_end = scan.end_page
-
-    out_of_range, seen_nums = _split_in_out_of_range(
-        all_results, exp_start, exp_end
-    )
-    # Hand-entered numbers outrank the offset heuristic, and blackletter's
-    # _auto_correct does not know about them, so withhold them here. This
-    # keeps a rebuild from clobbering what a recheck preserves.
-    all_results, corrections = _auto_correct(
-        all_results,
-        [r for r in out_of_range if not _is_manual_read(r)],
-        seen_nums,
-    )
-    if corrections:
-        out_of_range, seen_nums = _split_in_out_of_range(
-            all_results, exp_start, exp_end
-        )
-
-    # Auto-correction can move a page in or out of range, so the split done
-    # above is the one that applies and blackletter must not recompute it.
-    analysis = build_analysis(
-        all_results, exp_start, exp_end, out_of_range=out_of_range
-    )
-
-    result = build_issues(analysis, total, exp_start, exp_end)
-
-    scan.refresh_from_db()
-    scan.page_count = total
-    scan.page_map = result.get("page_map", [])
-    scan.missing_pages = result.get("missing_pages", [])
-    scan.ocr_results = all_results
-
-    scan.status = Status.PENDING_REVIEW
-    scan.s3_uploaded = False
-    scan.progress_message = "Done"
-    scan.save()
-
-    Issue.objects.filter(scan=scan).exclude(
-        check_name=CheckName.SUPPRESS_DETECTION
-    ).delete()
-    Issue.objects.bulk_create(
-        [Issue(scan=scan, **d) for d in result.get("issues", [])]
-    )
-
-
-def run_reprocess(scan_pk: int) -> None:
-    """Apply PDF fixes (inserts/deletions) using smart edits.
-
-    Reads page numbers off newly inserted pages only. Deleted pages are
-    removed from
-    ocr_results. Manual page assignments are preserved.
-
-    Designed to run in the daemon process.
-
-    :param scan_pk: Primary key of the scan to reprocess.
-    """
-    django.db.connections.close_all()
-    _pull_processing_files_from_s3(scan_pk)
-
-    scan = Scan.objects.get(pk=scan_pk)
-
-    try:
-        has_deletions = scan.deletions.exists()
-        has_inserts = scan.inserts.exists()
-
-        if not has_deletions and not has_inserts:
-            # Nothing changed — just rebuild issues from existing results
-            _update_progress(scan_pk, "Re-checking...")
-            all_results = scan.ocr_results
-            _rebuild_issues_from_results(scan_pk, all_results)
-            _re_pair_opinions(scan_pk)
-            return
-
-        output_dir = Path(scan.output_dir) if scan.output_dir else None
-        page_map = scan.page_map
-        all_results = scan.ocr_results
-
-        # Stale margin/redaction rects are indexed by old page positions, clear them
-        Scan.objects.filter(pk=scan_pk).update(
-            margin_rects="", redaction_rects=""
-        )
-
-        # Apply deletions (process in reverse order to keep indices stable)
-        if has_deletions:
-            _update_progress(scan_pk, "Deleting pages...")
-            deleted_pdf_pages = sorted(
-                (d.pdf_page for d in scan.deletions.all()), reverse=True
-            )
-            for pdf_page in deleted_pdf_pages:
-                page_idx = pdf_page - 1
-                _delete_page_and_detections(
-                    scan, scan_pk, page_idx, output_dir
-                )
-
-                # Remove from ocr_results and shift pdf_page numbers
-                all_results = [
-                    r for r in all_results if r["pdf_page"] != pdf_page
-                ]
-                for r in all_results:
-                    if r["pdf_page"] > pdf_page:
-                        r["pdf_page"] -= 1
-
-            scan.deletions.all().delete()
-
-        # After deletions, rebuild page_map so inserts use correct pdf indices
-        if has_deletions:
-            Scan.objects.filter(pk=scan_pk).update(ocr_results=all_results)
-            _rebuild_issues_from_results(scan_pk, all_results)
-            scan.refresh_from_db()
-            page_map = scan.page_map
-
-        # Apply inserts
-        if has_inserts:
-            _update_progress(scan_pk, "Inserting pages...")
-            inserts = {
-                ins.logical_page_number: ins for ins in scan.inserts.all()
-            }
-            for i, entry in enumerate(page_map):
-                if entry.get("type") != "missing":
-                    continue
-                logical_num = entry.get("logical_number")
-                if logical_num not in inserts:
-                    continue
-                run_smart_insert(
-                    scan_pk, logical_num, inserts[logical_num].image.path
-                )
-
-            scan.inserts.all().delete()
-
-        # run_smart_insert already handled detection, validation,
-        # re-pairing, and rect computation for each insert. Reload the
-        # final state from the DB.
-        scan.refresh_from_db()
-        all_results = scan.ocr_results
-
-        # Final rebuild with the fully updated results
-        _update_progress(scan_pk, "Rebuilding issues...")
-        _rebuild_issues_from_results(scan_pk, all_results)
-        _re_pair_opinions(scan_pk)
-
-        if output_dir:
-            pdf_path = processing_pdf_path(scan)
-            Scan.objects.filter(pk=scan_pk).update(
-                margin_rects="", redaction_rects=""
-            )
-            _compute_and_save_margin_rects(scan_pk, pdf_path, str(output_dir))
-            _compute_and_save_redaction_rects(scan_pk, pdf_path)
-
-        Scan.objects.filter(pk=scan_pk).update(
-            status=Status.PENDING_REVIEW,
-            s3_uploaded=False,
-            progress_message="Done",
-        )
-        _push_processing_files_to_s3(scan_pk)
-
-    except Exception as exc:
-        _handle_pipeline_exception(scan_pk, exc, context="reprocess")
-
-
-# ---------------------------------------------------------------------------
-# Smart page edits (patch single pages without full re-run)
-# ---------------------------------------------------------------------------
-
-
-def run_smart_delete(scan_pk: int, pdf_page: int) -> None:
-    """Delete a single page and patch detections/validation in place.
-
-    Removes the page from every PDF the scan keeps on disk (the original,
-    ``bitonal.pdf``, and a legacy OCR PDF if one is still there); deletes
-    detections on that page; shifts subsequent detection page_index
-    values down by 1; re-runs PaddleOCR validation and re-pairs.
-
-    :param scan_pk: Primary key of the scan to edit.
-    :param pdf_page: 1-based PDF page number to delete.
-    """
-    scan = Scan.objects.get(pk=scan_pk)
-    page_idx = pdf_page - 1
-    output_dir = Path(scan.output_dir) if scan.output_dir else None
-
-    _delete_page_and_detections(scan, scan_pk, page_idx, output_dir)
-
-    # Update page count
-    with fitz.open(scan.pdf_path) as pdf:
-        new_count = pdf.page_count
-    Scan.objects.filter(pk=scan_pk).update(page_count=new_count)
-
-    # Sync detections to disk and re-validate/re-pair
-    if output_dir:
-        _sync_detections_to_disk(scan_pk)
-
-    run_paddleocr_validation(scan_pk, scan.pdf_path)
-    _re_pair_opinions(scan_pk)
-
-    if output_dir:
-        _compute_and_save_redaction_rects(scan_pk, processing_pdf_path(scan))
-
-
-def run_smart_insert(
-    scan_pk: int, logical_page_number: int, image_path: str
-) -> None:
-    """Insert a page and run detection/validation on just that page.
-
-    Inserts the page image into every PDF the scan keeps on disk (the
-    original, ``bitonal.pdf``, and a legacy OCR PDF if one is still
-    there) at the correct position; shifts subsequent detection
-    page_index values up by 1; re-validates and re-pairs.
-
-    :param scan_pk: Primary key of the scan to edit.
-    :param logical_page_number: The logical page number to insert at.
-    :param image_path: Path to the image or PDF file to insert.
-    """
-    scan = Scan.objects.get(pk=scan_pk)
-    output_dir = Path(scan.output_dir) if scan.output_dir else None
-
-    # Determine insertion position from page_map
-    page_map = scan.page_map
-    with fitz.open(scan.pdf_path) as pdf:
-        insert_idx = len(pdf)  # default: append
-    for i, entry in enumerate(page_map):
-        if entry.get("logical_number") == logical_page_number:
-            # Insert before the next pdf_page entry
-            for j in range(i + 1, len(page_map)):
-                if page_map[j].get("type") == "pdf_page":
-                    insert_idx = page_map[j]["pdf_index"]
-                    break
-            break
-
-    # Insert into all PDFs
-    for pdf_path in _collect_pdf_paths(scan, output_dir):
-        with fitz.open(str(pdf_path)) as doc:
-            ref_page = doc[min(insert_idx, doc.page_count - 1)]
-            w, h = ref_page.rect.width, ref_page.rect.height
-
-            if str(image_path).lower().endswith(".pdf"):
-                with fitz.open(str(image_path)) as insert_pdf:
-                    doc.insert_pdf(
-                        insert_pdf,
-                        from_page=0,
-                        to_page=insert_pdf.page_count - 1,
-                        start_at=insert_idx,
-                    )
-            else:
-                new_page = doc.new_page(pno=insert_idx, width=w, height=h)
-                new_page.insert_image(new_page.rect, filename=str(image_path))
-            doc.saveIncr()
-
-    # Shift subsequent detections up
-    Detection.objects.filter(
-        scan_id=scan_pk, page_index__gte=insert_idx
-    ).update(page_index=F("page_index") + 1)
-
-    # Update page count
-    with fitz.open(scan.pdf_path) as pdf:
-        new_count = pdf.page_count
-    Scan.objects.filter(pk=scan_pk).update(page_count=new_count)
-
-    # Sync detections to disk
-    if output_dir:
-        _sync_detections_to_disk(scan_pk)
-
-    # Re-validate, re-pair, recompute rects
-    scan.refresh_from_db()
-    pdf_path = processing_pdf_path(scan)
-    run_incremental_validation(scan_pk, pdf_path)
-    _re_pair_opinions(scan_pk)
-
-    if output_dir:
-        Scan.objects.filter(pk=scan_pk).update(
-            margin_rects="", redaction_rects=""
-        )
-        _compute_and_save_margin_rects(scan_pk, pdf_path, str(output_dir))
-        _compute_and_save_redaction_rects(scan_pk, pdf_path)
-
-
-def _collect_pdf_paths(scan: "Scan", output_dir: str | None) -> list[Path]:
-    """Collect all PDF paths that need page edits applied.
-
-    :param scan: The Scan instance to collect paths for.
-    :param output_dir: Output directory to check for bitonal/OCR PDFs.
-    :return: List of Path objects for all relevant PDFs.
-    """
-    paths = [Path(scan.pdf_path)]
-    if output_dir:
-        output_dir = Path(output_dir)
-        bitonal = output_dir / "bitonal.pdf"
-        if bitonal.exists():
-            paths.append(bitonal)
-        ocr_pdf = find_ocr_pdf(str(output_dir))
-        if ocr_pdf and Path(ocr_pdf) not in paths:
-            paths.append(Path(ocr_pdf))
-    return paths
 
 
 # ---------------------------------------------------------------------------
@@ -2585,49 +1701,6 @@ def _sync_pages_for_scan(scan_pk: int) -> int:
         n += 1
 
     return n
-
-
-# ---------------------------------------------------------------------------
-# Detect (run YOLO detection + opinion pairing)
-# ---------------------------------------------------------------------------
-
-
-def run_detect(scan_pk: int) -> None:
-    """Run YOLO detection and pair opinions.
-
-    Designed to run in the daemon process.
-
-    :param scan_pk: Primary key of the scan to detect on.
-    """
-    django.db.connections.close_all()
-    _pull_processing_files_from_s3(scan_pk)
-
-    scan = Scan.objects.get(pk=scan_pk)
-    try:
-        output_dir = Path(scan.output_dir)
-        bitonal = output_dir / "bitonal.pdf"
-        pdf_path = str(bitonal) if bitonal.exists() else scan.pdf_path
-
-        _run_yolo(scan_pk, pdf_path, str(output_dir))
-        dets = _import_detections_from_json(scan_pk, str(output_dir))
-        _snap_text_columns_to_ink(scan_pk, pdf_path)
-
-        _update_progress(
-            scan_pk,
-            f"{len(dets)} detections. Pairing opinions...",
-        )
-
-        opinions = _re_pair_opinions(scan_pk)
-
-        Scan.objects.filter(pk=scan_pk).update(
-            status=Status.PENDING_REVIEW,
-            s3_uploaded=False,
-            progress_message=f"Done, {len(dets)} detections, {len(opinions)} opinions",
-        )
-        _push_processing_files_to_s3(scan_pk)
-
-    except Exception as exc:
-        _handle_pipeline_exception(scan_pk, exc, context="detect")
 
 
 # ---------------------------------------------------------------------------

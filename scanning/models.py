@@ -77,6 +77,14 @@ class Status(models.TextChoices):
     UPLOADED = "uploaded", "Uploaded"
     QUEUED = "queued", "Queued"
     PROCESSING = "processing", "Processing"
+    # Interim parking state (issue #173): the upload-side pipeline
+    # (sharding, and soon the dots.mocr raw run) finished, but
+    # page-number validation is disabled until the dots.mocr adapter
+    # (#149) replaces the retired PaddleOCR path. Scans wait here, out
+    # of the review flow, so nothing downstream mistakes them for
+    # reviewed or errored volumes. #154 refines this into the final
+    # review-1 state model.
+    AWAITING_VALIDATION = "awaiting_validation", "Awaiting Validation"
     PENDING_REVIEW = "pending_review", "Pending Review"
     APPROVED = "approved", "Approved"
     EXTRACTED = "extracted", "Extracted"

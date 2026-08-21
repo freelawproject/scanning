@@ -1798,12 +1798,14 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         self.assertEqual(served, bitonal_bytes)
 
     def test_not_ready_returns_202_when_no_preview(self):
-        """With no preview anywhere, return 202 'still processing'."""
+        """With no preview and no original anywhere, return 202."""
         user = self.make_user()
         self.client.force_login(user)
 
         tmp_root = tempfile.mkdtemp()
         scan = ScanFactory(start_page=1, end_page=2, status=Status.PROCESSING)
+        # No local original either, or the #173 fallback would serve it.
+        os.remove(scan.original_pdf.path)
 
         with (
             override_settings(
@@ -1812,6 +1814,7 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch("scanning.s3_sync.download_preview_pdf"),
+            patch("scanning.s3_sync.download_original_pdf"),
         ):
             response = self.client.get(
                 reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
@@ -1823,16 +1826,24 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         self.assertEqual(data["scan_status"], Status.PROCESSING)
         self.assertIn("processing", data["message"].lower())
 
-    def test_original_is_never_served(self):
-        """Even with a local original and no preview, never stream it."""
+    def test_original_served_when_no_preview_exists(self):
+        """Without a bitonal preview, the original is the fallback.
+
+        Sync bitonal conversion was disconnected (issue #173), so scans
+        uploaded after the cutover have no ``bitonal.pdf`` until the
+        doctor-run replacement (#168) lands. Rather than showing those
+        scans as forever "still processing", the viewer gets the
+        original.
+        """
         user = self.make_user()
         self.client.force_login(user)
 
         tmp_root = tempfile.mkdtemp()
-        scan = ScanFactory(start_page=1, end_page=2, status=Status.QUEUED)
-        # The original PDF is resolvable locally; the endpoint must still
-        # refuse to serve it (it's the multi-GB file we never stream).
+        scan = ScanFactory(
+            start_page=1, end_page=2, status=Status.AWAITING_VALIDATION
+        )
         self.assertTrue(os.path.exists(scan.original_pdf.path))
+        original_bytes = pathlib.Path(scan.original_pdf.path).read_bytes()
 
         with (
             override_settings(
@@ -1846,8 +1857,9 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
             )
 
-        self.assertEqual(response.status_code, 202)
-        self.assertEqual(response.json()["status"], "not_ready")
+        self.assertEqual(response.status_code, 200)
+        served = b"".join(response.streaming_content)
+        self.assertEqual(served, original_bytes)
 
     def test_terminal_status_returns_409_not_202(self):
         """An errored scan is terminal: 409 so the viewer stops polling."""
@@ -1856,6 +1868,8 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
 
         tmp_root = tempfile.mkdtemp()
         scan = ScanFactory(start_page=1, end_page=2, status=Status.ERROR)
+        # No local original either, or the #173 fallback would serve it.
+        os.remove(scan.original_pdf.path)
 
         with (
             override_settings(
@@ -1864,6 +1878,7 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch("scanning.s3_sync.download_preview_pdf"),
+            patch("scanning.s3_sync.download_original_pdf"),
         ):
             response = self.client.get(
                 reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
@@ -2181,10 +2196,6 @@ class TestPendingChangesGuard(ScanningTestCase):
         # The pending deletion is untouched.
         self.assertTrue(self.scan.deletions.exists())
 
-    def test_start_validate_blocked(self):
-        """Re-validate is blocked while a deletion is pending."""
-        self._assert_blocked("start_validate")
-
     def test_start_detect_blocked(self):
         """Next: Detect is blocked while a deletion is pending."""
         self._assert_blocked("start_detect")
@@ -2193,42 +2204,68 @@ class TestPendingChangesGuard(ScanningTestCase):
         """Recheck is blocked while a deletion is pending."""
         self._assert_blocked("recalculate")
 
-    def test_start_validate_allowed_without_pending(self):
-        """With no pending changes, Re-validate queues the scan."""
-        self.scan.deletions.all().delete()
-        response = self.client.post(
-            reverse("start_validate", kwargs={"pk": self.scan.pk})
-        )
-        self.assertEqual(response.status_code, 302)
-        self.scan.refresh_from_db()
-        self.assertEqual(self.scan.status, Status.QUEUED)
-        self.assertEqual(self.scan.queued_action, QueuedAction.FULL_PIPELINE)
+    def test_start_validate_refuses_and_keeps_stored_results(self):
+        """Re-validate is paused entirely by the #173 cutover.
 
-    def test_start_validate_drops_stored_gpu_results(self):
-        """Re-validate means re-run, so the resume cache must be cleared.
-
-        ``run_full_pipeline`` reuses a finished detect/analyze whose input
-        PDF hasn't changed, which is what makes a re-queue after a deploy
-        cheap. This button says "re-run from scratch" and warns about GPU
-        cost; without the invalidation it would hand back exactly the
-        detections the scan already had.
+        The pipeline it re-ran was disconnected, so the view refuses
+        with the unified message instead of queueing -- and it must not
+        invalidate the stored GPU results the way the live button did,
+        since nothing would regenerate them.
         """
         self.scan.deletions.all().delete()
         with patch("scanning.s3_sync.invalidate_job_results") as invalidate:
-            self.client.post(
-                reverse("start_validate", kwargs={"pk": self.scan.pk})
-            )
-        invalidate.assert_called_once()
-        self.assertEqual(invalidate.call_args.args[0].pk, self.scan.pk)
-
-    def test_blocked_start_validate_leaves_stored_results_alone(self):
-        """A refused action must not throw away a reusable result."""
-        PageDeletion.objects.create(scan=self.scan, pdf_page=3)
-        with patch("scanning.s3_sync.invalidate_job_results") as invalidate:
-            self.client.post(
+            response = self.client.post(
                 reverse("start_validate", kwargs={"pk": self.scan.pk})
             )
         invalidate.assert_not_called()
+        self.assertRedirects(
+            response,
+            reverse("scan_process", kwargs={"pk": self.scan.pk}),
+            fetch_redirect_response=False,
+        )
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, Status.PENDING_REVIEW)
+
+
+class TestPipelinePausedViews(ScanningTestCase):
+    """Every action that would re-trigger a disconnected pipeline stage
+    refuses with the unified message and queues nothing (issue #173)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user, status=Status.PENDING_REVIEW
+        )
+
+    def _assert_paused(self, url_name):
+        from scanning.utils import PIPELINE_PAUSED_MESSAGE
+
+        response = self.client.post(
+            reverse(url_name, kwargs={"pk": self.scan.pk}), follow=True
+        )
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, Status.PENDING_REVIEW)
+        flashed = [str(m) for m in response.context["messages"]]
+        self.assertIn(PIPELINE_PAUSED_MESSAGE, flashed)
+
+    def test_start_validate_paused(self):
+        self._assert_paused("start_validate")
+
+    def test_start_detect_paused_without_detections(self):
+        self._assert_paused("start_detect")
+
+    def test_reprocess_paused_and_pending_edits_survive(self):
+        PageDeletion.objects.create(scan=self.scan, pdf_page=2)
+        self._assert_paused("reprocess")
+        # The recorded edits must survive to be applied after the cutover.
+        self.assertTrue(self.scan.deletions.exists())
+
+    def test_generate_files_paused(self):
+        self._assert_paused("generate_files")
+        self.assertNotEqual(
+            self.scan.queued_action, QueuedAction.GENERATE_FILES
+        )
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

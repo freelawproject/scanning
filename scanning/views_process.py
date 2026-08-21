@@ -26,12 +26,12 @@ from scanning.models import (
     OpinionScan,
     PageDeletion,
     PageInsert,
-    QueuedAction,
     Scan,
     Stage,
     Status,
 )
 from scanning.utils import (
+    PIPELINE_PAUSED_MESSAGE,
     compute_coverage_gaps,
     find_processing_pdf,
     local_original_pdf,
@@ -472,14 +472,21 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
        containers with separate ephemeral ``/tmp/`` volumes. The targeted
        pull skips the original and images/, so opening a scan never drags
        gigabytes across the network.
-    3. If no preview PDF exists yet (scan still processing, or errored),
+    3. Otherwise fall back to the original PDF. Sync bitonal conversion
+       was disconnected (issue #173), so scans uploaded after the
+       cutover have no ``bitonal.pdf`` until the doctor-run replacement
+       (#168) lands; every earlier scan already has one, so only recent
+       uploads take this path. It costs what step 2 exists to avoid --
+       the original crosses the network and can be huge -- but a slow
+       preview beats none while the interim lasts.
+    4. If no PDF exists at all (scan still processing, or errored),
        return HTTP 202 with a status message so the viewer can show a
        "still processing" state instead of a hard error.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: File response streaming the preview PDF, or a 202 JSON
-        response when no preview is available yet.
+    :return: File response streaming the preview (or original) PDF, or
+        a 202 JSON response when nothing is available yet.
     """
     scan = get_object_or_404(Scan, pk=pk)
     # Breadcrumb (issue #115): serving may pull from S3 and stream a multi-GB
@@ -515,7 +522,21 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     if response is not None:
         return response
 
-    # 3. No preview PDF anywhere. Distinguish transient states (still
+    # 3. No processed preview exists (post-#173 upload with no bitonal
+    #    yet). Serve the original instead; ``local_original_pdf`` falls
+    #    back to a targeted S3 pull of just the original object.
+    original = local_original_pdf(scan)
+    if original:
+        logger.info(
+            "serve_scan_pdf: no processed preview for scan %s; serving "
+            "the original (#173 interim)",
+            scan.pk,
+        )
+        return FileResponse(
+            open(original, "rb"), content_type="application/pdf"
+        )
+
+    # 4. No preview PDF anywhere. Distinguish transient states (still
     #    producing a preview -- the viewer should poll) from terminal ones
     #    (a preview will never appear -- the viewer should show the message
     #    and stop). 202 means "retry"; 409 means "give up".
@@ -678,40 +699,33 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
 @login_required
 @require_POST
 def start_validate(request: HttpRequest, pk: int) -> HttpResponse:
-    """Queue a scan for validation (first step of the full pipeline).
+    """Refuse to re-run the pipeline while the legacy stages are gone.
 
-    Drops any stored GPU job results first. ``run_full_pipeline`` resumes
-    by default, reusing a finished detect/analyze whose input PDF hasn't
-    changed, which is what makes a re-queue after a deploy cheap. This
-    button means the opposite: it is labelled "re-run the full pipeline
-    from scratch", warns about GPU cost, and sits behind a confirm
-    dialog. Without the invalidation it would silently reuse and the
-    scan would come back with exactly the detections it already had.
+    This button used to re-queue the full pipeline from scratch
+    (invalidating stored GPU results first). The stages it re-ran --
+    bitonal, YOLO detect, PaddleOCR validation -- were disconnected by
+    issue #173, so until the dots.mocr replacements land it fails with
+    the unified pipeline-paused message instead of queueing work that
+    would park immediately.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
-    from scanning import s3_sync
-
     scan = get_object_or_404(Scan, pk=pk)
-    guard = _block_if_pending_changes(request, scan)
-    if guard:
-        return guard
-    s3_sync.invalidate_job_results(scan)
-    scan.status = Status.QUEUED
-    scan.stage = Stage.VALIDATE
-    scan.queued_action = QueuedAction.FULL_PIPELINE
-    scan.s3_uploaded = False
-    scan.progress_message = "Queued for processing..."
-    scan.save()
+    messages.warning(request, PIPELINE_PAUSED_MESSAGE)
     return redirect("scan_process", pk=scan.pk)
 
 
 @login_required
 @require_POST
 def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
-    """Queue a scan for detection or skip to review if detections exist.
+    """Skip to review when detections exist; otherwise refuse (#173).
+
+    YOLO detection was disconnected with the legacy pipeline, so the
+    only thing left of this action is its shortcut: a scan that already
+    has detections goes straight to step 2. Running detection anew
+    fails with the unified pipeline-paused message.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -722,20 +736,13 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     if guard:
         return guard
     if Detection.objects.filter(scan=scan).exists():
-        # Detections already exist (from full pipeline). Skip to review.
+        # Detections already exist (from the old full pipeline).
         return redirect(
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
         )
 
-    scan.status = Status.QUEUED
-    scan.stage = Stage.PROCESS
-    scan.queued_action = QueuedAction.DETECT
-    scan.s3_uploaded = False
-    scan.progress_message = "Queued for detection..."
-    scan.save()
-    return redirect(
-        reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
-    )
+    messages.warning(request, PIPELINE_PAUSED_MESSAGE)
+    return redirect("scan_process", pk=scan.pk)
 
 
 @login_required
@@ -793,18 +800,20 @@ def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
 @login_required
 @require_POST
 def reprocess(request: HttpRequest, pk: int) -> HttpResponse:
-    """Queue a scan for reprocessing (re-run the full pipeline).
+    """Refuse to apply pending page edits while the pipeline is paused.
+
+    Applying inserts/deletions re-ran OCR on the edited pages through
+    the retired PaddleOCR path (issue #173), so this fails with the
+    unified message until the dots.mocr replacement lands. Pending
+    ``PageDeletion`` / ``PageInsert`` rows stay recorded and will be
+    applicable again then.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    scan.status = Status.QUEUED
-    scan.queued_action = QueuedAction.REPROCESS
-    scan.s3_uploaded = False
-    scan.progress_message = "Queued for reprocessing..."
-    scan.save()
+    messages.warning(request, PIPELINE_PAUSED_MESSAGE)
     return redirect("scan_process", pk=scan.pk)
 
 

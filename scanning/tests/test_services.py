@@ -10,7 +10,6 @@ import tempfile
 from unittest.mock import patch
 
 import fitz
-from django.db.models import F
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from scanning import s3_sync
@@ -23,7 +22,6 @@ from scanning.factories import (
 from scanning.models import (
     Detection,
     QueueStatus,
-    Scan,
     Stage,
     Status,
 )
@@ -108,6 +106,41 @@ def _run_detect_on_fixture(tmpdir):
     return detect(str(PDF_PATH), tmpdir, models=["small", "medium", "large"])
 
 
+def _import_detections(scan_pk, output_dir):
+    """Load a ``detections.json`` into Detection rows, clearing old ones.
+
+    Test-local copy of the pipeline importer that left with the legacy
+    detect stage (issue #173). The geometry tests still need DB rows
+    that mirror what ``_run_detect_on_fixture`` wrote to disk.
+    """
+    from blackletter.models import Label
+
+    dets = json.loads(
+        (pathlib.Path(output_dir) / "detections.json").read_text()
+    )
+    Detection.objects.filter(scan_id=scan_pk).delete()
+    Detection.objects.bulk_create(
+        Detection(
+            scan_id=scan_pk,
+            page_index=d["page_index"],
+            label=Label(d["label_id"]).name,
+            label_id=d["label_id"],
+            confidence=d["confidence"],
+            x0=d["bbox"][0],
+            y0=d["bbox"][1],
+            x1=d["bbox"][2],
+            y1=d["bbox"][3],
+            img_width=d.get("img_width", 0),
+            img_height=d.get("img_height", 0),
+            model_name=d.get("found_by", [{}])[0].get("model", ""),
+            model_count=d.get("model_count", 1),
+            found_by=d.get("found_by", []),
+        )
+        for d in dets
+    )
+    return dets
+
+
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestUpdateProgress(TestCase):
     """Test the _update_progress helper."""
@@ -148,54 +181,6 @@ class TestUpdateProgress(TestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestImportDetections(TestCase):
-    """Test _import_detections_from_json."""
-
-    def setUp(self):
-        _require_fixture(self)
-
-    def test_imports_detections_from_json_file(self):
-        from scanning.services import _import_detections_from_json
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(tmpdir)
-            dets = _run_detect_on_fixture(tmpdir)
-
-            # The detect call writes detections.json
-            result = _import_detections_from_json(scan.pk, tmpdir)
-            self.assertEqual(len(result), len(dets))
-            self.assertEqual(
-                Detection.objects.filter(scan=scan).count(), len(dets)
-            )
-
-    def test_clears_existing_detections(self):
-        from scanning.services import _import_detections_from_json
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(tmpdir)
-            # Create a dummy detection
-            Detection.objects.create(
-                scan=scan,
-                page_index=0,
-                label="DUMMY",
-                label_id=99,
-                confidence=0.9,
-                x0=0,
-                y0=0,
-                x1=1,
-                y1=1,
-            )
-            self.assertEqual(Detection.objects.filter(scan=scan).count(), 1)
-
-            _run_detect_on_fixture(tmpdir)
-            _import_detections_from_json(scan.pk, tmpdir)
-            # The dummy should be gone, replaced by real detections
-            self.assertFalse(
-                Detection.objects.filter(scan=scan, label="DUMMY").exists()
-            )
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestSyncDetectionsToDisk(TestCase):
     """Test _sync_detections_to_disk."""
 
@@ -203,16 +188,13 @@ class TestSyncDetectionsToDisk(TestCase):
         _require_fixture(self)
 
     def test_writes_detections_json(self):
-        from scanning.services import (
-            _import_detections_from_json,
-            _sync_detections_to_disk,
-        )
+        from scanning.services import _sync_detections_to_disk
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(tmpdir)
             output = pathlib.Path(scan.output_dir)
             _run_detect_on_fixture(tmpdir)
-            _import_detections_from_json(scan.pk, tmpdir)
+            _import_detections(scan.pk, tmpdir)
 
             # Delete the file from output_dir and re-sync from DB
             det_path = output / "detections.json"
@@ -238,35 +220,6 @@ class TestSyncDetectionsToDisk(TestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestRePairOpinions(TestCase):
-    """Test _re_pair_opinions."""
-
-    def setUp(self):
-        _require_fixture(self)
-
-    def test_pairs_three_opinions(self):
-        from scanning.services import (
-            _import_detections_from_json,
-            _re_pair_opinions,
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            _run_detect_on_fixture(tmpdir)
-            _import_detections_from_json(scan.pk, tmpdir)
-
-            opinions = _re_pair_opinions(scan.pk)
-            self.assertEqual(len(opinions), 3)
-
-            scan.refresh_from_db()
-            stored = scan.opinions_json
-            self.assertEqual(len(stored), 3)
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestComputeAndSaveRedactionRects(TestCase):
     """Test _compute_and_save_redaction_rects."""
 
@@ -274,10 +227,7 @@ class TestComputeAndSaveRedactionRects(TestCase):
         _require_fixture(self)
 
     def test_writes_redaction_rects_json(self):
-        from scanning.services import (
-            _compute_and_save_redaction_rects,
-            _import_detections_from_json,
-        )
+        from scanning.services import _compute_and_save_redaction_rects
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(
@@ -285,7 +235,7 @@ class TestComputeAndSaveRedactionRects(TestCase):
                 reporter=ReporterFactory(short_name="a3d"),
             )
             _run_detect_on_fixture(tmpdir)
-            _import_detections_from_json(scan.pk, tmpdir)
+            _import_detections(scan.pk, tmpdir)
 
             rects = _compute_and_save_redaction_rects(scan.pk, str(PDF_PATH))
             self.assertGreater(len(rects), 0)
@@ -309,7 +259,7 @@ class TestComputeAndSaveRedactionRects(TestCase):
                 reporter=ReporterFactory(short_name="a3d"),
             )
             _run_detect_on_fixture(tmpdir)
-            services._import_detections_from_json(scan.pk, tmpdir)
+            _import_detections(scan.pk, tmpdir)
 
             with patch.object(services, "snap_document_columns") as snap:
                 services._compute_and_save_redaction_rects(
@@ -449,131 +399,6 @@ class TestComputeAndSaveMarginRects(TestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestSmartDeleteIndexShifting(TestCase):
-    """Test that run_smart_delete shifts detection page_index correctly."""
-
-    def _make_scan_with_detections(self, n_pages=3):
-        """Create a scan with one detection per page.
-
-        :param n_pages: Number of pages (and detections) to create.
-        :returns: The created Scan instance.
-        """
-        scan = ScanFactory(page_count=n_pages)
-        for page_idx in range(n_pages):
-            Detection.objects.create(
-                scan=scan,
-                page_index=page_idx,
-                label="CASE_CAPTION",
-                label_id=0,
-                confidence=0.95,
-                x0=0,
-                y0=0,
-                x1=50,
-                y1=50,
-            )
-        return scan
-
-    def _delete_and_shift(self, scan, delete_idx):
-        """Simulate the DB-side page delete: remove detections and shift indices.
-
-        :param scan: The Scan whose detections to update.
-        :param delete_idx: 0-based page index to remove.
-        :returns: Sorted list of remaining page_index values.
-        :rtype: list[int]
-        """
-        Detection.objects.filter(scan=scan, page_index=delete_idx).delete()
-        Detection.objects.filter(scan=scan, page_index__gt=delete_idx).update(
-            page_index=F("page_index") - 1
-        )
-        return list(
-            Detection.objects.filter(scan=scan)
-            .order_by("page_index")
-            .values_list("page_index", flat=True)
-        )
-
-    def test_deleting_page_shifts_subsequent_detections(self):
-        """Detections on pages after the deleted one should shift down by 1."""
-        scan = self._make_scan_with_detections()
-        self.assertEqual(Detection.objects.filter(scan=scan).count(), 3)
-        remaining = self._delete_and_shift(scan, delete_idx=1)
-        self.assertEqual(remaining, [0, 1])
-
-    def test_deleting_first_page_shifts_all(self):
-        """Deleting page 0 should shift all remaining detections down by 1."""
-        scan = self._make_scan_with_detections()
-        remaining = self._delete_and_shift(scan, delete_idx=0)
-        self.assertEqual(remaining, [0, 1])
-
-    def test_deleting_last_page_no_shift_needed(self):
-        """Deleting the last page should leave preceding indices unchanged."""
-        scan = self._make_scan_with_detections()
-        remaining = self._delete_and_shift(scan, delete_idx=2)
-        self.assertEqual(remaining, [0, 1])
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestSmartInsertIndexShifting(TestCase):
-    """Test that inserting a page shifts detection page_index correctly."""
-
-    def test_inserting_shifts_subsequent_detections_up(self):
-        scan = ScanFactory(page_count=2)
-        for page_idx in range(2):
-            Detection.objects.create(
-                scan=scan,
-                page_index=page_idx,
-                label="CASE_CAPTION",
-                label_id=0,
-                confidence=0.95,
-                x0=10,
-                y0=10,
-                x1=100,
-                y1=100,
-            )
-
-        # Simulate inserting at index 1
-        insert_idx = 1
-        from django.db.models import F
-
-        Detection.objects.filter(scan=scan, page_index__gte=insert_idx).update(
-            page_index=F("page_index") + 1
-        )
-
-        remaining = list(
-            Detection.objects.filter(scan=scan)
-            .order_by("page_index")
-            .values_list("page_index", flat=True)
-        )
-        self.assertEqual(remaining, [0, 2])
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestCollectPdfPaths(TestCase):
-    """Test _collect_pdf_paths helper."""
-
-    def setUp(self):
-        _require_fixture(self)
-
-    def test_collects_original_only_without_output_dir(self):
-        from scanning.services import _collect_pdf_paths
-
-        scan = ScanFactory()
-        paths = _collect_pdf_paths(scan, None)
-        self.assertEqual(len(paths), 1)
-
-    def test_collects_bitonal_if_exists(self):
-        from scanning.services import _collect_pdf_paths
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(tmpdir)
-            bitonal = pathlib.Path(tmpdir) / "bitonal.pdf"
-            shutil.copy2(PDF_PATH, bitonal)
-
-            paths = _collect_pdf_paths(scan, tmpdir)
-            path_names = [p.name for p in paths]
-            self.assertIn("bitonal.pdf", path_names)
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestBuildDocumentFromDetections(TestCase):
     """Test _build_document_from_detections."""
 
@@ -583,7 +408,6 @@ class TestBuildDocumentFromDetections(TestCase):
     def test_builds_document_with_pages(self):
         from scanning.services import (
             _build_document_from_detections,
-            _import_detections_from_json,
             _sync_detections_to_disk,
         )
 
@@ -593,7 +417,7 @@ class TestBuildDocumentFromDetections(TestCase):
                 reporter=ReporterFactory(short_name="a3d"),
             )
             _run_detect_on_fixture(tmpdir)
-            _import_detections_from_json(scan.pk, tmpdir)
+            _import_detections(scan.pk, tmpdir)
             det_data = _sync_detections_to_disk(scan.pk)
 
             document = _build_document_from_detections(
@@ -634,7 +458,6 @@ class TestComputeRedactionsApiView(TestCase):
             self.assertEqual(response.status_code, 400)
 
     def test_computes_rects_successfully(self):
-        from scanning.services import _import_detections_from_json
 
         user = UserFactory()
         self.client.force_login(user)
@@ -646,7 +469,7 @@ class TestComputeRedactionsApiView(TestCase):
                 reporter=ReporterFactory(short_name="a3d"),
             )
             _run_detect_on_fixture(tmpdir)
-            _import_detections_from_json(scan.pk, tmpdir)
+            _import_detections(scan.pk, tmpdir)
 
             # Set opinions_json so the view doesn't bail early
             scan.opinions_json = [{"dummy": True}]
@@ -728,181 +551,6 @@ PDF_23_PATH = (
     / "original"
     / "332_a3d_1-23_opinions.pdf"
 )
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestSmartEditEndToEnd(TestCase):
-    """End-to-end: remove pages → detect gaps → insert back → re-validate.
-
-    Uses the 23-page A3d PDF. Removes 3 pages from the middle, runs YOLO
-    detection + PaddleOCR validation to identify gaps, inserts the pages
-    back, and verifies all 23 page numbers are found.
-    """
-
-    def setUp(self):
-        if not PDF_23_PATH.exists():
-            self.skipTest(f"23-page PDF not found at {PDF_23_PATH}")
-
-    def _make_scan_23(self, pdf_dest, tmpdir):
-        """Create a scan pointing at the 23-page (or modified) PDF."""
-        import fitz
-
-        reporter = ReporterFactory(
-            short_name="a3d", full_name="Atlantic Reporter 3d"
-        )
-        doc = fitz.open(str(pdf_dest))
-        page_count = doc.page_count
-        doc.close()
-
-        scan = ScanFactory(
-            reporter=reporter,
-            start_page=1,
-            end_page=23,
-            number_of_pages=page_count,
-            page_count=page_count,
-        )
-        # Point original_pdf to media-relative path
-        media_dir = pathlib.Path(MEDIA_ROOT) / "test_pdfs"
-        media_dir.mkdir(parents=True, exist_ok=True)
-        media_pdf = media_dir / f"scan_{scan.pk}.pdf"
-        shutil.copy2(pdf_dest, media_pdf)
-        scan.original_pdf.name = str(media_pdf.relative_to(MEDIA_ROOT))
-        scan.save(update_fields=["original_pdf", "page_count"])
-
-        # Create computed output_dir and copy PDF there
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(pdf_dest, output / pdf_dest.name)
-        return scan
-
-    def test_remove_detect_insert_revalidate(self):
-        """Full cycle: remove pages, detect, find gaps, insert, re-validate."""
-        import fitz
-
-        from scanning.services import (
-            _import_detections_from_json,
-            run_paddleocr_validation,
-            run_smart_insert,
-        )
-
-        # Pages to remove (1-based): 8, 12, 17
-        remove_pages = [8, 12, 17]
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # --- Step 1: Extract the pages we'll remove, then delete them ---
-            original = fitz.open(str(PDF_23_PATH))
-            self.assertEqual(original.page_count, 23)
-
-            # Save each removed page as a single-page PDF
-            extracted_pdfs = {}
-            for pg in remove_pages:
-                single = fitz.open()
-                single.insert_pdf(original, from_page=pg - 1, to_page=pg - 1)
-                path = pathlib.Path(tmpdir) / f"extracted_page_{pg}.pdf"
-                single.save(str(path))
-                single.close()
-                extracted_pdfs[pg] = path
-
-            # Create the "damaged" PDF with pages removed
-            damaged_path = pathlib.Path(tmpdir) / "damaged.pdf"
-            damaged = fitz.open()
-            damaged.insert_pdf(original)
-            # Delete in reverse order so indices don't shift
-            for pg in sorted(remove_pages, reverse=True):
-                damaged.delete_page(pg - 1)
-            damaged.save(str(damaged_path))
-            damaged.close()
-            original.close()
-
-            verify = fitz.open(str(damaged_path))
-            self.assertEqual(verify.page_count, 20)
-            verify.close()
-
-            # --- Step 2: Create scan + run YOLO detection on 20-page PDF ---
-            scan = self._make_scan_23(damaged_path, tmpdir)
-            self.assertEqual(scan.page_count, 20)
-            output_dir = scan.output_dir
-
-            from blackletter.api import detect
-
-            dets = detect(
-                str(damaged_path),
-                output_dir,
-                models=["small", "medium", "large"],
-            )
-            self.assertGreater(len(dets), 0)
-            _import_detections_from_json(scan.pk, output_dir)
-
-            det_count = Detection.objects.filter(scan=scan).count()
-            self.assertGreater(det_count, 0)
-            print(f"\n  YOLO: {det_count} detections on 20-page PDF")
-
-            # --- Step 3: Run PaddleOCR validation → should find gaps ---
-            run_paddleocr_validation(scan.pk, str(damaged_path))
-            scan.refresh_from_db()
-
-            missing = scan.missing_pages
-            print(f"  Missing pages identified: {missing}")
-
-            # Pages 8, 12, 17 should be in the missing list
-            for pg in remove_pages:
-                self.assertIn(
-                    pg,
-                    missing,
-                    f"Page {pg} should be identified as missing but got {missing}",
-                )
-
-            # --- Step 4: Insert the missing pages back ---
-            # We need to copy the damaged PDF to where scan.pdf_path points
-            # since run_smart_insert modifies the file in place
-            scan.refresh_from_db()
-            for pg in sorted(missing):
-                if pg in extracted_pdfs:
-                    print(f"  Inserting page {pg} back...")
-                    run_smart_insert(scan.pk, pg, str(extracted_pdfs[pg]))
-                    scan.refresh_from_db()
-
-            # --- Step 5: Verify the PDF is back to 23 pages ---
-            scan.refresh_from_db()
-            self.assertEqual(
-                scan.page_count, 23, "PDF should be back to 23 pages"
-            )
-
-            # Check the actual PDF
-            final_pdf = fitz.open(scan.pdf_path)
-            self.assertEqual(final_pdf.page_count, 23)
-            final_pdf.close()
-
-            # --- Step 6: Verify all 23 page numbers are detected ---
-            ocr_results = scan.ocr_results
-            detected_nums = set()
-            for r in ocr_results:
-                if r.get("detected"):
-                    try:
-                        detected_nums.add(int(r["detected"]))
-                    except (ValueError, TypeError):
-                        pass
-
-            expected_nums = set(range(1, 24))
-            still_missing = expected_nums - detected_nums
-            print(f"  Detected page numbers: {sorted(detected_nums)}")
-            if still_missing:
-                print(f"  Still missing: {sorted(still_missing)}")
-
-            # All 23 pages should be detected
-            self.assertEqual(
-                detected_nums,
-                expected_nums,
-                f"Expected all pages 1-23 detected. Missing: {sorted(still_missing)}",
-            )
-
-            # No issues remaining
-            final_missing = scan.missing_pages
-            self.assertEqual(
-                final_missing,
-                [],
-                f"No missing pages expected after re-insert, got: {final_missing}",
-            )
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -1199,76 +847,6 @@ class TestRefreshVolumeQueueStatus(TestCase):
         refresh_volume_queue_status(volume)
         volume.refresh_from_db()
         self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestImmediateS3PushOnGeneration(TestCase):
-    """Bitonal and OCR PDFs are pushed to S3 the moment they're generated."""
-
-    def test_push_generated_delegates_to_upload(self):
-        """The helper forwards to s3_sync.upload_file_to_s3."""
-        from scanning import services
-
-        scan = ScanFactory(start_page=1, end_page=2)
-        with patch("scanning.s3_sync.upload_file_to_s3") as up:
-            services._push_generated_file_to_s3(scan.pk, "bitonal.pdf")
-
-        up.assert_called_once_with(scan, "bitonal.pdf")
-
-    def test_push_generated_skips_in_prod_without_creds(self):
-        """In prod with no AWS creds, skip the upload (don't raise)."""
-        from scanning import services
-
-        scan = ScanFactory(start_page=1, end_page=2)
-        with (
-            override_settings(DEVELOPMENT=False, TESTING=False),
-            patch.dict("os.environ", {}, clear=True),
-            patch("scanning.s3_sync.upload_file_to_s3") as up,
-        ):
-            services._push_generated_file_to_s3(scan.pk, "bitonal.pdf")
-
-        up.assert_not_called()
-
-    def test_ensure_bitonal_pushes_on_fresh_generation(self):
-        """A newly converted bitonal is uploaded immediately."""
-        from scanning import services
-
-        scan = ScanFactory(start_page=1, end_page=2)
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-
-        def _fake_bitonal(src, out, progress_callback=None):
-            (pathlib.Path(out) / "bitonal.pdf").write_bytes(b"%PDF-1.4 bw")
-
-        with (
-            patch.object(services, "bl_bitonal", side_effect=_fake_bitonal),
-            patch.object(services, "_push_generated_file_to_s3") as push,
-            patch.object(services.fitz, "open") as fitz_open,
-        ):
-            fitz_open.return_value.__enter__.return_value.page_count = 2
-            services._ensure_bitonal(scan, output)
-
-        push.assert_called_once_with(scan.pk, "bitonal.pdf")
-
-    def test_ensure_bitonal_skips_push_when_already_present(self):
-        """An existing bitonal is neither reconverted nor re-uploaded."""
-        from scanning import services
-
-        scan = ScanFactory(start_page=1, end_page=2)
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        (output / "bitonal.pdf").write_bytes(b"%PDF-1.4 existing")
-
-        with (
-            patch.object(services, "bl_bitonal") as bitonal,
-            patch.object(services, "_push_generated_file_to_s3") as push,
-            patch.object(services.fitz, "open") as fitz_open,
-        ):
-            fitz_open.return_value.__enter__.return_value.page_count = 2
-            services._ensure_bitonal(scan, output)
-
-        bitonal.assert_not_called()
-        push.assert_not_called()
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -1996,269 +1574,6 @@ class TestPagesForGeometry(TestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestPipelineCorrectsColumnsAfterDetecting(TestCase):
-    """``run_detect`` corrects the column boxes it just imported.
-
-    Re-detect is an explicit request for new geometry, and the reviewer is
-    watching one scan rather than waiting on an upload, so it persists the
-    correction rather than deferring it the way ``run_full_pipeline`` does.
-    Boxes left uncorrected sit a few points inside the printed text, and the
-    first or last character of every masked line survives in the
-    deliverable.
-    """
-
-    def setUp(self):
-        _require_fixture(self)
-
-    def test_run_detect_snaps_after_importing(self):
-        from scanning import services
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            output = pathlib.Path(scan.output_dir)
-            _run_detect_on_fixture(str(output))
-
-            with (
-                patch("django.db.connections.close_all"),
-                patch.object(services, "_run_yolo"),
-                patch.object(services, "_re_pair_opinions"),
-                patch.object(services, "_pull_processing_files_from_s3"),
-                patch.object(services, "_push_processing_files_to_s3"),
-                patch.object(
-                    services, "_snap_text_columns_to_ink", return_value=0
-                ) as snap,
-            ):
-                services.run_detect(scan.pk)
-
-            snap.assert_called_once()
-            self.assertEqual(
-                snap.call_args.args[1], str(output / "bitonal.pdf")
-            )
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestUploadPathSkipsRedactionGeometry(TestCase):
-    """The upload path stops at "is this volume complete?".
-
-    Review 1 asks nothing about redaction: no detection overlay, no rects.
-    Measuring either here cost three full-volume renders at 100 dpi that a
-    scanner sat through before the scan even reached PENDING_REVIEW, which
-    is most of what dropping the Tesseract pass was meant to give back.
-    """
-
-    def setUp(self):
-        _require_fixture(self)
-
-    def test_run_full_pipeline_defers_both(self):
-        from scanning import services
-
-        scan = _make_scan_with_output(
-            reporter=ReporterFactory(short_name="a3d"),
-        )
-        output = pathlib.Path(scan.output_dir)
-        bitonal = output / "bitonal.pdf"
-        _write_bitonal_copy(bitonal)
-
-        with (
-            patch("django.db.connections.close_all"),
-            patch.object(services, "_pull_processing_files_from_s3"),
-            patch.object(services, "_push_processing_files_to_s3"),
-            patch.object(services, "_ensure_bitonal", return_value=bitonal),
-            patch.object(services, "_run_yolo"),
-            patch.object(
-                services, "_import_detections_from_json", return_value=[]
-            ),
-            patch.object(services, "run_paddleocr_validation"),
-            patch.object(services, "_re_pair_opinions", return_value=[]),
-            patch.object(services, "_snap_text_columns_to_ink") as snap,
-            patch.object(
-                services, "_compute_and_save_redaction_rects"
-            ) as rects,
-            patch.object(
-                services, "_compute_and_save_margin_rects"
-            ) as margins,
-        ):
-            services.run_full_pipeline(scan.pk)
-
-        snap.assert_not_called()
-        rects.assert_not_called()
-        margins.assert_not_called()
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.PENDING_REVIEW)
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestPipelineResumesInsteadOfRerunningGpuStages(TestCase):
-    """A re-queued scan picks up finished stages instead of paying twice.
-
-    The daemon takes a SIGTERM on every deploy and re-queues whatever was
-    mid-pipeline, and ``run_full_pipeline`` restarts at step 1. Before
-    this, a detect that had already completed was re-submitted: another
-    ~200 s of GPU time to recompute detections already sitting on S3, and
-    its result object overwritten with an identical one.
-    """
-
-    def setUp(self):
-        _require_fixture(self)
-        self.scan = _make_scan_with_output(
-            reporter=ReporterFactory(short_name="a3d"),
-        )
-        self.bitonal = pathlib.Path(self.scan.output_dir) / "bitonal.pdf"
-        _write_bitonal_copy(self.bitonal)
-
-    def _run(self, reusable):
-        """Run the pipeline with ``reusable_result`` stubbed.
-
-        :param reusable: Return value for every ``reusable_result`` call.
-        :returns: ``(reuse_mock, yolo_mock, validation_mock)``.
-        """
-        from scanning import services
-
-        with (
-            patch("django.db.connections.close_all"),
-            patch.object(services, "_pull_processing_files_from_s3"),
-            patch.object(services, "_push_processing_files_to_s3"),
-            patch.object(
-                services, "_ensure_bitonal", return_value=self.bitonal
-            ),
-            patch.object(services, "_run_yolo") as yolo,
-            patch.object(
-                services, "_import_detections_from_json", return_value=[]
-            ),
-            patch.object(services, "run_paddleocr_validation") as validation,
-            patch.object(services, "_re_pair_opinions", return_value=[]),
-            patch(
-                "scanning.runpod_client.reusable_result",
-                return_value=reusable,
-            ) as reuse,
-        ):
-            services.run_full_pipeline(self.scan.pk)
-        return reuse, yolo, validation
-
-    def test_finished_detect_is_reused_not_resubmitted(self):
-        detections = [{"page_index": 0, "label_id": 1}]
-        _, yolo, _ = self._run({"detections": detections})
-
-        yolo.assert_not_called()
-        written = json.loads(
-            (
-                pathlib.Path(self.scan.output_dir) / "detections.json"
-            ).read_text()
-        )
-        self.assertEqual(written, detections)
-
-    def test_no_stored_result_runs_detection(self):
-        _, yolo, _ = self._run(None)
-        yolo.assert_called_once()
-
-    def test_payload_without_detections_runs_detection(self):
-        # A result whose shape we don't recognise is not a reason to
-        # skip the stage; it is a reason to run it.
-        _, yolo, _ = self._run({"page_count": 12})
-        yolo.assert_called_once()
-
-    def test_result_referencing_pages_past_the_end_is_rejected(self):
-        # Backstop on the timestamp check, which only notices an edited
-        # input if the edit changed the object's size. A detection on a
-        # page this PDF no longer has means the result predates a page
-        # deletion, whatever the timestamps say.
-        Scan.objects.filter(pk=self.scan.pk).update(page_count=2)
-        _, yolo, _ = self._run({"detections": [{"page_index": 7}]})
-        yolo.assert_called_once()
-
-    def test_result_within_the_page_count_is_still_reused(self):
-        Scan.objects.filter(pk=self.scan.pk).update(page_count=8)
-        _, yolo, _ = self._run({"detections": [{"page_index": 7}]})
-        yolo.assert_not_called()
-
-    def test_validation_is_asked_to_reuse(self):
-        # Step 5 is the other GPU stage; the pipeline is the only caller
-        # that opts it into reuse.
-        _, _, validation = self._run(None)
-        self.assertTrue(validation.call_args.kwargs["reuse"])
-
-    def test_ensure_bitonal_leaves_page_count_readable_on_the_instance(self):
-        """The page-count backstop reads the attribute, not the row.
-
-        ``_ensure_bitonal`` persists the count with a queryset
-        ``.update()``, which is a bare SQL write and leaves the caller's
-        instance holding whatever it loaded. ``run_full_pipeline`` hands
-        that same instance straight to ``_reuse_detect_result`` three
-        lines later, so the two have to stay in step.
-        """
-        from scanning import services
-
-        with fitz.open(str(self.bitonal)) as pdf:
-            real_pages = pdf.page_count
-        self.scan.page_count = real_pages + 99
-
-        services._ensure_bitonal(self.scan, pathlib.Path(self.scan.output_dir))
-
-        self.assertEqual(self.scan.page_count, real_pages)
-        self.scan.refresh_from_db()
-        self.assertEqual(self.scan.page_count, real_pages)
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestPaddleocrValidationReuse(TestCase):
-    """``run_paddleocr_validation`` only reuses when asked to."""
-
-    def setUp(self):
-        self.scan = ScanFactory(start_page=1, end_page=2)
-
-    def _run(self, reuse, stored):
-        """Run validation with the stored-result lookup stubbed.
-
-        :param reuse: Value for the ``reuse`` argument.
-        :param stored: Return value for ``reusable_result``.
-        :returns: The ``_dispatch_analyze`` mock.
-        """
-        from scanning import services
-
-        with (
-            patch.object(
-                services, "_dispatch_analyze", return_value=[{"pdf_page": 9}]
-            ) as dispatch,
-            patch.object(services, "_rebuild_issues_from_results"),
-            patch(
-                "scanning.runpod_client.reusable_result", return_value=stored
-            ),
-        ):
-            services.run_paddleocr_validation(
-                self.scan.pk, "some.original.pdf", reuse=reuse
-            )
-        return dispatch
-
-    def test_stored_result_skips_the_job(self):
-        results = [{"pdf_page": 1, "detected": "1"}]
-        dispatch = self._run(reuse=True, stored={"results": results})
-
-        dispatch.assert_not_called()
-        self.scan.refresh_from_db()
-        self.assertEqual(self.scan.ocr_results, results)
-
-    def test_reuse_off_always_dispatches(self):
-        # Every caller that means "analyze this again" keeps doing that,
-        # even with a perfectly good stored result sitting there.
-        dispatch = self._run(reuse=False, stored={"results": [{"a": 1}]})
-
-        dispatch.assert_called_once()
-        self.scan.refresh_from_db()
-        self.assertEqual(self.scan.ocr_results, [{"pdf_page": 9}])
-
-    def test_missing_stored_result_falls_through_to_the_job(self):
-        dispatch = self._run(reuse=True, stored=None)
-
-        dispatch.assert_called_once()
-        self.scan.refresh_from_db()
-        self.assertEqual(self.scan.ocr_results, [{"pdf_page": 9}])
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestSnapIgnoresDetectionsPastTheEnd(TestCase):
     """A detection can outlive the page it was found on.
 
@@ -2301,98 +1616,6 @@ class TestSnapIgnoresDetectionsPastTheEnd(TestCase):
         )
         ghost.refresh_from_db()
         self.assertEqual(ghost.x0, COLUMN_LEFT.x0 + 6, "moved a ghost box")
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestRebuildIssuesUsesTheCorrectedSplit(TestCase):
-    """Auto-correction decides which pages are out of range.
-
-    ``_auto_correct`` can pull a misread page number back into range, so the
-    in/out split computed after it is the one that applies. Letting
-    ``build_analysis`` recompute the split from scratch would be reading the
-    same results a second time and reaching a different answer.
-    """
-
-    def test_the_split_is_handed_over_not_recomputed(self):
-        from scanning import services
-
-        scan = ScanFactory(start_page=100, end_page=110, page_count=3)
-        results = [
-            {"pdf_page": 1, "detected": "100", "type": "single"},
-            {"pdf_page": 2, "detected": "101", "type": "single"},
-            {"pdf_page": 3, "detected": "102", "type": "single"},
-        ]
-        with patch.object(
-            services, "build_analysis", wraps=services.build_analysis
-        ) as analyse:
-            services._rebuild_issues_from_results(scan.pk, results)
-
-        self.assertIn("out_of_range", analyse.call_args.kwargs)
-        self.assertEqual(
-            analyse.call_args.kwargs["out_of_range"],
-            [],
-            "every reading is in range, so nothing should be flagged",
-        )
-
-    def test_a_scan_without_an_end_page_still_reports_gaps(self):
-        """The old hand-built analysis returned no missing pages at all."""
-        from scanning import services
-        from scanning.models import Issue
-
-        scan = ScanFactory(start_page=10, end_page=None, page_count=4)
-        results = [
-            {"pdf_page": 1, "detected": "10", "type": "single"},
-            {"pdf_page": 2, "detected": "11", "type": "single"},
-            {"pdf_page": 3, "detected": "15", "type": "single"},
-            {"pdf_page": 4, "detected": "16", "type": "single"},
-        ]
-        services._rebuild_issues_from_results(scan.pk, results)
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.missing_pages, [12, 13, 14])
-        self.assertTrue(Issue.objects.filter(scan=scan).exists())
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestRebuildIssuesFromResults(TestCase):
-    """The daemon rebuild behind 'Rebuild & Validate' auto-corrects stray
-    OCR readings but leaves hand-entered page numbers alone, matching
-    Recheck. run_reprocess never re-OCRs existing pages, so a manual entry
-    reaches this path with its ``manual`` markers intact.
-    """
-
-    def _results(self, last, **extra):
-        """Three good pages plus a fourth reading, optionally manual."""
-        return [
-            {"pdf_page": 1, "detected": "1", "type": "single"},
-            {"pdf_page": 2, "detected": "2", "type": "single"},
-            {"pdf_page": 3, "detected": "3", "type": "single"},
-            {"pdf_page": 4, "detected": last, "type": "single", **extra},
-        ]
-
-    def test_auto_corrects_stray_ocr_reading(self):
-        """An out-of-range OCR reading is interpolated from its neighbours."""
-        from scanning import services
-
-        scan = ScanFactory(start_page=1, end_page=4, page_count=4)
-        results = self._results("999")
-
-        services._rebuild_issues_from_results(scan.pk, results)
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.ocr_results[3]["detected"], "4")
-
-    def test_manual_page_number_preserved(self):
-        """A curator's typed number survives the rebuild untouched."""
-        from scanning import services
-
-        scan = ScanFactory(start_page=1, end_page=4, page_count=4)
-        results = self._results("999", zone="manual", ocr="manual")
-
-        services._rebuild_issues_from_results(scan.pk, results)
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.ocr_results[3]["detected"], "999")
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

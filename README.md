@@ -71,13 +71,15 @@ scanning/
     templates/        base.html, cotton components
     tailwind/         Config + input CSS
     static-global/    Generated CSS output
-  runpod/             GPU worker image for RunPod Serverless
+  runpod-dotsmocr/    dots.mocr GPU worker image for RunPod Serverless
 ```
 
-The GPU-heavy steps of the blackletter pipeline run on a RunPod Serverless
-worker built from `scanning/runpod/`. See
-[scanning/runpod/README.md](scanning/runpod/README.md) for the worker image,
-release workflow, endpoint configuration, and operational notes.
+GPU work runs on RunPod Serverless workers. The dots.mocr OCR worker is
+built from `scanning/runpod-dotsmocr/`; see
+[scanning/runpod-dotsmocr/README.md](scanning/runpod-dotsmocr/README.md)
+for the worker image, release workflow, endpoint configuration, and
+operational notes. (The legacy blackletter-gpu-worker -- YOLO detect +
+PaddleOCR analyze -- was removed with the legacy pipeline, issue #173.)
 
 ### Settings Pattern
 

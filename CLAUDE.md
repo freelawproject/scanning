@@ -46,6 +46,34 @@ uv sync --all-extras
 - Never pass `next` query strings directly into templates (open redirect risk). Let Django's auth views handle redirect validation internally.
 - All authenticated users see all scans (no per-user filtering). Staff-only distinction is the review form on the detail page.
 
+## Legacy Pipeline Disconnect (issue #173, interim state)
+
+The legacy processing stages — in-process bitonal conversion, the YOLO
+`detect` and PaddleOCR `analyze` RunPod actions (and the whole
+blackletter-gpu-worker under `scanning/runpod/`), and their
+`RUNPOD_ENABLED=False` in-process fallbacks — are deleted. Until the
+dots.mocr replacements land (#147 dispatch, #149 page numbers, #168
+bitonal via doctor):
+
+- `run_full_pipeline` is interim: it shards the original (#164), sets
+  `page_count`, and parks the scan in `Status.AWAITING_VALIDATION`.
+- Every user-facing action that would re-trigger a legacy stage
+  (`start_validate`, `start_detect` without existing detections,
+  `reprocess`, `generate_files`) refuses with
+  `utils.PIPELINE_PAUSED_MESSAGE` — one constant, flashed as a warning
+  banner in HTML views. The daemon parks pre-cutover queued rows
+  carrying a legacy `queued_action` back to PENDING_REVIEW with the
+  same message; admin re-queue resets `queued_action` to
+  FULL_PIPELINE.
+- The post-review-1 machinery (`run_generate_files`, pairing, redaction
+  geometry, `upload_approved_files`) is kept but nothing queues it.
+- `serve_scan_pdf` falls back to streaming the original when
+  `bitonal.pdf` is absent (only post-cutover uploads; every earlier
+  scan has one).
+- `RUNPOD_ENABLED` now only gates whether jobs dispatch at all; without
+  it an environment uploads and browses but does not process. Upload
+  paths must always keep working.
+
 ## Detection Workflow
 
 YOLO models detect elements on each page (captions, key icons, headnotes, etc.) and store them as `Detection` records with a confidence score. Users review detections in the process viewer (step 2) and can:

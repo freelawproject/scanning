@@ -15,6 +15,7 @@ from scanning.models import (
     PageDeletion,
     PageInsert,
     PendingUpload,
+    QueuedAction,
     Reporter,
     Scan,
     Status,
@@ -380,8 +381,14 @@ class ScanAdmin(admin.ModelAdmin):
             appended when part of the selection was left alone.
         :return: None.
         """
+        # Re-point every recovered scan at the (interim) full pipeline.
+        # The other queued actions were disconnected by issue #173, so a
+        # stale ``queued_action`` left over from before the cutover would
+        # make the daemon park the scan with the pipeline-paused message
+        # instead of recovering it.
         updated = queryset.filter(status__in=statuses).update(
             status=Status.QUEUED,
+            queued_action=QueuedAction.FULL_PIPELINE,
             progress_message=progress_message,
             progress_current=0,
             progress_total=0,

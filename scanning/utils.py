@@ -13,6 +13,18 @@ from scanning.models import Scan, Volume
 
 logger = logging.getLogger(__name__)
 
+# Unified user-facing message for every action the legacy-pipeline
+# teardown (issue #173) disconnected. One constant so the banner the
+# HTML views flash and the JSON error the API endpoints return read
+# identically, and so re-enabling a stage later is a grep for one
+# string. Surface it with ``messages.warning`` + redirect in HTML
+# views, and as ``JsonResponse({"error": ...}, status=503)`` in APIs.
+PIPELINE_PAUSED_MESSAGE = (
+    "Reprocessing is temporarily unavailable while the pipeline is "
+    "rebuilt on the new OCR stack. Uploads are unaffected, and existing "
+    "scans keep their current results."
+)
+
 
 def get_volume(reporter_slug: str, vol: int) -> Volume:
     """Look up a Volume by reporter slug and number.

@@ -59,6 +59,15 @@
   <div class="flex gap-4" style="height:calc(100vh - 200px);min-height:500px;">
     {# Sidebar #}
     <aside class="w-72 flex-shrink-0 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 px-3 pb-3{% if step != 1 or is_processing %} pt-3{% endif %}" style="max-height:calc(100vh - 200px);">
+      {% if scan.status == 'awaiting_validation' %}
+      {# Interim #173 parking state: uploaded and sharded, waiting for
+         the new validation stage. The progress message carries the
+         explanation the pipeline stamped when it parked the scan. #}
+      <div class="rounded border border-slate-300 dark:border-slate-600 bg-slate-100 dark:bg-slate-800 p-3 mb-2 mt-3 text-xs text-slate-700 dark:text-slate-200">
+        <p class="font-bold mb-1">Awaiting validation</p>
+        <p class="m-0">{{ scan.progress_message }}</p>
+      </div>
+      {% endif %}
       {% if is_processing %}
       <h2 class="text-sm font-bold mb-2">Processing</h2>
       <div class="rounded bg-gray-100 dark:bg-gray-800 p-3 mb-2">
