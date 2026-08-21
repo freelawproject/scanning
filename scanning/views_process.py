@@ -540,7 +540,16 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     #    producing a preview -- the viewer should poll) from terminal ones
     #    (a preview will never appear -- the viewer should show the message
     #    and stop). 202 means "retry"; 409 means "give up".
-    if scan.status in (Status.UPLOADED, Status.QUEUED, Status.PROCESSING):
+    #    AWAITING_VALIDATION is transient here: those scans never get a
+    #    bitonal (#173), so reaching this branch means the step-3 pull of
+    #    the original just failed -- the original is durably in S3 and the
+    #    next poll will very likely serve it.
+    if scan.status in (
+        Status.UPLOADED,
+        Status.QUEUED,
+        Status.PROCESSING,
+        Status.AWAITING_VALIDATION,
+    ):
         return JsonResponse(
             {
                 "status": "not_ready",
