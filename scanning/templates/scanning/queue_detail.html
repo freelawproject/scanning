@@ -124,12 +124,19 @@
     </div>
     <div id="upload-progress" class="hidden mt-3">
       <div class="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
-        <span id="upload-progress-label">Uploading&hellip;</span>
+        <span id="upload-progress-label" aria-live="polite">Uploading&hellip;</span>
         <span id="upload-progress-pct">0%</span>
       </div>
-      <div class="w-full h-2 rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">
+      <div class="w-full h-2 rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden"
+           role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"
+           aria-labelledby="upload-progress-label" id="upload-progress-track">
         <div id="upload-progress-bar" class="h-2 rounded-full bg-primary-600 transition-all duration-300" style="width: 0%"></div>
       </div>
+      {# Transfer rate readout. Deliberately not aria-live: it changes #}
+      {# several times a second, which a screen reader would announce #}
+      {# for the whole upload. The label above carries the live region. #}
+      <div id="upload-stats" class="mt-1 text-xs tabular-nums text-gray-500 dark:text-gray-400"
+           title="Multiply MB/s by 8 for Mbps"></div>
     </div>
     <p id="upload-error" class="hidden mt-2 text-sm text-red-600"></p>
   </form>
@@ -180,6 +187,8 @@
   var progressBar = document.getElementById('upload-progress-bar');
   var progressPct = document.getElementById('upload-progress-pct');
   var progressLabel = document.getElementById('upload-progress-label');
+  var progressTrack = document.getElementById('upload-progress-track');
+  var statsEl = document.getElementById('upload-stats');
   var errorEl = document.getElementById('upload-error');
   var buttons = form.querySelectorAll('button[type="submit"]');
 
@@ -209,6 +218,7 @@
 
   function showError(message) {
     uploading = false;
+    statsEl.textContent = '';
     progressWrap.classList.add('hidden');
     errorEl.textContent = message;
     errorEl.classList.remove('hidden');
@@ -218,11 +228,105 @@
   function setProgress(pct) {
     progressBar.style.width = pct + '%';
     progressPct.textContent = pct + '%';
+    progressTrack.setAttribute('aria-valuenow', pct);
+  }
+
+  // ── Transfer rate ───────────────────────────────────────────────────
+  // Both upload paths already get (loaded, total) from XHR; this turns
+  // them into the two numbers an uploader actually needs -- how fast it
+  // is going now, and how long it has left. `reportProgress` takes bytes
+  // rather than a percentage so parallel transfers (a future multipart
+  // upload, issue #181) can sum their parts into the same call.
+  var rate = null;
+
+  function resetRate() {
+    rate = { start: null, samples: [], lastPaint: 0 };
+  }
+
+  function fmtSize(n) {
+    return n >= 1073741824
+      ? (n / 1073741824).toFixed(2) + ' GB'
+      : (n / 1048576).toFixed(0) + ' MB';
+  }
+
+  function fmtDuration(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '';
+    if (seconds < 90) return Math.round(seconds) + 's';
+    var mins = Math.floor(seconds / 60);
+    return mins < 60
+      ? mins + 'm ' + Math.round(seconds % 60) + 's'
+      : Math.floor(mins / 60) + 'h ' + (mins % 60) + 'm';
+  }
+
+  function reportProgress(loaded, total) {
+    var now = Date.now();
+    if (rate.start === null) {
+      rate.start = now;
+      rate.samples.push({ t: now, loaded: 0 });
+    }
+    setProgress(total ? Math.round((loaded / total) * 100) : 0);
+
+    // A sliding ~5s window backs the instantaneous rate; the running
+    // average is measured from the first byte.
+    rate.samples.push({ t: now, loaded: loaded });
+    while (rate.samples.length > 2 && now - rate.samples[0].t > 5000) {
+      rate.samples.shift();
+    }
+
+    // Progress events can fire many times a second on a fast link.
+    // Repainting each one buys nothing and makes the digits unreadable.
+    if (now - rate.lastPaint < 400) return;
+    rate.lastPaint = now;
+
+    var elapsed = (now - rate.start) / 1000;
+    var avg = elapsed > 0 ? loaded / elapsed : 0;
+    var first = rate.samples[0];
+    var last = rate.samples[rate.samples.length - 1];
+    var span = (last.t - first.t) / 1000;
+    // TCP slow start plus a nearly-empty window makes the first seconds
+    // meaningless, and the first number shown is the one that sticks.
+    var current =
+      span > 0.5 && elapsed > 2 ? (last.loaded - first.loaded) / span : avg;
+
+    var parts = [fmtSize(loaded) + ' / ' + fmtSize(total)];
+    if (elapsed > 2) parts.push((current / 1048576).toFixed(1) + ' MB/s');
+    // Below half a second the average is dominated by the first event.
+    if (elapsed > 0.5) {
+      parts.push((avg / 1048576).toFixed(1) + ' MB/s avg');
+    }
+    if (loaded < total) {
+      if (current > 0) {
+        parts.push('~' + fmtDuration((total - loaded) / current) + ' left');
+      } else if (elapsed > 5) {
+        // A whole sample window with no bytes sent. Saying so beats both a
+        // stale estimate and silently dropping the one number they watch.
+        parts.push('stalled…');
+      }
+    }
+    statsEl.textContent = parts.join(' · ');
+  }
+
+  // The browser being done sending is not the upload being done: the
+  // server still has to verify (or, on the classic path, save) the file.
+  // Freeze the final numbers so the rate doesn't decay toward zero while
+  // the uploader waits on that.
+  function finishRate(total) {
+    if (!rate || rate.start === null) return;
+    var seconds = (Date.now() - rate.start) / 1000;
+    statsEl.textContent =
+      fmtSize(total) +
+      ' in ' +
+      fmtDuration(seconds) +
+      ' · ' +
+      (seconds > 0 ? (total / seconds / 1048576).toFixed(1) : '0.0') +
+      ' MB/s average';
   }
 
   function startProgress() {
     errorEl.classList.add('hidden');
     progressLabel.textContent = 'Uploading…';
+    resetRate();
+    statsEl.textContent = '';
     setProgress(0);
     progressWrap.classList.remove('hidden');
     setButtonsDisabled(true);
@@ -257,11 +361,12 @@
 
     xhr.upload.addEventListener('progress', function (ev) {
       if (!ev.lengthComputable) return;
-      setProgress(Math.round((ev.loaded / ev.total) * 100));
+      reportProgress(ev.loaded, ev.total);
       if (ev.loaded >= ev.total) {
         // The browser is done sending; the server is still saving the
         // file before it responds.
         progressLabel.textContent = 'Processing upload, this may take a while…';
+        finishRate(ev.total);
       }
     });
 
@@ -314,9 +419,10 @@
       xhr.open('POST', data.presigned.url);
       xhr.upload.addEventListener('progress', function (ev) {
         if (!ev.lengthComputable) return;
-        setProgress(Math.round((ev.loaded / ev.total) * 100));
+        reportProgress(ev.loaded, ev.total);
         if (ev.loaded >= ev.total) {
           progressLabel.textContent = 'Verifying upload…';
+          finishRate(ev.total);
         }
       });
       xhr.addEventListener('load', function () {
