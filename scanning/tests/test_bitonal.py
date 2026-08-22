@@ -449,3 +449,31 @@ class TestFinishedCount(ConvertJobsMixin, TestCase):
         scan.refresh_from_db()
         self.assertEqual(finished, 0)
         self.assertEqual(scan.status, Status.CANCELLED)
+
+
+class TestDurationLogging(ConvertJobsMixin, TestCase):
+    """Assembly and end-to-end timings, readable from the logs."""
+
+    def test_the_merge_logs_how_long_assembly_took(self):
+        scan, rows = self.build(shard_count=2, pages_per_shard=2)
+
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            with self.assertLogs("scanning.bitonal", level="INFO") as logs:
+                bitonal.merge_convert_results(scan, rows)
+
+        line = "\n".join(logs.output)
+        self.assertIn("Merged 2 converted shard(s)", line)
+        self.assertRegex(line, r"in \d+\.\d+s")
+
+    def test_finishing_logs_the_whole_stage(self):
+        """From the rows being created to the scan leaving AWAITING."""
+        scan, _ = self.build(shard_count=3, pages_per_shard=4)
+
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            with self.assertLogs("scanning.bitonal", level="INFO") as logs:
+                bitonal.finish_ready_scans()
+
+        line = "\n".join(logs.output)
+        self.assertIn(f"Bitonal stage done for scan {scan.pk}", line)
+        self.assertIn("3 shard(s), 12 page(s)", line)
+        self.assertRegex(line, r"pages/s")

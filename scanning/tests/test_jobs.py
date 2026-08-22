@@ -798,3 +798,70 @@ class TestSubmitNeedsS3(ScanningTestCase):
         self.assertEqual(
             {job.status for job in convert_jobs(scan)}, {JobStatus.PENDING}
         )
+
+
+@override_settings(**DOCTOR)
+class TestDurationLogging(ScanningTestCase):
+    """Timings readable from the logs, not only from SQL.
+
+    The point of the stage is that it is faster than the in-process pass
+    it replaced, so the numbers that prove it should not need a query to
+    recover.
+    """
+
+    def test_a_completed_shard_logs_its_duration(self):
+        job = ExternalJobFactory(
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            status=JobStatus.SUBMITTED,
+            shard_index=0,
+            shard_count=4,
+        )
+        submitted = timezone.now() - timedelta(seconds=42)
+        ExternalJob.objects.filter(pk=job.pk).update(submitted_at=submitted)
+        job.submitted_at = submitted
+
+        with self.assertLogs("scanning.jobs", level="INFO") as logs:
+            jobs._complete(
+                job, {"duration_ms": 31_200, "pages": 100}, timezone.now()
+            )
+
+        line = "\n".join(logs.output)
+        self.assertIn("shard 1/4", line)
+        self.assertIn("completed in 42.0s", line)
+        # Ours versus doctor's own clock: the gap is queue and transport.
+        self.assertIn("doctor 31.2s", line)
+        self.assertIn("100 page(s)", line)
+        self.assertIn("confirmed by response", line)
+
+    def test_a_shard_confirmed_by_s3_still_logs_a_duration(self):
+        """No response, so no doctor timing -- but ours is still known."""
+        job = ExternalJobFactory(
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            status=JobStatus.SUBMITTED,
+        )
+        submitted = timezone.now() - timedelta(seconds=10)
+        ExternalJob.objects.filter(pk=job.pk).update(submitted_at=submitted)
+        job.submitted_at = submitted
+
+        with self.assertLogs("scanning.jobs", level="INFO") as logs:
+            jobs._complete(job, None, timezone.now())
+
+        line = "\n".join(logs.output)
+        self.assertIn("completed in 10.0s", line)
+        self.assertIn("confirmed by s3_head", line)
+        self.assertNotIn("doctor", line)
+
+    def test_nothing_is_logged_when_the_write_loses_the_race(self):
+        job = ExternalJobFactory(status=JobStatus.SUBMITTED)
+        ExternalJob.objects.filter(pk=job.pk).update(
+            status=JobStatus.CANCELLED
+        )
+
+        with self.assertLogs("scanning.jobs", level="INFO") as logs:
+            self.assertFalse(jobs._complete(job, None, timezone.now()))
+
+        self.assertNotIn("completed in", "\n".join(logs.output))

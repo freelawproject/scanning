@@ -165,7 +165,7 @@ def _complete(job: ExternalJob, output: dict | None, now) -> bool:
     meta = dict(job.provider_meta or {})
     meta["output"] = output
     meta["confirmed_by"] = "response" if output else "s3_head"
-    return _write(
+    written = _write(
         job,
         status=JobStatus.COMPLETED,
         completed_at=now,
@@ -173,6 +173,49 @@ def _complete(job: ExternalJob, output: dict | None, now) -> bool:
         error_code="",
         error_message="",
         provider_meta=meta,
+    )
+    if written:
+        # Both halves of the wall clock in one line, so the timings this
+        # stage is judged on can be read off the logs instead of
+        # reconstructed from timestamps in SQL. Ours is what the shard
+        # cost us end to end; doctor's ``duration_ms`` is the conversion
+        # alone, so the gap between them is queue and transport.
+        _log_completion(job, output, now)
+    return written
+
+
+def _log_completion(job: ExternalJob, output: dict | None, now) -> None:
+    """Log how long one shard took, and how much of that was doctor's.
+
+    :param job: The row just completed.
+    :param output: Doctor's summary, when its response reached us.
+    :param now: Completion timestamp.
+    :return: None.
+    """
+    elapsed = (
+        (now - job.submitted_at).total_seconds() if job.submitted_at else None
+    )
+    detail = ""
+    if output:
+        duration_ms = output.get("duration_ms")
+        pages = output.get("pages")
+        parts = []
+        if isinstance(duration_ms, int | float):
+            parts.append(f"doctor {duration_ms / 1000:.1f}s")
+        if pages:
+            parts.append(f"{pages} page(s)")
+        if parts:
+            detail = f" ({', '.join(parts)})"
+    logger.info(
+        "%s/%s shard %d/%d of scan %s completed in %s%s, confirmed by %s",
+        job.stage,
+        job.engine,
+        job.shard_index + 1,
+        job.shard_count,
+        job.scan_id,
+        f"{elapsed:.1f}s" if elapsed is not None else "an unknown time",
+        detail,
+        job.provider_meta.get("confirmed_by", "?"),
     )
 
 

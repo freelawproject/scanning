@@ -110,6 +110,11 @@ must not be broken:
   deletes the results it consumed.
 - Every row write is a compare-and-swap on the row's current status
   (`jobs._write`), so no lock is held across an HTTP call.
+- Three INFO lines carry the timings the stage is judged on, so
+  benchmarking it needs no SQL: per shard (ours end to end, plus
+  doctor's own `duration_ms`, whose gap is queue and transport), per
+  merge, and per scan (row creation to leaving AWAITING, with
+  pages/second).
 - `dpi=200` / `threshold=160` are the legacy blackletter values, not
   doctor's own, so a converted volume matches every `bitonal.pdf`
   already in the corpus.

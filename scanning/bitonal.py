@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import time
 from pathlib import Path
 
 import fitz
@@ -146,6 +147,7 @@ def merge_convert_results(scan, convert_jobs: list[ExternalJob]) -> Path:
     expected_total = convert_jobs[0].input_manifest.get("source_page_count")
     output_dir = Path(ensure_output_dir(scan))
     destination = output_dir / s3_sync.PIPELINE_INPUT_NAME
+    started = time.monotonic()
 
     # A temp dir, not the output dir: the generic S3 sync sweeps up
     # everything there, and these are wire artifacts that stay out of it.
@@ -188,11 +190,12 @@ def merge_convert_results(scan, convert_jobs: list[ExternalJob]) -> Path:
 
     size_mb = destination.stat().st_size / 1024 / 1024
     logger.info(
-        "Merged %d converted shard(s) into %s for scan %s (%.1f MB)",
+        "Merged %d converted shard(s) into %s for scan %s (%.1f MB) in %.1fs",
         len(convert_jobs),
         destination.name,
         scan.pk,
         size_mb,
+        time.monotonic() - started,
     )
     s3_sync.upload_file_to_s3(scan, s3_sync.PIPELINE_INPUT_NAME)
     return destination
@@ -244,6 +247,7 @@ def _finish_scan(scan, convert_jobs: list[ExternalJob]) -> bool:
         if not _park(scan, Status.AWAITING_VALIDATION, CONVERTED_MESSAGE):
             return False
         now = timezone.now()
+        _log_stage_duration(scan, convert_jobs, now)
         ExternalJob.objects.filter(
             pk__in=[job.pk for job in convert_jobs],
             status=JobStatus.COMPLETED,
@@ -256,6 +260,40 @@ def _finish_scan(scan, convert_jobs: list[ExternalJob]) -> bool:
         [job.result_key for job in convert_jobs if job.result_key]
     )
     return True
+
+
+def _log_stage_duration(scan, convert_jobs: list[ExternalJob], now) -> None:
+    """Log what the whole conversion cost this scan, end to end.
+
+    Measured from when the rows were created -- the moment the stage
+    began -- to the scan leaving AWAITING, so it covers queueing,
+    conversion, retries and the merge. The pages-per-second figure is
+    the one comparable against the retired in-process pass.
+
+    :param scan: The scan leaving AWAITING.
+    :param convert_jobs: The live run's rows.
+    :param now: The time the scan was parked.
+    :return: None.
+    """
+    started = min(
+        (job.date_created for job in convert_jobs if job.date_created),
+        default=None,
+    )
+    if started is None:
+        return
+    elapsed = (now - started).total_seconds()
+    pages = sum(
+        job.input_manifest.get("page_count") or 0 for job in convert_jobs
+    )
+    rate = f", {pages / elapsed:.1f} pages/s" if pages and elapsed > 0 else ""
+    logger.info(
+        "Bitonal stage done for scan %s: %d shard(s), %d page(s) in %.1fs%s",
+        scan.pk,
+        len(convert_jobs),
+        pages,
+        elapsed,
+        rate,
+    )
 
 
 def finish_ready_scans() -> int:
