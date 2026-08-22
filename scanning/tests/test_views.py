@@ -769,6 +769,40 @@ class TestPresignedUpload(ScanningTestCase):
         )
         self.assertEqual(response.status_code, 400)
 
+    def test_presign_logs_upload_start(self):
+        # The bytes never touch Django, so this line is our only record
+        # that a transfer began (issue #181).
+        with self.assertLogs("scanning.views", level="INFO") as logs:
+            resp, _ = self._presign(size=str(2 * 1024 * 1024))
+        pending_id = resp.json()["pending_id"]
+        start = [ln for ln in logs.output if "Upload started" in ln]
+        self.assertEqual(len(start), 1)
+        self.assertIn("2.0 MB", start[0])
+        self.assertIn(pending_id, start[0])
+
+    def test_confirm_logs_upload_duration_and_rate(self):
+        # Paired with the presign line, this is what makes throughput
+        # measurable without joining logs against S3 metadata.
+        pending_id = self._presign(size=str(4 * 1024 * 1024))[0].json()[
+            "pending_id"
+        ]
+        with (
+            patch(
+                "scanning.s3_sync.verify_uploaded_object", return_value=True
+            ),
+            self.assertLogs("scanning.views", level="INFO") as logs,
+        ):
+            response = self.client.post(
+                self.confirm_url,
+                {"pending_id": pending_id, "action": "upload_only"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 200)
+        done = [ln for ln in logs.output if "Upload finished" in ln]
+        self.assertEqual(len(done), 1)
+        self.assertIn("4.0 MB", done[0])
+        self.assertIn("MB/s", done[0])
+
     def test_confirm_failure_deletes_s3_object(self):
         pending_id = self._presign()[0].json()["pending_id"]
         pending = PendingUpload.objects.get(pk=pending_id)

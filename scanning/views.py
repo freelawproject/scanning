@@ -745,6 +745,21 @@ def presign_scan_upload(request, reporter_slug, vol):
             status=503,
         )
 
+    # Marks the start of an upload. The bytes go straight from the browser
+    # to S3, so this line is the only record on our side that a transfer
+    # began: pair it with the matching "upload finished" line in
+    # ``confirm_scan_upload`` to measure a volunteer's real throughput
+    # (issue #181). Note the pairing survives a lost confirm only in the
+    # log -- the ``PendingUpload`` row is deleted once the upload lands.
+    logger.info(
+        "Upload started for scan %s: %.1f MB, action=%s, pending %s, key %s",
+        scan.pk,
+        size / 1024 / 1024,
+        action,
+        pending.id,
+        pending.s3_key,
+    )
+
     return JsonResponse(
         {"presigned": presigned, "pending_id": str(pending.id)}
     )
@@ -802,6 +817,24 @@ def confirm_scan_upload(request, reporter_slug, vol):
 
     scan.original_pdf.name = original_name
     scan.save(update_fields=["original_pdf"])
+
+    # Counterpart to the "Upload started" line in ``presign_scan_upload``.
+    # Measured from the row's creation, so it includes the seconds between
+    # presign and the browser's first byte; the size is the one the browser
+    # declared at presign time, which the policy's content-length-range
+    # condition caps but does not confirm. Close enough to answer "how fast
+    # are our uploaders?" (issue #181) without a HEAD per upload.
+    elapsed = (timezone.now() - pending.date_created).total_seconds()
+    size_mb = pending.expected_size / 1024 / 1024
+    logger.info(
+        "Upload finished for scan %s: %.1f MB in %.1fs (%.2f MB/s), "
+        "pending %s",
+        scan.pk,
+        size_mb,
+        elapsed,
+        size_mb / elapsed if elapsed > 0 else 0.0,
+        pending.id,
+    )
     pending.delete()
 
     return JsonResponse({"redirect": _finalize_uploaded_scan(request, scan)})
