@@ -106,6 +106,14 @@
            dark:bg-blue-900/50 dark:text-blue-300;
   }
 
+  /* Waiting on external jobs (#176): the shards are with doctor or
+     RunPod. Work is under way but nothing of ours is running, so it
+     gets a dimmer blue than the active .badge-processing. */
+  .badge-awaiting {
+    @apply badge bg-indigo-100 text-indigo-800
+           dark:bg-indigo-900/50 dark:text-indigo-300;
+  }
+
   /* Interim #173 parking state: sharded, waiting for the new
      validation stage. Slate keeps it visually distinct from both the
      active blue of processing and the actionable yellow of review. */

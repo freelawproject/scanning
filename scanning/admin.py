@@ -6,6 +6,7 @@ from django.urls import NoReverseMatch, reverse
 from django.utils.html import format_html
 from django.utils.text import capfirst
 
+from scanning import jobs
 from scanning.models import (
     Detection,
     ExternalJob,
@@ -29,27 +30,36 @@ from scanning.services import (
 logger = logging.getLogger(__name__)
 
 
-def _delete_scan_shard_objects(scan):
-    """Best-effort sweep of a scan's shard set from S3 before deletion.
+def _delete_scan_wire_objects(scan):
+    """Best-effort sweep of a scan's shards and job results from S3.
 
-    The shard PDFs duplicate the original's bytes, so they are the
-    largest objects a deleted scan would otherwise orphan under its
-    processing prefix. Best effort: an S3 hiccup must not block the
-    admin delete, an orphaned prefix is the pre-existing status quo.
+    The two prefixes nothing else removes, and the largest a deleted
+    scan would orphan: the shards duplicate the original's bytes, and
+    the job results hold one converted copy of the volume per attempt.
+    Both are excluded from every sync, so the row going away is the only
+    thing that triggers this.
+
+    Best effort: an S3 hiccup must not block the admin delete, and an
+    orphaned prefix is the pre-existing status quo.
 
     :param scan: The scan about to be deleted.
     """
     from scanning import s3_sync
 
-    try:
-        s3_sync.delete_shard_objects(scan)
-    except Exception:
-        logger.warning(
-            "Could not delete S3 shard objects for scan %s; they are "
-            "orphaned now that the scan row is gone",
-            scan.pk,
-            exc_info=True,
-        )
+    for label, sweep in (
+        ("shard", s3_sync.delete_shard_objects),
+        ("job result", s3_sync.delete_job_objects),
+    ):
+        try:
+            sweep(scan)
+        except Exception:
+            logger.warning(
+                "Could not delete S3 %s objects for scan %s; they are "
+                "orphaned now that the scan row is gone",
+                label,
+                scan.pk,
+                exc_info=True,
+            )
 
 
 class RetryCapFilter(admin.SimpleListFilter):
@@ -305,14 +315,15 @@ class ScanAdmin(admin.ModelAdmin):
 
         Without this, the volume can drift (e.g. stay at COMPLETE after
         its only approved scan is deleted from the admin). The scan's S3
-        shard set is swept too (best effort, before the row goes away):
-        it duplicates the original's bytes and nothing else removes it.
+        shards and job results are swept too (best effort, before the
+        row goes away): they duplicate the volume's bytes and nothing
+        else removes them.
 
         :param request: The admin HTTP request.
         :param obj: The Scan to delete.
         """
         volume = obj.volume_obj
-        _delete_scan_shard_objects(obj)
+        _delete_scan_wire_objects(obj)
         super().delete_model(request, obj)
         if volume is not None:
             refresh_volume_queue_status(volume)
@@ -320,7 +331,7 @@ class ScanAdmin(admin.ModelAdmin):
     def delete_queryset(self, request, queryset):
         """Bulk-delete Scans and refresh affected Volumes.
 
-        Sweeps each scan's S3 shard set first, same as
+        Sweeps each scan's S3 shards and job results first, same as
         :meth:`delete_model`.
 
         :param request: The admin HTTP request.
@@ -332,19 +343,22 @@ class ScanAdmin(admin.ModelAdmin):
             .distinct()
         )
         for scan in queryset:
-            _delete_scan_shard_objects(scan)
+            _delete_scan_wire_objects(scan)
         super().delete_queryset(request, queryset)
         for volume in Volume.objects.filter(pk__in=volume_ids):
             refresh_volume_queue_status(volume)
 
-    # Statuses a scan can be re-queued FROM: any error flavor, plus a
-    # scan stuck in PROCESSING after its daemon was killed. Anything
+    # Statuses a scan can be re-queued FROM: any error flavor, plus the
+    # two "busy" states an operator may need to break out of -- a scan
+    # stuck in PROCESSING after its daemon was killed, and one stuck in
+    # AWAITING behind external jobs that will never finish. Anything
     # else (QUEUED, PENDING_REVIEW, DONE, ...) is left alone.
     _REQUEUEABLE_STATUSES = (
         Status.ERROR,
         Status.ERROR_MAX_RETRIES,
         Status.ERROR_INTERRUPTED,
         Status.PROCESSING,
+        Status.AWAITING,
     )
 
     def _requeue(
@@ -381,6 +395,13 @@ class ScanAdmin(admin.ModelAdmin):
             appended when part of the selection was left alone.
         :return: None.
         """
+        # A re-queue means "start this over". Open rows would let a
+        # stale attempt's outcome land on a scan that has moved on, and
+        # would make ``ensure_convert_jobs`` reuse rows whose result
+        # objects another attempt may still be writing.
+        for scan in queryset.filter(status__in=statuses):
+            jobs.abandon_open(scan, "Re-queued from the admin")
+
         # Re-point every recovered scan at the (interim) full pipeline.
         # The other queued actions were disconnected by issue #173, so a
         # stale ``queued_action`` left over from before the cutover would

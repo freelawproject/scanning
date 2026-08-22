@@ -71,18 +71,61 @@ class ScanAdminRequeueActionTests(TestCase):
         self.assertEqual(scan.retry_count, 0)
         self.assertEqual(scan.interruption_count, 0)
 
-    def test_requeue_scans_covers_all_error_and_processing(self):
+    def test_requeue_scans_covers_all_error_and_busy_statuses(self):
         scans = [
             ScanFactory(status=Status.ERROR),
             ScanFactory(status=Status.ERROR_MAX_RETRIES),
             ScanFactory(status=Status.ERROR_INTERRUPTED),
             ScanFactory(status=Status.PROCESSING),
+            # A scan stuck behind external jobs that will never finish
+            # has to be recoverable too (issue #176).
+            ScanFactory(status=Status.AWAITING),
         ]
         pks = [s.pk for s in scans]
         self._run("requeue_scans", Scan.objects.filter(pk__in=pks))
         self.assertEqual(
-            Scan.objects.filter(pk__in=pks, status=Status.QUEUED).count(), 4
+            Scan.objects.filter(pk__in=pks, status=Status.QUEUED).count(), 5
         )
+
+    def test_requeue_cancels_the_scans_open_jobs(self):
+        """A re-queue means start over, so nothing may still be in flight.
+
+        Leaving a row open would let a stale attempt's outcome land on a
+        scan that has moved on, and would make ``ensure_convert_jobs``
+        reuse rows whose result objects another attempt is still writing.
+        """
+        from scanning.models import JobStatus
+
+        scan = ScanFactory(status=Status.AWAITING)
+        in_flight = ExternalJobFactory(
+            scan=scan, stage=JobStage.CONVERT, status=JobStatus.SUBMITTED
+        )
+        other = ScanFactory(status=Status.PENDING_REVIEW)
+        untouched = ExternalJobFactory(
+            scan=other, stage=JobStage.CONVERT, status=JobStatus.SUBMITTED
+        )
+
+        self._run("requeue_scans", Scan.objects.filter(pk=scan.pk))
+
+        in_flight.refresh_from_db()
+        untouched.refresh_from_db()
+        self.assertEqual(in_flight.status, JobStatus.CANCELLED)
+        self.assertEqual(in_flight.error_code, "ABANDONED")
+        self.assertEqual(untouched.status, JobStatus.SUBMITTED)
+
+    def test_requeue_leaves_a_skipped_scans_jobs_alone(self):
+        """Only the scans the action actually re-queues are abandoned."""
+        from scanning.models import JobStatus
+
+        scan = ScanFactory(status=Status.PENDING_REVIEW)
+        job = ExternalJobFactory(
+            scan=scan, stage=JobStage.CONVERT, status=JobStatus.SUBMITTED
+        )
+
+        self._run("requeue_scans", Scan.objects.filter(pk=scan.pk))
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.SUBMITTED)
 
     def test_requeue_scans_skips_non_error_leaves_it_untouched(self):
         err = ScanFactory(status=Status.ERROR)
@@ -191,30 +234,36 @@ class ScanAdminRequeueActionTests(TestCase):
 
 
 class ScanAdminDeleteShardSweepTests(TestCase):
-    """Scan deletion sweeps the S3 shard set (PR #169 review).
+    """Scan deletion sweeps the S3 shards and job results.
 
-    The shard PDFs duplicate the original's bytes, so they are the
-    largest objects a deleted scan would otherwise orphan under its
-    processing prefix.
+    The two prefixes nothing else removes (PR #169 review, issue #176).
+    The shard PDFs duplicate the original's bytes and each job result
+    holds a converted copy of the volume, so they are the largest
+    objects a deleted scan would otherwise orphan under its processing
+    prefix.
     """
 
     def setUp(self):
         self.admin = ScanAdmin(Scan, AdminSite())
 
-    def test_delete_model_sweeps_shard_objects(self):
+    def test_delete_model_sweeps_shards_and_job_results(self):
         scan = ScanFactory()
-        with patch("scanning.s3_sync.delete_shard_objects") as mock_delete:
-            self.admin.delete_model(_request_with_messages(), scan)
-        mock_delete.assert_called_once()
-        self.assertEqual(mock_delete.call_args.args[0].pk, scan.pk)
+        with patch("scanning.s3_sync.delete_shard_objects") as shards:
+            with patch("scanning.s3_sync.delete_job_objects") as results:
+                self.admin.delete_model(_request_with_messages(), scan)
+        for mock_delete in (shards, results):
+            mock_delete.assert_called_once()
+            self.assertEqual(mock_delete.call_args.args[0].pk, scan.pk)
         self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
 
     def test_delete_queryset_sweeps_each_scan(self):
         scans = [ScanFactory(), ScanFactory()]
         queryset = Scan.objects.filter(pk__in=[s.pk for s in scans])
         with patch("scanning.s3_sync.delete_shard_objects") as mock_delete:
-            self.admin.delete_queryset(_request_with_messages(), queryset)
+            with patch("scanning.s3_sync.delete_job_objects") as results:
+                self.admin.delete_queryset(_request_with_messages(), queryset)
         self.assertEqual(mock_delete.call_count, 2)
+        self.assertEqual(results.call_count, 2)
         self.assertEqual(
             sorted(c.args[0].pk for c in mock_delete.call_args_list),
             sorted(s.pk for s in scans),
@@ -222,15 +271,13 @@ class ScanAdminDeleteShardSweepTests(TestCase):
         self.assertFalse(queryset.exists())
 
     def test_delete_survives_an_s3_failure(self):
-        # Best effort: an S3 hiccup must not block the admin delete.
+        """Best effort, and one prefix failing must not skip the other."""
         scan = ScanFactory()
-        with patch(
-            "scanning.s3_sync.delete_shard_objects",
-            side_effect=ClientError(
-                {"Error": {"Code": "SlowDown"}}, "DeleteObjects"
-            ),
-        ):
-            self.admin.delete_model(_request_with_messages(), scan)
+        error = ClientError({"Error": {"Code": "SlowDown"}}, "DeleteObjects")
+        with patch("scanning.s3_sync.delete_shard_objects", side_effect=error):
+            with patch("scanning.s3_sync.delete_job_objects") as results:
+                self.admin.delete_model(_request_with_messages(), scan)
+        results.assert_called_once()
         self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
 
 

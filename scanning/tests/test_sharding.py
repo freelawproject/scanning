@@ -20,7 +20,7 @@ from PIL import Image
 
 from scanning import services, sharding
 from scanning.factories import ReporterFactory, ScanFactory
-from scanning.models import Status
+from scanning.models import Scan, Status
 
 MEDIA_ROOT = tempfile.mkdtemp()
 
@@ -88,6 +88,47 @@ class TestPlanShards(SimpleTestCase):
             sharding.plan_shards(10, 0, target_bytes=100)
         with self.assertRaises(sharding.ShardingError):
             sharding.plan_shards(10, 1000, target_bytes=0)
+
+    def test_no_page_cap_leaves_the_split_byte_driven(self):
+        for max_pages in (None, 0):
+            with self.subTest(max_pages=max_pages):
+                ranges = sharding.plan_shards(
+                    50, 10_000, target_bytes=20_000, max_pages=max_pages
+                )
+                self.assertEqual(ranges, [(0, 49)])
+
+    def test_a_compact_volume_is_split_by_pages(self):
+        """The case the byte target alone gets wrong (#176).
+
+        An already-bitonal 1300-page volume can sit under the byte
+        target and would become one ~5 minute conversion request against
+        a pod with a 30s termination grace. Conversion cost is per page,
+        so the page ceiling is what keeps shard duration uniform.
+        """
+        ranges = sharding.plan_shards(
+            1300, 50_000_000, target_bytes=200 * 1024**2, max_pages=100
+        )
+
+        self.assertEqual(len(ranges), 13)
+        self.assertEqual(ranges[0], (0, 99))
+        self.assert_covers(ranges, 1300)
+
+    def test_the_larger_of_the_two_demands_wins(self):
+        # Byte-bound: 1000/300 -> 4 shards, and the page cap of 5 would
+        # only ask for 2, so the bytes decide.
+        self.assertEqual(
+            len(sharding.plan_shards(10, 1000, target_bytes=300, max_pages=5)),
+            4,
+        )
+        # Page-bound: the bytes ask for 1, the cap of 2 asks for 5.
+        self.assertEqual(
+            len(sharding.plan_shards(10, 100, target_bytes=300, max_pages=2)),
+            5,
+        )
+
+    def test_the_page_cap_cannot_exceed_the_page_count(self):
+        ranges = sharding.plan_shards(3, 100, target_bytes=1000, max_pages=1)
+        self.assertEqual(ranges, [(0, 0), (1, 1), (2, 2)])
 
 
 class TestShardPdfAndVerify(SimpleTestCase):
@@ -262,6 +303,38 @@ class TestEnsureShards(TestCase):
         self.assertIn("split_seconds", stored["timings"])
         self.assertIn("verify_seconds", stored["timings"])
 
+    @override_settings(SHARD_TARGET_BYTES=200 * 1024**2, SHARD_MAX_PAGES=2)
+    def test_the_page_cap_is_applied_and_recorded(self):
+        """A volume far under the byte target still splits by pages."""
+        scan = self._scan_with_volume(pages=6)
+
+        manifest = sharding.ensure_shards(scan)
+
+        self.assertEqual(len(manifest["shards"]), 3)
+        self.assertEqual(
+            [entry["page_count"] for entry in manifest["shards"]], [2, 2, 2]
+        )
+        self.assertEqual(manifest["max_pages"], 2)
+
+    @override_settings(SHARD_TARGET_BYTES=200 * 1024**2, SHARD_MAX_PAGES=2)
+    def test_retuning_the_page_cap_does_not_reshard(self):
+        """Same rule as the byte target: once computed, never recompute.
+
+        Neither bound is part of the manifest fingerprint, so a change
+        only reaches volumes sharded after it. Re-cutting the corpus
+        would need a MANIFEST_VERSION bump.
+        """
+        scan = self._scan_with_volume(pages=6)
+        first = sharding.ensure_shards(scan)
+        self.assertEqual(len(first["shards"]), 3)
+
+        with override_settings(SHARD_MAX_PAGES=1):
+            with patch("scanning.sharding.shard_pdf") as mock_shard:
+                again = sharding.ensure_shards(scan)
+
+        mock_shard.assert_not_called()
+        self.assertEqual(len(again["shards"]), 3)
+
     def test_second_run_reuses_manifest(self):
         scan = self._scan_with_volume(pages=4)
         first = sharding.ensure_shards(scan)
@@ -417,8 +490,13 @@ class TestEnsureShards(TestCase):
                 services._ensure_shards(scan)
 
     def test_full_pipeline_runs_the_sharding_stage(self):
-        """Pin the call site: the interim pipeline shards, then parks."""
+        """Pin the call site: the pipeline shards, then parks.
+
+        PROCESSING because that is how the daemon hands a scan over,
+        and the pipeline's status writes are guarded on it.
+        """
         scan = self._scan_with_volume(pages=2)
+        Scan.objects.filter(pk=scan.pk).update(status=Status.PROCESSING)
         with (
             patch("scanning.services._ensure_shards") as mock_shards,
             # run_full_pipeline drops DB connections for the daemon; a

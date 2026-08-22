@@ -30,13 +30,24 @@ class TestRunDaemonSchedule(TestCase):
 
     @override_settings(
         DAEMON_POLL_INTERVAL=5,
+        DAEMON_SUBMIT_INTERVAL=5,
+        DAEMON_COLLECT_INTERVAL=15,
         PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS=900,
     )
-    def test_build_schedule_has_both_tasks(self):
+    def test_build_schedule_has_every_task(self):
         cmd = Command()
-        names = [t.name for t in cmd._build_schedule()]
+        schedule = cmd._build_schedule()
+        names = [t.name for t in schedule]
         self.assertIn("process_next_scan", names)
+        # The external-job loop (#176): submit waves, then confirm and
+        # apply. Without both scheduled, a scan parked in AWAITING never
+        # moves again.
+        self.assertIn("submit_external_jobs", names)
+        self.assertIn("collect_external_jobs", names)
         self.assertIn("cleanup_processing_tmp", names)
+        intervals = {t.name: t.interval_seconds for t in schedule}
+        self.assertEqual(intervals["submit_external_jobs"], 5.0)
+        self.assertEqual(intervals["collect_external_jobs"], 15.0)
 
     def test_handle_invokes_due_tasks_and_shuts_down(self):
         """The scheduler should call_command each due task then exit on signal."""
@@ -123,6 +134,23 @@ class TestHandleSignal(TestCase):
         self.assertIn("signal 15", in_flight.progress_message)
         self.assertEqual(other.status, Status.UPLOADED)
         mock_capture.assert_called_once()
+
+    def test_signal_leaves_awaiting_scans_alone(self):
+        """A deploy must not re-queue work a provider is still doing.
+
+        The scan is parked in AWAITING precisely because nothing of ours
+        is running (#176); re-queueing it on every daemon restart would
+        re-convert volumes and burn the interruption budget for waiting.
+        """
+        cmd = Command()
+        waiting = ScanFactory(status=Status.AWAITING, interruption_count=0)
+
+        with patch("sentry_sdk.capture_message"):
+            cmd._handle_signal(15, None)
+
+        waiting.refresh_from_db()
+        self.assertEqual(waiting.status, Status.AWAITING)
+        self.assertEqual(waiting.interruption_count, 0)
 
     def test_signal_with_no_processing_scans(self):
         """No-op on the DB side if nothing is in flight, but Sentry still fires."""

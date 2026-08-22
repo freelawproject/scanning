@@ -535,8 +535,10 @@ def _finalize_uploaded_scan(request, scan):
     """Apply the requested post-upload action and return the destination.
 
     Shared tail of both upload paths, run once the original PDF is
-    stored. ``upload_validate`` queues the full pipeline and sends the
-    user to the process viewer; ``upload_only`` just records success.
+    stored. Both actions queue the pipeline (see
+    ``services.apply_upload_action``); what differs is where the user
+    lands -- ``upload_validate`` opens the process viewer,
+    ``upload_only`` goes back to the queue.
 
     :param request: The HTTP request (source of the ``action`` field).
     :param scan: The scan whose original PDF is now stored.

@@ -761,8 +761,13 @@ class TestS3EnabledBranches(SimpleTestCase):
         with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
             self.assertTrue(s3_sync._s3_enabled())
 
-    @override_settings(DEVELOPMENT=True, RUNPOD_ENABLED=False, TESTING=False)
-    def test_dev_without_runpod_returns_false(self):
+    @override_settings(
+        DEVELOPMENT=True,
+        RUNPOD_ENABLED=False,
+        DOCTOR_ENABLED=False,
+        TESTING=False,
+    )
+    def test_dev_without_a_provider_returns_false(self):
         with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
             self.assertFalse(s3_sync._s3_enabled())
 
@@ -802,3 +807,242 @@ class TestS3ClientRegion(SimpleTestCase):
         mock_boto3.client.assert_called_once_with(
             "s3", region_name="us-west-2"
         )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestJobAttemptKeys(TestCase):
+    """Keys for one attempt of one job (issue #176)."""
+
+    def _job(self, **kwargs):
+        from scanning.factories import ExternalJobFactory
+        from scanning.models import JobEngine, JobProvider, JobStage
+
+        defaults = {
+            "scan": _reporter_scan(),
+            "stage": JobStage.CONVERT,
+            "engine": JobEngine.BITONAL,
+            "provider": JobProvider.DOCTOR,
+        }
+        defaults.update(kwargs)
+        return ExternalJobFactory(**defaults)
+
+    def test_the_key_names_run_shard_and_attempt(self):
+        job = self._job(run=2, shard_index=3, shard_count=4, attempt=5)
+
+        key = s3_sync.s3_job_attempt_key(job, suffix=".pdf")
+
+        self.assertEqual(
+            key,
+            f"processing/{job.scan.pk}/tc/164/1/jobs/convert/bitonal/"
+            "r2-s3-a5.pdf",
+        )
+
+    def test_the_suffix_defaults_to_json(self):
+        job = self._job()
+        self.assertTrue(s3_sync.s3_job_attempt_key(job).endswith(".json"))
+
+    def test_two_attempts_of_one_shard_never_share_a_key(self):
+        """Or an abandoned worker's late upload is read as the new one.
+
+        Doctor finishes a conversion even after we stop listening, so
+        this is the normal case for it, not a rare race.
+        """
+        job = self._job(attempt=1)
+        first = s3_sync.s3_job_attempt_key(job, suffix=".pdf")
+        job.attempt = 2
+        second = s3_sync.s3_job_attempt_key(job, suffix=".pdf")
+
+        self.assertNotEqual(first, second)
+
+    def test_shards_and_runs_are_distinct_too(self):
+        job = self._job(run=1, shard_index=0, shard_count=2)
+        base = s3_sync.s3_job_attempt_key(job, suffix=".pdf")
+        job.shard_index = 1
+        by_shard = s3_sync.s3_job_attempt_key(job, suffix=".pdf")
+        job.shard_index = 0
+        job.run = 2
+        by_run = s3_sync.s3_job_attempt_key(job, suffix=".pdf")
+
+        self.assertEqual(len({base, by_shard, by_run}), 3)
+
+    def test_an_opinion_job_is_namespaced_by_its_opinion(self):
+        from scanning.factories import OpinionScanFactory
+        from scanning.models import JobEngine, JobStage
+
+        scan = _reporter_scan()
+        opinion = OpinionScanFactory(scan=scan)
+        job = self._job(
+            scan=scan,
+            opinion=opinion,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.DOTS_MOCR,
+        )
+
+        self.assertIn(f"/op{opinion.pk}/", s3_sync.s3_job_attempt_key(job))
+
+    def test_the_key_lives_under_the_unsynced_jobs_subtree(self):
+        """Results are wire artifacts; the generic sync must skip them."""
+        job = self._job()
+
+        key = s3_sync.s3_job_attempt_key(job, suffix=".pdf")
+        relative = key.split(f"/{job.scan.start_page}/", 1)[1]
+
+        self.assertTrue(relative.startswith(s3_sync.JOB_RESULTS_SUBDIR))
+        self.assertFalse(s3_sync._is_synced_by_default(relative))
+
+
+class TestPresignHelpers(SimpleTestCase):
+    """Presigning for an external worker."""
+
+    @override_settings(
+        AWS_S3_REGION_NAME="us-west-2",
+        AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket",
+        TESTING=True,
+    )
+    def test_the_signing_client_pins_sigv4_and_the_region(self):
+        """Both are load-bearing for a PUT that sends a Content-Type.
+
+        SigV2 folds the header into the string to sign whether or not we
+        signed it, and SigV4 puts the region in the credential scope, so
+        either default being wrong is a 403 at upload time.
+        """
+        with patch("scanning.s3_sync.boto3") as mock_boto3:
+            s3_sync._signing_s3_client()
+
+        kwargs = mock_boto3.client.call_args.kwargs
+        self.assertEqual(kwargs["region_name"], "us-west-2")
+        self.assertEqual(kwargs["config"].signature_version, "s3v4")
+
+    @override_settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket", TESTING=True)
+    def test_presign_get_is_scoped_to_one_object(self):
+        client = MagicMock()
+        with patch("scanning.s3_sync._signing_s3_client", return_value=client):
+            s3_sync.presign_get("shards/0001.pdf", 3600)
+
+        client.generate_presigned_url.assert_called_once_with(
+            "get_object",
+            Params={"Bucket": "bucket", "Key": "shards/0001.pdf"},
+            ExpiresIn=3600,
+        )
+
+    @override_settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket", TESTING=True)
+    def test_presign_put_signs_the_content_type(self):
+        """Doctor sends application/pdf; an unsigned PUT gets a 403."""
+        client = MagicMock()
+        with patch("scanning.s3_sync._signing_s3_client", return_value=client):
+            s3_sync.presign_put("jobs/r1-s0-a1.pdf", "application/pdf", 60)
+
+        client.generate_presigned_url.assert_called_once_with(
+            "put_object",
+            Params={
+                "Bucket": "bucket",
+                "Key": "jobs/r1-s0-a1.pdf",
+                "ContentType": "application/pdf",
+            },
+            ExpiresIn=60,
+        )
+
+
+@override_settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket", TESTING=True)
+class TestObjectExists(SimpleTestCase):
+    """The completion test for a provider that reports nothing back."""
+
+    def _head(self, side_effect=None):
+        client = MagicMock()
+        if side_effect is not None:
+            client.head_object.side_effect = side_effect
+        return client
+
+    def test_a_present_object_is_true(self):
+        client = self._head()
+        with patch("scanning.s3_sync._s3_client", return_value=client):
+            self.assertTrue(s3_sync.object_exists("some/key.pdf"))
+
+    def test_a_missing_object_is_false(self):
+        for code in ("404", "NoSuchKey", "NotFound"):
+            with self.subTest(code=code):
+                client = self._head(
+                    ClientError({"Error": {"Code": code}}, "HeadObject")
+                )
+                with patch("scanning.s3_sync._s3_client", return_value=client):
+                    self.assertFalse(s3_sync.object_exists("some/key.pdf"))
+
+    def test_an_access_denied_is_raised_not_reported_as_absent(self):
+        """Otherwise a bad IAM policy looks like a worker producing nothing.
+
+        S3 answers 403 for a missing key when the caller lacks
+        ListBucket, so swallowing it would make every job silently time
+        out instead of surfacing the misconfiguration.
+        """
+        client = self._head(
+            ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
+        )
+        with patch("scanning.s3_sync._s3_client", return_value=client):
+            with self.assertRaises(ClientError):
+                s3_sync.object_exists("some/key.pdf")
+
+
+@override_settings(
+    AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket",
+    TESTING=False,
+    DEVELOPMENT=False,
+)
+class TestDeleteObjects(SimpleTestCase):
+    """Sweeping consumed job results."""
+
+    def setUp(self):
+        s3_sync._cached_s3_client.cache_clear()
+        self.addCleanup(s3_sync._cached_s3_client.cache_clear)
+
+    def test_keys_are_deleted_in_batches_of_a_thousand(self):
+        keys = [f"key-{i}" for i in range(1500)]
+        client = MagicMock()
+        client.delete_objects.side_effect = [
+            {"Deleted": [{"Key": k} for k in keys[:1000]]},
+            {"Deleted": [{"Key": k} for k in keys[1000:]]},
+        ]
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            with patch("scanning.s3_sync._s3_client", return_value=client):
+                deleted = s3_sync.delete_objects(keys)
+
+        self.assertEqual(deleted, 1500)
+        self.assertEqual(client.delete_objects.call_count, 2)
+
+    def test_a_failure_is_logged_not_raised(self):
+        """An orphan costs storage; a raise would fail a done pipeline."""
+        client = MagicMock()
+        client.delete_objects.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied"}}, "DeleteObjects"
+        )
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            with patch("scanning.s3_sync._s3_client", return_value=client):
+                with self.assertLogs("scanning.s3_sync", level="WARNING"):
+                    self.assertEqual(s3_sync.delete_objects(["k"]), 0)
+
+    def test_nothing_happens_without_keys_or_s3(self):
+        with patch("scanning.s3_sync._s3_client") as client:
+            self.assertEqual(s3_sync.delete_objects([]), 0)
+        client.assert_not_called()
+
+
+@override_settings(TESTING=False)
+class TestS3EnabledWithDoctor(SimpleTestCase):
+    """A doctor-only dev environment still needs the sync (issue #176).
+
+    Doctor reads its input through a presigned GET, so without the sync
+    the shards never reach the bucket it fetches them from.
+    """
+
+    @override_settings(
+        DEVELOPMENT=True, RUNPOD_ENABLED=False, DOCTOR_ENABLED=True
+    )
+    def test_dev_with_doctor_enabled_returns_true(self):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            self.assertTrue(s3_sync._s3_enabled())
+
+    @override_settings(
+        DEVELOPMENT=True, RUNPOD_ENABLED=False, DOCTOR_ENABLED=False
+    )
+    def test_dev_with_neither_provider_returns_false(self):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            self.assertFalse(s3_sync._s3_enabled())

@@ -9,9 +9,9 @@ code fast local-filesystem access (PyMuPDF, Pillow, blackletter).
 
 All sync helpers short-circuit when running under ``TESTING``, when
 AWS credentials are missing, and during ``DEVELOPMENT`` unless
-``RUNPOD_ENABLED`` is also True. The RunPod-enabled dev path needs
-the full sync so a local end-to-end test exercises the same recovery
-behavior as prod.
+``RUNPOD_ENABLED`` or ``DOCTOR_ENABLED`` is also True. A dev
+environment wired to a real provider needs the full sync so a local
+end-to-end test exercises the same recovery behavior as prod.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 
@@ -106,17 +107,37 @@ def _s3_enabled() -> bool:
 
     Skipped during TESTING (so unit tests don't reach live AWS) and
     when AWS credentials are missing. Also skipped during DEVELOPMENT
-    unless RUNPOD_ENABLED is True, since the RunPod-enabled dev path
-    needs full S3 sync to mirror the prod recovery behavior.
+    unless a provider is wired up: a dev environment that dispatches
+    real jobs needs full S3 sync to mirror the prod recovery behavior,
+    and doctor counts as much as RunPod does -- it reads its input
+    through a presigned GET, so without the sync the shards never
+    reach the bucket it fetches them from.
 
     :returns: Whether S3 sync is active in the current environment.
     :rtype: bool
     """
     if getattr(settings, "TESTING", False):
         return False
-    if settings.DEVELOPMENT and not settings.RUNPOD_ENABLED:
+    if settings.DEVELOPMENT and not (
+        settings.RUNPOD_ENABLED or settings.DOCTOR_ENABLED
+    ):
         return False
     return has_s3_credentials()
+
+
+def s3_active() -> bool:
+    """Return whether S3 is actually in use, for callers outside this
+    module.
+
+    The same gate every helper here applies. Exposed because a caller
+    handing an S3 key to a third party needs to know the object was
+    really uploaded: these helpers no-op silently when S3 is off, and a
+    URL for an object nobody wrote fails far from the cause.
+
+    :returns: Whether S3 sync is active in the current environment.
+    :rtype: bool
+    """
+    return _s3_enabled()
 
 
 def direct_upload_enabled() -> bool:
@@ -176,6 +197,227 @@ def s3_job_result_key(scan: Scan, stage: str) -> str:
     """
     return (
         f"{s3_processing_prefix(scan)}{JOB_RESULTS_SUBDIR}{stage}/result.json"
+    )
+
+
+def s3_job_attempt_key(job, suffix: str = ".json") -> str:
+    """Return the S3 key one attempt of one job writes its output to.
+
+    Unlike :func:`s3_job_result_key`, scoped all the way down to run,
+    shard and attempt, which is what a fanned-out stage needs:
+
+    - **shard**, since a volume pass is several jobs at once and they
+      must not overwrite each other.
+    - **run**, so re-running a stage leaves the previous run's output
+      addressable instead of stomping it.
+    - **attempt**, because a ``head_object`` probe is how we find a
+      finished job whose response we lost. A shared key would let an
+      abandoned worker's late upload be harvested as the current
+      attempt's output -- for doctor, whose conversion completes after
+      we stop reading, the normal case rather than a rare race.
+
+    Uniqueness per attempt is also why presence needs no freshness
+    window: anything at the key was written by this attempt.
+
+    :param job: The :class:`~scanning.models.ExternalJob` to address.
+    :param suffix: Extension for the output object. JSON by default; the
+        bitonal stage passes ``".pdf"``.
+    :returns: Key of the form ``{processing_prefix}jobs/{stage}/
+        {engine}/[op{opinion_id}/]r{run}-s{shard}-a{attempt}{suffix}``.
+    :rtype: str
+    """
+    target = f"op{job.opinion_id}/" if job.opinion_id else ""
+    return (
+        f"{s3_processing_prefix(job.scan)}{JOB_RESULTS_SUBDIR}"
+        f"{job.stage}/{job.engine}/{target}"
+        f"r{job.run}-s{job.shard_index}-a{job.attempt}{suffix}"
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _cached_signing_s3_client():
+    """Build and memoize the presigning client (see
+    :func:`_signing_s3_client`)."""
+    return boto3.client(
+        "s3",
+        region_name=settings.AWS_S3_REGION_NAME,
+        config=BotoConfig(signature_version="s3v4"),
+    )
+
+
+def _signing_s3_client():
+    """Return an S3 client pinned to SigV4 and the bucket's region.
+
+    Separate from :func:`_s3_client` because presigning needs two things
+    the ambient default does not guarantee, both invisible until a
+    signed request is rejected:
+
+    - **Signature version.** SigV2 folds ``Content-Type`` into the
+      string to sign whether or not we did, so a URL signed without it
+      and a request sent with it disagree
+      (``SignatureDoesNotMatch``). Every consumer of these sends one.
+    - **Region.** SigV4 puts the region in the credential scope, so
+      signing for the wrong one is rejected outright
+      (``AuthorizationQueryParametersError``). Unset, boto3 assumes
+      ``us-east-1``.
+
+    Bypasses its cache under ``TESTING``, like :func:`_s3_client`, so a
+    patched ``boto3`` is always seen.
+
+    :returns: A boto3 S3 client suitable for presigning.
+    """
+    if getattr(settings, "TESTING", False):
+        return boto3.client(
+            "s3",
+            region_name=settings.AWS_S3_REGION_NAME,
+            config=BotoConfig(signature_version="s3v4"),
+        )
+    return _cached_signing_s3_client()
+
+
+def presign_get(key: str, ttl: int) -> str:
+    """Presign a GET for one object, for an external worker to read.
+
+    :param key: Object key inside the private bucket.
+    :param ttl: Lifetime in seconds. Must outlive queue time plus
+        execution, with the job's deadline well inside it, so we give up
+        on a job long before its signature dies.
+    :returns: A presigned GET URL.
+    :rtype: str
+    """
+    return _signing_s3_client().generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": settings.AWS_PRIVATE_STORAGE_BUCKET_NAME,
+            "Key": key,
+        },
+        ExpiresIn=int(ttl),
+    )
+
+
+def presign_put(key: str, content_type: str, ttl: int) -> str:
+    """Presign a PUT for one object, for an external worker to write.
+
+    ``ContentType`` is signed deliberately: the worker sends the header,
+    and whether S3 folds it into the signature depends on the signature
+    version, so signing it makes both sides agree either way and leaves
+    the object correctly typed. Header and argument must therefore match
+    exactly -- doctor sends ``application/pdf``, and a mismatch is a 403
+    it reports as an expired signature.
+
+    The capability handed out is "overwrite this one object" and nothing
+    more. A prefix cannot be presigned, which is also why the key must
+    be known before submission rather than discovered after.
+
+    :param key: Object key inside the private bucket.
+    :param content_type: Content type the worker will send.
+    :param ttl: Lifetime in seconds.
+    :returns: A presigned PUT URL.
+    :rtype: str
+    """
+    return _signing_s3_client().generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": settings.AWS_PRIVATE_STORAGE_BUCKET_NAME,
+            "Key": key,
+            "ContentType": content_type,
+        },
+        ExpiresIn=int(ttl),
+    )
+
+
+#: Codes S3 answers a ``head_object`` on a missing key with. The 403 is
+#: deliberately absent: without ``s3:ListBucket`` S3 reports
+#: ``AccessDenied`` for a key that does not exist, and reading that as
+#: "no object" would hide an IAM misconfiguration behind jobs that
+#: silently never complete.
+_MISSING_OBJECT_CODES = ("404", "NoSuchKey", "NotFound")
+
+
+def object_exists(key: str) -> bool:
+    """Return whether an object is present at ``key``.
+
+    The completion test for a provider that reports nothing back. A
+    single PUT is atomic, so a partial upload never becomes a gettable
+    object: presence means the whole result is there, and with
+    per-attempt keys (:func:`s3_job_attempt_key`) that *this* attempt
+    wrote it.
+
+    :param key: Object key inside the private bucket.
+    :returns: True if the object exists.
+    :rtype: bool
+    :raises ClientError: On any S3 error other than a missing object: a
+        throttle or IAM failure must not read as "produced nothing".
+    """
+    try:
+        _s3_client().head_object(
+            Bucket=settings.AWS_PRIVATE_STORAGE_BUCKET_NAME, Key=key
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in _MISSING_OBJECT_CODES:
+            return False
+        raise
+    return True
+
+
+def delete_objects(keys: list[str]) -> int:
+    """Delete specific objects by key, best effort.
+
+    For wire artifacts a consumer has finished with. Job results are the
+    case that matters: a volume's shard results duplicate every byte of
+    the ``bitonal.pdf`` they were merged into, so keeping them doubles
+    what the volume costs to store.
+
+    Best effort on purpose: an orphan costs storage and nothing else, so
+    a failure is logged rather than raised into a pipeline that has
+    already succeeded.
+
+    :param keys: Object keys inside the private bucket.
+    :returns: Number of keys S3 accepted for deletion (0 when disabled).
+    :rtype: int
+    """
+    if not _s3_enabled() or not keys:
+        return 0
+
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    s3 = _s3_client()
+    deleted = 0
+    # delete_objects takes at most 1000 keys per call.
+    for start in range(0, len(keys), 1000):
+        batch = keys[start : start + 1000]
+        try:
+            response = s3.delete_objects(
+                Bucket=bucket,
+                Delete={"Objects": [{"Key": key} for key in batch]},
+            )
+        except (BotoCoreError, ClientError):
+            logger.warning(
+                "Could not delete %d object(s) under %s; they will be left "
+                "as orphans",
+                len(batch),
+                bucket,
+                exc_info=True,
+            )
+            continue
+        deleted += len(response.get("Deleted", []))
+    return deleted
+
+
+def download_object(key: str, dest_path: Path) -> None:
+    """Download one object by key to a local path.
+
+    For what the generic sync deliberately skips (job results, shards):
+    fetched by name rather than swept up by prefix.
+
+    :param key: Object key inside the private bucket.
+    :param dest_path: Local file to write; parents are created.
+    :return: None.
+    :raises ClientError: If the object is missing or unreadable.
+    """
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    _s3_client().download_file(
+        settings.AWS_PRIVATE_STORAGE_BUCKET_NAME, key, str(dest_path)
     )
 
 
@@ -734,11 +976,39 @@ def delete_shard_objects(scan: Scan) -> int:
         the prefix is empty).
     :rtype: int
     """
+    return _delete_prefix(scan, shards_prefix(scan), "shard")
+
+
+def delete_job_objects(scan: Scan) -> int:
+    """Delete every object under a scan's ``jobs/`` prefix.
+
+    For a scan that is going away. Results are per attempt and never
+    overwritten, so a volume accumulates one converted copy of itself
+    per abandoned attempt, and nothing else removes them: ``jobs/`` is
+    excluded from every sync.
+
+    :param scan: The scan whose job results to delete.
+    :returns: Number of objects deleted (0 when S3 sync is disabled or
+        the prefix is empty).
+    :rtype: int
+    """
+    prefix = f"{s3_processing_prefix(scan)}{JOB_RESULTS_SUBDIR}"
+    return _delete_prefix(scan, prefix, "job result")
+
+
+def _delete_prefix(scan: Scan, prefix: str, kind: str) -> int:
+    """Delete every object under one prefix, paginating the listing.
+
+    :param scan: The scan the prefix belongs to (for the log line).
+    :param prefix: Full S3 prefix to sweep.
+    :param kind: What the objects are, for the log line.
+    :returns: Number of objects deleted.
+    :rtype: int
+    """
     if not _s3_enabled():
         return 0
 
     bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
-    prefix = shards_prefix(scan)
     s3 = _s3_client()
     paginator = s3.get_paginator("list_objects_v2")
 
@@ -752,8 +1022,9 @@ def delete_shard_objects(scan: Scan) -> int:
 
     if deleted:
         logger.info(
-            "Deleted %d stale shard object(s) for scan %s under s3://%s/%s",
+            "Deleted %d %s object(s) for scan %s under s3://%s/%s",
             deleted,
+            kind,
             scan.pk,
             bucket,
             prefix,
