@@ -136,7 +136,7 @@
       {# several times a second, which a screen reader would announce #}
       {# for the whole upload. The label above carries the live region. #}
       <div id="upload-stats" class="mt-1 text-xs tabular-nums text-gray-500 dark:text-gray-400"
-           title="Multiply MB/s by 8 for Mbps"></div>
+           title="Multiply by 8 for bits per second (Mbps / Kbps)"></div>
     </div>
     <p id="upload-error" class="hidden mt-2 text-sm text-red-600"></p>
   </form>
@@ -249,6 +249,16 @@
       : (n / 1048576).toFixed(0) + ' MB';
   }
 
+  // Switch units below 1 MB/s. One decimal place of MB/s has no
+  // resolution left on a slow link -- a real 50 KB/s upload displayed as
+  // "0.1 MB/s", overstating it by half -- and slow links are exactly the
+  // ones this readout exists for.
+  function fmtRate(bytesPerSecond) {
+    return bytesPerSecond >= 1048576
+      ? (bytesPerSecond / 1048576).toFixed(1) + ' MB/s'
+      : (bytesPerSecond / 1024).toFixed(0) + ' KB/s';
+  }
+
   function fmtDuration(seconds) {
     if (!isFinite(seconds) || seconds < 0) return '';
     if (seconds < 90) return Math.round(seconds) + 's';
@@ -289,10 +299,10 @@
       span > 0.5 && elapsed > 2 ? (last.loaded - first.loaded) / span : avg;
 
     var parts = [fmtSize(loaded) + ' / ' + fmtSize(total)];
-    if (elapsed > 2) parts.push((current / 1048576).toFixed(1) + ' MB/s');
+    if (elapsed > 2) parts.push(fmtRate(current));
     // Below half a second the average is dominated by the first event.
     if (elapsed > 0.5) {
-      parts.push((avg / 1048576).toFixed(1) + ' MB/s avg');
+      parts.push(fmtRate(avg) + ' avg');
     }
     if (loaded < total) {
       if (current > 0) {
@@ -318,8 +328,8 @@
       ' in ' +
       fmtDuration(seconds) +
       ' · ' +
-      (seconds > 0 ? (total / seconds / 1048576).toFixed(1) : '0.0') +
-      ' MB/s average';
+      fmtRate(seconds > 0 ? total / seconds : 0) +
+      ' average';
   }
 
   function startProgress() {
