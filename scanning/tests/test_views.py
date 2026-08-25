@@ -441,6 +441,117 @@ class TestQueueUploadXhr(ScanningTestCase):
         self.assertFalse(Scan.objects.filter(volume_obj=self.volume).exists())
 
 
+class TestUploadFlagsPartialVolume(ScanningTestCase):
+    """A part label on an upload flags the parent volume (issue #178).
+
+    The upload form has no ``is_partial`` control. The flag is derived
+    from Part Label, and the write is set-only.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.volume = VolumeFactory()
+        kwargs = {
+            "reporter_slug": self.volume.reporter.short_name,
+            "vol": self.volume.volume_number,
+        }
+        self.url = reverse("queue_upload", kwargs=kwargs)
+        self.presign_url = reverse("presign_scan_upload", kwargs=kwargs)
+        self.confirm_url = reverse("confirm_scan_upload", kwargs=kwargs)
+
+    def _upload(self, **extra):
+        """Post one classic upload with a valid PDF body."""
+        pdf = SimpleUploadedFile(
+            "scan.pdf", b"%PDF-1.4 body", content_type="application/pdf"
+        )
+        data = {"new_scan": "1", "original_pdf": pdf}
+        data.update(extra)
+        return self.client.post(self.url, data)
+
+    @override_settings(DEVELOPMENT=True)
+    def test_part_label_flags_the_volume(self):
+        response = self._upload(part_label="A")
+        self.assertEqual(response.status_code, 302)
+        self.volume.refresh_from_db()
+        self.assertTrue(self.volume.is_partial)
+
+    @override_settings(DEVELOPMENT=True)
+    def test_no_part_label_keeps_an_unflagged_volume_unflagged(self):
+        response = self._upload()
+        self.assertEqual(response.status_code, 302)
+        self.volume.refresh_from_db()
+        self.assertFalse(self.volume.is_partial)
+
+    @override_settings(DEVELOPMENT=True)
+    def test_no_part_label_does_not_clear_a_flagged_volume(self):
+        """Part B can arrive with no label. That must not un-flag."""
+        self.volume.is_partial = True
+        self.volume.save(update_fields=["is_partial"])
+        response = self._upload()
+        self.assertEqual(response.status_code, 302)
+        self.volume.refresh_from_db()
+        self.assertTrue(self.volume.is_partial)
+
+    def test_presigned_upload_flags_the_volume_on_confirm(self):
+        """The presigned path derives the flag too, but only on confirm.
+
+        A presign that never completes must not flag the volume, so the
+        write waits for the file to land.
+        """
+        fake = {"url": "https://s3.example/bucket", "fields": {"key": "k"}}
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.generate_presigned_post", return_value=fake
+            ),
+        ):
+            response = self.client.post(
+                self.presign_url,
+                {
+                    "new_scan": "1",
+                    "filename": "scan.pdf",
+                    "content_type": "application/pdf",
+                    "size": "1024",
+                    "part_label": "B",
+                },
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        pending_id = response.json()["pending_id"]
+        self.volume.refresh_from_db()
+        self.assertFalse(self.volume.is_partial)
+
+        with patch(
+            "scanning.s3_sync.verify_uploaded_object", return_value=True
+        ):
+            response = self.client.post(
+                self.confirm_url,
+                {"pending_id": pending_id, "action": "upload_only"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.volume.refresh_from_db()
+        self.assertTrue(self.volume.is_partial)
+
+    def test_upload_form_has_no_is_partial_control(self):
+        """The dead checkbox is gone; the live one stays."""
+        response = self.client.get(
+            reverse(
+                "queue_detail",
+                kwargs={
+                    "reporter_slug": self.volume.reporter.short_name,
+                    "vol": self.volume.volume_number,
+                },
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode()
+        self.assertNotIn('name="is_partial"', body)
+        self.assertIn('name="has_state_abbrev"', body)
+        self.assertIn('name="part_label"', body)
+
+
 class TestPresignedUpload(ScanningTestCase):
     """Presigned direct-to-S3 upload: presign + confirm endpoints."""
 

@@ -531,6 +531,27 @@ def _original_pdf_name(scan, volume):
     )
 
 
+def _flag_partial_volume(scan):
+    """Mark the parent volume as split when the scan carries a part label.
+
+    A part label *is* the statement that the volume comes in more than
+    one piece, so the flag is derived from it instead of from a separate
+    control (issue #178). The rule matches ``import_scanlist``, the only
+    other writer.
+
+    The write is set-only. Parts arrive as separate uploads, and a later
+    part with no label must not un-flag a volume that genuinely has
+    parts.
+
+    :param scan: The scan whose original PDF is now stored.
+    :return: None.
+    """
+    volume = scan.volume_obj
+    if volume and scan.part_label and not volume.is_partial:
+        volume.is_partial = True
+        volume.save(update_fields=["is_partial"])
+
+
 def _finalize_uploaded_scan(request, scan):
     """Apply the requested post-upload action and return the destination.
 
@@ -540,11 +561,17 @@ def _finalize_uploaded_scan(request, scan):
     lands -- ``upload_validate`` opens the process viewer,
     ``upload_only`` goes back to the queue.
 
+    It is also the point where the volume's ``is_partial`` flag is
+    derived, because it is the first point both paths reach with the
+    file actually stored: ``presign_scan_upload`` deletes the scan again
+    when the presign fails.
+
     :param request: The HTTP request (source of the ``action`` field).
     :param scan: The scan whose original PDF is now stored.
     :return: The URL to redirect the browser to.
     :rtype: str
     """
+    _flag_partial_volume(scan)
     action = request.POST.get("action", UploadAction.UPLOAD_ONLY)
     apply_upload_action(scan, action)
     if action == UploadAction.UPLOAD_VALIDATE:
