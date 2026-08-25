@@ -193,12 +193,39 @@ def refresh_volume_queue_status_for_scan(scan: Scan) -> None:
     refresh_volume_queue_status(volume)
 
 
+def flag_partial_volume(scan: Scan) -> None:
+    """Mark the parent volume as split when the scan carries a part label.
+
+    A part label *is* the statement that the volume comes in more than
+    one piece, so the flag is derived from it instead of from a separate
+    control (issue #178). The rule matches ``import_scanlist``, the only
+    other writer.
+
+    The write is set-only. Parts arrive as separate uploads, and a later
+    part with no label must not un-flag a volume that genuinely has
+    parts.
+
+    :param scan: The scan whose original PDF is now stored.
+    :return: None.
+    """
+    if not scan.volume_obj_id or not scan.part_label:
+        return
+    volume = Volume.objects.get(pk=scan.volume_obj_id)
+    if not volume.is_partial:
+        volume.is_partial = True
+        volume.save(update_fields=["is_partial"])
+
+
 def apply_upload_action(scan: Scan, action: str) -> None:
     """Apply the uploader's post-upload action to a stored scan.
 
     Request-free core shared by the web confirm flow
     (``_finalize_uploaded_scan``) and the recovery path. Always refreshes
-    the parent volume's queue status.
+    the parent volume's queue status, and derives its ``is_partial``
+    flag (#178) -- both are volume facts that follow from an upload
+    landing, so they belong on this shared path rather than in the view.
+    A recovered upload is a completed upload and must flag its volume
+    exactly as a confirmed one does.
 
     Both actions queue the pipeline, because the stage the choice used
     to select -- page-number validation -- is disconnected (#173). What
@@ -222,6 +249,7 @@ def apply_upload_action(scan: Scan, action: str) -> None:
         else "Queued for conversion..."
     )
     scan.save()
+    flag_partial_volume(scan)
     refresh_volume_queue_status_for_scan(scan)
 
 
