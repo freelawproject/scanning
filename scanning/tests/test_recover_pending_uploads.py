@@ -8,7 +8,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from scanning import services
-from scanning.factories import ScanFactory, UserFactory
+from scanning.factories import ScanFactory, UserFactory, VolumeFactory
 from scanning.models import PendingUpload, Status, UploadAction
 
 
@@ -93,6 +93,54 @@ class TestRecoverPendingUpload(TestCase):
 
         self.assertFalse(recovered)
         mock_verify.assert_not_called()
+
+    def test_recovered_part_upload_flags_the_volume(self):
+        """A recovered upload is a completed upload (#178).
+
+        The tab died before confirm, so the view never ran. The part
+        label is still on the scan, and the volume must end up flagged
+        exactly as a confirmed upload would leave it.
+        """
+        volume = VolumeFactory()
+        scan = ScanFactory(
+            volume_obj=volume,
+            reporter=volume.reporter,
+            volume=volume.volume_number,
+            part_label="B",
+            original_pdf="",
+            status=Status.UPLOADED,
+        )
+        self.assertFalse(volume.is_partial)
+        pending = _make_pending(scan)
+
+        with patch(
+            "scanning.s3_sync.verify_uploaded_object", return_value=True
+        ):
+            recovered = services.recover_pending_upload(pending)
+
+        self.assertTrue(recovered)
+        volume.refresh_from_db()
+        self.assertTrue(volume.is_partial)
+
+    def test_recovered_upload_without_part_label_leaves_volume_alone(self):
+        volume = VolumeFactory()
+        scan = ScanFactory(
+            volume_obj=volume,
+            reporter=volume.reporter,
+            volume=volume.volume_number,
+            part_label="",
+            original_pdf="",
+            status=Status.UPLOADED,
+        )
+        pending = _make_pending(scan)
+
+        with patch(
+            "scanning.s3_sync.verify_uploaded_object", return_value=True
+        ):
+            services.recover_pending_upload(pending)
+
+        volume.refresh_from_db()
+        self.assertFalse(volume.is_partial)
 
 
 class TestRecoverCommand(TestCase):
