@@ -1186,7 +1186,11 @@ def run_full_pipeline(scan_pk: int) -> None:
 
         # Shard for external execution (#164): the bitonal jobs below
         # fan out over the shards, and dots.mocr will too.
-        _update_progress(scan_pk, "Sharding original PDF...")
+        _update_progress(
+            scan_pk,
+            "Cutting the PDF into parts (shards), so servers can work "
+            "on them in parallel...",
+        )
         manifest = _ensure_shards(scan)
 
         # Read off the original, not the conversion output: the merge
@@ -1227,7 +1231,8 @@ def run_full_pipeline(scan_pk: int) -> None:
                     scan_pk,
                     Status.AWAITING,
                     page_count,
-                    f"Converting {len(created)} shard(s) to bitonal...",
+                    f"Converting {len(created)} part(s) to a small "
+                    "black-and-white (bitonal) preview...",
                     progress_total=len(created),
                 )
                 if not handed_over:

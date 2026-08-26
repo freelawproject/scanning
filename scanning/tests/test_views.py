@@ -1950,15 +1950,44 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         served = b"".join(response.streaming_content)
         self.assertEqual(served, bitonal_bytes)
 
+    def test_served_preview_names_itself_bitonal(self):
+        """The viewer learns it got the lower-quality preview (#185)."""
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        scan = ScanFactory(start_page=1, end_page=2)
+
+        def _fake_download(scan_arg):
+            output = pathlib.Path(scan_arg.output_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "bitonal.pdf").write_bytes(b"%PDF-1.4 pulled")
+
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                TESTING=False,
+                PROCESSING_TMP_DIR=tmp_root,
+            ),
+            patch(
+                "scanning.s3_sync.download_preview_pdf",
+                side_effect=_fake_download,
+            ),
+        ):
+            response = self.client.get(
+                reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["X-Scan-Preview"], "bitonal")
+
     def test_not_ready_returns_202_when_no_preview(self):
-        """With no preview and no original anywhere, return 202."""
+        """With no preview yet, return 202 with a stage message."""
         user = self.make_user()
         self.client.force_login(user)
 
         tmp_root = tempfile.mkdtemp()
         scan = ScanFactory(start_page=1, end_page=2, status=Status.PROCESSING)
-        # No local original either, or the #173 fallback would serve it.
-        os.remove(scan.original_pdf.path)
 
         with (
             override_settings(
@@ -1967,7 +1996,6 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch("scanning.s3_sync.download_preview_pdf"),
-            patch("scanning.s3_sync.download_original_pdf"),
         ):
             response = self.client.get(
                 reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
@@ -1977,16 +2005,18 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         data = response.json()
         self.assertEqual(data["status"], "not_ready")
         self.assertEqual(data["scan_status"], Status.PROCESSING)
-        self.assertIn("processing", data["message"].lower())
+        # Stage-specific copy plus the standing reassurance (#185).
+        self.assertIn("preparing the scan", data["message"])
+        self.assertIn("close this tab", data["message"])
+        self.assertTrue(data["original_available"])
 
-    def test_original_served_when_no_preview_exists(self):
-        """Without a bitonal preview, the original is the fallback.
+    def test_original_never_streams_from_the_preview_endpoint(self):
+        """No preview means a JSON answer, never a multi-GB stream (#185).
 
-        Sync bitonal conversion was disconnected (issue #173), so scans
-        uploaded after the cutover have no ``bitonal.pdf`` until the
-        doctor-run replacement (#168) lands. Rather than showing those
-        scans as forever "still processing", the viewer gets the
-        original.
+        The old #173 interim served the original here, which pulled it to
+        the pod and streamed it through gunicorn -- the slow, truncating
+        path the viewer's retry loop made look broken. Now the endpoint
+        answers 409 and offers the original via ``scan_original_url``.
         """
         user = self.make_user()
         self.client.force_login(user)
@@ -1996,7 +2026,6 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
             start_page=1, end_page=2, status=Status.AWAITING_VALIDATION
         )
         self.assertTrue(os.path.exists(scan.original_pdf.path))
-        original_bytes = pathlib.Path(scan.original_pdf.path).read_bytes()
 
         with (
             override_settings(
@@ -2005,14 +2034,20 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch("scanning.s3_sync.download_preview_pdf"),
+            patch(
+                "scanning.s3_sync.download_original_pdf"
+            ) as mock_original_pull,
         ):
             response = self.client.get(
                 reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
             )
 
-        self.assertEqual(response.status_code, 200)
-        served = b"".join(response.streaming_content)
-        self.assertEqual(served, original_bytes)
+        self.assertEqual(response.status_code, 409)
+        data = response.json()
+        self.assertEqual(data["status"], "unavailable")
+        self.assertTrue(data["original_available"])
+        self.assertIn("original", data["message"])
+        mock_original_pull.assert_not_called()
 
     def test_awaiting_is_transient_so_the_viewer_keeps_polling(self):
         """A scan waiting on doctor will get a preview (issue #176)."""
@@ -2030,14 +2065,15 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch("scanning.s3_sync.download_preview_pdf"),
-            patch("scanning.s3_sync.download_original_pdf"),
         ):
             response = self.client.get(
                 reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
             )
 
         self.assertEqual(response.status_code, 202)
-        self.assertEqual(response.json()["scan_status"], Status.AWAITING)
+        data = response.json()
+        self.assertEqual(data["scan_status"], Status.AWAITING)
+        self.assertIn("converting", data["message"])
 
     def test_terminal_status_returns_409_not_202(self):
         """An errored scan is terminal: 409 so the viewer stops polling."""
@@ -2046,8 +2082,6 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
 
         tmp_root = tempfile.mkdtemp()
         scan = ScanFactory(start_page=1, end_page=2, status=Status.ERROR)
-        # No local original either, or the #173 fallback would serve it.
-        os.remove(scan.original_pdf.path)
 
         with (
             override_settings(
@@ -2056,7 +2090,6 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
                 PROCESSING_TMP_DIR=tmp_root,
             ),
             patch("scanning.s3_sync.download_preview_pdf"),
-            patch("scanning.s3_sync.download_original_pdf"),
         ):
             response = self.client.get(
                 reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
@@ -2066,6 +2099,165 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         data = response.json()
         self.assertEqual(data["status"], "unavailable")
         self.assertEqual(data["scan_status"], Status.ERROR)
+
+
+class TestScanOriginalUrl(ScanningTestCase):
+    """scan_original_url hands the browser a way to read the original."""
+
+    def test_presigned_url_when_s3_is_active(self):
+        """With S3, the browser gets a presigned GET, not our stream."""
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(start_page=1, end_page=2)
+
+        with patch(
+            "scanning.s3_sync.presign_original_get",
+            return_value="https://bucket.example/signed",
+        ) as mock_presign:
+            response = self.client.get(
+                reverse("scan_original_url", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["url"], "https://bucket.example/signed")
+        self.assertFalse(data["embedded_whole"])
+        mock_presign.assert_called_once()
+
+    def test_local_stream_url_when_s3_is_off(self):
+        """Without S3 (dev, tests) the answer is our own stream."""
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(start_page=1, end_page=2)
+
+        response = self.client.get(
+            reverse("scan_original_url", kwargs={"pk": scan.pk})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(
+            data["url"],
+            reverse("serve_scan_original", kwargs={"pk": scan.pk}),
+        )
+        self.assertTrue(data["embedded_whole"])
+
+    def test_404_when_the_scan_has_no_file(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(start_page=1, end_page=2)
+        scan.original_pdf.name = ""
+        scan.save(update_fields=["original_pdf"])
+
+        response = self.client.get(
+            reverse("scan_original_url", kwargs={"pk": scan.pk})
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_serve_scan_original_streams_the_local_file(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(start_page=1, end_page=2)
+        original_bytes = pathlib.Path(scan.original_pdf.path).read_bytes()
+
+        response = self.client.get(
+            reverse("serve_scan_original", kwargs={"pk": scan.pk})
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["X-Scan-Preview"], "original")
+        served = b"".join(response.streaming_content)
+        self.assertEqual(served, original_bytes)
+
+    def test_serve_scan_original_404s_without_a_local_copy(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(start_page=1, end_page=2)
+        os.remove(scan.original_pdf.path)
+
+        with patch("scanning.s3_sync.download_original_pdf"):
+            response = self.client.get(
+                reverse("serve_scan_original", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_serve_scan_original_refuses_when_s3_is_active(self):
+        """With S3 on, the stream view is the removed slow path: 404.
+
+        Streaming here would pull the whole original to the pod and push
+        it through gunicorn -- exactly what #185 removed. In that mode
+        the viewer reads the original via a presigned URL, and nothing
+        links to this view.
+        """
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(start_page=1, end_page=2)
+        self.assertTrue(os.path.exists(scan.original_pdf.path))
+
+        with patch("scanning.s3_sync.s3_active", return_value=True):
+            response = self.client.get(
+                reverse("serve_scan_original", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_original_key_matches_the_presigned_upload_key(self):
+        """``s3_original_key`` must read the key the upload wrote.
+
+        The presign view builds ``PendingUpload.s3_key``, the confirm
+        view stamps ``original_pdf.name``, and the viewer later derives
+        the read key from that name. This pins the three together, so a
+        drift in any of them fails a test instead of 403ing in prod.
+        """
+        from scanning import s3_sync
+
+        user = self.make_user()
+        self.client.force_login(user)
+        volume = VolumeFactory()
+        kwargs = {
+            "reporter_slug": volume.reporter.short_name,
+            "vol": volume.volume_number,
+        }
+
+        fake = {"url": "https://s3.example/bucket", "fields": {"key": "k"}}
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.generate_presigned_post", return_value=fake
+            ),
+        ):
+            response = self.client.post(
+                reverse("presign_scan_upload", kwargs=kwargs),
+                {
+                    "new_scan": "1",
+                    "filename": "scan.pdf",
+                    "content_type": "application/pdf",
+                    "size": "1024",
+                },
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        pending_id = response.json()["pending_id"]
+        # The confirm view deletes the pending row on success, so read
+        # the written key and the scan now.
+        pending = PendingUpload.objects.get(pk=pending_id)
+        uploaded_key = pending.s3_key
+        scan = pending.scan
+
+        with patch(
+            "scanning.s3_sync.verify_uploaded_object", return_value=True
+        ):
+            response = self.client.post(
+                reverse("confirm_scan_upload", kwargs=kwargs),
+                {"pending_id": pending_id, "action": "upload_only"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 200)
+
+        scan.refresh_from_db()
+        self.assertTrue(scan.original_pdf.name)
+        self.assertEqual(s3_sync.s3_original_key(scan), uploaded_key)
 
 
 class TestRunFullPipelinePullsFromS3(ScanningTestCase):

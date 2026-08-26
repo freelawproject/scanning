@@ -10,6 +10,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.http import (
     FileResponse,
+    Http404,
     HttpRequest,
     HttpResponse,
     JsonResponse,
@@ -454,6 +455,34 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     return JsonResponse(data)
 
 
+# Suffix for every "not ready" message the viewer shows (issue #185):
+# uploaders must know the tab is not doing the work.
+CLOSE_TAB_NOTE = " You can close this tab. The work continues on the server."
+
+# Stage-specific wait messages, keyed by scan status. Each names what
+# runs right now, so the viewer explains the wait instead of a generic
+# "still processing" (issue #185).
+PREVIEW_WAIT_MESSAGES = {
+    Status.UPLOADED: (
+        "Your upload is complete and safe. The scan waits for the "
+        "processing queue." + CLOSE_TAB_NOTE
+    ),
+    Status.QUEUED: (
+        "Your upload is complete and safe. The scan waits in the "
+        "processing queue." + CLOSE_TAB_NOTE
+    ),
+    Status.PROCESSING: (
+        "We are preparing the scan. We cut the PDF into parts, so "
+        "servers can work on them in parallel." + CLOSE_TAB_NOTE
+    ),
+    Status.AWAITING: (
+        "We are converting the scan to a small black-and-white preview, "
+        "so it loads fast. This takes some minutes, and the preview "
+        "appears here automatically." + CLOSE_TAB_NOTE
+    ),
+}
+
+
 @login_required
 def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     """Serve the small processed PDF (``bitonal.pdf``).
@@ -462,8 +491,10 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     multi-GB original is never streamed here: it blows past the gunicorn
     worker timeout (the connection dies mid-stream, so the browser sees a
     truncated body and reports ERR_CONTENT_LENGTH_MISMATCH) and pdf.js
-    can't handle a file that large anyway. The original stays reachable
-    only for server-side crops (``serve_original_crop``).
+    can't hold a file that large in memory anyway. The viewer reads the
+    original straight from S3 instead, via ``scan_original_url``
+    (issue #185); server-side crops keep their own path
+    (``serve_original_crop``).
 
     Resolution:
 
@@ -473,25 +504,34 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
        containers with separate ephemeral ``/tmp/`` volumes. The targeted
        pull skips the original and images/, so opening a scan never drags
        gigabytes across the network.
-    3. Otherwise fall back to the original PDF. Sync bitonal conversion
-       was disconnected (issue #173), so scans uploaded after the
-       cutover have no ``bitonal.pdf`` until the doctor-run replacement
-       (#168) lands; every earlier scan already has one, so only recent
-       uploads take this path. It costs what step 2 exists to avoid --
-       the original crosses the network and can be huge -- but a slow
-       preview beats none while the interim lasts.
-    4. If no PDF exists at all (scan still processing, or errored),
-       return HTTP 202 with a status message so the viewer can show a
-       "still processing" state instead of a hard error.
+    3. No preview exists. Distinguish transient states (a preview is
+       being produced -- the viewer should poll) from terminal ones (a
+       preview will never appear -- the viewer should stop and offer the
+       original instead). 202 means "poll again"; 409 means "give up".
+       Both carry a stage-specific message and ``original_available``,
+       which tells the viewer it can offer the "load the original"
+       button.
+
+    AWAITING is transient: a bitonal is being made right now (#176), so
+    polling gets one. AWAITING_VALIDATION is terminal here: a scan parks
+    there either converted (so a preview exists and step 3 is never
+    reached) or deliberately unconverted (skipped, failed, or a
+    pre-#176 post-cutover upload), and then no poll will ever find one.
+    The one transient case folded into that 409 is a converted scan
+    whose S3 preview pull just failed; a reload retries it.
+
+    A served preview carries ``X-Scan-Preview: bitonal`` so the viewer
+    knows it shows the lower-quality conversion and can offer the
+    original (issue #185).
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: File response streaming the preview (or original) PDF, or
-        a 202 JSON response when nothing is available yet.
+    :return: File response streaming the preview PDF, or a 202/409 JSON
+        response when there is none.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    # Breadcrumb (issue #115): serving may pull from S3 and stream a multi-GB
-    # original; mark the start so a stall here is attributable in the trail.
+    # Breadcrumb (issue #115): serving may pull from S3; mark the start
+    # so a stall here is attributable in the trail.
     logger.info("serve_scan_pdf: resolving pdf for scan=%s", scan.pk)
 
     def _processed_local() -> FileResponse | None:
@@ -501,9 +541,14 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
             return None
         base_pdf = find_processing_pdf(scan.output_dir)
         if base_pdf:
-            return FileResponse(
+            response = FileResponse(
                 base_pdf.open("rb"), content_type="application/pdf"
             )
+            # "bitonal" names the preview class, not the exact file: a
+            # legacy OCR PDF (same geometry, pre-#145 scans) reports the
+            # same value, and the banner text stays true for it.
+            response["X-Scan-Preview"] = "bitonal"
+            return response
         return None
 
     # 1. Prefer the small processed PDF if it is already on disk.
@@ -523,50 +568,28 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     if response is not None:
         return response
 
-    # 3. No processed preview exists (post-#173 upload with no bitonal
-    #    yet). Serve the original instead; ``local_original_pdf`` falls
-    #    back to a targeted S3 pull of just the original object.
-    original = local_original_pdf(scan)
-    if original:
-        logger.info(
-            "serve_scan_pdf: no processed preview for scan %s; serving "
-            "the original (#173 interim)",
-            scan.pk,
-        )
-        return FileResponse(
-            open(original, "rb"), content_type="application/pdf"
-        )
+    # 3. No preview anywhere. Answer with a stage-specific message and
+    #    whether the original is there to offer instead.
+    original_available = bool(scan.original_pdf and scan.original_pdf.name)
 
-    # 4. No preview PDF anywhere. Distinguish transient states (still
-    #    producing a preview -- the viewer should poll) from terminal ones
-    #    (a preview will never appear -- the viewer should show the message
-    #    and stop). 202 means "retry"; 409 means "give up".
-    #    AWAITING means a bitonal is being made right now (#176), so
-    #    polling gets one. AWAITING_VALIDATION is transient for the
-    #    opposite reason: a scan parks there either converted (so we
-    #    never reach step 4) or deliberately unconverted, and then
-    #    reaching here means the step-3 pull of the original failed --
-    #    it is durably in S3, so the next poll will likely serve it.
-    if scan.status in (
-        Status.UPLOADED,
-        Status.QUEUED,
-        Status.PROCESSING,
-        Status.AWAITING,
-        Status.AWAITING_VALIDATION,
-    ):
+    wait_message = PREVIEW_WAIT_MESSAGES.get(scan.status)
+    if wait_message:
         return JsonResponse(
             {
                 "status": "not_ready",
                 "scan_status": scan.status,
-                "message": (
-                    "We're still processing this file. The preview will "
-                    "appear here automatically once it's ready."
-                ),
+                "message": wait_message,
+                "original_available": original_available,
             },
             status=202,
         )
 
-    if scan.status in (Status.ERROR, Status.ERROR_MAX_RETRIES):
+    if scan.status == Status.AWAITING_VALIDATION:
+        message = (
+            "This scan has no small preview. You can load the original "
+            "scan instead."
+        )
+    elif scan.status in (Status.ERROR, Status.ERROR_MAX_RETRIES):
         message = (
             "This scan hit an error during processing, so there's no "
             "preview to show."
@@ -578,9 +601,84 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
             "status": "unavailable",
             "scan_status": scan.status,
             "message": message,
+            "original_available": original_available,
         },
         status=409,
     )
+
+
+@login_required
+def scan_original_url(request: HttpRequest, pk: int) -> JsonResponse:
+    """Return a URL the browser can read the original PDF from.
+
+    The viewer calls this when the user asks for the original (issue
+    #185). With S3 active, the answer is a presigned GET on the bucket:
+    pdf.js reads the (up to 3 GB) file with range requests, straight
+    from S3, so the web pod never streams it. Without S3 (dev, tests),
+    the answer is our own ``serve_scan_original`` stream, and
+    ``embedded_whole`` tells the viewer to load it in one piece --
+    local files are small and local.
+
+    The URL is minted per request, so every click gets a fresh
+    signature.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON with ``url`` and ``embedded_whole``, or a 404 when
+        the scan has no original file.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    if not (scan.original_pdf and scan.original_pdf.name):
+        return JsonResponse(
+            {"error": "This scan has no original PDF."}, status=404
+        )
+
+    from scanning import s3_sync
+
+    url = s3_sync.presign_original_get(scan)
+    if url:
+        return JsonResponse({"url": url, "embedded_whole": False})
+    return JsonResponse(
+        {
+            "url": reverse("serve_scan_original", kwargs={"pk": scan.pk}),
+            "embedded_whole": True,
+        }
+    )
+
+
+@login_required
+def serve_scan_original(request: HttpRequest, pk: int) -> FileResponse:
+    """Stream the original PDF from local disk.
+
+    The no-S3 fallback behind ``scan_original_url``: in dev and tests
+    the original never left this machine, so a plain stream serves it.
+    With S3 active this view refuses with a 404 instead of streaming:
+    it would pull the whole original to the pod and push it through
+    gunicorn -- the exact slow, truncating path #185 removed from the
+    preview endpoint -- and nothing links here in that mode, since the
+    viewer gets a presigned URL from ``scan_original_url``.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: File response streaming the original PDF.
+    :raises Http404: When S3 is active, or when no local copy can be
+        made available.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+
+    from scanning import s3_sync
+
+    if s3_sync.s3_active():
+        raise Http404("The original PDF is read from storage, not from here.")
+
+    original = local_original_pdf(scan)
+    if not original:
+        raise Http404("No original PDF is available for this scan.")
+    response = FileResponse(
+        open(original, "rb"), content_type="application/pdf"
+    )
+    response["X-Scan-Preview"] = "original"
+    return response
 
 
 @login_required

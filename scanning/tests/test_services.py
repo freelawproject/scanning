@@ -1928,7 +1928,7 @@ class TestFullPipelineConvertBranches(TestCase):
         self.assertEqual(scan.status, Status.AWAITING)
         self.assertEqual(scan.page_count, 3)
         self.assertEqual(scan.progress_total, 3)
-        self.assertIn("Converting 3 shard", scan.progress_message)
+        self.assertIn("Converting 3 part", scan.progress_message)
         rows = ExternalJob.objects.filter(scan=scan, stage=JobStage.CONVERT)
         self.assertEqual(rows.count(), 3)
         self.assertEqual({row.status for row in rows}, {JobStatus.PENDING})
