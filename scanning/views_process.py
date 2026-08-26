@@ -457,9 +457,7 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
 
 # Suffix for every "not ready" message the viewer shows (issue #185):
 # uploaders must know the tab is not doing the work.
-CLOSE_TAB_NOTE = (
-    " You can close this tab. The work continues on the server."
-)
+CLOSE_TAB_NOTE = " You can close this tab. The work continues on the server."
 
 # Stage-specific wait messages, keyed by scan status. Each names what
 # runs right now, so the viewer explains the wait instead of a generic
