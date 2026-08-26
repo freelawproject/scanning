@@ -544,6 +544,9 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
             response = FileResponse(
                 base_pdf.open("rb"), content_type="application/pdf"
             )
+            # "bitonal" names the preview class, not the exact file: a
+            # legacy OCR PDF (same geometry, pre-#145 scans) reports the
+            # same value, and the banner text stays true for it.
             response["X-Scan-Preview"] = "bitonal"
             return response
         return None
@@ -649,17 +652,27 @@ def serve_scan_original(request: HttpRequest, pk: int) -> FileResponse:
 
     The no-S3 fallback behind ``scan_original_url``: in dev and tests
     the original never left this machine, so a plain stream serves it.
-    With S3 active the viewer gets a presigned URL instead and never
-    hits this view -- a direct request here still works, but it pulls
-    the whole original to the pod first, the slow path #185 removed
-    from the preview endpoint.
+    With S3 active this view refuses with a 404 instead of streaming:
+    it would pull the whole original to the pod and push it through
+    gunicorn -- the exact slow, truncating path #185 removed from the
+    preview endpoint -- and nothing links here in that mode, since the
+    viewer gets a presigned URL from ``scan_original_url``.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: File response streaming the original PDF.
-    :raises Http404: When no local copy can be made available.
+    :raises Http404: When S3 is active, or when no local copy can be
+        made available.
     """
     scan = get_object_or_404(Scan, pk=pk)
+
+    from scanning import s3_sync
+
+    if s3_sync.s3_active():
+        raise Http404(
+            "The original PDF is read from storage, not from here."
+        )
+
     original = local_original_pdf(scan)
     if not original:
         raise Http404("No original PDF is available for this scan.")

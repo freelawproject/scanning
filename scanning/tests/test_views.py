@@ -2183,6 +2183,82 @@ class TestScanOriginalUrl(ScanningTestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    def test_serve_scan_original_refuses_when_s3_is_active(self):
+        """With S3 on, the stream view is the removed slow path: 404.
+
+        Streaming here would pull the whole original to the pod and push
+        it through gunicorn -- exactly what #185 removed. In that mode
+        the viewer reads the original via a presigned URL, and nothing
+        links to this view.
+        """
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(start_page=1, end_page=2)
+        self.assertTrue(os.path.exists(scan.original_pdf.path))
+
+        with patch("scanning.s3_sync.s3_active", return_value=True):
+            response = self.client.get(
+                reverse("serve_scan_original", kwargs={"pk": scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_original_key_matches_the_presigned_upload_key(self):
+        """``s3_original_key`` must read the key the upload wrote.
+
+        The presign view builds ``PendingUpload.s3_key``, the confirm
+        view stamps ``original_pdf.name``, and the viewer later derives
+        the read key from that name. This pins the three together, so a
+        drift in any of them fails a test instead of 403ing in prod.
+        """
+        from scanning import s3_sync
+
+        user = self.make_user()
+        self.client.force_login(user)
+        volume = VolumeFactory()
+        kwargs = {
+            "reporter_slug": volume.reporter.short_name,
+            "vol": volume.volume_number,
+        }
+
+        fake = {"url": "https://s3.example/bucket", "fields": {"key": "k"}}
+        with (
+            patch("scanning.views.has_s3_credentials", return_value=True),
+            patch(
+                "scanning.s3_sync.generate_presigned_post", return_value=fake
+            ),
+        ):
+            response = self.client.post(
+                reverse("presign_scan_upload", kwargs=kwargs),
+                {
+                    "new_scan": "1",
+                    "filename": "scan.pdf",
+                    "content_type": "application/pdf",
+                    "size": "1024",
+                },
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        pending_id = response.json()["pending_id"]
+        # The confirm view deletes the pending row on success, so read
+        # the written key and the scan now.
+        pending = PendingUpload.objects.get(pk=pending_id)
+        uploaded_key = pending.s3_key
+        scan = pending.scan
+
+        with patch(
+            "scanning.s3_sync.verify_uploaded_object", return_value=True
+        ):
+            response = self.client.post(
+                reverse("confirm_scan_upload", kwargs=kwargs),
+                {"pending_id": pending_id, "action": "upload_only"},
+                HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+            )
+        self.assertEqual(response.status_code, 200)
+
+        scan.refresh_from_db()
+        self.assertTrue(scan.original_pdf.name)
+        self.assertEqual(s3_sync.s3_original_key(scan), uploaded_key)
+
 
 class TestRunFullPipelinePullsFromS3(ScanningTestCase):
     """run_full_pipeline pulls files from S3 at entry (prod only)."""

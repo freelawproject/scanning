@@ -276,9 +276,14 @@
     {# PDF viewer #}
     <main class="flex-1 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 viewer-panel">
       {% csrf_token %}
-      {# Filled by renderPreviewBanner() for the bitonal preview (issue 185) #}
+      {% comment %}
+        Filled by renderPreviewBanner() for the bitonal preview (issue
+        #185). Not sticky: the zoom toolbar already sticks at top 0
+        (z-30), and a second sticky element at the same offset sits
+        under it.
+      {% endcomment %}
       <div id="preview-banner"
-           class="sticky top-0 z-20 flex items-center gap-2 text-xs px-3 py-1.5 border-b border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200"
+           class="flex items-center gap-2 text-xs px-3 py-1.5 border-b border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200"
            hidden></div>
       <div class="zoom-toolbar" role="toolbar" aria-label="PDF zoom">
         <button type="button" class="zoom-btn" data-zoom-action="out" title="Zoom out" aria-label="Zoom out">&minus;</button>

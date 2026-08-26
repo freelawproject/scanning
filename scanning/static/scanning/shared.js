@@ -38,6 +38,10 @@ function loadPreviewPdf(url, cb) {
     var pollMs = cb.pollMs || 4000;
     var maxErrorRetries = cb.errorRetries == null ? 3 : cb.errorRetries;
     var errorRetriesLeft = maxErrorRetries;
+    // The last 202/409 JSON body. Retry messages pass it through, so a
+    // "load the original" button offered by the previous answer does
+    // not blink away during each retry.
+    var lastNotReadyData = null;
 
     function current() {
         return !cancelled && (!cb.isCurrent || cb.isCurrent());
@@ -50,7 +54,8 @@ function loadPreviewPdf(url, cb) {
             errorRetriesLeft--;
             cb.onNotReady(
                 'Connection problem. Trying again (' +
-                n + ' of ' + maxErrorRetries + ')...'
+                n + ' of ' + maxErrorRetries + ')...',
+                lastNotReadyData
             );
             timer = setTimeout(attempt, n * 1000);
             return;
@@ -73,6 +78,7 @@ function loadPreviewPdf(url, cb) {
                     errorRetriesLeft = maxErrorRetries;
                     return resp.json().then(function (d) {
                         if (!current()) return null;
+                        lastNotReadyData = d;
                         cb.onNotReady((d && d.message) || 'Still processing…', d);
                         timer = setTimeout(attempt, pollMs);
                         return null;
@@ -83,6 +89,7 @@ function loadPreviewPdf(url, cb) {
                     // unavailable). Show the message and stop -- do not poll.
                     return resp.json().then(function (d) {
                         if (!current()) return null;
+                        lastNotReadyData = d;
                         cb.onNotReady((d && d.message) || 'No preview available.', d);
                         return null;
                     });
@@ -193,7 +200,12 @@ function loadOriginalPdf(docId, cb) {
             var opts = { url: d.url };
             if (!d.embedded_whole) {
                 // Range-request mode: fetch only the parts pdf.js needs.
+                // disableStream is load-bearing: with streaming on,
+                // pdf.js reads the WHOLE response into the worker and
+                // re-derives disableAutoFetch on its own, so without it
+                // the full multi-GB file still downloads.
                 opts.disableAutoFetch = true;
+                opts.disableStream = true;
                 opts.rangeChunkSize = 262144;
             }
             return pdfjsLib.getDocument(opts).promise.then(

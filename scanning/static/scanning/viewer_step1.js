@@ -42,6 +42,12 @@ document.addEventListener('DOMContentLoaded', function () {
     function startOriginalLoad() {
         if (_previewHandle) { _previewHandle.cancel(); _previewHandle = null; }
         renderPreviewBanner(null, startOriginalLoad);
+        // Reset the lazy-render bookkeeping: showPdf() rebuilds the
+        // placeholders with the same pdf-index values, and a stale
+        // renderedPages entry makes the observer skip exactly the pages
+        // the user already viewed in the preview.
+        renderedPages = {};
+        pdfDoc = null;
         showViewerMessage(container, 'Loading the original PDF...');
         loadOriginalPdf(documentId, {
             onReady: showPdf,
