@@ -669,9 +669,7 @@ def serve_scan_original(request: HttpRequest, pk: int) -> FileResponse:
     from scanning import s3_sync
 
     if s3_sync.s3_active():
-        raise Http404(
-            "The original PDF is read from storage, not from here."
-        )
+        raise Http404("The original PDF is read from storage, not from here.")
 
     original = local_original_pdf(scan)
     if not original:
