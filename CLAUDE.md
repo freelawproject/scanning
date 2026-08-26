@@ -105,11 +105,40 @@ must not be broken:
   Shards are named by position (`0001.pdf`), so a re-cut volume with the
   same shard count gives identical keys over different pages. A run
   holding a dead row (failed, cancelled, expired) is replaced — that is
-  what a cancel or admin re-queue leaves behind. A fully CONSUMED run
+  what a cancel or admin re-queue leaves behind. In practice that path
+  now sees CANCELLED rows and rows out of attempts, since `retry_dead`
+  picks a merely-failed row back up long before anyone re-queues. A
+  fully CONSUMED run
   means "already converted" and is never merged again, since the merge
   deletes the results it consumed.
 - Every row write is a compare-and-swap on the row's current status
-  (`jobs._write`), so no lock is held across an HTTP call.
+  (`jobs._write`), so no lock is held across an HTTP call. The writer it
+  guards against is the **web process**, not a second daemon: one daemon
+  runs, and both `views_process.cancel_processing` and the admin
+  re-queue call `jobs.abandon_open` from a request. A daemon that wrote
+  PENDING over their CANCELLED would convert a shard nobody wants.
+- **A slow page is a retry, not a dead volume.** Doctor reports a page
+  it could not rasterize in time as `CONVERSION_TIMEOUT` (doctor #245,
+  PR #246, in production), which is in `TRANSIENT_ERROR_CODES`, so the
+  submit pass retries it up to `DOCTOR_MAX_ATTEMPTS` instead of writing
+  the shard off on the first answer. A FAILED row therefore means the
+  attempts are spent, and one still sinks the whole volume to ERROR.
+  Do **not** add a pass that revives dead rows: everything that stops a
+  scan (`cancel_processing`, the admin re-queue) calls `abandon_open`,
+  which touches only `OPEN_JOB_STATUSES` and leaves a FAILED row alone,
+  and changes `Scan.status` in a *second*, uncommitted-in-between write
+  — so a reviver gated on the scan's status races it and converts a
+  shard of a volume somebody just cancelled.
+- **ERROR stays terminal.** `finish_ready_scans` looks at AWAITING only.
+  A pass that re-examined ERROR would re-run the merge — and its
+  download of every shard result — on every 15s tick of a failure that
+  is not going to change, because a failed merge leaves its rows
+  COMPLETED. The way back is an admin re-queue.
+- A failure names where it happened (`jobs._failure_location`): the
+  shard's volume page range off the row's own `input_manifest`, plus
+  doctor's `page_number` and `pixels` when it sends them (doctor #245),
+  so triage needs neither S3 nor a parse of doctor's prose. Page numbers
+  are logged 1-based; `from_page`/`to_page` are fitz indexes.
 - Three INFO lines carry the timings the stage is judged on, so
   benchmarking it needs no SQL: per shard (ours end to end, plus
   doctor's own `duration_ms`, whose gap is queue and transport), per

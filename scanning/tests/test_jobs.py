@@ -469,6 +469,48 @@ class TestRetryCeiling(ScanningTestCase):
 
 
 @override_settings(**DOCTOR)
+class TestFailureLocation(ScanningTestCase):
+    """Naming the volume pages a failed shard covers."""
+
+    def _failed(self, details=None, manifest=None):
+        """Fail one row and return it, with its manifest set.
+
+        :param details: Doctor's per-page fields, if any.
+        :param manifest: Override for the row's shard identity.
+        :returns: The refreshed row.
+        """
+        job = ExternalJobFactory(
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            status=JobStatus.SUBMITTED,
+            input_manifest=(
+                {"from_page": 700, "to_page": 799, "page_count": 100}
+                if manifest is None
+                else manifest
+            ),
+        )
+        with self.assertLogs("scanning.jobs", level="ERROR"):
+            jobs._fail(job, "CONVERSION_TIMEOUT", "timed out", details)
+        job.refresh_from_db()
+        return job
+
+    def test_the_shard_page_range_is_recorded(self):
+        """1-based, as a viewer shows it; the manifest is 0-based."""
+        job = self._failed()
+        self.assertIn("volume pages 701-800", job.error_message)
+
+    def test_doctors_page_number_names_the_volume_page(self):
+        job = self._failed({"page_number": 1, "pixels": 8_216_000})
+        self.assertIn("failed on volume page 701", job.error_message)
+        self.assertIn("8216000 pixel(s)", job.error_message)
+
+    def test_a_row_with_no_manifest_says_nothing_extra(self):
+        job = self._failed(manifest={})
+        self.assertEqual(job.error_message, "timed out")
+
+
+@override_settings(**DOCTOR)
 class TestSweepJobs(ScanningTestCase):
     """The confirm pass: the only path that recovers a lost response."""
 

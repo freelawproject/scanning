@@ -13,8 +13,10 @@ the batching work (#156) slot in rather than rewrite this.
 Two properties are load-bearing and easy to break:
 
 - **Every write is a compare-and-swap** (:func:`_write`), so no lock is
-  held across an HTTP call: two daemon replicas may read the same row,
-  and the loser's update simply matches nothing.
+  held across an HTTP call. The other writer is the web process, not a
+  second daemon: a user's cancel and the admin re-queue both call
+  :func:`abandon_open` from a request, and the loser's update simply
+  matches nothing.
 - **A resubmission bumps ``attempt``**, re-addressing the result
   object. Doctor finishes a conversion after we stop listening, so an
   abandoned attempt uploads *after* we gave up on it; one key shared
@@ -117,10 +119,18 @@ def _write(job: ExternalJob, **fields) -> bool:
     """Compare-and-swap ``job``'s row on its current status.
 
     The status is both the state and the lock: matching on the one we
-    last read means a writer that already moved the row (another
-    replica, an admin cancel) makes this update match nothing, rather
-    than the two taking turns overwriting each other. Nothing is locked
-    across the HTTP call that produced the outcome, which is the point.
+    last read means a writer that already moved the row makes this
+    update match nothing, rather than the two taking turns overwriting
+    each other. Nothing is locked across the HTTP call that produced the
+    outcome, which is the point.
+
+    The writer to guard against today is the web process: a user's
+    cancel (``views_process.cancel_processing``) and the admin re-queue
+    both call :func:`abandon_open` mid-tick, and a daemon that wrote
+    PENDING over their CANCELLED would convert a shard nobody wants.
+    One daemon runs, so daemon-against-daemon is not the case being
+    handled -- but this is also what makes a second replica safe if one
+    is ever deployed.
 
     On success the in-memory instance is updated too, so a caller can
     chain another :func:`_write` against the new status.
@@ -219,17 +229,58 @@ def _log_completion(job: ExternalJob, output: dict | None, now) -> None:
     )
 
 
-def _fail(job: ExternalJob, error_code: str, message: str) -> bool:
+def _failure_location(job: ExternalJob, details: dict | None = None) -> str:
+    """Describe where in the volume a shard's failure happened.
+
+    A shard index alone sends a reader to S3 with the manifest to find
+    out which pages it covers, so the row's own ``input_manifest``
+    answers that here. Doctor's ``page_number`` (its issue #245) narrows
+    it from the shard to the page, and ``pixels`` says whether that page
+    is merely enormous.
+
+    Page numbers are reported 1-based, as a viewer shows them, while
+    ``from_page``/``to_page`` are fitz indexes -- hence the ``+ 1``.
+
+    :param job: The row that failed.
+    :param details: Doctor's ``FAILURE_DETAIL_KEYS``, when it sent them.
+    :returns: A bracketed clause, or ``""`` when the row knows nothing.
+    :rtype: str
+    """
+    manifest = job.input_manifest or {}
+    from_page = manifest.get("from_page")
+    to_page = manifest.get("to_page")
+    if not isinstance(from_page, int) or not isinstance(to_page, int):
+        return ""
+
+    parts = [f"volume pages {from_page + 1}-{to_page + 1}"]
+    details = details or {}
+    page_number = details.get("page_number")
+    if isinstance(page_number, int) and page_number >= 1:
+        parts.append(f"failed on volume page {from_page + page_number}")
+    pixels = details.get("pixels")
+    if isinstance(pixels, int):
+        parts.append(f"{pixels} pixel(s) at {settings.DOCTOR_BITONAL_DPI} dpi")
+    return f" [{'; '.join(parts)}]"
+
+
+def _fail(
+    job: ExternalJob,
+    error_code: str,
+    message: str,
+    details: dict | None = None,
+) -> bool:
     """Write a job off for good.
 
     :param job: The row to fail.
     :param error_code: Provider (or local) error code.
     :param message: Human-readable detail, truncated.
+    :param details: Doctor's per-page failure fields, when it sent them.
     :returns: Whether the write landed.
     :rtype: bool
     """
+    location = _failure_location(job, details)
     logger.error(
-        "job %s (scan %s %s/%s shard %s) failed after %d attempt(s): %s %s",
+        "job %s (scan %s %s/%s shard %s) failed after %d attempt(s): %s %s%s",
         job.pk,
         job.scan_id,
         job.stage,
@@ -238,17 +289,22 @@ def _fail(job: ExternalJob, error_code: str, message: str) -> bool:
         job.attempt,
         error_code,
         message[:200],
+        location,
     )
     return _write(
         job,
         status=JobStatus.FAILED,
         error_code=error_code[:64],
-        error_message=message[:2000],
+        error_message=f"{message}{location}"[:2000],
     )
 
 
 def _retry_or_fail(
-    job: ExternalJob, error_code: str, message: str, now
+    job: ExternalJob,
+    error_code: str,
+    message: str,
+    now,
+    details: dict | None = None,
 ) -> str:
     """Send a job back for another attempt, or write it off.
 
@@ -258,17 +314,23 @@ def _retry_or_fail(
     submit mint a fresh attempt-scoped one, which is also what makes an
     expired signature self-healing rather than fatal.
 
+    The deadline is re-stamped from ``now``: a row carrying the previous
+    attempt's deadline would be swept straight back out by
+    :func:`sweep_jobs`, which writes off any PENDING row already past
+    its queue ceiling.
+
     :param job: The row to retry.
     :param error_code: Why the previous attempt did not stick.
     :param message: Human-readable detail.
     :param now: Current time.
+    :param details: Doctor's per-page failure fields, when it sent them.
     :returns: ``"retried"``, ``"failed"``, or ``"skipped"``.
     :rtype: str
     """
     if job.attempt >= int(settings.DOCTOR_MAX_ATTEMPTS):
-        return "failed" if _fail(job, error_code, message) else "skipped"
+        failed = _fail(job, error_code, message, details)
+        return "failed" if failed else "skipped"
 
-    job.push_attempt(save=False)
     logger.warning(
         "job %s (scan %s shard %s) attempt %d failed (%s); retrying",
         job.pk,
@@ -277,6 +339,7 @@ def _retry_or_fail(
         job.attempt,
         error_code,
     )
+    job.push_attempt(save=False)
     ok = _write(
         job,
         status=JobStatus.PENDING,
@@ -504,6 +567,7 @@ def _apply_submit_outcome(
     if exc is None:
         return "submitted" if _complete(job, output, now) else "skipped"
 
+    details = getattr(exc, "details", None)
     if isinstance(exc, doctor_client.DoctorTransientError):
         if exc.error_code == doctor_client.UNANSWERED_ERROR_CODE:
             logger.warning(
@@ -520,10 +584,11 @@ def _apply_submit_outcome(
                 error_message=str(exc)[:2000],
             )
             return "unanswered"
-        return _retry_or_fail(job, exc.error_code, str(exc), now)
+        return _retry_or_fail(job, exc.error_code, str(exc), now, details)
 
     if isinstance(exc, doctor_client.DoctorError):
-        return "failed" if _fail(job, exc.error_code, str(exc)) else "skipped"
+        failed = _fail(job, exc.error_code, str(exc), details)
+        return "failed" if failed else "skipped"
 
     logger.exception(
         "unexpected error submitting job %s", job.pk, exc_info=exc

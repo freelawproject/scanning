@@ -207,6 +207,12 @@ def _park(scan, status: str, message: str) -> bool:
     Guarded because an admin action or a cancel may have moved the scan
     while its jobs ran, and stomping that undoes a human decision.
 
+    ERROR is deliberately not a start status here. It is terminal: a
+    pass able to move a scan out of it would re-run this stage's merge
+    on every tick against a failure that is not going to change, and
+    the merge downloads every shard result to do it. The way back from
+    ERROR is a person, through an admin re-queue.
+
     :param scan: The scan to move.
     :param status: Status to write.
     :param message: Progress message to write.
@@ -304,10 +310,18 @@ def finish_ready_scans() -> int:
 
     - all rows completed -> merge, park in ``AWAITING_VALIDATION``.
     - any row dead (failed, cancelled, expired) -> ``ERROR``, naming the
-      code. Loud rather than a silent degrade: bitonal is display-only,
-      so the volume stays usable, but while this rolls out volume by
-      volume a failure should be seen. An admin re-queue starts a fresh
-      run.
+      code. A row only reaches FAILED once its attempts are spent, since
+      a retryable failure goes back to PENDING from the submit pass, so
+      a dead row here means the shard is genuinely over. Loud rather
+      than a silent degrade: bitonal is display-only, so the volume
+      stays usable, but while this rolls out volume by volume a failure
+      should be seen. An admin re-queue starts a fresh run.
+
+    Only scans in AWAITING are examined. ERROR is terminal, and a pass
+    that re-examined it would re-run the merge -- and its download of
+    every shard result -- on every tick of a failure that is not going
+    to change. A volume that lands in ERROR waits for a person: an admin
+    re-queue.
 
     :returns: How many scans were moved out of AWAITING.
     :rtype: int
@@ -322,7 +336,6 @@ def finish_ready_scans() -> int:
         .values_list("pk", flat=True)
         .distinct()
     )
-
     finished = 0
     for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
         "reporter"

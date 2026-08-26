@@ -42,7 +42,10 @@ RESULT_CONTENT_TYPE = "application/pdf"
 #: Error codes worth another attempt: blips on doctor's own egress,
 #: plus its "unexpected, retryable" label. The ``*_EXPIRED`` pair is
 #: retryable only because a new attempt mints fresh URLs -- never by
-#: replaying the same request.
+#: replaying the same request. ``CONVERSION_TIMEOUT`` is doctor's split
+#: of a time budget out of ``CONVERSION_FAILED`` (doctor #245): the page
+#: may convert on a less loaded node, or under a larger ``page_timeout``,
+#: so it retries where a defective PDF does not.
 TRANSIENT_ERROR_CODES = frozenset(
     {
         "INTERNAL_ERROR",
@@ -50,7 +53,21 @@ TRANSIENT_ERROR_CODES = frozenset(
         "RESULT_UPLOAD_FAILED",
         "INPUT_URL_EXPIRED",
         "RESULT_URL_EXPIRED",
+        "CONVERSION_TIMEOUT",
     }
+)
+
+#: Fields doctor reports beside a failure on a particular page, so a
+#: caller never parses the message text for them. Integers, hence safe
+#: to format into a log line: the page within the shard (1-indexed), how
+#: many pages converted before it, the elapsed time, and the page's
+#: raster size at the requested dpi -- which is what separates "one
+#: enormous page" from "poppler wedged".
+FAILURE_DETAIL_KEYS = (
+    "page_number",
+    "pages_completed",
+    "elapsed_ms",
+    "pixels",
 )
 
 #: "We never got an answer, so the work may still be running." Every
@@ -65,11 +82,20 @@ class DoctorError(RuntimeError):
 
     :ivar error_code: Doctor's error code, or ``""`` when it never
         answered in its documented shape.
+    :ivar details: The :data:`FAILURE_DETAIL_KEYS` doctor reported, when
+        it failed on a particular page. Empty for every other failure,
+        and for a doctor too old to send them.
     """
 
-    def __init__(self, message: str, error_code: str = ""):
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "",
+        details: dict | None = None,
+    ):
         super().__init__(message)
         self.error_code = error_code
+        self.details = details or {}
 
 
 class DoctorTransientError(DoctorError):
@@ -221,9 +247,36 @@ def convert_bitonal(
         f"doctor bitonal failed ({response.status_code} {error_code or '?'}): "
         f"{str(body.get('msg'))[:300]}"
     )
+    details = _failure_details(body)
     if error_code in TRANSIENT_ERROR_CODES:
-        raise DoctorTransientError(message, error_code=error_code)
+        raise DoctorTransientError(
+            message, error_code=error_code, details=details
+        )
     if not error_code and response.status_code >= 500:
         # A 5xx with no code to classify: assume infrastructure.
         raise DoctorTransientError(message, error_code="BAD_GATEWAY")
-    raise DoctorError(message, error_code=error_code or "UNKNOWN")
+    raise DoctorError(
+        message, error_code=error_code or "UNKNOWN", details=details
+    )
+
+
+def _failure_details(body: dict) -> dict:
+    """Pick doctor's per-page failure fields out of an error body.
+
+    Filtered to :data:`FAILURE_DETAIL_KEYS`, and to integers rather than
+    passed through, so a caller can format them without re-checking each
+    one. A doctor too old to send them, or a failure that names no page,
+    yields ``{}`` rather than a partly-typed dict.
+
+    :param body: Doctor's decoded JSON error body.
+    :returns: The reported detail fields, integers only.
+    :rtype: dict
+    """
+    details = {}
+    for key in FAILURE_DETAIL_KEYS:
+        value = body.get(key)
+        # bool is an int subclass, and "page_number": true must not
+        # reach a log line as a page number.
+        if isinstance(value, int) and not isinstance(value, bool):
+            details[key] = value
+    return details
