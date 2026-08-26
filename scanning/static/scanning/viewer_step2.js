@@ -256,6 +256,10 @@ document.addEventListener('DOMContentLoaded', function () {
         renderedPages = {};
         pdfDoc = null;
         redactions = {};
+        // Hide the previous document's banner now, not only on success:
+        // a failed or pending load (an opinion tab mid-regeneration)
+        // must not keep the old bitonal banner visible over it.
+        renderPreviewBanner(null, startOriginalLoad);
         showViewerMessage(container, 'Loading PDF...');
 
         _pdfLoadHandle = loadPreviewPdf(url, {
