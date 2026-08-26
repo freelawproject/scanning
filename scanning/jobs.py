@@ -10,7 +10,7 @@ One stage and one provider so far -- ``CONVERT`` on doctor (issue
 the attempt bookkeeping are shaped so dots.mocr on RunPod (#147) and
 the batching work (#156) slot in rather than rewrite this.
 
-Three properties are load-bearing and easy to break:
+Two properties are load-bearing and easy to break:
 
 - **Every write is a compare-and-swap** (:func:`_write`), so no lock is
   held across an HTTP call. The other writer is the web process, not a
@@ -22,10 +22,6 @@ Three properties are load-bearing and easy to break:
   abandoned attempt uploads *after* we gave up on it; one key shared
   across attempts would let that late object be harvested as the new
   attempt's output.
-- **A failed row is not a failed volume.** :func:`retry_dead` picks one
-  back up on the next tick, up to ``DOCTOR_MAX_ATTEMPTS``, so a shard
-  doctor could not rasterize in time costs its own retries rather than
-  the whole run's.
 """
 
 from __future__ import annotations
@@ -38,7 +34,6 @@ from datetime import timedelta
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F, Max, OuterRef, Subquery
 from django.utils import timezone
 
 from scanning import doctor_client, s3_sync
@@ -51,22 +46,9 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
-    Status,
 )
 
 logger = logging.getLogger(__name__)
-
-#: The dead statuses :func:`retry_dead` picks back up, which is
-#: ``DEAD_JOB_STATUSES`` minus CANCELLED. A cancel is a person's
-#: decision -- a user cancelling a volume, an admin re-queue abandoning
-#: the run -- and the daemon must not undo it. EXPIRED belongs here: it
-#: is our own lost answer, not a job doctor rejected.
-RETRYABLE_DEAD_STATUSES = frozenset(
-    {
-        JobStatus.FAILED,
-        JobStatus.EXPIRED,
-    }
-)
 
 
 @dataclass
@@ -317,10 +299,14 @@ def _fail(
     )
 
 
-def _back_to_pending(
-    job: ExternalJob, error_code: str, message: str, now
-) -> bool:
-    """Put a row back in the queue for a fresh attempt.
+def _retry_or_fail(
+    job: ExternalJob,
+    error_code: str,
+    message: str,
+    now,
+    details: dict | None = None,
+) -> str:
+    """Send a job back for another attempt, or write it off.
 
     A retry mutates the row rather than inserting one, so
     :meth:`~scanning.models.ExternalJob.push_attempt` preserves the
@@ -332,43 +318,6 @@ def _back_to_pending(
     attempt's deadline would be swept straight back out by
     :func:`sweep_jobs`, which writes off any PENDING row already past
     its queue ceiling.
-
-    Sole writer of this transition, shared by the submit path
-    (:func:`_retry_or_fail`) and the next-tick recovery
-    (:func:`retry_dead`).
-
-    :param job: The row to re-queue.
-    :param error_code: Why the previous attempt did not stick.
-    :param message: Human-readable detail.
-    :param now: Current time.
-    :returns: Whether this writer won the row.
-    :rtype: bool
-    """
-    job.push_attempt(save=False)
-    return _write(
-        job,
-        status=JobStatus.PENDING,
-        attempt=job.attempt + 1,
-        retry_count=job.retry_count + 1,
-        result_key="",
-        external_id="",
-        submitted_at=None,
-        completed_at=None,
-        deadline=queue_deadline(now),
-        error_code=error_code[:64],
-        error_message=message[:2000],
-        provider_meta=job.provider_meta,
-    )
-
-
-def _retry_or_fail(
-    job: ExternalJob,
-    error_code: str,
-    message: str,
-    now,
-    details: dict | None = None,
-) -> str:
-    """Send a job back for another attempt, or write it off.
 
     :param job: The row to retry.
     :param error_code: Why the previous attempt did not stick.
@@ -390,7 +339,21 @@ def _retry_or_fail(
         job.attempt,
         error_code,
     )
-    ok = _back_to_pending(job, error_code, message, now)
+    job.push_attempt(save=False)
+    ok = _write(
+        job,
+        status=JobStatus.PENDING,
+        attempt=job.attempt + 1,
+        retry_count=job.retry_count + 1,
+        result_key="",
+        external_id="",
+        submitted_at=None,
+        completed_at=None,
+        deadline=queue_deadline(now),
+        error_code=error_code[:64],
+        error_message=message[:2000],
+        provider_meta=job.provider_meta,
+    )
     return "retried" if ok else "skipped"
 
 
@@ -729,110 +692,6 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
         result = _apply_submit_outcome(job, exc, output, applied_at)
         setattr(summary, result, getattr(summary, result) + 1)
     return summary
-
-
-# ── recovering ──────────────────────────────────────────────────────
-def can_retry(job: ExternalJob) -> bool:
-    """Return whether :func:`retry_dead` will pick this dead row up.
-
-    Read by :func:`scanning.bitonal.finish_ready_scans` to tell a shard
-    that is merely between attempts from one that is out of them: the
-    first must leave its scan waiting in AWAITING, the second is what
-    ERRORs the volume.
-
-    :param job: A row of the scan's live run.
-    :returns: Whether the row is dead but still owed an attempt.
-    :rtype: bool
-    """
-    return job.status in RETRYABLE_DEAD_STATUSES and job.attempt < int(
-        settings.DOCTOR_MAX_ATTEMPTS
-    )
-
-
-def retry_dead(now=None) -> int:
-    """Send failed conversions back for another attempt (issue #187).
-
-    Doctor reports a page it could not rasterize in time with the same
-    finality as a corrupt PDF, so the submit path writes the row off
-    after one attempt (:func:`_apply_submit_outcome`). One such shard
-    used to strand a whole volume: the scan went to ERROR, and the only
-    way out was an admin re-queue, which abandons every sibling that
-    already converted and pays for all of them again.
-
-    So the daemon picks the row back up instead, and the run keeps its
-    converted siblings. ``DOCTOR_MAX_ATTEMPTS`` bounds it, so a page
-    that always fails still ends as a failure -- three conversions
-    later, which for bitonal is CPU seconds (see
-    :mod:`scanning.doctor_client`). Without that bound this would
-    convert a defective page on every tick, forever.
-
-    Only rows of a *live* run qualify. A superseded run's failure
-    belongs to a shard set that no longer exists, and reviving it would
-    submit a shard key the current manifest does not list.
-
-    And only for a scan still waiting in AWAITING. ERROR is terminal --
-    nothing merges a run under an errored scan, so a row revived there
-    would convert and then sit unread. A cancelled scan is the case that
-    matters most: ``abandon_open`` cannot cancel a row that already
-    failed, so without this filter the daemon would convert a shard of a
-    volume somebody stopped. An operator's way back into this pass is to
-    put the scan back in AWAITING, which is one field in the admin.
-
-    Doctor's ``CONVERSION_TIMEOUT`` (its issue #245, PR #246) is merged
-    but not necessarily released; until it is, a timeout and a corrupt
-    page both arrive here as ``CONVERSION_FAILED`` and nothing can tell
-    them apart. Once it is running in production, narrow this to the
-    codes that deserve it: that one and ``TRANSIENT_ERROR_CODES``.
-
-    :param now: Comparison time; defaults to ``timezone.now()``.
-    :returns: How many rows went back to PENDING.
-    :rtype: int
-    """
-    now = now or timezone.now()
-    ours = ExternalJob.objects.filter(
-        provider=JobProvider.DOCTOR,
-        stage=JobStage.CONVERT,
-        engine=JobEngine.BITONAL,
-        opinion=None,
-    )
-    # Grouped by scan alone because the filter above already pins the
-    # rest of a run's identity -- and pins ``opinion`` as the literal
-    # None a volume-level row carries, which an OuterRef could not: that
-    # would compile to ``= NULL``, true of nothing.
-    latest_run = (
-        ours.filter(scan_id=OuterRef("scan_id"))
-        .values("scan_id")
-        .annotate(latest=Max("run"))
-        .values("latest")[:1]
-    )
-    dead = (
-        ours.filter(
-            status__in=RETRYABLE_DEAD_STATUSES,
-            scan__status=Status.AWAITING,
-        )
-        .annotate(latest_run=Subquery(latest_run))
-        .filter(run=F("latest_run"))
-        .select_related("scan", "scan__reporter")
-        .order_by("scan_id", "shard_index")
-    )
-
-    retried = 0
-    for job in dead:
-        if not can_retry(job):
-            continue
-        logger.info(
-            "job %s (scan %s shard %d/%d) failed on attempt %d (%s); "
-            "sending it back for another attempt",
-            job.pk,
-            job.scan_id,
-            job.shard_index + 1,
-            job.shard_count,
-            job.attempt,
-            job.error_code or "?",
-        )
-        if _back_to_pending(job, job.error_code, job.error_message, now):
-            retried += 1
-    return retried
 
 
 # ── confirming ──────────────────────────────────────────────────────

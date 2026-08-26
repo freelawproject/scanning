@@ -27,7 +27,7 @@ import fitz
 from django.db import transaction
 from django.utils import timezone
 
-from scanning import jobs, s3_sync
+from scanning import s3_sync
 from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
@@ -211,8 +211,7 @@ def _park(scan, status: str, message: str) -> bool:
     pass able to move a scan out of it would re-run this stage's merge
     on every tick against a failure that is not going to change, and
     the merge downloads every shard result to do it. The way back from
-    ERROR is a person -- an admin re-queue, or putting the scan back in
-    AWAITING once its rows are worth another try.
+    ERROR is a person, through an admin re-queue.
 
     :param scan: The scan to move.
     :param status: Status to write.
@@ -310,14 +309,10 @@ def finish_ready_scans() -> int:
     row of its live run is in flight or waiting to be submitted:
 
     - all rows completed -> merge, park in ``AWAITING_VALIDATION``.
-    - a dead row still owed an attempt -> leave the scan in
-      ``AWAITING``. :func:`scanning.jobs.retry_dead` sends it back on
-      the next tick, and every sibling that already converted stays
-      converted. Writing ERROR here instead would spend a person's
-      re-queue, and the whole run's conversions, on a shard the daemon
-      is about to retry by itself.
-    - a dead row out of attempts (or cancelled) -> ``ERROR``, naming the
-      code. Loud rather than a silent degrade: bitonal is display-only,
+    - any row dead (failed, cancelled, expired) -> ``ERROR``, naming the
+      code. A row only reaches FAILED once its attempts are spent, since
+      a retryable failure goes back to PENDING from the submit pass, so
+      a dead row here means the shard is genuinely over. Loud rather than a silent degrade: bitonal is display-only,
       so the volume stays usable, but while this rolls out volume by
       volume a failure should be seen. An admin re-queue starts a fresh
       run.
@@ -326,8 +321,7 @@ def finish_ready_scans() -> int:
     that re-examined it would re-run the merge -- and its download of
     every shard result -- on every tick of a failure that is not going
     to change. A volume that lands in ERROR waits for a person: an admin
-    re-queue, or a scan put back in AWAITING once its rows deserve
-    another attempt, which ``jobs.retry_dead`` then picks up.
+    re-queue.
 
     :returns: How many scans were moved out of AWAITING.
     :rtype: int
@@ -372,15 +366,6 @@ def finish_ready_scans() -> int:
 
         dead = [job for job in convert_jobs if job.status in DEAD_JOB_STATUSES]
         if dead:
-            waiting = [job for job in dead if jobs.can_retry(job)]
-            if waiting:
-                logger.info(
-                    "scan %s has %d dead shard(s) still owed an attempt; "
-                    "leaving it in AWAITING for the retry pass",
-                    scan.pk,
-                    len(waiting),
-                )
-                continue
             first = dead[0]
             logger.error(
                 "Conversion failed for scan %s: %d of %d shard(s) dead, "

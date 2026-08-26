@@ -1,16 +1,12 @@
 """Confirm in-flight external jobs and finish the scans they belong to.
 
-Three parts, in order:
+Two halves, in order:
 
-1. ``jobs.retry_dead()`` -- put failed shards back in the queue while
-   they are still owed an attempt. First, so a row that goes back to
-   PENDING is already PENDING when part 3 judges its scan; otherwise
-   that scan would be written off in the same tick that revived it.
-2. ``jobs.sweep_jobs()`` -- for each job still in flight, check whether
+1. ``jobs.sweep_jobs()`` -- for each job still in flight, check whether
    its result object appeared. The only path that can finish a job whose
    response we never saw: doctor converts and uploads even after we stop
    reading, so a killed daemon loses the answer, not the work.
-3. ``bitonal.finish_ready_scans()`` -- merge the shards of any scan
+2. ``bitonal.finish_ready_scans()`` -- merge the shards of any scan
    whose jobs are all done and move it out of ``AWAITING``.
 
 Examples:
@@ -53,7 +49,6 @@ class Command(BaseCommand):
         for attempt in range(MAX_DB_RETRIES):
             connections.close_all()
             try:
-                retried = jobs.retry_dead()
                 summary = jobs.sweep_jobs()
                 finished = bitonal.finish_ready_scans()
                 break
@@ -72,7 +67,6 @@ class Command(BaseCommand):
 
         if any(
             (
-                retried,
                 summary.completed,
                 summary.retried,
                 summary.failed,
@@ -81,8 +75,7 @@ class Command(BaseCommand):
             )
         ):
             self.stdout.write(
-                f"Completed {summary.completed}, retried "
-                f"{summary.retried + retried}, failed {summary.failed}, "
-                f"still waiting {summary.pending}, check errors "
-                f"{summary.errors}; finished {finished} scan(s)"
+                f"Completed {summary.completed}, retried {summary.retried}, "
+                f"failed {summary.failed}, still waiting {summary.pending}, "
+                f"check errors {summary.errors}; finished {finished} scan(s)"
             )

@@ -330,35 +330,12 @@ class TestFinishReadyScans(ConvertJobsMixin, TestCase):
         self.assertEqual(finished, 0)
         self.assertEqual(scan.status, Status.AWAITING)
 
-    def test_a_dead_shard_owed_an_attempt_keeps_waiting(self):
-        """``retry_dead`` sends it back, so ERROR here is premature."""
+    def test_a_dead_shard_errors_the_scan_and_names_the_code(self):
         scan, rows = self.build(shard_count=2, pages_per_shard=1)
         ExternalJob.objects.filter(pk=rows[1].pk).update(
             status=JobStatus.FAILED,
             error_code="CONVERSION_FAILED",
             error_message="pdftoppm died",
-            attempt=1,
-        )
-
-        with self.assertLogs("scanning.bitonal", level="INFO"):
-            finished = bitonal.finish_ready_scans()
-
-        scan.refresh_from_db()
-        self.assertEqual(finished, 0)
-        self.assertEqual(scan.status, Status.AWAITING)
-        # The siblings keep their results: they are not reconverted.
-        self.assertEqual(
-            {job.status for job in bitonal.live_convert_jobs(scan)},
-            {JobStatus.COMPLETED, JobStatus.FAILED},
-        )
-
-    def test_a_dead_shard_out_of_attempts_errors_the_scan(self):
-        scan, rows = self.build(shard_count=2, pages_per_shard=1)
-        ExternalJob.objects.filter(pk=rows[1].pk).update(
-            status=JobStatus.FAILED,
-            error_code="CONVERSION_FAILED",
-            error_message="pdftoppm died",
-            attempt=3,
         )
 
         with self.assertLogs("scanning.bitonal", level="ERROR"):
@@ -368,19 +345,6 @@ class TestFinishReadyScans(ConvertJobsMixin, TestCase):
         self.assertEqual(finished, 1)
         self.assertEqual(scan.status, Status.ERROR)
         self.assertIn("CONVERSION_FAILED", scan.progress_message)
-
-    def test_a_cancelled_shard_errors_the_scan_without_a_retry(self):
-        """A cancel is never owed an attempt, whatever its count says."""
-        scan, rows = self.build(shard_count=2, pages_per_shard=1)
-        ExternalJob.objects.filter(pk=rows[1].pk).update(
-            status=JobStatus.CANCELLED, error_code="ABANDONED", attempt=1
-        )
-
-        with self.assertLogs("scanning.bitonal", level="ERROR"):
-            bitonal.finish_ready_scans()
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.ERROR)
 
     def test_a_merge_failure_errors_the_scan(self):
         scan, _ = self.build(
