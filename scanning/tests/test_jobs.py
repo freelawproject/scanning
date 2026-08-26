@@ -563,14 +563,14 @@ class TestRetryDead(ScanningTestCase):
         job.refresh_from_db()
         self.assertEqual(job.status, JobStatus.FAILED)
 
-    def test_an_errored_scan_is_the_recovery_case(self):
+    def test_an_errored_scan_is_left_alone(self):
+        """ERROR is terminal: nothing would merge the result."""
         job = self._row(scan=ScanFactory(status=Status.ERROR))
 
-        with self.assertLogs("scanning.jobs", level="INFO"):
-            self.assertEqual(jobs.retry_dead(), 1)
+        self.assertEqual(jobs.retry_dead(), 0)
 
         job.refresh_from_db()
-        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.status, JobStatus.FAILED)
 
     def test_a_superseded_runs_failure_is_left_alone(self):
         """Its shard set no longer exists, so its key is unsubmittable."""

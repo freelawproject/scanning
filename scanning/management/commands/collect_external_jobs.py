@@ -11,8 +11,7 @@ Three parts, in order:
    response we never saw: doctor converts and uploads even after we stop
    reading, so a killed daemon loses the answer, not the work.
 3. ``bitonal.finish_ready_scans()`` -- merge the shards of any scan
-   whose jobs are all done and move it out of ``AWAITING`` (or out of
-   ``ERROR``, for a run that finished after its scan was written off).
+   whose jobs are all done and move it out of ``AWAITING``.
 
 Examples:
 

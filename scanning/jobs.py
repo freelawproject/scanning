@@ -754,10 +754,10 @@ def retry_dead(now=None) -> int:
 
     Doctor reports a page it could not rasterize in time with the same
     finality as a corrupt PDF, so the submit path writes the row off
-    after one attempt (:func:`_record_outcome`). One such shard used to
-    strand a whole volume: the scan went to ERROR, and the only way out
-    was an admin re-queue, which abandons every sibling that already
-    converted and pays for all of them again.
+    after one attempt (:func:`_apply_submit_outcome`). One such shard
+    used to strand a whole volume: the scan went to ERROR, and the only
+    way out was an admin re-queue, which abandons every sibling that
+    already converted and pays for all of them again.
 
     So the daemon picks the row back up instead, and the run keeps its
     converted siblings. ``DOCTOR_MAX_ATTEMPTS`` bounds it, so a page
@@ -770,12 +770,13 @@ def retry_dead(now=None) -> int:
     belongs to a shard set that no longer exists, and reviving it would
     submit a shard key the current manifest does not list.
 
-    And only for a scan that still wants the conversion: AWAITING, where
-    it is waiting for exactly this, or ERROR, where the volume was
-    written off and a retry is the way back. A cancelled scan is the
-    case that matters -- ``abandon_open`` cannot cancel a row that
-    already failed, so without this filter the daemon would convert a
-    shard of a volume somebody stopped.
+    And only for a scan still waiting in AWAITING. ERROR is terminal --
+    nothing merges a run under an errored scan, so a row revived there
+    would convert and then sit unread. A cancelled scan is the case that
+    matters most: ``abandon_open`` cannot cancel a row that already
+    failed, so without this filter the daemon would convert a shard of a
+    volume somebody stopped. An operator's way back into this pass is to
+    put the scan back in AWAITING, which is one field in the admin.
 
     Doctor's ``CONVERSION_TIMEOUT`` (its issue #245, PR #246) is merged
     but not necessarily released; until it is, a timeout and a corrupt
@@ -807,7 +808,7 @@ def retry_dead(now=None) -> int:
     dead = (
         ours.filter(
             status__in=RETRYABLE_DEAD_STATUSES,
-            scan__status__in=(Status.AWAITING, Status.ERROR),
+            scan__status=Status.AWAITING,
         )
         .annotate(latest_run=Subquery(latest_run))
         .filter(run=F("latest_run"))

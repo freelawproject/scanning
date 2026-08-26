@@ -130,12 +130,13 @@ must not be broken:
   seconds, for bitonal. Doctor's `CONVERSION_TIMEOUT` (doctor #245, PR
   #246) is merged and already in `TRANSIENT_ERROR_CODES`; once it is
   released, narrow the retry to the codes that deserve it.
-- `finish_ready_scans` also examines scans in **ERROR**, for the one
-  case recoverable without a re-queue: a live run that is now entirely
-  COMPLETED, which is what a volume errored before `retry_dead` existed
-  looks like once its last shard converts. Nothing else about an ERROR
-  scan is touched — re-parking one would rewrite the same status and
-  re-raise the same Sentry event every 15 seconds.
+- **ERROR stays terminal.** Neither `finish_ready_scans` nor
+  `retry_dead` looks at a scan in ERROR. A pass that did would re-run
+  the merge — and its download of every shard result — on every 15s tick
+  of a failure that is not going to change. The way back is a person:
+  an admin re-queue, or the scan put back in AWAITING, which is one
+  field in the admin and is enough for `retry_dead` to pick its failed
+  rows up.
 - A failure names where it happened (`jobs._failure_location`): the
   shard's volume page range off the row's own `input_manifest`, plus
   doctor's `page_number` and `pixels` when it sends them (doctor #245),

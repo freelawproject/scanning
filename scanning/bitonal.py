@@ -201,25 +201,26 @@ def merge_convert_results(scan, convert_jobs: list[ExternalJob]) -> Path:
     return destination
 
 
-def _park(
-    scan, status: str, message: str, from_statuses=(Status.AWAITING,)
-) -> bool:
-    """Move a scan out of the status it is waiting in, if it still is.
+def _park(scan, status: str, message: str) -> bool:
+    """Move a scan out of AWAITING, if it is still there.
 
     Guarded because an admin action or a cancel may have moved the scan
     while its jobs ran, and stomping that undoes a human decision.
 
+    ERROR is deliberately not a start status here. It is terminal: a
+    pass able to move a scan out of it would re-run this stage's merge
+    on every tick against a failure that is not going to change, and
+    the merge downloads every shard result to do it. The way back from
+    ERROR is a person -- an admin re-queue, or putting the scan back in
+    AWAITING once its rows are worth another try.
+
     :param scan: The scan to move.
     :param status: Status to write.
     :param message: Progress message to write.
-    :param from_statuses: Statuses the scan may be moved out of. ERROR
-        joins AWAITING only for the recovery path in
-        :func:`finish_ready_scans`, which merges a run that finished
-        after its scan had already been written off.
     :returns: Whether this writer won the row.
     :rtype: bool
     """
-    updated = Scan.objects.filter(pk=scan.pk, status__in=from_statuses).update(
+    updated = Scan.objects.filter(pk=scan.pk, status=Status.AWAITING).update(
         status=status,
         progress_message=message[:255],
         progress_current=0,
@@ -227,19 +228,14 @@ def _park(
     )
     if not updated:
         logger.info(
-            "scan %s left %s before its conversion was applied; "
+            "scan %s left AWAITING before its conversion was applied; "
             "leaving its jobs alone",
             scan.pk,
-            "/".join(from_statuses),
         )
     return bool(updated)
 
 
-def _finish_scan(
-    scan,
-    convert_jobs: list[ExternalJob],
-    from_statuses=(Status.AWAITING,),
-) -> bool:
+def _finish_scan(scan, convert_jobs: list[ExternalJob]) -> bool:
     """Merge one scan's results, park it, and consume its rows.
 
     The park precedes the CONSUMED write and both sit in one
@@ -249,19 +245,13 @@ def _finish_scan(
 
     :param scan: The scan whose conversion finished.
     :param convert_jobs: The live run's rows.
-    :param from_statuses: Statuses the scan may be parked out of.
     :returns: Whether this writer moved the scan.
     :rtype: bool
     """
     merge_convert_results(scan, convert_jobs)
 
     with transaction.atomic():
-        if not _park(
-            scan,
-            Status.AWAITING_VALIDATION,
-            CONVERTED_MESSAGE,
-            from_statuses,
-        ):
+        if not _park(scan, Status.AWAITING_VALIDATION, CONVERTED_MESSAGE):
             return False
         now = timezone.now()
         _log_stage_duration(scan, convert_jobs, now)
@@ -332,20 +322,19 @@ def finish_ready_scans() -> int:
       volume a failure should be seen. An admin re-queue starts a fresh
       run.
 
-    Scans already in ``ERROR`` are examined too, for the one case that
-    is recoverable without a re-queue: a live run that is now entirely
-    COMPLETED. That is what a volume errored before ``retry_dead``
-    existed looks like once its last shard converts, and what any future
-    write-off followed by a late completion would leave. Nothing else
-    about an ERROR scan is touched -- re-parking one would rewrite the
-    same status and re-raise the same Sentry event on every tick.
+    Only scans in AWAITING are examined. ERROR is terminal, and a pass
+    that re-examined it would re-run the merge -- and its download of
+    every shard result -- on every tick of a failure that is not going
+    to change. A volume that lands in ERROR waits for a person: an admin
+    re-queue, or a scan put back in AWAITING once its rows deserve
+    another attempt, which ``jobs.retry_dead`` then picks up.
 
-    :returns: How many scans were moved out of AWAITING or ERROR.
+    :returns: How many scans were moved out of AWAITING.
     :rtype: int
     """
     scan_ids = (
         Scan.objects.filter(
-            status__in=(Status.AWAITING, Status.ERROR),
+            status=Status.AWAITING,
             jobs__stage=JobStage.CONVERT,
             jobs__engine=JobEngine.BITONAL,
             jobs__provider=JobProvider.DOCTOR,
@@ -366,20 +355,6 @@ def finish_ready_scans() -> int:
             for job in convert_jobs
         ):
             continue
-
-        recovering = scan.status == Status.ERROR
-        if recovering and not all(
-            job.status == JobStatus.COMPLETED for job in convert_jobs
-        ):
-            continue
-        # Widened for the recovery path only. On the ordinary path the
-        # guard stays AWAITING-only, so a scan that errored for some
-        # other reason mid-conversion is not overwritten with "converted".
-        from_statuses = (
-            (Status.AWAITING, Status.ERROR)
-            if recovering
-            else (Status.AWAITING,)
-        )
 
         if all(job.status == JobStatus.CONSUMED for job in convert_jobs):
             # Already merged, and the merge deletes the results it
@@ -428,7 +403,7 @@ def finish_ready_scans() -> int:
             continue
 
         try:
-            if _finish_scan(scan, convert_jobs, from_statuses):
+            if _finish_scan(scan, convert_jobs):
                 finished += 1
         except Exception as exc:
             # The merge is the one local step, so a failure is not the
