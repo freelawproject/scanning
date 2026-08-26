@@ -179,6 +179,30 @@ class TestErrorClassification(SimpleTestCase):
                 )
                 self.assertEqual(exc.error_code, code)
 
+    def test_a_timeout_is_transient_but_a_failed_conversion_is_not(self):
+        """The split doctor #245 added, and the reason we asked for it."""
+        timeout = self._raises(
+            500,
+            {
+                "success": False,
+                "error_code": "CONVERSION_TIMEOUT",
+                "msg": "pdftoppm timed out after 120s on page 1",
+            },
+            doctor_client.DoctorTransientError,
+        )
+        self.assertEqual(timeout.error_code, "CONVERSION_TIMEOUT")
+
+        failed = self._raises(
+            500,
+            {
+                "success": False,
+                "error_code": "CONVERSION_FAILED",
+                "msg": "pdftoppm failed on page 1",
+            },
+            doctor_client.DoctorError,
+        )
+        self.assertNotIsInstance(failed, doctor_client.DoctorTransientError)
+
     def test_terminal_codes_are_not_retried(self):
         for code, status in [
             ("VALIDATION_FAILED", 400),
@@ -254,6 +278,68 @@ class TestErrorClassification(SimpleTestCase):
             {"success": False, "error_code": "CONVERSION_FAILED", "msg": "x"},
             doctor_client.DoctorError,
         )
+
+
+@override_settings(**DOCTOR)
+class TestFailureDetails(SimpleTestCase):
+    """Doctor's per-page fields, which spare us parsing its prose."""
+
+    def _details(self, body):
+        with patch(
+            "scanning.doctor_client.requests.post",
+            return_value=_response(500, body),
+        ):
+            with self.assertRaises(doctor_client.DoctorError) as caught:
+                doctor_client.convert_bitonal("in", "out")
+        return caught.exception.details
+
+    def test_the_reported_fields_reach_the_exception(self):
+        details = self._details(
+            {
+                "success": False,
+                "error_code": "CONVERSION_TIMEOUT",
+                "msg": "pdftoppm timed out after 120s on page 7",
+                "page_number": 7,
+                "pages_completed": 6,
+                "elapsed_ms": 121_004,
+                "pixels": 8_216_000,
+            }
+        )
+        self.assertEqual(
+            details,
+            {
+                "page_number": 7,
+                "pages_completed": 6,
+                "elapsed_ms": 121_004,
+                "pixels": 8_216_000,
+            },
+        )
+
+    def test_a_doctor_that_reports_nothing_gives_an_empty_dict(self):
+        """A failure naming no page, or a doctor older than #245."""
+        details = self._details(
+            {
+                "success": False,
+                "error_code": "INVALID_PDF",
+                "msg": "could not read source PDF",
+            }
+        )
+        self.assertEqual(details, {})
+
+    def test_unexpected_types_are_dropped_rather_than_formatted(self):
+        """bool subclasses int, and "page true" must not reach a log."""
+        details = self._details(
+            {
+                "success": False,
+                "error_code": "CONVERSION_FAILED",
+                "msg": "?",
+                "page_number": True,
+                "pages_completed": "six",
+                "elapsed_ms": None,
+                "pixels": 8_216_000,
+            }
+        )
+        self.assertEqual(details, {"pixels": 8_216_000})
 
 
 @override_settings(**DOCTOR)

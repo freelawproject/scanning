@@ -330,12 +330,35 @@ class TestFinishReadyScans(ConvertJobsMixin, TestCase):
         self.assertEqual(finished, 0)
         self.assertEqual(scan.status, Status.AWAITING)
 
-    def test_a_dead_shard_errors_the_scan_and_names_the_code(self):
+    def test_a_dead_shard_owed_an_attempt_keeps_waiting(self):
+        """``retry_dead`` sends it back, so ERROR here is premature."""
         scan, rows = self.build(shard_count=2, pages_per_shard=1)
         ExternalJob.objects.filter(pk=rows[1].pk).update(
             status=JobStatus.FAILED,
             error_code="CONVERSION_FAILED",
             error_message="pdftoppm died",
+            attempt=1,
+        )
+
+        with self.assertLogs("scanning.bitonal", level="INFO"):
+            finished = bitonal.finish_ready_scans()
+
+        scan.refresh_from_db()
+        self.assertEqual(finished, 0)
+        self.assertEqual(scan.status, Status.AWAITING)
+        # The siblings keep their results: they are not reconverted.
+        self.assertEqual(
+            {job.status for job in bitonal.live_convert_jobs(scan)},
+            {JobStatus.COMPLETED, JobStatus.FAILED},
+        )
+
+    def test_a_dead_shard_out_of_attempts_errors_the_scan(self):
+        scan, rows = self.build(shard_count=2, pages_per_shard=1)
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.FAILED,
+            error_code="CONVERSION_FAILED",
+            error_message="pdftoppm died",
+            attempt=3,
         )
 
         with self.assertLogs("scanning.bitonal", level="ERROR"):
@@ -345,6 +368,19 @@ class TestFinishReadyScans(ConvertJobsMixin, TestCase):
         self.assertEqual(finished, 1)
         self.assertEqual(scan.status, Status.ERROR)
         self.assertIn("CONVERSION_FAILED", scan.progress_message)
+
+    def test_a_cancelled_shard_errors_the_scan_without_a_retry(self):
+        """A cancel is never owed an attempt, whatever its count says."""
+        scan, rows = self.build(shard_count=2, pages_per_shard=1)
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.CANCELLED, error_code="ABANDONED", attempt=1
+        )
+
+        with self.assertLogs("scanning.bitonal", level="ERROR"):
+            bitonal.finish_ready_scans()
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.ERROR)
 
     def test_a_merge_failure_errors_the_scan(self):
         scan, _ = self.build(
@@ -404,6 +440,62 @@ class TestFinishReadyScans(ConvertJobsMixin, TestCase):
         scan.refresh_from_db()
         self.assertEqual(finished, 1)
         self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+
+
+class TestErrorRecovery(ConvertJobsMixin, TestCase):
+    """A run that finished after its scan was already written off."""
+
+    def test_a_completed_run_under_an_errored_scan_is_merged(self):
+        """The volumes errored before ``retry_dead`` existed."""
+        scan, _ = self.build(shard_count=2, pages_per_shard=1)
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.ERROR,
+            progress_message="Bitonal conversion failed on 1 of 2 shard(s)",
+        )
+
+        with patch("scanning.s3_sync.upload_file_to_s3"):
+            with patch("scanning.s3_sync.delete_objects"):
+                finished = bitonal.finish_ready_scans()
+
+        scan.refresh_from_db()
+        self.assertEqual(finished, 1)
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertEqual(
+            {job.status for job in bitonal.live_convert_jobs(scan)},
+            {JobStatus.CONSUMED},
+        )
+
+    def test_an_errored_scan_with_a_dead_shard_is_left_alone(self):
+        """Re-parking it would re-raise the same Sentry event each tick."""
+        scan, rows = self.build(shard_count=2, pages_per_shard=1)
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.FAILED, error_code="CONVERSION_FAILED", attempt=3
+        )
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.ERROR, progress_message="already reported"
+        )
+
+        finished = bitonal.finish_ready_scans()
+
+        scan.refresh_from_db()
+        self.assertEqual(finished, 0)
+        self.assertEqual(scan.status, Status.ERROR)
+        self.assertEqual(scan.progress_message, "already reported")
+
+    def test_an_errored_scan_whose_run_was_merged_is_left_alone(self):
+        scan, rows = self.build(shard_count=2, pages_per_shard=1)
+        ExternalJob.objects.filter(pk__in=[job.pk for job in rows]).update(
+            status=JobStatus.CONSUMED
+        )
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.ERROR, progress_message="failed later on"
+        )
+
+        finished = bitonal.finish_ready_scans()
+
+        scan.refresh_from_db()
+        self.assertEqual(finished, 0)
+        self.assertEqual(scan.status, Status.ERROR)
 
 
 class TestAlreadyConsumedRun(ConvertJobsMixin, TestCase):

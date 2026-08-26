@@ -25,6 +25,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    Status,
 )
 from scanning.tests.test_views import ScanningTestCase
 
@@ -466,6 +467,184 @@ class TestRetryCeiling(ScanningTestCase):
         history = job.provider_meta["attempts"]
         self.assertEqual([entry["attempt"] for entry in history], [1, 2])
         self.assertEqual(history[0]["result_key"], "first-key.pdf")
+
+
+@override_settings(**DOCTOR)
+class TestRetryDead(ScanningTestCase):
+    """The next tick picking a failed shard back up."""
+
+    def _row(self, **kwargs):
+        """Build one bitonal conversion row on doctor.
+
+        :param kwargs: Field overrides.
+        :returns: The saved row.
+        """
+        fields = {
+            "scan": ScanFactory(status=Status.AWAITING),
+            "stage": JobStage.CONVERT,
+            "engine": JobEngine.BITONAL,
+            "provider": JobProvider.DOCTOR,
+            "status": JobStatus.FAILED,
+            "error_code": "CONVERSION_FAILED",
+            "error_message": "pdftoppm timed out after 120s on page 1",
+            "result_key": "jobs/convert/bitonal/r1-s0-a1.pdf",
+            "deadline": timezone.now() - timedelta(days=2),
+        }
+        fields.update(kwargs)
+        return ExternalJobFactory(**fields)
+
+    def test_a_failed_row_goes_back_to_pending(self):
+        job = self._row()
+
+        with self.assertLogs("scanning.jobs", level="INFO"):
+            self.assertEqual(jobs.retry_dead(), 1)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.attempt, 2)
+        self.assertEqual(job.retry_count, 1)
+        # Cleared so the next submit mints an attempt-scoped key: a late
+        # upload from attempt 1 must never be read as attempt 2's output.
+        self.assertEqual(job.result_key, "")
+        self.assertEqual(job.provider_meta["attempts"][0]["attempt"], 1)
+
+    def test_the_deadline_is_re_stamped_into_the_future(self):
+        """Otherwise the same tick's sweep writes the row straight off."""
+        job = self._row()
+
+        jobs.retry_dead()
+
+        job.refresh_from_db()
+        self.assertGreater(job.deadline, timezone.now())
+
+    def test_a_cancelled_row_is_left_alone(self):
+        """A cancel is a person's decision, not a failure to recover."""
+        job = self._row(status=JobStatus.CANCELLED, error_code="ABANDONED")
+
+        self.assertEqual(jobs.retry_dead(), 0)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.CANCELLED)
+
+    def test_an_expired_row_is_picked_up(self):
+        """Our own lost answer, not a job doctor rejected."""
+        job = self._row(status=JobStatus.EXPIRED)
+
+        with self.assertLogs("scanning.jobs", level="INFO"):
+            self.assertEqual(jobs.retry_dead(), 1)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.PENDING)
+
+    def test_a_row_out_of_attempts_stays_failed(self):
+        """The bound that stops a defective page converting forever."""
+        job = self._row(attempt=3)
+
+        self.assertEqual(jobs.retry_dead(), 0)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(job.attempt, 3)
+
+    def test_a_cancelled_scans_failure_is_left_alone(self):
+        """``abandon_open`` cannot cancel a row that already failed."""
+        job = self._row(scan=ScanFactory(status=Status.CANCELLED))
+
+        self.assertEqual(jobs.retry_dead(), 0)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.FAILED)
+
+    def test_a_scan_that_already_moved_on_is_left_alone(self):
+        job = self._row(scan=ScanFactory(status=Status.AWAITING_VALIDATION))
+
+        self.assertEqual(jobs.retry_dead(), 0)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.FAILED)
+
+    def test_an_errored_scan_is_the_recovery_case(self):
+        job = self._row(scan=ScanFactory(status=Status.ERROR))
+
+        with self.assertLogs("scanning.jobs", level="INFO"):
+            self.assertEqual(jobs.retry_dead(), 1)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.PENDING)
+
+    def test_a_superseded_runs_failure_is_left_alone(self):
+        """Its shard set no longer exists, so its key is unsubmittable."""
+        scan = ScanFactory(status=Status.AWAITING)
+        old_run = self._row(scan=scan, run=1)
+        live = self._row(scan=scan, run=2, shard_index=0)
+
+        with self.assertLogs("scanning.jobs", level="INFO"):
+            self.assertEqual(jobs.retry_dead(), 1)
+
+        old_run.refresh_from_db()
+        live.refresh_from_db()
+        self.assertEqual(old_run.status, JobStatus.FAILED)
+        self.assertEqual(live.status, JobStatus.PENDING)
+
+    def test_another_providers_rows_are_not_touched(self):
+        job = self._row(
+            provider=JobProvider.RUNPOD,
+            stage=JobStage.DETECT,
+            engine=JobEngine.BLACKLETTER,
+        )
+
+        self.assertEqual(jobs.retry_dead(), 0)
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.FAILED)
+
+    def test_can_retry_reads_the_status_and_the_ceiling(self):
+        self.assertTrue(jobs.can_retry(self._row(attempt=2)))
+        self.assertFalse(jobs.can_retry(self._row(attempt=3)))
+        self.assertFalse(jobs.can_retry(self._row(status=JobStatus.CANCELLED)))
+        self.assertFalse(jobs.can_retry(self._row(status=JobStatus.COMPLETED)))
+
+
+@override_settings(**DOCTOR)
+class TestFailureLocation(ScanningTestCase):
+    """Naming the volume pages a failed shard covers."""
+
+    def _failed(self, details=None, manifest=None):
+        """Fail one row and return it, with its manifest set.
+
+        :param details: Doctor's per-page fields, if any.
+        :param manifest: Override for the row's shard identity.
+        :returns: The refreshed row.
+        """
+        job = ExternalJobFactory(
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            status=JobStatus.SUBMITTED,
+            input_manifest=(
+                {"from_page": 700, "to_page": 799, "page_count": 100}
+                if manifest is None
+                else manifest
+            ),
+        )
+        with self.assertLogs("scanning.jobs", level="ERROR"):
+            jobs._fail(job, "CONVERSION_TIMEOUT", "timed out", details)
+        job.refresh_from_db()
+        return job
+
+    def test_the_shard_page_range_is_recorded(self):
+        """1-based, as a viewer shows it; the manifest is 0-based."""
+        job = self._failed()
+        self.assertIn("volume pages 701-800", job.error_message)
+
+    def test_doctors_page_number_names_the_volume_page(self):
+        job = self._failed({"page_number": 1, "pixels": 8_216_000})
+        self.assertIn("failed on volume page 701", job.error_message)
+        self.assertIn("8216000 pixel(s)", job.error_message)
+
+    def test_a_row_with_no_manifest_says_nothing_extra(self):
+        job = self._failed(manifest={})
+        self.assertEqual(job.error_message, "timed out")
 
 
 @override_settings(**DOCTOR)

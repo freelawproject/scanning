@@ -105,11 +105,42 @@ must not be broken:
   Shards are named by position (`0001.pdf`), so a re-cut volume with the
   same shard count gives identical keys over different pages. A run
   holding a dead row (failed, cancelled, expired) is replaced — that is
-  what a cancel or admin re-queue leaves behind. A fully CONSUMED run
+  what a cancel or admin re-queue leaves behind. In practice that path
+  now sees CANCELLED rows and rows out of attempts, since `retry_dead`
+  picks a merely-failed row back up long before anyone re-queues. A
+  fully CONSUMED run
   means "already converted" and is never merged again, since the merge
   deletes the results it consumed.
 - Every row write is a compare-and-swap on the row's current status
-  (`jobs._write`), so no lock is held across an HTTP call.
+  (`jobs._write`), so no lock is held across an HTTP call. The writer it
+  guards against is the **web process**, not a second daemon: one daemon
+  runs, and both `views_process.cancel_processing` and the admin
+  re-queue call `jobs.abandon_open` from a request. A daemon that wrote
+  PENDING over their CANCELLED would convert a shard nobody wants.
+- **A failed shard is not a failed volume.** `jobs.retry_dead` runs
+  first in the collect tick and sends a FAILED or EXPIRED row of a live
+  run back to PENDING, up to `DOCTOR_MAX_ATTEMPTS`, re-stamping its
+  deadline (a row still carrying the old one is swept straight back out
+  as `QUEUE_TIMEOUT`). CANCELLED is excluded — that is a person's
+  decision. So `finish_ready_scans` writes ERROR only once no dead row
+  is owed an attempt (`jobs.can_retry`); until then the scan waits in
+  AWAITING and keeps every sibling it already converted. The bound is
+  what stops a defective page converting on every tick forever, and it
+  means a terminal failure now costs three conversions, not one — CPU
+  seconds, for bitonal. Doctor's `CONVERSION_TIMEOUT` (doctor #245, PR
+  #246) is merged and already in `TRANSIENT_ERROR_CODES`; once it is
+  released, narrow the retry to the codes that deserve it.
+- `finish_ready_scans` also examines scans in **ERROR**, for the one
+  case recoverable without a re-queue: a live run that is now entirely
+  COMPLETED, which is what a volume errored before `retry_dead` existed
+  looks like once its last shard converts. Nothing else about an ERROR
+  scan is touched — re-parking one would rewrite the same status and
+  re-raise the same Sentry event every 15 seconds.
+- A failure names where it happened (`jobs._failure_location`): the
+  shard's volume page range off the row's own `input_manifest`, plus
+  doctor's `page_number` and `pixels` when it sends them (doctor #245),
+  so triage needs neither S3 nor a parse of doctor's prose. Page numbers
+  are logged 1-based; `from_page`/`to_page` are fitz indexes.
 - Three INFO lines carry the timings the stage is judged on, so
   benchmarking it needs no SQL: per shard (ours end to end, plus
   doctor's own `duration_ms`, whose gap is queue and transport), per

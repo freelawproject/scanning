@@ -79,23 +79,33 @@ class TestSubmitCommand(TestCase):
 class TestCollectCommand(TestCase):
     """``collect_external_jobs``."""
 
-    def test_it_confirms_then_applies(self):
-        """Order matters: a job confirmed this tick should finish it."""
+    def test_it_retries_then_confirms_then_applies(self):
+        """Order matters twice over.
+
+        A job confirmed this tick should finish its scan in the same
+        tick; and a failed shard must go back to PENDING *before* the
+        apply pass judges its scan, or that scan is written off in the
+        tick that revived it.
+        """
         calls = []
         with patch(
-            "scanning.jobs.sweep_jobs",
-            side_effect=lambda *a, **kw: (
-                calls.append("sweep") or SweepSummary(completed=2)
-            ),
+            "scanning.jobs.retry_dead",
+            side_effect=lambda *a, **kw: calls.append("retry") or 1,
         ):
             with patch(
-                "scanning.bitonal.finish_ready_scans",
-                side_effect=lambda: calls.append("finish") or 1,
+                "scanning.jobs.sweep_jobs",
+                side_effect=lambda *a, **kw: (
+                    calls.append("sweep") or SweepSummary(completed=2)
+                ),
             ):
-                with patch("django.db.connections.close_all"):
-                    call_command("collect_external_jobs")
+                with patch(
+                    "scanning.bitonal.finish_ready_scans",
+                    side_effect=lambda: calls.append("finish") or 1,
+                ):
+                    with patch("django.db.connections.close_all"):
+                        call_command("collect_external_jobs")
 
-        self.assertEqual(calls, ["sweep", "finish"])
+        self.assertEqual(calls, ["retry", "sweep", "finish"])
 
     def test_a_transient_db_error_is_survived_quietly(self):
         with patch(
