@@ -211,6 +211,48 @@ The full pipeline cuts the original PDF into shards (`scanning/sharding.py`, iss
 - Component classes defined in `input.css`: `.btn-primary`, `.btn-outline`, `.btn-danger`, `.btn-ghost`, `.card`, `.input-text`, `.alert-*`, `.badge-*`
 - Templates use cotton components: `<c-header />`, `<c-footer />`
 
+## Deploy labels
+
+Merging to `main` builds two images (`<sha>-web`, `<sha>-daemon`) and
+rolls out both deployments. Three PR labels gate that, read in
+`.github/workflows/deploy.yml`:
+
+| Label | Skips |
+| --- | --- |
+| `skip-deploy` | the build, and therefore both rollouts |
+| `skip-web-deploy` | the `scanning-web` rollout only |
+| `skip-daemon-deploy` | the `scanning-daemon` rollout only |
+
+**After opening a PR, work out whether one applies and suggest it to the
+user** (say which, and why). Do not add it yourself — it is their call.
+Suggest it, don't assume it: most PRs touch both processes and need no
+label. The web rollout is the expensive one — a 1.5 GB image pull, a
+reschedule, and the liveness restarts that follow — so a daemon-only
+change is worth labelling.
+
+A skip is only safe when the *other* process can keep running the
+previous image against this one. Check all four:
+
+- **Which process runs the changed code?** The daemon runs
+  `run_daemon`, its management commands, `jobs`, `bitonal`,
+  `doctor_client`, `sharding` and the pipeline half of `services`. The
+  web runs the views, the admin, and whatever they import — note that
+  `views_process.cancel_processing` and the admin re-queue call
+  `jobs.abandon_open`, so `jobs` is not daemon-only.
+- **Is there a migration?** If yes, no skip: the two images must not
+  disagree about the schema.
+- **Did a shared format change** — a model field's meaning, a JSON
+  payload, an S3 key layout, a status one writes and the other reads?
+- **Are the signature changes backward-compatible** both ways, since
+  either image may be the older one?
+
+Docs- and test-only PRs take `skip-deploy`.
+
+If a label the workflow reads does not exist in the repo yet, it has to
+be created before it can be applied. `contains()` is a substring test,
+but the three names do not overlap: `skip-web-deploy` does not contain
+`skip-deploy`, so the build still runs.
+
 ## Environment
 
 - `DEVELOPMENT=True` enables debug toolbar, local filesystem storage, dev S3 buckets
