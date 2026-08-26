@@ -34,6 +34,15 @@ MAX_ORIGINAL_UPLOAD_SIZE = env.int("MAX_UPLOAD_SIZE_GB", default=3) * 1024**3
 # out from under a live upload.
 PENDING_UPLOAD_TTL_HOURS = env.float("PENDING_UPLOAD_TTL_HOURS", default=9.0)
 
+# Lifetime (in seconds) of the presigned GET the viewer uses to read the
+# original PDF straight from S3 (issue #185). Long on purpose: pdf.js
+# fetches page ranges lazily while the user scrolls, so a range request
+# can come hours after the URL was issued. An expired signature 403s
+# mid-scroll. Default 8 hours, a long review session.
+ORIGINAL_VIEW_PRESIGN_TTL = env.int(
+    "ORIGINAL_VIEW_PRESIGN_TTL", default=8 * 3600
+)
+
 # Whether Generate Files adds a Tesseract text layer to the per-page PDFs in
 # ``llm/``. Off by default: the pipeline no longer embeds one anywhere (see
 # scanning #145), and the model that reads these pages reads the page image

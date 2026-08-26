@@ -69,12 +69,16 @@
       </div>
       {% endif %}
       {% if is_processing %}
-      <h2 class="text-sm font-bold mb-2">Processing</h2>
+      <h2 class="text-sm font-bold mb-2">Processing
+        <span class="cursor-help font-normal text-gray-400 dark:text-gray-500"
+              title="Sharding: we cut the PDF into parts, so servers can work on them in parallel. Bitonal: a small black-and-white copy of the scan that loads fast in the browser.">&#9432;</span>
+      </h2>
       <div class="rounded bg-gray-100 dark:bg-gray-800 p-3 mb-2">
         <div class="h-1.5 bg-gray-200 dark:bg-gray-700 rounded overflow-hidden mb-2">
           <div id="sidebar-bar" class="h-full bg-blue-600 rounded transition-all" style="width:0%"></div>
         </div>
         <p id="sidebar-status" class="text-xs text-gray-600 dark:text-gray-300 m-0">Starting...</p>
+        <p class="text-[10px] text-gray-400 dark:text-gray-500 mt-1 mb-0">You can close this tab. The work continues on the server.</p>
       </div>
       <div id="sidebar-pages" class="max-h-96 overflow-y-auto"></div>
 
@@ -268,6 +272,11 @@
     {# PDF viewer #}
     <main class="flex-1 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 viewer-panel">
       {% csrf_token %}
+      {# Filled by renderPreviewBanner() when the viewer shows the
+         lower-quality bitonal preview (issue #185). #}
+      <div id="preview-banner"
+           class="sticky top-0 z-20 flex items-center gap-2 text-xs px-3 py-1.5 border-b border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200"
+           hidden></div>
       <div class="zoom-toolbar" role="toolbar" aria-label="PDF zoom">
         <button type="button" class="zoom-btn" data-zoom-action="out" title="Zoom out" aria-label="Zoom out">&minus;</button>
         <span id="zoom-pct" class="zoom-pct" aria-live="polite">100%</span>

@@ -59,8 +59,10 @@ from scanning.views_process import (
     progress_api,
     recalculate,
     reprocess,
+    scan_original_url,
     scan_process_view,
     serve_original_crop,
+    serve_scan_original,
     serve_scan_pdf,
     start_detect,
     start_validate,
@@ -116,6 +118,16 @@ urlpatterns = [
     path("scans/<int:pk>/actions/", process_actions, name="process_actions"),
     path("scans/<int:pk>/progress/", progress_api, name="progress_api"),
     path("scans/<int:pk>/pdf/", serve_scan_pdf, name="serve_scan_pdf"),
+    path(
+        "scans/<int:pk>/original-url/",
+        scan_original_url,
+        name="scan_original_url",
+    ),
+    path(
+        "scans/<int:pk>/original/",
+        serve_scan_original,
+        name="serve_scan_original",
+    ),
     path(
         "scans/<int:pk>/original-crop/",
         serve_original_crop,

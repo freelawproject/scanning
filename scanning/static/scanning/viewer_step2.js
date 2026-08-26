@@ -216,6 +216,37 @@ document.addEventListener('DOMContentLoaded', function () {
 
     var _pdfLoadHandle = null;
 
+    function showPdf(pdf) {
+        pdfDoc = pdf;
+        container.innerHTML = '';
+        createPlaceholders(pdf.numPages);
+        setupLazyLoading();
+    }
+
+    // Swap the viewer to the original scan (issue #185). Cancels the
+    // preview load first: the user chose the original, so a bitonal that
+    // finishes later must not render over it. The sentinel URL lets a
+    // later tab click load a real URL again.
+    function startOriginalLoad() {
+        if (_pdfLoadHandle) { _pdfLoadHandle.cancel(); _pdfLoadHandle = null; }
+        currentUrl = '__original__';
+        renderPreviewBanner(null, startOriginalLoad);
+        if (observer) { observer.disconnect(); observer = null; }
+        renderedPages = {};
+        pdfDoc = null;
+        showViewerMessage(container, 'Loading the original PDF...');
+        loadOriginalPdf(documentId, {
+            onReady: function (pdf) {
+                if (currentUrl !== '__original__') return;
+                showPdf(pdf);
+            },
+            onFail: function (err, url) {
+                if (currentUrl !== '__original__') return;
+                showOriginalLoadFailure(container, url);
+            },
+        });
+    }
+
     function loadPdf(url) {
         if (url === currentUrl && url.indexOf('?t=') === -1) return;
         currentUrl = url;
@@ -231,14 +262,20 @@ document.addEventListener('DOMContentLoaded', function () {
             // Abort if a newer loadPdf() switched URLs (e.g. opinion tabs),
             // so a slow/pending load never renders over the current one.
             isCurrent: function () { return url === currentUrl; },
-            onReady: function (pdf) {
-                pdfDoc = pdf;
-                container.innerHTML = '';
-                createPlaceholders(pdf.numPages);
-                setupLazyLoading();
+            onReady: function (pdf, previewKind) {
+                showPdf(pdf);
+                renderPreviewBanner(previewKind, startOriginalLoad);
             },
-            onNotReady: function (message) {
-                showViewerMessage(container, message);
+            onNotReady: function (message, data) {
+                if (data && data.original_available) {
+                    showViewerWait(container, message, {
+                        buttonLabel: 'Load the original PDF',
+                        note: 'The original file is large. It can load slowly.',
+                        onButton: startOriginalLoad,
+                    });
+                } else {
+                    showViewerMessage(container, message);
+                }
             },
             onError: function (err) {
                 showViewerMessage(container, 'Error loading PDF: ' + err.message);

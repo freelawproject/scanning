@@ -326,6 +326,45 @@ def presign_put(key: str, content_type: str, ttl: int) -> str:
     )
 
 
+def s3_original_key(scan: Scan) -> str | None:
+    """Return the S3 key of a scan's original PDF.
+
+    Both upload paths (the presigned browser POST and the server-side
+    stream) write the original to the same key: the ``*.original.pdf``
+    name at the top of the scan's processing prefix.
+
+    :param scan: The scan whose original key is needed.
+    :returns: The full object key, or None when the scan has no file.
+    :rtype: str | None
+    """
+    if not scan.original_pdf or not scan.original_pdf.name:
+        return None
+    name = Path(scan.original_pdf.name).name
+    return f"{s3_processing_prefix(scan)}{name}"
+
+
+def presign_original_get(scan: Scan) -> str | None:
+    """Presign a GET for a scan's original PDF, for the browser to read.
+
+    The process viewer hands this URL to pdf.js, which reads the (up to
+    3 GB) original straight from S3 with range requests. The bytes never
+    cross the web pod, so no gunicorn timeout can truncate them. The TTL
+    is long (``ORIGINAL_VIEW_PRESIGN_TTL``) because pdf.js requests more
+    ranges while the user scrolls, possibly much later.
+
+    :param scan: The scan whose original PDF is needed.
+    :returns: A presigned GET URL, or None when S3 is off or the scan
+        has no file.
+    :rtype: str | None
+    """
+    if not _s3_enabled():
+        return None
+    key = s3_original_key(scan)
+    if not key:
+        return None
+    return presign_get(key, settings.ORIGINAL_VIEW_PRESIGN_TTL)
+
+
 #: Codes S3 answers a ``head_object`` on a missing key with. The 403 is
 #: deliberately absent: without ``s3:ListBucket`` S3 reports
 #: ``AccessDenied`` for a key that does not exist, and reading that as

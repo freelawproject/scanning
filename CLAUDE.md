@@ -68,9 +68,16 @@ dispatch) and #149 (page numbers), so:
   FULL_PIPELINE.
 - The post-review-1 machinery (`run_generate_files`, pairing, redaction
   geometry, `upload_approved_files`) is kept but nothing queues it.
-- `serve_scan_pdf` falls back to streaming the original when
-  `bitonal.pdf` is absent — now only for volumes whose conversion was
-  skipped or failed, plus every pre-#176 post-cutover upload.
+- `serve_scan_pdf` never streams the original (#185): with no
+  `bitonal.pdf` it answers 202 (a preview is coming — poll) or 409
+  (none will come) with a stage-specific message and
+  `original_available`. The viewer offers a "load the original" button
+  instead, backed by `scan_original_url`: a presigned S3 GET that
+  pdf.js reads with range requests (needs the bucket CORS rule from
+  infrastructure #808; until it deploys, the viewer shows an explicit
+  failure with a new-tab link), or the `serve_scan_original` local
+  stream when S3 is off. Served previews carry `X-Scan-Preview` so the
+  viewer can show the lower-quality banner.
 - `RUNPOD_ENABLED` now only gates whether GPU jobs dispatch at all;
   without it an environment uploads and browses but runs no GPU stage.
   Upload paths must always keep working.

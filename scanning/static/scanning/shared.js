@@ -17,8 +17,13 @@
  *
  * @param {string} url - The scan PDF endpoint URL.
  * @param {Object} cb - Callbacks.
- * @param {Function} cb.onReady - (pdfDoc) => void, the loaded pdf.js document.
- * @param {Function} cb.onNotReady - (message) => void, shown while processing.
+ * @param {Function} cb.onReady - (pdfDoc, previewKind) => void, the loaded
+ *   pdf.js document plus the server's X-Scan-Preview header ("bitonal",
+ *   "original", or null), so the caller can tell a lower-quality preview
+ *   from the original.
+ * @param {Function} cb.onNotReady - (message, data) => void, shown while
+ *   processing; data is the server's JSON body (may be undefined), whose
+ *   original_available flag says a "load the original" action is possible.
  * @param {Function} cb.onError - (error) => void, on a real failure.
  * @param {Function} [cb.isCurrent] - () => bool; return false to abort (e.g.
  *   the viewer switched to a different URL). Aborted work renders nothing.
@@ -43,7 +48,10 @@ function loadPreviewPdf(url, cb) {
         if (errorRetriesLeft > 0) {
             var n = maxErrorRetries - errorRetriesLeft + 1;
             errorRetriesLeft--;
-            cb.onNotReady('Loading PDF (retrying ' + n + ')...');
+            cb.onNotReady(
+                'Connection problem. Trying again (' +
+                n + ' of ' + maxErrorRetries + ')...'
+            );
             timer = setTimeout(attempt, n * 1000);
             return;
         }
@@ -52,6 +60,7 @@ function loadPreviewPdf(url, cb) {
 
     function attempt() {
         if (!current()) return;
+        var previewKind = null;
         fetch(url, { headers: { Accept: 'application/pdf' } })
             .then(function (resp) {
                 if (!current()) return null;
@@ -64,7 +73,7 @@ function loadPreviewPdf(url, cb) {
                     errorRetriesLeft = maxErrorRetries;
                     return resp.json().then(function (d) {
                         if (!current()) return null;
-                        cb.onNotReady((d && d.message) || 'Still processing…');
+                        cb.onNotReady((d && d.message) || 'Still processing…', d);
                         timer = setTimeout(attempt, pollMs);
                         return null;
                     });
@@ -74,17 +83,18 @@ function loadPreviewPdf(url, cb) {
                     // unavailable). Show the message and stop -- do not poll.
                     return resp.json().then(function (d) {
                         if (!current()) return null;
-                        cb.onNotReady((d && d.message) || 'No preview available.');
+                        cb.onNotReady((d && d.message) || 'No preview available.', d);
                         return null;
                     });
                 }
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                previewKind = resp.headers.get('X-Scan-Preview');
                 return resp.arrayBuffer();
             })
             .then(function (buf) {
                 if (buf === null || !current()) return null;
                 return pdfjsLib.getDocument({ data: buf }).promise.then(
-                    function (pdf) { if (current()) cb.onReady(pdf); }
+                    function (pdf) { if (current()) cb.onReady(pdf, previewKind); }
                 );
             })
             .catch(onTransientError);
@@ -111,6 +121,172 @@ function showViewerMessage(container, message) {
     div.className = 'viewer-loading';
     div.textContent = message;
     container.replaceChildren(div);
+}
+
+/**
+ * Show a wait/terminal message with an optional action button under it.
+ *
+ * Used for the "no preview yet" states (issue #185): the message explains
+ * the stage, and the button offers to load the original scan instead.
+ *
+ * @param {HTMLElement} container - The element to fill.
+ * @param {string} message - The status text to show.
+ * @param {Object} [opts] - Optional action.
+ * @param {string} [opts.buttonLabel] - Button text; no button if absent.
+ * @param {string} [opts.note] - Small disclaimer under the button.
+ * @param {Function} [opts.onButton] - Click handler for the button.
+ */
+function showViewerWait(container, message, opts) {
+    opts = opts || {};
+    var wrap = document.createElement('div');
+    wrap.className = 'viewer-loading';
+    wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center;padding:24px;';
+
+    var text = document.createElement('div');
+    text.textContent = message;
+    text.style.maxWidth = '460px';
+    wrap.appendChild(text);
+
+    if (opts.buttonLabel && opts.onButton) {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn-outline text-sm';
+        btn.textContent = opts.buttonLabel;
+        btn.addEventListener('click', opts.onButton);
+        wrap.appendChild(btn);
+        if (opts.note) {
+            var note = document.createElement('div');
+            note.textContent = opts.note;
+            note.style.cssText = 'font-size:11px;opacity:0.7;max-width:460px;';
+            wrap.appendChild(note);
+        }
+    }
+    container.replaceChildren(wrap);
+}
+
+/**
+ * Load a scan's ORIGINAL PDF into pdf.js, straight from storage.
+ *
+ * Asks the server for a URL (a presigned S3 GET in prod, a local stream
+ * in dev), then hands the URL to pdf.js. In prod pdf.js reads the
+ * (multi-GB) file with HTTP range requests, so only the visible pages
+ * cross the network and the web pod is not in the data path (issue #185).
+ *
+ * The S3 read needs a CORS rule on the bucket (GET/HEAD allowed, range
+ * headers exposed — infrastructure #808). Without it the load fails in
+ * the browser and onFail fires; callers show an explicit message with a
+ * direct link, since a top-level navigation is not subject to CORS.
+ *
+ * @param {number|string} docId - Scan primary key.
+ * @param {Object} cb - Callbacks.
+ * @param {Function} cb.onReady - (pdfDoc) => void on success.
+ * @param {Function} cb.onFail - (error, url) => void; url is the direct
+ *   link to offer (null when even the URL fetch failed).
+ */
+function loadOriginalPdf(docId, cb) {
+    fetch('/scans/' + docId + '/original-url/')
+        .then(function (resp) {
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            return resp.json();
+        })
+        .then(function (d) {
+            var opts = { url: d.url };
+            if (!d.embedded_whole) {
+                // Range-request mode: fetch only the parts pdf.js needs.
+                opts.disableAutoFetch = true;
+                opts.rangeChunkSize = 262144;
+            }
+            return pdfjsLib.getDocument(opts).promise.then(
+                function (pdf) { cb.onReady(pdf); },
+                function (err) {
+                    console.error('Original PDF load failed:', err);
+                    cb.onFail(err, d.url);
+                }
+            );
+        })
+        .catch(function (err) {
+            console.error('Original PDF URL fetch failed:', err);
+            cb.onFail(err, null);
+        });
+}
+
+/**
+ * Show the explicit in-page failure message for an original-PDF load,
+ * with a direct link that opens the file in a new tab. A top-level
+ * navigation is not subject to CORS, so the link works even when the
+ * embedded read was blocked (bucket CORS not deployed yet).
+ *
+ * @param {HTMLElement} container - The viewer element to fill.
+ * @param {string|null} url - Direct URL to the original, if known.
+ */
+function showOriginalLoadFailure(container, url) {
+    var wrap = document.createElement('div');
+    wrap.className = 'viewer-loading';
+    wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center;padding:24px;';
+
+    var text = document.createElement('div');
+    text.textContent = url
+        ? 'Your browser could not load the original in this page. Open it in a new tab instead.'
+        : 'The original PDF could not be loaded. Reload the page and try again.';
+    text.style.maxWidth = '460px';
+    wrap.appendChild(text);
+
+    if (url) {
+        var link = document.createElement('a');
+        link.href = url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.className = 'btn-outline text-sm';
+        link.textContent = 'Open the original PDF in a new tab';
+        wrap.appendChild(link);
+    }
+    container.replaceChildren(wrap);
+}
+
+/**
+ * Show or hide the "lower-quality preview" banner above the viewer.
+ *
+ * Fills #preview-banner when the served PDF is the bitonal preview, so
+ * the user knows the conversion finished and can load the original
+ * (issue #185). Hides the banner for any other load (original, opinion
+ * PDFs). No-op when the page has no banner element.
+ *
+ * @param {string|null} previewKind - The X-Scan-Preview header value.
+ * @param {Function} onLoadOriginal - Called when the user asks for the
+ *   original; the active viewer swaps its document in place.
+ */
+function renderPreviewBanner(previewKind, onLoadOriginal) {
+    var banner = document.getElementById('preview-banner');
+    if (!banner) return;
+    if (previewKind !== 'bitonal') {
+        banner.hidden = true;
+        banner.replaceChildren();
+        return;
+    }
+
+    var text = document.createElement('span');
+    text.textContent =
+        'You see a smaller, lower-quality preview, so pages load fast.';
+
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'underline font-medium';
+    btn.style.cssText = 'background:none;border:none;cursor:pointer;color:inherit;padding:0;font-size:inherit;';
+    btn.textContent = 'Load the original scan (large, can be slow)';
+    btn.addEventListener('click', function () {
+        banner.hidden = true;
+        onLoadOriginal();
+    });
+
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.setAttribute('aria-label', 'Dismiss');
+    close.textContent = '✕';
+    close.style.cssText = 'background:none;border:none;cursor:pointer;color:inherit;margin-left:auto;padding:0 4px;';
+    close.addEventListener('click', function () { banner.hidden = true; });
+
+    banner.replaceChildren(text, btn, close);
+    banner.hidden = false;
 }
 
 /**

@@ -27,15 +27,45 @@ document.addEventListener('DOMContentLoaded', function () {
     pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
 
-    loadPreviewPdf(pdfUrl, {
-        onReady: function (pdf) {
-            pdfDoc = pdf;
-            container.innerHTML = '';
-            createAllPlaceholders();
-            setupLazyLoading();
+    var _previewHandle = null;
+
+    function showPdf(pdf) {
+        pdfDoc = pdf;
+        container.innerHTML = '';
+        createAllPlaceholders();
+        setupLazyLoading();
+    }
+
+    // Swap the viewer to the original scan (issue #185). Stops the
+    // preview polling first: the user chose the original, so a bitonal
+    // that finishes later must not render over it.
+    function startOriginalLoad() {
+        if (_previewHandle) { _previewHandle.cancel(); _previewHandle = null; }
+        renderPreviewBanner(null, startOriginalLoad);
+        showViewerMessage(container, 'Loading the original PDF...');
+        loadOriginalPdf(documentId, {
+            onReady: showPdf,
+            onFail: function (err, url) {
+                showOriginalLoadFailure(container, url);
+            },
+        });
+    }
+
+    _previewHandle = loadPreviewPdf(pdfUrl, {
+        onReady: function (pdf, previewKind) {
+            showPdf(pdf);
+            renderPreviewBanner(previewKind, startOriginalLoad);
         },
-        onNotReady: function (message) {
-            showViewerMessage(container, message);
+        onNotReady: function (message, data) {
+            if (data && data.original_available) {
+                showViewerWait(container, message, {
+                    buttonLabel: 'Load the original PDF',
+                    note: 'The original file is large. It can load slowly.',
+                    onButton: startOriginalLoad,
+                });
+            } else {
+                showViewerMessage(container, message);
+            }
         },
         onError: function (err) {
             showViewerMessage(container, 'Error loading PDF: ' + err.message);
