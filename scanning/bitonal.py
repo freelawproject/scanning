@@ -305,17 +305,17 @@ def _log_stage_duration(scan, convert_jobs: list[ExternalJob], now) -> None:
 def finish_ready_scans() -> int:
     """Apply every finished conversion and report failures.
 
-    Runs after the retry and confirm passes. A scan is finished when no
-    row of its live run is in flight or waiting to be submitted:
+    Runs after the confirm pass. A scan is finished when no row of its
+    live run is in flight or waiting to be submitted:
 
     - all rows completed -> merge, park in ``AWAITING_VALIDATION``.
     - any row dead (failed, cancelled, expired) -> ``ERROR``, naming the
       code. A row only reaches FAILED once its attempts are spent, since
       a retryable failure goes back to PENDING from the submit pass, so
-      a dead row here means the shard is genuinely over. Loud rather than a silent degrade: bitonal is display-only,
-      so the volume stays usable, but while this rolls out volume by
-      volume a failure should be seen. An admin re-queue starts a fresh
-      run.
+      a dead row here means the shard is genuinely over. Loud rather
+      than a silent degrade: bitonal is display-only, so the volume
+      stays usable, but while this rolls out volume by volume a failure
+      should be seen. An admin re-queue starts a fresh run.
 
     Only scans in AWAITING are examined. ERROR is terminal, and a pass
     that re-examined it would re-run the merge -- and its download of
