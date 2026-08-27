@@ -197,9 +197,15 @@ trained on), tracked on `ExternalJob` rows at
 `views_process.start_dots_mocr` (the button). What must not be broken:
 
 - **A person starts it, the daemon runs it.** There is no automatic
-  dispatch: a staff-only button on `/scan/process/` writes the rows and
+  enqueueing: a staff-only button on `/scan/process/` writes the rows and
   returns, and the daemon submits, polls and retries them. That is
   deliberate while the stage is debugged — every press costs GPU money.
+  `DOTS_MOCR_ENABLED` (on by default) gates *dispatch*, not enqueueing,
+  so it starts no work by itself. What keeps that true is structural, not
+  a promise: `ensure_analyze_jobs` is the only thing that creates ANALYZE
+  rows and `start_dots_mocr` is its only caller, held by
+  `TestNothingAutoEnqueues`. Auto-dispatch is a follow-up that has to
+  retire that test on purpose.
   The request makes **no** call to RunPod, and it never cuts shards:
   `sharding.committed_manifest` verifies the stored set with one
   `head_object` on the original (size plus `Scan.page_count` *is* the
@@ -290,6 +296,12 @@ trained on), tracked on `ExternalJob` rows at
   cell's bbox describes the same pixel space as the rest of the corpus,
   and the prompt mode is what #149 needs (cells *and* text). A one-off
   experiment overrides them per row through `input_manifest`.
+- **The blocking wave goes last.** `submit_pending` sends the RunPod
+  wave before doctor's. A RunPod submit returns as soon as the job is
+  queued; a doctor submit holds its socket for the whole conversion
+  (~25-45s a shard), and the daemon's scheduler is serial (#156). The
+  other order would leave the GPU endpoint idle for a minute or more per
+  tick, wasting the queue depth a narrow worker pool depends on.
 - **The concurrency cap is per engine**, because each RunPod endpoint is
   its own scaling unit with its own `max_workers`. It is a debug guard
   on blast radius, **not** a cost control: RunPod bills each worker's

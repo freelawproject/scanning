@@ -1492,3 +1492,110 @@ class TestRunSummaryLabel(ScanningTestCase):
         self.assertNotIn("'", label)
         self.assertIn("1 completed", label)
         self.assertIn("2 pending submit", label)
+
+
+class TestNothingAutoEnqueues(ScanningTestCase):
+    """The button is the only thing that creates dots.mocr work.
+
+    ``DOTS_MOCR_ENABLED`` defaults on, so this is the line that keeps
+    that safe: the switch gates *dispatch* of rows that already exist,
+    and nothing but a staff press creates them. Auto-dispatch is a
+    follow-up, and it has to delete this test on purpose rather than
+    arrive by accident.
+    """
+
+    def test_ensure_analyze_jobs_has_exactly_one_caller(self):
+        import ast
+        import pathlib
+
+        root = pathlib.Path("scanning")
+        callers = set()
+        for path in root.rglob("*.py"):
+            if "tests" in path.parts or "migrations" in path.parts:
+                continue
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = getattr(func, "attr", getattr(func, "id", ""))
+                if name in ("ensure_analyze_jobs", "ensure_shard_jobs"):
+                    callers.add((str(path), name))
+
+        self.assertEqual(
+            callers,
+            {
+                # The staff button, and nothing else.
+                ("scanning/views_process.py", "ensure_analyze_jobs"),
+                # The generic creator's two wrappers.
+                ("scanning/dots_mocr.py", "ensure_shard_jobs"),
+                ("scanning/jobs.py", "ensure_shard_jobs"),
+            },
+            "Something new creates external-job rows. If a daemon path "
+            "now enqueues dots.mocr, that is the auto-dispatch follow-up "
+            "and this test should be updated deliberately.",
+        )
+
+    @override_settings(**DOTS)
+    def test_the_pipeline_creates_no_analyze_rows(self):
+        # run_full_pipeline owns CONVERT and no part of ANALYZE, so a
+        # normal upload must never start paid OCR.
+        scan = ScanFactory()
+        jobs.ensure_convert_jobs(scan, make_manifest(shard_count=2))
+        self.assertEqual(analyze_jobs(scan), [])
+
+    @override_settings(**DOTS)
+    def test_a_daemon_tick_submits_nothing_without_a_press(self):
+        scan = ScanFactory()
+        jobs.ensure_convert_jobs(scan, make_manifest(shard_count=2))
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.runpod_client.submit_job") as submit,
+        ):
+            jobs.submit_pending()
+        submit.assert_not_called()
+
+
+@override_settings(**DOTS)
+class TestWaveOrder(ScanningTestCase):
+    """The blocking provider goes last.
+
+    The daemon's scheduler is serial (#156), so whichever wave runs
+    first delays the other. A doctor submit holds its socket for the
+    whole conversion; a RunPod submit returns as soon as the job is
+    queued.
+    """
+
+    def test_runpod_is_sent_before_doctor(self):
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=1)
+        jobs.ensure_convert_jobs(scan, manifest)
+        dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        order = []
+        with (
+            patch.multiple(
+                "scanning.s3_sync",
+                s3_active=lambda: True,
+                presign_get=lambda key, ttl: "https://s3/in?get",
+                presign_put=lambda key, ct, ttl: "https://s3/out?put",
+            ),
+            override_settings(
+                DOCTOR_ENABLED=True, DOCTOR_HOST="http://doctor:5050"
+            ),
+            patch(
+                "scanning.runpod_client.submit_job",
+                side_effect=lambda *a, **k: (
+                    order.append("runpod") or "job-1"
+                ),
+            ),
+            patch(
+                "scanning.doctor_client.convert_bitonal",
+                side_effect=lambda *a, **k: (
+                    order.append("doctor") or {"pages": 10}
+                ),
+            ),
+        ):
+            jobs.submit_pending()
+
+        self.assertEqual(order, ["runpod", "doctor"])

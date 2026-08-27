@@ -5,12 +5,21 @@ saturated endpoint cannot starve another: doctor's ceiling is its replica
 count (``DOCTOR_MAX_CONCURRENCY``), and each RunPod engine's is that
 engine's own serverless endpoint (``DOTS_MOCR_MAX_CONCURRENCY``).
 
-The doctor wave blocks for as long as its slowest request (~25-45s for a
-100-page bitonal shard), deliberately: holding the request open is what
-keeps the provider's error code, instead of inferring failure from a
-missing object later. The RunPod wave does not -- ``POST /run`` returns
-as soon as the job is queued, and a poll on a later tick is what
-finishes it.
+The waves run non-blocking first, blocking last.
+
+A RunPod submit is a fast ``POST /run``: it returns as soon as the job is
+queued, and a poll on a later tick is what finishes it.
+
+A doctor submit holds the socket open for the whole conversion (~25-45s
+per 100-page shard). That is deliberate -- keeping the request open is
+what preserves doctor's own error code, instead of inferring failure from
+a missing object hours later -- but it does block this command for that
+long, and the daemon's scheduler is serial (issue #156).
+
+Hence the order. Sending the RunPod jobs first means they are already
+queueing on RunPod's side while doctor converts. The other way round,
+a wave of bitonal shards would leave the GPU endpoint idle for a minute
+or more per tick.
 
 Examples:
 

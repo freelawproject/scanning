@@ -1,17 +1,26 @@
 """Confirm in-flight external jobs and finish the scans they belong to.
 
-Two halves, in order:
+Two halves, in order.
 
-1. ``jobs.sweep_jobs()`` -- ask after every job still in flight. For a
-   RunPod job that is a status poll, and it is the normal path:
-   submitting only queued the work. For a doctor job it is a check for
-   the result object, and it is the only path that can finish a job whose
-   response we never saw -- doctor converts and uploads even after we
-   stop reading, so a killed daemon loses the answer, not the work.
-2. ``bitonal.finish_ready_scans()`` -- merge the shards of any scan
-   whose conversion jobs are all done and move it out of ``AWAITING``.
-   The dots.mocr stage has no equivalent yet: issue #190 ends when every
-   shard answers, and the merge follows in #149.
+**1. ``jobs.sweep_jobs()`` asks after every job still in flight.** How
+it asks depends on the provider:
+
+- A RunPod job is polled at ``GET /status``. This is the only way such a
+  job ever finishes, because submitting it merely put it in a queue.
+- A doctor job has no status endpoint, so instead we check whether its
+  result object has appeared in S3. Doctor answers on the submit call, so
+  this pass matters only when that answer was lost -- a killed daemon, a
+  redeployed pod, an abandoned read. Doctor converts and uploads whether
+  or not we are still listening, so a lost answer costs the answer, not
+  the work.
+
+**2. ``bitonal.finish_ready_scans()`` applies finished conversions.** It
+merges the shards of any scan whose conversion jobs are all done and
+moves it out of ``AWAITING``.
+
+The dots.mocr stage has no equivalent yet, by design: issue #190 ends
+when every shard has answered, leaving its rows at ``COMPLETED``. The
+merge that reads them is issue #149.
 
 Examples:
 

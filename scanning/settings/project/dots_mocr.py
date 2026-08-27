@@ -18,13 +18,25 @@ import environ
 
 env = environ.FileAwareEnv()
 
-# Master switch for dispatching shards to dots.mocr.
+# Master switch for **dispatching** dots.mocr shards to RunPod.
 #
-# Off by default, unlike DOCTOR_ENABLED. Every press starts real
-# graphics processing unit (GPU) work on RunPod, and issue #190 ships
-# the stage as a staff-only button precisely so the cost is deliberate.
-# An environment turns it on when someone means to spend money.
-DOTS_MOCR_ENABLED = env.bool("DOTS_MOCR_ENABLED", default=False)
+# Read the verb carefully: this gates whether the daemon submits rows
+# that already exist. It does not enqueue anything, and turning it on
+# starts no work on its own.
+#
+# Nothing auto-enqueues this stage, and that is structural rather than a
+# promise: ``dots_mocr.ensure_analyze_jobs`` is the only thing that
+# creates ANALYZE rows, and ``views_process.start_dots_mocr`` -- the
+# staff-only button -- is its only caller. ``run_full_pipeline`` owns
+# CONVERT and touches no part of ANALYZE. A test holds that line
+# (``TestNothingAutoEnqueues``), so a future daemon caller has to
+# delete it deliberately rather than add one by accident.
+#
+# On by default, therefore, so a deploy needs no secret-store change to
+# make the button work. The cost stays deliberate because a person still
+# has to press it. Auto-dispatch is a follow-up, after this stage has
+# been exercised on real volumes.
+DOTS_MOCR_ENABLED = env.bool("DOTS_MOCR_ENABLED", default=True)
 
 # The engine's own RunPod serverless endpoint id (from the RunPod
 # console). Per engine, not per account: dots.mocr and the coming YOLO

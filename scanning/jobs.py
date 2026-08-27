@@ -1322,6 +1322,16 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
     its replica count; each RunPod engine's is that engine's own
     serverless endpoint, which scales on its own.
 
+    **The non-blocking waves go first, and the blocking one goes last.**
+    A RunPod submit is a fast ``POST /run`` that returns as soon as the
+    job is queued, while a doctor submit holds the socket open for the
+    whole conversion (~25-45s per shard) -- and the daemon's scheduler
+    is serial (issue #156), so whatever runs first delays everything
+    after it. Ordered the other way, a wave of bitonal shards would keep
+    RunPod's queue empty for a minute or more at a time, wasting exactly
+    the queue depth a narrow worker pool depends on. Reversed, the GPU
+    work is already queueing at RunPod while doctor converts.
+
     :param limit: Concurrency override applied to **each** wave.
         Defaults to each provider's own setting.
     :returns: Counts of what the tick did, summed over the waves.
@@ -1342,8 +1352,11 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
             )
         return summary
 
-    _submit_doctor_wave(summary, limit)
+    # Non-blocking first. See the note above: the serial scheduler makes
+    # this ordering the difference between RunPod queueing during a
+    # conversion and waiting for one.
     _submit_runpod_wave(summary, limit)
+    _submit_doctor_wave(summary, limit)
     return summary
 
 
