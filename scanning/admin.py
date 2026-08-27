@@ -11,6 +11,7 @@ from scanning.models import (
     Detection,
     ExternalJob,
     Issue,
+    JobStage,
     OpinionScan,
     Page,
     PageDeletion,
@@ -400,7 +401,9 @@ class ScanAdmin(admin.ModelAdmin):
         # would make ``ensure_convert_jobs`` reuse rows whose result
         # objects another attempt may still be writing.
         for scan in queryset.filter(status__in=statuses):
-            jobs.abandon_open(scan, "Re-queued from the admin")
+            jobs.abandon_open(
+                scan, "Re-queued from the admin", stage=JobStage.CONVERT
+            )
 
         # Re-point every recovered scan at the (interim) full pipeline.
         # The other queued actions were disconnected by issue #173, so a

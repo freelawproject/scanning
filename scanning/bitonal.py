@@ -107,17 +107,9 @@ def live_convert_jobs(scan) -> list[ExternalJob]:
         list when the scan has never been converted.
     :rtype: list[ExternalJob]
     """
-    rows = list(
-        ExternalJob.objects.filter(
-            scan=scan,
-            stage=JobStage.CONVERT,
-            engine=JobEngine.BITONAL,
-            opinion=None,
-        ).order_by("-run", "shard_index")
-    )
-    if not rows:
-        return []
-    return [job for job in rows if job.run == rows[0].run]
+    from scanning import jobs
+
+    return jobs.live_run(scan, JobStage.CONVERT, JobEngine.BITONAL)
 
 
 def merge_convert_results(scan, convert_jobs: list[ExternalJob]) -> Path:

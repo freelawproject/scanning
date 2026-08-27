@@ -873,7 +873,7 @@ class TestDurationLogging(ScanningTestCase):
         self.assertIn("shard 1/4", line)
         self.assertIn("completed in 42.0s", line)
         # Ours versus doctor's own clock: the gap is queue and transport.
-        self.assertIn("doctor 31.2s", line)
+        self.assertIn("worker 31.2s", line)
         self.assertIn("100 page(s)", line)
         self.assertIn("confirmed by response", line)
 

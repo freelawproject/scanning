@@ -25,6 +25,7 @@ from scanning.models import (
     CheckName,
     Detection,
     Issue,
+    JobStage,
     OpinionScan,
     PageDeletion,
     PageInsert,
@@ -876,7 +877,9 @@ def cancel_processing(request: HttpRequest, pk: int) -> HttpResponse:
     scan = get_object_or_404(Scan, pk=pk)
     if scan.status in (Status.PROCESSING, Status.AWAITING):
         if scan.status == Status.AWAITING:
-            jobs.abandon_open(scan, "Cancelled by user")
+            jobs.abandon_open(
+                scan, "Cancelled by user", stage=JobStage.CONVERT
+            )
         if scan.stage == Stage.PROCESS:
             Scan.objects.filter(pk=pk).update(
                 status=Status.PENDING_REVIEW,
