@@ -398,6 +398,96 @@ def _existing_manifest(scan, shards_dir: Path) -> dict | None:
     return None
 
 
+def committed_manifest(scan) -> tuple[dict | None, str]:
+    """Return the scan's current shard manifest, without a download.
+
+    For a caller on a **request thread**, which is the whole point.
+    ``ensure_shards`` is the rule for reaching the shard set -- never
+    read ``shards/`` directly -- but it opens the original to fingerprint
+    it, and a web pod must not pull a multi-gigabyte PDF to answer a
+    button press (``views_process.scan_process_view`` avoids exactly that
+    I/O).
+
+    So it checks the same fingerprint by other means. The identity a
+    manifest records is only size plus page count
+    (:func:`_source_fingerprint`), and both are obtainable for free: the
+    size from one ``head_object`` on the original, and the page count
+    from ``Scan.page_count``, which ``run_full_pipeline`` reads off the
+    original and stores. No shard object is touched, and a mismatch
+    refuses rather than re-cuts -- re-cutting is a pipeline job, not a
+    request's.
+
+    :param scan: The scan to look up.
+    :returns: ``(manifest, reason)``. The manifest, with an empty reason,
+        when the stored set still describes today's original; otherwise
+        ``(None, reason)`` naming what is wrong, for a flash message.
+    :rtype: tuple[dict | None, str]
+    """
+    from scanning import s3_sync
+
+    if not s3_sync.s3_active():
+        return None, (
+            "S3 is not active in this environment, so the shards were "
+            "never uploaded and no worker could read them."
+        )
+
+    try:
+        manifest = s3_sync.fetch_shard_manifest(scan)
+    except Exception as exc:
+        # fetch_shard_manifest re-raises anything that is not a missing
+        # object, deliberately: a throttle must not read as "no shard
+        # set". Report it rather than let a 500 reach the user.
+        logger.warning(
+            "Could not read the shard manifest for scan %s",
+            scan.pk,
+            exc_info=True,
+        )
+        return None, f"Could not read the shard manifest: {exc}"
+
+    if manifest is None:
+        return None, (
+            "This scan has no committed shard set. Re-queue it so the "
+            "pipeline cuts one."
+        )
+    if manifest.get("version") != MANIFEST_VERSION:
+        return None, (
+            f"The stored shard set is version "
+            f"{manifest.get('version')!r}, and this code reads version "
+            f"{MANIFEST_VERSION}. Re-queue the scan to re-cut it."
+        )
+
+    source = manifest.get("source")
+    shards = manifest.get("shards")
+    if not isinstance(source, dict) or not isinstance(shards, list):
+        return None, "The stored shard manifest is malformed."
+    if not shards:
+        return None, "The stored shard manifest lists no shards."
+
+    key = s3_sync.s3_original_key(scan)
+    if not key:
+        return None, "This scan has no original PDF."
+    try:
+        size = s3_sync.object_size(key)
+    except Exception as exc:
+        return None, f"Could not check the original PDF: {exc}"
+    if size is None:
+        return None, "The original PDF is not in the bucket."
+
+    if source.get("size_bytes") != size:
+        return None, (
+            "The original PDF has changed since its shards were cut "
+            f"({source.get('size_bytes')} bytes then, {size} now). "
+            "Re-queue the scan to re-cut them."
+        )
+    if scan.page_count and source.get("page_count") != scan.page_count:
+        return None, (
+            "The shard set covers "
+            f"{source.get('page_count')} page(s), and the scan has "
+            f"{scan.page_count}. Re-queue the scan to re-cut them."
+        )
+    return manifest, ""
+
+
 def ensure_shards(scan) -> dict | None:
     """Compute, verify and store the scan's shard set, exactly once.
 

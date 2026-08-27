@@ -432,3 +432,135 @@ class TestStripDataUris(SimpleTestCase):
     def test_leaves_normal_links_alone(self):
         md = "![figure](https://example.com/fig.png) and [a link](x)."
         self.assertEqual(handler._strip_data_uris(md), md)
+
+
+class TestResultDelivery(SimpleTestCase):
+    """``_deliver`` chooses inline or S3, and never leaks the pages."""
+
+    def setUp(self):
+        self.result = {
+            "pages": [{"page_no": 0, "md": "text", "cells": []}],
+            "page_count": 1,
+            "failed_pages": [],
+            "duration_ms": 5210,
+        }
+        self.inputs = {
+            "action": "parse",
+            "result_url": "https://s3/out?sig",
+            "result_key": "processing/1/jobs/analyze/r1-s0-a1.json",
+        }
+
+    def _deliver(self, inputs=None, size=4096):
+        with mock.patch.object(
+            handler, "upload_result", return_value=size
+        ) as upload:
+            out = handler._deliver(
+                self.result, inputs if inputs is not None else self.inputs, 123
+            )
+        return out, upload
+
+    def test_no_result_url_answers_inline(self):
+        # The path dev and CI take without credentials, and the path a
+        # caller on an older contract gets.
+        out, upload = self._deliver({"action": "parse"})
+        self.assertEqual(out, self.result)
+        upload.assert_not_called()
+
+    def test_the_envelope_is_self_describing(self):
+        _, upload = self._deliver()
+        envelope = upload.call_args[0][1]
+        self.assertEqual(envelope["schema_version"], 1)
+        self.assertEqual(envelope["action"], "parse")
+        self.assertEqual(envelope["scan_pk"], 123)
+        self.assertEqual(envelope["result_key"], self.inputs["result_key"])
+        self.assertEqual(envelope["payload"], self.result)
+
+    def test_the_signed_content_type_is_passed_through(self):
+        _, upload = self._deliver()
+        self.assertEqual(upload.call_args[0][2], "application/json")
+        self.assertEqual(upload.call_args[0][0], "https://s3/out?sig")
+
+    def test_the_response_carries_only_a_summary(self):
+        # The response is capped at about 20 MB and discarded with the
+        # job record, which is the whole reason the payload goes to S3.
+        out, _ = self._deliver()
+        self.assertNotIn("pages", out)
+        self.assertEqual(out["page_count"], 1)
+        self.assertEqual(out["failed_pages"], [])
+        self.assertEqual(out["duration_ms"], 5210)
+        self.assertEqual(out["result_key"], self.inputs["result_key"])
+        self.assertEqual(out["bytes"], 4096)
+
+    def test_an_upload_failure_becomes_its_own_error_code(self):
+        # Returned, not raised: the code is what tells the daemon
+        # whether a fresh job could deliver where this one could not.
+        for code in (
+            "RESULT_UPLOAD_FAILED",
+            "RESULT_URL_EXPIRED",
+            "RESULT_UPLOAD_REJECTED",
+        ):
+            with self.subTest(code=code):
+                with (
+                    mock.patch.dict(sys.modules, _renderer_stubs()),
+                    mock.patch.object(handler, "_GPU_AVAILABLE", True),
+                    mock.patch.object(handler, "_VLLM_READY", True),
+                    mock.patch.object(
+                        handler, "_vllm_healthy", return_value=True
+                    ),
+                    mock.patch.object(handler, "download_pdf"),
+                    mock.patch.object(handler, "validate_pdf", return_value=1),
+                    mock.patch.object(
+                        handler,
+                        "_vllm_inference",
+                        return_value=("text", "stop", 4),
+                    ),
+                    mock.patch.object(
+                        handler,
+                        "upload_result",
+                        side_effect=handler.ResultUploadError("no", code),
+                    ),
+                ):
+                    out = handler.handler(
+                        {
+                            "input": {
+                                "action": "parse",
+                                "pdf_url": "https://x/y.pdf",
+                                "prompt_mode": "prompt_ocr",
+                                "num_threads": 1,
+                                "result_url": "https://s3/out?sig",
+                                "result_key": "k",
+                            }
+                        }
+                    )
+                self.assertEqual(out["error_code"], code)
+                self.assertIn("worker_boot_ms", out)
+
+
+class TestCorruptDownloadIsRetriable(SimpleTestCase):
+    """A copy that will not open is a transfer fault, not a bad input."""
+
+    def _handle(self, exc):
+        with (
+            mock.patch.dict(sys.modules, _renderer_stubs()),
+            mock.patch.object(handler, "_GPU_AVAILABLE", True),
+            mock.patch.object(handler, "_VLLM_READY", True),
+            mock.patch.object(handler, "_vllm_healthy", return_value=True),
+            mock.patch.object(handler, "download_pdf"),
+            mock.patch.object(handler, "validate_pdf", side_effect=exc),
+        ):
+            return handler.handler(
+                {"input": {"action": "parse", "pdf_url": "https://x/y.pdf"}}
+            )
+
+    def test_a_truncated_download_gets_its_own_code(self):
+        # BAD_INPUT is terminal, so it would write a volume off for a
+        # dropped connection.
+        out = self._handle(
+            handler.CorruptDownloadError("downloaded PDF is truncated")
+        )
+        self.assertEqual(out["error_code"], "INPUT_DOWNLOAD_CORRUPT")
+        self.assertIn("worker_boot_ms", out)
+
+    def test_a_real_bad_input_stays_terminal(self):
+        out = self._handle(ValueError("PDF has 9000 pages, exceeds MAX_PAGES"))
+        self.assertEqual(out["error_code"], "BAD_INPUT")

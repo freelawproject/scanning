@@ -17,6 +17,7 @@ too. Tested in ``scanning/tests/test_runpod_common.py``.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -223,6 +224,19 @@ def download_pdf(url: str, dest: Path) -> None:
 PDF_EOF_WINDOW = 2048
 
 
+class CorruptDownloadError(RuntimeError):
+    """The downloaded PDF is not a sound, openable document.
+
+    Distinct from ``ValueError`` so a caller can tell it from a bad
+    *input* (a missing url, an out-of-range option). The bytes at the
+    source are sound -- scanning cuts each shard itself and verifies it
+    against the original -- so a copy that will not open is a transfer
+    fault, and the next attempt is quite likely to get it right. A
+    handler that reported this as a terminal input error would write a
+    volume off for a dropped connection.
+    """
+
+
 def validate_pdf(pdf_path: Path) -> int:
     """Validate that ``pdf_path`` is a complete, openable PDF and return
     its page count.
@@ -241,15 +255,17 @@ def validate_pdf(pdf_path: Path) -> int:
     :param pdf_path: Path to the downloaded PDF on disk.
     :returns: Page count.
     :rtype: int
-    :raises ValueError: If the file is empty, lacks a ``%PDF-`` header or
-        an ``%%EOF`` trailer, or cannot be opened as a PDF with at least
-        one page.
+    :raises CorruptDownloadError: If the file is empty, lacks a
+        ``%PDF-`` header or an ``%%EOF`` trailer, or cannot be opened as
+        a PDF with at least one page. Every one of those describes the
+        copy we received rather than the object we asked for, so all of
+        them are worth another attempt.
     """
     import fitz
 
     size = pdf_path.stat().st_size if pdf_path.exists() else 0
     if size == 0:
-        raise ValueError(f"downloaded PDF is empty: {pdf_path}")
+        raise CorruptDownloadError(f"downloaded PDF is empty: {pdf_path}")
 
     with pdf_path.open("rb") as f:
         header = f.read(1024)
@@ -257,11 +273,11 @@ def validate_pdf(pdf_path: Path) -> int:
         trailer = f.read()
 
     if b"%PDF-" not in header:
-        raise ValueError(
+        raise CorruptDownloadError(
             f"downloaded file is not a PDF (no %PDF- header): {pdf_path}"
         )
     if b"%%EOF" not in trailer:
-        raise ValueError(
+        raise CorruptDownloadError(
             "downloaded PDF is truncated (no %%EOF trailer in last "
             f"{PDF_EOF_WINDOW} bytes): {pdf_path}"
         )
@@ -276,13 +292,144 @@ def validate_pdf(pdf_path: Path) -> int:
                 logger.warning(
                     "PyMuPDF repaired %s on open; proceeding", pdf_path
                 )
-    except ValueError:
+    except CorruptDownloadError:
         raise
     except Exception as exc:
-        raise ValueError(
+        raise CorruptDownloadError(
             f"downloaded file could not be opened as a PDF: {exc}"
         ) from exc
 
     if page_count < 1:
-        raise ValueError(f"downloaded PDF has no pages: {pdf_path}")
+        raise CorruptDownloadError(f"downloaded PDF has no pages: {pdf_path}")
     return page_count
+
+
+# ── Result delivery ─────────────────────────────────────────────────
+# How many times to (re)issue the PUT before giving up. Unlike a
+# download there is nothing to resume: S3 makes a single PUT atomic, so
+# a dropped connection means the object was never created and the whole
+# body goes again.
+UPLOAD_MAX_ATTEMPTS = int(os.environ.get("HANDLER_UPLOAD_MAX_ATTEMPTS", "3"))
+UPLOAD_TIMEOUT = int(os.environ.get("HANDLER_UPLOAD_TIMEOUT", "300"))
+UPLOAD_CONNECT_TIMEOUT = int(
+    os.environ.get("HANDLER_UPLOAD_CONNECT_TIMEOUT", "10")
+)
+
+
+class ResultUploadError(RuntimeError):
+    """A result could not be delivered to its presigned PUT.
+
+    Carries the ``error_code`` the caller reports, because the three
+    failure causes need different handling and only the worker can tell
+    them apart.
+
+    :ivar error_code: ``RESULT_UPLOAD_FAILED`` (transport, retry),
+        ``RESULT_URL_EXPIRED`` (the signature died, so a fresh job must
+        mint a new one), or ``RESULT_UPLOAD_REJECTED`` (S3 refused the
+        request itself -- terminal).
+    """
+
+    def __init__(self, message: str, error_code: str):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+def upload_result(url: str, payload: dict, content_type: str) -> int:
+    """PUT a JSON result to a presigned URL and return its size.
+
+    Why the result travels this way rather than inline in the job
+    response: RunPod caps a response at about 20 MB and discards it with
+    the job record roughly 30 minutes after it finishes. An S3 object has
+    neither limit, so a caller whose daemon was down for an hour can
+    still recover work it already paid for.
+
+    ``Content-Type`` is sent because it was **signed** into the URL.
+    Whether S3 folds the header into the signature depends on the
+    signature version, so signing it makes both sides agree either way
+    -- and it means this header and the caller's signing parameter must
+    match exactly. A mismatch is a 403 that reads like an expired
+    signature.
+
+    :param url: Presigned PUT URL for exactly one object.
+    :param payload: The envelope to serialize and send.
+    :param content_type: Must equal what the URL was signed with.
+    :returns: Bytes uploaded.
+    :rtype: int
+    :raises ResultUploadError: With an ``error_code`` the caller
+        classifies. See :class:`ResultUploadError`.
+    """
+    body = json.dumps(payload).encode("utf-8")
+    last_exc: Exception | None = None
+
+    for attempt in range(1, UPLOAD_MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.put(
+                url,
+                data=body,
+                headers={"Content-Type": content_type},
+                timeout=(UPLOAD_CONNECT_TIMEOUT, UPLOAD_TIMEOUT),
+            )
+        except TRANSIENT_TRANSFER_ERRORS as exc:
+            last_exc = exc
+            logger.warning(
+                "result upload attempt %d/%d failed: %s",
+                attempt,
+                UPLOAD_MAX_ATTEMPTS,
+                exc,
+            )
+            if attempt < UPLOAD_MAX_ATTEMPTS:
+                time.sleep(
+                    min(
+                        2 ** (attempt - 1) + random.random(),
+                        DOWNLOAD_BACKOFF_CAP,
+                    )
+                )
+            continue
+
+        if resp.status_code in (200, 201, 204):
+            logger.info(
+                "uploaded %d byte result on attempt %d", len(body), attempt
+            )
+            return len(body)
+
+        detail = (resp.text or "")[:300]
+        # 403 is the one S3 status worth its own code. It is what an
+        # expired signature answers, and a fresh job mints a fresh URL,
+        # so the caller retries. It is *also* what a signing mismatch
+        # answers, which no retry fixes -- but the two are
+        # indistinguishable from here, and treating both as retryable
+        # costs a bounded number of attempts where treating both as
+        # terminal would lose a volume to a slow queue.
+        if resp.status_code == 403:
+            raise ResultUploadError(
+                f"presigned PUT rejected with 403 (expired signature, or a "
+                f"Content-Type mismatch): {detail}",
+                error_code="RESULT_URL_EXPIRED",
+            )
+        # Anything else 4xx is S3 refusing the request as formed: a
+        # bucket policy demanding headers we do not send, a wrong
+        # region, a malformed key. Every retry re-uploads and fails
+        # identically, so this is terminal.
+        if 400 <= resp.status_code < 500:
+            raise ResultUploadError(
+                f"presigned PUT rejected with {resp.status_code}: {detail}",
+                error_code="RESULT_UPLOAD_REJECTED",
+            )
+
+        last_exc = RuntimeError(f"HTTP {resp.status_code}: {detail}")
+        logger.warning(
+            "result upload attempt %d/%d got HTTP %d",
+            attempt,
+            UPLOAD_MAX_ATTEMPTS,
+            resp.status_code,
+        )
+        if attempt < UPLOAD_MAX_ATTEMPTS:
+            time.sleep(
+                min(2 ** (attempt - 1) + random.random(), DOWNLOAD_BACKOFF_CAP)
+            )
+
+    raise ResultUploadError(
+        f"could not upload the result after {UPLOAD_MAX_ATTEMPTS} "
+        f"attempt(s): {last_exc}",
+        error_code="RESULT_UPLOAD_FAILED",
+    )

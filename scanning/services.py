@@ -51,6 +51,7 @@ from scanning.models import (
     CheckName,
     Detection,
     Issue,
+    JobStage,
     JobStatus,
     OpinionScan,
     OpinionStatus,
@@ -1243,6 +1244,7 @@ def run_full_pipeline(scan_pk: int) -> None:
                     jobs.abandon_open(
                         scan,
                         "Scan left PROCESSING before its conversion started",
+                        stage=JobStage.CONVERT,
                     )
 
         _push_processing_files_to_s3(scan_pk)

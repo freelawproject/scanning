@@ -1,8 +1,12 @@
 """RunPod Serverless client settings.
 
-These configure the daemon side (``scanning/runpod_client.py``). The
-worker-side env vars (``SENTRY_DSN_GPU``, ``PADDLEX_HOME``, etc.) live
-on the RunPod endpoint configuration, not in Django settings.
+Account-level settings shared by every RunPod engine. Per-engine ones
+(the endpoint id, the concurrency cap, the attempt cap, the per-page
+allowance) live with their engine -- see
+``scanning/settings/project/dots_mocr.py``.
+
+The worker-side env vars (``SENTRY_DSN_GPU``, ``HANDLER_DPI``, etc.)
+live on the RunPod endpoint configuration, not in Django settings.
 """
 
 import environ
@@ -16,20 +20,20 @@ env = environ.FileAwareEnv()
 # Default False so dev and CI never need RunPod credentials.
 RUNPOD_ENABLED = env.bool("RUNPOD_ENABLED", default=False)
 
-# RunPod serverless endpoint id (from the RunPod console).
-RUNPOD_ENDPOINT_ID = env.str("RUNPOD_ENDPOINT_ID", default="")
-
-# RunPod API key. Treat as a secret; never log.
+# RunPod API key. Treat as a secret; never log. One account key; the
+# endpoint id is per engine and lives with that engine's settings
+# (``RUNPOD_DOTSMOCR_ENDPOINT_ID`` in ``dots_mocr.py``), because each
+# engine is a separate serverless endpoint with its own image and its
+# own worker pool.
 RUNPOD_API_KEY = env.str("RUNPOD_API_KEY", default="")
 
-# Hard wall-clock ceiling (seconds) for the combined submit + poll
-# loop. Includes cold start + queue + execution. Client cancels the
-# job and raises if exceeded.
+# Base wall-clock budget (seconds) for a *running* job, before the
+# per-page allowance an engine adds (see
+# ``jobs.runpod_execution_deadline``). Never counted from submission:
+# queue time is free and unbounded by design, so the budget starts when
+# /status first reports IN_PROGRESS. Covers cold start and model load,
+# which a queued job has not paid yet.
 RUNPOD_REQUEST_TIMEOUT = env.int("RUNPOD_REQUEST_TIMEOUT", default=1800)
-
-# Retries on transport errors when submitting a job (network blips,
-# 5xx from the RunPod API). Terminal job failures are NOT retried.
-RUNPOD_MAX_RETRIES = env.int("RUNPOD_MAX_RETRIES", default=2)
 
 # Lifetime of presigned GET URLs handed to the worker (seconds).
 # Default 86400 (1 day): generous headroom for cold start + queue +

@@ -2578,16 +2578,13 @@ class TestPendingChangesGuard(ScanningTestCase):
         """Re-validate is paused entirely by the #173 cutover.
 
         The pipeline it re-ran was disconnected, so the view refuses
-        with the unified message instead of queueing -- and it must not
-        invalidate the stored GPU results the way the live button did,
-        since nothing would regenerate them.
+        with the unified message instead of queueing, and it leaves the
+        scan exactly where it found it.
         """
         self.scan.deletions.all().delete()
-        with patch("scanning.s3_sync.invalidate_job_results") as invalidate:
-            response = self.client.post(
-                reverse("start_validate", kwargs={"pk": self.scan.pk})
-            )
-        invalidate.assert_not_called()
+        response = self.client.post(
+            reverse("start_validate", kwargs={"pk": self.scan.pk})
+        )
         self.assertRedirects(
             response,
             reverse("scan_process", kwargs={"pk": self.scan.pk}),

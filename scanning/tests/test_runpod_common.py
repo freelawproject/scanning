@@ -15,6 +15,7 @@ extracted into the shared module.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -289,15 +290,131 @@ class ValidatePdfTest(SimpleTestCase):
         # download that died mid-transfer.
         self.path.write_bytes(full[: len(full) // 2])
 
-        with self.assertRaisesRegex(ValueError, "truncated"):
+        with self.assertRaisesRegex(
+            runpod_common.CorruptDownloadError, "truncated"
+        ):
             runpod_common.validate_pdf(self.path)
 
     def test_empty_file(self):
         self.path.write_bytes(b"")
-        with self.assertRaisesRegex(ValueError, "empty"):
+        with self.assertRaisesRegex(
+            runpod_common.CorruptDownloadError, "empty"
+        ):
             runpod_common.validate_pdf(self.path)
 
     def test_not_a_pdf(self):
         self.path.write_bytes(b"<html>nope</html>\n%%EOF")
-        with self.assertRaisesRegex(ValueError, "not a PDF"):
+        with self.assertRaisesRegex(
+            runpod_common.CorruptDownloadError, "not a PDF"
+        ):
             runpod_common.validate_pdf(self.path)
+
+    def test_it_is_not_a_value_error(self):
+        """The distinction the handler's error codes rest on.
+
+        A caller maps ``ValueError`` to a terminal BAD_INPUT, which is
+        right for a missing url or a bad option. But scanning cuts each
+        shard itself and verifies it against the original, so a copy
+        that will not open describes the *transfer*: terminal there
+        would write a volume off for a dropped connection.
+        """
+        self.path.write_bytes(b"")
+        self.assertFalse(
+            issubclass(runpod_common.CorruptDownloadError, ValueError)
+        )
+        with self.assertRaises(runpod_common.CorruptDownloadError):
+            runpod_common.validate_pdf(self.path)
+
+
+class UploadResultTest(SimpleTestCase):
+    """``upload_result`` PUTs the envelope and classifies its failures.
+
+    The three error codes are the whole point: two are worth a fresh
+    job, one never is, and only the worker can tell them apart.
+    """
+
+    def setUp(self):
+        self.payload = {"schema_version": 1, "payload": {"pages": []}}
+        # No real sleeping between attempts.
+        patcher = mock.patch.object(runpod_common.time, "sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _put(self, *responses):
+        """Run one upload with ``requests.put`` scripted.
+
+        :param responses: Status codes, or exceptions to raise.
+        :returns: ``(returned_size_or_exception, put_mock)``.
+        """
+        side_effect = [
+            r
+            if isinstance(r, Exception)
+            else mock.Mock(status_code=r, text="detail")
+            for r in responses
+        ]
+        with mock.patch.object(
+            runpod_common.requests, "put", side_effect=side_effect
+        ) as put:
+            try:
+                return runpod_common.upload_result(
+                    "https://s3/out?sig", self.payload, "application/json"
+                ), put
+            except runpod_common.ResultUploadError as exc:
+                return exc, put
+
+    def test_a_200_returns_the_body_size(self):
+        size, put = self._put(200)
+        self.assertEqual(size, len(json.dumps(self.payload).encode()))
+        self.assertEqual(put.call_count, 1)
+
+    def test_204_and_201_also_count_as_success(self):
+        for status in (201, 204):
+            with self.subTest(status=status):
+                self.assertIsInstance(self._put(status)[0], int)
+
+    def test_the_signed_content_type_is_sent(self):
+        # It is folded into the signature depending on the signature
+        # version, so the header and the signing parameter must agree.
+        _, put = self._put(200)
+        self.assertEqual(
+            put.call_args.kwargs["headers"]["Content-Type"],
+            "application/json",
+        )
+
+    def test_a_dropped_connection_is_retried_whole(self):
+        # S3 makes a single PUT atomic, so there is nothing to resume:
+        # a dropped connection means the object was never created.
+        size, put = self._put(
+            requests.exceptions.ConnectionError("reset"), 200
+        )
+        self.assertIsInstance(size, int)
+        self.assertEqual(put.call_count, 2)
+
+    def test_exhausted_attempts_report_upload_failed(self):
+        with mock.patch.object(runpod_common, "UPLOAD_MAX_ATTEMPTS", 2):
+            result, put = self._put(
+                requests.exceptions.Timeout("slow"),
+                requests.exceptions.Timeout("slow"),
+            )
+        self.assertEqual(result.error_code, "RESULT_UPLOAD_FAILED")
+        self.assertEqual(put.call_count, 2)
+
+    def test_a_5xx_is_retried_then_reported_as_upload_failed(self):
+        with mock.patch.object(runpod_common, "UPLOAD_MAX_ATTEMPTS", 2):
+            result, put = self._put(503, 503)
+        self.assertEqual(result.error_code, "RESULT_UPLOAD_FAILED")
+        self.assertEqual(put.call_count, 2)
+
+    def test_a_403_is_url_expired_and_not_retried(self):
+        # A fresh job mints a fresh URL, which is the only recovery, so
+        # spending the remaining attempts on the dead one is waste.
+        result, put = self._put(403)
+        self.assertEqual(result.error_code, "RESULT_URL_EXPIRED")
+        self.assertEqual(put.call_count, 1)
+
+    def test_another_4xx_is_terminal(self):
+        # S3 refusing the request as formed. Every retry re-runs the GPU
+        # work and fails identically.
+        result, put = self._put(400)
+        self.assertEqual(result.error_code, "RESULT_UPLOAD_REJECTED")
+        self.assertEqual(put.call_count, 1)

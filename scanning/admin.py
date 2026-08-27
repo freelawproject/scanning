@@ -11,6 +11,7 @@ from scanning.models import (
     Detection,
     ExternalJob,
     Issue,
+    JobStage,
     OpinionScan,
     Page,
     PageDeletion,
@@ -30,21 +31,47 @@ from scanning.services import (
 logger = logging.getLogger(__name__)
 
 
-def _delete_scan_wire_objects(scan):
-    """Best-effort sweep of a scan's shards and job results from S3.
+def _release_scan_external_work(scan):
+    """Stop a scan's external work, then sweep what it left in S3.
 
-    The two prefixes nothing else removes, and the largest a deleted
-    scan would orphan: the shards duplicate the original's bytes, and
-    the job results hold one converted copy of the volume per attempt.
-    Both are excluded from every sync, so the row going away is the only
-    thing that triggers this.
+    Called before a hard delete, and the order is the point.
 
-    Best effort: an S3 hiccup must not block the admin delete, and an
-    orphaned prefix is the pre-existing status quo.
+    **Cancel first.** ``ExternalJob.scan`` is ``CASCADE``, so deleting
+    the scan deletes the rows -- and with them ``external_id``, the only
+    handle on a running job. A RunPod worker bills for as long as it
+    runs, and ``sweep_jobs`` only iterates rows that still exist, so an
+    orphaned job would bill until it finished with nothing left anywhere
+    to find or cancel it. Doctor's cancel is a no-op, which is why this
+    was harmless until dots.mocr arrived (issue #190).
+
+    **Sweep second**, for the same reason: a worker still running could
+    PUT after the sweep and re-orphan an object we had just deleted.
+
+    Then the two prefixes nothing else removes, and the largest a
+    deleted scan would orphan: the shards duplicate the original's
+    bytes, and the job results hold one copy of the volume's output per
+    attempt. Both are excluded from every sync, so the row going away is
+    the only thing that triggers this.
+
+    Best effort throughout: neither a stuck provider nor an S3 hiccup
+    may block the admin delete, and an orphaned prefix is the
+    pre-existing status quo.
 
     :param scan: The scan about to be deleted.
     """
-    from scanning import s3_sync
+    from scanning import jobs, s3_sync
+
+    try:
+        # Unscoped deliberately, unlike the re-queue: the scan is going
+        # away, so no stage of it is worth keeping alive.
+        jobs.abandon_open(scan, "Scan deleted from the admin")
+    except Exception:
+        logger.warning(
+            "Could not cancel the external jobs of scan %s before "
+            "deleting it; a running job may keep billing",
+            scan.pk,
+            exc_info=True,
+        )
 
     for label, sweep in (
         ("shard", s3_sync.delete_shard_objects),
@@ -314,16 +341,17 @@ class ScanAdmin(admin.ModelAdmin):
         """Delete a Scan and refresh its parent Volume's queue_status.
 
         Without this, the volume can drift (e.g. stay at COMPLETE after
-        its only approved scan is deleted from the admin). The scan's S3
-        shards and job results are swept too (best effort, before the
-        row goes away): they duplicate the volume's bytes and nothing
-        else removes them.
+        its only approved scan is deleted from the admin). The scan's
+        external jobs are cancelled and its S3 shards and job results
+        swept first (best effort, before the row goes away): a running
+        RunPod job would otherwise keep billing with no row left to
+        cancel it, and the objects duplicate the volume's bytes.
 
         :param request: The admin HTTP request.
         :param obj: The Scan to delete.
         """
         volume = obj.volume_obj
-        _delete_scan_wire_objects(obj)
+        _release_scan_external_work(obj)
         super().delete_model(request, obj)
         if volume is not None:
             refresh_volume_queue_status(volume)
@@ -331,8 +359,8 @@ class ScanAdmin(admin.ModelAdmin):
     def delete_queryset(self, request, queryset):
         """Bulk-delete Scans and refresh affected Volumes.
 
-        Sweeps each scan's S3 shards and job results first, same as
-        :meth:`delete_model`.
+        Cancels each scan's external jobs and sweeps its S3 shards and
+        job results first, same as :meth:`delete_model`.
 
         :param request: The admin HTTP request.
         :param queryset: Scans selected for deletion.
@@ -343,7 +371,7 @@ class ScanAdmin(admin.ModelAdmin):
             .distinct()
         )
         for scan in queryset:
-            _delete_scan_wire_objects(scan)
+            _release_scan_external_work(scan)
         super().delete_queryset(request, queryset)
         for volume in Volume.objects.filter(pk__in=volume_ids):
             refresh_volume_queue_status(volume)
@@ -400,7 +428,9 @@ class ScanAdmin(admin.ModelAdmin):
         # would make ``ensure_convert_jobs`` reuse rows whose result
         # objects another attempt may still be writing.
         for scan in queryset.filter(status__in=statuses):
-            jobs.abandon_open(scan, "Re-queued from the admin")
+            jobs.abandon_open(
+                scan, "Re-queued from the admin", stage=JobStage.CONVERT
+            )
 
         # Re-point every recovered scan at the (interim) full pipeline.
         # The other queued actions were disconnected by issue #173, so a

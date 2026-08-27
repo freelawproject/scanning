@@ -1,11 +1,25 @@
-"""Submit one wave of pending external jobs (a single daemon tick).
+"""Submit one wave of pending external jobs per provider (a daemon tick).
 
-Claims up to ``DOCTOR_MAX_CONCURRENCY`` pending ``ExternalJob`` rows,
-sends them from a bounded thread pool, and records what came back.
-Blocks for as long as the slowest request in the wave (~25-45s for a
-100-page bitonal shard), deliberately: holding the request open is what
-keeps the provider's error code, instead of inferring failure from a
-missing object later.
+Each provider counts its own in-flight rows against its own cap, so one
+saturated endpoint cannot starve another: doctor's ceiling is its replica
+count (``DOCTOR_MAX_CONCURRENCY``), and each RunPod engine's is that
+engine's own serverless endpoint (``DOTS_MOCR_MAX_CONCURRENCY``).
+
+The waves run non-blocking first, blocking last.
+
+A RunPod submit is a fast ``POST /run``: it returns as soon as the job is
+queued, and a poll on a later tick is what finishes it.
+
+A doctor submit holds the socket open for the whole conversion (~25-45s
+per 100-page shard). That is deliberate -- keeping the request open is
+what preserves doctor's own error code, instead of inferring failure from
+a missing object hours later -- but it does block this command for that
+long, and the daemon's scheduler is serial (issue #156).
+
+Hence the order. Sending the RunPod jobs first means they are already
+queueing on RunPod's side while doctor converts. The other way round,
+a wave of bitonal shards would leave the GPU endpoint idle for a minute
+or more per tick.
 
 Examples:
 
@@ -31,8 +45,8 @@ RETRY_BACKOFF_SECONDS = 0.5
 
 class Command(BaseCommand):
     help = (
-        "Submit up to DOCTOR_MAX_CONCURRENCY pending external jobs and "
-        "record their outcomes."
+        "Submit one wave of pending external jobs per provider, each "
+        "within its own concurrency cap, and record their outcomes."
     )
 
     def add_arguments(self, parser):
@@ -46,8 +60,8 @@ class Command(BaseCommand):
             type=int,
             default=None,
             help=(
-                "Maximum jobs to submit in this wave. Defaults to "
-                "DOCTOR_MAX_CONCURRENCY."
+                "Concurrency override applied to EACH provider's wave. "
+                "Defaults to each provider's own setting."
             ),
         )
 
@@ -87,12 +101,13 @@ class Command(BaseCommand):
                 summary.submitted,
                 summary.failed,
                 summary.retried,
+                summary.deferred,
                 summary.unanswered,
                 summary.skipped,
             )
         ):
             self.stdout.write(
                 f"Submitted {summary.submitted}, retried {summary.retried}, "
-                f"failed {summary.failed}, unanswered {summary.unanswered}, "
-                f"skipped {summary.skipped}"
+                f"deferred {summary.deferred}, failed {summary.failed}, "
+                f"unanswered {summary.unanswered}, skipped {summary.skipped}"
             )

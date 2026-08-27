@@ -4,10 +4,31 @@ Step action bar for the scan processing page.
 Rendered both inline by scan_process.html and standalone by the
 process_actions view (fetched by the step-1/step-2 viewers to refresh the
 buttons in place after a page is marked for or restored from deletion).
+
+The OCR (dots.mocr) control is staff-only and moves no scan status, so
+its state comes from `dots_run` -- a summary of the ExternalJob rows
+(issue #190) -- rather than from `is_processing`.
 {% endcomment %}
 {% if is_processing %}
 
 {% elif step == 1 %}
+  {% if dots_run %}
+  <span class="text-sm text-gray-600 mr-2" title="OCR run {{ dots_run.run }}: {{ dots_run.label }}">
+    {% if dots_run.failed %}
+    OCR failed on {{ dots_run.failed }} of {{ dots_run.total }} part(s): {{ dots_run.error_code }}
+    {% elif dots_run.open %}
+    OCR running: {{ dots_run.done }} of {{ dots_run.total }} part(s) done
+    {% else %}
+    OCR done: {{ dots_run.total }} part(s)
+    {% endif %}
+  </span>
+  {% endif %}
+  {% if user.is_staff and not dots_run.open %}
+  <form method="post" action="{% url 'start_dots_mocr' scan.pk %}" class="inline">
+    {% csrf_token %}
+    <button type="submit" class="btn-outline text-sm" title="Read every page of the original with dots.mocr on RunPod (incurs costs $$$)" onclick="return confirm('This runs dots.mocr OCR on RunPod over every page of this volume. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}{% if dots_run %}Re-run OCR{% else %}Run OCR{% endif %}</button>
+  </form>
+  {% endif %}
   {% if has_pending_changes %}
   <form method="post" action="{% url 'reprocess' scan.pk %}" class="inline">
     {% csrf_token %}
