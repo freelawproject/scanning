@@ -178,33 +178,11 @@ def s3_processing_prefix(scan: Scan) -> str:
     return f"processing/{scan.pk}/{reporter_slug}/{volume}/{start_page}/"
 
 
-def s3_job_result_key(scan: Scan, stage: str) -> str:
-    """Return the S3 key a GPU worker PUTs one job's result to.
-
-    One object per scan and stage: a re-run overwrites the previous
-    attempt's output instead of leaving an orphan behind. Nothing
-    reads the object without first checking it was written after the
-    job that's reading it was submitted, so an overwritten-in-place
-    key can't be mistaken for a stale one (see
-    ``runpod_client._result_object_is_fresh``).
-
-    :param scan: The scan the job belongs to.
-    :param stage: Pipeline stage / handler action (``detect`` /
-        ``analyze``).
-    :returns: Key of the form
-        ``{processing_prefix}jobs/{stage}/result.json``.
-    :rtype: str
-    """
-    return (
-        f"{s3_processing_prefix(scan)}{JOB_RESULTS_SUBDIR}{stage}/result.json"
-    )
-
-
 def s3_job_attempt_key(job, suffix: str = ".json") -> str:
     """Return the S3 key one attempt of one job writes its output to.
 
-    Unlike :func:`s3_job_result_key`, scoped all the way down to run,
-    shard and attempt, which is what a fanned-out stage needs:
+    Scoped all the way down to run, shard and attempt, which is what a
+    fanned-out stage needs:
 
     - **shard**, since a volume pass is several jobs at once and they
       must not overwrite each other.
@@ -543,12 +521,12 @@ def _is_stage_input(rel: str) -> bool:
     numbers OCR better there. Both live in the scan's output dir, so both
     are in ``upload_processing_files``' path.
 
-    These two objects' ``LastModified`` are what
-    ``runpod_client.reusable_result`` compares a stored job result
-    against to decide whether it was computed from the current pages.
-    Re-uploading identical bytes would advance the timestamp and make
-    every stored result look stale, so they are the files worth a
-    ``head_object`` to skip.
+    Both are large and are re-written on every pipeline run, so both
+    are worth a ``head_object`` to skip an upload of bytes S3 already
+    holds. Their ``LastModified`` also used to answer "have the pages
+    changed since this stored result was computed?" for the retired
+    per-scan result keys; nothing reads it that way now that every
+    result lives at an attempt-scoped key (issue #190).
 
     :param rel: Object key relative to the scan's processing prefix.
     :returns: Whether the key is a stage input.
@@ -586,47 +564,6 @@ def _size_matches_s3(s3, bucket: str, key: str, path: Path) -> bool:
         # through the walk while the pipeline still reported success.
         return False
     return head.get("ContentLength") == path.stat().st_size
-
-
-def invalidate_job_results(scan: Scan) -> None:
-    """Delete a scan's stored GPU job results so the next run recomputes.
-
-    The counterpart to ``runpod_client.reusable_result``. That check is
-    keyed on the stage input's timestamp, which answers "have the pages
-    changed?" and nothing else, so a caller who means "re-run this even
-    though the pages are the same" has to say so by removing the objects.
-
-    Call it from the paths that express that intent. Today that is the
-    Re-validate action alone, which warns about GPU cost before it
-    queues. Deliberately not the admin re-queue: that one documents
-    itself as recovery for a scan stuck behind a killed daemon, which is
-    the resume case reuse exists to make cheap.
-
-    Best effort. A failed delete leaves a reusable result behind, which
-    costs correctness only for the caller that asked for freshness, so it
-    is logged rather than raised into a request or an admin action.
-
-    :param scan: Scan whose stored results to drop.
-    :return: None.
-    """
-    if not _s3_enabled():
-        return
-
-    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
-    s3 = _s3_client()
-    for stage in ("detect", "analyze"):
-        key = s3_job_result_key(scan, stage)
-        try:
-            s3.delete_object(Bucket=bucket, Key=key)
-        except (BotoCoreError, ClientError):
-            logger.warning(
-                "Could not drop the stored %s result for scan %s at %s; "
-                "the next run may reuse it",
-                stage,
-                scan.pk,
-                key,
-                exc_info=True,
-            )
 
 
 def upload_processing_files(scan: Scan) -> int:
