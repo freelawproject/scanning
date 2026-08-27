@@ -1585,9 +1585,7 @@ class TestWaveOrder(ScanningTestCase):
             ),
             patch(
                 "scanning.runpod_client.submit_job",
-                side_effect=lambda *a, **k: (
-                    order.append("runpod") or "job-1"
-                ),
+                side_effect=lambda *a, **k: order.append("runpod") or "job-1",
             ),
             patch(
                 "scanning.doctor_client.convert_bitonal",
