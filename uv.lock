@@ -141,7 +141,7 @@ wheels = [
 
 [[package]]
 name = "blackletter"
-version = "0.2.0"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -150,9 +150,9 @@ dependencies = [
     { name = "pillow" },
     { name = "pymupdf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ab/8a/a744ed3dbe5b00716a91f9b8b9933b125d7aa0b54710ebf4428621bcbf5e/blackletter-0.2.0.tar.gz", hash = "sha256:85a0d08edda53567f92b39bb1d2bc8378ed5a979882cb1a44a7fb1a0b01c01be", size = 170941, upload-time = "2026-08-05T01:36:06.898Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1f/ba/c5b427dec64f8612822dfa92c58bdbe873da6a88a78f1fa2256d24cfe02b/blackletter-0.3.0.tar.gz", hash = "sha256:345a3dc5b5e28c7e70315e9b060eb9121531fca0c713bc3d37396341b4182f8d", size = 177097, upload-time = "2026-08-27T03:43:07.446Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/19/61/db2868191379fadb08cea86cc8a6f3b2b897a045cb35a00b27147ad63ed9/blackletter-0.2.0-py3-none-any.whl", hash = "sha256:e909a0f2b96807de7287470874e75dbf1500ae7a7081196c3938c52d1b4f90b5", size = 130766, upload-time = "2026-08-05T01:36:05.595Z" },
+    { url = "https://files.pythonhosted.org/packages/64/4b/acffa8440fd0e0cdd6d1a81982a46c7dff366f88d77f7d042b5b0db86533/blackletter-0.3.0-py3-none-any.whl", hash = "sha256:634c849c0ea99a97dbf587c33277c799947b8dcaf7e66b7e130709132330c785", size = 134935, upload-time = "2026-08-27T03:43:06.096Z" },
 ]
 
 [package.optional-dependencies]
@@ -1482,14 +1482,14 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://paddle-whl.bj.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp312-cp312-linux_aarch64.whl" },
-    { url = "https://paddle-whl.bj.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp312-cp312-linux_x86_64.whl" },
-    { url = "https://paddle-whl.bj.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp312-cp312-macosx_11_0_arm64.whl" },
-    { url = "https://paddle-whl.bj.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp312-cp312-win_amd64.whl" },
-    { url = "https://paddle-whl.bj.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp313-cp313-linux_aarch64.whl" },
-    { url = "https://paddle-whl.bj.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp313-cp313-linux_x86_64.whl" },
-    { url = "https://paddle-whl.bj.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp313-cp313-macosx_11_0_arm64.whl" },
-    { url = "https://paddle-whl.bj.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp313-cp313-win_amd64.whl" },
+    { url = "https://paddle-whl.cdn.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp312-cp312-linux_aarch64.whl" },
+    { url = "https://paddle-whl.cdn.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp312-cp312-linux_x86_64.whl" },
+    { url = "https://paddle-whl.cdn.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp312-cp312-macosx_11_0_arm64.whl" },
+    { url = "https://paddle-whl.cdn.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp312-cp312-win_amd64.whl" },
+    { url = "https://paddle-whl.cdn.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp313-cp313-linux_aarch64.whl" },
+    { url = "https://paddle-whl.cdn.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp313-cp313-linux_x86_64.whl" },
+    { url = "https://paddle-whl.cdn.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp313-cp313-macosx_11_0_arm64.whl" },
+    { url = "https://paddle-whl.cdn.bcebos.com/stable/cpu/paddlepaddle/paddlepaddle-3.3.1-cp313-cp313-win_amd64.whl" },
 ]
 
 [[package]]
@@ -2360,8 +2360,8 @@ local-ml = [
 
 [package.metadata]
 requires-dist = [
-    { name = "blackletter", specifier = ">=0.2.0" },
-    { name = "blackletter", extras = ["detect", "analyze"], marker = "extra == 'local-ml'", specifier = ">=0.2.0" },
+    { name = "blackletter", specifier = ">=0.3.0" },
+    { name = "blackletter", extras = ["detect", "analyze"], marker = "extra == 'local-ml'", specifier = ">=0.3.0" },
     { name = "boto3" },
     { name = "daphne" },
     { name = "django", specifier = ">=6.0,<6.1" },
@@ -2604,13 +2604,13 @@ resolution-markers = [
     "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "setuptools" },
-    { name = "sympy" },
-    { name = "typing-extensions" },
+    { name = "filelock", marker = "platform_machine != 's390x' and sys_platform == 'darwin'" },
+    { name = "fsspec", marker = "platform_machine != 's390x' and sys_platform == 'darwin'" },
+    { name = "jinja2", marker = "platform_machine != 's390x' and sys_platform == 'darwin'" },
+    { name = "networkx", marker = "platform_machine != 's390x' and sys_platform == 'darwin'" },
+    { name = "setuptools", marker = "platform_machine != 's390x' and sys_platform == 'darwin'" },
+    { name = "sympy", marker = "platform_machine != 's390x' and sys_platform == 'darwin'" },
+    { name = "typing-extensions", marker = "platform_machine != 's390x' and sys_platform == 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:43b35116802c85fb88d99f4a396b8bd4472bfca1dd82e69499e5a4f9b8b4e252", upload-time = "2026-03-23T15:16:58Z" },
@@ -2637,13 +2637,13 @@ resolution-markers = [
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'darwin' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "setuptools" },
-    { name = "sympy" },
-    { name = "typing-extensions" },
+    { name = "filelock", marker = "platform_machine == 's390x' or sys_platform != 'darwin'" },
+    { name = "fsspec", marker = "platform_machine == 's390x' or sys_platform != 'darwin'" },
+    { name = "jinja2", marker = "platform_machine == 's390x' or sys_platform != 'darwin'" },
+    { name = "networkx", marker = "platform_machine == 's390x' or sys_platform != 'darwin'" },
+    { name = "setuptools", marker = "platform_machine == 's390x' or sys_platform != 'darwin'" },
+    { name = "sympy", marker = "platform_machine == 's390x' or sys_platform != 'darwin'" },
+    { name = "typing-extensions", marker = "platform_machine == 's390x' or sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp312-cp312-linux_s390x.whl", hash = "sha256:2db3ae5404e32cb42b5fcbd94f13607761eaec0cf1687fde95095289d1e26cfb", upload-time = "2026-04-28T00:06:06Z" },
@@ -2669,9 +2669,9 @@ resolution-markers = [
     "python_full_version < '3.13' and platform_machine != 's390x' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "numpy" },
-    { name = "pillow" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" } },
+    { name = "numpy", marker = "platform_machine != 's390x' and sys_platform == 'darwin'" },
+    { name = "pillow", marker = "platform_machine != 's390x' and sys_platform == 'darwin'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 's390x' and sys_platform == 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.26.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:c409e1c3fdebec7a3834465086dbda8bf7680eff79abf7fd2f10c6b59520a7a4", upload-time = "2026-03-23T15:36:09Z" },
@@ -2698,9 +2698,9 @@ resolution-markers = [
     "python_full_version < '3.13' and platform_machine == 's390x' and sys_platform != 'darwin' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "numpy" },
-    { name = "pillow" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" } },
+    { name = "numpy", marker = "platform_machine == 's390x' or sys_platform != 'darwin'" },
+    { name = "pillow", marker = "platform_machine == 's390x' or sys_platform != 'darwin'" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 's390x' or sys_platform != 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.26.0%2Bcpu-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:17f0b542331fc94230b4214c6d123f038af7330fd81019608c0d2402f3bc3079", upload-time = "2026-03-23T15:36:09Z" },
