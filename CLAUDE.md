@@ -307,12 +307,25 @@ trained on), tracked on `ExternalJob` rows at
   on blast radius, **not** a cost control: RunPod bills each worker's
   cold start, so parallel shards on cold workers pay boot several times
   and three in series on one warm worker may cost less.
-- **The stage stops at `COMPLETED`.** Nothing applies a result yet. The
-  merge is #149: read each row's `input_manifest`, offset each
-  `page_no` by its shard's `from_page` (`volume_index = from_page +
-  page_no`, and `pdf_page` is that plus one), write one volume JSON, and
-  flip the rows to `CONSUMED`. Nothing is at risk meanwhile — each
-  object sits at an attempt-scoped key and each row keeps its range.
+- **The glue applies the run, and it keeps the raw inputs.** Once every
+  row of the live run is `COMPLETED`, `dots_mocr.finish_ready_runs`
+  (on the collect tick, #202) offsets each `page_no` by its shard's
+  `from_page` (`page_index = from_page + page_no`, `pdf_page` is that
+  plus one), writes one volume JSON to
+  `jobs/analyze/dots_mocr/r{run}-volume.json` — under `jobs/` so the
+  generic sync never carries it — and flips the rows to `CONSUMED`.
+  The per-shard results are deliberately **not** deleted: the future
+  smart glue over page inserts and deletes re-reads them. A page the
+  worker failed keeps its slot with its `error` (#149 reads it as
+  `detected=None`). The pass writes no scan status (the #190
+  invariant); a run holding a dead row is skipped silently, since
+  `run_summary` already shows it and the button opens the fresh run. A
+  glue *failure* retries next tick up to `GLUE_MAX_ATTEMPTS`, counted
+  in the shard-0 row's `provider_meta["glue"]` (never in
+  `input_manifest` — `_still_describes` compares that exactly), with
+  one ERROR log at the crossing and silence after; the rows stay
+  `COMPLETED`, so recovery is a deploy plus clearing the counter, not
+  a re-paid run. Reading page numbers out of the glued JSON is #149.
 - **No provider abstraction, deliberately.** `jobs.py` branches on
   `job.provider`; ~600 of its lines are provider-agnostic and stay
   shared, and only the submit call and the in-flight check fork. Do not

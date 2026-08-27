@@ -92,10 +92,14 @@ class TestCollectCommand(TestCase):
                 "scanning.bitonal.finish_ready_scans",
                 side_effect=lambda: calls.append("finish") or 1,
             ):
-                with patch("django.db.connections.close_all"):
-                    call_command("collect_external_jobs")
+                with patch(
+                    "scanning.dots_mocr.finish_ready_runs",
+                    side_effect=lambda: calls.append("glue") or 1,
+                ):
+                    with patch("django.db.connections.close_all"):
+                        call_command("collect_external_jobs")
 
-        self.assertEqual(calls, ["sweep", "finish"])
+        self.assertEqual(calls, ["sweep", "finish", "glue"])
 
     def test_a_transient_db_error_is_survived_quietly(self):
         with patch(
@@ -103,17 +107,19 @@ class TestCollectCommand(TestCase):
             side_effect=OperationalError("ssl gone"),
         ) as sweep:
             with patch("scanning.bitonal.finish_ready_scans") as finish:
-                with patch("django.db.connections.close_all"):
-                    with patch(
-                        "scanning.management.commands."
-                        "collect_external_jobs.time.sleep"
-                    ):
-                        with self.assertLogs(
+                with patch("scanning.dots_mocr.finish_ready_runs") as glue:
+                    with patch("django.db.connections.close_all"):
+                        with patch(
                             "scanning.management.commands."
-                            "collect_external_jobs",
-                            level="WARNING",
+                            "collect_external_jobs.time.sleep"
                         ):
-                            call_command("collect_external_jobs")
+                            with self.assertLogs(
+                                "scanning.management.commands."
+                                "collect_external_jobs",
+                                level="WARNING",
+                            ):
+                                call_command("collect_external_jobs")
 
         self.assertEqual(sweep.call_count, 3)
         finish.assert_not_called()
+        glue.assert_not_called()
