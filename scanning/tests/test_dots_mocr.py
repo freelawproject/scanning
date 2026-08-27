@@ -15,9 +15,10 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from django.test import override_settings
+from django.urls import reverse
 from django.utils import timezone
 
-from scanning import dots_mocr, jobs, runpod_client
+from scanning import dots_mocr, jobs, runpod_client, sharding
 from scanning.factories import ScanFactory
 from scanning.models import (
     ExternalJob,
@@ -761,7 +762,10 @@ class TestRunSummary(ScanningTestCase):
         self.assertEqual(summary["run"], 1)
         self.assertEqual(summary["total"], 3)
         self.assertEqual(summary["done"], 1)
-        self.assertEqual(summary["open"], 3)
+        # "open" is what the daemon still has to do, so a COMPLETED row
+        # is not in it -- otherwise a run holding one failed shard would
+        # read as open forever and the button would refuse its re-run.
+        self.assertEqual(summary["open"], 2)
         self.assertEqual(summary["failed"], 0)
 
     def test_it_reports_the_first_failure(self):
@@ -790,3 +794,248 @@ class TestRunSummary(ScanningTestCase):
         summary = dots_mocr.run_summary(scan)
         self.assertEqual(summary["run"], 2)
         self.assertEqual(summary["failed"], 0)
+
+
+# ── the start button ────────────────────────────────────────────────
+@override_settings(**DOTS)
+class TestStartButton(ScanningTestCase):
+    """Staff-only, and it writes rows rather than calling RunPod."""
+
+    def setUp(self):
+        super().setUp()
+        self.staff = self.make_staff_user()
+        self.scan = ScanFactory(page_count=30)
+        self.url = reverse("start_dots_mocr", kwargs={"pk": self.scan.pk})
+        self.manifest = make_manifest(shard_count=3, pages_per_shard=10)
+
+    _UNSET = object()
+
+    def _committed(self, manifest=_UNSET, reason=""):
+        """Patch the manifest check to answer without S3."""
+        return patch(
+            "scanning.sharding.committed_manifest",
+            return_value=(
+                self.manifest if manifest is self._UNSET else manifest,
+                reason,
+            ),
+        )
+
+    def _press(self, user=None):
+        self.client.force_login(user or self.staff)
+        return self.client.post(self.url)
+
+    def test_staff_press_creates_one_row_per_shard(self):
+        with self._committed():
+            response = self._press()
+
+        self.assertRedirects(
+            response,
+            reverse("scan_process", kwargs={"pk": self.scan.pk}),
+            fetch_redirect_response=False,
+        )
+        rows = analyze_jobs(self.scan)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual({row.status for row in rows}, {JobStatus.PENDING})
+
+    def test_the_request_never_calls_runpod(self):
+        # The web pod writes rows; the daemon sends them. That keeps a
+        # request off a slow HTTP call and survives a redeployed pod.
+        with (
+            self._committed(),
+            patch("scanning.runpod_client.submit_job") as submit,
+        ):
+            self._press()
+        submit.assert_not_called()
+
+    def test_a_non_staff_user_is_refused(self):
+        with self._committed():
+            response = self._press(self.make_user())
+        self.assertEqual(analyze_jobs(self.scan), [])
+        messages = list(response.wsgi_request._messages)
+        self.assertIn("Only staff", str(messages[0]))
+
+    def test_an_anonymous_user_is_redirected_to_login(self):
+        response = self.client.post(self.url)
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/login", response["Location"])
+        self.assertEqual(analyze_jobs(self.scan), [])
+
+    def test_a_get_is_rejected(self):
+        self.client.force_login(self.staff)
+        self.assertEqual(self.client.get(self.url).status_code, 405)
+
+    def test_a_disabled_stage_is_refused(self):
+        with override_settings(DOTS_MOCR_ENABLED=False), self._committed():
+            self._press()
+        self.assertEqual(analyze_jobs(self.scan), [])
+
+    def test_no_committed_shard_set_is_refused(self):
+        # Re-cutting is the pipeline's job, not a request's.
+        with self._committed(manifest=None, reason="no shard set"):
+            response = self._press()
+        self.assertEqual(analyze_jobs(self.scan), [])
+        messages = list(response.wsgi_request._messages)
+        self.assertIn("no shard set", str(messages[0]))
+
+    def test_a_second_press_while_a_run_is_open_is_refused(self):
+        with self._committed():
+            self._press()
+            first = [row.pk for row in analyze_jobs(self.scan)]
+            response = self._press()
+
+        self.assertEqual([row.pk for row in analyze_jobs(self.scan)], first)
+        messages = list(response.wsgi_request._messages)
+        self.assertIn("already going", str(messages[-1]))
+
+    def test_a_press_after_a_finished_run_reuses_it(self):
+        # Idempotent rather than refused: it must not pay twice for
+        # shards already read.
+        with self._committed():
+            self._press()
+            rows = analyze_jobs(self.scan)
+            ExternalJob.objects.filter(pk__in=[row.pk for row in rows]).update(
+                status=JobStatus.COMPLETED
+            )
+            self._press()
+
+        self.assertEqual(len(analyze_jobs(self.scan)), 3)
+        self.assertEqual(
+            {row.status for row in analyze_jobs(self.scan)},
+            {JobStatus.COMPLETED},
+        )
+
+    def test_a_press_after_a_dead_run_starts_a_new_one(self):
+        # One failed shard beside two finished ones: the run can never
+        # complete, and a re-run is exactly what it needs.
+        with self._committed():
+            self._press()
+            rows = analyze_jobs(self.scan)
+            ExternalJob.objects.filter(pk=rows[0].pk).update(
+                status=JobStatus.FAILED
+            )
+            ExternalJob.objects.filter(
+                pk__in=[row.pk for row in rows[1:]]
+            ).update(status=JobStatus.COMPLETED)
+            self._press()
+
+        self.assertEqual(len(analyze_jobs(self.scan)), 6)
+        self.assertEqual(dots_mocr.run_summary(self.scan)["run"], 2)
+
+    def test_a_dead_shard_does_not_restart_while_siblings_run(self):
+        # The daemon may still be working on them, and a second run
+        # would read the same shards twice.
+        with self._committed():
+            self._press()
+            rows = analyze_jobs(self.scan)
+            ExternalJob.objects.filter(pk=rows[0].pk).update(
+                status=JobStatus.FAILED
+            )
+            self._press()
+
+        self.assertEqual(len(analyze_jobs(self.scan)), 3)
+
+    def test_the_scan_status_is_untouched(self):
+        # The stage is tracked on rows alone (#190), so a volume stays
+        # browsable and reviewable while it reads.
+        before = self.scan.status
+        with self._committed():
+            self._press()
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, before)
+
+
+class TestCommittedManifest(ScanningTestCase):
+    """The fingerprint check a request thread can afford."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = ScanFactory(page_count=30)
+        self.manifest = make_manifest(shard_count=3, pages_per_shard=10)
+
+    _UNSET = object()
+
+    def _check(self, manifest=_UNSET, size=3072, **kwargs):
+        defaults = {
+            "s3_active": lambda: True,
+            "fetch_shard_manifest": lambda scan: (
+                self.manifest if manifest is self._UNSET else manifest
+            ),
+            "object_size": lambda key: size,
+            "s3_original_key": lambda scan: "processing/1/vol.original.pdf",
+        }
+        with patch.multiple("scanning.s3_sync", **{**defaults, **kwargs}):
+            return sharding.committed_manifest(self.scan)
+
+    def test_a_current_set_is_accepted(self):
+        found, reason = self._check()
+        self.assertEqual(found, self.manifest)
+        self.assertEqual(reason, "")
+
+    def test_it_reads_no_shard_object(self):
+        # One head_object on the original, and nothing else. A web pod
+        # must not download a multi-gigabyte PDF to answer a button.
+        calls = []
+
+        def size(key):
+            calls.append(key)
+            return 3072
+
+        found, _ = self._check(object_size=size)
+        self.assertIsNotNone(found)
+        self.assertEqual(calls, ["processing/1/vol.original.pdf"])
+
+    def test_a_resized_original_is_refused(self):
+        found, reason = self._check(size=9999)
+        self.assertIsNone(found)
+        self.assertIn("has changed", reason)
+
+    def test_a_page_count_disagreement_is_refused(self):
+        self.scan.page_count = 44
+        found, reason = self._check()
+        self.assertIsNone(found)
+        self.assertIn("44", reason)
+
+    def test_a_missing_manifest_is_refused(self):
+        found, reason = self._check(
+            manifest=None, fetch_shard_manifest=lambda scan: None
+        )
+        self.assertIsNone(found)
+        self.assertIn("no committed shard set", reason)
+
+    def test_a_wrong_version_is_refused(self):
+        found, reason = self._check(manifest={**self.manifest, "version": 99})
+        self.assertIsNone(found)
+        self.assertIn("version", reason)
+
+    def test_a_malformed_manifest_is_refused(self):
+        found, reason = self._check(
+            manifest={"version": 1, "source": "nope", "shards": []}
+        )
+        self.assertIsNone(found)
+        self.assertIn("malformed", reason)
+
+    def test_an_empty_shard_list_is_refused(self):
+        found, reason = self._check(manifest={**self.manifest, "shards": []})
+        self.assertIsNone(found)
+        self.assertIn("no shards", reason)
+
+    def test_a_missing_original_is_refused(self):
+        found, reason = self._check(object_size=lambda key: None)
+        self.assertIsNone(found)
+        self.assertIn("not in the bucket", reason)
+
+    def test_an_s3_error_is_reported_not_raised(self):
+        # fetch_shard_manifest re-raises anything that is not a missing
+        # object on purpose. A throttle must not reach the user as a 500.
+        def boom(scan):
+            raise RuntimeError("throttled")
+
+        with self.assertLogs("scanning.sharding", level="WARNING"):
+            found, reason = self._check(fetch_shard_manifest=boom)
+        self.assertIsNone(found)
+        self.assertIn("throttled", reason)
+
+    def test_inactive_s3_is_refused(self):
+        found, reason = self._check(s3_active=lambda: False)
+        self.assertIsNone(found)
+        self.assertIn("S3 is not active", reason)

@@ -37,11 +37,12 @@ from django.conf import settings
 
 from scanning import jobs, runpod_client
 from scanning.models import (
-    OPEN_JOB_STATUSES,
+    IN_FLIGHT_JOB_STATUSES,
     ExternalJob,
     JobEngine,
     JobProvider,
     JobStage,
+    JobStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -164,6 +165,15 @@ def run_summary(scan) -> dict | None:
     it. ``open`` is what the start button refuses a second press on.
 
     :param scan: The scan (or its pk) to describe.
+    ``open`` counts what the daemon still has to do -- rows waiting to
+    be submitted or in flight. Deliberately **not**
+    ``OPEN_JOB_STATUSES``, which includes ``COMPLETED`` because the
+    provider finishing is not us having applied the result. On that
+    definition a run holding one failed shard beside two finished ones
+    would read as open forever, and the button would refuse the re-run
+    that is exactly what such a run needs.
+
+    :param scan: The scan (or its pk) to describe.
     :returns: ``{"run", "total", "done", "open", "failed", "statuses",
         "error_code", "error_message"}``, or ``None`` when the stage has
         never run for this scan.
@@ -177,18 +187,23 @@ def run_summary(scan) -> dict | None:
     for row in rows:
         statuses[row.status] = statuses.get(row.status, 0) + 1
 
-    failed = [row for row in rows if row.status in ("failed", "expired")]
+    failed = [
+        row
+        for row in rows
+        if row.status in (JobStatus.FAILED, JobStatus.EXPIRED)
+    ]
     done = sum(
         count
         for status, count in statuses.items()
-        if status in ("completed", "consumed")
+        if status in (JobStatus.COMPLETED, JobStatus.CONSUMED)
     )
+    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     first_failure = failed[0] if failed else None
     return {
         "run": rows[0].run,
         "total": len(rows),
         "done": done,
-        "open": sum(1 for row in rows if row.status in OPEN_JOB_STATUSES),
+        "open": sum(1 for row in rows if row.status in unfinished),
         "failed": len(failed),
         "statuses": statuses,
         "error_code": first_failure.error_code if first_failure else "",

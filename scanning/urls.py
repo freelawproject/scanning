@@ -65,6 +65,7 @@ from scanning.views_process import (
     serve_scan_original,
     serve_scan_pdf,
     start_detect,
+    start_dots_mocr,
     start_validate,
     undo_delete_page,
 )
@@ -137,6 +138,11 @@ urlpatterns = [
         "scans/<int:pk>/start-validate/", start_validate, name="start_validate"
     ),
     path("scans/<int:pk>/start-detect/", start_detect, name="start_detect"),
+    path(
+        "scans/<int:pk>/start-ocr/",
+        start_dots_mocr,
+        name="start_dots_mocr",
+    ),
     path(
         "scans/<int:pk>/cancel/", cancel_processing, name="cancel_processing"
     ),

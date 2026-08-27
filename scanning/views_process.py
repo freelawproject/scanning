@@ -151,6 +151,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     issues = list(scan.issues.all())
     inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
 
+    # The dots.mocr stage writes no scan status by design (#190), so its
+    # rows are the only place its progress lives.
+    from scanning import dots_mocr
+
+    dots_run = dots_mocr.run_summary(scan)
+
     page_map = scan.page_map
     missing_pages = scan.missing_pages
 
@@ -419,6 +425,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "has_pending_inserts": has_pending_inserts,
             "has_detections": has_detections,
             "is_processing": is_processing,
+            "dots_run": dots_run,
             "opinions": opinions,
             "opinions_json": json.dumps(opinions),
             "has_redaction_rects": has_redaction_rects,
@@ -453,6 +460,13 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     # the pages sidebar live without a full page reload.
     if scan.ocr_results:
         data["ocr_results"] = scan.ocr_results
+    # The dots.mocr stage moves no scan status, so a viewer polling this
+    # would otherwise see nothing happen for the whole run (#190).
+    from scanning import dots_mocr
+
+    dots_run = dots_mocr.run_summary(scan)
+    if dots_run:
+        data["dots_run"] = dots_run
     return JsonResponse(data)
 
 
@@ -787,6 +801,8 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
     if step < 1 or step > 3:
         step = 1
 
+    from scanning import dots_mocr
+
     has_pending_inserts = scan.inserts.exists()
     has_pending_changes = scan.deletions.exists() or has_pending_inserts
     context = {
@@ -799,6 +815,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "missing_pages": scan.missing_pages,
         "has_detections": Detection.objects.filter(scan=scan).exists(),
         "opinions": scan.opinions_json,
+        "dots_run": dots_mocr.run_summary(scan),
     }
     html = render_to_string(
         "scanning/_process_actions.html", context, request=request
@@ -855,6 +872,84 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
 
     messages.warning(request, PIPELINE_PAUSED_MESSAGE)
     return redirect("scan_process", pk=scan.pk)
+
+
+@login_required
+@require_POST
+def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
+    """Start the dots.mocr stage over a scan's original shards (#190).
+
+    Staff only, and deliberately manual. Every press starts real
+    graphics processing unit (GPU) work on RunPod that costs money, so
+    while the stage is being debugged a person decides, not the daemon.
+
+    **This request makes no call to RunPod.** It writes one
+    ``ExternalJob`` row per shard and returns; the daemon's next
+    ``submit_external_jobs`` tick sends them, and ``collect_external_jobs``
+    polls and retries them. That keeps a request thread off a slow HTTP
+    call, and it is what makes the run survive a redeployed web pod.
+
+    It also never cuts shards. ``sharding.committed_manifest`` verifies
+    the stored set against the original with one ``head_object``, so this
+    view neither downloads a multi-gigabyte PDF nor reads ``shards/``
+    directly. A stale or missing set is refused, because re-cutting is
+    the pipeline's job.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page.
+    """
+    from scanning import dots_mocr, sharding
+
+    scan = get_object_or_404(Scan, pk=pk)
+    back = redirect("scan_process", pk=scan.pk)
+
+    if not request.user.is_staff:
+        messages.error(
+            request,
+            "Only staff can start OCR: each run costs GPU time.",
+        )
+        return back
+
+    if not dots_mocr.enabled():
+        messages.warning(
+            request,
+            "dots.mocr is not switched on in this environment. Set "
+            "DOTS_MOCR_ENABLED and RUNPOD_DOTSMOCR_ENDPOINT_ID first.",
+        )
+        return back
+
+    # An open run means the daemon is still working on the last press.
+    # A finished run is reused rather than refused, which is what keeps
+    # ``ensure_analyze_jobs`` from paying twice for shards already read.
+    summary = dots_mocr.run_summary(scan)
+    if summary and summary["open"]:
+        messages.info(
+            request,
+            f"OCR run {summary['run']} is already going: "
+            f"{summary['done']} of {summary['total']} part(s) done.",
+        )
+        return back
+
+    manifest, reason = sharding.committed_manifest(scan)
+    if manifest is None:
+        messages.warning(request, reason)
+        return back
+
+    created = dots_mocr.ensure_analyze_jobs(scan, manifest)
+    logger.info(
+        "start_dots_mocr: scan=%s user=%s run=%s shards=%d",
+        scan.pk,
+        request.user.pk,
+        created[0].run if created else "?",
+        len(created),
+    )
+    messages.success(
+        request,
+        f"Queued OCR for {len(created)} part(s) of this volume. The "
+        "daemon sends them to RunPod within a few seconds.",
+    )
+    return back
 
 
 @login_required

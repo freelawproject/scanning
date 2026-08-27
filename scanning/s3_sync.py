@@ -378,6 +378,31 @@ def object_exists(key: str) -> bool:
     return True
 
 
+def object_size(key: str) -> int | None:
+    """Return the size of the object at ``key``, or None if absent.
+
+    One ``head_object`` and no download, which is what lets a request
+    thread check a multi-gigabyte original against a stored fingerprint
+    (``sharding.committed_manifest``).
+
+    :param key: Object key inside the private bucket.
+    :returns: ``ContentLength`` in bytes, or None when nothing is there.
+    :rtype: int | None
+    :raises ClientError: On any S3 error other than a missing object: a
+        throttle or IAM failure must not read as "the file is gone".
+    """
+    try:
+        head = _s3_client().head_object(
+            Bucket=settings.AWS_PRIVATE_STORAGE_BUCKET_NAME, Key=key
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code in _MISSING_OBJECT_CODES:
+            return None
+        raise
+    return head.get("ContentLength")
+
+
 def delete_objects(keys: list[str]) -> int:
     """Delete specific objects by key, best effort.
 

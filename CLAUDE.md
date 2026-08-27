@@ -52,8 +52,8 @@ The legacy processing stages — in-process bitonal conversion, the YOLO
 `detect` and PaddleOCR `analyze` RunPod actions (and the whole
 blackletter-gpu-worker under `scanning/runpod/`), and their
 `RUNPOD_ENABLED=False` in-process fallbacks — are deleted. Bitonal came
-back as an external job (see below); still missing are #147 (dots.mocr
-dispatch) and #149 (page numbers), so:
+back as an external job, and dots.mocr as a staff-started one (both
+below); still missing is #149 (page numbers from the dots output), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
   then either starts the bitonal conversion (`Status.AWAITING`) or
@@ -185,6 +185,99 @@ must not be broken:
   could not be submitted — those environments park unconverted, as every
   post-#173 upload already did. Dev *with* credentials dispatches for
   real.
+
+## dots.mocr via RunPod (issue #190)
+
+OCR runs on RunPod Serverless, one job per **original** shard (not the
+bitonal ones — dots wants the greyscale scan its layout model was
+trained on), tracked on `ExternalJob` rows at
+`ANALYZE`/`DOTS_MOCR`/`RUNPOD`. The pieces: `runpod_client.py`
+(transport), `dots_mocr.py` (the stage), `jobs.py` (row lifecycle), the
+`submit_external_jobs` / `collect_external_jobs` daemon commands, and
+`views_process.start_dots_mocr` (the button). What must not be broken:
+
+- **A person starts it, the daemon runs it.** There is no automatic
+  dispatch: a staff-only button on `/scan/process/` writes the rows and
+  returns, and the daemon submits, polls and retries them. That is
+  deliberate while the stage is debugged — every press costs GPU money.
+  The request makes **no** call to RunPod, and it never cuts shards:
+  `sharding.committed_manifest` verifies the stored set with one
+  `head_object` on the original (size plus `Scan.page_count` *is* the
+  whole fingerprint), so a web pod never pulls a multi-GB PDF and never
+  reads `shards/` directly. A stale set is refused, not re-cut.
+- **The stage writes no scan status.** Progress lives only on the rows,
+  read through `dots_mocr.run_summary` into the page context and
+  `progress_api`. So a volume stays browsable and reviewable while it
+  reads, and the bitonal stage keeps sole ownership of `AWAITING`.
+- **Queue time is not run time.** A row keeps
+  `DAEMON_JOB_MAX_QUEUE_SECONDS` (6h) until `/status` first reports
+  `IN_PROGRESS`; only that *crossing* stamps
+  `jobs.runpod_execution_deadline` (`RUNPOD_REQUEST_TIMEOUT` plus
+  `DOTS_MOCR_SECONDS_PER_PAGE` × the row's own `page_count`). An
+  endpoint with a narrow worker pool queues the excess by design, so a
+  run-sized timeout from submission would cancel the tail of every
+  fan-out, resubmit it to the back of the same queue, and eventually
+  fail a volume for being popular. Re-stamping on every tick would push
+  the deadline out forever, so only the transition writes it.
+- **A job nothing will read must be cancelled.** `_cancel_provider_job`
+  runs from `_fail`, `_retry_or_fail` and `abandon_open`. Doctor's
+  branch is a no-op; a RunPod job left running bills for nothing, and a
+  deadline write-off is exactly when the old attempt is still alive.
+- **`abandon_open` is scoped by stage**, and every caller passes
+  `JobStage.CONVERT`. `COMPLETED` is in `OPEN_JOB_STATUSES` on purpose,
+  so an unscoped re-queue would cancel a finished dots.mocr run and make
+  the next press pay RunPod for output already in S3. Stage is the right
+  grain: a re-queue re-runs `run_full_pipeline`, which owns `CONVERT`
+  whichever engine serves it and owns no part of `ANALYZE`.
+- **The result goes to S3, not inline.** The worker PUTs an envelope
+  (`schema_version`, `action`, `scan_pk`, `result_key`, `payload`) to a
+  presigned PUT signed `application/json`, and answers with a summary
+  only. RunPod caps a response at ~20 MB and discards it ~30 min after
+  the job finishes, so inline delivery would lose a paid parse to a
+  daemon that was down for an hour. Dropping `pages` from the summary is
+  load-bearing — echoing it back reintroduces the cap. Without
+  `result_url` the worker still answers inline (dev, CI, an older
+  image), so a rollback needs no daemon change.
+- **A 404 from `/status` asks S3 before writing the job off.** The key
+  is attempt-scoped, so presence needs no freshness window. Absent, the
+  row is `EXPIRED` *and* retriable: the inputs are still there and only
+  the job record is gone.
+- **`poll_once` never raises and never sleeps.** `status=None` means "we
+  learned nothing" — a 5xx or a blip leaves the row untouched, which is
+  not the same as learning it failed. An unrecognised provider status
+  reads as "still at work", so RunPod adding a state cannot fail jobs.
+  Pacing is the daemon's tick: the scheduler is serial (#156), so a
+  client that slept would stall every other task.
+- **A shard that lost some pages still completes.** `failed_pages` is
+  logged as a WARNING naming *volume* pages (the worker counts from zero
+  inside its shard) and kept in `provider_meta`. #149 reads a missing
+  page as `detected=None` and interpolates, so re-running 99 good pages
+  to recover one is poor value.
+- **`DPI = 200` and `PROMPT_MODE = "prompt_layout_all_en"` are module
+  constants, not settings.** The dpi matches `DOCTOR_BITONAL_DPI` so a
+  cell's bbox describes the same pixel space as the rest of the corpus,
+  and the prompt mode is what #149 needs (cells *and* text). A one-off
+  experiment overrides them per row through `input_manifest`.
+- **The concurrency cap is per engine**, because each RunPod endpoint is
+  its own scaling unit with its own `max_workers`. It is a debug guard
+  on blast radius, **not** a cost control: RunPod bills each worker's
+  cold start, so parallel shards on cold workers pay boot several times
+  and three in series on one warm worker may cost less.
+- **The stage stops at `COMPLETED`.** Nothing applies a result yet. The
+  merge is #149: read each row's `input_manifest`, offset each
+  `page_no` by its shard's `from_page` (`volume_index = from_page +
+  page_no`, and `pdf_page` is that plus one), write one volume JSON, and
+  flip the rows to `CONSUMED`. Nothing is at risk meanwhile — each
+  object sits at an attempt-scoped key and each row keeps its range.
+- **No provider abstraction, deliberately.** `jobs.py` branches on
+  `job.provider`; ~600 of its lines are provider-agnostic and stay
+  shared, and only the submit call and the in-flight check fork. Do not
+  answer a third provider by copying a wave or a sweep. **Mistral is the
+  point to promote the branches**, because it changes the shape again:
+  opinion-level `EXTRACT`, no shard fan-out, rate limits rather than a
+  worker pool, and no presigned PUT at all. YOLO on RunPod is a payload
+  builder, an endpoint id and a cap — it shares `submit_job` and
+  `poll_once` unchanged.
 
 ## Detection Workflow
 
