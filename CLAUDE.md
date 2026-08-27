@@ -323,6 +323,69 @@ trained on), tracked on `ExternalJob` rows at
   builder, an endpoint id and a cap — it shares `submit_job` and
   `poll_once` unchanged.
 
+## Generalized YOLO worker image (issue #194)
+
+`scanning/runpod/` is the RunPod Serverless image that runs detection
+with `bl_warm`, one 18-class checkpoint that replaced the
+small/medium/large trio (blackletter #73). It is the image only: the job
+rows and the daemon path are #195, and the redaction work that reads its
+output is #196, so a fresh deploy has no automatic caller. What must not
+be broken:
+
+- **Only `bl_warm.pt` is baked.** `api.detect` calls `ensure_weights`
+  itself, so an unbaked name would reach Hugging Face from inside a paid
+  job; `handler._missing_weights` refuses it up front and names what the
+  image does carry. Running the legacy trio again is a rebuild, not a
+  changed input. PR #167 kept the trio for exactly that rollback and it
+  is deliberately gone.
+- **The handler passes no `imgsz`, and that is the whole point.**
+  Ultralytics keeps the training resolution off the checkpoint
+  (`Model._reset_ckpt_args`) and `predict` merges those overrides ahead
+  of its own defaults, which name none. `bl_warm.pt` carries 1024, so it
+  predicts at 1024; passing the library default of 640 would quietly
+  cost the small classes (key icon, page number, state abbreviation).
+  The build prints the value and `_preload` logs it, because a
+  checkpoint that lost its training arguments falls back to 640 with no
+  error and a lower score.
+- **`found_by` survives into the payload.** blackletter's merge writes
+  that provenance in place of the per-model `model` key, and
+  `bl_warm.rows_are_bl_warm` reads it to pick the bl-warm confidence
+  gates. #196 needs it; stripping it silently changes every rect.
+- **Detection reads the original shard, never the bitonal copy.**
+  bl-warm was trained on greyscale renders and its large region classes
+  collapse on 1-bit pages (caption F1 0.99 -> 0.25, measured in #167).
+  This matches dots.mocr, so both stages fan out over the one shard set
+  of #164.
+- **`page_index` counts from zero inside the shard.** The caller offsets
+  it by the shard's own `from_page`, as #149 does for dots.mocr.
+- **The payload goes to S3, not inline.** The envelope
+  (`schema_version`, `action`, `scan_pk`, `result_key`, `payload`) is
+  PUT to a presigned URL signed `application/json`, and the response
+  carries a summary plus `detection_count`. Thousands of rows would
+  approach RunPod's ~20 MB response cap, which it discards ~30 min after
+  the job ends. Without `result_url` the worker answers inline, so a
+  rollback needs no daemon change.
+- **The base image carries no CUDA layer.** The torch `cu126` wheels
+  declare the CUDA runtime themselves, cuDNN included, so
+  `python:3.12-slim-bookworm` is enough. The `nvidia/cuda` base and the
+  build-time `libcuda.so.1` stub existed for PaddlePaddle alone and went
+  with the `analyze` step (#173), along with tesseract and Ghostscript.
+  About 4.2 GB to pull and 8 GB unpacked, against the ~22 GB the old
+  image extracted to. `mkdir -p $YOLO_CONFIG_DIR` is
+  load-bearing: ultralytics tests the parent for writability and would
+  otherwise write its settings to /tmp on every boot.
+- **The endpoint is reused, not replaced.** The restored
+  `build-runpod-worker.yml` pushes
+  `freelawproject/blackletter-gpu-worker:<sha>` and PATCHes the same
+  `RUNPOD_TEMPLATE_ID`, so no new endpoint, no new secret and no
+  settings change. `blackletter-dependency-pr.yml` bumps blackletter
+  here and in the repository root together, which is what keeps the
+  image and the application on one version.
+- The handler is tested without the worker stack
+  (`scanning/tests/test_runpod_yolo_handler.py`): the loader stubs
+  `runpod`, `torch` and `blackletter.api`, and a CUDA-less `torch` makes
+  the module-level `_preload` open no weight file.
+
 ## Detection Workflow
 
 YOLO models detect elements on each page (captions, key icons, headnotes, etc.) and store them as `Detection` records with a confidence score. Users review detections in the process viewer (step 2) and can:
