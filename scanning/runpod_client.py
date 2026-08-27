@@ -78,12 +78,19 @@ _HTTP_TIMEOUT = 30
 #: a misconfiguration (wrong signing region, a bucket policy demanding
 #: headers we do not send). Every retry re-runs the GPU work, pays for
 #: it, and fails identically, so that one stays terminal.
+#: ``INPUT_DOWNLOAD_CORRUPT``: the worker's copy of the shard would not
+#: open, or was truncated. We cut that shard ourselves and verified it
+#: against the original (issue #164), so the bytes in the bucket are
+#: sound and the fault is in the transfer -- which the next attempt is
+#: quite likely to get right. Terminal here would write a volume off for
+#: a dropped connection.
 TRANSIENT_ERROR_CODES = frozenset(
     {
         "NO_GPU",
         "VLLM_UNHEALTHY",
         "RESULT_UPLOAD_FAILED",
         "RESULT_URL_EXPIRED",
+        "INPUT_DOWNLOAD_CORRUPT",
     }
 )
 
@@ -91,7 +98,8 @@ TRANSIENT_ERROR_CODES = frozenset(
 #: rather than "this job is bad" -- an endpoint scaled to zero
 #: (``max_workers=0``) reports HTTP 409 ``ENDPOINT_PAUSED``. These raise
 #: :class:`RunpodEndpointBusy`, which costs the row no attempt: the job
-#: is fine and the endpoint will come back.
+#: is fine and the endpoint will come back. HTTP 429 (rate limited) is
+#: classified the same way by status alone, since it carries no code.
 TRANSIENT_SUBMIT_CODES = frozenset({"ENDPOINT_PAUSED"})
 
 #: "We never got an answer, so the job may exist and may still run."
@@ -159,6 +167,13 @@ class PollOutcome:
         Orthogonal to whether ``status`` is terminal: ``EXPIRED`` is
         both terminal and worth another submit, since the inputs are
         still on S3 and only the job record is gone.
+    :ivar confirmed_by: How a ``COMPLETED`` was learned --
+        ``"response"`` when RunPod said so, ``"s3_head"`` when its job
+        record was already gone and the output was found at the result
+        key instead. Carried rather than inferred from ``output``,
+        because the recovery path synthesises a truthy ``output`` and
+        would otherwise be recorded as a normal provider answer, hiding
+        from anyone triaging the run that the job record had expired.
     """
 
     status: str | None
@@ -167,6 +182,7 @@ class PollOutcome:
     error_code: str = ""
     error_message: str = ""
     retriable: bool = False
+    confirmed_by: str = "response"
 
 
 def enabled(endpoint_id: str) -> bool:
@@ -313,7 +329,11 @@ def submit_job(
                 error_code=UNANSWERED_ERROR_CODE,
             ) from exc
 
-        if status_code == 409 or error_code in TRANSIENT_SUBMIT_CODES:
+        # 429 belongs with 409, not with the other 4xx: both are the
+        # endpoint declining work for a reason that has nothing to do
+        # with this job, and both clear on their own. Failing a shard
+        # for good over one rate limit is wildly disproportionate.
+        if status_code in (409, 429) or error_code in TRANSIENT_SUBMIT_CODES:
             raise RunpodEndpointBusy(
                 f"runpod endpoint is not accepting work (HTTP "
                 f"{status_code} {error_code or '?'}): {exc}",
@@ -482,8 +502,9 @@ def _missing_job_outcome(job_id: str, result_key: str) -> PollOutcome:
         )
         return PollOutcome(
             status=JobStatus.COMPLETED,
-            provider_status="COMPLETED",
+            provider_status="NOT_FOUND",
             output={"result_key": result_key},
+            confirmed_by="s3_head",
         )
 
     return PollOutcome(

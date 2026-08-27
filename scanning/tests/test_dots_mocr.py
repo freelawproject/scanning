@@ -12,8 +12,10 @@ Under test is what separates an asynchronous provider from doctor:
 """
 
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import requests
+from django.db import IntegrityError
 from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -26,6 +28,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    Scan,
 )
 from scanning.tests.test_jobs import make_manifest
 from scanning.tests.test_views import ScanningTestCase
@@ -1039,3 +1042,453 @@ class TestCommittedManifest(ScanningTestCase):
         found, reason = self._check(s3_active=lambda: False)
         self.assertIsNone(found)
         self.assertIn("S3 is not active", reason)
+
+
+# ── review findings (PR #192) ───────────────────────────────────────
+@override_settings(**DOTS)
+class TestScanDeletionStopsBilling(ScanningTestCase):
+    """A deleted scan must not leave a GPU job running.
+
+    ``ExternalJob.scan`` is CASCADE, so the delete takes the row and
+    with it ``external_id`` -- the only handle on a running job. The
+    sweep iterates rows that still exist, so an orphan would bill to
+    completion with nothing left anywhere to cancel it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.scan = ScanFactory()
+        self.job = dots_mocr.ensure_analyze_jobs(
+            self.scan, make_manifest(shard_count=1)
+        )[0]
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            status=JobStatus.IN_PROGRESS, external_id="job-1"
+        )
+
+    def _delete(self, bulk=False):
+        from django.contrib import admin as django_admin
+
+        from scanning.admin import ScanAdmin
+
+        model_admin = ScanAdmin(Scan, django_admin.site)
+        with (
+            patch("scanning.runpod_client.cancel_job") as cancel,
+            patch("scanning.s3_sync.delete_shard_objects"),
+            patch("scanning.s3_sync.delete_job_objects"),
+        ):
+            if bulk:
+                model_admin.delete_queryset(
+                    None, Scan.objects.filter(pk=self.scan.pk)
+                )
+            else:
+                model_admin.delete_model(None, self.scan)
+        return cancel
+
+    def test_delete_model_cancels_the_running_job(self):
+        cancel = self._delete()
+        cancel.assert_called_once()
+        self.assertEqual(cancel.call_args[0][2], "job-1")
+        self.assertFalse(Scan.objects.filter(pk=self.scan.pk).exists())
+
+    def test_delete_queryset_cancels_the_running_job(self):
+        cancel = self._delete(bulk=True)
+        cancel.assert_called_once()
+
+    def test_the_cancel_runs_before_the_s3_sweep(self):
+        # A worker still running could PUT after the sweep and
+        # re-orphan an object we had just deleted.
+        order = []
+        from scanning.admin import _release_scan_external_work
+
+        with (
+            patch(
+                "scanning.jobs.abandon_open",
+                side_effect=lambda *a, **k: order.append("cancel"),
+            ),
+            patch(
+                "scanning.s3_sync.delete_shard_objects",
+                side_effect=lambda scan: order.append("shards"),
+            ),
+            patch(
+                "scanning.s3_sync.delete_job_objects",
+                side_effect=lambda scan: order.append("jobs"),
+            ),
+        ):
+            _release_scan_external_work(self.scan)
+        self.assertEqual(order, ["cancel", "shards", "jobs"])
+
+    def test_a_stuck_provider_does_not_block_the_delete(self):
+        from scanning.admin import _release_scan_external_work
+
+        with (
+            patch(
+                "scanning.jobs.abandon_open",
+                side_effect=RuntimeError("runpod down"),
+            ),
+            patch("scanning.s3_sync.delete_shard_objects") as shards,
+            patch("scanning.s3_sync.delete_job_objects"),
+            self.assertLogs("scanning.admin", level="WARNING"),
+        ):
+            _release_scan_external_work(self.scan)
+        # The sweep still ran, and nothing propagated.
+        shards.assert_called_once()
+
+
+@override_settings(**DOTS)
+class TestConfirmedByRecordsHowWeLearned(ScanningTestCase):
+    """A job recovered by probing S3 must not read as a normal answer."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = ScanFactory()
+        self.job = dots_mocr.ensure_analyze_jobs(
+            self.scan, make_manifest(shard_count=1)
+        )[0]
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            status=JobStatus.SUBMITTED,
+            external_id="job-1",
+            result_key="jobs/analyze/dots_mocr/r1-s0-a1.json",
+            submitted_at=timezone.now(),
+            deadline=jobs.queue_deadline(timezone.now()),
+        )
+        self.job.refresh_from_db()
+
+    def _sweep(self, poll_outcome):
+        with patch(
+            "scanning.runpod_client.poll_once", return_value=poll_outcome
+        ):
+            jobs.sweep_jobs()
+        self.job.refresh_from_db()
+
+    def test_a_provider_answer_reads_as_a_response(self):
+        self._sweep(outcome(JobStatus.COMPLETED, output={"page_count": 10}))
+        self.assertEqual(self.job.provider_meta["confirmed_by"], "response")
+
+    def test_a_404_recovered_job_reads_as_an_s3_head(self):
+        # The poll synthesises a truthy ``output`` for this path, so
+        # inferring the label would hide that the job record was gone.
+        recovered = runpod_client.PollOutcome(
+            status=JobStatus.COMPLETED,
+            provider_status="NOT_FOUND",
+            output={"result_key": self.job.result_key},
+            confirmed_by="s3_head",
+        )
+        self._sweep(recovered)
+        self.assertEqual(self.job.status, JobStatus.COMPLETED)
+        self.assertEqual(self.job.provider_meta["confirmed_by"], "s3_head")
+
+    def test_poll_once_labels_the_recovery_itself(self):
+        with (
+            patch("scanning.runpod_client.requests.get") as get,
+            patch("scanning.s3_sync.object_exists", return_value=True),
+        ):
+            get.return_value = MagicMock(status_code=404, text="gone")
+            found = runpod_client.poll_once(
+                "https://api.runpod.ai/v2/ep-dots",
+                {},
+                "job-1",
+                result_key="k",
+            )
+        self.assertEqual(found.status, JobStatus.COMPLETED)
+        self.assertEqual(found.confirmed_by, "s3_head")
+        self.assertEqual(found.provider_status, "NOT_FOUND")
+
+
+class TestConcurrentPressesDoNotCrash(ScanningTestCase):
+    """Two staff presses at once must reuse, not raise.
+
+    Until the button landed, the only caller of ``ensure_shard_jobs``
+    was the single-threaded daemon. Now two requests can read no rows,
+    compute the same run, and both insert -- and the unique constraint
+    is what serializes them.
+    """
+
+    def test_the_loser_reuses_the_winner_s_rows(self):
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=2)
+        winner = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        # Stand in for the race: this call decides it needs a new run
+        # (the shard set moved), and its insert collides with the run
+        # another writer committed in between.
+        with (
+            patch(
+                "scanning.jobs.ExternalJob.objects.bulk_create",
+                side_effect=IntegrityError("duplicate key"),
+            ),
+            self.assertLogs("scanning.jobs", level="INFO") as logs,
+        ):
+            loser = jobs.ensure_shard_jobs(
+                scan,
+                make_manifest(shard_count=2, pages_per_shard=25),
+                stage=JobStage.ANALYZE,
+                engine=JobEngine.DOTS_MOCR,
+                provider=JobProvider.RUNPOD,
+            )
+
+        self.assertEqual([row.pk for row in loser], [row.pk for row in winner])
+        self.assertIn("created by another writer", "\n".join(logs.output))
+
+    def test_no_duplicate_rows_survive(self):
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=2)
+        dots_mocr.ensure_analyze_jobs(scan, manifest)
+        dots_mocr.ensure_analyze_jobs(scan, manifest)
+        self.assertEqual(len(analyze_jobs(scan)), 2)
+
+
+@override_settings(**DOTS)
+class TestMessageMatchesWhatHappened(ScanningTestCase):
+    """The flash must not promise a dispatch that is not coming."""
+
+    def setUp(self):
+        super().setUp()
+        self.staff = self.make_staff_user()
+        self.scan = ScanFactory(page_count=30)
+        self.url = reverse("start_dots_mocr", kwargs={"pk": self.scan.pk})
+        self.manifest = make_manifest(shard_count=3, pages_per_shard=10)
+        self.client.force_login(self.staff)
+
+    def _press(self):
+        with patch(
+            "scanning.sharding.committed_manifest",
+            return_value=(self.manifest, ""),
+        ):
+            return self.client.post(self.url)
+
+    def test_a_first_press_says_it_queued_the_work(self):
+        response = self._press()
+        text = str(list(response.wsgi_request._messages)[0])
+        self.assertIn("Queued OCR for 3 part(s)", text)
+
+    def test_a_press_on_a_finished_run_says_nothing_was_queued(self):
+        self._press()
+        ExternalJob.objects.filter(scan=self.scan).update(
+            status=JobStatus.COMPLETED
+        )
+        response = self._press()
+
+        text = str(list(response.wsgi_request._messages)[-1])
+        self.assertIn("already read", text)
+        self.assertNotIn("Queued OCR", text)
+
+
+# ── review findings (second pass) ───────────────────────────────────
+@override_settings(**DOTS)
+class TestQueueCeilingCannotBeReset(ScanningTestCase):
+    """A paused endpoint must not hold a scan forever.
+
+    The ceiling is stamped once per attempt, when the row enters the
+    queue. A claim does not move it (being accepted is not being
+    started) and a defer does not (the row never left our queue), or a
+    row would have its wait forgiven on every tick.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.scan = ScanFactory()
+        self.jobs = dots_mocr.ensure_analyze_jobs(
+            self.scan, make_manifest(shard_count=1)
+        )
+        self.presign = patch.multiple(
+            "scanning.s3_sync",
+            s3_active=lambda: True,
+            presign_get=lambda key, ttl: "https://s3/in?get",
+            presign_put=lambda key, ct, ttl: "https://s3/out?put",
+        )
+        self.presign.start()
+        self.addCleanup(self.presign.stop)
+
+    def _row(self):
+        return analyze_jobs(self.scan)[0]
+
+    def _tick(self, side_effect=None):
+        with patch(
+            "scanning.runpod_client.submit_job",
+            side_effect=side_effect,
+            return_value="job-1",
+        ):
+            jobs.submit_pending()
+
+    def test_a_claim_keeps_the_queue_ceiling(self):
+        before = self._row().deadline
+        self._tick()
+        self.assertEqual(self._row().deadline, before)
+
+    def test_a_defer_keeps_the_queue_ceiling(self):
+        before = self._row().deadline
+        busy = runpod_client.RunpodEndpointBusy(
+            "paused", error_code="ENDPOINT_PAUSED"
+        )
+        for _ in range(3):
+            self._tick(side_effect=busy)
+        row = self._row()
+        self.assertEqual(row.status, JobStatus.PENDING)
+        self.assertEqual(row.deadline, before)
+
+    def test_a_permanently_paused_endpoint_eventually_times_out(self):
+        # The failure this whole ceiling exists to produce. Before the
+        # fix the deadline moved on every defer and this never fired.
+        busy = runpod_client.RunpodEndpointBusy(
+            "paused", error_code="ENDPOINT_PAUSED"
+        )
+        self._tick(side_effect=busy)
+        # Six hours later, still paused.
+        ExternalJob.objects.filter(pk=self.jobs[0].pk).update(
+            deadline=timezone.now() - timedelta(seconds=1)
+        )
+        self._tick(side_effect=busy)
+        summary = jobs.sweep_jobs()
+
+        row = self._row()
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(row.status, JobStatus.FAILED)
+        self.assertEqual(row.error_code, "QUEUE_TIMEOUT")
+
+    def test_a_retry_does_restart_the_wait(self):
+        # A new attempt is a new wait, so this one *must* move.
+        before = self._row().deadline
+        self._tick(
+            side_effect=runpod_client.RunpodTransientError(
+                "refused", error_code="BAD_GATEWAY"
+            )
+        )
+        row = self._row()
+        self.assertEqual(row.attempt, 2)
+        self.assertGreater(row.deadline, before)
+
+    def test_a_doctor_row_still_takes_its_flat_answer_budget(self):
+        convert = jobs.ensure_convert_jobs(
+            self.scan, make_manifest(shard_count=1)
+        )[0]
+        with (
+            override_settings(
+                DOCTOR_ENABLED=True,
+                DOCTOR_HOST="http://doctor:5050",
+                DOCTOR_JOB_DEADLINE_SECONDS=900,
+                DOTS_MOCR_ENABLED=False,
+            ),
+            patch(
+                "scanning.doctor_client.convert_bitonal",
+                side_effect=RuntimeError("stop after the claim"),
+            ),
+        ):
+            jobs.submit_pending()
+        convert.refresh_from_db()
+        # Its response *is* the completion, so its clock starts at the
+        # request rather than at the queue.
+        self.assertLess(
+            convert.deadline, timezone.now() + timedelta(seconds=1000)
+        )
+
+
+@override_settings(**DOTS)
+class TestSubmitCancelRace(ScanningTestCase):
+    """A job whose id has nowhere to live must still be cancelled."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = ScanFactory()
+        self.job = dots_mocr.ensure_analyze_jobs(
+            self.scan, make_manifest(shard_count=1)
+        )[0]
+        self.presign = patch.multiple(
+            "scanning.s3_sync",
+            s3_active=lambda: True,
+            presign_get=lambda key, ttl: "https://s3/in?get",
+            presign_put=lambda key, ct, ttl: "https://s3/out?put",
+        )
+        self.presign.start()
+        self.addCleanup(self.presign.stop)
+
+    def test_a_cancel_mid_submit_still_stops_the_billing(self):
+        # The sequence: the claim marks the row SUBMITTED, the user
+        # cancels (abandon_open's own cancel is a no-op, because
+        # external_id is still blank), then POST /run succeeds and the
+        # write of the id loses the compare-and-swap. Nothing else can
+        # ever find this job, so the submit path must cancel it here.
+        def submit_then_cancel(*args, **kwargs):
+            jobs.abandon_open(self.scan, "Cancelled by user")
+            return "job-1"
+
+        with (
+            patch(
+                "scanning.runpod_client.submit_job",
+                side_effect=submit_then_cancel,
+            ),
+            patch("scanning.runpod_client.cancel_job") as cancel,
+            self.assertLogs("scanning.jobs", level="WARNING") as logs,
+        ):
+            summary = jobs.submit_pending()
+
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, JobStatus.CANCELLED)
+        self.assertEqual(self.job.external_id, "")
+        self.assertEqual(summary.skipped, 1)
+        cancel.assert_called_once()
+        self.assertEqual(cancel.call_args[0][2], "job-1")
+        self.assertIn("cancelling it", "\n".join(logs.output))
+
+    def test_a_lost_write_with_no_job_id_cancels_nothing(self):
+        with patch("scanning.runpod_client.cancel_job") as cancel:
+            jobs._apply_runpod_outcome(self.job, None, None, timezone.now())
+        cancel.assert_not_called()
+
+
+class TestSubmitClassification(ScanningTestCase):
+    """The two status codes the first pass got wrong."""
+
+    def _submit(self, status_code, body):
+        response = MagicMock(status_code=status_code, text=str(body))
+        response.json.return_value = body
+        response.raise_for_status.side_effect = requests.HTTPError(
+            "err", response=response
+        )
+        with patch(
+            "scanning.runpod_client.requests.post", return_value=response
+        ):
+            try:
+                runpod_client.submit_job(
+                    "https://api.runpod.ai/v2/ep", {}, {"action": "parse"}
+                )
+            except runpod_client.RunpodError as exc:
+                return exc
+        return None
+
+    def test_a_rate_limit_is_the_endpoint_declining_work(self):
+        # Not a bad job. Failing a shard for good over one 429 is
+        # wildly disproportionate.
+        exc = self._submit(429, {"detail": "slow down"})
+        self.assertIsInstance(exc, runpod_client.RunpodEndpointBusy)
+
+    def test_a_paused_endpoint_is_still_busy(self):
+        exc = self._submit(409, {"code": "ENDPOINT_PAUSED"})
+        self.assertIsInstance(exc, runpod_client.RunpodEndpointBusy)
+
+    def test_another_4xx_stays_terminal(self):
+        exc = self._submit(401, {"detail": "bad key"})
+        self.assertNotIsInstance(exc, runpod_client.RunpodTransientError)
+
+    def test_a_corrupt_input_is_retriable(self):
+        # We cut the shard and verified it, so a copy that will not open
+        # is a transfer fault, not a bad volume.
+        self.assertIn(
+            "INPUT_DOWNLOAD_CORRUPT", runpod_client.TRANSIENT_ERROR_CODES
+        )
+
+
+class TestRunSummaryLabel(ScanningTestCase):
+    """The template must not print a Python dict."""
+
+    def test_the_label_is_readable_prose(self):
+        scan = ScanFactory()
+        rows = dots_mocr.ensure_analyze_jobs(scan, make_manifest(3))
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.COMPLETED
+        )
+
+        label = dots_mocr.run_summary(scan)["label"]
+        self.assertNotIn("{", label)
+        self.assertNotIn("'", label)
+        self.assertIn("1 completed", label)
+        self.assertIn("2 pending submit", label)

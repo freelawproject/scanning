@@ -37,6 +37,7 @@ from typing import Any
 import requests
 import runpod
 from runpod_common import (
+    CorruptDownloadError,
     ResultUploadError,
     download_pdf,
     upload_result,
@@ -1004,6 +1005,22 @@ def handler(job: dict) -> dict:
             sentry_sdk.capture_exception(exc)
         return _with_worker_meta(
             {"error": str(exc), "error_code": exc.error_code}
+        )
+    except CorruptDownloadError as exc:
+        # Our copy of the PDF would not open, or arrived truncated. The
+        # object in the bucket is sound -- the caller cut each shard and
+        # verified it against the original -- so this describes the
+        # transfer, not the input, and the next attempt may well get it
+        # right. Its own code, because BAD_INPUT is terminal and would
+        # write a volume off for a dropped connection.
+        logger.warning(
+            "corrupt download: action=%s scan_pk=%s: %s",
+            action,
+            scan_pk,
+            exc,
+        )
+        return _with_worker_meta(
+            {"error": str(exc), "error_code": "INPUT_DOWNLOAD_CORRUPT"}
         )
     except ValueError as exc:
         # Input validation (missing/invalid pdf_url, bad prompt_mode,

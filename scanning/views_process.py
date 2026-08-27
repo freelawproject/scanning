@@ -26,6 +26,7 @@ from scanning.models import (
     Detection,
     Issue,
     JobStage,
+    JobStatus,
     OpinionScan,
     PageDeletion,
     PageInsert,
@@ -937,18 +938,30 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
         return back
 
     created = dots_mocr.ensure_analyze_jobs(scan, manifest)
+    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
     logger.info(
-        "start_dots_mocr: scan=%s user=%s run=%s shards=%d",
+        "start_dots_mocr: scan=%s user=%s run=%s shards=%d queued=%d",
         scan.pk,
         request.user.pk,
         created[0].run if created else "?",
         len(created),
+        queued,
     )
-    messages.success(
-        request,
-        f"Queued OCR for {len(created)} part(s) of this volume. The "
-        "daemon sends them to RunPod within a few seconds.",
-    )
+    if queued:
+        messages.success(
+            request,
+            f"Queued OCR for {queued} part(s) of this volume. The "
+            "daemon sends them to RunPod within a few seconds.",
+        )
+    else:
+        # ``ensure_analyze_jobs`` reused a run that is already done, so
+        # nothing was queued and nothing will be sent. Saying otherwise
+        # would have staff waiting on a dispatch that is not coming.
+        messages.info(
+            request,
+            f"This volume was already read: run {created[0].run} covers "
+            f"all {len(created)} part(s). Nothing new was queued.",
+        )
     return back
 
 

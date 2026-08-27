@@ -290,17 +290,39 @@ class ValidatePdfTest(SimpleTestCase):
         # download that died mid-transfer.
         self.path.write_bytes(full[: len(full) // 2])
 
-        with self.assertRaisesRegex(ValueError, "truncated"):
+        with self.assertRaisesRegex(
+            runpod_common.CorruptDownloadError, "truncated"
+        ):
             runpod_common.validate_pdf(self.path)
 
     def test_empty_file(self):
         self.path.write_bytes(b"")
-        with self.assertRaisesRegex(ValueError, "empty"):
+        with self.assertRaisesRegex(
+            runpod_common.CorruptDownloadError, "empty"
+        ):
             runpod_common.validate_pdf(self.path)
 
     def test_not_a_pdf(self):
         self.path.write_bytes(b"<html>nope</html>\n%%EOF")
-        with self.assertRaisesRegex(ValueError, "not a PDF"):
+        with self.assertRaisesRegex(
+            runpod_common.CorruptDownloadError, "not a PDF"
+        ):
+            runpod_common.validate_pdf(self.path)
+
+    def test_it_is_not_a_value_error(self):
+        """The distinction the handler's error codes rest on.
+
+        A caller maps ``ValueError`` to a terminal BAD_INPUT, which is
+        right for a missing url or a bad option. But scanning cuts each
+        shard itself and verifies it against the original, so a copy
+        that will not open describes the *transfer*: terminal there
+        would write a volume off for a dropped connection.
+        """
+        self.path.write_bytes(b"")
+        self.assertFalse(
+            issubclass(runpod_common.CorruptDownloadError, ValueError)
+        )
+        with self.assertRaises(runpod_common.CorruptDownloadError):
             runpod_common.validate_pdf(self.path)
 
 

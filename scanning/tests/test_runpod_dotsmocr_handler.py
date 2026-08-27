@@ -534,3 +534,33 @@ class TestResultDelivery(SimpleTestCase):
                     )
                 self.assertEqual(out["error_code"], code)
                 self.assertIn("worker_boot_ms", out)
+
+
+class TestCorruptDownloadIsRetriable(SimpleTestCase):
+    """A copy that will not open is a transfer fault, not a bad input."""
+
+    def _handle(self, exc):
+        with (
+            mock.patch.dict(sys.modules, _renderer_stubs()),
+            mock.patch.object(handler, "_GPU_AVAILABLE", True),
+            mock.patch.object(handler, "_VLLM_READY", True),
+            mock.patch.object(handler, "_vllm_healthy", return_value=True),
+            mock.patch.object(handler, "download_pdf"),
+            mock.patch.object(handler, "validate_pdf", side_effect=exc),
+        ):
+            return handler.handler(
+                {"input": {"action": "parse", "pdf_url": "https://x/y.pdf"}}
+            )
+
+    def test_a_truncated_download_gets_its_own_code(self):
+        # BAD_INPUT is terminal, so it would write a volume off for a
+        # dropped connection.
+        out = self._handle(
+            handler.CorruptDownloadError("downloaded PDF is truncated")
+        )
+        self.assertEqual(out["error_code"], "INPUT_DOWNLOAD_CORRUPT")
+        self.assertIn("worker_boot_ms", out)
+
+    def test_a_real_bad_input_stays_terminal(self):
+        out = self._handle(ValueError("PDF has 9000 pages, exceeds MAX_PAGES"))
+        self.assertEqual(out["error_code"], "BAD_INPUT")

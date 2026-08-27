@@ -273,6 +273,7 @@ paid for. An S3 object has neither limit.
 | `VLLM_UNHEALTHY` | vLLM server died on this worker | Re-queue (transient) |
 | `BAD_INPUT` | Invalid input: `action`/`pdf_url` missing or wrong type, bad `prompt_mode`, out-of-range pixel bounds, page count over `HANDLER_MAX_PAGES` | Terminal |
 | `UNKNOWN_ACTION` | `action` not `"parse"` | Terminal |
+| `INPUT_DOWNLOAD_CORRUPT` | The downloaded PDF is empty, truncated, or will not open | Re-queue (transient) — the object in the bucket is sound, so the fault is in the transfer |
 | `RESULT_UPLOAD_FAILED` | The result PUT never got through | Re-queue (transient) — a fresh job mints a fresh URL |
 | `RESULT_URL_EXPIRED` | S3 answered 403: the signature died, or `Content-Type` disagrees with it | Re-queue (transient) — the two causes are indistinguishable from the worker, and a bounded retry costs less than losing a volume to a slow queue |
 | `RESULT_UPLOAD_REJECTED` | S3 refused the request as formed (wrong region, a bucket policy demanding headers we do not send) | Terminal — every retry re-runs the GPU work and fails identically |

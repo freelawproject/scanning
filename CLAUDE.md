@@ -217,8 +217,22 @@ trained on), tracked on `ExternalJob` rows at
   endpoint with a narrow worker pool queues the excess by design, so a
   run-sized timeout from submission would cancel the tail of every
   fan-out, resubmit it to the back of the same queue, and eventually
-  fail a volume for being popular. Re-stamping on every tick would push
-  the deadline out forever, so only the transition writes it.
+  fail a volume for being popular.
+- **The queue ceiling is stamped once per attempt**, when the row enters
+  the queue: at creation, and again when a retry sends it back. Nothing
+  else moves it. A claim does not (`submit_deadline_fields` writes no
+  deadline for a polling provider — being accepted is not being
+  started), a defer does not (the row never left our queue), and only
+  the `IN_PROGRESS` crossing replaces it. Any of those re-stamping would
+  forgive the row's wait on every tick, so a paused or saturated
+  endpoint would hold a scan forever instead of failing it — which is
+  the one outcome the ceiling exists to produce.
+- **A job id with nowhere to live is still cancelled.** If a cancel
+  takes the row while `POST /run` is in flight, `abandon_open` sees a
+  blank `external_id` and its own cancel is a no-op, and the later write
+  of the id loses the compare-and-swap. `_apply_runpod_outcome` cancels
+  from `_cancel_job_id` there, or the job runs and bills with nothing
+  left anywhere to find it.
 - **A job nothing will read must be cancelled.** `_cancel_provider_job`
   runs from `_fail`, `_retry_or_fail` and `abandon_open`. Doctor's
   branch is a no-op; a RunPod job left running bills for nothing, and a
@@ -241,7 +255,25 @@ trained on), tracked on `ExternalJob` rows at
 - **A 404 from `/status` asks S3 before writing the job off.** The key
   is attempt-scoped, so presence needs no freshness window. Absent, the
   row is `EXPIRED` *and* retriable: the inputs are still there and only
-  the job record is gone.
+  the job record is gone. That recovery carries
+  `PollOutcome.confirmed_by="s3_head"` rather than letting `_complete`
+  infer it, since the branch synthesises a truthy `output` and would
+  otherwise be audited as a normal provider answer.
+- **The endpoint declining work costs no attempt.** HTTP 409
+  (`ENDPOINT_PAUSED`) and 429 (rate limited) raise
+  `RunpodEndpointBusy`, and `_defer` returns the row to PENDING with its
+  attempt and its deadline intact. Every other 4xx stays terminal.
+- **A corrupt input is a transfer fault.** `validate_pdf` raises
+  `CorruptDownloadError` (not `ValueError`), which the worker reports as
+  the retriable `INPUT_DOWNLOAD_CORRUPT`. Sharding cut and verified that
+  shard against the original, so a copy that will not open describes the
+  download; `BAD_INPUT` there would write a volume off for a dropped
+  connection.
+- **Deleting a scan cancels its jobs first.** `ExternalJob.scan` is
+  CASCADE, so the delete takes `external_id` with it and `sweep_jobs`
+  only walks rows that exist. `admin._release_scan_external_work`
+  therefore cancels before it sweeps S3 — cancel first so a still-running
+  worker cannot PUT after the sweep and re-orphan an object.
 - **`poll_once` never raises and never sleeps.** `status=None` means "we
   learned nothing" — a 5xx or a blip leaves the row untouched, which is
   not the same as learning it failed. An unrecognised provider status

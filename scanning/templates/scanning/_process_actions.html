@@ -13,7 +13,7 @@ its state comes from `dots_run` -- a summary of the ExternalJob rows
 
 {% elif step == 1 %}
   {% if dots_run %}
-  <span class="text-sm text-gray-600 mr-2" title="OCR run {{ dots_run.run }}: {{ dots_run.statuses }}">
+  <span class="text-sm text-gray-600 mr-2" title="OCR run {{ dots_run.run }}: {{ dots_run.label }}">
     {% if dots_run.failed %}
     OCR failed on {{ dots_run.failed }} of {{ dots_run.total }} part(s): {{ dots_run.error_code }}
     {% elif dots_run.open %}

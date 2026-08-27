@@ -224,6 +224,19 @@ def download_pdf(url: str, dest: Path) -> None:
 PDF_EOF_WINDOW = 2048
 
 
+class CorruptDownloadError(RuntimeError):
+    """The downloaded PDF is not a sound, openable document.
+
+    Distinct from ``ValueError`` so a caller can tell it from a bad
+    *input* (a missing url, an out-of-range option). The bytes at the
+    source are sound -- scanning cuts each shard itself and verifies it
+    against the original -- so a copy that will not open is a transfer
+    fault, and the next attempt is quite likely to get it right. A
+    handler that reported this as a terminal input error would write a
+    volume off for a dropped connection.
+    """
+
+
 def validate_pdf(pdf_path: Path) -> int:
     """Validate that ``pdf_path`` is a complete, openable PDF and return
     its page count.
@@ -242,15 +255,17 @@ def validate_pdf(pdf_path: Path) -> int:
     :param pdf_path: Path to the downloaded PDF on disk.
     :returns: Page count.
     :rtype: int
-    :raises ValueError: If the file is empty, lacks a ``%PDF-`` header or
-        an ``%%EOF`` trailer, or cannot be opened as a PDF with at least
-        one page.
+    :raises CorruptDownloadError: If the file is empty, lacks a
+        ``%PDF-`` header or an ``%%EOF`` trailer, or cannot be opened as
+        a PDF with at least one page. Every one of those describes the
+        copy we received rather than the object we asked for, so all of
+        them are worth another attempt.
     """
     import fitz
 
     size = pdf_path.stat().st_size if pdf_path.exists() else 0
     if size == 0:
-        raise ValueError(f"downloaded PDF is empty: {pdf_path}")
+        raise CorruptDownloadError(f"downloaded PDF is empty: {pdf_path}")
 
     with pdf_path.open("rb") as f:
         header = f.read(1024)
@@ -258,11 +273,11 @@ def validate_pdf(pdf_path: Path) -> int:
         trailer = f.read()
 
     if b"%PDF-" not in header:
-        raise ValueError(
+        raise CorruptDownloadError(
             f"downloaded file is not a PDF (no %PDF- header): {pdf_path}"
         )
     if b"%%EOF" not in trailer:
-        raise ValueError(
+        raise CorruptDownloadError(
             "downloaded PDF is truncated (no %%EOF trailer in last "
             f"{PDF_EOF_WINDOW} bytes): {pdf_path}"
         )
@@ -277,15 +292,15 @@ def validate_pdf(pdf_path: Path) -> int:
                 logger.warning(
                     "PyMuPDF repaired %s on open; proceeding", pdf_path
                 )
-    except ValueError:
+    except CorruptDownloadError:
         raise
     except Exception as exc:
-        raise ValueError(
+        raise CorruptDownloadError(
             f"downloaded file could not be opened as a PDF: {exc}"
         ) from exc
 
     if page_count < 1:
-        raise ValueError(f"downloaded PDF has no pages: {pdf_path}")
+        raise CorruptDownloadError(f"downloaded PDF has no pages: {pdf_path}")
     return page_count
 
 

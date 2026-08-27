@@ -60,7 +60,7 @@ from datetime import timedelta
 
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from scanning import doctor_client, runpod_client, s3_sync
@@ -211,7 +211,22 @@ def _cancel_provider_job(job: ExternalJob) -> None:
     :param job: The row being written off.
     :return: None.
     """
-    if not (_is_runpod(job) and job.external_id):
+    if job.external_id:
+        _cancel_job_id(job, job.external_id)
+
+
+def _cancel_job_id(job: ExternalJob, job_id: str) -> None:
+    """Cancel one provider job id on ``job``'s endpoint.
+
+    Takes the id as an argument rather than reading the row, because the
+    one case that most needs cancelling is a job whose id never reached
+    the row: a submit that succeeded after a cancel took the row away.
+
+    :param job: The row the job was submitted for; names the endpoint.
+    :param job_id: The provider's job id.
+    :return: None.
+    """
+    if not (_is_runpod(job) and job_id):
         return
     try:
         base_url, headers = runpod_client.endpoint_config(
@@ -222,7 +237,7 @@ def _cancel_provider_job(job: ExternalJob) -> None:
             "cannot cancel job %s: its endpoint is not configured", job.pk
         )
         return
-    runpod_client.cancel_job(base_url, headers, job.external_id)
+    runpod_client.cancel_job(base_url, headers, job_id)
 
 
 # ── deadlines ───────────────────────────────────────────────────────
@@ -243,10 +258,15 @@ def queue_deadline(waiting_since):
     provider, and queued here because the endpoint is not accepting
     work.
 
+    Stamped **once per attempt**, when the row enters the queue: at
+    creation, and again when a retry sends it back. Nothing else moves
+    it. A claim does not (being accepted is not being started) and a
+    defer does not (the row never left our queue), or an endpoint that
+    is paused or saturated for good would push the ceiling out on every
+    tick and hold a scan forever.
+
     :param waiting_since: When the row started waiting -- when it was
-        created or last returned to PENDING for a row still to be
-        submitted, and when the provider accepted it for one already in
-        its queue.
+        created, or when a retry returned it to PENDING.
     :returns: The wall-clock time the row is written off at.
     """
     return waiting_since + timedelta(
@@ -289,22 +309,29 @@ def runpod_execution_deadline(job: ExternalJob, started_at):
     )
 
 
-def attempt_deadline(job: ExternalJob, submitted_at):
-    """Return the deadline to stamp when a row is submitted.
+def submit_deadline_fields(job: ExternalJob, submitted_at) -> dict:
+    """Return the deadline field a claim should write, if any.
 
     Doctor takes its flat answer budget straight away, because its
-    response *is* the completion and there is no queue to distinguish.
-    A RunPod row keeps the queue ceiling: it has been accepted but may
-    not have started, and only the crossing into ``IN_PROGRESS``
-    (handled in :func:`_sweep_runpod_job`) turns that into a run budget.
+    response *is* the completion: there is no queue to distinguish, and
+    the clock that matters starts when the request goes out.
+
+    A RunPod row is written **nothing**, and that is the point. It keeps
+    the queue ceiling it has carried since it entered the queue, because
+    being accepted is not being started -- the endpoint's worker cap may
+    hold it for hours. Re-stamping here would restart that wait on every
+    claim, which together with a deferring endpoint would let a row sit
+    forever. Only the crossing into ``IN_PROGRESS``
+    (:func:`_record_progress`) replaces the ceiling with a run budget.
 
     :param job: The row being submitted.
     :param submitted_at: Submission timestamp.
-    :returns: The wall-clock deadline.
+    :returns: Fields to merge into the claim's write.
+    :rtype: dict
     """
     if _is_runpod(job):
-        return queue_deadline(submitted_at)
-    return doctor_attempt_deadline(submitted_at)
+        return {}
+    return {"deadline": doctor_attempt_deadline(submitted_at)}
 
 
 # ── row writes ──────────────────────────────────────────────────────
@@ -351,7 +378,12 @@ def _write(job: ExternalJob, **fields) -> bool:
     return True
 
 
-def _complete(job: ExternalJob, output: dict | None, now) -> bool:
+def _complete(
+    job: ExternalJob,
+    output: dict | None,
+    now,
+    confirmed_by: str = "",
+) -> bool:
     """Mark a job COMPLETED, keeping the provider's summary.
 
     COMPLETED, not CONSUMED: the provider being finished is not us
@@ -362,12 +394,20 @@ def _complete(job: ExternalJob, output: dict | None, now) -> bool:
     :param output: The provider's JSON summary, or ``None`` for a job
         whose response was lost and whose object we found on S3 instead.
     :param now: Completion timestamp.
+    :param confirmed_by: How we learned the job was done, when the
+        caller knows better than ``output`` says. A RunPod job whose
+        record has expired is recovered by probing the result key, and
+        the poll synthesises a truthy ``output`` for it, so inferring
+        this would record that recovery as a normal provider answer and
+        hide from a reader that the job record was already gone.
     :returns: Whether the write landed.
     :rtype: bool
     """
     meta = dict(job.provider_meta or {})
     meta["output"] = output
-    meta["confirmed_by"] = "response" if output else "s3_head"
+    meta["confirmed_by"] = confirmed_by or (
+        "response" if output else "s3_head"
+    )
     written = _write(
         job,
         status=JobStatus.COMPLETED,
@@ -594,12 +634,18 @@ def _defer(job: ExternalJob, error_code: str, message: str, now) -> str:
     not accepting work. Burning a row's retry budget there would fail a
     volume for being submitted while an endpoint was scaled to zero.
 
-    The waiting clock restarts, since the row is queued here again.
+    **The deadline is left exactly as it was.** A defer means the row
+    never left our queue, so the wait it is accumulating is precisely
+    the wait :func:`queue_deadline` exists to bound. Re-stamping would
+    push the ceiling out on every tick, and an endpoint paused for good
+    would hold a scan forever instead of failing it -- which is the one
+    outcome the ceiling is there to prevent.
 
     :param job: The row to hand back.
     :param error_code: Why it was not sent.
     :param message: Human-readable detail.
-    :param now: Current time.
+    :param now: Current time. Unused, and kept so every outcome helper
+        reads the same at its call site.
     :returns: ``"deferred"`` or ``"skipped"``.
     :rtype: str
     """
@@ -616,7 +662,6 @@ def _defer(job: ExternalJob, error_code: str, message: str, now) -> str:
         result_key="",
         external_id="",
         submitted_at=None,
-        deadline=queue_deadline(now),
         error_code=error_code[:64],
         error_message=message[:2000],
     )
@@ -800,6 +845,16 @@ def ensure_shard_jobs(
     moved (a re-upload, a page edit), a new run starts and the previous
     run's rows and result objects stay addressable as history.
 
+    That idempotence has to survive two callers arriving at once, which
+    it did not have to before issue #190: until the dots.mocr button
+    landed, the only caller was the single-threaded daemon. Two staff
+    presses racing would both read no rows, both compute the same
+    ``next_run``, and both insert -- so the loser is caught on
+    ``unique_volume_job_per_engine_run`` and re-reads instead of
+    raising. The database constraint is the serializer, which is why no
+    lock is taken and none is held across the read: a lock would have to
+    be, since the reuse decision spans several queries.
+
     :param scan: The scan to process.
     :param manifest: The committed shard manifest.
     :param stage: A :class:`~scanning.models.JobStage` value.
@@ -832,29 +887,48 @@ def ensure_shard_jobs(
 
     run = ExternalJob.next_run(scan, stage, engine)
     now = timezone.now()
-    with transaction.atomic():
-        created = ExternalJob.objects.bulk_create(
-            [
-                ExternalJob(
-                    scan=scan,
-                    stage=stage,
-                    engine=engine,
-                    provider=provider,
-                    status=JobStatus.PENDING,
-                    run=run,
-                    shard_index=index,
-                    shard_count=len(specs),
-                    input_key=key,
-                    # Travels with the row, so the reuse check and any
-                    # later merge read what was actually processed
-                    # rather than a manifest that may since have
-                    # changed.
-                    input_manifest=identity,
-                    deadline=queue_deadline(now),
-                )
-                for index, (key, identity) in enumerate(specs)
-            ]
+    try:
+        with transaction.atomic():
+            created = ExternalJob.objects.bulk_create(
+                [
+                    ExternalJob(
+                        scan=scan,
+                        stage=stage,
+                        engine=engine,
+                        provider=provider,
+                        status=JobStatus.PENDING,
+                        run=run,
+                        shard_index=index,
+                        shard_count=len(specs),
+                        input_key=key,
+                        # Travels with the row, so the reuse check and
+                        # any later merge read what was actually
+                        # processed rather than a manifest that may
+                        # since have changed.
+                        input_manifest=identity,
+                        deadline=queue_deadline(now),
+                    )
+                    for index, (key, identity) in enumerate(specs)
+                ]
+            )
+    except IntegrityError:
+        # Somebody else created this exact run between our read and our
+        # insert. Their rows are the run, and ours were never written
+        # (bulk_create is one statement inside one transaction), so
+        # re-read and hand theirs back. This is what keeps two staff
+        # presses a no-op rather than a 500 for whoever lost.
+        rows = live_run(scan, stage, engine)
+        logger.info(
+            "scan %s %s/%s run %d was created by another writer; "
+            "reusing its %d row(s)",
+            scan.pk,
+            stage,
+            engine,
+            rows[0].run if rows else run,
+            len(rows),
         )
+        return rows
+
     logger.info(
         "created %d %s/%s job(s) for scan %s at run %d",
         len(created),
@@ -905,9 +979,9 @@ def _claim(job: ExternalJob, now) -> tuple[str, tuple[str, str] | None]:
         status=JobStatus.SUBMITTED,
         result_key=result_key,
         submitted_at=now,
-        deadline=attempt_deadline(job, now),
         error_code="",
         error_message="",
+        **submit_deadline_fields(job, now),
     ):
         return "skipped", None
 
@@ -1061,6 +1135,21 @@ def _apply_runpod_outcome(
     if exc is None:
         # Still SUBMITTED: RunPod has it, and only a poll can say more.
         written = _write(job, external_id=job_id or "")
+        if not written and job_id:
+            # The row was cancelled while the request was in flight, so
+            # the id has nowhere to live. Cancel from here or nothing
+            # ever will: `abandon_open` ran while `external_id` was
+            # still blank, so its own cancel was a no-op, and the sweep
+            # only looks at rows that are still open. Left alone this
+            # job runs to completion and bills for output nobody will
+            # read.
+            logger.warning(
+                "job %s was claimed by another writer while RunPod job "
+                "%s was being submitted; cancelling it",
+                job.pk,
+                job_id,
+            )
+            _cancel_job_id(job, job_id)
         return "submitted" if written else "skipped"
 
     if isinstance(exc, runpod_client.RunpodEndpointBusy):
@@ -1371,7 +1460,7 @@ def _sweep_runpod_job(job: ExternalJob, now, summary: SweepSummary) -> None:
         _write(job, last_polled_at=now)
         summary.pending += 1
     elif outcome.status == JobStatus.COMPLETED:
-        if _complete(job, outcome.output, now):
+        if _complete(job, outcome.output, now, outcome.confirmed_by):
             summary.completed += 1
         return
     elif outcome.status in DEAD_JOB_STATUSES:
