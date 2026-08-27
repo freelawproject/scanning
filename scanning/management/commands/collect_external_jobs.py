@@ -2,12 +2,16 @@
 
 Two halves, in order:
 
-1. ``jobs.sweep_jobs()`` -- for each job still in flight, check whether
-   its result object appeared. The only path that can finish a job whose
-   response we never saw: doctor converts and uploads even after we stop
-   reading, so a killed daemon loses the answer, not the work.
+1. ``jobs.sweep_jobs()`` -- ask after every job still in flight. For a
+   RunPod job that is a status poll, and it is the normal path:
+   submitting only queued the work. For a doctor job it is a check for
+   the result object, and it is the only path that can finish a job whose
+   response we never saw -- doctor converts and uploads even after we
+   stop reading, so a killed daemon loses the answer, not the work.
 2. ``bitonal.finish_ready_scans()`` -- merge the shards of any scan
-   whose jobs are all done and move it out of ``AWAITING``.
+   whose conversion jobs are all done and move it out of ``AWAITING``.
+   The dots.mocr stage has no equivalent yet: issue #190 ends when every
+   shard answers, and the merge follows in #149.
 
 Examples:
 
@@ -31,8 +35,8 @@ RETRY_BACKOFF_SECONDS = 0.5
 
 class Command(BaseCommand):
     help = (
-        "Confirm in-flight external jobs against their result objects, "
-        "then merge and park any scan whose jobs have all finished."
+        "Ask after every in-flight external job, then merge and park any "
+        "scan whose conversion jobs have all finished."
     )
 
     def handle(self, *args, **options):

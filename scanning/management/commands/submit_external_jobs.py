@@ -1,11 +1,16 @@
-"""Submit one wave of pending external jobs (a single daemon tick).
+"""Submit one wave of pending external jobs per provider (a daemon tick).
 
-Claims up to ``DOCTOR_MAX_CONCURRENCY`` pending ``ExternalJob`` rows,
-sends them from a bounded thread pool, and records what came back.
-Blocks for as long as the slowest request in the wave (~25-45s for a
+Each provider counts its own in-flight rows against its own cap, so one
+saturated endpoint cannot starve another: doctor's ceiling is its replica
+count (``DOCTOR_MAX_CONCURRENCY``), and each RunPod engine's is that
+engine's own serverless endpoint (``DOTS_MOCR_MAX_CONCURRENCY``).
+
+The doctor wave blocks for as long as its slowest request (~25-45s for a
 100-page bitonal shard), deliberately: holding the request open is what
 keeps the provider's error code, instead of inferring failure from a
-missing object later.
+missing object later. The RunPod wave does not -- ``POST /run`` returns
+as soon as the job is queued, and a poll on a later tick is what
+finishes it.
 
 Examples:
 
@@ -31,8 +36,8 @@ RETRY_BACKOFF_SECONDS = 0.5
 
 class Command(BaseCommand):
     help = (
-        "Submit up to DOCTOR_MAX_CONCURRENCY pending external jobs and "
-        "record their outcomes."
+        "Submit one wave of pending external jobs per provider, each "
+        "within its own concurrency cap, and record their outcomes."
     )
 
     def add_arguments(self, parser):
@@ -46,8 +51,8 @@ class Command(BaseCommand):
             type=int,
             default=None,
             help=(
-                "Maximum jobs to submit in this wave. Defaults to "
-                "DOCTOR_MAX_CONCURRENCY."
+                "Concurrency override applied to EACH provider's wave. "
+                "Defaults to each provider's own setting."
             ),
         )
 
@@ -87,12 +92,13 @@ class Command(BaseCommand):
                 summary.submitted,
                 summary.failed,
                 summary.retried,
+                summary.deferred,
                 summary.unanswered,
                 summary.skipped,
             )
         ):
             self.stdout.write(
                 f"Submitted {summary.submitted}, retried {summary.retried}, "
-                f"failed {summary.failed}, unanswered {summary.unanswered}, "
-                f"skipped {summary.skipped}"
+                f"deferred {summary.deferred}, failed {summary.failed}, "
+                f"unanswered {summary.unanswered}, skipped {summary.skipped}"
             )

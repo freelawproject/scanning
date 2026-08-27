@@ -140,6 +140,8 @@ is `parse`:
     "action": "parse",
     "scan_pk": 123,
     "pdf_url": "https://s3.../volume.pdf?X-Amz-...",
+    "result_url": "https://s3.../r1-s0-a1.json?X-Amz-...",
+    "result_key": "processing/1/tc/164/1/jobs/analyze/dots_mocr/r1-s0-a1.json",
     "prompt_mode": "prompt_layout_all_en",
     "dpi": 200,
     "num_threads": 16,
@@ -218,6 +220,51 @@ Notes on the page dicts:
   inlines them as base64 data URIs, which can blow RunPod's ~20 MB
   response cap); pass `include_pictures: true` to keep them.
 
+### Result delivery
+
+`result_url` decides where the payload goes, and the caller chooses:
+
+- **With `result_url`** (a presigned PUT), the payload is wrapped in a
+  self-describing envelope and uploaded, and the job response holds only
+  a summary:
+
+  ```json
+  {
+    "result_key": "processing/1/.../r1-s0-a1.json",
+    "bytes": 4812004,
+    "page_count": 100,
+    "failed_pages": [],
+    "duration_ms": 264120
+  }
+  ```
+
+  The envelope at that key is:
+
+  ```json
+  {
+    "schema_version": 1,
+    "action": "parse",
+    "scan_pk": 123,
+    "result_key": "processing/1/.../r1-s0-a1.json",
+    "payload": { "pages": [ ... ], "page_count": 100, ... }
+  }
+  ```
+
+- **Without `result_url`**, the payload comes back inline exactly as it
+  always did. That is the path dev and CI take without credentials, and
+  the path a caller on an older contract gets — so rolling this image
+  back needs no daemon change.
+
+Why S3 rather than inline for real volumes: RunPod caps a response at
+about 20 MB and discards it with the job record roughly 30 minutes after
+it finishes. A 100-page shard of dense pages can approach that cap, and
+a caller whose daemon was down for an hour would lose work it had already
+paid for. An S3 object has neither limit.
+
+`Content-Type: application/json` is sent on the PUT because the caller
+**signs** it into the URL. The two must match exactly; a mismatch is a
+403 that reads like an expired signature.
+
 ### Structured errors
 
 | `error_code` | Meaning | Suggested caller behaviour |
@@ -226,6 +273,9 @@ Notes on the page dicts:
 | `VLLM_UNHEALTHY` | vLLM server died on this worker | Re-queue (transient) |
 | `BAD_INPUT` | Invalid input: `action`/`pdf_url` missing or wrong type, bad `prompt_mode`, out-of-range pixel bounds, page count over `HANDLER_MAX_PAGES` | Terminal |
 | `UNKNOWN_ACTION` | `action` not `"parse"` | Terminal |
+| `RESULT_UPLOAD_FAILED` | The result PUT never got through | Re-queue (transient) — a fresh job mints a fresh URL |
+| `RESULT_URL_EXPIRED` | S3 answered 403: the signature died, or `Content-Type` disagrees with it | Re-queue (transient) — the two causes are indistinguishable from the worker, and a bounded retry costs less than losing a volume to a slow queue |
+| `RESULT_UPLOAD_REJECTED` | S3 refused the request as formed (wrong region, a bucket policy demanding headers we do not send) | Terminal — every retry re-runs the GPU work and fails identically |
 
 `NO_GPU` and `VLLM_UNHEALTHY` also set `refresh_worker: true`, which
 tells the RunPod SDK to terminate this worker after the response — a

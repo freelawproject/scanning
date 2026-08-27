@@ -36,7 +36,12 @@ from typing import Any
 
 import requests
 import runpod
-from runpod_common import download_pdf, validate_pdf
+from runpod_common import (
+    ResultUploadError,
+    download_pdf,
+    upload_result,
+    validate_pdf,
+)
 
 # Capture worker boot start as early as possible so ``_WORKER_BOOT_MS``
 # covers the full cold-start cost (module imports + vLLM startup).
@@ -520,7 +525,9 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
 
     :param job: RunPod job dict (used for progress updates).
     :param inputs: Handler input payload. Required: ``pdf_url``.
-        Optional: ``prompt_mode`` (default ``prompt_layout_all_en``),
+        Result delivery (handled by :func:`_deliver`, not here):
+        ``result_url`` and ``result_key``. Optional:
+        ``prompt_mode`` (default ``prompt_layout_all_en``),
         ``dpi`` (default 200), ``num_threads``, ``temperature``,
         ``top_p``, ``max_completion_tokens``, ``min_pixels``,
         ``max_pixels``, ``include_pictures`` (default False: strip
@@ -808,6 +815,69 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     }
 
 
+# Version of the result envelope. A caller reading an object written
+# here checks this before it trusts the payload, so bump it only when
+# the payload's shape changes -- and expect the caller to treat an
+# unknown version as "worker deployed ahead of the daemon" rather than
+# as a bad result.
+RESULT_SCHEMA_VERSION = 1
+
+# Content type sent on the result PUT. Signed into the presigned URL by
+# the caller, so this constant and its signing parameter must stay in
+# lockstep: a mismatch is a 403 that reads like an expired signature.
+RESULT_CONTENT_TYPE = "application/json"
+
+# Summary fields kept in the job response when the payload goes to S3.
+# Everything else -- above all ``pages`` -- is deliberately dropped: the
+# response is capped at about 20 MB and discarded with the job record,
+# which is the whole reason the payload travels through S3.
+_SUMMARY_FIELDS = ("page_count", "failed_pages", "duration_ms")
+
+
+def _deliver(result: dict, inputs: dict, scan_pk: Any) -> dict:
+    """Send a result to S3 when asked, and answer with a summary.
+
+    Two shapes, chosen by the caller and not by us:
+
+    - ``result_url`` present -> wrap the payload in a self-describing
+      envelope, PUT it, and return only the summary plus the key. This
+      is what a volume-sized parse needs.
+    - absent -> return the payload inline, as this worker always did.
+      That path is what dev and continuous integration use without
+      credentials, and what a caller running an older contract gets, so
+      rolling the image back needs no daemon change.
+
+    :param result: The action's own return value.
+    :param inputs: The handler input payload.
+    :param scan_pk: The scan the job belongs to, for the envelope.
+    :returns: What to answer RunPod with.
+    :rtype: dict
+    :raises ResultUploadError: If the upload failed. The caller turns
+        its ``error_code`` into a retry or a terminal failure.
+    """
+    result_url = inputs.get("result_url")
+    if not result_url:
+        return result
+
+    envelope = {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "action": inputs.get("action"),
+        "scan_pk": scan_pk,
+        # Echoed so a reader can confirm the object is the one it asked
+        # for, without trusting the key it happens to be stored under.
+        "result_key": inputs.get("result_key"),
+        "payload": result,
+    }
+    size = upload_result(result_url, envelope, RESULT_CONTENT_TYPE)
+
+    summary = {
+        field: result[field] for field in _SUMMARY_FIELDS if field in result
+    }
+    summary["result_key"] = inputs.get("result_key")
+    summary["bytes"] = size
+    return summary
+
+
 _ACTIONS = {
     "parse": _action_parse,
 }
@@ -830,6 +900,11 @@ def handler(job: dict) -> dict:
         level and RunPod marks the job ``FAILED``. The caller reads
         ``error_code`` from ``output`` to distinguish transient errors
         (re-queue) from terminal ones.
+
+        When the input carries ``result_url``, the payload is PUT to S3
+        and the response holds only a summary (``result_key``, ``bytes``,
+        ``page_count``, ``failed_pages``, ``duration_ms``). Without it
+        the payload comes back inline, as it always did.
     :rtype: dict
     """
     inputs = job.get("input") or {}
@@ -910,7 +985,26 @@ def handler(job: dict) -> dict:
     tmp_dir = Path(tempfile.mkdtemp(prefix="runpod-"))
     try:
         result = fn(job, inputs, tmp_dir)
-        return _with_worker_meta(result)
+        return _with_worker_meta(_deliver(result, inputs, scan_pk))
+    except ResultUploadError as exc:
+        # The compute succeeded but could not be delivered, so nothing
+        # was written and there is nothing for the caller to harvest.
+        # Returned as a structured error rather than raised, because the
+        # code is the whole point: RESULT_UPLOAD_FAILED and
+        # RESULT_URL_EXPIRED are worth a fresh job (which mints a fresh
+        # URL), and RESULT_UPLOAD_REJECTED never is.
+        logger.error(
+            "result delivery failed: action=%s scan_pk=%s code=%s: %s",
+            action,
+            scan_pk,
+            exc.error_code,
+            exc,
+        )
+        if sentry_sdk is not None:
+            sentry_sdk.capture_exception(exc)
+        return _with_worker_meta(
+            {"error": str(exc), "error_code": exc.error_code}
+        )
     except ValueError as exc:
         # Input validation (missing/invalid pdf_url, bad prompt_mode,
         # out-of-range pixel bounds, over-MAX_PAGES input). Returned as
