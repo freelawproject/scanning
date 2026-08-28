@@ -146,6 +146,12 @@ deploy needs no new endpoint and no new settings. For a fresh endpoint:
      (default 5000).
    - `HANDLER_DOWNLOAD_TIMEOUT` and friends — see the `runpod_common`
      tunables.
+   - `HANDLER_UPLOAD_MAX_ATTEMPTS`, `HANDLER_UPLOAD_TIMEOUT`,
+     `HANDLER_UPLOAD_CONNECT_TIMEOUT` — the result-PUT tunables, also
+     in `runpod_common`. **Caution:** rename any `HANDLER_RESULT_UPLOAD_*`
+     variables left on a reused endpoint template, because this image
+     silently ignores them — the legacy worker read that prefix, with a
+     default of 5 attempts where `runpod_common` defaults to 3.
 
 Note the **Endpoint ID**: the daemon reads it from settings when #195
 lands.
@@ -170,7 +176,10 @@ is `detect`:
 ```
 
 Everything but `pdf_url` is optional. `models` accepts a bare string as
-well as a list, and every name must be baked into the image.
+well as a list, and every name must be baked into the image. An absent
+key or JSON `null` means the default; an empty list is refused as
+`BAD_INPUT`, because it is indistinguishable from a caller bug that
+filtered every model away.
 `confidence` must be in `(0, 1]`; the default 0.20 is blackletter's
 `CONFIDENCE_THRESHOLD`, and the per-label gates that shape the
 redactions are applied downstream.

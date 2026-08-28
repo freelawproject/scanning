@@ -52,8 +52,10 @@ The legacy processing stages — in-process bitonal conversion, the YOLO
 `detect` and PaddleOCR `analyze` RunPod actions (and the whole
 blackletter-gpu-worker under `scanning/runpod/`), and their
 `RUNPOD_ENABLED=False` in-process fallbacks — are deleted. Bitonal came
-back as an external job, and dots.mocr as a staff-started one (both
-below); still missing is #149 (page numbers from the dots output), so:
+back as an external job, dots.mocr as a staff-started one, and YOLO
+detection as a rebuilt worker image (#194 — the image only, below);
+still missing are #149 (page numbers from the dots output) and the
+#195/#196 callers of the detect image, so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
   then either starts the bitonal conversion (`Status.AWAITING`) or
@@ -381,6 +383,20 @@ be broken:
   settings change. `blackletter-dependency-pr.yml` bumps blackletter
   here and in the repository root together, which is what keeps the
   image and the application on one version.
+- **The worker scaffold lives in `runpod_common`, once.** The Sentry
+  setup, the boot clock and worker-meta fields, the result envelope
+  (`RESULT_SCHEMA_VERSION`, which `runpod_client.py` imports too), and
+  the `execute_action` runner whose except arms map exceptions to the
+  error codes the daemon classifies — shared with the dots.mocr worker,
+  because one daemon reads every worker's output and an arm that
+  drifted in one image would misroute paid work. Each handler keeps
+  thin wrappers that bind its own module globals, so the tests keep
+  their patch points. Input checks raise `BadInputError` (a
+  `ValueError` subclass in `runpod_common`), and only that subclass is
+  answered as the terminal `BAD_INPUT`: the worker stack raises plain
+  `ValueError` at run time too (a degenerate page render, a model
+  shape check), and answering one of those as BAD_INPUT would write
+  the shard off as a caller error with no Sentry event.
 - The handler is tested without the worker stack
   (`scanning/tests/test_runpod_yolo_handler.py`): the loader stubs
   `runpod`, `torch` and `blackletter.api`, and a CUDA-less `torch` makes

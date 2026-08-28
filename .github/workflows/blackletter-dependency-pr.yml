@@ -22,9 +22,14 @@ jobs:
           version: "0.9.x"
 
       - name: Update blackletter dependency
+        # `uv lock`, not `uv sync`: only the lockfiles go into the PR,
+        # so nothing needs to be installed. A sync of scanning/runpod
+        # would pull the worker's multi-GB cu126 torch stack onto the
+        # runner and can fill its disk, which kills the step and
+        # silently skips the PR creation below.
         run: |
-          uv sync --upgrade-package blackletter
-          uv sync --upgrade-package blackletter --project scanning/runpod
+          uv lock --upgrade-package blackletter
+          uv lock --upgrade-package blackletter --project scanning/runpod
 
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v8

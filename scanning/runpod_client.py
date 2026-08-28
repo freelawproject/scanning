@@ -46,17 +46,22 @@ from typing import Any
 import requests
 from django.conf import settings
 
+# Re-exported: ``jobs.py`` reads them from this module, and they come
+# from ``runpod_common`` -- the module the workers themselves are built
+# on -- so the writer and this reader cannot drift in source. The
+# presigned PUT must be signed with exactly this content type, or S3
+# answers 403 and the worker reports ``RESULT_URL_EXPIRED``. A version
+# skew between a deployed image and this daemon is still possible and
+# is handled at read time: treat an unknown ``schema_version`` as
+# "worker deployed ahead of the daemon".
+from scanning.runpod_common import (
+    RESULT_CONTENT_TYPE as RESULT_CONTENT_TYPE,
+)
+from scanning.runpod_common import (
+    RESULT_SCHEMA_VERSION as RESULT_SCHEMA_VERSION,
+)
+
 logger = logging.getLogger(__name__)
-
-#: Version of the result envelope this client understands. A worker
-#: adopting the write-result-to-S3 contract stamps the same number into
-#: its envelope's ``schema_version``.
-RESULT_SCHEMA_VERSION = 1
-
-#: Content type the worker PUTs its result with. The presigned PUT must
-#: be signed with exactly this, or S3 answers 403 and the worker reports
-#: ``RESULT_URL_EXPIRED``.
-RESULT_CONTENT_TYPE = "application/json"
 
 #: How long a status call may take. Generous against a healthy endpoint,
 #: short enough that a wedged one does not hold the serial daemon loop.
