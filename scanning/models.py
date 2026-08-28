@@ -106,11 +106,12 @@ class Status(models.TextChoices):
     AWAITING_VALIDATION = "awaiting_validation", "Awaiting Validation"
     # The two page-completeness review states (#154). Both are parked
     # human states, not busy ones: the viewer does not poll them and
-    # the stale sweep must not touch them. The #149 apply is the only
-    # writer of READY_FOR_PAGE_COMPLETENESS_REVIEW, and the approve
-    # button (#151) is the only writer of PAGE_COMPLETENESS_REVIEW_DONE.
-    # The stages behind review 1 (#195/#196) trigger off DONE and write
-    # no scan status, so redaction work never blocks either review.
+    # the stale sweep must not touch them. The #149 apply and its
+    # recomputations write READY_FOR_PAGE_COMPLETENESS_REVIEW, and the
+    # approve button (#151) is the only writer of
+    # PAGE_COMPLETENESS_REVIEW_DONE. The stages behind review 1
+    # (#195/#196) trigger off DONE and write no scan status, so
+    # redaction work never blocks either review.
     READY_FOR_PAGE_COMPLETENESS_REVIEW = (
         "ready_for_page_completeness_review",
         "Ready for page review",

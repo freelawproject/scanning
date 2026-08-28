@@ -356,7 +356,10 @@ class TestFinishReadyRuns(AnalyzeJobsMixin, TestCase):
         delete.assert_not_called()
 
     def test_no_scan_status_is_written(self):
-        """The invariant of issue #190: progress lives on the rows."""
+        """The invariant of issue #190: progress lives on the rows.
+
+        The status write of the apply step (#149/#204) belongs to
+        ``apply_ready_runs``, not to the glue."""
         scan, _ = self.build(shard_count=2, pages_per_shard=1)
         before = scan.status
 

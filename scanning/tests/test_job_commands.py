@@ -96,10 +96,14 @@ class TestCollectCommand(TestCase):
                     "scanning.dots_mocr.finish_ready_runs",
                     side_effect=lambda: calls.append("glue") or 1,
                 ):
-                    with patch("django.db.connections.close_all"):
-                        call_command("collect_external_jobs")
+                    with patch(
+                        "scanning.dots_mocr.apply_ready_runs",
+                        side_effect=lambda: calls.append("apply") or 1,
+                    ):
+                        with patch("django.db.connections.close_all"):
+                            call_command("collect_external_jobs")
 
-        self.assertEqual(calls, ["sweep", "finish", "glue"])
+        self.assertEqual(calls, ["sweep", "finish", "glue", "apply"])
 
     def test_a_transient_db_error_is_survived_quietly(self):
         with patch(

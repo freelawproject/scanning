@@ -1146,6 +1146,77 @@ def recalculate_issues(scan: "Scan") -> None:
     )
 
 
+def run_compute_issues(scan: "Scan", result_key: str) -> bool:
+    """Read page numbers off a glued dots.mocr run and rebuild Issues.
+
+    The apply step of issues #149/#204, called by
+    ``dots_mocr.apply_ready_runs`` on the collect tick. Deliberately
+    not daemon-queued work (#212): the scan never transits
+    QUEUED/PROCESSING, so it stays in the review flow while its issues
+    recompute, there is no claim for a cancel to race, and no
+    scan-wide retry budget is spent. Failures raise to the caller,
+    whose per-run bookkeeping bounds the retries.
+
+    The one status write is a single compare-and-swap on the review
+    edge: ``AWAITING_VALIDATION`` or the legacy ``PENDING_REVIEW``
+    moves to ``READY_FOR_PAGE_COMPLETENESS_REVIEW``; a scan already
+    READY is a recompute and keeps its status. A scan the edge cannot
+    take (cancelled or moved between the caller's read and here) is
+    left alone: its ``ocr_results`` were refreshed -- idempotent data
+    -- but no Issues are rebuilt and no status moves. Once the scan is
+    READY, ``cancel_processing`` no longer matches it, so
+    :func:`recalculate_issues`'s own unguarded save can no longer
+    revive a cancelled scan; the remaining full-instance-save exposure
+    is the one the recheck view has always had.
+
+    :param scan: The scan whose live run is fully glued.
+    :param result_key: S3 key of the run's glued volume JSON.
+    :returns: Whether the apply completed. False means the scan left
+        the eligible statuses mid-apply and was left alone.
+    :rtype: bool
+    """
+    from scanning import page_numbers, s3_sync
+
+    started = time.monotonic()
+    document = s3_sync.download_json_object(result_key)
+    results = page_numbers.ocr_results_from_volume(document, scan.ocr_results)
+    scan.ocr_results = results
+    scan.save(update_fields=["ocr_results"])
+
+    if scan.status != Status.READY_FOR_PAGE_COMPLETENESS_REVIEW:
+        # The review edge: the apply is the last prerequisite of
+        # review 1, since the caller only sees scans whose conversion
+        # already parked and whose OCR run is glued.
+        edged = Scan.objects.filter(
+            pk=scan.pk,
+            status__in=(
+                Status.AWAITING_VALIDATION,
+                Status.PENDING_REVIEW,
+            ),
+        ).update(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
+        if not edged:
+            logger.info(
+                "compute_issues: scan %s left the eligible statuses "
+                "mid-apply; its issues were not rebuilt",
+                scan.pk,
+            )
+            return False
+
+    scan.status = Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+    recalculate_issues(scan)
+
+    logger.info(
+        "compute_issues: scan %s: %d page(s), %d without a number, "
+        "%d issue(s), in %.1fs",
+        scan.pk,
+        len(results),
+        sum(1 for entry in results if not entry["detected"]),
+        scan.issues.count(),
+        time.monotonic() - started,
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Full pipeline (upload and walk away)
 # ---------------------------------------------------------------------------

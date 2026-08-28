@@ -51,6 +51,7 @@ from scanning.models import (
     JobStage,
     JobStatus,
     Scan,
+    Status,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,13 @@ GLUE_SCHEMA_VERSION = 1
 #: every collect tick, and an unbounded retry of a deterministic bug
 #: would re-download every shard result every 15 seconds, forever.
 GLUE_MAX_ATTEMPTS = 3
+
+#: How many times :func:`apply_ready_runs` tries the apply (#149/#204)
+#: before it gives up on a run, for the same reason as
+#: ``GLUE_MAX_ATTEMPTS``: the pass runs every collect tick, and an
+#: unbounded retry of a deterministic bug would recompute -- and log --
+#: forever.
+APPLY_MAX_ATTEMPTS = 3
 
 
 class DotsMocrGlueError(Exception):
@@ -519,12 +527,13 @@ def finish_ready_runs() -> int:
     the volume, ``run_summary`` already shows it on the process page,
     and the way forward is the staff button opening a fresh run.
 
-    Unlike the bitonal pass this one writes **no scan status** -- that
-    invariant belongs to issue #190, and it is what keeps a volume
-    browsable while it is read. With no status to latch on, the rows are
-    the idempotence marker: a glued run is all ``CONSUMED``, so it drops
-    out of the candidate query. The per-shard results are kept, which is
-    what makes the retry after a crashed tick safe.
+    Like the reading stage itself, this pass writes **no scan status**
+    -- that invariant belongs to issue #190, and it is what keeps a
+    volume browsable while it is read. With no status to latch on, the
+    rows are the idempotence marker: a glued run is all ``CONSUMED``,
+    so it drops out of the candidate query and becomes
+    :func:`apply_ready_runs`'s input. The per-shard results are kept,
+    which is what makes the retry after a crashed tick safe.
 
     :returns: How many runs were glued and consumed.
     :rtype: int
@@ -576,3 +585,167 @@ def finish_ready_runs() -> int:
         glued += 1
 
     return glued
+
+
+def _apply_state(analyze_jobs: list[ExternalJob]) -> dict:
+    """Return the run's apply bookkeeping (#149/#204).
+
+    Kept on the first row's ``provider_meta`` like the glue counter,
+    and for the same reasons: the state describes the run, the rows
+    are per run so a fresh OCR run starts clean, and
+    ``input_manifest`` is off limits (``_still_describes`` compares it
+    exactly).
+
+    :param analyze_jobs: The live run's rows, ordered by shard index.
+    :returns: The stored state: ``applied_at``, ``attempts``,
+        ``last_error``, ``last_attempt_at``; empty when never tried.
+    :rtype: dict
+    """
+    meta = analyze_jobs[0].provider_meta or {}
+    return dict(meta.get("apply") or {})
+
+
+def _write_apply_state(analyze_jobs: list[ExternalJob], state: dict) -> None:
+    """Persist the run's apply bookkeeping on the first row.
+
+    :param analyze_jobs: The live run's rows, ordered by shard index.
+    :param state: The state to store.
+    :return: None.
+    """
+    head = analyze_jobs[0]
+    meta = head.provider_meta or {}
+    meta["apply"] = state
+    head.provider_meta = meta
+    head.save(update_fields=["provider_meta"])
+
+
+def _record_apply_failure(scan, analyze_jobs: list[ExternalJob], exc) -> None:
+    """Count one apply failure, and give up loudly on the last one.
+
+    Mirrors :func:`_record_glue_failure`: the glued document and the
+    shard results stay in S3, so the retry costs one small download.
+    The crossing into "out of tries" is the one ERROR-level event; the
+    way back after a fix is a person clearing ``provider_meta["apply"]``
+    on the named row.
+
+    :param scan: The scan whose apply failed.
+    :param analyze_jobs: The live run's rows, ordered by shard index.
+    :param exc: What the apply raised.
+    :return: None.
+    """
+    state = _apply_state(analyze_jobs)
+    attempts = int(state.get("attempts") or 0) + 1
+    state.update(
+        {
+            "attempts": attempts,
+            "last_error": str(exc)[:500],
+            "last_attempt_at": timezone.now().isoformat(),
+        }
+    )
+    _write_apply_state(analyze_jobs, state)
+    if attempts >= APPLY_MAX_ATTEMPTS:
+        logger.exception(
+            "Applying the dots.mocr results for scan %s failed; giving up "
+            "after %d attempt(s). The glued document stays in S3; clear "
+            "provider_meta['apply'] on job %s to retry.",
+            scan.pk,
+            attempts,
+            analyze_jobs[0].pk,
+        )
+    else:
+        logger.warning(
+            "Applying the dots.mocr results for scan %s failed (attempt "
+            "%d of %d): %s",
+            scan.pk,
+            attempts,
+            APPLY_MAX_ATTEMPTS,
+            exc,
+        )
+
+
+def apply_ready_runs() -> int:
+    """Apply every glued run: page numbers, Issues, and the READY edge.
+
+    The apply step of issues #149/#204, run right after the glue on the
+    collect tick. It reads the glued volume JSON (its S3 presence is a
+    checked precondition), rebuilds ``Scan.ocr_results``, recomputes
+    the Issues, and moves the scan to
+    ``READY_FOR_PAGE_COMPLETENESS_REVIEW``.
+
+    Deliberately **not** daemon-queued work (#212): the computation is
+    seconds of local work that does not change what the scan is, so it
+    never transits QUEUED/PROCESSING -- the scan stays in the review
+    flow throughout, there is no claim for a cancel to race, and no
+    scan-wide retry budget is spent. The one status write is a single
+    compare-and-swap on the review edge, inside
+    ``services.run_compute_issues``.
+
+    Which scans, and why:
+
+    - ``AWAITING_VALIDATION`` (the normal park) and the legacy
+      ``PENDING_REVIEW`` (staff ran OCR on it deliberately) take the
+      edge to READY. A failure leaves the status alone, so the pass
+      retries next tick, up to ``APPLY_MAX_ATTEMPTS``.
+    - ``READY_FOR_PAGE_COMPLETENESS_REVIEW`` is a recompute after a
+      fresh OCR run: data only, status untouched. ``applied_at`` on
+      the run is what keeps a recompute from looping every tick.
+    - ``AWAITING`` is deferred, not skipped: the pass leaves no mark,
+      so the scan is picked up on the tick after the bitonal merge
+      parks it. A cancelled, errored or approved scan is deferred the
+      same way and comes back only through the admin re-queue, which
+      parks it in ``AWAITING_VALIDATION``.
+
+    :returns: How many scans were applied.
+    :rtype: int
+    """
+    if not s3_sync.s3_active():
+        return 0
+
+    scan_ids = (
+        Scan.objects.filter(
+            jobs__stage=JobStage.ANALYZE,
+            jobs__engine=JobEngine.DOTS_MOCR,
+            jobs__provider=JobProvider.RUNPOD,
+            jobs__status=JobStatus.CONSUMED,
+        )
+        .values_list("pk", flat=True)
+        .distinct()
+    )
+    applied = 0
+    for scan in Scan.objects.filter(
+        pk__in=list(scan_ids),
+        status__in=(
+            Status.AWAITING_VALIDATION,
+            Status.PENDING_REVIEW,
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+        ),
+    ).select_related("reporter"):
+        rows = live_analyze_jobs(scan)
+        if not rows:
+            continue
+        if any(row.status != JobStatus.CONSUMED for row in rows):
+            # The candidate row belongs to an older run; the live one
+            # is not glued yet.
+            continue
+        state = _apply_state(rows)
+        if state.get("applied_at"):
+            continue
+        if int(state.get("attempts") or 0) >= APPLY_MAX_ATTEMPTS:
+            continue
+
+        from scanning import services
+
+        try:
+            done = services.run_compute_issues(
+                scan, glued_result_key(scan, rows[0].run)
+            )
+        except Exception as exc:
+            _record_apply_failure(scan, rows, exc)
+            continue
+
+        if done:
+            state["applied_at"] = timezone.now().isoformat()
+            _write_apply_state(rows, state)
+            applied += 1
+
+    return applied

@@ -20,8 +20,11 @@ from scanning.factories import (
     VolumeFactory,
 )
 from scanning.models import (
+    CheckName,
     Detection,
+    Issue,
     QueueStatus,
+    Scan,
     Stage,
     Status,
 )
@@ -458,7 +461,6 @@ class TestComputeRedactionsApiView(TestCase):
             self.assertEqual(response.status_code, 400)
 
     def test_computes_rects_successfully(self):
-
         user = UserFactory()
         self.client.force_login(user)
 
@@ -1890,6 +1892,186 @@ class TestRecalculateIssues(TestCase):
 
         scan.refresh_from_db()
         self.assertEqual(scan.missing_pages, [3, 4])
+        self.assertFalse(scan.issues.exists())
+
+
+class TestRunComputeIssues(TestCase):
+    """The apply of the glued dots.mocr output (#149/#204, #212).
+
+    Called by ``dots_mocr.apply_ready_runs`` with the scan and the
+    glued document's key; the download is patched in. The scan never
+    transits QUEUED/PROCESSING, and like the recheck the apply must
+    not need a local copy of the PDF.
+    """
+
+    def _make_scan(self, **kwargs):
+        """Create a scan with no local PDF, parked for the apply.
+
+        :param kwargs: ScanFactory overrides.
+        :returns: The scan.
+        """
+        kwargs.setdefault("status", Status.AWAITING_VALIDATION)
+        scan = ScanFactory(start_page=1, end_page=2, page_count=2, **kwargs)
+        pathlib.Path(scan.original_pdf.path).unlink()
+        return scan
+
+    def _document(self, texts):
+        """Build a glued volume document with one header cell per page.
+
+        :param texts: One header text per page; None makes the page a
+            filtered one.
+        :returns: The document dict.
+        """
+        from scanning.tests.test_page_numbers import cell, make_page
+
+        return {
+            "pages": [
+                make_page(index + 1, None if text is None else [cell(text)])
+                for index, text in enumerate(texts)
+            ]
+        }
+
+    def _run(self, scan, document):
+        from scanning import services
+
+        with patch(
+            "scanning.s3_sync.download_json_object", return_value=document
+        ) as download:
+            done = services.run_compute_issues(scan, "jobs/x/r1-volume.json")
+        return done, download
+
+    def test_the_apply_reads_pages_and_readies_the_scan(self):
+        scan = self._make_scan()
+
+        done, download = self._run(scan, self._document(["1", None]))
+
+        scan.refresh_from_db()
+        self.assertTrue(done)
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        self.assertEqual(scan.progress_message, "Done")
+        self.assertEqual(
+            [(r["pdf_page"], r["detected"]) for r in scan.ocr_results],
+            [(1, "1"), (2, None)],
+        )
+        self.assertTrue(scan.page_map)
+        self.assertTrue(
+            scan.issues.filter(
+                check_name=CheckName.NO_PAGE_NUMBER, page_number=2
+            ).exists()
+        )
+        download.assert_called_once_with("jobs/x/r1-volume.json")
+
+    def test_a_legacy_pending_review_scan_takes_the_edge(self):
+        scan = self._make_scan(status=Status.PENDING_REVIEW)
+
+        done, _ = self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertTrue(done)
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+
+    def test_a_ready_scan_recomputes_without_a_status_write(self):
+        scan = self._make_scan(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+
+        done, _ = self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertTrue(done)
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        self.assertEqual(scan.ocr_results[1]["detected"], "2")
+
+    def test_a_manual_read_survives_the_apply(self):
+        scan = self._make_scan(
+            ocr_results=[
+                {
+                    "pdf_page": 1,
+                    "detected": "9",
+                    "type": "single",
+                    "score": 1.0,
+                    "zone": "manual",
+                    "ocr": "manual",
+                }
+            ]
+        )
+
+        self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[0]["detected"], "9")
+        self.assertEqual(scan.ocr_results[0]["zone"], "manual")
+        self.assertEqual(scan.ocr_results[1]["detected"], "2")
+
+    def test_suppressed_detection_issues_are_kept(self):
+        scan = self._make_scan()
+        Issue.objects.create(
+            scan=scan,
+            check_name=CheckName.SUPPRESS_DETECTION,
+            severity=Issue.Severity.INFO,
+            message="curator decision",
+        )
+
+        self._run(scan, self._document(["1", "2"]))
+
+        self.assertTrue(
+            scan.issues.filter(
+                check_name=CheckName.SUPPRESS_DETECTION
+            ).exists()
+        )
+
+    def test_a_second_apply_recomputes_idempotently(self):
+        scan = self._make_scan()
+
+        self._run(scan, self._document(["1", "2"]))
+        scan.refresh_from_db()
+        done, _ = self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertTrue(done)
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        self.assertEqual(len(scan.ocr_results), 2)
+        self.assertEqual(
+            scan.issues.filter(check_name=CheckName.NO_PAGE_NUMBER).count(),
+            0,
+        )
+
+    def test_a_lost_edge_leaves_the_scan_alone(self):
+        """The #210 review race, closed: a scan cancelled between the
+        pass's read and the edge write keeps its status, and its
+        Issues are not rebuilt over a decision somebody just made."""
+        scan = self._make_scan()
+        Scan.objects.filter(pk=scan.pk).update(status=Status.CANCELLED)
+
+        done, _ = self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertFalse(done)
+        self.assertEqual(scan.status, Status.CANCELLED)
+        self.assertFalse(scan.issues.exists())
+
+    def test_a_download_failure_raises_to_the_caller(self):
+        from scanning import services
+
+        scan = self._make_scan()
+
+        with patch(
+            "scanning.s3_sync.download_json_object",
+            side_effect=RuntimeError("boom"),
+        ):
+            with self.assertRaises(RuntimeError):
+                services.run_compute_issues(scan, "jobs/x/r1-volume.json")
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
         self.assertFalse(scan.issues.exists())
 
 
