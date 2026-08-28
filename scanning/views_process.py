@@ -541,8 +541,11 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     there either converted (so a preview exists and step 3 is never
     reached) or deliberately unconverted (skipped, failed, or a
     pre-#176 post-cutover upload), and then no poll will ever find one.
-    The one transient case folded into that 409 is a converted scan
-    whose S3 preview pull just failed; a reload retries it.
+    The two #154 review states are also 409s, but with their own
+    message: they guarantee a stored preview, so reaching step 3 under
+    them means the S3 pull just failed, and a reload (not a poll)
+    retries it. The same failed-pull case under AWAITING_VALIDATION
+    stays folded into its generic 409.
 
     A served preview carries ``X-Scan-Preview: bitonal`` so the viewer
     knows it shows the lower-quality conversion and can offer the
