@@ -50,7 +50,9 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    QueuedAction,
     Scan,
+    Status,
 )
 
 logger = logging.getLogger(__name__)
@@ -510,6 +512,46 @@ def _record_glue_failure(scan, analyze_jobs: list[ExternalJob], exc) -> None:
         )
 
 
+def enqueue_compute_issues(scan) -> bool:
+    """Queue the page-number apply for ``scan``, if it may run now.
+
+    One guarded write, shared by both enqueue points (the glue below
+    and the bitonal park): only a scan parked in
+    ``AWAITING_VALIDATION``, already ``READY_FOR_PAGE_COMPLETENESS_
+    REVIEW`` (a recompute after a fresh OCR run), or in the legacy
+    ``PENDING_REVIEW`` (staff ran OCR on it deliberately) is moved to
+    QUEUED. A lost guard enqueues nothing: ``AWAITING`` belongs to the
+    bitonal merge, which reads only that status, and a cancelled,
+    errored or approved scan must not be revived or knocked back --
+    the way back for those is the admin re-queue.
+
+    :param scan: The scan whose glued run is ready to apply.
+    :returns: Whether the action was queued.
+    :rtype: bool
+    """
+    updated = Scan.objects.filter(
+        pk=scan.pk,
+        status__in=(
+            Status.AWAITING_VALIDATION,
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.PENDING_REVIEW,
+        ),
+    ).update(
+        status=Status.QUEUED,
+        queued_action=QueuedAction.COMPUTE_ISSUES,
+        progress_message="Reading page numbers from the OCR output...",
+        progress_current=0,
+        progress_total=0,
+    )
+    if not updated:
+        logger.info(
+            "compute_issues not queued for scan %s: its status does not "
+            "allow it",
+            scan.pk,
+        )
+    return bool(updated)
+
+
 def finish_ready_runs() -> int:
     """Glue every finished dots.mocr run into its volume document.
 
@@ -519,12 +561,15 @@ def finish_ready_runs() -> int:
     the volume, ``run_summary`` already shows it on the process page,
     and the way forward is the staff button opening a fresh run.
 
-    Unlike the bitonal pass this one writes **no scan status** -- that
-    invariant belongs to issue #190, and it is what keeps a volume
-    browsable while it is read. With no status to latch on, the rows are
-    the idempotence marker: a glued run is all ``CONSUMED``, so it drops
-    out of the candidate query. The per-shard results are kept, which is
-    what makes the retry after a crashed tick safe.
+    A glued run then queues the apply step (#149/#204) through
+    :func:`enqueue_compute_issues`. That write retires #190's
+    "the stage writes no scan status" invariant on purpose, and only at
+    this point: the volume stays browsable while it is read, and the
+    guarded statuses keep every other state -- ``AWAITING`` above all
+    -- out of reach. The rows stay the idempotence marker: a glued run
+    is all ``CONSUMED``, so it drops out of the candidate query. The
+    per-shard results are kept, which is what makes the retry after a
+    crashed tick safe.
 
     :returns: How many runs were glued and consumed.
     :rtype: int
@@ -574,5 +619,10 @@ def finish_ready_runs() -> int:
             status=JobStatus.COMPLETED,
         ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
         glued += 1
+
+        # The normal handoff to the apply step. A scan still AWAITING
+        # (conversion in flight) loses the guard here and gets its
+        # enqueue from the bitonal park instead.
+        enqueue_compute_issues(scan)
 
     return glued

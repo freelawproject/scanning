@@ -52,8 +52,10 @@ The legacy processing stages — in-process bitonal conversion, the YOLO
 `detect` and PaddleOCR `analyze` RunPod actions (and the whole
 blackletter-gpu-worker under `scanning/runpod/`), and their
 `RUNPOD_ENABLED=False` in-process fallbacks — are deleted. Bitonal came
-back as an external job, and dots.mocr as a staff-started one (both
-below); still missing is #149 (page numbers from the dots output), so:
+back as an external job, dots.mocr as a staff-started one, and the page
+numbers plus Issues as the daemon-queued apply (#149/#204, all below);
+still missing are the #151 approve button and the post-review stages
+(#195/#196), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
   then either starts the bitonal conversion (`Status.AWAITING`) or
@@ -86,17 +88,20 @@ below); still missing is #149 (page numbers from the dots output), so:
 
 `READY_FOR_PAGE_COMPLETENESS_REVIEW` and
 `PAGE_COMPLETENESS_REVIEW_DONE` give review 1 explicit edges. #154
-landed the values and the readers only — **nothing writes them yet**:
-the #149 apply sets READY (last prerequisite by construction; it must
-also restore READY after an admin re-queue parks a ready scan back in
-`AWAITING_VALIDATION`), the #151 approve button sets DONE, and
-#195/#196 trigger off DONE writing **no** scan status, so redaction
-work never blocks either review. Both are parked human states outside
+landed the values and the readers; the `compute_issues` apply
+(#149/#204, below) writes READY — the last prerequisite by
+construction, and it restores READY after an admin re-queue parks a
+ready scan back in `AWAITING_VALIDATION` (re-queue -> bitonal park ->
+re-enqueue -> apply). The #151 approve button sets DONE, and #195/#196
+trigger off DONE writing **no** scan status, so redaction work never
+blocks either review. Both are parked human states outside
 `BUSY_STATUSES` (no polling, no sweep); `AWAITING_VALIDATION` now means
 "review-1 prerequisites outstanding". `recalculate_issues` preserves
 both (`PENDING_REVIEW` remains for legacy rows and step 2 only), and
 `serve_scan_pdf` reads a missing preview under either as a failed S3
-pull (409 + reload hint), since READY guarantees a `bitonal.pdf`.
+pull (409 + reload hint) — READY implies the conversion finished or
+was skipped because the source is already bitonal (that copy nuance
+belongs to the #204 follow-up).
 
 ## Bitonal via doctor (issue #176)
 
@@ -227,10 +232,13 @@ trained on), tracked on `ExternalJob` rows at
   `head_object` on the original (size plus `Scan.page_count` *is* the
   whole fingerprint), so a web pod never pulls a multi-GB PDF and never
   reads `shards/` directly. A stale set is refused, not re-cut.
-- **The stage writes no scan status.** Progress lives only on the rows,
-  read through `dots_mocr.run_summary` into the page context and
-  `progress_api`. So a volume stays browsable and reviewable while it
-  reads, and the bitonal stage keeps sole ownership of `AWAITING`.
+- **The stage writes no scan status while it reads.** Progress lives
+  only on the rows, read through `dots_mocr.run_summary` into the page
+  context and `progress_api`. So a volume stays browsable and
+  reviewable while it reads, and the bitonal stage keeps sole ownership
+  of `AWAITING`. The one status write comes at the very end, from
+  `enqueue_compute_issues` (#204, below), and its guard reaches only
+  `AWAITING_VALIDATION`, READY and the legacy `PENDING_REVIEW`.
 - **Queue time is not run time.** A row keeps
   `DAEMON_JOB_MAX_QUEUE_SECONDS` (6h) until `/status` first reports
   `IN_PROGRESS`; only that *crossing* stamps
@@ -304,13 +312,14 @@ trained on), tracked on `ExternalJob` rows at
   client that slept would stall every other task.
 - **A shard that lost some pages still completes.** `failed_pages` is
   logged as a WARNING naming *volume* pages (the worker counts from zero
-  inside its shard) and kept in `provider_meta`. #149 reads a missing
-  page as `detected=None` and interpolates, so re-running 99 good pages
-  to recover one is poor value.
+  inside its shard) and kept in `provider_meta`. The apply reads a
+  missing page as `detected=None` and interpolates, so re-running 99
+  good pages to recover one is poor value.
 - **`DPI = 200` and `PROMPT_MODE = "prompt_layout_all_en"` are module
   constants, not settings.** The dpi matches `DOCTOR_BITONAL_DPI` so a
   cell's bbox describes the same pixel space as the rest of the corpus,
-  and the prompt mode is what #149 needs (cells *and* text). A one-off
+  and the prompt mode is what the apply needs (cells *and* text). A
+  one-off
   experiment overrides them per row through `input_manifest`.
 - **The blocking wave goes last.** `submit_pending` sends the RunPod
   wave before doctor's. A RunPod submit returns as soon as the job is
@@ -332,16 +341,34 @@ trained on), tracked on `ExternalJob` rows at
   generic sync never carries it — and flips the rows to `CONSUMED`.
   The per-shard results are deliberately **not** deleted: the future
   smart glue over page inserts and deletes re-reads them. A page the
-  worker failed keeps its slot with its `error` (#149 reads it as
-  `detected=None`). The pass writes no scan status (the #190
-  invariant); a run holding a dead row is skipped silently, since
+  worker failed keeps its slot with its `error` (the apply reads it as
+  `detected=None`). A run holding a dead row is skipped silently, since
   `run_summary` already shows it and the button opens the fresh run. A
   glue *failure* retries next tick up to `GLUE_MAX_ATTEMPTS`, counted
   in the shard-0 row's `provider_meta["glue"]` (never in
   `input_manifest` — `_still_describes` compares that exactly), with
   one ERROR log at the crossing and silence after; the rows stay
   `COMPLETED`, so recovery is a deploy plus clearing the counter, not
-  a re-paid run. Reading page numbers out of the glued JSON is #149.
+  a re-paid run.
+- **A glued run hands off to the `compute_issues` apply (#149/#204).**
+  The apply is daemon-enqueued work, not a pass of its own:
+  `enqueue_compute_issues` flips the scan to QUEUED with
+  `QueuedAction.COMPUTE_ISSUES`, `process_next_scan` claims it, and
+  `services.run_compute_issues` reads the glued JSON (its S3 presence
+  is a checked precondition, and a miss parks back to
+  `AWAITING_VALIDATION`, not ERROR), rebuilds `Scan.ocr_results`
+  through the `page_numbers` adapter (manual `assign_page` entries are
+  carried over verbatim), sets READY on the instance and runs the
+  unchanged `recalculate_issues` funnel, whose #154 preservation
+  branch persists it. The enqueue guard is one place and reaches only
+  `AWAITING_VALIDATION`, READY (a recompute) and the legacy
+  `PENDING_REVIEW`: `AWAITING` belongs to the bitonal merge — whose
+  park re-runs the enqueue when the OCR run finished first
+  (`bitonal._handoff_compute_issues`) — and a cancelled, errored or
+  approved scan is never revived or knocked back. Transient S3 errors
+  re-queue through `_handle_pipeline_exception` with `queued_action`
+  intact; the bands and token rules of the adapter come from
+  ai-research `pipeline/core/order.py` and issue #149.
 - **No provider abstraction, deliberately.** `jobs.py` branches on
   `job.provider`; ~600 of its lines are provider-agnostic and stay
   shared, and only the submit call and the in-flight check fork. Do not

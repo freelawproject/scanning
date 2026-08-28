@@ -21,10 +21,11 @@ moves it out of ``AWAITING``.
 **3. ``dots_mocr.finish_ready_runs()`` glues finished OCR runs.** It
 joins the per-shard payloads of any scan whose dots.mocr rows are all
 ``COMPLETED`` into one volume JSON on S3 and flips the rows to
-``CONSUMED`` (issue #202). It writes no scan status, and it keeps the
-per-shard results: a future smart glue over page inserts and deletes
-re-reads them. Reading page numbers out of the glued JSON is issue
-#149.
+``CONSUMED`` (issue #202). It keeps the per-shard results: a future
+smart glue over page inserts and deletes re-reads them. A glued run
+then queues the page-number apply (``compute_issues``, #149/#204) for
+the ``process_next_scan`` tick; the bitonal pass above does the same
+when it parks a scan whose OCR run finished first.
 
 Examples:
 

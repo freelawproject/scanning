@@ -12,7 +12,7 @@ from unittest.mock import patch
 import fitz
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from scanning import s3_sync
+from scanning import dots_mocr, s3_sync
 from scanning.factories import (
     ReporterFactory,
     ScanFactory,
@@ -20,7 +20,12 @@ from scanning.factories import (
     VolumeFactory,
 )
 from scanning.models import (
+    CheckName,
     Detection,
+    ExternalJob,
+    Issue,
+    JobStatus,
+    QueuedAction,
     QueueStatus,
     Stage,
     Status,
@@ -1891,6 +1896,204 @@ class TestRecalculateIssues(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.missing_pages, [3, 4])
         self.assertFalse(scan.issues.exists())
+
+
+class TestRunComputeIssues(TestCase):
+    """The daemon apply of the glued dots.mocr output (#149/#204).
+
+    The scan arrives claimed (PROCESSING) with a fully consumed OCR
+    run; the glued volume JSON is patched in. Like the recheck, the
+    apply must not need a local copy of the PDF.
+    """
+
+    def _make_scan(self, **kwargs):
+        """Create a claimed scan with a consumed OCR run and no local PDF.
+
+        :param kwargs: ScanFactory overrides.
+        :returns: The scan.
+        """
+        from scanning.tests.test_jobs import make_manifest
+
+        kwargs.setdefault("status", Status.PROCESSING)
+        kwargs.setdefault("queued_action", QueuedAction.COMPUTE_ISSUES)
+        scan = ScanFactory(
+            start_page=1, end_page=2, page_count=2, **kwargs
+        )
+        pathlib.Path(scan.original_pdf.path).unlink()
+        rows = dots_mocr.ensure_analyze_jobs(scan, make_manifest(2, 1))
+        ExternalJob.objects.filter(pk__in=[row.pk for row in rows]).update(
+            status=JobStatus.CONSUMED
+        )
+        return scan
+
+    def _document(self, texts):
+        """Build a glued volume document with one header cell per page.
+
+        :param texts: One header text per page; None makes the page a
+            filtered one.
+        :returns: The document dict.
+        """
+        from scanning.tests.test_page_numbers import cell, make_page
+
+        return {
+            "pages": [
+                make_page(index + 1, None if text is None else [cell(text)])
+                for index, text in enumerate(texts)
+            ]
+        }
+
+    def _run(self, scan, document):
+        from scanning import services
+
+        with patch(
+            "scanning.s3_sync.download_json_object", return_value=document
+        ) as download:
+            services.run_compute_issues(scan.pk)
+        return download
+
+    def test_the_apply_reads_pages_and_readies_the_scan(self):
+        scan = self._make_scan()
+
+        download = self._run(scan, self._document(["1", None]))
+
+        scan.refresh_from_db()
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        self.assertEqual(scan.progress_message, "Done")
+        self.assertEqual(
+            [(r["pdf_page"], r["detected"]) for r in scan.ocr_results],
+            [(1, "1"), (2, None)],
+        )
+        self.assertTrue(scan.page_map)
+        self.assertTrue(
+            scan.issues.filter(
+                check_name=CheckName.NO_PAGE_NUMBER, page_number=2
+            ).exists()
+        )
+        download.assert_called_once_with(
+            dots_mocr.glued_result_key(
+                scan, dots_mocr.live_analyze_jobs(scan)[0].run
+            )
+        )
+
+    def test_a_manual_read_survives_the_apply(self):
+        scan = self._make_scan(
+            ocr_results=[
+                {
+                    "pdf_page": 1,
+                    "detected": "9",
+                    "type": "single",
+                    "score": 1.0,
+                    "zone": "manual",
+                    "ocr": "manual",
+                }
+            ]
+        )
+
+        self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[0]["detected"], "9")
+        self.assertEqual(scan.ocr_results[0]["zone"], "manual")
+        self.assertEqual(scan.ocr_results[1]["detected"], "2")
+
+    def test_suppressed_detection_issues_are_kept(self):
+        scan = self._make_scan()
+        Issue.objects.create(
+            scan=scan,
+            check_name=CheckName.SUPPRESS_DETECTION,
+            severity=Issue.Severity.INFO,
+            message="curator decision",
+        )
+
+        self._run(scan, self._document(["1", "2"]))
+
+        self.assertTrue(
+            scan.issues.filter(
+                check_name=CheckName.SUPPRESS_DETECTION
+            ).exists()
+        )
+
+    def test_a_second_apply_recomputes_idempotently(self):
+        scan = self._make_scan()
+
+        self._run(scan, self._document(["1", "2"]))
+        self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        self.assertEqual(len(scan.ocr_results), 2)
+        self.assertEqual(
+            scan.issues.filter(check_name=CheckName.NO_PAGE_NUMBER).count(),
+            0,
+        )
+
+    def test_a_missing_document_parks_the_scan(self):
+        from botocore.exceptions import ClientError
+
+        from scanning import services
+
+        scan = self._make_scan()
+        missing = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
+        with patch(
+            "scanning.s3_sync.download_json_object", side_effect=missing
+        ):
+            services.run_compute_issues(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertEqual(scan.ocr_results, [])
+        self.assertFalse(scan.issues.exists())
+
+    def test_an_unglued_run_parks_the_scan(self):
+        from scanning import services
+
+        scan = self._make_scan()
+        ExternalJob.objects.filter(scan=scan).update(
+            status=JobStatus.COMPLETED
+        )
+
+        with patch("scanning.s3_sync.download_json_object") as download:
+            services.run_compute_issues(scan.pk)
+
+        download.assert_not_called()
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+
+    def test_a_transient_s3_error_requeues_the_scan(self):
+        from botocore.exceptions import ClientError
+
+        from scanning import services
+
+        scan = self._make_scan()
+        throttle = ClientError({"Error": {"Code": "SlowDown"}}, "GetObject")
+
+        with patch(
+            "scanning.s3_sync.download_json_object", side_effect=throttle
+        ):
+            services.run_compute_issues(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.queued_action, QueuedAction.COMPUTE_ISSUES)
+        self.assertEqual(scan.retry_count, 1)
+
+    def test_a_park_never_stomps_a_cancel(self):
+        from scanning import services
+
+        scan = self._make_scan(status=Status.CANCELLED)
+        ExternalJob.objects.filter(scan=scan).update(
+            status=JobStatus.COMPLETED
+        )
+
+        services.run_compute_issues(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.CANCELLED)
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT, DEVELOPMENT=True)

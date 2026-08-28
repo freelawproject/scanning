@@ -294,6 +294,24 @@ def _log_stage_duration(scan, convert_jobs: list[ExternalJob], now) -> None:
     )
 
 
+def _handoff_compute_issues(scan) -> None:
+    """Queue the page-number apply when an OCR run is already glued.
+
+    The glue's own enqueue (``dots_mocr.finish_ready_runs``) loses its
+    status guard against a scan still ``AWAITING`` this conversion, so
+    the park to ``AWAITING_VALIDATION`` is the second chance: whichever
+    stage finishes last hands the scan to the apply step (#149/#204).
+
+    :param scan: The scan that just left AWAITING.
+    :return: None.
+    """
+    from scanning import dots_mocr
+
+    rows = dots_mocr.live_analyze_jobs(scan)
+    if rows and all(row.status == JobStatus.CONSUMED for row in rows):
+        dots_mocr.enqueue_compute_issues(scan)
+
+
 def finish_ready_scans() -> int:
     """Apply every finished conversion and report failures.
 
@@ -354,6 +372,7 @@ def finish_ready_scans() -> int:
             )
             if _park(scan, Status.AWAITING_VALIDATION, CONVERTED_MESSAGE):
                 finished += 1
+                _handoff_compute_issues(scan)
             continue
 
         dead = [job for job in convert_jobs if job.status in DEAD_JOB_STATUSES]
@@ -382,6 +401,7 @@ def finish_ready_scans() -> int:
         try:
             if _finish_scan(scan, convert_jobs):
                 finished += 1
+                _handoff_compute_issues(scan)
         except Exception as exc:
             # The merge is the one local step, so a failure is not the
             # provider's fault and retries no job.

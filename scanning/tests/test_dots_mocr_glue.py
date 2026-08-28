@@ -7,8 +7,9 @@ test:
 - the page arithmetic: shard-local ``page_no`` to volume ``page_index``
 - the envelope checks, all that stands between a paid result and a
   document glued from the wrong bytes
-- the finish pass: rows consumed, results kept, no scan status written,
-  and a bounded retry of a glue that keeps failing
+- the finish pass: rows consumed, results kept, the apply queued only
+  from the eligible statuses (#204), and a bounded retry of a glue
+  that keeps failing
 """
 
 import json
@@ -21,7 +22,13 @@ from django.test import TestCase
 
 from scanning import dots_mocr, s3_sync
 from scanning.factories import ScanFactory
-from scanning.models import ExternalJob, JobStatus
+from scanning.models import (
+    ExternalJob,
+    JobStatus,
+    QueuedAction,
+    Scan,
+    Status,
+)
 from scanning.tests.test_jobs import make_manifest
 
 
@@ -355,15 +362,44 @@ class TestFinishReadyRuns(AnalyzeJobsMixin, TestCase):
 
         delete.assert_not_called()
 
-    def test_no_scan_status_is_written(self):
-        """The invariant of issue #190: progress lives on the rows."""
-        scan, _ = self.build(shard_count=2, pages_per_shard=1)
-        before = scan.status
+    def test_a_glued_run_queues_the_apply(self):
+        """The handoff of issues #149/#204, from every eligible status."""
+        for status in (
+            Status.AWAITING_VALIDATION,
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.PENDING_REVIEW,
+        ):
+            with self.subTest(status=status):
+                scan, _ = self.build(shard_count=2, pages_per_shard=1)
+                Scan.objects.filter(pk=scan.pk).update(status=status)
 
-        dots_mocr.finish_ready_runs()
+                dots_mocr.finish_ready_runs()
 
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, before)
+                scan.refresh_from_db()
+                self.assertEqual(scan.status, Status.QUEUED)
+                self.assertEqual(
+                    scan.queued_action, QueuedAction.COMPUTE_ISSUES
+                )
+
+    def test_an_ineligible_scan_keeps_its_status(self):
+        """What is left of issue #190's no-status invariant: the glue
+        never touches a busy, terminal, or approved scan. ``AWAITING``
+        stays the bitonal merge's alone; its park does the handoff."""
+        for status in (
+            Status.AWAITING,
+            Status.CANCELLED,
+            Status.ERROR,
+            Status.APPROVED,
+        ):
+            with self.subTest(status=status):
+                scan, _ = self.build(shard_count=2, pages_per_shard=1)
+                Scan.objects.filter(pk=scan.pk).update(status=status)
+
+                dots_mocr.finish_ready_runs()
+
+                scan.refresh_from_db()
+                self.assertEqual(scan.status, status)
+                self.assertEqual(scan.queued_action, "")
 
     def test_a_run_still_in_flight_is_left_alone(self):
         _, rows = self.build(shard_count=3, pages_per_shard=1)
