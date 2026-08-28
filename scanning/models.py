@@ -97,14 +97,28 @@ class Status(models.TextChoices):
     # the ExternalJob rows rather than in a call stack, which is what
     # lets a killed daemon resume by reading them.
     AWAITING = "awaiting", "Waiting on external jobs"
-    # Interim parking state (issue #173): the upload-side pipeline
-    # (sharding, and soon the dots.mocr raw run) finished, but
-    # page-number validation is disabled until the dots.mocr adapter
-    # (#149) replaces the retired PaddleOCR path. Scans wait here, out
+    # Parking state (issues #173/#154): the upload-side pipeline
+    # finished, but one or more inputs of the page completeness review
+    # are still outstanding -- the bitonal preview, the dots.mocr run,
+    # or the page numbers and issues from #149. Scans wait here, out
     # of the review flow, so nothing downstream mistakes them for
-    # reviewed or errored volumes. #154 refines this into the final
-    # review-1 state model.
+    # reviewed or errored volumes.
     AWAITING_VALIDATION = "awaiting_validation", "Awaiting Validation"
+    # The two page-completeness review states (#154). Both are parked
+    # human states, not busy ones: the viewer does not poll them and
+    # the stale sweep must not touch them. The #149 apply is the only
+    # writer of READY_FOR_PAGE_COMPLETENESS_REVIEW, and the approve
+    # button (#151) is the only writer of PAGE_COMPLETENESS_REVIEW_DONE.
+    # The stages behind review 1 (#195/#196) trigger off DONE and write
+    # no scan status, so redaction work never blocks either review.
+    READY_FOR_PAGE_COMPLETENESS_REVIEW = (
+        "ready_for_page_completeness_review",
+        "Ready for page review",
+    )
+    PAGE_COMPLETENESS_REVIEW_DONE = (
+        "page_completeness_review_done",
+        "Page review done",
+    )
     PENDING_REVIEW = "pending_review", "Pending Review"
     APPROVED = "approved", "Approved"
     EXTRACTED = "extracted", "Extracted"
@@ -527,7 +541,9 @@ class Scan(AbstractDateTimeModel):
         help_text="Verbose output from blackletter pipeline processing.",
     )
     status = models.CharField(
-        max_length=20,
+        # 40 fits the longest value,
+        # "ready_for_page_completeness_review" (34).
+        max_length=40,
         choices=Status.choices,
         default=Status.UPLOADED,
     )

@@ -74,9 +74,19 @@ class Command(BaseCommand):
         to_create = count - existing
         scans = ScanFactory.create_batch(to_create, uploaded_by=scanner)
 
+        # Seed one example of each page-completeness review state
+        # (#154) so the badges and the step selection are visible in
+        # dev; the rest get the legacy PENDING_REVIEW.
+        statuses = [
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        ]
         seeded = 0
-        for scan in scans:
-            if self._seed_reviewable(scan):
+        for i, scan in enumerate(scans):
+            status = (
+                statuses[i] if i < len(statuses) else Status.PENDING_REVIEW
+            )
+            if self._seed_reviewable(scan, status):
                 seeded += 1
 
         self.stdout.write(
@@ -86,7 +96,7 @@ class Command(BaseCommand):
             )
         )
 
-    def _seed_reviewable(self, scan):
+    def _seed_reviewable(self, scan, status=Status.PENDING_REVIEW):
         """Give a scan a real, viewable preview so the process viewer works.
 
         ``ScanFactory`` attaches only a placeholder ``b"%PDF-1.4 test"`` that
@@ -94,7 +104,7 @@ class Command(BaseCommand):
         freshly-seeded scan otherwise sits on "still processing" forever. Copy
         the bundled sample PDF into the scan's ``output_dir`` as both the
         bitonal preview (what ``serve_scan_pdf`` serves) and the original (used
-        by crops), then mark it pending review.
+        by crops), then park it in ``status``.
 
         Deliberately does NOT run the pipeline: OCR/detection are slow and can
         hard-segfault under x86 emulation, which would break container startup
@@ -102,6 +112,7 @@ class Command(BaseCommand):
         fast, pure file copy.
 
         :param scan: The scan to seed.
+        :param status: The status to park the seeded scan in.
         :returns: True if a preview was written, False if the fixture is
             missing or the copy failed (the scan is left as-is).
         :rtype: bool
@@ -125,7 +136,7 @@ class Command(BaseCommand):
             )
             (output_dir / original_name).write_bytes(data)
             scan.original_pdf.name = original_name
-            scan.status = Status.PENDING_REVIEW
+            scan.status = status
             scan.save(update_fields=["original_pdf", "status"])
         except Exception as exc:
             self.stdout.write(

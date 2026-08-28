@@ -82,6 +82,22 @@ below); still missing is #149 (page numbers from the dots output), so:
   without it an environment uploads and browses but runs no GPU stage.
   Upload paths must always keep working.
 
+## Page completeness review states (issue #154)
+
+`READY_FOR_PAGE_COMPLETENESS_REVIEW` and
+`PAGE_COMPLETENESS_REVIEW_DONE` give review 1 explicit edges. #154
+landed the values and the readers only — **nothing writes them yet**:
+the #149 apply sets READY (last prerequisite by construction; it must
+also restore READY after an admin re-queue parks a ready scan back in
+`AWAITING_VALIDATION`), the #151 approve button sets DONE, and
+#195/#196 trigger off DONE writing **no** scan status, so redaction
+work never blocks either review. Both are parked human states outside
+`BUSY_STATUSES` (no polling, no sweep); `AWAITING_VALIDATION` now means
+"review-1 prerequisites outstanding". `recalculate_issues` preserves
+both (`PENDING_REVIEW` remains for legacy rows and step 2 only), and
+`serve_scan_pdf` reads a missing preview under either as a failed S3
+pull (409 + reload hint), since READY guarantees a `bitonal.pdf`.
+
 ## Bitonal via doctor (issue #176)
 
 Conversion runs on doctor, one request per shard, tracked on
