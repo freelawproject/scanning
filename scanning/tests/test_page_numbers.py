@@ -79,9 +79,7 @@ class TestExtractPageNumber(SimpleTestCase):
         self.assertEqual(entry["score"], 0.8)
 
     def test_an_odd_page_number_trails_the_cite_line(self):
-        entry = self.extract(
-            [cell("STATE v. SMITH Cite as 218 A.3d 677 679")]
-        )
+        entry = self.extract([cell("STATE v. SMITH Cite as 218 A.3d 677 679")])
 
         self.assertEqual(entry["detected"], "679")
 

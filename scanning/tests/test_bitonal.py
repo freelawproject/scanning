@@ -491,9 +491,9 @@ class TestComputeIssuesHandoff(ConvertJobsMixin, TestCase):
 
     def test_an_already_consumed_conversion_hands_off_too(self):
         scan, _ = self.build(shard_count=2, pages_per_shard=1)
-        ExternalJob.objects.filter(
-            scan=scan, stage=JobStage.CONVERT
-        ).update(status=JobStatus.CONSUMED)
+        ExternalJob.objects.filter(scan=scan, stage=JobStage.CONVERT).update(
+            status=JobStatus.CONSUMED
+        )
         self.add_analyze_run(scan, JobStatus.CONSUMED)
 
         bitonal.finish_ready_scans()

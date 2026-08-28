@@ -1916,9 +1916,7 @@ class TestRunComputeIssues(TestCase):
 
         kwargs.setdefault("status", Status.PROCESSING)
         kwargs.setdefault("queued_action", QueuedAction.COMPUTE_ISSUES)
-        scan = ScanFactory(
-            start_page=1, end_page=2, page_count=2, **kwargs
-        )
+        scan = ScanFactory(start_page=1, end_page=2, page_count=2, **kwargs)
         pathlib.Path(scan.original_pdf.path).unlink()
         rows = dots_mocr.ensure_analyze_jobs(scan, make_manifest(2, 1))
         ExternalJob.objects.filter(pk__in=[row.pk for row in rows]).update(
