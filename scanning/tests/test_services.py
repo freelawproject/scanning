@@ -1665,6 +1665,35 @@ class TestRecalculateIssues(TestCase):
             scan.issues.filter(check_name="no_page_number").exists()
         )
 
+    def test_recheck_keeps_the_review_1_statuses(self):
+        """A recheck must not move a scan between review states (#154):
+        a scan in a page-completeness review state keeps it, and only
+        the legacy PENDING_REVIEW rows keep getting PENDING_REVIEW."""
+        from scanning import services
+
+        for status in (
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        ):
+            with self.subTest(status=status):
+                scan = self._make_scan(
+                    start_page=1,
+                    end_page=2,
+                    page_count=2,
+                    ocr_results=[
+                        {"pdf_page": 1, "detected": "1", "type": "single"},
+                        {"pdf_page": 2, "detected": "2", "type": "single"},
+                    ],
+                )
+                scan.status = status
+                scan.save(update_fields=["status"])
+
+                services.recalculate_issues(scan)
+
+                scan.refresh_from_db()
+                self.assertEqual(scan.status, status)
+                self.assertTrue(scan.page_map)
+
     def test_missing_pages_use_scan_page_range(self):
         """Pages the volume should contain but OCR never saw are reported,
         even when they fall past the last detected number."""

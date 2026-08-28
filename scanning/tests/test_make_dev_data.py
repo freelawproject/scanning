@@ -24,7 +24,10 @@ class TestMakeDevData(TestCase):
 
         scan = Scan.objects.get()
         # The scan is left in a reviewable state, not stuck "processing".
-        self.assertEqual(scan.status, Status.PENDING_REVIEW)
+        # The first seeded scan shows the #154 ready state.
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
         # A real, renderable bitonal preview is written to the output dir
         # (what serve_scan_pdf serves), plus the original for crops.
         output_dir = pathlib.Path(scan.output_dir)
@@ -34,6 +37,23 @@ class TestMakeDevData(TestCase):
         self.assertTrue(scan.original_pdf.name.endswith(".original.pdf"))
         # pdf_path resolves to the seeded original (used by crops).
         self.assertTrue(pathlib.Path(scan.pdf_path).is_file())
+
+    def test_seeds_one_example_of_each_review_state(self):
+        """The seed shows both #154 states plus the legacy review one,
+        so the badges and the step selection are visible in dev."""
+        call_command("make_dev_data", count=3)
+
+        statuses = list(
+            Scan.objects.order_by("pk").values_list("status", flat=True)
+        )
+        self.assertEqual(
+            statuses,
+            [
+                Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+                Status.PAGE_COMPLETENESS_REVIEW_DONE,
+                Status.PENDING_REVIEW,
+            ],
+        )
 
     def test_skips_when_not_development(self):
         with override_settings(DEVELOPMENT=False):

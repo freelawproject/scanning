@@ -122,6 +122,19 @@
            dark:bg-slate-700 dark:text-slate-200;
   }
 
+  /* Page completeness review states (#154). Ready shares the
+     actionable yellow of review; done gets teal, between the review
+     yellow and the approved green. */
+  .badge-ready_for_page_completeness_review {
+    @apply badge bg-yellow-100 text-yellow-800
+           dark:bg-yellow-900/50 dark:text-yellow-300;
+  }
+
+  .badge-page_completeness_review_done {
+    @apply badge bg-teal-100 text-teal-800
+           dark:bg-teal-900/50 dark:text-teal-300;
+  }
+
   .badge-pending_review {
     @apply badge bg-yellow-100 text-yellow-800
            dark:bg-yellow-900/50 dark:text-yellow-300;

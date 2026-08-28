@@ -136,6 +136,14 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             step = 1
         elif scan.stage == Stage.APPROVED:
             step = 3
+        elif scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE:
+            # Review 1 is done (#154), so land on the detection review
+            # when detections exist. The detection stage (#195) writes
+            # no scan status, so its output is the only signal.
+            if Detection.objects.filter(scan=scan).exists():
+                step = 2
+            else:
+                step = 1
         elif scan.stage == Stage.PROCESS or scan.opinions_json:
             # Stay on step 1 if there are unresolved issues
             has_issues = scan.issues.exclude(
@@ -600,7 +608,18 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
             status=202,
         )
 
-    if scan.status == Status.AWAITING_VALIDATION:
+    if scan.status in (
+        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+        Status.PAGE_COMPLETENESS_REVIEW_DONE,
+    ):
+        # These statuses guarantee a stored preview (#154): #149 sets
+        # the first one only after the bitonal merge. Landing here means
+        # the S3 pull above just failed, and a reload retries it.
+        message = (
+            "The preview did not load. Reload the page to try again, "
+            "or load the original scan instead."
+        )
+    elif scan.status == Status.AWAITING_VALIDATION:
         message = (
             "This scan has no small preview. You can load the original "
             "scan instead."

@@ -1125,7 +1125,14 @@ def recalculate_issues(scan: "Scan") -> None:
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
 
-    scan.status = Status.PENDING_REVIEW
+    # A recheck must not move a scan between review states (#154): a
+    # scan in a page-completeness review state keeps it. The write to
+    # PENDING_REVIEW stays for the legacy rows that already carry it.
+    if scan.status not in (
+        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+        Status.PAGE_COMPLETENESS_REVIEW_DONE,
+    ):
+        scan.status = Status.PENDING_REVIEW
     scan.s3_uploaded = False
     scan.progress_message = "Done"
     scan.save()
