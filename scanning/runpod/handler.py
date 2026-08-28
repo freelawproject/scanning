@@ -366,7 +366,19 @@ def _action_detect(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     if not pdf_url:
         raise ValueError("missing required input: pdf_url")
     models = _read_models(inputs)
-    confidence = float(inputs.get("confidence", DEFAULT_CONFIDENCE))
+    raw_confidence = inputs.get("confidence", DEFAULT_CONFIDENCE)
+    try:
+        confidence = float(raw_confidence)
+    except (TypeError, ValueError) as exc:
+        # TypeError, not just ValueError: ``float(None)`` raises the
+        # former, and JSON ``null`` is a natural way for a caller to
+        # say "use the default". handler() maps only ValueError to
+        # BAD_INPUT, so an uncaught TypeError would reach the caller as
+        # a raw traceback with no error_code -- the one thing every
+        # input check here exists to prevent.
+        raise ValueError(
+            f"'confidence' must be a number, got {raw_confidence!r}"
+        ) from exc
     if not 0 < confidence <= 1:
         raise ValueError(f"'confidence' must be in (0, 1], got {confidence!r}")
 

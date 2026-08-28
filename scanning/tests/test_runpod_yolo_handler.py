@@ -210,6 +210,18 @@ class TestDetectValidation(_DetectCase):
         self.assertIn("confidence", out["error"])
         self.detect.assert_not_called()
 
+    def test_confidence_of_the_wrong_type_is_refused(self):
+        # JSON null is a natural way to say "use the default", and
+        # float(None) raises TypeError rather than ValueError. Without
+        # its own guard that escapes the BAD_INPUT mapping and reaches
+        # the caller as a traceback with no error_code.
+        for value in (None, [0.2], {"value": 0.2}):
+            with self.subTest(confidence=value):
+                out = self.run_detect(confidence=value)
+                self.assertEqual(out["error_code"], "BAD_INPUT")
+                self.assertIn("confidence", out["error"])
+                self.detect.assert_not_called()
+
     def test_page_count_over_the_guard_is_refused(self):
         with mock.patch.object(
             handler, "validate_pdf", return_value=handler.MAX_PAGES + 1
@@ -319,30 +331,55 @@ class TestPreload(SimpleTestCase):
         # fitness check reads.
         self.assertFalse(handler._CUDA_AVAILABLE)
 
-    def test_a_broken_weight_load_is_swallowed(self):
+    def _run_preload_with_gpu(self, weights_dir: Path, yolo_error=None):
+        """Run ``_preload`` as if this host had a GPU.
+
+        :param weights_dir: What ``_weights_dir`` answers.
+        :param yolo_error: Exception ``YOLO(path)`` raises, if any.
+        :returns: The ultralytics stub, so a caller can assert on the
+            calls the preload made.
+        """
         stub_ultralytics = mock.MagicMock()
-        stub_ultralytics.YOLO.side_effect = RuntimeError("corrupt file")
+        if yolo_error is not None:
+            stub_ultralytics.YOLO.side_effect = yolo_error
         stub_torch = mock.MagicMock()
         stub_torch.__version__ = "2.13.0+cu126"
         stub_torch.cuda.is_available.return_value = True
         stub_blackletter = SimpleNamespace(
             __file__="/opt/venv/blackletter/__init__.py"
         )
-        with (
-            mock.patch.dict(
-                sys.modules,
-                {
-                    "torch": stub_torch,
-                    "ultralytics": stub_ultralytics,
-                    "blackletter": stub_blackletter,
-                },
-            ),
-            mock.patch.object(handler, "_weights_dir") as weights_dir,
-        ):
-            weights_dir.return_value = Path("/nonexistent")
-            handler._preload()
-        # A missing or broken weight is logged, not raised: the first
-        # job surfaces the real error instead.
-        self.assertTrue(handler._CUDA_AVAILABLE)
-        # Leave the module as the other tests expect to find it.
-        handler._CUDA_AVAILABLE = False
+        try:
+            with (
+                mock.patch.dict(
+                    sys.modules,
+                    {
+                        "torch": stub_torch,
+                        "ultralytics": stub_ultralytics,
+                        "blackletter": stub_blackletter,
+                    },
+                ),
+                mock.patch.object(
+                    handler, "_weights_dir", return_value=weights_dir
+                ),
+            ):
+                handler._preload()
+            self.assertTrue(handler._CUDA_AVAILABLE)
+        finally:
+            # Leave the module as the other tests expect to find it.
+            handler._CUDA_AVAILABLE = False
+        return stub_ultralytics
+
+    def test_a_missing_weight_is_logged_not_raised(self):
+        # The build bakes and verifies the file, so this means the image
+        # is wrong. It must still not stop the worker from starting.
+        stub = self._run_preload_with_gpu(Path("/nonexistent"))
+        stub.YOLO.assert_not_called()
+
+    def test_a_broken_weight_load_is_swallowed(self):
+        # The weight file has to exist for the load to be attempted at
+        # all, or this would only re-test the missing-file branch above.
+        weights_dir = _weights(Path(self.enterContext(_tmp_dir())))
+        stub = self._run_preload_with_gpu(
+            weights_dir, yolo_error=RuntimeError("corrupt file")
+        )
+        stub.YOLO.assert_called_once_with(str(weights_dir / "bl_warm.pt"))
