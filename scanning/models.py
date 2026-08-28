@@ -144,10 +144,6 @@ class Stage(models.TextChoices):
 
 class QueuedAction(models.TextChoices):
     FULL_PIPELINE = "full_pipeline", "Full Pipeline"
-    # Read page numbers out of the glued dots.mocr volume JSON and
-    # rebuild the Issues (#149/#204). Enqueued by the daemon when a
-    # glued run and a converted volume are both in place.
-    COMPUTE_ISSUES = "compute_issues", "Compute Issues"
     VALIDATE = "validate", "Validate"
     DETECT = "detect", "Detect"
     REPROCESS = "reprocess", "Reprocess"

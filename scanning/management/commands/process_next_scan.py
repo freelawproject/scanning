@@ -3,12 +3,10 @@
 Recovers any PROCESSING rows whose ``processed_at`` is older than
 ``DAEMON_PROCESSING_TIMEOUT`` back to QUEUED, then atomically claims
 one QUEUED scan (via ``SELECT ... FOR UPDATE SKIP LOCKED``) and
-dispatches the queued action. Two actions are dispatchable: the full
-(now interim: shard and park) pipeline, and the page-number apply
-(``compute_issues``, #149/#204) that the glue and the bitonal park
-enqueue. The legacy actions (validate, detect, reprocess,
-generate_files) were disconnected by issue #173 and rows still
-carrying one are parked back to PENDING_REVIEW with the unified
+dispatches the queued action. Only the full (now interim: shard and
+park) pipeline is dispatchable; the legacy actions (validate, detect,
+reprocess, generate_files) were disconnected by issue #173 and rows
+still carrying one are parked back to PENDING_REVIEW with the unified
 pipeline-paused message.
 
 Examples:
@@ -171,7 +169,6 @@ class Command(BaseCommand):
 
         dispatch = {
             QueuedAction.FULL_PIPELINE: services.run_full_pipeline,
-            QueuedAction.COMPUTE_ISSUES: services.run_compute_issues,
         }
 
         # Legacy actions whose pipelines were disconnected (issue #173).

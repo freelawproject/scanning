@@ -226,27 +226,3 @@ class TestLegacyQueuedActionsPark(TestCase):
                 self.assertFalse(
                     Scan.objects.filter(status=Status.QUEUED).exists()
                 )
-
-
-class TestComputeIssuesDispatch(TestCase):
-    """The page-number apply is a first-class action (#149/#204)."""
-
-    def test_compute_issues_reaches_its_service(self):
-        from scanning.models import QueuedAction
-
-        scan = ScanFactory(
-            status=Status.QUEUED,
-            queued_action=QueuedAction.COMPUTE_ISSUES,
-        )
-        cmd = Command()
-        with (
-            patch("django.db.connections.close_all"),
-            patch("scanning.services.run_compute_issues") as mock_apply,
-            patch("scanning.services.run_full_pipeline") as mock_pipeline,
-        ):
-            cmd.handle()
-
-        mock_apply.assert_called_once_with(scan.pk)
-        mock_pipeline.assert_not_called()
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.PROCESSING)

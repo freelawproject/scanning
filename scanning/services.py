@@ -1146,110 +1146,75 @@ def recalculate_issues(scan: "Scan") -> None:
     )
 
 
-def _park_compute_issues(scan_pk: int, message: str) -> None:
-    """Park a claimed scan whose compute-issues input is not there.
+def run_compute_issues(scan: "Scan", result_key: str) -> bool:
+    """Read page numbers off a glued dots.mocr run and rebuild Issues.
 
-    Back to ``AWAITING_VALIDATION``, not ERROR: a missing glued run
-    means an input of the page completeness review is still
-    outstanding, which is exactly what that status says. When the run
-    does land, the glue enqueues the action again. Guarded on
-    PROCESSING so a concurrent cancel or admin move is never stomped.
+    The apply step of issues #149/#204, called by
+    ``dots_mocr.apply_ready_runs`` on the collect tick. Deliberately
+    not daemon-queued work (#212): the scan never transits
+    QUEUED/PROCESSING, so it stays in the review flow while its issues
+    recompute, there is no claim for a cancel to race, and no
+    scan-wide retry budget is spent. Failures raise to the caller,
+    whose per-run bookkeeping bounds the retries.
 
-    :param scan_pk: Primary key of the claimed scan.
-    :param message: What was missing, for the progress line and log.
-    :return: None.
+    The one status write is a single compare-and-swap on the review
+    edge: ``AWAITING_VALIDATION`` or the legacy ``PENDING_REVIEW``
+    moves to ``READY_FOR_PAGE_COMPLETENESS_REVIEW``; a scan already
+    READY is a recompute and keeps its status. A scan the edge cannot
+    take (cancelled or moved between the caller's read and here) is
+    left alone: its ``ocr_results`` were refreshed -- idempotent data
+    -- but no Issues are rebuilt and no status moves. Once the scan is
+    READY, ``cancel_processing`` no longer matches it, so
+    :func:`recalculate_issues`'s own unguarded save can no longer
+    revive a cancelled scan; the remaining full-instance-save exposure
+    is the one the recheck view has always had.
+
+    :param scan: The scan whose live run is fully glued.
+    :param result_key: S3 key of the run's glued volume JSON.
+    :returns: Whether the apply completed. False means the scan left
+        the eligible statuses mid-apply and was left alone.
+    :rtype: bool
     """
-    logger.warning("compute_issues: scan %s parked: %s", scan_pk, message)
-    Scan.objects.filter(pk=scan_pk, status=Status.PROCESSING).update(
-        status=Status.AWAITING_VALIDATION,
-        progress_message=message[:255],
-        progress_current=0,
-        progress_total=0,
-    )
-
-
-def run_compute_issues(scan_pk: int) -> None:
-    """Read page numbers off the glued dots.mocr run and rebuild Issues.
-
-    The apply step of issues #149/#204, run in the daemon through
-    ``QueuedAction.COMPUTE_ISSUES``. The glue (and the bitonal park)
-    enqueue it; the glued volume JSON's presence in S3 is a
-    precondition checked here, not a discovery mechanism.
-
-    The scan arrives claimed (PROCESSING). On success the scan leaves
-    with ``READY_FOR_PAGE_COMPLETENESS_REVIEW``: the status is set on
-    the instance first and :func:`recalculate_issues` -- reused
-    unchanged -- preserves the review states, so its own save persists
-    it. The DB row stays PROCESSING until that save, which keeps a
-    crash mid-way inside the stale sweep's re-queue instead of
-    stranding the scan.
-
-    :param scan_pk: Primary key of the claimed scan.
-    :return: None.
-    """
-    from botocore.exceptions import BotoCoreError, ClientError
-
-    from scanning import dots_mocr, page_numbers, s3_sync
-    from scanning.runpod_client import RunpodTransientError
+    from scanning import page_numbers, s3_sync
 
     started = time.monotonic()
-    try:
-        scan = Scan.objects.get(pk=scan_pk)
-    except Scan.DoesNotExist:
-        logger.warning("compute_issues: scan %s no longer exists", scan_pk)
-        return
+    document = s3_sync.download_json_object(result_key)
+    results = page_numbers.ocr_results_from_volume(document, scan.ocr_results)
+    scan.ocr_results = results
+    scan.save(update_fields=["ocr_results"])
 
-    try:
-        rows = dots_mocr.live_analyze_jobs(scan)
-        if not rows or not all(
-            row.status == JobStatus.CONSUMED for row in rows
-        ):
-            _park_compute_issues(
-                scan_pk, "The OCR run is not glued yet; waiting for it."
+    if scan.status != Status.READY_FOR_PAGE_COMPLETENESS_REVIEW:
+        # The review edge: the apply is the last prerequisite of
+        # review 1, since the caller only sees scans whose conversion
+        # already parked and whose OCR run is glued.
+        edged = Scan.objects.filter(
+            pk=scan.pk,
+            status__in=(
+                Status.AWAITING_VALIDATION,
+                Status.PENDING_REVIEW,
+            ),
+        ).update(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
+        if not edged:
+            logger.info(
+                "compute_issues: scan %s left the eligible statuses "
+                "mid-apply; its issues were not rebuilt",
+                scan.pk,
             )
-            return
+            return False
 
-        key = dots_mocr.glued_result_key(scan, rows[0].run)
-        try:
-            document = s3_sync.download_json_object(key)
-        except ClientError as exc:
-            code = (exc.response.get("Error") or {}).get("Code", "")
-            if code in ("NoSuchKey", "404"):
-                _park_compute_issues(
-                    scan_pk, f"The glued OCR result is missing at {key}."
-                )
-                return
-            raise RunpodTransientError(
-                f"S3 error while reading {key}: {exc}"
-            ) from exc
-        except BotoCoreError as exc:
-            raise RunpodTransientError(
-                f"S3 error while reading {key}: {exc}"
-            ) from exc
+    scan.status = Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+    recalculate_issues(scan)
 
-        results = page_numbers.ocr_results_from_volume(
-            document, scan.ocr_results
-        )
-        scan.ocr_results = results
-        scan.save(update_fields=["ocr_results"])
-
-        # The apply is the last prerequisite of review 1: the bitonal
-        # preview and the OCR run both stand behind the enqueue guards.
-        scan.status = Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
-        recalculate_issues(scan)
-
-        logger.info(
-            "compute_issues: scan %s run %s: %d page(s), %d without a "
-            "number, %d issue(s), in %.1fs",
-            scan_pk,
-            rows[0].run,
-            len(results),
-            sum(1 for entry in results if not entry["detected"]),
-            scan.issues.count(),
-            time.monotonic() - started,
-        )
-    except Exception as exc:
-        _handle_pipeline_exception(scan_pk, exc, context="compute_issues")
+    logger.info(
+        "compute_issues: scan %s: %d page(s), %d without a number, "
+        "%d issue(s), in %.1fs",
+        scan.pk,
+        len(results),
+        sum(1 for entry in results if not entry["detected"]),
+        scan.issues.count(),
+        time.monotonic() - started,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------

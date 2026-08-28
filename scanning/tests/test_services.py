@@ -12,7 +12,7 @@ from unittest.mock import patch
 import fitz
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from scanning import dots_mocr, s3_sync
+from scanning import s3_sync
 from scanning.factories import (
     ReporterFactory,
     ScanFactory,
@@ -22,11 +22,9 @@ from scanning.factories import (
 from scanning.models import (
     CheckName,
     Detection,
-    ExternalJob,
     Issue,
-    JobStatus,
-    QueuedAction,
     QueueStatus,
+    Scan,
     Stage,
     Status,
 )
@@ -463,7 +461,6 @@ class TestComputeRedactionsApiView(TestCase):
             self.assertEqual(response.status_code, 400)
 
     def test_computes_rects_successfully(self):
-
         user = UserFactory()
         self.client.force_login(user)
 
@@ -1899,29 +1896,23 @@ class TestRecalculateIssues(TestCase):
 
 
 class TestRunComputeIssues(TestCase):
-    """The daemon apply of the glued dots.mocr output (#149/#204).
+    """The apply of the glued dots.mocr output (#149/#204, #212).
 
-    The scan arrives claimed (PROCESSING) with a fully consumed OCR
-    run; the glued volume JSON is patched in. Like the recheck, the
-    apply must not need a local copy of the PDF.
+    Called by ``dots_mocr.apply_ready_runs`` with the scan and the
+    glued document's key; the download is patched in. The scan never
+    transits QUEUED/PROCESSING, and like the recheck the apply must
+    not need a local copy of the PDF.
     """
 
     def _make_scan(self, **kwargs):
-        """Create a claimed scan with a consumed OCR run and no local PDF.
+        """Create a scan with no local PDF, parked for the apply.
 
         :param kwargs: ScanFactory overrides.
         :returns: The scan.
         """
-        from scanning.tests.test_jobs import make_manifest
-
-        kwargs.setdefault("status", Status.PROCESSING)
-        kwargs.setdefault("queued_action", QueuedAction.COMPUTE_ISSUES)
+        kwargs.setdefault("status", Status.AWAITING_VALIDATION)
         scan = ScanFactory(start_page=1, end_page=2, page_count=2, **kwargs)
         pathlib.Path(scan.original_pdf.path).unlink()
-        rows = dots_mocr.ensure_analyze_jobs(scan, make_manifest(2, 1))
-        ExternalJob.objects.filter(pk__in=[row.pk for row in rows]).update(
-            status=JobStatus.CONSUMED
-        )
         return scan
 
     def _document(self, texts):
@@ -1946,15 +1937,16 @@ class TestRunComputeIssues(TestCase):
         with patch(
             "scanning.s3_sync.download_json_object", return_value=document
         ) as download:
-            services.run_compute_issues(scan.pk)
-        return download
+            done = services.run_compute_issues(scan, "jobs/x/r1-volume.json")
+        return done, download
 
     def test_the_apply_reads_pages_and_readies_the_scan(self):
         scan = self._make_scan()
 
-        download = self._run(scan, self._document(["1", None]))
+        done, download = self._run(scan, self._document(["1", None]))
 
         scan.refresh_from_db()
+        self.assertTrue(done)
         self.assertEqual(
             scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
         )
@@ -1969,11 +1961,32 @@ class TestRunComputeIssues(TestCase):
                 check_name=CheckName.NO_PAGE_NUMBER, page_number=2
             ).exists()
         )
-        download.assert_called_once_with(
-            dots_mocr.glued_result_key(
-                scan, dots_mocr.live_analyze_jobs(scan)[0].run
-            )
+        download.assert_called_once_with("jobs/x/r1-volume.json")
+
+    def test_a_legacy_pending_review_scan_takes_the_edge(self):
+        scan = self._make_scan(status=Status.PENDING_REVIEW)
+
+        done, _ = self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertTrue(done)
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
         )
+
+    def test_a_ready_scan_recomputes_without_a_status_write(self):
+        scan = self._make_scan(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+
+        done, _ = self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertTrue(done)
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        self.assertEqual(scan.ocr_results[1]["detected"], "2")
 
     def test_a_manual_read_survives_the_apply(self):
         scan = self._make_scan(
@@ -2017,9 +2030,11 @@ class TestRunComputeIssues(TestCase):
         scan = self._make_scan()
 
         self._run(scan, self._document(["1", "2"]))
-        self._run(scan, self._document(["1", "2"]))
+        scan.refresh_from_db()
+        done, _ = self._run(scan, self._document(["1", "2"]))
 
         scan.refresh_from_db()
+        self.assertTrue(done)
         self.assertEqual(
             scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
         )
@@ -2029,69 +2044,35 @@ class TestRunComputeIssues(TestCase):
             0,
         )
 
-    def test_a_missing_document_parks_the_scan(self):
-        from botocore.exceptions import ClientError
-
-        from scanning import services
-
+    def test_a_lost_edge_leaves_the_scan_alone(self):
+        """The #210 review race, closed: a scan cancelled between the
+        pass's read and the edge write keeps its status, and its
+        Issues are not rebuilt over a decision somebody just made."""
         scan = self._make_scan()
-        missing = ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        Scan.objects.filter(pk=scan.pk).update(status=Status.CANCELLED)
 
-        with patch(
-            "scanning.s3_sync.download_json_object", side_effect=missing
-        ):
-            services.run_compute_issues(scan.pk)
+        done, _ = self._run(scan, self._document(["1", "2"]))
 
         scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
-        self.assertEqual(scan.ocr_results, [])
+        self.assertFalse(done)
+        self.assertEqual(scan.status, Status.CANCELLED)
         self.assertFalse(scan.issues.exists())
 
-    def test_an_unglued_run_parks_the_scan(self):
+    def test_a_download_failure_raises_to_the_caller(self):
         from scanning import services
 
         scan = self._make_scan()
-        ExternalJob.objects.filter(scan=scan).update(
-            status=JobStatus.COMPLETED
-        )
-
-        with patch("scanning.s3_sync.download_json_object") as download:
-            services.run_compute_issues(scan.pk)
-
-        download.assert_not_called()
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
-
-    def test_a_transient_s3_error_requeues_the_scan(self):
-        from botocore.exceptions import ClientError
-
-        from scanning import services
-
-        scan = self._make_scan()
-        throttle = ClientError({"Error": {"Code": "SlowDown"}}, "GetObject")
 
         with patch(
-            "scanning.s3_sync.download_json_object", side_effect=throttle
+            "scanning.s3_sync.download_json_object",
+            side_effect=RuntimeError("boom"),
         ):
-            services.run_compute_issues(scan.pk)
+            with self.assertRaises(RuntimeError):
+                services.run_compute_issues(scan, "jobs/x/r1-volume.json")
 
         scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.QUEUED)
-        self.assertEqual(scan.queued_action, QueuedAction.COMPUTE_ISSUES)
-        self.assertEqual(scan.retry_count, 1)
-
-    def test_a_park_never_stomps_a_cancel(self):
-        from scanning import services
-
-        scan = self._make_scan(status=Status.CANCELLED)
-        ExternalJob.objects.filter(scan=scan).update(
-            status=JobStatus.COMPLETED
-        )
-
-        services.run_compute_issues(scan.pk)
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.CANCELLED)
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertFalse(scan.issues.exists())
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT, DEVELOPMENT=True)

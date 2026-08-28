@@ -53,9 +53,9 @@ The legacy processing stages — in-process bitonal conversion, the YOLO
 blackletter-gpu-worker under `scanning/runpod/`), and their
 `RUNPOD_ENABLED=False` in-process fallbacks — are deleted. Bitonal came
 back as an external job, dots.mocr as a staff-started one, and the page
-numbers plus Issues as the daemon-queued apply (#149/#204, all below);
-still missing are the #151 approve button and the post-review stages
-(#195/#196), so:
+numbers plus Issues as an apply pass on the collect tick (#149/#204,
+all below); still missing are the #151 approve button and the
+post-review stages (#195/#196), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
   then either starts the bitonal conversion (`Status.AWAITING`) or
@@ -88,11 +88,11 @@ still missing are the #151 approve button and the post-review stages
 
 `READY_FOR_PAGE_COMPLETENESS_REVIEW` and
 `PAGE_COMPLETENESS_REVIEW_DONE` give review 1 explicit edges. #154
-landed the values and the readers; the `compute_issues` apply
-(#149/#204, below) writes READY — the last prerequisite by
-construction, and it restores READY after an admin re-queue parks a
-ready scan back in `AWAITING_VALIDATION` (re-queue -> bitonal park ->
-re-enqueue -> apply). The #151 approve button sets DONE, and #195/#196
+landed the values and the readers; the apply pass (#149/#204, below)
+writes READY — the last prerequisite by construction, and it restores
+READY after an admin re-queue parks a ready scan back in
+`AWAITING_VALIDATION` (re-queue -> bitonal park -> the next apply
+tick). The #151 approve button sets DONE, and #195/#196
 trigger off DONE writing **no** scan status, so redaction work never
 blocks either review. Both are parked human states outside
 `BUSY_STATUSES` (no polling, no sweep); `AWAITING_VALIDATION` now means
@@ -236,9 +236,10 @@ trained on), tracked on `ExternalJob` rows at
   only on the rows, read through `dots_mocr.run_summary` into the page
   context and `progress_api`. So a volume stays browsable and
   reviewable while it reads, and the bitonal stage keeps sole ownership
-  of `AWAITING`. The one status write comes at the very end, from
-  `enqueue_compute_issues` (#204, below), and its guard reaches only
-  `AWAITING_VALIDATION`, READY and the legacy `PENDING_REVIEW`.
+  of `AWAITING`. The one status write comes at the very end, from the
+  apply pass (#204, below): a single compare-and-swap over the review
+  edge, reaching only `AWAITING_VALIDATION` and the legacy
+  `PENDING_REVIEW`.
 - **Queue time is not run time.** A row keeps
   `DAEMON_JOB_MAX_QUEUE_SECONDS` (6h) until `/status` first reports
   `IN_PROGRESS`; only that *crossing* stamps
@@ -342,7 +343,8 @@ trained on), tracked on `ExternalJob` rows at
   The per-shard results are deliberately **not** deleted: the future
   smart glue over page inserts and deletes re-reads them. A page the
   worker failed keeps its slot with its `error` (the apply reads it as
-  `detected=None`). A run holding a dead row is skipped silently, since
+  `detected=None`). The glue writes no scan status (the #190
+  invariant); a run holding a dead row is skipped silently, since
   `run_summary` already shows it and the button opens the fresh run. A
   glue *failure* retries next tick up to `GLUE_MAX_ATTEMPTS`, counted
   in the shard-0 row's `provider_meta["glue"]` (never in
@@ -350,25 +352,29 @@ trained on), tracked on `ExternalJob` rows at
   one ERROR log at the crossing and silence after; the rows stay
   `COMPLETED`, so recovery is a deploy plus clearing the counter, not
   a re-paid run.
-- **A glued run hands off to the `compute_issues` apply (#149/#204).**
-  The apply is daemon-enqueued work, not a pass of its own:
-  `enqueue_compute_issues` flips the scan to QUEUED with
-  `QueuedAction.COMPUTE_ISSUES`, `process_next_scan` claims it, and
+- **A glued run is applied by `apply_ready_runs` (#149/#204), the
+  collect tick's fourth pass.** Deliberately NOT daemon-queued work
+  (#212): the apply is seconds of local work that does not change what
+  the scan is, so it never transits QUEUED/PROCESSING — the scan stays
+  in the review flow throughout, there is no claim for a cancel to
+  race, and no scan-wide `retry_count` is spent.
   `services.run_compute_issues` reads the glued JSON (its S3 presence
-  is a checked precondition, and a miss parks back to
-  `AWAITING_VALIDATION`, not ERROR), rebuilds `Scan.ocr_results`
-  through the `page_numbers` adapter (manual `assign_page` entries are
-  carried over verbatim), sets READY on the instance and runs the
-  unchanged `recalculate_issues` funnel, whose #154 preservation
-  branch persists it. The enqueue guard is one place and reaches only
-  `AWAITING_VALIDATION`, READY (a recompute) and the legacy
-  `PENDING_REVIEW`: `AWAITING` belongs to the bitonal merge — whose
-  park re-runs the enqueue when the OCR run finished first
-  (`bitonal._handoff_compute_issues`) — and a cancelled, errored or
-  approved scan is never revived or knocked back. Transient S3 errors
-  re-queue through `_handle_pipeline_exception` with `queued_action`
-  intact; the bands and token rules of the adapter come from
-  ai-research `pipeline/core/order.py` and issue #149.
+  is a checked precondition), rebuilds `Scan.ocr_results` through the
+  `page_numbers` adapter (manual `assign_page` entries are carried
+  over verbatim), takes the review edge with one compare-and-swap
+  (`AWAITING_VALIDATION` or the legacy `PENDING_REVIEW` -> READY; a
+  scan already READY is a recompute and keeps its status), and runs
+  the unchanged `recalculate_issues` funnel, whose #154 preservation
+  branch persists READY. Scans in any other status are deferred, not
+  marked: `AWAITING` belongs to the bitonal merge, and its park is
+  picked up on the next tick; a cancelled, errored or approved scan
+  comes back only through the admin re-queue. The run-scoped
+  `provider_meta["apply"]` on the shard-0 row is the idempotence
+  marker (`applied_at`) and the retry ledger (`APPLY_MAX_ATTEMPTS`,
+  same loud-then-quiet shape as the glue's); a failure leaves the
+  status alone, so the pass retries next tick. The bands and token
+  rules of the adapter come from ai-research `pipeline/core/order.py`
+  and issue #149.
 - **No provider abstraction, deliberately.** `jobs.py` branches on
   `job.provider`; ~600 of its lines are provider-agnostic and stay
   shared, and only the submit call and the in-flight check fork. Do not

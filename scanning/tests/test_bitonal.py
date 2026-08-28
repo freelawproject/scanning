@@ -20,16 +20,9 @@ import fitz
 from django.test import TestCase
 from PIL import Image
 
-from scanning import bitonal, dots_mocr, jobs
+from scanning import bitonal, jobs
 from scanning.factories import ScanFactory
-from scanning.models import (
-    ExternalJob,
-    JobStage,
-    JobStatus,
-    QueuedAction,
-    Scan,
-    Status,
-)
+from scanning.models import ExternalJob, JobStatus, Scan, Status
 from scanning.tests.test_jobs import make_manifest
 from scanning.utils import ensure_output_dir
 
@@ -433,74 +426,6 @@ class TestAlreadyConsumedRun(ConvertJobsMixin, TestCase):
         download.assert_not_called()
         self.assertEqual(finished, 1)
         self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
-
-
-class TestComputeIssuesHandoff(ConvertJobsMixin, TestCase):
-    """The park's handoff to the page-number apply (#149/#204).
-
-    The glue's own enqueue loses its guard against a scan still
-    AWAITING, so the park is the second chance: whichever stage ends
-    last hands over.
-    """
-
-    def add_analyze_run(self, scan, status):
-        """Give ``scan`` a dots.mocr run whose rows all carry ``status``.
-
-        :param scan: The scan to attach the run to.
-        :param status: The status for every row.
-        :return: None.
-        """
-        rows = dots_mocr.ensure_analyze_jobs(scan, make_manifest(2, 1))
-        ExternalJob.objects.filter(pk__in=[row.pk for row in rows]).update(
-            status=status
-        )
-
-    def test_a_park_with_a_glued_run_queues_the_apply(self):
-        scan, _ = self.build(shard_count=2, pages_per_shard=1)
-        self.add_analyze_run(scan, JobStatus.CONSUMED)
-
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            bitonal.finish_ready_scans()
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.QUEUED)
-        self.assertEqual(scan.queued_action, QueuedAction.COMPUTE_ISSUES)
-
-    def test_an_unglued_run_does_not_queue_the_apply(self):
-        """COMPLETED is not CONSUMED: the glue has not run yet, and its
-        own enqueue will fire once it has."""
-        scan, _ = self.build(shard_count=2, pages_per_shard=1)
-        self.add_analyze_run(scan, JobStatus.COMPLETED)
-
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            bitonal.finish_ready_scans()
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
-        self.assertEqual(scan.queued_action, "")
-
-    def test_no_ocr_run_means_no_handoff(self):
-        scan, _ = self.build(shard_count=2, pages_per_shard=1)
-
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            bitonal.finish_ready_scans()
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
-        self.assertEqual(scan.queued_action, "")
-
-    def test_an_already_consumed_conversion_hands_off_too(self):
-        scan, _ = self.build(shard_count=2, pages_per_shard=1)
-        ExternalJob.objects.filter(scan=scan, stage=JobStage.CONVERT).update(
-            status=JobStatus.CONSUMED
-        )
-        self.add_analyze_run(scan, JobStatus.CONSUMED)
-
-        bitonal.finish_ready_scans()
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.QUEUED)
-        self.assertEqual(scan.queued_action, QueuedAction.COMPUTE_ISSUES)
 
 
 class TestFinishedCount(ConvertJobsMixin, TestCase):
