@@ -2628,10 +2628,14 @@ class TestApproveDetection(ScanningTestCase):
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestPendingChangesGuard(ScanningTestCase):
-    """The validate/detect/recheck actions are blocked while page
-    changes are pending, so a deletion can't be silently stranded
-    behind an action that ignores it (and a full re-validation can't
-    burn a RunPod run for nothing)."""
+    """The detect action is blocked while page changes are pending, so a
+    deletion can't be silently stranded behind an action that ignores
+    it.
+
+    The recompute of review 1 left this guard with #151: "Rebuild &
+    Validate" refuses while the pipeline is paused (#173), so the
+    redirect had become a dead end. It warns and continues instead --
+    see ``TestRecomputePageNumberIssues``."""
 
     def setUp(self):
         self.user = self.make_user()
@@ -2659,10 +2663,6 @@ class TestPendingChangesGuard(ScanningTestCase):
     def test_start_detect_blocked(self):
         """Next: Detect is blocked while a deletion is pending."""
         self._assert_blocked("start_detect")
-
-    def test_recalculate_blocked(self):
-        """Recheck is blocked while a deletion is pending."""
-        self._assert_blocked("recalculate")
 
     def test_start_validate_refuses_and_keeps_stored_results(self):
         """Re-validate is paused entirely by the #173 cutover.
@@ -2707,6 +2707,13 @@ class TestPipelinePausedViews(ScanningTestCase):
         self.assertIn(PIPELINE_PAUSED_MESSAGE, flashed)
 
     def test_start_validate_paused(self):
+        """Only for a legacy row: its stages are gone rather than
+        pointless. A new-pipeline scan is refused for good instead --
+        see ``TestRevalidateIsGoneForNewScans`` (#151)."""
+        self.scan.ocr_results = [
+            {"pdf_page": 1, "detected": "1", "type": "single"}
+        ]
+        self.scan.save(update_fields=["ocr_results"])
         self._assert_paused("start_validate")
 
     def test_start_detect_paused_without_detections(self):
@@ -2801,9 +2808,21 @@ class TestRecalculateView(ScanningTestCase):
             start_page=1,
             end_page=2,
             page_count=2,
+            # A dots.mocr zone, because the recompute refuses a scan
+            # the retired OCR read (#151).
             ocr_results=[
-                {"pdf_page": 1, "detected": "1", "type": "single"},
-                {"pdf_page": 2, "detected": "2", "type": "single"},
+                {
+                    "pdf_page": 1,
+                    "detected": "1",
+                    "type": "single",
+                    "zone": "dots-header",
+                },
+                {
+                    "pdf_page": 2,
+                    "detected": "2",
+                    "type": "single",
+                    "zone": "dots-header",
+                },
             ],
         )
         # Production keeps the PDF in S3 only; the request thread has no

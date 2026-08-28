@@ -51,6 +51,7 @@ from scanning.views_api import (
 )
 from scanning.views_process import (
     add_page_insert,
+    approve_page_completeness,
     assign_page,
     cancel_processing,
     delete_page,
@@ -147,6 +148,11 @@ urlpatterns = [
         "scans/<int:pk>/cancel/", cancel_processing, name="cancel_processing"
     ),
     path("scans/<int:pk>/recalculate/", recalculate, name="recalculate"),
+    path(
+        "scans/<int:pk>/approve-pages/",
+        approve_page_completeness,
+        name="approve_page_completeness",
+    ),
     path("scans/<int:pk>/reprocess/", reprocess, name="reprocess"),
     path("scans/<int:pk>/assign-page/", assign_page, name="assign_page"),
     path("scans/<int:pk>/delete-page/", delete_page, name="delete_page"),

@@ -54,8 +54,8 @@ blackletter-gpu-worker under `scanning/runpod/`), and their
 `RUNPOD_ENABLED=False` in-process fallbacks — are deleted. Bitonal came
 back as an external job, dots.mocr as a staff-started one, and the page
 numbers plus Issues as an apply pass on the collect tick (#149/#204,
-all below); still missing are the #151 approve button and the
-post-review stages (#195/#196), so:
+all below), and review 1 got its approve button (#151); still missing
+are the post-review stages (#195/#196), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
   then either starts the bitonal conversion (`Status.AWAITING`) or
@@ -64,7 +64,9 @@ post-review stages (#195/#196), so:
   (`start_validate`, `start_detect` without existing detections,
   `reprocess`, `generate_files`) refuses with
   `utils.PIPELINE_PAUSED_MESSAGE` — one constant, flashed as a warning
-  banner in HTML views. The daemon parks pre-cutover queued rows
+  banner in HTML views. `start_validate` splits by scan (#151): only a
+  legacy row hears "paused", because a new-pipeline volume is refused
+  permanently, not temporarily. The daemon parks pre-cutover queued rows
   carrying a legacy `queued_action` back to PENDING_REVIEW with the
   same message; admin re-queue resets `queued_action` to
   FULL_PIPELINE.
@@ -92,7 +94,8 @@ landed the values and the readers; the apply pass (#149/#204, below)
 writes READY — the last prerequisite by construction, and it restores
 READY after an admin re-queue parks a ready scan back in
 `AWAITING_VALIDATION` (re-queue -> bitonal park -> the next apply
-tick). The #151 approve button sets DONE, and #195/#196
+tick). `views_process.approve_page_completeness` (#151, below) is the
+only writer of DONE, and #195/#196
 trigger off DONE writing **no** scan status, so redaction work never
 blocks either review. Both are parked human states outside
 `BUSY_STATUSES` (no polling, no sweep); `AWAITING_VALIDATION` now means
@@ -102,6 +105,50 @@ both (`PENDING_REVIEW` remains for legacy rows and step 2 only), and
 pull (409 + reload hint) — READY implies the conversion finished or
 was skipped because the source is already bitonal (that copy nuance
 belongs to the #204 follow-up).
+
+## The review-1 interface (issue #151)
+
+The buttons around those two statuses. Step 1 states its goal in the
+sidebar, and the step-1 bar (`_process_actions.html`) is rendered by
+both `scan_process_view` and the `process_actions` fragment, from the
+same `_review_flags` — a bar that disagreed with itself would offer an
+approve button the view refuses.
+
+- **Approving is a compare-and-swap on READY**, never a full instance
+  save: the collect tick can write READY over the same row at the same
+  moment. Any logged-in user may press it (review 1 is the scanners'
+  own step). Open issues do not block it — the browser asks for a
+  confirm and the view obeys, because the curator, not the model, is
+  the judge of a suspicion.
+- **Approving is the gate for "Next: Detect"**, which is why the button
+  cannot be gated on an empty issue list. A legacy `PENDING_REVIEW`
+  scan never reaches the #154 states, so it keeps the old bar (the old
+  "no open issues" rule, and "Validate"/"Re-validate") and still
+  reaches step 2.
+- **A new-pipeline volume is never re-run from the viewer.** Sharding,
+  the bitonal conversion and dots.mocr are deterministic, so a second
+  run returns what the first one stored, and charges another doctor
+  conversion and another park out of the review flow for it. So
+  `start_validate` refuses a non-legacy scan **for good**, not until
+  the stages return, and the bar offers it no button at all. A volume
+  that genuinely must be processed again goes through the admin
+  re-queue, which is deliberately not a curator's button. Re-reading
+  the *stored* page numbers is the recompute button, and it is
+  unrelated.
+- **The recompute button answers rather than obeys.** On a scan the
+  retired PaddleOCR stage read (`services.has_legacy_ocr`: no `dots-`
+  zone *and* no `ANALYZE` row — a volume dots read blank carries no
+  zone either) it explains and does nothing. With pending inserts or
+  deletes it warns and continues: it used to redirect to "Rebuild &
+  Validate", which refuses since #173, so the guard had become a dead
+  end. It never opens the PDF to fail: the page-count refresh inside
+  `recalculate_issues` survives an absent, partial, or invalid local
+  copy and keeps the stored count (#153).
+- **Every page edit says it is saved and not applied.** `shared.js`
+  calls the optional `window.onPageEditSaved` hook after a deletion and
+  an undo; step 1 defines it (a green toast) and step 2 leaves it
+  undefined. The page-number edit and the insert upload call it
+  directly. Nothing applies these edits to the volume yet.
 
 ## Bitonal via doctor (issue #176)
 

@@ -50,6 +50,7 @@ from django.db.models import Case, F, Value, When
 from scanning.models import (
     CheckName,
     Detection,
+    ExternalJob,
     Issue,
     JobStage,
     JobStatus,
@@ -983,6 +984,44 @@ def _expected_range(scan: "Scan") -> tuple[int | None, int | None]:
     return scan.start_page or 1, scan.end_page
 
 
+#: Prefix :mod:`scanning.page_numbers` stamps on the ``zone`` of every
+#: entry it reads off a dots.mocr run (``dots-header``,
+#: ``dots-footer``). It is what tells a new-pipeline page number from a
+#: legacy PaddleOCR one.
+DOTS_ZONE_PREFIX = "dots-"
+
+
+def has_legacy_ocr(scan: "Scan") -> bool:
+    """Return whether a scan's page numbers came from the retired OCR.
+
+    The legacy validate stage (PaddleOCR over a page-number crop) no
+    longer runs anywhere (#173), so a recompute over its readings can
+    only reproduce them. Review 1 says so instead of pretending to redo
+    the work (#151).
+
+    Two signals answer it, because neither alone is enough. A ``dots-``
+    zone proves the new stage wrote the entry, but a volume dots read
+    with no number on any page carries none. An ``ANALYZE`` job row
+    proves the new stage ran at all, and it outlives a recompute. A
+    scan with no readings at all is not legacy: it has nothing to
+    recompute either way, and the caller handles that first.
+
+    :param scan: The scan to classify.
+    :returns: ``True`` when the readings are the retired stage's.
+    :rtype: bool
+    """
+    if not scan.ocr_results:
+        return False
+    if any(
+        (entry.get("zone") or "").startswith(DOTS_ZONE_PREFIX)
+        for entry in scan.ocr_results
+    ):
+        return False
+    return not ExternalJob.objects.filter(
+        scan=scan, stage=JobStage.ANALYZE
+    ).exists()
+
+
 def _is_manual_read(result: dict) -> bool:
     """Return whether a per-page page number was entered by hand.
 
@@ -1114,13 +1153,26 @@ def recalculate_issues(scan: "Scan") -> None:
     # Refresh page_count opportunistically: the PDF has not changed since
     # validation, and in production the local copy is usually absent
     # because rechecks run on a web pod that never pulled it from S3.
+    # Every failure here is survivable -- an absent copy, a partial one,
+    # a file that is not a PDF at all -- and the stored count stands.
+    # The recompute is a read of stored data, and it must not 500 over
+    # a file it does not need (#153/#151).
     try:
         pdf_path = scan.pdf_path
     except FileNotFoundError:
         pdf_path = None
     if pdf_path:
-        with fitz.open(pdf_path) as pdf_fitz:
-            scan.page_count = len(pdf_fitz)
+        try:
+            with fitz.open(pdf_path) as pdf_fitz:
+                scan.page_count = len(pdf_fitz)
+        except Exception:
+            logger.warning(
+                "recalculate_issues: scan %s: could not read %s for a "
+                "page count; keeping the stored %s",
+                scan.pk,
+                pdf_path,
+                scan.page_count,
+            )
 
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]

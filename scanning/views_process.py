@@ -43,6 +43,33 @@ from scanning.utils import (
 
 logger = logging.getLogger(__name__)
 
+#: Flashed by the review-1 actions of issue #151. They are constants so
+#: the tests assert the copy the curator actually reads.
+PAGE_REVIEW_APPROVED_MESSAGE = (
+    "Thank you. This scan is marked as page complete."
+)
+PAGE_REVIEW_ALREADY_DONE_MESSAGE = (
+    "This scan is already marked as page complete."
+)
+PAGE_REVIEW_NOT_READY_MESSAGE = (
+    "This scan is not ready for the page completeness review."
+)
+LEGACY_OCR_RECOMPUTE_MESSAGE = (
+    "The old OCR engine that read this scan no longer runs here. Run "
+    "OCR again to recompute the page numbers."
+)
+RECOMPUTE_DONE_MESSAGE = "The page number issues are recomputed."
+REVALIDATE_UNAVAILABLE_MESSAGE = (
+    "This scan does not need a re-run. Sharding, the bitonal "
+    "conversion and dots.mocr are deterministic, so they would give "
+    "the same result again. Ask an admin to re-queue the scan if it "
+    "really must be processed a second time."
+)
+PENDING_EDITS_SAVED_MESSAGE = (
+    "Your page inserts and deletes are saved. We do not apply them to "
+    "the volume yet."
+)
+
 
 def _unmatched_detection_dict(
     det: Detection, idx_to_logical: dict[int, int]
@@ -435,6 +462,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "has_detections": has_detections,
             "is_processing": is_processing,
             "dots_run": dots_run,
+            **_review_flags(scan),
             "opinions": opinions,
             "opinions_json": json.dumps(opinions),
             "has_redaction_rects": has_redaction_rects,
@@ -769,16 +797,46 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     return resp
 
 
+def _review_flags(scan: Scan) -> dict:
+    """Return the review-1 flags the step-1 button bar reads (#151).
+
+    Both :func:`scan_process_view` and the :func:`process_actions`
+    fragment render that bar, so the flags come from one place. A bar
+    that disagreed with itself would offer an approve button the view
+    refuses, or hide the one it accepts.
+
+    :param scan: The scan the bar is rendered for.
+    :returns: ``page_review_ready``, ``page_review_done`` and
+        ``has_legacy_ocr`` for the template context.
+    :rtype: dict
+    """
+    from scanning import services
+
+    return {
+        "page_review_ready": (
+            scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        ),
+        "page_review_done": (
+            scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
+        ),
+        "has_legacy_ocr": services.has_legacy_ocr(scan),
+    }
+
+
 def _block_if_pending_changes(
     request: HttpRequest, scan: Scan
 ) -> HttpResponse | None:
     """Redirect back to step 1 when the scan has unapplied page changes.
 
-    The validate, detect, and recheck actions ignore pending
-    ``PageDeletion`` / ``PageInsert`` rows, so running them would
-    silently strand the user's edits (and, for a full re-validation,
-    spend a RunPod run for nothing). Pending changes must be applied via
-    "Rebuild & Validate" (the ``reprocess`` view).
+    The detect action ignores pending ``PageDeletion`` /
+    ``PageInsert`` rows, so running it would silently strand the user's
+    edits. Pending changes must be applied via "Rebuild & Validate"
+    (the ``reprocess`` view).
+
+    The recompute of review 1 no longer calls this: "Rebuild &
+    Validate" refuses while the pipeline is paused (#173), so the
+    redirect was a dead end. That view warns and continues instead
+    (#151).
 
     :param request: The HTTP request.
     :type request: HttpRequest
@@ -839,6 +897,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "has_detections": Detection.objects.filter(scan=scan).exists(),
         "opinions": scan.opinions_json,
         "dots_run": dots_mocr.run_summary(scan),
+        **_review_flags(scan),
     }
     html = render_to_string(
         "scanning/_process_actions.html", context, request=request
@@ -851,21 +910,37 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
 @login_required
 @require_POST
 def start_validate(request: HttpRequest, pk: int) -> HttpResponse:
-    """Refuse to re-run the pipeline while the legacy stages are gone.
+    """Refuse to re-run the pipeline. Say why, per scan.
 
-    This button used to re-queue the full pipeline from scratch
-    (invalidating stored GPU results first). The stages it re-ran --
-    bitonal, YOLO detect, PaddleOCR validation -- were disconnected by
-    issue #173, so until the dots.mocr replacements land it fails with
-    the unified pipeline-paused message instead of queueing work that
-    would park immediately.
+    This button used to re-queue the full pipeline from scratch,
+    invalidating the stored GPU results first so nothing was reused.
+    The stages it re-ran -- bitonal, YOLO detect, PaddleOCR validation
+    -- were disconnected by issue #173.
+
+    A **new-pipeline scan is refused for good** (#151), not until the
+    replacements land: sharding, the bitonal conversion and dots.mocr
+    are deterministic, so a second run returns what the first one
+    already stored, at the price of another doctor conversion and
+    another park out of the review flow. Nothing here is a recompute of
+    the page numbers either -- that is the recompute button, over the
+    stored readings. The escape hatch for a volume that genuinely must
+    be processed again is the admin re-queue, which is deliberately not
+    a curator's button.
+
+    A legacy row keeps the paused message: its stages are gone rather
+    than pointless, and the bar still offers it one (#173).
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
+    from scanning import services
+
     scan = get_object_or_404(Scan, pk=pk)
-    messages.warning(request, PIPELINE_PAUSED_MESSAGE)
+    if services.has_legacy_ocr(scan):
+        messages.warning(request, PIPELINE_PAUSED_MESSAGE)
+    else:
+        messages.warning(request, REVALIDATE_UNAVAILABLE_MESSAGE)
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -1030,25 +1105,83 @@ def cancel_processing(request: HttpRequest, pk: int) -> HttpResponse:
 @login_required
 @require_POST
 def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
-    """Recalculate validation issues from existing OCR results.
+    """Rebuild the page number Issues from the stored readings.
+
+    The "Recompute page number issues" button of review 1 (#151). It
+    runs on stored data only, so it works on a web pod that never
+    pulled the scan's files from S3 (#153).
+
+    Two cases it answers rather than obeys. A scan the retired
+    PaddleOCR stage read gets the legacy message and no recompute: the
+    readings cannot change, so a rebuild would only look like work
+    (#173). A scan carrying pending inserts or deletes gets the recompute
+    plus a warning that those edits are saved but not applied, because
+    the button that used to apply them ("Rebuild & Validate") now
+    refuses (#173) -- blocking here would leave the curator with no way
+    forward at all.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    guard = _block_if_pending_changes(request, scan)
-    if guard:
-        return guard
     if not scan.ocr_results:
         return redirect("scan_process", pk=pk)
     from scanning import services
+
+    if services.has_legacy_ocr(scan):
+        messages.warning(request, LEGACY_OCR_RECOMPUTE_MESSAGE)
+        return redirect("scan_process", pk=pk)
+    if scan.deletions.exists() or scan.inserts.exists():
+        messages.warning(request, PENDING_EDITS_SAVED_MESSAGE)
 
     # Breadcrumb (issue #115): recalculation runs synchronously on the request
     # thread over the scan's OCR results.
     logger.info("recalculate: recomputing issues for scan=%s", scan.pk)
     services.recalculate_issues(scan)
+    messages.success(request, RECOMPUTE_DONE_MESSAGE)
     return redirect("scan_process", pk=pk)
+
+
+@login_required
+@require_POST
+def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
+    """Record that a person reviewed the scan for page completeness.
+
+    The approve button of review 1 (#151), and the only writer of
+    ``PAGE_COMPLETENESS_REVIEW_DONE`` (#154). Every logged-in user may
+    press it: review 1 is the scanners' own step, not a staff one.
+
+    The write is one compare-and-swap on READY, never a full instance
+    save. The collect tick can write READY over the same row at the
+    same moment (``services.run_compute_issues``), and a scan that is
+    cancelled, errored, or still waiting on its inputs must not be
+    approved by a stale page a curator left open.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to step 1 of the scan processing page.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    approved = Scan.objects.filter(
+        pk=scan.pk, status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+    ).update(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
+    if approved:
+        # Breadcrumb (issue #115): this is a human decision, and the
+        # only record of who made it.
+        logger.info(
+            "approve_page_completeness: scan=%s approved by user=%s",
+            scan.pk,
+            request.user.pk,
+        )
+        messages.success(request, PAGE_REVIEW_APPROVED_MESSAGE)
+    elif scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE:
+        messages.info(request, PAGE_REVIEW_ALREADY_DONE_MESSAGE)
+    else:
+        messages.warning(request, PAGE_REVIEW_NOT_READY_MESSAGE)
+    return redirect(
+        reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+    )
 
 
 @login_required

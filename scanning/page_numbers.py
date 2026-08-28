@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import re
 
-from scanning.services import _is_manual_read
+from scanning.services import DOTS_ZONE_PREFIX, _is_manual_read
 
 #: Band fractions of the page render height, from ai-research
 #: ``pipeline/core/order.py``: a cell entirely above HEAD_BAND is a
@@ -216,7 +216,7 @@ def extract_page_number(page: dict) -> dict:
         detected=best["detected"],
         type=best["type"],
         score=best["score"],
-        zone=f"dots-{best['zone']}",
+        zone=f"{DOTS_ZONE_PREFIX}{best['zone']}",
         ocr=best["ocr"],
     )
     return entry
