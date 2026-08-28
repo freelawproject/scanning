@@ -84,35 +84,19 @@ below); still missing is #149 (page numbers from the dots output), so:
 
 ## Page completeness review states (issue #154)
 
-Two `Status` values give the first human review explicit edges. This
-issue landed the vocabulary and the readers only — **nothing in the
-codebase writes either status yet**; the writers are downstream:
-
-- `READY_FOR_PAGE_COMPLETENESS_REVIEW`: every review-1 input is in
-  place (bitonal preview, dots.mocr run, page numbers + issues). The
-  #149 apply is its only writer, being the last prerequisite by
-  construction. Note for #149: an admin re-queue re-runs
-  `run_full_pipeline` and parks a ready scan back in
-  `AWAITING_VALIDATION`, so the apply must restore READY on that path.
-- `PAGE_COMPLETENESS_REVIEW_DONE`: a person confirmed the volume is
-  complete. The approve button (#151) is its only writer. The stages
-  behind it (#195 detect, #196 redactions) trigger off DONE and write
-  **no** scan status — their progress lives on `ExternalJob` rows, so
-  redaction work can never block either review status.
-- Both are parked human states, deliberately outside `BUSY_STATUSES`:
-  the viewer does not poll them and the stale sweep must not touch
-  them. `AWAITING_VALIDATION` now reads as "review-1 prerequisites
-  still outstanding", no longer as the #173 interim park.
-- `recalculate_issues` preserves both states (a recheck must not move a
-  scan between review states); its `PENDING_REVIEW` write remains only
-  for the legacy rows that already carry it. `serve_scan_pdf` treats a
-  missing preview under either state as a failed S3 pull (409 with a
-  reload hint), since READY guarantees a stored `bitonal.pdf`.
-- Legacy `PENDING_REVIEW` rows do not migrate: they passed the retired
-  pipeline, and the step-2 flow (`run_generate_files`) also parks in
-  `PENDING_REVIEW`, which now means the later review only.
-- The status column is `max_length=40` for the 34-character ready
-  value; `test_status_column_fits_every_status_value` guards the fit.
+`READY_FOR_PAGE_COMPLETENESS_REVIEW` and
+`PAGE_COMPLETENESS_REVIEW_DONE` give review 1 explicit edges. #154
+landed the values and the readers only — **nothing writes them yet**:
+the #149 apply sets READY (last prerequisite by construction; it must
+also restore READY after an admin re-queue parks a ready scan back in
+`AWAITING_VALIDATION`), the #151 approve button sets DONE, and
+#195/#196 trigger off DONE writing **no** scan status, so redaction
+work never blocks either review. Both are parked human states outside
+`BUSY_STATUSES` (no polling, no sweep); `AWAITING_VALIDATION` now means
+"review-1 prerequisites outstanding". `recalculate_issues` preserves
+both (`PENDING_REVIEW` remains for legacy rows and step 2 only), and
+`serve_scan_pdf` reads a missing preview under either as a failed S3
+pull (409 + reload hint), since READY guarantees a `bitonal.pdf`.
 
 ## Bitonal via doctor (issue #176)
 
