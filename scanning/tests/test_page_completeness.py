@@ -454,6 +454,24 @@ class TestStepOneButtonBar(ScanningTestCase):
 
         self.assertIn(self.APPROVE, html)
 
+    def test_a_parked_scan_is_offered_no_way_forward(self):
+        """A new-pipeline volume whose review has not begun holds no
+        issue rows, which used to read as "nothing to fix" and reveal
+        "Next: Detect" -- a paid RunPod confirm that start_detect then
+        refuses. Approval is the gate; a scan that cannot be approved
+        yet is offered nothing."""
+        scan = ScanFactory(
+            status=Status.AWAITING_VALIDATION,
+            page_count=2,
+            ocr_results=dots_results(),
+        )
+
+        html = self._bar(scan)
+
+        self.assertNotIn(self.DETECT, html)
+        self.assertNotIn(self.APPROVE, html)
+        self.assertNotIn(self.REVALIDATE, html)
+
     def test_a_fresh_upload_offers_no_validate_button(self):
         """The other branch of the bar: no page count yet, and still no
         re-run to offer."""

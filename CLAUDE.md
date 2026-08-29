@@ -124,7 +124,11 @@ approve button the view refuses.
   cannot be gated on an empty issue list. A legacy `PENDING_REVIEW`
   scan never reaches the #154 states, so it keeps the old bar (the old
   "no open issues" rule, and "Validate"/"Re-validate") and still
-  reaches step 2.
+  reaches step 2. Those two clauses are the whole gate on purpose: a
+  scan that is neither approved nor legacy -- one still parked in
+  `AWAITING_VALIDATION`, or errored -- holds no issue rows either, and
+  a gate reading "no open issues" alone would show it a paid RunPod
+  confirm that `start_detect` then refuses.
 - **A new-pipeline volume is never re-run from the viewer.** Sharding,
   the bitonal conversion and dots.mocr are deterministic, so a second
   run returns what the first one stored, and charges another doctor

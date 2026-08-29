@@ -76,10 +76,15 @@ reach step 2.
   </form>
   {% endif %}
   {% comment %}
-    `and` binds tighter than `or`: approval is the gate for a #154 scan,
-    and a legacy scan keeps the old "no open issues" rule.
+    `and` binds tighter than `or`: approval is the gate for a
+    new-pipeline scan, and a legacy scan keeps the old "no open issues"
+    rule. The two clauses cover every scan between them, so a volume
+    that is neither -- one still parked in AWAITING_VALIDATION, or
+    errored -- is offered nothing. It used to read `not
+    page_review_ready` here, which showed a paid RunPod confirm to a
+    scan whose review has not begun, only for start_detect to refuse it.
   {% endcomment %}
-  {% if page_review_done or not page_review_ready and not issues and not missing_pages %}
+  {% if page_review_done or has_legacy_ocr and not issues and not missing_pages %}
   <form method="post" action="{% url 'start_detect' scan.pk %}" class="inline">
     {% csrf_token %}
     {% if has_detections %}
