@@ -1,6 +1,6 @@
 """Confirm in-flight external jobs and finish the scans they belong to.
 
-Two halves, in order.
+Four passes, in order.
 
 **1. ``jobs.sweep_jobs()`` asks after every job still in flight.** How
 it asks depends on the provider:
@@ -18,9 +18,20 @@ it asks depends on the provider:
 merges the shards of any scan whose conversion jobs are all done and
 moves it out of ``AWAITING``.
 
-The dots.mocr stage has no equivalent yet, by design: issue #190 ends
-when every shard has answered, leaving its rows at ``COMPLETED``. The
-merge that reads them is issue #149.
+**3. ``dots_mocr.finish_ready_runs()`` glues finished OCR runs.** It
+joins the per-shard payloads of any scan whose dots.mocr rows are all
+``COMPLETED`` into one volume JSON on S3 and flips the rows to
+``CONSUMED`` (issue #202). It writes no scan status, and it keeps the
+per-shard results: a future smart glue over page inserts and deletes
+re-reads them.
+
+**4. ``dots_mocr.apply_ready_runs()`` applies glued runs (#149/#204).**
+It reads each glued volume JSON, rebuilds ``Scan.ocr_results`` and the
+Issues, and takes the scan over the review edge to
+``READY_FOR_PAGE_COMPLETENESS_REVIEW`` with one compare-and-swap.
+Deliberately not queued work (#212): the scan never transits
+QUEUED/PROCESSING. A scan still ``AWAITING`` its conversion is
+deferred and picked up on the tick after the bitonal park.
 
 Examples:
 
@@ -45,7 +56,9 @@ RETRY_BACKOFF_SECONDS = 0.5
 class Command(BaseCommand):
     help = (
         "Ask after every in-flight external job, then merge and park any "
-        "scan whose conversion jobs have all finished."
+        "scan whose conversion jobs have all finished, then glue any "
+        "finished dots.mocr run into its volume document, then apply "
+        "every glued run (page numbers and Issues)."
     )
 
     def handle(self, *args, **options):
@@ -57,13 +70,15 @@ class Command(BaseCommand):
         """
         from django.db import OperationalError, connections
 
-        from scanning import bitonal, jobs
+        from scanning import bitonal, dots_mocr, jobs
 
         for attempt in range(MAX_DB_RETRIES):
             connections.close_all()
             try:
                 summary = jobs.sweep_jobs()
                 finished = bitonal.finish_ready_scans()
+                glued = dots_mocr.finish_ready_runs()
+                applied = dots_mocr.apply_ready_runs()
                 break
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -85,10 +100,13 @@ class Command(BaseCommand):
                 summary.failed,
                 summary.errors,
                 finished,
+                glued,
+                applied,
             )
         ):
             self.stdout.write(
                 f"Completed {summary.completed}, retried {summary.retried}, "
                 f"failed {summary.failed}, still waiting {summary.pending}, "
-                f"check errors {summary.errors}; finished {finished} scan(s)"
+                f"check errors {summary.errors}; finished {finished} "
+                f"scan(s), glued {glued} OCR run(s), applied {applied}"
             )

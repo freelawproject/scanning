@@ -463,6 +463,58 @@ def download_object(key: str, dest_path: Path) -> None:
     )
 
 
+def upload_json_object(key: str, data: dict) -> bool:
+    """Upload one JSON document to an exact key, bypassing the sync.
+
+    The write-side twin of :func:`download_object`, for artifacts that
+    live under a sync-excluded prefix (the glued dots.mocr output under
+    ``jobs/``, issue #202). ``upload_file_to_s3`` cannot serve those: it
+    keys off a path relative to the scan's output directory, so
+    everything it writes comes back down with the next generic pull.
+
+    :param key: Object key inside the private bucket.
+    :param data: A JSON-serializable document.
+    :returns: Whether the object was uploaded. False when S3 is off or
+        the PUT failed; the caller decides whether that is fatal.
+    :rtype: bool
+    """
+    if not _s3_enabled():
+        return False
+    try:
+        _s3_client().put_object(
+            Bucket=settings.AWS_PRIVATE_STORAGE_BUCKET_NAME,
+            Key=key,
+            Body=json.dumps(data).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except (BotoCoreError, ClientError):
+        logger.warning(
+            "Could not upload a JSON object to %s", key, exc_info=True
+        )
+        return False
+    return True
+
+
+def download_json_object(key: str) -> dict:
+    """Download and parse one JSON document by key.
+
+    The read-side twin of :func:`upload_json_object`, for the same
+    sync-excluded artifacts. Errors are the caller's to classify: a
+    missing key and a transport failure ask for different reactions,
+    so nothing is swallowed here.
+
+    :param key: Object key inside the private bucket.
+    :returns: The parsed document.
+    :rtype: dict
+    :raises ClientError: If the object is missing or unreadable.
+    :raises ValueError: If the object is not valid JSON.
+    """
+    response = _s3_client().get_object(
+        Bucket=settings.AWS_PRIVATE_STORAGE_BUCKET_NAME, Key=key
+    )
+    return json.loads(response["Body"].read())
+
+
 def _is_job_result(rel: str) -> bool:
     """Return True if a processing-prefix relative key is a job result.
 

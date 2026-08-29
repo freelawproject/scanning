@@ -1061,6 +1061,13 @@ class TestScanModel(ScanningTestCase):
         )
         self.assertTrue(scan.original_pdf.name.endswith(".original.pdf"))
 
+    def test_status_column_fits_every_status_value(self):
+        """The column was widened for the #154 values; a new status
+        must never silently exceed it again."""
+        max_length = Scan._meta.get_field("status").max_length
+        for value in Status.values:
+            self.assertLessEqual(len(value), max_length)
+
 
 class TestOpinionScanModel(ScanningTestCase):
     """Test the OpinionScan model."""
@@ -2099,6 +2106,89 @@ class TestServeScanPdfLazyPull(ScanningTestCase):
         data = response.json()
         self.assertEqual(data["status"], "unavailable")
         self.assertEqual(data["scan_status"], Status.ERROR)
+
+    def test_review_1_statuses_mean_the_preview_pull_failed(self):
+        """The #154 statuses guarantee a stored preview, so a miss here
+        is a failed S3 pull: 409 with a reload hint, and no polling."""
+        user = self.make_user()
+        self.client.force_login(user)
+
+        tmp_root = tempfile.mkdtemp()
+        for status in (
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        ):
+            with self.subTest(status=status):
+                scan = ScanFactory(start_page=1, end_page=2, status=status)
+                with (
+                    override_settings(
+                        DEVELOPMENT=False,
+                        TESTING=False,
+                        PROCESSING_TMP_DIR=tmp_root,
+                    ),
+                    patch("scanning.s3_sync.download_preview_pdf"),
+                ):
+                    response = self.client.get(
+                        reverse("serve_scan_pdf", kwargs={"pk": scan.pk})
+                    )
+
+                self.assertEqual(response.status_code, 409)
+                data = response.json()
+                self.assertEqual(data["status"], "unavailable")
+                self.assertEqual(data["scan_status"], status)
+                self.assertIn("Reload", data["message"])
+                self.assertTrue(data["original_available"])
+
+
+class TestPageCompletenessReviewSteps(ScanningTestCase):
+    """The #154 statuses land on the right step of the process viewer."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+
+    def _step_for(self, scan):
+        response = self.client.get(
+            reverse("scan_process", kwargs={"pk": scan.pk})
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.context["step"]
+
+    def test_ready_lands_on_step_1(self):
+        """A scan ready for review 1 opens on the page review."""
+        scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW, page_count=2
+        )
+        self.assertEqual(self._step_for(scan), 1)
+
+    def test_done_without_detections_lands_on_step_1(self):
+        """Review 1 is done but detection has not run: stay on step 1."""
+        scan = ScanFactory(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE, page_count=2
+        )
+        self.assertEqual(self._step_for(scan), 1)
+
+    def test_done_with_detections_lands_on_step_2(self):
+        """Review 1 is done and detections exist: open the detection
+        review. The detection stage (#195) writes no scan status, so
+        its output is the only signal."""
+        scan = ScanFactory(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE, page_count=2
+        )
+        Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="KEY",
+            label_id=0,
+            confidence=0.9,
+            x0=0,
+            y0=0,
+            x1=10,
+            y1=10,
+            img_width=100,
+            img_height=100,
+        )
+        self.assertEqual(self._step_for(scan), 2)
 
 
 class TestScanOriginalUrl(ScanningTestCase):
