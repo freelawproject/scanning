@@ -1,9 +1,12 @@
 """Claim and process the next queued scan (a single daemon tick).
 
 Recovers any PROCESSING rows whose ``processed_at`` is older than
-``DAEMON_PROCESSING_TIMEOUT`` back to QUEUED, then atomically claims
-one QUEUED scan (via ``SELECT ... FOR UPDATE SKIP LOCKED``) and
-dispatches the queued action. Only the full (now interim: shard and
+``DAEMON_PROCESSING_TIMEOUT`` back to QUEUED. Then, unless
+``DAEMON_MAX_ACTIVE_SCANS`` scans already hold unfinished external work
+(issue #218), atomically claims one QUEUED scan (via ``SELECT ... FOR
+UPDATE SKIP LOCKED``) and dispatches the queued action. The cap is the
+daemon's only backpressure: a scan it refuses stays QUEUED, which costs
+nothing and times out nowhere. Only the full (now interim: shard and
 park) pipeline is dispatchable; the legacy actions (validate, detect,
 reprocess, generate_files) were disconnected by issue #173 and rows
 still carrying one are parked back to PENDING_REVIEW with the unified
@@ -32,11 +35,18 @@ logger = logging.getLogger(__name__)
 MAX_DB_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 0.5
 
+# Whether the last tick found intake full, so the crossing is logged
+# once in each direction instead of on every one of the 720 ticks an
+# hour. Module level because ``call_command`` builds a fresh Command
+# each tick; a daemon restart costs one extra line.
+_intake_full = False
+
 
 class Command(BaseCommand):
     help = (
         "Process the next queued scan: recover stale PROCESSING rows, "
-        "then atomically claim one QUEUED scan and dispatch its action."
+        "then, if fewer than DAEMON_MAX_ACTIVE_SCANS scans hold external "
+        "work, atomically claim one QUEUED scan and dispatch its action."
     )
 
     def handle(self, *args, **options):
@@ -63,8 +73,12 @@ class Command(BaseCommand):
         logged at WARNING (not ERROR) so a recovered, self-healing tick
         doesn't create a Sentry error event.
 
+        The intake cap sits between the two, so a full queue skips the
+        claim but never the recovery (issue #218).
+
         :return: ``(scan, action)`` for the claimed scan, or ``None`` if
-            nothing was queued or the connection never recovered.
+            nothing was queued, intake is full, or the connection never
+            recovered.
         :rtype: tuple | None
         """
         from django.db import OperationalError, connections
@@ -73,6 +87,8 @@ class Command(BaseCommand):
             connections.close_all()
             try:
                 self._recover_stale()
+                if self._intake_is_full():
+                    return None
                 return self._claim_next()
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -120,6 +136,62 @@ class Command(BaseCommand):
             stale,
             requeue_message="Re-queued (previous attempt timed out)",
         )
+
+    def _intake_is_full(self):
+        """Return whether the external queues are too full to admit a scan.
+
+        The daemon's only backpressure (issue #218). Without it the tick
+        claimed the oldest QUEUED scan whatever the queues held, and a
+        bulk re-queue put more work behind the parked scans than the
+        6-hour ``DAEMON_JOB_MAX_QUEUE_SECONDS`` ceiling allows a row to
+        wait -- which fails volumes hours later for being popular.
+
+        Three properties this placement carries:
+
+        - It gates the **claim**, not the dispatch after it. A claimed
+          scan that was then refused would transit PROCESSING and spend
+          a status write for nothing.
+        - A refused scan simply stays QUEUED. Nothing times out there,
+          the status page already says "queued", and the scan starts as
+          soon as a slot opens.
+        - Stale-scan recovery runs first and unconditionally. Returning
+          a scan the daemon dropped is not intake.
+
+        There is no deadlock: the submit and collect ticks drain the
+        queues whether or not anything is being claimed, and the cap is
+        read fresh on the next tick.
+
+        The staff buttons are deliberately outside this gate. They
+        create rows straight from a request, one scan at a time, so a
+        person can still start a re-run over an already-admitted volume.
+
+        :return: Whether this tick must claim nothing.
+        :rtype: bool
+        """
+        global _intake_full
+
+        from django.conf import settings
+
+        from scanning import jobs
+
+        cap = int(settings.DAEMON_MAX_ACTIVE_SCANS)
+        active = jobs.active_scan_count()
+        full = active >= cap
+        if full and not _intake_full:
+            logger.warning(
+                "intake paused: %d scan(s) hold external work at a cap of "
+                "%d; queued scans wait for a slot (issue #218)",
+                active,
+                cap,
+            )
+        elif _intake_full and not full:
+            logger.info(
+                "intake resumed: %d scan(s) hold external work at a cap of %d",
+                active,
+                cap,
+            )
+        _intake_full = full
+        return full
 
     def _claim_next(self):
         """Atomically claim the next queued scan and mark it PROCESSING.

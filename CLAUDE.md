@@ -459,6 +459,54 @@ trained on), tracked on `ExternalJob` rows at
   SIGKILL orphans in the system temp dir. Off under TESTING; the
   command's tests point `gettempdir` at a scratch root.
 
+## Intake backpressure (issue #218)
+
+`process_next_scan` claims a QUEUED scan only while fewer than
+`DAEMON_MAX_ACTIVE_SCANS` (5) scans hold unfinished external work
+(`jobs.active_scan_count`). It is the daemon's only backpressure: until
+it landed, the tick claimed the oldest QUEUED scan whatever the queues
+held, and on 2026-08-31 that put 2023 conversion rows behind 27 parked
+scans — about 20 hours of work against the 6-hour
+`DAEMON_JOB_MAX_QUEUE_SECONDS` ceiling — which expired most of them
+unsubmitted and sank 29 volumes to ERROR.
+
+- **The gate is on the claim, not on the dispatch after it.** A claimed
+  scan that was then refused would transit PROCESSING and spend a
+  status write for nothing. A refused scan simply stays QUEUED: nothing
+  times out there, the page already says "queued", and it starts when a
+  slot opens. The admin re-queue is therefore safe at any batch size.
+- **Recovery runs first and unconditionally.** `_recover_stale` returns
+  a scan the daemon dropped; that is not intake, and gating it would
+  strand a scan in PROCESSING for as long as the queues stay full.
+- **The count is scans, not rows, and covers every stage.** A scan is
+  what a slot holds — its whole shard set enters every queue at once
+  and nothing releases part of it — so a row cap would say the same
+  thing with a ~40% shard-count error bar. Counting `CONVERT` alone
+  would be worse than useless: doctor drains ~100 rows/h while
+  dots.mocr drains 24-36, so the doctor queue is not the one that
+  overflows first.
+- **`COMPLETED` does not hold a slot** (`WAITING_JOB_STATUSES` is
+  `OPEN_JOB_STATUSES` minus it). Those rows wait on local work — the
+  merge, the glue, the apply — which costs a provider nothing, and a
+  failed merge or a spent glue budget leaves `COMPLETED` rows nothing
+  moves again, so counting them would hold a slot for good.
+- **The knob moves by the arithmetic it was chosen with**: slots ×
+  the largest volume's shards must stay under
+  `DAEMON_JOB_MAX_QUEUE_SECONDS` at the slowest queue's drain rate. At
+  5 slots and ~20 shards that is ~100 dots.mocr rows, ~4.2h against the
+  6h ceiling. Ten slots would not fit.
+- There is no deadlock: the submit and collect ticks drain the queues
+  whether or not anything is claimed. A stage switched off with rows
+  still PENDING does hold its slots until the queue deadline expires
+  them.
+- The staff buttons are outside the gate on purpose — they create rows
+  from a request, one scan at a time, so a re-run over an already
+  admitted volume still works.
+- One log line per crossing (WARNING pausing, INFO resuming), the
+  loud-then-quiet shape the glue and apply retries use. The flag is
+  module state in the command, so a daemon restart costs one extra
+  line.
+
 ## Detection Workflow
 
 YOLO models detect elements on each page (captions, key icons, headnotes, etc.) and store them as `Detection` records with a confidence score. Users review detections in the process viewer (step 2) and can:

@@ -1426,6 +1426,14 @@ OPEN_JOB_STATUSES = frozenset(
     {JobStatus.PENDING, JobStatus.COMPLETED} | IN_FLIGHT_JOB_STATUSES
 )
 
+#: Jobs a provider still owes us an answer for: what the intake cap
+#: measures a scan by (issue #218). Deliberately not OPEN_JOB_STATUSES.
+#: A COMPLETED row waits for local work -- the merge, the glue, the
+#: apply -- which costs a provider nothing, and a merge that fails or a
+#: glue budget that runs out leaves COMPLETED rows nothing moves again,
+#: so counting them would hold a slot for good.
+WAITING_JOB_STATUSES = frozenset({JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES)
+
 #: Jobs that ended without their work being applied. Separate from the
 #: terminal set below because a run holding one can never finish -- it
 #: will not complete and cannot be merged -- so it has to be replaced
