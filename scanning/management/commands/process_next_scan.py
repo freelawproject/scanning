@@ -4,9 +4,8 @@ Recovers any PROCESSING rows whose ``processed_at`` is older than
 ``DAEMON_PROCESSING_TIMEOUT`` back to QUEUED. Then, unless
 ``DAEMON_MAX_ACTIVE_SCANS`` scans already hold unfinished external work
 (issue #218), atomically claims one QUEUED scan (via ``SELECT ... FOR
-UPDATE SKIP LOCKED``) and dispatches the queued action. The cap is the
-daemon's only backpressure: a scan it refuses stays QUEUED, which costs
-nothing and times out nowhere. Only the full (now interim: shard and
+UPDATE SKIP LOCKED``) and dispatches the queued action. Only the full
+(now interim: shard and
 park) pipeline is dispatchable; the legacy actions (validate, detect,
 reprocess, generate_files) were disconnected by issue #173 and rows
 still carrying one are parked back to PENDING_REVIEW with the unified
@@ -35,10 +34,8 @@ logger = logging.getLogger(__name__)
 MAX_DB_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 0.5
 
-# Whether the last tick found intake full, so the crossing is logged
-# once in each direction instead of on every one of the 720 ticks an
-# hour. Module level because ``call_command`` builds a fresh Command
-# each tick; a daemon restart costs one extra line.
+# Whether the last tick found intake full, so only the crossing logs.
+# Module level because ``call_command`` builds a fresh Command a tick.
 _intake_full = False
 
 
@@ -140,30 +137,14 @@ class Command(BaseCommand):
     def _intake_is_full(self):
         """Return whether the external queues are too full to admit a scan.
 
-        The daemon's only backpressure (issue #218). Without it the tick
-        claimed the oldest QUEUED scan whatever the queues held, and a
-        bulk re-queue put more work behind the parked scans than the
-        6-hour ``DAEMON_JOB_MAX_QUEUE_SECONDS`` ceiling allows a row to
-        wait -- which fails volumes hours later for being popular.
+        The daemon's only backpressure (issue #218): without it a bulk
+        re-queue queues more work than ``DAEMON_JOB_MAX_QUEUE_SECONDS``
+        lets a row wait, and the rows expire unsubmitted.
 
-        Three properties this placement carries:
-
-        - It gates the **claim**, not the dispatch after it. A claimed
-          scan that was then refused would transit PROCESSING and spend
-          a status write for nothing.
-        - A refused scan simply stays QUEUED. Nothing times out there,
-          the status page already says "queued", and the scan starts as
-          soon as a slot opens.
-        - Stale-scan recovery runs first and unconditionally. Returning
-          a scan the daemon dropped is not intake.
-
-        There is no deadlock: the submit and collect ticks drain the
-        queues whether or not anything is being claimed, and the cap is
-        read fresh on the next tick.
-
-        The staff buttons are deliberately outside this gate. They
-        create rows straight from a request, one scan at a time, so a
-        person can still start a re-run over an already-admitted volume.
+        It gates the **claim**, so a refused scan stays QUEUED rather
+        than transiting PROCESSING for nothing. No deadlock: the submit
+        and collect ticks drain the queues regardless. The staff
+        buttons bypass it -- one scan at a time, from a request.
 
         :return: Whether this tick must claim nothing.
         :rtype: bool

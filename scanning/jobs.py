@@ -962,19 +962,9 @@ def ensure_convert_jobs(scan, manifest: dict) -> list[ExternalJob]:
 def active_scan_count() -> int:
     """Count the scans that hold unfinished work in an external queue.
 
-    What the daemon's intake cap is measured against (issue #218): a
-    scan is *active* while any provider still owes it an answer, and
-    the slot it holds is released only when every one of its rows has
-    left :data:`~scanning.models.WAITING_JOB_STATUSES`.
-
-    Scans, not rows, because a scan is what a slot holds: its whole
-    shard set enters every stage's queue at once and nothing releases
-    part of it. Counting rows would say the same thing with a
-    shard-count error bar of about 40%.
-
-    Across every stage, engine and provider, deliberately. A scan that
-    is being converted on doctor is usually being read on RunPod at the
-    same time, and admitting more work charges both queues.
+    What the daemon's intake cap is measured against (issue #218).
+    Scans, not rows, because a scan's whole shard set enters every
+    queue at once; every stage, because it charges all of them.
 
     :returns: How many scans hold at least one waiting job row.
     :rtype: int

@@ -243,11 +243,9 @@ class TestLegacyQueuedActionsPark(TestCase):
 class TestIntakeCap(TestCase):
     """The tick admits no scan while DAEMON_MAX_ACTIVE_SCANS are busy.
 
-    Issue #218. Intake had no cap: the tick claimed the oldest QUEUED
-    scan whatever the external queues held, so a bulk re-queue put more
-    work behind the parked scans than DAEMON_JOB_MAX_QUEUE_SECONDS lets
-    a row wait. The rows then expired unsubmitted and sank their
-    volumes to ERROR.
+    Issue #218: uncapped intake queued more work than
+    DAEMON_JOB_MAX_QUEUE_SECONDS lets a row wait, so the rows expired
+    unsubmitted and sank their volumes to ERROR.
     """
 
     def _busy_scan(self, status=JobStatus.PENDING, rows=1):
@@ -340,10 +338,8 @@ class TestIntakeCap(TestCase):
     def test_finished_and_dead_rows_free_the_slot(self):
         """Only unfinished provider work holds a slot.
 
-        A COMPLETED row waits for local work -- the merge, the glue, the
-        apply -- which costs a provider nothing. It must not hold a
-        slot, or a failed merge (which leaves its rows COMPLETED) would
-        hold one for good.
+        A COMPLETED row waits on local work, and a failed merge leaves
+        one nothing moves again -- so it must not hold a slot for good.
         """
         for status in (
             JobStatus.COMPLETED,

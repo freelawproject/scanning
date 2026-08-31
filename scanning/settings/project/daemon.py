@@ -35,25 +35,13 @@ DAEMON_JOB_MAX_QUEUE_SECONDS = env.int(
     "DAEMON_JOB_MAX_QUEUE_SECONDS", default=6 * 60 * 60
 )
 
-# How many scans may hold unfinished work in an external queue before
-# the daemon stops admitting new ones (issue #218).
+# How many scans may hold unfinished external work before the daemon
+# stops admitting new ones (issue #218). Uncapped intake put 2023 rows
+# behind 27 parked scans on 2026-08-31; most expired unsubmitted
+# against the ceiling above and sank 29 volumes to ERROR.
 #
-# Intake had no cap at all: ``process_next_scan`` claimed the oldest
-# QUEUED scan every tick whatever the queues held. On 2026-08-31 that
-# put 2023 conversion rows behind 27 parked scans -- about 20 hours of
-# work against the 6-hour ceiling above -- and most of them expired
-# unsubmitted, which sank 29 volumes to ERROR.
-#
-# Counted in scans rather than rows because a scan is what a slot
-# holds: its whole shard set enters every stage's queue at once, and
-# nothing releases part of it. A row cap would encode the same intent
-# with a shard-count error bar of about 40%.
-#
-# Move this knob by the rule it was chosen with: the slot count times
-# the shards of the largest volume must stay below
-# DAEMON_JOB_MAX_QUEUE_SECONDS at the slowest queue's drain rate. Today
-# the slowest queue is dots.mocr (2-3 RunPod workers at ~5 minutes a
-# shard, so 24-36 rows an hour), and the largest volume is ~20 shards
-# (2000 pages at SHARD_MAX_PAGES). Five slots therefore hold at most
-# ~100 rows, which clears in ~4.2 hours. Ten slots would not.
+# Move it by the rule it was chosen with: slots x the largest volume's
+# shards must clear within DAEMON_JOB_MAX_QUEUE_SECONDS at the slowest
+# queue's drain rate. Today that is dots.mocr (24-36 rows/h) over ~20
+# shards, so 5 slots hold ~100 rows and clear in ~4.2h. Ten would not.
 DAEMON_MAX_ACTIVE_SCANS = env.int("DAEMON_MAX_ACTIVE_SCANS", default=5)

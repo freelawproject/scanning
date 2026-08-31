@@ -463,49 +463,33 @@ trained on), tracked on `ExternalJob` rows at
 
 `process_next_scan` claims a QUEUED scan only while fewer than
 `DAEMON_MAX_ACTIVE_SCANS` (5) scans hold unfinished external work
-(`jobs.active_scan_count`). It is the daemon's only backpressure: until
-it landed, the tick claimed the oldest QUEUED scan whatever the queues
-held, and on 2026-08-31 that put 2023 conversion rows behind 27 parked
-scans — about 20 hours of work against the 6-hour
-`DAEMON_JOB_MAX_QUEUE_SECONDS` ceiling — which expired most of them
-unsubmitted and sank 29 volumes to ERROR.
+(`jobs.active_scan_count`). It is the daemon's only backpressure:
+uncapped intake put 2023 conversion rows behind 27 parked scans on
+2026-08-31, three times what the 6-hour
+`DAEMON_JOB_MAX_QUEUE_SECONDS` ceiling can drain, and 29 volumes died
+of it.
 
-- **The gate is on the claim, not on the dispatch after it.** A claimed
-  scan that was then refused would transit PROCESSING and spend a
-  status write for nothing. A refused scan simply stays QUEUED: nothing
-  times out there, the page already says "queued", and it starts when a
-  slot opens. The admin re-queue is therefore safe at any batch size.
-- **Recovery runs first and unconditionally.** `_recover_stale` returns
-  a scan the daemon dropped; that is not intake, and gating it would
-  strand a scan in PROCESSING for as long as the queues stay full.
-- **The count is scans, not rows, and covers every stage.** A scan is
-  what a slot holds — its whole shard set enters every queue at once
-  and nothing releases part of it — so a row cap would say the same
-  thing with a ~40% shard-count error bar. Counting `CONVERT` alone
-  would be worse than useless: doctor drains ~100 rows/h while
-  dots.mocr drains 24-36, so the doctor queue is not the one that
-  overflows first.
+- **The gate is on the claim, not the dispatch after it.** A refused
+  scan stays QUEUED — nothing times out there — instead of transiting
+  PROCESSING for nothing. The admin re-queue is safe at any batch size.
+- **Recovery runs first and unconditionally**: returning a scan the
+  daemon dropped is not intake.
+- **Scans, not rows, over every stage.** A scan's whole shard set
+  enters every queue at once. Counting `CONVERT` alone would watch the
+  wrong queue: doctor drains ~100 rows/h, dots.mocr 24-36.
 - **`COMPLETED` does not hold a slot** (`WAITING_JOB_STATUSES` is
-  `OPEN_JOB_STATUSES` minus it). Those rows wait on local work — the
-  merge, the glue, the apply — which costs a provider nothing, and a
-  failed merge or a spent glue budget leaves `COMPLETED` rows nothing
-  moves again, so counting them would hold a slot for good.
-- **The knob moves by the arithmetic it was chosen with**: slots ×
-  the largest volume's shards must stay under
-  `DAEMON_JOB_MAX_QUEUE_SECONDS` at the slowest queue's drain rate. At
-  5 slots and ~20 shards that is ~100 dots.mocr rows, ~4.2h against the
-  6h ceiling. Ten slots would not fit.
-- There is no deadlock: the submit and collect ticks drain the queues
-  whether or not anything is claimed. A stage switched off with rows
-  still PENDING does hold its slots until the queue deadline expires
-  them.
-- The staff buttons are outside the gate on purpose — they create rows
-  from a request, one scan at a time, so a re-run over an already
-  admitted volume still works.
+  `OPEN_JOB_STATUSES` minus it): those rows wait on the merge, the glue
+  or the apply, and a failed merge leaves one nothing moves again.
+- **The knob moves by its arithmetic**: slots × the largest volume's
+  shards must clear `DAEMON_JOB_MAX_QUEUE_SECONDS` at the slowest
+  queue's rate. 5 × ~20 shards is ~100 dots.mocr rows, ~4.2h against
+  6h. Ten slots would not fit.
+- No deadlock — the submit and collect ticks drain regardless — but a
+  stage switched off with rows still PENDING holds its slots until the
+  queue deadline expires them. The staff buttons bypass the gate: one
+  scan at a time, from a request.
 - One log line per crossing (WARNING pausing, INFO resuming), the
-  loud-then-quiet shape the glue and apply retries use. The flag is
-  module state in the command, so a daemon restart costs one extra
-  line.
+  loud-then-quiet shape the glue and apply retries use.
 
 ## Detection Workflow
 
