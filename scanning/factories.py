@@ -9,6 +9,7 @@ from scanning.models import (
     JobStatus,
     OpinionScan,
     OpinionStatus,
+    PageEdit,
     Reporter,
     Scan,
     Source,
@@ -150,6 +151,34 @@ class ExternalJobFactory(factory.django.DjangoModelFactory):
     run = 1
     shard_index = 0
     shard_count = 1
+
+
+class PageEditFactory(factory.django.DjangoModelFactory):
+    """Factory for creating PageEdit instances (issue #214).
+
+    Defaults to a page number a curator typed on page 1, since that
+    shape needs no image and no anchor. For an insert pass
+    ``kind=PageEdit.Kind.INSERT_PAGE``, ``pdf_page=None`` and an
+    ``anchor_pdf_page``, which the ``page_edit_address_matches_kind``
+    constraint requires together.
+
+    Default declarations:
+
+    - ``scan``: auto-created via ``ScanFactory``.
+    - ``kind``: ``PageEdit.Kind.SET_NUMBER``.
+    - ``author``: auto-created via ``UserFactory``.
+    - ``pdf_page``: 1.
+    - ``value``: ``"1"``.
+    """
+
+    class Meta:
+        model = PageEdit
+
+    scan = factory.SubFactory(ScanFactory)
+    kind = PageEdit.Kind.SET_NUMBER
+    author = factory.SubFactory(UserFactory)
+    pdf_page = 1
+    value = "1"
 
 
 class OpinionScanFactory(factory.django.DjangoModelFactory):

@@ -313,6 +313,45 @@ def _source_fingerprint(source_path: Path) -> dict:
     }
 
 
+def fingerprint_value(fingerprint: dict) -> str:
+    """Return a source fingerprint as the one string others compare.
+
+    The pair a manifest records, flattened, so a row that was written
+    against one original can be told from a row written against
+    another (``Scan.source_fingerprint``, ``PageEdit`` of issue #214).
+
+    :param fingerprint: A :func:`_source_fingerprint` result, or a
+        manifest's ``source`` dict, which holds the same two keys.
+    :returns: ``"{size_bytes}:{page_count}"``.
+    :rtype: str
+    """
+    return f"{fingerprint['size_bytes']}:{fingerprint['page_count']}"
+
+
+def _stamp_source_fingerprint(scan, fingerprint: dict) -> None:
+    """Record on the scan which original its shard set describes.
+
+    A curator's page edits are addressed in the physical space of that
+    original (#214), and they copy this value when they are written. A
+    re-cut set therefore makes every edit against the old original
+    detectable, instead of silently naming the wrong page.
+
+    The write is a targeted update, never a full instance save: the
+    daemon holds a ``Scan`` it read before a long conversion, and a
+    full save would push its stale status over a concurrent one.
+
+    :param scan: The scan that was sharded.
+    :param fingerprint: The fingerprint its shard set was cut from.
+    """
+    from scanning.models import Scan
+
+    value = fingerprint_value(fingerprint)
+    if scan.source_fingerprint == value:
+        return
+    Scan.objects.filter(pk=scan.pk).update(source_fingerprint=value)
+    scan.source_fingerprint = value
+
+
 def _manifest_matches(manifest: object, fingerprint: dict) -> bool:
     """Return True when an existing manifest describes this exact source.
 
@@ -552,6 +591,7 @@ def ensure_shards(scan) -> dict | None:
                 len(existing["shards"]),
                 fingerprint["size_bytes"],
             )
+            _stamp_source_fingerprint(scan, fingerprint)
             return existing
         # .get chains, not indexing: a structurally broken manifest (the
         # other way _manifest_matches says no) may have no source dict at
@@ -606,6 +646,8 @@ def ensure_shards(scan) -> dict | None:
     if uploaded:
         for entry in manifest["shards"]:
             (shards_dir / entry["name"]).unlink(missing_ok=True)
+
+    _stamp_source_fingerprint(scan, fingerprint)
 
     total_mb = fingerprint["size_bytes"] / 1024 / 1024
     logger.info(

@@ -368,6 +368,53 @@ class TestEnsureShards(TestCase):
         shards_dir = Path(scan.output_dir) / "shards"
         self.assertEqual(len(list(shards_dir.glob("*.pdf"))), 3)
 
+    def test_the_scan_records_the_fingerprint_it_was_cut_from(self):
+        # Page edits copy this value (#214), so a re-cut set must move
+        # it: an edit against the old original names the wrong page.
+        scan = self._scan_with_volume(pages=4)
+        manifest = sharding.ensure_shards(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(
+            scan.source_fingerprint,
+            sharding.fingerprint_value(manifest["source"]),
+        )
+
+        original = Path(scan.pdf_path)
+        with fitz.open(str(original)) as doc:
+            doc.delete_page(0)
+            doc.save(str(original) + ".new")
+        Path(str(original) + ".new").replace(original)
+        second = sharding.ensure_shards(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(
+            scan.source_fingerprint,
+            sharding.fingerprint_value(second["source"]),
+        )
+        self.assertNotEqual(
+            sharding.fingerprint_value(manifest["source"]),
+            sharding.fingerprint_value(second["source"]),
+        )
+
+    def test_a_reused_shard_set_still_stamps_the_scan(self):
+        # The stamp is new, so the volumes already sharded must get it
+        # on their next pipeline run, not only on a re-cut.
+        scan = self._scan_with_volume(pages=4)
+        manifest = sharding.ensure_shards(scan)
+        Scan.objects.filter(pk=scan.pk).update(source_fingerprint="")
+        scan.refresh_from_db()
+
+        with patch("scanning.sharding.shard_pdf") as mock_shard:
+            sharding.ensure_shards(scan)
+
+        mock_shard.assert_not_called()
+        scan.refresh_from_db()
+        self.assertEqual(
+            scan.source_fingerprint,
+            sharding.fingerprint_value(manifest["source"]),
+        )
+
     @override_settings(SHARDING_ENABLED=False)
     def test_disabled_returns_none(self):
         scan = self._scan_with_volume(pages=2)

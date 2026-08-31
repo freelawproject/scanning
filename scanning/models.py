@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 _local_storage = LocalProcessingStorage()
 
+# Legal ``PageEdit.value`` entries for a ROTATE_PAGE row: clockwise
+# degrees. A module constant because a check constraint is declared
+# inside ``Meta``, which cannot read the enclosing class body.
+PAGE_EDIT_ROTATIONS = ("90", "180", "270")
+
 
 class AutoNowQuerySet(models.QuerySet):
     """QuerySet that stamps ``auto_now`` fields on bulk writes.
@@ -625,6 +630,19 @@ class Scan(AbstractDateTimeModel):
         blank=True,
         help_text="Per-page redaction rects in image pixels.",
     )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "Identity of the original the pipeline last sharded:"
+            " '{size_bytes}:{page_count}', the same pair the shard"
+            " manifest records. Stamped by sharding.ensure_shards, and"
+            " copied onto every PageEdit a curator writes (#214), so a"
+            " re-cut or replaced original makes the edits written"
+            " against the old one detectable rather than wrong."
+        ),
+    )
     page_count = models.PositiveIntegerField(
         default=0,
         help_text=(
@@ -1113,6 +1131,312 @@ class PageDeletion(AbstractDateTimeModel):
 
     def __str__(self):
         return f"Delete PDF p.{self.pdf_page} from {self.scan}"
+
+
+def page_edit_image_path(instance: "PageEdit", filename: str) -> str:
+    """Return the storage key of one page edit's image.
+
+    The image goes under the scan's own processing prefix, in
+    ``page_edits/``, beside ``shards/`` and ``jobs/`` (issue #214).
+    Three reasons, and all three are about the apply that reads it:
+
+    - The default storage is S3 in production, so the file outlives the
+      web pod that took the upload. ``PageInsert`` used
+      ``LocalProcessingStorage``, so an insert lost its image to the
+      next preemption and a second pod could not read it at all.
+    - The key is presignable, so the apply (#206) hands the image to
+      doctor and to RunPod as a one-page shard, with the helpers every
+      other stage input already uses.
+    - The prefix is the scan's, so the admin scan deletion sweeps these
+      objects with the two it already sweeps.
+
+    The name carries a UUID, not the page address: an address is a
+    column, and a curator who replaces an image must not overwrite the
+    object an in-flight apply is reading.
+
+    :param instance: The PageEdit the image belongs to.
+    :param filename: The name the browser sent, read for its extension
+        only.
+    :returns: The storage key, relative to the default storage.
+    :rtype: str
+    """
+    from scanning import s3_sync
+
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "png"
+    ext = "".join(c for c in ext if c.isalnum())[:8] or "png"
+    return (
+        f"{s3_sync.s3_processing_prefix(instance.scan)}"
+        f"{s3_sync.PAGE_EDITS_SUBDIR}{uuid.uuid4().hex}.{ext}"
+    )
+
+
+class PageEdit(AbstractDateTimeModel):
+    """One decision a person made about one page of a scan (issue #214).
+
+    Review 1 asks a curator four kinds of question about a volume, and
+    the portal used to answer them in three different ways: a page
+    number inside the ``Scan.ocr_results`` JSON blob, a
+    ``PageDeletion`` row addressed by PDF page, a ``PageInsert`` row
+    addressed by printed page number, and nothing at all for a
+    replacement. This model is the one home for all of them, plus the
+    dismissal of an issue, which used to be a ``DELETE`` of the derived
+    ``Issue`` row and so did not survive one recompute.
+
+    What must not be broken:
+
+    - **Every address is in the physical space of the original as it
+      was uploaded**, 1-based, the space ``Detection.page_index`` and
+      the shard manifest already use. No stored address ever names a
+      page of an edited document.
+    - **An insert is addressed by a gap, not by a page.**
+      ``anchor_pdf_page`` is the original page the image follows, and 0
+      means "before page 1". ``ordinal`` orders several images in one
+      gap. The anchor is resolved once, when the curator uploads the
+      image; ``logical_page`` is the label beside it, never the
+      address. A printed number cannot address anything: front matter
+      has none, and two pages can both print 1074 -- which is one of
+      the defects review 1 exists to find.
+    - **Applying an edit closes it; it never rewrites it.** The apply
+      (#206) stamps ``applied_at`` and the row becomes history. So
+      every unique constraint is partial over the open rows: a curator
+      who edits the same page again after an apply writes a new row,
+      against the new original's fingerprint.
+    - **``source_fingerprint`` is the scan's**
+      (``Scan.source_fingerprint``, size plus page count, the identity
+      the shard manifest trusts). A replaced or re-cut original makes
+      the edits written against the old one detectable, instead of
+      silently wrong. A blank value is a legacy row, from before the
+      field existed, and matches anything.
+
+    :cvar Kind: What the curator decided. One kind per decision, so the
+        apply reads a decision in one step: a replacement is *not* a
+        delete beside an insert, which would need two addresses in two
+        spaces to say "this image stands where that page stood", and
+        two undos to take back.
+    """
+
+    class Kind(models.TextChoices):
+        """The decisions review 1 can record about a page."""
+
+        SET_NUMBER = "set_number", "Set the printed page number"
+        DELETE_PAGE = "delete_page", "Delete a page"
+        INSERT_PAGE = "insert_page", "Insert a page image"
+        REPLACE_PAGE = "replace_page", "Replace a page with an image"
+        ROTATE_PAGE = "rotate_page", "Rotate a page"
+        DISMISS_ISSUE = "dismiss_issue", "Dismiss an issue"
+
+    #: Kinds that change what the volume is, so the apply (#206) must
+    #: run before the change is real. These are what
+    #: ``has_pending_changes`` counts. A number, and a dismissal, need
+    #: no apply: the issue rebuild overlays them on every pass.
+    STRUCTURAL_KINDS = (
+        Kind.DELETE_PAGE,
+        Kind.INSERT_PAGE,
+        Kind.REPLACE_PAGE,
+        Kind.ROTATE_PAGE,
+    )
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="page_edits",
+    )
+    kind = models.CharField(
+        max_length=32,
+        choices=Kind.choices,
+        db_index=True,
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="page_edits",
+        help_text=(
+            "Who decided. Null on a row the #214 data migration wrote, "
+            "since the storage it read kept no author."
+        ),
+    )
+
+    pdf_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "1-based page of the original PDF this decision is about. "
+            "Set for every kind but an insert; null on a dismissal of "
+            "an issue that names a printed page number or the whole "
+            "volume rather than a physical page."
+        ),
+    )
+    anchor_pdf_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Inserts only: the 1-based original page the image "
+            "follows. 0 puts the image before page 1."
+        ),
+    )
+    ordinal = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Inserts only: the order of several images in one gap.",
+    )
+
+    value = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text=(
+            "What was decided: the printed number ('1075') or range "
+            "('678-686') for a number, blank when the curator cleared "
+            "it; the rotation in degrees; the dismissed check's name."
+        ),
+    )
+    replaced = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text="What the decision overwrote, for the audit.",
+    )
+    logical_page = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text=(
+            "The printed page number this edit is about, as a label "
+            "and for the audit. Never an address."
+        ),
+    )
+
+    image = models.FileField(
+        upload_to=page_edit_image_path,
+        blank=True,
+        help_text="Inserts and replacements: the page the curator uploaded.",
+    )
+
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the decision was made. "
+            "Blank on a legacy row, which matches anything."
+        ),
+    )
+    applied_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the apply (#206) built this decision into a new "
+            "original. A stamped row is history: it is never rewritten."
+        ),
+    )
+
+    class Meta:
+        ordering = ["scan", "pdf_page", "anchor_pdf_page", "ordinal"]
+        indexes = [
+            models.Index(
+                fields=["scan", "kind", "applied_at"],
+                name="idx_page_edit_scan_kind",
+            ),
+        ]
+        constraints = [
+            # One address column per kind, so a null is never a second
+            # meaning of a column. An insert lives in a gap; every
+            # other kind lives on a page.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        kind="insert_page",
+                        pdf_page__isnull=True,
+                        anchor_pdf_page__isnull=False,
+                    )
+                    | models.Q(
+                        kind="dismiss_issue",
+                        anchor_pdf_page__isnull=True,
+                    )
+                    | models.Q(
+                        kind__in=(
+                            "set_number",
+                            "delete_page",
+                            "replace_page",
+                            "rotate_page",
+                        ),
+                        pdf_page__isnull=False,
+                        anchor_pdf_page__isnull=True,
+                    )
+                ),
+                name="page_edit_address_matches_kind",
+            ),
+            # A dismissal names the check it dismisses; the rebuild
+            # matches on that name, since it gives every Issue row it
+            # rebuilds a new primary key.
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(kind="dismiss_issue") | ~models.Q(value="")
+                ),
+                name="page_edit_dismissal_names_a_check",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(kind="rotate_page")
+                    | models.Q(value__in=PAGE_EDIT_ROTATIONS)
+                ),
+                name="page_edit_rotation_is_a_quarter_turn",
+            ),
+            # The unique keys are partial over the open rows: an
+            # applied row is history, and a curator may edit the same
+            # page again against the new original.
+            models.UniqueConstraint(
+                fields=["scan", "kind", "pdf_page"],
+                condition=(
+                    models.Q(applied_at__isnull=True)
+                    & models.Q(pdf_page__isnull=False)
+                    & ~models.Q(kind="dismiss_issue")
+                ),
+                name="uniq_open_page_edit_per_page",
+            ),
+            # A page raises several checks, so a dismissal is unique
+            # per check, not per page. Both address columns are in the
+            # key because an issue names a page in one of two spaces: a
+            # physical one (``no_page_number`` on PDF page 7) or a
+            # printed one (``missing_page`` 1074), and the rebuild
+            # compares whichever the check uses.
+            # ``nulls_distinct=False`` makes the key hold for the
+            # volume-level dismissals too, whose ``pdf_page`` is null.
+            models.UniqueConstraint(
+                fields=[
+                    "scan",
+                    "kind",
+                    "pdf_page",
+                    "logical_page",
+                    "value",
+                ],
+                condition=(
+                    models.Q(applied_at__isnull=True)
+                    & models.Q(kind="dismiss_issue")
+                ),
+                nulls_distinct=False,
+                name="uniq_open_dismissal_per_check",
+            ),
+            models.UniqueConstraint(
+                fields=["scan", "anchor_pdf_page", "ordinal"],
+                condition=(
+                    models.Q(applied_at__isnull=True)
+                    & models.Q(kind="insert_page")
+                ),
+                name="uniq_open_insert_per_gap",
+            ),
+        ]
+
+    def __str__(self):
+        where = (
+            f"after p.{self.anchor_pdf_page}"
+            if self.kind == self.Kind.INSERT_PAGE
+            else f"p.{self.pdf_page}"
+        )
+        value = f" = {self.value!r}" if self.value else ""
+        state = "" if self.applied_at is None else " [applied]"
+        return f"{self.get_kind_display()} {where}{value}{state}"
 
 
 class ExtractionStatus(models.TextChoices):
