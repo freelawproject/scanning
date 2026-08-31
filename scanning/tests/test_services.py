@@ -762,6 +762,55 @@ class TestHandlePipelineExceptionRetryCap(TestCase):
         self.assertIn("Max retries exceeded", scan.progress_message)
 
 
+class TestHandlePipelineExceptionReleasesLocalFiles(TestCase):
+    """Terminal failures free the local tree; a re-queue keeps it (#215)."""
+
+    def _handle(self, scan, exc):
+        from scanning.services import _handle_pipeline_exception
+
+        with (
+            self.settings(RUNPOD_MAX_TRANSIENT_RETRIES=5),
+            patch("scanning.s3_sync.release_local_processing") as release,
+        ):
+            _handle_pipeline_exception(scan.pk, exc, context="test")
+        return release
+
+    def test_a_requeue_keeps_the_local_files(self):
+        from scanning.runpod_client import RunpodTransientError
+
+        scan = ScanFactory(status=Status.PROCESSING, retry_count=0)
+
+        release = self._handle(scan, RunpodTransientError("NO_GPU"))
+
+        release.assert_not_called()
+
+    def test_max_retries_releases_the_local_files(self):
+        from scanning.runpod_client import RunpodTransientError
+
+        scan = ScanFactory(status=Status.PROCESSING, retry_count=5)
+
+        release = self._handle(scan, RunpodTransientError("NO_GPU"))
+
+        release.assert_called_once()
+        self.assertEqual(release.call_args.args[0].pk, scan.pk)
+
+    def test_a_terminal_error_releases_the_local_files(self):
+        scan = ScanFactory(status=Status.PROCESSING)
+
+        release = self._handle(scan, ValueError("boom"))
+
+        release.assert_called_once()
+        self.assertEqual(release.call_args.args[0].pk, scan.pk)
+
+    def test_a_lost_guard_keeps_the_local_files(self):
+        """The scan left PROCESSING first; someone else owns it now."""
+        scan = ScanFactory(status=Status.CANCELLED)
+
+        release = self._handle(scan, ValueError("boom"))
+
+        release.assert_not_called()
+
+
 def _make_scan_for_volume(volume, start=1, end=100, status=Status.UPLOADED):
     """Create a Scan attached to ``volume`` with sensible defaults."""
     return ScanFactory(

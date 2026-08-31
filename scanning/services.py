@@ -330,11 +330,19 @@ def _handle_pipeline_exception(
     never stomp a scan that a concurrent process (stale-recovery, admin
     action, second daemon replica) has already moved out of PROCESSING.
 
+    The two terminal outcomes (ERROR, ERROR_MAX_RETRIES) release the
+    scan's local processing files: no retry will read them, so keeping
+    them spends disk on a failure only an admin re-queue -- which
+    re-downloads from S3 -- can revive (#215). The re-queue outcome
+    keeps its files on purpose, so the retry does not pay the download
+    again.
+
     :param scan_pk: Primary key of the scan that failed.
     :param exc: The exception that was raised.
     :param context: Short label for log messages (e.g. ``"pipeline"``,
         ``"validate"``, ``"detect"``).
     """
+    from scanning import s3_sync
     from scanning.runpod_client import RunpodTransientError
 
     if isinstance(exc, RunpodTransientError):
@@ -390,6 +398,11 @@ def _handle_pipeline_exception(
                 max_retries,
                 exc,
             )
+            # Terminal: no retry reads the local files. The read-back,
+            # not the update count, says which status the CASE wrote --
+            # and a status another writer moved here since is terminal
+            # all the same.
+            s3_sync.release_local_processing(scan)
         else:
             logger.warning(
                 "[%s] scan %s transient RunPod failure (%d/%d), re-queuing: %s",
@@ -412,6 +425,10 @@ def _handle_pipeline_exception(
             context,
             scan_pk,
         )
+        return
+    scan = Scan.objects.filter(pk=scan_pk).only("pk").first()
+    if scan is not None:
+        s3_sync.release_local_processing(scan)
 
 
 def _ensure_shards(scan: "Scan") -> dict | None:

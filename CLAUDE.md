@@ -387,31 +387,20 @@ trained on), tracked on `ExternalJob` rows at
 
 ## Local disk hygiene (issue #215)
 
-The daemon's node disk filled up because local processing files
-outlived their use. Three rules keep it bounded:
-
-- **The daemon frees a scan's `/tmp/scanning/{pk}` tree when it is done
-  with it** (`s3_sync.release_local_processing`): after
-  `run_full_pipeline`'s S3 push — only when the push reports success,
-  since the tree may otherwise hold bytes S3 never received — and after
-  every exit from `AWAITING` in `bitonal.finish_ready_scans` (success
-  park, consumed-run park, both ERROR sinks). Only when the park won
-  the row: a lost park means someone else owns the scan. Never from
-  failure paths that re-queue — the retry reads the local files instead
-  of re-downloading. The helper no-ops in DEVELOPMENT (local files are
-  the workspace) and when S3 is inactive (the local copy may be the
-  only copy).
-- **The `cleanup_processing_tmp` sweep measures the newest mtime in the
-  whole tree** (`_tree_mtime`), not the top directory's own mtime.
-  Writes land at `{pk}/{reporter}/{vol}/{start}/`, so the top mtime is
-  just the creation time — the old sweep deleted trees of scans still
-  in work and could not extend a viewer's cache.
-- **The sweep also reclaims leaked stage scratch dirs**: the merge and
-  the glue download shard results into `TemporaryDirectory` dirs in the
-  system temp dir (prefixes `bitonal.MERGE_TMP_PREFIX`,
-  `dots_mocr.GLUE_TMP_PREFIX`), which a SIGKILL leaks. Guarded off
-  under TESTING so the suite never walks the developer's real temp dir;
-  the command's tests point `gettempdir` at a scratch root and lift it.
+- The daemon frees `/tmp/scanning/{pk}`
+  (`s3_sync.release_local_processing`) once S3 holds every byte: after
+  `run_full_pipeline`'s push (only on push success), on every exit from
+  `AWAITING` in `bitonal.finish_ready_scans` (only when the park won
+  the row), and on the terminal failures (ERROR, ERROR_MAX_RETRIES) in
+  `_handle_pipeline_exception`. Never on a re-queue — the retry reads
+  the local files. No-ops in DEVELOPMENT and when S3 is inactive.
+- The `cleanup_processing_tmp` sweep judges staleness on the newest
+  mtime in the whole tree (`_tree_mtime`) — writes land three levels
+  down, so the top mtime is only the creation time.
+- The sweep also reclaims leaked `TemporaryDirectory` scratch dirs
+  (`bitonal.MERGE_TMP_PREFIX`, `dots_mocr.GLUE_TMP_PREFIX`) that a
+  SIGKILL orphans in the system temp dir. Off under TESTING; the
+  command's tests point `gettempdir` at a scratch root.
 
 ## Detection Workflow
 

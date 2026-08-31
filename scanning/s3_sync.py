@@ -560,12 +560,14 @@ def release_local_processing(scan: Scan) -> bool:
     """Delete a scan's local processing tree once S3 holds every byte.
 
     Called by the daemon when it is done with a scan for now: after
-    ``run_full_pipeline`` pushed the tree, and after the bitonal stage
-    took the scan out of AWAITING (issue #215). The local files are a
-    cache of S3 from that point on, and the 24-hour TTL sweep frees
-    them far too late for multi-GB volumes.
+    ``run_full_pipeline`` pushed the tree, after the bitonal stage took
+    the scan out of AWAITING, and on the terminal failure statuses
+    (ERROR, ERROR_MAX_RETRIES) in ``_handle_pipeline_exception``
+    (issue #215). The local files are a cache of S3 from those points
+    on, and the 24-hour TTL sweep frees them far too late for multi-GB
+    volumes.
 
-    Deliberately not called from failure handlers that re-queue: the
+    Deliberately not called from the re-queue failure outcome: the
     retry reads the same local files and should not pay the download
     again.
 
