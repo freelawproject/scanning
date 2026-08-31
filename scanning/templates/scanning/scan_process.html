@@ -89,8 +89,18 @@
       {% elif step == 1 %}
       {# Step 1: Build - issues first, then collapsible pages #}
 
+      {% comment %}
+        The objective of review 1 (#151). A curator lands here with no
+        statement of what to look for, so say it before the issue list
+        -- the issue list only names what a model already suspects.
+      {% endcomment %}
+      <div class="rounded border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 p-2 mb-2 mt-3 text-xs text-blue-800 dark:text-blue-200">
+        <p class="font-bold mb-1">Goal: make sure this volume is page complete</p>
+        <p class="m-0">Look for missing, duplicated, mislabeled, or blurry pages. Approve the scan when it is complete.</p>
+      </div>
+
       <div id="pending-banner" class="sticky top-0 z-10 -mx-3 px-3 py-2 rounded-t shadow-sm bg-yellow-100 dark:bg-yellow-900/30 text-yellow-800 dark:text-yellow-200 text-xs"{% if not has_pending_changes %} hidden{% endif %}>
-        Pending changes &mdash; rebuild to apply
+        Pending changes &mdash; saved, but not applied to the volume yet
       </div>
 
       {% if ocr_results %}

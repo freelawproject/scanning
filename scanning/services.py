@@ -48,8 +48,10 @@ from django.conf import settings
 from django.db.models import Case, F, Value, When
 
 from scanning.models import (
+    DEAD_JOB_STATUSES,
     CheckName,
     Detection,
+    ExternalJob,
     Issue,
     JobStage,
     JobStatus,
@@ -330,11 +332,19 @@ def _handle_pipeline_exception(
     never stomp a scan that a concurrent process (stale-recovery, admin
     action, second daemon replica) has already moved out of PROCESSING.
 
+    The two terminal outcomes (ERROR, ERROR_MAX_RETRIES) release the
+    scan's local processing files: no retry will read them, so keeping
+    them spends disk on a failure only an admin re-queue -- which
+    re-downloads from S3 -- can revive (#215). The re-queue outcome
+    keeps its files on purpose, so the retry does not pay the download
+    again.
+
     :param scan_pk: Primary key of the scan that failed.
     :param exc: The exception that was raised.
     :param context: Short label for log messages (e.g. ``"pipeline"``,
         ``"validate"``, ``"detect"``).
     """
+    from scanning import s3_sync
     from scanning.runpod_client import RunpodTransientError
 
     if isinstance(exc, RunpodTransientError):
@@ -390,6 +400,11 @@ def _handle_pipeline_exception(
                 max_retries,
                 exc,
             )
+            # Terminal: no retry reads the local files. The read-back,
+            # not the update count, says which status the CASE wrote --
+            # and a status another writer moved here since is terminal
+            # all the same.
+            s3_sync.release_local_processing(scan)
         else:
             logger.warning(
                 "[%s] scan %s transient RunPod failure (%d/%d), re-queuing: %s",
@@ -412,6 +427,10 @@ def _handle_pipeline_exception(
             context,
             scan_pk,
         )
+        return
+    scan = Scan.objects.filter(pk=scan_pk).only("pk").first()
+    if scan is not None:
+        s3_sync.release_local_processing(scan)
 
 
 def _ensure_shards(scan: "Scan") -> dict | None:
@@ -545,7 +564,7 @@ def _page_number_lookup(scan: "Scan") -> dict:
     return lookup
 
 
-def _push_processing_files_to_s3(scan_pk: int) -> None:
+def _push_processing_files_to_s3(scan_pk: int) -> bool:
     """Upload a scan's intermediate processing files to S3.
 
     Wraps ``s3_sync.upload_processing_files`` with an exception guard so
@@ -555,7 +574,10 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
     ``upload_processing_files`` silently returns 0).
 
     :param scan_pk: Primary key of the scan whose files to upload.
-    :return: None.
+    :returns: Whether the push ran without an error. Callers that want
+        to delete the local files afterwards must not do so on False --
+        the local tree may hold bytes S3 never received.
+    :rtype: bool
     """
     from scanning import s3_sync
     from scanning.utils import has_s3_credentials
@@ -569,7 +591,7 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
             "Skipping S3 push for scan %s: AWS credentials not configured",
             scan_pk,
         )
-        return
+        return False
     try:
         scan = Scan.objects.get(pk=scan_pk)
         s3_sync.upload_processing_files(scan)
@@ -577,6 +599,8 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
         logger.exception(
             "Failed to push processing files to S3 for scan %s", scan_pk
         )
+        return False
+    return True
 
 
 def _pull_processing_files_from_s3(scan_pk: int) -> None:
@@ -983,6 +1007,50 @@ def _expected_range(scan: "Scan") -> tuple[int | None, int | None]:
     return scan.start_page or 1, scan.end_page
 
 
+#: Prefix :mod:`scanning.page_numbers` stamps on the ``zone`` of every
+#: entry it reads off a dots.mocr run (``dots-header``,
+#: ``dots-footer``). It is what tells a new-pipeline page number from a
+#: legacy PaddleOCR one.
+DOTS_ZONE_PREFIX = "dots-"
+
+
+def has_legacy_ocr(scan: "Scan") -> bool:
+    """Return whether a scan's page numbers came from the retired OCR.
+
+    The legacy validate stage (PaddleOCR over a page-number crop) no
+    longer runs anywhere (#173), so a recompute over its readings can
+    only reproduce them. Review 1 says so instead of pretending to redo
+    the work (#151).
+
+    Two signals answer it, because neither alone is enough. A ``dots-``
+    zone proves the new stage wrote the entry, but a volume dots read
+    with no number on any page carries none. An ``ANALYZE`` job row
+    proves the new stage ran at all, and it outlives a recompute. A
+    scan with no readings at all is not legacy: it has nothing to
+    recompute either way, and the caller handles that first.
+
+    A dead row does not count: a run that failed, was cancelled, or
+    expired delivered nothing, so the scan's readings are still the
+    retired stage's, and "run OCR again" is the right advice for it.
+
+    :param scan: The scan to classify.
+    :returns: ``True`` when the readings are the retired stage's.
+    :rtype: bool
+    """
+    if not scan.ocr_results:
+        return False
+    if any(
+        (entry.get("zone") or "").startswith(DOTS_ZONE_PREFIX)
+        for entry in scan.ocr_results
+    ):
+        return False
+    return (
+        not ExternalJob.objects.filter(scan=scan, stage=JobStage.ANALYZE)
+        .exclude(status__in=DEAD_JOB_STATUSES)
+        .exists()
+    )
+
+
 def _is_manual_read(result: dict) -> bool:
     """Return whether a per-page page number was entered by hand.
 
@@ -1114,28 +1182,56 @@ def recalculate_issues(scan: "Scan") -> None:
     # Refresh page_count opportunistically: the PDF has not changed since
     # validation, and in production the local copy is usually absent
     # because rechecks run on a web pod that never pulled it from S3.
+    # Every failure here is survivable -- an absent copy, a partial one,
+    # a file that is not a PDF at all -- and the stored count stands.
+    # The recompute is a read of stored data, and it must not 500 over
+    # a file it does not need (#153/#151).
     try:
         pdf_path = scan.pdf_path
     except FileNotFoundError:
         pdf_path = None
     if pdf_path:
-        with fitz.open(pdf_path) as pdf_fitz:
-            scan.page_count = len(pdf_fitz)
+        try:
+            with fitz.open(pdf_path) as pdf_fitz:
+                scan.page_count = len(pdf_fitz)
+        except Exception:
+            logger.warning(
+                "recalculate_issues: scan %s: could not read %s for a "
+                "page count; keeping the stored %s",
+                scan.pk,
+                pdf_path,
+                scan.page_count,
+            )
 
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
-
+    scan.s3_uploaded = False
+    scan.progress_message = "Done"
+    # Never a full save: the approve button (#151) writes
+    # PAGE_COMPLETENESS_REVIEW_DONE concurrently, and a full save off
+    # this instance would silently write a stale status over it. Save
+    # only the fields this function owns, and decide the status on the
+    # row as it is in the DB, not on the copy in memory.
+    scan.save(
+        update_fields=[
+            "ocr_results",
+            "page_count",
+            "page_map",
+            "missing_pages",
+            "s3_uploaded",
+            "progress_message",
+        ]
+    )
     # A recheck must not move a scan between review states (#154): a
     # scan in a page-completeness review state keeps it. The write to
     # PENDING_REVIEW stays for the legacy rows that already carry it.
-    if scan.status not in (
-        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
-        Status.PAGE_COMPLETENESS_REVIEW_DONE,
-    ):
-        scan.status = Status.PENDING_REVIEW
-    scan.s3_uploaded = False
-    scan.progress_message = "Done"
-    scan.save()
+    Scan.objects.filter(pk=scan.pk).exclude(
+        status__in=(
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        )
+    ).update(status=Status.PENDING_REVIEW)
+    scan.refresh_from_db(fields=["status"])
 
     # Suppression flags are curator decisions stored as Issue rows, not
     # derived from the page numbers, so a recheck keeps them (same
@@ -1163,11 +1259,13 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
     READY is a recompute and keeps its status. A scan the edge cannot
     take (cancelled or moved between the caller's read and here) is
     left alone: its ``ocr_results`` were refreshed -- idempotent data
-    -- but no Issues are rebuilt and no status moves. Once the scan is
-    READY, ``cancel_processing`` no longer matches it, so
-    :func:`recalculate_issues`'s own unguarded save can no longer
-    revive a cancelled scan; the remaining full-instance-save exposure
-    is the one the recheck view has always had.
+    -- but no Issues are rebuilt and no status moves. A legacy
+    ``CANCELLED`` row is one such scan (#219 deleted the view that
+    wrote it, so only historical rows hold it), and
+    :func:`recalculate_issues` never full-saves: it writes its data
+    fields with ``update_fields`` and decides the status with one
+    conditional DB update, so it can neither revive a cancelled scan
+    nor write a stale READY over a concurrent approval (#151).
 
     :param scan: The scan whose live run is fully glued.
     :param result_key: S3 key of the run's glued volume JSON.
@@ -1227,14 +1325,15 @@ def run_full_pipeline(scan_pk: int) -> None:
 
     Designed to run in the daemon process.
 
-    Two stages of the rebuilt pipeline exist so far. This runs the first
-    (sharding, #164) and *starts* the second (conversion, #176): it
-    creates one ``ExternalJob`` row per shard and parks the scan in
-    ``Status.AWAITING``. It does not wait -- submitting, confirming and
-    merging belong to the ``submit_external_jobs`` /
-    ``collect_external_jobs`` ticks, which read those rows. Nothing
-    about what runs next may live in a call stack, or a killed daemon
-    loses it.
+    This runs the sharding (#164) and *starts* the two external stages
+    that fan out over the shards: the bitonal conversion (#176), which
+    parks the scan in ``Status.AWAITING``, and the dots.mocr read
+    (#190/#207), which writes no scan status at all. Each stage is one
+    ``ExternalJob`` row per shard. It does not wait -- submitting,
+    confirming, merging, gluing and applying belong to the
+    ``submit_external_jobs`` / ``collect_external_jobs`` ticks, which
+    read those rows. Nothing about what runs next may live in a call
+    stack, or a killed daemon loses it.
 
     A volume that cannot or need not be converted parks straight in
     ``Status.AWAITING_VALIDATION``, #173's interim state, and
@@ -1249,7 +1348,7 @@ def run_full_pipeline(scan_pk: int) -> None:
 
     :param scan_pk: Primary key of the scan to process.
     """
-    from scanning import bitonal, jobs
+    from scanning import bitonal, dots_mocr, jobs
 
     django.db.connections.close_all()
     _pull_processing_files_from_s3(scan_pk)
@@ -1277,8 +1376,20 @@ def run_full_pipeline(scan_pk: int) -> None:
         with fitz.open(scan.pdf_path) as pdf:
             page_count = pdf.page_count
 
+        # Start the OCR read (#190/#207) over the same shard set. The
+        # stage is independent of the bitonal branch below: it reads
+        # the *original* shards, writes no scan status while it runs,
+        # and the apply pass (#149/#204) defers a scan that is still
+        # AWAITING. Created before the status writes, like the convert
+        # rows, so a lost guard hands them back below. Idempotent
+        # through the run's shard identity: a re-queue finds the live
+        # run -- CONSUMED included -- instead of paying for it again.
+        analyze_created: list = []
+        if _can_analyze(scan_pk, manifest):
+            analyze_created = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
         if not _can_convert(scan_pk, manifest):
-            _park_unconverted(
+            still_ours = _park_unconverted(
                 scan_pk,
                 page_count,
                 "Uploaded and sharded. Page-number validation is "
@@ -1290,7 +1401,9 @@ def run_full_pipeline(scan_pk: int) -> None:
             logger.info(
                 "Scan %s is already bitonal; skipping conversion", scan_pk
             )
-            _park_unconverted(scan_pk, page_count, bitonal.SKIPPED_MESSAGE)
+            still_ours = _park_unconverted(
+                scan_pk, page_count, bitonal.SKIPPED_MESSAGE
+            )
         else:
             created = jobs.ensure_convert_jobs(scan, manifest)
             if all(job.status == JobStatus.CONSUMED for job in created):
@@ -1302,11 +1415,11 @@ def run_full_pipeline(scan_pk: int) -> None:
                     "Scan %s is already converted; skipping the stage",
                     scan_pk,
                 )
-                _park_unconverted(
+                still_ours = _park_unconverted(
                     scan_pk, page_count, bitonal.CONVERTED_MESSAGE
                 )
             else:
-                handed_over = _advance_scan(
+                still_ours = _advance_scan(
                     scan_pk,
                     Status.AWAITING,
                     page_count,
@@ -1314,7 +1427,7 @@ def run_full_pipeline(scan_pk: int) -> None:
                     "black-and-white (bitonal) preview...",
                     progress_total=len(created),
                 )
-                if not handed_over:
+                if not still_ours:
                     # The scan left PROCESSING while we sharded (a
                     # cancel, an admin action). Its rows exist but
                     # nothing watches them now, so hand them back
@@ -1325,7 +1438,39 @@ def run_full_pipeline(scan_pk: int) -> None:
                         stage=JobStage.CONVERT,
                     )
 
-        _push_processing_files_to_s3(scan_pk)
+        if not still_ours and analyze_created:
+            # The claim was lost -- any writer that moved the scan off
+            # PROCESSING, most often the daemon's own shutdown: the
+            # SIGTERM handler re-queues mid-flight scans and *returns*,
+            # so this very pipeline continues on a scan it no longer
+            # holds. That is a retry, not an end, so hand back only the
+            # unstarted work: a PENDING row of a stopped scan would
+            # still be submitted and paid (submit_pending does not read
+            # scan status), but a COMPLETED row is a paid result the
+            # carry re-reads on the retry -- cancelling it would re-pay
+            # whole volumes on every deploy that catches a pipeline
+            # mid-shard.
+            from scanning.models import IN_FLIGHT_JOB_STATUSES
+
+            jobs.abandon_open(
+                scan,
+                "Scan left PROCESSING before its OCR read started",
+                stage=JobStage.ANALYZE,
+                statuses=frozenset({JobStatus.PENDING})
+                | IN_FLIGHT_JOB_STATUSES,
+            )
+
+        pushed = _push_processing_files_to_s3(scan_pk)
+
+        # After a clean push S3 holds every byte the daemon wrote,
+        # whichever branch parked the scan, so the local tree is a
+        # cache it no longer needs. A failed push keeps the files, and
+        # so does the failure path below: a re-queued retry reads them
+        # instead of downloading again.
+        if pushed:
+            from scanning import s3_sync
+
+            s3_sync.release_local_processing(scan)
 
     except Exception as exc:
         _handle_pipeline_exception(scan_pk, exc, context="pipeline")
@@ -1364,6 +1509,46 @@ def _can_convert(scan_pk: int, manifest: dict | None) -> bool:
         logger.info(
             "Scan %s: S3 is inactive, so its shards are not readable by "
             "doctor; skipping conversion",
+            scan_pk,
+        )
+        return False
+    return True
+
+
+def _can_analyze(scan_pk: int, manifest: dict | None) -> bool:
+    """Return whether this environment can hand shards to dots.mocr.
+
+    The mirror of :func:`_can_convert`, for the same reason: a row
+    created where it cannot be submitted sits PENDING until its queue
+    deadline expires hours later, and its failure is noise about a
+    volume that did nothing wrong. An environment that fails a check
+    parks as before, and the staff button stays as the manual way in.
+
+    - a committed shard set, or there is nothing for a job to read;
+    - ``dots_mocr.enabled()``, the operator switch plus the account
+      credentials and the engine's endpoint id;
+    - S3 active, because the worker fetches the shard through a
+      presigned GET.
+
+    :param scan_pk: Primary key of the scan, for the log line.
+    :param manifest: The shard manifest, or None when sharding is off.
+    :returns: Whether to create OCR jobs for this scan.
+    :rtype: bool
+    """
+    from scanning import dots_mocr, s3_sync
+
+    if manifest is None:
+        logger.info("Scan %s has no shard set; skipping OCR", scan_pk)
+        return False
+    if not dots_mocr.enabled():
+        logger.info(
+            "Scan %s: dots.mocr is not configured; skipping OCR", scan_pk
+        )
+        return False
+    if not s3_sync.s3_active():
+        logger.info(
+            "Scan %s: S3 is inactive, so its shards are not readable by "
+            "the OCR worker; skipping OCR",
             scan_pk,
         )
         return False

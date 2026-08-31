@@ -34,3 +34,14 @@ DAEMON_COLLECT_INTERVAL = env.int("DAEMON_COLLECT_INTERVAL", default=15)
 DAEMON_JOB_MAX_QUEUE_SECONDS = env.int(
     "DAEMON_JOB_MAX_QUEUE_SECONDS", default=6 * 60 * 60
 )
+
+# How many scans may hold unfinished external work before the daemon
+# stops admitting new ones (issue #218). Uncapped intake put 2023 rows
+# behind 27 parked scans on 2026-08-31; most expired unsubmitted
+# against the ceiling above and sank 29 volumes to ERROR.
+#
+# Move it by the rule it was chosen with: slots x the largest volume's
+# shards must clear within DAEMON_JOB_MAX_QUEUE_SECONDS at the slowest
+# queue's drain rate. Today that is dots.mocr (24-36 rows/h) over ~20
+# shards, so 5 slots hold ~100 rows and clear in ~4.2h. Ten would not.
+DAEMON_MAX_ACTIVE_SCANS = env.int("DAEMON_MAX_ACTIVE_SCANS", default=5)

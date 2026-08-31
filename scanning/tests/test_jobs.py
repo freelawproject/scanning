@@ -137,6 +137,7 @@ class TestEnsureConvertJobs(ScanningTestCase):
                 "from_page": 7,
                 "to_page": 13,
                 "page_count": 7,
+                "size_bytes": 1024,
                 "source_page_count": 14,
             },
         )

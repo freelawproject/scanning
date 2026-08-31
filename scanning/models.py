@@ -108,7 +108,8 @@ class Status(models.TextChoices):
     # human states, not busy ones: the viewer does not poll them and
     # the stale sweep must not touch them. The #149 apply and its
     # recomputations write READY_FOR_PAGE_COMPLETENESS_REVIEW, and the
-    # approve button (#151) is the only writer of
+    # approve button (#151,
+    # views_process.approve_page_completeness) is the only writer of
     # PAGE_COMPLETENESS_REVIEW_DONE. The stages behind review 1
     # (#195/#196) trigger off DONE and write no scan status, so
     # redaction work never blocks either review.
@@ -126,6 +127,12 @@ class Status(models.TextChoices):
     ERROR = "error", "Error"
     ERROR_MAX_RETRIES = "error_max_retries", "Error (retry cap hit)"
     ERROR_INTERRUPTED = "error_interrupted", "Error (interrupted too often)"
+    # Legacy (#219): the user cancel that wrote this was unreachable --
+    # no template ever rendered its button -- and is deleted. The value
+    # stays because historical rows hold it, and because the tests use
+    # it as a status the pipeline must not stomp. Nothing writes it now.
+    # A future cancel should abandon the job rows and leave the status
+    # to the daemon (#212), not revive this.
     CANCELLED = "cancelled", "Cancelled"
 
 
@@ -1424,6 +1431,11 @@ IN_FLIGHT_JOB_STATUSES = frozenset(
 OPEN_JOB_STATUSES = frozenset(
     {JobStatus.PENDING, JobStatus.COMPLETED} | IN_FLIGHT_JOB_STATUSES
 )
+
+#: Jobs a provider still owes an answer for: what the intake cap counts
+#: (issue #218). Not OPEN_JOB_STATUSES: a COMPLETED row waits on local
+#: work, and a failed merge leaves one nothing moves again.
+WAITING_JOB_STATUSES = frozenset({JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES)
 
 #: Jobs that ended without their work being applied. Separate from the
 #: terminal set below because a run holding one can never finish -- it

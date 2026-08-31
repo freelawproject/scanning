@@ -23,11 +23,14 @@ result objects are deliberately **kept**: a future smart glue over page
 inserts and deletes re-reads them, so nothing may delete a raw input.
 Reading page numbers out of the glued JSON is issue #149.
 
-Who starts it: a staff-only button (``views_process.start_dots_mocr``),
-not the daemon. That is the point of #190 -- the stage costs real
-graphics processing unit (GPU) money per press, so a person decides
-while it is being debugged. The web process only writes rows; the daemon
-submits, polls and retries them.
+Who starts it: the upload pipeline (``services.run_full_pipeline``,
+issue #207) creates the rows for every new scan, next to the convert
+rows and gated the same way (``services._can_analyze``). The staff-only
+button (``views_process.start_dots_mocr``) remains as the manual way
+in: a re-run over an edited volume, or a backfill for scans uploaded
+while the stage was button-only (#190). Either way the web process and
+the pipeline only write rows; the daemon submits, polls and retries
+them.
 """
 
 from __future__ import annotations
@@ -92,6 +95,12 @@ GLUE_SCHEMA_VERSION = 1
 #: every collect tick, and an unbounded retry of a deterministic bug
 #: would re-download every shard result every 15 seconds, forever.
 GLUE_MAX_ATTEMPTS = 3
+
+#: Prefix of the glue's scratch directory in the system temp dir.
+#: ``cleanup_processing_tmp`` sweeps leaked ones (a SIGKILL mid-glue
+#: skips the ``TemporaryDirectory`` cleanup), so the name is shared
+#: rather than inlined (#215).
+GLUE_TMP_PREFIX = "dotsmocr-"
 
 #: How many times :func:`apply_ready_runs` tries the apply (#149/#204)
 #: before it gives up on a run, for the same reason as
@@ -164,6 +173,13 @@ def ensure_analyze_jobs(scan, manifest: dict) -> list[ExternalJob]:
     (failed, cancelled, expired) is replaced instead, since nothing will
     move it again.
 
+    A replacement run does not re-read shards already read:
+    ``reuse_results`` carries a prior result forward whenever the
+    shard's identity is unchanged and its result object is still on S3
+    (``jobs._reusable_results``). This engine can carry, because its
+    per-shard results are deliberately kept after the apply; the
+    bitonal merge deletes its results, so the convert stage must not.
+
     :param scan: The scan to read.
     :param manifest: The committed shard manifest.
     :returns: The live run's rows, ordered by shard index.
@@ -175,6 +191,7 @@ def ensure_analyze_jobs(scan, manifest: dict) -> list[ExternalJob]:
         stage=JobStage.ANALYZE,
         engine=JobEngine.DOTS_MOCR,
         provider=JobProvider.RUNPOD,
+        reuse_results=True,
     )
 
 
@@ -349,7 +366,9 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
     next_page = 0
     # A temp dir, not the output dir: the generic S3 sync sweeps up
     # everything there, and these are wire artifacts that stay out of it.
-    with tempfile.TemporaryDirectory(prefix=f"dotsmocr-{scan.pk}-") as tmp:
+    with tempfile.TemporaryDirectory(
+        prefix=f"{GLUE_TMP_PREFIX}{scan.pk}-"
+    ) as tmp:
         tmp_dir = Path(tmp)
         for index, job in enumerate(analyze_jobs):
             if job.shard_index != index:

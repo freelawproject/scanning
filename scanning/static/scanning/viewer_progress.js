@@ -141,7 +141,7 @@
                     if (sstatus)
                         sstatus.textContent = "Error: " + data.message;
                     if (sbar) sbar.style.background = "#ef4444";
-                } else if (data.status !== "cancelled") {
+                } else {
                     setTimeout(poll, 1000);
                 }
             })

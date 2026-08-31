@@ -52,21 +52,25 @@ The legacy processing stages — in-process bitonal conversion, the YOLO
 `detect` and PaddleOCR `analyze` RunPod actions (and the whole
 blackletter-gpu-worker under `scanning/runpod/`), and their
 `RUNPOD_ENABLED=False` in-process fallbacks — are deleted. Bitonal came
-back as an external job, dots.mocr as a staff-started one, the page
-numbers plus Issues as an apply pass on the collect tick (#149/#204),
-and YOLO detection as a rebuilt worker image (#194 — the image only,
-all below); still missing are the #151 approve button and the
+back as an external job, dots.mocr as a pipeline-enqueued one (#207,
+with the staff button kept for re-runs), the page numbers plus Issues
+as an apply pass on the collect tick (#149/#204), review 1 got its
+approve button (#151), and YOLO detection came back as a rebuilt
+worker image (#194 — the image only), all below; still missing are the
 post-review stages (#195/#196 — the callers the detect image waits
 for), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
+  enqueues the dots.mocr read (#207) when `_can_analyze` allows,
   then either starts the bitonal conversion (`Status.AWAITING`) or
   parks the scan in `Status.AWAITING_VALIDATION`.
 - Every user-facing action that would re-trigger a legacy stage
   (`start_validate`, `start_detect` without existing detections,
   `reprocess`, `generate_files`) refuses with
   `utils.PIPELINE_PAUSED_MESSAGE` — one constant, flashed as a warning
-  banner in HTML views. The daemon parks pre-cutover queued rows
+  banner in HTML views. `start_validate` splits by scan (#151): only a
+  legacy row hears "paused", because a new-pipeline volume is refused
+  permanently, not temporarily. The daemon parks pre-cutover queued rows
   carrying a legacy `queued_action` back to PENDING_REVIEW with the
   same message; admin re-queue resets `queued_action` to
   FULL_PIPELINE.
@@ -94,16 +98,71 @@ landed the values and the readers; the apply pass (#149/#204, below)
 writes READY — the last prerequisite by construction, and it restores
 READY after an admin re-queue parks a ready scan back in
 `AWAITING_VALIDATION` (re-queue -> bitonal park -> the next apply
-tick). The #151 approve button sets DONE, and #195/#196
+tick). `views_process.approve_page_completeness` (#151, below) is the
+only writer of DONE, and #195/#196
 trigger off DONE writing **no** scan status, so redaction work never
 blocks either review. Both are parked human states outside
 `BUSY_STATUSES` (no polling, no sweep); `AWAITING_VALIDATION` now means
 "review-1 prerequisites outstanding". `recalculate_issues` preserves
-both (`PENDING_REVIEW` remains for legacy rows and step 2 only), and
+both (`PENDING_REVIEW` remains for legacy rows and step 2 only) with a
+conditional DB update over the row's *current* status, never a full
+save — a full save off a stale instance would silently write READY
+back over a concurrent approval — and
 `serve_scan_pdf` reads a missing preview under either as a failed S3
 pull (409 + reload hint) — READY implies the conversion finished or
 was skipped because the source is already bitonal (that copy nuance
 belongs to the #204 follow-up).
+
+## The review-1 interface (issue #151)
+
+The buttons around those two statuses. Step 1 states its goal in the
+sidebar, and the step-1 bar (`_process_actions.html`) is rendered by
+both `scan_process_view` and the `process_actions` fragment, from the
+same `_review_flags` — a bar that disagreed with itself would offer an
+approve button the view refuses.
+
+- **Approving is a compare-and-swap on READY**, never a full instance
+  save: the collect tick can write READY over the same row at the same
+  moment. Any logged-in user may press it (review 1 is the scanners'
+  own step). Open issues do not block it — the browser asks for a
+  confirm and the view obeys, because the curator, not the model, is
+  the judge of a suspicion.
+- **Approving is the gate for "Next: Detect"**, which is why the button
+  cannot be gated on an empty issue list. The view enforces it too:
+  `start_detect` sends a scan still in READY back to step 1, so a
+  direct POST cannot walk past the review. READY is the one status
+  where the approval is pending, and a legacy scan never holds it. A legacy `PENDING_REVIEW`
+  scan never reaches the #154 states, so it keeps the old bar (the old
+  "no open issues" rule, and "Validate"/"Re-validate") and still
+  reaches step 2. Those two clauses are the whole gate on purpose: a
+  scan that is neither approved nor legacy -- one still parked in
+  `AWAITING_VALIDATION`, or errored -- holds no issue rows either, and
+  a gate reading "no open issues" alone would show it a paid RunPod
+  confirm that `start_detect` then refuses.
+- **A new-pipeline volume is never re-run from the viewer.** Sharding,
+  the bitonal conversion and dots.mocr are deterministic, so a second
+  run returns what the first one stored, and charges another doctor
+  conversion and another park out of the review flow for it. So
+  `start_validate` refuses a non-legacy scan **for good**, not until
+  the stages return, and the bar offers it no button at all. A volume
+  that genuinely must be processed again goes through the admin
+  re-queue, which is deliberately not a curator's button. Re-reading
+  the *stored* page numbers is the recompute button, and it is
+  unrelated.
+- **The recompute button answers rather than obeys.** On a scan the
+  retired PaddleOCR stage read (`services.has_legacy_ocr`: no `dots-`
+  zone *and* no `ANALYZE` row — a volume dots read blank carries no
+  zone either) it explains and does nothing. With pending inserts or
+  deletes it warns and continues: it used to redirect to "Rebuild &
+  Validate", which refuses since #173, so the guard had become a dead
+  end. It never opens the PDF to fail: the page-count refresh inside
+  `recalculate_issues` survives an absent, partial, or invalid local
+  copy and keeps the stored count (#153).
+- **Every page edit says it is saved and not applied.** `shared.js`
+  calls the optional `window.onPageEditSaved` hook after a deletion and
+  an undo; step 1 defines it (a green toast) and step 2 leaves it
+  undefined. The page-number edit and the insert upload call it
+  directly. Nothing applies these edits to the volume yet.
 
 ## Bitonal via doctor (issue #176)
 
@@ -144,17 +203,19 @@ must not be broken:
 - Every row write is a compare-and-swap on the row's current status
   (`jobs._write`), so no lock is held across an HTTP call. The writer it
   guards against is the **web process**, not a second daemon: one daemon
-  runs, and both `views_process.cancel_processing` and the admin
-  re-queue call `jobs.abandon_open` from a request. A daemon that wrote
-  PENDING over their CANCELLED would convert a shard nobody wants.
+  runs, and the admin re-queue, the admin scan deletion and
+  `start_dots_mocr` all call `jobs.abandon_open` from a request. A
+  daemon that wrote PENDING over their CANCELLED would convert a shard
+  nobody wants. The user cancel was a fourth such writer until #219
+  deleted it as unreachable.
 - **A slow page is a retry, not a dead volume.** Doctor reports a page
   it could not rasterize in time as `CONVERSION_TIMEOUT` (doctor #245,
   PR #246, in production), which is in `TRANSIENT_ERROR_CODES`, so the
   submit pass retries it up to `DOCTOR_MAX_ATTEMPTS` instead of writing
   the shard off on the first answer. A FAILED row therefore means the
   attempts are spent, and one still sinks the whole volume to ERROR.
-  Do **not** add a pass that revives dead rows: everything that stops a
-  scan (`cancel_processing`, the admin re-queue) calls `abandon_open`,
+  Do **not** add a pass that revives dead rows: the admin re-queue —
+  the only thing that stops a scan since #219 — calls `abandon_open`,
   which touches only `OPEN_JOB_STATUSES` and leaves a FAILED row alone,
   and changes `Scan.status` in a *second*, uncommitted-in-between write
   — so a reviver gated on the scan's status races it and converts a
@@ -195,8 +256,12 @@ must not be broken:
   `status=PROCESSING`, and on losing the guard the rows it created are
   abandoned: writing AWAITING anyway would spend real capacity on a
   volume somebody cancelled.
-- `cancel_processing` covers AWAITING as well as PROCESSING, and cancels
-  the scan's job rows with it.
+- **There is no user cancel (#219).** `views_process.cancel_processing`
+  covered PROCESSING and AWAITING, but no template ever rendered its
+  button, so a POST-only endpoint nobody could reach carried a whole
+  race. It is deleted; `Status.CANCELLED` stays for historical rows and
+  has no writer. A replacement belongs on `jobs.abandon_open` with the
+  status left to the daemon (#212) — do not restore the status write.
 - `DOCTOR_ENABLED` and `DOCTOR_HOST` both default to working values, so
   a deploy converts with no env or secret-store change. The host is
   fully qualified because an unqualified `cl-doctor` does not resolve
@@ -219,21 +284,47 @@ trained on), tracked on `ExternalJob` rows at
 `submit_external_jobs` / `collect_external_jobs` daemon commands, and
 `views_process.start_dots_mocr` (the button). What must not be broken:
 
-- **A person starts it, the daemon runs it.** There is no automatic
-  enqueueing: a staff-only button on `/scan/process/` writes the rows and
-  returns, and the daemon submits, polls and retries them. That is
-  deliberate while the stage is debugged — every press costs GPU money.
-  `DOTS_MOCR_ENABLED` (on by default) gates *dispatch*, not enqueueing,
-  so it starts no work by itself. What keeps that true is structural, not
-  a promise: `ensure_analyze_jobs` is the only thing that creates ANALYZE
-  rows and `start_dots_mocr` is its only caller, held by
-  `TestNothingAutoEnqueues`. Auto-dispatch is a follow-up that has to
-  retire that test on purpose.
-  The request makes **no** call to RunPod, and it never cuts shards:
-  `sharding.committed_manifest` verifies the stored set with one
-  `head_object` on the original (size plus `Scan.page_count` *is* the
-  whole fingerprint), so a web pod never pulls a multi-GB PDF and never
-  reads `shards/` directly. A stale set is refused, not re-cut.
+- **The pipeline starts it, the daemon runs it** (#207).
+  `run_full_pipeline` creates the ANALYZE rows next to the CONVERT
+  rows, gated by `services._can_analyze` (committed shards,
+  `dots_mocr.enabled()`, S3 active — the mirror of `_can_convert`),
+  and the daemon submits, polls and retries them. The stage is
+  independent of the bitonal branch: it reads the *original* shards,
+  so a volume that parks unconverted still gets its read. A lost
+  status guard hands back only the *unstarted* ANALYZE rows (PENDING
+  plus in-flight, via `abandon_open(statuses=...)`): the claim is lost
+  most often to the daemon's own shutdown — the SIGTERM handler
+  re-queues mid-flight scans and returns, so the pipeline continues on
+  a scan it no longer holds — and a COMPLETED row is a paid result the
+  carry re-reads on that retry. The
+  staff button on `/scan/process/` remains as the manual way in — a
+  re-run over an edited volume, or a backfill for scans uploaded while
+  the stage was button-only. Row creation is what costs GPU money, so
+  the creators' caller set stays pinned by an AST test
+  (`TestKnownEnqueuePaths`): exactly the pipeline and the button.
+  The button's request makes **no** call to RunPod, and it never cuts
+  shards: `sharding.committed_manifest` verifies the stored set with
+  one `head_object` on the original (size plus `Scan.page_count` *is*
+  the whole fingerprint), so a web pod never pulls a multi-GB PDF and
+  never reads `shards/` directly. A stale set is refused, not re-cut.
+  A `cancel_processing` does **not** touch a running read: the results
+  are kept, the apply defers a cancelled scan, and a later re-queue
+  reuses the completed run for free.
+- **A replacement run re-reads only the shards that need it.** When
+  `ensure_shard_jobs` starts a new ANALYZE run (a dead row sank the
+  old one), a shard whose identity is unchanged and whose result
+  object an S3 HEAD confirms enters the run as a `COMPLETED` row
+  pointing at the prior attempt's object (`jobs._reusable_results`,
+  opt-in via `reuse_results` — dots.mocr only, since the bitonal
+  merge deletes its results). The row identity now carries the
+  shard's `size_bytes`: pages alone cannot tell a re-uploaded
+  original with the same page count from the one the result was
+  computed on, and size plus page count is the fingerprint the shard
+  manifest itself trusts. The carry match is strict — a legacy row
+  without the field re-reads — while `_still_describes` accepts the
+  legacy shape, so pre-deploy live runs are still reused whole
+  instead of re-paid. A carried row has a blank `external_id`, so
+  every cancel path stays a provider no-op on it.
 - **The stage writes no scan status while it reads.** Progress lives
   only on the rows, read through `dots_mocr.run_summary` into the page
   context and `progress_api`. So a volume stays browsable and
@@ -463,6 +554,55 @@ be broken:
   (`scanning/tests/test_runpod_yolo_handler.py`): the loader stubs
   `runpod`, `torch` and `blackletter.api`, and a CUDA-less `torch` makes
   the module-level `_preload` open no weight file.
+
+## Local disk hygiene (issue #215)
+
+- The daemon frees `/tmp/scanning/{pk}`
+  (`s3_sync.release_local_processing`) once S3 holds every byte: after
+  `run_full_pipeline`'s push (only on push success), on every exit from
+  `AWAITING` in `bitonal.finish_ready_scans` (only when the park won
+  the row), and on the terminal failures (ERROR, ERROR_MAX_RETRIES) in
+  `_handle_pipeline_exception`. Never on a re-queue — the retry reads
+  the local files. No-ops in DEVELOPMENT and when S3 is inactive.
+- The `cleanup_processing_tmp` sweep judges staleness on the newest
+  mtime in the whole tree (`_tree_mtime`) — writes land three levels
+  down, so the top mtime is only the creation time.
+- The sweep also reclaims leaked `TemporaryDirectory` scratch dirs
+  (`bitonal.MERGE_TMP_PREFIX`, `dots_mocr.GLUE_TMP_PREFIX`) that a
+  SIGKILL orphans in the system temp dir. Off under TESTING; the
+  command's tests point `gettempdir` at a scratch root.
+
+## Intake backpressure (issue #218)
+
+`process_next_scan` claims a QUEUED scan only while fewer than
+`DAEMON_MAX_ACTIVE_SCANS` (5) scans hold unfinished external work
+(`jobs.active_scan_count`). It is the daemon's only backpressure:
+uncapped intake put 2023 conversion rows behind 27 parked scans on
+2026-08-31, three times what the 6-hour
+`DAEMON_JOB_MAX_QUEUE_SECONDS` ceiling can drain, and 29 volumes died
+of it.
+
+- **The gate is on the claim, not the dispatch after it.** A refused
+  scan stays QUEUED — nothing times out there — instead of transiting
+  PROCESSING for nothing. The admin re-queue is safe at any batch size.
+- **Recovery runs first and unconditionally**: returning a scan the
+  daemon dropped is not intake.
+- **Scans, not rows, over every stage.** A scan's whole shard set
+  enters every queue at once. Counting `CONVERT` alone would watch the
+  wrong queue: doctor drains ~100 rows/h, dots.mocr 24-36.
+- **`COMPLETED` does not hold a slot** (`WAITING_JOB_STATUSES` is
+  `OPEN_JOB_STATUSES` minus it): those rows wait on the merge, the glue
+  or the apply, and a failed merge leaves one nothing moves again.
+- **The knob moves by its arithmetic**: slots × the largest volume's
+  shards must clear `DAEMON_JOB_MAX_QUEUE_SECONDS` at the slowest
+  queue's rate. 5 × ~20 shards is ~100 dots.mocr rows, ~4.2h against
+  6h. Ten slots would not fit.
+- No deadlock — the submit and collect ticks drain regardless — but a
+  stage switched off with rows still PENDING holds its slots until the
+  queue deadline expires them. The staff buttons bypass the gate: one
+  scan at a time, from a request.
+- One log line per crossing (WARNING pausing, INFO resuming), the
+  loud-then-quiet shape the glue and apply retries use.
 
 ## Detection Workflow
 
