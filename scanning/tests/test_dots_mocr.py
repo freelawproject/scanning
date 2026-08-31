@@ -1494,17 +1494,16 @@ class TestRunSummaryLabel(ScanningTestCase):
         self.assertIn("2 pending submit", label)
 
 
-class TestNothingAutoEnqueues(ScanningTestCase):
-    """The button is the only thing that creates dots.mocr work.
+class TestKnownEnqueuePaths(ScanningTestCase):
+    """Only two paths create dots.mocr work: the pipeline and the button.
 
-    ``DOTS_MOCR_ENABLED`` defaults on, so this is the line that keeps
-    that safe: the switch gates *dispatch* of rows that already exist,
-    and nothing but a staff press creates them. Auto-dispatch is a
-    follow-up, and it has to delete this test on purpose rather than
-    arrive by accident.
+    The pipeline enqueue is #207; the button remains as the re-run and
+    backfill path (#190). Row creation is what costs GPU money, so a
+    new caller of the creators must be a deliberate decision that
+    updates this set -- not an accident this test lets through.
     """
 
-    def test_ensure_analyze_jobs_has_exactly_one_caller(self):
+    def test_the_row_creators_have_exactly_the_known_callers(self):
         import ast
         import pathlib
 
@@ -1525,35 +1524,212 @@ class TestNothingAutoEnqueues(ScanningTestCase):
         self.assertEqual(
             callers,
             {
-                # The staff button, and nothing else.
+                # The staff button (#190) and the pipeline (#207).
                 ("scanning/views_process.py", "ensure_analyze_jobs"),
+                ("scanning/services.py", "ensure_analyze_jobs"),
                 # The generic creator's two wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
                 ("scanning/jobs.py", "ensure_shard_jobs"),
             },
-            "Something new creates external-job rows. If a daemon path "
-            "now enqueues dots.mocr, that is the auto-dispatch follow-up "
-            "and this test should be updated deliberately.",
+            "Something new creates external-job rows. Row creation "
+            "starts paid GPU work, so update this set only on purpose.",
         )
 
     @override_settings(**DOTS)
-    def test_the_pipeline_creates_no_analyze_rows(self):
-        # run_full_pipeline owns CONVERT and no part of ANALYZE, so a
-        # normal upload must never start paid OCR.
+    def test_convert_rows_alone_submit_no_ocr(self):
+        # The convert stage creates no ANALYZE rows, so a tick over a
+        # convert-only scan must make no RunPod call.
         scan = ScanFactory()
         jobs.ensure_convert_jobs(scan, make_manifest(shard_count=2))
         self.assertEqual(analyze_jobs(scan), [])
-
-    @override_settings(**DOTS)
-    def test_a_daemon_tick_submits_nothing_without_a_press(self):
-        scan = ScanFactory()
-        jobs.ensure_convert_jobs(scan, make_manifest(shard_count=2))
         with (
             patch("scanning.s3_sync.s3_active", return_value=True),
             patch("scanning.runpod_client.submit_job") as submit,
         ):
             jobs.submit_pending()
         submit.assert_not_called()
+
+
+@override_settings(**DOTS)
+class TestShardResultCarryOver(ScanningTestCase):
+    """A replacement run re-reads only the shards that need it.
+
+    A shard whose identity is unchanged and whose result object is
+    still on S3 enters the new run as a COMPLETED row pointing at the
+    prior attempt's object (``jobs._reusable_results``). The identity
+    includes the shard's byte size, so a re-uploaded original with the
+    same page count carries nothing.
+    """
+
+    def _dead_run(self, manifest):
+        """Build a run with shard 0 COMPLETED and shard 1 FAILED."""
+        scan = ScanFactory()
+        rows = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.COMPLETED,
+            result_key="jobs/analyze/dots_mocr/r1-s0-a1.json",
+            completed_at=timezone.now(),
+        )
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.FAILED
+        )
+        return scan, rows
+
+    def _carry_patches(self, object_exists=True):
+        return (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch(
+                "scanning.s3_sync.object_exists",
+                return_value=object_exists,
+            ),
+        )
+
+    def test_an_unchanged_completed_shard_is_carried(self):
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, old = self._dead_run(manifest)
+
+        active, exists = self._carry_patches()
+        with active, exists:
+            fresh = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        self.assertEqual(len(fresh), 2)
+        self.assertEqual(fresh[0].run, 2)
+        self.assertEqual(fresh[0].status, JobStatus.COMPLETED)
+        self.assertEqual(
+            fresh[0].result_key, "jobs/analyze/dots_mocr/r1-s0-a1.json"
+        )
+        self.assertEqual(
+            fresh[0].provider_meta["carried_from"],
+            {"run": 1, "job": old[0].pk},
+        )
+        self.assertEqual(fresh[0].external_id, "")
+        self.assertEqual(fresh[1].status, JobStatus.PENDING)
+
+    def test_a_carried_row_is_not_submitted(self):
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, _ = self._dead_run(manifest)
+
+        active, exists = self._carry_patches()
+        with active, exists:
+            fresh = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        with (
+            patch.multiple(
+                "scanning.s3_sync",
+                s3_active=lambda: True,
+                presign_get=lambda key, ttl: "https://s3/in?get",
+                presign_put=lambda key, ct, ttl: "https://s3/out?put",
+            ),
+            patch(
+                "scanning.runpod_client.submit_job", return_value="job-1"
+            ) as submit,
+        ):
+            jobs.submit_pending()
+
+        # One call for the still-pending shard; none for the carried one.
+        self.assertEqual(submit.call_count, 1)
+        carried, pending = [
+            ExternalJob.objects.get(pk=row.pk) for row in fresh
+        ]
+        self.assertEqual(carried.status, JobStatus.COMPLETED)
+        self.assertEqual(
+            carried.result_key, "jobs/analyze/dots_mocr/r1-s0-a1.json"
+        )
+        self.assertEqual(pending.status, JobStatus.SUBMITTED)
+
+    def test_an_s3_blip_reads_the_shard_again(self):
+        """The carry is an optimization: a throttle or IAM fault must
+        cost the shard's price, never the volume (an unhandled S3
+        error would mark the scan ERROR in the pipeline, with no
+        retry, and 500 the start button)."""
+        from botocore.exceptions import ClientError
+
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, _ = self._dead_run(manifest)
+        blip = ClientError(
+            {"Error": {"Code": "SlowDown", "Message": "throttled"}},
+            "HeadObject",
+        )
+
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", side_effect=blip),
+            self.assertLogs("scanning.jobs", level="WARNING"),
+        ):
+            fresh = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        self.assertEqual({row.status for row in fresh}, {JobStatus.PENDING})
+
+    def test_a_missing_result_object_is_not_carried(self):
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, _ = self._dead_run(manifest)
+
+        active, exists = self._carry_patches(object_exists=False)
+        with active, exists:
+            fresh = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        self.assertEqual({row.status for row in fresh}, {JobStatus.PENDING})
+
+    def test_a_changed_shard_is_not_carried(self):
+        """Same pages, different bytes: a re-uploaded original."""
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, _ = self._dead_run(manifest)
+        recut = make_manifest(shard_count=2, pages_per_shard=1)
+        for entry in recut["shards"]:
+            entry["size_bytes"] = 2048
+
+        active, exists = self._carry_patches()
+        with active, exists:
+            fresh = dots_mocr.ensure_analyze_jobs(scan, recut)
+
+        self.assertEqual({row.status for row in fresh}, {JobStatus.PENDING})
+
+    def test_a_legacy_row_without_size_bytes_is_not_carried(self):
+        """The byte size is the proof, so a row without it re-reads."""
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, old = self._dead_run(manifest)
+        legacy = dict(old[0].input_manifest)
+        legacy.pop("size_bytes")
+        ExternalJob.objects.filter(pk=old[0].pk).update(input_manifest=legacy)
+
+        active, exists = self._carry_patches()
+        with active, exists:
+            fresh = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        self.assertEqual({row.status for row in fresh}, {JobStatus.PENDING})
+
+    def test_a_legacy_live_run_is_still_reused_whole(self):
+        """The lenient identity match: no re-pay on deploy."""
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan = ScanFactory()
+        rows = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        for row in rows:
+            legacy = dict(row.input_manifest)
+            legacy.pop("size_bytes")
+            ExternalJob.objects.filter(pk=row.pk).update(input_manifest=legacy)
+
+        again = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        self.assertEqual([row.pk for row in again], [row.pk for row in rows])
+
+    def test_the_convert_stage_never_carries(self):
+        """The bitonal merge deletes its results; there is nothing to
+        point a carried row at."""
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan = ScanFactory()
+        rows = jobs.ensure_convert_jobs(scan, manifest)
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.COMPLETED,
+            result_key="jobs/convert/bitonal/r1-s0-a1.pdf",
+        )
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.FAILED
+        )
+
+        active, exists = self._carry_patches()
+        with active, exists:
+            fresh = jobs.ensure_convert_jobs(scan, manifest)
+
+        self.assertEqual({row.status for row in fresh}, {JobStatus.PENDING})
 
 
 @override_settings(**DOTS)

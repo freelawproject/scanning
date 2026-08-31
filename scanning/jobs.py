@@ -53,6 +53,7 @@ Four properties are load-bearing and easy to break:
 
 from __future__ import annotations
 
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -742,6 +743,13 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
     the row stores in ``input_manifest`` -- which pages of which volume
     the shard holds -- so a row can be checked against a later manifest.
 
+    ``size_bytes`` is part of the identity: pages alone cannot tell a
+    re-uploaded original with the same page count from the one a prior
+    result was computed on, and byte size plus page count is exactly
+    the fingerprint the shard manifest itself trusts. Rows written
+    before this field existed match leniently in
+    :func:`_still_describes` and never in :func:`_reusable_results`.
+
     :param scan: The scan the shards belong to.
     :param manifest: The shard manifest from :mod:`scanning.sharding`.
     :returns: ``(key, identity)`` per shard, ordered by shard index.
@@ -757,11 +765,33 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
                 "from_page": entry["from_page"],
                 "to_page": entry["to_page"],
                 "page_count": entry["page_count"],
+                "size_bytes": entry["size_bytes"],
                 "source_page_count": source_page_count,
             },
         )
         for entry in sorted(manifest["shards"], key=lambda e: e["index"])
     ]
+
+
+def _identity_matches(stored: dict | None, identity: dict) -> bool:
+    """Return whether a row's stored identity describes today's spec.
+
+    Exact equality, with one lenient case: a row written before
+    ``size_bytes`` joined the identity has every other field, and
+    demanding the missing field would read every pre-deploy run as
+    stale -- a re-queue would then re-pay work that is plainly the
+    same. The carry path (:func:`_reusable_results`) does **not** get
+    this leniency, because there the missing field is the proof.
+
+    :param stored: The row's ``input_manifest``.
+    :param identity: Today's identity for the same shard position.
+    :returns: Whether they describe the same work.
+    :rtype: bool
+    """
+    if stored == identity:
+        return True
+    legacy = {k: v for k, v in identity.items() if k != "size_bytes"}
+    return stored == legacy
 
 
 def _still_describes(
@@ -784,7 +814,8 @@ def _still_describes(
     if len(live) != len(specs):
         return False
     return all(
-        job.input_key == key and job.input_manifest == identity
+        job.input_key == key
+        and _identity_matches(job.input_manifest, identity)
         for job, (key, identity) in zip(live, specs, strict=True)
     )
 
@@ -830,6 +861,90 @@ def live_run(scan, stage: str, engine: str) -> list[ExternalJob]:
     return [job for job in rows if job.run == rows[0].run]
 
 
+def _reusable_results(
+    scan, stage: str, engine: str, specs: list[tuple[str, dict]]
+) -> dict[int, ExternalJob]:
+    """Map today's shard indexes to prior rows whose results still serve.
+
+    A shard's work is addressed by its ``(input_key, input_manifest)``
+    identity, so a prior ``COMPLETED`` or ``CONSUMED`` row with the
+    same identity holds output for exactly the bytes today's spec asks
+    for -- whatever run it belongs to. The newest such row wins, and
+    one S3 HEAD confirms its result object is really there: the keys
+    are attempt-scoped, so presence needs no freshness window.
+
+    The match is strict, no legacy leniency: ``size_bytes`` is the only
+    field that separates today's shard from an equally-paginated shard
+    of a re-uploaded original, so a row that cannot prove it gets read
+    again rather than trusted.
+
+    The HEAD never raises out of here. The carry is an optimization,
+    so an S3 blip must degrade to "not carried" -- the pre-carry cost,
+    in money -- and not into a failure: in the pipeline it would mark
+    the scan ERROR (an S3 fault is not a ``RunpodTransientError``, so
+    no retry), and in the start button it would be a 500. A shard that
+    cannot prove its result is read again, with a WARNING naming the
+    fault.
+
+    Only useful for an engine whose results are *kept* after the
+    apply (dots.mocr keeps them for the future smart glue; the bitonal
+    merge deletes them), which is why :func:`ensure_shard_jobs` takes
+    it as an opt-in.
+
+    :param scan: The scan the shards belong to.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param specs: Today's work, from :func:`_shard_specs`.
+    :returns: ``{shard_index: prior_row}`` for every reusable shard.
+    :rtype: dict[int, ExternalJob]
+    """
+    if not s3_sync.s3_active():
+        return {}
+
+    def _identity_key(input_key: str, identity) -> str:
+        return f"{input_key}\n{json.dumps(identity or {}, sort_keys=True)}"
+
+    by_identity: dict[str, ExternalJob] = {}
+    prior_rows = ExternalJob.objects.filter(
+        scan=scan,
+        stage=stage,
+        engine=engine,
+        opinion=None,
+        status__in=(JobStatus.COMPLETED, JobStatus.CONSUMED),
+    ).order_by("-run", "-attempt")
+    for row in prior_rows:
+        if not row.result_key:
+            continue
+        by_identity.setdefault(
+            _identity_key(row.input_key, row.input_manifest), row
+        )
+    if not by_identity:
+        return {}
+
+    reusable: dict[int, ExternalJob] = {}
+    for index, (input_key, identity) in enumerate(specs):
+        row = by_identity.get(_identity_key(input_key, identity))
+        if row is None:
+            continue
+        try:
+            if not s3_sync.object_exists(row.result_key):
+                continue
+        except (BotoCoreError, ClientError) as exc:
+            logger.warning(
+                "carry check for scan %s %s/%s shard %d could not "
+                "confirm %s (%s); the shard will be read again",
+                getattr(scan, "pk", scan),
+                stage,
+                engine,
+                index,
+                row.result_key,
+                exc,
+            )
+            continue
+        reusable[index] = row
+    return reusable
+
+
 def ensure_shard_jobs(
     scan,
     manifest: dict,
@@ -837,6 +952,7 @@ def ensure_shard_jobs(
     stage: str,
     engine: str,
     provider: str,
+    reuse_results: bool = False,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``scan``'s shards,
     creating them if the current run does not describe today's shard set.
@@ -847,6 +963,14 @@ def ensure_shard_jobs(
     button is a no-op rather than a second run. When the shard set has
     moved (a re-upload, a page edit), a new run starts and the previous
     run's rows and result objects stay addressable as history.
+
+    With ``reuse_results`` a new run does not start from zero: a shard
+    whose identity is unchanged and whose prior result object is still
+    on S3 (:func:`_reusable_results`) enters the run as a ``COMPLETED``
+    row pointing at that object, and only the rest are ``PENDING``. So
+    a run replaced for one dead shard re-pays one shard, and a re-cut
+    that moved a few page ranges re-pays only the shards that moved.
+    Pass it only for an engine whose results outlive the apply.
 
     That idempotence has to survive two callers arriving at once, which
     it did not have to before issue #190: until the dots.mocr button
@@ -890,30 +1014,44 @@ def ensure_shard_jobs(
 
     run = ExternalJob.next_run(scan, stage, engine)
     now = timezone.now()
+    reusable = (
+        _reusable_results(scan, stage, engine, specs) if reuse_results else {}
+    )
+    rows = []
+    for index, (key, identity) in enumerate(specs):
+        row = ExternalJob(
+            scan=scan,
+            stage=stage,
+            engine=engine,
+            provider=provider,
+            status=JobStatus.PENDING,
+            run=run,
+            shard_index=index,
+            shard_count=len(specs),
+            input_key=key,
+            # Travels with the row, so the reuse check and any later
+            # merge read what was actually processed rather than a
+            # manifest that may since have changed.
+            input_manifest=identity,
+            deadline=queue_deadline(now),
+        )
+        prior = reusable.get(index)
+        if prior is not None:
+            # Born COMPLETED: the prior attempt's result object serves
+            # this identical shard, so the daemon submits nothing and
+            # the merge reads the old key. The blank ``external_id``
+            # keeps every cancel path a no-op on the provider.
+            row.status = JobStatus.COMPLETED
+            row.result_key = prior.result_key
+            row.attempt = prior.attempt
+            row.completed_at = prior.completed_at or now
+            row.provider_meta = {
+                "carried_from": {"run": prior.run, "job": prior.pk}
+            }
+        rows.append(row)
     try:
         with transaction.atomic():
-            created = ExternalJob.objects.bulk_create(
-                [
-                    ExternalJob(
-                        scan=scan,
-                        stage=stage,
-                        engine=engine,
-                        provider=provider,
-                        status=JobStatus.PENDING,
-                        run=run,
-                        shard_index=index,
-                        shard_count=len(specs),
-                        input_key=key,
-                        # Travels with the row, so the reuse check and
-                        # any later merge read what was actually
-                        # processed rather than a manifest that may
-                        # since have changed.
-                        input_manifest=identity,
-                        deadline=queue_deadline(now),
-                    )
-                    for index, (key, identity) in enumerate(specs)
-                ]
-            )
+            created = ExternalJob.objects.bulk_create(rows)
     except IntegrityError:
         # Somebody else created this exact run between our read and our
         # insert. Their rows are the run, and ours were never written
@@ -1605,6 +1743,7 @@ def abandon_open(
     reason: str,
     stage: str | None = None,
     engine: str | None = None,
+    statuses: frozenset = OPEN_JOB_STATUSES,
 ) -> int:
     """Cancel a scan's open jobs, optionally for one engine only.
 
@@ -1622,6 +1761,14 @@ def abandon_open(
     re-queue re-runs ``run_full_pipeline``, which owns ``CONVERT``
     whichever engine serves it, and owns no part of ``ANALYZE``.
 
+    ``statuses`` narrows the default further for a caller whose stop is
+    a *retry*, not an end. The pipeline's lost-claim hand-back keeps
+    ``COMPLETED`` rows: those are paid results the carry
+    (:func:`_reusable_results`) re-reads on the retry, and the claim is
+    lost most often to the daemon's own shutdown -- every deploy that
+    catches a pipeline mid-flight -- so cancelling them would re-pay
+    whole volumes routinely, not rarely.
+
     Each cancelled row's provider job is cancelled too, so a GPU worker
     stops billing for output nobody will read.
 
@@ -1629,10 +1776,12 @@ def abandon_open(
     :param reason: Recorded on each row for the audit trail.
     :param stage: Limit to one :class:`~scanning.models.JobStage`.
     :param engine: Limit to one :class:`~scanning.models.JobEngine`.
+    :param statuses: The statuses to treat as open. Narrow, never
+        widen: ``CONSUMED`` and the dead statuses must stay terminal.
     :returns: How many rows were cancelled.
     :rtype: int
     """
-    rows = ExternalJob.objects.filter(scan=scan, status__in=OPEN_JOB_STATUSES)
+    rows = ExternalJob.objects.filter(scan=scan, status__in=statuses)
     if stage is not None:
         rows = rows.filter(stage=stage)
     if engine is not None:

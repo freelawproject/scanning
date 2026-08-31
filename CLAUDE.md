@@ -52,12 +52,14 @@ The legacy processing stages — in-process bitonal conversion, the YOLO
 `detect` and PaddleOCR `analyze` RunPod actions (and the whole
 blackletter-gpu-worker under `scanning/runpod/`), and their
 `RUNPOD_ENABLED=False` in-process fallbacks — are deleted. Bitonal came
-back as an external job, dots.mocr as a staff-started one, and the page
+back as an external job, dots.mocr as a pipeline-enqueued one (#207,
+with the staff button kept for re-runs), and the page
 numbers plus Issues as an apply pass on the collect tick (#149/#204,
 all below), and review 1 got its approve button (#151); still missing
 are the post-review stages (#195/#196), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
+  enqueues the dots.mocr read (#207) when `_can_analyze` allows,
   then either starts the bitonal conversion (`Status.AWAITING`) or
   parks the scan in `Status.AWAITING_VALIDATION`.
 - Every user-facing action that would re-trigger a legacy stage
@@ -280,21 +282,47 @@ trained on), tracked on `ExternalJob` rows at
 `submit_external_jobs` / `collect_external_jobs` daemon commands, and
 `views_process.start_dots_mocr` (the button). What must not be broken:
 
-- **A person starts it, the daemon runs it.** There is no automatic
-  enqueueing: a staff-only button on `/scan/process/` writes the rows and
-  returns, and the daemon submits, polls and retries them. That is
-  deliberate while the stage is debugged — every press costs GPU money.
-  `DOTS_MOCR_ENABLED` (on by default) gates *dispatch*, not enqueueing,
-  so it starts no work by itself. What keeps that true is structural, not
-  a promise: `ensure_analyze_jobs` is the only thing that creates ANALYZE
-  rows and `start_dots_mocr` is its only caller, held by
-  `TestNothingAutoEnqueues`. Auto-dispatch is a follow-up that has to
-  retire that test on purpose.
-  The request makes **no** call to RunPod, and it never cuts shards:
-  `sharding.committed_manifest` verifies the stored set with one
-  `head_object` on the original (size plus `Scan.page_count` *is* the
-  whole fingerprint), so a web pod never pulls a multi-GB PDF and never
-  reads `shards/` directly. A stale set is refused, not re-cut.
+- **The pipeline starts it, the daemon runs it** (#207).
+  `run_full_pipeline` creates the ANALYZE rows next to the CONVERT
+  rows, gated by `services._can_analyze` (committed shards,
+  `dots_mocr.enabled()`, S3 active — the mirror of `_can_convert`),
+  and the daemon submits, polls and retries them. The stage is
+  independent of the bitonal branch: it reads the *original* shards,
+  so a volume that parks unconverted still gets its read. A lost
+  status guard hands back only the *unstarted* ANALYZE rows (PENDING
+  plus in-flight, via `abandon_open(statuses=...)`): the claim is lost
+  most often to the daemon's own shutdown — the SIGTERM handler
+  re-queues mid-flight scans and returns, so the pipeline continues on
+  a scan it no longer holds — and a COMPLETED row is a paid result the
+  carry re-reads on that retry. The
+  staff button on `/scan/process/` remains as the manual way in — a
+  re-run over an edited volume, or a backfill for scans uploaded while
+  the stage was button-only. Row creation is what costs GPU money, so
+  the creators' caller set stays pinned by an AST test
+  (`TestKnownEnqueuePaths`): exactly the pipeline and the button.
+  The button's request makes **no** call to RunPod, and it never cuts
+  shards: `sharding.committed_manifest` verifies the stored set with
+  one `head_object` on the original (size plus `Scan.page_count` *is*
+  the whole fingerprint), so a web pod never pulls a multi-GB PDF and
+  never reads `shards/` directly. A stale set is refused, not re-cut.
+  A `cancel_processing` does **not** touch a running read: the results
+  are kept, the apply defers a cancelled scan, and a later re-queue
+  reuses the completed run for free.
+- **A replacement run re-reads only the shards that need it.** When
+  `ensure_shard_jobs` starts a new ANALYZE run (a dead row sank the
+  old one), a shard whose identity is unchanged and whose result
+  object an S3 HEAD confirms enters the run as a `COMPLETED` row
+  pointing at the prior attempt's object (`jobs._reusable_results`,
+  opt-in via `reuse_results` — dots.mocr only, since the bitonal
+  merge deletes its results). The row identity now carries the
+  shard's `size_bytes`: pages alone cannot tell a re-uploaded
+  original with the same page count from the one the result was
+  computed on, and size plus page count is the fingerprint the shard
+  manifest itself trusts. The carry match is strict — a legacy row
+  without the field re-reads — while `_still_describes` accepts the
+  legacy shape, so pre-deploy live runs are still reused whole
+  instead of re-paid. A carried row has a blank `external_id`, so
+  every cancel path stays a provider no-op on it.
 - **The stage writes no scan status while it reads.** Progress lives
   only on the rows, read through `dots_mocr.run_summary` into the page
   context and `progress_api`. So a volume stays browsable and

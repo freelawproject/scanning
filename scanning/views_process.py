@@ -991,9 +991,12 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
 def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
     """Start the dots.mocr stage over a scan's original shards (#190).
 
-    Staff only, and deliberately manual. Every press starts real
-    graphics processing unit (GPU) work on RunPod that costs money, so
-    while the stage is being debugged a person decides, not the daemon.
+    Staff only. Since #207 the pipeline enqueues this stage for every
+    new upload, so this button is the manual way in: a fresh run over
+    an edited volume, or a backfill for a scan uploaded while the
+    stage was button-only. Every press can start real graphics
+    processing unit (GPU) work on RunPod that costs money, which is
+    why it stays behind the staff gate.
 
     **This request makes no call to RunPod.** It writes one
     ``ExternalJob`` row per shard and returns; the daemon's next

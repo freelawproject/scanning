@@ -2316,6 +2316,226 @@ class TestFullPipelineConvertBranches(TestCase):
         release.assert_not_called()
 
 
+@override_settings(MEDIA_ROOT=MEDIA_ROOT, DEVELOPMENT=True)
+class TestFullPipelineOcrEnqueue(TestCase):
+    """The pipeline enqueues the dots.mocr read (issue #207).
+
+    The OCR rows are independent of the bitonal branch: the stage
+    reads the original shards, so a volume that parks unconverted, or
+    skips the conversion, still gets its read. ``_can_analyze`` is the
+    gate, mirror of ``_can_convert``.
+    """
+
+    def _scan(self, pages=2, status=Status.PROCESSING):
+        scan = ScanFactory(
+            reporter=ReporterFactory(short_name="tc"),
+            volume=207,
+            start_page=1,
+            end_page=pages,
+            status=status,
+        )
+        output_dir = pathlib.Path(scan.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        original = output_dir / pathlib.Path(scan.original_pdf.name).name
+        doc = fitz.open()
+        for _ in range(pages):
+            doc.new_page(width=PAGE_W, height=PAGE_H)
+        doc.save(str(original))
+        doc.close()
+        return scan
+
+    @staticmethod
+    def _manifest(shard_count=2):
+        from scanning.tests.test_jobs import make_manifest
+
+        return make_manifest(shard_count, 1)
+
+    def _run(
+        self,
+        scan,
+        manifest,
+        is_bitonal=False,
+        doctor=True,
+        dots=True,
+        s3=True,
+        cancel_midway=False,
+    ):
+        from scanning import services
+        from scanning.models import Scan as ScanModel
+
+        def _shard(inner_scan):
+            if cancel_midway:
+                ScanModel.objects.filter(pk=inner_scan.pk).update(
+                    status=Status.CANCELLED
+                )
+            return manifest
+
+        with (
+            patch("scanning.services._ensure_shards", side_effect=_shard),
+            patch(
+                "scanning.bitonal.source_is_bitonal",
+                return_value=is_bitonal,
+            ),
+            patch("scanning.doctor_client.enabled", return_value=doctor),
+            patch("scanning.dots_mocr.enabled", return_value=dots),
+            patch("scanning.s3_sync.s3_active", return_value=s3),
+            patch("django.db.connections.close_all"),
+        ):
+            services.run_full_pipeline(scan.pk)
+        scan.refresh_from_db()
+        return scan
+
+    @staticmethod
+    def _analyze_rows(scan):
+        from scanning.models import ExternalJob, JobStage
+
+        return list(
+            ExternalJob.objects.filter(
+                scan=scan, stage=JobStage.ANALYZE
+            ).order_by("shard_index")
+        )
+
+    def test_a_new_upload_gets_ocr_rows_beside_the_convert_rows(self):
+        from scanning.models import ExternalJob, JobStage, JobStatus
+
+        scan = self._scan(pages=2)
+
+        scan = self._run(scan, self._manifest(shard_count=2))
+
+        self.assertEqual(scan.status, Status.AWAITING)
+        rows = self._analyze_rows(scan)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row.status for row in rows}, {JobStatus.PENDING})
+        self.assertEqual(
+            ExternalJob.objects.filter(
+                scan=scan, stage=JobStage.CONVERT
+            ).count(),
+            2,
+        )
+
+    def test_a_volume_doctor_cannot_serve_still_gets_ocr(self):
+        from scanning.models import ExternalJob, JobStage, JobStatus
+
+        scan = self._scan(pages=2)
+
+        scan = self._run(scan, self._manifest(), doctor=False)
+
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        rows = self._analyze_rows(scan)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row.status for row in rows}, {JobStatus.PENDING})
+        self.assertFalse(
+            ExternalJob.objects.filter(
+                scan=scan, stage=JobStage.CONVERT
+            ).exists()
+        )
+
+    def test_an_already_bitonal_volume_still_gets_ocr(self):
+        scan = self._scan(pages=2)
+
+        scan = self._run(scan, self._manifest(), is_bitonal=True)
+
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertEqual(len(self._analyze_rows(scan)), 2)
+
+    def test_dots_mocr_off_creates_no_ocr_rows(self):
+        scan = self._scan(pages=2)
+
+        scan = self._run(scan, self._manifest(), dots=False)
+
+        self.assertEqual(scan.status, Status.AWAITING)
+        self.assertEqual(self._analyze_rows(scan), [])
+
+    def test_without_s3_no_ocr_rows_are_created(self):
+        """The worker fetches its shard through a presigned GET."""
+        scan = self._scan(pages=2)
+
+        scan = self._run(scan, self._manifest(), s3=False)
+
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertEqual(self._analyze_rows(scan), [])
+
+    def test_without_shards_no_ocr_rows_are_created(self):
+        scan = self._scan(pages=2)
+
+        scan = self._run(scan, None)
+
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+        self.assertEqual(self._analyze_rows(scan), [])
+
+    def test_a_scan_cancelled_mid_shard_hands_back_its_ocr_rows(self):
+        from scanning.models import JobStatus
+
+        scan = self._scan(pages=2)
+
+        with self.assertLogs("scanning.services", level="WARNING"):
+            scan = self._run(scan, self._manifest(), cancel_midway=True)
+
+        self.assertEqual(scan.status, Status.CANCELLED)
+        rows = self._analyze_rows(scan)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row.status for row in rows}, {JobStatus.CANCELLED})
+
+    def test_a_lost_claim_keeps_carried_results_carryable(self):
+        """The claim is lost most often to the daemon's own shutdown,
+        which re-queues the scan and returns -- a retry, not an end. A
+        carried COMPLETED row is a paid result the retry re-reads, so
+        the hand-back cancels only the unstarted rows."""
+        from scanning import dots_mocr
+        from scanning.models import ExternalJob, JobStatus
+
+        scan = self._scan(pages=2)
+        manifest = self._manifest(shard_count=2)
+        old = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        ExternalJob.objects.filter(pk=old[0].pk).update(
+            status=JobStatus.COMPLETED,
+            result_key="jobs/analyze/dots_mocr/r1-s0-a1.json",
+        )
+        ExternalJob.objects.filter(pk=old[1].pk).update(
+            status=JobStatus.FAILED
+        )
+
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            self.assertLogs("scanning.services", level="WARNING"),
+        ):
+            scan = self._run(scan, manifest, cancel_midway=True)
+
+        self.assertEqual(scan.status, Status.CANCELLED)
+        carried, pending = dots_mocr.live_analyze_jobs(scan)
+        self.assertEqual(carried.status, JobStatus.COMPLETED)
+        self.assertEqual(pending.status, JobStatus.CANCELLED)
+
+        # The retry (an admin re-queue) carries the kept result again.
+        type(scan).objects.filter(pk=scan.pk).update(status=Status.PROCESSING)
+        with patch("scanning.s3_sync.object_exists", return_value=True):
+            scan = self._run(scan, manifest)
+        fresh = dots_mocr.live_analyze_jobs(scan)
+        self.assertEqual(fresh[0].status, JobStatus.COMPLETED)
+        self.assertEqual(
+            fresh[0].result_key, "jobs/analyze/dots_mocr/r1-s0-a1.json"
+        )
+        self.assertEqual(fresh[1].status, JobStatus.PENDING)
+
+    def test_a_requeue_reuses_a_consumed_ocr_run(self):
+        """An applied run is history nobody pays for twice."""
+        from scanning import dots_mocr
+        from scanning.models import ExternalJob, JobStatus
+
+        scan = self._scan(pages=2)
+        manifest = self._manifest(shard_count=2)
+        first = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        ExternalJob.objects.filter(pk__in=[row.pk for row in first]).update(
+            status=JobStatus.CONSUMED
+        )
+
+        scan = self._run(scan, manifest)
+
+        rows = self._analyze_rows(scan)
+        self.assertEqual({row.pk for row in rows}, {row.pk for row in first})
+        self.assertEqual({row.status for row in rows}, {JobStatus.CONSUMED})
+
+
 class TestApplyUploadAction(TestCase):
     """Both upload actions queue the pipeline (issue #176)."""
 
