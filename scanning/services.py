@@ -330,11 +330,19 @@ def _handle_pipeline_exception(
     never stomp a scan that a concurrent process (stale-recovery, admin
     action, second daemon replica) has already moved out of PROCESSING.
 
+    The two terminal outcomes (ERROR, ERROR_MAX_RETRIES) release the
+    scan's local processing files: no retry will read them, so keeping
+    them spends disk on a failure only an admin re-queue -- which
+    re-downloads from S3 -- can revive (#215). The re-queue outcome
+    keeps its files on purpose, so the retry does not pay the download
+    again.
+
     :param scan_pk: Primary key of the scan that failed.
     :param exc: The exception that was raised.
     :param context: Short label for log messages (e.g. ``"pipeline"``,
         ``"validate"``, ``"detect"``).
     """
+    from scanning import s3_sync
     from scanning.runpod_client import RunpodTransientError
 
     if isinstance(exc, RunpodTransientError):
@@ -390,6 +398,11 @@ def _handle_pipeline_exception(
                 max_retries,
                 exc,
             )
+            # Terminal: no retry reads the local files. The read-back,
+            # not the update count, says which status the CASE wrote --
+            # and a status another writer moved here since is terminal
+            # all the same.
+            s3_sync.release_local_processing(scan)
         else:
             logger.warning(
                 "[%s] scan %s transient RunPod failure (%d/%d), re-queuing: %s",
@@ -412,6 +425,10 @@ def _handle_pipeline_exception(
             context,
             scan_pk,
         )
+        return
+    scan = Scan.objects.filter(pk=scan_pk).only("pk").first()
+    if scan is not None:
+        s3_sync.release_local_processing(scan)
 
 
 def _ensure_shards(scan: "Scan") -> dict | None:
@@ -545,7 +562,7 @@ def _page_number_lookup(scan: "Scan") -> dict:
     return lookup
 
 
-def _push_processing_files_to_s3(scan_pk: int) -> None:
+def _push_processing_files_to_s3(scan_pk: int) -> bool:
     """Upload a scan's intermediate processing files to S3.
 
     Wraps ``s3_sync.upload_processing_files`` with an exception guard so
@@ -555,7 +572,10 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
     ``upload_processing_files`` silently returns 0).
 
     :param scan_pk: Primary key of the scan whose files to upload.
-    :return: None.
+    :returns: Whether the push ran without an error. Callers that want
+        to delete the local files afterwards must not do so on False --
+        the local tree may hold bytes S3 never received.
+    :rtype: bool
     """
     from scanning import s3_sync
     from scanning.utils import has_s3_credentials
@@ -569,7 +589,7 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
             "Skipping S3 push for scan %s: AWS credentials not configured",
             scan_pk,
         )
-        return
+        return False
     try:
         scan = Scan.objects.get(pk=scan_pk)
         s3_sync.upload_processing_files(scan)
@@ -577,6 +597,8 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
         logger.exception(
             "Failed to push processing files to S3 for scan %s", scan_pk
         )
+        return False
+    return True
 
 
 def _pull_processing_files_from_s3(scan_pk: int) -> None:
@@ -1325,7 +1347,17 @@ def run_full_pipeline(scan_pk: int) -> None:
                         stage=JobStage.CONVERT,
                     )
 
-        _push_processing_files_to_s3(scan_pk)
+        pushed = _push_processing_files_to_s3(scan_pk)
+
+        # After a clean push S3 holds every byte the daemon wrote,
+        # whichever branch parked the scan, so the local tree is a
+        # cache it no longer needs. A failed push keeps the files, and
+        # so does the failure path below: a re-queued retry reads them
+        # instead of downloading again.
+        if pushed:
+            from scanning import s3_sync
+
+            s3_sync.release_local_processing(scan)
 
     except Exception as exc:
         _handle_pipeline_exception(scan_pk, exc, context="pipeline")

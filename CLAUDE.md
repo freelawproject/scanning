@@ -385,6 +385,23 @@ trained on), tracked on `ExternalJob` rows at
   builder, an endpoint id and a cap — it shares `submit_job` and
   `poll_once` unchanged.
 
+## Local disk hygiene (issue #215)
+
+- The daemon frees `/tmp/scanning/{pk}`
+  (`s3_sync.release_local_processing`) once S3 holds every byte: after
+  `run_full_pipeline`'s push (only on push success), on every exit from
+  `AWAITING` in `bitonal.finish_ready_scans` (only when the park won
+  the row), and on the terminal failures (ERROR, ERROR_MAX_RETRIES) in
+  `_handle_pipeline_exception`. Never on a re-queue — the retry reads
+  the local files. No-ops in DEVELOPMENT and when S3 is inactive.
+- The `cleanup_processing_tmp` sweep judges staleness on the newest
+  mtime in the whole tree (`_tree_mtime`) — writes land three levels
+  down, so the top mtime is only the creation time.
+- The sweep also reclaims leaked `TemporaryDirectory` scratch dirs
+  (`bitonal.MERGE_TMP_PREFIX`, `dots_mocr.GLUE_TMP_PREFIX`) that a
+  SIGKILL orphans in the system temp dir. Off under TESTING; the
+  command's tests point `gettempdir` at a scratch root.
+
 ## Detection Workflow
 
 YOLO models detect elements on each page (captions, key icons, headnotes, etc.) and store them as `Detection` records with a confidence score. Users review detections in the process viewer (step 2) and can:

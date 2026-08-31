@@ -93,6 +93,12 @@ GLUE_SCHEMA_VERSION = 1
 #: would re-download every shard result every 15 seconds, forever.
 GLUE_MAX_ATTEMPTS = 3
 
+#: Prefix of the glue's scratch directory in the system temp dir.
+#: ``cleanup_processing_tmp`` sweeps leaked ones (a SIGKILL mid-glue
+#: skips the ``TemporaryDirectory`` cleanup), so the name is shared
+#: rather than inlined (#215).
+GLUE_TMP_PREFIX = "dotsmocr-"
+
 #: How many times :func:`apply_ready_runs` tries the apply (#149/#204)
 #: before it gives up on a run, for the same reason as
 #: ``GLUE_MAX_ATTEMPTS``: the pass runs every collect tick, and an
@@ -349,7 +355,9 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
     next_page = 0
     # A temp dir, not the output dir: the generic S3 sync sweeps up
     # everything there, and these are wire artifacts that stay out of it.
-    with tempfile.TemporaryDirectory(prefix=f"dotsmocr-{scan.pk}-") as tmp:
+    with tempfile.TemporaryDirectory(
+        prefix=f"{GLUE_TMP_PREFIX}{scan.pk}-"
+    ) as tmp:
         tmp_dir = Path(tmp)
         for index, job in enumerate(analyze_jobs):
             if job.shard_index != index:

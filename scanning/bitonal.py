@@ -58,6 +58,12 @@ SKIPPED_MESSAGE = (
     "disabled while the pipeline is rebuilt on the new OCR stack."
 )
 
+#: Prefix of the merge's scratch directory in the system temp dir.
+#: ``cleanup_processing_tmp`` sweeps leaked ones (a SIGKILL mid-merge
+#: skips the ``TemporaryDirectory`` cleanup), so the name is shared
+#: rather than inlined (#215).
+MERGE_TMP_PREFIX = "bitonal-"
+
 
 class BitonalMergeError(Exception):
     """A converted shard set could not be reassembled."""
@@ -143,7 +149,9 @@ def merge_convert_results(scan, convert_jobs: list[ExternalJob]) -> Path:
 
     # A temp dir, not the output dir: the generic S3 sync sweeps up
     # everything there, and these are wire artifacts that stay out of it.
-    with tempfile.TemporaryDirectory(prefix=f"bitonal-{scan.pk}-") as tmp:
+    with tempfile.TemporaryDirectory(
+        prefix=f"{MERGE_TMP_PREFIX}{scan.pk}-"
+    ) as tmp:
         tmp_dir = Path(tmp)
         with fitz.open() as merged:
             for index, job in enumerate(convert_jobs):
@@ -354,6 +362,11 @@ def finish_ready_scans() -> int:
             )
             if _park(scan, Status.AWAITING_VALIDATION, CONVERTED_MESSAGE):
                 finished += 1
+                # Out of AWAITING, S3 holds everything: the local tree
+                # is now a cache the daemon does not need (#215). Same
+                # at every exit below; a lost park means someone else
+                # owns the scan, so its files stay.
+                s3_sync.release_local_processing(scan)
             continue
 
         dead = [job for job in convert_jobs if job.status in DEAD_JOB_STATUSES]
@@ -377,11 +390,13 @@ def finish_ready_scans() -> int:
                 f"{first.error_message}",
             ):
                 finished += 1
+                s3_sync.release_local_processing(scan)
             continue
 
         try:
             if _finish_scan(scan, convert_jobs):
                 finished += 1
+                s3_sync.release_local_processing(scan)
         except Exception as exc:
             # The merge is the one local step, so a failure is not the
             # provider's fault and retries no job.
@@ -392,5 +407,6 @@ def finish_ready_scans() -> int:
                 f"Could not assemble the converted volume: {exc}",
             ):
                 finished += 1
+                s3_sync.release_local_processing(scan)
 
     return finished

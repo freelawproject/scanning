@@ -1004,3 +1004,56 @@ class TestS3EnabledWithDoctor(SimpleTestCase):
     def test_dev_with_neither_provider_returns_false(self):
         with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
             self.assertFalse(s3_sync._s3_enabled())
+
+
+class TestReleaseLocalProcessing(TestCase):
+    """The daemon frees a scan's local tree once S3 holds every byte."""
+
+    def setUp(self):
+        self.tmp_root = pathlib.Path(tempfile.mkdtemp())
+        self.scan = _reporter_scan(status=Status.AWAITING)
+        leaf = self.tmp_root / str(self.scan.pk) / "tc" / "164" / "1"
+        leaf.mkdir(parents=True)
+        (leaf / "bitonal.pdf").write_text("x")
+        self.top = self.tmp_root / str(self.scan.pk)
+
+    def test_removes_the_scan_tree(self):
+        with (
+            override_settings(
+                DEVELOPMENT=False, PROCESSING_TMP_DIR=str(self.tmp_root)
+            ),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+        ):
+            self.assertTrue(s3_sync.release_local_processing(self.scan))
+        self.assertFalse(self.top.exists())
+
+    def test_noop_in_development(self):
+        with (
+            override_settings(
+                DEVELOPMENT=True, PROCESSING_TMP_DIR=str(self.tmp_root)
+            ),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+        ):
+            self.assertFalse(s3_sync.release_local_processing(self.scan))
+        self.assertTrue(self.top.exists())
+
+    def test_noop_when_s3_is_inactive(self):
+        # The local copy may be the only copy; keep it.
+        with (
+            override_settings(
+                DEVELOPMENT=False, PROCESSING_TMP_DIR=str(self.tmp_root)
+            ),
+            patch("scanning.s3_sync.s3_active", return_value=False),
+        ):
+            self.assertFalse(s3_sync.release_local_processing(self.scan))
+        self.assertTrue(self.top.exists())
+
+    def test_missing_tree_is_a_silent_noop(self):
+        with (
+            override_settings(
+                DEVELOPMENT=False,
+                PROCESSING_TMP_DIR="/nonexistent/path/for/tests",
+            ),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+        ):
+            self.assertFalse(s3_sync.release_local_processing(self.scan))
