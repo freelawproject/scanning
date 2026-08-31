@@ -19,7 +19,9 @@ Examples:
 """
 
 import logging
+import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -27,6 +29,33 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 
 logger = logging.getLogger(__name__)
+
+
+def _tree_mtime(path: Path) -> float:
+    """Return the newest mtime anywhere under ``path``, itself included.
+
+    The sweep decides staleness on this, not on the top directory's own
+    mtime: the processing layout is ``{pk}/{reporter}/{vol}/{start}/...``,
+    so every real write lands levels below the directory the sweep
+    iterates, and the top mtime is just the creation time (#215).
+    Entries that vanish or refuse a stat mid-walk are skipped.
+
+    :param path: Directory to examine.
+    :returns: The newest mtime found, as an epoch timestamp.
+    :rtype: float
+    """
+    try:
+        newest = path.stat().st_mtime
+    except OSError:
+        newest = 0.0
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                mtime = os.stat(os.path.join(root, name)).st_mtime
+            except OSError:
+                continue
+            newest = max(newest, mtime)
+    return newest
 
 
 class Command(BaseCommand):
@@ -74,32 +103,90 @@ class Command(BaseCommand):
             ttl_hours = settings.PROCESSING_TMP_TTL_HOURS
         cutoff = time.time() - (ttl_hours * 3600)
 
+        removed = self._sweep_processing_dirs(cutoff)
+        if removed:
+            logger.info(
+                "cleanup_processing_tmp: removed %d stale dir(s) under %s",
+                removed,
+                settings.PROCESSING_TMP_DIR,
+            )
+
+        leaked = self._sweep_leaked_stage_dirs(cutoff)
+        if leaked:
+            logger.info(
+                "cleanup_processing_tmp: removed %d leaked stage temp dir(s)",
+                leaked,
+            )
+
+    def _sweep_processing_dirs(self, cutoff: float) -> int:
+        """Delete per-scan processing directories idle past the cutoff.
+
+        Staleness is the newest mtime anywhere in the tree
+        (:func:`_tree_mtime`), so a scan the daemon or a viewer touched
+        deep down stays, however old its top directory is.
+
+        :param cutoff: Epoch timestamp; older trees are removed.
+        :returns: How many directories were removed.
+        :rtype: int
+        """
         tmp_root = Path(settings.PROCESSING_TMP_DIR)
         if not tmp_root.is_dir():
-            return
+            return 0
 
         removed = 0
         for child in tmp_root.iterdir():
             if not child.is_dir():
                 continue
-            try:
-                mtime = child.stat().st_mtime
-            except OSError:
-                logger.exception("Failed to stat %s; skipping", child)
-                continue
-            if mtime < cutoff:
+            if _tree_mtime(child) < cutoff:
                 try:
                     shutil.rmtree(child)
                     removed += 1
                 except OSError:
                     logger.exception("Failed to remove stale dir %s", child)
+        return removed
 
-        if removed:
-            logger.info(
-                "cleanup_processing_tmp: removed %d stale dir(s) under %s",
-                removed,
-                tmp_root,
-            )
+    def _sweep_leaked_stage_dirs(self, cutoff: float) -> int:
+        """Delete leaked merge and glue scratch directories.
+
+        The bitonal merge and the dots.mocr glue download shard results
+        into ``TemporaryDirectory`` dirs in the system temp dir --
+        outside ``PROCESSING_TMP_DIR``, so the sweep above never sees
+        them. A normal exit removes them; a SIGKILL mid-stage leaks
+        them, and nothing else ever reclaims the space (#215). A live
+        stage is safe from this: its directory is minutes old and the
+        TTL is hours.
+
+        :param cutoff: Epoch timestamp; older directories are removed.
+        :returns: How many directories were removed.
+        :rtype: int
+        """
+        from scanning.bitonal import MERGE_TMP_PREFIX
+        from scanning.dots_mocr import GLUE_TMP_PREFIX
+
+        if getattr(settings, "TESTING", False):
+            # A test run must never walk the developer's real temp dir.
+            # The command's own tests lift this and point gettempdir at
+            # a scratch root.
+            return 0
+
+        temp_root = Path(tempfile.gettempdir())
+        if not temp_root.is_dir():
+            return 0
+
+        removed = 0
+        for child in temp_root.iterdir():
+            if not child.is_dir():
+                continue
+            if not child.name.startswith((MERGE_TMP_PREFIX, GLUE_TMP_PREFIX)):
+                continue
+            if _tree_mtime(child) < cutoff:
+                try:
+                    shutil.rmtree(child)
+                    removed += 1
+                    logger.info("Removed leaked stage temp dir %s", child)
+                except OSError:
+                    logger.exception("Failed to remove leaked dir %s", child)
+        return removed
 
     def _sweep_pending_uploads(self):
         """Recover or delete unconfirmed direct-to-S3 uploads.

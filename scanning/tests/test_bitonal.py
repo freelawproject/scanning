@@ -477,3 +477,69 @@ class TestDurationLogging(ConvertJobsMixin, TestCase):
         self.assertIn(f"Bitonal stage done for scan {scan.pk}", line)
         self.assertIn("3 shard(s), 12 page(s)", line)
         self.assertRegex(line, r"pages/s")
+
+
+class TestLocalFilesReleasedOnExit(ConvertJobsMixin, TestCase):
+    """Every exit from AWAITING frees the daemon's local tree (#215).
+
+    The helper's own behavior (guards, the delete) is covered in
+    ``test_s3_sync``; here only the call sites are under test, so the
+    helper is patched.
+    """
+
+    def _finish(self):
+        with (
+            patch("scanning.s3_sync.upload_file_to_s3"),
+            patch("scanning.s3_sync.release_local_processing") as release,
+        ):
+            bitonal.finish_ready_scans()
+        return release
+
+    def test_released_after_the_success_park(self):
+        scan, _ = self.build(shard_count=2, pages_per_shard=1)
+
+        release = self._finish()
+
+        release.assert_called_once()
+        self.assertEqual(release.call_args.args[0].pk, scan.pk)
+
+    def test_released_after_the_consumed_run_park(self):
+        scan, rows = self.build(shard_count=2, pages_per_shard=1)
+        ExternalJob.objects.filter(pk__in=[job.pk for job in rows]).update(
+            status=JobStatus.CONSUMED
+        )
+
+        release = self._finish()
+
+        release.assert_called_once()
+        self.assertEqual(release.call_args.args[0].pk, scan.pk)
+
+    def test_released_after_the_dead_shard_error(self):
+        scan, rows = self.build(shard_count=2, pages_per_shard=1)
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.FAILED, error_code="CONVERSION_FAILED"
+        )
+
+        with self.assertLogs("scanning.bitonal", level="ERROR"):
+            release = self._finish()
+
+        release.assert_called_once()
+        self.assertEqual(release.call_args.args[0].pk, scan.pk)
+
+    def test_released_after_the_merge_failure_error(self):
+        self.build(shard_count=2, pages_per_shard=2, result_pages=[2, 1])
+
+        with self.assertLogs("scanning.bitonal", level="ERROR"):
+            release = self._finish()
+
+        release.assert_called_once()
+
+    def test_not_released_when_the_scan_left_awaiting(self):
+        """Someone else owns the scan now; its files stay."""
+        scan, _ = self.build(shard_count=2, pages_per_shard=1)
+        scan.status = Status.CANCELLED
+        scan.save(update_fields=["status"])
+
+        release = self._finish()
+
+        release.assert_not_called()

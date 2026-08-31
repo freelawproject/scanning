@@ -385,6 +385,34 @@ trained on), tracked on `ExternalJob` rows at
   builder, an endpoint id and a cap — it shares `submit_job` and
   `poll_once` unchanged.
 
+## Local disk hygiene (issue #215)
+
+The daemon's node disk filled up because local processing files
+outlived their use. Three rules keep it bounded:
+
+- **The daemon frees a scan's `/tmp/scanning/{pk}` tree when it is done
+  with it** (`s3_sync.release_local_processing`): after
+  `run_full_pipeline`'s S3 push — only when the push reports success,
+  since the tree may otherwise hold bytes S3 never received — and after
+  every exit from `AWAITING` in `bitonal.finish_ready_scans` (success
+  park, consumed-run park, both ERROR sinks). Only when the park won
+  the row: a lost park means someone else owns the scan. Never from
+  failure paths that re-queue — the retry reads the local files instead
+  of re-downloading. The helper no-ops in DEVELOPMENT (local files are
+  the workspace) and when S3 is inactive (the local copy may be the
+  only copy).
+- **The `cleanup_processing_tmp` sweep measures the newest mtime in the
+  whole tree** (`_tree_mtime`), not the top directory's own mtime.
+  Writes land at `{pk}/{reporter}/{vol}/{start}/`, so the top mtime is
+  just the creation time — the old sweep deleted trees of scans still
+  in work and could not extend a viewer's cache.
+- **The sweep also reclaims leaked stage scratch dirs**: the merge and
+  the glue download shard results into `TemporaryDirectory` dirs in the
+  system temp dir (prefixes `bitonal.MERGE_TMP_PREFIX`,
+  `dots_mocr.GLUE_TMP_PREFIX`), which a SIGKILL leaks. Guarded off
+  under TESTING so the suite never walks the developer's real temp dir;
+  the command's tests point `gettempdir` at a scratch root and lift it.
+
 ## Detection Workflow
 
 YOLO models detect elements on each page (captions, key icons, headnotes, etc.) and store them as `Detection` records with a confidence score. Users review detections in the process viewer (step 2) and can:

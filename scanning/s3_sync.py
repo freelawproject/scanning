@@ -19,6 +19,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import shutil
 import time
 from pathlib import Path
 
@@ -553,6 +554,58 @@ def tmp_output_dir(scan: Scan) -> Path:
         / volume
         / start_page
     )
+
+
+def release_local_processing(scan: Scan) -> bool:
+    """Delete a scan's local processing tree once S3 holds every byte.
+
+    Called by the daemon when it is done with a scan for now: after
+    ``run_full_pipeline`` pushed the tree, and after the bitonal stage
+    took the scan out of AWAITING (issue #215). The local files are a
+    cache of S3 from that point on, and the 24-hour TTL sweep frees
+    them far too late for multi-GB volumes.
+
+    Deliberately not called from failure handlers that re-queue: the
+    retry reads the same local files and should not pay the download
+    again.
+
+    No-ops:
+
+    - ``DEVELOPMENT``, where local files are the developer's workspace
+      (``Scan.output_dir`` lives under ``MEDIA_ROOT`` there, so the
+      tree this would remove is empty anyway).
+    - S3 inactive, where the local copy may be the only copy.
+
+    Best effort: a failed delete costs disk until the TTL sweep, so it
+    logs and returns rather than fail the pipeline step around it.
+
+    :param scan: The scan whose local tree is no longer needed.
+    :returns: Whether a tree was removed.
+    :rtype: bool
+    """
+    if settings.DEVELOPMENT:
+        return False
+    if not s3_active():
+        return False
+    local_root = Path(settings.PROCESSING_TMP_DIR) / str(scan.pk)
+    if not local_root.is_dir():
+        return False
+    try:
+        shutil.rmtree(local_root)
+    except OSError:
+        logger.warning(
+            "Could not remove local processing files at %s for scan %s",
+            local_root,
+            scan.pk,
+            exc_info=True,
+        )
+        return False
+    logger.info(
+        "Removed local processing files at %s for scan %s",
+        local_root,
+        scan.pk,
+    )
+    return True
 
 
 def _iter_files_to_sync(local_root: Path):

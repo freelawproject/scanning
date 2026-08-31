@@ -2233,6 +2233,39 @@ class TestFullPipelineConvertBranches(TestCase):
             first,
         )
 
+    def test_local_files_release_after_the_push(self):
+        """S3 holds every byte after the push; the tree is a cache (#215)."""
+        scan = self._scan(pages=3)
+
+        with patch("scanning.s3_sync.release_local_processing") as release:
+            self._run(scan, self._manifest(shard_count=3))
+
+        release.assert_called_once()
+        self.assertEqual(release.call_args.args[0].pk, scan.pk)
+
+    def test_a_parked_unconverted_scan_also_releases(self):
+        scan = self._scan(pages=2)
+
+        with patch("scanning.s3_sync.release_local_processing") as release:
+            self._run(scan, self._manifest(), doctor=False)
+
+        release.assert_called_once()
+
+    def test_a_failed_push_keeps_the_local_files(self):
+        """The local tree may hold bytes S3 never received."""
+        scan = self._scan(pages=2)
+
+        with (
+            patch(
+                "scanning.services._push_processing_files_to_s3",
+                return_value=False,
+            ),
+            patch("scanning.s3_sync.release_local_processing") as release,
+        ):
+            self._run(scan, self._manifest(), doctor=False)
+
+        release.assert_not_called()
+
 
 class TestApplyUploadAction(TestCase):
     """Both upload actions queue the pipeline (issue #176)."""

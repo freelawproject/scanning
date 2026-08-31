@@ -545,7 +545,7 @@ def _page_number_lookup(scan: "Scan") -> dict:
     return lookup
 
 
-def _push_processing_files_to_s3(scan_pk: int) -> None:
+def _push_processing_files_to_s3(scan_pk: int) -> bool:
     """Upload a scan's intermediate processing files to S3.
 
     Wraps ``s3_sync.upload_processing_files`` with an exception guard so
@@ -555,7 +555,10 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
     ``upload_processing_files`` silently returns 0).
 
     :param scan_pk: Primary key of the scan whose files to upload.
-    :return: None.
+    :returns: Whether the push ran without an error. Callers that want
+        to delete the local files afterwards must not do so on False --
+        the local tree may hold bytes S3 never received.
+    :rtype: bool
     """
     from scanning import s3_sync
     from scanning.utils import has_s3_credentials
@@ -569,7 +572,7 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
             "Skipping S3 push for scan %s: AWS credentials not configured",
             scan_pk,
         )
-        return
+        return False
     try:
         scan = Scan.objects.get(pk=scan_pk)
         s3_sync.upload_processing_files(scan)
@@ -577,6 +580,8 @@ def _push_processing_files_to_s3(scan_pk: int) -> None:
         logger.exception(
             "Failed to push processing files to S3 for scan %s", scan_pk
         )
+        return False
+    return True
 
 
 def _pull_processing_files_from_s3(scan_pk: int) -> None:
@@ -1325,7 +1330,17 @@ def run_full_pipeline(scan_pk: int) -> None:
                         stage=JobStage.CONVERT,
                     )
 
-        _push_processing_files_to_s3(scan_pk)
+        pushed = _push_processing_files_to_s3(scan_pk)
+
+        # After a clean push S3 holds every byte the daemon wrote,
+        # whichever branch parked the scan, so the local tree is a
+        # cache it no longer needs. A failed push keeps the files, and
+        # so does the failure path below: a re-queued retry reads them
+        # instead of downloading again.
+        if pushed:
+            from scanning import s3_sync
+
+            s3_sync.release_local_processing(scan)
 
     except Exception as exc:
         _handle_pipeline_exception(scan_pk, exc, context="pipeline")
