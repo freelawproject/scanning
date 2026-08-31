@@ -875,6 +875,14 @@ def _reusable_results(
     of a re-uploaded original, so a row that cannot prove it gets read
     again rather than trusted.
 
+    The HEAD never raises out of here. The carry is an optimization,
+    so an S3 blip must degrade to "not carried" -- the pre-carry cost,
+    in money -- and not into a failure: in the pipeline it would mark
+    the scan ERROR (an S3 fault is not a ``RunpodTransientError``, so
+    no retry), and in the start button it would be a 500. A shard that
+    cannot prove its result is read again, with a WARNING naming the
+    fault.
+
     Only useful for an engine whose results are *kept* after the
     apply (dots.mocr keeps them for the future smart glue; the bitonal
     merge deletes them), which is why :func:`ensure_shard_jobs` takes
@@ -915,7 +923,20 @@ def _reusable_results(
         row = by_identity.get(_identity_key(input_key, identity))
         if row is None:
             continue
-        if not s3_sync.object_exists(row.result_key):
+        try:
+            if not s3_sync.object_exists(row.result_key):
+                continue
+        except (BotoCoreError, ClientError) as exc:
+            logger.warning(
+                "carry check for scan %s %s/%s shard %d could not "
+                "confirm %s (%s); the shard will be read again",
+                getattr(scan, "pk", scan),
+                stage,
+                engine,
+                index,
+                row.result_key,
+                exc,
+            )
             continue
         reusable[index] = row
     return reusable

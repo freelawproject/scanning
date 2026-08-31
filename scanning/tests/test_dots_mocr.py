@@ -1636,6 +1636,29 @@ class TestShardResultCarryOver(ScanningTestCase):
         )
         self.assertEqual(pending.status, JobStatus.SUBMITTED)
 
+    def test_an_s3_blip_reads_the_shard_again(self):
+        """The carry is an optimization: a throttle or IAM fault must
+        cost the shard's price, never the volume (an unhandled S3
+        error would mark the scan ERROR in the pipeline, with no
+        retry, and 500 the start button)."""
+        from botocore.exceptions import ClientError
+
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, _ = self._dead_run(manifest)
+        blip = ClientError(
+            {"Error": {"Code": "SlowDown", "Message": "throttled"}},
+            "HeadObject",
+        )
+
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", side_effect=blip),
+            self.assertLogs("scanning.jobs", level="WARNING"),
+        ):
+            fresh = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        self.assertEqual({row.status for row in fresh}, {JobStatus.PENDING})
+
     def test_a_missing_result_object_is_not_carried(self):
         manifest = make_manifest(shard_count=2, pages_per_shard=1)
         scan, _ = self._dead_run(manifest)
