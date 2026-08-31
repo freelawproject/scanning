@@ -1249,14 +1249,15 @@ def run_full_pipeline(scan_pk: int) -> None:
 
     Designed to run in the daemon process.
 
-    Two stages of the rebuilt pipeline exist so far. This runs the first
-    (sharding, #164) and *starts* the second (conversion, #176): it
-    creates one ``ExternalJob`` row per shard and parks the scan in
-    ``Status.AWAITING``. It does not wait -- submitting, confirming and
-    merging belong to the ``submit_external_jobs`` /
-    ``collect_external_jobs`` ticks, which read those rows. Nothing
-    about what runs next may live in a call stack, or a killed daemon
-    loses it.
+    This runs the sharding (#164) and *starts* the two external stages
+    that fan out over the shards: the bitonal conversion (#176), which
+    parks the scan in ``Status.AWAITING``, and the dots.mocr read
+    (#190/#207), which writes no scan status at all. Each stage is one
+    ``ExternalJob`` row per shard. It does not wait -- submitting,
+    confirming, merging, gluing and applying belong to the
+    ``submit_external_jobs`` / ``collect_external_jobs`` ticks, which
+    read those rows. Nothing about what runs next may live in a call
+    stack, or a killed daemon loses it.
 
     A volume that cannot or need not be converted parks straight in
     ``Status.AWAITING_VALIDATION``, #173's interim state, and
@@ -1271,7 +1272,7 @@ def run_full_pipeline(scan_pk: int) -> None:
 
     :param scan_pk: Primary key of the scan to process.
     """
-    from scanning import bitonal, jobs
+    from scanning import bitonal, dots_mocr, jobs
 
     django.db.connections.close_all()
     _pull_processing_files_from_s3(scan_pk)
@@ -1299,8 +1300,20 @@ def run_full_pipeline(scan_pk: int) -> None:
         with fitz.open(scan.pdf_path) as pdf:
             page_count = pdf.page_count
 
+        # Start the OCR read (#190/#207) over the same shard set. The
+        # stage is independent of the bitonal branch below: it reads
+        # the *original* shards, writes no scan status while it runs,
+        # and the apply pass (#149/#204) defers a scan that is still
+        # AWAITING. Created before the status writes, like the convert
+        # rows, so a lost guard hands them back below. Idempotent
+        # through the run's shard identity: a re-queue finds the live
+        # run -- CONSUMED included -- instead of paying for it again.
+        analyze_created: list = []
+        if _can_analyze(scan_pk, manifest):
+            analyze_created = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
         if not _can_convert(scan_pk, manifest):
-            _park_unconverted(
+            still_ours = _park_unconverted(
                 scan_pk,
                 page_count,
                 "Uploaded and sharded. Page-number validation is "
@@ -1312,7 +1325,9 @@ def run_full_pipeline(scan_pk: int) -> None:
             logger.info(
                 "Scan %s is already bitonal; skipping conversion", scan_pk
             )
-            _park_unconverted(scan_pk, page_count, bitonal.SKIPPED_MESSAGE)
+            still_ours = _park_unconverted(
+                scan_pk, page_count, bitonal.SKIPPED_MESSAGE
+            )
         else:
             created = jobs.ensure_convert_jobs(scan, manifest)
             if all(job.status == JobStatus.CONSUMED for job in created):
@@ -1324,11 +1339,11 @@ def run_full_pipeline(scan_pk: int) -> None:
                     "Scan %s is already converted; skipping the stage",
                     scan_pk,
                 )
-                _park_unconverted(
+                still_ours = _park_unconverted(
                     scan_pk, page_count, bitonal.CONVERTED_MESSAGE
                 )
             else:
-                handed_over = _advance_scan(
+                still_ours = _advance_scan(
                     scan_pk,
                     Status.AWAITING,
                     page_count,
@@ -1336,7 +1351,7 @@ def run_full_pipeline(scan_pk: int) -> None:
                     "black-and-white (bitonal) preview...",
                     progress_total=len(created),
                 )
-                if not handed_over:
+                if not still_ours:
                     # The scan left PROCESSING while we sharded (a
                     # cancel, an admin action). Its rows exist but
                     # nothing watches them now, so hand them back
@@ -1346,6 +1361,16 @@ def run_full_pipeline(scan_pk: int) -> None:
                         "Scan left PROCESSING before its conversion started",
                         stage=JobStage.CONVERT,
                     )
+
+        if not still_ours and analyze_created:
+            # Same reasoning as the CONVERT abandonment above, for
+            # whichever branch lost the guard: OCR rows for a volume
+            # somebody stopped would read shards nobody wants.
+            jobs.abandon_open(
+                scan,
+                "Scan left PROCESSING before its OCR read started",
+                stage=JobStage.ANALYZE,
+            )
 
         pushed = _push_processing_files_to_s3(scan_pk)
 
@@ -1396,6 +1421,46 @@ def _can_convert(scan_pk: int, manifest: dict | None) -> bool:
         logger.info(
             "Scan %s: S3 is inactive, so its shards are not readable by "
             "doctor; skipping conversion",
+            scan_pk,
+        )
+        return False
+    return True
+
+
+def _can_analyze(scan_pk: int, manifest: dict | None) -> bool:
+    """Return whether this environment can hand shards to dots.mocr.
+
+    The mirror of :func:`_can_convert`, for the same reason: a row
+    created where it cannot be submitted sits PENDING until its queue
+    deadline expires hours later, and its failure is noise about a
+    volume that did nothing wrong. An environment that fails a check
+    parks as before, and the staff button stays as the manual way in.
+
+    - a committed shard set, or there is nothing for a job to read;
+    - ``dots_mocr.enabled()``, the operator switch plus the account
+      credentials and the engine's endpoint id;
+    - S3 active, because the worker fetches the shard through a
+      presigned GET.
+
+    :param scan_pk: Primary key of the scan, for the log line.
+    :param manifest: The shard manifest, or None when sharding is off.
+    :returns: Whether to create OCR jobs for this scan.
+    :rtype: bool
+    """
+    from scanning import dots_mocr, s3_sync
+
+    if manifest is None:
+        logger.info("Scan %s has no shard set; skipping OCR", scan_pk)
+        return False
+    if not dots_mocr.enabled():
+        logger.info(
+            "Scan %s: dots.mocr is not configured; skipping OCR", scan_pk
+        )
+        return False
+    if not s3_sync.s3_active():
+        logger.info(
+            "Scan %s: S3 is inactive, so its shards are not readable by "
+            "the OCR worker; skipping OCR",
             scan_pk,
         )
         return False

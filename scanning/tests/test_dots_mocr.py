@@ -1494,17 +1494,16 @@ class TestRunSummaryLabel(ScanningTestCase):
         self.assertIn("2 pending submit", label)
 
 
-class TestNothingAutoEnqueues(ScanningTestCase):
-    """The button is the only thing that creates dots.mocr work.
+class TestKnownEnqueuePaths(ScanningTestCase):
+    """Only two paths create dots.mocr work: the pipeline and the button.
 
-    ``DOTS_MOCR_ENABLED`` defaults on, so this is the line that keeps
-    that safe: the switch gates *dispatch* of rows that already exist,
-    and nothing but a staff press creates them. Auto-dispatch is a
-    follow-up, and it has to delete this test on purpose rather than
-    arrive by accident.
+    The pipeline enqueue is #207; the button remains as the re-run and
+    backfill path (#190). Row creation is what costs GPU money, so a
+    new caller of the creators must be a deliberate decision that
+    updates this set -- not an accident this test lets through.
     """
 
-    def test_ensure_analyze_jobs_has_exactly_one_caller(self):
+    def test_the_row_creators_have_exactly_the_known_callers(self):
         import ast
         import pathlib
 
@@ -1525,29 +1524,24 @@ class TestNothingAutoEnqueues(ScanningTestCase):
         self.assertEqual(
             callers,
             {
-                # The staff button, and nothing else.
+                # The staff button (#190) and the pipeline (#207).
                 ("scanning/views_process.py", "ensure_analyze_jobs"),
+                ("scanning/services.py", "ensure_analyze_jobs"),
                 # The generic creator's two wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
                 ("scanning/jobs.py", "ensure_shard_jobs"),
             },
-            "Something new creates external-job rows. If a daemon path "
-            "now enqueues dots.mocr, that is the auto-dispatch follow-up "
-            "and this test should be updated deliberately.",
+            "Something new creates external-job rows. Row creation "
+            "starts paid GPU work, so update this set only on purpose.",
         )
 
     @override_settings(**DOTS)
-    def test_the_pipeline_creates_no_analyze_rows(self):
-        # run_full_pipeline owns CONVERT and no part of ANALYZE, so a
-        # normal upload must never start paid OCR.
+    def test_convert_rows_alone_submit_no_ocr(self):
+        # The convert stage creates no ANALYZE rows, so a tick over a
+        # convert-only scan must make no RunPod call.
         scan = ScanFactory()
         jobs.ensure_convert_jobs(scan, make_manifest(shard_count=2))
         self.assertEqual(analyze_jobs(scan), [])
-
-    @override_settings(**DOTS)
-    def test_a_daemon_tick_submits_nothing_without_a_press(self):
-        scan = ScanFactory()
-        jobs.ensure_convert_jobs(scan, make_manifest(shard_count=2))
         with (
             patch("scanning.s3_sync.s3_active", return_value=True),
             patch("scanning.runpod_client.submit_job") as submit,

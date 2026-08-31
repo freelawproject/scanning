@@ -23,11 +23,14 @@ result objects are deliberately **kept**: a future smart glue over page
 inserts and deletes re-reads them, so nothing may delete a raw input.
 Reading page numbers out of the glued JSON is issue #149.
 
-Who starts it: a staff-only button (``views_process.start_dots_mocr``),
-not the daemon. That is the point of #190 -- the stage costs real
-graphics processing unit (GPU) money per press, so a person decides
-while it is being debugged. The web process only writes rows; the daemon
-submits, polls and retries them.
+Who starts it: the upload pipeline (``services.run_full_pipeline``,
+issue #207) creates the rows for every new scan, next to the convert
+rows and gated the same way (``services._can_analyze``). The staff-only
+button (``views_process.start_dots_mocr``) remains as the manual way
+in: a re-run over an edited volume, or a backfill for scans uploaded
+while the stage was button-only (#190). Either way the web process and
+the pipeline only write rows; the daemon submits, polls and retries
+them.
 """
 
 from __future__ import annotations

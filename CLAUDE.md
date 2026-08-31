@@ -52,12 +52,14 @@ The legacy processing stages — in-process bitonal conversion, the YOLO
 `detect` and PaddleOCR `analyze` RunPod actions (and the whole
 blackletter-gpu-worker under `scanning/runpod/`), and their
 `RUNPOD_ENABLED=False` in-process fallbacks — are deleted. Bitonal came
-back as an external job, dots.mocr as a staff-started one, and the page
+back as an external job, dots.mocr as a pipeline-enqueued one (#207,
+with the staff button kept for re-runs), and the page
 numbers plus Issues as an apply pass on the collect tick (#149/#204,
 all below); still missing are the #151 approve button and the
 post-review stages (#195/#196), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
+  enqueues the dots.mocr read (#207) when `_can_analyze` allows,
   then either starts the bitonal conversion (`Status.AWAITING`) or
   parks the scan in `Status.AWAITING_VALIDATION`.
 - Every user-facing action that would re-trigger a legacy stage
@@ -217,21 +219,27 @@ trained on), tracked on `ExternalJob` rows at
 `submit_external_jobs` / `collect_external_jobs` daemon commands, and
 `views_process.start_dots_mocr` (the button). What must not be broken:
 
-- **A person starts it, the daemon runs it.** There is no automatic
-  enqueueing: a staff-only button on `/scan/process/` writes the rows and
-  returns, and the daemon submits, polls and retries them. That is
-  deliberate while the stage is debugged — every press costs GPU money.
-  `DOTS_MOCR_ENABLED` (on by default) gates *dispatch*, not enqueueing,
-  so it starts no work by itself. What keeps that true is structural, not
-  a promise: `ensure_analyze_jobs` is the only thing that creates ANALYZE
-  rows and `start_dots_mocr` is its only caller, held by
-  `TestNothingAutoEnqueues`. Auto-dispatch is a follow-up that has to
-  retire that test on purpose.
-  The request makes **no** call to RunPod, and it never cuts shards:
-  `sharding.committed_manifest` verifies the stored set with one
-  `head_object` on the original (size plus `Scan.page_count` *is* the
-  whole fingerprint), so a web pod never pulls a multi-GB PDF and never
-  reads `shards/` directly. A stale set is refused, not re-cut.
+- **The pipeline starts it, the daemon runs it** (#207).
+  `run_full_pipeline` creates the ANALYZE rows next to the CONVERT
+  rows, gated by `services._can_analyze` (committed shards,
+  `dots_mocr.enabled()`, S3 active — the mirror of `_can_convert`),
+  and the daemon submits, polls and retries them. The stage is
+  independent of the bitonal branch: it reads the *original* shards,
+  so a volume that parks unconverted still gets its read, and a lost
+  status guard abandons the ANALYZE rows beside the CONVERT ones. The
+  staff button on `/scan/process/` remains as the manual way in — a
+  re-run over an edited volume, or a backfill for scans uploaded while
+  the stage was button-only. Row creation is what costs GPU money, so
+  the creators' caller set stays pinned by an AST test
+  (`TestKnownEnqueuePaths`): exactly the pipeline and the button.
+  The button's request makes **no** call to RunPod, and it never cuts
+  shards: `sharding.committed_manifest` verifies the stored set with
+  one `head_object` on the original (size plus `Scan.page_count` *is*
+  the whole fingerprint), so a web pod never pulls a multi-GB PDF and
+  never reads `shards/` directly. A stale set is refused, not re-cut.
+  A `cancel_processing` does **not** touch a running read: the results
+  are kept, the apply defers a cancelled scan, and a later re-queue
+  reuses the completed run for free.
 - **The stage writes no scan status while it reads.** Progress lives
   only on the rows, read through `dots_mocr.run_summary` into the page
   context and `progress_api`. So a volume stays browsable and
