@@ -127,6 +127,12 @@ class Status(models.TextChoices):
     ERROR = "error", "Error"
     ERROR_MAX_RETRIES = "error_max_retries", "Error (retry cap hit)"
     ERROR_INTERRUPTED = "error_interrupted", "Error (interrupted too often)"
+    # Legacy (#219): the user cancel that wrote this was unreachable --
+    # no template ever rendered its button -- and is deleted. The value
+    # stays because historical rows hold it, and because the tests use
+    # it as a status the pipeline must not stomp. Nothing writes it now.
+    # A future cancel should abandon the job rows and leave the status
+    # to the daemon (#212), not revive this.
     CANCELLED = "cancelled", "Cancelled"
 
 

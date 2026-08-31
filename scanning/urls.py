@@ -53,7 +53,6 @@ from scanning.views_process import (
     add_page_insert,
     approve_page_completeness,
     assign_page,
-    cancel_processing,
     delete_page,
     dismiss_issue,
     process_actions,
@@ -143,9 +142,6 @@ urlpatterns = [
         "scans/<int:pk>/start-ocr/",
         start_dots_mocr,
         name="start_dots_mocr",
-    ),
-    path(
-        "scans/<int:pk>/cancel/", cancel_processing, name="cancel_processing"
     ),
     path("scans/<int:pk>/recalculate/", recalculate, name="recalculate"),
     path(

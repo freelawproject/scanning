@@ -30,9 +30,9 @@ Four properties are load-bearing and easy to break:
 
 - **Every write is a compare-and-swap** (:func:`_write`), so no lock is
   held across an HTTP call. The other writer is the web process, not a
-  second daemon: a user's cancel and the admin re-queue both call
-  :func:`abandon_open` from a request, and the loser's update simply
-  matches nothing.
+  second daemon: the admin re-queue, the admin scan deletion and the
+  dots.mocr start button all call into this module from a request, and
+  the loser's update simply matches nothing.
 - **A resubmission bumps ``attempt``**, re-addressing the result
   object. Doctor finishes a conversion after we stop listening, and
   RunPod's worker PUTs whether or not we are still reading, so an
@@ -344,13 +344,15 @@ def _write(job: ExternalJob, **fields) -> bool:
     each other. Nothing is locked across the HTTP call that produced the
     outcome, which is the point.
 
-    The writer to guard against today is the web process: a user's
-    cancel (``views_process.cancel_processing``), the dots.mocr start
-    button and the admin re-queue all call into this module from a
-    request, and a daemon that wrote PENDING over their CANCELLED would
-    run a shard nobody wants. One daemon runs, so daemon-against-daemon
-    is not the case being handled -- but this is also what makes a
-    second replica safe if one is ever deployed.
+    The writer to guard against today is the web process: the dots.mocr
+    start button, the admin re-queue and the admin scan deletion all
+    call into this module from a request, and a daemon that wrote
+    PENDING over their CANCELLED would run a shard nobody wants. The
+    user cancel was a fourth such writer until #219 deleted it as
+    unreachable, and whatever replaces it will be one again -- so the
+    guard stays whether or not a cancel exists. One daemon runs, so
+    daemon-against-daemon is not the case being handled -- but this is
+    also what makes a second replica safe if one is ever deployed.
 
     On success the in-memory instance is updated too, so a caller can
     chain another :func:`_write` against the new status.
