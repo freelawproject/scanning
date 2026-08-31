@@ -1183,18 +1183,33 @@ def recalculate_issues(scan: "Scan") -> None:
 
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
-
+    scan.s3_uploaded = False
+    scan.progress_message = "Done"
+    # Never a full save: the approve button (#151) writes
+    # PAGE_COMPLETENESS_REVIEW_DONE concurrently, and a full save off
+    # this instance would silently write a stale status over it. Save
+    # only the fields this function owns, and decide the status on the
+    # row as it is in the DB, not on the copy in memory.
+    scan.save(
+        update_fields=[
+            "ocr_results",
+            "page_count",
+            "page_map",
+            "missing_pages",
+            "s3_uploaded",
+            "progress_message",
+        ]
+    )
     # A recheck must not move a scan between review states (#154): a
     # scan in a page-completeness review state keeps it. The write to
     # PENDING_REVIEW stays for the legacy rows that already carry it.
-    if scan.status not in (
-        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
-        Status.PAGE_COMPLETENESS_REVIEW_DONE,
-    ):
-        scan.status = Status.PENDING_REVIEW
-    scan.s3_uploaded = False
-    scan.progress_message = "Done"
-    scan.save()
+    Scan.objects.filter(pk=scan.pk).exclude(
+        status__in=(
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        )
+    ).update(status=Status.PENDING_REVIEW)
+    scan.refresh_from_db(fields=["status"])
 
     # Suppression flags are curator decisions stored as Issue rows, not
     # derived from the page numbers, so a recheck keeps them (same
@@ -1223,10 +1238,11 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
     take (cancelled or moved between the caller's read and here) is
     left alone: its ``ocr_results`` were refreshed -- idempotent data
     -- but no Issues are rebuilt and no status moves. Once the scan is
-    READY, ``cancel_processing`` no longer matches it, so
-    :func:`recalculate_issues`'s own unguarded save can no longer
-    revive a cancelled scan; the remaining full-instance-save exposure
-    is the one the recheck view has always had.
+    READY, ``cancel_processing`` no longer matches it, and
+    :func:`recalculate_issues` never full-saves: it writes its data
+    fields with ``update_fields`` and decides the status with one
+    conditional DB update, so it can neither revive a cancelled scan
+    nor write a stale READY over a concurrent approval (#151).
 
     :param scan: The scan whose live run is fully glued.
     :param result_key: S3 key of the run's glued volume JSON.

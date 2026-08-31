@@ -22,6 +22,7 @@ from scanning.models import (
     JobStage,
     JobStatus,
     PageInsert,
+    Scan,
     Status,
 )
 from scanning.tests.test_dots_mocr_apply import ApplyRunsMixin
@@ -367,6 +368,30 @@ class TestRecomputePageNumberIssues(ScanningTestCase):
         self._recompute(scan)
 
         self.assertEqual(scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
+
+    def test_a_stale_recompute_cannot_undo_a_concurrent_approval(self):
+        """The approve button flips READY -> DONE while a recompute
+        holds a scan it fetched as READY. The recompute decides the
+        status on the row as it is in the DB, never on its own stale
+        copy, so the approval must survive the save."""
+        scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            start_page=1,
+            end_page=2,
+            page_count=2,
+            ocr_results=dots_results(),
+        )
+        stale = Scan.objects.get(pk=scan.pk)
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+
+        services.recalculate_issues(stale)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        self.assertEqual(stale.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        self.assertTrue(scan.page_map)
 
     def test_a_legacy_scan_is_told_instead(self):
         """The retired stage cannot read the volume again, so a rebuild

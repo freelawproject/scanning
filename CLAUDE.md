@@ -100,7 +100,10 @@ trigger off DONE writing **no** scan status, so redaction work never
 blocks either review. Both are parked human states outside
 `BUSY_STATUSES` (no polling, no sweep); `AWAITING_VALIDATION` now means
 "review-1 prerequisites outstanding". `recalculate_issues` preserves
-both (`PENDING_REVIEW` remains for legacy rows and step 2 only), and
+both (`PENDING_REVIEW` remains for legacy rows and step 2 only) with a
+conditional DB update over the row's *current* status, never a full
+save — a full save off a stale instance would silently write READY
+back over a concurrent approval — and
 `serve_scan_pdf` reads a missing preview under either as a failed S3
 pull (409 + reload hint) — READY implies the conversion finished or
 was skipped because the source is already bitonal (that copy nuance
