@@ -68,6 +68,7 @@ from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
     OPEN_JOB_STATUSES,
+    WAITING_JOB_STATUSES,
     ExternalJob,
     JobEngine,
     JobProvider,
@@ -954,6 +955,25 @@ def ensure_convert_jobs(scan, manifest: dict) -> list[ExternalJob]:
         stage=JobStage.CONVERT,
         engine=JobEngine.BITONAL,
         provider=JobProvider.DOCTOR,
+    )
+
+
+# ── intake ──────────────────────────────────────────────────────────
+def active_scan_count() -> int:
+    """Count the scans that hold unfinished work in an external queue.
+
+    What the daemon's intake cap is measured against (issue #218).
+    Scans, not rows, because a scan's whole shard set enters every
+    queue at once; every stage, because it charges all of them.
+
+    :returns: How many scans hold at least one waiting job row.
+    :rtype: int
+    """
+    return (
+        ExternalJob.objects.filter(status__in=WAITING_JOB_STATUSES)
+        .values("scan_id")
+        .distinct()
+        .count()
     )
 
 

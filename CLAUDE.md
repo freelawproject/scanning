@@ -459,6 +459,38 @@ trained on), tracked on `ExternalJob` rows at
   SIGKILL orphans in the system temp dir. Off under TESTING; the
   command's tests point `gettempdir` at a scratch root.
 
+## Intake backpressure (issue #218)
+
+`process_next_scan` claims a QUEUED scan only while fewer than
+`DAEMON_MAX_ACTIVE_SCANS` (5) scans hold unfinished external work
+(`jobs.active_scan_count`). It is the daemon's only backpressure:
+uncapped intake put 2023 conversion rows behind 27 parked scans on
+2026-08-31, three times what the 6-hour
+`DAEMON_JOB_MAX_QUEUE_SECONDS` ceiling can drain, and 29 volumes died
+of it.
+
+- **The gate is on the claim, not the dispatch after it.** A refused
+  scan stays QUEUED — nothing times out there — instead of transiting
+  PROCESSING for nothing. The admin re-queue is safe at any batch size.
+- **Recovery runs first and unconditionally**: returning a scan the
+  daemon dropped is not intake.
+- **Scans, not rows, over every stage.** A scan's whole shard set
+  enters every queue at once. Counting `CONVERT` alone would watch the
+  wrong queue: doctor drains ~100 rows/h, dots.mocr 24-36.
+- **`COMPLETED` does not hold a slot** (`WAITING_JOB_STATUSES` is
+  `OPEN_JOB_STATUSES` minus it): those rows wait on the merge, the glue
+  or the apply, and a failed merge leaves one nothing moves again.
+- **The knob moves by its arithmetic**: slots × the largest volume's
+  shards must clear `DAEMON_JOB_MAX_QUEUE_SECONDS` at the slowest
+  queue's rate. 5 × ~20 shards is ~100 dots.mocr rows, ~4.2h against
+  6h. Ten slots would not fit.
+- No deadlock — the submit and collect ticks drain regardless — but a
+  stage switched off with rows still PENDING holds its slots until the
+  queue deadline expires them. The staff buttons bypass the gate: one
+  scan at a time, from a request.
+- One log line per crossing (WARNING pausing, INFO resuming), the
+  loud-then-quiet shape the glue and apply retries use.
+
 ## Detection Workflow
 
 YOLO models detect elements on each page (captions, key icons, headnotes, etc.) and store them as `Detection` records with a confidence score. Users review detections in the process viewer (step 2) and can:
