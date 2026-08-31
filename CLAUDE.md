@@ -225,8 +225,13 @@ trained on), tracked on `ExternalJob` rows at
   `dots_mocr.enabled()`, S3 active — the mirror of `_can_convert`),
   and the daemon submits, polls and retries them. The stage is
   independent of the bitonal branch: it reads the *original* shards,
-  so a volume that parks unconverted still gets its read, and a lost
-  status guard abandons the ANALYZE rows beside the CONVERT ones. The
+  so a volume that parks unconverted still gets its read. A lost
+  status guard hands back only the *unstarted* ANALYZE rows (PENDING
+  plus in-flight, via `abandon_open(statuses=...)`): the claim is lost
+  most often to the daemon's own shutdown — the SIGTERM handler
+  re-queues mid-flight scans and returns, so the pipeline continues on
+  a scan it no longer holds — and a COMPLETED row is a paid result the
+  carry re-reads on that retry. The
   staff button on `/scan/process/` remains as the manual way in — a
   re-run over an edited volume, or a backfill for scans uploaded while
   the stage was button-only. Row creation is what costs GPU money, so

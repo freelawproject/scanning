@@ -1363,13 +1363,25 @@ def run_full_pipeline(scan_pk: int) -> None:
                     )
 
         if not still_ours and analyze_created:
-            # Same reasoning as the CONVERT abandonment above, for
-            # whichever branch lost the guard: OCR rows for a volume
-            # somebody stopped would read shards nobody wants.
+            # The claim was lost -- any writer that moved the scan off
+            # PROCESSING, most often the daemon's own shutdown: the
+            # SIGTERM handler re-queues mid-flight scans and *returns*,
+            # so this very pipeline continues on a scan it no longer
+            # holds. That is a retry, not an end, so hand back only the
+            # unstarted work: a PENDING row of a stopped scan would
+            # still be submitted and paid (submit_pending does not read
+            # scan status), but a COMPLETED row is a paid result the
+            # carry re-reads on the retry -- cancelling it would re-pay
+            # whole volumes on every deploy that catches a pipeline
+            # mid-shard.
+            from scanning.models import IN_FLIGHT_JOB_STATUSES
+
             jobs.abandon_open(
                 scan,
                 "Scan left PROCESSING before its OCR read started",
                 stage=JobStage.ANALYZE,
+                statuses=frozenset({JobStatus.PENDING})
+                | IN_FLIGHT_JOB_STATUSES,
             )
 
         pushed = _push_processing_files_to_s3(scan_pk)

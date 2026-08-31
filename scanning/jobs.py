@@ -1700,6 +1700,7 @@ def abandon_open(
     reason: str,
     stage: str | None = None,
     engine: str | None = None,
+    statuses: frozenset = OPEN_JOB_STATUSES,
 ) -> int:
     """Cancel a scan's open jobs, optionally for one engine only.
 
@@ -1717,6 +1718,14 @@ def abandon_open(
     re-queue re-runs ``run_full_pipeline``, which owns ``CONVERT``
     whichever engine serves it, and owns no part of ``ANALYZE``.
 
+    ``statuses`` narrows the default further for a caller whose stop is
+    a *retry*, not an end. The pipeline's lost-claim hand-back keeps
+    ``COMPLETED`` rows: those are paid results the carry
+    (:func:`_reusable_results`) re-reads on the retry, and the claim is
+    lost most often to the daemon's own shutdown -- every deploy that
+    catches a pipeline mid-flight -- so cancelling them would re-pay
+    whole volumes routinely, not rarely.
+
     Each cancelled row's provider job is cancelled too, so a GPU worker
     stops billing for output nobody will read.
 
@@ -1724,10 +1733,12 @@ def abandon_open(
     :param reason: Recorded on each row for the audit trail.
     :param stage: Limit to one :class:`~scanning.models.JobStage`.
     :param engine: Limit to one :class:`~scanning.models.JobEngine`.
+    :param statuses: The statuses to treat as open. Narrow, never
+        widen: ``CONSUMED`` and the dead statuses must stay terminal.
     :returns: How many rows were cancelled.
     :rtype: int
     """
-    rows = ExternalJob.objects.filter(scan=scan, status__in=OPEN_JOB_STATUSES)
+    rows = ExternalJob.objects.filter(scan=scan, status__in=statuses)
     if stage is not None:
         rows = rows.filter(stage=stage)
     if engine is not None:

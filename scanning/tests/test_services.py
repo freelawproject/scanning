@@ -2476,6 +2476,47 @@ class TestFullPipelineOcrEnqueue(TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual({row.status for row in rows}, {JobStatus.CANCELLED})
 
+    def test_a_lost_claim_keeps_carried_results_carryable(self):
+        """The claim is lost most often to the daemon's own shutdown,
+        which re-queues the scan and returns -- a retry, not an end. A
+        carried COMPLETED row is a paid result the retry re-reads, so
+        the hand-back cancels only the unstarted rows."""
+        from scanning import dots_mocr
+        from scanning.models import ExternalJob, JobStatus
+
+        scan = self._scan(pages=2)
+        manifest = self._manifest(shard_count=2)
+        old = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        ExternalJob.objects.filter(pk=old[0].pk).update(
+            status=JobStatus.COMPLETED,
+            result_key="jobs/analyze/dots_mocr/r1-s0-a1.json",
+        )
+        ExternalJob.objects.filter(pk=old[1].pk).update(
+            status=JobStatus.FAILED
+        )
+
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            self.assertLogs("scanning.services", level="WARNING"),
+        ):
+            scan = self._run(scan, manifest, cancel_midway=True)
+
+        self.assertEqual(scan.status, Status.CANCELLED)
+        carried, pending = dots_mocr.live_analyze_jobs(scan)
+        self.assertEqual(carried.status, JobStatus.COMPLETED)
+        self.assertEqual(pending.status, JobStatus.CANCELLED)
+
+        # The retry (an admin re-queue) carries the kept result again.
+        type(scan).objects.filter(pk=scan.pk).update(status=Status.PROCESSING)
+        with patch("scanning.s3_sync.object_exists", return_value=True):
+            scan = self._run(scan, manifest)
+        fresh = dots_mocr.live_analyze_jobs(scan)
+        self.assertEqual(fresh[0].status, JobStatus.COMPLETED)
+        self.assertEqual(
+            fresh[0].result_key, "jobs/analyze/dots_mocr/r1-s0-a1.json"
+        )
+        self.assertEqual(fresh[1].status, JobStatus.PENDING)
+
     def test_a_requeue_reuses_a_consumed_ocr_run(self):
         """An applied run is history nobody pays for twice."""
         from scanning import dots_mocr
