@@ -399,3 +399,67 @@ class TestIntakeCap(TestCase):
         self.assertEqual(levels, ["WARNING", "INFO"])
         self.assertIn("intake paused", logs.records[0].getMessage())
         self.assertIn("intake resumed", logs.records[1].getMessage())
+
+
+class TestIntakeCapUnderInterruption(TestCase):
+    """A killed daemon changes Scan.status, never the job rows.
+
+    The cap counts rows, so an interrupted scan keeps the slot its
+    running jobs really occupy -- and frees it when they finish, which
+    is what lets the scan win a claim and be finished (issue #218).
+    """
+
+    def _scan_with_rows(self, status):
+        """Create a PROCESSING scan holding one job row at ``status``."""
+        scan = ScanFactory(status=Status.PROCESSING)
+        ExternalJobFactory(
+            scan=scan,
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            status=status,
+        )
+        return scan
+
+    def test_a_re_queued_scan_keeps_its_slot(self):
+        """SIGTERM re-queues the scan; doctor is still converting it."""
+        scan = self._scan_with_rows(JobStatus.SUBMITTED)
+
+        Scan.requeue_or_flag_interrupted(
+            Scan.objects.filter(pk=scan.pk), requeue_message="killed"
+        )
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(jobs.active_scan_count(), 1)
+
+    @override_settings(DAEMON_MAX_INTERRUPTIONS=0)
+    def test_a_flagged_scan_keeps_its_slot(self):
+        """ERROR_INTERRUPTED is a scan verdict, not a provider one."""
+        scan = self._scan_with_rows(JobStatus.IN_PROGRESS)
+
+        Scan.requeue_or_flag_interrupted(
+            Scan.objects.filter(pk=scan.pk), requeue_message="killed"
+        )
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.ERROR_INTERRUPTED)
+        self.assertEqual(jobs.active_scan_count(), 1)
+
+    def test_an_interrupted_scan_frees_its_own_slot(self):
+        """No wedge: the daemon drains the rows without a claim.
+
+        The submit and collect ticks read rows, not Scan.status, so the
+        work an interrupted scan is holding a slot for finishes anyway.
+        It then needs a claim -- and by then it is not blocking itself.
+        """
+        scan = self._scan_with_rows(JobStatus.SUBMITTED)
+        Scan.requeue_or_flag_interrupted(
+            Scan.objects.filter(pk=scan.pk), requeue_message="killed"
+        )
+
+        ExternalJob.objects.filter(scan=scan).update(
+            status=JobStatus.COMPLETED
+        )
+
+        self.assertEqual(jobs.active_scan_count(), 0)
