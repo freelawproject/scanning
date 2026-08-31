@@ -8,6 +8,17 @@ buttons in place after a page is marked for or restored from deletion).
 The OCR (dots.mocr) control is staff-only and moves no scan status, so
 its state comes from `dots_run` -- a summary of the ExternalJob rows
 (issue #190) -- rather than from `is_processing`.
+
+The review-1 controls (issue #151) read `page_review_ready` /
+`page_review_done`, the two #154 statuses. Approving is the gate: it is
+what reveals "Next: Detect".
+
+"Validate" and "Re-validate" are offered to a legacy scan only
+(`has_legacy_ocr`). A new-pipeline volume needs no re-run: sharding,
+the bitonal conversion and dots.mocr are deterministic, so the view
+refuses one for good and says so. A legacy scan otherwise keeps the
+whole old bar, so the rows that never reach the #154 states still
+reach step 2.
 {% endcomment %}
 {% if is_processing %}
 
@@ -39,20 +50,41 @@ its state comes from `dots_run` -- a summary of the ExternalJob rows
     {% endif %}
   </form>
   {% elif not scan.page_count %}
+    {% if has_legacy_ocr %}
   <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
     {% csrf_token %}
     <button type="submit" class="btn-primary text-sm" title="Run the full processing pipeline: bitonal conversion, OCR, detection, and page number validation on RunPod (incurs costs $$$)" onclick="return confirm('Validate will run YOLO detection and PaddleOCR validation on RunPod. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Validate</button>
   </form>
+    {% endif %}
   {% else %}
   <form method="post" action="{% url 'recalculate' scan.pk %}" class="inline">
     {% csrf_token %}
-    <button type="submit" class="btn-primary text-sm" title="Re-check page numbers and issues using existing OCR results without re-running the pipeline">Recheck</button>
+    <button type="submit" class="btn-outline text-sm" title="Read the stored page numbers again and rebuild the list of issues. This does not run OCR.">Recompute page number issues</button>
   </form>
+  {% if page_review_ready %}
+  <form method="post" action="{% url 'approve_page_completeness' scan.pk %}" class="inline">
+    {% csrf_token %}
+    <button type="submit" class="btn-primary text-sm" title="Confirm this volume is page complete: no missing, duplicated, mislabeled or blurry pages"{% if issues or missing_pages %} onclick="return confirm('This scan still lists issues or missing pages. Approve it as page complete anyway?');"{% endif %}>I reviewed this scan and it is complete</button>
+  </form>
+  {% elif page_review_done %}
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed this volume is page complete">&#10003; Page review done</span>
+  {% endif %}
+  {% if has_legacy_ocr %}
   <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
     {% csrf_token %}
     <button type="submit" class="btn-outline text-sm" title="Re-run the full pipeline from scratch: bitonal, OCR, detection, and validation on RunPod (incurs costs $$$)" onclick="return confirm('Re-validate will run YOLO detection and PaddleOCR validation on RunPod. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Re-validate</button>
   </form>
-  {% if not issues and not missing_pages %}
+  {% endif %}
+  {% comment %}
+    `and` binds tighter than `or`: approval is the gate for a
+    new-pipeline scan, and a legacy scan keeps the old "no open issues"
+    rule. The two clauses cover every scan between them, so a volume
+    that is neither -- one still parked in AWAITING_VALIDATION, or
+    errored -- is offered nothing. It used to read `not
+    page_review_ready` here, which showed a paid RunPod confirm to a
+    scan whose review has not begun, only for start_detect to refuse it.
+  {% endcomment %}
+  {% if page_review_done or has_legacy_ocr and not issues and not missing_pages %}
   <form method="post" action="{% url 'start_detect' scan.pk %}" class="inline">
     {% csrf_token %}
     {% if has_detections %}

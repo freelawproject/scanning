@@ -48,8 +48,10 @@ from django.conf import settings
 from django.db.models import Case, F, Value, When
 
 from scanning.models import (
+    DEAD_JOB_STATUSES,
     CheckName,
     Detection,
+    ExternalJob,
     Issue,
     JobStage,
     JobStatus,
@@ -1005,6 +1007,50 @@ def _expected_range(scan: "Scan") -> tuple[int | None, int | None]:
     return scan.start_page or 1, scan.end_page
 
 
+#: Prefix :mod:`scanning.page_numbers` stamps on the ``zone`` of every
+#: entry it reads off a dots.mocr run (``dots-header``,
+#: ``dots-footer``). It is what tells a new-pipeline page number from a
+#: legacy PaddleOCR one.
+DOTS_ZONE_PREFIX = "dots-"
+
+
+def has_legacy_ocr(scan: "Scan") -> bool:
+    """Return whether a scan's page numbers came from the retired OCR.
+
+    The legacy validate stage (PaddleOCR over a page-number crop) no
+    longer runs anywhere (#173), so a recompute over its readings can
+    only reproduce them. Review 1 says so instead of pretending to redo
+    the work (#151).
+
+    Two signals answer it, because neither alone is enough. A ``dots-``
+    zone proves the new stage wrote the entry, but a volume dots read
+    with no number on any page carries none. An ``ANALYZE`` job row
+    proves the new stage ran at all, and it outlives a recompute. A
+    scan with no readings at all is not legacy: it has nothing to
+    recompute either way, and the caller handles that first.
+
+    A dead row does not count: a run that failed, was cancelled, or
+    expired delivered nothing, so the scan's readings are still the
+    retired stage's, and "run OCR again" is the right advice for it.
+
+    :param scan: The scan to classify.
+    :returns: ``True`` when the readings are the retired stage's.
+    :rtype: bool
+    """
+    if not scan.ocr_results:
+        return False
+    if any(
+        (entry.get("zone") or "").startswith(DOTS_ZONE_PREFIX)
+        for entry in scan.ocr_results
+    ):
+        return False
+    return (
+        not ExternalJob.objects.filter(scan=scan, stage=JobStage.ANALYZE)
+        .exclude(status__in=DEAD_JOB_STATUSES)
+        .exists()
+    )
+
+
 def _is_manual_read(result: dict) -> bool:
     """Return whether a per-page page number was entered by hand.
 
@@ -1136,28 +1182,56 @@ def recalculate_issues(scan: "Scan") -> None:
     # Refresh page_count opportunistically: the PDF has not changed since
     # validation, and in production the local copy is usually absent
     # because rechecks run on a web pod that never pulled it from S3.
+    # Every failure here is survivable -- an absent copy, a partial one,
+    # a file that is not a PDF at all -- and the stored count stands.
+    # The recompute is a read of stored data, and it must not 500 over
+    # a file it does not need (#153/#151).
     try:
         pdf_path = scan.pdf_path
     except FileNotFoundError:
         pdf_path = None
     if pdf_path:
-        with fitz.open(pdf_path) as pdf_fitz:
-            scan.page_count = len(pdf_fitz)
+        try:
+            with fitz.open(pdf_path) as pdf_fitz:
+                scan.page_count = len(pdf_fitz)
+        except Exception:
+            logger.warning(
+                "recalculate_issues: scan %s: could not read %s for a "
+                "page count; keeping the stored %s",
+                scan.pk,
+                pdf_path,
+                scan.page_count,
+            )
 
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
-
+    scan.s3_uploaded = False
+    scan.progress_message = "Done"
+    # Never a full save: the approve button (#151) writes
+    # PAGE_COMPLETENESS_REVIEW_DONE concurrently, and a full save off
+    # this instance would silently write a stale status over it. Save
+    # only the fields this function owns, and decide the status on the
+    # row as it is in the DB, not on the copy in memory.
+    scan.save(
+        update_fields=[
+            "ocr_results",
+            "page_count",
+            "page_map",
+            "missing_pages",
+            "s3_uploaded",
+            "progress_message",
+        ]
+    )
     # A recheck must not move a scan between review states (#154): a
     # scan in a page-completeness review state keeps it. The write to
     # PENDING_REVIEW stays for the legacy rows that already carry it.
-    if scan.status not in (
-        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
-        Status.PAGE_COMPLETENESS_REVIEW_DONE,
-    ):
-        scan.status = Status.PENDING_REVIEW
-    scan.s3_uploaded = False
-    scan.progress_message = "Done"
-    scan.save()
+    Scan.objects.filter(pk=scan.pk).exclude(
+        status__in=(
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        )
+    ).update(status=Status.PENDING_REVIEW)
+    scan.refresh_from_db(fields=["status"])
 
     # Suppression flags are curator decisions stored as Issue rows, not
     # derived from the page numbers, so a recheck keeps them (same
@@ -1186,10 +1260,11 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
     take (cancelled or moved between the caller's read and here) is
     left alone: its ``ocr_results`` were refreshed -- idempotent data
     -- but no Issues are rebuilt and no status moves. Once the scan is
-    READY, ``cancel_processing`` no longer matches it, so
-    :func:`recalculate_issues`'s own unguarded save can no longer
-    revive a cancelled scan; the remaining full-instance-save exposure
-    is the one the recheck view has always had.
+    READY, ``cancel_processing`` no longer matches it, and
+    :func:`recalculate_issues` never full-saves: it writes its data
+    fields with ``update_fields`` and decides the status with one
+    conditional DB update, so it can neither revive a cancelled scan
+    nor write a stale READY over a concurrent approval (#151).
 
     :param scan: The scan whose live run is fully glued.
     :param result_key: S3 key of the run's glued volume JSON.

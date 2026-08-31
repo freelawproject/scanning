@@ -311,6 +311,10 @@ function renderPreviewBanner(previewKind, onLoadOriginal) {
  * @param {HTMLElement} pageDiv - The page container element.
  * @param {string} [labelPrefix="Page"] - Prefix for the deletion label.
  * @param {Function} [onDelete] - Callback to re-bind delete handler after undo.
+ *
+ * On success this calls the optional `window.onPageEditSaved` hook, as
+ * `undoDeletePage` does. Step 1 defines it to confirm the save to the
+ * curator (issue #151); step 2 leaves it undefined and shows nothing.
  */
 function deletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelete) {
     labelPrefix = labelPrefix || 'Page';
@@ -328,6 +332,9 @@ function deletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelete) {
             markPageAsDeleted(pageDiv, pdfPage, labelPrefix, csrfToken, docId, onDelete);
             if (typeof window.refreshProcessActionBar === 'function') {
                 window.refreshProcessActionBar();
+            }
+            if (typeof window.onPageEditSaved === 'function') {
+                window.onPageEditSaved();
             }
         }
     });
@@ -402,6 +409,9 @@ function undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelet
             if (typeof window.refreshProcessActionBar === 'function') {
                 window.refreshProcessActionBar();
             }
+            if (typeof window.onPageEditSaved === 'function') {
+                window.onPageEditSaved();
+            }
         }
     });
 }
@@ -410,7 +420,8 @@ function undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelet
  * Show a stacking toast notification that auto-dismisses after 5 seconds.
  *
  * @param {string} message - Text to display.
- * @param {string} [type="error"] - "error" (red) or "info" (blue).
+ * @param {string} [type="error"] - "error" (red), "info" (blue), or
+ *     "success" (green).
  */
 function showToast(message, type) {
     type = type || 'error';
@@ -422,7 +433,9 @@ function showToast(message, type) {
         document.body.appendChild(container);
     }
     var toast = document.createElement('div');
-    var bg = type === 'error' ? '#dc2626' : '#2563eb';
+    var bg = '#2563eb';
+    if (type === 'error') { bg = '#dc2626'; }
+    else if (type === 'success') { bg = '#059669'; }
     toast.style.cssText = 'background:' + bg + ';color:#fff;padding:10px 16px;border-radius:6px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.3);opacity:1;transition:opacity 0.4s;max-width:320px;pointer-events:auto;display:flex;align-items:center;gap:10px;';
 
     var text = document.createElement('span');

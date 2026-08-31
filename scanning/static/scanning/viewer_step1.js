@@ -415,19 +415,20 @@ document.addEventListener('DOMContentLoaded', function () {
                         editBtn.className = 'ocr-tag miss editable-page';
                         editBtn.innerHTML = '[no page # found — click to assign]';
                     }
+                    window.onPageEditSaved();
                     // The server already rebuilt page_map, but the rendered
-                    // duplicate/missing badges and the issue cards are now stale.
-                    // Surface the pending banner so the user can click Recheck to
-                    // refresh them (a cheap recalculate, no RunPod rebuild needed).
-                    // Only set the edit-specific wording when nothing was pending
-                    // yet (banner hidden). If a page insert/deletion is already
-                    // pending, leave its "rebuild to apply" text: Recheck is hidden
-                    // in that state and Rebuild & Validate handles both.
+                    // duplicate/missing badges and the issue cards are now
+                    // stale. Surface the pending banner so the user can
+                    // recompute them (no RunPod, no rebuild). Only set the
+                    // edit-specific wording when nothing was pending yet
+                    // (banner hidden): a pending insert or deletion keeps its
+                    // own text, which says the same thing about its own edit.
                     var banner = document.getElementById('pending-banner');
                     if (banner && banner.hidden) {
                         banner.textContent =
-                            'Page numbers changed. Click Recheck to refresh ' +
-                            'duplicate flags and issues.';
+                            'Page numbers changed. Click "Recompute page ' +
+                            'number issues" to refresh the duplicate flags ' +
+                            'and the issues.';
                         banner.hidden = false;
                     }
                     var badge = document.getElementById('pending-badge');
@@ -448,6 +449,15 @@ document.addEventListener('DOMContentLoaded', function () {
 
         return div;
     }
+
+    // Every page edit of review 1 is recorded, but nothing applies it to
+    // the volume yet (issue #151), so say both. shared.js calls this
+    // after a page deletion and after an undo; the page-number edit and
+    // the insert upload call it directly.
+    var SAVED_MESSAGE = 'Saved. We do not apply this change to the volume yet.';
+    window.onPageEditSaved = function () {
+        showToast(SAVED_MESSAGE, 'success');
+    };
 
     // --- Delete page ---
     // deletePage is defined in shared.js; call resolveIssuesForPage after
@@ -691,6 +701,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 '<div class="canvas-wrapper">' +
                 '  <img src="' + data.image_url + '" class="inserted-image">' +
                 '</div>';
+            if (data && data.status === 'ok') { window.onPageEditSaved(); }
         })
         .catch(function (err) {
             if (placeholder) placeholder.innerHTML = '<p>Upload failed. Try again.</p>';
