@@ -60,10 +60,13 @@ LEGACY_OCR_RECOMPUTE_MESSAGE = (
 )
 RECOMPUTE_DONE_MESSAGE = "The page number issues are recomputed."
 REVALIDATE_UNAVAILABLE_MESSAGE = (
-    "This scan does not need a re-run. Sharding, the bitonal "
-    "conversion and dots.mocr are deterministic, so they would give "
-    "the same result again. Ask an admin to re-queue the scan if it "
-    "really must be processed a second time."
+    "This scan cannot be re-run from here. Sharding, the bitonal "
+    "conversion and dots.mocr are deterministic, so a re-run adds "
+    "nothing. Ask an admin to re-queue the scan if it really must be "
+    "processed a second time."
+)
+PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE = (
+    "Approve the page completeness review first. Then continue to detection."
 )
 PENDING_EDITS_SAVED_MESSAGE = (
     "Your page inserts and deletes are saved. We do not apply them to "
@@ -954,6 +957,13 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     has detections goes straight to step 2. Running detection anew
     fails with the unified pipeline-paused message.
 
+    Approval is the gate (#151), in the view and not only in the bar:
+    a scan still in READY_FOR_PAGE_COMPLETENESS_REVIEW is sent back to
+    step 1, so a direct POST cannot walk past the review the template
+    hides the button for. READY is the one status where the approval
+    is pending; a legacy scan never holds it, so the old rows keep
+    their shortcut.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page (step 2).
@@ -962,6 +972,11 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     guard = _block_if_pending_changes(request, scan)
     if guard:
         return guard
+    if scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW:
+        messages.warning(request, PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE)
+        return redirect(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+        )
     if Detection.objects.filter(scan=scan).exists():
         # Detections already exist (from the old full pipeline).
         return redirect(
@@ -1175,10 +1190,15 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
             request.user.pk,
         )
         messages.success(request, PAGE_REVIEW_APPROVED_MESSAGE)
-    elif scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE:
-        messages.info(request, PAGE_REVIEW_ALREADY_DONE_MESSAGE)
     else:
-        messages.warning(request, PAGE_REVIEW_NOT_READY_MESSAGE)
+        # The write lost, so the fetch above is stale: a concurrent
+        # approval moved the row between the read and the write.
+        # Re-read it so the message describes the row as it is.
+        scan.refresh_from_db()
+        if scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE:
+            messages.info(request, PAGE_REVIEW_ALREADY_DONE_MESSAGE)
+        else:
+            messages.warning(request, PAGE_REVIEW_NOT_READY_MESSAGE)
     return redirect(
         reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
     )

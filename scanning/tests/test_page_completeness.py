@@ -29,6 +29,7 @@ from scanning.tests.test_views import ScanningTestCase
 from scanning.views_process import (
     LEGACY_OCR_RECOMPUTE_MESSAGE,
     PAGE_REVIEW_ALREADY_DONE_MESSAGE,
+    PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE,
     PAGE_REVIEW_APPROVED_MESSAGE,
     PAGE_REVIEW_NOT_READY_MESSAGE,
     PENDING_EDITS_SAVED_MESSAGE,
@@ -95,6 +96,25 @@ class TestHasLegacyOcr(ScanningTestCase):
         """It has nothing to recompute either way, and the view
         answers that case before it asks this one."""
         self.assertFalse(services.has_legacy_ocr(ScanFactory()))
+
+    def test_a_dead_run_does_not_flip_a_legacy_scan(self):
+        """A failed, cancelled or expired run delivered nothing, so
+        the scan's readings are still the retired stage's, and "run
+        OCR again" stays the right advice."""
+        for status in (
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+            JobStatus.EXPIRED,
+        ):
+            with self.subTest(status=status):
+                scan = ScanFactory(ocr_results=legacy_results())
+                ExternalJobFactory(
+                    scan=scan,
+                    stage=JobStage.ANALYZE,
+                    engine=JobEngine.DOTS_MOCR,
+                    status=status,
+                )
+                self.assertTrue(services.has_legacy_ocr(scan))
 
 
 class TestApprovePageCompleteness(ScanningTestCase):
@@ -218,6 +238,83 @@ class TestApprovalSurvivesTheApplyPass(ApplyRunsMixin, ScanningTestCase):
         self.assertEqual(applied, 0)
         self.assertEqual(scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
         self.assertEqual(scan.ocr_results, [])
+
+
+class TestDetectRequiresTheApproval(ScanningTestCase):
+    """The view enforces the gate the bar draws (#151).
+
+    A scan still in READY has a pending approval by definition, so a
+    direct POST to ``start_detect`` is sent back to step 1. A legacy
+    scan never holds READY, so the old rows keep their shortcut --
+    ``TestStartDetectSkipsIfExists`` covers that side.
+    """
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+
+    def _detect(self, scan):
+        """POST the detect action and return the response.
+
+        :param scan: The scan to act on.
+        :returns: The redirect response.
+        """
+        response = self.client.post(
+            reverse("start_detect", kwargs={"pk": scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        return response
+
+    def _make_detection(self, scan):
+        """Give the scan one detection, so the step-2 shortcut opens.
+
+        :param scan: The scan to attach it to.
+        """
+        Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="KEY",
+            label_id=0,
+            confidence=0.9,
+            x0=0,
+            y0=0,
+            x1=10,
+            y1=10,
+            img_width=100,
+            img_height=100,
+        )
+
+    def test_a_ready_scan_is_sent_back_to_its_review(self):
+        scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            page_count=2,
+            ocr_results=dots_results(),
+        )
+        self._make_detection(scan)
+
+        response = self._detect(scan)
+
+        self.assertEqual(
+            response["Location"],
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1",
+        )
+        flashed = [str(m) for m in get_messages(response.wsgi_request)]
+        self.assertIn(PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE, flashed)
+
+    def test_an_approved_scan_passes_to_step_2(self):
+        scan = ScanFactory(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
+            page_count=2,
+            ocr_results=dots_results(),
+        )
+        self._make_detection(scan)
+
+        response = self._detect(scan)
+
+        self.assertEqual(
+            response["Location"],
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2",
+        )
 
 
 class TestRecomputePageNumberIssues(ScanningTestCase):

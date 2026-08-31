@@ -121,7 +121,10 @@ approve button the view refuses.
   confirm and the view obeys, because the curator, not the model, is
   the judge of a suspicion.
 - **Approving is the gate for "Next: Detect"**, which is why the button
-  cannot be gated on an empty issue list. A legacy `PENDING_REVIEW`
+  cannot be gated on an empty issue list. The view enforces it too:
+  `start_detect` sends a scan still in READY back to step 1, so a
+  direct POST cannot walk past the review. READY is the one status
+  where the approval is pending, and a legacy scan never holds it. A legacy `PENDING_REVIEW`
   scan never reaches the #154 states, so it keeps the old bar (the old
   "no open issues" rule, and "Validate"/"Re-validate") and still
   reaches step 2. Those two clauses are the whole gate on purpose: a

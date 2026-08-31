@@ -48,6 +48,7 @@ from django.conf import settings
 from django.db.models import Case, F, Value, When
 
 from scanning.models import (
+    DEAD_JOB_STATUSES,
     CheckName,
     Detection,
     ExternalJob,
@@ -1006,6 +1007,10 @@ def has_legacy_ocr(scan: "Scan") -> bool:
     scan with no readings at all is not legacy: it has nothing to
     recompute either way, and the caller handles that first.
 
+    A dead row does not count: a run that failed, was cancelled, or
+    expired delivered nothing, so the scan's readings are still the
+    retired stage's, and "run OCR again" is the right advice for it.
+
     :param scan: The scan to classify.
     :returns: ``True`` when the readings are the retired stage's.
     :rtype: bool
@@ -1017,9 +1022,11 @@ def has_legacy_ocr(scan: "Scan") -> bool:
         for entry in scan.ocr_results
     ):
         return False
-    return not ExternalJob.objects.filter(
-        scan=scan, stage=JobStage.ANALYZE
-    ).exists()
+    return (
+        not ExternalJob.objects.filter(scan=scan, stage=JobStage.ANALYZE)
+        .exclude(status__in=DEAD_JOB_STATUSES)
+        .exists()
+    )
 
 
 def _is_manual_read(result: dict) -> bool:
