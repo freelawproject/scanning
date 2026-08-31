@@ -173,6 +173,13 @@ def ensure_analyze_jobs(scan, manifest: dict) -> list[ExternalJob]:
     (failed, cancelled, expired) is replaced instead, since nothing will
     move it again.
 
+    A replacement run does not re-read shards already read:
+    ``reuse_results`` carries a prior result forward whenever the
+    shard's identity is unchanged and its result object is still on S3
+    (``jobs._reusable_results``). This engine can carry, because its
+    per-shard results are deliberately kept after the apply; the
+    bitonal merge deletes its results, so the convert stage must not.
+
     :param scan: The scan to read.
     :param manifest: The committed shard manifest.
     :returns: The live run's rows, ordered by shard index.
@@ -184,6 +191,7 @@ def ensure_analyze_jobs(scan, manifest: dict) -> list[ExternalJob]:
         stage=JobStage.ANALYZE,
         engine=JobEngine.DOTS_MOCR,
         provider=JobProvider.RUNPOD,
+        reuse_results=True,
     )
 
 

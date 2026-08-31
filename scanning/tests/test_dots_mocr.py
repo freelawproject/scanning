@@ -1551,6 +1551,165 @@ class TestKnownEnqueuePaths(ScanningTestCase):
 
 
 @override_settings(**DOTS)
+class TestShardResultCarryOver(ScanningTestCase):
+    """A replacement run re-reads only the shards that need it.
+
+    A shard whose identity is unchanged and whose result object is
+    still on S3 enters the new run as a COMPLETED row pointing at the
+    prior attempt's object (``jobs._reusable_results``). The identity
+    includes the shard's byte size, so a re-uploaded original with the
+    same page count carries nothing.
+    """
+
+    def _dead_run(self, manifest):
+        """Build a run with shard 0 COMPLETED and shard 1 FAILED."""
+        scan = ScanFactory()
+        rows = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.COMPLETED,
+            result_key="jobs/analyze/dots_mocr/r1-s0-a1.json",
+            completed_at=timezone.now(),
+        )
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.FAILED
+        )
+        return scan, rows
+
+    def _carry_patches(self, object_exists=True):
+        return (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch(
+                "scanning.s3_sync.object_exists",
+                return_value=object_exists,
+            ),
+        )
+
+    def test_an_unchanged_completed_shard_is_carried(self):
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, old = self._dead_run(manifest)
+
+        active, exists = self._carry_patches()
+        with active, exists:
+            fresh = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        self.assertEqual(len(fresh), 2)
+        self.assertEqual(fresh[0].run, 2)
+        self.assertEqual(fresh[0].status, JobStatus.COMPLETED)
+        self.assertEqual(
+            fresh[0].result_key, "jobs/analyze/dots_mocr/r1-s0-a1.json"
+        )
+        self.assertEqual(
+            fresh[0].provider_meta["carried_from"],
+            {"run": 1, "job": old[0].pk},
+        )
+        self.assertEqual(fresh[0].external_id, "")
+        self.assertEqual(fresh[1].status, JobStatus.PENDING)
+
+    def test_a_carried_row_is_not_submitted(self):
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, _ = self._dead_run(manifest)
+
+        active, exists = self._carry_patches()
+        with active, exists:
+            fresh = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        with (
+            patch.multiple(
+                "scanning.s3_sync",
+                s3_active=lambda: True,
+                presign_get=lambda key, ttl: "https://s3/in?get",
+                presign_put=lambda key, ct, ttl: "https://s3/out?put",
+            ),
+            patch(
+                "scanning.runpod_client.submit_job", return_value="job-1"
+            ) as submit,
+        ):
+            jobs.submit_pending()
+
+        # One call for the still-pending shard; none for the carried one.
+        self.assertEqual(submit.call_count, 1)
+        carried, pending = [
+            ExternalJob.objects.get(pk=row.pk) for row in fresh
+        ]
+        self.assertEqual(carried.status, JobStatus.COMPLETED)
+        self.assertEqual(
+            carried.result_key, "jobs/analyze/dots_mocr/r1-s0-a1.json"
+        )
+        self.assertEqual(pending.status, JobStatus.SUBMITTED)
+
+    def test_a_missing_result_object_is_not_carried(self):
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, _ = self._dead_run(manifest)
+
+        active, exists = self._carry_patches(object_exists=False)
+        with active, exists:
+            fresh = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        self.assertEqual({row.status for row in fresh}, {JobStatus.PENDING})
+
+    def test_a_changed_shard_is_not_carried(self):
+        """Same pages, different bytes: a re-uploaded original."""
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, _ = self._dead_run(manifest)
+        recut = make_manifest(shard_count=2, pages_per_shard=1)
+        for entry in recut["shards"]:
+            entry["size_bytes"] = 2048
+
+        active, exists = self._carry_patches()
+        with active, exists:
+            fresh = dots_mocr.ensure_analyze_jobs(scan, recut)
+
+        self.assertEqual({row.status for row in fresh}, {JobStatus.PENDING})
+
+    def test_a_legacy_row_without_size_bytes_is_not_carried(self):
+        """The byte size is the proof, so a row without it re-reads."""
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan, old = self._dead_run(manifest)
+        legacy = dict(old[0].input_manifest)
+        legacy.pop("size_bytes")
+        ExternalJob.objects.filter(pk=old[0].pk).update(input_manifest=legacy)
+
+        active, exists = self._carry_patches()
+        with active, exists:
+            fresh = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        self.assertEqual({row.status for row in fresh}, {JobStatus.PENDING})
+
+    def test_a_legacy_live_run_is_still_reused_whole(self):
+        """The lenient identity match: no re-pay on deploy."""
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan = ScanFactory()
+        rows = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        for row in rows:
+            legacy = dict(row.input_manifest)
+            legacy.pop("size_bytes")
+            ExternalJob.objects.filter(pk=row.pk).update(input_manifest=legacy)
+
+        again = dots_mocr.ensure_analyze_jobs(scan, manifest)
+
+        self.assertEqual([row.pk for row in again], [row.pk for row in rows])
+
+    def test_the_convert_stage_never_carries(self):
+        """The bitonal merge deletes its results; there is nothing to
+        point a carried row at."""
+        manifest = make_manifest(shard_count=2, pages_per_shard=1)
+        scan = ScanFactory()
+        rows = jobs.ensure_convert_jobs(scan, manifest)
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.COMPLETED,
+            result_key="jobs/convert/bitonal/r1-s0-a1.pdf",
+        )
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.FAILED
+        )
+
+        active, exists = self._carry_patches()
+        with active, exists:
+            fresh = jobs.ensure_convert_jobs(scan, manifest)
+
+        self.assertEqual({row.status for row in fresh}, {JobStatus.PENDING})
+
+
+@override_settings(**DOTS)
 class TestWaveOrder(ScanningTestCase):
     """The blocking provider goes last.
 

@@ -240,6 +240,21 @@ trained on), tracked on `ExternalJob` rows at
   A `cancel_processing` does **not** touch a running read: the results
   are kept, the apply defers a cancelled scan, and a later re-queue
   reuses the completed run for free.
+- **A replacement run re-reads only the shards that need it.** When
+  `ensure_shard_jobs` starts a new ANALYZE run (a dead row sank the
+  old one), a shard whose identity is unchanged and whose result
+  object an S3 HEAD confirms enters the run as a `COMPLETED` row
+  pointing at the prior attempt's object (`jobs._reusable_results`,
+  opt-in via `reuse_results` — dots.mocr only, since the bitonal
+  merge deletes its results). The row identity now carries the
+  shard's `size_bytes`: pages alone cannot tell a re-uploaded
+  original with the same page count from the one the result was
+  computed on, and size plus page count is the fingerprint the shard
+  manifest itself trusts. The carry match is strict — a legacy row
+  without the field re-reads — while `_still_describes` accepts the
+  legacy shape, so pre-deploy live runs are still reused whole
+  instead of re-paid. A carried row has a blank `external_id`, so
+  every cancel path stays a provider no-op on it.
 - **The stage writes no scan status while it reads.** Progress lives
   only on the rows, read through `dots_mocr.run_summary` into the page
   context and `progress_api`. So a volume stays browsable and
