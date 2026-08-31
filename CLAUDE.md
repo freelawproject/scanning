@@ -199,17 +199,19 @@ must not be broken:
 - Every row write is a compare-and-swap on the row's current status
   (`jobs._write`), so no lock is held across an HTTP call. The writer it
   guards against is the **web process**, not a second daemon: one daemon
-  runs, and both `views_process.cancel_processing` and the admin
-  re-queue call `jobs.abandon_open` from a request. A daemon that wrote
-  PENDING over their CANCELLED would convert a shard nobody wants.
+  runs, and the admin re-queue, the admin scan deletion and
+  `start_dots_mocr` all call `jobs.abandon_open` from a request. A
+  daemon that wrote PENDING over their CANCELLED would convert a shard
+  nobody wants. The user cancel was a fourth such writer until #219
+  deleted it as unreachable.
 - **A slow page is a retry, not a dead volume.** Doctor reports a page
   it could not rasterize in time as `CONVERSION_TIMEOUT` (doctor #245,
   PR #246, in production), which is in `TRANSIENT_ERROR_CODES`, so the
   submit pass retries it up to `DOCTOR_MAX_ATTEMPTS` instead of writing
   the shard off on the first answer. A FAILED row therefore means the
   attempts are spent, and one still sinks the whole volume to ERROR.
-  Do **not** add a pass that revives dead rows: everything that stops a
-  scan (`cancel_processing`, the admin re-queue) calls `abandon_open`,
+  Do **not** add a pass that revives dead rows: the admin re-queue —
+  the only thing that stops a scan since #219 — calls `abandon_open`,
   which touches only `OPEN_JOB_STATUSES` and leaves a FAILED row alone,
   and changes `Scan.status` in a *second*, uncommitted-in-between write
   — so a reviver gated on the scan's status races it and converts a
@@ -250,8 +252,12 @@ must not be broken:
   `status=PROCESSING`, and on losing the guard the rows it created are
   abandoned: writing AWAITING anyway would spend real capacity on a
   volume somebody cancelled.
-- `cancel_processing` covers AWAITING as well as PROCESSING, and cancels
-  the scan's job rows with it.
+- **There is no user cancel (#219).** `views_process.cancel_processing`
+  covered PROCESSING and AWAITING, but no template ever rendered its
+  button, so a POST-only endpoint nobody could reach carried a whole
+  race. It is deleted; `Status.CANCELLED` stays for historical rows and
+  has no writer. A replacement belongs on `jobs.abandon_open` with the
+  status left to the daemon (#212) — do not restore the status write.
 - `DOCTOR_ENABLED` and `DOCTOR_HOST` both default to working values, so
   a deploy converts with no env or secret-store change. The host is
   fully qualified because an unqualified `cl-doctor` does not resolve

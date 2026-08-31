@@ -1259,8 +1259,9 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
     READY is a recompute and keeps its status. A scan the edge cannot
     take (cancelled or moved between the caller's read and here) is
     left alone: its ``ocr_results`` were refreshed -- idempotent data
-    -- but no Issues are rebuilt and no status moves. Once the scan is
-    READY, ``cancel_processing`` no longer matches it, and
+    -- but no Issues are rebuilt and no status moves. A legacy
+    ``CANCELLED`` row is one such scan (#219 deleted the view that
+    wrote it, so only historical rows hold it), and
     :func:`recalculate_issues` never full-saves: it writes its data
     fields with ``update_fields`` and decides the status with one
     conditional DB update, so it can neither revive a cancelled scan

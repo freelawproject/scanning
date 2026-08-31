@@ -1402,13 +1402,13 @@ class TestSubmitCancelRace(ScanningTestCase):
         self.addCleanup(self.presign.stop)
 
     def test_a_cancel_mid_submit_still_stops_the_billing(self):
-        # The sequence: the claim marks the row SUBMITTED, the user
-        # cancels (abandon_open's own cancel is a no-op, because
-        # external_id is still blank), then POST /run succeeds and the
-        # write of the id loses the compare-and-swap. Nothing else can
-        # ever find this job, so the submit path must cancel it here.
+        # The sequence: the claim marks the row SUBMITTED, an admin
+        # re-queue abandons it (abandon_open's own cancel is a no-op,
+        # because external_id is still blank), then POST /run succeeds
+        # and the write of the id loses the compare-and-swap. Nothing
+        # else can ever find this job, so the submit path cancels here.
         def submit_then_cancel(*args, **kwargs):
-            jobs.abandon_open(self.scan, "Cancelled by user")
+            jobs.abandon_open(self.scan, "Re-queued from the admin")
             return "job-1"
 
         with (

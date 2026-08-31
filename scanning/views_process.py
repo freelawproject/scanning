@@ -25,7 +25,6 @@ from scanning.models import (
     CheckName,
     Detection,
     Issue,
-    JobStage,
     JobStatus,
     OpinionScan,
     PageDeletion,
@@ -1075,46 +1074,6 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
             f"all {len(created)} part(s). Nothing new was queued.",
         )
     return back
-
-
-@login_required
-@require_POST
-def cancel_processing(request: HttpRequest, pk: int) -> HttpResponse:
-    """Cancel an in-progress scan processing task.
-
-    AWAITING counts as in progress: a scan spends its whole conversion
-    there (#176) and the viewer shows it as busy, so ignoring it would
-    make cancel a silent no-op for the longest part of the run. The job
-    rows go with it, or a finished shard's outcome would land on a scan
-    the user stopped.
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: Redirect to the scan processing page.
-    """
-    from scanning import jobs
-
-    scan = get_object_or_404(Scan, pk=pk)
-    if scan.status in (Status.PROCESSING, Status.AWAITING):
-        if scan.status == Status.AWAITING:
-            jobs.abandon_open(
-                scan, "Cancelled by user", stage=JobStage.CONVERT
-            )
-        if scan.stage == Stage.PROCESS:
-            Scan.objects.filter(pk=pk).update(
-                status=Status.PENDING_REVIEW,
-                stage=Stage.VALIDATE,
-                progress_message="",
-                progress_log="",
-                redacted_pdf_path="",
-                opinions_json=[],
-            )
-        else:
-            Scan.objects.filter(pk=pk).update(
-                status=Status.CANCELLED,
-                progress_message="Cancelled by user.",
-            )
-    return redirect("scan_process", pk=pk)
 
 
 @login_required
