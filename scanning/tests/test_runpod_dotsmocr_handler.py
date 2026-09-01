@@ -517,7 +517,9 @@ class TestResultDelivery(SimpleTestCase):
                     mock.patch.object(
                         handler,
                         "upload_result",
-                        side_effect=handler.ResultUploadError("no", code),
+                        side_effect=runpod_common.ResultUploadError(
+                            "no", code
+                        ),
                     ),
                 ):
                     out = handler.handler(
@@ -556,11 +558,24 @@ class TestCorruptDownloadIsRetriable(SimpleTestCase):
         # BAD_INPUT is terminal, so it would write a volume off for a
         # dropped connection.
         out = self._handle(
-            handler.CorruptDownloadError("downloaded PDF is truncated")
+            runpod_common.CorruptDownloadError("downloaded PDF is truncated")
         )
         self.assertEqual(out["error_code"], "INPUT_DOWNLOAD_CORRUPT")
         self.assertIn("worker_boot_ms", out)
 
     def test_a_real_bad_input_stays_terminal(self):
-        out = self._handle(ValueError("PDF has 9000 pages, exceeds MAX_PAGES"))
+        out = self._handle(
+            runpod_common.BadInputError(
+                "PDF has 9000 pages, exceeds MAX_PAGES"
+            )
+        )
         self.assertEqual(out["error_code"], "BAD_INPUT")
+
+    def test_a_runtime_value_error_is_not_bad_input(self):
+        # The worker stack raises ValueError at run time too (a
+        # degenerate page render, a model shape check). Answering one
+        # as BAD_INPUT would write the shard off as a caller error, so
+        # only BadInputError takes that arm; a plain ValueError crosses
+        # the runner and RunPod marks the job FAILED with a traceback.
+        with self.assertRaisesMessage(ValueError, "buffer is not large"):
+            self._handle(ValueError("buffer is not large enough"))

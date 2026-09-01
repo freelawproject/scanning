@@ -53,10 +53,12 @@ The legacy processing stages — in-process bitonal conversion, the YOLO
 blackletter-gpu-worker under `scanning/runpod/`), and their
 `RUNPOD_ENABLED=False` in-process fallbacks — are deleted. Bitonal came
 back as an external job, dots.mocr as a pipeline-enqueued one (#207,
-with the staff button kept for re-runs), and the page
-numbers plus Issues as an apply pass on the collect tick (#149/#204,
-all below), and review 1 got its approve button (#151); still missing
-are the post-review stages (#195/#196), so:
+with the staff button kept for re-runs), the page numbers plus Issues
+as an apply pass on the collect tick (#149/#204), review 1 got its
+approve button (#151), and YOLO detection came back as a rebuilt
+worker image (#194 — the image only), all below; still missing are the
+post-review stages (#195/#196 — the callers the detect image waits
+for), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
   enqueues the dots.mocr read (#207) when `_can_analyze` allows,
@@ -475,6 +477,83 @@ trained on), tracked on `ExternalJob` rows at
   worker pool, and no presigned PUT at all. YOLO on RunPod is a payload
   builder, an endpoint id and a cap — it shares `submit_job` and
   `poll_once` unchanged.
+
+## Generalized YOLO worker image (issue #194)
+
+`scanning/runpod/` is the RunPod Serverless image that runs detection
+with `bl_warm`, one 18-class checkpoint that replaced the
+small/medium/large trio (blackletter #73). It is the image only: the job
+rows and the daemon path are #195, and the redaction work that reads its
+output is #196, so a fresh deploy has no automatic caller. What must not
+be broken:
+
+- **Only `bl_warm.pt` is baked.** `api.detect` calls `ensure_weights`
+  itself, so an unbaked name would reach Hugging Face from inside a paid
+  job; `handler._missing_weights` refuses it up front and names what the
+  image does carry. Running the legacy trio again is a rebuild, not a
+  changed input. PR #167 kept the trio for exactly that rollback and it
+  is deliberately gone.
+- **The handler passes no `imgsz`, and that is the whole point.**
+  Ultralytics keeps the training resolution off the checkpoint
+  (`Model._reset_ckpt_args`) and `predict` merges those overrides ahead
+  of its own defaults, which name none. `bl_warm.pt` carries 1024, so it
+  predicts at 1024; passing the library default of 640 would quietly
+  cost the small classes (key icon, page number, state abbreviation).
+  The build prints the value and `_preload` logs it, because a
+  checkpoint that lost its training arguments falls back to 640 with no
+  error and a lower score.
+- **`found_by` survives into the payload.** blackletter's merge writes
+  that provenance in place of the per-model `model` key, and
+  `bl_warm.rows_are_bl_warm` reads it to pick the bl-warm confidence
+  gates. #196 needs it; stripping it silently changes every rect.
+- **Detection reads the original shard, never the bitonal copy.**
+  bl-warm was trained on greyscale renders and its large region classes
+  collapse on 1-bit pages (caption F1 0.99 -> 0.25, measured in #167).
+  This matches dots.mocr, so both stages fan out over the one shard set
+  of #164.
+- **`page_index` counts from zero inside the shard.** The caller offsets
+  it by the shard's own `from_page`, as #149 does for dots.mocr.
+- **The payload goes to S3, not inline.** The envelope
+  (`schema_version`, `action`, `scan_pk`, `result_key`, `payload`) is
+  PUT to a presigned URL signed `application/json`, and the response
+  carries a summary plus `detection_count`. Thousands of rows would
+  approach RunPod's ~20 MB response cap, which it discards ~30 min after
+  the job ends. Without `result_url` the worker answers inline, so a
+  rollback needs no daemon change.
+- **The base image carries no CUDA layer.** The torch `cu126` wheels
+  declare the CUDA runtime themselves, cuDNN included, so
+  `python:3.12-slim-bookworm` is enough. The `nvidia/cuda` base and the
+  build-time `libcuda.so.1` stub existed for PaddlePaddle alone and went
+  with the `analyze` step (#173), along with tesseract and Ghostscript.
+  About 4.2 GB to pull and 8 GB unpacked, against the ~22 GB the old
+  image extracted to. `mkdir -p $YOLO_CONFIG_DIR` is
+  load-bearing: ultralytics tests the parent for writability and would
+  otherwise write its settings to /tmp on every boot.
+- **The endpoint is reused, not replaced.** The restored
+  `build-runpod-worker.yml` pushes
+  `freelawproject/blackletter-gpu-worker:<sha>` and PATCHes the same
+  `RUNPOD_TEMPLATE_ID`, so no new endpoint, no new secret and no
+  settings change. `blackletter-dependency-pr.yml` bumps blackletter
+  here and in the repository root together, which is what keeps the
+  image and the application on one version.
+- **The worker scaffold lives in `runpod_common`, once.** The Sentry
+  setup, the boot clock and worker-meta fields, the result envelope
+  (`RESULT_SCHEMA_VERSION`, which `runpod_client.py` imports too), and
+  the `execute_action` runner whose except arms map exceptions to the
+  error codes the daemon classifies — shared with the dots.mocr worker,
+  because one daemon reads every worker's output and an arm that
+  drifted in one image would misroute paid work. Each handler keeps
+  thin wrappers that bind its own module globals, so the tests keep
+  their patch points. Input checks raise `BadInputError` (a
+  `ValueError` subclass in `runpod_common`), and only that subclass is
+  answered as the terminal `BAD_INPUT`: the worker stack raises plain
+  `ValueError` at run time too (a degenerate page render, a model
+  shape check), and answering one of those as BAD_INPUT would write
+  the shard off as a caller error with no Sentry event.
+- The handler is tested without the worker stack
+  (`scanning/tests/test_runpod_yolo_handler.py`): the loader stubs
+  `runpod`, `torch` and `blackletter.api`, and a CUDA-less `torch` makes
+  the module-level `_preload` open no weight file.
 
 ## Local disk hygiene (issue #215)
 
