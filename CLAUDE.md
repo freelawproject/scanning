@@ -542,46 +542,36 @@ trained on), tracked on `ExternalJob` rows at
 
 ## Reading the page number (issue #228)
 
-`page_numbers.py` picks one number out of a page's layout cells. The
-head band of a reporter page carries several: the volume number in the
-reporter title, the parallel citation page, the first page of the
-opinion in the `Cite as` line, a headnote number dots also labels
-`Page-header`, and the last word of a case name that ends in a digit.
+A reporter's head band carries rival numbers: the volume number in the
+title, the parallel citation page, the first page in the `Cite as`
+line, a headnote digit dots labels `Page-header` too, a case name that
+ends in a digit.
 
-- **Position is what tells them apart.** The printed number sits at the
-  page's outer corner and every rival sits nearer the middle, so the
-  rank is geometric: header before footer, then the corner distance,
-  then the line inside the cell, then printed parity. Before #228 the
-  rank was the synthetic score and the model's cell order broke every
-  tie. Measured over one 1294-page volume: 666 pages carried a rival
-  value, 8 read the wrong one, and 6 more read none.
-- **The corner distance is per token, not per cell.** One bbox covers
-  the whole running head, so the end of the line the token was read at
-  says which edge to measure against. `CORNER_BAND` (0.25 of the page
-  width) only grades the score: a true reading measured 0.19 or less
-  and every rival 0.25 or more, but the rank never gates on it, because
-  a volume whose number is centred in the footer has no rival to lose
-  to.
-- **Each line of a cell is read on its own.** dots returns the running
-  head and the `Cite as` line as two lines of one cell, which put the
-  number in the middle of the text and read as no number at all. The
-  two lines share the one bbox, so the line index breaks that tie: the
-  running head is the top line.
-- **A bare digit is no longer full marks.** `_score` counts the corner
-  in place of "the text is only digits", which is exactly what a
-  headnote number is. It stays display-only: `blackletter.validate`
-  ignores it and only the two viewer scripts print it.
-- **The neighbour pass is the second net, not the rule.**
-  `_resolve_by_neighbours` moves a pick only when the page offers more
-  than one value and the geometric pick continues neither neighbour. It
-  reads the neighbours off the *geometric* picks throughout, so one
-  wrong page cannot cascade, and it never invents a number.
-- **A reading change reaches no volume already applied.** `applied_at`
-  closes the run (#204), so run `reapply_page_numbers` after the
-  deploy: it clears the stamp and the next collect tick re-reads the
-  stored glued document, with no GPU cost and no new run. The numbers a
-  curator typed survive it (the #214 overlay is re-applied), and an
-  approved volume is outside the status filter of `apply_ready_runs`.
+- **Position tells them apart, so the rank in `page_numbers.py` is
+  geometric**: header before footer, then the corner distance, then the
+  line inside the cell, then printed parity. The printed number is at
+  the outer corner, every rival nearer the middle. The rank was the
+  synthetic score until #228, which left the model's cell order to
+  break every tie: 666 of one volume's 1294 pages carried a rival
+  value, and 8 read the wrong one.
+- **The distance is per token**: one bbox covers the whole running
+  head, so the end of the line the token was read at says which edge to
+  measure. `CORNER_BAND` only grades the score -- a number centred in a
+  footer has no rival to lose to -- and `_score` counts the corner in
+  place of "only digits", which is what a headnote number is.
+- **Each line of a cell is read alone**: dots returns the running head
+  and the `Cite as` line as two lines of one cell, which puts the
+  number mid-text. They share the one bbox, so the line index separates
+  them.
+- **`_resolve_by_neighbours` is the second net, not the rule**: it
+  moves a pick only when the page offers more than one value and the
+  geometric pick continues neither neighbour, and it reads the
+  neighbours off the *geometric* picks, so one wrong page cannot
+  cascade.
+- **A reading change reaches no volume already applied** (`applied_at`
+  closes the run, #204). Run `reapply_page_numbers` after the deploy:
+  it re-reads the stored glued document at no GPU cost, keeps the
+  numbers a curator typed (#214), and leaves an approved volume alone.
 
 ## Generalized YOLO worker image (issue #194)
 
