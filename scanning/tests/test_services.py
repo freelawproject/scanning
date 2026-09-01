@@ -14,6 +14,7 @@ from django.test import SimpleTestCase, TestCase, override_settings
 
 from scanning import s3_sync
 from scanning.factories import (
+    PageEditFactory,
     ReporterFactory,
     ScanFactory,
     UserFactory,
@@ -23,6 +24,7 @@ from scanning.models import (
     CheckName,
     Detection,
     Issue,
+    PageEdit,
     QueueStatus,
     Scan,
     Stage,
@@ -2037,18 +2039,16 @@ class TestRunComputeIssues(TestCase):
         )
         self.assertEqual(scan.ocr_results[1]["detected"], "2")
 
-    def test_a_manual_read_survives_the_apply(self):
-        scan = self._make_scan(
-            ocr_results=[
-                {
-                    "pdf_page": 1,
-                    "detected": "9",
-                    "type": "single",
-                    "score": 1.0,
-                    "zone": "manual",
-                    "ocr": "manual",
-                }
-            ]
+    def test_a_curators_number_survives_the_apply(self):
+        # The row outranks the run, and the blob is rebuilt from both
+        # (#214). It used to be carried over from the previous blob by
+        # a "manual" stamp on two of its fields.
+        scan = self._make_scan()
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.SET_NUMBER,
+            pdf_page=1,
+            value="9",
         )
 
         self._run(scan, self._document(["1", "2"]))
@@ -2057,6 +2057,82 @@ class TestRunComputeIssues(TestCase):
         self.assertEqual(scan.ocr_results[0]["detected"], "9")
         self.assertEqual(scan.ocr_results[0]["zone"], "manual")
         self.assertEqual(scan.ocr_results[1]["detected"], "2")
+
+    def test_a_curators_range_survives_the_apply(self):
+        # One PDF page can carry several book pages, which is what
+        # CheckName.PAGE_RANGE is raised for.
+        scan = self._make_scan()
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.SET_NUMBER,
+            pdf_page=1,
+            value="678-686",
+        )
+
+        self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[0]["detected"], "678-686")
+        self.assertEqual(scan.ocr_results[0]["type"], "range")
+
+    def test_a_cleared_number_survives_the_apply(self):
+        scan = self._make_scan()
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.SET_NUMBER,
+            pdf_page=1,
+            value="",
+        )
+
+        self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertIsNone(scan.ocr_results[0]["detected"])
+        self.assertEqual(scan.ocr_results[0]["zone"], "manual")
+
+    def test_an_edit_against_another_original_is_reported(self):
+        # An address names a page of the original it was made on. An
+        # edit from another one is dropped and said out loud, never
+        # placed on whatever page now holds that number.
+        scan = self._make_scan()
+        Scan.objects.filter(pk=scan.pk).update(source_fingerprint="200:2")
+        scan.refresh_from_db()
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.SET_NUMBER,
+            pdf_page=1,
+            value="9",
+            source_fingerprint="100:2",
+        )
+
+        self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[0]["detected"], "1")
+        self.assertTrue(
+            scan.issues.filter(
+                check_name=CheckName.STALE_PAGE_EDIT, page_number=1
+            ).exists()
+        )
+
+    def test_an_edit_naming_an_absent_page_is_reported(self):
+        scan = self._make_scan()
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.SET_NUMBER,
+            pdf_page=7,
+            value="9",
+        )
+
+        self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertEqual(len(scan.ocr_results), 2)
+        self.assertTrue(
+            scan.issues.filter(
+                check_name=CheckName.STALE_PAGE_EDIT, page_number=7
+            ).exists()
+        )
 
     def test_suppressed_detection_issues_are_kept(self):
         scan = self._make_scan()

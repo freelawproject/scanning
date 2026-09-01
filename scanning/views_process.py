@@ -22,12 +22,14 @@ from django.views.decorators.http import require_POST
 
 from scanning.models import (
     BUSY_STATUSES,
+    PHYSICAL_PAGE_CHECKS,
     CheckName,
     Detection,
     Issue,
     JobStatus,
     OpinionScan,
     PageDeletion,
+    PageEdit,
     PageInsert,
     Scan,
     Stage,
@@ -230,14 +232,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # PDF page for some checks and a logical/printed page number for others;
     # logical numbers can repeat when unnumbered front matter borrows numbers
     # from the real pages (issue #90), so they must be resolved through the
-    # page_map rather than matched directly.
-    physical_page_checks = {
-        CheckName.NO_PAGE_NUMBER,
-        CheckName.SUSPICIOUS_READING,
-        CheckName.AUTO_CORRECTED,
-        CheckName.BLANK_PAGE,
-        CheckName.ORIENTATION,
-    }
+    # page_map rather than matched directly. The set is shared with the
+    # dismissal, which keeps its address in the same two spaces (#214).
     flagged_indices: set[int] = set()
     for i in issues:
         # Resolve each issue to PDF page indices (unique physical positions),
@@ -247,7 +243,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         i.nav_pdf_index = None
         if i.page_number is None:
             continue
-        if i.check_name in physical_page_checks:
+        if i.check_name in PHYSICAL_PAGE_CHECKS:
             indices = [i.page_number - 1]
         else:
             indices = logical_to_indices.get(i.page_number, [])
@@ -1186,15 +1182,54 @@ def reprocess(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=scan.pk)
 
 
+def _page_number_value(raw) -> str | None:
+    """Return a curator's page number entry, normalized, or None.
+
+    Accepts a positive whole number, and a printed range like
+    ``678-686`` for the one PDF page that carries several book pages --
+    the shape ``CheckName.PAGE_RANGE`` exists for, and the shape
+    ``Page.book_page`` has always documented. A blank entry is the
+    curator clearing the number, which is a decision, so it returns the
+    empty string rather than None.
+
+    :param raw: The ``page_number`` field of the request body.
+    :returns: The value for ``PageEdit.value``, or None when the entry
+        is not a page number at all.
+    :rtype: str | None
+    """
+    if raw is None:
+        return ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+    parts = [part.strip() for part in text.split("-")]
+    if len(parts) > 2 or not all(p.isdigit() and int(p) >= 1 for p in parts):
+        return None
+    if len(parts) == 2 and int(parts[0]) >= int(parts[1]):
+        return None
+    return "-".join(str(int(p)) for p in parts)
+
+
 @login_required
 @require_POST
 def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
-    """Manually set or clear a PDF page's detected page number.
+    """Record the page number a curator read off the page itself.
 
-    A blank/empty ``page_number`` clears the number, marking the page as
-    having none (e.g. front matter the model mis-tagged). Any other value
-    must be a positive integer. After updating, the page_map is rebuilt so
-    duplicate flags stay in sync with the change.
+    One ``PageEdit`` row per page, since #214: the decision used to be
+    an edit of one entry inside the ``Scan.ocr_results`` list, written
+    back whole, so two curators on two pages of one volume lost one of
+    the two numbers with no error and no trace.
+
+    A blank ``page_number`` clears the number, marking the page as
+    having none (front matter the model mis-tagged, say). It is the
+    same kind of row with a blank value, so the row's existence still
+    separates "a person cleared this" from "the model read nothing".
+    Any other value is a printed number, or a printed range like
+    ``678-686`` when one PDF page carries several book pages, which is
+    what ``page_range`` is raised for.
+
+    The blob is then rebuilt from the run plus the rows, so the viewer
+    shows the number and its duplicate flags at once.
 
     :param request: The HTTP request (JSON body with ``pdf_page`` and
         ``page_number``; ``page_number`` may be null/empty to clear).
@@ -1214,42 +1249,38 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
             {"error": 'page_number is required (send null or "" to clear).'},
             status=400,
         )
-    raw = data["page_number"]
-
-    clear = raw is None or (isinstance(raw, str) and not raw.strip())
-    page_value = None
-    if not clear:
-        try:
-            number = int(str(raw).strip())
-        except (TypeError, ValueError):
-            return JsonResponse(
-                {"error": "Page number must be a positive whole number."},
-                status=400,
-            )
-        if number < 1:
-            return JsonResponse(
-                {"error": "Page number must be a positive whole number."},
-                status=400,
-            )
-        page_value = str(number)
+    page_value = _page_number_value(data["page_number"])
+    if page_value is None:
+        return JsonResponse(
+            {
+                "error": (
+                    "Page number must be a positive whole number, or a "
+                    "range like 678-686."
+                )
+            },
+            status=400,
+        )
 
     ocr_results = scan.ocr_results
-    if not any(r["pdf_page"] == pdf_page for r in ocr_results):
+    entry = next((r for r in ocr_results if r["pdf_page"] == pdf_page), None)
+    if entry is None:
         return JsonResponse({"error": "Unknown PDF page."}, status=404)
-    for r in ocr_results:
-        if r["pdf_page"] == pdf_page:
-            if clear:
-                r["detected"] = None
-                r["type"] = None
-                r["score"] = None
-            else:
-                r["detected"] = page_value
-                r["type"] = "single"
-                r["score"] = 1.0
-            r["zone"] = "manual"
-            r["ocr"] = "manual"
-            break
-    scan.ocr_results = ocr_results
+
+    PageEdit.objects.update_or_create(
+        scan=scan,
+        kind=PageEdit.Kind.SET_NUMBER,
+        pdf_page=pdf_page,
+        applied_at=None,
+        defaults={
+            "author": request.user,
+            "value": page_value,
+            # What the decision overwrote, for the audit: the model's
+            # reading is rebuilt from the run on every recompute, so
+            # this row is the only record that it was overruled.
+            "replaced": str(entry.get("detected") or ""),
+            "source_fingerprint": scan.source_fingerprint,
+        },
+    )
 
     # Clear the page's no-page-number flag; the rebuild does not touch Issue
     # rows, so a full Recheck re-derives the issue list (and any new flag).
@@ -1258,7 +1289,8 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
     ).delete()
 
     # Rebuild page_map so the viewer/sidebar duplicate flags reflect the edit
-    # immediately (saves the scan, including the updated ocr_results).
+    # immediately. It overlays the rows, so it also writes the new number
+    # into the cached ocr_results.
     from scanning import services
 
     services.rebuild_page_map(scan)
@@ -1270,7 +1302,11 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
         for e in scan.page_map
     )
     return JsonResponse(
-        {"status": "ok", "detected": page_value, "duplicate": duplicate}
+        {
+            "status": "ok",
+            "detected": page_value or None,
+            "duplicate": duplicate,
+        }
     )
 
 
@@ -1353,26 +1389,55 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
 @login_required
 @require_POST
 def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
-    """Dismiss a single validation issue for a scan.
+    """Record that a curator judged one issue not worth acting on.
+
+    One ``PageEdit`` row, since #214, and no longer a ``DELETE`` of the
+    ``Issue`` row: every rebuild deletes the derived issues and writes
+    them again with new primary keys, so a dismissal used to come back
+    on the next press of the recompute button. The rebuild now reads
+    these rows as an input, the way it already keeps
+    ``suppress_detection``.
+
+    The row keeps the address in the space its check uses -- a physical
+    PDF page for the checks in ``PHYSICAL_PAGE_CHECKS``, the printed
+    number for the rest -- because those two are different spaces and a
+    printed number is not unique.
+
+    The issue row itself is deleted too, so the card goes away at once
+    without a page reload. The pending-changes guard is gone with the
+    convention it protected: a dismissal is durable now, so it needs no
+    apply and cannot be lost by one.
 
     :param request: The HTTP request (JSON body with issue_id).
     :param pk: Scan primary key.
     :return: JSON response confirming dismissal.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    has_pending = scan.deletions.exists() or scan.inserts.exists()
-    if has_pending:
-        return JsonResponse(
-            {
-                "status": "error",
-                "message": "Reprocess first -- there are pending changes.",
-            },
-            status=400,
-        )
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-    issue_id = data.get("issue_id")
-    Issue.objects.filter(pk=issue_id, scan=scan).delete()
+    issue = Issue.objects.filter(pk=data.get("issue_id"), scan=scan).first()
+    if issue is None:
+        return JsonResponse({"error": "Unknown issue."}, status=404)
+
+    physical = issue.check_name in PHYSICAL_PAGE_CHECKS
+    PageEdit.objects.update_or_create(
+        scan=scan,
+        kind=PageEdit.Kind.DISMISS_ISSUE,
+        pdf_page=issue.page_number if physical else None,
+        logical_page=(
+            ""
+            if physical or issue.page_number is None
+            else str(issue.page_number)
+        ),
+        value=issue.check_name,
+        applied_at=None,
+        defaults={
+            "author": request.user,
+            "replaced": issue.severity,
+            "source_fingerprint": scan.source_fingerprint,
+        },
+    )
+    issue.delete()
     return JsonResponse({"status": "ok"})

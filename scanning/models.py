@@ -980,12 +980,31 @@ class CheckName(models.TextChoices):
     AUTO_CORRECTED = "auto_corrected", "Auto-corrected page number"
     BLANK_PAGE = "blank_page", "Blank page detected"
     ORIENTATION = "orientation", "Page orientation issue"
+    STALE_PAGE_EDIT = "stale_page_edit", "Page edit not applied"
 
     # User actions (from scanning views)
     PROCESS_FLAG = "process_flag", "User-flagged issue"
     SUPPRESS_DETECTION = "suppress_detection", "Suppress a detection"
     ADD_DETECTION = "add_detection", "Add a detection"
     APPROVE_DETECTION = "approve_detection", "Approve a detection"
+
+
+#: Checks whose ``Issue.page_number`` is a physical PDF page, 1-based.
+#: Every other check names the printed page number, which repeats when
+#: unnumbered front matter borrows numbers from the real pages (#90), so
+#: a reader must resolve it through the page map rather than match it.
+#: The viewer highlights by physical position, and a dismissal keeps the
+#: address in whichever space its check uses (#214), so both need this.
+PHYSICAL_PAGE_CHECKS = frozenset(
+    {
+        CheckName.NO_PAGE_NUMBER,
+        CheckName.SUSPICIOUS_READING,
+        CheckName.AUTO_CORRECTED,
+        CheckName.BLANK_PAGE,
+        CheckName.ORIENTATION,
+        CheckName.STALE_PAGE_EDIT,
+    }
+)
 
 
 class Issue(AbstractDateTimeModel):

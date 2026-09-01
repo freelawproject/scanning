@@ -1075,17 +1075,26 @@ def rebuild_page_map(scan: "Scan") -> None:
 
     :param scan: The Scan whose page_map to rebuild.
     """
+    from scanning import page_edits
+
     ocr_results = scan.ocr_results
     if not ocr_results:
         return
+    # The curator's own numbers live on PageEdit rows (#214), and this
+    # blob is the cache of the run plus those rows. Overlaying here is
+    # what makes the viewer show a number the moment it is typed.
+    ocr_results, _stale = page_edits.overlay_page_numbers(scan, ocr_results)
     exp_start, exp_end = _expected_range(scan)
     analysis = build_analysis(ocr_results, exp_start, exp_end)
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
+    scan.ocr_results = ocr_results
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
-    scan.save()
+    # Only the fields this function owns: the approve button (#151) and
+    # the collect tick both write the status of the same row.
+    scan.save(update_fields=["ocr_results", "page_map", "missing_pages"])
 
 
 def recalculate_issues(scan: "Scan") -> None:
@@ -1096,10 +1105,19 @@ def recalculate_issues(scan: "Scan") -> None:
 
     :param scan: The Scan instance to recalculate issues for.
     """
+    from scanning import page_edits
 
     ocr_results = scan.ocr_results
     if not ocr_results:
         return
+
+    # The curator outranks the model, so the overlay comes first: every
+    # step below -- the offset heuristic, the sequence analysis, the
+    # issue list -- must see the numbers a person typed (#214).
+    ocr_results, stale_edits = page_edits.overlay_page_numbers(
+        scan, ocr_results
+    )
+    scan.ocr_results = ocr_results
 
     exp_start, exp_end = _expected_range(scan)
 
@@ -1164,6 +1182,13 @@ def recalculate_issues(scan: "Scan") -> None:
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
+
+    # A dismissal is a curator decision, so it is a PageEdit row, not
+    # the absence of an Issue row: the rebuild below gives every issue
+    # it writes a new primary key, and a deleted row came back on the
+    # next press of the recompute button (#214).
+    result["issues"] = page_edits.drop_dismissed(scan, result["issues"])
+    result["issues"].extend(page_edits.stale_edit_issues(stale_edits))
 
     for pdf_page, old_val, new_val in auto_corrected:
         result["issues"].append(
@@ -1273,11 +1298,16 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
         the eligible statuses mid-apply and was left alone.
     :rtype: bool
     """
-    from scanning import page_numbers, s3_sync
+    from scanning import page_edits, page_numbers, s3_sync
 
     started = time.monotonic()
     document = s3_sync.download_json_object(result_key)
-    results = page_numbers.ocr_results_from_volume(document, scan.ocr_results)
+    results = page_numbers.ocr_results_from_volume(document)
+    # Overlay before the save, not only inside recalculate_issues: a
+    # scan that fails the edge below keeps this blob until its next
+    # recompute, and the viewer would show the model's reading over a
+    # number a curator had already typed (#214).
+    results, _stale = page_edits.overlay_page_numbers(scan, results)
     scan.ocr_results = results
     scan.save(update_fields=["ocr_results"])
 

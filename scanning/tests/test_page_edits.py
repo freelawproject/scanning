@@ -7,14 +7,16 @@ that overlay these rows live in ``test_services.py`` and
 ``test_views.py``.
 """
 
+import json
 import tempfile
 
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
+from django.urls import reverse
 from django.utils import timezone
 
-from scanning.factories import PageEditFactory, ScanFactory
-from scanning.models import PageEdit
+from scanning.factories import PageEditFactory, ScanFactory, UserFactory
+from scanning.models import CheckName, Issue, PageEdit, Status
 
 MEDIA_ROOT = tempfile.mkdtemp()
 
@@ -232,3 +234,278 @@ class TestPageEditImageKey(TestCase):
         from scanning import s3_sync
 
         self.assertFalse(s3_sync._is_synced_by_default("page_edits/abc.png"))
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestAssignPageWritesAnEdit(TestCase):
+    """``views_process.assign_page`` records a decision, not a blob edit."""
+
+    def setUp(self):
+        self.user = UserFactory()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            page_count=2,
+            source_fingerprint="100:2",
+            ocr_results=[
+                {
+                    "pdf_page": 1,
+                    "detected": "5",
+                    "type": "single",
+                    "zone": "dots-header",
+                },
+                {
+                    "pdf_page": 2,
+                    "detected": None,
+                    "type": None,
+                    "zone": None,
+                },
+            ],
+        )
+
+    def _post(self, pdf_page, page_number):
+        """POST one page number to the view.
+
+        :param pdf_page: 1-based PDF page.
+        :param page_number: The value a curator typed.
+        :returns: The response.
+        """
+        return self.client.post(
+            reverse("assign_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps(
+                {"pdf_page": pdf_page, "page_number": page_number}
+            ),
+            content_type="application/json",
+        )
+
+    def test_a_number_becomes_one_row(self):
+        self.assertEqual(self._post(2, "6").status_code, 200)
+
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.kind, PageEdit.Kind.SET_NUMBER)
+        self.assertEqual(edit.pdf_page, 2)
+        self.assertEqual(edit.value, "6")
+        self.assertEqual(edit.author, self.user)
+        self.assertEqual(edit.source_fingerprint, "100:2")
+        self.assertIsNone(edit.applied_at)
+
+    def test_the_row_records_what_it_overruled(self):
+        self._post(1, "6")
+
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.replaced, "5")
+
+    def test_a_second_edit_of_one_page_updates_its_row(self):
+        # Two curators on two pages was the lost update this model
+        # removes; one curator changing their mind is still one row.
+        self._post(2, "6")
+        self._post(2, "7")
+
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.value, "7")
+
+    def test_two_curators_keep_both_numbers(self):
+        # The defect in the blob: the second full-list write dropped
+        # the first curator's entry, with no error and no trace.
+        self._post(1, "6")
+        self._post(2, "7")
+
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.page_edits.count(), 2)
+        self.assertEqual(
+            [r["detected"] for r in self.scan.ocr_results], ["6", "7"]
+        )
+
+    def test_a_range_is_accepted(self):
+        self.assertEqual(self._post(2, "678-686").status_code, 200)
+
+        self.assertEqual(self.scan.page_edits.get().value, "678-686")
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.ocr_results[1]["type"], "range")
+
+    def test_a_backwards_range_is_refused(self):
+        self.assertEqual(self._post(2, "686-678").status_code, 400)
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_a_blank_value_is_a_decision_too(self):
+        self.assertEqual(self._post(1, "").status_code, 200)
+
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.kind, PageEdit.Kind.SET_NUMBER)
+        self.assertEqual(edit.value, "")
+        self.scan.refresh_from_db()
+        self.assertIsNone(self.scan.ocr_results[0]["detected"])
+
+    def test_an_unknown_page_writes_nothing(self):
+        self.assertEqual(self._post(99, "6").status_code, 404)
+        self.assertFalse(self.scan.page_edits.exists())
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestDismissIssueWritesAnEdit(TestCase):
+    """A dismissal is a decision, so it survives the rebuild."""
+
+    def setUp(self):
+        self.user = UserFactory()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            start_page=1,
+            end_page=2,
+            page_count=2,
+            source_fingerprint="100:2",
+            ocr_results=[
+                {"pdf_page": 1, "detected": None, "type": None, "zone": None},
+                {
+                    "pdf_page": 2,
+                    "detected": "2",
+                    "type": "single",
+                    "zone": "dots-header",
+                },
+            ],
+        )
+
+    def _dismiss(self, issue):
+        """POST the dismissal of one issue.
+
+        :param issue: The Issue row to dismiss.
+        :returns: The response.
+        """
+        return self.client.post(
+            reverse("dismiss_issue", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"issue_id": issue.pk}),
+            content_type="application/json",
+        )
+
+    def test_a_physical_check_keeps_a_physical_address(self):
+        issue = Issue.objects.create(
+            scan=self.scan,
+            page_number=1,
+            check_name=CheckName.NO_PAGE_NUMBER,
+            message="no number",
+        )
+
+        self.assertEqual(self._dismiss(issue).status_code, 200)
+
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.kind, PageEdit.Kind.DISMISS_ISSUE)
+        self.assertEqual(edit.value, CheckName.NO_PAGE_NUMBER)
+        self.assertEqual(edit.pdf_page, 1)
+        self.assertEqual(edit.logical_page, "")
+        self.assertFalse(Issue.objects.filter(pk=issue.pk).exists())
+
+    def test_a_logical_check_keeps_a_printed_address(self):
+        issue = Issue.objects.create(
+            scan=self.scan,
+            page_number=1074,
+            check_name=CheckName.MISSING_PAGE,
+            message="missing",
+        )
+
+        self._dismiss(issue)
+
+        edit = self.scan.page_edits.get()
+        self.assertIsNone(edit.pdf_page)
+        self.assertEqual(edit.logical_page, "1074")
+
+    def test_a_dismissal_survives_a_recompute(self):
+        # The rebuild deletes every derived issue and writes new rows,
+        # so a dismissal that was a deleted row came straight back.
+        from scanning import services
+
+        services.recalculate_issues(self.scan)
+        issue = self.scan.issues.get(check_name=CheckName.NO_PAGE_NUMBER)
+        self._dismiss(issue)
+
+        services.recalculate_issues(self.scan)
+
+        self.assertFalse(
+            self.scan.issues.filter(
+                check_name=CheckName.NO_PAGE_NUMBER
+            ).exists()
+        )
+
+    def test_an_unknown_issue_is_a_404(self):
+        self.assertEqual(
+            self.client.post(
+                reverse("dismiss_issue", kwargs={"pk": self.scan.pk}),
+                data=json.dumps({"issue_id": 9999}),
+                content_type="application/json",
+            ).status_code,
+            404,
+        )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestManualReadingMigration(TestCase):
+    """The #214 data migration, run against the live app registry.
+
+    The historical models it asks for are these models, so the real
+    registry answers the same question the migration asks.
+    """
+
+    def _migrate(self):
+        """Run the migration's forward function once."""
+        from importlib import import_module
+
+        from django.apps import apps as live_apps
+
+        migration = import_module(
+            "scanning.migrations.0013_page_edits_from_manual_readings"
+        )
+        migration.create_page_edits(live_apps, None)
+
+    def test_a_manual_reading_becomes_a_row(self):
+        scan = ScanFactory(
+            ocr_results=[
+                {"pdf_page": 1, "detected": "5", "zone": "dots-header"},
+                {
+                    "pdf_page": 2,
+                    "detected": "9",
+                    "zone": "manual",
+                    "ocr": "manual",
+                },
+            ]
+        )
+
+        self._migrate()
+
+        edit = scan.page_edits.get()
+        self.assertEqual(edit.kind, PageEdit.Kind.SET_NUMBER)
+        self.assertEqual(edit.pdf_page, 2)
+        self.assertEqual(edit.value, "9")
+        self.assertIsNone(edit.author)
+        self.assertEqual(edit.source_fingerprint, "")
+
+    def test_a_cleared_reading_becomes_a_blank_row(self):
+        scan = ScanFactory(
+            ocr_results=[
+                {
+                    "pdf_page": 1,
+                    "detected": None,
+                    "zone": "manual",
+                    "ocr": "manual",
+                }
+            ]
+        )
+
+        self._migrate()
+
+        self.assertEqual(scan.page_edits.get().value, "")
+
+    def test_running_it_twice_writes_one_row(self):
+        scan = ScanFactory(
+            ocr_results=[
+                {
+                    "pdf_page": 1,
+                    "detected": "9",
+                    "zone": "manual",
+                    "ocr": "manual",
+                }
+            ]
+        )
+
+        self._migrate()
+        self._migrate()
+
+        self.assertEqual(scan.page_edits.count(), 1)

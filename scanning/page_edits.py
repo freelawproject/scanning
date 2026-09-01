@@ -1,0 +1,205 @@
+"""The human page edits of review 1: the rows, and how a reader uses them.
+
+One curator decision is one ``PageEdit`` row (issue #214). This module
+holds the query helpers over those rows and the overlay that writes a
+curator's page numbers over what the model read.
+
+Two rules run through it:
+
+- **The rows are the source; ``Scan.ocr_results`` is a cache.** The
+  blob is rebuilt whole, from the glued dots.mocr run plus these rows,
+  on every recompute. Nothing edits one entry of it in place any more,
+  so two curators working on two pages of one volume cannot write each
+  other's decision away.
+- **An edit whose original is gone is reported, never guessed at.**
+  Every address names a page of the original as it was when the edit
+  was made (``PageEdit.source_fingerprint``). An edit made against
+  another original, or one naming a page the current volume does not
+  have, is dropped from the overlay and raised as an issue the curator
+  can see. Silently keeping it would put a number on the wrong page;
+  silently dropping it is the defect this model exists to remove.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from scanning.models import CheckName, Issue, PageEdit, Scan
+
+logger = logging.getLogger(__name__)
+
+
+def open_edits(scan: Scan, *kinds: str):
+    """Return the scan's unapplied edits of the given kinds.
+
+    :param scan: The scan whose edits are wanted.
+    :param kinds: ``PageEdit.Kind`` values. All kinds when empty.
+    :returns: A queryset of open rows, in address order.
+    :rtype: django.db.models.QuerySet
+    """
+    rows = scan.page_edits.filter(applied_at__isnull=True)
+    if kinds:
+        rows = rows.filter(kind__in=kinds)
+    return rows
+
+
+def is_stale(edit: PageEdit, scan: Scan) -> bool:
+    """Return whether an edit describes an original this scan no longer has.
+
+    A blank fingerprint on either side is a legacy value -- the row or
+    the scan predates the field -- and matches anything, the same
+    tolerance ``jobs._still_describes`` gives a legacy job row.
+
+    :param edit: The edit to judge.
+    :param scan: The scan it belongs to.
+    :returns: Whether the edit was made against another original.
+    :rtype: bool
+    """
+    if not edit.source_fingerprint or not scan.source_fingerprint:
+        return False
+    return edit.source_fingerprint != scan.source_fingerprint
+
+
+def has_pending_changes(scan: Scan) -> bool:
+    """Return whether the scan carries edits the apply has not built in.
+
+    Only the structural kinds count. A page number and a dismissal need
+    no apply: every recompute reads them off the rows.
+
+    :param scan: The scan to check.
+    :returns: Whether an unapplied structural edit exists.
+    :rtype: bool
+    """
+    return open_edits(scan, *PageEdit.STRUCTURAL_KINDS).exists()
+
+
+def overlay_page_numbers(
+    scan: Scan, results: list[dict]
+) -> tuple[list[dict], list[PageEdit]]:
+    """Write the curator's page numbers over the model's readings.
+
+    The curator outranks the model: a typed number is the one thing in
+    ``Scan.ocr_results`` a rerun of the OCR stage must not overwrite.
+    Each overlaid entry keeps the ``"manual"`` stamp the rest of the
+    portal reads (``services._is_manual_read``, the sidebar), so the
+    stamp stays a derived marker and the row stays the source.
+
+    :param scan: The scan the results belong to.
+    :param results: Per-page entries, straight from the OCR stage.
+    :returns: The overlaid entries, and the edits that could not be
+        placed on a page of this original.
+    :rtype: tuple[list[dict], list[PageEdit]]
+    """
+    by_page = {entry["pdf_page"]: entry for entry in results}
+    stale: list[PageEdit] = []
+    for edit in open_edits(scan, PageEdit.Kind.SET_NUMBER):
+        entry = by_page.get(edit.pdf_page)
+        if entry is None or is_stale(edit, scan):
+            logger.warning(
+                "page_edits: scan %s: page number %r for PDF page %s was "
+                "not applied (%s)",
+                scan.pk,
+                edit.value,
+                edit.pdf_page,
+                "the original changed"
+                if entry is not None
+                else "the volume has no such page",
+            )
+            stale.append(edit)
+            continue
+        if edit.value:
+            entry["detected"] = edit.value
+            entry["type"] = "range" if "-" in edit.value else "single"
+            entry["score"] = 1.0
+        else:
+            entry["detected"] = None
+            entry["type"] = None
+            entry["score"] = None
+        entry["zone"] = "manual"
+        entry["ocr"] = "manual"
+    return results, stale
+
+
+def _dismissal_matches(edit: PageEdit, issue: dict) -> bool:
+    """Return whether one dismissal covers one rebuilt issue.
+
+    An issue names a page in one of two spaces, and the check decides
+    which: a physical PDF page for the checks in
+    ``models.PHYSICAL_PAGE_CHECKS``, and the printed number for the
+    rest, which is why the dismissal keeps both columns.
+
+    :param edit: An open ``DISMISS_ISSUE`` row.
+    :param issue: One rebuilt issue dict, before it becomes a row.
+    :returns: Whether the curator already dismissed this issue.
+    :rtype: bool
+    """
+    from scanning.models import PHYSICAL_PAGE_CHECKS
+
+    if edit.value != issue["check_name"]:
+        return False
+    page = issue.get("page_number")
+    if page is None:
+        return edit.pdf_page is None and not edit.logical_page
+    if issue["check_name"] in PHYSICAL_PAGE_CHECKS:
+        return edit.pdf_page == page
+    return edit.pdf_page is None and edit.logical_page == str(page)
+
+
+def drop_dismissed(scan: Scan, issues: list[dict]) -> list[dict]:
+    """Remove the issues a curator has already dismissed.
+
+    A rebuild writes new ``Issue`` rows with new primary keys, so a
+    dismissal cannot be a row that was deleted: it is a decision, and
+    it lives with the other decisions. The match is on the check's name
+    plus its page, for that reason.
+
+    :param scan: The scan being rebuilt.
+    :param issues: The rebuilt issue dicts.
+    :returns: The dicts the curator has not dismissed.
+    :rtype: list[dict]
+    """
+    dismissals = [
+        edit
+        for edit in open_edits(scan, PageEdit.Kind.DISMISS_ISSUE)
+        if not is_stale(edit, scan)
+    ]
+    if not dismissals:
+        return issues
+    return [
+        issue
+        for issue in issues
+        if not any(_dismissal_matches(e, issue) for e in dismissals)
+    ]
+
+
+def stale_edit_issues(stale: list[PageEdit]) -> list[dict]:
+    """Describe edits that were not applied, as issues for the curator.
+
+    The portal used to drop a curator's number in silence when the page
+    it named was absent from a new OCR run. A person who typed a number
+    must be told it did not land, and the issue list is where review 1
+    already looks.
+
+    :param stale: The edits the overlay could not place.
+    :returns: Issue dicts, ready for ``Issue`` rows.
+    :rtype: list[dict]
+    """
+    issues = []
+    for edit in stale:
+        page = edit.pdf_page or edit.anchor_pdf_page
+        issues.append(
+            {
+                "page_number": page,
+                "check_name": CheckName.STALE_PAGE_EDIT,
+                "severity": Issue.Severity.WARNING,
+                "message": (
+                    f"PDF page {page}: your edit "
+                    f"({edit.get_kind_display().lower()}"
+                    f"{f', {edit.value!r}' if edit.value else ''}) was "
+                    f"made against a different version of this scan, or "
+                    f"names a page it no longer has, so it was not "
+                    f"applied. Make it again on the page as it is now."
+                ),
+            }
+        )
+    return issues
