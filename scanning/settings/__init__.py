@@ -9,5 +9,6 @@ from .project.runpod import *
 from .project.security import *
 from .project.sharding import *
 from .project.testing import *
+from .project.yolo import *
 from .third_party.aws import *
 from .third_party.sentry import *

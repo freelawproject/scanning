@@ -1659,13 +1659,18 @@ class JobProvider(models.TextChoices):
 class JobEngine(models.TextChoices):
     """What a job actually does: the model or program that runs.
 
-    ``BLACKLETTER`` runs detection and page analysis over a volume; the
-    OCR engines read opinion PDFs. ``BITONAL`` is not a model but the
-    1-bit conversion pass, which gets rows because it runs on doctor
-    rather than on the portal host (#158).
+    ``BLACKLETTER`` runs YOLO detection over a volume; the OCR engines
+    read opinion PDFs. ``BITONAL`` is not a model but the 1-bit
+    conversion pass, which gets rows because it runs on doctor rather
+    than on the portal host (#158).
+
+    The engine names the library, not the checkpoint it loads: the
+    weights are a worker input (``yolo.MODELS``), so a later checkpoint
+    is a payload change rather than a new engine. Its PaddleOCR half
+    went with the legacy pipeline (#173), which is what the label says.
     """
 
-    BLACKLETTER = "blackletter", "blackletter (YOLO + PaddleOCR)"
+    BLACKLETTER = "blackletter", "blackletter (YOLO detection)"
     BITONAL = "bitonal", "Bitonal conversion"
     DOTS_MOCR = "dots_mocr", "dots.mocr"
     MISTRAL_OCR = "mistral_ocr", "Mistral OCR"
