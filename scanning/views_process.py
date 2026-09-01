@@ -191,11 +191,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
 
     issues = list(scan.issues.all())
 
-    # The dots.mocr stage writes no scan status by design (#190), so its
-    # rows are the only place its progress lives.
-    from scanning import dots_mocr
+    # Neither GPU stage writes a scan status by design (#190, #195), so
+    # their rows are the only place their progress lives.
+    from scanning import dots_mocr, yolo
 
     dots_run = dots_mocr.run_summary(scan)
+    yolo_run = yolo.run_summary(scan)
 
     # Each uploaded image is shown at the gap its row names, and every
     # remaining placeholder is stamped with the physical page it
@@ -454,6 +455,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "has_detections": has_detections,
             "is_processing": is_processing,
             "dots_run": dots_run,
+            "yolo_run": yolo_run,
             **_review_flags(scan),
             "opinions": opinions,
             "opinions_json": json.dumps(opinions),
@@ -489,13 +491,16 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     # the pages sidebar live without a full page reload.
     if scan.ocr_results:
         data["ocr_results"] = scan.ocr_results
-    # The dots.mocr stage moves no scan status, so a viewer polling this
-    # would otherwise see nothing happen for the whole run (#190).
-    from scanning import dots_mocr
+    # Neither GPU stage moves a scan status, so a viewer polling this
+    # would otherwise see nothing happen for a whole run (#190, #195).
+    from scanning import dots_mocr, yolo
 
     dots_run = dots_mocr.run_summary(scan)
     if dots_run:
         data["dots_run"] = dots_run
+    yolo_run = yolo.run_summary(scan)
+    if yolo_run:
+        data["yolo_run"] = yolo_run
     return JsonResponse(data)
 
 
@@ -875,7 +880,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
     if step < 1 or step > 3:
         step = 1
 
-    from scanning import dots_mocr
+    from scanning import dots_mocr, yolo
 
     context = {
         "scan": scan,
@@ -886,6 +891,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "has_detections": Detection.objects.filter(scan=scan).exists(),
         "opinions": scan.opinions_json,
         "dots_run": dots_mocr.run_summary(scan),
+        "yolo_run": yolo.run_summary(scan),
         **_review_flags(scan),
     }
     html = render_to_string(
@@ -1065,6 +1071,106 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
             request,
             f"This volume was already read: run {created[0].run} covers "
             f"all {len(created)} part(s). Nothing new was queued.",
+        )
+    return back
+
+
+@login_required
+@require_POST
+def start_yolo_detect(request: HttpRequest, pk: int) -> HttpResponse:
+    """Start YOLO detection over a scan's original shards (#195).
+
+    Staff only, and the **only** way into this stage. The pipeline
+    deliberately does not enqueue it: the rebuilt worker image (#194)
+    has to be exercised on a few volumes before it runs over the
+    corpus (#211). Every press can start real graphics processing unit
+    (GPU) work on RunPod that costs money.
+
+    Detection reads the **original** shards, not the converted ones.
+    bl-warm was trained on greyscale renders, and its large region
+    classes collapse on 1-bit pages (#167).
+
+    **This request makes no call to RunPod.** It writes one
+    ``ExternalJob`` row per shard and returns; the daemon's next
+    ``submit_external_jobs`` tick sends them, and ``collect_external_jobs``
+    polls and retries them. That keeps a request thread off a slow HTTP
+    call, and it is what makes the run survive a redeployed web pod.
+
+    It also never cuts shards. ``sharding.committed_manifest`` verifies
+    the stored set against the original with one ``head_object``, so this
+    view neither downloads a multi-gigabyte PDF nor reads ``shards/``
+    directly. A stale or missing set is refused, because re-cutting is
+    the pipeline's job.
+
+    Nothing reads the output yet. The rows stop at ``COMPLETED`` and
+    the results sit in S3 until #196 turns them into detections and
+    redaction geometry.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page.
+    """
+    from scanning import sharding, yolo
+
+    scan = get_object_or_404(Scan, pk=pk)
+    back = redirect("scan_process", pk=scan.pk)
+
+    if not request.user.is_staff:
+        messages.error(
+            request,
+            "Only staff can start detection: each run costs GPU time.",
+        )
+        return back
+
+    if not yolo.enabled():
+        messages.warning(
+            request,
+            "YOLO detection is not switched on in this environment. Set "
+            "YOLO_ENABLED and RUNPOD_YOLO_ENDPOINT_ID first.",
+        )
+        return back
+
+    # An open run means the daemon is still working on the last press.
+    # A finished run is reused rather than refused, which is what keeps
+    # ``ensure_detect_jobs`` from paying twice for shards already read.
+    summary = yolo.run_summary(scan)
+    if summary and summary["open"]:
+        messages.info(
+            request,
+            f"Detection run {summary['run']} is already going: "
+            f"{summary['done']} of {summary['total']} part(s) done.",
+        )
+        return back
+
+    manifest, reason = sharding.committed_manifest(scan)
+    if manifest is None:
+        messages.warning(request, reason)
+        return back
+
+    created = yolo.ensure_detect_jobs(scan, manifest)
+    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
+    logger.info(
+        "start_yolo_detect: scan=%s user=%s run=%s shards=%d queued=%d",
+        scan.pk,
+        request.user.pk,
+        created[0].run if created else "?",
+        len(created),
+        queued,
+    )
+    if queued:
+        messages.success(
+            request,
+            f"Queued detection for {queued} part(s) of this volume. The "
+            "daemon sends them to RunPod within a few seconds.",
+        )
+    else:
+        # ``ensure_detect_jobs`` reused a run that is already done, so
+        # nothing was queued and nothing will be sent. Saying otherwise
+        # would have staff waiting on a dispatch that is not coming.
+        messages.info(
+            request,
+            f"This volume was already detected: run {created[0].run} "
+            f"covers all {len(created)} part(s). Nothing new was queued.",
         )
     return back
 
