@@ -294,11 +294,11 @@ class TestAssignPageWritesAnEdit(TestCase):
         self.assertEqual(edit.source_fingerprint, "100:2")
         self.assertIsNone(edit.applied_at)
 
-    def test_the_row_records_what_it_overruled(self):
+    def test_the_row_records_the_reading_it_overruled(self):
         self._post(1, "6")
 
         edit = self.scan.page_edits.get()
-        self.assertEqual(edit.replaced, "5")
+        self.assertEqual(edit.previous_value, "5")
 
     def test_a_second_edit_of_one_page_updates_its_row(self):
         # Two curators on two pages was the lost update this model

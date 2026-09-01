@@ -177,12 +177,14 @@ pieces: `models.PageEdit`, `page_edits.py` (the queries and the
 overlay), and the endpoints in `views_process.py`. What must not be
 broken:
 
-- **Every address is the physical space of the original as it was
-  uploaded**, 1-based -- the space `Detection.page_index` and the shard
-  manifest already use. A printed number addresses nothing: front
-  matter has none, and two pages can print 1074, which is one of the
-  defects review 1 exists to find. It rides along as `logical_page`,
-  for the label and the audit.
+- **A row's address -- which page of the volume it is about -- is
+  always the physical space of the original as it was uploaded**,
+  1-based, the space `Detection.page_index` and the shard manifest
+  already use. Two columns carry it, `pdf_page` and `anchor_pdf_page`,
+  and nothing else on the row locates anything. A printed number
+  cannot: front matter has none, and two pages can print 1074, which
+  is one of the defects review 1 exists to find. It rides along as
+  `logical_page`, a label only.
 - **An insert is addressed by a gap.** `anchor_pdf_page` is the page
   the image follows, 0 means "before page 1", and `ordinal` orders
   several images in one gap. `page_edits.project_inserts` does both

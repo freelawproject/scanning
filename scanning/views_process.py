@@ -1274,10 +1274,10 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
         defaults={
             "author": request.user,
             "value": page_value,
-            # What the decision overwrote, for the audit: the model's
-            # reading is rebuilt from the run on every recompute, so
-            # this row is the only record that it was overruled.
-            "replaced": str(entry.get("detected") or ""),
+            # The reading this number overrules. It is rebuilt from
+            # the run on every recompute, so this row is the only
+            # record that a person disagreed with the model.
+            "previous_value": str(entry.get("detected") or ""),
             "source_fingerprint": scan.source_fingerprint,
         },
     )
@@ -1664,7 +1664,6 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
         applied_at=None,
         defaults={
             "author": request.user,
-            "replaced": issue.severity,
             "source_fingerprint": scan.source_fingerprint,
         },
     )

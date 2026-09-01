@@ -44,7 +44,7 @@ def create_page_edits(apps, schema_editor):
                     kind="set_number",
                     pdf_page=page,
                     value=value,
-                    replaced="",
+                    previous_value="",
                     logical_page="",
                     source_fingerprint="",
                 )

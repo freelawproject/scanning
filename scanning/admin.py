@@ -682,7 +682,7 @@ class PageEditAdmin(admin.ModelAdmin):
         "anchor_pdf_page",
         "ordinal",
         "value",
-        "replaced",
+        "previous_value",
         "logical_page",
         "image",
         "source_fingerprint",

@@ -1164,6 +1164,11 @@ class PageEdit(AbstractDateTimeModel):
     dismissal of an issue, which used to be a ``DELETE`` of the derived
     ``Issue`` row and so did not survive one recompute.
 
+    A row's **address** is the page it is about: which page of the
+    volume the curator was looking at. Two columns carry it --
+    ``pdf_page`` for a page, ``anchor_pdf_page`` for the gap between
+    two pages -- and nothing else on the row locates anything.
+
     What must not be broken:
 
     - **Every address is in the physical space of the original as it
@@ -1174,10 +1179,10 @@ class PageEdit(AbstractDateTimeModel):
       ``anchor_pdf_page`` is the original page the image follows, and 0
       means "before page 1". ``ordinal`` orders several images in one
       gap. The anchor is resolved once, when the curator uploads the
-      image; ``logical_page`` is the label beside it, never the
-      address. A printed number cannot address anything: front matter
-      has none, and two pages can both print 1074 -- which is one of
-      the defects review 1 exists to find.
+      image; ``logical_page`` is the printed number beside it, a label
+      only. A printed number cannot be an address: front matter has
+      none, and two pages can both print 1074 -- which is one of the
+      defects review 1 exists to find.
     - **Applying an edit closes it; it never rewrites it.** The apply
       (#206) stamps ``applied_at`` and the row becomes history. So
       every unique constraint is partial over the open rows: a curator
@@ -1273,19 +1278,30 @@ class PageEdit(AbstractDateTimeModel):
             "it; the rotation in degrees; the dismissed check's name."
         ),
     )
-    replaced = models.CharField(
+    previous_value = models.CharField(
         max_length=32,
         blank=True,
         default="",
-        help_text="What the decision overwrote, for the audit.",
+        help_text=(
+            "The page number this row overruled, on a SET_NUMBER row: "
+            "what the model had read on that page ('677'), or blank "
+            "when it had read nothing. Blank on every other kind. The "
+            "model's reading is rebuilt from the OCR run on every "
+            "recompute, so this is the only record that a person "
+            "disagreed with it."
+        ),
     )
     logical_page = models.CharField(
         max_length=32,
         blank=True,
         default="",
         help_text=(
-            "The printed page number this edit is about, as a label "
-            "and for the audit. Never an address."
+            "The page number printed on the page, kept as a label and "
+            "for the audit: the number an insert's placeholder showed, "
+            "or the number a dismissed issue named. It never locates "
+            "the page -- front matter prints no number, and two pages "
+            "can both print 1074, so pdf_page and anchor_pdf_page are "
+            "what a reader follows."
         ),
     )
 
