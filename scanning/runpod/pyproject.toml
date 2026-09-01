@@ -1,0 +1,43 @@
+[project]
+name = "blackletter-gpu-worker"
+version = "0.0.1"
+description = "RunPod Serverless handler for the blackletter detection step (YOLO)."
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    # GPU stack. torch and torchvision come from the cu126 index below,
+    # and their nvidia-* dependencies carry the CUDA runtime, which is
+    # why the image needs no CUDA base layer.
+    "torch",
+    "torchvision",
+
+    # Inference. The `detect` extra adds ultralytics and
+    # huggingface_hub; base blackletter brings numpy, opencv-python,
+    # pillow, pymupdf and ocrmypdf. 0.3.0 is the floor: it is the
+    # release that carries the bl_warm adapter, the bl_warm entry in
+    # the Hugging Face weight table, and its confidence gates
+    # (blackletter #73).
+    "blackletter[detect]>=0.3.0",
+
+    # RunPod plumbing
+    "requests>=2.33,<3",
+    "runpod>=1.9,<2",
+    "sentry-sdk>=2,<3",
+]
+
+# This project is an application (handler.py), not a library. Tell uv
+# not to try to build it as an installable package.
+[tool.uv]
+package = false
+
+# Route the GPU wheels to their vendor index. Other deps come from PyPI
+# by default. ``explicit = true`` means this index is only searched for
+# packages routed to it here, so a plain PyPI package never falls
+# through to it.
+[tool.uv.sources]
+torch = { index = "pytorch-gpu" }
+torchvision = { index = "pytorch-gpu" }
+
+[[tool.uv.index]]
+name = "pytorch-gpu"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

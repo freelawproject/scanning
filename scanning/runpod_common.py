@@ -8,11 +8,17 @@ or anything not installed in every worker venv — only ``requests``,
 PyMuPDF (imported lazily), and the stdlib.
 
 Extracted from the previously byte-for-byte duplicated copies in the
-worker handlers so a fix to the resume/validation logic lands in every
-worker at once. The only worker left is ``scanning/runpod-dotsmocr/``
-(the legacy blackletter-gpu-worker went with the legacy pipeline,
-issue #173), but the next engine image (#147) starts from this module
-too. Tested in ``scanning/tests/test_runpod_common.py``.
+worker handlers so a fix to the shared logic lands in every worker at
+once. Two workers build on it: ``scanning/runpod-dotsmocr/`` (#190) and
+the bl_warm detection worker under ``scanning/runpod/`` (#194). The
+next engine image (#147) starts from this module too. It carries the
+transfer and validation code, and also the worker scaffold: the Sentry
+setup, the boot clock, the worker-meta fields, the result envelope, and
+the action runner whose error codes the daemon (``runpod_client.py``)
+classifies. One daemon reads the output of every worker, so these
+blocks are one contract and must not fork per image. Tested in
+``scanning/tests/test_runpod_common.py`` and through both handler test
+modules.
 """
 
 from __future__ import annotations
@@ -21,13 +27,57 @@ import json
 import logging
 import os
 import random
+import shutil
+import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import requests
 from urllib3.exceptions import IncompleteRead, ProtocolError
 
 logger = logging.getLogger("runpod_common")
+
+
+class BadInputError(ValueError):
+    """A job input the caller got wrong. Terminal.
+
+    The action runner answers this as ``error_code=BAD_INPUT``, which
+    the daemon treats as terminal. A distinct type, and not a bare
+    ``ValueError``, because the worker stack raises ``ValueError`` at
+    run time too (a degenerate page render, a shape check inside the
+    model libraries). An ``except ValueError`` arm around the whole
+    action would answer those as BAD_INPUT: the daemon would write the
+    shard off as a caller error, and no Sentry event would say why.
+    Subclasses ``ValueError`` so an old caller of the input checks
+    keeps working.
+    """
+
+
+def coerce_input(name: str, value: Any, cast: Callable) -> Any:
+    """Cast one job input, and refuse a bad value as a caller error.
+
+    ``float(None)`` and ``float([])`` raise ``TypeError``, not
+    ``ValueError``, and JSON ``null`` is a natural way for a caller to
+    say "use the default". Both must come back as ``BAD_INPUT``: an
+    uncaught ``TypeError`` reaches the caller as a raw traceback with
+    no ``error_code``, so the daemon retries a terminally-bad input at
+    full GPU price.
+
+    :param name: The input's name, for the error message.
+    :param value: The raw value from the job input.
+    :param cast: ``int`` or ``float``.
+    :returns: The cast value.
+    :raises BadInputError: If the value does not cast.
+    """
+    try:
+        return cast(value)
+    except (TypeError, ValueError) as exc:
+        raise BadInputError(
+            f"{name!r} must be a number, got {value!r}"
+        ) from exc
+
 
 # Read timeout: max seconds to wait for the next chunk of body. A single
 # value would also bound connect; we split connect/read so a stalled
@@ -121,7 +171,8 @@ def download_pdf(url: str, dest: Path) -> None:
 
     :param url: PDF URL (typically a presigned S3 GET URL).
     :param dest: Local filesystem target.
-    :raises ValueError: If ``url`` is not http(s).
+    :raises BadInputError: If ``url`` is not http(s). A caller error,
+        so the handlers answer it as a terminal ``BAD_INPUT``.
     :raises requests.HTTPError: On a non-2xx response other than the
         handled 403/416 cases.
     :raises RuntimeError: If the presigned URL is expired (403), or if
@@ -129,7 +180,7 @@ def download_pdf(url: str, dest: Path) -> None:
         ``DOWNLOAD_MAX_ATTEMPTS`` attempts.
     """
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        raise ValueError(
+        raise BadInputError(
             f"refusing to download PDF from non-http(s) URL: {url!r}"
         )
 
@@ -433,3 +484,309 @@ def upload_result(url: str, payload: dict, content_type: str) -> int:
         f"attempt(s): {last_exc}",
         error_code="RESULT_UPLOAD_FAILED",
     )
+
+
+# ── Worker scaffold ─────────────────────────────────────────────────
+# The blocks below existed once per handler. They are one contract:
+# one daemon reads every worker's envelope, error codes and meta
+# fields, so a change that lands in one image and not the other makes
+# the daemon misread paid work. Each handler keeps thin wrappers that
+# bind its own module globals (its GPU flag, its patched transfer
+# functions), so the handler tests keep their patch points.
+
+#: Version of the result envelope. A caller reading an object written
+#: here checks this before it trusts the payload, so bump it only when
+#: the payload's shape changes -- and expect the caller to treat an
+#: unknown version as "worker deployed ahead of the daemon" rather
+#: than as a bad result. ``runpod_client.py`` imports this same
+#: constant, so the writer and the reader cannot drift in source; a
+#: deploy skew between them is what the unknown-version rule is for.
+RESULT_SCHEMA_VERSION = 1
+
+#: Content type sent on the result PUT. Signed into the presigned URL
+#: by the caller, so this constant and its signing parameter must stay
+#: in lockstep: a mismatch is a 403 that reads like an expired
+#: signature.
+RESULT_CONTENT_TYPE = "application/json"
+
+
+def init_sentry(handler_logger: logging.Logger) -> Any:
+    """Initialise Sentry for a worker process, if it is configured.
+
+    :param handler_logger: The handler's logger, for the init line.
+    :returns: The ``sentry_sdk`` module, or ``None`` when the image
+        does not carry it. The caller guards every capture on that.
+    :rtype: module | None
+    """
+    try:
+        import sentry_sdk
+    except ImportError:
+        return None
+
+    dsn = os.environ.get("SENTRY_DSN_GPU", "").strip()
+    if dsn:
+        sentry_sdk.init(
+            dsn=dsn,
+            environment=os.environ.get("SENTRY_ENV", "prod"),
+            release=os.environ.get("GIT_SHA", "unknown"),
+            traces_sample_rate=0.0,
+        )
+        handler_logger.info("Sentry initialised")
+    return sentry_sdk
+
+
+class WorkerClock:
+    """Boot and uptime accounting for one worker process.
+
+    Construct it as early as possible in the handler module, so
+    ``boot_ms`` covers the cold-start cost (module imports plus the
+    model preload). Call :meth:`mark_ready` once the preload is done.
+    ``boot_ms`` is then constant per worker, and ``uptime_ms()``
+    anchors per-job uptime: the same ``boot_ms`` plus an increasing
+    uptime across jobs identifies one warm worker. Uses
+    ``time.monotonic()`` so wall-clock jumps do not move the numbers.
+    """
+
+    def __init__(self) -> None:
+        self._start = time.monotonic()
+        self._ready_at = self._start
+        self.boot_ms = 0
+
+    def mark_ready(self) -> None:
+        """Freeze the cold-start cost. Call once, after the preload."""
+        self._ready_at = time.monotonic()
+        self.boot_ms = int((self._ready_at - self._start) * 1000)
+
+    def uptime_ms(self) -> int:
+        """Return milliseconds since :meth:`mark_ready`.
+
+        :returns: Uptime in ms. A small value means a cold start; a
+            large value means a reused warm worker.
+        :rtype: int
+        """
+        return int((time.monotonic() - self._ready_at) * 1000)
+
+
+def with_worker_meta(
+    payload: dict, *, clock: WorkerClock, gpu_available: bool
+) -> dict:
+    """Attach worker boot / uptime / GPU status to a response dict.
+
+    Used for both successful and structured-error returns so the
+    caller can always see whether this job hit a warm worker and
+    whether inference ran on GPU.
+
+    :param payload: The response dict to augment in place.
+    :param clock: The worker's boot clock.
+    :param gpu_available: The handler's own GPU flag.
+    :returns: The same dict with meta fields added.
+    :rtype: dict
+    """
+    payload["worker_boot_ms"] = clock.boot_ms
+    payload["worker_uptime_ms"] = clock.uptime_ms()
+    payload["gpu_available"] = gpu_available
+    return payload
+
+
+def tag_sentry(
+    sentry: Any,
+    job: dict,
+    action: str,
+    scan_pk: Any,
+    *,
+    clock: WorkerClock,
+    gpu_available: bool,
+    handler_logger: logging.Logger,
+) -> None:
+    """Tag the current Sentry scope with job-identifying context.
+
+    Every exception captured during a handler invocation carries these
+    tags, so an event points at the scan and the RunPod job that
+    triggered it.
+
+    :param sentry: The ``sentry_sdk`` module, or ``None`` (no-op).
+    :param job: RunPod job dict (expects an ``id`` field).
+    :param action: The handler action being executed.
+    :param scan_pk: Primary key of the scan this job belongs to.
+    :param clock: The worker's boot clock.
+    :param gpu_available: The handler's own GPU flag.
+    :param handler_logger: The handler's logger, for the warning line.
+    """
+    if sentry is None:
+        return
+    sentry.set_tag("action", action)
+    sentry.set_tag("gpu_available", str(gpu_available))
+    sentry.set_tag("worker_boot_ms", str(clock.boot_ms))
+    sentry.set_tag("worker_uptime_ms", str(clock.uptime_ms()))
+    # Set unconditionally: tags live on the global scope, which a warm
+    # worker reuses across jobs. Skipping the set when the value is
+    # absent would leave the *previous* job's scan_pk/job id on every
+    # event this job captures, misattributing its failures.
+    scan_tag = "unknown"
+    if scan_pk is not None:
+        try:
+            scan_tag = str(int(scan_pk))
+        except (TypeError, ValueError):
+            handler_logger.warning("ignoring non-integer scan_pk: %r", scan_pk)
+    sentry.set_tag("scan_pk", scan_tag)
+    sentry.set_tag("runpod_job_id", str(job.get("id") or "unknown"))
+
+
+def deliver_result(
+    result: dict,
+    inputs: dict,
+    scan_pk: Any,
+    *,
+    summary_fields: tuple,
+    upload: Callable,
+    extra_summary: Callable[[dict], dict] | None = None,
+) -> dict:
+    """Send a result to S3 when asked, and answer with a summary.
+
+    Two shapes, chosen by the caller and not by us:
+
+    - ``result_url`` present -> wrap the payload in a self-describing
+      envelope, PUT it, and return only the summary plus the key. This
+      is what a volume-sized payload needs: RunPod caps a response at
+      about 20 MB and discards it with the job record.
+    - absent -> return the payload inline. That path is what dev and
+      continuous integration use without credentials, and what a
+      caller running an older contract gets, so rolling an image back
+      needs no daemon change.
+
+    :param result: The action's own return value.
+    :param inputs: The handler input payload.
+    :param scan_pk: The scan the job belongs to, for the envelope.
+    :param summary_fields: The small ``result`` fields the response
+        keeps on the S3 path. The volume-sized field must not be in
+        here -- echoing it back reintroduces the response cap.
+    :param upload: The handler's own ``upload_result`` reference, so a
+        test that patches the handler module still intercepts the PUT.
+    :param extra_summary: Optional; computes handler-specific summary
+        fields from ``result`` (the detect worker's
+        ``detection_count``).
+    :returns: What to answer RunPod with.
+    :rtype: dict
+    :raises ResultUploadError: If the upload failed. The caller turns
+        its ``error_code`` into a retry or a terminal failure.
+    """
+    result_url = inputs.get("result_url")
+    if not result_url:
+        return result
+
+    envelope = {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "action": inputs.get("action"),
+        "scan_pk": scan_pk,
+        # Echoed so a reader can confirm the object is the one it asked
+        # for, without trusting the key it happens to be stored under.
+        "result_key": inputs.get("result_key"),
+        "payload": result,
+    }
+    size = upload(result_url, envelope, RESULT_CONTENT_TYPE)
+
+    summary = {
+        field: result[field] for field in summary_fields if field in result
+    }
+    if extra_summary is not None:
+        summary.update(extra_summary(result))
+    summary["result_key"] = inputs.get("result_key")
+    summary["bytes"] = size
+    return summary
+
+
+def execute_action(
+    fn: Callable,
+    job: dict,
+    inputs: dict,
+    *,
+    action: str,
+    scan_pk: Any,
+    deliver: Callable,
+    meta: Callable[[dict], dict],
+    sentry: Any,
+    handler_logger: logging.Logger,
+) -> dict:
+    """Run one action inside the error-code contract the daemon reads.
+
+    The ``except`` arms below *are* that contract, which is why they
+    live here and not once per handler: the daemon classifies each
+    ``error_code`` as a retry or a terminal failure, and an arm that
+    drifted in one image would misroute paid work.
+
+    :param fn: The action function: ``fn(job, inputs, tmp_dir)``.
+    :param job: The RunPod job dict.
+    :param inputs: The handler input payload.
+    :param action: The action name, for the log lines.
+    :param scan_pk: The scan the job belongs to, for the log lines.
+    :param deliver: The handler's ``_deliver`` wrapper.
+    :param meta: The handler's ``_with_worker_meta`` wrapper.
+    :param sentry: The ``sentry_sdk`` module, or ``None``.
+    :param handler_logger: The handler's logger.
+    :returns: What to answer RunPod with.
+    :rtype: dict
+    """
+    tmp_dir = Path(tempfile.mkdtemp(prefix="runpod-"))
+    try:
+        result = fn(job, inputs, tmp_dir)
+        return meta(deliver(result, inputs, scan_pk))
+    except ResultUploadError as exc:
+        # The compute succeeded but could not be delivered, so nothing
+        # was written and there is nothing for the caller to harvest.
+        # Returned as a structured error rather than raised, because
+        # the code is the whole point: RESULT_UPLOAD_FAILED and
+        # RESULT_URL_EXPIRED are worth a fresh job (which mints a fresh
+        # URL), and RESULT_UPLOAD_REJECTED never is.
+        handler_logger.error(
+            "result delivery failed: action=%s scan_pk=%s code=%s: %s",
+            action,
+            scan_pk,
+            exc.error_code,
+            exc,
+        )
+        if sentry is not None:
+            sentry.capture_exception(exc)
+        return meta({"error": str(exc), "error_code": exc.error_code})
+    except CorruptDownloadError as exc:
+        # Our copy of the PDF would not open, or arrived truncated. The
+        # object in the bucket is sound -- the caller cut each shard
+        # and verified it against the original -- so this describes the
+        # transfer, not the input, and the next attempt may well get it
+        # right. Its own code, because BAD_INPUT is terminal and would
+        # write a volume off for a dropped connection.
+        handler_logger.warning(
+            "corrupt download: action=%s scan_pk=%s: %s",
+            action,
+            scan_pk,
+            exc,
+        )
+        return meta(
+            {"error": str(exc), "error_code": "INPUT_DOWNLOAD_CORRUPT"}
+        )
+    except BadInputError as exc:
+        # Input validation (a missing pdf_url, an out-of-range option,
+        # an over-MAX_PAGES input). Returned as a structured error, not
+        # raised: a raw traceback carries no error_code, so the caller
+        # couldn't tell this terminal input error from a transient
+        # failure and would retry it to fail identically forever.
+        # Deliberately NOT ``except ValueError``: the worker stack
+        # raises ValueError at run time too (a degenerate page render,
+        # a model shape check), and answering one of those as BAD_INPUT
+        # would write the shard off as a caller error with no Sentry
+        # event. Those fall through to the arm below instead.
+        handler_logger.warning(
+            "bad input: action=%s scan_pk=%s: %s", action, scan_pk, exc
+        )
+        return meta({"error": str(exc), "error_code": "BAD_INPUT"})
+    except Exception as exc:
+        if sentry is not None:
+            sentry.capture_exception(exc)
+        handler_logger.exception(
+            "handler failed: action=%s scan_pk=%s", action, scan_pk
+        )
+        # Re-raise so RunPod marks the job FAILED with the traceback.
+        # Worker meta is on the Sentry event through tag_sentry; there
+        # is no output dict to attach it to here.
+        raise
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)

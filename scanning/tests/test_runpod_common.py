@@ -218,7 +218,9 @@ class DownloadPdfTest(SimpleTestCase):
         self.assertEqual(len(calls), runpod_common.DOWNLOAD_MAX_ATTEMPTS)
 
     def test_rejects_non_http_url(self):
-        with self.assertRaisesRegex(ValueError, "non-http"):
+        # BadInputError specifically: the URL comes from the caller, so
+        # the handlers must answer it as a terminal BAD_INPUT.
+        with self.assertRaisesRegex(runpod_common.BadInputError, "non-http"):
             runpod_common.download_pdf("file:///etc/passwd", self.dest)
 
 
@@ -418,3 +420,50 @@ class UploadResultTest(SimpleTestCase):
         result, put = self._put(400)
         self.assertEqual(result.error_code, "RESULT_UPLOAD_REJECTED")
         self.assertEqual(put.call_count, 1)
+
+
+class BadInputTest(SimpleTestCase):
+    """The caller-error type and the input coercion helper."""
+
+    def test_it_is_a_value_error(self):
+        # Old code that catches ValueError around an input check keeps
+        # working; the runner's arm catches only the subclass.
+        self.assertTrue(issubclass(runpod_common.BadInputError, ValueError))
+
+    def test_coerce_input_casts(self):
+        self.assertEqual(runpod_common.coerce_input("dpi", "200", int), 200)
+        self.assertEqual(
+            runpod_common.coerce_input("confidence", 0.2, float), 0.2
+        )
+
+    def test_coerce_input_refuses_uncastable_values(self):
+        # ``float(None)`` raises TypeError, not ValueError; both must
+        # come back as the caller error they are, or the daemon retries
+        # a terminally-bad input at full GPU price.
+        for value in (None, [0.2], {"value": 0.2}, "not-a-number"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    runpod_common.BadInputError, "confidence"
+                ):
+                    runpod_common.coerce_input("confidence", value, float)
+
+
+class WorkerClockTest(SimpleTestCase):
+    """Boot and uptime accounting shared by the worker handlers."""
+
+    def test_mark_ready_freezes_boot_ms(self):
+        clock = runpod_common.WorkerClock()
+        clock.mark_ready()
+        boot_ms = clock.boot_ms
+        self.assertGreaterEqual(boot_ms, 0)
+        # boot_ms is constant per worker; only uptime keeps moving.
+        clock.uptime_ms()
+        self.assertEqual(clock.boot_ms, boot_ms)
+
+    def test_uptime_anchors_on_ready(self):
+        clock = runpod_common.WorkerClock()
+        with mock.patch.object(
+            runpod_common.time, "monotonic", side_effect=[100.0, 100.5]
+        ):
+            clock.mark_ready()
+            self.assertEqual(clock.uptime_ms(), 500)

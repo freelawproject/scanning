@@ -33,9 +33,12 @@ dependencies = [
   # validation and the ink geometry — no torch/paddle. The heavy in-process
   # inference stack lives in the `local-ml` extra so the web/daemon images stay
   # lean whenever detection is offloaded to RunPod (RUNPOD_ENABLED=True).
-  # 0.2.0 is the floor: it is the release that carries the ink geometry
-  # (blackletter #68/#69) this app reads instead of measuring it here.
-  "blackletter>=0.2.0",
+  # 0.3.0 is the floor. 0.2.0 brought the ink geometry (blackletter #68/#69)
+  # this app reads instead of measuring it here; 0.3.0 adds the bl_warm
+  # adapter, its weight source and its confidence gates (blackletter #73),
+  # which the generalized YOLO stage needs (#193 and its parts). The worker
+  # image (#194) resolves the same floor from its own lock file.
+  "blackletter>=0.3.0",
   # No longer called directly: the pipeline embeds no text layer. Declared
   # so LLM_PAGE_TEXT_LAYER (blackletter's add_text_layer) has an engine, and
   # because base blackletter requires it anyway.
@@ -74,7 +77,7 @@ dev = [
 # wherever detection runs locally instead of on RunPod: local dev, CI, the
 # offline daemon, and the RunPod worker image. Excluded from the lean web image.
 local-ml = [
-  "blackletter[detect,analyze]>=0.2.0",
+  "blackletter[detect,analyze]>=0.3.0",
   "torch",
   "torchvision",
   "ultralytics>=8.3",
