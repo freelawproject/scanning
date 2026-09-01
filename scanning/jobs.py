@@ -5,16 +5,22 @@ write off lives on :class:`~scanning.models.ExternalJob` rows, never in
 a Python call stack. That is what makes an interrupted daemon
 resumable: the next tick re-reads the rows and carries on.
 
-Two stages, two providers, and they differ in *shape* rather than only
-in transport:
+Two providers, and they differ in *shape* rather than only in
+transport:
 
 - ``CONVERT`` on doctor (issue #176) is **synchronous**. The response is
   the completion signal. There is nothing to poll and nothing to cancel,
   and a lost response is recovered with an S3 HEAD on the result key.
-- ``ANALYZE`` on RunPod (issue #190) is **asynchronous**. Submitting
-  returns a job id, ``GET /status`` reports progress, and cancelling
-  matters because a graphics processing unit (GPU) job bills while it
-  runs.
+- ``ANALYZE`` and ``DETECT`` on RunPod (issues #190 and #195) are
+  **asynchronous**. Submitting returns a job id, ``GET /status``
+  reports progress, and cancelling matters because a graphics
+  processing unit (GPU) job bills while it runs.
+
+Those two RunPod stages are two *engines*, and each is a separate
+serverless endpoint with its own image, its own GPU class and its own
+worker pool. What differs is small and it is tabulated once, in
+:class:`RunpodEngine`: an endpoint id, three caps and a payload
+builder. Everything else about them is shared.
 
 That difference is carried by plain branches on ``job.provider``, not by
 a provider abstraction. The deliberate trade: about 600 of the lines
@@ -31,8 +37,8 @@ Four properties are load-bearing and easy to break:
 - **Every write is a compare-and-swap** (:func:`_write`), so no lock is
   held across an HTTP call. The other writer is the web process, not a
   second daemon: the admin re-queue, the admin scan deletion and the
-  dots.mocr start button all call into this module from a request, and
-  the loser's update simply matches nothing.
+  two start buttons all call into this module from a request, and the
+  loser's update simply matches nothing.
 - **A resubmission bumps ``attempt``**, re-addressing the result
   object. Doctor finishes a conversion after we stop listening, and
   RunPod's worker PUTs whether or not we are still reading, so an
@@ -55,6 +61,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
@@ -133,6 +140,126 @@ def _is_runpod(job: ExternalJob) -> bool:
     return job.provider == JobProvider.RUNPOD
 
 
+# ── per-engine RunPod knobs ─────────────────────────────────────────
+# One provider, several engines, and each engine is its own serverless
+# endpoint with its own image, its own graphics processing unit (GPU)
+# class and its own worker pool. So the endpoint, the caps and the
+# payload are per engine, while everything else here stays per provider.
+#
+# This is a table, not a provider layer. The module docstring says why a
+# third *provider* must promote the branches rather than copy a wave;
+# a second engine on RunPod is a smaller thing -- a payload builder, an
+# endpoint id and a cap -- and this is where those three live.
+class UnknownRunpodEngine(runpod_client.RunpodError):
+    """A RunPod row names an engine this module cannot serve.
+
+    A subclass of ``RunpodError`` on purpose: the poll and the cancel
+    already treat that as "not the job's fault, say so once and move
+    on", which is what an unservable row needs. Only the two
+    ``ensure_*_jobs`` wrappers create rows, so this is an internal
+    fault, never an operator's.
+    """
+
+
+@dataclass(frozen=True)
+class RunpodEngine:
+    """What one RunPod engine needs that the others do not.
+
+    Settings are held by **name** and read with ``getattr`` at call
+    time. A value captured when this table is built would ignore
+    ``override_settings``, which every test in this area uses.
+
+    :ivar engine: The :class:`~scanning.models.JobEngine` value.
+    :ivar stage: The :class:`~scanning.models.JobStage` it runs at.
+    :ivar endpoint_setting: Name of the setting holding its endpoint id.
+    :ivar concurrency_setting: Name of the setting capping one wave.
+    :ivar attempts_setting: Name of the setting capping its attempts.
+    :ivar seconds_per_page_setting: Name of the setting adding a
+        per-page allowance to a *running* job's budget.
+    :ivar is_enabled: Whether this engine may be dispatched at all.
+    :ivar build_payload: Builds the ``input`` dict for one shard.
+    :ivar label: What a log line calls this engine.
+    """
+
+    engine: str
+    stage: str
+    endpoint_setting: str
+    concurrency_setting: str
+    attempts_setting: str
+    seconds_per_page_setting: str
+    is_enabled: Callable[[], bool]
+    build_payload: Callable[[ExternalJob, str, str], dict]
+    label: str
+
+
+def _runpod_engines() -> dict[str, RunpodEngine]:
+    """Return every RunPod engine this deploy knows, keyed by engine.
+
+    Rebuilt on each call, and deliberately not cached: the two entries
+    read their functions off the engine modules at build time, so a test
+    that patches ``dots_mocr.enabled`` reaches this table too.
+
+    The imports are inside the function because both engine modules
+    import this one.
+
+    :returns: The engine table.
+    :rtype: dict[str, RunpodEngine]
+    """
+    from scanning import dots_mocr, yolo
+
+    return {
+        JobEngine.DOTS_MOCR: RunpodEngine(
+            engine=JobEngine.DOTS_MOCR,
+            stage=JobStage.ANALYZE,
+            endpoint_setting="RUNPOD_DOTSMOCR_ENDPOINT_ID",
+            concurrency_setting="DOTS_MOCR_MAX_CONCURRENCY",
+            attempts_setting="DOTS_MOCR_MAX_ATTEMPTS",
+            seconds_per_page_setting="DOTS_MOCR_SECONDS_PER_PAGE",
+            is_enabled=dots_mocr.enabled,
+            build_payload=dots_mocr.build_payload,
+            label="dots.mocr",
+        ),
+        JobEngine.BLACKLETTER: RunpodEngine(
+            engine=JobEngine.BLACKLETTER,
+            stage=JobStage.DETECT,
+            endpoint_setting="RUNPOD_YOLO_ENDPOINT_ID",
+            concurrency_setting="YOLO_MAX_CONCURRENCY",
+            attempts_setting="YOLO_MAX_ATTEMPTS",
+            seconds_per_page_setting="YOLO_SECONDS_PER_PAGE",
+            is_enabled=yolo.enabled,
+            build_payload=yolo.build_payload,
+            label="YOLO",
+        ),
+    }
+
+
+def _runpod_engine(job: ExternalJob) -> RunpodEngine:
+    """Return the table entry that serves this row.
+
+    :param job: A RunPod row.
+    :returns: Its engine's entry.
+    :rtype: RunpodEngine
+    :raises UnknownRunpodEngine: If the table has no entry for it.
+    """
+    spec = _runpod_engines().get(job.engine)
+    if spec is None:
+        raise UnknownRunpodEngine(
+            f"job {job.pk} runs {job.engine} on RunPod, but that engine "
+            "has no endpoint, no caps and no payload here"
+        )
+    return spec
+
+
+def _engine_setting(job: ExternalJob, field: str):
+    """Return one per-engine setting's current value for a row.
+
+    :param job: A RunPod row.
+    :param field: Which name field of the entry to read.
+    :returns: The setting's value.
+    """
+    return getattr(settings, getattr(_runpod_engine(job), field))
+
+
 def _max_attempts(job: ExternalJob) -> int:
     """Return how many submissions this row gets before it is failed.
 
@@ -141,7 +268,7 @@ def _max_attempts(job: ExternalJob) -> int:
     :rtype: int
     """
     if _is_runpod(job):
-        return int(settings.DOTS_MOCR_MAX_ATTEMPTS)
+        return int(_engine_setting(job, "attempts_setting"))
     return int(settings.DOCTOR_MAX_ATTEMPTS)
 
 
@@ -192,10 +319,9 @@ def _runpod_endpoint(job: ExternalJob) -> str:
     :param job: A RunPod row.
     :returns: The endpoint id, or ``""`` when the engine has none.
     :rtype: str
+    :raises UnknownRunpodEngine: If no table entry serves the row.
     """
-    if job.engine == JobEngine.DOTS_MOCR:
-        return settings.RUNPOD_DOTSMOCR_ENDPOINT_ID
-    return ""
+    return _engine_setting(job, "endpoint_setting")
 
 
 def _cancel_provider_job(job: ExternalJob) -> None:
@@ -302,6 +428,9 @@ def runpod_execution_deadline(job: ExternalJob, started_at):
     the row's own ``input_manifest`` rather than divided out of the
     volume, so a short tail shard is not given a full shard's budget.
 
+    The per-page allowance is the engine's own: a detection pass and a
+    full page read do not take the same time per page.
+
     :param job: The row that has started.
     :param started_at: When the provider reported it running.
     :returns: The wall-clock time the attempt is written off at.
@@ -309,7 +438,7 @@ def runpod_execution_deadline(job: ExternalJob, started_at):
     pages = job.input_manifest.get("page_count") or 0
     return started_at + timedelta(
         seconds=int(settings.RUNPOD_REQUEST_TIMEOUT)
-        + pages * float(settings.DOTS_MOCR_SECONDS_PER_PAGE)
+        + pages * float(_engine_setting(job, "seconds_per_page_setting"))
     )
 
 
@@ -868,6 +997,70 @@ def live_run(scan, stage: str, engine: str) -> list[ExternalJob]:
     return [job for job in rows if job.run == rows[0].run]
 
 
+def run_summary(scan, stage: str, engine: str) -> dict | None:
+    """Describe a scan's live run of one engine for the process page.
+
+    Neither GPU stage writes a scan status while it works (issue #190),
+    so the rows are the only place its progress lives, and this is how a
+    viewer sees it. Written once for every engine: a second copy would
+    drift, and the ``open`` count below is too subtle to duplicate.
+
+    ``open`` is what the daemon still has to do -- rows waiting to be
+    submitted or in flight -- and it is what a start button refuses a
+    second press on. Deliberately **not** ``OPEN_JOB_STATUSES``, which
+    includes ``COMPLETED`` because the provider finishing is not us
+    having applied the result. On that definition a run holding one
+    failed shard beside two finished ones would read as open forever,
+    and the button would refuse the re-run such a run needs.
+
+    ``label`` is the same counts as one readable phrase, because a
+    template rendering ``statuses`` directly would print a Python dict.
+
+    :param scan: The scan (or its pk) to describe.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :returns: ``{"run", "total", "done", "open", "failed", "statuses",
+        "label", "error_code", "error_message"}``, or ``None`` when the
+        engine has never run for this scan.
+    :rtype: dict | None
+    """
+    rows = live_run(scan, stage, engine)
+    if not rows:
+        return None
+
+    statuses: dict[str, int] = {}
+    for row in rows:
+        statuses[row.status] = statuses.get(row.status, 0) + 1
+
+    failed = [
+        row
+        for row in rows
+        if row.status in (JobStatus.FAILED, JobStatus.EXPIRED)
+    ]
+    done = sum(
+        count
+        for status, count in statuses.items()
+        if status in (JobStatus.COMPLETED, JobStatus.CONSUMED)
+    )
+    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
+    first_failure = failed[0] if failed else None
+    label = ", ".join(
+        f"{count} {ExternalJob(status=status).get_status_display().lower()}"
+        for status, count in sorted(statuses.items())
+    )
+    return {
+        "run": rows[0].run,
+        "total": len(rows),
+        "done": done,
+        "open": sum(1 for row in rows if row.status in unfinished),
+        "failed": len(failed),
+        "statuses": statuses,
+        "label": label,
+        "error_code": first_failure.error_code if first_failure else "",
+        "error_message": first_failure.error_message if first_failure else "",
+    }
+
+
 def _reusable_results(
     scan, stage: str, engine: str, specs: list[tuple[str, dict]]
 ) -> dict[int, ExternalJob]:
@@ -1410,29 +1603,44 @@ def _submit_doctor_wave(summary: SubmitSummary, limit: int | None) -> None:
 
 
 def _submit_runpod_wave(summary: SubmitSummary, limit: int | None) -> None:
-    """Send one wave of pending dots.mocr shards to RunPod.
+    """Send one wave per RunPod engine.
+
+    Each engine counts its own in-flight rows against its own cap,
+    because each is a separate serverless endpoint that scales on its
+    own. So a saturated dots.mocr queue cannot starve detection, and an
+    engine switched off holds nothing up.
+
+    :param summary: Counts to update.
+    :param limit: Concurrency override applied to each engine.
+    :return: None.
+    """
+    for spec in _runpod_engines().values():
+        if spec.is_enabled():
+            _submit_runpod_engine_wave(spec, summary, limit)
+
+
+def _submit_runpod_engine_wave(
+    spec: RunpodEngine, summary: SubmitSummary, limit: int | None
+) -> None:
+    """Send one wave of one engine's pending shards to RunPod.
 
     Serially, not from a pool: ``POST /run`` returns as soon as the job
     is queued, so a wave costs a second or two rather than doctor's
     25-45s per shard. A pool here would add threads for no wall clock.
 
+    :param spec: The engine to send for.
     :param summary: Counts to update.
-    :param limit: Concurrency override; defaults to
-        ``settings.DOTS_MOCR_MAX_CONCURRENCY``.
+    :param limit: Concurrency override; defaults to the engine's own
+        concurrency setting.
     :return: None.
     """
-    from scanning import dots_mocr
-
-    if not dots_mocr.enabled():
-        return
     ours = ExternalJob.objects.filter(
         provider=JobProvider.RUNPOD,
-        stage=JobStage.ANALYZE,
-        engine=JobEngine.DOTS_MOCR,
+        stage=spec.stage,
+        engine=spec.engine,
     )
-    room = _room_for(
-        ours, int(limit or settings.DOTS_MOCR_MAX_CONCURRENCY), "dots.mocr"
-    )
+    cap = limit or getattr(settings, spec.concurrency_setting)
+    room = _room_for(ours, int(cap), spec.label)
     if not room:
         return
     pending = _pending_slice(ours, room)
@@ -1444,7 +1652,9 @@ def _submit_runpod_wave(summary: SubmitSummary, limit: int | None) -> None:
     if not claimed:
         return
 
-    logger.info("submitting %d dots.mocr shard(s) to RunPod", len(claimed))
+    logger.info(
+        "submitting %d %s shard(s) to RunPod", len(claimed), spec.label
+    )
     for job, (input_url, output_url) in claimed:
         exc: Exception | None = None
         job_id = None
@@ -1455,7 +1665,7 @@ def _submit_runpod_wave(summary: SubmitSummary, limit: int | None) -> None:
             job_id = runpod_client.submit_job(
                 base_url,
                 headers,
-                dots_mocr.build_payload(job, input_url, output_url),
+                spec.build_payload(job, input_url, output_url),
                 label=f"{job.engine} shard {job.shard_index + 1}",
             )
         except Exception as caught:  # noqa: BLE001 - classified below
@@ -1493,7 +1703,7 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
         # without S3 the shards were never uploaded: every request would
         # 404 and burn a job's whole retry budget under a misleading
         # code. Say so once instead.
-        if doctor_client.enabled() or _dots_mocr_enabled():
+        if doctor_client.enabled() or _any_runpod_engine_enabled():
             logger.error(
                 "an external stage is enabled but S3 is inactive (no "
                 "credentials, or DEVELOPMENT without them): shards never "
@@ -1510,18 +1720,13 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
     return summary
 
 
-def _dots_mocr_enabled() -> bool:
-    """Return whether the dots.mocr stage is switched on.
+def _any_runpod_engine_enabled() -> bool:
+    """Return whether any RunPod engine would dispatch a job.
 
-    Imported lazily and wrapped, so :func:`submit_pending`'s S3 guard
-    can name the stage without importing it at module scope.
-
-    :returns: Whether dots.mocr jobs would be dispatched.
+    :returns: Whether at least one engine is switched on.
     :rtype: bool
     """
-    from scanning import dots_mocr
-
-    return dots_mocr.enabled()
+    return any(spec.is_enabled() for spec in _runpod_engines().values())
 
 
 # ── confirming ──────────────────────────────────────────────────────

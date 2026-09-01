@@ -56,9 +56,9 @@ back as an external job, dots.mocr as a pipeline-enqueued one (#207,
 with the staff button kept for re-runs), the page numbers plus Issues
 as an apply pass on the collect tick (#149/#204), review 1 got its
 approve button (#151) and one model for its human page edits (#214),
-and YOLO detection came back as a rebuilt worker image (#194 — the
-image only), all below; still missing are the post-review stages
-(#195/#196 — the callers the detect image waits for), so:
+and YOLO detection came back as a rebuilt worker image (#194) with its
+job rows and its staff button (#195), all below; still missing is the
+redaction work that reads the detection output (#196), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
   enqueues the dots.mocr read (#207) when `_can_analyze` allows,
@@ -536,8 +536,9 @@ trained on), tracked on `ExternalJob` rows at
   answer a third provider by copying a wave or a sweep. **Mistral is the
   point to promote the branches**, because it changes the shape again:
   opinion-level `EXTRACT`, no shard fan-out, rate limits rather than a
-  worker pool, and no presigned PUT at all. YOLO on RunPod is a payload
-  builder, an endpoint id and a cap — it shares `submit_job` and
+  worker pool, and no presigned PUT at all. YOLO on RunPod was exactly
+  a payload builder, an endpoint id and a cap, which is what
+  `jobs.RunpodEngine` now tabulates (#195); it shares `submit_job` and
   `poll_once` unchanged.
 
 ## Generalized YOLO worker image (issue #194)
@@ -545,9 +546,9 @@ trained on), tracked on `ExternalJob` rows at
 `scanning/runpod/` is the RunPod Serverless image that runs detection
 with `bl_warm`, one 18-class checkpoint that replaced the
 small/medium/large trio (blackletter #73). It is the image only: the job
-rows and the daemon path are #195, and the redaction work that reads its
-output is #196, so a fresh deploy has no automatic caller. What must not
-be broken:
+rows and the daemon path are #195 (below), and the redaction work that
+reads its output is #196, so a fresh deploy still has no automatic
+caller — one staff button is the only way in. What must not be broken:
 
 - **Only `bl_warm.pt` is baked.** `api.detect` calls `ensure_weights`
   itself, so an unbaked name would reach Hugging Face from inside a paid
@@ -616,6 +617,80 @@ be broken:
   (`scanning/tests/test_runpod_yolo_handler.py`): the loader stubs
   `runpod`, `torch` and `blackletter.api`, and a CUDA-less `torch` makes
   the module-level `_preload` open no weight file.
+
+## YOLO detection via RunPod (issue #195)
+
+The caller the #194 image was waiting for. Detection runs on RunPod
+Serverless, one job per **original** shard, tracked on `ExternalJob`
+rows at `DETECT`/`BLACKLETTER`/`RUNPOD`. The pieces: `yolo.py` (the
+stage), `settings/project/yolo.py` (five variables), the
+`jobs.RunpodEngine` table, and `views_process.start_yolo_detect` (the
+button). It reuses the whole #190 machinery — the claim, the poll, the
+deadlines, the cancel, the retry, the carry-over — so what follows is
+only what is new or specific:
+
+- **One staff button starts it, and nothing else.** `run_full_pipeline`
+  enqueues no `DETECT` row: the rebuilt image has to be tried on a few
+  volumes before it runs over the corpus (#211). That is structural —
+  `yolo.ensure_detect_jobs` is the only creator, and
+  `TestKnownEnqueuePaths` pins its one caller — so an automatic caller
+  has to delete a test line rather than slip in. The button is **not**
+  "Next: Detect": that button still refuses (#173), and rewiring step 2
+  belongs to #196, which is what gives the output a reader.
+- **Each RunPod engine is its own endpoint, and `jobs.RunpodEngine` is
+  where that lives.** dots.mocr's endpoint id, concurrency cap, attempt
+  cap and per-page allowance used to be read by name for every RunPod
+  row, so a detection row would silently have taken them. The table
+  holds settings **by name** and reads them with `getattr` at call
+  time, or `override_settings` would not reach them, and it is rebuilt
+  per call so a patched `enabled` reaches it too. A row naming an
+  engine with no entry raises `UnknownRunpodEngine`, a `RunpodError`
+  subclass, so the poll and the cancel already handle it the way they
+  handle an unconfigured endpoint: one warning, every other row on the
+  tick still judged. **This is not a provider layer** — see the
+  `jobs.py` docstring; a second engine on one provider is a payload
+  builder, an endpoint id and a cap, and that is all the table holds.
+- **`RUNPOD_YOLO_ENDPOINT_ID` names the endpoint the deleted
+  `RUNPOD_ENDPOINT_ID` named.** #194 pushed the rebuilt image to the
+  same Docker Hub repository and PATCHed the same RunPod template, so
+  a deploy copies the old value under the new name and creates
+  nothing. Blank turns detection off and leaves dots.mocr running.
+- **Detection reads the original shards, never the bitonal copies.**
+  bl-warm was trained on greyscale renders and its large region classes
+  collapse on 1-bit pages (caption F1 0.99 -> 0.25, measured in #167).
+  Same as dots.mocr, so both fan out over the one shard set of #164 and
+  neither cuts its own.
+- **The rows stop at `COMPLETED`.** There is deliberately no glue and
+  no `CONSUMED`: #196 reads the per-shard results, offsets each
+  `page_index` by its shard's own `from_page` (the worker counts from
+  zero inside its shard), and turns them into `Detection` rows and
+  redaction geometry. So **nothing may delete a detect result** — a
+  re-read must never cost a paid run, which is also why
+  `ensure_detect_jobs` passes `reuse_results=True` while the bitonal
+  stage, whose merge deletes its results, must not.
+- **A pending run holds nothing else up.** Intake has no cap and a row
+  waiting in our own queue carries no clock (#218): detect rows drain
+  at their engine's own concurrency limit, and the other engines count
+  only their own rows against theirs.
+- **Only the admin scan deletion may cancel a detect run.**
+  `abandon_open` is scoped by stage everywhere else and every caller
+  passes `CONVERT`; an unscoped re-queue would cancel a finished run
+  and make the next press pay for output already in S3.
+- `MODELS = ["bl_warm"]` and `CONFIDENCE = 0.20` are module constants,
+  like the dots.mocr `DPI`: no operational reason to retune per deploy,
+  and `input_manifest` already carries a per-row override for a one-off
+  experiment. Only `bl_warm.pt` is baked, so another name would reach
+  Hugging Face from inside a paid job; the worker refuses it up front.
+  The payload sends **no** `dpi` (blackletter fixes 200, matching
+  `DOCTOR_BITONAL_DPI`) and no `max_pages` (the worker has its own
+  ceiling, and a partial detection merged as a whole volume is worse
+  than a failure).
+- `JobEngine.BLACKLETTER` keeps its value and lost its PaddleOCR label,
+  which went with the legacy pipeline (#173). The engine names the
+  library, not the checkpoint: the weights are a worker input, so a
+  later checkpoint is a payload change and not a new engine.
+- `YOLO_SECONDS_PER_PAGE = 2.0` is a first guess, deliberately
+  generous. #211 replaces it with a measured value.
 
 ## Local disk hygiene (issue #215)
 

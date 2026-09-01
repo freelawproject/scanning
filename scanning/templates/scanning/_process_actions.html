@@ -5,9 +5,15 @@ Rendered both inline by scan_process.html and standalone by the
 process_actions view (fetched by the step-1/step-2 viewers to refresh the
 buttons in place after a page is marked for or restored from deletion).
 
-The OCR (dots.mocr) control is staff-only and moves no scan status, so
-its state comes from `dots_run` -- a summary of the ExternalJob rows
-(issue #190) -- rather than from `is_processing`.
+The OCR (dots.mocr) and detection (YOLO) controls are staff-only and
+move no scan status, so their state comes from `dots_run` and
+`yolo_run` -- summaries of the ExternalJob rows (issues #190 and #195)
+-- rather than from `is_processing`.
+
+The detection control is not "Next: Detect". It runs the stage and
+stores its output in S3, and nothing reads that output until #196. It
+is here so the rebuilt worker image can be tried on a few volumes
+before it runs over the corpus (#211).
 
 The review-1 controls (issue #151) read `page_review_ready` /
 `page_review_done`, the two #154 statuses. Approving is the gate: it is
@@ -38,6 +44,23 @@ reach step 2.
   <form method="post" action="{% url 'start_dots_mocr' scan.pk %}" class="inline">
     {% csrf_token %}
     <button type="submit" class="btn-outline text-sm" title="Read every page of the original with dots.mocr on RunPod (incurs costs $$$)" onclick="return confirm('This runs dots.mocr OCR on RunPod over every page of this volume. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}{% if dots_run %}Re-run OCR{% else %}Run OCR{% endif %}</button>
+  </form>
+  {% endif %}
+  {% if yolo_run %}
+  <span class="text-sm text-gray-600 mr-2" title="Detection run {{ yolo_run.run }}: {{ yolo_run.label }}">
+    {% if yolo_run.failed %}
+    Detection failed on {{ yolo_run.failed }} of {{ yolo_run.total }} part(s): {{ yolo_run.error_code }}
+    {% elif yolo_run.open %}
+    Detection running: {{ yolo_run.done }} of {{ yolo_run.total }} part(s) done
+    {% else %}
+    Detection done: {{ yolo_run.total }} part(s)
+    {% endif %}
+  </span>
+  {% endif %}
+  {% if user.is_staff and not yolo_run.open %}
+  <form method="post" action="{% url 'start_yolo_detect' scan.pk %}" class="inline">
+    {% csrf_token %}
+    <button type="submit" class="btn-outline text-sm" title="Detect captions, key icons and headnotes on every page of the original with YOLO on RunPod. Nothing reads the output yet (incurs costs $$$)" onclick="return confirm('This runs YOLO detection on RunPod over every page of this volume. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}{% if yolo_run %}Re-run detection{% else %}Run detection{% endif %}</button>
   </form>
   {% endif %}
   {% if has_pending_changes %}

@@ -1498,12 +1498,16 @@ class TestRunSummaryLabel(ScanningTestCase):
 
 
 class TestKnownEnqueuePaths(ScanningTestCase):
-    """Only two paths create dots.mocr work: the pipeline and the button.
+    """Every path that creates paid GPU work, pinned.
 
-    The pipeline enqueue is #207; the button remains as the re-run and
-    backfill path (#190). Row creation is what costs GPU money, so a
-    new caller of the creators must be a deliberate decision that
-    updates this set -- not an accident this test lets through.
+    dots.mocr has two: the pipeline (#207) and the button that remains
+    as the re-run and backfill path (#190). YOLO detection has one, its
+    staff button (#195); the pipeline deliberately does not enqueue it
+    until the stage has been exercised on real volumes (#211).
+
+    Row creation is what costs GPU money, so a new caller of the
+    creators must be a deliberate decision that updates this set -- not
+    an accident this test lets through.
     """
 
     def test_the_row_creators_have_exactly_the_known_callers(self):
@@ -1521,17 +1525,25 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                     continue
                 func = node.func
                 name = getattr(func, "attr", getattr(func, "id", ""))
-                if name in ("ensure_analyze_jobs", "ensure_shard_jobs"):
+                if name in (
+                    "ensure_analyze_jobs",
+                    "ensure_detect_jobs",
+                    "ensure_shard_jobs",
+                ):
                     callers.add((str(path), name))
 
         self.assertEqual(
             callers,
             {
-                # The staff button (#190) and the pipeline (#207).
+                # dots.mocr: the staff button (#190), the pipeline (#207).
                 ("scanning/views_process.py", "ensure_analyze_jobs"),
                 ("scanning/services.py", "ensure_analyze_jobs"),
-                # The generic creator's two wrappers.
+                # Detection: the staff button alone (#195). Nothing in
+                # the pipeline may appear here until #211 says so.
+                ("scanning/views_process.py", "ensure_detect_jobs"),
+                # The generic creator's three wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
+                ("scanning/yolo.py", "ensure_shard_jobs"),
                 ("scanning/jobs.py", "ensure_shard_jobs"),
             },
             "Something new creates external-job rows. Row creation "

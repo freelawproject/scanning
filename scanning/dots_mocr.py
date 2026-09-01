@@ -209,62 +209,14 @@ def live_analyze_jobs(scan) -> list[ExternalJob]:
 def run_summary(scan) -> dict | None:
     """Describe a scan's dots.mocr run for the process page.
 
-    The stage writes no scan status by design (issue #190), so the rows
-    are the only place its progress lives and this is how a viewer sees
-    it.
-
-    ``open`` is what the daemon still has to do -- rows waiting to be
-    submitted or in flight -- and it is what the start button refuses a
-    second press on. Deliberately **not** ``OPEN_JOB_STATUSES``, which
-    includes ``COMPLETED`` because the provider finishing is not us
-    having applied the result. On that definition a run holding one
-    failed shard beside two finished ones would read as open forever,
-    and the button would refuse the re-run such a run needs.
-
-    ``label`` is the same counts as one readable phrase, because a
-    template rendering ``statuses`` directly would print a Python dict.
+    See :func:`jobs.run_summary`, which every engine shares.
 
     :param scan: The scan (or its pk) to describe.
-    :returns: ``{"run", "total", "done", "open", "failed", "statuses",
-        "label", "error_code", "error_message"}``, or ``None`` when the
-        stage has never run for this scan.
+    :returns: The summary dict, or ``None`` when the stage has never
+        run for this scan.
     :rtype: dict | None
     """
-    rows = live_analyze_jobs(scan)
-    if not rows:
-        return None
-
-    statuses: dict[str, int] = {}
-    for row in rows:
-        statuses[row.status] = statuses.get(row.status, 0) + 1
-
-    failed = [
-        row
-        for row in rows
-        if row.status in (JobStatus.FAILED, JobStatus.EXPIRED)
-    ]
-    done = sum(
-        count
-        for status, count in statuses.items()
-        if status in (JobStatus.COMPLETED, JobStatus.CONSUMED)
-    )
-    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
-    first_failure = failed[0] if failed else None
-    label = ", ".join(
-        f"{count} {ExternalJob(status=status).get_status_display().lower()}"
-        for status, count in sorted(statuses.items())
-    )
-    return {
-        "run": rows[0].run,
-        "total": len(rows),
-        "done": done,
-        "open": sum(1 for row in rows if row.status in unfinished),
-        "failed": len(failed),
-        "statuses": statuses,
-        "label": label,
-        "error_code": first_failure.error_code if first_failure else "",
-        "error_message": first_failure.error_message if first_failure else "",
-    }
+    return jobs.run_summary(scan, JobStage.ANALYZE, JobEngine.DOTS_MOCR)
 
 
 def glued_result_key(scan, run: int) -> str:
