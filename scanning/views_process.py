@@ -239,9 +239,21 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # ``nav_pdf_index`` is the first resolved index, or None when the issue
         # has no page (or points at a missing page absent from the page_map).
         i.nav_pdf_index = None
-        if i.page_number is None:
+        metadata = i.metadata if isinstance(i.metadata, dict) else {}
+        meta_pages = [
+            p
+            for p in metadata.get("pdf_pages", [])
+            if isinstance(p, int) and p >= 1
+        ]
+        if meta_pages:
+            # A grouped card names its physical pages directly (#227):
+            # the merged missing/no-number card has no entry in the
+            # page_map, and a grouped stray-number card must highlight
+            # every page it names.
+            indices = [p - 1 for p in meta_pages]
+        elif i.page_number is None:
             continue
-        if i.check_name in PHYSICAL_PAGE_CHECKS:
+        elif i.check_name in PHYSICAL_PAGE_CHECKS:
             indices = [i.page_number - 1]
         else:
             indices = logical_to_indices.get(i.page_number, [])
@@ -1691,21 +1703,32 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
         return JsonResponse({"error": "Unknown issue."}, status=404)
 
     physical = issue.check_name in PHYSICAL_PAGE_CHECKS
-    PageEdit.objects.update_or_create(
-        scan=scan,
-        kind=PageEdit.Kind.DISMISS_ISSUE,
-        pdf_page=issue.page_number if physical else None,
-        logical_page=(
-            ""
-            if physical or issue.page_number is None
-            else str(issue.page_number)
-        ),
-        value=issue.check_name,
-        applied_at=None,
-        defaults={
-            "author": request.user,
-            "source_fingerprint": scan.source_fingerprint,
-        },
-    )
+    # A grouped physical card names every page it covers (#227), and
+    # the dismissal key is one page. So: one row per page. The grouped
+    # card matches its first page's row on the next rebuild, and a
+    # later re-split leaves every single-page card covered too.
+    metadata = issue.metadata if isinstance(issue.metadata, dict) else {}
+    pdf_pages: list[int | None] = []
+    if physical and isinstance(metadata.get("pdf_pages"), list):
+        pdf_pages = [p for p in metadata["pdf_pages"] if isinstance(p, int)]
+    if not pdf_pages:
+        pdf_pages = [issue.page_number if physical else None]
+    for pdf_page in pdf_pages:
+        PageEdit.objects.update_or_create(
+            scan=scan,
+            kind=PageEdit.Kind.DISMISS_ISSUE,
+            pdf_page=pdf_page,
+            logical_page=(
+                ""
+                if physical or issue.page_number is None
+                else str(issue.page_number)
+            ),
+            value=issue.check_name,
+            applied_at=None,
+            defaults={
+                "author": request.user,
+                "source_fingerprint": scan.source_fingerprint,
+            },
+        )
     issue.delete()
     return JsonResponse({"status": "ok"})

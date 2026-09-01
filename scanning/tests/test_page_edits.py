@@ -413,10 +413,65 @@ class TestDismissIssueWritesAnEdit(TestCase):
         self.assertIsNone(edit.pdf_page)
         self.assertEqual(edit.logical_page, "1074")
 
+    def test_a_grouped_physical_card_fans_out(self):
+        # A grouped card names every page it covers (#227), and the
+        # dismissal key is one page: one row per page, so a later
+        # re-split of the group stays covered too.
+        issue = Issue.objects.create(
+            scan=self.scan,
+            page_number=3,
+            check_name=CheckName.SUSPICIOUS_READING,
+            severity="warning",
+            message="PDF pages 3, 5 and 7 detected as '1881'...",
+            metadata={"pdf_pages": [3, 5, 7]},
+        )
+
+        self.assertEqual(self._dismiss(issue).status_code, 200)
+
+        edits = self.scan.page_edits.all()
+        self.assertEqual(sorted(e.pdf_page for e in edits), [3, 5, 7])
+        self.assertEqual(
+            {e.value for e in edits}, {CheckName.SUSPICIOUS_READING}
+        )
+
+    def test_a_grouped_logical_card_keeps_one_row(self):
+        # backward_page lives in the printed space, so its grouped
+        # card still dismisses by the printed number, whatever pages
+        # its metadata names for the viewer.
+        issue = Issue.objects.create(
+            scan=self.scan,
+            page_number=90,
+            check_name=CheckName.BACKWARD_PAGE,
+            severity="warning",
+            message="Page 90 goes backward on PDF pages 93, 97 and 99.",
+            metadata={"pdf_pages": [93, 97, 99]},
+        )
+
+        self._dismiss(issue)
+
+        edit = self.scan.page_edits.get()
+        self.assertIsNone(edit.pdf_page)
+        self.assertEqual(edit.logical_page, "90")
+
     def test_a_dismissal_survives_a_recompute(self):
         # The rebuild deletes every derived issue and writes new rows,
         # so a dismissal that was a deleted row came straight back.
+        # The blank page's neighbors must disagree here, or the #227
+        # merge folds its info card into the missing-page error.
         from scanning import services
+
+        Scan.objects.filter(pk=self.scan.pk).update(
+            start_page=1,
+            end_page=3,
+            page_count=3,
+            source_fingerprint="100:3",
+            ocr_results=[
+                {"pdf_page": 1, "detected": "1", "type": "single"},
+                {"pdf_page": 2, "detected": None, "type": None},
+                {"pdf_page": 3, "detected": "4", "type": "single"},
+            ],
+        )
+        self.scan.refresh_from_db()
 
         services.recalculate_issues(self.scan)
         issue = self.scan.issues.get(check_name=CheckName.NO_PAGE_NUMBER)

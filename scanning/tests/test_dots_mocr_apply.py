@@ -115,11 +115,11 @@ class TestApplyReadyRuns(ApplyRunsMixin, TestCase):
 
         dots_mocr.apply_ready_runs()
 
-        self.assertTrue(
-            scan.issues.filter(
-                check_name=CheckName.NO_PAGE_NUMBER, page_number=2
-            ).exists()
-        )
+        # The blank page interpolates to the one missing number, so
+        # the info and the error merge into one card (#227) that
+        # names the physical page.
+        merged = scan.issues.get(check_name=CheckName.MISSING_PAGE)
+        self.assertEqual(merged.metadata["pdf_pages"], [2])
 
     def test_a_recompute_keeps_ready(self):
         scan, _ = self.build(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)

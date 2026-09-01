@@ -47,6 +47,7 @@ from blackletter.validate import (
 from django.conf import settings
 from django.db.models import Case, F, Value, When
 
+from scanning.issue_grouping import group_issues
 from scanning.models import (
     DEAD_JOB_STATUSES,
     CheckName,
@@ -1183,6 +1184,12 @@ def recalculate_issues(scan: "Scan") -> None:
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
+
+    # One card per fact (#227): a stray number read on many pages
+    # makes build_issues repeat its missing, backward and duplicate
+    # cards. Grouped here, before the appends below and before the
+    # dismissal filter, so the dismissal sees the grouped cards.
+    result["issues"] = group_issues(result["issues"], analysis)
 
     # Every open edit this volume cannot take, not only the page
     # numbers: a delete or an insert made against another original is
