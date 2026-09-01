@@ -342,15 +342,18 @@ trained on), tracked on `ExternalJob` rows at
   run-sized timeout from submission would cancel the tail of every
   fan-out, resubmit it to the back of the same queue, and eventually
   fail a volume for being popular.
-- **The queue ceiling is stamped once per attempt**, when the row enters
-  the queue: at creation, and again when a retry sends it back. Nothing
-  else moves it. A claim does not (`submit_deadline_fields` writes no
-  deadline for a polling provider — being accepted is not being
-  started), a defer does not (the row never left our queue), and only
-  the `IN_PROGRESS` crossing replaces it. Any of those re-stamping would
-  forgive the row's wait on every tick, so a paused or saturated
-  endpoint would hold a scan forever instead of failing it — which is
-  the one outcome the ceiling exists to produce.
+- **The queue ceiling is stamped once per attempt, at the attempt's
+  first claim** (`submit_deadline_fields`) — the moment the row is
+  handed to the provider. A row waiting in **our own** queue carries no
+  deadline at all (issue #218, below): an admitted backlog may lawfully
+  wait longer than any ceiling. Nothing after the first claim moves it.
+  A defer does not, a re-claim after a defer does not (the ceiling is
+  written only over `deadline=None`), and only the `IN_PROGRESS`
+  crossing replaces it. Any of those re-stamping would forgive the
+  row's wait on every tick, so a paused or saturated endpoint would
+  hold a scan forever instead of failing it — which is the one outcome
+  the ceiling exists to produce. A retry clears the deadline, so the
+  next attempt's first claim restarts the wait.
 - **A job id with nowhere to live is still cancelled.** If a cancel
   takes the row while `POST /run` is in flight, `abandon_open` sees a
   blank `external_id` and its own cancel is a no-op, and the later write
@@ -572,37 +575,36 @@ be broken:
   SIGKILL orphans in the system temp dir. Off under TESTING; the
   command's tests point `gettempdir` at a scratch root.
 
-## Intake backpressure (issue #218)
+## Uncapped intake, and where the queue clock starts (issue #218)
 
-`process_next_scan` claims a QUEUED scan only while fewer than
-`DAEMON_MAX_ACTIVE_SCANS` (5) scans hold unfinished external work
-(`jobs.active_scan_count`). It is the daemon's only backpressure:
-uncapped intake put 2023 conversion rows behind 27 parked scans on
-2026-08-31, three times what the 6-hour
-`DAEMON_JOB_MAX_QUEUE_SECONDS` ceiling can drain, and 29 volumes died
-of it.
+Intake has no cap: `process_next_scan` claims every QUEUED scan in
+order, and the per-engine concurrency limits pace the providers. What
+makes that safe is where the queue ceiling starts. A job row waiting in
+**our own** queue (PENDING, never claimed) carries no deadline; the
+6-hour `DAEMON_JOB_MAX_QUEUE_SECONDS` ceiling is stamped at the
+attempt's first claim, when the row is handed to the provider.
 
-- **The gate is on the claim, not the dispatch after it.** A refused
-  scan stays QUEUED — nothing times out there — instead of transiting
-  PROCESSING for nothing. The admin re-queue is safe at any batch size.
-- **Recovery runs first and unconditionally**: returning a scan the
-  daemon dropped is not intake.
-- **Scans, not rows, over every stage.** A scan's whole shard set
-  enters every queue at once. Counting `CONVERT` alone would watch the
-  wrong queue: doctor drains ~100 rows/h, dots.mocr 24-36.
-- **`COMPLETED` does not hold a slot** (`WAITING_JOB_STATUSES` is
-  `OPEN_JOB_STATUSES` minus it): those rows wait on the merge, the glue
-  or the apply, and a failed merge leaves one nothing moves again.
-- **The knob moves by its arithmetic**: slots × the largest volume's
-  shards must clear `DAEMON_JOB_MAX_QUEUE_SECONDS` at the slowest
-  queue's rate. 5 × ~20 shards is ~100 dots.mocr rows, ~4.2h against
-  6h. Ten slots would not fit.
-- No deadlock — the submit and collect ticks drain regardless — but a
-  stage switched off with rows still PENDING holds its slots until the
-  queue deadline expires them. The staff buttons bypass the gate: one
-  scan at a time, from a request.
-- One log line per crossing (WARNING pausing, INFO resuming), the
-  loud-then-quiet shape the glue and apply retries use.
+- **The clock placement is the whole fix.** The ceiling used to start
+  at row creation, so on 2026-08-31 an uncapped intake put 2023
+  conversion rows behind 27 parked scans — three times what 6h can
+  drain — and 29 volumes died of `QUEUE_TIMEOUT`, unsubmitted. A first
+  patch capped intake at `DAEMON_MAX_ACTIVE_SCANS` (5) scans, which
+  then held 532 queued scans behind five slots that slow dots.mocr rows
+  occupied for hours. Both the cap and the creation-time stamp are
+  gone. Do not restore one without the other.
+- **A backlog in our queue is not a fault, however long.** Rows drain
+  in creation order at each engine's concurrency limit
+  (`DOCTOR_MAX_CONCURRENCY`, `DOTS_MOCR_MAX_CONCURRENCY`), and nothing
+  expires while they wait. The trade, accepted: an engine switched off
+  with PENDING rows now parks its scans until it returns or an admin
+  re-queues them, instead of erroring them at 6h.
+- **The stranded sweep still exists** for the rows that carry a
+  ceiling: a deferred row an endpoint kept declining past it (and rows
+  stamped before the move). `sweep_jobs` fails those `QUEUE_TIMEOUT`,
+  terminally — a paused-for-good endpoint must still end its scans.
+- **Only the provider's queue is bounded**, and the submit wave keeps
+  it shallow: at most the concurrency cap is in flight, so a healthy
+  endpoint's queue wait sits far under the ceiling.
 
 ## Detection Workflow
 

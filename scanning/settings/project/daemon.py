@@ -24,24 +24,13 @@ DAEMON_SUBMIT_INTERVAL = env.int("DAEMON_SUBMIT_INTERVAL", default=5)
 # (an S3 HEAD per row) and finishes any scan whose jobs are all done.
 DAEMON_COLLECT_INTERVAL = env.int("DAEMON_COLLECT_INTERVAL", default=15)
 
-# How long (in seconds) a created-but-unsubmitted job may wait before
-# it is written off. Not an execution budget: waiting to be submitted
-# is the other way a job waits, and a scan parked behind one cannot
-# tell the two apart. Guards against rows stranded by a provider being
-# switched off after they were created. Default 6 hours -- long enough
-# that a backlog drains, short enough that a scan is not parked for a
-# week.
+# How long (in seconds) a job may sit in a provider's queue before it
+# is written off. The clock starts at the attempt's first claim -- the
+# moment the row is handed to the provider -- never at row creation: a
+# creation-stamped clock expired 2023 rows unsubmitted in our own queue
+# on 2026-08-31 and sank 29 volumes to ERROR (issue #218). A row
+# waiting in our own queue has no clock at all. Not an execution
+# budget either: the run budget starts at the IN_PROGRESS crossing.
 DAEMON_JOB_MAX_QUEUE_SECONDS = env.int(
     "DAEMON_JOB_MAX_QUEUE_SECONDS", default=6 * 60 * 60
 )
-
-# How many scans may hold unfinished external work before the daemon
-# stops admitting new ones (issue #218). Uncapped intake put 2023 rows
-# behind 27 parked scans on 2026-08-31; most expired unsubmitted
-# against the ceiling above and sank 29 volumes to ERROR.
-#
-# Move it by the rule it was chosen with: slots x the largest volume's
-# shards must clear within DAEMON_JOB_MAX_QUEUE_SECONDS at the slowest
-# queue's drain rate. Today that is dots.mocr (24-36 rows/h) over ~20
-# shards, so 5 slots hold ~100 rows and clear in ~4.2h. Ten would not.
-DAEMON_MAX_ACTIVE_SCANS = env.int("DAEMON_MAX_ACTIVE_SCANS", default=5)
