@@ -548,12 +548,15 @@ line, a headnote digit dots labels `Page-header` too, a case name that
 ends in a digit.
 
 - **Position tells them apart, so the rank in `page_numbers.py` is
-  geometric**: header before footer, then the corner distance, then the
-  line inside the cell, then printed parity. The printed number is at
-  the outer corner, every rival nearer the middle. The rank was the
-  synthetic score until #228, which left the model's cell order to
-  break every tie: 666 of one volume's 1294 pages carried a rival
-  value, and 8 read the wrong one.
+  geometric**: header before footer, then the score, then the corner
+  distance, then the line inside the cell, then printed parity. The
+  printed number is at the outer corner, every rival nearer the middle.
+  The score stays ahead of the distance because it carries the band:
+  dots labels a headnote digit `Page-header` wherever it sits, and a
+  distance-first rank hands the page to a column of them printed in the
+  margin of the body. Before #228 the rank was the score alone, which
+  left the model's cell order to break every tie: 666 of one volume's
+  1294 pages carried a rival value, and 8 read the wrong one.
 - **The distance is per token**: one bbox covers the whole running
   head, so the end of the line the token was read at says which edge to
   measure. `CORNER_BAND` only grades the score -- a number centred in a
@@ -564,10 +567,11 @@ ends in a digit.
   number mid-text. They share the one bbox, so the line index separates
   them.
 - **`_resolve_by_neighbours` is the second net, not the rule**: it
-  moves a pick only when the page offers more than one value and the
-  geometric pick continues neither neighbour, and it reads the
-  neighbours off the *geometric* picks, so one wrong page cannot
-  cascade.
+  moves a pick only when **both** neighbours name one number the page
+  offers, off the *geometric* picks throughout. One neighbour is not
+  enough -- the rivals run in sequence themselves, so a single misread
+  page would hand its own sequence to the page beside it. It never
+  moves a range, and it never invents a number.
 - **A reading change reaches no volume already applied** (`applied_at`
   closes the run, #204). Run `reapply_page_numbers` after the deploy:
   it re-reads the stored glued document at no GPU cost, keeps the

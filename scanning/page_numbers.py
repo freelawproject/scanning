@@ -226,11 +226,19 @@ def _rank_key(candidate: dict) -> tuple:
 
     A header outranks a footer: a section-opening page carries its
     number in the footer only, so the footer is the fallback, not a
-    competitor. Then the geometry decides, because every rival number
-    of a reporter page sits nearer the middle than the printed one.
-    The line index breaks the tie the two lines of one cell produce --
-    the running head is the top line, the ``Cite as`` line is below it
-    and both share the one bbox.
+    competitor. Then how many signals agreed, then the geometry,
+    because every rival number of a reporter page sits nearer the
+    middle than the printed one. The line index breaks the tie the two
+    lines of one cell produce -- the running head is the top line, the
+    ``Cite as`` line is below it and both share the one bbox.
+
+    The score comes **before** the distance on purpose. dots labels a
+    headnote number ``Page-header`` too, wherever on the page it sits,
+    so a distance-first rank hands the page to a headnote digit printed
+    in the margin of the body -- and to a whole column of them, which
+    :func:`_resolve_by_neighbours` then reads as a sequence and
+    approves. The band is what separates the two, and the score is
+    where the band is counted.
 
     :param candidate: One candidate of :func:`page_candidates`.
     :returns: The sort key.
@@ -238,6 +246,7 @@ def _rank_key(candidate: dict) -> tuple:
     """
     return (
         candidate["zone"] != "header",
+        -candidate["score"],
         candidate["distance"],
         candidate["line"],
         _parity_rank(candidate),
@@ -346,15 +355,25 @@ def _value(candidate: dict | None) -> int | None:
 def _resolve_by_neighbours(
     chosen: list[dict | None], candidates: list[list[dict]]
 ) -> list[dict | None]:
-    """Prefer a reading that continues the page before or after (#228).
+    """Prefer the reading both neighbours ask for (#228).
 
     The second net under the geometry, for the volume whose head cell
-    holds the citation page and the page number at one distance. It
-    reads the neighbours off the *geometric* picks throughout, never
-    off its own repairs, so one wrong page cannot cascade down the
-    volume. It never invents a number, and it never touches a page
-    that offers one value: a reading no rival contests is the
-    geometry's to keep, and the sequence analysis reports it.
+    holds the citation page and the page number at one distance.
+
+    **Both** neighbours must name the same number, and the page must
+    offer it. One neighbour is not enough: the rivals of a page number
+    run in sequence themselves -- a parallel citation page, a headnote
+    column -- so a single misread page would hand its own sequence to
+    the page beside it, which is the one page the geometry may have
+    read correctly. Asking two independent readings for one value
+    costs the pass nothing measurable: over a real 1294-page volume it
+    fires on no page at all, because the geometry already answers them.
+
+    It reads the neighbours off the *geometric* picks throughout, never
+    off its own repairs, so no repair can cascade. It never invents a
+    number. It never touches a page that offers one value -- a reading
+    no rival contests is the geometry's to keep -- and it never touches
+    a range, which names two pages and answers no sequence.
 
     :param chosen: The geometric pick per page, in page order.
     :param candidates: The ranked candidates per page, in page order.
@@ -365,18 +384,18 @@ def _resolve_by_neighbours(
     resolved = list(chosen)
     for index, options in enumerate(candidates):
         current = chosen[index]
-        if current is None or len({o["detected"] for o in options}) < 2:
+        if current is None or current["type"] != "single":
+            continue
+        if len({o["detected"] for o in options}) < 2:
             continue
         previous = values[index - 1] if index else None
         following = values[index + 1] if index + 1 < len(values) else None
-        wanted = set()
-        if previous is not None:
-            wanted.add(previous + 1)
-        if following is not None:
-            wanted.add(following - 1)
-        if not wanted or _value(current) in wanted:
+        if previous is None or following is None:
             continue
-        agreeing = [o for o in options if _value(o) in wanted]
+        wanted = previous + 1
+        if wanted != following - 1 or _value(current) == wanted:
+            continue
+        agreeing = [o for o in options if _value(o) == wanted]
         if agreeing:
             resolved[index] = agreeing[0]
     return resolved

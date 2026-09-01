@@ -290,6 +290,24 @@ class TestTheCornerWins(SimpleTestCase):
 
         self.assertEqual(entry["detected"], "743")
 
+    def test_a_labelled_body_cell_loses_to_the_head_band(self):
+        """dots labels a headnote number Page-header wherever it is.
+
+        This one is printed in the margin of the body, nearer its edge
+        than the running head is to its own, so distance alone would
+        hand it the page. The band is what separates them, and the
+        score is where the band is counted.
+        """
+        entry = self.extract(
+            [
+                cell("Okl. 743", bbox=[1285, 107, 1427, 144]),
+                cell("2", bbox=[250, 900, 265, 925]),
+            ],
+            pdf_page=743,
+        )
+
+        self.assertEqual(entry["detected"], "743")
+
     def test_a_head_cell_of_two_lines_is_read_line_by_line(self):
         """Page 137: dots returns the head and the Cite line as one."""
         entry = self.extract(
@@ -374,6 +392,93 @@ class TestOcrResultsFromVolume(SimpleTestCase):
         results = page_numbers.ocr_results_from_volume(document)
 
         self.assertEqual(results[1]["detected"], "150")
+
+    def test_a_column_of_headnote_numbers_is_not_a_sequence(self):
+        """The rivals of a page number run in sequence themselves.
+
+        A headnote column counts 1, 2, 3 down the volume, so a pass
+        that trusted the sequence over the band would read it as the
+        page numbers and approve itself.
+        """
+        document = {
+            "pages": [
+                make_page(
+                    1,
+                    [
+                        cell("Okl. 741", bbox=[1285, 107, 1427, 144]),
+                        cell("1", bbox=[250, 900, 265, 925]),
+                    ],
+                ),
+                make_page(
+                    2,
+                    [
+                        cell("742 Okl.", bbox=[274, 112, 411, 147]),
+                        cell("2", bbox=[250, 1100, 265, 1125]),
+                    ],
+                ),
+                make_page(
+                    3,
+                    [
+                        cell("Okl. 743", bbox=[1285, 107, 1427, 144]),
+                        cell("3", bbox=[250, 1300, 265, 1325]),
+                    ],
+                ),
+            ]
+        }
+
+        results = page_numbers.ocr_results_from_volume(document)
+
+        self.assertEqual(
+            [r["detected"] for r in results], ["741", "742", "743"]
+        )
+
+    def test_one_neighbour_alone_never_moves_a_pick(self):
+        """A misread page must not hand its sequence to the next one.
+
+        Page 1 reads a rival, and page 2 offers the number that
+        continues it. Only page 3 could confirm that, and it has no
+        number at all, so page 2 keeps what the geometry read.
+        """
+        document = {
+            "pages": [
+                make_page(1, [cell("Ky. 500", bbox=[1285, 107, 1427, 144])]),
+                make_page(
+                    2,
+                    [
+                        cell("Ky. 101", bbox=[1285, 107, 1427, 144]),
+                        cell("501", bbox=[1200, 114, 1249, 147]),
+                    ],
+                ),
+                make_page(3, None),
+            ]
+        }
+
+        results = page_numbers.ocr_results_from_volume(document)
+
+        self.assertEqual(results[1]["detected"], "101")
+
+    def test_a_range_is_never_moved(self):
+        """A range names two pages, so it answers no sequence."""
+        document = {
+            "pages": [
+                make_page(1, [cell("Ky. 100", bbox=[1285, 107, 1427, 144])]),
+                make_page(
+                    2,
+                    [
+                        cell("101-109", bbox=[1285, 107, 1427, 144]),
+                        cell(
+                            "101", "Page-footer", bbox=[800, 2120, 900, 2160]
+                        ),
+                    ],
+                ),
+                make_page(3, [cell("Ky. 102", bbox=[1285, 107, 1427, 144])]),
+            ]
+        }
+
+        results = page_numbers.ocr_results_from_volume(document)
+
+        self.assertEqual(results[1]["detected"], "101-109")
+        self.assertEqual(results[1]["type"], "range")
 
     def test_the_pass_never_invents_a_number(self):
         document = {
