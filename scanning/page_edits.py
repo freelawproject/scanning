@@ -60,6 +60,38 @@ def is_stale(edit: PageEdit, scan: Scan) -> bool:
     return edit.source_fingerprint != scan.source_fingerprint
 
 
+def current_edits(scan: Scan, *kinds: str) -> list[PageEdit]:
+    """Return the unapplied edits that describe *this* original.
+
+    What every consumer that **acts** on an edit must read. A row whose
+    fingerprint does not match the scan's was made against another
+    document, so its address names a page nobody chose: applying it
+    would delete, or displace, a page the curator never saw.
+
+    :param scan: The scan whose edits are wanted.
+    :param kinds: ``PageEdit.Kind`` values. All kinds when empty.
+    :returns: The open rows that still describe this original.
+    :rtype: list[PageEdit]
+    """
+    return [
+        edit for edit in open_edits(scan, *kinds) if not is_stale(edit, scan)
+    ]
+
+
+def stale_open_edits(scan: Scan, *kinds: str) -> list[PageEdit]:
+    """Return the unapplied edits that describe another original.
+
+    The other half of :func:`current_edits`, for the reader that has to
+    *report* them. They are never applied and never silently dropped.
+
+    :param scan: The scan whose edits are wanted.
+    :param kinds: ``PageEdit.Kind`` values. All kinds when empty.
+    :returns: The open rows made against another original.
+    :rtype: list[PageEdit]
+    """
+    return [edit for edit in open_edits(scan, *kinds) if is_stale(edit, scan)]
+
+
 def has_pending_changes(scan: Scan) -> bool:
     """Return whether the scan carries edits the apply has not built in.
 
@@ -70,25 +102,31 @@ def has_pending_changes(scan: Scan) -> bool:
     :returns: Whether an unapplied structural edit exists.
     :rtype: bool
     """
-    return open_edits(scan, *PageEdit.STRUCTURAL_KINDS).exists()
+    # The current ones only: a stale row can never be applied, so
+    # counting it would hold the review open for good. It is reported
+    # as an issue instead, which is the channel a person can act on.
+    return bool(current_edits(scan, *PageEdit.STRUCTURAL_KINDS))
 
 
 def deleted_pages(scan: Scan) -> set[int]:
     """Return the 1-based original pages marked for deletion.
 
     :param scan: The scan to read.
-    :returns: The pages a curator marked, unapplied ones only.
+    :returns: The pages a curator marked: unapplied, and against this
+        original.
     :rtype: set[int]
     """
-    return set(
-        open_edits(scan, PageEdit.Kind.DELETE_PAGE).values_list(
-            "pdf_page", flat=True
-        )
-    )
+    return {
+        edit.pdf_page
+        for edit in current_edits(scan, PageEdit.Kind.DELETE_PAGE)
+    }
 
 
 def inserts_by_gap(scan: Scan) -> dict[int, list[PageEdit]]:
     """Return the images to insert, keyed by the page they follow.
+
+    What the apply and the export read, so it holds the current rows
+    only -- an image anchored in another original has no gap here.
 
     :param scan: The scan to read.
     :returns: ``{anchor_pdf_page: [edit, ...]}``, each list in
@@ -96,8 +134,9 @@ def inserts_by_gap(scan: Scan) -> dict[int, list[PageEdit]]:
     :rtype: dict[int, list[PageEdit]]
     """
     gaps: dict[int, list[PageEdit]] = {}
-    rows = open_edits(scan, PageEdit.Kind.INSERT_PAGE).order_by(
-        "anchor_pdf_page", "ordinal"
+    rows = sorted(
+        current_edits(scan, PageEdit.Kind.INSERT_PAGE),
+        key=lambda edit: (edit.anchor_pdf_page, edit.ordinal),
     )
     for edit in rows:
         gaps.setdefault(edit.anchor_pdf_page, []).append(edit)
@@ -118,13 +157,17 @@ def next_ordinal(scan: Scan, anchor_pdf_page: int) -> int:
     return max(taken) + 1 if taken else 0
 
 
-def _inserted_entry(edit: PageEdit, entry: dict | None) -> dict:
+def _inserted_entry(
+    edit: PageEdit, entry: dict | None, unplaced: bool = False
+) -> dict:
     """Return the page map entry that shows one uploaded image.
 
     :param edit: The ``INSERT_PAGE`` row.
     :param entry: The ``missing`` placeholder it fills, when there is
         one. Without it the entry is built from the row alone, which is
         what an insert whose placeholder a later OCR run removed needs.
+    :param unplaced: Whether the volume has no position for this image.
+        The viewer says so, and offers the same Remove button.
     :returns: An ``inserted`` page map entry.
     :rtype: dict
     """
@@ -132,6 +175,7 @@ def _inserted_entry(edit: PageEdit, entry: dict | None) -> dict:
     out["type"] = "inserted"
     out["insert_url"] = edit.image.url if edit.image else ""
     out["insert_edit_id"] = edit.pk
+    out["unplaced"] = unplaced
     if not out.get("logical_number"):
         out["logical_number"] = edit.logical_page or ""
     return out
@@ -155,6 +199,14 @@ def project_inserts(scan: Scan, page_map: list[dict]) -> list[dict]:
     number the placeholder stood for -- is still shown, right after its
     anchor page. Dropping it would hide a page a curator uploaded.
 
+    **Every open insert reaches the viewer**, including the ones this
+    volume has no position for: an image anchored past the last page, a
+    page map that is empty or has lost the anchor page, and one made
+    against another original. They go last, flagged ``unplaced``,
+    because the viewer's Remove button is the only way to take an
+    insert back. An image the walk dropped would strand its row where
+    nothing in the portal could reach it.
+
     :param scan: The scan whose page map is being rendered.
     :param page_map: The stored page map. Not modified in place.
     :returns: The page map to render.
@@ -162,11 +214,22 @@ def project_inserts(scan: Scan, page_map: list[dict]) -> list[dict]:
     """
     gaps = inserts_by_gap(scan)
     out: list[dict] = []
+    placed: set[int] = set()
     anchor = 0
     queue = list(gaps.get(0, []))
+
+    def _flush(queued):
+        """Emit the images of a gap the walk is leaving.
+
+        :param queued: The rows still queued for that gap.
+        :returns: Their page map entries.
+        """
+        placed.update(edit.pk for edit in queued)
+        return [_inserted_entry(edit, None) for edit in queued]
+
     for entry in page_map:
         if entry.get("type") == "pdf_page":
-            out.extend(_inserted_entry(edit, None) for edit in queue)
+            out.extend(_flush(queue))
             out.append(entry)
             anchor = entry["pdf_index"] + 1
             queue = list(gaps.get(anchor, []))
@@ -174,10 +237,18 @@ def project_inserts(scan: Scan, page_map: list[dict]) -> list[dict]:
         if entry.get("type") == "missing":
             entry = dict(entry, anchor_pdf_page=anchor)
             if queue:
-                out.append(_inserted_entry(queue.pop(0), entry))
+                edit = queue.pop(0)
+                placed.add(edit.pk)
+                out.append(_inserted_entry(edit, entry))
                 continue
         out.append(entry)
-    out.extend(_inserted_entry(edit, None) for edit in queue)
+    out.extend(_flush(queue))
+
+    out.extend(
+        _inserted_entry(edit, None, unplaced=True)
+        for edit in open_edits(scan, PageEdit.Kind.INSERT_PAGE)
+        if edit.pk not in placed
+    )
     return out
 
 

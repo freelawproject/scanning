@@ -1033,3 +1033,124 @@ class TestInsertMigrationAnchor(TestCase):
 
     def test_a_volume_with_no_page_map_cannot_place_it(self):
         self.assertIsNone(self._anchor_for([], 2))
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestStructuralEditsAgainstAnotherOriginal(TestCase):
+    """A delete or an insert from another original must not be acted on.
+
+    The page numbers already refuse to be placed on a volume whose
+    fingerprint moved. The structural kinds are the ones that would do
+    real damage: a delete drops a page of a document the curator never
+    saw.
+    """
+
+    def setUp(self):
+        self.scan = ScanFactory(page_count=4, source_fingerprint="200:4")
+
+    def test_a_stale_deletion_is_not_reported_as_a_deletion(self):
+        from scanning import page_edits
+
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+            source_fingerprint="100:4",
+        )
+
+        self.assertEqual(page_edits.deleted_pages(self.scan), set())
+
+    def test_a_stale_insert_is_not_handed_to_the_apply(self):
+        from scanning import page_edits
+
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=1,
+            value="",
+            source_fingerprint="100:4",
+        )
+
+        self.assertEqual(page_edits.inserts_by_gap(self.scan), {})
+
+    def test_a_stale_structural_edit_is_reported(self):
+        from scanning import services
+
+        Scan.objects.filter(pk=self.scan.pk).update(
+            start_page=1,
+            end_page=4,
+            ocr_results=[
+                {
+                    "pdf_page": n,
+                    "detected": str(n),
+                    "type": "single",
+                    "zone": "dots-header",
+                }
+                for n in range(1, 5)
+            ],
+        )
+        self.scan.refresh_from_db()
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+            source_fingerprint="100:4",
+        )
+
+        services.recalculate_issues(self.scan)
+
+        self.assertTrue(
+            self.scan.issues.filter(
+                check_name=CheckName.STALE_PAGE_EDIT, page_number=2
+            ).exists()
+        )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestAnInsertTheMapCannotPlace(TestCase):
+    """An image the page map cannot place is shown, never hidden.
+
+    Its Remove button is the only way to take it back, so hiding the
+    image strands the row: nothing else in the portal can reach it.
+    """
+
+    def setUp(self):
+        self.scan = ScanFactory(page_count=2)
+        self.page_map = [
+            {"type": "pdf_page", "pdf_index": 0, "logical_number": 1},
+            {"type": "pdf_page", "pdf_index": 1, "logical_number": 3},
+        ]
+
+    def test_an_anchor_beyond_the_page_map_is_still_shown(self):
+        from scanning import page_edits
+
+        edit = PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=7,
+            value="",
+        )
+
+        out = page_edits.project_inserts(self.scan, self.page_map)
+
+        shown = [e for e in out if e.get("insert_edit_id") == edit.pk]
+        self.assertEqual(len(shown), 1)
+
+    def test_an_insert_on_a_volume_with_no_page_map_is_still_shown(self):
+        from scanning import page_edits
+
+        edit = PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=1,
+            value="",
+        )
+
+        out = page_edits.project_inserts(self.scan, [])
+
+        self.assertEqual([e["insert_edit_id"] for e in out], [edit.pk])

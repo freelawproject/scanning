@@ -319,7 +319,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var pageDiv = document.createElement('div');
         pageDiv.className = 'page-container inserted-page';
         pageDiv.id = 'page-' + entry.logical_number;
-        pageDiv.innerHTML = insertedPageHtml(entry.logical_number, entry.insert_url, entry.insert_edit_id);
+        pageDiv.innerHTML = insertedPageHtml(entry.logical_number, entry.insert_url, entry.insert_edit_id, entry.unplaced);
         bindRemoveInsert(pageDiv, entry.insert_edit_id);
         container.appendChild(pageDiv);
     }
@@ -327,8 +327,12 @@ document.addEventListener('DOMContentLoaded', function () {
     // The label of an inserted page, with the button that takes it
     // back. A deletion has always had its undo and an insert had none,
     // so a wrong image could only be covered by another one (#214).
-    function insertedPageHtml(logicalNumber, imageUrl, editId) {
-        var label = 'Page ' + logicalNumber + ' &mdash; INSERTED';
+    function insertedPageHtml(logicalNumber, imageUrl, editId, unplaced) {
+        // An image this volume has no position for is shown all the
+        // same: Remove is the only way to take an insert back (#214).
+        var label = unplaced
+            ? 'Page ' + logicalNumber + ' &mdash; UPLOADED, BUT THIS VOLUME HAS NO PLACE FOR IT'
+            : 'Page ' + logicalNumber + ' &mdash; INSERTED';
         var button = editId
             ? ' <button class="remove-insert-btn" style="cursor:pointer;' +
               'background:#dc2626;color:white;border:none;border-radius:3px;' +

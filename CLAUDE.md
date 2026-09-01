@@ -210,12 +210,22 @@ broken:
   pages no longer lose one of the two numbers. The `"manual"` stamp
   survives as a *derived* marker the sidebar and the offset heuristic
   read; it is no longer how a number survives a rerun.
-- **An edit that cannot be placed is reported, never guessed at.** A
-  fingerprint mismatch (`Scan.source_fingerprint`, stamped by
-  `sharding.ensure_shards`, copied onto each row at write time) or a
-  page the volume no longer has raises a `stale_page_edit` issue naming
-  the page. A blank fingerprint on either side is legacy and matches
-  anything. The old code dropped such an entry in silence.
+- **An edit that cannot be placed is reported, never guessed at, and
+  never acted on.** A fingerprint mismatch (`Scan.source_fingerprint`,
+  stamped by `sharding.ensure_shards`, copied onto each row at write
+  time) or a page the volume no longer has raises a `stale_page_edit`
+  issue naming the page. A blank fingerprint on either side is legacy
+  and matches anything. So every reader that *acts* on an edit --
+  `deleted_pages`, `inserts_by_gap`, `has_pending_changes`, and
+  `overlay_page_numbers` -- goes through `current_edits`, never
+  `open_edits`: a stale delete would drop a page of a document the
+  curator never saw. A stale row does not hold the review open either;
+  the issue is the channel a person can act on.
+- **Every open insert reaches the viewer**, including one this volume
+  cannot place: `project_inserts` appends it flagged `unplaced` rather
+  than dropping it. The viewer's Remove button is the only way to take
+  an insert back, so an image the walk dropped would strand its row
+  where nothing in the portal could reach it.
 - **`has_pending_changes` counts the structural kinds only**
   (`PageEdit.STRUCTURAL_KINDS`). A number and a dismissal need no
   apply, so they no longer block the recompute button, and

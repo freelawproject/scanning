@@ -57,6 +57,7 @@ from scanning.models import (
     JobStatus,
     OpinionScan,
     OpinionStatus,
+    PageEdit,
     QueueStatus,
     Scan,
     Stage,
@@ -1183,7 +1184,20 @@ def recalculate_issues(scan: "Scan") -> None:
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
 
-    result["issues"].extend(page_edits.stale_edit_issues(stale_edits))
+    # Every open edit this volume cannot take, not only the page
+    # numbers: a delete or an insert made against another original is
+    # refused by the readers that act on it, so the curator has to hear
+    # about it here or the decision just disappears.
+    result["issues"].extend(
+        page_edits.stale_edit_issues(
+            stale_edits
+            + [
+                edit
+                for edit in page_edits.stale_open_edits(scan)
+                if edit.kind != PageEdit.Kind.SET_NUMBER
+            ]
+        )
+    )
 
     for pdf_page, old_val, new_val in auto_corrected:
         result["issues"].append(
