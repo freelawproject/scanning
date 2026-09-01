@@ -123,9 +123,7 @@ class TestEnsureDetectJobs(ScanningTestCase):
         first = yolo.ensure_detect_jobs(scan, manifest)
         second = yolo.ensure_detect_jobs(scan, manifest)
 
-        self.assertEqual(
-            [row.pk for row in first], [row.pk for row in second]
-        )
+        self.assertEqual([row.pk for row in first], [row.pk for row in second])
         self.assertEqual(len(detect_jobs(scan)), 2)
 
     def test_a_dead_row_starts_a_new_run(self):
@@ -261,9 +259,7 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(payload["models"], ["bl_warm"])
         # Its own endpoint, not the other engine's.
         config.assert_called_with("ep-yolo")
-        self.assertEqual(
-            detect_jobs(scan)[0].status, JobStatus.SUBMITTED
-        )
+        self.assertEqual(detect_jobs(scan)[0].status, JobStatus.SUBMITTED)
 
     def test_a_disabled_engine_sends_nothing(self):
         scan = ScanFactory()
@@ -325,9 +321,7 @@ class TestPerEngineKnobs(ScanningTestCase):
     @override_settings(YOLO_MAX_ATTEMPTS=7, DOTS_MOCR_MAX_ATTEMPTS=2)
     def test_the_attempt_cap_is_this_engine_s_own(self):
         self.assertEqual(jobs._max_attempts(self._row()), 7)
-        self.assertEqual(
-            jobs._max_attempts(self._row(JobEngine.DOTS_MOCR)), 2
-        )
+        self.assertEqual(jobs._max_attempts(self._row(JobEngine.DOTS_MOCR)), 2)
 
     @override_settings(
         RUNPOD_REQUEST_TIMEOUT=100,
@@ -342,9 +336,7 @@ class TestPerEngineKnobs(ScanningTestCase):
             timezone.timedelta(seconds=110),
         )
         self.assertEqual(
-            jobs.runpod_execution_deadline(
-                self._row(JobEngine.DOTS_MOCR), now
-            )
+            jobs.runpod_execution_deadline(self._row(JobEngine.DOTS_MOCR), now)
             - now,
             timezone.timedelta(seconds=150),
         )
@@ -470,9 +462,9 @@ class TestStartButton(ScanningTestCase):
         with self._committed():
             self._press()
             rows = detect_jobs(self.scan)
-            ExternalJob.objects.filter(
-                pk__in=[row.pk for row in rows]
-            ).update(status=JobStatus.COMPLETED)
+            ExternalJob.objects.filter(pk__in=[row.pk for row in rows]).update(
+                status=JobStatus.COMPLETED
+            )
             with (
                 patch("scanning.s3_sync.s3_active", return_value=True),
                 patch("scanning.s3_sync.object_exists", return_value=True),
