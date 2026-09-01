@@ -9,11 +9,15 @@ with one compare-and-swap. Under test:
 - the run-scoped ``applied_at`` marker that keeps a recompute from
   looping every tick
 - the bounded retry of an apply that keeps failing, mirroring the glue
+- ``reapply_page_numbers``, which hands an applied run back to the pass
+  after a change to how the numbers are read (#228)
 """
 
 import pathlib
+from io import StringIO
 from unittest.mock import patch
 
+from django.core.management import call_command
 from django.test import TestCase
 
 from scanning import dots_mocr
@@ -240,3 +244,59 @@ class TestApplyReadyRuns(ApplyRunsMixin, TestCase):
         self.assertEqual(
             scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
         )
+
+
+class TestReapplyPageNumbers(ApplyRunsMixin, TestCase):
+    """``reapply_page_numbers``: read a glued run again (#228).
+
+    A change to how the adapter reads a page number reaches only the
+    volumes read after the deploy, because ``applied_at`` closes the
+    run. The command hands those volumes back to the pass.
+    """
+
+    def test_a_handed_back_run_applies_again(self):
+        scan, _ = self.build()
+        dots_mocr.apply_ready_runs()
+
+        call_command("reapply_page_numbers", stdout=StringIO())
+        applied = dots_mocr.apply_ready_runs()
+
+        self.assertEqual(applied, 1)
+        self.assertEqual(self.download.call_count, 2)
+        scan.refresh_from_db()
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+
+    def test_a_dry_run_changes_nothing(self):
+        self.build()
+        dots_mocr.apply_ready_runs()
+
+        out = StringIO()
+        call_command("reapply_page_numbers", "--dry-run", stdout=out)
+        applied = dots_mocr.apply_ready_runs()
+
+        self.assertEqual(applied, 0)
+        self.assertIn("would be handed back", out.getvalue())
+
+    def test_an_approved_volume_is_left_alone(self):
+        """Review 1 is over, so nothing may rewrite its numbers."""
+        scan, _ = self.build()
+        dots_mocr.apply_ready_runs()
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+
+        call_command("reapply_page_numbers", stdout=StringIO())
+
+        rows = dots_mocr.live_analyze_jobs(scan)
+        self.assertTrue(dots_mocr._apply_state(rows)["applied_at"])
+
+    def test_a_scan_that_never_applied_is_not_counted(self):
+        """Its run is glued but the pass has not read it yet."""
+        self.build()
+
+        out = StringIO()
+        call_command("reapply_page_numbers", stdout=out)
+
+        self.assertIn("0 scan(s) to read again", out.getvalue())

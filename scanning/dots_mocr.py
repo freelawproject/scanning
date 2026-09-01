@@ -768,3 +768,38 @@ def apply_ready_runs() -> int:
             applied += 1
 
     return applied
+
+
+def reopen_apply(scan, dry_run: bool = False) -> bool:
+    """Let the collect tick apply a glued run a second time (#228).
+
+    ``applied_at`` is what stops :func:`apply_ready_runs` from looping
+    every tick, so a change to how the page numbers are read reaches
+    no volume that already applied. Clearing it hands the volume back
+    to the pass, which re-reads the *stored* glued document: no GPU
+    time, no new run, and the numbers a curator typed survive, because
+    ``page_edits.overlay_page_numbers`` writes them over the machine
+    output on every apply.
+
+    The whole apply state goes, not only the stamp: a second apply is
+    a fresh attempt and deserves the full ``APPLY_MAX_ATTEMPTS``
+    budget.
+
+    The caller decides which scans may take it. A scan outside the
+    statuses ``apply_ready_runs`` reads would simply keep the cleared
+    state until an admin re-queue parks it back in the review flow.
+
+    :param scan: The scan whose live run should apply again.
+    :param dry_run: Answer whether the run qualifies, and write
+        nothing.
+    :returns: Whether a glued, applied run was handed back.
+    :rtype: bool
+    """
+    rows = live_analyze_jobs(scan)
+    if not rows or any(row.status != JobStatus.CONSUMED for row in rows):
+        return False
+    if not _apply_state(rows).get("applied_at"):
+        return False
+    if not dry_run:
+        _write_apply_state(rows, {})
+    return True
