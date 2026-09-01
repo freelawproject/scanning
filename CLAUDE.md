@@ -55,8 +55,9 @@ blackletter-gpu-worker under `scanning/runpod/`), and their
 back as an external job, dots.mocr as a pipeline-enqueued one (#207,
 with the staff button kept for re-runs), and the page
 numbers plus Issues as an apply pass on the collect tick (#149/#204,
-all below), and review 1 got its approve button (#151); still missing
-are the post-review stages (#195/#196), so:
+all below), review 1 got its approve button (#151), and its human page
+edits got one model (#214); still missing are the post-review stages
+(#195/#196), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
   enqueues the dots.mocr read (#207) when `_can_analyze` allows,
@@ -161,6 +162,76 @@ approve button the view refuses.
   an undo; step 1 defines it (a green toast) and step 2 leaves it
   undefined. The page-number edit and the insert upload call it
   directly. Nothing applies these edits to the volume yet.
+
+## Human page edits (issue #214)
+
+Every decision a person makes about a page in review 1 is one
+`PageEdit` row: the printed number (`SET_NUMBER`, blank value = the
+curator cleared it), a delete, an insert, a replacement, a rotation,
+and the dismissal of an issue. It replaced three storages in two
+address spaces -- an entry inside the `Scan.ocr_results` JSON, a
+`PageDeletion` addressed by PDF page, a `PageInsert` addressed by
+printed page number -- plus nothing at all for a replacement. The
+pieces: `models.PageEdit`, `page_edits.py` (the queries and the
+overlay), and the endpoints in `views_process.py`. What must not be
+broken:
+
+- **Every address is the physical space of the original as it was
+  uploaded**, 1-based -- the space `Detection.page_index` and the shard
+  manifest already use. A printed number addresses nothing: front
+  matter has none, and two pages can print 1074, which is one of the
+  defects review 1 exists to find. It rides along as `logical_page`,
+  for the label and the audit.
+- **An insert is addressed by a gap.** `anchor_pdf_page` is the page
+  the image follows, 0 means "before page 1", and `ordinal` orders
+  several images in one gap. `page_edits.project_inserts` does both
+  halves in one walk: it stamps the anchor on every `missing`
+  placeholder it renders, and the upload sends that back. Resolving it
+  in the browser and throwing it away is what left the old model with
+  no address at all.
+- **Applying an edit closes it; it never rewrites it.** The apply
+  (#206) stamps `applied_at`. So every unique key is **partial over the
+  open rows** (`condition=Q(applied_at__isnull=True)`) -- without that,
+  a curator could not edit the same page again after an apply.
+- **A dismissal is unique per check, not per page.** One page raises
+  several checks, and each rebuild writes new `Issue` rows with new
+  primary keys, so the check's name is the only stable handle. Its
+  address is in whichever space the check uses
+  (`models.PHYSICAL_PAGE_CHECKS`), and `logical_page` is in the key
+  because two `missing_page` dismissals differ only by printed number.
+- **`Scan.ocr_results` is a cache, not a source.** It is rebuilt whole
+  from the glued run (`page_numbers.ocr_results_from_volume`, now pure
+  machine output) plus the rows (`page_edits.overlay_page_numbers`), by
+  `recalculate_issues`, `rebuild_page_map` and `run_compute_issues`.
+  Nothing edits one entry in place any more, so two curators on two
+  pages no longer lose one of the two numbers. The `"manual"` stamp
+  survives as a *derived* marker the sidebar and the offset heuristic
+  read; it is no longer how a number survives a rerun.
+- **An edit that cannot be placed is reported, never guessed at.** A
+  fingerprint mismatch (`Scan.source_fingerprint`, stamped by
+  `sharding.ensure_shards`, copied onto each row at write time) or a
+  page the volume no longer has raises a `stale_page_edit` issue naming
+  the page. A blank fingerprint on either side is legacy and matches
+  anything. The old code dropped such an entry in silence.
+- **`has_pending_changes` counts the structural kinds only**
+  (`PageEdit.STRUCTURAL_KINDS`). A number and a dismissal need no
+  apply, so they no longer block the recompute button, and
+  `dismiss_issue` lost its "reprocess first" guard with the convention
+  it protected.
+- **The image is on the default storage** (S3 in production), under the
+  scan's `page_edits/` prefix -- excluded from the generic sync like
+  `shards/` and `jobs/`, swept by the admin scan deletion, and
+  presignable, which is how #206 will hand it to doctor and RunPod as a
+  one-page shard. `PageInsert` wrote to `LocalProcessingStorage`, so a
+  preempted web pod took the image with it.
+- `replace_page` and `rotate_page` have endpoints and no buttons: the
+  interface belongs with #206 and #151. `export_pdf` applies the
+  deletes and the inserts only.
+- The data migrations are 0013 (the manual readings) and 0015 (the two
+  retired models); 0016 drops them. The **image bytes** are moved by
+  `migrate_page_insert_images`, which must run on the pod holding the
+  files: until it does, a migrated insert names an S3 key the bucket
+  does not have.
 
 ## Bitonal via doctor (issue #176)
 
