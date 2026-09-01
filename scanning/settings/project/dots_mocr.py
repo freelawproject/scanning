@@ -55,8 +55,8 @@ RUNPOD_DOTSMOCR_ENDPOINT_ID = env.str(
 # bills each worker's cold start, so shards running in parallel on cold
 # workers pay boot several times over, and three shards in series on one
 # warm worker may cost less than three at once. The real cost control is
-# the endpoint's own ``max_workers``. Low while the stage is new.
-DOTS_MOCR_MAX_CONCURRENCY = env.int("DOTS_MOCR_MAX_CONCURRENCY", default=3)
+# the endpoint's own ``max_workers``.
+DOTS_MOCR_MAX_CONCURRENCY = env.int("DOTS_MOCR_MAX_CONCURRENCY", default=5)
 
 # Attempts per shard before its job is failed. Serverless workers are
 # preempted, scheduled without a GPU, or land with a dead inference
