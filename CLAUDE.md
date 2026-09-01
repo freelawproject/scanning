@@ -55,10 +55,10 @@ blackletter-gpu-worker under `scanning/runpod/`), and their
 back as an external job, dots.mocr as a pipeline-enqueued one (#207,
 with the staff button kept for re-runs), the page numbers plus Issues
 as an apply pass on the collect tick (#149/#204), review 1 got its
-approve button (#151), and YOLO detection came back as a rebuilt
-worker image (#194 — the image only), all below; still missing are the
-post-review stages (#195/#196 — the callers the detect image waits
-for), so:
+approve button (#151) and one model for its human page edits (#214),
+and YOLO detection came back as a rebuilt worker image (#194 — the
+image only), all below; still missing are the post-review stages
+(#195/#196 — the callers the detect image waits for), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
   enqueues the dots.mocr read (#207) when `_can_analyze` allows,
@@ -163,6 +163,65 @@ approve button the view refuses.
   an undo; step 1 defines it (a green toast) and step 2 leaves it
   undefined. The page-number edit and the insert upload call it
   directly. Nothing applies these edits to the volume yet.
+
+## Human page edits (issue #214)
+
+One `PageEdit` row per curator decision in review 1: a printed number
+(`SET_NUMBER`, blank value = cleared), a delete, an insert, a
+replacement, a rotation, and the dismissal of an issue. It replaced
+three storages in two address spaces. The pieces: `models.PageEdit`,
+`page_edits.py` (queries and overlay), the endpoints in
+`views_process.py`. What must not be broken:
+
+- **Every address is a physical page of the original as uploaded**,
+  1-based (`pdf_page` / `anchor_pdf_page`) — the space
+  `Detection.page_index` and the shard manifest use. A printed number
+  locates nothing (front matter has none, duplicates exist); it rides
+  along as the `logical_page` label.
+- **An insert is addressed by a gap**: `anchor_pdf_page` is the page
+  the image follows (0 = before page 1), `ordinal` orders one gap.
+  `project_inserts` stamps the anchor on every `missing` placeholder,
+  and the upload sends it back.
+- **Applying closes an edit** (`applied_at`), never rewrites it, so
+  every unique key is partial over the open rows
+  (`condition=Q(applied_at__isnull=True)`) — else a page could not be
+  edited again after an apply.
+- **A dismissal is unique per check, not per page**: rebuilds give
+  `Issue` rows new PKs, so the check name is the only stable handle.
+  Its address space follows `models.PHYSICAL_PAGE_CHECKS`;
+  `logical_page` is in the key.
+- **`Scan.ocr_results` is a cache**: rebuilt whole from the glued run
+  (`page_numbers.ocr_results_from_volume`) plus the rows
+  (`page_edits.overlay_page_numbers`) by `recalculate_issues`,
+  `rebuild_page_map` and `run_compute_issues`. The `"manual"` stamp is
+  a derived marker, not how a number survives a rerun.
+- **An unplaceable edit is reported, never applied**: a
+  `Scan.source_fingerprint` mismatch (stamped by `ensure_shards`,
+  copied onto each row; blank = legacy, matches anything) or an absent
+  page raises a `stale_page_edit` issue. Every acting reader
+  (`deleted_pages`, `inserts_by_gap`, `has_pending_changes`,
+  `overlay_page_numbers`) goes through `current_edits`, never
+  `open_edits`. A stale row does not hold the review open.
+- **Every open insert reaches the viewer**: `project_inserts` appends
+  an unplaceable one flagged `unplaced` — Remove is the only way to
+  take an insert back, so a dropped image would strand its row.
+- **`has_pending_changes` counts `STRUCTURAL_KINDS` only** — a number
+  or a dismissal needs no apply. Both step-1 bar flags come from one
+  read (`page_edits.pending_edit_flags` via `_review_flags`); computed
+  apart they disagreed on stale rows.
+- **The image is on the default storage** under the scan's
+  `page_edits/` prefix: excluded from the generic sync, swept by admin
+  deletion, presignable for #206. `PageInsert` used
+  `LocalProcessingStorage`, so a preempted web pod lost the image.
+- **The printed label is free text: narrowed** (`_page_label`) **and
+  escaped** (`escapeHtml` in `shared.js`) — both layers on purpose.
+  `SET_NUMBER.value` stays numeric: the sequence analysis parses it.
+- `replace_page` / `rotate_page` are endpoints without buttons (the
+  interface belongs to #206/#151). `export_pdf` applies deletes and
+  inserts only.
+- Data migrations: 0013 (manual readings), 0015 (the retired models),
+  0016 (the drop). Run `migrate_page_insert_images` on the pod holding
+  the files; until then a migrated insert names an absent S3 key.
 
 ## Bitonal via doctor (issue #176)
 

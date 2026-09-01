@@ -234,13 +234,12 @@ class ScanAdminRequeueActionTests(TestCase):
 
 
 class ScanAdminDeleteShardSweepTests(TestCase):
-    """Scan deletion sweeps the S3 shards and job results.
+    """Scan deletion sweeps the shards, job results and page edits.
 
-    The two prefixes nothing else removes (PR #169 review, issue #176).
-    The shard PDFs duplicate the original's bytes and each job result
-    holds a converted copy of the volume, so they are the largest
-    objects a deleted scan would otherwise orphan under its processing
-    prefix.
+    The three prefixes nothing else removes (PR #169 review, issues
+    #176 and #214). The shard PDFs duplicate the original's bytes, each
+    job result holds a converted copy of the volume, and the page edit
+    images are the only copy of what a curator uploaded.
     """
 
     def setUp(self):
@@ -248,10 +247,13 @@ class ScanAdminDeleteShardSweepTests(TestCase):
 
     def test_delete_model_sweeps_shards_and_job_results(self):
         scan = ScanFactory()
-        with patch("scanning.s3_sync.delete_shard_objects") as shards:
-            with patch("scanning.s3_sync.delete_job_objects") as results:
-                self.admin.delete_model(_request_with_messages(), scan)
-        for mock_delete in (shards, results):
+        with (
+            patch("scanning.s3_sync.delete_shard_objects") as shards,
+            patch("scanning.s3_sync.delete_job_objects") as results,
+            patch("scanning.s3_sync.delete_page_edit_objects") as images,
+        ):
+            self.admin.delete_model(_request_with_messages(), scan)
+        for mock_delete in (shards, results, images):
             mock_delete.assert_called_once()
             self.assertEqual(mock_delete.call_args.args[0].pk, scan.pk)
         self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
@@ -274,10 +276,14 @@ class ScanAdminDeleteShardSweepTests(TestCase):
         """Best effort, and one prefix failing must not skip the other."""
         scan = ScanFactory()
         error = ClientError({"Error": {"Code": "SlowDown"}}, "DeleteObjects")
-        with patch("scanning.s3_sync.delete_shard_objects", side_effect=error):
-            with patch("scanning.s3_sync.delete_job_objects") as results:
-                self.admin.delete_model(_request_with_messages(), scan)
+        with (
+            patch("scanning.s3_sync.delete_shard_objects", side_effect=error),
+            patch("scanning.s3_sync.delete_job_objects") as results,
+            patch("scanning.s3_sync.delete_page_edit_objects") as images,
+        ):
+            self.admin.delete_model(_request_with_messages(), scan)
         results.assert_called_once()
+        images.assert_called_once()
         self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
 
 

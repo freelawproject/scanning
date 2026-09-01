@@ -14,8 +14,7 @@ from scanning.models import (
     JobStage,
     OpinionScan,
     Page,
-    PageDeletion,
-    PageInsert,
+    PageEdit,
     PendingUpload,
     QueuedAction,
     Reporter,
@@ -47,11 +46,12 @@ def _release_scan_external_work(scan):
     **Sweep second**, for the same reason: a worker still running could
     PUT after the sweep and re-orphan an object we had just deleted.
 
-    Then the two prefixes nothing else removes, and the largest a
-    deleted scan would orphan: the shards duplicate the original's
-    bytes, and the job results hold one copy of the volume's output per
-    attempt. Both are excluded from every sync, so the row going away is
-    the only thing that triggers this.
+    Then the three prefixes nothing else removes: the shards duplicate
+    the original's bytes, the job results hold one copy of the volume's
+    output per attempt, and the page edit images are the pages a
+    curator uploaded in review 1 (#214). All three are excluded from
+    every sync, so the row going away is the only thing that triggers
+    this.
 
     Best effort throughout: neither a stuck provider nor an S3 hiccup
     may block the admin delete, and an orphaned prefix is the
@@ -76,6 +76,7 @@ def _release_scan_external_work(scan):
     for label, sweep in (
         ("shard", s3_sync.delete_shard_objects),
         ("job result", s3_sync.delete_job_objects),
+        ("page edit image", s3_sync.delete_page_edit_objects),
     ):
         try:
             sweep(scan)
@@ -275,8 +276,7 @@ class ScanAdmin(admin.ModelAdmin):
             Page,
             Detection,
             Issue,
-            PageInsert,
-            PageDeletion,
+            PageEdit,
             PendingUpload,
             ExternalJob,
         ):
@@ -652,18 +652,43 @@ class DetectionAdmin(admin.ModelAdmin):
     raw_id_fields = ["scan"]
 
 
-@admin.register(PageInsert)
-class PageInsertAdmin(admin.ModelAdmin):
-    list_display = ["scan", "logical_page_number", "date_created"]
-    raw_id_fields = ["scan"]
-    readonly_fields = ["date_created", "date_modified"]
+@admin.register(PageEdit)
+class PageEditAdmin(admin.ModelAdmin):
+    """One human decision about one page (issue #214).
 
+    Read-only but for the apply stamp: a row records what a person
+    decided, and an admin who edits one rewrites history rather than
+    correcting it. The way to change a decision is the review page.
+    """
 
-@admin.register(PageDeletion)
-class PageDeletionAdmin(admin.ModelAdmin):
-    list_display = ["scan", "pdf_page", "date_created"]
-    raw_id_fields = ["scan"]
-    readonly_fields = ["date_created", "date_modified"]
+    list_display = [
+        "scan",
+        "kind",
+        "pdf_page",
+        "anchor_pdf_page",
+        "value",
+        "author",
+        "applied_at",
+        "date_created",
+    ]
+    list_filter = ["kind", "applied_at"]
+    search_fields = ["scan__id", "value"]
+    raw_id_fields = ["scan", "author"]
+    readonly_fields = [
+        "scan",
+        "kind",
+        "author",
+        "pdf_page",
+        "anchor_pdf_page",
+        "ordinal",
+        "value",
+        "previous_value",
+        "logical_page",
+        "image",
+        "source_fingerprint",
+        "date_created",
+        "date_modified",
+    ]
 
 
 @admin.register(PendingUpload)

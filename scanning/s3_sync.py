@@ -97,6 +97,15 @@ JOB_RESULTS_SUBDIR = "jobs/"
 SHARDS_SUBDIR = "shards/"
 SHARD_MANIFEST_NAME = "manifest.json"
 
+# Subdirectory under a scan's processing prefix holding the images a
+# curator uploaded in review 1 -- an absent page, or a replacement for
+# an unreadable one (``models.PageEdit``, issue #214). Excluded from
+# the generic sync in both directions, like the two above: the images
+# belong to one scan's edit rows, the apply (#206) reads them straight
+# from S3 as a one-page shard, and no stage reads them off local disk.
+# The admin scan deletion sweeps this prefix, since nothing else does.
+PAGE_EDITS_SUBDIR = "page_edits/"
+
 # The bitonal PDF the detect stage runs against. Named because its S3
 # ``LastModified`` is a reference timestamp, not just a filename: see
 # :func:`_is_stage_input`.
@@ -529,14 +538,17 @@ def _is_job_result(rel: str) -> bool:
 def _is_synced_by_default(rel: str) -> bool:
     """Return True if the generic processing sync should carry this key.
 
-    Job results and the shard set are both excluded -- see the comments
-    on ``JOB_RESULTS_SUBDIR`` and ``SHARDS_SUBDIR``.
+    Job results, the shard set and the review-1 page edit images are
+    all excluded -- see the comments on ``JOB_RESULTS_SUBDIR``,
+    ``SHARDS_SUBDIR`` and ``PAGE_EDITS_SUBDIR``.
 
     :param rel: Object key relative to the scan's processing prefix.
     :returns: Whether the generic up/down sync should include the key.
     :rtype: bool
     """
-    return not _is_job_result(rel) and not rel.startswith(SHARDS_SUBDIR)
+    return not _is_job_result(rel) and not rel.startswith(
+        (SHARDS_SUBDIR, PAGE_EDITS_SUBDIR)
+    )
 
 
 def tmp_output_dir(scan: Scan) -> Path:
@@ -1102,6 +1114,23 @@ def delete_job_objects(scan: Scan) -> int:
     """
     prefix = f"{s3_processing_prefix(scan)}{JOB_RESULTS_SUBDIR}"
     return _delete_prefix(scan, prefix, "job result")
+
+
+def delete_page_edit_objects(scan: Scan) -> int:
+    """Delete every object under a scan's ``page_edits/`` prefix.
+
+    For a scan that is going away. The images a curator uploaded in
+    review 1 belong to that scan's ``PageEdit`` rows (#214) and to
+    nothing else, and ``page_edits/`` is excluded from every sync, so
+    the row going away is the only thing that removes them.
+
+    :param scan: The scan whose page edit images to delete.
+    :returns: Number of objects deleted (0 when S3 sync is disabled or
+        the prefix is empty).
+    :rtype: int
+    """
+    prefix = f"{s3_processing_prefix(scan)}{PAGE_EDITS_SUBDIR}"
+    return _delete_prefix(scan, prefix, "page edit image")
 
 
 def _delete_prefix(scan: Scan, prefix: str, kind: str) -> int:

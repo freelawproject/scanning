@@ -203,34 +203,19 @@ class TestOcrResultsFromVolume(SimpleTestCase):
             ]
         }
 
-        results = page_numbers.ocr_results_from_volume(document, None)
+        results = page_numbers.ocr_results_from_volume(document)
 
         self.assertEqual(
             [(r["pdf_page"], r["detected"]) for r in results],
             [(1, "677"), (2, "678")],
         )
 
-    def test_a_manual_entry_is_kept_verbatim(self):
-        manual = {
-            "pdf_page": 1,
-            "detected": "9",
-            "type": "single",
-            "score": 1.0,
-            "zone": "manual",
-            "ocr": "manual",
-            "img_width": WIDTH,
-            "img_height": HEIGHT,
-        }
+    def test_the_output_is_the_run_and_nothing_else(self):
+        # Pure machine output since #214: a curator's own number is a
+        # PageEdit row, overlaid on top of this by page_edits.
         document = {"pages": [make_page(1, [cell("677")])]}
 
-        results = page_numbers.ocr_results_from_volume(document, [manual])
-
-        self.assertEqual(results, [manual])
-
-    def test_a_model_entry_is_replaced(self):
-        stale = {"pdf_page": 1, "detected": "9", "zone": "dots-header"}
-        document = {"pages": [make_page(1, [cell("677")])]}
-
-        results = page_numbers.ocr_results_from_volume(document, [stale])
+        results = page_numbers.ocr_results_from_volume(document)
 
         self.assertEqual(results[0]["detected"], "677")
+        self.assertEqual(results[0]["zone"], "dots-header")

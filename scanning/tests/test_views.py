@@ -18,6 +18,7 @@ from PIL import Image
 
 from scanning.factories import (
     OpinionScanFactory,
+    PageEditFactory,
     ReporterFactory,
     ScanFactory,
     UserFactory,
@@ -27,7 +28,7 @@ from scanning.models import (
     Detection,
     OpinionScan,
     OpinionStatus,
-    PageDeletion,
+    PageEdit,
     PendingUpload,
     QueuedAction,
     QueueStatus,
@@ -2643,7 +2644,12 @@ class TestPendingChangesGuard(ScanningTestCase):
         self.scan = ScanFactory(
             uploaded_by=self.user, status=Status.PENDING_REVIEW
         )
-        PageDeletion.objects.create(scan=self.scan, pdf_page=2)
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+        )
 
     def _assert_blocked(self, url_name):
         response = self.client.post(
@@ -2658,7 +2664,11 @@ class TestPendingChangesGuard(ScanningTestCase):
         # The action must NOT have queued the scan.
         self.assertEqual(self.scan.status, Status.PENDING_REVIEW)
         # The pending deletion is untouched.
-        self.assertTrue(self.scan.deletions.exists())
+        self.assertTrue(
+            self.scan.page_edits.filter(
+                kind=PageEdit.Kind.DELETE_PAGE
+            ).exists()
+        )
 
     def test_start_detect_blocked(self):
         """Next: Detect is blocked while a deletion is pending."""
@@ -2671,7 +2681,7 @@ class TestPendingChangesGuard(ScanningTestCase):
         with the unified message instead of queueing, and it leaves the
         scan exactly where it found it.
         """
-        self.scan.deletions.all().delete()
+        self.scan.page_edits.all().delete()
         response = self.client.post(
             reverse("start_validate", kwargs={"pk": self.scan.pk})
         )
@@ -2720,10 +2730,19 @@ class TestPipelinePausedViews(ScanningTestCase):
         self._assert_paused("start_detect")
 
     def test_reprocess_paused_and_pending_edits_survive(self):
-        PageDeletion.objects.create(scan=self.scan, pdf_page=2)
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+        )
         self._assert_paused("reprocess")
         # The recorded edits must survive to be applied after the cutover.
-        self.assertTrue(self.scan.deletions.exists())
+        self.assertTrue(
+            self.scan.page_edits.filter(
+                kind=PageEdit.Kind.DELETE_PAGE
+            ).exists()
+        )
 
     def test_generate_files_paused(self):
         self._assert_paused("generate_files")
@@ -2877,7 +2896,12 @@ class TestProcessActionsFragment(ScanningTestCase):
 
     def test_pending_deletion_shows_rebuild(self):
         """A pending deletion makes the bar show Rebuild & Validate."""
-        PageDeletion.objects.create(scan=self.scan, pdf_page=2)
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+        )
         response = self.client.get(
             reverse("process_actions", kwargs={"pk": self.scan.pk}) + "?step=1"
         )

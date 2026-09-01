@@ -7,8 +7,8 @@ even pages, ``STATE v. SMITH -- Cite as 218 A.3d 677 -- 679`` on odd
 ones -- so this adapter must pick the right cell and then the number
 token inside it. Only the producer changes: the emitted entries keep
 the ``ocr_results`` shape the sequence analysis
-(``blackletter.validate``), the review-1 UI, and manual page
-assignment (``assign_page``) already consume.
+(``blackletter.validate``), the review-1 UI, and the overlay of the
+curator's own page numbers (``page_edits``) already consume.
 
 Cell selection intersects three redundant signals, degrading gracefully
 when they disagree:
@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import re
 
-from scanning.services import DOTS_ZONE_PREFIX, _is_manual_read
+from scanning.services import DOTS_ZONE_PREFIX
 
 #: Band fractions of the page render height, from ai-research
 #: ``pipeline/core/order.py``: a cell entirely above HEAD_BAND is a
@@ -222,29 +222,22 @@ def extract_page_number(page: dict) -> dict:
     return entry
 
 
-def ocr_results_from_volume(
-    document: dict, existing: list[dict] | None
-) -> list[dict]:
+def ocr_results_from_volume(document: dict) -> list[dict]:
     """Convert one glued volume document into ``Scan.ocr_results``.
 
-    One entry per page, in ``pdf_page`` order. An entry a curator typed
-    by hand (``assign_page`` stamps ``zone`` and ``ocr`` with
-    ``"manual"``) outranks anything a model read, so it is carried over
-    verbatim from ``existing``.
+    One entry per page, in ``pdf_page`` order, and pure machine output:
+    a curator's own numbers are ``PageEdit`` rows since #214, and
+    ``page_edits.overlay_page_numbers`` writes them over this on every
+    recompute. This function used to carry them over from the previous
+    blob, by the ``"manual"`` stamp on two of its fields -- a
+    convention any new writer could forget, and one that dropped an
+    entry whose page the new run did not report, in silence.
 
     :param document: The glued volume JSON (issue #202).
-    :param existing: The scan's current ``ocr_results``, for the manual
-        carry-over. None or empty when the stage never ran.
     :returns: The new ``ocr_results`` list.
     :rtype: list[dict]
     """
-    manual = {
-        entry["pdf_page"]: entry
-        for entry in (existing or [])
-        if _is_manual_read(entry)
-    }
-    results = []
-    for page in sorted(document["pages"], key=lambda p: p["pdf_page"]):
-        kept = manual.get(page["pdf_page"])
-        results.append(kept or extract_page_number(page))
-    return results
+    return [
+        extract_page_number(page)
+        for page in sorted(document["pages"], key=lambda p: p["pdf_page"])
+    ]

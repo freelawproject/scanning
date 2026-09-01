@@ -288,13 +288,14 @@ document.addEventListener('DOMContentLoaded', function () {
         pageDiv.className = 'page-container missing-page';
         pageDiv.id = 'page-' + entry.logical_number;
         pageDiv.style.width = defaultPageWidth + 'px';
+        var missingLabel = escapeHtml(entry.logical_number);
         pageDiv.innerHTML =
-            '<div class="page-label">Page ' + entry.logical_number + ' &mdash; MISSING</div>' +
+            '<div class="page-label">Page ' + missingLabel + ' &mdash; MISSING</div>' +
             '<div class="missing-placeholder">' +
             '  <p>This page was not found in the document.</p>' +
             '  <p>Upload a scan or image to fill this gap:</p>' +
             '  <form class="insert-form" enctype="multipart/form-data">' +
-            '    <input type="hidden" name="page_number" value="' + entry.logical_number + '">' +
+            '    <input type="hidden" name="page_number" value="' + missingLabel + '">' +
             '    <label class="upload-btn">' +
             '      Choose Image' +
             '      <input type="file" name="image" accept="image/*" style="display:none">' +
@@ -306,7 +307,11 @@ document.addEventListener('DOMContentLoaded', function () {
         var fileInput = pageDiv.querySelector('input[type="file"]');
         fileInput.addEventListener('change', function () {
             if (fileInput.files.length > 0) {
-                uploadPageInsert(entry.logical_number, fileInput.files[0], pageDiv);
+                // The anchor is the physical position the server
+                // stamped on this placeholder (issue #214). The printed
+                // number cannot place an image: front matter has none,
+                // and two pages can print the same one.
+                uploadPageInsert(entry, fileInput.files[0], pageDiv);
             }
         });
     }
@@ -315,12 +320,59 @@ document.addEventListener('DOMContentLoaded', function () {
         var pageDiv = document.createElement('div');
         pageDiv.className = 'page-container inserted-page';
         pageDiv.id = 'page-' + entry.logical_number;
-        pageDiv.innerHTML =
-            '<div class="page-label">Page ' + entry.logical_number + ' &mdash; INSERTED</div>' +
-            '<div class="canvas-wrapper">' +
-            '  <img src="' + entry.insert_url + '" class="inserted-image">' +
-            '</div>';
+        pageDiv.innerHTML = insertedPageHtml(entry.logical_number, entry.insert_url, entry.insert_edit_id, entry.unplaced);
+        bindRemoveInsert(pageDiv, entry.insert_edit_id);
         container.appendChild(pageDiv);
+    }
+
+    // The label of an inserted page, with the button that takes it
+    // back. A deletion has always had its undo and an insert had none,
+    // so a wrong image could only be covered by another one (#214).
+    function insertedPageHtml(logicalNumber, imageUrl, editId, unplaced) {
+        // The printed number is a person's typing (a curator files the
+        // page under what is printed on it, and that is not always
+        // digits), and every viewer of this scan sees it. So it is
+        // escaped here, at the sink, not narrowed at the source.
+        var printed = escapeHtml(logicalNumber);
+        // An image this volume has no position for is shown all the
+        // same: Remove is the only way to take an insert back (#214).
+        var label = unplaced
+            ? 'Page ' + printed + ' &mdash; UPLOADED, BUT THIS VOLUME HAS NO PLACE FOR IT'
+            : 'Page ' + printed + ' &mdash; INSERTED';
+        var button = editId
+            ? ' <button class="remove-insert-btn" style="cursor:pointer;' +
+              'background:#dc2626;color:white;border:none;border-radius:3px;' +
+              'padding:1px 6px;font-size:10px;margin-left:4px">Remove</button>'
+            : '';
+        return '<div class="page-label">' + label + button + '</div>' +
+            '<div class="canvas-wrapper">' +
+            '  <img src="' + escapeHtml(imageUrl) + '" class="inserted-image">' +
+            '</div>';
+    }
+
+    function bindRemoveInsert(pageDiv, editId) {
+        var button = pageDiv.querySelector('.remove-insert-btn');
+        if (!button) { return; }
+        button.addEventListener('click', function (e) {
+            e.stopPropagation();
+            if (!confirm('Remove this uploaded page?')) { return; }
+            fetch('/scans/' + documentId + '/insert/remove/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+                body: JSON.stringify({ edit_id: editId }),
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.status !== 'ok') { return; }
+                if (typeof window.refreshProcessActionBar === 'function') {
+                    window.refreshProcessActionBar();
+                }
+                if (typeof window.onPageEditSaved === 'function') {
+                    window.onPageEditSaved();
+                }
+                window.location.reload();
+            });
+        });
     }
 
     // --- Page container with OCR label, redact & delete buttons ---
@@ -410,7 +462,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     ocr.detected = res.data.detected;
                     if (res.data.detected) {
                         editBtn.className = 'ocr-tag editable-page';
-                        editBtn.innerHTML = '#' + res.data.detected + ' <small>(manual)</small>';
+                        editBtn.innerHTML = '#' + escapeHtml(res.data.detected) + ' <small>(manual)</small>';
                     } else {
                         editBtn.className = 'ocr-tag miss editable-page';
                         editBtn.innerHTML = '[no page # found — click to assign]';
@@ -679,9 +731,11 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // --- Page insert upload ---
-    function uploadPageInsert(pageNumber, file, pageDiv) {
+    function uploadPageInsert(entry, file, pageDiv) {
+        var pageNumber = entry.logical_number;
         var formData = new FormData();
         formData.append('page_number', pageNumber);
+        formData.append('anchor_pdf_page', entry.anchor_pdf_page);
         formData.append('image', file);
 
         var placeholder = pageDiv.querySelector('.missing-placeholder');
@@ -694,14 +748,20 @@ document.addEventListener('DOMContentLoaded', function () {
         })
         .then(function (r) { return r.json(); })
         .then(function (data) {
+            if (data.status !== 'ok') {
+                if (placeholder) {
+                    placeholder.innerHTML = '<p>' + escapeHtml(data.error || 'Upload failed. Try again.') + '</p>';
+                }
+                return;
+            }
             pageDiv.className = 'page-container inserted-page';
             pageDiv.style.width = '';
-            pageDiv.innerHTML =
-                '<div class="page-label">Page ' + pageNumber + ' &mdash; INSERTED</div>' +
-                '<div class="canvas-wrapper">' +
-                '  <img src="' + data.image_url + '" class="inserted-image">' +
-                '</div>';
-            if (data && data.status === 'ok') { window.onPageEditSaved(); }
+            pageDiv.innerHTML = insertedPageHtml(pageNumber, data.image_url, data.edit_id);
+            bindRemoveInsert(pageDiv, data.edit_id);
+            if (typeof window.refreshProcessActionBar === 'function') {
+                window.refreshProcessActionBar();
+            }
+            window.onPageEditSaved();
         })
         .catch(function (err) {
             if (placeholder) placeholder.innerHTML = '<p>Upload failed. Try again.</p>';

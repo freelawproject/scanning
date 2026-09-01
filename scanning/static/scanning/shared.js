@@ -302,6 +302,27 @@ function renderPreviewBanner(previewKind, onLoadOriginal) {
 }
 
 /**
+ * Escape text for safe interpolation into an innerHTML string.
+ *
+ * A page label can be a person's typing: the printed number a curator
+ * files an uploaded page under is free text, because printed numbers
+ * are not always digits ("xiv", "A-3", "1075a"), and every viewer of
+ * the scan sees it. Use this on any value that came from a person or
+ * a server response before it is concatenated into markup.
+ *
+ * @param {*} value - The value to escape. Coerced to a string.
+ * @returns {string} The value with the five markup characters escaped.
+ */
+function escapeHtml(value) {
+    return String(value === null || value === undefined ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/**
  * Mark a PDF page for deletion during reprocessing.
  * Shows a confirmation dialog before proceeding.
  *
