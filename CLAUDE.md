@@ -166,100 +166,62 @@ approve button the view refuses.
 
 ## Human page edits (issue #214)
 
-Every decision a person makes about a page in review 1 is one
-`PageEdit` row: the printed number (`SET_NUMBER`, blank value = the
-curator cleared it), a delete, an insert, a replacement, a rotation,
-and the dismissal of an issue. It replaced three storages in two
-address spaces -- an entry inside the `Scan.ocr_results` JSON, a
-`PageDeletion` addressed by PDF page, a `PageInsert` addressed by
-printed page number -- plus nothing at all for a replacement. The
-pieces: `models.PageEdit`, `page_edits.py` (the queries and the
-overlay), and the endpoints in `views_process.py`. What must not be
-broken:
+One `PageEdit` row per curator decision in review 1: a printed number
+(`SET_NUMBER`, blank value = cleared), a delete, an insert, a
+replacement, a rotation, and the dismissal of an issue. It replaced
+three storages in two address spaces. The pieces: `models.PageEdit`,
+`page_edits.py` (queries and overlay), the endpoints in
+`views_process.py`. What must not be broken:
 
-- **A row's address -- which page of the volume it is about -- is
-  always the physical space of the original as it was uploaded**,
-  1-based, the space `Detection.page_index` and the shard manifest
-  already use. Two columns carry it, `pdf_page` and `anchor_pdf_page`,
-  and nothing else on the row locates anything. A printed number
-  cannot: front matter has none, and two pages can print 1074, which
-  is one of the defects review 1 exists to find. It rides along as
-  `logical_page`, a label only.
-- **An insert is addressed by a gap.** `anchor_pdf_page` is the page
-  the image follows, 0 means "before page 1", and `ordinal` orders
-  several images in one gap. `page_edits.project_inserts` does both
-  halves in one walk: it stamps the anchor on every `missing`
-  placeholder it renders, and the upload sends that back. Resolving it
-  in the browser and throwing it away is what left the old model with
-  no address at all.
-- **Applying an edit closes it; it never rewrites it.** The apply
-  (#206) stamps `applied_at`. So every unique key is **partial over the
-  open rows** (`condition=Q(applied_at__isnull=True)`) -- without that,
-  a curator could not edit the same page again after an apply.
-- **A dismissal is unique per check, not per page.** One page raises
-  several checks, and each rebuild writes new `Issue` rows with new
-  primary keys, so the check's name is the only stable handle. Its
-  address is in whichever space the check uses
-  (`models.PHYSICAL_PAGE_CHECKS`), and `logical_page` is in the key
-  because two `missing_page` dismissals differ only by printed number.
-- **`Scan.ocr_results` is a cache, not a source.** It is rebuilt whole
-  from the glued run (`page_numbers.ocr_results_from_volume`, now pure
-  machine output) plus the rows (`page_edits.overlay_page_numbers`), by
-  `recalculate_issues`, `rebuild_page_map` and `run_compute_issues`.
-  Nothing edits one entry in place any more, so two curators on two
-  pages no longer lose one of the two numbers. The `"manual"` stamp
-  survives as a *derived* marker the sidebar and the offset heuristic
-  read; it is no longer how a number survives a rerun.
-- **An edit that cannot be placed is reported, never guessed at, and
-  never acted on.** A fingerprint mismatch (`Scan.source_fingerprint`,
-  stamped by `sharding.ensure_shards`, copied onto each row at write
-  time) or a page the volume no longer has raises a `stale_page_edit`
-  issue naming the page. A blank fingerprint on either side is legacy
-  and matches anything. So every reader that *acts* on an edit --
-  `deleted_pages`, `inserts_by_gap`, `has_pending_changes`, and
-  `overlay_page_numbers` -- goes through `current_edits`, never
-  `open_edits`: a stale delete would drop a page of a document the
-  curator never saw. A stale row does not hold the review open either;
-  the issue is the channel a person can act on.
-- **Every open insert reaches the viewer**, including one this volume
-  cannot place: `project_inserts` appends it flagged `unplaced` rather
-  than dropping it. The viewer's Remove button is the only way to take
-  an insert back, so an image the walk dropped would strand its row
-  where nothing in the portal could reach it.
-- **`has_pending_changes` counts the structural kinds only**
-  (`PageEdit.STRUCTURAL_KINDS`). A number and a dismissal need no
-  apply, so they no longer block the recompute button, and
-  `dismiss_issue` lost its "reprocess first" guard with the convention
-  it protected. The step-1 bar's two flags come from one read
-  (`page_edits.pending_edit_flags`, through `_review_flags`, which both
-  renderers of the bar already call): they answer one question about
-  one set of rows, and read apart they disagreed — the insert flag
-  counted a stale row the change flag refused.
-- **The image is on the default storage** (S3 in production), under the
-  scan's `page_edits/` prefix -- excluded from the generic sync like
-  `shards/` and `jobs/`, swept by the admin scan deletion, and
-  presignable, which is how #206 will hand it to doctor and RunPod as a
-  one-page shard. `PageInsert` wrote to `LocalProcessingStorage`, so a
-  preempted web pod took the image with it.
-- **A printed page number is free text, and it is escaped, not cast.**
-  A volume prints roman numerals, letter suffixes and section numbers,
-  so `int()` on `PageEdit.logical_page` would lose what the curator
-  read off the page. Instead `views_process._page_label` narrows the
-  label to the alphabet a printed number uses, and `escapeHtml` in
-  `shared.js` escapes it where the viewer builds markup with it — the
-  label is one person's typing that every viewer of the scan then
-  sees. Both layers, since narrowing alone is one regex change away
-  from an injection and escaping alone would keep junk in the column.
-  `SET_NUMBER.value` stays numeric (a number or a range) for a
-  different reason: the sequence analysis parses it as an integer.
-- `replace_page` and `rotate_page` have endpoints and no buttons: the
-  interface belongs with #206 and #151. `export_pdf` applies the
-  deletes and the inserts only.
-- The data migrations are 0013 (the manual readings) and 0015 (the two
-  retired models); 0016 drops them. The **image bytes** are moved by
-  `migrate_page_insert_images`, which must run on the pod holding the
-  files: until it does, a migrated insert names an S3 key the bucket
-  does not have.
+- **Every address is a physical page of the original as uploaded**,
+  1-based (`pdf_page` / `anchor_pdf_page`) — the space
+  `Detection.page_index` and the shard manifest use. A printed number
+  locates nothing (front matter has none, duplicates exist); it rides
+  along as the `logical_page` label.
+- **An insert is addressed by a gap**: `anchor_pdf_page` is the page
+  the image follows (0 = before page 1), `ordinal` orders one gap.
+  `project_inserts` stamps the anchor on every `missing` placeholder,
+  and the upload sends it back.
+- **Applying closes an edit** (`applied_at`), never rewrites it, so
+  every unique key is partial over the open rows
+  (`condition=Q(applied_at__isnull=True)`) — else a page could not be
+  edited again after an apply.
+- **A dismissal is unique per check, not per page**: rebuilds give
+  `Issue` rows new PKs, so the check name is the only stable handle.
+  Its address space follows `models.PHYSICAL_PAGE_CHECKS`;
+  `logical_page` is in the key.
+- **`Scan.ocr_results` is a cache**: rebuilt whole from the glued run
+  (`page_numbers.ocr_results_from_volume`) plus the rows
+  (`page_edits.overlay_page_numbers`) by `recalculate_issues`,
+  `rebuild_page_map` and `run_compute_issues`. The `"manual"` stamp is
+  a derived marker, not how a number survives a rerun.
+- **An unplaceable edit is reported, never applied**: a
+  `Scan.source_fingerprint` mismatch (stamped by `ensure_shards`,
+  copied onto each row; blank = legacy, matches anything) or an absent
+  page raises a `stale_page_edit` issue. Every acting reader
+  (`deleted_pages`, `inserts_by_gap`, `has_pending_changes`,
+  `overlay_page_numbers`) goes through `current_edits`, never
+  `open_edits`. A stale row does not hold the review open.
+- **Every open insert reaches the viewer**: `project_inserts` appends
+  an unplaceable one flagged `unplaced` — Remove is the only way to
+  take an insert back, so a dropped image would strand its row.
+- **`has_pending_changes` counts `STRUCTURAL_KINDS` only** — a number
+  or a dismissal needs no apply. Both step-1 bar flags come from one
+  read (`page_edits.pending_edit_flags` via `_review_flags`); computed
+  apart they disagreed on stale rows.
+- **The image is on the default storage** under the scan's
+  `page_edits/` prefix: excluded from the generic sync, swept by admin
+  deletion, presignable for #206. `PageInsert` used
+  `LocalProcessingStorage`, so a preempted web pod lost the image.
+- **The printed label is free text: narrowed** (`_page_label`) **and
+  escaped** (`escapeHtml` in `shared.js`) — both layers on purpose.
+  `SET_NUMBER.value` stays numeric: the sequence analysis parses it.
+- `replace_page` / `rotate_page` are endpoints without buttons (the
+  interface belongs to #206/#151). `export_pdf` applies deletes and
+  inserts only.
+- Data migrations: 0013 (manual readings), 0015 (the retired models),
+  0016 (the drop). Run `migrate_page_insert_images` on the pod holding
+  the files; until then a migrated insert names an absent S3 key.
 
 ## Bitonal via doctor (issue #176)
 
