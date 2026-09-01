@@ -1183,11 +1183,6 @@ def recalculate_issues(scan: "Scan") -> None:
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
 
-    # A dismissal is a curator decision, so it is a PageEdit row, not
-    # the absence of an Issue row: the rebuild below gives every issue
-    # it writes a new primary key, and a deleted row came back on the
-    # next press of the recompute button (#214).
-    result["issues"] = page_edits.drop_dismissed(scan, result["issues"])
     result["issues"].extend(page_edits.stale_edit_issues(stale_edits))
 
     for pdf_page, old_val, new_val in auto_corrected:
@@ -1203,6 +1198,18 @@ def recalculate_issues(scan: "Scan") -> None:
                 ),
             }
         )
+
+    # A dismissal is a curator decision, so it is a PageEdit row, not
+    # the absence of an Issue row: the rebuild below gives every issue
+    # it writes a new primary key, and a deleted row came back on the
+    # next press of the recompute button (#214).
+    #
+    # Last, so that it covers the whole list. The two kinds appended
+    # above are exactly the ones a curator meets again and again --
+    # the apply pass rewrites ocr_results from the run on every tick,
+    # so the offset heuristic re-corrects and re-warns each time, and a
+    # stale edit stays stale until someone acts on it.
+    result["issues"] = page_edits.drop_dismissed(scan, result["issues"])
 
     # Refresh page_count opportunistically: the PDF has not changed since
     # validation, and in production the local copy is usually absent

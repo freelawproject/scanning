@@ -19,7 +19,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from scanning.factories import PageEditFactory, ScanFactory, UserFactory
-from scanning.models import CheckName, Issue, PageEdit, Status
+from scanning.models import CheckName, Issue, PageEdit, Scan, Status
 from scanning.tests.test_sharding import write_image_volume
 from scanning.tests.test_views import ScanningTestCase
 
@@ -427,6 +427,76 @@ class TestDismissIssueWritesAnEdit(TestCase):
         self.assertFalse(
             self.scan.issues.filter(
                 check_name=CheckName.NO_PAGE_NUMBER
+            ).exists()
+        )
+
+    def test_a_dismissed_auto_correction_stays_dismissed(self):
+        # The auto-correction warnings are appended after the checks
+        # the analysis produced, so the filter must run over the whole
+        # list. The apply pass rewrites ocr_results from the run on
+        # every tick, so the heuristic -- and its warning -- come back
+        # each time until a curator's decision stops them.
+        from scanning import services
+
+        raw = [
+            {
+                "pdf_page": 1,
+                "detected": "100",
+                "type": "single",
+                "zone": "dots-header",
+            },
+            {
+                "pdf_page": 2,
+                "detected": "5",
+                "type": "single",
+                "zone": "dots-header",
+            },
+            {
+                "pdf_page": 3,
+                "detected": "102",
+                "type": "single",
+                "zone": "dots-header",
+            },
+        ]
+        Scan.objects.filter(pk=self.scan.pk).update(
+            start_page=100, end_page=110, page_count=3, ocr_results=raw
+        )
+        self.scan.refresh_from_db()
+
+        services.recalculate_issues(self.scan)
+        self._dismiss(
+            self.scan.issues.get(check_name=CheckName.AUTO_CORRECTED)
+        )
+
+        Scan.objects.filter(pk=self.scan.pk).update(ocr_results=raw)
+        self.scan.refresh_from_db()
+        services.recalculate_issues(self.scan)
+
+        self.assertFalse(
+            self.scan.issues.filter(
+                check_name=CheckName.AUTO_CORRECTED
+            ).exists()
+        )
+
+    def test_a_dismissed_stale_edit_warning_stays_dismissed(self):
+        from scanning import services
+
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.SET_NUMBER,
+            pdf_page=9,
+            value="9",
+        )
+        services.recalculate_issues(self.scan)
+        self._dismiss(
+            self.scan.issues.get(check_name=CheckName.STALE_PAGE_EDIT)
+        )
+
+        services.recalculate_issues(self.scan)
+
+        self.assertFalse(
+            self.scan.issues.filter(
+                check_name=CheckName.STALE_PAGE_EDIT
             ).exists()
         )
 
