@@ -58,7 +58,10 @@ from scanning.views_process import (
     process_actions,
     progress_api,
     recalculate,
+    remove_page_insert,
+    replace_page,
     reprocess,
+    rotate_page,
     scan_original_url,
     scan_process_view,
     serve_original_crop,
@@ -158,6 +161,13 @@ urlpatterns = [
         name="undo_delete_page",
     ),
     path("scans/<int:pk>/insert/", add_page_insert, name="add_page_insert"),
+    path(
+        "scans/<int:pk>/insert/remove/",
+        remove_page_insert,
+        name="remove_page_insert",
+    ),
+    path("scans/<int:pk>/replace-page/", replace_page, name="replace_page"),
+    path("scans/<int:pk>/rotate-page/", rotate_page, name="rotate_page"),
     path("scans/<int:pk>/dismiss-issue/", dismiss_issue, name="dismiss_issue"),
     # views_api.py
     path(

@@ -20,17 +20,17 @@ from django.template.loader import render_to_string
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
+from scanning import page_edits
 from scanning.models import (
     BUSY_STATUSES,
+    PAGE_EDIT_ROTATIONS,
     PHYSICAL_PAGE_CHECKS,
     CheckName,
     Detection,
     Issue,
     JobStatus,
     OpinionScan,
-    PageDeletion,
     PageEdit,
-    PageInsert,
     Scan,
     Stage,
     Status,
@@ -189,7 +189,6 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             step = 1
 
     issues = list(scan.issues.all())
-    inserts = {ins.logical_page_number: ins for ins in scan.inserts.all()}
 
     # The dots.mocr stage writes no scan status by design (#190), so its
     # rows are the only place its progress lives.
@@ -197,13 +196,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
 
     dots_run = dots_mocr.run_summary(scan)
 
-    page_map = scan.page_map
+    # Each uploaded image is shown at the gap its row names, and every
+    # remaining placeholder is stamped with the physical page it
+    # follows, so an upload can send that address back (#214).
+    page_map = page_edits.project_inserts(scan, scan.page_map)
     missing_pages = scan.missing_pages
-
-    for entry in page_map:
-        if entry["type"] == "missing" and entry["logical_number"] in inserts:
-            entry["type"] = "inserted"
-            entry["insert_url"] = inserts[entry["logical_number"]].image.url
 
     # Map pdf_index → logical page number for navigation
     idx_to_logical = {}
@@ -279,8 +276,10 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 r["seq_issue"] = "gap"
         prev_num = num
 
-    has_pending_inserts = scan.inserts.exists()
-    has_pending_changes = scan.deletions.exists() or has_pending_inserts
+    has_pending_inserts = page_edits.open_edits(
+        scan, PageEdit.Kind.INSERT_PAGE, PageEdit.Kind.REPLACE_PAGE
+    ).exists()
+    has_pending_changes = page_edits.has_pending_changes(scan)
     has_detections = Detection.objects.filter(scan=scan).exists()
 
     opinions = scan.opinions_json
@@ -469,7 +468,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "unmatched_keys": unmatched_keys,
             "unmatched_captions": unmatched_captions,
             "deleted_pages_json": json.dumps(
-                list(scan.deletions.values_list("pdf_page", flat=True))
+                sorted(page_edits.deleted_pages(scan))
             ),
         },
     )
@@ -826,10 +825,9 @@ def _block_if_pending_changes(
 ) -> HttpResponse | None:
     """Redirect back to step 1 when the scan has unapplied page changes.
 
-    The detect action ignores pending ``PageDeletion`` /
-    ``PageInsert`` rows, so running it would silently strand the user's
-    edits. Pending changes must be applied via "Rebuild & Validate"
-    (the ``reprocess`` view).
+    The detect action ignores the structural page edits -- a delete, an
+    insert, a replacement, a rotation -- so running it would silently
+    strand the curator's work. They must be applied first (#206).
 
     The recompute of review 1 no longer calls this: "Rebuild &
     Validate" refuses while the pipeline is paused (#173), so the
@@ -844,7 +842,7 @@ def _block_if_pending_changes(
         ``None``.
     :rtype: HttpResponse | None
     """
-    if scan.deletions.exists() or scan.inserts.exists():
+    if page_edits.has_pending_changes(scan):
         messages.warning(
             request,
             'Apply your pending page changes with "Rebuild & Validate" '
@@ -882,8 +880,10 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
 
     from scanning import dots_mocr
 
-    has_pending_inserts = scan.inserts.exists()
-    has_pending_changes = scan.deletions.exists() or has_pending_inserts
+    has_pending_inserts = page_edits.open_edits(
+        scan, PageEdit.Kind.INSERT_PAGE, PageEdit.Kind.REPLACE_PAGE
+    ).exists()
+    has_pending_changes = page_edits.has_pending_changes(scan)
     context = {
         "scan": scan,
         "step": step,
@@ -1105,7 +1105,7 @@ def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
     if services.has_legacy_ocr(scan):
         messages.warning(request, LEGACY_OCR_RECOMPUTE_MESSAGE)
         return redirect("scan_process", pk=pk)
-    if scan.deletions.exists() or scan.inserts.exists():
+    if page_edits.has_pending_changes(scan):
         messages.warning(request, PENDING_EDITS_SAVED_MESSAGE)
 
     # Breadcrumb (issue #115): recalculation runs synchronously on the request
@@ -1169,9 +1169,9 @@ def reprocess(request: HttpRequest, pk: int) -> HttpResponse:
 
     Applying inserts/deletions re-ran OCR on the edited pages through
     the retired PaddleOCR path (issue #173), so this fails with the
-    unified message until the dots.mocr replacement lands. Pending
-    ``PageDeletion`` / ``PageInsert`` rows stay recorded and will be
-    applicable again then.
+    unified message until the dots.mocr replacement lands. The
+    ``PageEdit`` rows stay recorded and will be applicable again then
+    (#206).
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -1310,10 +1310,69 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
     )
 
 
+def _pdf_page_of(scan: Scan, raw) -> int | None:
+    """Return a 1-based page of this volume, or None.
+
+    An address the volume does not have is refused rather than stored:
+    a row naming a page that is not there is the drift this model
+    exists to prevent.
+
+    :param scan: The scan the page belongs to.
+    :param raw: The page number from the request.
+    :returns: The page, or None when it is not one of this volume's.
+    :rtype: int | None
+    """
+    try:
+        page = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if page < 1:
+        return None
+    if scan.page_count and page > scan.page_count:
+        return None
+    return page
+
+
+def _anchor_of(scan: Scan, raw, label: str) -> int | None:
+    """Return the original page an uploaded image follows, or None.
+
+    The viewer sends the anchor it rendered. An older viewer sends only
+    the printed number, so the anchor is resolved from the stored page
+    map instead -- the same walk the viewer's stamp comes from.
+
+    :param scan: The scan the insert belongs to.
+    :param raw: The ``anchor_pdf_page`` field, when the viewer sent one.
+    :param label: The printed page number the placeholder showed.
+    :returns: The anchor, or None when the position cannot be resolved.
+    :rtype: int | None
+    """
+    if raw not in (None, ""):
+        try:
+            anchor = int(raw)
+        except (TypeError, ValueError):
+            return None
+        if 0 <= anchor <= (scan.page_count or anchor):
+            return anchor
+        return None
+    if not label:
+        return None
+    for entry in page_edits.project_inserts(scan, scan.page_map):
+        if entry.get("type") == "missing" and str(
+            entry.get("logical_number")
+        ) == str(label):
+            return entry.get("anchor_pdf_page")
+    return None
+
+
 @login_required
 @require_POST
 def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
-    """Mark a PDF page for deletion during reprocessing.
+    """Mark a page of the original for deletion.
+
+    A duplicate page, or a blank one: two of the issue types review 1
+    exists to find. One ``PageEdit`` row, addressed by the physical
+    page (#214). The apply (#206) decides what a delete does to the
+    volume; until then the row is a saved decision and nothing else.
 
     :param request: The HTTP request (JSON body with pdf_page).
     :param pk: Scan primary key.
@@ -1324,15 +1383,29 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-    pdf_page = data["pdf_page"]
-    PageDeletion.objects.get_or_create(scan=scan, pdf_page=pdf_page)
+    pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
+    if pdf_page is None:
+        return JsonResponse({"error": "Unknown PDF page."}, status=404)
+    PageEdit.objects.get_or_create(
+        scan=scan,
+        kind=PageEdit.Kind.DELETE_PAGE,
+        pdf_page=pdf_page,
+        applied_at=None,
+        defaults={
+            "author": request.user,
+            "source_fingerprint": scan.source_fingerprint,
+        },
+    )
     return JsonResponse({"status": "ok"})
 
 
 @login_required
 @require_POST
 def undo_delete_page(request: HttpRequest, pk: int) -> HttpResponse:
-    """Remove a page deletion record, restoring the page.
+    """Take back a page deletion, restoring the page.
+
+    The row is deleted, not stamped: an unapplied decision that a
+    curator took back is not history, it never happened.
 
     :param request: The HTTP request (JSON body with pdf_page).
     :param pk: Scan primary key.
@@ -1343,47 +1416,203 @@ def undo_delete_page(request: HttpRequest, pk: int) -> HttpResponse:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-    pdf_page = data["pdf_page"]
-    PageDeletion.objects.filter(scan=scan, pdf_page=pdf_page).delete()
+    page_edits.open_edits(scan, PageEdit.Kind.DELETE_PAGE).filter(
+        pdf_page=data.get("pdf_page")
+    ).delete()
     return JsonResponse({"status": "ok"})
 
 
 @login_required
 @require_POST
 def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
-    """Upload an image to insert at a missing page position.
+    """Upload the image of a page the volume is missing.
 
-    :param request: The HTTP request (form data with page_number and
-        image file).
+    The address is the gap, not the printed number (#214):
+    ``anchor_pdf_page`` is the original page the image follows, and 0
+    puts it before page 1. The viewer stamps that anchor on every
+    ``missing`` placeholder it renders and sends it back here, so the
+    physical position is resolved once, by the person who can see it.
+    A printed number cannot address anything -- front matter has none,
+    and two pages can print the same one -- so it is kept beside the
+    address as the label.
+
+    :param request: The HTTP request (form data with ``image``,
+        ``anchor_pdf_page`` and the ``page_number`` label).
     :param pk: Scan primary key.
     :return: JSON response with the insert URL and page number.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    try:
-        page_number = int(request.POST.get("page_number", 0))
-    except ValueError:
-        page_number = 0
     image_file = request.FILES.get("image")
-    if not page_number or not image_file:
-        return JsonResponse(
-            {"error": "Missing page_number or image"}, status=400
-        )
-    if not image_file.content_type.startswith("image/"):
+    if not image_file:
+        return JsonResponse({"error": "Missing image"}, status=400)
+    if not (image_file.content_type or "").startswith("image/"):
         return JsonResponse(
             {"error": "Uploaded file must be an image"}, status=400
         )
-    insert, _created = PageInsert.objects.update_or_create(
+    label = (request.POST.get("page_number") or "").strip()
+    anchor = _anchor_of(scan, request.POST.get("anchor_pdf_page"), label)
+    if anchor is None:
+        return JsonResponse(
+            {
+                "error": (
+                    "This page could not be placed in the volume. "
+                    "Reload the page and try again."
+                )
+            },
+            status=400,
+        )
+
+    edit = PageEdit.objects.create(
         scan=scan,
-        logical_page_number=page_number,
-        defaults={"image": image_file},
+        kind=PageEdit.Kind.INSERT_PAGE,
+        author=request.user,
+        anchor_pdf_page=anchor,
+        ordinal=page_edits.next_ordinal(scan, anchor),
+        logical_page=label[:32],
+        image=image_file,
+        source_fingerprint=scan.source_fingerprint,
     )
     return JsonResponse(
         {
             "status": "ok",
-            "page_number": page_number,
-            "image_url": insert.image.url,
+            "page_number": label,
+            "edit_id": edit.pk,
+            "image_url": edit.image.url,
         }
     )
+
+
+@login_required
+@require_POST
+def remove_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
+    """Take back an uploaded page image.
+
+    The portal had no way to undo an insert: a deletion had its undo
+    and an insert did not, so a wrong image could only be replaced by
+    another one. The row and its image both go.
+
+    :param request: The HTTP request (JSON body with ``edit_id``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the removal.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    edit = (
+        page_edits.open_edits(scan, PageEdit.Kind.INSERT_PAGE)
+        .filter(pk=data.get("edit_id"))
+        .first()
+    )
+    if edit is None:
+        return JsonResponse({"error": "Unknown page insert."}, status=404)
+    # The object is this row's alone, and nothing has read it yet: the
+    # apply is what reads an image, and an unapplied row has not been
+    # through it.
+    edit.image.delete(save=False)
+    edit.delete()
+    return JsonResponse({"status": "ok"})
+
+
+@login_required
+@require_POST
+def replace_page(request: HttpRequest, pk: int) -> JsonResponse:
+    """Upload an image to stand in for a page that cannot be read.
+
+    A blurry page is a kind of missing page (#205), and the portal
+    could not record it at all. One kind, not a delete beside an
+    insert: those two would need an address in two spaces to say "this
+    image stands where that page stood", and a curator taking the
+    replacement back would have to take back both.
+
+    The endpoint lands with the model; the button belongs with #206 and
+    #151, which own the apply and the review-1 interface.
+
+    :param request: The HTTP request (form data with ``pdf_page`` and
+        ``image``).
+    :param pk: Scan primary key.
+    :return: JSON response with the image URL.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    image_file = request.FILES.get("image")
+    if not image_file:
+        return JsonResponse({"error": "Missing image"}, status=400)
+    if not (image_file.content_type or "").startswith("image/"):
+        return JsonResponse(
+            {"error": "Uploaded file must be an image"}, status=400
+        )
+    try:
+        pdf_page = _pdf_page_of(scan, int(request.POST.get("pdf_page", 0)))
+    except (TypeError, ValueError):
+        pdf_page = None
+    if pdf_page is None:
+        return JsonResponse({"error": "Unknown PDF page."}, status=404)
+
+    edit, _created = PageEdit.objects.update_or_create(
+        scan=scan,
+        kind=PageEdit.Kind.REPLACE_PAGE,
+        pdf_page=pdf_page,
+        applied_at=None,
+        defaults={
+            "author": request.user,
+            "image": image_file,
+            "source_fingerprint": scan.source_fingerprint,
+        },
+    )
+    return JsonResponse(
+        {"status": "ok", "edit_id": edit.pk, "image_url": edit.image.url}
+    )
+
+
+@login_required
+@require_POST
+def rotate_page(request: HttpRequest, pk: int) -> JsonResponse:
+    """Record that a page is printed the wrong way up.
+
+    The answer to ``CheckName.ORIENTATION``, which the portal could
+    raise but never resolve. The value is clockwise degrees, and only a
+    quarter turn is a legal one.
+
+    The endpoint lands with the model; the button belongs with #206 and
+    #151.
+
+    :param request: The HTTP request (JSON body with ``pdf_page`` and
+        ``degrees``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the rotation.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
+    if pdf_page is None:
+        return JsonResponse({"error": "Unknown PDF page."}, status=404)
+    degrees = str(data.get("degrees", "")).strip()
+    if degrees not in PAGE_EDIT_ROTATIONS:
+        return JsonResponse(
+            {
+                "error": (
+                    "A rotation must be one of "
+                    f"{', '.join(PAGE_EDIT_ROTATIONS)} degrees."
+                )
+            },
+            status=400,
+        )
+    PageEdit.objects.update_or_create(
+        scan=scan,
+        kind=PageEdit.Kind.ROTATE_PAGE,
+        pdf_page=pdf_page,
+        applied_at=None,
+        defaults={
+            "author": request.user,
+            "value": degrees,
+            "source_fingerprint": scan.source_fingerprint,
+        },
+    )
+    return JsonResponse({"status": "ok"})
 
 
 @login_required

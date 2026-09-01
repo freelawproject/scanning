@@ -14,9 +14,7 @@ from scanning.models import (
     JobStage,
     OpinionScan,
     Page,
-    PageDeletion,
     PageEdit,
-    PageInsert,
     PendingUpload,
     QueuedAction,
     Reporter,
@@ -279,8 +277,6 @@ class ScanAdmin(admin.ModelAdmin):
             Detection,
             Issue,
             PageEdit,
-            PageInsert,
-            PageDeletion,
             PendingUpload,
             ExternalJob,
         ):
@@ -654,20 +650,6 @@ class DetectionAdmin(admin.ModelAdmin):
     list_filter = ["label", "active", "model_name"]
     search_fields = ["label"]
     raw_id_fields = ["scan"]
-
-
-@admin.register(PageInsert)
-class PageInsertAdmin(admin.ModelAdmin):
-    list_display = ["scan", "logical_page_number", "date_created"]
-    raw_id_fields = ["scan"]
-    readonly_fields = ["date_created", "date_modified"]
-
-
-@admin.register(PageDeletion)
-class PageDeletionAdmin(admin.ModelAdmin):
-    list_display = ["scan", "pdf_page", "date_created"]
-    raw_id_fields = ["scan"]
-    readonly_fields = ["date_created", "date_modified"]
 
 
 @admin.register(PageEdit)

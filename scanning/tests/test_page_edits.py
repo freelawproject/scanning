@@ -8,8 +8,11 @@ that overlay these rows live in ``test_services.py`` and
 """
 
 import json
+import pathlib
 import tempfile
 
+import fitz
+from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
 from django.urls import reverse
@@ -17,6 +20,8 @@ from django.utils import timezone
 
 from scanning.factories import PageEditFactory, ScanFactory, UserFactory
 from scanning.models import CheckName, Issue, PageEdit, Status
+from scanning.tests.test_sharding import write_image_volume
+from scanning.tests.test_views import ScanningTestCase
 
 MEDIA_ROOT = tempfile.mkdtemp()
 
@@ -509,3 +514,452 @@ class TestManualReadingMigration(TestCase):
         self._migrate()
 
         self.assertEqual(scan.page_edits.count(), 1)
+
+
+class TestDeletePageWritesAnEdit(ScanningTestCase):
+    """``delete_page`` and its undo, over the rows."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(page_count=4, source_fingerprint="100:4")
+
+    def _post(self, name, pdf_page):
+        """POST one page to a page-scoped endpoint.
+
+        :param name: The URL name.
+        :param pdf_page: The page to send.
+        :returns: The response.
+        """
+        return self.client.post(
+            reverse(name, kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"pdf_page": pdf_page}),
+            content_type="application/json",
+        )
+
+    def test_a_deletion_becomes_one_row(self):
+        self.assertEqual(self._post("delete_page", 2).status_code, 200)
+
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.kind, PageEdit.Kind.DELETE_PAGE)
+        self.assertEqual(edit.pdf_page, 2)
+        self.assertEqual(edit.author, self.user)
+        self.assertEqual(edit.source_fingerprint, "100:4")
+
+    def test_a_second_press_changes_nothing(self):
+        self._post("delete_page", 2)
+        self._post("delete_page", 2)
+        self.assertEqual(self.scan.page_edits.count(), 1)
+
+    def test_an_undo_removes_the_row(self):
+        self._post("delete_page", 2)
+
+        self.assertEqual(self._post("undo_delete_page", 2).status_code, 200)
+
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_a_page_the_volume_does_not_have_is_refused(self):
+        self.assertEqual(self._post("delete_page", 9).status_code, 404)
+        self.assertFalse(self.scan.page_edits.exists())
+
+
+class TestPageInsertEndpoints(ScanningTestCase):
+    """An insert is addressed by the gap it fills, and can be taken back."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            page_count=2,
+            source_fingerprint="100:2",
+            page_map=[
+                {"type": "pdf_page", "pdf_index": 0, "logical_number": 1},
+                {"type": "missing", "logical_number": 2},
+                {"type": "pdf_page", "pdf_index": 1, "logical_number": 3},
+            ],
+        )
+
+    def _upload(self, **fields):
+        """POST one image to ``add_page_insert``.
+
+        :param fields: Form fields beside the image.
+        :returns: The response.
+        """
+        return self.client.post(
+            reverse("add_page_insert", kwargs={"pk": self.scan.pk}),
+            data={"image": self.make_image(), **fields},
+        )
+
+    def test_the_anchor_the_viewer_sends_is_stored(self):
+        response = self._upload(anchor_pdf_page=1, page_number=2)
+
+        self.assertEqual(response.status_code, 200)
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.kind, PageEdit.Kind.INSERT_PAGE)
+        self.assertEqual(edit.anchor_pdf_page, 1)
+        self.assertEqual(edit.ordinal, 0)
+        self.assertEqual(edit.logical_page, "2")
+        self.assertIsNone(edit.pdf_page)
+        self.assertTrue(edit.image.name.endswith(".png"))
+
+    def test_a_second_image_in_one_gap_queues_behind_the_first(self):
+        self._upload(anchor_pdf_page=1, page_number=2)
+        self._upload(anchor_pdf_page=1, page_number=2)
+
+        self.assertEqual(
+            sorted(self.scan.page_edits.values_list("ordinal", flat=True)),
+            [0, 1],
+        )
+
+    def test_an_image_can_go_before_page_one(self):
+        self._upload(anchor_pdf_page=0, page_number=1)
+
+        self.assertEqual(self.scan.page_edits.get().anchor_pdf_page, 0)
+
+    def test_an_older_viewer_is_placed_from_the_page_map(self):
+        # No anchor in the form: resolve the placeholder by its printed
+        # number, the address the retired PageInsert model used.
+        response = self._upload(page_number=2)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.scan.page_edits.get().anchor_pdf_page, 1)
+
+    def test_an_unplaceable_upload_is_refused(self):
+        response = self._upload(page_number=99)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_a_file_that_is_not_an_image_is_refused(self):
+        response = self.client.post(
+            reverse("add_page_insert", kwargs={"pk": self.scan.pk}),
+            data={"image": self.make_pdf(), "anchor_pdf_page": 1},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_an_insert_can_be_removed(self):
+        edit_id = json.loads(
+            self._upload(anchor_pdf_page=1, page_number=2).content
+        )["edit_id"]
+
+        response = self.client.post(
+            reverse("remove_page_insert", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"edit_id": edit_id}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_removing_an_unknown_insert_is_a_404(self):
+        response = self.client.post(
+            reverse("remove_page_insert", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"edit_id": 9999}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 404)
+
+
+class TestReplaceAndRotateEndpoints(ScanningTestCase):
+    """The two decisions the portal could not record at all."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(page_count=3, source_fingerprint="100:3")
+
+    def test_a_blurry_page_is_replaced_in_one_row(self):
+        response = self.client.post(
+            reverse("replace_page", kwargs={"pk": self.scan.pk}),
+            data={"image": self.make_image(), "pdf_page": 2},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.kind, PageEdit.Kind.REPLACE_PAGE)
+        self.assertEqual(edit.pdf_page, 2)
+        self.assertTrue(edit.image.name)
+
+    def test_a_second_replacement_of_one_page_updates_its_row(self):
+        for _ in range(2):
+            self.client.post(
+                reverse("replace_page", kwargs={"pk": self.scan.pk}),
+                data={"image": self.make_image(), "pdf_page": 2},
+            )
+        self.assertEqual(self.scan.page_edits.count(), 1)
+
+    def test_a_rotation_is_recorded(self):
+        response = self.client.post(
+            reverse("rotate_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"pdf_page": 2, "degrees": "180"}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.scan.page_edits.get().value, "180")
+
+    def test_a_rotation_that_is_not_a_quarter_turn_is_refused(self):
+        response = self.client.post(
+            reverse("rotate_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"pdf_page": 2, "degrees": "45"}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(self.scan.page_edits.exists())
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestProjectInserts(TestCase):
+    """What the viewer is given: the images in place, and the anchors."""
+
+    def setUp(self):
+        self.scan = ScanFactory(page_count=2)
+        self.page_map = [
+            {"type": "pdf_page", "pdf_index": 0, "logical_number": 1},
+            {"type": "missing", "logical_number": 2},
+            {"type": "pdf_page", "pdf_index": 1, "logical_number": 3},
+        ]
+
+    def _insert(self, anchor, **kwargs):
+        """Create one insert row.
+
+        :param anchor: The page the image follows.
+        :param kwargs: Overrides for the factory.
+        :returns: The row.
+        """
+        return PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=anchor,
+            value="",
+            **kwargs,
+        )
+
+    def test_every_placeholder_carries_its_anchor(self):
+        from scanning import page_edits
+
+        out = page_edits.project_inserts(self.scan, self.page_map)
+
+        self.assertEqual(out[1]["anchor_pdf_page"], 1)
+
+    def test_an_image_fills_the_placeholder_it_was_anchored_to(self):
+        from scanning import page_edits
+
+        edit = self._insert(1, logical_page="2")
+
+        out = page_edits.project_inserts(self.scan, self.page_map)
+
+        self.assertEqual(out[1]["type"], "inserted")
+        self.assertEqual(out[1]["insert_edit_id"], edit.pk)
+        self.assertEqual(out[1]["logical_number"], 2)
+        self.assertEqual(len(out), 3)
+
+    def test_an_image_before_page_one_comes_first(self):
+        self._insert(0, logical_page="0")
+
+        from scanning import page_edits
+
+        out = page_edits.project_inserts(self.scan, self.page_map)
+
+        self.assertEqual(out[0]["type"], "inserted")
+        self.assertEqual(out[1]["type"], "pdf_page")
+
+    def test_an_image_whose_placeholder_is_gone_is_still_shown(self):
+        # A later OCR run read the number the placeholder stood for.
+        # The uploaded page must not disappear with it.
+        from scanning import page_edits
+
+        self._insert(2, logical_page="4")
+
+        out = page_edits.project_inserts(self.scan, self.page_map)
+
+        self.assertEqual(out[-1]["type"], "inserted")
+        self.assertEqual(out[-1]["logical_number"], "4")
+
+
+class TestMigratePageInsertImagesCommand(ScanningTestCase):
+    """The command that moves a migrated image off the pod's disk."""
+
+    def _legacy_edit(self):
+        """Create an insert row whose image is at the legacy key.
+
+        :returns: The row.
+        """
+        from scanning.storage import LocalProcessingStorage
+
+        name = LocalProcessingStorage().save(
+            "page_inserts/old.png", self.make_image()
+        )
+        edit = PageEditFactory(
+            scan=ScanFactory(),
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=1,
+            value="",
+        )
+        PageEdit.objects.filter(pk=edit.pk).update(image=name)
+        edit.refresh_from_db()
+        return edit
+
+    def test_the_image_moves_under_the_scans_prefix(self):
+        from scanning import s3_sync
+
+        edit = self._legacy_edit()
+
+        call_command("migrate_page_insert_images")
+
+        edit.refresh_from_db()
+        self.assertTrue(
+            edit.image.name.startswith(
+                f"{s3_sync.s3_processing_prefix(edit.scan)}"
+                f"{s3_sync.PAGE_EDITS_SUBDIR}"
+            )
+        )
+        self.assertTrue(edit.image.storage.exists(edit.image.name))
+
+    def test_a_dry_run_changes_nothing(self):
+        edit = self._legacy_edit()
+
+        call_command("migrate_page_insert_images", "--dry-run")
+
+        edit.refresh_from_db()
+        self.assertTrue(edit.image.name.startswith("page_inserts/"))
+
+    def test_a_file_the_pod_lost_clears_the_field(self):
+        edit = self._legacy_edit()
+        edit.image.storage.delete(edit.image.name)
+
+        call_command("migrate_page_insert_images")
+
+        edit.refresh_from_db()
+        self.assertEqual(edit.image.name, "")
+
+
+class TestExportPdfAppliesTheEdits(ScanningTestCase):
+    """``views_api.export_pdf`` reads the rows, in the original's space."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(page_count=4)
+        output_dir = pathlib.Path(self.scan.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        original = output_dir / pathlib.Path(self.scan.original_pdf.name).name
+        write_image_volume(original, pages=4)
+
+    def _export(self):
+        """Ask for the corrected PDF and open it.
+
+        :returns: The exported document's page count.
+        :rtype: int
+        """
+        response = self.client.get(
+            reverse("export_pdf", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 200)
+        data = b"".join(response.streaming_content)
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            return doc.page_count
+
+    def test_a_deleted_page_is_dropped(self):
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+        )
+
+        self.assertEqual(self._export(), 3)
+
+    def test_an_inserted_image_is_added(self):
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=1,
+            value="",
+            image=self.make_image(),
+        )
+
+        self.assertEqual(self._export(), 5)
+
+    def test_an_applied_edit_is_not_applied_again(self):
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+            applied_at=timezone.now(),
+        )
+
+        self.assertEqual(self._export(), 4)
+
+    def test_a_delete_and_an_insert_do_not_move_each_other(self):
+        # The anchor names a page of the original, so the position it
+        # points at moves by every page removed before it.
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=1,
+            value="",
+        )
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=3,
+            value="",
+            image=self.make_image(),
+        )
+
+        self.assertEqual(self._export(), 4)
+
+
+class TestInsertMigrationAnchor(TestCase):
+    """The #214 migration's resolution of an insert's anchor."""
+
+    def _anchor_for(self, page_map, logical_number):
+        """Call the migration's helper.
+
+        :param page_map: A stored page map.
+        :param logical_number: The printed number of the insert.
+        :returns: The anchor it resolves.
+        """
+        from importlib import import_module
+
+        migration = import_module(
+            "scanning.migrations.0015_page_edits_from_inserts_and_deletions"
+        )
+        return migration._anchor_for(page_map, logical_number)
+
+    def test_the_placeholder_is_the_exact_answer(self):
+        page_map = [
+            {"type": "pdf_page", "pdf_index": 0, "logical_number": 1},
+            {"type": "missing", "logical_number": 2},
+            {"type": "pdf_page", "pdf_index": 1, "logical_number": 3},
+        ]
+
+        self.assertEqual(self._anchor_for(page_map, 2), 1)
+
+    def test_a_gone_placeholder_falls_back_to_the_neighbour(self):
+        page_map = [
+            {"type": "pdf_page", "pdf_index": 0, "logical_number": 1},
+            {"type": "pdf_page", "pdf_index": 1, "logical_number": 3},
+        ]
+
+        self.assertEqual(self._anchor_for(page_map, 2), 1)
+
+    def test_an_insert_before_the_first_page_anchors_at_zero(self):
+        page_map = [
+            {"type": "pdf_page", "pdf_index": 0, "logical_number": 5},
+            {"type": "missing", "logical_number": 4},
+        ]
+
+        self.assertEqual(self._anchor_for(page_map, 4), 1)
+
+    def test_a_volume_with_no_page_map_cannot_place_it(self):
+        self.assertIsNone(self._anchor_for([], 2))

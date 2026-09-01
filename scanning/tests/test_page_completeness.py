@@ -21,7 +21,7 @@ from scanning.models import (
     JobEngine,
     JobStage,
     JobStatus,
-    PageInsert,
+    PageEdit,
     Scan,
     Status,
 )
@@ -420,8 +420,12 @@ class TestRecomputePageNumberIssues(ScanningTestCase):
             page_count=2,
             ocr_results=dots_results(),
         )
-        PageInsert.objects.create(
-            scan=scan, logical_page_number=2, image=self.make_image()
+        PageEdit.objects.create(
+            scan=scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            anchor_pdf_page=1,
+            logical_page="2",
+            image=self.make_image(),
         )
 
         flashed = self._recompute(scan)
@@ -429,7 +433,9 @@ class TestRecomputePageNumberIssues(ScanningTestCase):
         self.assertIn(PENDING_EDITS_SAVED_MESSAGE, flashed)
         self.assertIn(RECOMPUTE_DONE_MESSAGE, flashed)
         self.assertTrue(scan.page_map)
-        self.assertTrue(scan.inserts.exists())
+        self.assertTrue(
+            scan.page_edits.filter(kind=PageEdit.Kind.INSERT_PAGE).exists()
+        )
 
 
 class TestRevalidateIsGoneForNewScans(ScanningTestCase):

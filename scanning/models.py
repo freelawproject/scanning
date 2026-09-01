@@ -1115,43 +1115,6 @@ class Detection(AbstractDateTimeModel):
         )
 
 
-class PageInsert(AbstractDateTimeModel):
-    """User-uploaded image to replace a missing page."""
-
-    scan = models.ForeignKey(
-        Scan,
-        on_delete=models.CASCADE,
-        related_name="inserts",
-    )
-    logical_page_number = models.PositiveIntegerField()
-    image = models.FileField(upload_to="page_inserts/", storage=_local_storage)
-
-    class Meta:
-        unique_together = ("scan", "logical_page_number")
-
-    def __str__(self):
-        return f"Insert p.{self.logical_page_number} for {self.scan}"
-
-
-class PageDeletion(AbstractDateTimeModel):
-    """Page marked for deletion from the PDF."""
-
-    scan = models.ForeignKey(
-        Scan,
-        on_delete=models.CASCADE,
-        related_name="deletions",
-    )
-    pdf_page = models.PositiveIntegerField(
-        help_text="1-based PDF page number.",
-    )
-
-    class Meta:
-        unique_together = ("scan", "pdf_page")
-
-    def __str__(self):
-        return f"Delete PDF p.{self.pdf_page} from {self.scan}"
-
-
 def page_edit_image_path(instance: "PageEdit", filename: str) -> str:
     """Return the storage key of one page edit's image.
 

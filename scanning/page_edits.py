@@ -73,6 +73,114 @@ def has_pending_changes(scan: Scan) -> bool:
     return open_edits(scan, *PageEdit.STRUCTURAL_KINDS).exists()
 
 
+def deleted_pages(scan: Scan) -> set[int]:
+    """Return the 1-based original pages marked for deletion.
+
+    :param scan: The scan to read.
+    :returns: The pages a curator marked, unapplied ones only.
+    :rtype: set[int]
+    """
+    return set(
+        open_edits(scan, PageEdit.Kind.DELETE_PAGE).values_list(
+            "pdf_page", flat=True
+        )
+    )
+
+
+def inserts_by_gap(scan: Scan) -> dict[int, list[PageEdit]]:
+    """Return the images to insert, keyed by the page they follow.
+
+    :param scan: The scan to read.
+    :returns: ``{anchor_pdf_page: [edit, ...]}``, each list in
+        ``ordinal`` order. Key 0 holds the images that go before page 1.
+    :rtype: dict[int, list[PageEdit]]
+    """
+    gaps: dict[int, list[PageEdit]] = {}
+    rows = open_edits(scan, PageEdit.Kind.INSERT_PAGE).order_by(
+        "anchor_pdf_page", "ordinal"
+    )
+    for edit in rows:
+        gaps.setdefault(edit.anchor_pdf_page, []).append(edit)
+    return gaps
+
+
+def next_ordinal(scan: Scan, anchor_pdf_page: int) -> int:
+    """Return the next free position for an image in one gap.
+
+    :param scan: The scan the insert belongs to.
+    :param anchor_pdf_page: The original page the image follows.
+    :returns: One past the highest ordinal in that gap, or 0.
+    :rtype: int
+    """
+    taken = [
+        edit.ordinal for edit in inserts_by_gap(scan).get(anchor_pdf_page, [])
+    ]
+    return max(taken) + 1 if taken else 0
+
+
+def _inserted_entry(edit: PageEdit, entry: dict | None) -> dict:
+    """Return the page map entry that shows one uploaded image.
+
+    :param edit: The ``INSERT_PAGE`` row.
+    :param entry: The ``missing`` placeholder it fills, when there is
+        one. Without it the entry is built from the row alone, which is
+        what an insert whose placeholder a later OCR run removed needs.
+    :returns: An ``inserted`` page map entry.
+    :rtype: dict
+    """
+    out = dict(entry or {})
+    out["type"] = "inserted"
+    out["insert_url"] = edit.image.url if edit.image else ""
+    out["insert_edit_id"] = edit.pk
+    if not out.get("logical_number"):
+        out["logical_number"] = edit.logical_page or ""
+    return out
+
+
+def project_inserts(scan: Scan, page_map: list[dict]) -> list[dict]:
+    """Show each uploaded image at the gap its row names, and stamp the
+    anchor on every placeholder.
+
+    Two jobs, one walk, because both need the same running answer to
+    "which original page does this position follow?".
+
+    The stamp is the fix for the address the portal used to compute and
+    throw away: the viewer resolved a placeholder's physical neighbour
+    at render time, uploaded the image under the *printed* number, and
+    left the apply with no way back to a position. Now the placeholder
+    carries ``anchor_pdf_page``, the upload sends it back, and the row
+    stores it once.
+
+    An insert whose placeholder is gone -- a later OCR run read the
+    number the placeholder stood for -- is still shown, right after its
+    anchor page. Dropping it would hide a page a curator uploaded.
+
+    :param scan: The scan whose page map is being rendered.
+    :param page_map: The stored page map. Not modified in place.
+    :returns: The page map to render.
+    :rtype: list[dict]
+    """
+    gaps = inserts_by_gap(scan)
+    out: list[dict] = []
+    anchor = 0
+    queue = list(gaps.get(0, []))
+    for entry in page_map:
+        if entry.get("type") == "pdf_page":
+            out.extend(_inserted_entry(edit, None) for edit in queue)
+            out.append(entry)
+            anchor = entry["pdf_index"] + 1
+            queue = list(gaps.get(anchor, []))
+            continue
+        if entry.get("type") == "missing":
+            entry = dict(entry, anchor_pdf_page=anchor)
+            if queue:
+                out.append(_inserted_entry(queue.pop(0), entry))
+                continue
+        out.append(entry)
+    out.extend(_inserted_entry(edit, None) for edit in queue)
+    return out
+
+
 def overlay_page_numbers(
     scan: Scan, results: list[dict]
 ) -> tuple[list[dict], list[PageEdit]]:
