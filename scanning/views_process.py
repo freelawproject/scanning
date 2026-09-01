@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import fitz
@@ -1326,6 +1327,35 @@ def _pdf_page_of(scan: Scan, raw) -> int | None:
     return page
 
 
+#: What a printed page number may be made of. Not digits alone: a
+#: volume prints roman numerals in its front matter ("xiv"), letter
+#: suffixes on inserted leaves ("1075a"), and section numbers ("A-3").
+#: Everything outside this refuses -- which is every character markup
+#: is made of, plus every control character. The label is a person's
+#: typing that every viewer of the scan then sees, so it is narrowed
+#: here *and* escaped where the viewer draws it (``escapeHtml`` in
+#: ``shared.js``): narrowing alone would be one regex away from an
+#: injection, and escaping alone would keep junk in the column.
+_PAGE_LABEL_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z .\u2013/-]*$")
+
+
+def _page_label(raw: str) -> str | None:
+    """Return the printed page number a curator filed a page under.
+
+    :param raw: The ``page_number`` form field.
+    :returns: The label, or None when it is not a page number at all.
+        An empty entry is allowed and returns the empty string: an
+        inserted page need not carry a printed number.
+    :rtype: str | None
+    """
+    label = (raw or "").strip()
+    if not label:
+        return ""
+    if len(label) > 32 or not _PAGE_LABEL_RE.match(label):
+        return None
+    return label
+
+
 def _anchor_of(scan: Scan, raw, label: str) -> int | None:
     """Return the original page an uploaded image follows, or None.
 
@@ -1429,6 +1459,12 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     and two pages can print the same one -- so it is kept beside the
     address as the label.
 
+    The label is free text on purpose: a printed page number is not
+    always a whole number ("xiv", "1075a", "A-3"), so casting it to an
+    integer would lose what the curator read off the page. It is
+    narrowed to the alphabet a printed number uses (``_page_label``)
+    and escaped where the viewer draws it, rather than cast.
+
     :param request: The HTTP request (form data with ``image``,
         ``anchor_pdf_page`` and the ``page_number`` label).
     :param pk: Scan primary key.
@@ -1442,7 +1478,18 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
         return JsonResponse(
             {"error": "Uploaded file must be an image"}, status=400
         )
-    label = (request.POST.get("page_number") or "").strip()
+    label = _page_label(request.POST.get("page_number"))
+    if label is None:
+        return JsonResponse(
+            {
+                "error": (
+                    "A page number may hold letters and digits, spaces, "
+                    "a dot, a slash and a dash, and no more than 32 of "
+                    "them."
+                )
+            },
+            status=400,
+        )
     anchor = _anchor_of(scan, request.POST.get("anchor_pdf_page"), label)
     if anchor is None:
         return JsonResponse(
@@ -1461,7 +1508,7 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
         author=request.user,
         anchor_pdf_page=anchor,
         ordinal=page_edits.next_ordinal(scan, anchor),
-        logical_page=label[:32],
+        logical_page=label,
         image=image_file,
         source_fingerprint=scan.source_fingerprint,
     )

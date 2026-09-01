@@ -241,6 +241,17 @@ broken:
   presignable, which is how #206 will hand it to doctor and RunPod as a
   one-page shard. `PageInsert` wrote to `LocalProcessingStorage`, so a
   preempted web pod took the image with it.
+- **A printed page number is free text, and it is escaped, not cast.**
+  A volume prints roman numerals, letter suffixes and section numbers,
+  so `int()` on `PageEdit.logical_page` would lose what the curator
+  read off the page. Instead `views_process._page_label` narrows the
+  label to the alphabet a printed number uses, and `escapeHtml` in
+  `shared.js` escapes it where the viewer builds markup with it — the
+  label is one person's typing that every viewer of the scan then
+  sees. Both layers, since narrowing alone is one regex change away
+  from an injection and escaping alone would keep junk in the column.
+  `SET_NUMBER.value` stays numeric (a number or a range) for a
+  different reason: the sequence analysis parses it as an integer.
 - `replace_page` and `rotate_page` have endpoints and no buttons: the
   interface belongs with #206 and #151. `export_pdf` applies the
   deletes and the inserts only.

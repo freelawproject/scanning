@@ -694,6 +694,45 @@ class TestPageInsertEndpoints(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.scan.page_edits.get().anchor_pdf_page, 1)
 
+    def test_a_printed_number_may_hold_letters(self):
+        # A printed page number is not always a whole number: front
+        # matter prints roman numerals, and an inserted leaf prints a
+        # letter suffix. Casting the label to an integer would lose
+        # what the curator read off the page.
+        for label in ("xiv", "1075a", "A-3"):
+            with self.subTest(label=label):
+                self.scan.page_edits.all().delete()
+                response = self._upload(anchor_pdf_page=1, page_number=label)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    self.scan.page_edits.get().logical_page, label
+                )
+
+    def test_a_label_carrying_markup_is_refused(self):
+        # The label is a person's typing, and every viewer of the scan
+        # sees it. The viewer escapes it where it draws it; the column
+        # never takes it in the first place.
+        response = self._upload(
+            anchor_pdf_page=1,
+            page_number="<img src=x onerror=alert(1)>",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_a_label_longer_than_the_column_is_refused(self):
+        response = self._upload(anchor_pdf_page=1, page_number="9" * 33)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_a_page_that_prints_no_number_may_be_inserted(self):
+        response = self._upload(anchor_pdf_page=1, page_number="")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.scan.page_edits.get().logical_page, "")
+
     def test_an_unplaceable_upload_is_refused(self):
         response = self._upload(page_number=99)
 

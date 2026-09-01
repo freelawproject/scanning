@@ -288,13 +288,14 @@ document.addEventListener('DOMContentLoaded', function () {
         pageDiv.className = 'page-container missing-page';
         pageDiv.id = 'page-' + entry.logical_number;
         pageDiv.style.width = defaultPageWidth + 'px';
+        var missingLabel = escapeHtml(entry.logical_number);
         pageDiv.innerHTML =
-            '<div class="page-label">Page ' + entry.logical_number + ' &mdash; MISSING</div>' +
+            '<div class="page-label">Page ' + missingLabel + ' &mdash; MISSING</div>' +
             '<div class="missing-placeholder">' +
             '  <p>This page was not found in the document.</p>' +
             '  <p>Upload a scan or image to fill this gap:</p>' +
             '  <form class="insert-form" enctype="multipart/form-data">' +
-            '    <input type="hidden" name="page_number" value="' + entry.logical_number + '">' +
+            '    <input type="hidden" name="page_number" value="' + missingLabel + '">' +
             '    <label class="upload-btn">' +
             '      Choose Image' +
             '      <input type="file" name="image" accept="image/*" style="display:none">' +
@@ -328,11 +329,16 @@ document.addEventListener('DOMContentLoaded', function () {
     // back. A deletion has always had its undo and an insert had none,
     // so a wrong image could only be covered by another one (#214).
     function insertedPageHtml(logicalNumber, imageUrl, editId, unplaced) {
+        // The printed number is a person's typing (a curator files the
+        // page under what is printed on it, and that is not always
+        // digits), and every viewer of this scan sees it. So it is
+        // escaped here, at the sink, not narrowed at the source.
+        var printed = escapeHtml(logicalNumber);
         // An image this volume has no position for is shown all the
         // same: Remove is the only way to take an insert back (#214).
         var label = unplaced
-            ? 'Page ' + logicalNumber + ' &mdash; UPLOADED, BUT THIS VOLUME HAS NO PLACE FOR IT'
-            : 'Page ' + logicalNumber + ' &mdash; INSERTED';
+            ? 'Page ' + printed + ' &mdash; UPLOADED, BUT THIS VOLUME HAS NO PLACE FOR IT'
+            : 'Page ' + printed + ' &mdash; INSERTED';
         var button = editId
             ? ' <button class="remove-insert-btn" style="cursor:pointer;' +
               'background:#dc2626;color:white;border:none;border-radius:3px;' +
@@ -340,7 +346,7 @@ document.addEventListener('DOMContentLoaded', function () {
             : '';
         return '<div class="page-label">' + label + button + '</div>' +
             '<div class="canvas-wrapper">' +
-            '  <img src="' + imageUrl + '" class="inserted-image">' +
+            '  <img src="' + escapeHtml(imageUrl) + '" class="inserted-image">' +
             '</div>';
     }
 
@@ -456,7 +462,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     ocr.detected = res.data.detected;
                     if (res.data.detected) {
                         editBtn.className = 'ocr-tag editable-page';
-                        editBtn.innerHTML = '#' + res.data.detected + ' <small>(manual)</small>';
+                        editBtn.innerHTML = '#' + escapeHtml(res.data.detected) + ' <small>(manual)</small>';
                     } else {
                         editBtn.className = 'ocr-tag miss editable-page';
                         editBtn.innerHTML = '[no page # found — click to assign]';
@@ -744,7 +750,7 @@ document.addEventListener('DOMContentLoaded', function () {
         .then(function (data) {
             if (data.status !== 'ok') {
                 if (placeholder) {
-                    placeholder.innerHTML = '<p>' + (data.error || 'Upload failed. Try again.') + '</p>';
+                    placeholder.innerHTML = '<p>' + escapeHtml(data.error || 'Upload failed. Try again.') + '</p>';
                 }
                 return;
             }
