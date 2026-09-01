@@ -230,7 +230,11 @@ broken:
   (`PageEdit.STRUCTURAL_KINDS`). A number and a dismissal need no
   apply, so they no longer block the recompute button, and
   `dismiss_issue` lost its "reprocess first" guard with the convention
-  it protected.
+  it protected. The step-1 bar's two flags come from one read
+  (`page_edits.pending_edit_flags`, through `_review_flags`, which both
+  renderers of the bar already call): they answer one question about
+  one set of rows, and read apart they disagreed — the insert flag
+  counted a stale row the change flag refused.
 - **The image is on the default storage** (S3 in production), under the
   scan's `page_edits/` prefix -- excluded from the generic sync like
   `shards/` and `jobs/`, swept by the admin scan deletion, and

@@ -276,10 +276,6 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 r["seq_issue"] = "gap"
         prev_num = num
 
-    has_pending_inserts = page_edits.open_edits(
-        scan, PageEdit.Kind.INSERT_PAGE, PageEdit.Kind.REPLACE_PAGE
-    ).exists()
-    has_pending_changes = page_edits.has_pending_changes(scan)
     has_detections = Detection.objects.filter(scan=scan).exists()
 
     opinions = scan.opinions_json
@@ -454,8 +450,6 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "flagged_indices_json": json.dumps(sorted(flagged_indices)),
             "ocr_results": ocr_results,
             "ocr_by_page_json": json.dumps(ocr_by_page),
-            "has_pending_changes": has_pending_changes,
-            "has_pending_inserts": has_pending_inserts,
             "has_detections": has_detections,
             "is_processing": is_processing,
             "dots_run": dots_run,
@@ -803,8 +797,9 @@ def _review_flags(scan: Scan) -> dict:
     refuses, or hide the one it accepts.
 
     :param scan: The scan the bar is rendered for.
-    :returns: ``page_review_ready``, ``page_review_done`` and
-        ``has_legacy_ocr`` for the template context.
+    :returns: ``page_review_ready``, ``page_review_done``,
+        ``has_legacy_ocr`` and the two pending-edit flags, for the
+        template context.
     :rtype: dict
     """
     from scanning import services
@@ -817,6 +812,7 @@ def _review_flags(scan: Scan) -> dict:
             scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
         ),
         "has_legacy_ocr": services.has_legacy_ocr(scan),
+        **page_edits.pending_edit_flags(scan),
     }
 
 
@@ -880,16 +876,10 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
 
     from scanning import dots_mocr
 
-    has_pending_inserts = page_edits.open_edits(
-        scan, PageEdit.Kind.INSERT_PAGE, PageEdit.Kind.REPLACE_PAGE
-    ).exists()
-    has_pending_changes = page_edits.has_pending_changes(scan)
     context = {
         "scan": scan,
         "step": step,
         "is_processing": scan.status in BUSY_STATUSES,
-        "has_pending_changes": has_pending_changes,
-        "has_pending_inserts": has_pending_inserts,
         "issues": scan.issues.all(),
         "missing_pages": scan.missing_pages,
         "has_detections": Detection.objects.filter(scan=scan).exists(),
@@ -901,7 +891,10 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "scanning/_process_actions.html", context, request=request
     )
     return JsonResponse(
-        {"html": html, "has_pending_changes": has_pending_changes}
+        {
+            "html": html,
+            "has_pending_changes": context["has_pending_changes"],
+        }
     )
 
 

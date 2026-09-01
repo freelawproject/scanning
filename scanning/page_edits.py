@@ -108,6 +108,29 @@ def has_pending_changes(scan: Scan) -> bool:
     return bool(current_edits(scan, *PageEdit.STRUCTURAL_KINDS))
 
 
+def pending_edit_flags(scan: Scan) -> dict:
+    """Return the two pending-edit flags the step-1 bar reads.
+
+    One read for both, because they answer one question about one set
+    of rows and the bar shows them together: the outer condition is
+    "are there unapplied edits", the inner one is "does applying them
+    cost a GPU run". Two reads let the pair disagree, which is how one
+    of them came to count a stale insert the other refused.
+
+    :param scan: The scan the bar is rendered for.
+    :returns: ``has_pending_changes`` and ``has_pending_inserts``.
+    :rtype: dict
+    """
+    pending = current_edits(scan, *PageEdit.STRUCTURAL_KINDS)
+    with_an_image = (PageEdit.Kind.INSERT_PAGE, PageEdit.Kind.REPLACE_PAGE)
+    return {
+        "has_pending_changes": bool(pending),
+        "has_pending_inserts": any(
+            edit.kind in with_an_image for edit in pending
+        ),
+    }
+
+
 def deleted_pages(scan: Scan) -> set[int]:
     """Return the 1-based original pages marked for deletion.
 

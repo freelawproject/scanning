@@ -1154,3 +1154,77 @@ class TestAnInsertTheMapCannotPlace(TestCase):
         out = page_edits.project_inserts(self.scan, [])
 
         self.assertEqual([e["insert_edit_id"] for e in out], [edit.pk])
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestPendingEditFlags(TestCase):
+    """The two flags the step-1 bar reads come from one read of one set."""
+
+    def setUp(self):
+        self.scan = ScanFactory(page_count=4, source_fingerprint="200:4")
+
+    def test_no_edits_means_no_flags(self):
+        from scanning import page_edits
+
+        self.assertEqual(
+            page_edits.pending_edit_flags(self.scan),
+            {"has_pending_changes": False, "has_pending_inserts": False},
+        )
+
+    def test_a_deletion_is_a_change_and_costs_no_run(self):
+        from scanning import page_edits
+
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+        )
+
+        self.assertEqual(
+            page_edits.pending_edit_flags(self.scan),
+            {"has_pending_changes": True, "has_pending_inserts": False},
+        )
+
+    def test_an_image_costs_a_run(self):
+        from scanning import page_edits
+
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+        )
+
+        self.assertEqual(
+            page_edits.pending_edit_flags(self.scan),
+            {"has_pending_changes": True, "has_pending_inserts": True},
+        )
+
+    def test_a_stale_insert_raises_neither_flag(self):
+        # The two used to be read separately, and disagreed here: the
+        # insert flag counted a row the change flag refused.
+        from scanning import page_edits
+
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=1,
+            value="",
+            source_fingerprint="100:4",
+        )
+
+        self.assertEqual(
+            page_edits.pending_edit_flags(self.scan),
+            {"has_pending_changes": False, "has_pending_inserts": False},
+        )
+
+    def test_a_page_number_is_not_a_pending_change(self):
+        from scanning import page_edits
+
+        PageEditFactory(scan=self.scan, pdf_page=2, value="7")
+
+        self.assertFalse(
+            page_edits.pending_edit_flags(self.scan)["has_pending_changes"]
+        )
