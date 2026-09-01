@@ -868,6 +868,70 @@ def live_run(scan, stage: str, engine: str) -> list[ExternalJob]:
     return [job for job in rows if job.run == rows[0].run]
 
 
+def run_summary(scan, stage: str, engine: str) -> dict | None:
+    """Describe a scan's live run of one engine for the process page.
+
+    Neither GPU stage writes a scan status while it works (issue #190),
+    so the rows are the only place its progress lives, and this is how a
+    viewer sees it. Written once for every engine: a second copy would
+    drift, and the ``open`` count below is too subtle to duplicate.
+
+    ``open`` is what the daemon still has to do -- rows waiting to be
+    submitted or in flight -- and it is what a start button refuses a
+    second press on. Deliberately **not** ``OPEN_JOB_STATUSES``, which
+    includes ``COMPLETED`` because the provider finishing is not us
+    having applied the result. On that definition a run holding one
+    failed shard beside two finished ones would read as open forever,
+    and the button would refuse the re-run such a run needs.
+
+    ``label`` is the same counts as one readable phrase, because a
+    template rendering ``statuses`` directly would print a Python dict.
+
+    :param scan: The scan (or its pk) to describe.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :returns: ``{"run", "total", "done", "open", "failed", "statuses",
+        "label", "error_code", "error_message"}``, or ``None`` when the
+        engine has never run for this scan.
+    :rtype: dict | None
+    """
+    rows = live_run(scan, stage, engine)
+    if not rows:
+        return None
+
+    statuses: dict[str, int] = {}
+    for row in rows:
+        statuses[row.status] = statuses.get(row.status, 0) + 1
+
+    failed = [
+        row
+        for row in rows
+        if row.status in (JobStatus.FAILED, JobStatus.EXPIRED)
+    ]
+    done = sum(
+        count
+        for status, count in statuses.items()
+        if status in (JobStatus.COMPLETED, JobStatus.CONSUMED)
+    )
+    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
+    first_failure = failed[0] if failed else None
+    label = ", ".join(
+        f"{count} {ExternalJob(status=status).get_status_display().lower()}"
+        for status, count in sorted(statuses.items())
+    )
+    return {
+        "run": rows[0].run,
+        "total": len(rows),
+        "done": done,
+        "open": sum(1 for row in rows if row.status in unfinished),
+        "failed": len(failed),
+        "statuses": statuses,
+        "label": label,
+        "error_code": first_failure.error_code if first_failure else "",
+        "error_message": first_failure.error_message if first_failure else "",
+    }
+
+
 def _reusable_results(
     scan, stage: str, engine: str, specs: list[tuple[str, dict]]
 ) -> dict[int, ExternalJob]:
