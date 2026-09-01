@@ -10,6 +10,24 @@ the ``ocr_results`` shape the sequence analysis
 (``blackletter.validate``), the review-1 UI, and the overlay of the
 curator's own page numbers (``page_edits``) already consume.
 
+A page of a reporter carries several numbers in its head band, and only
+one of them is the page number:
+
+- the volume number, in the reporter title (``469 PACIFIC REPORTER, 3d
+  SERIES``);
+- the parallel citation page, alone in its own cell;
+- the first page of the opinion, in the ``Cite as`` line;
+- a headnote number, which dots also labels ``Page-header``;
+- the last word of a case name that ends in a digit (``SCHOOL DIST.
+  NO. 1``).
+
+**Position is what tells them apart** (#228): the printed number sits
+at the outer corner of the page, and every rival sits nearer the
+middle. So the rank is geometric, not textual. Measured over one
+1294-page volume, a true reading sits within 0.19 of the page width
+from its edge and every rival at 0.25 or more, which is what
+``CORNER_BAND`` records.
+
 Cell selection intersects three redundant signals, degrading gracefully
 when they disagree:
 
@@ -18,12 +36,13 @@ when they disagree:
   ai-research ``pipeline/core/order.py`` (branch ``extraction_align``):
   a head cell ends above ``0.085 * H``, a foot cell starts below
   ``0.95 * H``, with H the page's own render height;
-- the text carries a plausible digit token.
+- the text carries a plausible digit token at a line's outer end.
 
 Known dots noise, handled here: superscript digits leak in beside the
-number, and the parallel-page-number icon is dropped or read as a stray
-``L`` glued to the number. Parallel page numbers themselves are
-deferred.
+number, the parallel-page-number icon is dropped or read as a stray
+``L`` glued to the number, and the running head and the ``Cite as``
+line arrive as two lines of **one** cell. Parallel page numbers
+themselves are deferred.
 
 A page the worker failed or filtered has no cells and gets
 ``detected=None``; the sequence analysis reports it as
@@ -42,6 +61,12 @@ from scanning.services import DOTS_ZONE_PREFIX
 #: running head, one starting below FOOT_BAND is a footer.
 HEAD_BAND = 0.085
 FOOT_BAND = 0.95
+
+#: How near its own edge of the page a token must sit to read as a
+#: corner one, as a fraction of the page width. It grades the score and
+#: names a trusted reading; it never gates the rank, because a volume
+#: whose number is centred in the footer has no rival to lose to.
+CORNER_BAND = 0.25
 
 HEADER_CATEGORY = "Page-header"
 FOOTER_CATEGORY = "Page-footer"
@@ -74,47 +99,62 @@ def _clean(text: str) -> str:
     return text.translate(_SUPERSCRIPTS).strip()
 
 
-def _outer_token(text: str) -> str | None:
-    """Return the page-number token at the outer corner of ``text``.
+def _line_readings(line: str) -> list[tuple[str, str, str]]:
+    """Read the page numbers one line of a cell offers.
 
     The running head puts the number at the page's outer corner, so it
-    is the first or the last whitespace token. When both ends carry a
-    number (rare), printed parity breaks the tie: even numbers sit on
-    left pages (leading), odd numbers on right pages (trailing).
+    is the first or the last token of its line -- never a token buried
+    in the middle, which is a year, a docket number or a citation.
 
-    :param text: A cleaned cell text.
-    :returns: The digits, or None when neither end holds a number.
-    :rtype: str | None
+    :param line: One cleaned line of a cell's text.
+    :returns: ``(detected, type, side)`` per reading, where ``side`` is
+        ``"left"``, ``"right"``, or ``"both"`` for a line that is the
+        number and nothing else.
+    :rtype: list[tuple[str, str, str]]
     """
-    tokens = text.split()
+    tokens = line.split()
     if not tokens:
-        return None
-    leading = _NUMBER_RE.match(tokens[0])
-    trailing = _NUMBER_RE.match(tokens[-1])
-    if leading and trailing and len(tokens) > 1:
-        if int(trailing.group(1)) % 2 == 1:
-            return trailing.group(1)
-        return leading.group(1)
-    match = leading or trailing
-    return match.group(1) if match else None
-
-
-def _read_cell(text: str) -> tuple[str, str] | None:
-    """Read a page number (or range) out of one cell's text.
-
-    :param text: The cell's raw text.
-    :returns: ``(detected, type)``, or None when the text holds no
-        number.
-    :rtype: tuple[str, str] | None
-    """
-    cleaned = _clean(text)
-    range_match = _RANGE_RE.match(cleaned)
+        return []
+    range_match = _RANGE_RE.match(line)
     if range_match:
-        return f"{range_match.group(1)}-{range_match.group(2)}", "range"
-    number = _outer_token(cleaned)
-    if number:
-        return number, "single"
-    return None
+        return [
+            (f"{range_match.group(1)}-{range_match.group(2)}", "range", "both")
+        ]
+    leading = _NUMBER_RE.match(tokens[0])
+    if len(tokens) == 1:
+        return [(leading.group(1), "single", "both")] if leading else []
+    trailing = _NUMBER_RE.match(tokens[-1])
+    readings = []
+    if leading:
+        readings.append((leading.group(1), "single", "left"))
+    if trailing:
+        readings.append((trailing.group(1), "single", "right"))
+    return readings
+
+
+def _corner_distance(bbox: list, width: int | float, side: str) -> float:
+    """Measure how far a token sits from its own edge of the page.
+
+    The bbox belongs to the whole cell, so the side the token was read
+    at is what says which edge to measure against: a leading token
+    starts where the cell starts, a trailing one ends where it ends.
+
+    :param bbox: The cell's bbox, ``[x0, y0, x1, y1]``.
+    :param width: The page's render width, the space the bbox lives in.
+    :param side: Which end of its line the token was read at.
+    :returns: The distance as a fraction of the page width, 1.0 when
+        the page reports no geometry.
+    :rtype: float
+    """
+    if len(bbox) < 4 or not width:
+        return 1.0
+    if side == "left":
+        distance = bbox[0]
+    elif side == "right":
+        distance = width - bbox[2]
+    else:
+        distance = min(bbox[0], width - bbox[2])
+    return max(distance, 0) / width
 
 
 def _band(cell: dict, origin_height: int | float) -> str | None:
@@ -136,48 +176,86 @@ def _band(cell: dict, origin_height: int | float) -> str | None:
     return None
 
 
-def _score(label_ok: bool, band_ok: bool, digits_only: bool) -> float:
-    """Grade how many of the three signals agreed.
+def _score(
+    label_ok: bool, band_ok: bool, corner_ok: bool, digits_only: bool
+) -> float:
+    """Grade how many of the signals agreed.
 
     dots has no per-region confidence, so the score is synthetic:
     ``validate``'s auto-correct and the review UI only need a rough
-    "how sure was the producer" ordering.
+    "how sure was the producer" ordering. Position carries it (#228):
+    a bare digit anywhere on the page used to score full marks, which
+    is exactly what a headnote number is.
 
     :param label_ok: The cell carried a Page-header/Page-footer label.
     :param band_ok: The cell's bbox sat in the head or foot band.
-    :param digits_only: The cell's text was the number and nothing else.
+    :param corner_ok: The token sat within CORNER_BAND of its edge.
+    :param digits_only: The token's line was the number and nothing
+        else.
     :returns: 1.0 down to 0.5.
     :rtype: float
     """
-    if digits_only and label_ok and band_ok:
+    if corner_ok and label_ok and band_ok:
         return 1.0
-    if (label_ok and band_ok) or digits_only:
+    if (corner_ok and (label_ok or band_ok)) or (
+        digits_only and label_ok and band_ok
+    ):
         return 0.8
     return 0.5
 
 
-def extract_page_number(page: dict) -> dict:
-    """Build one ``ocr_results`` entry from one glued page dict.
+def _parity_rank(candidate: dict) -> int:
+    """Rank a candidate on printed parity, for an exact geometry tie.
 
-    Header candidates outrank footer ones -- a section-opening page
-    carries its number in the footer only, so the footer is the
-    fallback, not a competitor.
+    Even numbers sit on left pages, odd numbers on right ones. This
+    decides only between two readings of one line at one distance --
+    a head cell whose two ends both carry a number.
+
+    :param candidate: One candidate of :func:`page_candidates`.
+    :returns: 0 when the parity agrees with the corner, else 1.
+    :rtype: int
+    """
+    if candidate["type"] != "single" or candidate["side"] == "both":
+        return 0
+    is_odd = int(candidate["detected"]) % 2 == 1
+    return 0 if is_odd == (candidate["side"] == "right") else 1
+
+
+def _rank_key(candidate: dict) -> tuple:
+    """Order the candidates of one page, best first.
+
+    A header outranks a footer: a section-opening page carries its
+    number in the footer only, so the footer is the fallback, not a
+    competitor. Then the geometry decides, because every rival number
+    of a reporter page sits nearer the middle than the printed one.
+    The line index breaks the tie the two lines of one cell produce --
+    the running head is the top line, the ``Cite as`` line is below it
+    and both share the one bbox.
+
+    :param candidate: One candidate of :func:`page_candidates`.
+    :returns: The sort key.
+    :rtype: tuple
+    """
+    return (
+        candidate["zone"] != "header",
+        candidate["distance"],
+        candidate["line"],
+        _parity_rank(candidate),
+    )
+
+
+def page_candidates(page: dict) -> list[dict]:
+    """Read every page number one page's cells offer, best first.
 
     :param page: One ``pages[]`` entry of the glued volume document.
-    :returns: ``{pdf_page, detected, type, score, zone, ocr,
-        img_width, img_height}``; ``detected`` is None when the page
-        was filtered, failed, or shows no number.
-    :rtype: dict
+    :returns: The ranked candidates. Empty when the page was filtered,
+        failed, or shows no number.
+    :rtype: list[dict]
     """
-    entry = {
-        "pdf_page": page["pdf_page"],
-        **_EMPTY,
-        "img_width": page.get("origin_width"),
-        "img_height": page.get("origin_height"),
-    }
     origin_height = page.get("origin_height") or 0
-
+    origin_width = page.get("origin_width") or 0
     label_zone = {HEADER_CATEGORY: "header", FOOTER_CATEGORY: "footer"}
+
     candidates = []
     for cell in page.get("cells") or []:
         label = cell.get("category")
@@ -186,40 +264,122 @@ def extract_page_number(page: dict) -> dict:
         if zone is None:
             continue
         text = cell.get("text") or ""
-        read = _read_cell(text)
-        if read is None:
-            continue
-        detected, number_type = read
-        cleaned = _clean(text)
-        digits_only = bool(
-            _NUMBER_RE.match(cleaned) or _RANGE_RE.match(cleaned)
-        )
-        candidates.append(
-            {
-                "zone": zone,
-                "detected": detected,
-                "type": number_type,
-                "score": _score(
-                    label in label_zone, band is not None, digits_only
-                ),
-                "ocr": text,
-            }
-        )
+        bbox = cell.get("bbox") or []
+        for index, line in enumerate(_clean(text).splitlines()):
+            line = line.strip()
+            for detected, number_type, side in _line_readings(line):
+                distance = _corner_distance(bbox, origin_width, side)
+                candidates.append(
+                    {
+                        "zone": zone,
+                        "detected": detected,
+                        "type": number_type,
+                        "side": side,
+                        "line": index,
+                        "distance": distance,
+                        "score": _score(
+                            label in label_zone,
+                            band is not None,
+                            distance <= CORNER_BAND,
+                            len(line.split()) == 1,
+                        ),
+                        "ocr": text,
+                    }
+                )
+    return sorted(candidates, key=_rank_key)
 
-    if not candidates:
+
+def _entry(page: dict, candidate: dict | None) -> dict:
+    """Build one ``ocr_results`` entry from a page and its reading.
+
+    :param page: One ``pages[]`` entry of the glued volume document.
+    :param candidate: The chosen candidate, or None for no reading.
+    :returns: ``{pdf_page, detected, type, score, zone, ocr,
+        img_width, img_height}``.
+    :rtype: dict
+    """
+    entry = {
+        "pdf_page": page["pdf_page"],
+        **_EMPTY,
+        "img_width": page.get("origin_width"),
+        "img_height": page.get("origin_height"),
+    }
+    if candidate is None:
         return entry
-    best = sorted(
-        candidates,
-        key=lambda c: (c["zone"] != "header", -c["score"]),
-    )[0]
     entry.update(
-        detected=best["detected"],
-        type=best["type"],
-        score=best["score"],
-        zone=f"{DOTS_ZONE_PREFIX}{best['zone']}",
-        ocr=best["ocr"],
+        detected=candidate["detected"],
+        type=candidate["type"],
+        score=candidate["score"],
+        zone=f"{DOTS_ZONE_PREFIX}{candidate['zone']}",
+        ocr=candidate["ocr"],
     )
     return entry
+
+
+def extract_page_number(page: dict) -> dict:
+    """Build one ``ocr_results`` entry from one glued page dict.
+
+    Geometry alone, one page at a time. The volume-wide reading
+    (:func:`ocr_results_from_volume`) adds the neighbour pass on top.
+
+    :param page: One ``pages[]`` entry of the glued volume document.
+    :returns: The entry; ``detected`` is None when the page was
+        filtered, failed, or shows no number.
+    :rtype: dict
+    """
+    candidates = page_candidates(page)
+    return _entry(page, candidates[0] if candidates else None)
+
+
+def _value(candidate: dict | None) -> int | None:
+    """Return a candidate's number, when it is a single page number.
+
+    :param candidate: One candidate, or None.
+    :returns: The number, or None for a range or no reading.
+    :rtype: int | None
+    """
+    if candidate is None or candidate["type"] != "single":
+        return None
+    return int(candidate["detected"])
+
+
+def _resolve_by_neighbours(
+    chosen: list[dict | None], candidates: list[list[dict]]
+) -> list[dict | None]:
+    """Prefer a reading that continues the page before or after (#228).
+
+    The second net under the geometry, for the volume whose head cell
+    holds the citation page and the page number at one distance. It
+    reads the neighbours off the *geometric* picks throughout, never
+    off its own repairs, so one wrong page cannot cascade down the
+    volume. It never invents a number, and it never touches a page
+    that offers one value: a reading no rival contests is the
+    geometry's to keep, and the sequence analysis reports it.
+
+    :param chosen: The geometric pick per page, in page order.
+    :param candidates: The ranked candidates per page, in page order.
+    :returns: The picks, with the contested ones resolved.
+    :rtype: list[dict | None]
+    """
+    values = [_value(candidate) for candidate in chosen]
+    resolved = list(chosen)
+    for index, options in enumerate(candidates):
+        current = chosen[index]
+        if current is None or len({o["detected"] for o in options}) < 2:
+            continue
+        previous = values[index - 1] if index else None
+        following = values[index + 1] if index + 1 < len(values) else None
+        wanted = set()
+        if previous is not None:
+            wanted.add(previous + 1)
+        if following is not None:
+            wanted.add(following - 1)
+        if not wanted or _value(current) in wanted:
+            continue
+        agreeing = [o for o in options if _value(o) in wanted]
+        if agreeing:
+            resolved[index] = agreeing[0]
+    return resolved
 
 
 def ocr_results_from_volume(document: dict) -> list[dict]:
@@ -237,7 +397,8 @@ def ocr_results_from_volume(document: dict) -> list[dict]:
     :returns: The new ``ocr_results`` list.
     :rtype: list[dict]
     """
-    return [
-        extract_page_number(page)
-        for page in sorted(document["pages"], key=lambda p: p["pdf_page"])
-    ]
+    pages = sorted(document["pages"], key=lambda p: p["pdf_page"])
+    candidates = [page_candidates(page) for page in pages]
+    chosen = [options[0] if options else None for options in candidates]
+    chosen = _resolve_by_neighbours(chosen, candidates)
+    return [_entry(page, candidate) for page, candidate in zip(pages, chosen)]

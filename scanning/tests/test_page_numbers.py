@@ -1,9 +1,13 @@
-"""Tests for the dots.mocr page-number adapter (issues #149/#204).
+"""Tests for the dots.mocr page-number adapter (issues #149/#204/#228).
 
 Pure-function tests over hand-built page dicts of the glued volume
 shape: no DB, no S3. The geometry matches the worker's defaults --
-2200px render height, so the head band ends at 187 and the foot band
-starts at 2090.
+1700x2200px renders, so the head band ends at 187, the foot band
+starts at 2090, and a token within 425px of its own edge is a corner
+one.
+
+The cells of the #228 tests are copied from a real run: scan run 1 of
+469 P.3d, 1294 pages.
 """
 
 from django.test import SimpleTestCase
@@ -14,6 +18,9 @@ WIDTH, HEIGHT = 1700, 2200
 HEAD_BBOX = [323, 143, 364, 177]
 FOOT_BBOX = [800, 2120, 900, 2160]
 BODY_BBOX = [200, 900, 1500, 1100]
+#: A running head that spans the text block, so its two ends sit at
+#: the same distance from their own edge of the page.
+WIDE_HEAD_BBOX = [150, 143, 1550, 177]
 
 
 def make_page(pdf_page: int, cells: list | None, **overrides) -> dict:
@@ -76,7 +83,7 @@ class TestExtractPageNumber(SimpleTestCase):
 
         self.assertEqual(entry["detected"], "678")
         self.assertEqual(entry["type"], "single")
-        self.assertEqual(entry["score"], 0.8)
+        self.assertEqual(entry["score"], 1.0)
 
     def test_an_odd_page_number_trails_the_cite_line(self):
         entry = self.extract([cell("STATE v. SMITH Cite as 218 A.3d 677 679")])
@@ -84,12 +91,16 @@ class TestExtractPageNumber(SimpleTestCase):
         self.assertEqual(entry["detected"], "679")
 
     def test_numbers_at_both_ends_break_the_tie_on_parity(self):
-        """An odd number sits on a right page's trailing corner."""
-        entry = self.extract([cell("10 SOMETHING 11")])
-        self.assertEqual(entry["detected"], "11")
+        """An even number sits left, an odd one right (#228).
 
-        entry = self.extract([cell("11 SOMETHING 10")])
-        self.assertEqual(entry["detected"], "11")
+        Both ends of this head cell are the same distance from their
+        own edge, so only the printed parity separates them.
+        """
+        entry = self.extract([cell("12 SOMETHING 14", bbox=WIDE_HEAD_BBOX)])
+        self.assertEqual(entry["detected"], "12")
+
+        entry = self.extract([cell("13 SOMETHING 15", bbox=WIDE_HEAD_BBOX)])
+        self.assertEqual(entry["detected"], "15")
 
     def test_a_range_is_read_whole(self):
         for text in ("677-685", "677–685"):
@@ -145,11 +156,23 @@ class TestExtractPageNumber(SimpleTestCase):
         self.assertEqual(entry["score"], 0.8)
         self.assertEqual(entry["zone"], "dots-header")
 
-    def test_a_band_only_corner_token_scores_lowest(self):
+    def test_a_band_only_corner_token_loses_a_signal(self):
         entry = self.extract([cell("678 ATLANTIC REPORTER", "Text")])
 
         self.assertEqual(entry["detected"], "678")
-        self.assertEqual(entry["score"], 0.5)
+        self.assertEqual(entry["score"], 0.8)
+
+    def test_a_bare_digit_away_from_the_edges_is_not_full_marks(self):
+        """The parallel citation page of scan run 1, page 732.
+
+        The label, the band and the digits agree, which was the full
+        1.0 before #228. Only its position says it is not the page
+        number, and only the rank acts on that.
+        """
+        entry = self.extract([cell("115", bbox=[1200, 114, 1249, 147])])
+
+        self.assertEqual(entry["detected"], "115")
+        self.assertEqual(entry["score"], 0.8)
 
     def test_a_labeled_cell_out_of_band_still_counts(self):
         entry = self.extract([cell("677", "Page-header", BODY_BBOX)])
@@ -194,6 +217,110 @@ class TestExtractPageNumber(SimpleTestCase):
         self.assertIsNone(entry["detected"])
 
 
+class TestTheCornerWins(SimpleTestCase):
+    """The printed number is at the outer corner, every rival is not.
+
+    Each test carries the cells of one page of scan run 1 (469 P.3d).
+    Before #228 the cell order decided all of them.
+    """
+
+    def extract(self, cells, pdf_page: int = 1):
+        return page_numbers.extract_page_number(make_page(pdf_page, cells))
+
+    def test_the_volume_number_loses_to_the_page_number(self):
+        """Page 2: the reporter title leads with the volume number."""
+        entry = self.extract(
+            [
+                cell("2 Idaho", bbox=[285, 95, 406, 130]),
+                cell(
+                    "469 PACIFIC REPORTER, 3d SERIES",
+                    bbox=[584, 97, 1081, 128],
+                ),
+            ],
+            pdf_page=2,
+        )
+
+        self.assertEqual(entry["detected"], "2")
+
+    def test_the_parallel_citation_page_loses_to_the_page_number(self):
+        """Page 732: '115' sits alone in a cell of its own."""
+        entry = self.extract(
+            [
+                cell("732 Okl.", bbox=[274, 112, 411, 147]),
+                cell(
+                    "469 PACIFIC REPORTER, 3d SERIES",
+                    bbox=[581, 114, 1113, 147],
+                ),
+                cell("115", bbox=[1200, 114, 1249, 147]),
+            ],
+            pdf_page=732,
+        )
+
+        self.assertEqual(entry["detected"], "732")
+
+    def test_a_headnote_number_loses_to_the_page_number(self):
+        """Page 105: dots labels a headnote number Page-header too.
+
+        The headnote is a bare digit with the label and the band, which
+        scored the full 1.0 before #228 and beat the true corner cell.
+        """
+        entry = self.extract(
+            [
+                cell("Kan. 105", bbox=[1291, 104, 1439, 140]),
+                cell("1", bbox=[556, 174, 569, 196]),
+                cell("3", bbox=[1149, 174, 1162, 196]),
+            ],
+            pdf_page=105,
+        )
+
+        self.assertEqual(entry["detected"], "105")
+
+    def test_a_case_name_that_ends_in_a_digit_loses(self):
+        """Page 743: 'SCHOOL DIST. NO. 1' ends in a number."""
+        entry = self.extract(
+            [
+                cell(
+                    "ALBURTUS v. INDEPENDENT SCHOOL DIST. NO. 1",
+                    bbox=[472, 107, 1219, 139],
+                ),
+                cell("Okl. 743", bbox=[1285, 107, 1427, 144]),
+            ],
+            pdf_page=743,
+        )
+
+        self.assertEqual(entry["detected"], "743")
+
+    def test_a_head_cell_of_two_lines_is_read_line_by_line(self):
+        """Page 137: dots returns the head and the Cite line as one."""
+        entry = self.extract(
+            [
+                cell(
+                    "MOUNTAIN WATER v. MONTANA DEPT. OF REVENUE Mont. 137\n"
+                    "Cite as 469 P.3d 316 (Mont. 2020)",
+                    bbox=[447, 104, 1442, 165],
+                )
+            ],
+            pdf_page=137,
+        )
+
+        self.assertEqual(entry["detected"], "137")
+
+    def test_the_head_line_outranks_the_cite_line_below_it(self):
+        """The two lines share one bbox, so the line order decides."""
+        entry = self.extract(
+            [
+                cell(
+                    "MOUNTAIN WATER v. MONTANA DEPT. OF REVENUE Mont. 137\n"
+                    "Cite as 469 P.3d 316",
+                    bbox=[447, 104, 1442, 165],
+                )
+            ],
+            pdf_page=137,
+        )
+
+        self.assertEqual(entry["detected"], "137")
+
+
 class TestOcrResultsFromVolume(SimpleTestCase):
     def test_entries_come_out_in_page_order(self):
         document = {
@@ -209,6 +336,57 @@ class TestOcrResultsFromVolume(SimpleTestCase):
             [(r["pdf_page"], r["detected"]) for r in results],
             [(1, "677"), (2, "678")],
         )
+
+    def test_a_neighbour_resolves_two_readings_of_one_line(self):
+        """The citation page and the page number, at one distance.
+
+        Both ends of the middle page's head cell sit the same distance
+        from their own edge, and both agree with the printed parity, so
+        the geometry cannot separate them. The page before decides.
+        """
+        document = {
+            "pages": [
+                make_page(1, [cell("Ky. 100", bbox=[1285, 107, 1427, 144])]),
+                make_page(
+                    2,
+                    [cell("90 SMITH v. JONES 101", bbox=WIDE_HEAD_BBOX)],
+                ),
+                make_page(3, [cell("Ky. 102", bbox=[1285, 107, 1427, 144])]),
+            ]
+        }
+
+        results = page_numbers.ocr_results_from_volume(document)
+
+        self.assertEqual(
+            [r["detected"] for r in results], ["100", "101", "102"]
+        )
+
+    def test_an_uncontested_reading_is_the_geometry_s_to_keep(self):
+        """The pass never overrules a page that offers one number."""
+        document = {
+            "pages": [
+                make_page(1, [cell("Ky. 100", bbox=[1285, 107, 1427, 144])]),
+                make_page(2, [cell("Ky. 150", bbox=[1285, 107, 1427, 144])]),
+                make_page(3, [cell("Ky. 102", bbox=[1285, 107, 1427, 144])]),
+            ]
+        }
+
+        results = page_numbers.ocr_results_from_volume(document)
+
+        self.assertEqual(results[1]["detected"], "150")
+
+    def test_the_pass_never_invents_a_number(self):
+        document = {
+            "pages": [
+                make_page(1, [cell("Ky. 100", bbox=[1285, 107, 1427, 144])]),
+                make_page(2, None),
+                make_page(3, [cell("Ky. 102", bbox=[1285, 107, 1427, 144])]),
+            ]
+        }
+
+        results = page_numbers.ocr_results_from_volume(document)
+
+        self.assertIsNone(results[1]["detected"])
 
     def test_the_output_is_the_run_and_nothing_else(self):
         # Pure machine output since #214: a curator's own number is a
