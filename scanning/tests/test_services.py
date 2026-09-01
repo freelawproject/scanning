@@ -1714,9 +1714,10 @@ class TestRecalculateIssues(TestCase):
             [e["pdf_index"] for e in scan.page_map if "pdf_index" in e],
             [0, 1, 2],
         )
-        self.assertTrue(
-            scan.issues.filter(check_name="no_page_number").exists()
-        )
+        # The blank page interpolates to the one missing number, so
+        # the two cards merge into one (#227).
+        merged = scan.issues.get(check_name="missing_page")
+        self.assertEqual(merged.metadata["pdf_pages"], [2])
 
     def test_recheck_keeps_the_review_1_statuses(self):
         """A recheck must not move a scan between review states (#154):
@@ -1945,6 +1946,91 @@ class TestRecalculateIssues(TestCase):
         self.assertEqual(scan.missing_pages, [3, 4])
         self.assertFalse(scan.issues.exists())
 
+    def _make_stray_number_scan(self):
+        """Create the screenshot-1 shape of #227.
+
+        A stray "81" read between the real pages 84, 86 and 88 makes
+        the overlapping gaps 81->84, 81->86 and 81->88.
+        """
+        return self._make_scan(
+            start_page=81,
+            end_page=88,
+            page_count=6,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "81", "type": "single"},
+                {"pdf_page": 2, "detected": "84", "type": "single"},
+                {"pdf_page": 3, "detected": "81", "type": "single"},
+                {"pdf_page": 4, "detected": "86", "type": "single"},
+                {"pdf_page": 5, "detected": "81", "type": "single"},
+                {"pdf_page": 6, "detected": "88", "type": "single"},
+            ],
+        )
+
+    def test_a_stray_number_makes_one_row_per_fact(self):
+        """The rebuilt rows are grouped (#227): one missing_page row
+        per printed number, one backward_page row for the stray."""
+        from scanning import services
+
+        scan = self._make_stray_number_scan()
+
+        services.recalculate_issues(scan)
+
+        missing = scan.issues.filter(check_name=CheckName.MISSING_PAGE)
+        self.assertEqual(
+            sorted(i.page_number for i in missing), [82, 83, 85, 87]
+        )
+        backward = scan.issues.get(check_name=CheckName.BACKWARD_PAGE)
+        self.assertEqual(backward.page_number, 81)
+        self.assertEqual(backward.metadata["pdf_pages"], [3, 5])
+
+    def test_a_dismissed_grouped_card_stays_dismissed(self):
+        """The grouped card keeps the dismissal key (#227): the check
+        name plus the printed number."""
+        from scanning import services
+
+        scan = self._make_stray_number_scan()
+        services.recalculate_issues(scan)
+        issue = scan.issues.get(check_name=CheckName.BACKWARD_PAGE)
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.DISMISS_ISSUE,
+            pdf_page=None,
+            logical_page=str(issue.page_number),
+            value=CheckName.BACKWARD_PAGE,
+        )
+
+        services.recalculate_issues(scan)
+
+        self.assertFalse(
+            scan.issues.filter(check_name=CheckName.BACKWARD_PAGE).exists()
+        )
+
+    def test_a_missing_number_meets_its_blank_page(self):
+        """The screenshot-3 shape of #227: the error and the info
+        merge into one row that names the physical page."""
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=79,
+            end_page=81,
+            page_count=3,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "79", "type": "single"},
+                {"pdf_page": 2, "detected": None, "type": None},
+                {"pdf_page": 3, "detected": "81", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        self.assertFalse(
+            scan.issues.filter(check_name=CheckName.NO_PAGE_NUMBER).exists()
+        )
+        missing = scan.issues.get(check_name=CheckName.MISSING_PAGE)
+        self.assertEqual(missing.page_number, 80)
+        self.assertEqual(missing.metadata["pdf_pages"], [2])
+        self.assertIn("PDF page 2", missing.message)
+
 
 class TestRunComputeIssues(TestCase):
     """The apply of the glued dots.mocr output (#149/#204, #212).
@@ -2007,11 +2093,10 @@ class TestRunComputeIssues(TestCase):
             [(1, "1"), (2, None)],
         )
         self.assertTrue(scan.page_map)
-        self.assertTrue(
-            scan.issues.filter(
-                check_name=CheckName.NO_PAGE_NUMBER, page_number=2
-            ).exists()
-        )
+        # The blank page merges with the missing number (#227), so
+        # the one issue names the physical page.
+        merged = scan.issues.get(check_name=CheckName.MISSING_PAGE)
+        self.assertEqual(merged.metadata["pdf_pages"], [2])
         download.assert_called_once_with("jobs/x/r1-volume.json")
 
     def test_a_legacy_pending_review_scan_takes_the_edge(self):
