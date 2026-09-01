@@ -207,17 +207,16 @@ class TestEnsureConvertJobs(ScanningTestCase):
             convert_jobs(second)[0].input_key,
         )
 
-    def test_rows_start_with_a_queue_ceiling(self):
-        """Waiting to be submitted is the other way a job waits."""
+    def test_rows_start_with_no_deadline(self):
+        """A row in our own queue has no clock (issue #218).
+
+        A creation-stamped ceiling expired a whole admitted backlog
+        unsubmitted and sank its volumes to ERROR. The queue ceiling is
+        stamped at the attempt's first claim instead.
+        """
         scan = ScanFactory()
-        with override_settings(DAEMON_JOB_MAX_QUEUE_SECONDS=60):
-            created = jobs.ensure_convert_jobs(
-                scan, make_manifest(shard_count=1)
-            )
-        self.assertIsNotNone(created[0].deadline)
-        self.assertLess(
-            created[0].deadline, timezone.now() + timedelta(seconds=61)
-        )
+        created = jobs.ensure_convert_jobs(scan, make_manifest(shard_count=1))
+        self.assertIsNone(created[0].deadline)
 
 
 @override_settings(**DOCTOR)
@@ -574,8 +573,13 @@ class TestSweepJobs(ScanningTestCase):
         self.assertEqual(self.job.status, JobStatus.SUBMITTED)
         self.assertEqual(self.job.attempt, 1)
 
-    def test_a_never_submitted_row_is_written_off_past_its_queue_ceiling(self):
-        """Otherwise its scan waits in AWAITING forever."""
+    def test_a_pending_row_past_its_stamped_ceiling_is_written_off(self):
+        """A row an endpoint kept declining must still end.
+
+        Only a row that carries a ceiling can strand: a defer hands a
+        claimed row back with the ceiling its first claim stamped. A
+        row never claimed carries none and waits instead.
+        """
         stranded = jobs.ensure_convert_jobs(
             ScanFactory(), make_manifest(shard_count=1)
         )[0]

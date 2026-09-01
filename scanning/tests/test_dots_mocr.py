@@ -267,15 +267,13 @@ class TestSubmitWave(ScanningTestCase):
             self.assertEqual(job.external_id, "job-1")
             self.assertTrue(job.result_key.endswith(".json"))
 
-    def test_a_claimed_row_keeps_the_queue_ceiling(self):
-        # It has been accepted but may not have started, and queue time
-        # is free. Only the IN_PROGRESS crossing starts the run budget.
+    def test_the_claim_stamps_the_queue_ceiling(self):
+        # The claim hands the row to the provider's queue, which is
+        # where the bounded wait starts. Being accepted is not being
+        # started: only the IN_PROGRESS crossing starts the run budget.
         self._tick()
         job = analyze_jobs(self.scan)[0]
-        expected = jobs.queue_deadline(job.submitted_at)
-        self.assertAlmostEqual(
-            job.deadline, expected, delta=timedelta(seconds=2)
-        )
+        self.assertEqual(job.deadline, jobs.queue_deadline(job.submitted_at))
 
     def test_the_result_key_is_scoped_to_run_shard_and_attempt(self):
         self._tick()
@@ -1278,10 +1276,12 @@ class TestMessageMatchesWhatHappened(ScanningTestCase):
 class TestQueueCeilingCannotBeReset(ScanningTestCase):
     """A paused endpoint must not hold a scan forever.
 
-    The ceiling is stamped once per attempt, when the row enters the
-    queue. A claim does not move it (being accepted is not being
-    started) and a defer does not (the row never left our queue), or a
-    row would have its wait forgiven on every tick.
+    The ceiling is stamped once per attempt, at the attempt's first
+    claim -- the moment the row is handed to the provider. A re-claim
+    after a defer does not move it and a defer does not, or a row would
+    have its wait forgiven on every tick. A row nothing has claimed yet
+    carries no ceiling at all: our own queue has no clock, so a long
+    backlog drains instead of expiring (issue #218).
     """
 
     def setUp(self):
@@ -1310,21 +1310,24 @@ class TestQueueCeilingCannotBeReset(ScanningTestCase):
         ):
             jobs.submit_pending()
 
-    def test_a_claim_keeps_the_queue_ceiling(self):
-        before = self._row().deadline
-        self._tick()
-        self.assertEqual(self._row().deadline, before)
+    def test_a_created_row_carries_no_ceiling(self):
+        # Waiting in our own queue is not a fault, however long: a
+        # creation-stamped clock expired a whole backlog unsubmitted
+        # (issue #218).
+        self.assertIsNone(self._row().deadline)
 
     def test_a_defer_keeps_the_queue_ceiling(self):
-        before = self._row().deadline
         busy = runpod_client.RunpodEndpointBusy(
             "paused", error_code="ENDPOINT_PAUSED"
         )
+        self._tick(side_effect=busy)
+        stamped = self._row().deadline
+        self.assertIsNotNone(stamped)
         for _ in range(3):
             self._tick(side_effect=busy)
         row = self._row()
         self.assertEqual(row.status, JobStatus.PENDING)
-        self.assertEqual(row.deadline, before)
+        self.assertEqual(row.deadline, stamped)
 
     def test_a_permanently_paused_endpoint_eventually_times_out(self):
         # The failure this whole ceiling exists to produce. Before the
@@ -1345,9 +1348,9 @@ class TestQueueCeilingCannotBeReset(ScanningTestCase):
         self.assertEqual(row.status, JobStatus.FAILED)
         self.assertEqual(row.error_code, "QUEUE_TIMEOUT")
 
-    def test_a_retry_does_restart_the_wait(self):
-        # A new attempt is a new wait, so this one *must* move.
-        before = self._row().deadline
+    def test_a_retry_clears_the_ceiling_for_the_next_claim(self):
+        # A new attempt is a new wait, and its clock starts when the
+        # next claim hands it to the provider.
         self._tick(
             side_effect=runpod_client.RunpodTransientError(
                 "refused", error_code="BAD_GATEWAY"
@@ -1355,7 +1358,7 @@ class TestQueueCeilingCannotBeReset(ScanningTestCase):
         )
         row = self._row()
         self.assertEqual(row.attempt, 2)
-        self.assertGreater(row.deadline, before)
+        self.assertIsNone(row.deadline)
 
     def test_a_doctor_row_still_takes_its_flat_answer_budget(self):
         convert = jobs.ensure_convert_jobs(

@@ -69,7 +69,6 @@ from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
     OPEN_JOB_STATUSES,
-    WAITING_JOB_STATUSES,
     ExternalJob,
     JobEngine,
     JobProvider,
@@ -254,21 +253,24 @@ def queue_deadline(waiting_since):
     it to the back of the same queue, and eventually fail a volume for
     being popular.
 
-    A ceiling still exists, generously, so a job nobody has started
-    cannot park its scan forever. It covers both waits a row can be
-    stuck in, since the scan cannot tell them apart: queued at the
-    provider, and queued here because the endpoint is not accepting
-    work.
+    A ceiling still exists, generously, so a job a provider has
+    accepted and never starts cannot park its scan forever. It measures
+    the **provider's** queue only, never ours. A row that waits in our
+    own queue carries no clock at all: an admitted backlog may lawfully
+    wait longer than any ceiling, and a clock that started at creation
+    once expired 2000+ rows unsubmitted and sank 29 volumes to ERROR
+    (issue #218).
 
-    Stamped **once per attempt**, when the row enters the queue: at
-    creation, and again when a retry sends it back. Nothing else moves
-    it. A claim does not (being accepted is not being started) and a
-    defer does not (the row never left our queue), or an endpoint that
+    Stamped **once per attempt**, at the attempt's first claim
+    (:func:`submit_deadline_fields`) -- the moment the row is handed to
+    the provider. Nothing after that first claim moves it. A re-claim
+    after a defer does not, and a defer does not, or an endpoint that
     is paused or saturated for good would push the ceiling out on every
-    tick and hold a scan forever.
+    tick and hold a scan forever. A retry clears it, so the next
+    attempt's first claim restarts the wait. Only the crossing into
+    ``IN_PROGRESS`` replaces it, with the run budget.
 
-    :param waiting_since: When the row started waiting -- when it was
-        created, or when a retry returned it to PENDING.
+    :param waiting_since: When the attempt was handed to the provider.
     :returns: The wall-clock time the row is written off at.
     """
     return waiting_since + timedelta(
@@ -318,13 +320,14 @@ def submit_deadline_fields(job: ExternalJob, submitted_at) -> dict:
     response *is* the completion: there is no queue to distinguish, and
     the clock that matters starts when the request goes out.
 
-    A RunPod row is written **nothing**, and that is the point. It keeps
-    the queue ceiling it has carried since it entered the queue, because
-    being accepted is not being started -- the endpoint's worker cap may
-    hold it for hours. Re-stamping here would restart that wait on every
-    claim, which together with a deferring endpoint would let a row sit
-    forever. Only the crossing into ``IN_PROGRESS``
-    (:func:`_record_progress`) replaces the ceiling with a run budget.
+    A RunPod row takes the queue ceiling here, at the attempt's
+    **first** claim -- the moment it leaves our queue for the
+    provider's. A row that already carries one is written **nothing**:
+    the only way back to a claim with a ceiling intact is a defer, and
+    re-stamping there would restart the wait on every tick, so an
+    endpoint paused for good would hold a scan forever. Only the
+    crossing into ``IN_PROGRESS`` (:func:`_record_progress`) replaces
+    the ceiling with a run budget.
 
     :param job: The row being submitted.
     :param submitted_at: Submission timestamp.
@@ -332,7 +335,9 @@ def submit_deadline_fields(job: ExternalJob, submitted_at) -> dict:
     :rtype: dict
     """
     if _is_runpod(job):
-        return {}
+        if job.deadline is not None:
+            return {}
+        return {"deadline": queue_deadline(submitted_at)}
     return {"deadline": doctor_attempt_deadline(submitted_at)}
 
 
@@ -638,12 +643,13 @@ def _defer(job: ExternalJob, error_code: str, message: str, now) -> str:
     not accepting work. Burning a row's retry budget there would fail a
     volume for being submitted while an endpoint was scaled to zero.
 
-    **The deadline is left exactly as it was.** A defer means the row
-    never left our queue, so the wait it is accumulating is precisely
-    the wait :func:`queue_deadline` exists to bound. Re-stamping would
-    push the ceiling out on every tick, and an endpoint paused for good
-    would hold a scan forever instead of failing it -- which is the one
-    outcome the ceiling is there to prevent.
+    **The deadline is left exactly as it was.** The first claim stamped
+    it when it handed the row to the provider, and the endpoint
+    declining is that wait going on, not a new one. Clearing or
+    re-stamping it here would push the ceiling out on every tick, and
+    an endpoint paused for good would hold a scan forever instead of
+    failing it -- which is the one outcome the ceiling is there to
+    prevent.
 
     :param job: The row to hand back.
     :param error_code: Why it was not sent.
@@ -687,10 +693,11 @@ def _retry_or_fail(
     submit mint a fresh attempt-scoped one, which is also what makes an
     expired signature self-healing rather than fatal.
 
-    The deadline is re-stamped from ``now``: a row carrying the previous
-    attempt's deadline would be swept straight back out by
-    :func:`sweep_jobs`, which writes off any PENDING row already past
-    its queue ceiling.
+    The deadline is cleared, not re-stamped: a new attempt is a new
+    wait, and its ceiling is stamped when the attempt's first claim
+    hands it to the provider. A row carrying the previous attempt's
+    deadline would be swept straight back out by :func:`sweep_jobs`,
+    which writes off any PENDING row already past its queue ceiling.
 
     The previous attempt is cancelled on the way out. It may still be
     running -- a deadline write-off is exactly the case where it is --
@@ -727,7 +734,7 @@ def _retry_or_fail(
         external_id="",
         submitted_at=None,
         completed_at=None,
-        deadline=queue_deadline(now),
+        deadline=None,
         error_code=error_code[:64],
         error_message=message[:2000],
         provider_meta=job.provider_meta,
@@ -1033,7 +1040,9 @@ def ensure_shard_jobs(
             # merge read what was actually processed rather than a
             # manifest that may since have changed.
             input_manifest=identity,
-            deadline=queue_deadline(now),
+            # No deadline: a row in our own queue has no clock. The
+            # queue ceiling is stamped at the attempt's first claim,
+            # when the row is handed to the provider (issue #218).
         )
         prior = reusable.get(index)
         if prior is not None:
@@ -1095,25 +1104,6 @@ def ensure_convert_jobs(scan, manifest: dict) -> list[ExternalJob]:
         stage=JobStage.CONVERT,
         engine=JobEngine.BITONAL,
         provider=JobProvider.DOCTOR,
-    )
-
-
-# ── intake ──────────────────────────────────────────────────────────
-def active_scan_count() -> int:
-    """Count the scans that hold unfinished work in an external queue.
-
-    What the daemon's intake cap is measured against (issue #218).
-    Scans, not rows, because a scan's whole shard set enters every
-    queue at once; every stage, because it charges all of them.
-
-    :returns: How many scans hold at least one waiting job row.
-    :rtype: int
-    """
-    return (
-        ExternalJob.objects.filter(status__in=WAITING_JOB_STATUSES)
-        .values("scan_id")
-        .distinct()
-        .count()
     )
 
 
@@ -1719,9 +1709,12 @@ def sweep_jobs(now=None) -> SweepSummary:
         else:
             _sweep_doctor_job(job, now, summary)
 
-    # Rows never submitted at all -- a provider switched off after they
-    # were created, a submit loop that never ran. Without this their
-    # scan waits forever.
+    # PENDING rows that carry an expired ceiling. Since the ceiling
+    # moved to the first claim (issue #218), that means an endpoint
+    # that kept declining the attempt for the whole ceiling -- plus
+    # rows stamped at creation before the move. A row never claimed
+    # carries no deadline and waits for its engine instead: our own
+    # queue is not a fault, however long it is.
     stranded = ExternalJob.objects.filter(
         status=JobStatus.PENDING,
         deadline__isnull=False,
