@@ -108,8 +108,9 @@ def _line_readings(line: str) -> list[tuple[str, str, str]]:
 
     :param line: One cleaned line of a cell's text.
     :returns: ``(detected, type, side)`` per reading, where ``side`` is
-        ``"left"``, ``"right"``, or ``"both"`` for a line that is the
-        number and nothing else.
+        the end of the line the token was read at -- ``"left"`` or
+        ``"right"`` -- or ``"both"`` when the reading is the whole
+        line, which a bare number and a range (spaced or not) are.
     :rtype: list[tuple[str, str, str]]
     """
     tokens = line.split()
@@ -177,7 +178,7 @@ def _band(cell: dict, origin_height: int | float) -> str | None:
 
 
 def _score(
-    label_ok: bool, band_ok: bool, corner_ok: bool, digits_only: bool
+    label_ok: bool, band_ok: bool, corner_ok: bool, whole_line: bool
 ) -> float:
     """Grade how many of the signals agreed.
 
@@ -190,35 +191,18 @@ def _score(
     :param label_ok: The cell carried a Page-header/Page-footer label.
     :param band_ok: The cell's bbox sat in the head or foot band.
     :param corner_ok: The token sat within CORNER_BAND of its edge.
-    :param digits_only: The token's line was the number and nothing
-        else.
+    :param whole_line: The reading was the whole line -- a bare
+        number, or a range.
     :returns: 1.0 down to 0.5.
     :rtype: float
     """
     if corner_ok and label_ok and band_ok:
         return 1.0
     if (corner_ok and (label_ok or band_ok)) or (
-        digits_only and label_ok and band_ok
+        whole_line and label_ok and band_ok
     ):
         return 0.8
     return 0.5
-
-
-def _parity_rank(candidate: dict) -> int:
-    """Rank a candidate on printed parity, for an exact geometry tie.
-
-    Even numbers sit on left pages, odd numbers on right ones. This
-    decides only between two readings of one line at one distance --
-    a head cell whose two ends both carry a number.
-
-    :param candidate: One candidate of :func:`page_candidates`.
-    :returns: 0 when the parity agrees with the corner, else 1.
-    :rtype: int
-    """
-    if candidate["type"] != "single" or candidate["side"] == "both":
-        return 0
-    is_odd = int(candidate["detected"]) % 2 == 1
-    return 0 if is_odd == (candidate["side"] == "right") else 1
 
 
 def _rank_key(candidate: dict) -> tuple:
@@ -240,6 +224,13 @@ def _rank_key(candidate: dict) -> tuple:
     approves. The band is what separates the two, and the score is
     where the band is counted.
 
+    There is no printed-parity key. Even numbers do sit on left pages,
+    but the rule reaches only two readings of one line at one exact
+    distance, which needs a head cell centred to the pixel -- a
+    synthetic page, not a render. A tie that deep keeps the order the
+    cells arrived in, and :func:`_resolve_by_neighbours` is what
+    resolves it.
+
     :param candidate: One candidate of :func:`page_candidates`.
     :returns: The sort key.
     :rtype: tuple
@@ -249,7 +240,6 @@ def _rank_key(candidate: dict) -> tuple:
         -candidate["score"],
         candidate["distance"],
         candidate["line"],
-        _parity_rank(candidate),
     )
 
 
@@ -283,14 +273,13 @@ def page_candidates(page: dict) -> list[dict]:
                         "zone": zone,
                         "detected": detected,
                         "type": number_type,
-                        "side": side,
                         "line": index,
                         "distance": distance,
                         "score": _score(
                             label in label_zone,
                             band is not None,
                             distance <= CORNER_BAND,
-                            len(line.split()) == 1,
+                            side == "both",
                         ),
                         "ocr": text,
                     }

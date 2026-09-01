@@ -109,6 +109,17 @@ GLUE_TMP_PREFIX = "dotsmocr-"
 #: forever.
 APPLY_MAX_ATTEMPTS = 3
 
+#: The statuses the apply pass acts on: the two parks it takes to
+#: READY, and READY itself for a recompute. One tuple, because
+#: ``reapply_page_numbers`` must offer the pass exactly the scans the
+#: pass will read -- a scan outside them would hold a cleared stamp
+#: that nothing reads.
+APPLY_STATUSES = (
+    Status.AWAITING_VALIDATION,
+    Status.PENDING_REVIEW,
+    Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+)
+
 
 class DotsMocrGlueError(Exception):
     """A completed dots.mocr run could not be glued into one document."""
@@ -732,12 +743,7 @@ def apply_ready_runs() -> int:
     )
     applied = 0
     for scan in Scan.objects.filter(
-        pk__in=list(scan_ids),
-        status__in=(
-            Status.AWAITING_VALIDATION,
-            Status.PENDING_REVIEW,
-            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
-        ),
+        pk__in=list(scan_ids), status__in=APPLY_STATUSES
     ).select_related("reporter"):
         rows = live_analyze_jobs(scan)
         if not rows:
@@ -785,9 +791,19 @@ def reopen_apply(scan, dry_run: bool = False) -> bool:
     a fresh attempt and deserves the full ``APPLY_MAX_ATTEMPTS``
     budget.
 
-    The caller decides which scans may take it. A scan outside the
-    statuses ``apply_ready_runs`` reads would simply keep the cleared
-    state until an admin re-queue parks it back in the review flow.
+    The caller decides which scans may take it, from
+    ``APPLY_STATUSES``. A scan outside them would simply keep the
+    cleared state until an admin re-queue parks it back in the review
+    flow.
+
+    The write is not a compare-and-swap, and needs none, although
+    ``apply_ready_runs`` stamps ``applied_at`` onto a state it read
+    seconds earlier. The two cannot interleave: this function writes
+    only when ``applied_at`` is set, and a run whose ``applied_at`` is
+    set is one the pass skips before it does any work. So there is
+    never a stale state to overwrite -- for the pass to be working, the
+    stamp must already be absent, and then there is nothing here to
+    clear.
 
     :param scan: The scan whose live run should apply again.
     :param dry_run: Answer whether the run qualifies, and write

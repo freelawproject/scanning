@@ -90,20 +90,18 @@ class TestExtractPageNumber(SimpleTestCase):
 
         self.assertEqual(entry["detected"], "679")
 
-    def test_numbers_at_both_ends_break_the_tie_on_parity(self):
-        """An even number sits left, an odd one right (#228).
-
-        Both ends of this head cell are the same distance from their
-        own edge, so only the printed parity separates them.
-        """
-        entry = self.extract([cell("12 SOMETHING 14", bbox=WIDE_HEAD_BBOX)])
+    def test_the_nearer_end_of_a_line_wins(self):
+        """Both ends carry a number, so the geometry separates them."""
+        entry = self.extract([cell("12 SOMETHING 14")])
         self.assertEqual(entry["detected"], "12")
 
-        entry = self.extract([cell("13 SOMETHING 15", bbox=WIDE_HEAD_BBOX)])
-        self.assertEqual(entry["detected"], "15")
+        entry = self.extract(
+            [cell("12 SOMETHING 14", bbox=[1200, 143, 1550, 177])]
+        )
+        self.assertEqual(entry["detected"], "14")
 
     def test_a_range_is_read_whole(self):
-        for text in ("677-685", "677–685"):
+        for text in ("677-685", "677–685", "677 - 685"):
             with self.subTest(text=text):
                 entry = self.extract([cell(text)])
 

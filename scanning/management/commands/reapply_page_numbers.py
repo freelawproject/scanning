@@ -42,15 +42,6 @@ from scanning.models import (
     JobStage,
     JobStatus,
     Scan,
-    Status,
-)
-
-#: The statuses ``dots_mocr.apply_ready_runs`` acts on. A scan outside
-#: them would hold a cleared stamp and nothing would read it.
-ELIGIBLE_STATUSES = (
-    Status.AWAITING_VALIDATION,
-    Status.PENDING_REVIEW,
-    Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
 )
 
 
@@ -101,7 +92,7 @@ class Command(BaseCommand):
             .distinct()
         )
         scans = Scan.objects.filter(
-            pk__in=list(glued), status__in=ELIGIBLE_STATUSES
+            pk__in=list(glued), status__in=dots_mocr.APPLY_STATUSES
         ).order_by("pk")
         if wanted:
             scans = scans.filter(pk__in=wanted)

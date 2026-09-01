@@ -549,8 +549,8 @@ ends in a digit.
 
 - **Position tells them apart, so the rank in `page_numbers.py` is
   geometric**: header before footer, then the score, then the corner
-  distance, then the line inside the cell, then printed parity. The
-  printed number is at the outer corner, every rival nearer the middle.
+  distance, then the line inside the cell. The printed number is at the
+  outer corner, every rival nearer the middle.
   The score stays ahead of the distance because it carries the band:
   dots labels a headnote digit `Page-header` wherever it sits, and a
   distance-first rank hands the page to a column of them printed in the
