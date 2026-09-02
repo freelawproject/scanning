@@ -1292,6 +1292,13 @@ def _page_number_value(raw) -> str | None:
     curator clearing the number, which is a decision, so it returns the
     empty string rather than None.
 
+    A reporter prints the range with an en dash (``913–925``), and a
+    curator types what the page shows, so an en dash and an em dash
+    read as the hyphen (issue #233). The stored value carries one
+    hyphen, which is the shape every reader of a range parses
+    (``services._page_number_lookup``,
+    ``blackletter.validate.RANGE_RE``).
+
     :param raw: The ``page_number`` field of the request body.
     :returns: The value for ``PageEdit.value``, or None when the entry
         is not a page number at all.
@@ -1299,7 +1306,7 @@ def _page_number_value(raw) -> str | None:
     """
     if raw is None:
         return ""
-    text = str(raw).strip()
+    text = str(raw).strip().replace("–", "-").replace("—", "-")
     if not text:
         return ""
     parts = [part.strip() for part in text.split("-")]
