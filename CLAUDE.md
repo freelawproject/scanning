@@ -578,6 +578,33 @@ ends in a digit.
   it re-reads the stored glued document at no GPU cost, keeps the
   numbers a curator typed (#214), and leaves an approved volume alone.
 
+## The compressed page (issue #233)
+
+A book prints several pages on one physical page, and the head band
+then carries a range (`913–925`) in place of the number. The stage
+that answers it is the reading, not the issue computation:
+`blackletter.validate` already breaks the sequence at a `type="range"`
+entry and counts every page the range covers as present, so a volume
+that shows "Large gap" is a volume whose range nobody read.
+
+- **A range is read at the corner of its line**, like a single number.
+  The whole-line rule alone left the compressed page of a reporter
+  with no number at all, because the line reads
+  `913–925 ATLANTIC REPORTER, 2d SERIES`.
+- **Two numbers joined by a dash are not always a range.**
+  `page_numbers._range_value` guards every range: forward, and at most
+  `MAX_RANGE_SPAN` pages. A docket number (`19-1234`) runs past the
+  end of any volume and a split year (`1996-97`) runs backward.
+- **The curator may type one**, in step 1 and in `assign_page`, with
+  the dash the page prints: `views_process._page_number_value` reads
+  an en dash and an em dash and stores one hyphen, which is the shape
+  every reader of a range parses.
+- **A range the curator typed is a note, not a question.**
+  `services._note_curator_ranges` lowers the `page_range` card to
+  `info` and rewords it. The card stays: the range is a fact about the
+  volume the next reader must see. A range the *model* read keeps the
+  warning and its "Verify this is expected".
+
 ## Generalized YOLO worker image (issue #194)
 
 `scanning/runpod/` is the RunPod Serverless image that runs detection

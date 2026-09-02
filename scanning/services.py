@@ -536,6 +536,13 @@ def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
     return len(changed)
 
 
+#: A printed page range as ``Scan.ocr_results`` stores it. The en dash
+#: is what a reporter prints; ``views_process._page_number_value``
+#: normalizes a curator's entry, and ``page_numbers`` the model's
+#: reading, so a stored value carries a hyphen. Both are read here.
+_PAGE_RANGE_RE = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
+
+
 def _page_number_lookup(scan: "Scan") -> dict:
     """Build {page_index: (page_number, page_number_end)} from ocr_results.
 
@@ -547,14 +554,13 @@ def _page_number_lookup(scan: "Scan") -> dict:
     """
     ocr_results = scan.ocr_results
     lookup = {}
-    range_re = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
     for r in ocr_results:
         pdf_idx = r["pdf_page"] - 1
         detected = r.get("detected")
         if not detected:
             continue
         if r.get("type") == "range":
-            m = range_re.match(str(detected).replace("\u2013", "-"))
+            m = _PAGE_RANGE_RE.match(str(detected))
             if m:
                 lookup[pdf_idx] = (int(m.group(1)), int(m.group(2)))
             continue
@@ -1065,6 +1071,50 @@ def _is_manual_read(result: dict) -> bool:
     return "manual" in (result.get("ocr"), result.get("zone"))
 
 
+def _note_curator_ranges(issues: list[dict], ocr_results: list[dict]) -> None:
+    """Answer a curator's own page range with a note, not a warning.
+
+    ``build_issues`` writes one ``page_range`` card per range page:
+    "Verify this is expected." That is the right question to ask of a
+    machine reading. It is noise for a range the curator typed a
+    minute earlier with the page in front of them (#233). The card
+    stays, because the range is a fact about the volume that the next
+    reader must see, and it stays at ``info``, worded as the record it
+    is.
+
+    The card names the range's first page, which is the key this
+    matches on: the address space of ``page_range`` is the printed
+    number, not the physical page (``models.PHYSICAL_PAGE_CHECKS``).
+
+    :param issues: The rebuilt issue dicts, edited in place.
+    :param ocr_results: The per-page entries the issues were built
+        from, curator numbers already overlaid.
+    :returns: None.
+    """
+    typed: dict[int, tuple[int, str]] = {}
+    for entry in ocr_results:
+        if entry.get("type") != "range" or not _is_manual_read(entry):
+            continue
+        match = _PAGE_RANGE_RE.match(str(entry.get("detected") or ""))
+        if match:
+            first, last = int(match.group(1)), int(match.group(2))
+            typed[first] = (entry["pdf_page"], f"{first}-{last}")
+    if not typed:
+        return
+    for issue in issues:
+        if issue["check_name"] != CheckName.PAGE_RANGE:
+            continue
+        named = typed.get(issue["page_number"])
+        if named is None:
+            continue
+        pdf_page, label = named
+        issue["severity"] = Issue.Severity.INFO
+        issue["message"] = (
+            f"PDF page {pdf_page} carries the printed page range "
+            f"{label}, entered at review 1."
+        )
+
+
 def rebuild_page_map(scan: "Scan") -> None:
     """Rebuild ``page_map`` and ``missing_pages`` from current ocr_results.
 
@@ -1183,6 +1233,10 @@ def recalculate_issues(scan: "Scan") -> None:
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
+
+    # Before the cards scanning appends below, and before the
+    # dismissal filter, so a dismissal matches the card as it reads.
+    _note_curator_ranges(result["issues"], ocr_results)
 
     # Every open edit this volume cannot take, not only the page
     # numbers: a delete or an insert made against another original is
