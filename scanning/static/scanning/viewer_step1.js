@@ -17,6 +17,27 @@ document.addEventListener('DOMContentLoaded', function () {
 
     const SCALE = 1.5;
     const PLACEHOLDER_HEIGHT = 1056; // 792 * 1.5 (letter height at scale)
+
+    // What a curator may type as a page number: one printed number, or
+    // the range one physical page carries when the book prints several
+    // pages on it (issue #233). The server takes the same two shapes
+    // and stores a range with a hyphen, whatever dash was typed, so the
+    // dashes here are the ones a reporter prints and a person pastes.
+    const PAGE_ENTRY_RE = /^(\d{1,4})(?:\s*[-–—]\s*(\d{1,4}))?$/;
+
+    // The label the page render gives a range, so a saved entry reads
+    // the same before and after a reload.
+    const RANGE_TAG = 'Range ';
+
+    function isPageNumberEntry(text) {
+        var parts = PAGE_ENTRY_RE.exec(text);
+        if (!parts) return false;
+        var first = parseInt(parts[1], 10);
+        if (first < 1) return false;
+        if (parts[2] === undefined) return true;
+        return first < parseInt(parts[2], 10);
+    }
+
     let pdfDoc = null;
     let defaultPageWidth = 918; // 612 * 1.5
 
@@ -386,7 +407,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var ocrLabel = '';
         if (ocr) {
             if (ocr.detected) {
-                var tag = ocr.type === 'range' ? 'Range ' : '#';
+                var tag = ocr.type === 'range' ? RANGE_TAG : '#';
                 ocrLabel = '<span class="ocr-tag editable-page" data-pdf-page="' + pdfPage + '" ' +
                     'title="Click to correct page number">' + tag + ocr.detected +
                     ' <small>(' + ocr.zone + ' ' + (ocr.score ? ocr.score.toFixed(2) : '') + ')</small></span>';
@@ -431,13 +452,17 @@ document.addEventListener('DOMContentLoaded', function () {
                 var current = ocr && ocr.detected ? ocr.detected : '';
                 var num = prompt(
                     'Page number for PDF page ' + pdfPage +
-                    ' (leave blank if this page has no number):',
+                    ' (a range like 913-925 if this page carries several ' +
+                    'book pages; leave blank if it has no number):',
                     current
                 );
                 if (num === null) return; // cancelled
                 var trimmed = num.trim();
-                if (trimmed && (!/^\d+$/.test(trimmed) || parseInt(trimmed, 10) < 1)) {
-                    alert('Page number must be a positive whole number, or blank for none.');
+                if (trimmed && !isPageNumberEntry(trimmed)) {
+                    alert(
+                        'Page number must be a positive whole number, a ' +
+                        'range like 913-925, or blank for none.'
+                    );
                     return;
                 }
                 fetch('/scans/' + documentId + '/assign-page/', {
@@ -461,9 +486,14 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                     ocr.detected = res.data.detected;
                     if (res.data.detected) {
+                        // The server normalizes a range to one hyphen.
+                        ocr.type = res.data.detected.indexOf('-') === -1
+                            ? 'single' : 'range';
+                        var tag = ocr.type === 'range' ? RANGE_TAG : '#';
                         editBtn.className = 'ocr-tag editable-page';
-                        editBtn.innerHTML = '#' + escapeHtml(res.data.detected) + ' <small>(manual)</small>';
+                        editBtn.innerHTML = tag + escapeHtml(res.data.detected) + ' <small>(manual)</small>';
                     } else {
+                        ocr.type = null;
                         editBtn.className = 'ocr-tag miss editable-page';
                         editBtn.innerHTML = '[no page # found — click to assign]';
                     }
