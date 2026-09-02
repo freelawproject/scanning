@@ -288,6 +288,21 @@ def save_margin_rect(request: HttpRequest, pk: int) -> JsonResponse:
     return JsonResponse({"status": "ok", "found": found})
 
 
+#: Whether a curator may ask for the redaction computation from review
+#: 2. Off for now (#196): the computation renders every page of the
+#: volume and takes the scan out of review for a minute or more, and
+#: the one run the daemon starts after a detection run is the only one
+#: wanted until the stage has been watched on a few volumes (#211).
+#: Turning it back on is this flag plus the "Re-pair Opinions" button
+#: in ``_process_actions.html``; the queueing code below is kept.
+REPAIR_ON_REQUEST_ENABLED = False
+
+REPAIR_DISABLED_MESSAGE = (
+    "Re-pairing on request is off for now. The redactions are computed "
+    "once, when the detection run finishes."
+)
+
+
 @login_required
 @require_POST
 def pair_opinions_api(request: HttpRequest, pk: int) -> JsonResponse:
@@ -306,9 +321,12 @@ def pair_opinions_api(request: HttpRequest, pk: int) -> JsonResponse:
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response saying the work is queued.
+    :return: JSON response saying the work is queued, or 409 while
+        re-pairing on request is off (``REPAIR_ON_REQUEST_ENABLED``).
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if not REPAIR_ON_REQUEST_ENABLED:
+        return JsonResponse({"error": REPAIR_DISABLED_MESSAGE}, status=409)
     if not Detection.objects.filter(scan=scan, active=True).exists():
         return JsonResponse({"error": "No detections found"}, status=400)
 
@@ -331,9 +349,12 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response saying the work is queued.
+    :return: JSON response saying the work is queued, or 409 while
+        re-pairing on request is off (``REPAIR_ON_REQUEST_ENABLED``).
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if not REPAIR_ON_REQUEST_ENABLED:
+        return JsonResponse({"error": REPAIR_DISABLED_MESSAGE}, status=409)
     if not Detection.objects.filter(scan=scan, active=True).exists():
         return JsonResponse({"error": "No detections found"}, status=400)
 

@@ -764,7 +764,10 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   it. An ERROR on an approved volume needs an admin re-queue, and that
   re-queue runs the whole pipeline again. Failures are counted on the
   run instead (`provider_meta["apply"]`, `APPLY_MAX_ATTEMPTS`), the
-  same loud-then-quiet ledger the glue uses.
+  same loud-then-quiet ledger the glue uses. `record_apply_failure`
+  returns whether that failure spent the last attempt, and the park
+  message follows it: "runs again by itself" only while the trigger
+  will, and "stopped, ask a staff member" at the crossing.
 - **`queued_at` is the claim, `applied_at` is the stamp.** The trigger
   writes `queued_at` so it does not queue the same scan on every tick;
   the work drops it as it starts, so a failed apply is queued again.
@@ -813,19 +816,30 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   looked at. What is checkable is checked: the shard sequence, the
   shard's own page count as the worker reported it, every page index
   inside its shard, and one model family for the whole volume.
-- **No page view and no page action starts a measurement.** The
+- **Nothing a curator does starts a measurement, for now.** The
   step-2 template used to fire `compute-redactions` on load whenever
   the rects were missing; the add path in `viewer_step2.js` and the
   approve path in `viewer_sidebar.js` used to re-pair after every box.
   All three are gone: a volume whose apply failed would have started a
   volume-wide render on every reload, and a curator approving five
   captions would have taken the volume out of review five times. The
-  edits show a toast instead. The one trigger a curator has is the
-  "Re-pair Opinions" button, behind a confirm, and the two review-2
-  endpoints behind it queue the work and answer 202;
-  `viewer_progress.js` reloads the page when the scan parks. The button
-  recomputes the pairing, the rects and the strips together, which is
-  right, since all three are measured from the same detections.
+  edits show a toast that says the redactions are not recomputed from
+  them yet. The "Re-pair Opinions" button is commented out and the two
+  review-2 endpoints answer 409 behind
+  `views_api.REPAIR_ON_REQUEST_ENABLED = False`: until the stage has
+  been watched on a few volumes (#211), the daemon's one run after a
+  detection run is the only computation wanted. Turning it back on is
+  the flag plus the button; the queueing code behind them is kept, and
+  `viewer_progress.js` already reloads the page when the scan parks.
+  The button recomputes the pairing, the rects and the strips together,
+  which is right, since all three are measured from the same detections.
+- **"Next: Detect" carries no paid confirm when there are no
+  detections.** `start_detect` starts nothing since #195: it walks to
+  step 2 when detections exist and otherwise flashes
+  `NO_DETECTIONS_MESSAGE`. The button's confirm used to name RunPod and
+  a cost for a run the view then did not start; the no-detections
+  branch now says what the view says. The staff "Run detection" button
+  is the one that pays, and the only one with a confirm.
 
 ## Local disk hygiene (issue #215)
 

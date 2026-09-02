@@ -620,7 +620,9 @@ class TestComputeRedactionsApiView(TestCase):
 
     It used to measure inside the request. The measurement renders
     every page of the volume -- 83 seconds for 1364 pages -- so it runs
-    on the daemon now, and this view writes one status.
+    on the daemon now, and this view writes one status. And for now it
+    is switched off (``REPAIR_ON_REQUEST_ENABLED``): the queueing tests
+    turn the switch on, and one test checks the refusal.
     """
 
     def setUp(self):
@@ -644,6 +646,21 @@ class TestComputeRedactionsApiView(TestCase):
             y1=4,
         )
 
+    def test_the_switch_is_off_for_now(self):
+        self._detection()
+
+        response = self.client.post(
+            f"/scans/{self.scan.pk}/compute-redactions/"
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("off for now", response.json()["error"])
+        self.scan.refresh_from_db()
+        self.assertEqual(
+            self.scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+
+    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
     def test_a_volume_with_no_detections_is_refused(self):
         response = self.client.post(
             f"/scans/{self.scan.pk}/compute-redactions/"
@@ -651,6 +668,7 @@ class TestComputeRedactionsApiView(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("error", response.json())
 
+    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
     def test_a_volume_with_detections_is_queued(self):
         self._detection()
 

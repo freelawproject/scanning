@@ -2841,6 +2841,38 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
         )
         self.assertEqual(response.status_code, 404)
 
+    def _caption(self):
+        """Store one detection, so the endpoints get past their guard."""
+        return Detection.objects.create(
+            scan=self.scan,
+            page_index=0,
+            label="CAPTION",
+            label_id=1,
+            confidence=0.9,
+            x0=0,
+            y0=0,
+            x1=1,
+            y1=1,
+        )
+
+    def test_re_pairing_on_request_is_off_for_now(self):
+        """Both review-2 endpoints refuse and queue nothing (#196): the
+        daemon's one run after detection is the only computation wanted
+        until the stage has been watched on a few volumes."""
+        from scanning.views_api import REPAIR_DISABLED_MESSAGE
+
+        self._caption()
+        before = self.scan.status
+        for name in ("pair_opinions_api", "compute_redactions_api"):
+            response = self.client.post(
+                reverse(name, kwargs={"pk": self.scan.pk})
+            )
+            self.assertEqual(response.status_code, 409, name)
+            self.assertEqual(response.json()["error"], REPAIR_DISABLED_MESSAGE)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, before)
+
+    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
     def test_compute_redactions_needs_no_pdf_in_the_request(self):
         """It queues the work, so a missing local PDF is not its problem.
 
@@ -2854,19 +2886,11 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"], "No detections found")
 
+    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
     def test_pair_opinions_queues_the_work(self):
-        """Pairing is queued with the geometry it feeds (#196)."""
-        Detection.objects.create(
-            scan=self.scan,
-            page_index=0,
-            label="CAPTION",
-            label_id=1,
-            confidence=0.9,
-            x0=0,
-            y0=0,
-            x1=1,
-            y1=1,
-        )
+        """Pairing is queued with the geometry it feeds (#196), once the
+        switch is back on."""
+        self._caption()
         response = self.client.post(
             reverse("pair_opinions_api", kwargs={"pk": self.scan.pk})
         )

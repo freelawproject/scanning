@@ -1265,12 +1265,12 @@ document.addEventListener('DOMContentLoaded', function () {
             // whole computation now runs on the daemon and takes the
             // volume out of review while it does (#196), so it is not
             // started here: an auto re-pair on every added box would
-            // interrupt the reviewer in the middle of their edits. Say
-            // what is pending instead, and let them press the button
-            // once they are done.
+            // interrupt the reviewer in the middle of their edits. And
+            // re-pairing on request is off for now, so say what the
+            // edit did and did not change.
             var _pLabels = ['CASE_CAPTION', 'KEY_ICON'];
             if (_pLabels.indexOf(labelName) >= 0) {
-                showToast('Saved. Press "Re-pair Opinions" when you finish editing.', 'success');
+                showToast('Saved. The redactions are not recomputed from this yet.', 'success');
             }
         });
     }

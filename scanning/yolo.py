@@ -689,7 +689,7 @@ def record_apply_success(detect_jobs: list[ExternalJob]) -> None:
     write_apply_state(detect_jobs, state)
 
 
-def record_apply_failure(scan, detect_jobs: list[ExternalJob], exc) -> None:
+def record_apply_failure(scan, detect_jobs: list[ExternalJob], exc) -> bool:
     """Count one apply failure, and give up loudly on the last one.
 
     Mirrors :func:`_record_merge_failure`: the merged document and the
@@ -701,7 +701,10 @@ def record_apply_failure(scan, detect_jobs: list[ExternalJob], exc) -> None:
     :param scan: The scan whose apply failed.
     :param detect_jobs: The live run's rows, ordered by shard index.
     :param exc: What the apply raised.
-    :return: None.
+    :returns: Whether this failure spent the last attempt, so the caller
+        can tell the curator the truth: :func:`queue_ready_runs` skips
+        the run from here on, and nothing "runs again by itself".
+    :rtype: bool
     """
     state = apply_state(detect_jobs)
     attempts = int(state.get("attempts") or 0) + 1
@@ -714,7 +717,8 @@ def record_apply_failure(scan, detect_jobs: list[ExternalJob], exc) -> None:
         }
     )
     write_apply_state(detect_jobs, state)
-    if attempts >= APPLY_MAX_ATTEMPTS:
+    gave_up = attempts >= APPLY_MAX_ATTEMPTS
+    if gave_up:
         logger.exception(
             "Applying the detection results for scan %s failed; giving up "
             "after %d attempt(s). The merged document stays in S3; clear "
@@ -732,6 +736,7 @@ def record_apply_failure(scan, detect_jobs: list[ExternalJob], exc) -> None:
             APPLY_MAX_ATTEMPTS,
             exc,
         )
+    return gave_up
 
 
 def queue_ready_runs() -> int:

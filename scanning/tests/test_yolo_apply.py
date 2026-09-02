@@ -422,6 +422,39 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         self.assertIn("boom", state["last_error"])
         self.assertNotIn("applied_at", state)
 
+    def test_a_counted_failure_promises_the_retry_it_gets(self):
+        # PROCESSING, as the daemon's claim leaves it: the park writes
+        # over the busy statuses only, so a scan created parked would
+        # keep the message it had.
+        scan, rows = merged_scan(status=Status.PROCESSING)
+        stubs = self.patch_geometry()
+        stubs["bl_pair"].side_effect = RuntimeError("boom")
+
+        with self.assertLogs("scanning", level="WARNING"):
+            services.run_compute_redactions(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        self.assertIn("runs again by itself", scan.progress_message)
+
+    def test_the_last_failure_says_it_stopped(self):
+        """The trigger skips a run out of attempts, so a park that still
+        promised a retry would have the curator waiting for nothing."""
+        scan, rows = merged_scan(status=Status.PROCESSING)
+        yolo.write_apply_state(rows, {"attempts": yolo.APPLY_MAX_ATTEMPTS - 1})
+        stubs = self.patch_geometry()
+        stubs["bl_pair"].side_effect = RuntimeError("boom")
+
+        with self.assertLogs("scanning", level="ERROR"):
+            services.run_compute_redactions(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        self.assertIn("stopped", scan.progress_message)
+        self.assertNotIn("by itself", scan.progress_message)
+        with patch("scanning.s3_sync.s3_active", return_value=True):
+            self.assertEqual(yolo.queue_ready_runs(), 0)
+
     def test_a_failed_apply_is_queued_again(self):
         scan, rows = merged_scan()
         stubs = self.patch_geometry()

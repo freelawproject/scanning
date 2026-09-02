@@ -1609,14 +1609,28 @@ def run_compute_redactions(scan_pk: int) -> None:
             scan_pk,
             time.monotonic() - started,
         )
-        if merged:
-            yolo.record_apply_failure(scan, rows, exc)
-        _park_after_redactions(
-            scan_pk,
-            "The redaction computation failed. The detections are safe, "
-            "and it runs again by itself.",
-            park,
-        )
+        gave_up = merged and yolo.record_apply_failure(scan, rows, exc)
+        # The message must match what happens next: the trigger retries
+        # a counted failure on its next tick, and skips a run that spent
+        # its attempts. A promise of a retry the last failure does not
+        # get would have the curator waiting for nothing.
+        if gave_up:
+            message = (
+                "The redaction computation failed "
+                f"{yolo.APPLY_MAX_ATTEMPTS} times and stopped. The "
+                "detections are safe. Ask a staff member to look at it."
+            )
+        elif merged:
+            message = (
+                "The redaction computation failed. The detections are "
+                "safe, and it runs again by itself."
+            )
+        else:
+            message = (
+                "The redaction computation failed. The detections are "
+                "safe; ask a staff member to look at it."
+            )
+        _park_after_redactions(scan_pk, message, park)
         return
 
     if merged:

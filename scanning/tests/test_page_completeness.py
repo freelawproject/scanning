@@ -568,6 +568,21 @@ class TestStepOneButtonBar(ScanningTestCase):
         self.assertIn(self.DETECT, html)
         self.assertNotIn(self.REVALIDATE, html)
 
+    def test_an_approved_scan_without_detections_is_promised_no_run(self):
+        """start_detect starts nothing (#195/#196), so the button must not
+        confirm a paid RunPod run; it says who starts one."""
+        scan = ScanFactory(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
+            page_count=2,
+            ocr_results=dots_results(),
+        )
+
+        html = self._bar(scan)
+
+        self.assertIn(self.DETECT, html)
+        self.assertNotIn("incur costs", html.split("start_detect")[-1])
+        self.assertIn("A staff member starts the detection run", html)
+
     def test_open_issues_do_not_hide_the_approval(self):
         """The old bar hid the way forward until the issue list was
         empty. Review 1 asks the person instead."""
