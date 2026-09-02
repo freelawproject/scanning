@@ -553,9 +553,10 @@ trained on), tracked on `ExternalJob` rows at
   again. `_parse_page` climbs a ladder: greedy on the render, then
   greedy on the render thresholded at `RETRY_THRESHOLD` (100 removes
   the show-through and keeps the text; doctor's 160 does not), then
-  sampling plus a repetition penalty. Only a page with no usable output
-  climbs, so good pages stay deterministic; the page dict says what
-  happened (`attempts`, `recovered_by`, `render`, `sampled`, `errors`)
+  greedy with a repetition penalty. No rung samples: the stage stays
+  deterministic for the same page. Only a page with no usable output
+  climbs; the page dict says what happened (`attempts`,
+  `recovered_by`, `render`, `repetition_penalty`, `errors`)
   and the summary carries `recovered_pages`, logged at INFO beside the
   WARNING. The cap is `HANDLER_MAX_COMPLETION_TOKENS` = 6144, about
   twice the longest measured page (3114) and not 16384: every rung

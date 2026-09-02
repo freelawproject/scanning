@@ -135,14 +135,11 @@ INFERENCE_ATTEMPTS = int(os.environ.get("HANDLER_INFERENCE_ATTEMPTS", "2"))
 # to change the input. Rung 2 re-runs the page on the same render with
 # a grey threshold that removes the show-through and keeps the real
 # text (100 does on the sampled pages; doctor's bitonal 160 does not).
-# Rung 3 adds sampling and a repetition penalty for a loop the render
-# change did not break. Only a page with no usable output climbs the
-# ladder, so good pages stay deterministic.
+# Rung 3 adds a repetition penalty for a loop the render change did not
+# break. Every rung decodes greedily: a penalty is a fixed change to the
+# logits, so the argmax stays deterministic, and no rung samples --
+# the whole stage has to give the same output for the same page.
 RETRY_THRESHOLD = int(os.environ.get("HANDLER_RETRY_THRESHOLD", "100"))
-# Upstream ``DotsOCRParser`` defaults, the values the model was tuned
-# with; the greedy 0.0 above is our own choice for determinism.
-RETRY_TEMPERATURE = float(os.environ.get("HANDLER_RETRY_TEMPERATURE", "0.1"))
-RETRY_TOP_P = float(os.environ.get("HANDLER_RETRY_TOP_P", "0.9"))
 RETRY_REPETITION_PENALTY = float(
     os.environ.get("HANDLER_RETRY_REPETITION_PENALTY", "1.05")
 )
@@ -433,8 +430,9 @@ def _vllm_inference(
     :param prompt: The prompt-mode text.
     :param repetition_penalty: vLLM's ``repetition_penalty`` sampling
         parameter, sent through ``extra_body`` because the OpenAI
-        schema has no such field. ``None`` sends nothing, which is the
-        greedy first rung; the retry rungs pass a value above 1.0.
+        schema has no such field. ``None`` sends nothing; the last
+        retry rung passes a value above 1.0. Decoding stays greedy
+        either way.
     :returns: ``(content, finish_reason, completion_tokens)``.
         ``content`` may be ``None`` if the server returns an empty
         choice. ``finish_reason == "length"`` means the output was cut
@@ -574,8 +572,8 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         valid JSON and ``md`` holds the cleaned text fallback.
         The retry ladder (#238) adds ``attempts`` (rungs spent),
         ``recovered_by`` (the rung that answered, absent on a first-try
-        success), ``render: "threshold"`` and ``sampled: true`` for the
-        rungs that changed the render and the sampling, and ``errors``
+        success), ``render: "threshold"`` and ``repetition_penalty`` for
+        the rungs that changed the render and the decoding, and ``errors``
         (one text per failed rung) whenever a rung failed.
         ``recovered_pages`` lists the pages a retry rung saved.
         ``render_fallback: true`` flags pages the pinned upstream
@@ -819,9 +817,10 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 result["md"] = response
             return result
 
-        # The ladder (scanning #238). Rung 1 is the deterministic
-        # baseline; rung 2 changes the render, rung 3 the sampling too.
-        # A rung fails on a loop, an exhausted transient error, an
+        # The ladder (scanning #238). Rung 1 is the baseline; rung 2
+        # changes the render, rung 3 adds the repetition penalty. All
+        # three decode greedily, so the stage stays deterministic. A
+        # rung fails on a loop, an exhausted transient error, an
         # exhausted empty answer, a post-process exception, or a
         # filtered answer. The filtered answer is kept as the fallback
         # result in case no later rung does better: it is not an error,
@@ -831,16 +830,19 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             "top_p": top_p,
             "repetition_penalty": None,
         }
-        sampled = {
-            "temperature": RETRY_TEMPERATURE,
-            "top_p": RETRY_TOP_P,
-            "repetition_penalty": RETRY_REPETITION_PENALTY,
-        }
+        penalized = {**greedy, "repetition_penalty": RETRY_REPETITION_PENALTY}
         thresholded = None
         rungs = (
             (origin_image, greedy, {}),
             (None, greedy, {"render": "threshold"}),
-            (None, sampled, {"render": "threshold", "sampled": True}),
+            (
+                None,
+                penalized,
+                {
+                    "render": "threshold",
+                    "repetition_penalty": RETRY_REPETITION_PENALTY,
+                },
+            ),
         )
         errors: list[str] = []
         fallback: dict | None = None

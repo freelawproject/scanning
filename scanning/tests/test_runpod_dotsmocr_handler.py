@@ -391,7 +391,7 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(page["attempts"], 1)
         self.assertNotIn("recovered_by", page)
         self.assertNotIn("render", page)
-        self.assertNotIn("sampled", page)
+        self.assertNotIn("repetition_penalty", page)
         self.assertNotIn("errors", page)
         self.assertEqual(result["recovered_pages"], [])
         # The default cap reaches the model: about twice the longest
@@ -434,7 +434,7 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(page["recovered_by"], 2)
         self.assertEqual(page["attempts"], 2)
         self.assertEqual(page["render"], "threshold")
-        self.assertNotIn("sampled", page)
+        self.assertNotIn("repetition_penalty", page)
         self.assertEqual(len(page["errors"]), 1)
         self.assertIn("truncated at 6144 tokens", page["errors"][0])
         self.assertEqual(result["failed_pages"], [])
@@ -449,21 +449,26 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(second["temperature"], 0.0)
         self.assertIsNone(second["repetition_penalty"])
 
-    def test_a_second_loop_is_retried_with_sampling(self):
+    def test_a_second_loop_is_retried_with_a_repetition_penalty(self):
+        # Still greedy: the penalty changes the logits, not the choice
+        # rule, so the stage stays deterministic for the same page.
         result, infer = self._run([self.LOOP, self.LOOP, ("ok", "stop", 3)])
         page = result["pages"][0]
         self.assertEqual(page["md"], "ok")
         self.assertEqual(page["recovered_by"], 3)
         self.assertEqual(page["attempts"], 3)
         self.assertEqual(page["render"], "threshold")
-        self.assertIs(page["sampled"], True)
+        self.assertEqual(
+            page["repetition_penalty"], handler.RETRY_REPETITION_PENALTY
+        )
         self.assertEqual(len(page["errors"]), 2)
         third = infer.call_args_list[2].kwargs
-        self.assertEqual(third["temperature"], handler.RETRY_TEMPERATURE)
-        self.assertEqual(third["top_p"], handler.RETRY_TOP_P)
+        self.assertEqual(third["temperature"], 0.0)
+        self.assertEqual(third["top_p"], 1.0)
         self.assertEqual(
             third["repetition_penalty"], handler.RETRY_REPETITION_PENALTY
         )
+        self.assertFalse(hasattr(handler, "RETRY_TEMPERATURE"))
 
     def test_three_loops_fail_the_page_with_its_history(self):
         result, infer = self._run(
