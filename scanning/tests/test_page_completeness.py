@@ -15,7 +15,11 @@ from django.contrib.messages import get_messages
 from django.urls import reverse
 
 from scanning import dots_mocr, services
-from scanning.factories import ExternalJobFactory, ScanFactory
+from scanning.factories import (
+    ExternalJobFactory,
+    PageEditFactory,
+    ScanFactory,
+)
 from scanning.models import (
     Detection,
     JobEngine,
@@ -315,6 +319,35 @@ class TestDetectRequiresTheApproval(ScanningTestCase):
         self.assertEqual(
             response["Location"],
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2",
+        )
+
+    def test_an_approved_scan_with_an_open_edit_hears_about_the_edit(self):
+        """The pending guard runs after the approval check (#232).
+
+        The other order told a reviewer who had approved to approve
+        again, and sent them to a step 1 with no approve button.
+        """
+        scan = ScanFactory(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
+            page_count=2,
+            ocr_results=dots_results(),
+        )
+        self._make_detection(scan)
+        PageEditFactory(
+            scan=scan, kind=PageEdit.Kind.DELETE_PAGE, pdf_page=1, value=""
+        )
+
+        response = self._detect(scan)
+
+        self.assertEqual(
+            response["Location"],
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1",
+        )
+        flashed = [str(m) for m in get_messages(response.wsgi_request)]
+        self.assertNotIn(PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE, flashed)
+        self.assertTrue(
+            any("not built into the volume yet" in m for m in flashed),
+            flashed,
         )
 
 

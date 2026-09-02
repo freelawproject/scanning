@@ -2894,8 +2894,14 @@ class TestProcessActionsFragment(ScanningTestCase):
         self.assertFalse(body["has_pending_changes"])
         self.assertNotIn("Rebuild &amp; Validate", body["html"])
 
-    def test_pending_deletion_shows_rebuild(self):
-        """A pending deletion makes the bar show Rebuild & Validate."""
+    def test_pending_deletion_keeps_the_review_buttons(self):
+        """A pending deletion no longer takes the bar over (#232).
+
+        The bar used to answer one open edit with "Rebuild & Validate"
+        alone, which refuses since #173, and it hid the recompute and
+        approve buttons while it did. Nothing stamps ``applied_at``
+        until #206, so that state never ended.
+        """
         PageEditFactory(
             scan=self.scan,
             kind=PageEdit.Kind.DELETE_PAGE,
@@ -2908,9 +2914,12 @@ class TestProcessActionsFragment(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.content)
         self.assertTrue(body["has_pending_changes"])
-        self.assertIn("Rebuild &amp; Validate", body["html"])
-        self.assertIn(
+        self.assertNotIn("Rebuild &amp; Validate", body["html"])
+        self.assertNotIn(
             reverse("reprocess", kwargs={"pk": self.scan.pk}), body["html"]
+        )
+        self.assertIn(
+            reverse("recalculate", kwargs={"pk": self.scan.pk}), body["html"]
         )
 
 

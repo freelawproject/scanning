@@ -11,6 +11,10 @@ Two rules run through it:
   on every recompute. Nothing edits one entry of it in place any more,
   so two curators working on two pages of one volume cannot write each
   other's decision away.
+- **A decision is closed, never deleted.** A curator who takes an
+  edit back stamps ``withdrawn_at``, and a second file uploaded for
+  one page withdraws the row before it (#232). So the rows carry
+  every decision a person made about the volume, in order.
 - **An edit whose original is gone is reported, never guessed at.**
   Every address names a page of the original as it was when the edit
   was made (``PageEdit.source_fingerprint``). An edit made against
@@ -24,23 +28,55 @@ from __future__ import annotations
 
 import logging
 
+from django.urls import reverse
+from django.utils import timezone
+
 from scanning.models import CheckName, Issue, PageEdit, Scan
 
 logger = logging.getLogger(__name__)
 
 
 def open_edits(scan: Scan, *kinds: str):
-    """Return the scan's unapplied edits of the given kinds.
+    """Return the scan's standing edits of the given kinds.
+
+    A decision stands until one of two stamps closes it: the apply
+    (#206) writes ``applied_at``, and a curator who takes it back
+    writes ``withdrawn_at`` (#232). Neither stamp deletes anything, so
+    the closed rows stay as the audit of what a person decided and
+    when. Both are filtered here, once, because every reader of these
+    rows comes through this function.
 
     :param scan: The scan whose edits are wanted.
     :param kinds: ``PageEdit.Kind`` values. All kinds when empty.
     :returns: A queryset of open rows, in address order.
     :rtype: django.db.models.QuerySet
     """
-    rows = scan.page_edits.filter(applied_at__isnull=True)
+    rows = scan.page_edits.filter(
+        applied_at__isnull=True, withdrawn_at__isnull=True
+    )
     if kinds:
         rows = rows.filter(kind__in=kinds)
     return rows
+
+
+def withdraw(rows, user) -> int:
+    """Take back the decisions in ``rows``, without deleting them.
+
+    A curator who undoes a deletion, removes an inserted page, or
+    uploads a second file for one page takes a decision back. The row
+    stays, stamped, so the audit shows what was decided and when it
+    was undone (#232). The portal used to delete the row and, for an
+    insert, the file with it.
+
+    :param rows: A queryset of ``PageEdit`` rows to close.
+    :param user: Who took them back. May be None.
+    :returns: How many rows were stamped.
+    :rtype: int
+    """
+    # ``update`` skips ``auto_now``, so the row's ``date_modified`` is
+    # written by hand: the audit reads it as the last touch.
+    now = timezone.now()
+    return rows.update(withdrawn_at=now, withdrawn_by=user, date_modified=now)
 
 
 def is_stale(edit: PageEdit, scan: Scan) -> bool:
@@ -112,10 +148,16 @@ def pending_edit_flags(scan: Scan) -> dict:
     """Return the two pending-edit flags the step-1 bar reads.
 
     One read for both, because they answer one question about one set
-    of rows and the bar shows them together: the outer condition is
-    "are there unapplied edits", the inner one is "does applying them
-    cost a GPU run". Two reads let the pair disagree, which is how one
-    of them came to count a stale insert the other refused.
+    of rows: the outer condition is "are there unapplied edits", the
+    inner one is "does applying them cost a GPU run". Two reads let
+    the pair disagree, which is how one of them came to count a stale
+    insert the other refused.
+
+    Only ``has_pending_changes`` has a reader today: it raises the
+    banner and the badge of step 1. ``has_pending_inserts`` is kept
+    for the apply of #206, whose button is the one that must warn
+    about a paid run; the button that used to read it applied nothing
+    and was deleted with the bar branch that held it (#232).
 
     :param scan: The scan the bar is rendered for.
     :returns: ``has_pending_changes`` and ``has_pending_inserts``.
@@ -142,6 +184,24 @@ def deleted_pages(scan: Scan) -> set[int]:
     return {
         edit.pdf_page
         for edit in current_edits(scan, PageEdit.Kind.DELETE_PAGE)
+    }
+
+
+def replacements_by_page(scan: Scan) -> dict[int, PageEdit]:
+    """Return the standing replacements, keyed by the page they cover.
+
+    What the viewer reads to show that a page was replaced (#232). The
+    current rows only: a row made against another original names a
+    page nobody chose, and ``stale_edit_issues`` reports it instead.
+
+    :param scan: The scan to read.
+    :returns: ``{pdf_page: edit}``, one row per page at most, which
+        the partial unique key holds.
+    :rtype: dict[int, PageEdit]
+    """
+    return {
+        edit.pdf_page: edit
+        for edit in current_edits(scan, PageEdit.Kind.REPLACE_PAGE)
     }
 
 
@@ -180,6 +240,24 @@ def next_ordinal(scan: Scan, anchor_pdf_page: int) -> int:
     return max(taken) + 1 if taken else 0
 
 
+def uploaded_kind(edit: PageEdit) -> str:
+    """Return whether a curator's file is a PDF or an image.
+
+    The stored key keeps the extension the browser sent, narrowed by
+    ``models.page_edit_image_path``, and the upload endpoint writes it
+    from the sniffed bytes rather than from the name (#232). So the
+    extension is the answer, and the viewer draws a PDF in a canvas
+    where it draws an image in an ``<img>``.
+
+    :param edit: An insert or a replacement row.
+    :returns: ``"pdf"`` or ``"image"``. An empty file reads as an
+        image, which is what the viewer's fallback draws.
+    :rtype: str
+    """
+    name = (edit.image.name or "") if edit.image else ""
+    return "pdf" if name.lower().endswith(".pdf") else "image"
+
+
 def _inserted_entry(
     edit: PageEdit, entry: dict | None, unplaced: bool = False
 ) -> dict:
@@ -198,6 +276,13 @@ def _inserted_entry(
     out["type"] = "inserted"
     out["insert_url"] = edit.image.url if edit.image else ""
     out["insert_edit_id"] = edit.pk
+    out["insert_kind"] = uploaded_kind(edit)
+    # The signed URL above expires within the hour, and a review page
+    # stays open for longer. A link a curator may press later goes
+    # through the view that signs one at the moment of the click.
+    out["insert_file_url"] = reverse(
+        "page_edit_file", kwargs={"pk": edit.scan_id, "edit_id": edit.pk}
+    )
     out["unplaced"] = unplaced
     if not out.get("logical_number"):
         out["logical_number"] = edit.logical_page or ""
