@@ -2,7 +2,6 @@
 
 import json
 import logging
-import mimetypes
 import os
 import re
 from pathlib import Path
@@ -10,7 +9,7 @@ from pathlib import Path
 import fitz
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.http import (
     FileResponse,
     Http404,
@@ -85,15 +84,37 @@ PENDING_EDITS_SAVED_MESSAGE = (
 #: mistake, and the web pod would read it into memory to check it.
 PAGE_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
 
-#: What a PDF starts with. The content type is the browser's word, and
-#: the stored extension decides how ``views_api.export_pdf`` and the
-#: apply (#206) read the file later, so the first bytes decide.
+#: What a page file may start with, and the extension that says what
+#: it is. The content type is the browser's word, and the stored
+#: extension decides how ``views_api.export_pdf`` and the apply (#206)
+#: read the file later, so the first bytes decide -- for an image as
+#: much as for a PDF. The image formats are the ones MuPDF opens:
+#: ``insert_image`` fails on any other, and a file it refuses would be
+#: found out at the apply rather than at the upload. WEBP and SVG are
+#: absent for that reason.
 _PDF_MAGIC = b"%PDF-"
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpg"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+    (b"II*\x00", "tif"),
+    (b"MM\x00*", "tif"),
+    (b"BM", "bmp"),
+)
+_MAGIC_LENGTH = max(len(_PDF_MAGIC), *(len(m) for m, _ in _IMAGE_MAGIC))
 
 UPLOAD_TOO_LARGE_MESSAGE = (
     "This file is larger than 50 MB. Upload one page, not a volume."
 )
-UPLOAD_WRONG_TYPE_MESSAGE = "Upload an image of the page, or a PDF of it."
+UPLOAD_WRONG_TYPE_MESSAGE = (
+    "Upload an image of the page (PNG, JPEG, GIF, TIFF or BMP), or a "
+    "PDF of it."
+)
+UPLOAD_LOST_RACE_MESSAGE = (
+    "Somebody else changed this page at the same moment. Reload the "
+    "page to see their file."
+)
 UPLOAD_BAD_PDF_MESSAGE = (
     "This PDF could not be opened. Upload it again, or send an image."
 )
@@ -877,10 +898,12 @@ def _block_if_pending_changes(
     strand the curator's work. They must be applied first (#206), and
     the apply runs after the review-1 approval.
 
-    Only ``start_detect`` calls this, which is step 2. The recompute
-    of review 1 does not: it warns and continues (#151), and the
-    approve button of review 1 does not either (#232) -- the approval
-    is what the apply waits for.
+    Only ``start_detect`` calls this, which is step 2, and it checks
+    the approval before it calls this, so the message here never asks
+    an approved reviewer to approve. The recompute of review 1 does
+    not call this: it warns and continues (#151), and the approve
+    button of review 1 does not either (#232) -- the approval is what
+    the apply waits for.
 
     :param request: The HTTP request.
     :type request: HttpRequest
@@ -894,8 +917,8 @@ def _block_if_pending_changes(
         messages.warning(
             request,
             "Your page changes are not built into the volume yet, so "
-            "this step would ignore them. Approve the page "
-            "completeness review first.",
+            "this step would ignore them. The pass that builds them "
+            "(#206) is not ready.",
         )
         return redirect(
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
@@ -1011,14 +1034,17 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     :return: Redirect to the scan processing page (step 2).
     """
     scan = get_object_or_404(Scan, pk=pk)
-    guard = _block_if_pending_changes(request, scan)
-    if guard:
-        return guard
+    # The approval first, then the pending edits: a scan already
+    # approved with an open edit must hear about the edit, not be
+    # asked to approve again (#232).
     if scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW:
         messages.warning(request, PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE)
         return redirect(
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
         )
+    guard = _block_if_pending_changes(request, scan)
+    if guard:
+        return guard
     if Detection.objects.filter(scan=scan).exists():
         # Detections already exist (from the old full pipeline).
         return redirect(
@@ -1467,9 +1493,12 @@ def _uploaded_page_file(upload) -> str | None:
     - **The bytes decide, not the content type.** A browser names the
       type, and a person can name it wrong. A file that says PDF and
       does not start with ``%PDF-`` is refused, and a file that starts
-      with it is a PDF whatever the browser said.
+      with it is a PDF whatever the browser said. An image is judged
+      the same way, against ``_IMAGE_MAGIC``: a file sent as
+      ``image/svg+xml`` used to pass on its content type alone and
+      fail in ``insert_image`` at the export.
     - **The stored name carries the right extension.** A browser may
-      send a PDF with no extension at all.
+      send a PDF with no extension at all, or a JPEG named ``.png``.
       ``models.page_edit_image_path`` keeps the extension of the name,
       and ``views_api.export_pdf`` reads it to decide between
       ``insert_pdf`` and ``insert_image``, so a wrong extension puts a
@@ -1483,16 +1512,18 @@ def _uploaded_page_file(upload) -> str | None:
     """
     if upload is None:
         return None
-    content_type = (upload.content_type or "").lower()
-    head = upload.read(len(_PDF_MAGIC))
+    head = upload.read(_MAGIC_LENGTH)
     upload.seek(0)
-    if head == _PDF_MAGIC:
+    if head.startswith(_PDF_MAGIC):
         kind, ext = "pdf", "pdf"
-    elif content_type.startswith("image/"):
-        kind = "image"
-        ext = (mimetypes.guess_extension(content_type) or ".png").lstrip(".")
     else:
-        return None
+        ext = next(
+            (ext for magic, ext in _IMAGE_MAGIC if head.startswith(magic)),
+            None,
+        )
+        if ext is None:
+            return None
+        kind = "image"
     base = (upload.name or "page").rsplit("/", 1)[-1].rsplit(".", 1)[0]
     upload.name = f"{base[:64] or 'page'}.{ext}"
     return kind
@@ -1542,6 +1573,36 @@ def _accept_page_upload(upload, one_page: bool) -> tuple[str | None, str]:
         if one_page and pages != 1:
             return None, REPLACEMENT_IS_ONE_PAGE_MESSAGE.format(pages=pages)
     return kind, ""
+
+
+def _save_page_file_row(edit: PageEdit, upload, before=None) -> bool:
+    """Store an upload's file, then its row; drop the file if the row loses.
+
+    Two curators who act on one page at the same moment both find no
+    row to withdraw, and the second insert loses to the partial unique
+    key. ``PageEdit.objects.create`` would have uploaded the file inside
+    the row's own save, so the losing request left an object in the
+    bucket that no row names. Here the file goes to the storage first
+    and the row after it, and a refused row takes its file back.
+
+    :param edit: The unsaved row. Its ``image`` is empty.
+    :param upload: The ``UploadedFile`` to store under it.
+    :param before: Run inside the row's transaction, before the save:
+        the withdrawal of the rows this one supersedes.
+    :returns: Whether the row was saved. False when the unique key
+        refused it, which is the race above.
+    :rtype: bool
+    """
+    edit.image.save(upload.name, upload, save=False)
+    try:
+        with transaction.atomic():
+            if before is not None:
+                before()
+            edit.save()
+    except IntegrityError:
+        edit.image.delete(save=False)
+        return False
+    return True
 
 
 def _pdf_page_of(scan: Scan, raw) -> int | None:
@@ -1751,16 +1812,19 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
             status=400,
         )
 
-    edit = PageEdit.objects.create(
+    edit = PageEdit(
         scan=scan,
         kind=PageEdit.Kind.INSERT_PAGE,
         author=request.user,
         anchor_pdf_page=anchor,
         ordinal=page_edits.next_ordinal(scan, anchor),
         logical_page=label,
-        image=image_file,
         source_fingerprint=scan.source_fingerprint,
     )
+    # Two inserts into one gap at the same moment compute one ordinal;
+    # the second loses to the partial key and leaves no file behind.
+    if not _save_page_file_row(edit, image_file):
+        return JsonResponse({"error": UPLOAD_LOST_RACE_MESSAGE}, status=409)
     return JsonResponse(
         {
             "status": "ok",
@@ -1847,21 +1911,27 @@ def replace_page(request: HttpRequest, pk: int) -> JsonResponse:
     if pdf_page is None:
         return JsonResponse({"error": "Unknown PDF page."}, status=404)
 
-    with transaction.atomic():
+    def withdraw_earlier():
+        """Close the replacement this one supersedes, if any."""
         page_edits.withdraw(
             page_edits.open_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
                 pdf_page=pdf_page
             ),
             request.user,
         )
-        edit = PageEdit.objects.create(
-            scan=scan,
-            kind=PageEdit.Kind.REPLACE_PAGE,
-            author=request.user,
-            pdf_page=pdf_page,
-            image=image_file,
-            source_fingerprint=scan.source_fingerprint,
-        )
+
+    edit = PageEdit(
+        scan=scan,
+        kind=PageEdit.Kind.REPLACE_PAGE,
+        author=request.user,
+        pdf_page=pdf_page,
+        source_fingerprint=scan.source_fingerprint,
+    )
+    # Two replacements of one page at the same moment both withdraw
+    # nothing and both insert; the second loses to the partial unique
+    # key, and its file is taken back with it.
+    if not _save_page_file_row(edit, image_file, before=withdraw_earlier):
+        return JsonResponse({"error": UPLOAD_LOST_RACE_MESSAGE}, status=409)
     return JsonResponse(
         {
             "status": "ok",
@@ -1885,6 +1955,10 @@ def undo_replace_page(request: HttpRequest, pk: int) -> JsonResponse:
     may be replaced again: the unique key is partial over the rows
     that carry neither stamp.
 
+    An undo of a replacement that no longer stands is a no-op, as it
+    is in ``undo_delete_page``: a second tab, or a second click, must
+    not show an error for a page that is already back.
+
     :param request: The HTTP request (JSON body with ``pdf_page``).
     :param pk: Scan primary key.
     :return: JSON response confirming the undo.
@@ -1894,14 +1968,12 @@ def undo_replace_page(request: HttpRequest, pk: int) -> JsonResponse:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-    withdrawn = page_edits.withdraw(
+    page_edits.withdraw(
         page_edits.open_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
             pdf_page=data.get("pdf_page")
         ),
         request.user,
     )
-    if not withdrawn:
-        return JsonResponse({"error": "Unknown replacement."}, status=404)
     return JsonResponse({"status": "ok"})
 
 

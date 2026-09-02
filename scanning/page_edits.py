@@ -73,7 +73,10 @@ def withdraw(rows, user) -> int:
     :returns: How many rows were stamped.
     :rtype: int
     """
-    return rows.update(withdrawn_at=timezone.now(), withdrawn_by=user)
+    # ``update`` skips ``auto_now``, so the row's ``date_modified`` is
+    # written by hand: the audit reads it as the last touch.
+    now = timezone.now()
+    return rows.update(withdrawn_at=now, withdrawn_by=user, date_modified=now)
 
 
 def is_stale(edit: PageEdit, scan: Scan) -> bool:

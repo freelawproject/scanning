@@ -10,8 +10,10 @@ that overlay these rows live in ``test_services.py`` and
 import json
 import pathlib
 import tempfile
+from unittest import mock
 
 import fitz
+from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.db import IntegrityError, transaction
@@ -19,7 +21,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from scanning import page_edits, views_process
+from scanning import page_edits, s3_sync, views_process
 from scanning.factories import PageEditFactory, ScanFactory, UserFactory
 from scanning.models import CheckName, Issue, PageEdit, Scan, Status
 from scanning.tests.test_sharding import write_image_volume
@@ -631,6 +633,8 @@ class TestDeletePageWritesAnEdit(ScanningTestCase):
         edit = self.scan.page_edits.get()
         self.assertIsNotNone(edit.withdrawn_at)
         self.assertEqual(edit.withdrawn_by, self.user)
+        # ``update`` skips ``auto_now``; the audit reads the last touch.
+        self.assertEqual(edit.date_modified, edit.withdrawn_at)
         self.assertEqual(page_edits.deleted_pages(self.scan), set())
 
     def test_a_page_can_be_deleted_again_after_an_undo(self):
@@ -971,13 +975,17 @@ class TestReplaceButton(ScanningTestCase):
         self.assertEqual(self.scan.page_edits.count(), 2)
         self.assertEqual(list(page_edits.replacements_by_page(self.scan)), [2])
 
-    def test_taking_back_a_replacement_that_is_not_there_is_a_404(self):
+    def test_taking_back_a_replacement_that_is_not_there_is_a_no_op(self):
+        """A second tab or a second click must not fail a page that is
+        already back, as in ``undo_delete_page``."""
         response = self.client.post(
             reverse("undo_replace_page", kwargs={"pk": self.scan.pk}),
             data=json.dumps({"pdf_page": 2}),
             content_type="application/json",
         )
-        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content)["status"], "ok")
+        self.assertFalse(self.scan.page_edits.exists())
 
     def test_the_file_view_sends_the_reader_to_the_file(self):
         edit_id = json.loads(self._replace().content)["edit_id"]
@@ -1165,6 +1173,96 @@ class TestPageUploadsTakeAPdf(ScanningTestCase):
         self._replace(self.make_image())
 
         self.assertTrue(self.scan.page_edits.get().image.name.endswith(".png"))
+
+    def test_an_image_is_judged_by_its_bytes_not_its_name(self):
+        """A JPEG named ``.png`` is stored as the JPEG it is."""
+        jpeg = SimpleUploadedFile(
+            "page.png",
+            b"\xff\xd8\xff\xe0" + b"\x00" * 16,
+            content_type="image/png",
+        )
+
+        response = self._replace(jpeg)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.scan.page_edits.get().image.name.endswith(".jpg"))
+
+    def test_an_image_format_mupdf_cannot_open_is_refused(self):
+        """An SVG passed on its content type alone and failed at the export."""
+        svg = SimpleUploadedFile(
+            "page.svg",
+            b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+            content_type="image/svg+xml",
+        )
+
+        response = self._replace(svg)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.content)["error"],
+            views_process.UPLOAD_WRONG_TYPE_MESSAGE,
+        )
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def _stored_files(self):
+        """Return the files under the scan's ``page_edits/`` prefix.
+
+        :returns: The file names the storage holds there.
+        """
+        prefix = (
+            f"{s3_sync.s3_processing_prefix(self.scan)}"
+            f"{s3_sync.PAGE_EDITS_SUBDIR}"
+        )
+        return default_storage.listdir(prefix)[1]
+
+    def test_a_replacement_that_loses_the_race_leaves_no_file(self):
+        """Two replacements of one page at once: the second answers 409
+        and takes its file back, so no object stays that no row names.
+
+        The other request's row is committed before ours, and our
+        withdrawal did not see it: that is the moment the partial
+        unique key refuses our insert.
+        """
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+            image=self.make_image(),
+        )
+        with mock.patch.object(
+            views_process.page_edits, "withdraw", return_value=0
+        ):
+            response = self._replace(self.make_image())
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            json.loads(response.content)["error"],
+            views_process.UPLOAD_LOST_RACE_MESSAGE,
+        )
+        self.assertEqual(self.scan.page_edits.count(), 1)
+        self.assertEqual(len(self._stored_files()), 1)
+
+    def test_an_insert_that_loses_the_race_leaves_no_file(self):
+        """Two inserts into one gap at once compute one ordinal."""
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=1,
+            ordinal=0,
+            logical_page="2",
+            value="",
+            image=self.make_image(),
+        )
+        with mock.patch.object(
+            views_process.page_edits, "next_ordinal", return_value=0
+        ):
+            response = self._insert(self.make_image())
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.scan.page_edits.count(), 1)
+        self.assertEqual(len(self._stored_files()), 1)
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

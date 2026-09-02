@@ -210,8 +210,11 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
   take an insert back, so a dropped image would strand its row.
 - **An undo stamps, and nothing is ever deleted** (#232):
   `undo_delete_page`, `remove_page_insert` and `undo_replace_page` all
-  call `page_edits.withdraw`, and the file of a withdrawn insert or
-  replacement stays in the bucket. The audit must show every decision
+  call `page_edits.withdraw` (which also writes `date_modified`, since
+  `update()` skips `auto_now`), and the file of a withdrawn insert or
+  replacement stays in the bucket. An undo of a decision that no
+  longer stands is a no-op, not an error: a second tab or a second
+  click must not fail a page that is already back. The audit must show every decision
   a person made and every page they sent. It replaced three hard
   deletes and the `update_or_create` of `replace_page`, which wrote
   over `image` and left the first object with no row naming it.
@@ -229,12 +232,21 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
   escaped** (`escapeHtml` in `shared.js`) — both layers on purpose.
   `SET_NUMBER.value` stays numeric: the sequence analysis parses it.
 - **An upload is an image or a PDF** (#232, `_accept_page_upload`).
-  The first bytes decide, not the content type, and the stored name is
-  given the extension of what they say: `page_edit_image_path` keeps
-  that extension and `export_pdf` reads it to choose between
-  `insert_pdf` and `insert_image`. A replacement must be one page; an
-  insert may be several, because a missing leaf often is. Both cap at
+  The first bytes decide, not the content type -- for an image too
+  (`_IMAGE_MAGIC`: PNG, JPEG, GIF, TIFF, BMP, the formats MuPDF opens;
+  an SVG sent as `image/svg+xml` used to pass and fail in
+  `insert_image` at the export) -- and the stored name is given the
+  extension of what they say: `page_edit_image_path` keeps that
+  extension and `export_pdf` reads it to choose between `insert_pdf`
+  and `insert_image`. A replacement must be one page; an insert may be
+  several, because a missing leaf often is. Both cap at
   `PAGE_UPLOAD_MAX_BYTES`.
+- **The file is stored before the row, and taken back if the row
+  loses** (`_save_page_file_row`). Two uploads for one page or one gap
+  at the same moment both find nothing to withdraw and both insert;
+  the second loses to the partial unique key and answers 409. With
+  `objects.create` the losing request left an object in the bucket
+  that no row named.
 - `rotate_page` is an endpoint without a button (the interface belongs
   to #206/#151). `replace_page` has one since #232. `export_pdf`
   applies deletes and inserts only.
@@ -272,9 +284,14 @@ is #206.
   `shared.js markPageAsDeleted` writes over the whole `page-label`,
   and its undo restores the saved label and re-binds the delete button
   alone, so a listener on the Replace button would not survive a
-  deletion and an undo. `markPageAsReplaced` also refreshes
-  `label.dataset.originalHtml` when it exists, or the undo of a
-  deletion would drop the note.
+  deletion and an undo. `refreshSavedLabel` copies the label into
+  `label.dataset.originalHtml` after a note is added or removed, or
+  the undo of a deletion would drop the change -- on a live page only,
+  because while the page is marked for deletion the label is the
+  deletion mark, and saving that would make the undo restore the mark.
+- **`start_detect` checks the approval before the pending edits.** The
+  other order told a scan already approved, with one open edit, to
+  approve again, and sent it to a step 1 with no approve button.
 - **A PDF insert draws its first page in a canvas** with the pdf.js
   the page already loads, under a link that opens the whole file. The
   link stands whatever the render does: a cross-origin read of the

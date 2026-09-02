@@ -649,11 +649,20 @@ document.addEventListener('DOMContentLoaded', function () {
             ' <button class="undo-replace-btn" data-pdf-page="' + pdfPage + '" ' +
             'title="Take this replacement back">Undo</button>';
         label.appendChild(note);
-        // The saved label of a page already marked for deletion must
-        // carry the note too, or the undo of the deletion drops it.
-        if (label.dataset.originalHtml) {
-            label.dataset.originalHtml = label.innerHTML;
-        }
+        refreshSavedLabel(label);
+    }
+
+    // markPageAsDeleted (shared.js) saves the label it finds in
+    // originalHtml, and its undo writes that copy back. A note added
+    // or removed on a live page must reach the copy too, or the undo
+    // of a later deletion drops it. While the page is marked for
+    // deletion the label *is* the deletion mark, and saving that would
+    // make the undo restore the mark itself: so the copy is refreshed
+    // on a live page only.
+    function refreshSavedLabel(label) {
+        if (!label || !label.dataset.originalHtml) { return; }
+        if (label.querySelector('.undo-delete-btn')) { return; }
+        label.dataset.originalHtml = label.innerHTML;
     }
 
     function undoPageReplacement(pdfPage, pageDiv) {
@@ -671,10 +680,7 @@ document.addEventListener('DOMContentLoaded', function () {
             }
             var note = pageDiv.querySelector('.replaced-note');
             if (note) { note.remove(); }
-            var label = pageDiv.querySelector('.page-label');
-            if (label && label.dataset.originalHtml) {
-                label.dataset.originalHtml = label.innerHTML;
-            }
+            refreshSavedLabel(pageDiv.querySelector('.page-label'));
             markSidebarReplaced(pdfPage, false);
             if (typeof window.refreshProcessActionBar === 'function') {
                 window.refreshProcessActionBar();
