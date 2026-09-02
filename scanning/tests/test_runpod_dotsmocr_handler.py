@@ -519,6 +519,23 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(result["recovered_pages"], [])
         self.assertEqual(infer.call_count, 2)
 
+    def test_a_render_failure_on_rung_2_keeps_rung_1_in_the_history(self):
+        # The threshold render runs inside the rung's try, so a PIL
+        # error is rung 2's failure and rung 1's loop is not lost.
+        with mock.patch.object(
+            handler, "_threshold_render", side_effect=ValueError("bad image")
+        ):
+            result, infer = self._run([self.LOOP, ("ok", "stop", 3)], pages=2)
+        page = result["pages"][0]
+        self.assertEqual(result["failed_pages"], [0])
+        self.assertEqual(page["attempts"], 2)
+        self.assertIn("truncated at 6144 tokens", page["errors"][0])
+        self.assertEqual(page["errors"][1], "bad image")
+        self.assertEqual(page["error"], "bad image")
+        self.assertEqual(page["raw"], "x" * 50)
+        self.assertEqual(result["pages"][1]["md"], "ok")
+        self.assertEqual(infer.call_count, 2)
+
     def test_a_loop_then_a_filtered_answer_is_not_a_recovery(self):
         # The fallback text came from rung 2, but nothing can read the
         # page: ``recovered_pages`` is what the deploy reads to judge
