@@ -573,7 +573,11 @@ trained on), tracked on `ExternalJob` rows at
   twice the longest measured page (3114) and not 16384: every rung
   pays the cap once, and at the old value one looping page made its
   shard four times slower. **A result with a hole is never carried**
-  (`jobs.has_unread_pages` in `_reusable_results`, either list), which is what makes
+  (`jobs.has_unread_pages` in `_reusable_results`, either list). The
+  lists are read off the row's stored summary, and the glue stamps
+  them there from the result object itself (`_stamp_page_lists`): a
+  row completed by an S3 HEAD stores `output=None`, and would
+  otherwise pass as clean for good. That is what makes
   `reread_failed_pages` the backfill: it forces a new run
   (`ensure_shard_jobs(force_new_run=True)`) that re-pays only the
   shards with unread pages. Run it after the worker image is live.

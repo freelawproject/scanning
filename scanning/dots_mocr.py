@@ -313,6 +313,53 @@ def _check_envelope(scan, job: ExternalJob, envelope) -> dict:
     return envelope["payload"]
 
 
+#: The per-shard page lists the daemon acts on, and the page-dict key
+#: that puts a page in each (``"error"`` and ``"recovered_by"`` by
+#: presence, ``"filtered"`` by truth).
+PAGE_LISTS = (
+    ("failed_pages", lambda page: "error" in page),
+    ("filtered_pages", lambda page: bool(page.get("filtered"))),
+    ("recovered_pages", lambda page: "recovered_by" in page),
+)
+
+
+def _stamp_page_lists(job: ExternalJob, shard_pages: list[dict]) -> None:
+    """Write a shard's page lists onto its row from the result itself.
+
+    ``jobs.has_unread_pages`` reads the lists off the summary the
+    worker answered with, and a row does not always have one: a row
+    completed by an S3 HEAD after a lost response stores
+    ``output=None``, a carried row copies no summary, and a row
+    written before the worker reported ``filtered_pages`` has that
+    list missing. The glue has the whole result in hand, so it is the
+    one place that can say for sure, and a row it has stamped tells the
+    carry and the backfill the truth whatever the worker's response
+    was.
+
+    Writes only when the stored lists differ, guarded on the row's
+    current status like every other row write, and leaves the rest of
+    the summary alone.
+
+    :param job: The shard's row.
+    :param shard_pages: Its result's page dicts, shard-local.
+    :return: None.
+    """
+    lists = {
+        name: [page["page_no"] for page in shard_pages if member(page)]
+        for name, member in PAGE_LISTS
+    }
+    meta = dict(job.provider_meta or {})
+    output = dict(meta.get("output") or {})
+    if all(output.get(name) == pages for name, pages in lists.items()):
+        return
+    output.update(lists)
+    meta["output"] = output
+    if ExternalJob.objects.filter(pk=job.pk, status=job.status).update(
+        provider_meta=meta
+    ):
+        job.provider_meta = meta
+
+
 def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
     """Glue one run's shard payloads into a volume document on S3.
 
@@ -384,6 +431,7 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
                     f"scan {scan.pk} shard {index} answered page(s) "
                     f"{answered}, the shard has {page_count}"
                 )
+            _stamp_page_lists(job, shard_pages)
             for page in shard_pages:
                 page_index = from_page + page["page_no"]
                 # ``raw`` -- the model's answer as written (#238) --

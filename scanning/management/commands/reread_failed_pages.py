@@ -111,16 +111,25 @@ class Command(BaseCommand):
         scans = list(scans)
 
         started = skipped = 0
+
+        def skip(scan, reason: str) -> None:
+            # A scan the operator named deserves the reason; the
+            # unnamed rest is a count.
+            nonlocal skipped
+            skipped += 1
+            if scan.pk in wanted:
+                self.stderr.write(f"scan {scan.pk}: {reason}")
+
         for scan in scans:
             rows = dots_mocr.live_analyze_jobs(scan)
             if not rows or any(
                 row.status != JobStatus.CONSUMED for row in rows
             ):
-                skipped += 1
+                skip(scan, "the live dots.mocr run is not glued yet")
                 continue
             holes = dots_mocr.shards_with_holes(rows)
             if not holes:
-                skipped += 1
+                skip(scan, "no shard of the live run reports unread pages")
                 continue
             shards = ", ".join(str(row.shard_index + 1) for row in holes)
             if dry_run:
@@ -133,6 +142,7 @@ class Command(BaseCommand):
 
             manifest, reason = sharding.committed_manifest(scan)
             if manifest is None:
+                # Named or not: a stale shard set is worth a line.
                 skipped += 1
                 self.stderr.write(f"scan {scan.pk}: {reason}")
                 continue

@@ -100,10 +100,23 @@ class TestRereadFailedPages(TestCase):
     def test_a_run_without_holes_is_skipped(self):
         scan = self._glued_scan(holes=())
 
-        out, _ = self._call()
+        out, err = self._call()
 
         self.assertEqual(dots_mocr.live_analyze_jobs(scan)[0].run, 1)
         self.assertIn("0 scan(s) to read again, 1 skipped", out)
+        # Unnamed, so a count is enough.
+        self.assertEqual(err, "")
+
+    def test_a_named_scan_hears_why_it_was_skipped(self):
+        scan = self._glued_scan(holes=())
+
+        out, err = self._call(str(scan.pk))
+
+        self.assertIn("1 skipped", out)
+        self.assertIn(
+            f"scan {scan.pk}: no shard of the live run reports unread pages",
+            err,
+        )
 
     def test_an_approved_volume_is_left_alone(self):
         scan = self._glued_scan(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
