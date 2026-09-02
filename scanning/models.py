@@ -160,6 +160,11 @@ class QueuedAction(models.TextChoices):
     DETECT = "detect", "Detect"
     REPROCESS = "reprocess", "Reprocess"
     GENERATE_FILES = "generate_files", "Generate Files"
+    # Issue #196: turn a merged detection run into Detection rows,
+    # paired opinions and redaction geometry. Queued work rather than a
+    # pass on the collect tick, because it renders every page of the
+    # volume three times (~83s for 1364 pages).
+    COMPUTE_REDACTIONS = "compute_redactions", "Compute Redactions"
 
 
 class UploadAction(models.TextChoices):
@@ -1059,11 +1064,22 @@ class Detection(AbstractDateTimeModel):
     )
 
     class ModelName(models.TextChoices):
-        """YOLO model tier or source of the detection."""
+        """YOLO model tier or source of the detection.
+
+        ``BL_WARM`` is the single 18-class checkpoint that replaced the
+        small/medium/large trio (blackletter #73, image #194). It is
+        not only a label: the confidence gates differ per model family
+        (``label_confidence(label, bl_warm)``), so a row that cannot
+        say which family found it is read with the legacy gates. The
+        row's ``found_by`` carries the same fact per detection, and
+        ``blackletter.bl_warm.rows_are_bl_warm`` is the one reader of
+        it.
+        """
 
         SMALL = "small", "Small"
         MEDIUM = "medium", "Medium"
         LARGE = "large", "Large"
+        BL_WARM = "bl_warm", "bl-warm"
         MANUAL = "manual", "Manual"
 
     page_index = models.PositiveIntegerField(db_index=True)

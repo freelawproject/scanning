@@ -21,6 +21,10 @@ import fitz
 from blackletter.api import (
     build_redactions as bl_build_redactions,
 )
+from blackletter.api import (
+    pair as bl_pair,
+)
+from blackletter.bl_warm import rows_are_bl_warm
 from blackletter.margins import compute_margin_rects
 from blackletter.models import (
     BBox,
@@ -48,6 +52,7 @@ from django.conf import settings
 from django.db.models import Case, F, Value, When
 
 from scanning.models import (
+    BUSY_STATUSES,
     DEAD_JOB_STATUSES,
     CheckName,
     Detection,
@@ -58,6 +63,7 @@ from scanning.models import (
     OpinionScan,
     OpinionStatus,
     PageEdit,
+    QueuedAction,
     QueueStatus,
     Scan,
     Stage,
@@ -658,6 +664,16 @@ def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
             "img_height": d.img_height,
             "model_count": d.model_count,
         }
+        if d.found_by:
+            # Load-bearing, not decoration: the confidence gates are per
+            # model family since blackletter #73, and
+            # ``rows_are_bl_warm`` reads this provenance off the file.
+            # ``blackletter.api.pair`` reads it from here, so a file
+            # without it pairs a bl-warm volume on the legacy gates.
+            # A hand-added detection carries none, and must not: it
+            # would read as a second model family and send the whole
+            # volume back to those gates.
+            entry["found_by"] = d.found_by
         pn = page_numbers.get(d.page_index)
         if pn:
             entry["page_number"] = pn[0]
@@ -732,6 +748,14 @@ def _build_document_from_detections(
         volume=str(scan_obj.volume) or "",
         first_page=scan_obj.start_page or 1,
         ocr_applied=True,
+        # Which confidence gates every consumer of this document reads
+        # (``label_confidence(label, document.bl_warm)``). bl-warm and
+        # the legacy trio score the same labels differently, so this is
+        # not a label: on one volume of 1364 pages the wrong family
+        # keeps 13 editorial notes bl-warm drops, and drops 8 header
+        # boxes it keeps. The provenance travels on each row's
+        # ``found_by``, and blackletter reads it (blackletter #73).
+        bl_warm=rows_are_bl_warm(det_data),
     )
     return document
 
@@ -816,6 +840,10 @@ def _detections_for_geometry(scan_pk: int, output_dir: str | Path) -> list:
             "bbox": [d.x0, d.y0, d.x1, d.y1],
             "img_width": d.img_width,
             "img_height": d.img_height,
+            # The model family, which picks the confidence gates. See
+            # :func:`_sync_detections_to_disk`, which writes the same
+            # field to the file this function falls back to.
+            **({"found_by": d.found_by} if d.found_by else {}),
         }
         for d in rows
     ]
@@ -854,7 +882,7 @@ def _pages_for_geometry(
 
 
 def _compute_and_save_margin_rects(
-    scan_pk: int, pdf_path: str, output_dir: str
+    scan_pk: int, pdf_path: str, output_dir: str, force: bool = False
 ) -> list:
     """Compute margin rects and save them to the Scan model.
 
@@ -866,10 +894,15 @@ def _compute_and_save_margin_rects(
     :param scan_pk: Primary key of the scan.
     :param pdf_path: Path to the PDF to compute margins for.
     :param output_dir: Directory (used for detection lookup only).
+    :param force: Measure again even when the scan already holds
+        strips. The stored strips are computed *from* the detections,
+        so a fresh detection run must replace them; every other caller
+        wants the cached answer, since measuring renders the whole
+        volume at 100 dpi.
     :return: The computed margin rects list.
     """
     scan = Scan.objects.get(pk=scan_pk)
-    if scan.margin_rects:
+    if scan.margin_rects and not force:
         return scan.margin_rects
     pages = _pages_for_geometry(scan, pdf_path, Path(output_dir))
     if not pages:
@@ -1369,6 +1402,308 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
 # ---------------------------------------------------------------------------
 # Full pipeline (upload and walk away)
 # ---------------------------------------------------------------------------
+
+
+def _import_detections(scan_pk: int, detections: list) -> int:
+    """Replace a scan's model detections with the ones just merged.
+
+    The rows a curator made by hand (``model_name`` ``MANUAL``) are
+    kept, and every other row goes. A hand-drawn box costs curator time
+    and it addresses the same physical page of the same original, so a
+    re-run of a deterministic model is no reason to throw it away.
+    What the re-run does replace is every box the model itself drew.
+
+    ``found_by`` is copied onto each row, because the confidence gates
+    are per model family (``label_confidence(label, bl_warm)``), and
+    that field is where every reader looks for the family.
+
+    :param scan_pk: Primary key of the scan.
+    :param detections: The merged document's ``detections`` list, in
+        volume page coordinates.
+    :return: How many rows were created.
+    """
+    kept = Detection.objects.filter(
+        scan_id=scan_pk, model_name=Detection.ModelName.MANUAL
+    ).count()
+    Detection.objects.filter(scan_id=scan_pk).exclude(
+        model_name=Detection.ModelName.MANUAL
+    ).delete()
+
+    # One decision for the whole run, off blackletter's own reader,
+    # rather than a guess per row: the run either came from bl-warm or
+    # it did not.
+    model_name = (
+        Detection.ModelName.BL_WARM if rows_are_bl_warm(detections) else ""
+    )
+    rows = []
+    for entry in detections:
+        bbox = entry.get("bbox") or [0, 0, 1, 1]
+        rows.append(
+            Detection(
+                scan_id=scan_pk,
+                page_index=entry["page_index"],
+                label=entry["label"],
+                label_id=entry["label_id"],
+                confidence=entry["confidence"],
+                x0=bbox[0],
+                y0=bbox[1],
+                x1=bbox[2],
+                y1=bbox[3],
+                img_width=entry.get("img_width", 0),
+                img_height=entry.get("img_height", 0),
+                model_name=model_name,
+                model_count=entry.get("model_count", 1),
+                found_by=entry.get("found_by") or [],
+                active=True,
+            )
+        )
+    Detection.objects.bulk_create(rows, batch_size=1000)
+    logger.info(
+        "Imported %d detection(s) for scan %s (%d hand-made row(s) kept)",
+        len(rows),
+        scan_pk,
+        kept,
+    )
+    return len(rows)
+
+
+def run_compute_redactions(scan_pk: int) -> None:
+    """Turn a merged detection run into the geometry review 2 reads.
+
+    The apply step of issue #196, dispatched by ``process_next_scan``
+    from ``QueuedAction.COMPUTE_REDACTIONS``, which
+    ``yolo.queue_ready_runs`` writes on the collect tick.
+
+    **Queued work, unlike the page-number apply of #204.** Three of its
+    steps read the page ink, so they render every page of the volume:
+    83 seconds for 1364 pages, measured, plus the pull of the bitonal
+    copy. The collect tick runs every 15 seconds on a serial scheduler
+    (#156), so this belongs where the other long stages already run.
+
+    **The model read the original; the geometry reads the bitonal
+    copy.** bl-warm collapses on 1-bit pages, so detection fans out
+    over the original shards (#167/#194), while the rects are stamped
+    on the bitonal copy and must be measured against its ink. Both
+    files have the page geometry of the original, so the two spaces
+    agree.
+
+    **The detections are imported once per run.** A run the apply has
+    already stamped is a *recompute*, which a curator asks for after
+    they add or delete a box: it keeps every row in the database and
+    measures again from those. Importing again there would throw the
+    curator's edits away, which is the whole reason they pressed the
+    button.
+
+    The scan goes back to the review it came from whatever happens,
+    and this function raises nothing. An ``ERROR`` status on
+    an approved volume would need an admin re-queue, and that re-queue
+    runs the whole pipeline again. A failure is counted on the run
+    instead (``yolo.record_apply_failure``), which bounds the retries.
+
+    :param scan_pk: Primary key of the scan to compute redactions for.
+    :return: None.
+    """
+    from scanning import s3_sync, yolo
+
+    django.db.connections.close_all()
+    scan = Scan.objects.get(pk=scan_pk)
+    rows = yolo.live_detect_jobs(scan)
+    merged = bool(rows) and all(
+        row.status == JobStatus.CONSUMED for row in rows
+    )
+    has_rows = Detection.objects.filter(scan_id=scan_pk, active=True).exists()
+    # Where to hand the scan back. A volume with detections but no
+    # detection *run* is a legacy one, and its step 2 lives in
+    # PENDING_REVIEW, since the #154 states describe a review it never
+    # had. Every other volume came from review 1, dead run or not.
+    park = (
+        Status.PENDING_REVIEW
+        if has_rows and not rows
+        else Status.PAGE_COMPLETENESS_REVIEW_DONE
+    )
+    if not merged and not has_rows:
+        # Nothing to measure: no merged run, and no detections from an
+        # earlier one. Park the scan back rather than fail it -- the
+        # queue claim is the only thing that was wrong.
+        logger.warning(
+            "compute_redactions: scan %s has neither a merged detection "
+            "run nor detections",
+            scan_pk,
+        )
+        _park_after_redactions(
+            scan_pk,
+            "No detections to work from. Run detection first.",
+            park,
+        )
+        return
+
+    # A merged run that was never applied brings its detections in. Any
+    # other case measures what the database already holds: a recompute
+    # after a curator's edit, or a legacy volume whose rows the old
+    # pipeline wrote.
+    importing = merged and not yolo.apply_state(rows).get("applied_at")
+    if merged:
+        yolo.record_apply_start(rows)
+    started = time.monotonic()
+    try:
+        detections = []
+        if importing:
+            _update_progress(
+                scan_pk, "Reading the detections of this volume..."
+            )
+            document = yolo.load_merged_document(scan, rows[0].run)
+            detections = document.get("detections") or []
+            if not detections:
+                raise RuntimeError(
+                    f"scan {scan_pk}: the merged detection run holds no "
+                    f"detections"
+                )
+
+        _pull_processing_files_from_s3(scan_pk)
+        scan.refresh_from_db()
+        ensure_output_dir(scan)
+        output_dir = scan.output_dir
+        pdf_path = processing_pdf_path(scan)
+
+        if importing:
+            with _log_stage("Import detections"):
+                _import_detections(scan_pk, detections)
+
+            # Only after an import: the correction converges, so it is
+            # a no-op once it is stored, and it renders every page.
+            _update_progress(scan_pk, "Measuring the text columns...")
+            with _log_stage("Column correction"):
+                _snap_text_columns_to_ink(scan_pk, pdf_path)
+
+        det_data = _sync_detections_to_disk(scan_pk, upload=False)
+        _update_progress(scan_pk, "Pairing the opinions...")
+        with _log_stage("Opinion pairing"):
+            opinions = bl_pair(
+                str(Path(output_dir) / "detections.json"),
+                pdf_path,
+                reporter=scan.reporter.short_name or "",
+                volume=str(scan.volume) or "",
+                first_page=scan.start_page or 1,
+            )
+        Scan.objects.filter(pk=scan_pk).update(opinions_json=opinions)
+
+        _update_progress(scan_pk, "Computing the redactions...")
+        rects = _compute_and_save_redaction_rects(scan_pk, pdf_path)
+
+        _update_progress(scan_pk, "Measuring the page margins...")
+        margins = _compute_and_save_margin_rects(
+            scan_pk, pdf_path, output_dir, force=True
+        )
+
+        Scan.objects.filter(pk=scan_pk).update(s3_uploaded=False)
+        _push_processing_files_to_s3(scan_pk)
+    except Exception as exc:
+        logger.exception(
+            "compute_redactions: scan %s failed after %.1fs",
+            scan_pk,
+            time.monotonic() - started,
+        )
+        if merged:
+            yolo.record_apply_failure(scan, rows, exc)
+        _park_after_redactions(
+            scan_pk,
+            "The redaction computation failed. The detections are safe, "
+            "and it runs again by itself.",
+            park,
+        )
+        return
+
+    if merged:
+        yolo.record_apply_success(rows)
+    _park_after_redactions(
+        scan_pk, "Detection review is ready: check the redactions.", park
+    )
+    logger.info(
+        "compute_redactions: scan %s: %d detection(s), %d opinion(s), "
+        "%d page(s) with rects, %d page(s) with margins, in %.1fs",
+        scan_pk,
+        len(det_data or []),
+        len(opinions),
+        len(rects),
+        len(margins),
+        time.monotonic() - started,
+    )
+    if s3_sync.s3_active():
+        s3_sync.release_local_processing(scan)
+
+
+#: The statuses a redaction computation may be queued from. The
+#: approved volume of the new flow, and the legacy ``PENDING_REVIEW``
+#: rows, which reached review 2 before the #154 statuses existed. A
+#: busy scan is refused: it holds a claim already.
+REDACTION_COMPUTE_STATUSES = (
+    Status.PAGE_COMPLETENESS_REVIEW_DONE,
+    Status.PENDING_REVIEW,
+)
+
+
+def queue_redaction_compute(scan: "Scan") -> tuple[bool, str]:
+    """Ask the daemon to compute this scan's redaction geometry.
+
+    The request path never does this work itself. It renders every page
+    of the volume, which is 83 seconds for 1364 pages and beyond what
+    an ingress gives a request. So the two review-2 buttons write a
+    status here and return, and the viewer's progress poll reloads the
+    page when the daemon is done -- the same route every other long
+    stage takes.
+
+    The compare-and-swap is what keeps a second press from stacking:
+    the scan leaves the eligible statuses on the first one.
+
+    :param scan: The scan to compute for.
+    :returns: Whether it was queued, and a message for the curator.
+    :rtype: tuple[bool, str]
+    """
+    queued = Scan.objects.filter(
+        pk=scan.pk, status__in=REDACTION_COMPUTE_STATUSES
+    ).update(
+        status=Status.QUEUED,
+        queued_action=QueuedAction.COMPUTE_REDACTIONS,
+        progress_message="The redactions are queued for computation.",
+        progress_current=0,
+        progress_total=0,
+    )
+    if queued:
+        return True, (
+            "Queued. The redactions are computed on the server, and this "
+            "page reloads when they are ready."
+        )
+    if scan.status in BUSY_STATUSES:
+        return False, "This volume is busy. Wait for the current work."
+    return False, (
+        "This volume is not in a state that can compute redactions."
+    )
+
+
+def _park_after_redactions(
+    scan_pk: int, message: str, status: str = None
+) -> None:
+    """Return a scan to the review it was taken from, whatever happened.
+
+    The compute is the only queued action that runs *after* a review,
+    so it must give the scan back where it took it. It is guarded on
+    the busy statuses alone, so an admin who moved the scan while it
+    computed keeps their decision.
+
+    :param scan_pk: Primary key of the scan.
+    :param message: What to show under the progress bar.
+    :param status: Where to park it. Defaults to review 1's finished
+        state; a legacy volume goes back to ``PENDING_REVIEW``, which
+        is where its own step 2 lives, because the #154 states describe
+        a review it never had.
+    :return: None.
+    """
+    Scan.objects.filter(
+        pk=scan_pk, status__in=(Status.PROCESSING, Status.QUEUED)
+    ).update(
+        status=status or Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        progress_message=message,
+    )
 
 
 def run_full_pipeline(scan_pk: int) -> None:

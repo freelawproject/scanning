@@ -57,10 +57,14 @@ reach step 2.
     {% endif %}
   </span>
   {% endif %}
-  {% if user.is_staff and not yolo_run.open %}
+  {# Only an approved volume: the run ends in an apply that rewrites the
+     detections and the redaction geometry (#196), and the queue pass
+     takes a scan from PAGE_COMPLETENESS_REVIEW_DONE alone -- so a
+     button offered earlier would pay for a run nothing applies. #}
+  {% if user.is_staff and page_review_done and not yolo_run.open %}
   <form method="post" action="{% url 'start_yolo_detect' scan.pk %}" class="inline">
     {% csrf_token %}
-    <button type="submit" class="btn-outline text-sm" title="Detect captions, key icons and headnotes on every page of the original with YOLO on RunPod. Nothing reads the output yet (incurs costs $$$)" onclick="return confirm('This runs YOLO detection on RunPod over every page of this volume. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}{% if yolo_run %}Re-run detection{% else %}Run detection{% endif %}</button>
+    <button type="submit" class="btn-outline text-sm" title="Detect captions, key icons and headnotes on every page of the original with YOLO on RunPod, then compute the redactions of review 2 (incurs costs $$$)" onclick="return confirm('This runs YOLO detection on RunPod over every page of this volume. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}{% if yolo_run %}Re-run detection{% else %}Run detection{% endif %}</button>
   </form>
   {% endif %}
   {% if has_pending_changes %}

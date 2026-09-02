@@ -57,25 +57,29 @@ with the staff button kept for re-runs), the page numbers plus Issues
 as an apply pass on the collect tick (#149/#204), review 1 got its
 approve button (#151) and one model for its human page edits (#214),
 and YOLO detection came back as a rebuilt worker image (#194) with its
-job rows and its staff button (#195), all below; still missing is the
-redaction work that reads the detection output (#196), so:
+job rows and its staff button (#195) and the redaction work that reads
+its output (#196), all below; what is still missing is step 3, the
+file generation (#206), so:
 
 - `run_full_pipeline` shards the original (#164), sets `page_count`,
   enqueues the dots.mocr read (#207) when `_can_analyze` allows,
   then either starts the bitonal conversion (`Status.AWAITING`) or
   parks the scan in `Status.AWAITING_VALIDATION`.
 - Every user-facing action that would re-trigger a legacy stage
-  (`start_validate`, `start_detect` without existing detections,
-  `reprocess`, `generate_files`) refuses with
+  (`start_validate`, `reprocess`, `generate_files`) refuses with
   `utils.PIPELINE_PAUSED_MESSAGE` — one constant, flashed as a warning
   banner in HTML views. `start_validate` splits by scan (#151): only a
   legacy row hears "paused", because a new-pipeline volume is refused
-  permanently, not temporarily. The daemon parks pre-cutover queued rows
+  permanently, not temporarily. `start_detect` left that set with #196:
+  detection works, so a volume with no detections is told that a staff
+  member starts the run (`NO_DETECTIONS_MESSAGE`), not that a pipeline
+  is paused. The daemon parks pre-cutover queued rows
   carrying a legacy `queued_action` back to PENDING_REVIEW with the
   same message; admin re-queue resets `queued_action` to
   FULL_PIPELINE.
-- The post-review-1 machinery (`run_generate_files`, pairing, redaction
-  geometry, `upload_approved_files`) is kept but nothing queues it.
+- Pairing and the redaction geometry have a caller again (#196, below).
+  `run_generate_files` and `upload_approved_files` — step 3 — are kept
+  but nothing queues them.
 - `serve_scan_pdf` never streams the original (#185): with no
   `bitonal.pdf` it answers 202 (a preview is coming — poll) or 409
   (none will come) with a stage-specific message and
@@ -99,9 +103,10 @@ writes READY — the last prerequisite by construction, and it restores
 READY after an admin re-queue parks a ready scan back in
 `AWAITING_VALIDATION` (re-queue -> bitonal park -> the next apply
 tick). `views_process.approve_page_completeness` (#151, below) is the
-only writer of DONE, and #195/#196
-trigger off DONE writing **no** scan status, so redaction work never
-blocks either review. Both are parked human states outside
+only writer of DONE, and both detection stages trigger off it: #195
+writes **no** scan status while it reads, and #196 borrows the scan
+from DONE and hands it straight back (`_park_after_redactions`), so
+neither review is ever blocked by redaction work. Both are parked human states outside
 `BUSY_STATUSES` (no polling, no sweep); `AWAITING_VALIDATION` now means
 "review-1 prerequisites outstanding". `recalculate_issues` preserves
 both (`PENDING_REVIEW` remains for legacy rows and step 2 only) with a
@@ -584,8 +589,9 @@ ends in a digit.
 with `bl_warm`, one 18-class checkpoint that replaced the
 small/medium/large trio (blackletter #73). It is the image only: the job
 rows and the daemon path are #195 (below), and the redaction work that
-reads its output is #196, so a fresh deploy still has no automatic
-caller — one staff button is the only way in. What must not be broken:
+reads its output is #196 (below). One staff button is still the only
+way in — the pipeline enqueues no detection until #211. What must not
+be broken:
 
 - **Only `bl_warm.pt` is baked.** `api.detect` calls `ensure_weights`
   itself, so an unbaked name would reach Hugging Face from inside a paid
@@ -672,8 +678,11 @@ only what is new or specific:
   `yolo.ensure_detect_jobs` is the only creator, and
   `TestKnownEnqueuePaths` pins its one caller — so an automatic caller
   has to delete a test line rather than slip in. The button is **not**
-  "Next: Detect": that button still refuses (#173), and rewiring step 2
-  belongs to #196, which is what gives the output a reader.
+  "Next: Detect": that one only walks to step 2 when detections exist
+  (#196). Since #196 the button also refuses a volume review 1 has not
+  approved, because the apply takes a scan from
+  `PAGE_COMPLETENESS_REVIEW_DONE` alone — a run started earlier would
+  be paid for and never read.
 - **Each RunPod engine is its own endpoint, and `jobs.RunpodEngine` is
   where that lives.** dots.mocr's endpoint id, concurrency cap, attempt
   cap and per-page allowance used to be read by name for every RunPod
@@ -697,11 +706,10 @@ only what is new or specific:
   collapse on 1-bit pages (caption F1 0.99 -> 0.25, measured in #167).
   Same as dots.mocr, so both fan out over the one shard set of #164 and
   neither cuts its own.
-- **The rows stop at `COMPLETED`.** There is deliberately no glue and
-  no `CONSUMED`: #196 reads the per-shard results, offsets each
-  `page_index` by its shard's own `from_page` (the worker counts from
-  zero inside its shard), and turns them into `Detection` rows and
-  redaction geometry. So **nothing may delete a detect result** — a
+- **The rows stop at `COMPLETED` until the merge takes them.** The
+  merge is #196, below: it offsets each `page_index` by its shard's own
+  `from_page` (the worker counts from zero inside its shard) and flips
+  the rows to `CONSUMED`. **Nothing may delete a detect result** — a
   re-read must never cost a paid run, which is also why
   `ensure_detect_jobs` passes `reuse_results=True` while the bitonal
   stage, whose merge deletes its results, must not.
@@ -729,6 +737,86 @@ only what is new or specific:
 - `YOLO_SECONDS_PER_PAGE = 2.0` is a first guess, deliberately
   generous. #211 replaces it with a measured value.
 
+## Redactions from the detection run (issue #196)
+
+What reads the #195 output, and what re-opened review 2. Two steps,
+and the split between them is the whole design: `yolo.finish_ready_runs`
+merges the run on the collect tick, and
+`services.run_compute_redactions` measures the geometry as queued work.
+The pieces: the merge half of `yolo.py`,
+`services.run_compute_redactions` / `_import_detections` /
+`queue_redaction_compute`, `QueuedAction.COMPUTE_REDACTIONS`, and the
+two review-2 endpoints in `views_api.py`. What must not be broken:
+
+- **The apply is queued work, and the collect tick only triggers it.**
+  Three of its steps read the page ink, so they render every page of
+  the volume: 83 seconds for 1364 pages, measured, plus the pull of
+  `bitonal.pdf`. The tick runs every 15 seconds on a serial scheduler
+  (#156), so a pass that measured inline would stop every submit and
+  every poll for minutes. `yolo.queue_ready_runs` writes one status and
+  returns; `process_next_scan` runs the work. This is the one place
+  where the shape differs from the page-number apply (#204), which
+  stays off the queue because it is seconds of work over a JSON file.
+- **The apply never writes ERROR.** It parks the scan back in
+  `PAGE_COMPLETENESS_REVIEW_DONE` on every path
+  (`_park_after_redactions`, guarded on the busy statuses) and raises
+  nothing, so the generic ERROR arm in `process_next_scan` never sees
+  it. An ERROR on an approved volume needs an admin re-queue, and that
+  re-queue runs the whole pipeline again. Failures are counted on the
+  run instead (`provider_meta["apply"]`, `APPLY_MAX_ATTEMPTS`), the
+  same loud-then-quiet ledger the glue uses.
+- **`queued_at` is the claim, `applied_at` is the stamp.** The trigger
+  writes `queued_at` so it does not queue the same scan on every tick;
+  the work drops it as it starts, so a failed apply is queued again.
+  `applied_at` closes the run for good.
+- **Only `PAGE_COMPLETENESS_REVIEW_DONE` is taken**, with a
+  compare-and-swap, and the staff button refuses every other status for
+  the same reason: review 2 follows review 1, and a run started earlier
+  would be paid for and never read.
+- **The detections are imported once per run.** A run already stamped
+  is a *recompute*, which a curator asks for after they edit a box: it
+  keeps every row in the database and measures again from those.
+  Importing again there would throw the curator's edits away, which is
+  the whole reason they pressed the button. A first import keeps the
+  `MANUAL` rows and replaces every other one, and a volume with no
+  detect rows at all (the legacy pipeline wrote its detections)
+  measures what the database holds.
+- **The model read the original; the geometry reads the bitonal copy.**
+  bl-warm collapses on 1-bit pages, so detection fans out over the
+  original shards (#167/#194), while the rects are stamped on the
+  bitonal copy and must be measured against its ink (PR #167). Both
+  files carry the page geometry of the original.
+- **`found_by` is load-bearing, in three places.** The confidence gates
+  are per model family since blackletter #73
+  (`label_confidence(label, document.bl_warm)`), so the provenance has
+  to survive the merge, the `Detection` row and `detections.json` —
+  `blackletter.api.pair` reads `rows_are_bl_warm` off that *file*. On
+  one volume of 1364 pages the wrong family keeps 13 editorial notes
+  bl-warm drops and loses 8 header boxes it keeps. A hand-added box
+  carries no `found_by` on purpose: one would read as a second family
+  and send the whole volume back to the legacy gates.
+- **The per-shard results are kept.** Issue #196 asks for it: a page
+  insert or a replacement recomputes the merge from them. The bitonal
+  merge deletes its results, and this stage must not copy that.
+- **The merged document carries `Scan.source_fingerprint`**, and the
+  apply refuses one from another original. The shard identity ties the
+  *rows* to today's bytes, but the document outlives its run. A blank
+  on either side matches anything, the rule the page edits use (#214).
+- **The merge checks less than the dots.mocr glue, and has to.** That
+  payload lists every page, so a lost page is visible; this one lists
+  detections, and a page with none reads exactly like a page nobody
+  looked at. What is checkable is checked: the shard sequence, the
+  shard's own page count as the worker reported it, every page index
+  inside its shard, and one model family for the whole volume.
+- **No page view starts a measurement.** The step-2 template used to
+  fire `compute-redactions` on load whenever the rects were missing;
+  that is deleted, or a volume whose apply failed would start a
+  volume-wide render on every reload. The two review-2 endpoints queue
+  the work and answer 202, and `viewer_progress.js` already reloads the
+  page when the scan parks — so "Re-pair Opinions" now recomputes the
+  pairing, the rects and the strips together, which is right, since all
+  three are measured from the same detections.
+
 ## Local disk hygiene (issue #215)
 
 - The daemon frees `/tmp/scanning/{pk}`
@@ -742,7 +830,8 @@ only what is new or specific:
   mtime in the whole tree (`_tree_mtime`) — writes land three levels
   down, so the top mtime is only the creation time.
 - The sweep also reclaims leaked `TemporaryDirectory` scratch dirs
-  (`bitonal.MERGE_TMP_PREFIX`, `dots_mocr.GLUE_TMP_PREFIX`) that a
+  (`bitonal.MERGE_TMP_PREFIX`, `dots_mocr.GLUE_TMP_PREFIX`,
+  `yolo.MERGE_TMP_PREFIX`) that a
   SIGKILL orphans in the system temp dir. Off under TESTING; the
   command's tests point `gettempdir` at a scratch root.
 

@@ -441,7 +441,13 @@ function pairOpinions() {
     if (cfg.step < 2) return;
     var btn = document.getElementById("pair-btn");
     if (!btn) return;
-    btn.textContent = "Pairing...";
+    // The endpoint queues the work and answers at once (#196): the
+    // pairing, the redaction rects and the margin strips are measured
+    // together on the daemon, because they all read the same
+    // detections and the measurement renders every page. The reload
+    // below shows the progress bar, which reloads again when the
+    // daemon parks the scan.
+    btn.textContent = "Queueing...";
     btn.disabled = true;
     fetch("/scans/" + cfg.docId + "/pair-opinions/", {
         method: "POST",

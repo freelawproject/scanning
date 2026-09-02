@@ -973,6 +973,58 @@ def _is_reusable(live: list[ExternalJob]) -> bool:
     return not any(job.status in DEAD_JOB_STATUSES for job in live)
 
 
+def check_result_envelope(
+    scan, job: ExternalJob, envelope, action: str, error_cls: type
+) -> dict:
+    """Return an envelope's payload, or refuse the envelope.
+
+    Shared by every stage that reads a worker's result object, because
+    the envelope is the one thing the workers agree on: the same
+    ``RESULT_SCHEMA_VERSION``, written by ``runpod_common``, for every
+    image. The checks close delivery faults, not model quality -- the
+    object at the row's key must be an envelope this reader
+    understands, written for this scan by this attempt. An unknown
+    ``schema_version`` usually means a worker deployed ahead of the
+    daemon, so the message names both versions rather than guessing at
+    the content.
+
+    :param scan: The scan being read.
+    :param job: The row whose result the envelope claims to be.
+    :param envelope: The parsed JSON found at ``job.result_key``.
+    :param action: The handler action the envelope must name.
+    :param error_cls: The exception class to raise, so each stage
+        reports its own failure type.
+    :returns: ``envelope["payload"]``.
+    :rtype: dict
+    :raises error_cls: If the envelope is not one this attempt should
+        have produced.
+    """
+    if not isinstance(envelope, dict) or "payload" not in envelope:
+        raise error_cls(
+            f"scan {scan.pk} shard {job.shard_index}: the object at "
+            f"{job.result_key} is not a result envelope"
+        )
+    version = envelope.get("schema_version")
+    if version != runpod_client.RESULT_SCHEMA_VERSION:
+        raise error_cls(
+            f"scan {scan.pk} shard {job.shard_index} answered result "
+            f"schema {version}; this reader knows "
+            f"{runpod_client.RESULT_SCHEMA_VERSION}"
+        )
+    for field, expected in (
+        ("action", action),
+        ("scan_pk", scan.pk),
+        ("result_key", job.result_key),
+    ):
+        got = envelope.get(field)
+        if got != expected:
+            raise error_cls(
+                f"scan {scan.pk} shard {job.shard_index} envelope has "
+                f"{field}={got!r}, expected {expected!r}"
+            )
+    return envelope["payload"]
+
+
 def live_run(scan, stage: str, engine: str) -> list[ExternalJob]:
     """Return a target's current-run rows for one engine, in page order.
 

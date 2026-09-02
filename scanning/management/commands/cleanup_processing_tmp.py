@@ -148,7 +148,8 @@ class Command(BaseCommand):
     def _sweep_leaked_stage_dirs(self, cutoff: float) -> int:
         """Delete leaked merge and glue scratch directories.
 
-        The bitonal merge and the dots.mocr glue download shard results
+        The bitonal merge, the dots.mocr glue and the detection merge
+        download shard results
         into ``TemporaryDirectory`` dirs in the system temp dir --
         outside ``PROCESSING_TMP_DIR``, so the sweep above never sees
         them. A normal exit removes them; a SIGKILL mid-stage leaks
@@ -162,6 +163,7 @@ class Command(BaseCommand):
         """
         from scanning.bitonal import MERGE_TMP_PREFIX
         from scanning.dots_mocr import GLUE_TMP_PREFIX
+        from scanning.yolo import MERGE_TMP_PREFIX as DETECT_TMP_PREFIX
 
         if getattr(settings, "TESTING", False):
             # A test run must never walk the developer's real temp dir.
@@ -177,7 +179,9 @@ class Command(BaseCommand):
         for child in temp_root.iterdir():
             if not child.is_dir():
                 continue
-            if not child.name.startswith((MERGE_TMP_PREFIX, GLUE_TMP_PREFIX)):
+            if not child.name.startswith(
+                (MERGE_TMP_PREFIX, GLUE_TMP_PREFIX, DETECT_TMP_PREFIX)
+            ):
                 continue
             if _tree_mtime(child) < cutoff:
                 try:

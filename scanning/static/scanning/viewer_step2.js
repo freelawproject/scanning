@@ -965,11 +965,20 @@ document.addEventListener('DOMContentLoaded', function () {
             STATE_ABBREVIATION: true, PAGE_HEADER: true, PAGE_NUMBER: true,
             DIVIDER: true, HEADNOTE_BRACKET: true, EDITORIAL: true,
             CASE_SEQUENCE: true, HEADNOTE: true, CASE_METADATA: true,
-            FOOTNOTES: true, IMAGE: true,
+            FOOTNOTES: true, IMAGE: true, TEXT_COLUMN: true,
+            BACKGROUND: true, SYLLABUS: true, JUDGES: true,
         };
-        var pageDets = _detectionsForPage(pdfIndex).filter(function (d) {
-            return d.manual || USED_LABELS[d.label];
-        });
+        // A column box is the full height of its column, so it would cover the
+        // detections inside it and take their clicks. Draw those first, and the
+        // .layout class puts them a layer down, so what sits inside them stays
+        // on top and stays selectable.
+        var pageDets = _detectionsForPage(pdfIndex)
+            .filter(function (d) {
+                return d.manual || USED_LABELS[d.label];
+            })
+            .sort(function (a, b) {
+                return (a.label === 'TEXT_COLUMN' ? 0 : 1) - (b.label === 'TEXT_COLUMN' ? 0 : 1);
+            });
         if (!pageDets.length) return;
 
         // Scale: detections are in pixel coords (img_width x img_height)
@@ -1005,6 +1014,7 @@ document.addEventListener('DOMContentLoaded', function () {
             box.title = d.label + ' (' + d.confidence + ')\n' + detTag;
 
             if (d.manual) box.classList.add('manual');
+            if (d.label === 'TEXT_COLUMN') box.classList.add('layout');
 
             var label = document.createElement('span');
             label.className = 'detection-label';
@@ -1250,20 +1260,17 @@ document.addEventListener('DOMContentLoaded', function () {
             pageDiv.querySelector('.detect-btn').classList.add('active');
             drawDetectionOverlay(pageDiv, pdfIndex);
 
-            // Auto re-pair if pairing label
+            // A caption or a key icon changes the opinion pairing, and
+            // with it the redaction rects and the margin strips. That
+            // whole computation now runs on the daemon and takes the
+            // volume out of review while it does (#196), so it is not
+            // started here: an auto re-pair on every added box would
+            // interrupt the reviewer in the middle of their edits. Say
+            // what is pending instead, and let them press the button
+            // once they are done.
             var _pLabels = ['CASE_CAPTION', 'KEY_ICON'];
             if (_pLabels.indexOf(labelName) >= 0) {
-                fetch('/scans/' + documentId + '/pair-opinions/', {
-                    method: 'POST',
-                    headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-                }).then(function(r) { return r.json(); })
-                .then(function(d2) {
-                    if (d2.error) {
-                        alert('Error: ' + d2.error);
-                        return;
-                    }
-                    window.location.reload();
-                });
+                showToast('Saved. Press "Re-pair Opinions" when you finish editing.', 'success');
             }
         });
     }
