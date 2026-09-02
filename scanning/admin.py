@@ -669,9 +669,11 @@ class PageEditAdmin(admin.ModelAdmin):
         "value",
         "author",
         "applied_at",
+        "withdrawn_at",
+        "withdrawn_by",
         "date_created",
     ]
-    list_filter = ["kind", "applied_at"]
+    list_filter = ["kind", "applied_at", "withdrawn_at"]
     search_fields = ["scan__id", "value"]
     raw_id_fields = ["scan", "author"]
     readonly_fields = [
@@ -686,6 +688,8 @@ class PageEditAdmin(admin.ModelAdmin):
         "logical_page",
         "image",
         "source_fingerprint",
+        "withdrawn_at",
+        "withdrawn_by",
         "date_created",
         "date_modified",
     ]

@@ -10,14 +10,18 @@ that overlay these rows live in ``test_services.py`` and
 import json
 import pathlib
 import tempfile
+from unittest import mock
 
 import fitz
+from django.core.files.storage import default_storage
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
+from scanning import page_edits, s3_sync, views_process
 from scanning.factories import PageEditFactory, ScanFactory, UserFactory
 from scanning.models import CheckName, Issue, PageEdit, Scan, Status
 from scanning.tests.test_sharding import write_image_volume
@@ -621,12 +625,26 @@ class TestDeletePageWritesAnEdit(ScanningTestCase):
         self._post("delete_page", 2)
         self.assertEqual(self.scan.page_edits.count(), 1)
 
-    def test_an_undo_removes_the_row(self):
+    def test_an_undo_withdraws_the_row_and_keeps_it(self):
         self._post("delete_page", 2)
 
         self.assertEqual(self._post("undo_delete_page", 2).status_code, 200)
 
-        self.assertFalse(self.scan.page_edits.exists())
+        edit = self.scan.page_edits.get()
+        self.assertIsNotNone(edit.withdrawn_at)
+        self.assertEqual(edit.withdrawn_by, self.user)
+        # ``update`` skips ``auto_now``; the audit reads the last touch.
+        self.assertEqual(edit.date_modified, edit.withdrawn_at)
+        self.assertEqual(page_edits.deleted_pages(self.scan), set())
+
+    def test_a_page_can_be_deleted_again_after_an_undo(self):
+        self._post("delete_page", 2)
+        self._post("undo_delete_page", 2)
+
+        self.assertEqual(self._post("delete_page", 2).status_code, 200)
+
+        self.assertEqual(self.scan.page_edits.count(), 2)
+        self.assertEqual(page_edits.deleted_pages(self.scan), {2})
 
     def test_a_page_the_volume_does_not_have_is_refused(self):
         self.assertEqual(self._post("delete_page", 9).status_code, 404)
@@ -760,7 +778,26 @@ class TestPageInsertEndpoints(ScanningTestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertFalse(self.scan.page_edits.exists())
+        edit = self.scan.page_edits.get()
+        self.assertIsNotNone(edit.withdrawn_at)
+        self.assertEqual(edit.withdrawn_by, self.user)
+        self.assertEqual(page_edits.inserts_by_gap(self.scan), {})
+
+    def test_a_removed_insert_keeps_its_file(self):
+        edit_id = json.loads(
+            self._upload(anchor_pdf_page=1, page_number=2).content
+        )["edit_id"]
+        name = PageEdit.objects.get(pk=edit_id).image.name
+
+        self.client.post(
+            reverse("remove_page_insert", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"edit_id": edit_id}),
+            content_type="application/json",
+        )
+
+        edit = PageEdit.objects.get(pk=edit_id)
+        self.assertEqual(edit.image.name, name)
+        self.assertTrue(edit.image.storage.exists(name))
 
     def test_removing_an_unknown_insert_is_a_404(self):
         response = self.client.post(
@@ -791,13 +828,23 @@ class TestReplaceAndRotateEndpoints(ScanningTestCase):
         self.assertEqual(edit.pdf_page, 2)
         self.assertTrue(edit.image.name)
 
-    def test_a_second_replacement_of_one_page_updates_its_row(self):
+    def test_a_second_replacement_withdraws_the_first_row(self):
         for _ in range(2):
             self.client.post(
                 reverse("replace_page", kwargs={"pk": self.scan.pk}),
                 data={"image": self.make_image(), "pdf_page": 2},
             )
-        self.assertEqual(self.scan.page_edits.count(), 1)
+
+        rows = list(self.scan.page_edits.order_by("date_created"))
+        self.assertEqual(len(rows), 2)
+        self.assertIsNotNone(rows[0].withdrawn_at)
+        self.assertIsNone(rows[1].withdrawn_at)
+        # Both files stand: the audit shows every page a person sent,
+        # and an overwritten field would leave the first with no row.
+        self.assertNotEqual(rows[0].image.name, rows[1].image.name)
+        for row in rows:
+            self.assertTrue(row.image.storage.exists(row.image.name))
+        self.assertEqual(list(page_edits.replacements_by_page(self.scan)), [2])
 
     def test_a_rotation_is_recorded(self):
         response = self.client.post(
@@ -818,6 +865,404 @@ class TestReplaceAndRotateEndpoints(ScanningTestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertFalse(self.scan.page_edits.exists())
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestReplaceButton(ScanningTestCase):
+    """The Replace button of review 1, and what it shows (issue #232)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            page_count=3,
+            source_fingerprint="100:3",
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            ocr_results=[
+                {
+                    "pdf_page": n,
+                    "detected": str(n),
+                    "type": "single",
+                    "score": 1.0,
+                    "zone": "header",
+                }
+                for n in (1, 2, 3)
+            ],
+        )
+
+    def _replace(self, pdf_page=2, upload=None):
+        """Post one replacement.
+
+        :param pdf_page: The page it stands for.
+        :param upload: The file. A small PNG when None.
+        :returns: The HTTP response.
+        """
+        return self.client.post(
+            reverse("replace_page", kwargs={"pk": self.scan.pk}),
+            data={"image": upload or self.make_image(), "pdf_page": pdf_page},
+        )
+
+    def _step_one(self):
+        """Return the rendered step-1 page.
+
+        :returns: The HTTP response.
+        """
+        return self.client.get(
+            reverse("scan_process", kwargs={"pk": self.scan.pk}) + "?step=1"
+        )
+
+    def test_the_page_carries_the_replacement_for_the_viewer(self):
+        edit_id = json.loads(self._replace().content)["edit_id"]
+
+        context = self._step_one().context
+
+        replaced = json.loads(context["replaced_pages_json"])
+        self.assertEqual(list(replaced), ["2"])
+        self.assertEqual(replaced["2"]["edit_id"], edit_id)
+        self.assertEqual(replaced["2"]["kind"], "image")
+        self.assertEqual(
+            replaced["2"]["url"],
+            reverse(
+                "page_edit_file",
+                kwargs={"pk": self.scan.pk, "edit_id": edit_id},
+            ),
+        )
+
+    def test_the_sidebar_row_of_a_replaced_page_says_so(self):
+        self._replace(pdf_page=2)
+
+        response = self._step_one()
+
+        rows = response.context["ocr_results"]
+        self.assertEqual(
+            [r["is_replaced"] for r in rows], [False, True, False]
+        )
+        self.assertContains(response, "REPL")
+
+    def test_a_replacement_of_another_original_is_not_shown(self):
+        self._replace()
+        self.scan.page_edits.update(source_fingerprint="999:9")
+
+        context = self._step_one().context
+
+        self.assertEqual(json.loads(context["replaced_pages_json"]), {})
+
+    def test_a_replacement_can_be_taken_back(self):
+        self._replace(pdf_page=2)
+
+        response = self.client.post(
+            reverse("undo_replace_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"pdf_page": 2}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        edit = self.scan.page_edits.get()
+        self.assertIsNotNone(edit.withdrawn_at)
+        self.assertEqual(edit.withdrawn_by, self.user)
+        self.assertEqual(page_edits.replacements_by_page(self.scan), {})
+
+    def test_a_page_can_be_replaced_again_after_an_undo(self):
+        self._replace(pdf_page=2)
+        self.client.post(
+            reverse("undo_replace_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"pdf_page": 2}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(self._replace(pdf_page=2).status_code, 200)
+
+        self.assertEqual(self.scan.page_edits.count(), 2)
+        self.assertEqual(list(page_edits.replacements_by_page(self.scan)), [2])
+
+    def test_taking_back_a_replacement_that_is_not_there_is_a_no_op(self):
+        """A second tab or a second click must not fail a page that is
+        already back, as in ``undo_delete_page``."""
+        response = self.client.post(
+            reverse("undo_replace_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"pdf_page": 2}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content)["status"], "ok")
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_the_file_view_sends_the_reader_to_the_file(self):
+        edit_id = json.loads(self._replace().content)["edit_id"]
+
+        response = self.client.get(
+            reverse(
+                "page_edit_file",
+                kwargs={"pk": self.scan.pk, "edit_id": edit_id},
+            )
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(
+            PageEdit.objects.get(pk=edit_id).image.name, response["Location"]
+        )
+
+    def test_the_file_view_serves_a_withdrawn_row(self):
+        edit_id = json.loads(self._replace().content)["edit_id"]
+        self.client.post(
+            reverse("undo_replace_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"pdf_page": 2}),
+            content_type="application/json",
+        )
+
+        response = self.client.get(
+            reverse(
+                "page_edit_file",
+                kwargs={"pk": self.scan.pk, "edit_id": edit_id},
+            )
+        )
+
+        self.assertEqual(response.status_code, 302)
+
+    def test_the_file_view_refuses_a_row_of_another_scan(self):
+        other = ScanFactory(page_count=1)
+        edit_id = json.loads(self._replace().content)["edit_id"]
+
+        response = self.client.get(
+            reverse(
+                "page_edit_file",
+                kwargs={"pk": other.pk, "edit_id": edit_id},
+            )
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_the_file_view_needs_a_login(self):
+        edit_id = json.loads(self._replace().content)["edit_id"]
+        self.client.logout()
+
+        response = self.client.get(
+            reverse(
+                "page_edit_file",
+                kwargs={"pk": self.scan.pk, "edit_id": edit_id},
+            )
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/login", response["Location"])
+
+    def test_the_approve_button_stands_although_edits_are_pending(self):
+        self._replace()
+
+        response = self._step_one()
+
+        self.assertContains(
+            response, "I reviewed this scan and it is complete"
+        )
+        self.assertNotContains(response, "Rebuild &amp; Validate")
+
+    def test_the_banner_says_what_is_not_done_yet(self):
+        self._replace()
+
+        response = self._step_one()
+
+        self.assertContains(response, "Your page changes are saved.")
+        self.assertContains(response, "#206")
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestPageUploadsTakeAPdf(ScanningTestCase):
+    """A curator may send an image of a page or a PDF of it (#232)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(page_count=3, source_fingerprint="100:3")
+
+    @staticmethod
+    def _pdf(pages=1, name="page.pdf"):
+        """Return an uploaded PDF of the given length.
+
+        :param pages: How many pages it holds.
+        :param name: The name the browser sends.
+        :returns: A SimpleUploadedFile holding a real PDF.
+        """
+        doc = fitz.open()
+        for _ in range(pages):
+            doc.new_page()
+        data = doc.tobytes()
+        doc.close()
+        return SimpleUploadedFile(name, data, content_type="application/pdf")
+
+    def _replace(self, upload, pdf_page=2):
+        """Post one replacement.
+
+        :param upload: The file to send.
+        :param pdf_page: The page it stands for.
+        :returns: The HTTP response.
+        """
+        return self.client.post(
+            reverse("replace_page", kwargs={"pk": self.scan.pk}),
+            data={"image": upload, "pdf_page": pdf_page},
+        )
+
+    def _insert(self, upload):
+        """Post one insert into the gap after page 1.
+
+        :param upload: The file to send.
+        :returns: The HTTP response.
+        """
+        return self.client.post(
+            reverse("add_page_insert", kwargs={"pk": self.scan.pk}),
+            data={"image": upload, "anchor_pdf_page": 1, "page_number": "2"},
+        )
+
+    def test_a_pdf_replaces_a_page(self):
+        response = self._replace(self._pdf())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content)["kind"], "pdf")
+        self.assertTrue(self.scan.page_edits.get().image.name.endswith(".pdf"))
+
+    def test_a_pdf_with_no_extension_is_stored_as_one(self):
+        self._replace(self._pdf(name="scan"))
+
+        self.assertTrue(self.scan.page_edits.get().image.name.endswith(".pdf"))
+
+    def test_a_pdf_of_several_pages_is_refused_as_a_replacement(self):
+        response = self._replace(self._pdf(pages=2))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("one page", json.loads(response.content)["error"])
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_a_pdf_of_several_pages_is_accepted_as_an_insert(self):
+        response = self._insert(self._pdf(pages=2))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content)["kind"], "pdf")
+
+    def test_a_file_that_lies_about_being_a_pdf_is_refused(self):
+        upload = SimpleUploadedFile(
+            "page.pdf", b"not a pdf at all", content_type="application/pdf"
+        )
+
+        response = self._replace(upload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_neither_an_image_nor_a_pdf_is_refused(self):
+        upload = SimpleUploadedFile(
+            "notes.txt", b"hello", content_type="text/plain"
+        )
+
+        response = self._replace(upload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_a_file_over_the_cap_is_refused(self):
+        upload = SimpleUploadedFile(
+            "page.png",
+            b"x" * (views_process.PAGE_UPLOAD_MAX_BYTES + 1),
+            content_type="image/png",
+        )
+
+        response = self._replace(upload)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("50 MB", json.loads(response.content)["error"])
+
+    def test_an_image_keeps_its_own_extension(self):
+        self._replace(self.make_image())
+
+        self.assertTrue(self.scan.page_edits.get().image.name.endswith(".png"))
+
+    def test_an_image_is_judged_by_its_bytes_not_its_name(self):
+        """A JPEG named ``.png`` is stored as the JPEG it is."""
+        jpeg = SimpleUploadedFile(
+            "page.png",
+            b"\xff\xd8\xff\xe0" + b"\x00" * 16,
+            content_type="image/png",
+        )
+
+        response = self._replace(jpeg)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.scan.page_edits.get().image.name.endswith(".jpg"))
+
+    def test_an_image_format_mupdf_cannot_open_is_refused(self):
+        """An SVG passed on its content type alone and failed at the export."""
+        svg = SimpleUploadedFile(
+            "page.svg",
+            b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+            content_type="image/svg+xml",
+        )
+
+        response = self._replace(svg)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.content)["error"],
+            views_process.UPLOAD_WRONG_TYPE_MESSAGE,
+        )
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def _stored_files(self):
+        """Return the files under the scan's ``page_edits/`` prefix.
+
+        :returns: The file names the storage holds there.
+        """
+        prefix = (
+            f"{s3_sync.s3_processing_prefix(self.scan)}"
+            f"{s3_sync.PAGE_EDITS_SUBDIR}"
+        )
+        return default_storage.listdir(prefix)[1]
+
+    def test_a_replacement_that_loses_the_race_leaves_no_file(self):
+        """Two replacements of one page at once: the second answers 409
+        and takes its file back, so no object stays that no row names.
+
+        The other request's row is committed before ours, and our
+        withdrawal did not see it: that is the moment the partial
+        unique key refuses our insert.
+        """
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+            image=self.make_image(),
+        )
+        with mock.patch.object(
+            views_process.page_edits, "withdraw", return_value=0
+        ):
+            response = self._replace(self.make_image())
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            json.loads(response.content)["error"],
+            views_process.UPLOAD_LOST_RACE_MESSAGE,
+        )
+        self.assertEqual(self.scan.page_edits.count(), 1)
+        self.assertEqual(len(self._stored_files()), 1)
+
+    def test_an_insert_that_loses_the_race_leaves_no_file(self):
+        """Two inserts into one gap at once compute one ordinal."""
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=1,
+            ordinal=0,
+            logical_page="2",
+            value="",
+            image=self.make_image(),
+        )
+        with mock.patch.object(
+            views_process.page_edits, "next_ordinal", return_value=0
+        ):
+            response = self._insert(self.make_image())
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.scan.page_edits.count(), 1)
+        self.assertEqual(len(self._stored_files()), 1)
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

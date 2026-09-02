@@ -44,6 +44,12 @@ number, the parallel-page-number icon is dropped or read as a stray
 line arrive as two lines of **one** cell. Parallel page numbers
 themselves are deferred.
 
+A page the book compresses prints a range in place of the number
+(``913–925``, issue #233). The range is read at the corner of its
+line, exactly as a single number is, and it enters ``ocr_results``
+with ``type="range"``: the sequence analysis then breaks at that page
+and counts every page the range covers as present.
+
 A page the worker failed or filtered has no cells and gets
 ``detected=None``; the sequence analysis reports it as
 ``no_page_number`` and interpolates across it, and review 1's manual
@@ -74,8 +80,15 @@ FOOTER_CATEGORY = "Page-footer"
 #: A printed page number: 1 to 4 digits, possibly glued to the stray
 #: ``L`` the parallel-page icon is misread as.
 _NUMBER_RE = re.compile(r"^L?(\d{1,4})L?$")
-#: A first-last range like ``677-685``, hyphen or en dash.
+#: A first-last range like ``677-685``, hyphen or en dash. The line
+#: form allows the spaces the printer sets around the dash; the token
+#: form is the range as one word of a longer line.
 _RANGE_RE = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
+_RANGE_TOKEN_RE = re.compile(r"^(\d{1,4})[–\-](\d{1,4})$")
+#: How many pages one printed range may cover. A compressed opinion
+#: covers tens of pages; a docket number (``19-1234``) covers more
+#: than any book page can, which is how the guard tells them apart.
+MAX_RANGE_SPAN = 200
 #: Superscript digits are neighbouring-footnote noise, never part of
 #: the page number; drop them before any token is read.
 _SUPERSCRIPTS = str.maketrans("", "", "⁰¹²³⁴⁵⁶⁷⁸⁹")
@@ -99,12 +112,39 @@ def _clean(text: str) -> str:
     return text.translate(_SUPERSCRIPTS).strip()
 
 
+def _range_value(match: re.Match | None) -> str | None:
+    """Return the range a match names, when the two numbers are pages.
+
+    A page range runs forward and it is short: the compressed page of
+    a withdrawn opinion covers tens of pages (issue #233). Two numbers
+    joined by a dash are not always a range -- a docket number
+    (``19-1234``) runs far past the end of any volume, and a split
+    year (``1996-97``) runs backward -- so both shapes are refused
+    here rather than read as a page.
+
+    :param match: A match of one of the range patterns, or None.
+    :returns: The range as ``"913-925"``, or None.
+    :rtype: str | None
+    """
+    if match is None:
+        return None
+    first, last = int(match.group(1)), int(match.group(2))
+    if first < 1 or last <= first or last - first > MAX_RANGE_SPAN:
+        return None
+    return f"{first}-{last}"
+
+
 def _line_readings(line: str) -> list[tuple[str, str, str]]:
     """Read the page numbers one line of a cell offers.
 
     The running head puts the number at the page's outer corner, so it
     is the first or the last token of its line -- never a token buried
     in the middle, which is a year, a docket number or a citation.
+
+    A range is read at the corner too, not only as the whole line
+    (#233): the head band of a compressed page prints
+    ``913–925 ATLANTIC REPORTER, 2d SERIES``, and the whole-line rule
+    left that page with no number at all.
 
     :param line: One cleaned line of a cell's text.
     :returns: ``(detected, type, side)`` per reading, where ``side`` is
@@ -116,20 +156,26 @@ def _line_readings(line: str) -> list[tuple[str, str, str]]:
     tokens = line.split()
     if not tokens:
         return []
-    range_match = _RANGE_RE.match(line)
-    if range_match:
-        return [
-            (f"{range_match.group(1)}-{range_match.group(2)}", "range", "both")
-        ]
+    whole_line_range = _range_value(_RANGE_RE.match(line))
+    if whole_line_range:
+        return [(whole_line_range, "range", "both")]
     leading = _NUMBER_RE.match(tokens[0])
     if len(tokens) == 1:
+        # A lone token that is a range was the whole line above, so
+        # only a bare number is left to read here.
         return [(leading.group(1), "single", "both")] if leading else []
+    leading_range = _range_value(_RANGE_TOKEN_RE.match(tokens[0]))
     trailing = _NUMBER_RE.match(tokens[-1])
+    trailing_range = _range_value(_RANGE_TOKEN_RE.match(tokens[-1]))
     readings = []
     if leading:
         readings.append((leading.group(1), "single", "left"))
+    elif leading_range:
+        readings.append((leading_range, "range", "left"))
     if trailing:
         readings.append((trailing.group(1), "single", "right"))
+    elif trailing_range:
+        readings.append((trailing_range, "range", "right"))
     return readings
 
 

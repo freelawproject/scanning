@@ -187,10 +187,13 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
   the image follows (0 = before page 1), `ordinal` orders one gap.
   `project_inserts` stamps the anchor on every `missing` placeholder,
   and the upload sends it back.
-- **Applying closes an edit** (`applied_at`), never rewrites it, so
-  every unique key is partial over the open rows
-  (`condition=Q(applied_at__isnull=True)`) — else a page could not be
-  edited again after an apply.
+- **Two stamps close an edit, and neither rewrites or deletes it**:
+  `applied_at` (the apply, #206) and `withdrawn_at` (the curator took
+  it back, #232). So every unique key is partial over the rows that
+  carry neither (`applied_at__isnull=True &
+  withdrawn_at__isnull=True`) — else a page could not be edited again
+  — and so is every lookup of `get_or_create` / `update_or_create` in
+  `views_process`, or one would match a row that decides nothing.
 - **A dismissal is unique per check, not per page**: rebuilds give
   `Issue` rows new PKs, so the check name is the only stable handle.
   Its address space follows `models.PHYSICAL_PAGE_CHECKS`;
@@ -210,10 +213,22 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
 - **Every open insert reaches the viewer**: `project_inserts` appends
   an unplaceable one flagged `unplaced` — Remove is the only way to
   take an insert back, so a dropped image would strand its row.
+- **An undo stamps, and nothing is ever deleted** (#232):
+  `undo_delete_page`, `remove_page_insert` and `undo_replace_page` all
+  call `page_edits.withdraw` (which also writes `date_modified`, since
+  `update()` skips `auto_now`), and the file of a withdrawn insert or
+  replacement stays in the bucket. An undo of a decision that no
+  longer stands is a no-op, not an error: a second tab or a second
+  click must not fail a page that is already back. The audit must show every decision
+  a person made and every page they sent. It replaced three hard
+  deletes and the `update_or_create` of `replace_page`, which wrote
+  over `image` and left the first object with no row naming it.
 - **`has_pending_changes` counts `STRUCTURAL_KINDS` only** — a number
-  or a dismissal needs no apply. Both step-1 bar flags come from one
-  read (`page_edits.pending_edit_flags` via `_review_flags`); computed
-  apart they disagreed on stale rows.
+  or a dismissal needs no apply. It raises the step-1 banner and
+  badge; `has_pending_inserts` comes from the same read
+  (`page_edits.pending_edit_flags` via `_review_flags`) and waits for
+  #206, whose apply button is the one that must warn about a paid
+  run. Computed apart, the two disagreed on stale rows.
 - **The image is on the default storage** under the scan's
   `page_edits/` prefix: excluded from the generic sync, swept by admin
   deletion, presignable for #206. `PageInsert` used
@@ -221,12 +236,72 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
 - **The printed label is free text: narrowed** (`_page_label`) **and
   escaped** (`escapeHtml` in `shared.js`) — both layers on purpose.
   `SET_NUMBER.value` stays numeric: the sequence analysis parses it.
-- `replace_page` / `rotate_page` are endpoints without buttons (the
-  interface belongs to #206/#151). `export_pdf` applies deletes and
-  inserts only.
+- **An upload is an image or a PDF** (#232, `_accept_page_upload`).
+  The first bytes decide, not the content type -- for an image too
+  (`_IMAGE_MAGIC`: PNG, JPEG, GIF, TIFF, BMP, the formats MuPDF opens;
+  an SVG sent as `image/svg+xml` used to pass and fail in
+  `insert_image` at the export) -- and the stored name is given the
+  extension of what they say: `page_edit_image_path` keeps that
+  extension and `export_pdf` reads it to choose between `insert_pdf`
+  and `insert_image`. A replacement must be one page; an insert may be
+  several, because a missing leaf often is. Both cap at
+  `PAGE_UPLOAD_MAX_BYTES`.
+- **The file is stored before the row, and taken back if the row
+  loses** (`_save_page_file_row`). Two uploads for one page or one gap
+  at the same moment both find nothing to withdraw and both insert;
+  the second loses to the partial unique key and answers 409. With
+  `objects.create` the losing request left an object in the bucket
+  that no row named.
+- `rotate_page` is an endpoint without a button (the interface belongs
+  to #206/#151). `replace_page` has one since #232. `export_pdf`
+  applies deletes and inserts only.
 - Data migrations: 0013 (manual readings), 0015 (the retired models),
   0016 (the drop). Run `migrate_page_insert_images` on the pod holding
   the files; until then a migrated insert names an absent S3 key.
+
+## Replace a page, and approve with edits pending (issue #232)
+
+The Replace button of review 1, beside Delete on every page of step 1.
+It writes a `REPLACE_PAGE` row (#214) and shows a note on the page and
+a `REPL` badge in the sidebar row; the note's "View" link goes through
+`page_edit_file`, a redirect that signs a URL at the moment of the
+click (the storage's own URL expires within the hour, and a review
+page stays open longer). Nothing builds the row into the volume: that
+is #206.
+
+- **The approve button no longer waits for an apply.** The step-1 bar
+  answered one open structural edit with "Rebuild & Validate" alone,
+  and hid the recompute and approve buttons while it did. That branch
+  is deleted. Two things had made it a dead end: `reprocess` refuses
+  for every scan since #173, and nothing stamps `PageEdit.applied_at`,
+  so "pending" lasted for the rest of the review rather than until the
+  next rebuild. One deleted duplicate page therefore ended a curator's
+  review. The apply runs *after* the approval by design, so a bar that
+  waited for it waited for the button it was hiding.
+- **The pending banner says the whole truth**, and
+  `PENDING_EDITS_SAVED_MESSAGE` says the same words: the changes are
+  saved, the corrected volume is not built from them yet, each
+  inserted or replaced page must go through the conversion and the OCR
+  on its own, and we apply them when that pass is ready. Do not
+  shorten it back to "not applied yet" — a curator who cannot see why
+  has no way to judge the risk of approving.
+- **The viewer binds Replace by delegation on the container.**
+  `shared.js markPageAsDeleted` writes over the whole `page-label`,
+  and its undo restores the saved label and re-binds the delete button
+  alone, so a listener on the Replace button would not survive a
+  deletion and an undo. `refreshSavedLabel` copies the label into
+  `label.dataset.originalHtml` after a note is added or removed, or
+  the undo of a deletion would drop the change -- on a live page only,
+  because while the page is marked for deletion the label is the
+  deletion mark, and saving that would make the undo restore the mark.
+- **`start_detect` checks the approval before the pending edits.** The
+  other order told a scan already approved, with one open edit, to
+  approve again, and sent it to a step 1 with no approve button.
+- **A PDF insert draws its first page in a canvas** with the pdf.js
+  the page already loads, under a link that opens the whole file. The
+  link stands whatever the render does: a cross-origin read of the
+  bucket needs the CORS rule of #185, which a deployment may not carry
+  yet.
 
 ## Bitonal via doctor (issue #176)
 
@@ -582,6 +657,33 @@ ends in a digit.
   closes the run, #204). Run `reapply_page_numbers` after the deploy:
   it re-reads the stored glued document at no GPU cost, keeps the
   numbers a curator typed (#214), and leaves an approved volume alone.
+
+## The compressed page (issue #233)
+
+A book prints several pages on one physical page, and the head band
+then carries a range (`913–925`) in place of the number. The stage
+that answers it is the reading, not the issue computation:
+`blackletter.validate` already breaks the sequence at a `type="range"`
+entry and counts every page the range covers as present, so a volume
+that shows "Large gap" is a volume whose range nobody read.
+
+- **A range is read at the corner of its line**, like a single number.
+  The whole-line rule alone left the compressed page of a reporter
+  with no number at all, because the line reads
+  `913–925 ATLANTIC REPORTER, 2d SERIES`.
+- **Two numbers joined by a dash are not always a range.**
+  `page_numbers._range_value` guards every range: forward, and at most
+  `MAX_RANGE_SPAN` pages. A docket number (`19-1234`) runs past the
+  end of any volume and a split year (`1996-97`) runs backward.
+- **The curator may type one**, in step 1 and in `assign_page`, with
+  the dash the page prints: `views_process._page_number_value` reads
+  an en dash and an em dash and stores one hyphen, which is the shape
+  every reader of a range parses.
+- **A range the curator typed is a note, not a question.**
+  `services._note_curator_ranges` lowers the `page_range` card to
+  `info` and rewords it. The card stays: the range is a fact about the
+  volume the next reader must see. A range the *model* read keeps the
+  warning and its "Verify this is expected".
 
 ## Generalized YOLO worker image (issue #194)
 

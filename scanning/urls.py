@@ -55,6 +55,7 @@ from scanning.views_process import (
     assign_page,
     delete_page,
     dismiss_issue,
+    page_edit_file,
     process_actions,
     progress_api,
     recalculate,
@@ -72,6 +73,7 @@ from scanning.views_process import (
     start_validate,
     start_yolo_detect,
     undo_delete_page,
+    undo_replace_page,
 )
 
 urlpatterns = [
@@ -173,6 +175,16 @@ urlpatterns = [
         name="remove_page_insert",
     ),
     path("scans/<int:pk>/replace-page/", replace_page, name="replace_page"),
+    path(
+        "scans/<int:pk>/replace-page/undo/",
+        undo_replace_page,
+        name="undo_replace_page",
+    ),
+    path(
+        "scans/<int:pk>/page-edit/<int:edit_id>/file/",
+        page_edit_file,
+        name="page_edit_file",
+    ),
     path("scans/<int:pk>/rotate-page/", rotate_page, name="rotate_page"),
     path("scans/<int:pk>/dismiss-issue/", dismiss_issue, name="dismiss_issue"),
     # views_api.py

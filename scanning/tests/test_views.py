@@ -2984,8 +2984,14 @@ class TestProcessActionsFragment(ScanningTestCase):
         self.assertFalse(body["has_pending_changes"])
         self.assertNotIn("Rebuild &amp; Validate", body["html"])
 
-    def test_pending_deletion_shows_rebuild(self):
-        """A pending deletion makes the bar show Rebuild & Validate."""
+    def test_pending_deletion_keeps_the_review_buttons(self):
+        """A pending deletion no longer takes the bar over (#232).
+
+        The bar used to answer one open edit with "Rebuild & Validate"
+        alone, which refuses since #173, and it hid the recompute and
+        approve buttons while it did. Nothing stamps ``applied_at``
+        until #206, so that state never ended.
+        """
         PageEditFactory(
             scan=self.scan,
             kind=PageEdit.Kind.DELETE_PAGE,
@@ -2998,9 +3004,12 @@ class TestProcessActionsFragment(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.content)
         self.assertTrue(body["has_pending_changes"])
-        self.assertIn("Rebuild &amp; Validate", body["html"])
-        self.assertIn(
+        self.assertNotIn("Rebuild &amp; Validate", body["html"])
+        self.assertNotIn(
             reverse("reprocess", kwargs={"pk": self.scan.pk}), body["html"]
+        )
+        self.assertIn(
+            reverse("recalculate", kwargs={"pk": self.scan.pk}), body["html"]
         )
 
 
@@ -3123,6 +3132,36 @@ class TestAssignPage(ScanningTestCase):
         }
         self.assertIn(2, flagged)  # pdf_page 3 -> index 2 (newly-created "5")
         self.assertIn(0, flagged)  # the pre-existing "5" is flagged too
+
+    def test_sets_a_printed_range(self):
+        """One PDF page can carry several book pages (issue #233)."""
+        response = self._post(2, "913-925")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content)["detected"], "913-925")
+        self.scan.refresh_from_db()
+        r = self.scan.ocr_results[1]
+        self.assertEqual(r["detected"], "913-925")
+        self.assertEqual(r["type"], "range")
+        self.assertEqual(r["zone"], "manual")
+
+    def test_takes_the_dash_the_reporter_prints(self):
+        """A curator types what the page shows, which is an en dash."""
+        for typed in ("913–925", "913—925", " 913 - 925 "):
+            with self.subTest(typed=typed):
+                response = self._post(2, typed)
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    json.loads(response.content)["detected"], "913-925"
+                )
+
+    def test_rejects_a_backward_range(self):
+        """A range names a first page and a last page, in that order."""
+        self.assertEqual(self._post(2, "925-913").status_code, 400)
+
+    def test_rejects_a_three_part_range(self):
+        self.assertEqual(self._post(2, "913-925-930").status_code, 400)
 
     def test_clearing_duplicate_unflags_page_map(self):
         """Clearing a duplicated number removes the duplicate flag."""

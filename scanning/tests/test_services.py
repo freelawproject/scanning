@@ -2127,6 +2127,74 @@ class TestRecalculateIssues(TestCase):
         )
         self.assertFalse(Issue.objects.filter(pk=stale.pk).exists())
 
+    def _make_range_scan(self, **range_entry):
+        """Create the volume of issue #233.
+
+        One physical page carries the book pages 913 to 925, between
+        page 911 and page 926.
+
+        :param range_entry: Fields to add to the range page's entry.
+        :returns: The scan.
+        """
+        entry = {"pdf_page": 3, "detected": "913-925", "type": "range"}
+        entry.update(range_entry)
+        return self._make_scan(
+            start_page=910,
+            end_page=927,
+            page_count=5,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "910", "type": "single"},
+                {"pdf_page": 2, "detected": "911", "type": "single"},
+                entry,
+                {"pdf_page": 4, "detected": "926", "type": "single"},
+                {"pdf_page": 5, "detected": "927", "type": "single"},
+            ],
+        )
+
+    def test_a_range_page_answers_the_large_gap(self):
+        """The pages a range covers are present, not missing (#233)."""
+        from scanning import services
+
+        scan = self._make_range_scan()
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertFalse(
+            scan.issues.filter(check_name=CheckName.LARGE_GAP).exists()
+        )
+        self.assertEqual(scan.missing_pages, [912])
+        self.assertTrue(
+            scan.issues.filter(check_name=CheckName.PAGE_RANGE).exists()
+        )
+
+    def test_a_machine_range_keeps_its_warning(self):
+        """A reading of the model is a question for the curator."""
+        from scanning import services
+
+        scan = self._make_range_scan(zone="dots-header", ocr="913-925")
+
+        services.recalculate_issues(scan)
+
+        card = scan.issues.get(check_name=CheckName.PAGE_RANGE)
+        self.assertEqual(card.severity, Issue.Severity.WARNING)
+        self.assertIn("Verify", card.message)
+
+    def test_a_curators_range_is_a_note(self):
+        """The curator had the page in front of them, so the card
+        records the range instead of asking about it (#233)."""
+        from scanning import services
+
+        scan = self._make_range_scan(zone="manual", ocr="manual")
+
+        services.recalculate_issues(scan)
+
+        card = scan.issues.get(check_name=CheckName.PAGE_RANGE)
+        self.assertEqual(card.severity, Issue.Severity.INFO)
+        self.assertEqual(card.page_number, 913)
+        self.assertIn("913-925", card.message)
+        self.assertNotIn("Verify", card.message)
+
     def test_rebuild_page_map_without_local_pdf(self):
         """rebuild_page_map (manual page edits) also runs off stored data
         and applies the scan's page range."""

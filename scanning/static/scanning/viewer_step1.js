@@ -17,6 +17,27 @@ document.addEventListener('DOMContentLoaded', function () {
 
     const SCALE = 1.5;
     const PLACEHOLDER_HEIGHT = 1056; // 792 * 1.5 (letter height at scale)
+
+    // What a curator may type as a page number: one printed number, or
+    // the range one physical page carries when the book prints several
+    // pages on it (issue #233). The server takes the same two shapes
+    // and stores a range with a hyphen, whatever dash was typed, so the
+    // dashes here are the ones a reporter prints and a person pastes.
+    const PAGE_ENTRY_RE = /^(\d{1,4})(?:\s*[-–—]\s*(\d{1,4}))?$/;
+
+    // The label the page render gives a range, so a saved entry reads
+    // the same before and after a reload.
+    const RANGE_TAG = 'Range ';
+
+    function isPageNumberEntry(text) {
+        var parts = PAGE_ENTRY_RE.exec(text);
+        if (!parts) return false;
+        var first = parseInt(parts[1], 10);
+        if (first < 1) return false;
+        if (parts[2] === undefined) return true;
+        return first < parseInt(parts[2], 10);
+    }
+
     let pdfDoc = null;
     let defaultPageWidth = 918; // 612 * 1.5
 
@@ -293,12 +314,12 @@ document.addEventListener('DOMContentLoaded', function () {
             '<div class="page-label">Page ' + missingLabel + ' &mdash; MISSING</div>' +
             '<div class="missing-placeholder">' +
             '  <p>This page was not found in the document.</p>' +
-            '  <p>Upload a scan or image to fill this gap:</p>' +
+            '  <p>Upload an image or a PDF to fill this gap:</p>' +
             '  <form class="insert-form" enctype="multipart/form-data">' +
             '    <input type="hidden" name="page_number" value="' + missingLabel + '">' +
             '    <label class="upload-btn">' +
-            '      Choose Image' +
-            '      <input type="file" name="image" accept="image/*" style="display:none">' +
+            '      Choose a file' +
+            '      <input type="file" name="image" accept="image/*,application/pdf" style="display:none">' +
             '    </label>' +
             '  </form>' +
             '</div>';
@@ -320,15 +341,50 @@ document.addEventListener('DOMContentLoaded', function () {
         var pageDiv = document.createElement('div');
         pageDiv.className = 'page-container inserted-page';
         pageDiv.id = 'page-' + entry.logical_number;
-        pageDiv.innerHTML = insertedPageHtml(entry.logical_number, entry.insert_url, entry.insert_edit_id, entry.unplaced);
+        pageDiv.innerHTML = insertedPageHtml(entry.logical_number, entry.insert_url, entry.insert_edit_id, entry.unplaced, entry.insert_kind, entry.insert_file_url);
         bindRemoveInsert(pageDiv, entry.insert_edit_id);
         container.appendChild(pageDiv);
+        drawInsertedPdf(pageDiv);
+    }
+
+    // A curator may upload a PDF of the page as well as an image
+    // (#232), and an <img> draws nothing for one. Render its first page
+    // into the canvas, and leave the link that opens the whole file.
+    // The link stands whatever happens: the file is on the default
+    // storage, and a cross-origin read of it needs a bucket CORS rule
+    // that a deployment may not carry yet.
+    function drawInsertedPdf(pageDiv) {
+        var canvas = pageDiv.querySelector('.inserted-pdf');
+        if (!canvas || !canvas.dataset.pdfUrl) { return; }
+        pdfjsLib.getDocument(canvas.dataset.pdfUrl).promise.then(function (pdf) {
+            var note = pageDiv.querySelector('.inserted-pdf-note');
+            if (note && pdf.numPages > 1) {
+                note.textContent = 'PDF, ' + pdf.numPages + ' pages. ' +
+                    'The first one is shown.';
+            }
+            return pdf.getPage(1).then(function (page) {
+                var viewport = page.getViewport({ scale: SCALE * getPdfZoom() });
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+                canvas.style.width = '100%';
+                return page.render({
+                    canvasContext: canvas.getContext('2d'),
+                    viewport: viewport,
+                }).promise;
+            });
+        }).catch(function () {
+            var note = pageDiv.querySelector('.inserted-pdf-note');
+            if (note) {
+                note.textContent = 'This PDF cannot be shown here. ' +
+                    'Open it with the link above.';
+            }
+        });
     }
 
     // The label of an inserted page, with the button that takes it
     // back. A deletion has always had its undo and an insert had none,
     // so a wrong image could only be covered by another one (#214).
-    function insertedPageHtml(logicalNumber, imageUrl, editId, unplaced) {
+    function insertedPageHtml(logicalNumber, imageUrl, editId, unplaced, kind, fileUrl) {
         // The printed number is a person's typing (a curator files the
         // page under what is printed on it, and that is not always
         // digits), and every viewer of this scan sees it. So it is
@@ -344,9 +400,16 @@ document.addEventListener('DOMContentLoaded', function () {
               'background:#dc2626;color:white;border:none;border-radius:3px;' +
               'padding:1px 6px;font-size:10px;margin-left:4px">Remove</button>'
             : '';
+        var pdfUrl = escapeHtml(fileUrl || imageUrl);
+        var body = kind === 'pdf'
+            ? '  <p class="inserted-pdf-note">' +
+              '<a href="' + pdfUrl + '" target="_blank" rel="noopener">Open the PDF</a>' +
+              '</p>' +
+              '  <canvas class="inserted-pdf" data-pdf-url="' + pdfUrl + '"></canvas>'
+            : '  <img src="' + escapeHtml(imageUrl) + '" class="inserted-image">';
         return '<div class="page-label">' + label + button + '</div>' +
             '<div class="canvas-wrapper">' +
-            '  <img src="' + escapeHtml(imageUrl) + '" class="inserted-image">' +
+            body +
             '</div>';
     }
 
@@ -386,7 +449,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var ocrLabel = '';
         if (ocr) {
             if (ocr.detected) {
-                var tag = ocr.type === 'range' ? 'Range ' : '#';
+                var tag = ocr.type === 'range' ? RANGE_TAG : '#';
                 ocrLabel = '<span class="ocr-tag editable-page" data-pdf-page="' + pdfPage + '" ' +
                     'title="Click to correct page number">' + tag + ocr.detected +
                     ' <small>(' + ocr.zone + ' ' + (ocr.score ? ocr.score.toFixed(2) : '') + ')</small></span>';
@@ -403,7 +466,10 @@ document.addEventListener('DOMContentLoaded', function () {
             // Redact/whiteout buttons are only functional in step 2 (process_viewer.js)
             // '    <button class="redact-btn" data-fill="black" title="Draw a black redaction">Redact</button>' +
             // '    <button class="whiteout-btn" data-fill="white" title="Draw a white redaction">Whiteout</button>' +
+            '    <button class="replace-btn" data-pdf-page="' + pdfPage + '" ' +
+            'title="Upload an image or a PDF that stands in for this page">Replace</button>' +
             '    <button class="delete-btn" title="Delete this page">Delete</button>' +
+            '    <input type="file" class="replace-input" accept="image/*,application/pdf" hidden>' +
             '  </span>' +
             '</div>' +
             '<div class="canvas-wrapper">' +
@@ -431,13 +497,17 @@ document.addEventListener('DOMContentLoaded', function () {
                 var current = ocr && ocr.detected ? ocr.detected : '';
                 var num = prompt(
                     'Page number for PDF page ' + pdfPage +
-                    ' (leave blank if this page has no number):',
+                    ' (a range like 913-925 if this page carries several ' +
+                    'book pages; leave blank if it has no number):',
                     current
                 );
                 if (num === null) return; // cancelled
                 var trimmed = num.trim();
-                if (trimmed && (!/^\d+$/.test(trimmed) || parseInt(trimmed, 10) < 1)) {
-                    alert('Page number must be a positive whole number, or blank for none.');
+                if (trimmed && !isPageNumberEntry(trimmed)) {
+                    alert(
+                        'Page number must be a positive whole number, a ' +
+                        'range like 913-925, or blank for none.'
+                    );
                     return;
                 }
                 fetch('/scans/' + documentId + '/assign-page/', {
@@ -461,9 +531,14 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                     ocr.detected = res.data.detected;
                     if (res.data.detected) {
+                        // The server normalizes a range to one hyphen.
+                        ocr.type = res.data.detected.indexOf('-') === -1
+                            ? 'single' : 'range';
+                        var tag = ocr.type === 'range' ? RANGE_TAG : '#';
                         editBtn.className = 'ocr-tag editable-page';
-                        editBtn.innerHTML = '#' + escapeHtml(res.data.detected) + ' <small>(manual)</small>';
+                        editBtn.innerHTML = tag + escapeHtml(res.data.detected) + ' <small>(manual)</small>';
                     } else {
+                        ocr.type = null;
                         editBtn.className = 'ocr-tag miss editable-page';
                         editBtn.innerHTML = '[no page # found — click to assign]';
                     }
@@ -494,6 +569,14 @@ document.addEventListener('DOMContentLoaded', function () {
             deletePageAndResolve(pdfPage, div);
         });
 
+        // A page a curator already replaced carries its note before the
+        // deletion mark is drawn: markPageAsDeleted saves the label it
+        // finds, and the undo puts that saved label back.
+        var replaced = (SCAN_CONFIG.replacedPages || {})[String(pdfPage)];
+        if (replaced) {
+            markPageAsReplaced(div, pdfPage, replaced);
+        }
+
         // If page is already marked for deletion, show the deleted state
         if (typeof deletedPages !== 'undefined' && deletedPages.indexOf(pdfPage) !== -1) {
             markPageAsDeleted(div, pdfPage, 'PDF p.', csrfToken, documentId, deletePageAndResolve);
@@ -510,6 +593,156 @@ document.addEventListener('DOMContentLoaded', function () {
     window.onPageEditSaved = function () {
         showToast(SAVED_MESSAGE, 'success');
     };
+
+    // --- Replace a page (issue #232) ---
+    // A blurry or unreadable page gets an image or a PDF in its place.
+    // The row is a saved decision: nothing builds it into the volume
+    // until the apply of #206, which is why the note says so.
+    //
+    // Both handlers are bound on the container and not on the buttons.
+    // markPageAsDeleted (shared.js) writes over the whole page-label,
+    // and its undo writes the saved label back and re-binds the delete
+    // button alone -- a listener bound to the Replace button would not
+    // survive that round trip.
+    container.addEventListener('click', function (e) {
+        var replaceBtn = e.target.closest('.replace-btn');
+        if (replaceBtn) {
+            var pageDiv = replaceBtn.closest('.page-container');
+            var input = pageDiv && pageDiv.querySelector('.replace-input');
+            if (input) { input.click(); }
+            return;
+        }
+        var undoBtn = e.target.closest('.undo-replace-btn');
+        if (undoBtn) {
+            e.stopPropagation();
+            undoPageReplacement(parseInt(undoBtn.dataset.pdfPage, 10),
+                                undoBtn.closest('.page-container'));
+        }
+    });
+
+    container.addEventListener('change', function (e) {
+        var input = e.target.closest('.replace-input');
+        if (!input || !input.files || !input.files.length) { return; }
+        var pageDiv = input.closest('.page-container');
+        var btn = pageDiv.querySelector('.replace-btn');
+        var pdfPage = parseInt(btn.dataset.pdfPage, 10);
+        uploadPageReplacement(pdfPage, input.files[0], pageDiv);
+        input.value = '';
+    });
+
+    function uploadPageReplacement(pdfPage, file, pageDiv) {
+        var formData = new FormData();
+        formData.append('pdf_page', pdfPage);
+        formData.append('image', file);
+        fetch('/scans/' + documentId + '/replace-page/', {
+            method: 'POST',
+            headers: { 'X-CSRFToken': csrfToken },
+            body: formData,
+        })
+        .then(function (r) {
+            return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+        })
+        .then(function (res) {
+            if (!res.ok || res.data.status !== 'ok') {
+                showToast((res.data && res.data.error) ||
+                          'Could not replace this page.');
+                return;
+            }
+            markPageAsReplaced(pageDiv, pdfPage, {
+                url: res.data.file_url,
+                kind: res.data.kind,
+            });
+            markSidebarReplaced(pdfPage, true);
+            if (typeof window.refreshProcessActionBar === 'function') {
+                window.refreshProcessActionBar();
+            }
+            window.onPageEditSaved();
+        })
+        .catch(function () {
+            showToast('Could not replace this page. Try again.');
+        });
+    }
+
+    // The note that says this page stands in for the scanned one. It
+    // goes on the label itself and not inside the label's first span,
+    // which carries the OCR tag the page-number editor rewrites.
+    function markPageAsReplaced(pageDiv, pdfPage, replaced) {
+        var label = pageDiv.querySelector('.page-label');
+        if (!label) { return; }
+        var old = label.querySelector('.replaced-note');
+        if (old) { old.remove(); }
+        var note = document.createElement('span');
+        note.className = 'replaced-note';
+        note.innerHTML =
+            'This page has been replaced. ' +
+            '<a href="' + escapeHtml(replaced.url) + '" target="_blank" rel="noopener">View</a>' +
+            ' <button class="undo-replace-btn" data-pdf-page="' + pdfPage + '" ' +
+            'title="Take this replacement back">Undo</button>';
+        label.appendChild(note);
+        refreshSavedLabel(label);
+    }
+
+    // markPageAsDeleted (shared.js) saves the label it finds in
+    // originalHtml, and its undo writes that copy back. A note added
+    // or removed on a live page must reach the copy too, or the undo
+    // of a later deletion drops it. While the page is marked for
+    // deletion the label *is* the deletion mark, and saving that would
+    // make the undo restore the mark itself: so the copy is refreshed
+    // on a live page only.
+    function refreshSavedLabel(label) {
+        if (!label || !label.dataset.originalHtml) { return; }
+        if (label.querySelector('.undo-delete-btn')) { return; }
+        label.dataset.originalHtml = label.innerHTML;
+    }
+
+    function undoPageReplacement(pdfPage, pageDiv) {
+        if (!confirm('Take this replacement back?')) { return; }
+        fetch('/scans/' + documentId + '/replace-page/undo/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+            body: JSON.stringify({ pdf_page: pdfPage }),
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (data.status !== 'ok') {
+                showToast(data.error || 'Could not take the replacement back.');
+                return;
+            }
+            var note = pageDiv.querySelector('.replaced-note');
+            if (note) { note.remove(); }
+            refreshSavedLabel(pageDiv.querySelector('.page-label'));
+            markSidebarReplaced(pdfPage, false);
+            if (typeof window.refreshProcessActionBar === 'function') {
+                window.refreshProcessActionBar();
+            }
+            window.onPageEditSaved();
+        })
+        .catch(function () {
+            showToast('Could not take the replacement back. Try again.');
+        });
+    }
+
+    // The sidebar row of one page carries the same warning as a badge,
+    // beside the DUP one the server renders.
+    function markSidebarReplaced(pdfPage, on) {
+        var row = document.querySelector(
+            '#pages-list [data-pdf-index="' + (pdfPage - 1) + '"]'
+        );
+        if (!row) { return; }
+        var badge = row.querySelector('.page-repl-badge');
+        if (on && !badge) {
+            badge = document.createElement('span');
+            badge.className =
+                'page-repl-badge text-[9px] font-bold text-purple-600 ' +
+                'dark:text-purple-400 ml-1';
+            badge.title = 'A curator replaced this page';
+            badge.textContent = 'REPL';
+            var holder = row.querySelector('span') || row;
+            holder.appendChild(badge);
+        } else if (!on && badge) {
+            badge.remove();
+        }
+    }
 
     // --- Delete page ---
     // deletePage is defined in shared.js; call resolveIssuesForPage after
@@ -756,8 +989,9 @@ document.addEventListener('DOMContentLoaded', function () {
             }
             pageDiv.className = 'page-container inserted-page';
             pageDiv.style.width = '';
-            pageDiv.innerHTML = insertedPageHtml(pageNumber, data.image_url, data.edit_id);
+            pageDiv.innerHTML = insertedPageHtml(pageNumber, data.image_url, data.edit_id, false, data.kind, data.file_url);
             bindRemoveInsert(pageDiv, data.edit_id);
+            drawInsertedPdf(pageDiv);
             if (typeof window.refreshProcessActionBar === 'function') {
                 window.refreshProcessActionBar();
             }

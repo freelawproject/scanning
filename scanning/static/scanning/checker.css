@@ -533,6 +533,51 @@ a.doc-name:hover { text-decoration: underline; }
 .ocr-tag small { color: #999; font-weight: 400; }
 .page-tools { display: flex; gap: 4px; }
 
+/* Replace page button (issue #232). Blue, so red stays the colour of
+   the one button that takes a page out of the volume. */
+.replace-btn {
+    padding: 3px 10px;
+    font-size: 11px;
+    background: #eff6ff;
+    color: #1e40af;
+    border: 1px solid #93c5fd;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.replace-btn:hover { background: #dbeafe; }
+
+/* The warning on a page that stands in for the scanned one. */
+.replaced-note {
+    flex-basis: 100%;
+    font-size: 11px;
+    color: #92400e;
+}
+.replaced-note a {
+    color: #92400e;
+    font-weight: 600;
+    text-decoration: underline;
+}
+.undo-replace-btn {
+    cursor: pointer;
+    background: #b45309;
+    color: white;
+    border: none;
+    border-radius: 3px;
+    padding: 1px 6px;
+    font-size: 10px;
+    margin-left: 4px;
+}
+.undo-replace-btn:hover { background: #92400e; }
+
+/* An inserted page uploaded as a PDF. */
+.inserted-pdf { display: block; max-width: 100%; }
+.inserted-pdf-note {
+    padding: 6px 12px;
+    font-size: 11px;
+    color: #166534;
+    line-height: 1.4;
+}
+
 /* Delete page button */
 .delete-btn {
     padding: 3px 10px;

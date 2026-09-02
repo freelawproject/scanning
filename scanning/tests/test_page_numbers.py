@@ -109,6 +109,42 @@ class TestExtractPageNumber(SimpleTestCase):
                 self.assertEqual(entry["type"], "range")
                 self.assertEqual(entry["score"], 1.0)
 
+    def test_a_range_leads_the_running_head(self):
+        """The compressed page of issue #233: the range is one token of
+        a full head line, which the whole-line rule alone missed."""
+        for text in (
+            "913-925 ATLANTIC REPORTER, 2d SERIES",
+            "913–925 ATLANTIC REPORTER, 2d SERIES",
+        ):
+            with self.subTest(text=text):
+                entry = self.extract([cell(text)])
+
+                self.assertEqual(entry["detected"], "913-925")
+                self.assertEqual(entry["type"], "range")
+
+    def test_a_range_trails_the_running_head(self):
+        entry = self.extract(
+            [
+                cell(
+                    "STATE v. SMITH Cite as 218 A.3d 913-925",
+                    bbox=[1200, 143, 1550, 177],
+                )
+            ]
+        )
+
+        self.assertEqual(entry["detected"], "913-925")
+        self.assertEqual(entry["type"], "range")
+
+    def test_two_numbers_that_are_no_page_range(self):
+        """A docket number runs past the end of any volume, and a split
+        year runs backward. Neither is a page range."""
+        for text in ("19-1234", "1996-97", "925-913", "0-5"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.extract([cell(text)])["detected"])
+                self.assertIsNone(
+                    self.extract([cell(f"{text} A REPORTER")])["detected"]
+                )
+
     def test_a_section_opening_page_reads_its_footer(self):
         entry = self.extract(
             [
