@@ -263,23 +263,30 @@ def _signing_s3_client():
     return _cached_signing_s3_client()
 
 
-def presign_get(key: str, ttl: int) -> str:
+def presign_get(
+    key: str, ttl: int, *, content_disposition: str | None = None
+) -> str:
     """Presign a GET for one object, for an external worker to read.
 
     :param key: Object key inside the private bucket.
     :param ttl: Lifetime in seconds. Must outlive queue time plus
         execution, with the job's deadline well inside it, so we give up
         on a job long before its signature dies.
+    :param content_disposition: When set, S3 answers the GET with this
+        ``Content-Disposition`` header. The glued-output routes (#243)
+        hand the URL to a browser, and ``attachment; filename=...``
+        makes it save a named file in place of a page of JSON.
     :returns: A presigned GET URL.
     :rtype: str
     """
+    params = {
+        "Bucket": settings.AWS_PRIVATE_STORAGE_BUCKET_NAME,
+        "Key": key,
+    }
+    if content_disposition:
+        params["ResponseContentDisposition"] = content_disposition
     return _signing_s3_client().generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": settings.AWS_PRIVATE_STORAGE_BUCKET_NAME,
-            "Key": key,
-        },
-        ExpiresIn=int(ttl),
+        "get_object", Params=params, ExpiresIn=int(ttl)
     )
 
 
