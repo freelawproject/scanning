@@ -2726,8 +2726,22 @@ class TestPipelinePausedViews(ScanningTestCase):
         self.scan.save(update_fields=["ocr_results"])
         self._assert_paused("start_validate")
 
-    def test_start_detect_paused_without_detections(self):
-        self._assert_paused("start_detect")
+    def test_start_detect_explains_itself_without_detections(self):
+        """Not "paused" any more: detection works since #195/#196.
+
+        The action still starts nothing -- a run costs GPU time, so a
+        staff member starts it -- but it says who does, instead of
+        blaming a pipeline that is back.
+        """
+        from scanning.views_process import NO_DETECTIONS_MESSAGE
+
+        response = self.client.post(
+            reverse("start_detect", kwargs={"pk": self.scan.pk}), follow=True
+        )
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, Status.PENDING_REVIEW)
+        flashed = [str(m) for m in response.context["messages"]]
+        self.assertIn(NO_DETECTIONS_MESSAGE, flashed)
 
     def test_reprocess_paused_and_pending_edits_survive(self):
         PageEditFactory(
@@ -2752,6 +2766,48 @@ class TestPipelinePausedViews(ScanningTestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestServeDetections(ScanningTestCase):
+    """What review 2 reads to draw the overlay."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(uploaded_by=self.user, page_count=1)
+        self.url = reverse("serve_detections", kwargs={"pk": self.scan.pk})
+
+    def _detection(self, **kwargs):
+        fields = {
+            "scan": self.scan,
+            "page_index": 0,
+            "label": "PAGE_HEADER",
+            "label_id": 2,
+            "confidence": 0.9,
+            "x0": 1,
+            "y0": 2,
+            "x1": 3,
+            "y1": 4,
+        }
+        fields.update(kwargs)
+        return Detection.objects.create(**fields)
+
+    def test_a_hand_added_box_is_marked_manual(self):
+        """The viewer draws it dashed and shows it whatever its label.
+        Until this flag came from here, a hand-added box lost both on
+        the next page load (PR #167)."""
+        self._detection(model_name=Detection.ModelName.BL_WARM)
+        self._detection(
+            page_index=0,
+            label="KEY_ICON",
+            label_id=1,
+            confidence=1.0,
+            model_name=Detection.ModelName.MANUAL,
+        )
+
+        data = self.client.get(self.url).json()
+
+        self.assertEqual([d["manual"] for d in data], [False, True])
+
+
 class TestViewsWithoutLocalOriginal(ScanningTestCase):
     """Endpoints that need the original PDF degrade gracefully when it is
     S3-only and cannot be pulled, instead of raising FileNotFoundError
@@ -2785,17 +2841,9 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
         )
         self.assertEqual(response.status_code, 404)
 
-    def test_compute_redactions_returns_json_error(self):
-        """Redaction computation reports a JSON error, not a traceback."""
-        response = self.client.post(
-            reverse("compute_redactions_api", kwargs={"pk": self.scan.pk})
-        )
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.json()["error"], "No PDF available")
-
-    def test_pair_opinions_returns_json_error(self):
-        """Opinion pairing reports a JSON error, not a traceback."""
-        Detection.objects.create(
+    def _caption(self):
+        """Store one detection, so the endpoints get past their guard."""
+        return Detection.objects.create(
             scan=self.scan,
             page_index=0,
             label="CAPTION",
@@ -2806,11 +2854,53 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
             x1=1,
             y1=1,
         )
+
+    def test_re_pairing_on_request_is_off_for_now(self):
+        """Both review-2 endpoints refuse and queue nothing (#196): the
+        daemon's one run after detection is the only computation wanted
+        until the stage has been watched on a few volumes."""
+        from scanning.views_api import REPAIR_DISABLED_MESSAGE
+
+        self._caption()
+        before = self.scan.status
+        for name in ("pair_opinions_api", "compute_redactions_api"):
+            response = self.client.post(
+                reverse(name, kwargs={"pk": self.scan.pk})
+            )
+            self.assertEqual(response.status_code, 409, name)
+            self.assertEqual(response.json()["error"], REPAIR_DISABLED_MESSAGE)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, before)
+
+    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
+    def test_compute_redactions_needs_no_pdf_in_the_request(self):
+        """It queues the work, so a missing local PDF is not its problem.
+
+        Since #196 the measurement runs on the daemon, which pulls the
+        bitonal copy itself. The request writes a status and returns,
+        and it refuses only what it can see from the database.
+        """
+        response = self.client.post(
+            reverse("compute_redactions_api", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "No detections found")
+
+    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
+    def test_pair_opinions_queues_the_work(self):
+        """Pairing is queued with the geometry it feeds (#196), once the
+        switch is back on."""
+        self._caption()
         response = self.client.post(
             reverse("pair_opinions_api", kwargs={"pk": self.scan.pk})
         )
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.json()["error"], "No PDF available")
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "queued")
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, Status.QUEUED)
+        self.assertEqual(
+            self.scan.queued_action, QueuedAction.COMPUTE_REDACTIONS
+        )
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

@@ -122,6 +122,14 @@ REPLACEMENT_IS_ONE_PAGE_MESSAGE = (
     "A replacement stands for one page, and this PDF holds {pages}. "
     "Upload the one page that replaces it."
 )
+# What a curator sees when they ask for step 2 on a volume nobody has
+# run detection over. Since #195/#196 that is no longer a paused
+# pipeline: the stage works, and a staff member starts it, because each
+# run costs GPU time.
+NO_DETECTIONS_MESSAGE = (
+    "This volume has no detections yet. A staff member starts the "
+    "detection run, and the redactions appear here when it finishes."
+)
 
 
 def _unmatched_detection_dict(
@@ -1015,12 +1023,13 @@ def start_validate(request: HttpRequest, pk: int) -> HttpResponse:
 @login_required
 @require_POST
 def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
-    """Skip to review when detections exist; otherwise refuse (#173).
+    """Skip to review 2 when detections exist; otherwise explain.
 
-    YOLO detection was disconnected with the legacy pipeline, so the
-    only thing left of this action is its shortcut: a scan that already
-    has detections goes straight to step 2. Running detection anew
-    fails with the unified pipeline-paused message.
+    The only thing left of this action is its shortcut: a scan that has
+    detections goes straight to step 2. It starts nothing itself --
+    since #195 the detection run has its own staff button, because each
+    run costs GPU time -- so a volume with no detections is told who
+    starts one.
 
     Approval is the gate (#151), in the view and not only in the bar:
     a scan still in READY_FOR_PAGE_COMPLETENESS_REVIEW is sent back to
@@ -1046,12 +1055,13 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     if guard:
         return guard
     if Detection.objects.filter(scan=scan).exists():
-        # Detections already exist (from the old full pipeline).
+        # Detections exist: the #196 apply imported them, or the old
+        # full pipeline left them behind.
         return redirect(
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
         )
 
-    messages.warning(request, PIPELINE_PAUSED_MESSAGE)
+    messages.info(request, NO_DETECTIONS_MESSAGE)
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -1159,6 +1169,12 @@ def start_yolo_detect(request: HttpRequest, pk: int) -> HttpResponse:
     corpus (#211). Every press can start real graphics processing unit
     (GPU) work on RunPod that costs money.
 
+    Review 2 follows review 1, so the volume must be approved first
+    (``PAGE_COMPLETENESS_REVIEW_DONE``). The gate is here and not only
+    in the template: the run ends in an apply that imports detections
+    and rewrites the redaction geometry (#196), and a volume whose page
+    set a curator is still editing would be detected twice.
+
     Detection reads the **original** shards, not the converted ones.
     bl-warm was trained on greyscale renders, and its large region
     classes collapse on 1-bit pages (#167).
@@ -1175,9 +1191,10 @@ def start_yolo_detect(request: HttpRequest, pk: int) -> HttpResponse:
     directly. A stale or missing set is refused, because re-cutting is
     the pipeline's job.
 
-    Nothing reads the output yet. The rows stop at ``COMPLETED`` and
-    the results sit in S3 until #196 turns them into detections and
-    redaction geometry.
+    The daemon reads the output. Once every row is ``COMPLETED``, the
+    collect tick merges the run into one volume document and queues the
+    redaction computation, which imports the detections, pairs the
+    opinions and measures the geometry review 2 shows (#196).
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -1192,6 +1209,14 @@ def start_yolo_detect(request: HttpRequest, pk: int) -> HttpResponse:
         messages.error(
             request,
             "Only staff can start detection: each run costs GPU time.",
+        )
+        return back
+
+    if scan.status != Status.PAGE_COMPLETENESS_REVIEW_DONE:
+        messages.warning(
+            request,
+            "Detection runs after the page completeness review is "
+            "approved. This volume is not approved yet.",
         )
         return back
 

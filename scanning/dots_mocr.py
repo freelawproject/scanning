@@ -254,11 +254,9 @@ def glued_result_key(scan, run: int) -> str:
 def _check_envelope(scan, job: ExternalJob, envelope) -> dict:
     """Return an envelope's payload, or refuse the envelope.
 
-    The checks close delivery faults, not model quality: the object at
-    the row's key must be an envelope this reader understands, written
-    for this scan by this attempt. An unknown ``schema_version`` usually
-    means a worker deployed ahead of the daemon, so the message names
-    both versions rather than guessing at the content.
+    A thin wrapper over :func:`jobs.check_result_envelope`, which every
+    stage that reads a worker's result shares. This one binds the
+    action and the error type of this stage.
 
     :param scan: The scan being glued.
     :param job: The row whose result the envelope claims to be.
@@ -268,30 +266,9 @@ def _check_envelope(scan, job: ExternalJob, envelope) -> dict:
     :raises DotsMocrGlueError: If the envelope is not one this attempt
         should have produced.
     """
-    if not isinstance(envelope, dict) or "payload" not in envelope:
-        raise DotsMocrGlueError(
-            f"scan {scan.pk} shard {job.shard_index}: the object at "
-            f"{job.result_key} is not a result envelope"
-        )
-    version = envelope.get("schema_version")
-    if version != runpod_client.RESULT_SCHEMA_VERSION:
-        raise DotsMocrGlueError(
-            f"scan {scan.pk} shard {job.shard_index} answered result "
-            f"schema {version}; this reader knows "
-            f"{runpod_client.RESULT_SCHEMA_VERSION}"
-        )
-    for field, expected in (
-        ("action", ACTION),
-        ("scan_pk", scan.pk),
-        ("result_key", job.result_key),
-    ):
-        got = envelope.get(field)
-        if got != expected:
-            raise DotsMocrGlueError(
-                f"scan {scan.pk} shard {job.shard_index} envelope has "
-                f"{field}={got!r}, expected {expected!r}"
-            )
-    return envelope["payload"]
+    return jobs.check_result_envelope(
+        scan, job, envelope, ACTION, DotsMocrGlueError
+    )
 
 
 def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:

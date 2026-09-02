@@ -24,6 +24,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    Status,
 )
 from scanning.tests.test_jobs import make_manifest
 from scanning.tests.test_views import ScanningTestCase
@@ -362,7 +363,13 @@ class TestStartButton(ScanningTestCase):
     def setUp(self):
         super().setUp()
         self.staff = self.make_staff_user()
-        self.scan = ScanFactory(page_count=30)
+        # Review 2 follows review 1, so only an approved volume may be
+        # detected (#196): the apply that reads the run takes a scan
+        # from this status alone.
+        self.scan = ScanFactory(
+            page_count=30,
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        )
         self.url = reverse("start_yolo_detect", kwargs={"pk": self.scan.pk})
         self.manifest = make_manifest(shard_count=3, pages_per_shard=10)
 
@@ -438,6 +445,18 @@ class TestStartButton(ScanningTestCase):
         self.assertEqual(detect_jobs(self.scan), [])
         messages = list(response.wsgi_request._messages)
         self.assertIn("YOLO_ENABLED", str(messages[0]))
+
+    def test_a_volume_review_one_has_not_approved_is_refused(self):
+        # The apply that reads the run takes a scan from
+        # PAGE_COMPLETENESS_REVIEW_DONE alone, so a run started earlier
+        # would be paid for and never applied.
+        self.scan.status = Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        self.scan.save(update_fields=["status"])
+        with self._committed():
+            response = self._press()
+        self.assertEqual(detect_jobs(self.scan), [])
+        messages = list(response.wsgi_request._messages)
+        self.assertIn("not approved", str(messages[0]))
 
     def test_no_committed_shard_set_is_refused(self):
         with self._committed(manifest=None, reason="no shard set"):

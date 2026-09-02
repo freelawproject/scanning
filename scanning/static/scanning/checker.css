@@ -700,6 +700,15 @@ a.doc-name:hover { text-decoration: underline; }
 .detection-box:hover {
     background: rgba(255, 255, 255, 0.3);
 }
+/* Full-column boxes (TEXT_COLUMN): a layer below the detections they
+   contain, so those keep the hover and the double-click. The lighter hover
+   fill is because this one covers a whole column. */
+.detection-box.layout {
+    z-index: 4;
+}
+.detection-box.layout:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
 .detection-label {
     position: absolute;
     top: -18px;

@@ -5,7 +5,6 @@ import logging
 import os
 import shutil
 import tempfile
-import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -39,7 +38,6 @@ from scanning.models import (
 )
 from scanning.utils import (
     PIPELINE_PAUSED_MESSAGE,
-    compute_coverage_gaps,
     find_json_file,
     find_processing_pdf,
     local_original_pdf,
@@ -100,6 +98,11 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
             "img_width": d.img_width,
             "img_height": d.img_height,
             "model_count": d.model_count,
+            # The viewer draws a hand-added detection dashed, and shows
+            # it whatever its label. It sets this flag itself when the
+            # reviewer draws the box, so until it came from here a
+            # hand-added box lost both on the next page load (PR #167).
+            "manual": d.model_name == Detection.ModelName.MANUAL,
         }
         for d in dets
     ]
@@ -285,95 +288,82 @@ def save_margin_rect(request: HttpRequest, pk: int) -> JsonResponse:
     return JsonResponse({"status": "ok", "found": found})
 
 
+#: Whether a curator may ask for the redaction computation from review
+#: 2. Off for now (#196): the computation renders every page of the
+#: volume and takes the scan out of review for a minute or more, and
+#: the one run the daemon starts after a detection run is the only one
+#: wanted until the stage has been watched on a few volumes (#211).
+#: Turning it back on is this flag plus the "Re-pair Opinions" button
+#: in ``_process_actions.html``; the queueing code below is kept.
+REPAIR_ON_REQUEST_ENABLED = False
+
+REPAIR_DISABLED_MESSAGE = (
+    "Re-pairing on request is off for now. The redactions are computed "
+    "once, when the detection run finishes."
+)
+
+
 @login_required
 @require_POST
 def pair_opinions_api(request: HttpRequest, pk: int) -> JsonResponse:
-    """Run opinion pairing on detections and save the result.
+    """Ask the daemon to pair the opinions again, with the geometry.
+
+    A curator presses this after they add or delete a detection, and
+    what they want is every consequence of that edit: the pairing, the
+    redaction rects and the margin strips, which are all measured from
+    the same detections. One queued action computes all three (#196),
+    so none of them can be left describing the boxes of an hour ago.
+
+    It runs on the daemon rather than here, because the measurement
+    renders every page of the volume: 83 seconds for 1364 pages. The
+    viewer reloads, sees the scan busy, and its progress poll reloads
+    again when the daemon parks it.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response with paired opinions and coverage gaps.
+    :return: JSON response saying the work is queued, or 409 while
+        re-pairing on request is off (``REPAIR_ON_REQUEST_ENABLED``).
     """
     scan = get_object_or_404(Scan, pk=pk)
-    output_dir = Path(scan.output_dir)
-    if not output_dir.is_dir():
-        return JsonResponse({"error": "No output directory"}, status=400)
-    det_path = output_dir / "detections.json"
-    from scanning.services import _sync_detections_to_disk
-
-    det_data = _sync_detections_to_disk(scan.pk)
-    if not det_data:
+    if not REPAIR_ON_REQUEST_ENABLED:
+        return JsonResponse({"error": REPAIR_DISABLED_MESSAGE}, status=409)
+    if not Detection.objects.filter(scan=scan, active=True).exists():
         return JsonResponse({"error": "No detections found"}, status=400)
-    bitonal = output_dir / "bitonal.pdf"
-    pdf_path = str(bitonal) if bitonal.exists() else local_original_pdf(scan)
-    if not pdf_path:
-        return JsonResponse({"error": "No PDF available"}, status=500)
-    try:
-        from blackletter.api import pair as bl_pair
 
-        opinions = bl_pair(
-            str(det_path),
-            pdf_path,
-            reporter=scan.reporter.short_name,
-            volume=str(scan.volume),
-            first_page=scan.start_page or 1,
-        )
-        scan.opinions_json = opinions
-        scan.s3_uploaded = False
-        scan.save()
-        gaps = [
-            {"start": start, "end": end, "count": count}
-            for start, end, count in compute_coverage_gaps(
-                opinions, scan.start_page, scan.end_page
-            )
-        ]
-        return JsonResponse(
-            {"status": "ok", "opinions": opinions, "gaps": gaps}
-        )
-    except Exception:
-        traceback.print_exc()
-        return JsonResponse({"error": "Opinion pairing failed"}, status=500)
+    from scanning.services import queue_redaction_compute
+
+    queued, message = queue_redaction_compute(scan)
+    if not queued:
+        return JsonResponse({"error": message}, status=409)
+    return JsonResponse({"status": "queued", "message": message}, status=202)
 
 
 @login_required
 @require_POST
 def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
-    """Compute and save redaction and margin rectangles for a scan.
+    """Ask the daemon to compute this scan's redaction geometry.
+
+    The same queued action as :func:`pair_opinions_api`, and for the
+    same reason: the measurement renders every page of the volume, so
+    it cannot run inside a request (#196).
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response with page and rect counts.
+    :return: JSON response saying the work is queued, or 409 while
+        re-pairing on request is off (``REPAIR_ON_REQUEST_ENABLED``).
     """
-    from scanning.services import (
-        _compute_and_save_margin_rects,
-        _compute_and_save_redaction_rects,
-    )
-
     scan = get_object_or_404(Scan, pk=pk)
-    if not Path(scan.output_dir).is_dir():
-        return JsonResponse({"error": "No output directory"}, status=400)
-    if not scan.opinions_json:
-        return JsonResponse({"error": "No opinions paired yet"}, status=400)
-    output_dir = scan.output_dir
-    processing_pdf = find_processing_pdf(output_dir)
-    pdf_path = (
-        str(processing_pdf) if processing_pdf else local_original_pdf(scan)
-    )
-    if not pdf_path:
-        return JsonResponse({"error": "No PDF available"}, status=500)
-    try:
-        rects = _compute_and_save_redaction_rects(pk, pdf_path)
-        _compute_and_save_margin_rects(pk, pdf_path, output_dir)
-        Scan.objects.filter(pk=pk).update(s3_uploaded=False)
-        total_rects = sum(len(r["rects"]) for r in rects)
-        return JsonResponse(
-            {"status": "ok", "pages": len(rects), "rects": total_rects}
-        )
-    except Exception:
-        traceback.print_exc()
-        return JsonResponse(
-            {"error": "Redaction computation failed"}, status=500
-        )
+    if not REPAIR_ON_REQUEST_ENABLED:
+        return JsonResponse({"error": REPAIR_DISABLED_MESSAGE}, status=409)
+    if not Detection.objects.filter(scan=scan, active=True).exists():
+        return JsonResponse({"error": "No detections found"}, status=400)
+
+    from scanning.services import queue_redaction_compute
+
+    queued, message = queue_redaction_compute(scan)
+    if not queued:
+        return JsonResponse({"error": message}, status=409)
+    return JsonResponse({"status": "queued", "message": message}, status=202)
 
 
 @login_required
@@ -952,7 +942,10 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 img_height=det.get("img_height", 0),
                 model_name=Detection.ModelName.MANUAL,
                 model_count=1,
-                found_by=[{"model": "manual", "confidence": 1.0}],
+                # No provenance, on purpose (#196): the confidence gates
+                # are per model family, and a second family in the file
+                # sends the whole volume back to the legacy gates.
+                found_by=[],
             )
         except Exception:
             logger.exception("Failed to create manual detection")

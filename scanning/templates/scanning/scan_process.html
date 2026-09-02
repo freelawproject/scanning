@@ -394,19 +394,10 @@ document.addEventListener('DOMContentLoaded', function () {
 {% if is_processing %}
 <script src="{% static 'scanning/viewer_progress.js' %}"></script>
 {% endif %}
-{% if step == 2 and not is_processing and not has_redaction_rects %}
-<script>
-document.addEventListener('DOMContentLoaded', function() {
-    fetch('/scans/' + SCAN_CONFIG.docId + '/compute-redactions/', {
-        method: 'POST',
-        headers: {'X-CSRFToken': SCAN_CONFIG.csrfToken},
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-        if (window.refreshOverlays) window.refreshOverlays();
-    });
-});
-</script>
-{% endif %}
+{# No auto-computation on page load any more (#196). The daemon computes
+   the geometry when a detection run finishes, and the measurement
+   renders every page of the volume, so a page view must never start it
+   on its own: a volume whose apply failed would start one on every
+   reload. The "Re-pair Opinions" button queues it, once, on purpose. #}
 {% endblock %}
 {% block footer %}{% endblock %}

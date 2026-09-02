@@ -1,6 +1,6 @@
 """Confirm in-flight external jobs and finish the scans they belong to.
 
-Four passes, in order.
+Six passes, in order.
 
 **1. ``jobs.sweep_jobs()`` asks after every job still in flight.** How
 it asks depends on the provider:
@@ -33,6 +33,21 @@ Deliberately not queued work (#212): the scan never transits
 QUEUED/PROCESSING. A scan still ``AWAITING`` its conversion is
 deferred and picked up on the tick after the bitonal park.
 
+**5. ``yolo.finish_ready_runs()`` merges finished detection runs.** It
+joins the per-shard payloads of any scan whose detection rows are all
+``COMPLETED`` into one volume JSON on S3 and flips the rows to
+``CONSUMED`` (issue #196). Like the dots.mocr glue it writes no scan
+status and keeps the per-shard results: a page insert recomputes the
+merge from them.
+
+**6. ``yolo.queue_ready_runs()`` queues the redaction computation.**
+It is a trigger, not the work: it takes a scan in
+``PAGE_COMPLETENESS_REVIEW_DONE`` to ``QUEUED`` with
+``COMPUTE_REDACTIONS``, and ``process_next_scan`` runs it. The
+computation renders every page of the volume three times (83s for 1364
+pages, measured), and this tick's scheduler is serial (#156), so it
+must not run here.
+
 Examples:
 
     # Run one confirm tick and exit.
@@ -58,7 +73,8 @@ class Command(BaseCommand):
         "Ask after every in-flight external job, then merge and park any "
         "scan whose conversion jobs have all finished, then glue any "
         "finished dots.mocr run into its volume document, then apply "
-        "every glued run (page numbers and Issues)."
+        "every glued run (page numbers and Issues), then merge every "
+        "finished detection run and queue its redaction computation."
     )
 
     def handle(self, *args, **options):
@@ -70,7 +86,7 @@ class Command(BaseCommand):
         """
         from django.db import OperationalError, connections
 
-        from scanning import bitonal, dots_mocr, jobs
+        from scanning import bitonal, dots_mocr, jobs, yolo
 
         for attempt in range(MAX_DB_RETRIES):
             connections.close_all()
@@ -79,6 +95,8 @@ class Command(BaseCommand):
                 finished = bitonal.finish_ready_scans()
                 glued = dots_mocr.finish_ready_runs()
                 applied = dots_mocr.apply_ready_runs()
+                detected = yolo.finish_ready_runs()
+                queued = yolo.queue_ready_runs()
                 break
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -102,11 +120,15 @@ class Command(BaseCommand):
                 finished,
                 glued,
                 applied,
+                detected,
+                queued,
             )
         ):
             self.stdout.write(
                 f"Completed {summary.completed}, retried {summary.retried}, "
                 f"failed {summary.failed}, still waiting {summary.pending}, "
                 f"check errors {summary.errors}; finished {finished} "
-                f"scan(s), glued {glued} OCR run(s), applied {applied}"
+                f"scan(s), glued {glued} OCR run(s), applied {applied}, "
+                f"merged {detected} detection run(s), queued {queued} "
+                f"redaction computation(s)"
             )

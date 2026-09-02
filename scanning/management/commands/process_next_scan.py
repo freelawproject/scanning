@@ -172,6 +172,11 @@ class Command(BaseCommand):
 
         dispatch = {
             QueuedAction.FULL_PIPELINE: services.run_full_pipeline,
+            # Issue #196. It runs here, and not on the collect tick,
+            # because it renders every page of the volume three times.
+            # It parks the scan itself and raises nothing, so the
+            # generic ERROR arm below never sees it.
+            QueuedAction.COMPUTE_REDACTIONS: services.run_compute_redactions,
         }
 
         # Legacy actions whose pipelines were disconnected (issue #173).

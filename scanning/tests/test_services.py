@@ -186,6 +186,188 @@ class TestUpdateProgress(TestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestModelProvenanceSurvives(TestCase):
+    """Which model family found a detection, end to end (issue #196).
+
+    The confidence gates are per family since blackletter #73
+    (``label_confidence(label, bl_warm)``), so the provenance has to
+    reach every reader: the file ``blackletter.api.pair`` reads, and
+    the ``Document`` the redaction geometry reads. Neither needs the
+    detection stack, so these run without the ``local-ml`` extra.
+    """
+
+    def setUp(self):
+        _require_fixture(self)
+        self.scan = _make_scan_with_output(
+            reporter=ReporterFactory(short_name="a3d")
+        )
+
+    def _detection(self, **kwargs):
+        """Store one bl-warm detection.
+
+        :param kwargs: Fields to override.
+        :returns: The row.
+        """
+        fields = {
+            "scan": self.scan,
+            "page_index": 0,
+            "label": "PAGE_HEADER",
+            "label_id": 2,
+            "confidence": 0.92,
+            "x0": 10,
+            "y0": 20,
+            "x1": 30,
+            "y1": 40,
+            "img_width": 1700,
+            "img_height": 2200,
+            "model_name": Detection.ModelName.BL_WARM,
+            "found_by": [{"model": "bl_warm", "confidence": 0.92}],
+        }
+        fields.update(kwargs)
+        return Detection.objects.create(**fields)
+
+    def test_detections_json_carries_found_by(self):
+        from scanning.services import _sync_detections_to_disk
+
+        self._detection()
+
+        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+
+        self.assertEqual(
+            det_data[0]["found_by"],
+            [{"model": "bl_warm", "confidence": 0.92}],
+        )
+        on_disk = json.loads(
+            (
+                pathlib.Path(self.scan.output_dir) / "detections.json"
+            ).read_text()
+        )
+        self.assertEqual(on_disk[0]["found_by"], det_data[0]["found_by"])
+
+    def test_a_hand_added_box_claims_no_model(self):
+        """It would read as a second family and send the whole volume
+        back to the legacy gates."""
+        from blackletter.bl_warm import rows_are_bl_warm
+
+        from scanning.services import _sync_detections_to_disk
+
+        self._detection()
+        self._detection(
+            label="KEY_ICON",
+            label_id=1,
+            confidence=1.0,
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[],
+        )
+
+        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+
+        self.assertNotIn("found_by", det_data[1])
+        self.assertTrue(rows_are_bl_warm(det_data))
+
+    def test_a_hand_added_row_with_a_model_claim_is_silenced(self):
+        """Rows written before #196 name ``manual`` as their model. The
+        row kind is the guard, so a re-import that keeps them cannot
+        send the volume back to the legacy gates."""
+        from blackletter.bl_warm import rows_are_bl_warm
+
+        from scanning.services import (
+            _detections_for_geometry,
+            _sync_detections_to_disk,
+        )
+
+        self._detection()
+        self._detection(
+            label="KEY_ICON",
+            label_id=1,
+            confidence=1.0,
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[{"model": "manual", "confidence": 1.0}],
+        )
+
+        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+        geometry = _detections_for_geometry(self.scan.pk, self.scan.output_dir)
+
+        self.assertNotIn("found_by", det_data[1])
+        self.assertNotIn("found_by", geometry[1])
+        self.assertTrue(rows_are_bl_warm(det_data))
+        self.assertTrue(rows_are_bl_warm(geometry))
+
+    def test_the_add_endpoint_writes_no_provenance(self):
+        """Through the view, not the model: the view is the writer that
+        used to claim a ``manual`` family."""
+        from django.urls import reverse
+
+        self._detection()
+        det_path = pathlib.Path(self.scan.output_dir) / "detections.json"
+        det_path.write_text("[]")
+        self.client.force_login(UserFactory())
+
+        response = self.client.post(
+            reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+            data=json.dumps(
+                {
+                    "page_index": 3,
+                    "label_id": 1,
+                    "bbox": [100, 100, 140, 140],
+                    "img_width": 1700,
+                    "img_height": 2200,
+                }
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["added"])
+        added = Detection.objects.get(
+            scan=self.scan, model_name=Detection.ModelName.MANUAL
+        )
+        self.assertEqual(added.found_by, [])
+
+    def test_the_document_reads_the_bl_warm_gates(self):
+        from scanning.services import (
+            _build_document_from_detections,
+            _sync_detections_to_disk,
+        )
+
+        self._detection()
+        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+
+        document = _build_document_from_detections(
+            self.scan, det_data, PDF_PATH
+        )
+
+        self.assertTrue(document.bl_warm)
+
+    def test_a_legacy_volume_keeps_the_legacy_gates(self):
+        from scanning.services import (
+            _build_document_from_detections,
+            _sync_detections_to_disk,
+        )
+
+        self._detection(model_name=Detection.ModelName.LARGE, found_by=[])
+        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+
+        document = _build_document_from_detections(
+            self.scan, det_data, PDF_PATH
+        )
+
+        self.assertFalse(document.bl_warm)
+
+    def test_the_geometry_lookup_carries_it_too(self):
+        from scanning.services import _detections_for_geometry
+
+        self._detection()
+
+        dets = _detections_for_geometry(self.scan.pk, self.scan.output_dir)
+
+        self.assertEqual(
+            dets[0]["found_by"],
+            [{"model": "bl_warm", "confidence": 0.92}],
+        )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestSyncDetectionsToDisk(TestCase):
     """Test _sync_detections_to_disk."""
 
@@ -434,58 +616,79 @@ class TestBuildDocumentFromDetections(TestCase):
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestComputeRedactionsApiView(TestCase):
-    """Test that compute_redactions_api delegates to service helpers."""
+    """The endpoint queues the measurement (issue #196).
+
+    It used to measure inside the request. The measurement renders
+    every page of the volume -- 83 seconds for 1364 pages -- so it runs
+    on the daemon now, and this view writes one status. And for now it
+    is switched off (``REPAIR_ON_REQUEST_ENABLED``): the queueing tests
+    turn the switch on, and one test checks the refusal.
+    """
 
     def setUp(self):
-        _require_fixture(self)
+        self.user = UserFactory()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user,
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        )
 
-    def test_returns_error_without_output_dir(self):
-        user = UserFactory()
-        self.client.force_login(user)
-        scan = ScanFactory(uploaded_by=user)
-        # output_dir is computed but the directory doesn't exist on disk
-        response = self.client.post(f"/scans/{scan.pk}/compute-redactions/")
+    def _detection(self):
+        return Detection.objects.create(
+            scan=self.scan,
+            page_index=0,
+            label="PAGE_HEADER",
+            label_id=2,
+            confidence=0.9,
+            x0=1,
+            y0=2,
+            x1=3,
+            y1=4,
+        )
+
+    def test_the_switch_is_off_for_now(self):
+        self._detection()
+
+        response = self.client.post(
+            f"/scans/{self.scan.pk}/compute-redactions/"
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("off for now", response.json()["error"])
+        self.scan.refresh_from_db()
+        self.assertEqual(
+            self.scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+
+    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
+    def test_a_volume_with_no_detections_is_refused(self):
+        response = self.client.post(
+            f"/scans/{self.scan.pk}/compute-redactions/"
+        )
         self.assertEqual(response.status_code, 400)
         self.assertIn("error", response.json())
 
-    def test_returns_error_without_opinions(self):
-        user = UserFactory()
-        self.client.force_login(user)
+    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
+    def test_a_volume_with_detections_is_queued(self):
+        self._detection()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(tmpdir, uploaded_by=user)
-            scan.opinions_json = ""
-            scan.save(update_fields=["opinions_json"])
+        response = self.client.post(
+            f"/scans/{self.scan.pk}/compute-redactions/"
+        )
 
-            response = self.client.post(
-                f"/scans/{scan.pk}/compute-redactions/"
-            )
-            self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["status"], "queued")
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, Status.QUEUED)
 
-    def test_computes_rects_successfully(self):
-        user = UserFactory()
-        self.client.force_login(user)
+    def test_the_request_opens_no_pdf(self):
+        """It needs no local copy: the daemon pulls what it measures."""
+        self._detection()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                uploaded_by=user,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            _run_detect_on_fixture(tmpdir)
-            _import_detections(scan.pk, tmpdir)
+        with patch("fitz.open") as opened:
+            self.client.post(f"/scans/{self.scan.pk}/compute-redactions/")
 
-            # Set opinions_json so the view doesn't bail early
-            scan.opinions_json = [{"dummy": True}]
-            scan.save(update_fields=["opinions_json"])
-
-            response = self.client.post(
-                f"/scans/{scan.pk}/compute-redactions/"
-            )
-            self.assertEqual(response.status_code, 200)
-            data = response.json()
-            self.assertEqual(data["status"], "ok")
-            self.assertIn("rects", data)
+        opened.assert_not_called()
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

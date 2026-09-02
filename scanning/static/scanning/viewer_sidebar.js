@@ -360,7 +360,12 @@ function approveDetection(btn) {
             row.style.opacity = "0.3";
             row.style.pointerEvents = "none";
             btn.textContent = "\u2713";
-            pairOpinions();
+            // Not an automatic re-pair (#196): the pairing endpoint
+            // now queues the whole redaction computation, which
+            // renders every page and takes the volume out of review,
+            // and re-pairing on request is off for now. Say what the
+            // edit did and did not change.
+            showToast("Approved. The redactions are not recomputed from this yet.", "success");
         })
         .catch(function () {
             console.error("Failed to approve detection");
@@ -441,7 +446,13 @@ function pairOpinions() {
     if (cfg.step < 2) return;
     var btn = document.getElementById("pair-btn");
     if (!btn) return;
-    btn.textContent = "Pairing...";
+    // The endpoint queues the work and answers at once (#196): the
+    // pairing, the redaction rects and the margin strips are measured
+    // together on the daemon, because they all read the same
+    // detections and the measurement renders every page. The reload
+    // below shows the progress bar, which reloads again when the
+    // daemon parks the scan.
+    btn.textContent = "Queueing...";
     btn.disabled = true;
     fetch("/scans/" + cfg.docId + "/pair-opinions/", {
         method: "POST",
