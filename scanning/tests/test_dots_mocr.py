@@ -185,6 +185,68 @@ class TestEnsureAnalyzeJobs(ScanningTestCase):
             self.assertEqual(job.run, 1)
             self.assertEqual(job.status, JobStatus.PENDING)
 
+    def _finished_run(self, scan, manifest, holes=()):
+        """Complete a run whose shards in ``holes`` left pages unread."""
+        rows = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        for row in rows:
+            output = {"page_count": 10, "failed_pages": []}
+            if row.shard_index in holes:
+                output["failed_pages"] = [3]
+            ExternalJob.objects.filter(pk=row.pk).update(
+                status=JobStatus.CONSUMED,
+                result_key=f"r{row.run}-s{row.shard_index}-a1.json",
+                provider_meta={"output": output},
+            )
+        return dots_mocr.live_analyze_jobs(scan)
+
+    def test_a_whole_run_is_kept_unless_a_new_one_is_forced(self):
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=2)
+        first = self._finished_run(scan, manifest, holes=(1,))
+
+        again = dots_mocr.ensure_analyze_jobs(scan, manifest)
+        self.assertEqual([job.pk for job in again], [job.pk for job in first])
+
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+        ):
+            forced = dots_mocr.ensure_analyze_jobs(
+                scan, manifest, force_new_run=True
+            )
+        self.assertEqual(forced[0].run, 2)
+        self.assertEqual(len(analyze_jobs(scan)), 4)
+
+    def test_a_result_with_unread_pages_is_not_carried(self):
+        # The carry is what makes a forced run the backfill of #238:
+        # the clean shard rides along for free, the shard with a hole
+        # is read again.
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=2)
+        self._finished_run(scan, manifest, holes=(1,))
+
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+        ):
+            forced = dots_mocr.ensure_analyze_jobs(
+                scan, manifest, force_new_run=True
+            )
+
+        self.assertEqual(forced[0].status, JobStatus.COMPLETED)
+        self.assertEqual(forced[0].result_key, "r1-s0-a1.json")
+        self.assertEqual(forced[1].status, JobStatus.PENDING)
+        self.assertEqual(forced[1].result_key, "")
+        self.assertEqual(
+            [
+                row.shard_index
+                for row in dots_mocr.shards_with_holes(
+                    dots_mocr.live_analyze_jobs(scan)
+                )
+            ],
+            [],
+        )
+
 
 class TestBuildPayload(ScanningTestCase):
     """What one shard is asked for."""
@@ -710,6 +772,32 @@ class TestFailedPages(ScanningTestCase):
         )
         self.job.refresh_from_db()
         self.assertEqual(self.job.provider_meta["output"]["failed_pages"], [2])
+
+    def test_recovered_pages_are_logged_at_info_in_volume_numbering(self):
+        # The worker's retry ladder (#238) saved a page; the INFO line
+        # beside the WARNING is what makes the recovery rate readable
+        # off the logs. Shard 2 page 2 is volume page 13.
+        with self.assertLogs("scanning.jobs", level="INFO") as logs:
+            jobs._complete(
+                self.job,
+                {"page_count": 10, "failed_pages": [], "recovered_pages": [2]},
+                timezone.now(),
+            )
+        lines = [line for line in logs.output if "recovered" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("recovered 1 page(s) on a retry", lines[0])
+        self.assertIn("[13]", lines[0])
+        self.assertFalse(any("could not read" in line for line in logs.output))
+        self.assertFalse(jobs.has_failed_pages(self.job))
+
+    def test_a_row_with_unread_pages_says_so(self):
+        jobs._complete(
+            self.job,
+            {"page_count": 10, "failed_pages": [2]},
+            timezone.now(),
+        )
+        self.job.refresh_from_db()
+        self.assertTrue(jobs.has_failed_pages(self.job))
 
 
 # ── run completion ──────────────────────────────────────────────────
@@ -1535,9 +1623,15 @@ class TestKnownEnqueuePaths(ScanningTestCase):
         self.assertEqual(
             callers,
             {
-                # dots.mocr: the staff button (#190), the pipeline (#207).
+                # dots.mocr: the staff button (#190), the pipeline (#207),
+                # and the backfill of runs that left pages unread (#238)
+                # -- a command, never a tick, because it spends money.
                 ("scanning/views_process.py", "ensure_analyze_jobs"),
                 ("scanning/services.py", "ensure_analyze_jobs"),
+                (
+                    "scanning/management/commands/reread_failed_pages.py",
+                    "ensure_analyze_jobs",
+                ),
                 # Detection: the staff button alone (#195). Nothing in
                 # the pipeline may appear here until #211 says so.
                 ("scanning/views_process.py", "ensure_detect_jobs"),

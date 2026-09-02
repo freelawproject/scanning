@@ -123,6 +123,17 @@ misprovisioned RunPod worker.
      local vLLM server (default 16).
    - `HANDLER_DPI` — page render DPI (default 200, upstream's
      default).
+   - `HANDLER_MAX_COMPLETION_TOKENS` — generation cap per page
+     (default 6144). Measured over 13159 production pages: median
+     1498, p95 1950, max 3114. The cap is what ends a repetition loop,
+     so keep it near twice the longest real page.
+   - `HANDLER_RETRY_THRESHOLD` (default 100), `HANDLER_RETRY_TEMPERATURE`
+     (0.1), `HANDLER_RETRY_TOP_P` (0.9),
+     `HANDLER_RETRY_REPETITION_PENALTY` (1.05) — the retry ladder
+     (scanning #238). A page with no usable output is re-run on the
+     same render thresholded at `HANDLER_RETRY_THRESHOLD` (removes the
+     verso show-through that causes the loops), then once more with
+     sampling and a repetition penalty. Good pages never take a rung.
    - `VLLM_GPU_MEMORY_UTILIZATION` (default 0.9),
      `VLLM_STARTUP_TIMEOUT` (default 900 s), `VLLM_EXTRA_ARGS`
      (extra `vllm serve` flags, e.g. `--max-model-len 16384`).
@@ -147,7 +158,7 @@ is `parse`:
     "num_threads": 16,
     "temperature": 0.0,
     "top_p": 1.0,
-    "max_completion_tokens": 16384,
+    "max_completion_tokens": 6144,
     "include_pictures": false
   }
 }

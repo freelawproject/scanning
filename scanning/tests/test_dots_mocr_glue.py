@@ -236,6 +236,24 @@ class TestMergeDotsmocrResults(AnalyzeJobsMixin, TestCase):
         self.assertEqual(document["pages"][3]["error"], "boom")
         self.assertEqual(document["failed_pages"], [3])
 
+    def test_filtered_and_recovered_pages_are_listed(self):
+        """Two lists for the survey of #238; the apply reads neither."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=3)
+        filtered = make_page(1)
+        filtered.update({"filtered": True, "cells": None})
+        recovered = make_page(2)
+        recovered.update({"recovered_by": 2, "render": "threshold"})
+        self.write_envelope(
+            0, make_envelope(rows[0], [make_page(0), filtered, recovered])
+        )
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        document = self.upload.call_args[0][1]
+        self.assertEqual(document["failed_pages"], [])
+        self.assertEqual(document["filtered_pages"], [1])
+        self.assertEqual(document["recovered_pages"], [2])
+
     def test_gluing_twice_gives_the_same_document(self):
         """Idempotent, so a crash before the CONSUMED write costs
         nothing."""

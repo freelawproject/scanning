@@ -608,31 +608,52 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
     """Warn about pages a worker could not read, in volume numbering.
 
     A shard that produced most of its pages is a success, not a retry:
-    the page-number adapter (issue #149) reads a missing page as
-    ``detected=None`` and interpolates, so re-running 99 good pages to
-    recover one is poor value. But the gap has to be visible, and it has
-    to name pages of the *volume* -- the worker counts from zero inside
-    the shard it was given.
+    the worker itself retries a page that gave no output, on a changed
+    render and then with sampling (the ladder of issue #238), so a page
+    still failed here is one three configurations could not read. The
+    page-number adapter (issue #149) reads it as ``detected=None`` and
+    interpolates, and re-running 99 good pages to try a fourth time is
+    poor value. But the gap has to be visible, and it has to name pages
+    of the *volume* -- the worker counts from zero inside the shard it
+    was given.
 
-    The numbers survive in ``provider_meta["output"]`` either way;
-    ``_complete`` stores the whole summary.
+    The pages a retry rung saved are logged too, at INFO, so the
+    ladder's recovery rate can be read off the logs as the ratio of two
+    lines. The numbers survive in ``provider_meta["output"]`` either
+    way; ``_complete`` stores the whole summary.
 
     :param job: The row just completed.
     :param output: The provider's summary.
     :return: None.
     """
-    failed = (output or {}).get("failed_pages")
+    output = output or {}
+    from_page = job.input_manifest.get("from_page")
+
+    def _where(pages: list) -> str:
+        if isinstance(from_page, int):
+            # Shard-local and 0-based on the wire, volume and 1-based
+            # here.
+            volume = [
+                from_page + page + 1 for page in pages if isinstance(page, int)
+            ]
+            return f"volume page(s) {volume}"
+        return f"shard page(s) {pages}"
+
+    recovered = output.get("recovered_pages")
+    if recovered and isinstance(recovered, list):
+        logger.info(
+            "%s/%s shard %d/%d of scan %s recovered %d page(s) on a retry: %s",
+            job.stage,
+            job.engine,
+            job.shard_index + 1,
+            job.shard_count,
+            job.scan_id,
+            len(recovered),
+            _where(recovered),
+        )
+    failed = output.get("failed_pages")
     if not failed or not isinstance(failed, list):
         return
-    from_page = job.input_manifest.get("from_page")
-    if isinstance(from_page, int):
-        # Shard-local and 0-based on the wire, volume and 1-based here.
-        pages = [
-            from_page + page + 1 for page in failed if isinstance(page, int)
-        ]
-        where = f"volume page(s) {pages}"
-    else:
-        where = f"shard page(s) {failed}"
     logger.warning(
         "%s/%s shard %d/%d of scan %s could not read %d of %s page(s): %s",
         job.stage,
@@ -642,7 +663,7 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
         job.scan_id,
         len(failed),
         job.input_manifest.get("page_count", "?"),
-        where,
+        _where(failed),
     )
 
 
@@ -1061,6 +1082,23 @@ def run_summary(scan, stage: str, engine: str) -> dict | None:
     }
 
 
+def has_failed_pages(job: ExternalJob) -> bool:
+    """Return whether a completed row's worker left pages unread.
+
+    Read off the summary ``_complete`` stores in
+    ``provider_meta["output"]``: the dots.mocr worker reports
+    ``failed_pages`` there (shard-local indexes). A row with no summary
+    -- a carried row, a doctor row -- has no holes to report.
+
+    :param job: A completed or consumed row.
+    :returns: Whether ``failed_pages`` is non-empty.
+    :rtype: bool
+    """
+    output = (job.provider_meta or {}).get("output") or {}
+    failed = output.get("failed_pages")
+    return bool(failed) and isinstance(failed, list)
+
+
 def _reusable_results(
     scan, stage: str, engine: str, specs: list[tuple[str, dict]]
 ) -> dict[int, ExternalJob]:
@@ -1115,6 +1153,12 @@ def _reusable_results(
     for row in prior_rows:
         if not row.result_key:
             continue
+        if has_failed_pages(row):
+            # A result with a hole is not a result to carry (#238): the
+            # new run exists to read the pages the old one could not,
+            # so this shard is re-paid while its clean siblings ride
+            # along for free.
+            continue
         by_identity.setdefault(
             _identity_key(row.input_key, row.input_manifest), row
         )
@@ -1153,6 +1197,7 @@ def ensure_shard_jobs(
     engine: str,
     provider: str,
     reuse_results: bool = False,
+    force_new_run: bool = False,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``scan``'s shards,
     creating them if the current run does not describe today's shard set.
@@ -1187,6 +1232,15 @@ def ensure_shard_jobs(
     :param stage: A :class:`~scanning.models.JobStage` value.
     :param engine: A :class:`~scanning.models.JobEngine` value.
     :param provider: A :class:`~scanning.models.JobProvider` value.
+    :param reuse_results: Carry prior results forward, as described
+        above. Only for an engine whose results outlive the apply.
+    :param force_new_run: Start a new run even when the live one still
+        describes today's shard set and is reusable. For the backfill
+        of a run that completed with unread pages (#238): the live run
+        is whole and consumed, so nothing else would replace it, and
+        with ``reuse_results`` the carry re-pays only the shards with a
+        hole. A deliberate way to spend GPU money, which is why no tick
+        passes it.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -1199,15 +1253,22 @@ def ensure_shard_jobs(
     )
     if existing:
         live = [job for job in existing if job.run == existing[0].run]
-        if _still_describes(live, specs) and _is_reusable(live):
+        if (
+            not force_new_run
+            and _still_describes(live, specs)
+            and _is_reusable(live)
+        ):
             return live
         logger.info(
-            "scan %s %s/%s run %d cannot be picked back up (%d shard(s), "
-            "statuses %s); starting a new run",
+            "scan %s %s/%s run %d %s (%d shard(s), statuses %s); starting "
+            "a new run",
             scan.pk,
             stage,
             engine,
             live[0].run,
+            "is replaced on request"
+            if force_new_run
+            else "cannot be picked back up",
             len(live),
             sorted({job.status for job in live}),
         )

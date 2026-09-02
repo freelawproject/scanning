@@ -175,7 +175,9 @@ def build_payload(job: ExternalJob, input_url: str, output_url: str) -> dict:
     }
 
 
-def ensure_analyze_jobs(scan, manifest: dict) -> list[ExternalJob]:
+def ensure_analyze_jobs(
+    scan, manifest: dict, *, force_new_run: bool = False
+) -> list[ExternalJob]:
     """Return the live dots.mocr jobs for ``scan``, creating them if
     the current run does not describe today's shard set.
 
@@ -190,9 +192,14 @@ def ensure_analyze_jobs(scan, manifest: dict) -> list[ExternalJob]:
     (``jobs._reusable_results``). This engine can carry, because its
     per-shard results are deliberately kept after the apply; the
     bitonal merge deletes its results, so the convert stage must not.
+    A result with unread pages is never carried (#238), which is what
+    makes ``force_new_run`` the backfill for those: the new run re-pays
+    the shards with a hole and nothing else.
 
     :param scan: The scan to read.
     :param manifest: The committed shard manifest.
+    :param force_new_run: Replace a whole, reusable live run. Only the
+        ``reread_failed_pages`` command passes it.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -203,7 +210,18 @@ def ensure_analyze_jobs(scan, manifest: dict) -> list[ExternalJob]:
         engine=JobEngine.DOTS_MOCR,
         provider=JobProvider.RUNPOD,
         reuse_results=True,
+        force_new_run=force_new_run,
     )
+
+
+def shards_with_holes(rows: list[ExternalJob]) -> list[ExternalJob]:
+    """Return the rows of a run whose worker left pages unread.
+
+    :param rows: A run's rows.
+    :returns: Those with a non-empty ``failed_pages`` in their summary.
+    :rtype: list[ExternalJob]
+    """
+    return [row for row in rows if jobs.has_failed_pages(row)]
 
 
 def live_analyze_jobs(scan) -> list[ExternalJob]:
@@ -414,6 +432,15 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
         "failed_pages": [
             page["page_index"] for page in pages if "error" in page
         ],
+        # Two more lists for the survey of #238, neither read by the
+        # apply: a filtered page has no cells and so no page number
+        # either, and a recovered page is one a retry rung saved.
+        "filtered_pages": [
+            page["page_index"] for page in pages if page.get("filtered")
+        ],
+        "recovered_pages": [
+            page["page_index"] for page in pages if "recovered_by" in page
+        ],
     }
     key = glued_result_key(scan, run)
     if not s3_sync.upload_json_object(key, document):
@@ -423,12 +450,14 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
         )
     logger.info(
         "Glued %d dots.mocr shard(s) for scan %s into %s (%d page(s), "
-        "%d unread) in %.1fs",
+        "%d unread, %d filtered, %d recovered on a retry) in %.1fs",
         len(analyze_jobs),
         scan.pk,
         key,
         len(pages),
         len(document["failed_pages"]),
+        len(document["filtered_pages"]),
+        len(document["recovered_pages"]),
         time.monotonic() - started,
     )
     return key

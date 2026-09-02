@@ -546,6 +546,25 @@ trained on), tracked on `ExternalJob` rows at
   inside its shard) and kept in `provider_meta`. The apply reads a
   missing page as `detected=None` and interpolates, so re-running 99
   good pages to recover one is poor value.
+- **The worker retries a page itself, on a changed input (#238).**
+  Every unread page in 30 days of production was a repetition loop on
+  the last, mostly blank page of an opinion whose verso showed
+  through; greedy decoding is deterministic, so the same render loops
+  again. `_parse_page` climbs a ladder: greedy on the render, then
+  greedy on the render thresholded at `RETRY_THRESHOLD` (100 removes
+  the show-through and keeps the text; doctor's 160 does not), then
+  sampling plus a repetition penalty. Only a page with no usable output
+  climbs, so good pages stay deterministic; the page dict says what
+  happened (`attempts`, `recovered_by`, `render`, `sampled`, `errors`)
+  and the summary carries `recovered_pages`, logged at INFO beside the
+  WARNING. The cap is `HANDLER_MAX_COMPLETION_TOKENS` = 6144, about
+  twice the longest measured page (3114) and not 16384: every rung
+  pays the cap once, and at the old value one looping page made its
+  shard four times slower. **A result with a hole is never carried**
+  (`jobs.has_failed_pages` in `_reusable_results`), which is what makes
+  `reread_failed_pages` the backfill: it forces a new run
+  (`ensure_shard_jobs(force_new_run=True)`) that re-pays only the
+  shards with unread pages. Run it after the worker image is live.
 - **`DPI = 200` and `PROMPT_MODE = "prompt_layout_all_en"` are module
   constants, not settings.** The dpi matches `DOCTOR_BITONAL_DPI` so a
   cell's bbox describes the same pixel space as the rest of the corpus,

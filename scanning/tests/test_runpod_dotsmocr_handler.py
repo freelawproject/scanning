@@ -25,7 +25,6 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from django.test import SimpleTestCase
@@ -125,11 +124,11 @@ def _renderer_stubs(origin_size=(1700, 2200)):
     fitz = mock.MagicMock()
     fitz.open.return_value.__getitem__.return_value = page
     stubs["fitz"] = fitz
-    stubs[
-        "dots_mocr.utils.doc_utils"
-    ].fitz_doc_to_image.return_value = SimpleNamespace(
-        width=origin_size[0], height=origin_size[1]
-    )
+    # A MagicMock, not a SimpleNamespace: the retry ladder's threshold
+    # render calls ``.convert`` and ``.point`` on it.
+    render = mock.MagicMock()
+    render.width, render.height = origin_size
+    stubs["dots_mocr.utils.doc_utils"].fitz_doc_to_image.return_value = render
     stubs["dots_mocr.utils.image_utils"].smart_resize.return_value = (
         2212,
         1708,
@@ -341,13 +340,206 @@ class TestParsePageInference(SimpleTestCase):
     worker thread so a ``side_effect`` list maps to pages in order.
     """
 
-    def _run(self, vllm_side_effect, pages=1, origin_size=(1700, 2200)):
+    LOOP = ("x" * 50, "length", 6144)
+
+    def _run(
+        self,
+        vllm_side_effect,
+        pages=1,
+        origin_size=(1700, 2200),
+        prompt_mode="prompt_ocr",
+        post_process=None,
+    ):
+        stubs = _renderer_stubs(origin_size)
+        if post_process is not None:
+            stubs[
+                "dots_mocr.utils.layout_utils"
+            ].post_process_output.side_effect = post_process
+        self.stubs = stubs
         with (
-            mock.patch.dict(sys.modules, _renderer_stubs(origin_size)),
+            mock.patch.dict(sys.modules, stubs),
             mock.patch.object(handler, "download_pdf"),
             mock.patch.object(handler, "validate_pdf", return_value=pages),
             mock.patch.object(
                 handler, "_vllm_inference", side_effect=vllm_side_effect
+            ) as infer,
+        ):
+            result = handler._action_parse(
+                {"id": "job-1"},
+                {
+                    "pdf_url": "https://x/y.pdf",
+                    "prompt_mode": prompt_mode,
+                    "num_threads": 1,
+                },
+                Path("/nonexistent"),
+            )
+        return result, infer
+
+    def test_page_carries_dims_and_token_count(self):
+        result, infer = self._run([("some text", "stop", 42)])
+        page = result["pages"][0]
+        self.assertEqual(page["md"], "some text")
+        self.assertEqual(page["completion_tokens"], 42)
+        self.assertEqual(page["origin_width"], 1700)
+        self.assertEqual(page["origin_height"], 2200)
+        self.assertEqual(page["input_width"], 1708)
+        self.assertEqual(page["input_height"], 2212)
+        self.assertNotIn("render_fallback", page)
+        self.assertEqual(result["failed_pages"], [])
+        # A first-try success spends one rung and carries no ladder
+        # marks, so a reader can tell it from a recovered page.
+        self.assertEqual(page["attempts"], 1)
+        self.assertNotIn("recovered_by", page)
+        self.assertNotIn("render", page)
+        self.assertNotIn("sampled", page)
+        self.assertNotIn("errors", page)
+        self.assertEqual(result["recovered_pages"], [])
+        # The default cap reaches the model: about twice the longest
+        # measured page, not the old 16384.
+        self.assertEqual(infer.call_args.kwargs["max_completion_tokens"], 6144)
+        self.assertEqual(handler.DEFAULT_MAX_COMPLETION_TOKENS, 6144)
+
+    def test_empty_response_retries_then_succeeds(self):
+        # "" used to slip through the ``is not None`` check and come
+        # back as a successful page with md="". The retry is inside the
+        # rung, so it spends no rung.
+        result, infer = self._run([("", "stop", 0), ("text!", "stop", 7)])
+        self.assertEqual(infer.call_count, 2)
+        page = result["pages"][0]
+        self.assertEqual(page["md"], "text!")
+        self.assertEqual(page["attempts"], 1)
+        self.assertEqual(result["failed_pages"], [])
+
+    def test_persistently_empty_response_fails_the_page(self):
+        # Every rung gets its own in-rung retries before the page fails.
+        empties = [("", "stop", 0)] * handler.INFERENCE_ATTEMPTS * 3
+        result, _ = self._run(empties + [("ok", "stop", 1)], pages=2)
+        self.assertEqual(result["failed_pages"], [0])
+        self.assertIn("empty response", result["pages"][0]["error"])
+        self.assertEqual(result["pages"][0]["attempts"], 3)
+        self.assertEqual(result["pages"][1]["md"], "ok")
+
+    def test_a_loop_is_retried_on_the_thresholded_render(self):
+        # finish_reason='length' means the cap cut the generation — a
+        # repetition loop, in practice on the show-through of a mostly
+        # blank page. Rung 2 reads the same page with the show-through
+        # thresholded away, still greedy.
+        sentinel = mock.MagicMock(name="thresholded")
+        with mock.patch.object(
+            handler, "_threshold_render", return_value=sentinel
+        ) as threshold:
+            result, infer = self._run([self.LOOP, ("ok", "stop", 3)])
+        page = result["pages"][0]
+        self.assertEqual(page["md"], "ok")
+        self.assertEqual(page["recovered_by"], 2)
+        self.assertEqual(page["attempts"], 2)
+        self.assertEqual(page["render"], "threshold")
+        self.assertNotIn("sampled", page)
+        self.assertEqual(len(page["errors"]), 1)
+        self.assertIn("truncated at 6144 tokens", page["errors"][0])
+        self.assertEqual(result["failed_pages"], [])
+        self.assertEqual(result["recovered_pages"], [0])
+        self.assertEqual(infer.call_count, 2)
+        # The second rung fed the thresholded render to the model's
+        # image pipeline, and kept greedy decoding.
+        threshold.assert_called_once()
+        fetch = self.stubs["dots_mocr.utils.image_utils"].fetch_image
+        self.assertIs(fetch.call_args_list[1].args[0], sentinel)
+        second = infer.call_args_list[1].kwargs
+        self.assertEqual(second["temperature"], 0.0)
+        self.assertIsNone(second["repetition_penalty"])
+
+    def test_a_second_loop_is_retried_with_sampling(self):
+        result, infer = self._run([self.LOOP, self.LOOP, ("ok", "stop", 3)])
+        page = result["pages"][0]
+        self.assertEqual(page["md"], "ok")
+        self.assertEqual(page["recovered_by"], 3)
+        self.assertEqual(page["attempts"], 3)
+        self.assertEqual(page["render"], "threshold")
+        self.assertIs(page["sampled"], True)
+        self.assertEqual(len(page["errors"]), 2)
+        third = infer.call_args_list[2].kwargs
+        self.assertEqual(third["temperature"], handler.RETRY_TEMPERATURE)
+        self.assertEqual(third["top_p"], handler.RETRY_TOP_P)
+        self.assertEqual(
+            third["repetition_penalty"], handler.RETRY_REPETITION_PENALTY
+        )
+
+    def test_three_loops_fail_the_page_with_its_history(self):
+        result, infer = self._run(
+            [self.LOOP, self.LOOP, self.LOOP, ("ok", "stop", 3)], pages=2
+        )
+        page = result["pages"][0]
+        self.assertEqual(result["failed_pages"], [0])
+        # ``error`` keeps the shape every reader knows: the last text.
+        self.assertIn("truncated at 6144 tokens", page["error"])
+        self.assertEqual(page["attempts"], 3)
+        self.assertEqual(len(page["errors"]), 3)
+        self.assertNotIn("recovered_by", page)
+        self.assertEqual(result["pages"][1]["md"], "ok")
+        self.assertEqual(result["recovered_pages"], [])
+        self.assertEqual(infer.call_count, 4)
+
+    def test_a_filtered_answer_takes_a_rung(self):
+        # Not-JSON output has no cells and so no page number; it is
+        # worth the same retry as a loop, and a rung that answers JSON
+        # replaces it.
+        result, _ = self._run(
+            [("junk", "stop", 5), ("[]", "stop", 6)],
+            prompt_mode="prompt_layout_only_en",
+            post_process=[
+                ("junk text", True),
+                ([{"bbox": [0, 0, 1, 1]}], False),
+            ],
+        )
+        page = result["pages"][0]
+        self.assertIs(page["filtered"], False)
+        self.assertEqual(page["cells"], [{"bbox": [0, 0, 1, 1]}])
+        self.assertEqual(page["recovered_by"], 2)
+        self.assertEqual(page["errors"], ["model output was not layout JSON"])
+        self.assertEqual(result["recovered_pages"], [0])
+
+    def test_a_page_filtered_on_every_rung_is_not_an_error(self):
+        # The cleaned text is still text a reader can search, so the
+        # page keeps today's shape and stays out of ``failed_pages``.
+        result, infer = self._run(
+            [("junk", "stop", 5)] * 3,
+            prompt_mode="prompt_layout_only_en",
+            post_process=[("junk text", True)] * 3,
+        )
+        page = result["pages"][0]
+        self.assertIs(page["filtered"], True)
+        self.assertIsNone(page["cells"])
+        self.assertEqual(page["md"], "junk text")
+        self.assertEqual(page["attempts"], 3)
+        self.assertEqual(len(page["errors"]), 3)
+        self.assertNotIn("recovered_by", page)
+        self.assertEqual(result["failed_pages"], [])
+        self.assertEqual(result["recovered_pages"], [])
+        self.assertEqual(infer.call_count, 3)
+
+    def test_an_empty_render_takes_no_rung(self):
+        # The render is the input to every rung; a re-render of the same
+        # page gives the same nothing, so no inference is spent on it.
+        result, infer = self._run_empty_render()
+        page = result["pages"][0]
+        self.assertEqual(page["error"], "page rendered empty")
+        self.assertEqual(page["attempts"], 1)
+        self.assertEqual(result["failed_pages"], [0])
+        self.assertEqual(infer.call_count, 1)
+
+    def _run_empty_render(self):
+        stubs = _renderer_stubs()
+        stubs["dots_mocr.utils.doc_utils"].fitz_doc_to_image.side_effect = [
+            None,
+            stubs["dots_mocr.utils.doc_utils"].fitz_doc_to_image.return_value,
+        ]
+        with (
+            mock.patch.dict(sys.modules, stubs),
+            mock.patch.object(handler, "download_pdf"),
+            mock.patch.object(handler, "validate_pdf", return_value=2),
+            mock.patch.object(
+                handler, "_vllm_inference", side_effect=[("ok", "stop", 1)]
             ) as infer,
         ):
             result = handler._action_parse(
@@ -361,47 +553,6 @@ class TestParsePageInference(SimpleTestCase):
             )
         return result, infer
 
-    def test_page_carries_dims_and_token_count(self):
-        result, _ = self._run([("some text", "stop", 42)])
-        page = result["pages"][0]
-        self.assertEqual(page["md"], "some text")
-        self.assertEqual(page["completion_tokens"], 42)
-        self.assertEqual(page["origin_width"], 1700)
-        self.assertEqual(page["origin_height"], 2200)
-        self.assertEqual(page["input_width"], 1708)
-        self.assertEqual(page["input_height"], 2212)
-        self.assertNotIn("render_fallback", page)
-        self.assertEqual(result["failed_pages"], [])
-
-    def test_empty_response_retries_then_succeeds(self):
-        # "" used to slip through the ``is not None`` check and come
-        # back as a successful page with md="".
-        result, infer = self._run([("", "stop", 0), ("text!", "stop", 7)])
-        self.assertEqual(infer.call_count, 2)
-        page = result["pages"][0]
-        self.assertEqual(page["md"], "text!")
-        self.assertEqual(result["failed_pages"], [])
-
-    def test_persistently_empty_response_fails_the_page(self):
-        empties = [("", "stop", 0)] * handler.INFERENCE_ATTEMPTS
-        result, _ = self._run(empties + [("ok", "stop", 1)], pages=2)
-        self.assertEqual(result["failed_pages"], [0])
-        self.assertIn("empty response", result["pages"][0]["error"])
-        self.assertEqual(result["pages"][1]["md"], "ok")
-
-    def test_truncated_output_is_a_page_failure(self):
-        # finish_reason='length' means the cap cut the generation — in
-        # practice a repetition loop. It must land in failed_pages, not
-        # silently degrade into a "successful" page.
-        result, infer = self._run(
-            [("x" * 50, "length", 16384), ("ok", "stop", 3)], pages=2
-        )
-        self.assertEqual(result["failed_pages"], [0])
-        self.assertIn("truncated at 16384 tokens", result["pages"][0]["error"])
-        self.assertEqual(result["pages"][1]["md"], "ok")
-        # No retry on truncation: same input, same loop.
-        self.assertEqual(infer.call_count, 2)
-
     def test_silent_72dpi_rerender_is_flagged(self):
         # Upstream re-renders any page over 4500 px at 72 dpi with no
         # signal; the page must carry the actual render dims and the
@@ -412,6 +563,55 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(page["origin_width"], 612)
         self.assertEqual(page["origin_height"], 792)
         self.assertEqual(result["failed_pages"], [])
+
+
+class TestThresholdRender(SimpleTestCase):
+    """The retry render: a grey cut that removes the verso show-through."""
+
+    def test_pixels_above_the_threshold_go_white_and_the_rest_black(self):
+        from PIL import Image
+
+        image = Image.new("L", (3, 1))
+        image.putdata([0, handler.RETRY_THRESHOLD, 255])
+
+        out = handler._threshold_render(image)
+
+        self.assertEqual(out.mode, "RGB")
+        self.assertEqual(out.size, image.size)
+        self.assertEqual(
+            list(out.getdata()), [(0, 0, 0), (0, 0, 0), (255, 255, 255)]
+        )
+
+
+class TestVllmInferenceSampling(SimpleTestCase):
+    """The repetition penalty travels in ``extra_body`` or not at all."""
+
+    def _create(self, **kwargs):
+        client = mock.MagicMock()
+        choice = mock.MagicMock()
+        choice.message.content = "text"
+        choice.finish_reason = "stop"
+        client.chat.completions.create.return_value.choices = [choice]
+        client.chat.completions.create.return_value.usage.completion_tokens = 9
+        stubs = _stub_dots_mocr_modules()
+        with mock.patch.dict(sys.modules, stubs):
+            handler._vllm_inference(
+                client,
+                mock.MagicMock(),
+                "prompt",
+                temperature=0.0,
+                top_p=1.0,
+                max_completion_tokens=6144,
+                **kwargs,
+            )
+        return client.chat.completions.create.call_args.kwargs
+
+    def test_greedy_sends_no_extra_body(self):
+        self.assertNotIn("extra_body", self._create())
+
+    def test_a_penalty_is_sent_through_extra_body(self):
+        sent = self._create(repetition_penalty=1.05)
+        self.assertEqual(sent["extra_body"], {"repetition_penalty": 1.05})
 
 
 class TestStripDataUris(SimpleTestCase):
