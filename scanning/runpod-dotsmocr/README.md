@@ -123,6 +123,25 @@ misprovisioned RunPod worker.
      local vLLM server (default 16).
    - `HANDLER_DPI` — page render DPI (default 200, upstream's
      default).
+   - `HANDLER_MAX_COMPLETION_TOKENS` — generation cap per page
+     (default 6144). Measured over 13159 production pages: median
+     1498, p95 1950, max 3114. The cap is what ends a repetition loop,
+     so keep it near twice the longest real page.
+   - `HANDLER_RETRY_THRESHOLD` (default 100) — the retry of scanning
+     #238. A page with no usable output is re-run once on the same
+     render thresholded at this grey level, which removes the verso
+     show-through that causes the loops. The render is the only
+     change: same greedy decoding, so the stage stays deterministic.
+     Good pages never take the retry. A page filtered on both rungs
+     (an answer that was not layout JSON) keeps upstream's cleaned
+     text in `md`; the summary lists it in `filtered_pages` beside
+     `failed_pages` and `recovered_pages`.
+   - Every page that got an answer carries `raw`, the answer as the
+     model wrote it (about 6 KB a page). `cells` is upstream's parsed
+     and rescaled copy, so `raw` is what a later post-processor
+     starts from. On a failed page it is the last truncated answer.
+     It lives in the shard result object on S3 only; the glue leaves
+     it out of the volume document.
    - `VLLM_GPU_MEMORY_UTILIZATION` (default 0.9),
      `VLLM_STARTUP_TIMEOUT` (default 900 s), `VLLM_EXTRA_ARGS`
      (extra `vllm serve` flags, e.g. `--max-model-len 16384`).
@@ -147,7 +166,7 @@ is `parse`:
     "num_threads": 16,
     "temperature": 0.0,
     "top_p": 1.0,
-    "max_completion_tokens": 16384,
+    "max_completion_tokens": 6144,
     "include_pictures": false
   }
 }

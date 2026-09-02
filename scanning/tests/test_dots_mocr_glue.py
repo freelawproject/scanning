@@ -195,7 +195,8 @@ class TestMergeDotsmocrResults(AnalyzeJobsMixin, TestCase):
         )
 
     def test_the_per_page_payload_survives_whole(self):
-        """The glue is naive on purpose: nothing is trimmed."""
+        """The glue is naive on purpose: nothing but ``raw`` is left
+        out (see the test below)."""
         scan, rows = self.build(shard_count=1, pages_per_shard=1)
 
         dots_mocr.merge_dotsmocr_results(scan, rows)
@@ -235,6 +236,92 @@ class TestMergeDotsmocrResults(AnalyzeJobsMixin, TestCase):
         self.assertEqual(len(document["pages"]), 4)
         self.assertEqual(document["pages"][3]["error"], "boom")
         self.assertEqual(document["failed_pages"], [3])
+
+    def test_the_glue_stamps_the_page_lists_on_a_row_without_a_summary(self):
+        """A row completed by an S3 HEAD stores ``output=None``; the
+        glue has the result in hand and says whether it has a hole."""
+        from scanning import jobs
+
+        scan, rows = self.build(shard_count=2, pages_per_shard=2)
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            provider_meta={"output": None, "confirmed_by": "s3_head"}
+        )
+        rows = dots_mocr.live_analyze_jobs(scan)
+        filtered = make_page(0)
+        filtered.update({"filtered": True, "cells": None})
+        self.write_envelope(
+            1,
+            make_envelope(
+                rows[1], [filtered, {"page_no": 1, "error": "boom"}]
+            ),
+        )
+        self.assertFalse(jobs.has_unread_pages(rows[1]))
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        rows[1].refresh_from_db()
+        output = rows[1].provider_meta["output"]
+        self.assertEqual(output["failed_pages"], [1])
+        self.assertEqual(output["filtered_pages"], [0])
+        self.assertEqual(output["recovered_pages"], [])
+        self.assertEqual(rows[1].provider_meta["confirmed_by"], "s3_head")
+        self.assertTrue(jobs.has_unread_pages(rows[1]))
+        # A clean shard is stamped clean, and stays clean.
+        rows[0].refresh_from_db()
+        self.assertEqual(rows[0].provider_meta["output"]["failed_pages"], [])
+        self.assertFalse(jobs.has_unread_pages(rows[0]))
+
+    def test_the_stamp_is_a_compare_and_swap_that_logs_a_loss(self):
+        """Through ``jobs._write``: a row that moved under the glue is
+        not overwritten, and the loss is in the log."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+        self.write_envelope(
+            0, make_envelope(rows[0], [{"page_no": 0, "error": "boom"}])
+        )
+        # Somebody moved the row after the glue read it.
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.CANCELLED
+        )
+
+        with self.assertLogs("scanning.jobs", level="INFO") as logs:
+            dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        self.assertTrue(any("moved out of" in line for line in logs.output))
+        rows[0].refresh_from_db()
+        self.assertNotIn(
+            "failed_pages", rows[0].provider_meta.get("output") or {}
+        )
+
+    def test_the_raw_answer_stays_in_the_shard_object(self):
+        """The apply never reads it, and it would double the download."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=2)
+        first = make_page(0)
+        first["raw"] = '[{"bbox": [1, 2, 3, 4], "category": "Text"}]'
+        self.write_envelope(0, make_envelope(rows[0], [first, make_page(1)]))
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        document = self.upload.call_args[0][1]
+        self.assertNotIn("raw", document["pages"][0])
+        self.assertEqual(document["pages"][0]["md"], "98")
+
+    def test_filtered_and_recovered_pages_are_listed(self):
+        """Two lists for the survey of #238; the apply reads neither."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=3)
+        filtered = make_page(1)
+        filtered.update({"filtered": True, "cells": None})
+        recovered = make_page(2)
+        recovered.update({"recovered_by": 2, "render": "threshold"})
+        self.write_envelope(
+            0, make_envelope(rows[0], [make_page(0), filtered, recovered])
+        )
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        document = self.upload.call_args[0][1]
+        self.assertEqual(document["failed_pages"], [])
+        self.assertEqual(document["filtered_pages"], [1])
+        self.assertEqual(document["recovered_pages"], [2])
 
     def test_gluing_twice_gives_the_same_document(self):
         """Idempotent, so a crash before the CONSUMED write costs

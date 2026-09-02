@@ -112,10 +112,36 @@ DEFAULT_NUM_THREADS = int(os.environ.get("HANDLER_NUM_THREADS", "16"))
 # batch-composition numerics), which the alignment pipeline relies on.
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
-DEFAULT_MAX_COMPLETION_TOKENS = 16384
+# Generation cap per page. Measured over 13159 pages of nine reporters
+# (scanning #238): a real page takes 1498 tokens at the median, 1950
+# at p95 and 3114 at most, so 6144 is about twice the longest page.
+# The cap is what ends a repetition loop, and a loop runs alone for
+# minutes after the rest of the shard is done -- at the old 16384 a
+# shard with one looping page took about four times as long as a clean
+# one. Every rung of the retry ladder below pays the cap once, so it
+# has to be tight.
+DEFAULT_MAX_COMPLETION_TOKENS = int(
+    os.environ.get("HANDLER_MAX_COMPLETION_TOKENS", "6144")
+)
 # Per-page attempts when the vLLM call returns nothing (upstream's
 # ``inference_with_vllm`` swallows transport errors and returns None).
 INFERENCE_ATTEMPTS = int(os.environ.get("HANDLER_INFERENCE_ATTEMPTS", "2"))
+
+# ── Retry ladder (scanning #238) ────────────────────────────────────
+# Every page failure seen in 30 days of production was one thing: a
+# repetition loop on the last, mostly blank page of an opinion whose
+# verso showed through as faint mirrored text. Greedy decoding is
+# deterministic per page, so the same render loops again; a retry has
+# to change the input. Rung 2 re-runs the page on the same render with
+# a grey threshold that removes the show-through and keeps the real
+# text (100 does on the pages we examined; doctor's bitonal 160 does
+# not).
+# The render is the only thing that changes: both rungs decode greedily
+# with the same parameters, so the stage gives the same output for the
+# same page on every run. No sampling and no repetition penalty, on
+# purpose -- a penalty cannot tell a loop from the keys and brackets
+# layout JSON repeats by design.
+RETRY_THRESHOLD = int(os.environ.get("HANDLER_RETRY_THRESHOLD", "100"))
 
 # Prompt modes this worker accepts. The remaining upstream modes
 # (grounding OCR, web parsing, scene spotting, SVG) target single
@@ -447,6 +473,59 @@ def _vllm_inference(
 _DATA_URI_MD_IMG_RE = re.compile(r"!\[[^\]]*\]\(data:image/[^)]*\)")
 
 
+class TruncatedOutput(RuntimeError):
+    """A rung's generation was cut at the cap: a repetition loop.
+
+    :ivar raw: The truncated answer, kept so a failed page can still
+        show what the loop repeated.
+    """
+
+    def __init__(self, message: str, raw: str | None = None):
+        self.raw = raw
+        super().__init__(message)
+
+
+class PageFailed(RuntimeError):
+    """Every rung of the retry ladder failed on one page (#238).
+
+    :ivar errors: One error text per rung, in rung order.
+    :ivar last: The last rung's text, which is what the page's
+        ``error`` field carries -- the shape every reader knows.
+    :ivar raw: The last truncated answer any rung produced, or None
+        when no rung produced text at all.
+    """
+
+    def __init__(self, errors: list[str], raw: str | None = None):
+        self.errors = list(errors)
+        self.last = self.errors[-1] if self.errors else "no output"
+        self.raw = raw
+        super().__init__(
+            "; ".join(
+                f"rung {rung}: {text}"
+                for rung, text in enumerate(self.errors, start=1)
+            )
+        )
+
+
+def _threshold_render(image):
+    """Return ``image`` with every pixel lighter than the threshold white.
+
+    The retry render of scanning #238. The verso of a thin page shows
+    through as mid-grey mirrored text; the real ink is near black. A
+    cut at ``RETRY_THRESHOLD`` removes the one and keeps the other,
+    and the size does not change, so a cell's bbox stays in the same
+    pixel space as every other page of the corpus. Back to RGB because
+    that is what the model's image pipeline expects.
+
+    :param image: The page render, a PIL image.
+    :returns: The thresholded render, RGB, same size.
+    """
+    grey = image.convert("L")
+    return grey.point(lambda v: 255 if v > RETRY_THRESHOLD else 0).convert(
+        "RGB"
+    )
+
+
 def _strip_data_uris(md: str) -> str:
     """Replace inline base64 markdown images with an empty placeholder.
 
@@ -485,15 +564,29 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         the env-level ``MAX_PAGES`` are rejected.
     :param tmp_dir: Per-job scratch directory.
     :returns: ``{"pages": list[dict], "page_count": int,
-        "failed_pages": list[int], "duration_ms": int}``. Each page
+        "failed_pages": list[int], "filtered_pages": list[int],
+        "recovered_pages": list[int], "duration_ms": int}``. Each page
         dict carries ``page_no``, ``input_width``/``input_height``
         (model-input dims for interpreting bboxes),
         ``origin_width``/``origin_height`` (actual render dims — the
         pixel space ``cells`` bboxes are rescaled into), a
         ``completion_tokens`` count, ``duration_ms``, and either
         ``cells`` (layout JSON) + ``md`` (markdown), or ``error``.
+        Every page that got an answer also carries ``raw``, the answer
+        as the model wrote it: ``cells`` is a parsed and rescaled copy,
+        so ``raw`` is what a later post-processor starts from. On a
+        failed page it is the last truncated answer, when there was one.
         ``filtered: true`` marks pages where the model output wasn't
         valid JSON and ``md`` holds the cleaned text fallback.
+        The retry ladder (#238) adds ``attempts`` (rungs spent),
+        ``recovered_by`` (the rung that gave usable output, absent on
+        a first-try success and on a filtered page),
+        ``fallback_from_rung`` (on a page filtered on every rung, the
+        rung whose text was kept, when not the first),
+        ``render: "threshold"`` for the rung that changed
+        the render, and ``errors``
+        (one text per failed rung) whenever a rung failed.
+        ``recovered_pages`` lists the pages a retry rung saved.
         ``render_fallback: true`` flags pages the pinned upstream
         silently re-rendered at 72 dpi (any dimension over 4500 px at
         the requested dpi): bboxes are still consistent with
@@ -598,7 +691,13 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         page = _doc()[page_idx]
         origin_image = fitz_doc_to_image(page, target_dpi=dpi)
         if origin_image is None:
-            return {"page_no": page_idx, "error": "page rendered empty"}
+            # No ladder: the render is the input to every rung, and a
+            # re-render of the same page gives the same nothing.
+            return {
+                "page_no": page_idx,
+                "error": "page rendered empty",
+                "attempts": 1,
+            }
         # The pinned upstream silently re-renders any page over 4500 px
         # at 72 dpi with no signal, which puts that page's bboxes in a
         # different pixel space than every other page's. Detect it by
@@ -623,105 +722,208 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 round(page.rect.height * dpi / 72),
                 dpi,
             )
-        image = fetch_image(
-            origin_image, min_pixels=min_pixels, max_pixels=max_pixels
-        )
-        input_height, input_width = smart_resize(image.height, image.width)
 
-        response = None
-        finish_reason = None
-        completion_tokens = None
-        for attempt in range(INFERENCE_ATTEMPTS):
-            try:
-                response, finish_reason, completion_tokens = _vllm_inference(
-                    client,
-                    image,
-                    prompt,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_completion_tokens=max_completion_tokens,
-                )
-            except transient_vllm_errors as exc:
-                if attempt == INFERENCE_ATTEMPTS - 1:
-                    raise
+        def _infer(page_image) -> dict:
+            """Run one rung: inference plus post-process on one render.
+
+            :param page_image: The render this rung reads.
+            :returns: The page dict, without the ladder bookkeeping.
+            :raises RuntimeError: When the rung produced no usable
+                output; the message is the rung's error text.
+            """
+            image = fetch_image(
+                page_image, min_pixels=min_pixels, max_pixels=max_pixels
+            )
+            input_height, input_width = smart_resize(image.height, image.width)
+
+            response = None
+            finish_reason = None
+            completion_tokens = None
+            for attempt in range(INFERENCE_ATTEMPTS):
+                try:
+                    response, finish_reason, completion_tokens = (
+                        _vllm_inference(
+                            client,
+                            image,
+                            prompt,
+                            temperature=temperature,
+                            top_p=top_p,
+                            max_completion_tokens=max_completion_tokens,
+                        )
+                    )
+                except transient_vllm_errors as exc:
+                    if attempt == INFERENCE_ATTEMPTS - 1:
+                        raise
+                    logger.warning(
+                        "page %d: vLLM error (attempt %d/%d): %s",
+                        page_idx,
+                        attempt + 1,
+                        INFERENCE_ATTEMPTS,
+                        exc,
+                    )
+                    continue
+                # Truthiness, not ``is not None``: an empty-string
+                # response (immediate EOS) is exactly the case this
+                # retry exists for.
+                if response:
+                    break
                 logger.warning(
-                    "page %d: vLLM error (attempt %d/%d): %s",
+                    "page %d: empty vLLM response (attempt %d/%d)",
                     page_idx,
                     attempt + 1,
                     INFERENCE_ATTEMPTS,
-                    exc,
                 )
-                continue
-            # Truthiness, not ``is not None``: an empty-string response
-            # (immediate EOS) is exactly the case this retry exists for.
-            if response:
-                break
-            logger.warning(
-                "page %d: empty vLLM response (attempt %d/%d)",
-                page_idx,
-                attempt + 1,
-                INFERENCE_ATTEMPTS,
-            )
-        if not response:
-            raise RuntimeError("empty response from vLLM")
-        # A generation cut at max_completion_tokens is almost never
-        # dense content (the cap is ~2x the worst realistic page) — it
-        # is a repetition loop, and its output was garbage before the
-        # cut. Fail the page loudly instead of letting the truncated
-        # JSON degrade into filtered=true, indistinguishable from
-        # genuine model garbage.
-        if finish_reason == "length":
-            raise RuntimeError(
-                f"output truncated at {completion_tokens} tokens "
-                "(finish_reason='length'); likely a repetition loop"
-            )
+            if not response:
+                raise RuntimeError("empty response from vLLM")
+            # A generation cut at max_completion_tokens is almost never
+            # dense content (the cap is ~2x the longest measured page)
+            # -- it is a repetition loop, and its output was garbage
+            # before the cut. Fail the rung loudly instead of letting
+            # the truncated JSON degrade into filtered=true,
+            # indistinguishable from genuine model garbage.
+            if finish_reason == "length":
+                raise TruncatedOutput(
+                    f"output truncated at {completion_tokens} tokens "
+                    "(finish_reason='length'); likely a repetition loop",
+                    raw=response,
+                )
 
-        result = {
-            "page_no": page_idx,
-            "input_width": input_width,
-            "input_height": input_height,
-            "origin_width": origin_image.width,
-            "origin_height": origin_image.height,
-            "completion_tokens": completion_tokens,
-        }
-        if render_fallback:
-            result["render_fallback"] = True
-        if prompt_mode in ("prompt_layout_all_en", "prompt_layout_only_en"):
-            cells, filtered = post_process_output(
-                response,
-                prompt_mode,
-                origin_image,
-                image,
-                min_pixels=min_pixels,
-                max_pixels=max_pixels,
-            )
-            result["filtered"] = bool(filtered)
-            if filtered:
-                # Model output wasn't valid JSON; ``cells`` is upstream's
-                # cleaned-text fallback, usable only as markdown.
-                result["cells"] = None
-                result["md"] = cells if isinstance(cells, str) else None
-            else:
-                result["cells"] = cells
-                if prompt_mode == "prompt_layout_all_en":
-                    md = layoutjson2md(origin_image, cells, text_key="text")
-                    if not include_pictures:
-                        md = _strip_data_uris(md)
-                    result["md"] = md
-        else:  # prompt_ocr: plain text extraction, no layout JSON
-            result["md"] = response
-        result["duration_ms"] = int((time.monotonic() - t0) * 1000)
-        return result
+            result = {
+                "page_no": page_idx,
+                "input_width": input_width,
+                "input_height": input_height,
+                "origin_width": origin_image.width,
+                "origin_height": origin_image.height,
+                "completion_tokens": completion_tokens,
+                # The answer as the model wrote it, on every page (#238).
+                # ``cells`` below is upstream's parsed and rescaled copy
+                # (``int()`` on every coordinate, pictures stripped from
+                # the markdown), so a later post-processor would have
+                # nothing else to start from. About 6 KB a page, and the
+                # payload goes to S3, so the response cap is no concern.
+                # The glue leaves it out of the volume document.
+                "raw": response,
+            }
+            if render_fallback:
+                result["render_fallback"] = True
+            if prompt_mode in (
+                "prompt_layout_all_en",
+                "prompt_layout_only_en",
+            ):
+                cells, filtered = post_process_output(
+                    response,
+                    prompt_mode,
+                    page_image,
+                    image,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
+                )
+                result["filtered"] = bool(filtered)
+                if filtered:
+                    # Model output wasn't valid JSON; ``cells`` is
+                    # upstream's cleaned-text fallback, usable only as
+                    # markdown. ``raw`` above is what says which
+                    # character failed the parse: upstream's cleaner
+                    # consumes the broken JSON and returns the words.
+                    result["cells"] = None
+                    result["md"] = cells if isinstance(cells, str) else None
+                else:
+                    result["cells"] = cells
+                    if prompt_mode == "prompt_layout_all_en":
+                        md = layoutjson2md(page_image, cells, text_key="text")
+                        if not include_pictures:
+                            md = _strip_data_uris(md)
+                        result["md"] = md
+            else:  # prompt_ocr: plain text extraction, no layout JSON
+                result["md"] = response
+            return result
+
+        # The ladder (scanning #238). Rung 1 is the baseline; rung 2
+        # reads the same page with the show-through thresholded away.
+        # The render is the only difference, so the stage stays
+        # deterministic. A rung fails on a loop, an exhausted transient
+        # error, an exhausted empty answer, a post-process exception,
+        # or a filtered answer. The filtered answer is kept as the
+        # fallback result in case the later rung does no better: it is
+        # not an error, only an answer the layout reader cannot use.
+        # The threshold render is built lazily: most pages never need it.
+        rungs = (
+            (lambda: origin_image, {}),
+            (lambda: _threshold_render(origin_image), {"render": "threshold"}),
+        )
+        errors: list[str] = []
+        fallback: dict | None = None
+        last_raw: str | None = None
+        for rung, (render, marks) in enumerate(rungs, start=1):
+            try:
+                result = _infer(render())
+            except TruncatedOutput as exc:
+                errors.append(str(exc))
+                last_raw = exc.raw
+                continue
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            result.update(marks)
+            result["attempts"] = rung
+            if result.get("filtered"):
+                errors.append("model output was not layout JSON")
+                if fallback is None:
+                    fallback = result
+                continue
+            if rung > 1:
+                result["recovered_by"] = rung
+                result["errors"] = errors
+                logger.warning(
+                    "page %d recovered on rung %d after: %s",
+                    page_idx,
+                    rung,
+                    "; ".join(
+                        f"rung {n}: {text}"
+                        for n, text in enumerate(errors, start=1)
+                    ),
+                )
+            result["duration_ms"] = int((time.monotonic() - t0) * 1000)
+            return result
+        if fallback is not None:
+            # Every rung answered garbage or nothing; the first
+            # filtered answer is still text a reader can search. It is
+            # not a recovery: ``recovered_by`` means a rung gave usable
+            # output, and ``recovered_pages`` is the number the deploy
+            # reads to judge the threshold. The rung that produced the
+            # text is recorded under its own name.
+            if fallback["attempts"] > 1:
+                fallback["fallback_from_rung"] = fallback["attempts"]
+            fallback["attempts"] = len(rungs)
+            fallback["errors"] = errors
+            fallback["duration_ms"] = int((time.monotonic() - t0) * 1000)
+            return fallback
+        raise PageFailed(errors, raw=last_raw)
 
     def _parse_page_safe(page_idx: int) -> dict:
         try:
             return _parse_page(page_idx)
+        except PageFailed as exc:
+            # Out of rungs. Keep the last rung's text as ``error`` (the
+            # shape every reader knows) and the whole history beside it,
+            # plus the last truncated answer when a rung produced one:
+            # it is the only evidence of what the loop repeated.
+            logger.error("page %d failed: %s", page_idx, exc)
+            page = {
+                "page_no": page_idx,
+                "error": exc.last,
+                "attempts": len(exc.errors),
+                "errors": exc.errors,
+            }
+            if exc.raw is not None:
+                page["raw"] = exc.raw
+            return page
         except Exception as exc:
             # One bad page must not sink a 1000-page job: record the
             # error per page and keep going. If *every* page fails the
             # whole job raises below.
             logger.exception("page %d failed", page_idx)
-            return {"page_no": page_idx, "error": str(exc)}
+            return {"page_no": page_idx, "error": str(exc), "attempts": 1}
 
     t0 = time.monotonic()
     results: list[dict] = []
@@ -747,6 +949,8 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
 
     results.sort(key=lambda r: r["page_no"])
     failed = [r["page_no"] for r in results if "error" in r]
+    filtered = [r["page_no"] for r in results if r.get("filtered")]
+    recovered = [r["page_no"] for r in results if "recovered_by" in r]
     if len(failed) == pages:
         raise RuntimeError(
             f"all {pages} pages failed; first error: {results[0].get('error')}"
@@ -754,9 +958,12 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
 
     duration_ms = int((time.monotonic() - t0) * 1000)
     logger.info(
-        "parse OK: %d pages (%d failed) in %d ms (mode=%s, dpi=%d)",
+        "parse OK: %d pages (%d failed, %d filtered, %d recovered on a "
+        "retry) in %d ms (mode=%s, dpi=%d)",
         pages,
         len(failed),
+        len(filtered),
+        len(recovered),
         duration_ms,
         prompt_mode,
         dpi,
@@ -765,6 +972,8 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         "pages": results,
         "page_count": pages,
         "failed_pages": failed,
+        "filtered_pages": filtered,
+        "recovered_pages": recovered,
         "duration_ms": duration_ms,
     }
 
@@ -772,8 +981,17 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
 # Summary fields kept in the job response when the payload goes to S3.
 # Everything else -- above all ``pages`` -- is deliberately dropped: the
 # response is capped at about 20 MB and discarded with the job record,
-# which is the whole reason the payload travels through S3.
-_SUMMARY_FIELDS = ("page_count", "failed_pages", "duration_ms")
+# which is the whole reason the payload travels through S3. The three
+# page lists are small and are what the daemon acts on: a filtered page
+# is as much a hole to the page-number reader as a failed one (#238),
+# and a list that only the S3 object carried was invisible to it.
+_SUMMARY_FIELDS = (
+    "page_count",
+    "failed_pages",
+    "filtered_pages",
+    "recovered_pages",
+    "duration_ms",
+)
 
 
 def _deliver(result: dict, inputs: dict, scan_pk: Any) -> dict:

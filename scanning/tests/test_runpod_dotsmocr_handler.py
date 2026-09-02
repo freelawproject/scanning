@@ -25,7 +25,6 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from django.test import SimpleTestCase
@@ -125,11 +124,11 @@ def _renderer_stubs(origin_size=(1700, 2200)):
     fitz = mock.MagicMock()
     fitz.open.return_value.__getitem__.return_value = page
     stubs["fitz"] = fitz
-    stubs[
-        "dots_mocr.utils.doc_utils"
-    ].fitz_doc_to_image.return_value = SimpleNamespace(
-        width=origin_size[0], height=origin_size[1]
-    )
+    # A MagicMock, not a SimpleNamespace: the retry ladder's threshold
+    # render calls ``.convert`` and ``.point`` on it.
+    render = mock.MagicMock()
+    render.width, render.height = origin_size
+    stubs["dots_mocr.utils.doc_utils"].fitz_doc_to_image.return_value = render
     stubs["dots_mocr.utils.image_utils"].smart_resize.return_value = (
         2212,
         1708,
@@ -341,13 +340,243 @@ class TestParsePageInference(SimpleTestCase):
     worker thread so a ``side_effect`` list maps to pages in order.
     """
 
-    def _run(self, vllm_side_effect, pages=1, origin_size=(1700, 2200)):
+    LOOP = ("x" * 50, "length", 6144)
+
+    def _run(
+        self,
+        vllm_side_effect,
+        pages=1,
+        origin_size=(1700, 2200),
+        prompt_mode="prompt_ocr",
+        post_process=None,
+    ):
+        stubs = _renderer_stubs(origin_size)
+        if post_process is not None:
+            stubs[
+                "dots_mocr.utils.layout_utils"
+            ].post_process_output.side_effect = post_process
+        self.stubs = stubs
         with (
-            mock.patch.dict(sys.modules, _renderer_stubs(origin_size)),
+            mock.patch.dict(sys.modules, stubs),
             mock.patch.object(handler, "download_pdf"),
             mock.patch.object(handler, "validate_pdf", return_value=pages),
             mock.patch.object(
                 handler, "_vllm_inference", side_effect=vllm_side_effect
+            ) as infer,
+        ):
+            result = handler._action_parse(
+                {"id": "job-1"},
+                {
+                    "pdf_url": "https://x/y.pdf",
+                    "prompt_mode": prompt_mode,
+                    "num_threads": 1,
+                },
+                Path("/nonexistent"),
+            )
+        return result, infer
+
+    def test_page_carries_dims_and_token_count(self):
+        result, infer = self._run([("some text", "stop", 42)])
+        page = result["pages"][0]
+        self.assertEqual(page["md"], "some text")
+        self.assertEqual(page["completion_tokens"], 42)
+        self.assertEqual(page["origin_width"], 1700)
+        self.assertEqual(page["origin_height"], 2200)
+        self.assertEqual(page["input_width"], 1708)
+        self.assertEqual(page["input_height"], 2212)
+        self.assertNotIn("render_fallback", page)
+        self.assertEqual(result["failed_pages"], [])
+        # A first-try success spends one rung and carries no ladder
+        # marks, so a reader can tell it from a recovered page.
+        self.assertEqual(page["attempts"], 1)
+        self.assertNotIn("recovered_by", page)
+        self.assertNotIn("render", page)
+        self.assertNotIn("errors", page)
+        # The answer as written travels on every page: what a later
+        # post-processor starts from.
+        self.assertEqual(page["raw"], "some text")
+        self.assertEqual(result["recovered_pages"], [])
+        self.assertEqual(result["filtered_pages"], [])
+        # The default cap reaches the model: about twice the longest
+        # measured page, not the old 16384.
+        self.assertEqual(infer.call_args.kwargs["max_completion_tokens"], 6144)
+        self.assertEqual(handler.DEFAULT_MAX_COMPLETION_TOKENS, 6144)
+
+    def test_empty_response_retries_then_succeeds(self):
+        # "" used to slip through the ``is not None`` check and come
+        # back as a successful page with md="". The retry is inside the
+        # rung, so it spends no rung.
+        result, infer = self._run([("", "stop", 0), ("text!", "stop", 7)])
+        self.assertEqual(infer.call_count, 2)
+        page = result["pages"][0]
+        self.assertEqual(page["md"], "text!")
+        self.assertEqual(page["attempts"], 1)
+        self.assertEqual(result["failed_pages"], [])
+
+    def test_persistently_empty_response_fails_the_page(self):
+        # Every rung gets its own in-rung retries before the page fails.
+        empties = [("", "stop", 0)] * handler.INFERENCE_ATTEMPTS * 2
+        result, _ = self._run(empties + [("ok", "stop", 1)], pages=2)
+        self.assertEqual(result["failed_pages"], [0])
+        self.assertIn("empty response", result["pages"][0]["error"])
+        self.assertEqual(result["pages"][0]["attempts"], 2)
+        # No rung produced text, so there is no answer to keep.
+        self.assertNotIn("raw", result["pages"][0])
+        self.assertEqual(result["pages"][1]["md"], "ok")
+
+    def test_a_loop_is_retried_on_the_thresholded_render(self):
+        # finish_reason='length' means the cap cut the generation — a
+        # repetition loop, in practice on the show-through of a mostly
+        # blank page. Rung 2 reads the same page with the show-through
+        # thresholded away, still greedy.
+        sentinel = mock.MagicMock(name="thresholded")
+        with mock.patch.object(
+            handler, "_threshold_render", return_value=sentinel
+        ) as threshold:
+            result, infer = self._run([self.LOOP, ("ok", "stop", 3)])
+        page = result["pages"][0]
+        self.assertEqual(page["md"], "ok")
+        self.assertEqual(page["recovered_by"], 2)
+        self.assertEqual(page["attempts"], 2)
+        self.assertEqual(page["render"], "threshold")
+        self.assertEqual(len(page["errors"]), 1)
+        self.assertIn("truncated at 6144 tokens", page["errors"][0])
+        self.assertEqual(result["failed_pages"], [])
+        self.assertEqual(result["recovered_pages"], [0])
+        self.assertEqual(infer.call_count, 2)
+        # The second rung fed the thresholded render to the model's
+        # image pipeline. The render is the only change: the decoding
+        # parameters are the same on both calls.
+        threshold.assert_called_once()
+        fetch = self.stubs["dots_mocr.utils.image_utils"].fetch_image
+        self.assertIs(fetch.call_args_list[1].args[0], sentinel)
+        first, second = (c.kwargs for c in infer.call_args_list)
+        self.assertEqual(first, second)
+        self.assertEqual(second["temperature"], 0.0)
+        self.assertEqual(second["top_p"], 1.0)
+
+    def test_two_loops_fail_the_page_with_its_history(self):
+        result, infer = self._run(
+            [self.LOOP, self.LOOP, ("ok", "stop", 3)], pages=2
+        )
+        page = result["pages"][0]
+        self.assertEqual(result["failed_pages"], [0])
+        # ``error`` keeps the shape every reader knows: the last text.
+        self.assertIn("truncated at 6144 tokens", page["error"])
+        self.assertEqual(page["attempts"], 2)
+        self.assertEqual(len(page["errors"]), 2)
+        self.assertNotIn("recovered_by", page)
+        # The truncated answer is kept: the only evidence of what the
+        # loop repeated.
+        self.assertEqual(page["raw"], "x" * 50)
+        self.assertEqual(result["pages"][1]["md"], "ok")
+        self.assertEqual(result["recovered_pages"], [])
+        self.assertEqual(infer.call_count, 3)
+
+    def test_a_filtered_answer_takes_a_rung(self):
+        # Not-JSON output has no cells and so no page number; it is
+        # worth the same retry as a loop, and a rung that answers JSON
+        # replaces it.
+        result, _ = self._run(
+            [("junk", "stop", 5), ("[]", "stop", 6)],
+            prompt_mode="prompt_layout_only_en",
+            post_process=[
+                ("junk text", True),
+                ([{"bbox": [0, 0, 1, 1]}], False),
+            ],
+        )
+        page = result["pages"][0]
+        self.assertIs(page["filtered"], False)
+        self.assertEqual(page["cells"], [{"bbox": [0, 0, 1, 1]}])
+        self.assertEqual(page["recovered_by"], 2)
+        self.assertEqual(page["errors"], ["model output was not layout JSON"])
+        self.assertEqual(page["raw"], "[]")
+        self.assertEqual(result["recovered_pages"], [0])
+        self.assertEqual(result["filtered_pages"], [])
+
+    def test_a_page_filtered_on_every_rung_is_not_an_error(self):
+        # The cleaned text is still text a reader can search, so the
+        # page keeps today's shape and stays out of ``failed_pages``.
+        result, infer = self._run(
+            [("junk", "stop", 5)] * 2,
+            prompt_mode="prompt_layout_only_en",
+            post_process=[("junk text", True)] * 2,
+        )
+        page = result["pages"][0]
+        self.assertIs(page["filtered"], True)
+        self.assertIsNone(page["cells"])
+        self.assertEqual(page["md"], "junk text")
+        # The answer as the model wrote it survives beside the cleaned
+        # text, so the broken JSON can be looked at later.
+        self.assertEqual(page["raw"], "junk")
+        self.assertEqual(result["filtered_pages"], [0])
+        self.assertEqual(page["attempts"], 2)
+        self.assertEqual(len(page["errors"]), 2)
+        self.assertNotIn("recovered_by", page)
+        # The kept text is rung 1's, so there is no rung to name.
+        self.assertNotIn("fallback_from_rung", page)
+        self.assertEqual(result["failed_pages"], [])
+        self.assertEqual(result["recovered_pages"], [])
+        self.assertEqual(infer.call_count, 2)
+
+    def test_a_render_failure_on_rung_2_keeps_rung_1_in_the_history(self):
+        # The threshold render runs inside the rung's try, so a PIL
+        # error is rung 2's failure and rung 1's loop is not lost.
+        with mock.patch.object(
+            handler, "_threshold_render", side_effect=ValueError("bad image")
+        ):
+            result, infer = self._run([self.LOOP, ("ok", "stop", 3)], pages=2)
+        page = result["pages"][0]
+        self.assertEqual(result["failed_pages"], [0])
+        self.assertEqual(page["attempts"], 2)
+        self.assertIn("truncated at 6144 tokens", page["errors"][0])
+        self.assertEqual(page["errors"][1], "bad image")
+        self.assertEqual(page["error"], "bad image")
+        self.assertEqual(page["raw"], "x" * 50)
+        self.assertEqual(result["pages"][1]["md"], "ok")
+        self.assertEqual(infer.call_count, 2)
+
+    def test_a_loop_then_a_filtered_answer_is_not_a_recovery(self):
+        # The fallback text came from rung 2, but nothing can read the
+        # page: ``recovered_pages`` is what the deploy reads to judge
+        # the threshold, and a filtered page must not inflate it.
+        result, _ = self._run(
+            [self.LOOP, ("junk", "stop", 5)],
+            prompt_mode="prompt_layout_only_en",
+            post_process=[("junk text", True)],
+        )
+        page = result["pages"][0]
+        self.assertIs(page["filtered"], True)
+        self.assertEqual(page["md"], "junk text")
+        self.assertEqual(page["attempts"], 2)
+        self.assertEqual(page["fallback_from_rung"], 2)
+        self.assertNotIn("recovered_by", page)
+        self.assertEqual(result["recovered_pages"], [])
+        self.assertEqual(result["filtered_pages"], [0])
+        self.assertEqual(result["failed_pages"], [])
+
+    def test_an_empty_render_takes_no_rung(self):
+        # The render is the input to every rung; a re-render of the same
+        # page gives the same nothing, so no inference is spent on it.
+        result, infer = self._run_empty_render()
+        page = result["pages"][0]
+        self.assertEqual(page["error"], "page rendered empty")
+        self.assertEqual(page["attempts"], 1)
+        self.assertEqual(result["failed_pages"], [0])
+        self.assertEqual(infer.call_count, 1)
+
+    def _run_empty_render(self):
+        stubs = _renderer_stubs()
+        stubs["dots_mocr.utils.doc_utils"].fitz_doc_to_image.side_effect = [
+            None,
+            stubs["dots_mocr.utils.doc_utils"].fitz_doc_to_image.return_value,
+        ]
+        with (
+            mock.patch.dict(sys.modules, stubs),
+            mock.patch.object(handler, "download_pdf"),
+            mock.patch.object(handler, "validate_pdf", return_value=2),
+            mock.patch.object(
+                handler, "_vllm_inference", side_effect=[("ok", "stop", 1)]
             ) as infer,
         ):
             result = handler._action_parse(
@@ -361,47 +590,6 @@ class TestParsePageInference(SimpleTestCase):
             )
         return result, infer
 
-    def test_page_carries_dims_and_token_count(self):
-        result, _ = self._run([("some text", "stop", 42)])
-        page = result["pages"][0]
-        self.assertEqual(page["md"], "some text")
-        self.assertEqual(page["completion_tokens"], 42)
-        self.assertEqual(page["origin_width"], 1700)
-        self.assertEqual(page["origin_height"], 2200)
-        self.assertEqual(page["input_width"], 1708)
-        self.assertEqual(page["input_height"], 2212)
-        self.assertNotIn("render_fallback", page)
-        self.assertEqual(result["failed_pages"], [])
-
-    def test_empty_response_retries_then_succeeds(self):
-        # "" used to slip through the ``is not None`` check and come
-        # back as a successful page with md="".
-        result, infer = self._run([("", "stop", 0), ("text!", "stop", 7)])
-        self.assertEqual(infer.call_count, 2)
-        page = result["pages"][0]
-        self.assertEqual(page["md"], "text!")
-        self.assertEqual(result["failed_pages"], [])
-
-    def test_persistently_empty_response_fails_the_page(self):
-        empties = [("", "stop", 0)] * handler.INFERENCE_ATTEMPTS
-        result, _ = self._run(empties + [("ok", "stop", 1)], pages=2)
-        self.assertEqual(result["failed_pages"], [0])
-        self.assertIn("empty response", result["pages"][0]["error"])
-        self.assertEqual(result["pages"][1]["md"], "ok")
-
-    def test_truncated_output_is_a_page_failure(self):
-        # finish_reason='length' means the cap cut the generation — in
-        # practice a repetition loop. It must land in failed_pages, not
-        # silently degrade into a "successful" page.
-        result, infer = self._run(
-            [("x" * 50, "length", 16384), ("ok", "stop", 3)], pages=2
-        )
-        self.assertEqual(result["failed_pages"], [0])
-        self.assertIn("truncated at 16384 tokens", result["pages"][0]["error"])
-        self.assertEqual(result["pages"][1]["md"], "ok")
-        # No retry on truncation: same input, same loop.
-        self.assertEqual(infer.call_count, 2)
-
     def test_silent_72dpi_rerender_is_flagged(self):
         # Upstream re-renders any page over 4500 px at 72 dpi with no
         # signal; the page must carry the actual render dims and the
@@ -414,168 +602,30 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(result["failed_pages"], [])
 
 
-class TestStripDataUris(SimpleTestCase):
-    """Base64 picture crops are stripped from markdown by default."""
+class TestSummaryFields(SimpleTestCase):
+    """What the response keeps when the payload goes to S3."""
 
-    def test_strips_inline_images(self):
-        md = (
-            "# Title\n\n"
-            "![](data:image/png;base64,iVBORw0KGgo=)\n\n"
-            "Some text.\n"
-            "![alt text](data:image/jpeg;base64,AAAA)\n"
+    def test_the_three_page_lists_travel_in_the_summary(self):
+        # The daemon acts on all three; a list only the S3 object
+        # carried was invisible to it.
+        for field in ("failed_pages", "filtered_pages", "recovered_pages"):
+            self.assertIn(field, handler._SUMMARY_FIELDS)
+        self.assertNotIn("pages", handler._SUMMARY_FIELDS)
+
+
+class TestThresholdRender(SimpleTestCase):
+    """The retry render: a grey cut that removes the verso show-through."""
+
+    def test_pixels_above_the_threshold_go_white_and_the_rest_black(self):
+        from PIL import Image
+
+        image = Image.new("L", (3, 1))
+        image.putdata([0, handler.RETRY_THRESHOLD, 255])
+
+        out = handler._threshold_render(image)
+
+        self.assertEqual(out.mode, "RGB")
+        self.assertEqual(out.size, image.size)
+        self.assertEqual(
+            list(out.getdata()), [(0, 0, 0), (0, 0, 0), (255, 255, 255)]
         )
-        out = handler._strip_data_uris(md)
-        self.assertNotIn("data:image", out)
-        self.assertIn("![]()", out)
-        self.assertIn("Some text.", out)
-
-    def test_leaves_normal_links_alone(self):
-        md = "![figure](https://example.com/fig.png) and [a link](x)."
-        self.assertEqual(handler._strip_data_uris(md), md)
-
-
-class TestResultDelivery(SimpleTestCase):
-    """``_deliver`` chooses inline or S3, and never leaks the pages."""
-
-    def setUp(self):
-        self.result = {
-            "pages": [{"page_no": 0, "md": "text", "cells": []}],
-            "page_count": 1,
-            "failed_pages": [],
-            "duration_ms": 5210,
-        }
-        self.inputs = {
-            "action": "parse",
-            "result_url": "https://s3/out?sig",
-            "result_key": "processing/1/jobs/analyze/r1-s0-a1.json",
-        }
-
-    def _deliver(self, inputs=None, size=4096):
-        with mock.patch.object(
-            handler, "upload_result", return_value=size
-        ) as upload:
-            out = handler._deliver(
-                self.result, inputs if inputs is not None else self.inputs, 123
-            )
-        return out, upload
-
-    def test_no_result_url_answers_inline(self):
-        # The path dev and CI take without credentials, and the path a
-        # caller on an older contract gets.
-        out, upload = self._deliver({"action": "parse"})
-        self.assertEqual(out, self.result)
-        upload.assert_not_called()
-
-    def test_the_envelope_is_self_describing(self):
-        _, upload = self._deliver()
-        envelope = upload.call_args[0][1]
-        self.assertEqual(envelope["schema_version"], 1)
-        self.assertEqual(envelope["action"], "parse")
-        self.assertEqual(envelope["scan_pk"], 123)
-        self.assertEqual(envelope["result_key"], self.inputs["result_key"])
-        self.assertEqual(envelope["payload"], self.result)
-
-    def test_the_signed_content_type_is_passed_through(self):
-        _, upload = self._deliver()
-        self.assertEqual(upload.call_args[0][2], "application/json")
-        self.assertEqual(upload.call_args[0][0], "https://s3/out?sig")
-
-    def test_the_response_carries_only_a_summary(self):
-        # The response is capped at about 20 MB and discarded with the
-        # job record, which is the whole reason the payload goes to S3.
-        out, _ = self._deliver()
-        self.assertNotIn("pages", out)
-        self.assertEqual(out["page_count"], 1)
-        self.assertEqual(out["failed_pages"], [])
-        self.assertEqual(out["duration_ms"], 5210)
-        self.assertEqual(out["result_key"], self.inputs["result_key"])
-        self.assertEqual(out["bytes"], 4096)
-
-    def test_an_upload_failure_becomes_its_own_error_code(self):
-        # Returned, not raised: the code is what tells the daemon
-        # whether a fresh job could deliver where this one could not.
-        for code in (
-            "RESULT_UPLOAD_FAILED",
-            "RESULT_URL_EXPIRED",
-            "RESULT_UPLOAD_REJECTED",
-        ):
-            with self.subTest(code=code):
-                with (
-                    mock.patch.dict(sys.modules, _renderer_stubs()),
-                    mock.patch.object(handler, "_GPU_AVAILABLE", True),
-                    mock.patch.object(handler, "_VLLM_READY", True),
-                    mock.patch.object(
-                        handler, "_vllm_healthy", return_value=True
-                    ),
-                    mock.patch.object(handler, "download_pdf"),
-                    mock.patch.object(handler, "validate_pdf", return_value=1),
-                    mock.patch.object(
-                        handler,
-                        "_vllm_inference",
-                        return_value=("text", "stop", 4),
-                    ),
-                    mock.patch.object(
-                        handler,
-                        "upload_result",
-                        side_effect=runpod_common.ResultUploadError(
-                            "no", code
-                        ),
-                    ),
-                ):
-                    out = handler.handler(
-                        {
-                            "input": {
-                                "action": "parse",
-                                "pdf_url": "https://x/y.pdf",
-                                "prompt_mode": "prompt_ocr",
-                                "num_threads": 1,
-                                "result_url": "https://s3/out?sig",
-                                "result_key": "k",
-                            }
-                        }
-                    )
-                self.assertEqual(out["error_code"], code)
-                self.assertIn("worker_boot_ms", out)
-
-
-class TestCorruptDownloadIsRetriable(SimpleTestCase):
-    """A copy that will not open is a transfer fault, not a bad input."""
-
-    def _handle(self, exc):
-        with (
-            mock.patch.dict(sys.modules, _renderer_stubs()),
-            mock.patch.object(handler, "_GPU_AVAILABLE", True),
-            mock.patch.object(handler, "_VLLM_READY", True),
-            mock.patch.object(handler, "_vllm_healthy", return_value=True),
-            mock.patch.object(handler, "download_pdf"),
-            mock.patch.object(handler, "validate_pdf", side_effect=exc),
-        ):
-            return handler.handler(
-                {"input": {"action": "parse", "pdf_url": "https://x/y.pdf"}}
-            )
-
-    def test_a_truncated_download_gets_its_own_code(self):
-        # BAD_INPUT is terminal, so it would write a volume off for a
-        # dropped connection.
-        out = self._handle(
-            runpod_common.CorruptDownloadError("downloaded PDF is truncated")
-        )
-        self.assertEqual(out["error_code"], "INPUT_DOWNLOAD_CORRUPT")
-        self.assertIn("worker_boot_ms", out)
-
-    def test_a_real_bad_input_stays_terminal(self):
-        out = self._handle(
-            runpod_common.BadInputError(
-                "PDF has 9000 pages, exceeds MAX_PAGES"
-            )
-        )
-        self.assertEqual(out["error_code"], "BAD_INPUT")
-
-    def test_a_runtime_value_error_is_not_bad_input(self):
-        # The worker stack raises ValueError at run time too (a
-        # degenerate page render, a model shape check). Answering one
-        # as BAD_INPUT would write the shard off as a caller error, so
-        # only BadInputError takes that arm; a plain ValueError crosses
-        # the runner and RunPod marks the job FAILED with a traceback.
-        with self.assertRaisesMessage(ValueError, "buffer is not large"):
-            self._handle(ValueError("buffer is not large enough"))

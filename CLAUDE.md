@@ -551,6 +551,47 @@ trained on), tracked on `ExternalJob` rows at
   inside its shard) and kept in `provider_meta`. The apply reads a
   missing page as `detected=None` and interpolates, so re-running 99
   good pages to recover one is poor value.
+- **The worker retries a page itself, on a changed input (#238).**
+  Every unread page in 30 days of production was a repetition loop on
+  the last, mostly blank page of an opinion whose verso showed
+  through; greedy decoding is deterministic, so the same render loops
+  again. `_parse_page` climbs a two-rung ladder: greedy on the render,
+  then greedy on the render thresholded at `RETRY_THRESHOLD` (100
+  removes the show-through and keeps the text; doctor's 160 does not).
+  The render is the only change -- no sampling, no repetition penalty
+  (a penalty cannot tell a loop from the keys layout JSON repeats) --
+  so the stage stays deterministic for the same page. Only a page with
+  no usable output climbs; the page dict says what happened
+  (`attempts`, `recovered_by`, `render`, `errors`)
+  and the summary carries `recovered_pages` and `filtered_pages`,
+  logged at INFO beside the WARNING. **A filtered page is a hole
+  too**: the answer was text but not layout JSON, so there is no cell
+  to place a number in; the page keeps upstream's cleaned text in
+  `md`. **Every page keeps the answer as the model wrote it in
+  `raw`** (a failed page: the last truncated answer): `cells` is
+  upstream's parsed and rescaled copy with `int()` on every
+  coordinate, and the cleaner discards a broken JSON, so `raw` is the
+  only thing a later post-processor can start from. It lives in the
+  shard result object, which is kept for good; the glue leaves it out
+  of the volume document the apply downloads. The
+  cap is `HANDLER_MAX_COMPLETION_TOKENS` = 6144, about
+  twice the longest measured page (3114) and not 16384: every rung
+  pays the cap once, and at the old value one looping page made its
+  shard four times slower. **A result with a hole is never carried**
+  (`jobs.has_unread_pages` in `_reusable_results`, either list). The
+  lists are read off the row's stored summary, and the glue stamps
+  them there from the result object itself (`_stamp_page_lists`): a
+  row completed by an S3 HEAD stores `output=None`, and would
+  otherwise pass as clean for good. **A stable hole is carried after
+  all** (`jobs.hole_is_stable`): the worker is deterministic, so when
+  the previous run already re-read the shard and its summary holds
+  the same lists, a third read buys the same answer; the backfill
+  skips a volume whose every hole is stable, so it may be run again
+  after each new worker image and reads only what that image has not
+  tried. That is what makes
+  `reread_failed_pages` the backfill: it forces a new run
+  (`ensure_shard_jobs(force_new_run=True)`) that re-pays only the
+  shards with unread pages. Run it after the worker image is live.
 - **`DPI = 200` and `PROMPT_MODE = "prompt_layout_all_en"` are module
   constants, not settings.** The dpi matches `DOCTOR_BITONAL_DPI` so a
   cell's bbox describes the same pixel space as the rest of the corpus,
