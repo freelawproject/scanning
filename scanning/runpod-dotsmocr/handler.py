@@ -134,7 +134,8 @@ INFERENCE_ATTEMPTS = int(os.environ.get("HANDLER_INFERENCE_ATTEMPTS", "2"))
 # deterministic per page, so the same render loops again; a retry has
 # to change the input. Rung 2 re-runs the page on the same render with
 # a grey threshold that removes the show-through and keeps the real
-# text (100 does on the sampled pages; doctor's bitonal 160 does not).
+# text (100 does on the pages we examined; doctor's bitonal 160 does
+# not).
 # The render is the only thing that changes: both rungs decode greedily
 # with the same parameters, so the stage gives the same output for the
 # same page on every run. No sampling and no repetition penalty, on

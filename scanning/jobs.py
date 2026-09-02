@@ -608,11 +608,11 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
     """Warn about pages a worker could not read, in volume numbering.
 
     A shard that produced most of its pages is a success, not a retry:
-    the worker itself retries a page that gave no output, on a changed
-    render and then with sampling (the ladder of issue #238), so a page
+    the worker itself retries a page that gave no output, once, on a
+    thresholded render (the two-rung ladder of issue #238), so a page
     still failed here is one two renders could not read. The
     page-number adapter (issue #149) reads it as ``detected=None`` and
-    interpolates, and re-running 99 good pages to try a fourth time is
+    interpolates, and re-running 99 good pages to try a third time is
     poor value. But the gap has to be visible, and it has to name pages
     of the *volume* -- the worker counts from zero inside the shard it
     was given.

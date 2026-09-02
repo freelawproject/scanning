@@ -1,15 +1,16 @@
 """Read again the shards whose dots.mocr worker left pages unread (#238).
 
 Over 30 days every unread page was a repetition loop on a mostly blank
-page whose verso showed through. The worker now retries such a page on
-a thresholded render, then with sampling. That reaches no volume already
-read: the shard completed, the glue kept the slot with its ``error``,
-and the apply read the page as ``detected=None``.
+page whose verso showed through. The worker now retries such a page
+once, on a thresholded render. That reaches no volume already read: the
+shard completed, the glue kept the slot with its ``error``, and the
+apply read the page as ``detected=None``.
 
 This command starts a new dots.mocr run over every such volume, and the
 new run re-pays only the shards with a hole: ``jobs._reusable_results``
 carries a clean shard's result forward and refuses one that reports
-``failed_pages``. The glue and the apply follow on the collect tick, as
+``failed_pages`` or ``filtered_pages`` (``jobs.has_unread_pages``).
+The glue and the apply follow on the collect tick, as
 for any run. The apply on a volume already in
 ``READY_FOR_PAGE_COMPLETENESS_REVIEW`` is a recompute and keeps the
 status; the numbers a curator typed survive it (#214).
