@@ -15,9 +15,20 @@ for any run. The apply on a volume already in
 status; the numbers a curator typed survive it (#214).
 
 Row creation is what costs GPU money, so this is a command and not a
-tick, and ``TestKnownEnqueuePaths`` names it on purpose. Run it once,
-after the worker image with the retry ladder is live -- before that,
-the re-read repeats the failure.
+tick, and ``TestKnownEnqueuePaths`` names it on purpose. Run it after
+the worker image with the retry ladder is live -- before that, the
+re-read repeats the failure.
+
+**A second run does not pay twice for the same answer.** The worker
+decodes greedily on a fixed render, so a shard read again gives the
+same output. A hole the previous run already re-read and got again is
+therefore stable (``jobs.hole_is_stable``): the command skips a volume
+whose every hole is stable, and the carry keeps such a shard instead of
+re-paying it. So the command may be run again after a new worker image,
+and reads only what that image has not yet tried. Without a new image
+a second run buys nothing, and says so per named scan. If the fix for
+a filtered page turns out to be a JSON repair in the worker (#242), no
+re-read helps until that image ships.
 
 An approved volume is not touched: the command takes only the
 statuses ``apply_ready_runs`` reads, and
@@ -130,6 +141,14 @@ class Command(BaseCommand):
             holes = dots_mocr.shards_with_holes(rows)
             if not holes:
                 skip(scan, "no shard of the live run reports unread pages")
+                continue
+            if not dots_mocr.shards_worth_rereading(rows):
+                skip(
+                    scan,
+                    f"run {rows[0].run} already read the unread pages again "
+                    "and got the same answer; another run buys nothing "
+                    "without a new worker image",
+                )
                 continue
             shards = ", ".join(str(row.shard_index + 1) for row in holes)
             if dry_run:

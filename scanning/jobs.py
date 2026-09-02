@@ -1088,6 +1088,29 @@ def run_summary(scan, stage: str, engine: str) -> dict | None:
     }
 
 
+#: The per-shard page lists a dots.mocr summary carries (shard-local
+#: indexes). The first two are holes to the page-number reader; the
+#: third is the pages a retry rung saved.
+PAGE_LIST_NAMES = ("failed_pages", "filtered_pages", "recovered_pages")
+
+
+def page_lists(job: ExternalJob) -> dict[str, list]:
+    """Return a row's stored page lists, empty where the summary has none.
+
+    :param job: A completed or consumed row.
+    :returns: ``{name: shard-local page indexes}`` for every name in
+        :data:`PAGE_LIST_NAMES`.
+    :rtype: dict[str, list]
+    """
+    output = (job.provider_meta or {}).get("output") or {}
+    return {
+        name: list(output.get(name))
+        if isinstance(output.get(name), list)
+        else []
+        for name in PAGE_LIST_NAMES
+    }
+
+
 def has_unread_pages(job: ExternalJob) -> bool:
     """Return whether a completed row's worker left pages unread.
 
@@ -1103,11 +1126,46 @@ def has_unread_pages(job: ExternalJob) -> bool:
     :returns: Whether either list is non-empty.
     :rtype: bool
     """
-    output = (job.provider_meta or {}).get("output") or {}
-    return any(
-        isinstance(output.get(field), list) and output.get(field)
-        for field in ("failed_pages", "filtered_pages")
+    lists = page_lists(job)
+    return bool(lists["failed_pages"] or lists["filtered_pages"])
+
+
+def hole_is_stable(job: ExternalJob) -> bool:
+    """Return whether a re-read of this shard already gave this answer.
+
+    The dots.mocr worker decodes greedily on a fixed render, so the
+    same shard read twice gives the same output. When the previous run
+    read the same shard -- same key, same identity -- and its summary
+    holds the same page lists, this row *is* that re-read, and a third
+    read would pay for the answer a third time. The carry then keeps
+    the row and the backfill leaves the volume alone (#238).
+
+    Only the immediately previous run is consulted: that is the run
+    this row's holes were meant to close. A row with no holes is never
+    "stable" in this sense -- there is nothing to re-read.
+
+    :param job: A completed or consumed row with unread pages.
+    :returns: Whether the previous run's row for the same shard holds
+        identical page lists.
+    :rtype: bool
+    """
+    if not has_unread_pages(job):
+        return False
+    previous = (
+        ExternalJob.objects.filter(
+            scan_id=job.scan_id,
+            stage=job.stage,
+            engine=job.engine,
+            opinion=None,
+            input_key=job.input_key,
+            input_manifest=job.input_manifest,
+            run__lt=job.run,
+            status__in=(JobStatus.COMPLETED, JobStatus.CONSUMED),
+        )
+        .order_by("-run", "-attempt")
+        .first()
     )
+    return previous is not None and page_lists(previous) == page_lists(job)
 
 
 def _reusable_results(
@@ -1164,11 +1222,13 @@ def _reusable_results(
     for row in prior_rows:
         if not row.result_key:
             continue
-        if has_unread_pages(row):
+        if has_unread_pages(row) and not hole_is_stable(row):
             # A result with a hole is not a result to carry (#238): the
             # new run exists to read the pages the old one could not,
             # so this shard is re-paid while its clean siblings ride
-            # along for free.
+            # along for free. Unless the previous run already re-read
+            # this shard and got the same holes: the worker is
+            # deterministic, so a third read buys the same answer.
             continue
         by_identity.setdefault(
             _identity_key(row.input_key, row.input_manifest), row

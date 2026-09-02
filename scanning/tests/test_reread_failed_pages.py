@@ -87,6 +87,29 @@ class TestRereadFailedPages(TestCase):
         self.assertEqual(rows[1].status, JobStatus.COMPLETED)
         self.assertIn("shard(s) 1 had unread pages", out)
 
+    def test_a_second_run_does_not_pay_for_the_same_answer(self):
+        # Run 2 re-read shard 2 and got the same hole. The worker is
+        # deterministic, so run 3 would buy the same answer.
+        scan = self._glued_scan(holes=(1,))
+        self._call()
+        for row in dots_mocr.live_analyze_jobs(scan):
+            if row.status == JobStatus.PENDING:
+                ExternalJob.objects.filter(pk=row.pk).update(
+                    result_key="r2-s1-a1.json",
+                    provider_meta={
+                        "output": {"page_count": 10, "failed_pages": [4]}
+                    },
+                )
+        ExternalJob.objects.filter(scan=scan, run=2).update(
+            status=JobStatus.CONSUMED
+        )
+
+        out, err = self._call(str(scan.pk))
+
+        self.assertEqual(dots_mocr.live_analyze_jobs(scan)[0].run, 2)
+        self.assertIn("0 scan(s) to read again, 1 skipped", out)
+        self.assertIn("run 2 already read the unread pages again", err)
+
     def test_a_dry_run_reports_and_creates_nothing(self):
         scan = self._glued_scan(holes=(0, 1))
 

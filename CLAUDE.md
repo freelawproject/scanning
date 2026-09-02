@@ -577,7 +577,13 @@ trained on), tracked on `ExternalJob` rows at
   lists are read off the row's stored summary, and the glue stamps
   them there from the result object itself (`_stamp_page_lists`): a
   row completed by an S3 HEAD stores `output=None`, and would
-  otherwise pass as clean for good. That is what makes
+  otherwise pass as clean for good. **A stable hole is carried after
+  all** (`jobs.hole_is_stable`): the worker is deterministic, so when
+  the previous run already re-read the shard and its summary holds
+  the same lists, a third read buys the same answer; the backfill
+  skips a volume whose every hole is stable, so it may be run again
+  after each new worker image and reads only what that image has not
+  tried. That is what makes
   `reread_failed_pages` the backfill: it forces a new run
   (`ensure_shard_jobs(force_new_run=True)`) that re-pays only the
   shards with unread pages. Run it after the worker image is live.

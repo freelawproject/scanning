@@ -249,6 +249,80 @@ class TestEnsureAnalyzeJobs(ScanningTestCase):
             [],
         )
 
+    def test_a_result_with_filtered_pages_is_not_carried_either(self):
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=2)
+        self._finished_run(scan, manifest, filtered=(0,))
+
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+        ):
+            forced = dots_mocr.ensure_analyze_jobs(
+                scan, manifest, force_new_run=True
+            )
+
+        self.assertEqual(forced[0].status, JobStatus.PENDING)
+        self.assertEqual(forced[1].status, JobStatus.COMPLETED)
+
+    def _reread(self, scan, manifest, shard_index, failed_pages):
+        """Force a new run and answer its re-read of one shard."""
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+        ):
+            rows = dots_mocr.ensure_analyze_jobs(
+                scan, manifest, force_new_run=True
+            )
+        row = rows[shard_index]
+        ExternalJob.objects.filter(pk=row.pk).update(
+            result_key=f"r{row.run}-s{shard_index}-a1.json",
+            provider_meta={
+                "output": {"page_count": 10, "failed_pages": failed_pages}
+            },
+        )
+        ExternalJob.objects.filter(scan=scan, run=row.run).update(
+            status=JobStatus.CONSUMED
+        )
+        return dots_mocr.live_analyze_jobs(scan)
+
+    def test_a_hole_the_previous_run_reproduced_is_carried(self):
+        # The worker is deterministic: run 2 re-read shard 1 and got the
+        # same hole, so run 3 would pay for the same answer. The stable
+        # hole rides along, and the command has nothing to start.
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=2)
+        self._finished_run(scan, manifest, holes=(1,))
+        live = self._reread(scan, manifest, 1, failed_pages=[3])
+        self.assertTrue(jobs.hole_is_stable(live[1]))
+        self.assertEqual(dots_mocr.shards_worth_rereading(live), [])
+
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+        ):
+            third = dots_mocr.ensure_analyze_jobs(
+                scan, manifest, force_new_run=True
+            )
+        self.assertEqual(third[0].run, 3)
+        self.assertEqual(
+            [row.status for row in third],
+            [JobStatus.COMPLETED, JobStatus.COMPLETED],
+        )
+        self.assertEqual(third[1].result_key, "r2-s1-a1.json")
+
+    def test_a_hole_that_changed_is_not_stable(self):
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=2)
+        self._finished_run(scan, manifest, holes=(1,))
+        live = self._reread(scan, manifest, 1, failed_pages=[5])
+        self.assertFalse(jobs.hole_is_stable(live[1]))
+        self.assertEqual(dots_mocr.shards_worth_rereading(live), [live[1]])
+        # A first hole has no previous run to compare with.
+        first = self._finished_run(ScanFactory(), manifest, holes=(0,))
+        self.assertFalse(jobs.hole_is_stable(first[0]))
+        self.assertEqual(dots_mocr.shards_worth_rereading(first), [first[0]])
+
 
 class TestBuildPayload(ScanningTestCase):
     """What one shard is asked for."""

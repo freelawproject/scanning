@@ -225,6 +225,23 @@ def shards_with_holes(rows: list[ExternalJob]) -> list[ExternalJob]:
     return [row for row in rows if jobs.has_unread_pages(row)]
 
 
+def shards_worth_rereading(rows: list[ExternalJob]) -> list[ExternalJob]:
+    """Return the rows with holes a new run would not simply reproduce.
+
+    A hole the previous run already re-read and got again is stable
+    (``jobs.hole_is_stable``): the worker is deterministic, so paying
+    for the shard a third time returns the same answer. These are the
+    rows the backfill is for.
+
+    :param rows: A run's rows.
+    :returns: The rows with holes, minus the stable ones.
+    :rtype: list[ExternalJob]
+    """
+    return [
+        row for row in shards_with_holes(rows) if not jobs.hole_is_stable(row)
+    ]
+
+
 def live_analyze_jobs(scan) -> list[ExternalJob]:
     """Return a scan's current-run dots.mocr rows, in page order.
 
@@ -315,12 +332,30 @@ def _check_envelope(scan, job: ExternalJob, envelope) -> dict:
 
 #: The per-shard page lists the daemon acts on, and the page-dict key
 #: that puts a page in each (``"error"`` and ``"recovered_by"`` by
-#: presence, ``"filtered"`` by truth).
+#: presence, ``"filtered"`` by truth). The names are
+#: ``jobs.PAGE_LIST_NAMES``; this is the one place the membership rule
+#: lives, for the row summary and the volume document alike.
 PAGE_LISTS = (
     ("failed_pages", lambda page: "error" in page),
     ("filtered_pages", lambda page: bool(page.get("filtered"))),
     ("recovered_pages", lambda page: "recovered_by" in page),
 )
+assert tuple(name for name, _ in PAGE_LISTS) == jobs.PAGE_LIST_NAMES
+
+
+def _page_lists(pages: list[dict], key: str) -> dict[str, list]:
+    """Sort ``pages`` into the three lists, naming each by ``key``.
+
+    :param pages: Page dicts, shard-local or volume-level.
+    :param key: The page-number field to list: ``"page_no"`` for a
+        shard's rows, ``"page_index"`` for the volume document.
+    :returns: ``{list name: page numbers}``.
+    :rtype: dict[str, list]
+    """
+    return {
+        name: [page[key] for page in pages if member(page)]
+        for name, member in PAGE_LISTS
+    }
 
 
 def _stamp_page_lists(job: ExternalJob, shard_pages: list[dict]) -> None:
@@ -336,28 +371,23 @@ def _stamp_page_lists(job: ExternalJob, shard_pages: list[dict]) -> None:
     carry and the backfill the truth whatever the worker's response
     was.
 
-    Writes only when the stored lists differ, guarded on the row's
-    current status like every other row write, and leaves the rest of
-    the summary alone.
+    Writes only when the stored lists differ, through ``jobs._write``
+    like every other row write, so the compare-and-swap on the row's
+    status lives in one place and a lost one is logged. The rest of
+    the summary is left alone.
 
     :param job: The shard's row.
     :param shard_pages: Its result's page dicts, shard-local.
     :return: None.
     """
-    lists = {
-        name: [page["page_no"] for page in shard_pages if member(page)]
-        for name, member in PAGE_LISTS
-    }
+    lists = _page_lists(shard_pages, "page_no")
     meta = dict(job.provider_meta or {})
     output = dict(meta.get("output") or {})
     if all(output.get(name) == pages for name, pages in lists.items()):
         return
     output.update(lists)
     meta["output"] = output
-    if ExternalJob.objects.filter(pk=job.pk, status=job.status).update(
-        provider_meta=meta
-    ):
-        job.provider_meta = meta
+    jobs._write(job, provider_meta=meta)
 
 
 def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
@@ -483,18 +513,12 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
         "generated_at": timezone.now().isoformat(),
         "shards": shards,
         "pages": pages,
-        "failed_pages": [
-            page["page_index"] for page in pages if "error" in page
-        ],
-        # Two more lists for the survey of #238, neither read by the
-        # apply: a filtered page has no cells and so no page number
-        # either, and a recovered page is one a retry rung saved.
-        "filtered_pages": [
-            page["page_index"] for page in pages if page.get("filtered")
-        ],
-        "recovered_pages": [
-            page["page_index"] for page in pages if "recovered_by" in page
-        ],
+        # The same three lists as each row's summary, in volume
+        # numbering. The apply reads only ``failed_pages``; the other
+        # two are for the survey of #238: a filtered page has no cells
+        # and so no page number either, and a recovered page is one a
+        # retry rung saved.
+        **_page_lists(pages, "page_index"),
     }
     key = glued_result_key(scan, run)
     if not s3_sync.upload_json_object(key, document):

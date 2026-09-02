@@ -271,6 +271,27 @@ class TestMergeDotsmocrResults(AnalyzeJobsMixin, TestCase):
         self.assertEqual(rows[0].provider_meta["output"]["failed_pages"], [])
         self.assertFalse(jobs.has_unread_pages(rows[0]))
 
+    def test_the_stamp_is_a_compare_and_swap_that_logs_a_loss(self):
+        """Through ``jobs._write``: a row that moved under the glue is
+        not overwritten, and the loss is in the log."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+        self.write_envelope(
+            0, make_envelope(rows[0], [{"page_no": 0, "error": "boom"}])
+        )
+        # Somebody moved the row after the glue read it.
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.CANCELLED
+        )
+
+        with self.assertLogs("scanning.jobs", level="INFO") as logs:
+            dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        self.assertTrue(any("moved out of" in line for line in logs.output))
+        rows[0].refresh_from_db()
+        self.assertNotIn(
+            "failed_pages", rows[0].provider_meta.get("output") or {}
+        )
+
     def test_the_raw_answer_stays_in_the_shard_object(self):
         """The apply never reads it, and it would double the download."""
         scan, rows = self.build(shard_count=1, pages_per_shard=2)
