@@ -17,6 +17,7 @@ from django.utils import timezone
 from PIL import Image
 
 from scanning.factories import (
+    ExternalJobFactory,
     OpinionScanFactory,
     PageEditFactory,
     ReporterFactory,
@@ -26,6 +27,9 @@ from scanning.factories import (
 )
 from scanning.models import (
     Detection,
+    JobEngine,
+    JobStage,
+    JobStatus,
     OpinionScan,
     OpinionStatus,
     PageEdit,
@@ -3393,4 +3397,354 @@ class TestDeleteDetectionPrunesStaleRects(ScanningTestCase):
         self.scan.refresh_from_db()
         self.assertEqual(
             [e["page_index"] for e in self.scan.redaction_rects], [0, 1]
+        )
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestGluedOutputs(ScanningTestCase):
+    """The glued outputs of the GPU stages, by scan id (issue #243).
+
+    An index of the runs and their shards, read off the rows alone, and
+    one redirect per file to a presigned GET. The bytes never cross the
+    web pod, and one HEAD keeps the browser off an S3 XML error.
+    """
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(uploaded_by=self.user, page_count=400)
+
+    def _dots_row(self, **fields):
+        defaults = {
+            "scan": self.scan,
+            "stage": JobStage.ANALYZE,
+            "engine": JobEngine.DOTS_MOCR,
+            "status": JobStatus.CONSUMED,
+            "run": 1,
+            "shard_index": 0,
+            "shard_count": 2,
+            "attempt": 1,
+            "result_key": "jobs/analyze/dots_mocr/r1-s0-a1.json",
+            "input_manifest": {
+                "from_page": 0,
+                "to_page": 199,
+                "page_count": 200,
+            },
+        }
+        defaults.update(fields)
+        return ExternalJobFactory(**defaults)
+
+    def _index(self, output="dots-mocr"):
+        return self.client.get(
+            reverse(
+                "glued_output_index",
+                kwargs={"pk": self.scan.pk, "output": output},
+            )
+        )
+
+    def _volume(self, run=1, output="dots-mocr"):
+        return self.client.get(
+            reverse(
+                "serve_glued_volume",
+                kwargs={"pk": self.scan.pk, "output": output, "run": run},
+            )
+        )
+
+    def _shard(self, shard=0, run=1, output="dots-mocr"):
+        return self.client.get(
+            reverse(
+                "serve_glued_shard",
+                kwargs={
+                    "pk": self.scan.pk,
+                    "output": output,
+                    "run": run,
+                    "shard": shard,
+                },
+            )
+        )
+
+    # -- the index ------------------------------------------------------
+
+    def test_index_needs_a_login(self):
+        self.client.logout()
+        response = self._index()
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("login"), response["Location"])
+
+    def test_index_refuses_an_unknown_output(self):
+        self.assertEqual(self._index("paddle").status_code, 404)
+
+    def test_index_of_a_scan_nothing_read_is_empty_not_an_error(self):
+        response = self._index()
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["runs"], [])
+        self.assertIsNone(body["live_run"])
+        self.assertEqual(body["stage"], JobStage.ANALYZE)
+        self.assertEqual(body["engine"], JobEngine.DOTS_MOCR)
+
+    def test_index_lists_every_run_newest_first_with_its_shards(self):
+        """The answer to "how many shards, and which one failed"."""
+        self._dots_row(run=1, shard_index=0)
+        self._dots_row(
+            run=1,
+            shard_index=1,
+            result_key="jobs/analyze/dots_mocr/r1-s1-a1.json",
+            input_manifest={
+                "from_page": 200,
+                "to_page": 399,
+                "page_count": 200,
+            },
+            provider_meta={
+                "output": {"failed_pages": [7], "recovered_pages": [2]}
+            },
+        )
+        self._dots_row(
+            run=2,
+            shard_index=0,
+            status=JobStatus.COMPLETED,
+            result_key="jobs/analyze/dots_mocr/r2-s0-a1.json",
+        )
+        self._dots_row(
+            run=2,
+            shard_index=1,
+            status=JobStatus.FAILED,
+            error_code="QUEUE_TIMEOUT",
+            result_key="",
+        )
+
+        with patch("scanning.s3_sync.object_exists") as head:
+            body = self._index().json()
+
+        head.assert_not_called()
+        self.assertEqual(body["live_run"], 2)
+        self.assertEqual([run["run"] for run in body["runs"]], [2, 1])
+
+        live, previous = body["runs"]
+        self.assertFalse(live["glued"])
+        self.assertTrue(previous["glued"])
+        self.assertEqual(previous["label"], "2 result applied")
+        self.assertEqual(
+            live["volume_url"],
+            reverse(
+                "serve_glued_volume",
+                kwargs={"pk": self.scan.pk, "output": "dots-mocr", "run": 2},
+            ),
+        )
+
+        first, second = previous["shards"]
+        self.assertEqual(
+            (first["from_page"], first["to_page"], first["page_count"]),
+            (1, 200, 200),
+            "volume pages are 1-based, the manifest holds fitz indexes",
+        )
+        self.assertEqual((second["from_page"], second["to_page"]), (201, 400))
+        self.assertEqual(second["failed_pages"], [7])
+        self.assertEqual(second["filtered_pages"], [])
+        self.assertEqual(second["recovered_pages"], [2])
+        self.assertEqual(
+            second["url"],
+            reverse(
+                "serve_glued_shard",
+                kwargs={
+                    "pk": self.scan.pk,
+                    "output": "dots-mocr",
+                    "run": 1,
+                    "shard": 1,
+                },
+            ),
+        )
+
+        failed = live["shards"][1]
+        self.assertEqual(failed["status"], JobStatus.FAILED)
+        self.assertEqual(failed["error_code"], "QUEUE_TIMEOUT")
+        self.assertNotIn(
+            "url", failed, "no result: the key is absent, not blank"
+        )
+
+    def test_index_of_a_detection_run_carries_no_page_lists(self):
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.DETECT,
+            engine=JobEngine.BLACKLETTER,
+            status=JobStatus.CONSUMED,
+            result_key="jobs/detect/blackletter/r1-s0-a1.json",
+            provider_meta={"output": {"failed_pages": [1]}},
+        )
+
+        body = self._index("yolo").json()
+
+        shard = body["runs"][0]["shards"][0]
+        self.assertNotIn("failed_pages", shard)
+        self.assertEqual(body["engine"], JobEngine.BLACKLETTER)
+
+    # -- the volume document --------------------------------------------
+
+    def test_volume_redirects_to_a_presigned_get_of_the_glued_key(self):
+        from scanning import dots_mocr
+
+        self._dots_row()
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch(
+                "scanning.s3_sync.presign_get",
+                return_value="https://bucket.example/signed",
+            ) as presign,
+        ):
+            response = self._volume()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "https://bucket.example/signed")
+        key, ttl = presign.call_args.args
+        self.assertEqual(key, dots_mocr.glued_result_key(self.scan, 1))
+        self.assertEqual(ttl, 600)
+        self.assertEqual(
+            presign.call_args.kwargs["content_disposition"],
+            f'attachment; filename="scan-{self.scan.pk}-dots-mocr-r1.json"',
+        )
+
+    def test_volume_of_a_detection_run_uses_the_merged_key(self):
+        from scanning import yolo
+
+        ExternalJobFactory(scan=self.scan, status=JobStatus.CONSUMED, run=3)
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch(
+                "scanning.s3_sync.presign_get", return_value="https://x/y"
+            ) as presign,
+        ):
+            response = self._volume(run=3, output="yolo")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            presign.call_args.args[0], yolo.merged_result_key(self.scan, 3)
+        )
+
+    def test_volume_not_glued_yet_is_a_404_that_names_the_run_state(self):
+        self._dots_row(status=JobStatus.COMPLETED)
+        self._dots_row(shard_index=1, status=JobStatus.PENDING)
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=False),
+        ):
+            response = self._volume()
+
+        self.assertEqual(response.status_code, 404)
+        body = response.json()
+        self.assertEqual(body["run"], 1)
+        self.assertIn("not glued yet", body["error"])
+        self.assertIn(body["label"], body["error"])
+
+    def test_volume_of_a_run_nobody_made_is_a_404(self):
+        self._dots_row()
+        self.assertEqual(self._volume(run=9).status_code, 404)
+
+    def test_volume_without_s3_is_a_404_and_makes_no_head(self):
+        """No environment without S3 holds a glued document: the glue
+        returns before any work when S3 is off."""
+        self._dots_row()
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=False),
+            patch("scanning.s3_sync.object_exists") as head,
+        ):
+            response = self._volume()
+
+        self.assertEqual(response.status_code, 404)
+        head.assert_not_called()
+        self.assertIn("without S3", response.json()["error"])
+
+    def test_a_non_missing_s3_error_propagates(self):
+        """A throttle or an IAM fault must reach Sentry, not read as
+        "not glued"."""
+        from botocore.exceptions import ClientError
+
+        self._dots_row()
+        error = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}},
+            "HeadObject",
+        )
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", side_effect=error),
+            self.assertRaises(ClientError),
+        ):
+            self._volume()
+
+    # -- the shard result -----------------------------------------------
+
+    def test_shard_redirects_to_the_rows_own_result_key(self):
+        """The worker's answer itself, ``raw`` included (#238, #242)."""
+        self._dots_row(
+            shard_index=1,
+            attempt=2,
+            result_key="jobs/analyze/dots_mocr/r1-s1-a2.json",
+        )
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True) as head,
+            patch(
+                "scanning.s3_sync.presign_get", return_value="https://x/y"
+            ) as presign,
+        ):
+            response = self._shard(shard=1)
+
+        self.assertEqual(response.status_code, 302)
+        head.assert_called_once_with("jobs/analyze/dots_mocr/r1-s1-a2.json")
+        self.assertEqual(
+            presign.call_args.args[0], "jobs/analyze/dots_mocr/r1-s1-a2.json"
+        )
+        self.assertEqual(
+            presign.call_args.kwargs["content_disposition"],
+            f'attachment; filename="scan-{self.scan.pk}-dots-mocr-r1-s1.json"',
+        )
+
+    def test_shard_that_does_not_exist_is_a_404(self):
+        self._dots_row()
+        self.assertEqual(self._shard(shard=5).status_code, 404)
+
+    def test_shard_without_a_result_is_a_404_that_says_so(self):
+        self._dots_row(status=JobStatus.FAILED, result_key="")
+        with patch("scanning.s3_sync.object_exists") as head:
+            response = self._shard()
+
+        self.assertEqual(response.status_code, 404)
+        head.assert_not_called()
+        self.assertIn("has no result", response.json()["error"])
+
+    # -- the link in the step-1 bar -------------------------------------
+
+    def test_staff_see_the_files_link_in_the_bar(self):
+        self._dots_row()
+        staff = self.make_staff_user()
+        self.client.force_login(staff)
+
+        body = self.client.get(
+            reverse("process_actions", kwargs={"pk": self.scan.pk}) + "?step=1"
+        ).json()
+
+        self.assertIn(
+            reverse(
+                "glued_output_index",
+                kwargs={"pk": self.scan.pk, "output": "dots-mocr"},
+            ),
+            body["html"],
+        )
+
+    def test_a_curator_does_not_see_the_files_link(self):
+        self._dots_row()
+
+        body = self.client.get(
+            reverse("process_actions", kwargs={"pk": self.scan.pk}) + "?step=1"
+        ).json()
+
+        self.assertIn("OCR done", body["html"])
+        self.assertNotIn(
+            reverse(
+                "glued_output_index",
+                kwargs={"pk": self.scan.pk, "output": "dots-mocr"},
+            ),
+            body["html"],
         )

@@ -1,9 +1,11 @@
 """Process viewer and scan processing action views."""
 
+import itertools
 import json
 import logging
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import fitz
@@ -22,14 +24,17 @@ from django.template.loader import render_to_string
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
-from scanning import page_edits
+from scanning import dots_mocr, jobs, page_edits, s3_sync, yolo
 from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
     PHYSICAL_PAGE_CHECKS,
     CheckName,
     Detection,
+    ExternalJob,
     Issue,
+    JobEngine,
+    JobStage,
     JobStatus,
     OpinionScan,
     PageEdit,
@@ -816,6 +821,301 @@ def serve_scan_original(request: HttpRequest, pk: int) -> FileResponse:
     )
     response["X-Scan-Preview"] = "original"
     return response
+
+
+#: Lifetime of a presigned GET minted by the glued-output routes (#243).
+#: One click is one download, so ten minutes is ample.
+#: ``ORIGINAL_VIEW_PRESIGN_TTL`` (8h) serves a viewer that scrolls for
+#: hours and is the wrong size here.
+GLUED_OUTPUT_PRESIGN_TTL = 600
+
+#: Slug -> (stage, engine, glued key function): the two glued documents
+#: of issue #243. The outputs differ in nothing else, so a third engine
+#: is one more entry, not a view.
+GLUED_OUTPUTS: dict[str, tuple[str, str, Callable]] = {
+    "dots-mocr": (
+        JobStage.ANALYZE,
+        JobEngine.DOTS_MOCR,
+        dots_mocr.glued_result_key,
+    ),
+    "yolo": (JobStage.DETECT, JobEngine.BLACKLETTER, yolo.merged_result_key),
+}
+
+NO_S3_GLUED_OUTPUT_MESSAGE = (
+    "No glued output exists without S3: the daemon glues into the "
+    "bucket, and the workers write their results there."
+)
+
+
+def _glued_output(output: str) -> tuple[str, str, Callable]:
+    """Return the stage, the engine and the key function of one slug.
+
+    :param output: A key of :data:`GLUED_OUTPUTS`.
+    :returns: ``(stage, engine, key_fn)``.
+    :raises Http404: For a slug the table does not know.
+    """
+    try:
+        return GLUED_OUTPUTS[output]
+    except KeyError:
+        raise Http404(f"Unknown glued output {output!r}.") from None
+
+
+def _glued_run_rows(
+    scan: Scan, stage: str, engine: str, run: int
+) -> list[ExternalJob]:
+    """Return one run's rows in shard order, or refuse a run nobody made.
+
+    :param scan: The scan.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param run: The run number.
+    :returns: The rows ordered by ``shard_index``.
+    :raises Http404: When the run has no rows.
+    """
+    rows = list(
+        ExternalJob.objects.filter(
+            scan=scan, stage=stage, engine=engine, opinion=None, run=run
+        ).order_by("shard_index")
+    )
+    if not rows:
+        raise Http404(f"Run {run} does not exist for this scan.")
+    return rows
+
+
+def _redirect_to_object(
+    scan: Scan,
+    output: str,
+    run: int,
+    key: str,
+    filename: str,
+    missing_message: str,
+    label: str,
+) -> HttpResponse:
+    """Send the browser to one object of the bucket, or say why not.
+
+    A redirect to a presigned GET, not a stream (#243): a glued
+    document of a long volume holds every cell and the text of every
+    page, and #185 already took the large stream out of the preview
+    endpoint for the gunicorn timeout. The bytes never cross the web
+    pod. A navigation to S3 needs no CORS rule.
+
+    One ``head_object`` first. Without it a run that is not glued yet,
+    or a shard that never completed, would send the browser to an S3
+    XML error. A non-missing S3 error is left to raise: a throttle or
+    an IAM fault must reach Sentry, not read as "not there".
+
+    :param scan: The scan the object belongs to.
+    :param output: The slug, for the log line.
+    :param run: The run number, for the log line and the answer.
+    :param key: Object key inside the private bucket.
+    :param filename: The name the browser saves the file under.
+    :param missing_message: The 404 message when the object is absent.
+    :param label: The run's status counts, for the 404 body.
+    :returns: A 302 to the presigned URL, or a 404 JSON response.
+    """
+    if not s3_sync.s3_active():
+        return JsonResponse(
+            {"error": NO_S3_GLUED_OUTPUT_MESSAGE, "run": run, "label": label},
+            status=404,
+        )
+    if not s3_sync.object_exists(key):
+        return JsonResponse(
+            {"error": missing_message, "run": run, "label": label},
+            status=404,
+        )
+    logger.info(
+        "glued output: scan=%s output=%s run=%s key=%s",
+        scan.pk,
+        output,
+        run,
+        key,
+    )
+    url = s3_sync.presign_get(
+        key,
+        GLUED_OUTPUT_PRESIGN_TTL,
+        content_disposition=f'attachment; filename="{filename}"',
+    )
+    return redirect(url)
+
+
+def _shard_entry(scan: Scan, output: str, row: ExternalJob) -> dict:
+    """Describe one shard row for the glued-output index.
+
+    ``from_page`` and ``to_page`` are 1-based volume pages, the
+    convention of the log lines (``jobs._failure_location``); the
+    stored manifest holds fitz indexes. The dots.mocr page lists stay
+    shard-local, as the worker reports them: an offset would put two
+    conventions in one document. ``url`` is absent, not blank, on a
+    row with no result, so a reader tells "no result" from "not
+    looked".
+
+    :param scan: The scan.
+    :param output: The slug the row is listed under.
+    :param row: The row.
+    :returns: One entry of the ``shards`` list.
+    """
+    manifest = row.input_manifest or {}
+    from_page = manifest.get("from_page")
+    to_page = manifest.get("to_page")
+    entry = {
+        "shard_index": row.shard_index,
+        "shard_count": row.shard_count,
+        "attempt": row.attempt,
+        "status": row.status,
+        "error_code": row.error_code,
+        "from_page": from_page + 1 if isinstance(from_page, int) else None,
+        "to_page": to_page + 1 if isinstance(to_page, int) else None,
+        "page_count": manifest.get("page_count"),
+    }
+    if row.engine == JobEngine.DOTS_MOCR:
+        entry.update(jobs.page_lists(row))
+    if row.result_key:
+        entry["url"] = reverse(
+            "serve_glued_shard",
+            kwargs={
+                "pk": scan.pk,
+                "output": output,
+                "run": row.run,
+                "shard": row.shard_index,
+            },
+        )
+    return entry
+
+
+@login_required
+def glued_output_index(
+    request: HttpRequest, pk: int, output: str
+) -> JsonResponse:
+    """List every run and every shard of one glued output (#243).
+
+    The answer to "how many shards are there, and which one failed":
+    the runs newest first, each with its shards, their page ranges,
+    their states, and the URL of each file. Every fact is on the rows,
+    so the index makes no S3 call and answers in every environment.
+    ``glued`` is "every row of the run is CONSUMED", which the glue and
+    the merge write; the volume route still checks the object before
+    it redirects. A scan with no rows gets an empty list, not an
+    error: nothing ran is a fact.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param output: A key of :data:`GLUED_OUTPUTS`.
+    :return: JSON with ``scan``, ``output``, ``stage``, ``engine``,
+        ``live_run`` and ``runs``.
+    """
+    stage, engine, _key_fn = _glued_output(output)
+    scan = get_object_or_404(Scan, pk=pk)
+    rows = ExternalJob.objects.filter(
+        scan=scan, stage=stage, engine=engine, opinion=None
+    ).order_by("-run", "shard_index")
+    runs = []
+    for run, group in itertools.groupby(rows, key=lambda row: row.run):
+        group = list(group)
+        runs.append(
+            {
+                "run": run,
+                "glued": all(
+                    row.status == JobStatus.CONSUMED for row in group
+                ),
+                "label": jobs.rows_label(group),
+                "volume_url": reverse(
+                    "serve_glued_volume",
+                    kwargs={"pk": scan.pk, "output": output, "run": run},
+                ),
+                "shards": [_shard_entry(scan, output, row) for row in group],
+            }
+        )
+    return JsonResponse(
+        {
+            "scan": scan.pk,
+            "output": output,
+            "stage": stage,
+            "engine": engine,
+            "live_run": runs[0]["run"] if runs else None,
+            "runs": runs,
+        }
+    )
+
+
+@login_required
+def serve_glued_volume(
+    request: HttpRequest, pk: int, output: str, run: int
+) -> HttpResponse:
+    """Send the browser to one run's glued volume document (#243).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param output: A key of :data:`GLUED_OUTPUTS`.
+    :param run: The run number.
+    :return: A 302 to a presigned GET, or a 404 JSON response when the
+        run is not glued yet or no S3 is active.
+    """
+    stage, engine, key_fn = _glued_output(output)
+    scan = get_object_or_404(Scan, pk=pk)
+    rows = _glued_run_rows(scan, stage, engine, run)
+    label = jobs.rows_label(rows)
+    return _redirect_to_object(
+        scan,
+        output,
+        run,
+        key_fn(scan, run),
+        f"scan-{scan.pk}-{output}-r{run}.json",
+        f"Run {run} is not glued yet: {label}.",
+        label,
+    )
+
+
+@login_required
+def serve_glued_shard(
+    request: HttpRequest, pk: int, output: str, run: int, shard: int
+) -> HttpResponse:
+    """Send the browser to one shard's result object (#243).
+
+    The worker's own answer, at the row's ``result_key``: for dots.mocr
+    it holds ``raw``, the answer as the model wrote it, which the glue
+    leaves out of the volume document (#238) and which #242 needs. A
+    carried row (#190) names the previous attempt's object, and that
+    is the right file.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param output: A key of :data:`GLUED_OUTPUTS`.
+    :param run: The run number.
+    :param shard: The ``shard_index`` inside the run.
+    :return: A 302 to a presigned GET, or a 404 JSON response when the
+        shard has no result or no S3 is active.
+    """
+    stage, engine, _key_fn = _glued_output(output)
+    scan = get_object_or_404(Scan, pk=pk)
+    rows = _glued_run_rows(scan, stage, engine, run)
+    row = next((row for row in rows if row.shard_index == shard), None)
+    if row is None:
+        raise Http404(f"Run {run} has no shard {shard}.")
+    label = jobs.rows_label(rows)
+    status = row.get_status_display().lower()
+    if not row.result_key:
+        return JsonResponse(
+            {
+                "error": (
+                    f"Shard {shard} of run {run} has no result ({status})."
+                ),
+                "run": run,
+                "label": label,
+            },
+            status=404,
+        )
+    return _redirect_to_object(
+        scan,
+        output,
+        run,
+        row.result_key,
+        f"scan-{scan.pk}-{output}-r{run}-s{shard}.json",
+        (
+            f"The result of shard {shard} of run {run} is not in the "
+            f"bucket ({status})."
+        ),
+        label,
+    )
 
 
 @login_required
