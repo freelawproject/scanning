@@ -39,13 +39,17 @@ class TestRereadFailedPages(TestCase):
         self.committed = committed.start()
         self.addCleanup(committed.stop)
 
-    def _glued_scan(self, holes=(1,), status=Status.AWAITING_VALIDATION):
+    def _glued_scan(
+        self, holes=(1,), filtered=(), status=Status.AWAITING_VALIDATION
+    ):
         """Create a scan whose live run is consumed, with ``holes``."""
         scan = ScanFactory(status=status, page_count=20)
         for row in dots_mocr.ensure_analyze_jobs(scan, self.manifest):
             output = {"page_count": 10, "failed_pages": []}
             if row.shard_index in holes:
                 output["failed_pages"] = [4]
+            if row.shard_index in filtered:
+                output["filtered_pages"] = [8]
             ExternalJob.objects.filter(pk=row.pk).update(
                 status=JobStatus.CONSUMED,
                 result_key=f"r1-s{row.shard_index}-a1.json",
@@ -70,6 +74,18 @@ class TestRereadFailedPages(TestCase):
         self.assertIn("1 of 2 shard(s) to read again", out)
         self.assertIn("shard(s) 2 had unread pages", out)
         self.assertIn("1 scan(s) to read again", out)
+
+    def test_a_filtered_page_is_read_again_too(self):
+        # No cell, no page number: the same hole as a failed page.
+        scan = self._glued_scan(holes=(), filtered=(0,))
+
+        out, _ = self._call()
+
+        rows = dots_mocr.live_analyze_jobs(scan)
+        self.assertEqual(rows[0].run, 2)
+        self.assertEqual(rows[0].status, JobStatus.PENDING)
+        self.assertEqual(rows[1].status, JobStatus.COMPLETED)
+        self.assertIn("shard(s) 1 had unread pages", out)
 
     def test_a_dry_run_reports_and_creates_nothing(self):
         scan = self._glued_scan(holes=(0, 1))

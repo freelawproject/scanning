@@ -617,10 +617,12 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
     of the *volume* -- the worker counts from zero inside the shard it
     was given.
 
-    The pages a retry rung saved are logged too, at INFO, so the
-    ladder's recovery rate can be read off the logs as the ratio of two
-    lines. The numbers survive in ``provider_meta["output"]`` either
-    way; ``_complete`` stores the whole summary.
+    The pages a retry rung saved, and the pages whose answer was not
+    layout JSON (``filtered``: text but no cell, so no page number
+    either), are logged too, at INFO, so the ladder's recovery rate and
+    the size of each hole class can be read off the logs. The numbers
+    survive in ``provider_meta["output"]`` either way; ``_complete``
+    stores the whole summary.
 
     :param job: The row just completed.
     :param output: The provider's summary.
@@ -639,18 +641,22 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
             return f"volume page(s) {volume}"
         return f"shard page(s) {pages}"
 
-    recovered = output.get("recovered_pages")
-    if recovered and isinstance(recovered, list):
-        logger.info(
-            "%s/%s shard %d/%d of scan %s recovered %d page(s) on a retry: %s",
-            job.stage,
-            job.engine,
-            job.shard_index + 1,
-            job.shard_count,
-            job.scan_id,
-            len(recovered),
-            _where(recovered),
-        )
+    for field, verb in (
+        ("recovered_pages", "recovered %d page(s) on a retry"),
+        ("filtered_pages", "answered %d page(s) with no layout JSON"),
+    ):
+        pages = output.get(field)
+        if pages and isinstance(pages, list):
+            logger.info(
+                "%s/%s shard %d/%d of scan %s " + verb + ": %s",
+                job.stage,
+                job.engine,
+                job.shard_index + 1,
+                job.shard_count,
+                job.scan_id,
+                len(pages),
+                _where(pages),
+            )
     failed = output.get("failed_pages")
     if not failed or not isinstance(failed, list):
         return
@@ -1082,21 +1088,26 @@ def run_summary(scan, stage: str, engine: str) -> dict | None:
     }
 
 
-def has_failed_pages(job: ExternalJob) -> bool:
+def has_unread_pages(job: ExternalJob) -> bool:
     """Return whether a completed row's worker left pages unread.
 
     Read off the summary ``_complete`` stores in
     ``provider_meta["output"]``: the dots.mocr worker reports
-    ``failed_pages`` there (shard-local indexes). A row with no summary
-    -- a carried row, a doctor row -- has no holes to report.
+    ``failed_pages`` (no answer) and ``filtered_pages`` (an answer that
+    was not layout JSON) there, both as shard-local indexes. Either is
+    a hole to the page-number reader, which needs a cell to place a
+    number, so either counts. A row with no summary -- a carried row, a
+    doctor row -- has no holes to report.
 
     :param job: A completed or consumed row.
-    :returns: Whether ``failed_pages`` is non-empty.
+    :returns: Whether either list is non-empty.
     :rtype: bool
     """
     output = (job.provider_meta or {}).get("output") or {}
-    failed = output.get("failed_pages")
-    return bool(failed) and isinstance(failed, list)
+    return any(
+        isinstance(output.get(field), list) and output.get(field)
+        for field in ("failed_pages", "filtered_pages")
+    )
 
 
 def _reusable_results(
@@ -1153,7 +1164,7 @@ def _reusable_results(
     for row in prior_rows:
         if not row.result_key:
             continue
-        if has_failed_pages(row):
+        if has_unread_pages(row):
             # A result with a hole is not a result to carry (#238): the
             # new run exists to read the pages the old one could not,
             # so this shard is re-paid while its clean siblings ride

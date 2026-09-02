@@ -132,7 +132,11 @@ misprovisioned RunPod worker.
      render thresholded at this grey level, which removes the verso
      show-through that causes the loops. The render is the only
      change: same greedy decoding, so the stage stays deterministic.
-     Good pages never take the retry.
+     Good pages never take the retry. A page filtered on both rungs
+     (an answer that was not layout JSON) keeps upstream's cleaned
+     text in `md` and the answer as written in `raw`; the summary
+     lists it in `filtered_pages` beside `failed_pages` and
+     `recovered_pages`.
    - `VLLM_GPU_MEMORY_UTILIZATION` (default 0.9),
      `VLLM_STARTUP_TIMEOUT` (default 900 s), `VLLM_EXTRA_ARGS`
      (extra `vllm serve` flags, e.g. `--max-model-len 16384`).

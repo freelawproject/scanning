@@ -218,10 +218,11 @@ def shards_with_holes(rows: list[ExternalJob]) -> list[ExternalJob]:
     """Return the rows of a run whose worker left pages unread.
 
     :param rows: A run's rows.
-    :returns: Those with a non-empty ``failed_pages`` in their summary.
+    :returns: Those with a non-empty ``failed_pages`` or
+        ``filtered_pages`` in their summary.
     :rtype: list[ExternalJob]
     """
-    return [row for row in rows if jobs.has_failed_pages(row)]
+    return [row for row in rows if jobs.has_unread_pages(row)]
 
 
 def live_analyze_jobs(scan) -> list[ExternalJob]:

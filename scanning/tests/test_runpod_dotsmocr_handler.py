@@ -392,7 +392,9 @@ class TestParsePageInference(SimpleTestCase):
         self.assertNotIn("recovered_by", page)
         self.assertNotIn("render", page)
         self.assertNotIn("errors", page)
+        self.assertNotIn("raw", page)
         self.assertEqual(result["recovered_pages"], [])
+        self.assertEqual(result["filtered_pages"], [])
         # The default cap reaches the model: about twice the longest
         # measured page, not the old 16384.
         self.assertEqual(infer.call_args.kwargs["max_completion_tokens"], 6144)
@@ -481,7 +483,9 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(page["cells"], [{"bbox": [0, 0, 1, 1]}])
         self.assertEqual(page["recovered_by"], 2)
         self.assertEqual(page["errors"], ["model output was not layout JSON"])
+        self.assertNotIn("raw", page)
         self.assertEqual(result["recovered_pages"], [0])
+        self.assertEqual(result["filtered_pages"], [])
 
     def test_a_page_filtered_on_every_rung_is_not_an_error(self):
         # The cleaned text is still text a reader can search, so the
@@ -495,6 +499,10 @@ class TestParsePageInference(SimpleTestCase):
         self.assertIs(page["filtered"], True)
         self.assertIsNone(page["cells"])
         self.assertEqual(page["md"], "junk text")
+        # The answer as the model wrote it survives beside the cleaned
+        # text, so the broken JSON can be looked at later.
+        self.assertEqual(page["raw"], "junk")
+        self.assertEqual(result["filtered_pages"], [0])
         self.assertEqual(page["attempts"], 2)
         self.assertEqual(len(page["errors"]), 2)
         self.assertNotIn("recovered_by", page)
@@ -547,6 +555,17 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(page["origin_width"], 612)
         self.assertEqual(page["origin_height"], 792)
         self.assertEqual(result["failed_pages"], [])
+
+
+class TestSummaryFields(SimpleTestCase):
+    """What the response keeps when the payload goes to S3."""
+
+    def test_the_three_page_lists_travel_in_the_summary(self):
+        # The daemon acts on all three; a list only the S3 object
+        # carried was invisible to it.
+        for field in ("failed_pages", "filtered_pages", "recovered_pages"):
+            self.assertIn(field, handler._SUMMARY_FIELDS)
+        self.assertNotIn("pages", handler._SUMMARY_FIELDS)
 
 
 class TestThresholdRender(SimpleTestCase):

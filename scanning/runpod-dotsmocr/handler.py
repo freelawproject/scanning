@@ -548,8 +548,8 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         the env-level ``MAX_PAGES`` are rejected.
     :param tmp_dir: Per-job scratch directory.
     :returns: ``{"pages": list[dict], "page_count": int,
-        "failed_pages": list[int], "recovered_pages": list[int],
-        "duration_ms": int}``. Each page
+        "failed_pages": list[int], "filtered_pages": list[int],
+        "recovered_pages": list[int], "duration_ms": int}``. Each page
         dict carries ``page_no``, ``input_width``/``input_height``
         (model-input dims for interpreting bboxes),
         ``origin_width``/``origin_height`` (actual render dims — the
@@ -557,7 +557,8 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         ``completion_tokens`` count, ``duration_ms``, and either
         ``cells`` (layout JSON) + ``md`` (markdown), or ``error``.
         ``filtered: true`` marks pages where the model output wasn't
-        valid JSON and ``md`` holds the cleaned text fallback.
+        valid JSON, ``md`` holds the cleaned text fallback and ``raw``
+        the answer as the model wrote it.
         The retry ladder (#238) adds ``attempts`` (rungs spent),
         ``recovered_by`` (the rung that answered, absent on a first-try
         success), ``render: "threshold"`` for the rung that changed
@@ -790,9 +791,14 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 if filtered:
                     # Model output wasn't valid JSON; ``cells`` is
                     # upstream's cleaned-text fallback, usable only as
-                    # markdown.
+                    # markdown. The raw answer is kept beside it (#238):
+                    # upstream's cleaner consumes the broken JSON and
+                    # returns only the words, so without this nothing
+                    # could ever say which character failed the parse.
+                    # About 6 KB on one page in 770.
                     result["cells"] = None
                     result["md"] = cells if isinstance(cells, str) else None
+                    result["raw"] = response
                 else:
                     result["cells"] = cells
                     if prompt_mode == "prompt_layout_all_en":
@@ -901,6 +907,7 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
 
     results.sort(key=lambda r: r["page_no"])
     failed = [r["page_no"] for r in results if "error" in r]
+    filtered = [r["page_no"] for r in results if r.get("filtered")]
     recovered = [r["page_no"] for r in results if "recovered_by" in r]
     if len(failed) == pages:
         raise RuntimeError(
@@ -909,10 +916,11 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
 
     duration_ms = int((time.monotonic() - t0) * 1000)
     logger.info(
-        "parse OK: %d pages (%d failed, %d recovered on a retry) in %d ms "
-        "(mode=%s, dpi=%d)",
+        "parse OK: %d pages (%d failed, %d filtered, %d recovered on a "
+        "retry) in %d ms (mode=%s, dpi=%d)",
         pages,
         len(failed),
+        len(filtered),
         len(recovered),
         duration_ms,
         prompt_mode,
@@ -922,6 +930,7 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         "pages": results,
         "page_count": pages,
         "failed_pages": failed,
+        "filtered_pages": filtered,
         "recovered_pages": recovered,
         "duration_ms": duration_ms,
     }
@@ -930,10 +939,14 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
 # Summary fields kept in the job response when the payload goes to S3.
 # Everything else -- above all ``pages`` -- is deliberately dropped: the
 # response is capped at about 20 MB and discarded with the job record,
-# which is the whole reason the payload travels through S3.
+# which is the whole reason the payload travels through S3. The three
+# page lists are small and are what the daemon acts on: a filtered page
+# is as much a hole to the page-number reader as a failed one (#238),
+# and a list that only the S3 object carried was invisible to it.
 _SUMMARY_FIELDS = (
     "page_count",
     "failed_pages",
+    "filtered_pages",
     "recovered_pages",
     "duration_ms",
 )

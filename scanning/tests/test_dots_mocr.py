@@ -185,13 +185,15 @@ class TestEnsureAnalyzeJobs(ScanningTestCase):
             self.assertEqual(job.run, 1)
             self.assertEqual(job.status, JobStatus.PENDING)
 
-    def _finished_run(self, scan, manifest, holes=()):
+    def _finished_run(self, scan, manifest, holes=(), filtered=()):
         """Complete a run whose shards in ``holes`` left pages unread."""
         rows = dots_mocr.ensure_analyze_jobs(scan, manifest)
         for row in rows:
             output = {"page_count": 10, "failed_pages": []}
             if row.shard_index in holes:
                 output["failed_pages"] = [3]
+            if row.shard_index in filtered:
+                output["filtered_pages"] = [7]
             ExternalJob.objects.filter(pk=row.pk).update(
                 status=JobStatus.CONSUMED,
                 result_key=f"r{row.run}-s{row.shard_index}-a1.json",
@@ -788,7 +790,7 @@ class TestFailedPages(ScanningTestCase):
         self.assertIn("recovered 1 page(s) on a retry", lines[0])
         self.assertIn("[13]", lines[0])
         self.assertFalse(any("could not read" in line for line in logs.output))
-        self.assertFalse(jobs.has_failed_pages(self.job))
+        self.assertFalse(jobs.has_unread_pages(self.job))
 
     def test_a_row_with_unread_pages_says_so(self):
         jobs._complete(
@@ -797,7 +799,23 @@ class TestFailedPages(ScanningTestCase):
             timezone.now(),
         )
         self.job.refresh_from_db()
-        self.assertTrue(jobs.has_failed_pages(self.job))
+        self.assertTrue(jobs.has_unread_pages(self.job))
+
+    def test_a_filtered_page_is_a_hole_too_and_is_logged(self):
+        # An answer that was not layout JSON has no cell, so the
+        # page-number reader gets nothing from it either.
+        with self.assertLogs("scanning.jobs", level="INFO") as logs:
+            jobs._complete(
+                self.job,
+                {"page_count": 10, "failed_pages": [], "filtered_pages": [5]},
+                timezone.now(),
+            )
+        lines = [line for line in logs.output if "no layout JSON" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("answered 1 page(s) with no layout JSON", lines[0])
+        self.assertIn("[16]", lines[0])
+        self.job.refresh_from_db()
+        self.assertTrue(jobs.has_unread_pages(self.job))
 
 
 # ── run completion ──────────────────────────────────────────────────

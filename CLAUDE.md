@@ -558,12 +558,17 @@ trained on), tracked on `ExternalJob` rows at
   so the stage stays deterministic for the same page. Only a page with
   no usable output climbs; the page dict says what happened
   (`attempts`, `recovered_by`, `render`, `errors`)
-  and the summary carries `recovered_pages`, logged at INFO beside the
-  WARNING. The cap is `HANDLER_MAX_COMPLETION_TOKENS` = 6144, about
+  and the summary carries `recovered_pages` and `filtered_pages`,
+  logged at INFO beside the WARNING. **A filtered page is a hole
+  too**: the answer was text but not layout JSON, so there is no cell
+  to place a number in; the page keeps upstream's cleaned text in `md`
+  and the answer as written in `raw`, because the cleaner discards the
+  broken JSON and nothing else could say which character failed. The
+  cap is `HANDLER_MAX_COMPLETION_TOKENS` = 6144, about
   twice the longest measured page (3114) and not 16384: every rung
   pays the cap once, and at the old value one looping page made its
   shard four times slower. **A result with a hole is never carried**
-  (`jobs.has_failed_pages` in `_reusable_results`), which is what makes
+  (`jobs.has_unread_pages` in `_reusable_results`, either list), which is what makes
   `reread_failed_pages` the backfill: it forces a new run
   (`ensure_shard_jobs(force_new_run=True)`) that re-pays only the
   shards with unread pages. Run it after the worker image is live.
