@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('scanning', '0017_alter_externaljob_engine'),
+        ('scanning', '0018_page_edit_withdrawal'),
     ]
 
     operations = [
