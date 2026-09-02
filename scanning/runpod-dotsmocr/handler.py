@@ -578,8 +578,11 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         ``filtered: true`` marks pages where the model output wasn't
         valid JSON and ``md`` holds the cleaned text fallback.
         The retry ladder (#238) adds ``attempts`` (rungs spent),
-        ``recovered_by`` (the rung that answered, absent on a first-try
-        success), ``render: "threshold"`` for the rung that changed
+        ``recovered_by`` (the rung that gave usable output, absent on
+        a first-try success and on a filtered page),
+        ``fallback_from_rung`` (on a page filtered on every rung, the
+        rung whose text was kept, when not the first),
+        ``render: "threshold"`` for the rung that changed
         the render, and ``errors``
         (one text per failed rung) whenever a rung failed.
         ``recovered_pages`` lists the pages a retry rung saved.
@@ -883,9 +886,13 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             return result
         if fallback is not None:
             # Every rung answered garbage or nothing; the first
-            # filtered answer is still text a reader can search.
+            # filtered answer is still text a reader can search. It is
+            # not a recovery: ``recovered_by`` means a rung gave usable
+            # output, and ``recovered_pages`` is the number the deploy
+            # reads to judge the threshold. The rung that produced the
+            # text is recorded under its own name.
             if fallback["attempts"] > 1:
-                fallback["recovered_by"] = fallback["attempts"]
+                fallback["fallback_from_rung"] = fallback["attempts"]
             fallback["attempts"] = len(rungs)
             fallback["errors"] = errors
             fallback["duration_ms"] = int((time.monotonic() - t0) * 1000)

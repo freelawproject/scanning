@@ -513,9 +513,30 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(page["attempts"], 2)
         self.assertEqual(len(page["errors"]), 2)
         self.assertNotIn("recovered_by", page)
+        # The kept text is rung 1's, so there is no rung to name.
+        self.assertNotIn("fallback_from_rung", page)
         self.assertEqual(result["failed_pages"], [])
         self.assertEqual(result["recovered_pages"], [])
         self.assertEqual(infer.call_count, 2)
+
+    def test_a_loop_then_a_filtered_answer_is_not_a_recovery(self):
+        # The fallback text came from rung 2, but nothing can read the
+        # page: ``recovered_pages`` is what the deploy reads to judge
+        # the threshold, and a filtered page must not inflate it.
+        result, _ = self._run(
+            [self.LOOP, ("junk", "stop", 5)],
+            prompt_mode="prompt_layout_only_en",
+            post_process=[("junk text", True)],
+        )
+        page = result["pages"][0]
+        self.assertIs(page["filtered"], True)
+        self.assertEqual(page["md"], "junk text")
+        self.assertEqual(page["attempts"], 2)
+        self.assertEqual(page["fallback_from_rung"], 2)
+        self.assertNotIn("recovered_by", page)
+        self.assertEqual(result["recovered_pages"], [])
+        self.assertEqual(result["filtered_pages"], [0])
+        self.assertEqual(result["failed_pages"], [])
 
     def test_an_empty_render_takes_no_rung(self):
         # The render is the input to every rung; a re-render of the same
