@@ -561,9 +561,14 @@ trained on), tracked on `ExternalJob` rows at
   and the summary carries `recovered_pages` and `filtered_pages`,
   logged at INFO beside the WARNING. **A filtered page is a hole
   too**: the answer was text but not layout JSON, so there is no cell
-  to place a number in; the page keeps upstream's cleaned text in `md`
-  and the answer as written in `raw`, because the cleaner discards the
-  broken JSON and nothing else could say which character failed. The
+  to place a number in; the page keeps upstream's cleaned text in
+  `md`. **Every page keeps the answer as the model wrote it in
+  `raw`** (a failed page: the last truncated answer): `cells` is
+  upstream's parsed and rescaled copy with `int()` on every
+  coordinate, and the cleaner discards a broken JSON, so `raw` is the
+  only thing a later post-processor can start from. It lives in the
+  shard result object, which is kept for good; the glue leaves it out
+  of the volume document the apply downloads. The
   cap is `HANDLER_MAX_COMPLETION_TOKENS` = 6144, about
   twice the longest measured page (3114) and not 16384: every rung
   pays the cap once, and at the old value one looping page made its

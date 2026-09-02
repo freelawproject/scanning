@@ -195,7 +195,8 @@ class TestMergeDotsmocrResults(AnalyzeJobsMixin, TestCase):
         )
 
     def test_the_per_page_payload_survives_whole(self):
-        """The glue is naive on purpose: nothing is trimmed."""
+        """The glue is naive on purpose: nothing but ``raw`` is left
+        out (see the test below)."""
         scan, rows = self.build(shard_count=1, pages_per_shard=1)
 
         dots_mocr.merge_dotsmocr_results(scan, rows)
@@ -235,6 +236,19 @@ class TestMergeDotsmocrResults(AnalyzeJobsMixin, TestCase):
         self.assertEqual(len(document["pages"]), 4)
         self.assertEqual(document["pages"][3]["error"], "boom")
         self.assertEqual(document["failed_pages"], [3])
+
+    def test_the_raw_answer_stays_in_the_shard_object(self):
+        """The apply never reads it, and it would double the download."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=2)
+        first = make_page(0)
+        first["raw"] = '[{"bbox": [1, 2, 3, 4], "category": "Text"}]'
+        self.write_envelope(0, make_envelope(rows[0], [first, make_page(1)]))
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        document = self.upload.call_args[0][1]
+        self.assertNotIn("raw", document["pages"][0])
+        self.assertEqual(document["pages"][0]["md"], "98")
 
     def test_filtered_and_recovered_pages_are_listed(self):
         """Two lists for the survey of #238; the apply reads neither."""

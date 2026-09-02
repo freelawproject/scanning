@@ -134,9 +134,14 @@ misprovisioned RunPod worker.
      change: same greedy decoding, so the stage stays deterministic.
      Good pages never take the retry. A page filtered on both rungs
      (an answer that was not layout JSON) keeps upstream's cleaned
-     text in `md` and the answer as written in `raw`; the summary
-     lists it in `filtered_pages` beside `failed_pages` and
-     `recovered_pages`.
+     text in `md`; the summary lists it in `filtered_pages` beside
+     `failed_pages` and `recovered_pages`.
+   - Every page that got an answer carries `raw`, the answer as the
+     model wrote it (about 6 KB a page). `cells` is upstream's parsed
+     and rescaled copy, so `raw` is what a later post-processor
+     starts from. On a failed page it is the last truncated answer.
+     It lives in the shard result object on S3 only; the glue leaves
+     it out of the volume document.
    - `VLLM_GPU_MEMORY_UTILIZATION` (default 0.9),
      `VLLM_STARTUP_TIMEOUT` (default 900 s), `VLLM_EXTRA_ARGS`
      (extra `vllm serve` flags, e.g. `--max-model-len 16384`).

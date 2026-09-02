@@ -386,12 +386,17 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
                 )
             for page in shard_pages:
                 page_index = from_page + page["page_no"]
+                # ``raw`` -- the model's answer as written (#238) --
+                # stays in the shard object, which is kept for good.
+                # Copying it would double the volume document the
+                # apply downloads every time, for a field the apply
+                # never reads.
                 pages.append(
                     {
                         "page_index": page_index,
                         "pdf_page": page_index + 1,
                         "shard_index": index,
-                        **page,
+                        **{k: v for k, v in page.items() if k != "raw"},
                     }
                 )
 

@@ -392,7 +392,9 @@ class TestParsePageInference(SimpleTestCase):
         self.assertNotIn("recovered_by", page)
         self.assertNotIn("render", page)
         self.assertNotIn("errors", page)
-        self.assertNotIn("raw", page)
+        # The answer as written travels on every page: what a later
+        # post-processor starts from.
+        self.assertEqual(page["raw"], "some text")
         self.assertEqual(result["recovered_pages"], [])
         self.assertEqual(result["filtered_pages"], [])
         # The default cap reaches the model: about twice the longest
@@ -418,6 +420,8 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(result["failed_pages"], [0])
         self.assertIn("empty response", result["pages"][0]["error"])
         self.assertEqual(result["pages"][0]["attempts"], 2)
+        # No rung produced text, so there is no answer to keep.
+        self.assertNotIn("raw", result["pages"][0])
         self.assertEqual(result["pages"][1]["md"], "ok")
 
     def test_a_loop_is_retried_on_the_thresholded_render(self):
@@ -462,6 +466,9 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(page["attempts"], 2)
         self.assertEqual(len(page["errors"]), 2)
         self.assertNotIn("recovered_by", page)
+        # The truncated answer is kept: the only evidence of what the
+        # loop repeated.
+        self.assertEqual(page["raw"], "x" * 50)
         self.assertEqual(result["pages"][1]["md"], "ok")
         self.assertEqual(result["recovered_pages"], [])
         self.assertEqual(infer.call_count, 3)
@@ -483,7 +490,7 @@ class TestParsePageInference(SimpleTestCase):
         self.assertEqual(page["cells"], [{"bbox": [0, 0, 1, 1]}])
         self.assertEqual(page["recovered_by"], 2)
         self.assertEqual(page["errors"], ["model output was not layout JSON"])
-        self.assertNotIn("raw", page)
+        self.assertEqual(page["raw"], "[]")
         self.assertEqual(result["recovered_pages"], [0])
         self.assertEqual(result["filtered_pages"], [])
 

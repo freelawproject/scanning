@@ -472,17 +472,32 @@ def _vllm_inference(
 _DATA_URI_MD_IMG_RE = re.compile(r"!\[[^\]]*\]\(data:image/[^)]*\)")
 
 
+class TruncatedOutput(RuntimeError):
+    """A rung's generation was cut at the cap: a repetition loop.
+
+    :ivar raw: The truncated answer, kept so a failed page can still
+        show what the loop repeated.
+    """
+
+    def __init__(self, message: str, raw: str | None = None):
+        self.raw = raw
+        super().__init__(message)
+
+
 class PageFailed(RuntimeError):
     """Every rung of the retry ladder failed on one page (#238).
 
     :ivar errors: One error text per rung, in rung order.
     :ivar last: The last rung's text, which is what the page's
         ``error`` field carries -- the shape every reader knows.
+    :ivar raw: The last truncated answer any rung produced, or None
+        when no rung produced text at all.
     """
 
-    def __init__(self, errors: list[str]):
+    def __init__(self, errors: list[str], raw: str | None = None):
         self.errors = list(errors)
         self.last = self.errors[-1] if self.errors else "no output"
+        self.raw = raw
         super().__init__(
             "; ".join(
                 f"rung {rung}: {text}"
@@ -556,9 +571,12 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         pixel space ``cells`` bboxes are rescaled into), a
         ``completion_tokens`` count, ``duration_ms``, and either
         ``cells`` (layout JSON) + ``md`` (markdown), or ``error``.
+        Every page that got an answer also carries ``raw``, the answer
+        as the model wrote it: ``cells`` is a parsed and rescaled copy,
+        so ``raw`` is what a later post-processor starts from. On a
+        failed page it is the last truncated answer, when there was one.
         ``filtered: true`` marks pages where the model output wasn't
-        valid JSON, ``md`` holds the cleaned text fallback and ``raw``
-        the answer as the model wrote it.
+        valid JSON and ``md`` holds the cleaned text fallback.
         The retry ladder (#238) adds ``attempts`` (rungs spent),
         ``recovered_by`` (the rung that answered, absent on a first-try
         success), ``render: "threshold"`` for the rung that changed
@@ -760,9 +778,10 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             # the truncated JSON degrade into filtered=true,
             # indistinguishable from genuine model garbage.
             if finish_reason == "length":
-                raise RuntimeError(
+                raise TruncatedOutput(
                     f"output truncated at {completion_tokens} tokens "
-                    "(finish_reason='length'); likely a repetition loop"
+                    "(finish_reason='length'); likely a repetition loop",
+                    raw=response,
                 )
 
             result = {
@@ -772,6 +791,14 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 "origin_width": origin_image.width,
                 "origin_height": origin_image.height,
                 "completion_tokens": completion_tokens,
+                # The answer as the model wrote it, on every page (#238).
+                # ``cells`` below is upstream's parsed and rescaled copy
+                # (``int()`` on every coordinate, pictures stripped from
+                # the markdown), so a later post-processor would have
+                # nothing else to start from. About 6 KB a page, and the
+                # payload goes to S3, so the response cap is no concern.
+                # The glue leaves it out of the volume document.
+                "raw": response,
             }
             if render_fallback:
                 result["render_fallback"] = True
@@ -791,14 +818,11 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 if filtered:
                     # Model output wasn't valid JSON; ``cells`` is
                     # upstream's cleaned-text fallback, usable only as
-                    # markdown. The raw answer is kept beside it (#238):
-                    # upstream's cleaner consumes the broken JSON and
-                    # returns only the words, so without this nothing
-                    # could ever say which character failed the parse.
-                    # About 6 KB on one page in 770.
+                    # markdown. ``raw`` above is what says which
+                    # character failed the parse: upstream's cleaner
+                    # consumes the broken JSON and returns the words.
                     result["cells"] = None
                     result["md"] = cells if isinstance(cells, str) else None
-                    result["raw"] = response
                 else:
                     result["cells"] = cells
                     if prompt_mode == "prompt_layout_all_en":
@@ -825,9 +849,14 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         )
         errors: list[str] = []
         fallback: dict | None = None
+        last_raw: str | None = None
         for rung, (render, marks) in enumerate(rungs, start=1):
             try:
                 result = _infer(render())
+            except TruncatedOutput as exc:
+                errors.append(str(exc))
+                last_raw = exc.raw
+                continue
             except Exception as exc:
                 errors.append(str(exc))
                 continue
@@ -861,21 +890,26 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             fallback["errors"] = errors
             fallback["duration_ms"] = int((time.monotonic() - t0) * 1000)
             return fallback
-        raise PageFailed(errors)
+        raise PageFailed(errors, raw=last_raw)
 
     def _parse_page_safe(page_idx: int) -> dict:
         try:
             return _parse_page(page_idx)
         except PageFailed as exc:
             # Out of rungs. Keep the last rung's text as ``error`` (the
-            # shape every reader knows) and the whole history beside it.
+            # shape every reader knows) and the whole history beside it,
+            # plus the last truncated answer when a rung produced one:
+            # it is the only evidence of what the loop repeated.
             logger.error("page %d failed: %s", page_idx, exc)
-            return {
+            page = {
                 "page_no": page_idx,
                 "error": exc.last,
                 "attempts": len(exc.errors),
                 "errors": exc.errors,
             }
+            if exc.raw is not None:
+                page["raw"] = exc.raw
+            return page
         except Exception as exc:
             # One bad page must not sink a 1000-page job: record the
             # error per page and keep going. If *every* page fails the
