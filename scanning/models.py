@@ -1183,11 +1183,17 @@ class PageEdit(AbstractDateTimeModel):
       only. A printed number cannot be an address: front matter has
       none, and two pages can both print 1074 -- which is one of the
       defects review 1 exists to find.
-    - **Applying an edit closes it; it never rewrites it.** The apply
-      (#206) stamps ``applied_at`` and the row becomes history. So
-      every unique constraint is partial over the open rows: a curator
-      who edits the same page again after an apply writes a new row,
-      against the new original's fingerprint.
+    - **A decision is closed, never rewritten and never deleted.** The
+      apply (#206) stamps ``applied_at``; a curator who takes the
+      decision back stamps ``withdrawn_at`` and ``withdrawn_by``
+      (#232). Either stamp makes the row history. So every unique
+      constraint is partial over the rows that carry neither: a
+      curator who edits the same page again writes a new row, against
+      the fingerprint of the original as it is then. A second file
+      uploaded for one page withdraws the first row rather than
+      writing over it -- the audit must show every file a person
+      uploaded, and the object of an overwritten row would stay in the
+      bucket with nothing naming it.
     - **``source_fingerprint`` is the scan's**
       (``Scan.source_fingerprint``, size plus page count, the identity
       the shard manifest trusts). A replaced or re-cut original makes
@@ -1328,6 +1334,24 @@ class PageEdit(AbstractDateTimeModel):
             "original. A stamped row is history: it is never rewritten."
         ),
     )
+    withdrawn_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=(
+            "When the decision was taken back: the curator undid it, "
+            "or replaced it with a later one (#232). A stamped row is "
+            "history too, and it is never rewritten either."
+        ),
+    )
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_page_edits",
+        help_text="Who took the decision back. Null while it stands.",
+    )
 
     class Meta:
         ordering = ["scan", "pdf_page", "anchor_pdf_page", "ordinal"]
@@ -1381,13 +1405,16 @@ class PageEdit(AbstractDateTimeModel):
                 ),
                 name="page_edit_rotation_is_a_quarter_turn",
             ),
-            # The unique keys are partial over the open rows: an
-            # applied row is history, and a curator may edit the same
-            # page again against the new original.
+            # The unique keys are partial over the open rows. A row
+            # leaves that set in one of two ways, and both are
+            # history: the apply built it in, or the curator took it
+            # back (#232). After either, the same page may be edited
+            # again.
             models.UniqueConstraint(
                 fields=["scan", "kind", "pdf_page"],
                 condition=(
                     models.Q(applied_at__isnull=True)
+                    & models.Q(withdrawn_at__isnull=True)
                     & models.Q(pdf_page__isnull=False)
                     & ~models.Q(kind="dismiss_issue")
                 ),
@@ -1411,6 +1438,7 @@ class PageEdit(AbstractDateTimeModel):
                 ],
                 condition=(
                     models.Q(applied_at__isnull=True)
+                    & models.Q(withdrawn_at__isnull=True)
                     & models.Q(kind="dismiss_issue")
                 ),
                 nulls_distinct=False,
@@ -1420,6 +1448,7 @@ class PageEdit(AbstractDateTimeModel):
                 fields=["scan", "anchor_pdf_page", "ordinal"],
                 condition=(
                     models.Q(applied_at__isnull=True)
+                    & models.Q(withdrawn_at__isnull=True)
                     & models.Q(kind="insert_page")
                 ),
                 name="uniq_open_insert_per_gap",
@@ -1433,7 +1462,11 @@ class PageEdit(AbstractDateTimeModel):
             else f"p.{self.pdf_page}"
         )
         value = f" = {self.value!r}" if self.value else ""
-        state = "" if self.applied_at is None else " [applied]"
+        state = ""
+        if self.applied_at is not None:
+            state = " [applied]"
+        elif self.withdrawn_at is not None:
+            state = " [withdrawn]"
         return f"{self.get_kind_display()} {where}{value}{state}"
 
 

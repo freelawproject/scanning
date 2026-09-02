@@ -99,8 +99,20 @@
         <p class="m-0">Look for missing, duplicated, mislabeled, or blurry pages. Approve the scan when it is complete.</p>
       </div>
 
+      {% comment %}
+        What "pending" means, in full (#232). The apply that builds a
+        corrected volume out of these rows is #206, and it is not
+        written: an inserted or a replaced page has been through no
+        stage, so it carries no bitonal copy, no reading and no page
+        number. Nothing stamps ``PageEdit.applied_at`` yet, so this
+        banner stays up for the rest of the review. Say so, and say
+        that the approval does not wait for it -- the bar used to hide
+        the approve button here, which left the curator with no way
+        forward at all.
+      {% endcomment %}
       <div id="pending-banner" class="sticky top-0 z-10 -mx-3 px-3 py-2 rounded-t shadow-sm bg-yellow-100 dark:bg-yellow-900/30 text-yellow-800 dark:text-yellow-200 text-xs"{% if not has_pending_changes %} hidden{% endif %}>
-        Pending changes &mdash; saved, but not applied to the volume yet
+        <p class="font-bold m-0">Your page changes are saved.</p>
+        <p class="m-0">We do not build the corrected volume from them yet. Each inserted or replaced page must go through the conversion and the OCR on its own, and that pass is not built (#206). Approve this volume when the pages are complete. We apply your changes for you when the pass is ready.</p>
       </div>
 
       {% if ocr_results %}
@@ -171,6 +183,7 @@
           <span class="text-red-600 dark:text-red-400 ml-1">—</span>
           {% endif %}
           {% if r.is_duplicate %}<span class="text-[9px] font-bold text-orange-600 dark:text-orange-400 ml-1">DUP</span>{% endif %}
+          {% if r.is_replaced %}<span class="page-repl-badge text-[9px] font-bold text-purple-600 dark:text-purple-400 ml-1" title="A curator replaced this page">REPL</span>{% endif %}
         </span>
         {% if r.type == 'range' %}<span class="text-[9px] text-blue-500">range</span>{% endif %}
         {% if r.zone == 'manual' %}<span class="text-[9px] text-purple-500">manual</span>{% endif %}
@@ -335,6 +348,7 @@ var SCAN_CONFIG = {
     docId: {{ scan.pk }},
     step: {{ step }},
     deletedPages: {{ deleted_pages_json|safe }},
+    replacedPages: {{ replaced_pages_json|safe }},
     {% if is_processing %}progressUrl: '{% url "progress_api" scan.pk %}',{% endif %}
 };
 // Backward-compatible globals used by viewer_step1.js and shared.js

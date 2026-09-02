@@ -2,6 +2,7 @@
 
 import json
 import logging
+import mimetypes
 import os
 import re
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import fitz
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.db import transaction
 from django.http import (
     FileResponse,
     Http404,
@@ -71,8 +73,33 @@ PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE = (
     "Approve the page completeness review first. Then continue to detection."
 )
 PENDING_EDITS_SAVED_MESSAGE = (
-    "Your page inserts and deletes are saved. We do not apply them to "
-    "the volume yet."
+    "Your page changes are saved. We do not build the corrected "
+    "volume from them yet. Each inserted or replaced page must go "
+    "through the conversion and the OCR on its own, and that pass is "
+    "not built (#206). Approve this volume when the pages are "
+    "complete. We apply your changes for you when the pass is ready."
+)
+
+#: The largest page file a curator may upload (#232). One page is one
+#: image or a short PDF. A bigger file is a whole volume sent by
+#: mistake, and the web pod would read it into memory to check it.
+PAGE_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+
+#: What a PDF starts with. The content type is the browser's word, and
+#: the stored extension decides how ``views_api.export_pdf`` and the
+#: apply (#206) read the file later, so the first bytes decide.
+_PDF_MAGIC = b"%PDF-"
+
+UPLOAD_TOO_LARGE_MESSAGE = (
+    "This file is larger than 50 MB. Upload one page, not a volume."
+)
+UPLOAD_WRONG_TYPE_MESSAGE = "Upload an image of the page, or a PDF of it."
+UPLOAD_BAD_PDF_MESSAGE = (
+    "This PDF could not be opened. Upload it again, or send an image."
+)
+REPLACEMENT_IS_ONE_PAGE_MESSAGE = (
+    "A replacement stands for one page, and this PDF holds {pages}. "
+    "Upload the one page that replaces it."
 )
 
 
@@ -204,6 +231,10 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     page_map = page_edits.project_inserts(scan, scan.page_map)
     missing_pages = scan.missing_pages
 
+    # The pages a curator replaced (#232). The viewer draws a note on
+    # each one, with a link that opens the file the curator uploaded.
+    replaced_pages = page_edits.replacements_by_page(scan)
+
     # Map pdf_index → logical page number for navigation
     idx_to_logical = {}
     logical_to_indices: dict[int, list[int]] = {}
@@ -262,6 +293,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     for r in ocr_results:
         r["seq_issue"] = ""
         r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
+        r["is_replaced"] = r["pdf_page"] in replaced_pages
         if not r.get("detected") or r.get("type") == "range":
             prev_num = None
             continue
@@ -466,6 +498,19 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "unmatched_captions": unmatched_captions,
             "deleted_pages_json": json.dumps(
                 sorted(page_edits.deleted_pages(scan))
+            ),
+            "replaced_pages_json": json.dumps(
+                {
+                    str(page): {
+                        "edit_id": edit.pk,
+                        "url": reverse(
+                            "page_edit_file",
+                            kwargs={"pk": scan.pk, "edit_id": edit.pk},
+                        ),
+                        "kind": page_edits.uploaded_kind(edit),
+                    }
+                    for page, edit in replaced_pages.items()
+                }
             ),
         },
     )
@@ -829,12 +874,13 @@ def _block_if_pending_changes(
 
     The detect action ignores the structural page edits -- a delete, an
     insert, a replacement, a rotation -- so running it would silently
-    strand the curator's work. They must be applied first (#206).
+    strand the curator's work. They must be applied first (#206), and
+    the apply runs after the review-1 approval.
 
-    The recompute of review 1 no longer calls this: "Rebuild &
-    Validate" refuses while the pipeline is paused (#173), so the
-    redirect was a dead end. That view warns and continues instead
-    (#151).
+    Only ``start_detect`` calls this, which is step 2. The recompute
+    of review 1 does not: it warns and continues (#151), and the
+    approve button of review 1 does not either (#232) -- the approval
+    is what the apply waits for.
 
     :param request: The HTTP request.
     :type request: HttpRequest
@@ -847,8 +893,9 @@ def _block_if_pending_changes(
     if page_edits.has_pending_changes(scan):
         messages.warning(
             request,
-            'Apply your pending page changes with "Rebuild & Validate" '
-            "before running this.",
+            "Your page changes are not built into the volume yet, so "
+            "this step would ignore them. Approve the page "
+            "completeness review first.",
         )
         return redirect(
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
@@ -1188,10 +1235,10 @@ def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
     PaddleOCR stage read gets the legacy message and no recompute: the
     readings cannot change, so a rebuild would only look like work
     (#173). A scan carrying pending inserts or deletes gets the recompute
-    plus a warning that those edits are saved but not applied, because
-    the button that used to apply them ("Rebuild & Validate") now
-    refuses (#173) -- blocking here would leave the curator with no way
-    forward at all.
+    plus the warning that says what is and is not done with those
+    rows: nothing applies them until #206. Blocking here would leave
+    the curator with no way forward at all, which is the fault that
+    took the approve button away until #232.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -1371,6 +1418,7 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
         kind=PageEdit.Kind.SET_NUMBER,
         pdf_page=pdf_page,
         applied_at=None,
+        withdrawn_at=None,
         defaults={
             "author": request.user,
             "value": page_value,
@@ -1408,6 +1456,92 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
             "duplicate": duplicate,
         }
     )
+
+
+def _uploaded_page_file(upload) -> str | None:
+    """Return ``"pdf"`` or ``"image"`` for an accepted upload, else None.
+
+    A curator scans a page as often to a PDF as to an image (#232), so
+    both endpoints that take a page take both. Three rules:
+
+    - **The bytes decide, not the content type.** A browser names the
+      type, and a person can name it wrong. A file that says PDF and
+      does not start with ``%PDF-`` is refused, and a file that starts
+      with it is a PDF whatever the browser said.
+    - **The stored name carries the right extension.** A browser may
+      send a PDF with no extension at all.
+      ``models.page_edit_image_path`` keeps the extension of the name,
+      and ``views_api.export_pdf`` reads it to decide between
+      ``insert_pdf`` and ``insert_image``, so a wrong extension puts a
+      page through the wrong call.
+    - **The upload is rewound.** Both readers here read from the file
+      the storage backend then saves.
+
+    :param upload: The ``UploadedFile``, or None.
+    :returns: The kind, or None when the file is neither.
+    :rtype: str | None
+    """
+    if upload is None:
+        return None
+    content_type = (upload.content_type or "").lower()
+    head = upload.read(len(_PDF_MAGIC))
+    upload.seek(0)
+    if head == _PDF_MAGIC:
+        kind, ext = "pdf", "pdf"
+    elif content_type.startswith("image/"):
+        kind = "image"
+        ext = (mimetypes.guess_extension(content_type) or ".png").lstrip(".")
+    else:
+        return None
+    base = (upload.name or "page").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    upload.name = f"{base[:64] or 'page'}.{ext}"
+    return kind
+
+
+def _pdf_page_count(upload) -> int | None:
+    """Return how many pages an uploaded PDF holds, or None.
+
+    :param upload: The ``UploadedFile``, rewound by
+        :func:`_uploaded_page_file`.
+    :returns: The page count, or None when the file will not open.
+    :rtype: int | None
+    """
+    data = upload.read()
+    upload.seek(0)
+    try:
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            return doc.page_count
+    except Exception:
+        return None
+
+
+def _accept_page_upload(upload, one_page: bool) -> tuple[str | None, str]:
+    """Judge one uploaded page file for either endpoint.
+
+    :param upload: The ``UploadedFile``, or None.
+    :param one_page: Whether the file must hold exactly one page. True
+        for a replacement: one page stands for one page, and a volume
+        uploaded by mistake would land whole on that address. An
+        insert takes every page, because a missing leaf is often two
+        and ``export_pdf`` already places them all.
+    :returns: The kind and an empty message, or None and the message
+        the curator reads.
+    :rtype: tuple[str | None, str]
+    """
+    if upload is None:
+        return None, "Missing file"
+    if upload.size and upload.size > PAGE_UPLOAD_MAX_BYTES:
+        return None, UPLOAD_TOO_LARGE_MESSAGE
+    kind = _uploaded_page_file(upload)
+    if kind is None:
+        return None, UPLOAD_WRONG_TYPE_MESSAGE
+    if kind == "pdf":
+        pages = _pdf_page_count(upload)
+        if pages is None or pages < 1:
+            return None, UPLOAD_BAD_PDF_MESSAGE
+        if one_page and pages != 1:
+            return None, REPLACEMENT_IS_ONE_PAGE_MESSAGE.format(pages=pages)
+    return kind, ""
 
 
 def _pdf_page_of(scan: Scan, raw) -> int | None:
@@ -1515,11 +1649,15 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
     if pdf_page is None:
         return JsonResponse({"error": "Unknown PDF page."}, status=404)
+    # Both stamps are in the lookup, not just the apply's (#232): a
+    # withdrawn row is history, and matching it would hand the caller
+    # a row that marks nothing.
     PageEdit.objects.get_or_create(
         scan=scan,
         kind=PageEdit.Kind.DELETE_PAGE,
         pdf_page=pdf_page,
         applied_at=None,
+        withdrawn_at=None,
         defaults={
             "author": request.user,
             "source_fingerprint": scan.source_fingerprint,
@@ -1533,8 +1671,9 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
 def undo_delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     """Take back a page deletion, restoring the page.
 
-    The row is deleted, not stamped: an unapplied decision that a
-    curator took back is not history, it never happened.
+    The row is stamped, not deleted (#232): a decision a curator took
+    back is history too, and the audit must show that somebody marked
+    this page and somebody unmarked it.
 
     :param request: The HTTP request (JSON body with pdf_page).
     :param pk: Scan primary key.
@@ -1545,9 +1684,12 @@ def undo_delete_page(request: HttpRequest, pk: int) -> HttpResponse:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-    page_edits.open_edits(scan, PageEdit.Kind.DELETE_PAGE).filter(
-        pdf_page=data.get("pdf_page")
-    ).delete()
+    page_edits.withdraw(
+        page_edits.open_edits(scan, PageEdit.Kind.DELETE_PAGE).filter(
+            pdf_page=data.get("pdf_page")
+        ),
+        request.user,
+    )
     return JsonResponse({"status": "ok"})
 
 
@@ -1571,6 +1713,10 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     narrowed to the alphabet a printed number uses (``_page_label``)
     and escaped where the viewer draws it, rather than cast.
 
+    The file may be an image of the page or a PDF of it (#232), and a
+    PDF may hold several pages: a missing leaf is often two, and
+    ``views_api.export_pdf`` already places every page of one.
+
     :param request: The HTTP request (form data with ``image``,
         ``anchor_pdf_page`` and the ``page_number`` label).
     :param pk: Scan primary key.
@@ -1578,12 +1724,9 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     """
     scan = get_object_or_404(Scan, pk=pk)
     image_file = request.FILES.get("image")
-    if not image_file:
-        return JsonResponse({"error": "Missing image"}, status=400)
-    if not (image_file.content_type or "").startswith("image/"):
-        return JsonResponse(
-            {"error": "Uploaded file must be an image"}, status=400
-        )
+    kind, refusal = _accept_page_upload(image_file, one_page=False)
+    if kind is None:
+        return JsonResponse({"error": refusal}, status=400)
     label = _page_label(request.POST.get("page_number"))
     if label is None:
         return JsonResponse(
@@ -1624,6 +1767,10 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
             "page_number": label,
             "edit_id": edit.pk,
             "image_url": edit.image.url,
+            "kind": kind,
+            "file_url": reverse(
+                "page_edit_file", kwargs={"pk": scan.pk, "edit_id": edit.pk}
+            ),
         }
     )
 
@@ -1635,7 +1782,9 @@ def remove_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
 
     The portal had no way to undo an insert: a deletion had its undo
     and an insert did not, so a wrong image could only be replaced by
-    another one. The row and its image both go.
+    another one. The row is stamped and the file is kept (#232): the
+    audit shows what a person uploaded, and an object nobody reads
+    costs less than a row that names a file which is gone.
 
     :param request: The HTTP request (JSON body with ``edit_id``).
     :param pk: Scan primary key.
@@ -1653,62 +1802,134 @@ def remove_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     )
     if edit is None:
         return JsonResponse({"error": "Unknown page insert."}, status=404)
-    # The object is this row's alone, and nothing has read it yet: the
-    # apply is what reads an image, and an unapplied row has not been
-    # through it.
-    edit.image.delete(save=False)
-    edit.delete()
+    page_edits.withdraw(
+        page_edits.open_edits(scan, PageEdit.Kind.INSERT_PAGE).filter(
+            pk=edit.pk
+        ),
+        request.user,
+    )
     return JsonResponse({"status": "ok"})
 
 
 @login_required
 @require_POST
 def replace_page(request: HttpRequest, pk: int) -> JsonResponse:
-    """Upload an image to stand in for a page that cannot be read.
+    """Upload a page to stand in for one that cannot be read.
 
-    A blurry page is a kind of missing page (#205), and the portal
-    could not record it at all. One kind, not a delete beside an
-    insert: those two would need an address in two spaces to say "this
-    image stands where that page stood", and a curator taking the
-    replacement back would have to take back both.
+    The Replace button of review 1 (#232). A blurry page is a kind of
+    missing page (#205), and the portal could not record it at all.
+    One kind, not a delete beside an insert: those two would need an
+    address in two spaces to say "this page stands where that page
+    stood", and a curator taking the replacement back would have to
+    take back both.
 
-    The endpoint lands with the model; the button belongs with #206 and
-    #151, which own the apply and the review-1 interface.
+    The upload may be an image or a PDF of one page. **A second upload
+    for one page withdraws the row before it and writes a new one**,
+    rather than writing over its ``image`` field: the audit must show
+    every file a person uploaded, and an overwritten field leaves its
+    object in the bucket with no row that names it.
+
+    Nothing applies the row to the volume yet. The pass that does is
+    #206, and it runs each replacement through the stages as a
+    one-page shard.
 
     :param request: The HTTP request (form data with ``pdf_page`` and
         ``image``).
     :param pk: Scan primary key.
-    :return: JSON response with the image URL.
+    :return: JSON response with the edit id and the file URL.
     """
     scan = get_object_or_404(Scan, pk=pk)
     image_file = request.FILES.get("image")
-    if not image_file:
-        return JsonResponse({"error": "Missing image"}, status=400)
-    if not (image_file.content_type or "").startswith("image/"):
-        return JsonResponse(
-            {"error": "Uploaded file must be an image"}, status=400
-        )
-    try:
-        pdf_page = _pdf_page_of(scan, int(request.POST.get("pdf_page", 0)))
-    except (TypeError, ValueError):
-        pdf_page = None
+    kind, refusal = _accept_page_upload(image_file, one_page=True)
+    if kind is None:
+        return JsonResponse({"error": refusal}, status=400)
+    pdf_page = _pdf_page_of(scan, request.POST.get("pdf_page"))
     if pdf_page is None:
         return JsonResponse({"error": "Unknown PDF page."}, status=404)
 
-    edit, _created = PageEdit.objects.update_or_create(
-        scan=scan,
-        kind=PageEdit.Kind.REPLACE_PAGE,
-        pdf_page=pdf_page,
-        applied_at=None,
-        defaults={
-            "author": request.user,
-            "image": image_file,
-            "source_fingerprint": scan.source_fingerprint,
-        },
-    )
+    with transaction.atomic():
+        page_edits.withdraw(
+            page_edits.open_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
+                pdf_page=pdf_page
+            ),
+            request.user,
+        )
+        edit = PageEdit.objects.create(
+            scan=scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            author=request.user,
+            pdf_page=pdf_page,
+            image=image_file,
+            source_fingerprint=scan.source_fingerprint,
+        )
     return JsonResponse(
-        {"status": "ok", "edit_id": edit.pk, "image_url": edit.image.url}
+        {
+            "status": "ok",
+            "edit_id": edit.pk,
+            "image_url": edit.image.url,
+            "kind": kind,
+            "file_url": reverse(
+                "page_edit_file", kwargs={"pk": scan.pk, "edit_id": edit.pk}
+            ),
+        }
     )
+
+
+@login_required
+@require_POST
+def undo_replace_page(request: HttpRequest, pk: int) -> JsonResponse:
+    """Take back the replacement of a page.
+
+    The row is stamped and the file is kept (#232), like every other
+    undo of review 1. The page then stands as it was scanned, and it
+    may be replaced again: the unique key is partial over the rows
+    that carry neither stamp.
+
+    :param request: The HTTP request (JSON body with ``pdf_page``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the undo.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    withdrawn = page_edits.withdraw(
+        page_edits.open_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
+            pdf_page=data.get("pdf_page")
+        ),
+        request.user,
+    )
+    if not withdrawn:
+        return JsonResponse({"error": "Unknown replacement."}, status=404)
+    return JsonResponse({"status": "ok"})
+
+
+@login_required
+def page_edit_file(
+    request: HttpRequest, pk: int, edit_id: int
+) -> HttpResponse:
+    """Send the reader to the file a curator uploaded for one page.
+
+    A redirect, and not the URL itself in the page (#232): the default
+    storage signs its URLs and the signature expires in an hour, while
+    a review page stays open for longer. Signing at the moment of the
+    click also keeps the link working with the local storage of a
+    development environment.
+
+    A withdrawn or applied row is served too, so a link in the audit
+    keeps working after the decision is closed.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param edit_id: The ``PageEdit`` whose file is wanted.
+    :return: A redirect to the file.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    edit = get_object_or_404(PageEdit, pk=edit_id, scan=scan)
+    if not edit.image:
+        raise Http404("This page edit carries no file.")
+    return redirect(edit.image.url)
 
 
 @login_required
@@ -1752,6 +1973,7 @@ def rotate_page(request: HttpRequest, pk: int) -> JsonResponse:
         kind=PageEdit.Kind.ROTATE_PAGE,
         pdf_page=pdf_page,
         applied_at=None,
+        withdrawn_at=None,
         defaults={
             "author": request.user,
             "value": degrees,
@@ -1808,6 +2030,7 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
         ),
         value=issue.check_name,
         applied_at=None,
+        withdrawn_at=None,
         defaults={
             "author": request.user,
             "source_fingerprint": scan.source_fingerprint,

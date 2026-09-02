@@ -17,7 +17,9 @@ before it runs over the corpus (#211).
 
 The review-1 controls (issue #151) read `page_review_ready` /
 `page_review_done`, the two #154 statuses. Approving is the gate: it is
-what reveals "Next: Detect".
+what reveals "Next: Detect". Open page edits do not hide it (#232):
+the apply runs after the approval, so a bar that waited for the apply
+waited for a button it was hiding.
 
 "Validate" and "Re-validate" are offered to a legacy scan only
 (`has_legacy_ocr`). A new-pipeline volume needs no re-run: sharding,
@@ -63,16 +65,19 @@ reach step 2.
     <button type="submit" class="btn-outline text-sm" title="Detect captions, key icons and headnotes on every page of the original with YOLO on RunPod. Nothing reads the output yet (incurs costs $$$)" onclick="return confirm('This runs YOLO detection on RunPod over every page of this volume. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}{% if yolo_run %}Re-run detection{% else %}Run detection{% endif %}</button>
   </form>
   {% endif %}
-  {% if has_pending_changes %}
-  <form method="post" action="{% url 'reprocess' scan.pk %}" class="inline">
-    {% csrf_token %}
-    {% if has_pending_inserts %}
-    <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Apply pending page inserts and deletions, then re-run OCR and validation. Inserted pages are OCR'd and validated on RunPod (incurs costs $$$)." onclick="return confirm('Pending page inserts will run OCR and validation on RunPod for each inserted page. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}Rebuild &amp; Validate</button>
-    {% else %}
-    <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Apply pending page deletions and rebuild issues (no RunPod, no extra cost)">Rebuild &amp; Validate</button>
-    {% endif %}
-  </form>
-  {% elif not scan.page_count %}
+  {% comment %}
+    There is no "Rebuild & Validate" branch here any more (#232). It
+    showed whenever a structural page edit was open, and it hid the
+    recompute button and the approve button while it did. Two things
+    made that a dead end: `reprocess` refuses for every scan since
+    #173, and nothing stamps `PageEdit.applied_at`, so "pending" lasts
+    until #206 ships rather than until the next rebuild. One deleted
+    duplicate page therefore ended a curator's review. The pending
+    banner in the sidebar says what is and is not done with the rows;
+    the approval is a statement about the pages, and #206 applies the
+    rows after it.
+  {% endcomment %}
+  {% if not scan.page_count %}
     {% if has_legacy_ocr %}
   <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
     {% csrf_token %}
@@ -87,7 +92,7 @@ reach step 2.
   {% if page_review_ready %}
   <form method="post" action="{% url 'approve_page_completeness' scan.pk %}" class="inline">
     {% csrf_token %}
-    <button type="submit" class="btn-primary text-sm" title="Confirm this volume is page complete: no missing, duplicated, mislabeled or blurry pages"{% if issues or missing_pages %} onclick="return confirm('This scan still lists issues or missing pages. Approve it as page complete anyway?');"{% endif %}>I reviewed this scan and it is complete</button>
+    <button type="submit" class="btn-primary text-sm" title="Confirm this volume is page complete: no missing, duplicated, mislabeled or blurry pages.{% if has_pending_changes %} Your saved page changes are applied for you when the pass that builds the corrected volume is ready (#206).{% endif %}"{% if issues or missing_pages %} onclick="return confirm('This scan still lists issues or missing pages. Approve it as page complete anyway?');"{% elif has_pending_changes %} onclick="return confirm('Your page changes are saved. We apply them to the volume later, when that pass is ready. Approve this scan as page complete?');"{% endif %}>I reviewed this scan and it is complete</button>
   </form>
   {% elif page_review_done %}
   <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed this volume is page complete">&#10003; Page review done</span>
