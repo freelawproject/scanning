@@ -550,13 +550,14 @@ trained on), tracked on `ExternalJob` rows at
   Every unread page in 30 days of production was a repetition loop on
   the last, mostly blank page of an opinion whose verso showed
   through; greedy decoding is deterministic, so the same render loops
-  again. `_parse_page` climbs a ladder: greedy on the render, then
-  greedy on the render thresholded at `RETRY_THRESHOLD` (100 removes
-  the show-through and keeps the text; doctor's 160 does not), then
-  greedy with a repetition penalty. No rung samples: the stage stays
-  deterministic for the same page. Only a page with no usable output
-  climbs; the page dict says what happened (`attempts`,
-  `recovered_by`, `render`, `repetition_penalty`, `errors`)
+  again. `_parse_page` climbs a two-rung ladder: greedy on the render,
+  then greedy on the render thresholded at `RETRY_THRESHOLD` (100
+  removes the show-through and keeps the text; doctor's 160 does not).
+  The render is the only change -- no sampling, no repetition penalty
+  (a penalty cannot tell a loop from the keys layout JSON repeats) --
+  so the stage stays deterministic for the same page. Only a page with
+  no usable output climbs; the page dict says what happened
+  (`attempts`, `recovered_by`, `render`, `errors`)
   and the summary carries `recovered_pages`, logged at INFO beside the
   WARNING. The cap is `HANDLER_MAX_COMPLETION_TOKENS` = 6144, about
   twice the longest measured page (3114) and not 16384: every rung

@@ -610,7 +610,7 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
     A shard that produced most of its pages is a success, not a retry:
     the worker itself retries a page that gave no output, on a changed
     render and then with sampling (the ladder of issue #238), so a page
-    still failed here is one three configurations could not read. The
+    still failed here is one two renders could not read. The
     page-number adapter (issue #149) reads it as ``detected=None`` and
     interpolates, and re-running 99 good pages to try a fourth time is
     poor value. But the gap has to be visible, and it has to name pages

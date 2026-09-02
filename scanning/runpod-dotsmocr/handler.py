@@ -135,14 +135,12 @@ INFERENCE_ATTEMPTS = int(os.environ.get("HANDLER_INFERENCE_ATTEMPTS", "2"))
 # to change the input. Rung 2 re-runs the page on the same render with
 # a grey threshold that removes the show-through and keeps the real
 # text (100 does on the sampled pages; doctor's bitonal 160 does not).
-# Rung 3 adds a repetition penalty for a loop the render change did not
-# break. Every rung decodes greedily: a penalty is a fixed change to the
-# logits, so the argmax stays deterministic, and no rung samples --
-# the whole stage has to give the same output for the same page.
+# The render is the only thing that changes: both rungs decode greedily
+# with the same parameters, so the stage gives the same output for the
+# same page on every run. No sampling and no repetition penalty, on
+# purpose -- a penalty cannot tell a loop from the keys and brackets
+# layout JSON repeats by design.
 RETRY_THRESHOLD = int(os.environ.get("HANDLER_RETRY_THRESHOLD", "100"))
-RETRY_REPETITION_PENALTY = float(
-    os.environ.get("HANDLER_RETRY_REPETITION_PENALTY", "1.05")
-)
 
 # Prompt modes this worker accepts. The remaining upstream modes
 # (grounding OCR, web parsing, scene spotting, SVG) target single
@@ -411,7 +409,6 @@ def _vllm_inference(
     temperature: float,
     top_p: float,
     max_completion_tokens: int,
-    repetition_penalty: float | None = None,
 ) -> tuple[str | None, str | None, int | None]:
     """Run one chat completion against the local vLLM server.
 
@@ -428,11 +425,6 @@ def _vllm_inference(
     :param image: PIL image of the page, already sized as the model
         should see it.
     :param prompt: The prompt-mode text.
-    :param repetition_penalty: vLLM's ``repetition_penalty`` sampling
-        parameter, sent through ``extra_body`` because the OpenAI
-        schema has no such field. ``None`` sends nothing; the last
-        retry rung passes a value above 1.0. Decoding stays greedy
-        either way.
     :returns: ``(content, finish_reason, completion_tokens)``.
         ``content`` may be ``None`` if the server returns an empty
         choice. ``finish_reason == "length"`` means the output was cut
@@ -444,9 +436,6 @@ def _vllm_inference(
     """
     from dots_mocr.utils.image_utils import PILimage_to_base64
 
-    extra: dict[str, Any] = {}
-    if repetition_penalty is not None:
-        extra["extra_body"] = {"repetition_penalty": repetition_penalty}
     response = client.chat.completions.create(
         messages=[
             {
@@ -467,7 +456,6 @@ def _vllm_inference(
         max_completion_tokens=max_completion_tokens,
         temperature=temperature,
         top_p=top_p,
-        **extra,
     )
     choice = response.choices[0]
     usage = getattr(response, "usage", None)
@@ -572,8 +560,8 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         valid JSON and ``md`` holds the cleaned text fallback.
         The retry ladder (#238) adds ``attempts`` (rungs spent),
         ``recovered_by`` (the rung that answered, absent on a first-try
-        success), ``render: "threshold"`` and ``repetition_penalty`` for
-        the rungs that changed the render and the decoding, and ``errors``
+        success), ``render: "threshold"`` for the rung that changed
+        the render, and ``errors``
         (one text per failed rung) whenever a rung failed.
         ``recovered_pages`` lists the pages a retry rung saved.
         ``render_fallback: true`` flags pages the pinned upstream
@@ -712,12 +700,10 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 dpi,
             )
 
-        def _infer(page_image, sampling: dict) -> dict:
+        def _infer(page_image) -> dict:
             """Run one rung: inference plus post-process on one render.
 
             :param page_image: The render this rung reads.
-            :param sampling: ``temperature``, ``top_p`` and
-                ``repetition_penalty`` for this rung.
             :returns: The page dict, without the ladder bookkeeping.
             :raises RuntimeError: When the rung produced no usable
                 output; the message is the rung's error text.
@@ -737,8 +723,9 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                             client,
                             image,
                             prompt,
+                            temperature=temperature,
+                            top_p=top_p,
                             max_completion_tokens=max_completion_tokens,
-                            **sampling,
                         )
                     )
                 except transient_vllm_errors as exc:
@@ -818,41 +805,23 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             return result
 
         # The ladder (scanning #238). Rung 1 is the baseline; rung 2
-        # changes the render, rung 3 adds the repetition penalty. All
-        # three decode greedily, so the stage stays deterministic. A
-        # rung fails on a loop, an exhausted transient error, an
-        # exhausted empty answer, a post-process exception, or a
-        # filtered answer. The filtered answer is kept as the fallback
-        # result in case no later rung does better: it is not an error,
-        # only an answer the layout reader cannot use.
-        greedy = {
-            "temperature": temperature,
-            "top_p": top_p,
-            "repetition_penalty": None,
-        }
-        penalized = {**greedy, "repetition_penalty": RETRY_REPETITION_PENALTY}
-        thresholded = None
+        # reads the same page with the show-through thresholded away.
+        # The render is the only difference, so the stage stays
+        # deterministic. A rung fails on a loop, an exhausted transient
+        # error, an exhausted empty answer, a post-process exception,
+        # or a filtered answer. The filtered answer is kept as the
+        # fallback result in case the later rung does no better: it is
+        # not an error, only an answer the layout reader cannot use.
+        # The threshold render is built lazily: most pages never need it.
         rungs = (
-            (origin_image, greedy, {}),
-            (None, greedy, {"render": "threshold"}),
-            (
-                None,
-                penalized,
-                {
-                    "render": "threshold",
-                    "repetition_penalty": RETRY_REPETITION_PENALTY,
-                },
-            ),
+            (lambda: origin_image, {}),
+            (lambda: _threshold_render(origin_image), {"render": "threshold"}),
         )
         errors: list[str] = []
         fallback: dict | None = None
-        for rung, (page_image, sampling, marks) in enumerate(rungs, start=1):
-            if page_image is None:
-                if thresholded is None:
-                    thresholded = _threshold_render(origin_image)
-                page_image = thresholded
+        for rung, (render, marks) in enumerate(rungs, start=1):
             try:
-                result = _infer(page_image, sampling)
+                result = _infer(render())
             except Exception as exc:
                 errors.append(str(exc))
                 continue

@@ -127,13 +127,12 @@ misprovisioned RunPod worker.
      (default 6144). Measured over 13159 production pages: median
      1498, p95 1950, max 3114. The cap is what ends a repetition loop,
      so keep it near twice the longest real page.
-   - `HANDLER_RETRY_THRESHOLD` (default 100) and
-     `HANDLER_RETRY_REPETITION_PENALTY` (1.05) — the retry ladder
-     (scanning #238). A page with no usable output is re-run on the
-     same render thresholded at `HANDLER_RETRY_THRESHOLD` (removes the
-     verso show-through that causes the loops), then once more with a
-     repetition penalty. Every rung decodes greedily, so the stage
-     stays deterministic. Good pages never take a rung.
+   - `HANDLER_RETRY_THRESHOLD` (default 100) — the retry of scanning
+     #238. A page with no usable output is re-run once on the same
+     render thresholded at this grey level, which removes the verso
+     show-through that causes the loops. The render is the only
+     change: same greedy decoding, so the stage stays deterministic.
+     Good pages never take the retry.
    - `VLLM_GPU_MEMORY_UTILIZATION` (default 0.9),
      `VLLM_STARTUP_TIMEOUT` (default 900 s), `VLLM_EXTRA_ARGS`
      (extra `vllm serve` flags, e.g. `--max-model-len 16384`).
