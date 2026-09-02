@@ -794,7 +794,12 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   one volume of 1364 pages the wrong family keeps 13 editorial notes
   bl-warm drops and loses 8 header boxes it keeps. A hand-added box
   carries no `found_by` on purpose: one would read as a second family
-  and send the whole volume back to the legacy gates.
+  and send the whole volume back to the legacy gates. `add_single_detection`
+  used to write a `manual` claim there, so the two collectors
+  (`_sync_detections_to_disk`, `_detections_for_geometry`) copy the
+  field off non-`MANUAL` rows only — the row kind is the guard, because
+  the rows written before the fix are still in the database and a
+  re-import keeps them.
 - **The per-shard results are kept.** Issue #196 asks for it: a page
   insert or a replacement recomputes the merge from them. The bitonal
   merge deletes its results, and this stage must not copy that.
@@ -808,14 +813,19 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   looked at. What is checkable is checked: the shard sequence, the
   shard's own page count as the worker reported it, every page index
   inside its shard, and one model family for the whole volume.
-- **No page view starts a measurement.** The step-2 template used to
-  fire `compute-redactions` on load whenever the rects were missing;
-  that is deleted, or a volume whose apply failed would start a
-  volume-wide render on every reload. The two review-2 endpoints queue
-  the work and answer 202, and `viewer_progress.js` already reloads the
-  page when the scan parks — so "Re-pair Opinions" now recomputes the
-  pairing, the rects and the strips together, which is right, since all
-  three are measured from the same detections.
+- **No page view and no page action starts a measurement.** The
+  step-2 template used to fire `compute-redactions` on load whenever
+  the rects were missing; the add path in `viewer_step2.js` and the
+  approve path in `viewer_sidebar.js` used to re-pair after every box.
+  All three are gone: a volume whose apply failed would have started a
+  volume-wide render on every reload, and a curator approving five
+  captions would have taken the volume out of review five times. The
+  edits show a toast instead. The one trigger a curator has is the
+  "Re-pair Opinions" button, behind a confirm, and the two review-2
+  endpoints behind it queue the work and answer 202;
+  `viewer_progress.js` reloads the page when the scan parks. The button
+  recomputes the pairing, the rects and the strips together, which is
+  right, since all three are measured from the same detections.
 
 ## Local disk hygiene (issue #215)
 

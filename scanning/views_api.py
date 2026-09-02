@@ -921,7 +921,10 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 img_height=det.get("img_height", 0),
                 model_name=Detection.ModelName.MANUAL,
                 model_count=1,
-                found_by=[{"model": "manual", "confidence": 1.0}],
+                # No provenance, on purpose (#196): the confidence gates
+                # are per model family, and a second family in the file
+                # sends the whole volume back to the legacy gates.
+                found_by=[],
             )
         except Exception:
             logger.exception("Failed to create manual detection")

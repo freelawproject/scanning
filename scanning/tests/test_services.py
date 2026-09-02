@@ -265,6 +265,65 @@ class TestModelProvenanceSurvives(TestCase):
         self.assertNotIn("found_by", det_data[1])
         self.assertTrue(rows_are_bl_warm(det_data))
 
+    def test_a_hand_added_row_with_a_model_claim_is_silenced(self):
+        """Rows written before #196 name ``manual`` as their model. The
+        row kind is the guard, so a re-import that keeps them cannot
+        send the volume back to the legacy gates."""
+        from blackletter.bl_warm import rows_are_bl_warm
+
+        from scanning.services import (
+            _detections_for_geometry,
+            _sync_detections_to_disk,
+        )
+
+        self._detection()
+        self._detection(
+            label="KEY_ICON",
+            label_id=1,
+            confidence=1.0,
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[{"model": "manual", "confidence": 1.0}],
+        )
+
+        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+        geometry = _detections_for_geometry(self.scan.pk, self.scan.output_dir)
+
+        self.assertNotIn("found_by", det_data[1])
+        self.assertNotIn("found_by", geometry[1])
+        self.assertTrue(rows_are_bl_warm(det_data))
+        self.assertTrue(rows_are_bl_warm(geometry))
+
+    def test_the_add_endpoint_writes_no_provenance(self):
+        """Through the view, not the model: the view is the writer that
+        used to claim a ``manual`` family."""
+        from django.urls import reverse
+
+        self._detection()
+        det_path = pathlib.Path(self.scan.output_dir) / "detections.json"
+        det_path.write_text("[]")
+        self.client.force_login(UserFactory())
+
+        response = self.client.post(
+            reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+            data=json.dumps(
+                {
+                    "page_index": 3,
+                    "label_id": 1,
+                    "bbox": [100, 100, 140, 140],
+                    "img_width": 1700,
+                    "img_height": 2200,
+                }
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["added"])
+        added = Detection.objects.get(
+            scan=self.scan, model_name=Detection.ModelName.MANUAL
+        )
+        self.assertEqual(added.found_by, [])
+
     def test_the_document_reads_the_bl_warm_gates(self):
         from scanning.services import (
             _build_document_from_detections,

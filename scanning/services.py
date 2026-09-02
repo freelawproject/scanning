@@ -664,7 +664,7 @@ def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
             "img_height": d.img_height,
             "model_count": d.model_count,
         }
-        if d.found_by:
+        if d.found_by and d.model_name != Detection.ModelName.MANUAL:
             # Load-bearing, not decoration: the confidence gates are per
             # model family since blackletter #73, and
             # ``rows_are_bl_warm`` reads this provenance off the file.
@@ -672,7 +672,9 @@ def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
             # without it pairs a bl-warm volume on the legacy gates.
             # A hand-added detection carries none, and must not: it
             # would read as a second model family and send the whole
-            # volume back to those gates.
+            # volume back to those gates. Rows written before #196 carry
+            # a "manual" claim, so the row kind is the guard, not the
+            # field.
             entry["found_by"] = d.found_by
         pn = page_numbers.get(d.page_index)
         if pn:
@@ -843,7 +845,11 @@ def _detections_for_geometry(scan_pk: int, output_dir: str | Path) -> list:
             # The model family, which picks the confidence gates. See
             # :func:`_sync_detections_to_disk`, which writes the same
             # field to the file this function falls back to.
-            **({"found_by": d.found_by} if d.found_by else {}),
+            **(
+                {"found_by": d.found_by}
+                if d.found_by and d.model_name != Detection.ModelName.MANUAL
+                else {}
+            ),
         }
         for d in rows
     ]

@@ -360,7 +360,12 @@ function approveDetection(btn) {
             row.style.opacity = "0.3";
             row.style.pointerEvents = "none";
             btn.textContent = "\u2713";
-            pairOpinions();
+            // Not an automatic re-pair (#196): the pairing endpoint
+            // now queues the whole redaction computation, which
+            // renders every page and takes the volume out of review.
+            // Say what is pending, and let the curator press the
+            // button once when they finish.
+            showToast('Approved. Press "Re-pair Opinions" when you finish editing.', "success");
         })
         .catch(function () {
             console.error("Failed to approve detection");

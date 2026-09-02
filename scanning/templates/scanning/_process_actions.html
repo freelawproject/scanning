@@ -124,7 +124,10 @@ reach step 2.
   {% endif %}
 
 {% elif step == 2 %}
-  <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()" title="Match detected captions and key icons to identify individual opinions">Re-pair Opinions</button>
+{# The one trigger of the redaction computation a curator has (#196).
+   It renders every page of the volume on the daemon and takes the
+   scan out of review for a minute or more, so it asks first. #}
+  <button class="btn-primary text-sm" id="pair-btn" onclick="if (confirm('This pairs the opinions and computes every redaction of this volume again on the server. It takes a minute or more, and this page reloads when it is done. Continue?')) pairOpinions();" title="Pair the captions and key icons into opinions again, then compute the redaction rects and the margin strips from the current detections. Runs on the server; the page reloads when it is done.">Re-pair Opinions</button>
   {% if opinions %}
   <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
   {% endif %}
