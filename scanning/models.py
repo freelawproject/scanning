@@ -1486,6 +1486,221 @@ class PageEdit(AbstractDateTimeModel):
         return f"{self.get_kind_display()} {where}{value}{state}"
 
 
+class PageRepairRequest(AbstractDateTimeModel):
+    """One request for a page a person with the book must scan (#249).
+
+    A reviewer finds a blurry page or a missing leaf. The reviewer has
+    no book, so the finding is work for a scanner. This row keeps the
+    finding until the scanner does the work. The finding used to go to
+    a chat message, and the system kept nothing.
+
+    A request is **not** a ``PageEdit``. A ``PageEdit`` is a decision
+    about the document, and the apply (#206) builds it into the volume.
+    A request is work for a person. It carries a free-text ``note``,
+    and it has an end state a decision does not have: **fulfilled**.
+    A reader of ``page_edits.open_edits`` never sees a request, so the
+    apply cannot mistake one for a decision.
+
+    What must not be broken:
+
+    - **The address is a physical page of the original as uploaded**,
+      1-based, the space ``PageEdit`` uses. ``pdf_page`` names the page
+      to scan again (REPLACE). ``anchor_pdf_page`` names the page the
+      missing leaf follows (INSERT), and 0 means "before page 1". The
+      printed number is a label in ``logical_page`` and locates
+      nothing.
+    - **A request is dismissed, never deleted.** ``dismissed_at`` and
+      ``dismissed_by`` close it. The row stays as the audit of what a
+      reviewer asked for and who judged it unnecessary.
+    - **Fulfilled is derived, not stamped.** A request is fulfilled
+      when a standing ``INSERT_PAGE`` or ``REPLACE_PAGE`` edit exists
+      at its address (``repairs._fulfilling_edits``), and made after
+      the request. No writer stamps
+      it, so the upload cannot race a stamp, and an undo of the upload
+      (#232) reopens the request with no second writer.
+    - **One open request per address.** The unique key is partial over
+      the rows with no dismissal. A second request for the same page
+      answers the first row. A dismissed row frees the address.
+    - **``source_fingerprint`` is the scan's** at the time of the
+      request. The original never changes (the apply writes another
+      file), so it moves only when somebody re-uploads the volume. A
+      request made against an earlier upload is shown with a mark,
+      never dropped: it is for a person, and the person judges it.
+    """
+
+    class Action(models.TextChoices):
+        """What the scanner must do."""
+
+        INSERT = "insert", "Scan a missing page"
+        REPLACE = "replace", "Scan this page again"
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="repair_requests",
+    )
+    action = models.CharField(
+        max_length=16,
+        choices=Action.choices,
+        db_index=True,
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="repair_requests",
+        help_text="Who found the page.",
+    )
+    pdf_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "REPLACE only: the 1-based page of the original PDF to scan again."
+        ),
+    )
+    anchor_pdf_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "INSERT only: the 1-based original page the missing leaf "
+            "follows. 0 puts it before page 1."
+        ),
+    )
+    logical_page = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text=(
+            "The printed page number, a label for the scanner. It "
+            "never locates the page."
+        ),
+    )
+    note = models.TextField(
+        blank=True,
+        default="",
+        help_text="What the reviewer saw. Free text, cut at 500 characters.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the request was made. "
+            "Blank matches anything."
+        ),
+    )
+    dismissed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=(
+            "When a person judged the request unnecessary. A stamped "
+            "row is history, and it is never rewritten."
+        ),
+    )
+    dismissed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="dismissed_repair_requests",
+        help_text="Who dismissed the request. Null while it stands.",
+    )
+
+    class Meta:
+        # The address order needs the column the action uses;
+        # ``repairs.annotate_fulfilled`` orders by that.
+        ordering = ["scan", "pk"]
+        indexes = [
+            models.Index(
+                fields=["scan", "dismissed_at"],
+                name="idx_repair_request_scan_open",
+            ),
+            models.Index(
+                fields=["dismissed_at", "date_created"],
+                name="idx_repair_request_queue",
+            ),
+        ]
+        constraints = [
+            # One address column per action, as on PageEdit: a null is
+            # never a second meaning of a column.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        action="insert",
+                        pdf_page__isnull=True,
+                        anchor_pdf_page__isnull=False,
+                    )
+                    | models.Q(
+                        action="replace",
+                        pdf_page__isnull=False,
+                        anchor_pdf_page__isnull=True,
+                    )
+                ),
+                name="repair_request_address_matches_action",
+            ),
+            # Partial over the open rows: a dismissed request frees the
+            # address, so a later reviewer can ask again.
+            # ``nulls_distinct=False`` because one of the two address
+            # columns is always null.
+            models.UniqueConstraint(
+                fields=["scan", "action", "pdf_page", "anchor_pdf_page"],
+                condition=models.Q(dismissed_at__isnull=True),
+                nulls_distinct=False,
+                name="uniq_open_repair_request_per_address",
+            ),
+        ]
+
+    @property
+    def address(self) -> int:
+        """Return the page or the anchor this request names.
+
+        :returns: ``pdf_page`` for a REPLACE, ``anchor_pdf_page`` for
+            an INSERT.
+        :rtype: int
+        """
+        if self.action == self.Action.INSERT:
+            return self.anchor_pdf_page
+        return self.pdf_page
+
+    @property
+    def is_stale(self) -> bool:
+        """Return whether this request names an earlier upload of the scan.
+
+        A person judges a stale request; nothing applies it, so it is
+        marked and never dropped. Reads ``self.scan``, so a caller that
+        lists many rows joins the scan first.
+
+        :returns: Whether the fingerprints differ. A blank on either
+            side matches anything, the rule of ``page_edits.is_stale``.
+        :rtype: bool
+        """
+        mine, theirs = self.source_fingerprint, self.scan.source_fingerprint
+        return bool(mine and theirs and mine != theirs)
+
+    @property
+    def nav_pdf_index(self) -> int:
+        """Return the 0-based page the viewer scrolls to.
+
+        A missing leaf has no page of its own, so the viewer shows the
+        page before the gap. A gap before page 1 shows page 1.
+
+        :returns: A 0-based PDF page index.
+        :rtype: int
+        """
+        if self.action == self.Action.INSERT:
+            return max(self.anchor_pdf_page - 1, 0)
+        return self.pdf_page - 1
+
+    def __str__(self):
+        where = (
+            f"after p.{self.anchor_pdf_page}"
+            if self.action == self.Action.INSERT
+            else f"p.{self.pdf_page}"
+        )
+        state = " [dismissed]" if self.dismissed_at is not None else ""
+        return f"{self.get_action_display()} {where}{state}"
+
+
 class ExtractionStatus(models.TextChoices):
     """Lifecycle of a Page through the LLM extraction pipeline."""
 

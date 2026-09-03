@@ -15,6 +15,7 @@ from scanning.models import (
     OpinionScan,
     Page,
     PageEdit,
+    PageRepairRequest,
     PendingUpload,
     QueuedAction,
     Reporter,
@@ -690,6 +691,45 @@ class PageEditAdmin(admin.ModelAdmin):
         "source_fingerprint",
         "withdrawn_at",
         "withdrawn_by",
+        "date_created",
+        "date_modified",
+    ]
+
+
+@admin.register(PageRepairRequest)
+class PageRepairRequestAdmin(admin.ModelAdmin):
+    """One page a reviewer asked a scanner to scan (issue #249).
+
+    Read-only: a row records what a person asked for, and an admin
+    who edits one rewrites history. The way to close a request is the
+    Dismiss button of the review page, or the upload that fulfils it.
+    """
+
+    list_display = [
+        "scan",
+        "action",
+        "pdf_page",
+        "anchor_pdf_page",
+        "logical_page",
+        "requested_by",
+        "dismissed_at",
+        "dismissed_by",
+        "date_created",
+    ]
+    list_filter = ["action", "dismissed_at"]
+    search_fields = ["scan__id", "note"]
+    raw_id_fields = ["scan", "requested_by", "dismissed_by"]
+    readonly_fields = [
+        "scan",
+        "action",
+        "requested_by",
+        "pdf_page",
+        "anchor_pdf_page",
+        "logical_page",
+        "note",
+        "source_fingerprint",
+        "dismissed_at",
+        "dismissed_by",
         "date_created",
         "date_modified",
     ]

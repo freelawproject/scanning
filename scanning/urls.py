@@ -19,6 +19,7 @@ from scanning.views import (
     queue_detail_view,
     queue_upload,
     queue_view,
+    repair_queue,
     scan_detail,
     scan_list,
     scan_pages_list,
@@ -55,6 +56,7 @@ from scanning.views_process import (
     assign_page,
     delete_page,
     dismiss_issue,
+    dismiss_page_repair,
     glued_output_index,
     page_edit_file,
     process_actions,
@@ -63,6 +65,7 @@ from scanning.views_process import (
     remove_page_insert,
     replace_page,
     reprocess,
+    request_page_repair,
     rotate_page,
     scan_original_url,
     scan_process_view,
@@ -93,6 +96,7 @@ urlpatterns = [
     path("profile/", profile, name="profile"),
     path("profile/password/", password_change, name="password_change"),
     path("queue/", queue_view, name="queue"),
+    path("repairs/", repair_queue, name="repair_queue"),
     path(
         "queue/<str:reporter_slug>/<int:vol>/",
         queue_detail_view,
@@ -207,6 +211,18 @@ urlpatterns = [
     ),
     path("scans/<int:pk>/rotate-page/", rotate_page, name="rotate_page"),
     path("scans/<int:pk>/dismiss-issue/", dismiss_issue, name="dismiss_issue"),
+    # The repair requests of a reviewer with no book (#249): ask, and
+    # dismiss.
+    path(
+        "scans/<int:pk>/repair/request/",
+        request_page_repair,
+        name="request_page_repair",
+    ),
+    path(
+        "scans/<int:pk>/repair/dismiss/",
+        dismiss_page_repair,
+        name="dismiss_page_repair",
+    ),
     # views_api.py
     path(
         "scans/<int:pk>/detections/", serve_detections, name="serve_detections"
