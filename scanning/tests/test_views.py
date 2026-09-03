@@ -3471,8 +3471,13 @@ class TestGluedOutputs(ScanningTestCase):
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("login"), response["Location"])
 
-    def test_index_refuses_an_unknown_output(self):
-        self.assertEqual(self._index("paddle").status_code, 404)
+    def test_index_refuses_an_unknown_output_as_json(self):
+        """Every answer of these routes is JSON, the 404s included: a
+        curl user must not get an HTML page from one of them."""
+        response = self._index("paddle")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("dots-mocr, yolo", response.json()["error"])
 
     def test_index_of_a_scan_nothing_read_is_empty_not_an_error(self):
         response = self._index()
@@ -3538,6 +3543,11 @@ class TestGluedOutputs(ScanningTestCase):
             (first["from_page"], first["to_page"], first["page_count"]),
             (1, 200, 200),
             "volume pages are 1-based, the manifest holds fitz indexes",
+        )
+        self.assertNotIn(
+            "failed_pages",
+            first,
+            "no stored summary: the lists are absent, not empty (#242)",
         )
         self.assertEqual((second["from_page"], second["to_page"]), (201, 400))
         self.assertEqual(second["failed_pages"], [7])
@@ -3638,9 +3648,29 @@ class TestGluedOutputs(ScanningTestCase):
         self.assertIn("not glued yet", body["error"])
         self.assertIn(body["label"], body["error"])
 
-    def test_volume_of_a_run_nobody_made_is_a_404(self):
+    def test_volume_of_a_glued_run_whose_object_is_gone_says_so(self):
+        """Every row CONSUMED and no object: the run *was* glued, so
+        "not glued yet: 2 result applied" would contradict itself."""
         self._dots_row()
-        self.assertEqual(self._volume(run=9).status_code, 404)
+        self._dots_row(shard_index=1)
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=False),
+        ):
+            response = self._volume()
+
+        self.assertEqual(response.status_code, 404)
+        body = response.json()
+        self.assertNotIn("not glued yet", body["error"])
+        self.assertIn("was glued", body["error"])
+        self.assertIn("not in the bucket", body["error"])
+
+    def test_volume_of_a_run_nobody_made_is_a_json_404(self):
+        self._dots_row()
+        response = self._volume(run=9)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["run"], 9)
 
     def test_volume_without_s3_is_a_404_and_makes_no_head(self):
         """No environment without S3 holds a glued document: the glue
@@ -3701,9 +3731,12 @@ class TestGluedOutputs(ScanningTestCase):
             f'attachment; filename="scan-{self.scan.pk}-dots-mocr-r1-s1.json"',
         )
 
-    def test_shard_that_does_not_exist_is_a_404(self):
+    def test_shard_that_does_not_exist_is_a_json_404_with_the_count(self):
         self._dots_row()
-        self.assertEqual(self._shard(shard=5).status_code, 404)
+        response = self._shard(shard=5)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("it has 1 shard(s)", response.json()["error"])
 
     def test_shard_without_a_result_is_a_404_that_says_so(self):
         self._dots_row(status=JobStatus.FAILED, result_key="")

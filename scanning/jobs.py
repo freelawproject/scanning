@@ -1107,10 +1107,7 @@ def run_summary(scan, stage: str, engine: str) -> dict | None:
     if not rows:
         return None
 
-    statuses: dict[str, int] = {}
-    for row in rows:
-        statuses[row.status] = statuses.get(row.status, 0) + 1
-
+    statuses = _status_counts(rows)
     failed = [
         row
         for row in rows
@@ -1136,6 +1133,19 @@ def run_summary(scan, stage: str, engine: str) -> dict | None:
     }
 
 
+def _status_counts(rows: list[ExternalJob]) -> dict[str, int]:
+    """Count the rows of one run by status.
+
+    :param rows: The rows of one run.
+    :returns: ``{status: count}``.
+    :rtype: dict[str, int]
+    """
+    statuses: dict[str, int] = {}
+    for row in rows:
+        statuses[row.status] = statuses.get(row.status, 0) + 1
+    return statuses
+
+
 def rows_label(rows: list[ExternalJob]) -> str:
     """Return the status counts of some rows as one readable phrase.
 
@@ -1148,12 +1158,9 @@ def rows_label(rows: list[ExternalJob]) -> str:
     :returns: The counts, one per status, in status order.
     :rtype: str
     """
-    statuses: dict[str, int] = {}
-    for row in rows:
-        statuses[row.status] = statuses.get(row.status, 0) + 1
     return ", ".join(
         f"{count} {ExternalJob(status=status).get_status_display().lower()}"
-        for status, count in sorted(statuses.items())
+        for status, count in sorted(_status_counts(rows).items())
     )
 
 

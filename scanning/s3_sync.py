@@ -266,7 +266,7 @@ def _signing_s3_client():
 def presign_get(
     key: str, ttl: int, *, content_disposition: str | None = None
 ) -> str:
-    """Presign a GET for one object, for an external worker to read.
+    """Presign a GET for one object, for a worker or a browser to read.
 
     :param key: Object key inside the private bucket.
     :param ttl: Lifetime in seconds. Must outlive queue time plus
