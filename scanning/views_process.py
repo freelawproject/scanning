@@ -24,7 +24,7 @@ from django.template.loader import render_to_string
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
-from scanning import dots_mocr, jobs, page_edits, s3_sync, yolo
+from scanning import dots_mocr, jobs, page_edits, repairs, s3_sync, yolo
 from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
@@ -38,6 +38,7 @@ from scanning.models import (
     JobStatus,
     OpinionScan,
     PageEdit,
+    PageRepairRequest,
     Scan,
     Stage,
     Status,
@@ -267,6 +268,16 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # each one, with a link that opens the file the curator uploaded.
     replaced_pages = page_edits.replacements_by_page(scan)
 
+    # The pages a reviewer asked a scanner to scan again, or the gaps
+    # they asked a scanner to fill (#249). The waiting ones raise the
+    # sidebar badge and the section; every open one reaches the viewer,
+    # so a fulfilled request shows as fulfilled on its page.
+    repair_requests = repairs.viewer_payload(scan)
+    waiting_repairs = [r for r in repair_requests if not r["fulfilled"]]
+    pages_needing_repair = {
+        r["pdf_page"] for r in waiting_repairs if r["pdf_page"] is not None
+    }
+
     # Map pdf_index → logical page number for navigation
     idx_to_logical = {}
     logical_to_indices: dict[int, list[int]] = {}
@@ -326,6 +337,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         r["seq_issue"] = ""
         r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
         r["is_replaced"] = r["pdf_page"] in replaced_pages
+        r["needs_repair"] = r["pdf_page"] in pages_needing_repair
         if not r.get("detected") or r.get("type") == "range":
             prev_num = None
             continue
@@ -531,6 +543,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "deleted_pages_json": json.dumps(
                 sorted(page_edits.deleted_pages(scan))
             ),
+            "repair_requests": repair_requests,
+            "waiting_repairs": waiting_repairs,
             "replaced_pages_json": json.dumps(
                 {
                     str(page): {
@@ -2459,3 +2473,132 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
     )
     issue.delete()
     return JsonResponse({"status": "ok"})
+
+
+def _printed_number_of(scan: Scan, pdf_page: int) -> str:
+    """Return the printed number the page shows, as a label.
+
+    Read off the cached ``ocr_results``, which carries the curator's
+    own numbers too (#214). A label only: the scanner reads it on the
+    Repairs page to find the leaf in the book.
+
+    :param scan: The scan.
+    :param pdf_page: The 1-based page.
+    :returns: The printed number, or the empty string.
+    :rtype: str
+    """
+    for entry in scan.ocr_results or []:
+        if entry.get("pdf_page") == pdf_page:
+            return str(entry.get("detected") or "")[:32]
+    return ""
+
+
+@login_required
+@require_POST
+def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
+    """Record that a page needs a scanner, and what the scanner must do.
+
+    The button of a reviewer who has no book (#249). A REPLACE names
+    the page to scan again; an INSERT names the gap a missing leaf
+    goes in, by the page it follows, the address an insert uses
+    (#214). One open row per address: a second request for the same
+    page answers the first row, with ``created`` false, so two
+    reviewers who find one page do not stack two requests.
+
+    The note is free text a person typed. It is cut at
+    ``repairs.NOTE_MAX_CHARS`` here and escaped where it is drawn: in
+    the viewer through ``escapeHtml``, in the templates by the
+    auto-escape. Both layers, on purpose.
+
+    :param request: The HTTP request (JSON body with ``action``,
+        ``pdf_page`` or ``anchor_pdf_page``, ``logical_page``,
+        ``note``).
+    :param pk: Scan primary key.
+    :return: JSON response with the request, and whether it is new.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    action = data.get("action")
+    if action not in PageRepairRequest.Action.values:
+        return JsonResponse({"error": "Unknown action."}, status=400)
+    label = _page_label(str(data.get("logical_page") or ""))
+    if label is None:
+        return JsonResponse({"error": "Invalid page number."}, status=400)
+    note = str(data.get("note") or "").strip()[: repairs.NOTE_MAX_CHARS]
+
+    address = {}
+    if action == PageRepairRequest.Action.REPLACE:
+        pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
+        if pdf_page is None:
+            return JsonResponse({"error": "Unknown PDF page."}, status=404)
+        address["pdf_page"] = pdf_page
+        if not label:
+            label = _printed_number_of(scan, pdf_page)
+    else:
+        anchor = _anchor_of(scan, data.get("anchor_pdf_page"), label)
+        if anchor is None:
+            return JsonResponse({"error": "Unknown gap."}, status=404)
+        address["anchor_pdf_page"] = anchor
+
+    row, created = PageRepairRequest.objects.get_or_create(
+        scan=scan,
+        action=action,
+        dismissed_at=None,
+        **address,
+        defaults={
+            "requested_by": request.user,
+            "logical_page": label,
+            "note": note,
+            "source_fingerprint": scan.source_fingerprint,
+        },
+    )
+    row = repairs.open_requests(scan).get(pk=row.pk)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "created": created,
+            "request": repairs.as_dict(row, scan),
+        }
+    )
+
+
+@login_required
+@require_POST
+def dismiss_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
+    """Close a repair request without deleting it.
+
+    Any logged-in user may dismiss, the rule of every review-1 button.
+    The row is stamped with who and when. A second dismissal of the
+    same row is a no-op, not an error, like ``undo_delete_page``: a
+    second tab must not fail on a request that is already closed.
+
+    :param request: The HTTP request (JSON body with ``request_id``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the dismissal.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    rows = scan.repair_requests.filter(pk=data.get("request_id"))
+    if not rows.exists():
+        return JsonResponse({"error": "Unknown request."}, status=404)
+    repairs.dismiss(rows, request.user)
+    return JsonResponse({"status": "ok"})
+
+
+@login_required
+def page_repairs(request: HttpRequest, pk: int) -> JsonResponse:
+    """Return the scan's open repair requests, for a refresh in place.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON response with the open requests and their state.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    return JsonResponse({"requests": repairs.viewer_payload(scan)})

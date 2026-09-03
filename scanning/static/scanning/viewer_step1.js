@@ -55,6 +55,7 @@ document.addEventListener('DOMContentLoaded', function () {
         container.innerHTML = '';
         createAllPlaceholders();
         setupLazyLoading();
+        goToRequestedPage();
     }
 
     // Swap the viewer to the original scan (issue #185). Stops the
@@ -322,8 +323,14 @@ document.addEventListener('DOMContentLoaded', function () {
             '      <input type="file" name="image" accept="image/*,application/pdf" style="display:none">' +
             '    </label>' +
             '  </form>' +
+            '  <button class="repair-btn" data-action="insert" ' +
+            'data-anchor-pdf-page="' + entry.anchor_pdf_page + '" ' +
+            'data-logical-page="' + missingLabel + '" ' +
+            'title="Ask a scanner with the book to scan this page">Ask for this page</button>' +
             '</div>';
         container.appendChild(pageDiv);
+        pageDiv.dataset.anchorPdfPage = entry.anchor_pdf_page;
+        drawRepairNote(pageDiv, findRepair('insert', entry.anchor_pdf_page));
 
         var fileInput = pageDiv.querySelector('input[type="file"]');
         fileInput.addEventListener('change', function () {
@@ -469,6 +476,8 @@ document.addEventListener('DOMContentLoaded', function () {
             '    <button class="replace-btn" data-pdf-page="' + pdfPage + '" ' +
             'title="Upload an image or a PDF that stands in for this page">Replace</button>' +
             '    <button class="delete-btn" title="Delete this page">Delete</button>' +
+            '    <button class="repair-btn" data-action="replace" data-pdf-page="' + pdfPage + '" ' +
+            'title="Ask a scanner with the book to scan this page again">Ask for a rescan</button>' +
             '    <input type="file" class="replace-input" accept="image/*,application/pdf" hidden>' +
             '  </span>' +
             '</div>' +
@@ -576,6 +585,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (replaced) {
             markPageAsReplaced(div, pdfPage, replaced);
         }
+        drawRepairNote(div, findRepair('replace', pdfPage));
 
         // If page is already marked for deletion, show the deleted state
         if (typeof deletedPages !== 'undefined' && deletedPages.indexOf(pdfPage) !== -1) {
@@ -741,6 +751,221 @@ document.addEventListener('DOMContentLoaded', function () {
             holder.appendChild(badge);
         } else if (!on && badge) {
             badge.remove();
+        }
+    }
+
+    // --- Ask a scanner for a page (issue #249) ---
+    // A reviewer with no book cannot replace a blurry page or fill a
+    // gap. The request is a row a scanner finds on the Repairs page and
+    // on this page. It is fulfilled by the upload at the same address
+    // (the server derives that), and dismissed by any user, never
+    // deleted. The rows live in repairRequests, and every drawing reads
+    // that one list: the note on the page, the sidebar badge, the
+    // sidebar section and the header badge.
+    var repairRequests = (SCAN_CONFIG.repairRequests || []).slice();
+
+    function findRepair(action, address) {
+        for (var i = 0; i < repairRequests.length; i++) {
+            var r = repairRequests[i];
+            if (r.action !== action) { continue; }
+            var at = action === 'insert' ? r.anchor_pdf_page : r.pdf_page;
+            if (String(at) === String(address)) { return r; }
+        }
+        return null;
+    }
+
+    function replaceRepair(row) {
+        repairRequests = repairRequests.filter(function (r) { return r.id !== row.id; });
+        repairRequests.push(row);
+    }
+
+    function dropRepair(id) {
+        repairRequests = repairRequests.filter(function (r) { return r.id !== id; });
+    }
+
+    // The buttons and the Dismiss are bound on the container, like the
+    // Replace button: markPageAsDeleted writes over the whole label.
+    container.addEventListener('click', function (e) {
+        var askBtn = e.target.closest('.repair-btn');
+        if (askBtn) {
+            e.preventDefault();
+            askForRepair(askBtn, askBtn.closest('.page-container'));
+            return;
+        }
+        var dismissBtn = e.target.closest('.dismiss-repair-btn');
+        if (dismissBtn) {
+            e.stopPropagation();
+            dismissRepair(parseInt(dismissBtn.dataset.requestId, 10),
+                          dismissBtn.closest('.page-container'));
+        }
+    });
+
+    function askForRepair(btn, pageDiv) {
+        var action = btn.dataset.action;
+        var what = action === 'insert' ? 'scan this missing page' : 'scan this page again';
+        var note = prompt('Ask a scanner to ' + what + '.\nWhat did you see? (optional)', '');
+        if (note === null) { return; }
+        var body = { action: action, note: note.trim() };
+        if (action === 'insert') {
+            body.anchor_pdf_page = parseInt(btn.dataset.anchorPdfPage, 10);
+            body.logical_page = btn.dataset.logicalPage || '';
+        } else {
+            body.pdf_page = parseInt(btn.dataset.pdfPage, 10);
+            var ocr = ocrByPage[body.pdf_page];
+            body.logical_page = ocr && ocr.detected ? String(ocr.detected) : '';
+        }
+        fetch('/scans/' + documentId + '/repair/request/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+            body: JSON.stringify(body),
+        })
+        .then(function (r) {
+            return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+        })
+        .then(function (res) {
+            if (!res.ok || res.data.status !== 'ok') {
+                showToast((res.data && res.data.error) || 'Could not save the request.');
+                return;
+            }
+            replaceRepair(res.data.request);
+            drawRepairNote(pageDiv, res.data.request);
+            renderRepairsSection();
+            showToast(res.data.created
+                ? 'Saved. A scanner sees this on the Repairs page.'
+                : 'This page was already requested.', 'success');
+        })
+        .catch(function () {
+            showToast('Could not save the request. Try again.');
+        });
+    }
+
+    function dismissRepair(requestId, pageDiv) {
+        if (!confirm('Dismiss this request? The row is kept, and the page is not scanned again.')) { return; }
+        fetch('/scans/' + documentId + '/repair/dismiss/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+            body: JSON.stringify({ request_id: requestId }),
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (data.status !== 'ok') {
+                showToast(data.error || 'Could not dismiss the request.');
+                return;
+            }
+            dropRepair(requestId);
+            drawRepairNote(pageDiv, null);
+            renderRepairsSection();
+            showToast('Dismissed.', 'success');
+        })
+        .catch(function () {
+            showToast('Could not dismiss the request. Try again.');
+        });
+    }
+
+    // The note on the page. On a PDF page it goes on the label, like
+    // the replaced note; on a missing placeholder it goes above the
+    // upload form. A null row removes the note.
+    function drawRepairNote(pageDiv, row) {
+        if (!pageDiv) { return; }
+        var label = pageDiv.querySelector('.page-label');
+        var host = pageDiv.classList.contains('missing-page')
+            ? pageDiv.querySelector('.missing-placeholder') : label;
+        if (!host) { return; }
+        var old = host.querySelector('.repair-note');
+        if (old) { old.remove(); }
+        var askBtn = pageDiv.querySelector('.repair-btn');
+        if (askBtn) { askBtn.hidden = !!row; }
+        if (row) {
+            var note = document.createElement('span');
+            note.className = 'repair-note' + (row.fulfilled ? ' fulfilled' : '');
+            var text = row.fulfilled
+                ? 'A scanner was asked for this page, and a new scan is saved. '
+                : (row.action === 'insert' ? 'A scanner was asked for this page. '
+                                           : 'A scanner was asked to scan this page again. ');
+            note.innerHTML =
+                escapeHtml(text) +
+                '<span class="repair-note-text">' +
+                (row.note ? escapeHtml(row.note) + ' ' : '') +
+                '(' + escapeHtml(row.requested_by) + ', ' + escapeHtml(row.date_created) + ')' +
+                (row.stale ? ', made on an earlier upload of this scan' : '') +
+                '</span>' +
+                (row.fulfilled ? '' :
+                    ' <button class="dismiss-repair-btn" data-request-id="' + row.id + '" ' +
+                    'title="The page is fine, or the request no longer applies">Dismiss</button>');
+            if (host === label) { label.appendChild(note); }
+            else { host.insertBefore(note, host.firstChild); }
+        }
+        if (host === label) { refreshSavedLabel(label); }
+        if (row && row.action === 'replace') { markSidebarNeed(row.pdf_page, !row.fulfilled); }
+        if (!row && pageDiv.dataset.pdfIndex !== undefined) {
+            markSidebarNeed(parseInt(pageDiv.dataset.pdfIndex, 10) + 1, false);
+        }
+    }
+
+    function markSidebarNeed(pdfPage, on) {
+        var sidebarRow = document.querySelector(
+            '#pages-list [data-pdf-index="' + (pdfPage - 1) + '"]'
+        );
+        if (!sidebarRow) { return; }
+        var badge = sidebarRow.querySelector('.page-need-badge');
+        if (on && !badge) {
+            badge = document.createElement('span');
+            badge.className =
+                'page-need-badge text-[9px] font-bold text-orange-600 ' +
+                'dark:text-orange-400 ml-1';
+            badge.title = 'A reviewer asked a scanner to scan this page again';
+            badge.textContent = 'NEED';
+            var holder = sidebarRow.querySelector('span') || sidebarRow;
+            holder.appendChild(badge);
+        } else if (!on && badge) {
+            badge.remove();
+        }
+    }
+
+    // The sidebar section and the header badge, redrawn whole from the
+    // list, so they cannot disagree with the notes on the pages.
+    function renderRepairsSection() {
+        var waiting = repairRequests.filter(function (r) { return !r.fulfilled; });
+        var section = document.getElementById('repairs-section');
+        var list = document.getElementById('repairs-list');
+        var badge = document.getElementById('repairs-badge');
+        document.querySelectorAll('.repairs-count').forEach(function (el) {
+            el.textContent = waiting.length;
+        });
+        if (badge) { badge.hidden = waiting.length === 0; }
+        if (!section || !list) { return; }
+        section.hidden = waiting.length === 0;
+        list.innerHTML = waiting.map(function (r) {
+            var where = r.action === 'insert'
+                ? 'after PDF p.' + r.anchor_pdf_page : 'PDF p.' + r.pdf_page;
+            return '<div class="repair-card rounded border border-orange-300 bg-orange-50 ' +
+                'hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/20 ' +
+                'dark:hover:bg-orange-900/40 px-2 py-1.5 mb-1 cursor-pointer text-xs" ' +
+                'data-request-id="' + r.id + '" data-pdf-index="' + r.nav_pdf_index + '" ' +
+                'onclick="goToPage(this)">' +
+                '<div class="flex items-center gap-1.5">' +
+                '<span class="font-bold uppercase text-[10px]">' + escapeHtml(r.action_label) + '</span>' +
+                '<span class="text-gray-500 dark:text-gray-400">' + escapeHtml(where) +
+                (r.logical_page ? ' (#' + escapeHtml(r.logical_page) + ')' : '') + '</span>' +
+                (r.stale ? '<span class="text-[9px] font-bold text-gray-500">EARLIER UPLOAD</span>' : '') +
+                '</div>' +
+                (r.note ? '<p class="mt-0.5 text-gray-700 dark:text-gray-300">' + escapeHtml(r.note) + '</p>' : '') +
+                '<p class="mt-0.5 text-[10px] text-gray-500 dark:text-gray-400">' +
+                escapeHtml(r.requested_by) + ', ' + escapeHtml(r.date_created) + '</p>' +
+                '</div>';
+        }).join('');
+    }
+
+    // The Repairs page links to one page of step 1 (?goto=<pdf_index>).
+    // The placeholders exist as soon as the document is shown, so the
+    // scroll works before the page itself is rendered.
+    function goToRequestedPage() {
+        var params = new URLSearchParams(window.location.search);
+        var index = params.get('goto');
+        if (index === null || !/^\d+$/.test(index)) { return; }
+        var el = container.querySelector('.lazy-page[data-pdf-index="' + index + '"]');
+        if (el && typeof goToPage === 'function') {
+            setTimeout(function () { goToPage(el); }, 150);
         }
     }
 

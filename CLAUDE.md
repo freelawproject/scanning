@@ -306,6 +306,62 @@ is #206.
   bucket needs the CORS rule of #185, which a deployment may not carry
   yet.
 
+## Page repair requests (issue #249)
+
+A reviewer with no book finds a blurry page or a missing leaf, and
+cannot fix it. `models.PageRepairRequest` keeps the finding until a
+scanner does the work. The pieces: the model, `repairs.py` (queries
+and the derived state), three endpoints in `views_process.py`
+(`request_page_repair`, `dismiss_page_repair`, `page_repairs`), the
+`views.repair_queue` page at `/repairs/`, and the "Ask for a rescan"
+and "Ask for this page" buttons of step 1 (`viewer_step1.js`). What
+must not be broken:
+
+- **A request is not a `PageEdit`.** A `PageEdit` is a decision the
+  apply builds into the volume; a request is work for a person. It
+  needs a free-text `note` (500 characters, `repairs.NOTE_MAX_CHARS`)
+  and it has an end state a decision does not have. A reader of
+  `page_edits.open_edits` never sees one, so the apply cannot mistake
+  it for a decision, and `has_pending_changes` ignores it.
+- **The address is the `PageEdit` address**: `pdf_page` for a rescan
+  (REPLACE), `anchor_pdf_page` for a missing leaf (INSERT, 0 = before
+  page 1), both in the physical space of the original as uploaded.
+  The printed number rides along in `logical_page` as a label. The
+  endpoint resolves both through `_pdf_page_of` and `_anchor_of`, so
+  a page outside the volume is 404.
+- **Fulfilled is derived, never stamped.** `repairs.annotate_fulfilled`
+  marks a request whose address carries a standing `REPLACE_PAGE` or
+  `INSERT_PAGE` edit (neither stamp, same fingerprint or a blank one).
+  So the upload cannot race a stamp, an undo of the upload (#232)
+  reopens the request with no second writer, and the "Fulfilled" tab
+  of the queue costs one `Exists` subquery.
+- **Dismissed, never deleted.** `repairs.dismiss` stamps `dismissed_at`
+  and `dismissed_by` (and writes `date_modified`, since `update()`
+  skips `auto_now`). Any logged-in user may dismiss, the rule of every
+  review-1 button. A second dismissal is a no-op. One open row per
+  address (`uniq_open_repair_request_per_address`, partial over
+  `dismissed_at IS NULL`, `nulls_distinct=False`): a second request
+  answers the first row with `created: false`.
+- **A stale request is marked, not dropped**: `repairs.is_stale` is
+  the fingerprint rule of `page_edits.is_stale`, and the viewer and
+  the queue show "earlier upload". Nothing applies a request, so
+  nothing needs to refuse one.
+- **The note is escaped where it is drawn**: `escapeHtml` in the
+  viewer and the auto-escape in the templates. It is not narrowed,
+  because it is prose, not a page number; the label goes through
+  `_page_label` like every other label.
+- **Step 1 draws everything from one list** (`SCAN_CONFIG.repairRequests`):
+  the note on the page (with Dismiss while it waits), the `NEED`
+  sidebar badge, the "Repairs requested" section and the header badge.
+  A request is not an `Issue` row: an issue card has its own dismiss,
+  and one finding must have one. The buttons bind by delegation on
+  the container, as Replace does (#232), and `refreshSavedLabel` runs
+  after a note is added or removed.
+- **The queue links to a page**: `scan_process?step=1&goto=<pdf_index>`
+  scrolls to the placeholder once it exists (`goToRequestedPage`).
+  The header count (`context_processors.waiting_repairs`) is one
+  query for a logged-in user.
+
 ## Bitonal via doctor (issue #176)
 
 Conversion runs on doctor, one request per shard, tracked on

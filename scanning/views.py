@@ -19,7 +19,7 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
-from scanning import s3_sync
+from scanning import repairs, s3_sync
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
@@ -355,6 +355,57 @@ def queue_view(request: HttpRequest) -> HttpResponse:
             },
             "queue_statuses": QueueStatus.choices,
             "priorities": Priority.choices,
+        },
+    )
+
+
+@login_required
+def repair_queue(request: HttpRequest) -> HttpResponse:
+    """The queue of pages a scanner must scan again or scan anew (#249).
+
+    Every user sees it. The rows are grouped by scan, so a scanner
+    with the book fixes every page of a volume in one trip. Each row
+    links to the page in step 1. The ``state`` filter reads
+    ``repairs.QUEUE_STATES``; the default shows the requests that
+    wait, which is the work.
+
+    :param request: The current HTTP request.
+    :return: The rendered repair queue page.
+    """
+    state = request.GET.get("state", "waiting")
+    if state not in repairs.QUEUE_STATES:
+        state = "waiting"
+    reporter_filter = request.GET.get("reporter", "")
+
+    rows = repairs.queue(state)
+    if reporter_filter:
+        rows = rows.filter(scan__reporter__short_name=reporter_filter)
+
+    # Group by scan, in the order the query gives (newest scan first).
+    # The rows of one scan are adjacent, so one pass is enough.
+    groups: list[dict] = []
+    by_scan: dict[int, dict] = {}
+    for row in rows:
+        group = by_scan.get(row.scan_id)
+        if group is None:
+            group = {"scan": row.scan, "requests": []}
+            by_scan[row.scan_id] = group
+            groups.append(group)
+        group["requests"].append(row)
+
+    paginator = Paginator(groups, 50)
+    page_obj = paginator.get_page(request.GET.get("page"))
+
+    return render(
+        request,
+        "scanning/repair_queue.html",
+        {
+            "page_obj": page_obj,
+            "state": state,
+            "states": repairs.QUEUE_STATES,
+            "reporters": Reporter.objects.all(),
+            "selected_reporter": reporter_filter,
+            "waiting_total": repairs.waiting_count(),
         },
     )
 
