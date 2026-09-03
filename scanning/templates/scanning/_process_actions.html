@@ -5,10 +5,13 @@ Rendered both inline by scan_process.html and standalone by the
 process_actions view (fetched by the step-1/step-2 viewers to refresh the
 buttons in place after a page is marked for or restored from deletion).
 
-The OCR (dots.mocr) and detection (YOLO) controls are staff-only and
-move no scan status, so their state comes from `dots_run` and
-`yolo_run` -- summaries of the ExternalJob rows (issues #190 and #195)
--- rather than from `is_processing`.
+The OCR (dots.mocr), detection (YOLO) and Mistral OCR controls are
+staff-only and move no scan status, so their state comes from
+`dots_run`, `yolo_run` and `mistral_run` -- summaries of the
+ExternalJob rows (issues #190, #195 and #191) -- rather than from
+`is_processing`. The Mistral control lives in _mistral_actions.html
+and is included by the step-1 bar beside the dots.mocr control: both
+read the original shards.
 
 The detection control is not "Next: Detect". It runs the stage and
 stores its output in S3, and nothing reads that output until #196. It
@@ -51,6 +54,7 @@ reach step 2.
     <button type="submit" class="btn-outline text-sm" title="Read every page of the original with dots.mocr on RunPod (incurs costs $$$)" onclick="return confirm('This runs dots.mocr OCR on RunPod over every page of this volume. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}{% if dots_run %}Re-run OCR{% else %}Run OCR{% endif %}</button>
   </form>
   {% endif %}
+  {% include "scanning/_mistral_actions.html" %}
   {% if yolo_run %}
   <span class="text-sm text-gray-600 mr-2" title="Detection run {{ yolo_run.run }}: {{ yolo_run.label }}">
     {% if yolo_run.failed %}

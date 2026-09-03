@@ -1738,9 +1738,13 @@ class JobStage(models.TextChoices):
 
     Stages come in two shapes, which is what ``opinion`` on the job
     expresses. ``CONVERT``, ``DETECT`` and ``ANALYZE`` run once over
-    the volume, before review. ``EXTRACT`` and ``TIEBREAK`` run after
-    file generation, once per opinion PDF, so 300 opinions read by
-    three engines is 900 rows.
+    the volume, before review. ``TIEBREAK`` runs after file
+    generation, once per opinion PDF. ``EXTRACT`` takes either shape
+    (#191): the Mistral read fans out over the volume's original shards,
+    and an engine that reads opinion PDFs instead keys its rows by
+    opinion, so 300 opinions read by three engines is 900 rows. The
+    two unique constraints below are conditional on ``opinion`` for
+    exactly this reason.
 
     Two things the daemon has to respect. Local steps own no rows and
     sit between stages: reconciling two engines' text, pairing, rect
@@ -1764,7 +1768,12 @@ class JobStage(models.TextChoices):
 #: A tuple, not a frozenset: it is embedded in a database constraint,
 #: and an unordered container rewrites the migration every time the
 #: interpreter hashes it differently.
-OPINION_LEVEL_STAGES = (JobStage.EXTRACT, JobStage.TIEBREAK)
+OPINION_LEVEL_STAGES = (JobStage.TIEBREAK,)
+
+#: Stages that take either shape: a volume-level row (``opinion`` NULL,
+#: keyed by shard) or an opinion-level row (``opinion`` set). ``EXTRACT``
+#: is one since #191, when the Mistral read joined it over the shards.
+EITHER_LEVEL_STAGES = (JobStage.EXTRACT,)
 
 
 class JobStatus(models.TextChoices):
@@ -2124,17 +2133,21 @@ class ExternalJob(AbstractDateTimeModel):
                 name="unique_opinion_job_per_engine_run",
             ),
             # A stage's shape decides whether an opinion is required.
-            # An extract row without one attributes a single opinion's
+            # A tiebreak row without one attributes a single opinion's
             # work to the whole volume and collides with its siblings;
             # a detect row with one claims a target that did not exist
-            # when it ran.
+            # when it ran. EXTRACT takes either shape (#191), so the
+            # constraint leaves it alone and the two conditional unique
+            # keys above sort its rows by shape.
             models.CheckConstraint(
                 condition=(
                     models.Q(
                         stage__in=OPINION_LEVEL_STAGES, opinion__isnull=False
                     )
+                    | models.Q(stage__in=EITHER_LEVEL_STAGES)
                     | (
                         ~models.Q(stage__in=OPINION_LEVEL_STAGES)
+                        & ~models.Q(stage__in=EITHER_LEVEL_STAGES)
                         & models.Q(opinion__isnull=True)
                     )
                 ),

@@ -657,16 +657,113 @@ trained on), tracked on `ExternalJob` rows at
   status alone, so the pass retries next tick. The bands and token
   rules of the adapter come from ai-research `pipeline/core/order.py`
   and issue #149.
-- **No provider abstraction, deliberately.** `jobs.py` branches on
-  `job.provider`; ~600 of its lines are provider-agnostic and stay
-  shared, and only the submit call and the in-flight check fork. Do not
-  answer a third provider by copying a wave or a sweep. **Mistral is the
-  point to promote the branches**, because it changes the shape again:
-  opinion-level `EXTRACT`, no shard fan-out, rate limits rather than a
-  worker pool, and no presigned PUT at all. YOLO on RunPod was exactly
-  a payload builder, an endpoint id and a cap, which is what
-  `jobs.RunpodEngine` now tabulates (#195); it shares `submit_job` and
+- **One provider table, `jobs.ProviderSpec`, and no deeper abstraction
+  (#191).** Until Mistral arrived, `jobs.py` branched on `job.provider`
+  in thirteen places; the third provider promoted those branches to one
+  table (`jobs._providers()`), keyed by `JobProvider`, holding only
+  what a transport forces: the wave, the sweep, the cancel, the caps,
+  the deadline rules, whether a claim signs URLs, and the result
+  suffix. ~600 lines stay provider-agnostic and shared: every
+  compare-and-swap, the attempt bookkeeping, the run reuse, the carry.
+  **Insertion order is wave order** (RunPod, doctor, Mistral: what a
+  person waits behind first, the wave nothing waits behind last). Do
+  not answer a fourth provider by copying a wave or a sweep: add an
+  entry, and build its wave and its sweep out of the three shared
+  pieces --- `jobs.claim_for_wave` (the prologue of every wave: count
+  what is in flight, take what the cap leaves, claim it, with
+  `per_tick` for a wave whose own work blocks the scheduler),
+  `jobs.apply_poll_outcome` (the cascade of every poll, which owns the
+  `summary.pending` order and the "we learned nothing is not we
+  learned it failed" rule) and `jobs.count_sweep_outcome` (the one
+  spelling of counting an outcome). Mistral first arrived by copying
+  the cascade whole, which put those two rules in two places. YOLO on RunPod was exactly a payload
+  builder, an endpoint id and a cap, which is what `jobs.RunpodEngine`
+  tabulates (#195) inside the RunPod entry; it shares `submit_job` and
   `poll_once` unchanged.
+
+## Mistral OCR via the batch API (issue #191)
+
+The third provider, and the first the daemon prepares the input for.
+One `ExternalJob` row per **original** shard at
+`EXTRACT`/`MISTRAL_OCR`/`MISTRAL`, one Mistral batch job per row. The
+pieces: `mistral_client.py` (transport), `mistral_ocr.py` (the stage:
+render, wave, sweep, harvest, cancel), `settings/project/mistral.py`
+(two variables), the `MISTRAL` entry of `jobs._providers()`, and
+`views_process.start_mistral_ocr` (the button). **The job reads the
+original scan and nothing else**: no redaction, no detection, no
+review state. Where it is called from is a separate question from what
+it does; the button answers it today, a trigger later. What must not
+be broken:
+
+- **Two settings, and no other**: `MISTRAL_API_KEY` and
+  `MISTRAL_MODEL`, the two the ai-research runner reads
+  (`runpod/mistral/.env.example` on `extraction_align`). A set key is
+  the switch. Every other knob is a module constant in
+  `mistral_ocr.py` (`RENDER_W`/`RENDER_H` = 1700x2200,
+  `MAX_SUBMITS_PER_TICK` = 1, `MAX_CONCURRENCY` = 16 batch jobs,
+  `MAX_ATTEMPTS` = 2, `BATCH_TIMEOUT_HOURS` = 24), and
+  `input_manifest["model"]` is the one per-row override.
+- **The daemon renders, in the submit pass, with the branch's render**
+  (`pipeline/core/render.py`, line for line): zoom to 1700 wide, RGB,
+  resize to exactly 1700x2200. Every engine of the ensemble saw that
+  image, and every bbox of every engine lives in that pixel space, so
+  do not render grey and do not threshold. The source is the
+  **original** scan: the ensemble's tests all ran on non-bitonal
+  images, and the shards are cut from it.
+- **The wave takes one shard per tick** (`MAX_SUBMITS_PER_TICK` = 1),
+  because it blocks the serial scheduler (#156) for as long as the
+  shard takes: 100 renders (about 160 ms each for a synthetic page,
+  more for a 200 dpi scan) plus 100 uploads of 2-4 MB in sequence is
+  minutes, and every poll, the glue and both applies wait behind it.
+  `MAX_CONCURRENCY` (batches in flight, 16) is a separate number and
+  the throughput limit: a batch waits at Mistral for hours, so a
+  volume of more shards than that needs a second round of the latency.
+  Sixteen covers a normal volume in one round. Parallel uploads inside
+  a shard, or a render off the tick as #196 did for its geometry, wait
+  for a measurement on a real volume. The full-cap line of `_room_for`
+  is logged at DEBUG for this provider, or it would repeat every tick
+  for the whole wait.
+- **A result with a hole is never carried** (`carry_stable_holes=False`
+  on `ensure_shard_jobs`). The stable-hole rule of #238 trusts
+  dots.mocr's deterministic decoder; a Mistral batch line can fail from
+  a transient fault, and two unlucky runs would freeze a page as unread
+  for good.
+- **The harvest stores everything Mistral returned, whole.** The
+  result document at `result_key` holds every output line and every
+  error line verbatim, plus the batch job object; the only thing read
+  out of a line is its `custom_id`, to name the holes
+  (`failed_pages`). No `parse()`, no reshaping, before the glue (a
+  follow-up): a better transform must be a re-glue at no API cost.
+- **Our code writes `result_key`**, after the download and before
+  `_complete`. Nothing presigned is handed out (`presigned_ttl=None` in
+  the table, and `_claim` signs nothing). A failed PUT leaves the row
+  in flight and the next tick downloads the output again.
+- **The deadline is Mistral's own `timeout_hours` plus one hour**,
+  stamped at the first claim and never restamped on `RUNNING`
+  (`run_deadline=None`): a batch is queued and run inside one budget
+  Mistral enforces. The 6 h RunPod queue ceiling does not apply.
+- **A row with no `external_id` at sweep time is a lost claim**, and is
+  retried at once (`LOST_CLAIM`): the scheduler is serial, so no wave
+  is running while the sweep runs. There is no "unanswered" branch on
+  the create either -- a create that did not answer minted no id we
+  can find, so the row retries and the attempt is spent.
+- **A 429 defers, and deletes what was uploaded.** Every page image,
+  the manifest and the two output files live at Mistral until we
+  delete them: the harvest deletes them once the object is in S3, and
+  every path that writes a row off (`cancel_job`) deletes the row's
+  `provider_meta["files"]`. A row cancelled while its thread works
+  has its batch cancelled from the wave, as the RunPod wave does.
+- **`EXTRACT` takes either shape** (`EITHER_LEVEL_STAGES`, migration
+  0020): a shard row with `opinion` NULL for Mistral, an opinion row
+  for an engine that reads opinion PDFs. The two conditional unique
+  keys sort them; only `TIEBREAK` still requires an opinion.
+- **One staff button starts it, and nothing else.** It sits on the
+  step-1 bar beside the dots.mocr button and, like that one, needs no
+  review state: it refuses only a missing key, an open run and a
+  missing shard set. The creator set is pinned in
+  `TestKnownEnqueuePaths`; the daemon trigger and the glue are
+  follow-ups, and the trigger is where the question of *when* a
+  volume is read gets answered.
 
 ## Reading the page number (issue #228)
 
@@ -1121,7 +1218,7 @@ difference between the two outputs: a third engine is one entry.
   down, so the top mtime is only the creation time.
 - The sweep also reclaims leaked `TemporaryDirectory` scratch dirs
   (`bitonal.MERGE_TMP_PREFIX`, `dots_mocr.GLUE_TMP_PREFIX`,
-  `yolo.MERGE_TMP_PREFIX`) that a
+  `yolo.MERGE_TMP_PREFIX`, `mistral_ocr.RENDER_TMP_PREFIX`) that a
   SIGKILL orphans in the system temp dir. Off under TESTING; the
   command's tests point `gettempdir` at a scratch root.
 

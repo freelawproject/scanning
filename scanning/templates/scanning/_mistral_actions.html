@@ -1,0 +1,26 @@
+{% comment %}
+The Mistral OCR control (issue #191), staff-only, included by the
+step-1 bar of _process_actions.html beside the dots.mocr control.
+
+The stage reads the original shards and moves no scan status, so its
+state comes from `mistral_run`, a summary of the ExternalJob rows.
+Like the dots.mocr button, it is the manual way in: every press can
+start paid work on Mistral's batch API.
+{% endcomment %}
+{% if mistral_run %}
+<span class="text-sm text-gray-600 mr-2" title="Mistral OCR run {{ mistral_run.run }}: {{ mistral_run.label }}">
+  {% if mistral_run.failed %}
+  Mistral OCR failed on {{ mistral_run.failed }} of {{ mistral_run.total }} part(s): {{ mistral_run.error_code }}
+  {% elif mistral_run.open %}
+  Mistral OCR running: {{ mistral_run.done }} of {{ mistral_run.total }} part(s) done
+  {% else %}
+  Mistral OCR done: {{ mistral_run.total }} part(s)
+  {% endif %}
+</span>
+{% endif %}
+{% if user.is_staff and not mistral_run.open %}
+<form method="post" action="{% url 'start_mistral_ocr' scan.pk %}" class="inline">
+  {% csrf_token %}
+  <button type="submit" class="btn-outline text-sm" title="Read every page of the original with Mistral OCR on Mistral's batch API (incurs costs $$$)" onclick="return confirm('This sends every page of this volume to the Mistral OCR batch API. This will incur costs $$$. Continue?');">{% if mistral_run %}Re-run Mistral OCR{% else %}Run Mistral OCR{% endif %}</button>
+</form>
+{% endif %}
