@@ -1286,7 +1286,7 @@ def recalculate_issues(scan: "Scan") -> None:
             stale_edits
             + [
                 edit
-                for edit in page_edits.stale_open_edits(scan)
+                for edit in page_edits.stale_edits(scan)
                 if edit.kind != PageEdit.Kind.SET_NUMBER
             ]
         )
@@ -1778,6 +1778,47 @@ def _park_after_redactions(
         status=status or Status.PAGE_COMPLETENESS_REVIEW_DONE,
         progress_message=message,
     )
+
+
+def run_apply_page_edits(scan_pk: int) -> None:
+    """Build the corrected volume from the page edits, or glue it.
+
+    The worker behind ``QueuedAction.APPLY_PAGE_EDITS`` (issue #224),
+    which ``apply.queue_ready_scans`` writes on the collect tick.
+    Queued work, like the redaction compute (#196): the build pulls the
+    original and the glue pulls the volume bitonal copy, minutes on a
+    large volume, and the tick's scheduler is serial.
+
+    The scan goes back to ``PAGE_COMPLETENESS_REVIEW_DONE`` whatever
+    happens, and this raises nothing: a failure is counted on the
+    ``ApplyRun`` row, which bounds the retries. The park is guarded on
+    PROCESSING alone. A lost claim -- the daemon's own shutdown
+    re-queued the scan, or an admin moved it -- supersedes the run, so
+    the rows it created are cancelled and the next claim builds the
+    next number from the same shards.
+
+    :param scan_pk: Primary key of the scan to apply.
+    :return: None.
+    """
+    from scanning import apply
+
+    django.db.connections.close_all()
+    scan = Scan.objects.get(pk=scan_pk)
+    try:
+        message = apply.run_due_phases(scan)
+    except Exception as exc:  # pragma: no cover - run_due_phases catches
+        logger.exception("apply: scan %s: unexpected failure", scan_pk)
+        message = f"Building the corrected volume failed: {exc}"
+    parked = Scan.objects.filter(pk=scan_pk, status=Status.PROCESSING).update(
+        status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        progress_message=message[:255],
+        progress_current=0,
+        progress_total=0,
+    )
+    if not parked:
+        apply.supersede_runs(
+            scan, "the daemon lost its claim during the apply"
+        )
 
 
 def run_full_pipeline(scan_pk: int) -> None:

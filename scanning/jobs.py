@@ -927,27 +927,37 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
     before this field existed match leniently in
     :func:`_still_describes` and never in :func:`_reusable_results`.
 
+    An apply manifest (#224) names each shard's ``key`` itself, under
+    ``jobs/apply/pages/``, and carries the ``edit_id`` the shard was
+    built from: that is what keeps two edits' shards apart when both
+    hold one page of the same size.
+
     :param scan: The scan the shards belong to.
-    :param manifest: The shard manifest from :mod:`scanning.sharding`.
+    :param manifest: The shard manifest from :mod:`scanning.sharding`,
+        or the apply's (:func:`scanning.apply.shard_manifest`).
     :returns: ``(key, identity)`` per shard, ordered by shard index.
     :rtype: list[tuple[str, dict]]
     """
     prefix = s3_sync.shards_prefix(scan)
     source_page_count = manifest["source"]["page_count"]
-    return [
-        (
-            f"{prefix}{entry['name']}",
-            {
-                "name": entry["name"],
-                "from_page": entry["from_page"],
-                "to_page": entry["to_page"],
-                "page_count": entry["page_count"],
-                "size_bytes": entry["size_bytes"],
-                "source_page_count": source_page_count,
-            },
+    specs = []
+    for entry in sorted(manifest["shards"], key=lambda e: e["index"]):
+        identity = {
+            "name": entry["name"],
+            "from_page": entry["from_page"],
+            "to_page": entry["to_page"],
+            "page_count": entry["page_count"],
+            "size_bytes": entry["size_bytes"],
+            "source_page_count": entry.get(
+                "source_page_count", source_page_count
+            ),
+        }
+        if "edit_id" in entry:
+            identity["edit_id"] = entry["edit_id"]
+        specs.append(
+            (entry.get("key") or f"{prefix}{entry['name']}", identity)
         )
-        for entry in sorted(manifest["shards"], key=lambda e: e["index"])
-    ]
+    return specs
 
 
 def _identity_matches(stored: dict | None, identity: dict) -> bool:
@@ -1066,23 +1076,36 @@ def check_result_envelope(
     return envelope["payload"]
 
 
-def live_run(scan, stage: str, engine: str) -> list[ExternalJob]:
+def live_run(
+    scan, stage: str, engine: str, apply_run=None
+) -> list[ExternalJob]:
     """Return a target's current-run rows for one engine, in page order.
 
     The live run is the rows at ``max(run)``: a re-run keeps the
     previous run as history, and reading those as live would report work
     nobody wants any more.
 
+    The volume run by default. The rows of an apply run (#224) are a
+    target of their own -- one-page shards of the pages a curator
+    changed -- and they are read only through ``apply_run``; a volume
+    reader that saw them would glue a one-page shard as the volume.
+
     :param scan: The scan, or its pk.
     :param stage: A :class:`~scanning.models.JobStage` value.
     :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param apply_run: The apply run whose rows are wanted, or None for
+        the volume run.
     :returns: The live run's rows ordered by shard index, or an empty
-        list when the engine has never run for this scan.
+        list when the engine has never run for this target.
     :rtype: list[ExternalJob]
     """
     rows = list(
         ExternalJob.objects.filter(
-            scan=scan, stage=stage, engine=engine, opinion=None
+            scan=scan,
+            stage=stage,
+            engine=engine,
+            opinion=None,
+            apply_run=apply_run,
         ).order_by("-run", "shard_index")
     )
     if not rows:
@@ -1090,7 +1113,7 @@ def live_run(scan, stage: str, engine: str) -> list[ExternalJob]:
     return [job for job in rows if job.run == rows[0].run]
 
 
-def run_summary(scan, stage: str, engine: str) -> dict | None:
+def run_summary(scan, stage: str, engine: str, apply_run=None) -> dict | None:
     """Describe a scan's live run of one engine for the process page.
 
     Neither GPU stage writes a scan status while it works (issue #190),
@@ -1112,12 +1135,14 @@ def run_summary(scan, stage: str, engine: str) -> dict | None:
     :param scan: The scan (or its pk) to describe.
     :param stage: A :class:`~scanning.models.JobStage` value.
     :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param apply_run: The apply run to describe instead of the volume
+        run (#224).
     :returns: ``{"run", "total", "done", "open", "failed", "statuses",
         "label", "error_code", "error_message"}``, or ``None`` when the
-        engine has never run for this scan.
+        engine has never run for this target.
     :rtype: dict | None
     """
-    rows = live_run(scan, stage, engine)
+    rows = live_run(scan, stage, engine, apply_run)
     if not rows:
         return None
 
@@ -1365,6 +1390,7 @@ def ensure_shard_jobs(
     provider: str,
     reuse_results: bool = False,
     force_new_run: bool = False,
+    apply_run=None,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``scan``'s shards,
     creating them if the current run does not describe today's shard set.
@@ -1408,6 +1434,11 @@ def ensure_shard_jobs(
         with ``reuse_results`` the carry re-pays only the shards with a
         hole. A deliberate way to spend GPU money, which is why no tick
         passes it.
+    :param apply_run: The apply run (#224) the rows work for, or None
+        for the volume run. The rows carry it, the live-run read is
+        scoped by it, and the run number still comes from the one
+        sequence of :meth:`ExternalJob.next_run`, so the unique key
+        holds unchanged.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -1415,7 +1446,11 @@ def ensure_shard_jobs(
 
     existing = list(
         ExternalJob.objects.filter(
-            scan=scan, stage=stage, engine=engine, opinion=None
+            scan=scan,
+            stage=stage,
+            engine=engine,
+            opinion=None,
+            apply_run=apply_run,
         ).order_by("-run", "shard_index")
     )
     if existing:
@@ -1456,6 +1491,7 @@ def ensure_shard_jobs(
             run=run,
             shard_index=index,
             shard_count=len(specs),
+            apply_run=apply_run,
             input_key=key,
             # Travels with the row, so the reuse check and any later
             # merge read what was actually processed rather than a
@@ -1488,7 +1524,7 @@ def ensure_shard_jobs(
         # (bulk_create is one statement inside one transaction), so
         # re-read and hand theirs back. This is what keeps two staff
         # presses a no-op rather than a 500 for whoever lost.
-        rows = live_run(scan, stage, engine)
+        rows = live_run(scan, stage, engine, apply_run)
         logger.info(
             "scan %s %s/%s run %d was created by another writer; "
             "reusing its %d row(s)",
@@ -2170,6 +2206,7 @@ def abandon_open(
     stage: str | None = None,
     engine: str | None = None,
     statuses: frozenset = OPEN_JOB_STATUSES,
+    apply_run=None,
 ) -> int:
     """Cancel a scan's open jobs, optionally for one engine only.
 
@@ -2204,6 +2241,12 @@ def abandon_open(
     :param engine: Limit to one :class:`~scanning.models.JobEngine`.
     :param statuses: The statuses to treat as open. Narrow, never
         widen: ``CONSUMED`` and the dead statuses must stay terminal.
+    :param apply_run: Limit to the rows of one apply run (#224). The
+        reopen of a page review cancels the run it supersedes and
+        nothing else; without this scope it would take the volume
+        runs down with it. The default keeps the volume-run behaviour:
+        an unscoped call still reaches every row, apply rows included,
+        which is what the admin scan deletion wants.
     :returns: How many rows were cancelled.
     :rtype: int
     """
@@ -2212,6 +2255,12 @@ def abandon_open(
         rows = rows.filter(stage=stage)
     if engine is not None:
         rows = rows.filter(engine=engine)
+    if apply_run is not None:
+        rows = rows.filter(apply_run=apply_run)
+    elif stage is not None or engine is not None:
+        # A stage is restarted for the volume run: a re-queue re-runs
+        # the pipeline, which owns no part of an apply run (#224).
+        rows = rows.filter(apply_run__isnull=True)
 
     # Read the handles before the update: it is the only thing that says
     # what to cancel, and afterwards the rows no longer read as open.

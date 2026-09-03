@@ -118,6 +118,7 @@ class Command(BaseCommand):
                 engine=JobEngine.DOTS_MOCR,
                 provider=JobProvider.RUNPOD,
                 status=JobStatus.CONSUMED,
+                apply_run__isnull=True,
             )
             .values_list("scan_id", flat=True)
             .distinct()

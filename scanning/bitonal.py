@@ -332,6 +332,7 @@ def finish_ready_scans() -> int:
             jobs__stage=JobStage.CONVERT,
             jobs__engine=JobEngine.BITONAL,
             jobs__provider=JobProvider.DOCTOR,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()

@@ -335,3 +335,20 @@ class ScanAdminDeleteSummaryTests(TestCase):
 
         self.assertNotIn("external jobs", model_count)
         self.assertNotIn("pending uploads", model_count)
+
+
+class TestApplyRunAdmin(TestCase):
+    """The apply run is a ledger: superseded, never deleted (#224)."""
+
+    def test_the_delete_is_refused(self):
+        from scanning.admin import ApplyRunAdmin
+        from scanning.models import ApplyRun
+
+        run = ApplyRun.objects.create(scan=ScanFactory(), number=1)
+        request = RequestFactory().get("/")
+        request.user = UserFactory(is_staff=True, is_superuser=True)
+        admin_site = ApplyRunAdmin(ApplyRun, AdminSite())
+
+        self.assertFalse(admin_site.has_delete_permission(request))
+        self.assertFalse(admin_site.has_delete_permission(request, run))
+        self.assertNotIn("delete_selected", admin_site.get_actions(request))

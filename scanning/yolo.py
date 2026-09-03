@@ -180,7 +180,9 @@ def build_payload(job: ExternalJob, input_url: str, output_url: str) -> dict:
     }
 
 
-def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
+def ensure_detect_jobs(
+    scan, manifest: dict, *, apply_run=None
+) -> list[ExternalJob]:
     """Return the live detection jobs for ``scan``, creating them if the
     current run does not describe today's shard set.
 
@@ -199,6 +201,8 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
 
     :param scan: The scan to detect over.
     :param manifest: The committed shard manifest.
+    :param apply_run: The apply run (#224) whose one-page shards the
+        manifest describes, or None for the volume.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -209,6 +213,7 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
         engine=JobEngine.BLACKLETTER,
         provider=JobProvider.RUNPOD,
         reuse_results=True,
+        apply_run=apply_run,
     )
 
 
@@ -590,6 +595,7 @@ def finish_ready_runs() -> int:
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.COMPLETED,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()
@@ -739,6 +745,20 @@ def record_apply_failure(scan, detect_jobs: list[ExternalJob], exc) -> bool:
     return gave_up
 
 
+def _apply_ready(scan) -> bool:
+    """Return whether the page edit apply has glued this volume (#224).
+
+    :param scan: An approved scan with a merged detection run.
+    :returns: Whether the standing apply run has its bitonal copy and
+        its detections in the final page space.
+    :rtype: bool
+    """
+    from scanning import apply
+
+    run = apply.current_run(scan)
+    return bool(run and run.bitonal_key and run.detections_key)
+
+
 def queue_ready_runs() -> int:
     """Queue the apply for every merged run that has none.
 
@@ -774,6 +794,7 @@ def queue_ready_runs() -> int:
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()
@@ -791,6 +812,12 @@ def queue_ready_runs() -> int:
             continue
         state = apply_state(rows)
         if state.get("applied_at"):
+            continue
+        # The redactions are measured on the final volume (#224): the
+        # apply's bitonal copy and its detections in the final page
+        # space. Until the apply has glued both, the compute would read
+        # the space of the original.
+        if not _apply_ready(scan):
             continue
         # ``queued_at`` is an audit stamp, never a guard. A scan whose
         # apply is really pending has left this status, so the filter

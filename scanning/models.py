@@ -165,6 +165,11 @@ class QueuedAction(models.TextChoices):
     # pass on the collect tick, because it renders every page of the
     # volume three times (~83s for 1364 pages).
     COMPUTE_REDACTIONS = "compute_redactions", "Compute Redactions"
+    # Issue #224: build the final volume from the original plus the
+    # PageEdit rows, and glue the paid results into its space. Queued
+    # work in two phases (build, glue), because both pull and write
+    # whole volumes.
+    APPLY_PAGE_EDITS = "apply_page_edits", "Apply Page Edits"
 
 
 class UploadAction(models.TextChoices):
@@ -1199,15 +1204,21 @@ class PageEdit(AbstractDateTimeModel):
       only. A printed number cannot be an address: front matter has
       none, and two pages can both print 1074 -- which is one of the
       defects review 1 exists to find.
-    - **A decision is closed, never rewritten and never deleted.** The
-      apply (#206) stamps ``applied_at``; a curator who takes the
-      decision back stamps ``withdrawn_at`` and ``withdrawn_by``
-      (#232). Either stamp makes the row history. So every unique
-      constraint is partial over the rows that carry neither: a
-      curator who edits the same page again writes a new row, against
-      the fingerprint of the original as it is then. A second file
-      uploaded for one page withdraws the first row rather than
-      writing over it -- the audit must show every file a person
+    - **A decision stands until it is withdrawn, and it is never
+      rewritten or deleted.** A curator who takes the decision back
+      stamps ``withdrawn_at`` and ``withdrawn_by`` (#232), and that is
+      the one stamp that closes a row. The apply (#224) stamps
+      ``applied_at`` and ``applied_run`` when it builds the decision
+      into a final volume, but the row keeps standing: a reopened
+      review must show an applied deletion as deleted, and the next
+      apply run must build it again, or the second final PDF would
+      restore the page in silence. So every unique constraint is
+      partial over the standing rows -- one decision per address --
+      and a curator who edits the same page again supersedes the row
+      there (``page_edits.supersede``): an open row is updated in
+      place, an applied row is withdrawn and a new one is written. A
+      second file uploaded for one page withdraws the first row rather
+      than writing over it -- the audit must show every file a person
       uploaded, and the object of an overwritten row would stay in the
       bucket with nothing naming it.
     - **``source_fingerprint`` is the scan's**
@@ -1346,8 +1357,20 @@ class PageEdit(AbstractDateTimeModel):
         null=True,
         blank=True,
         help_text=(
-            "When the apply (#206) built this decision into a new "
-            "original. A stamped row is history: it is never rewritten."
+            "When the apply (#224) built this decision into a final "
+            "volume. A ledger stamp, not a close: the row keeps "
+            "standing until it is withdrawn, and it is never rewritten."
+        ),
+    )
+    applied_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="applied_edits",
+        help_text=(
+            "The apply run whose final volume carries this decision. "
+            "Null while no build has read the row."
         ),
     )
     withdrawn_at = models.DateTimeField(
@@ -1421,20 +1444,20 @@ class PageEdit(AbstractDateTimeModel):
                 ),
                 name="page_edit_rotation_is_a_quarter_turn",
             ),
-            # The unique keys are partial over the open rows. A row
-            # leaves that set in one of two ways, and both are
-            # history: the apply built it in, or the curator took it
-            # back (#232). After either, the same page may be edited
-            # again.
+            # The unique keys are partial over the standing rows: one
+            # decision per address. A row leaves that set in one way
+            # only, the curator taking it back (#232). The apply stamp
+            # is not a close (#224): an applied row stands, and the
+            # curator who edits that page again supersedes it, so the
+            # audit keeps both rows and the address keeps one decision.
             models.UniqueConstraint(
                 fields=["scan", "kind", "pdf_page"],
                 condition=(
-                    models.Q(applied_at__isnull=True)
-                    & models.Q(withdrawn_at__isnull=True)
+                    models.Q(withdrawn_at__isnull=True)
                     & models.Q(pdf_page__isnull=False)
                     & ~models.Q(kind="dismiss_issue")
                 ),
-                name="uniq_open_page_edit_per_page",
+                name="uniq_standing_page_edit_per_page",
             ),
             # A page raises several checks, so a dismissal is unique
             # per check, not per page. Both address columns are in the
@@ -1453,21 +1476,19 @@ class PageEdit(AbstractDateTimeModel):
                     "value",
                 ],
                 condition=(
-                    models.Q(applied_at__isnull=True)
-                    & models.Q(withdrawn_at__isnull=True)
+                    models.Q(withdrawn_at__isnull=True)
                     & models.Q(kind="dismiss_issue")
                 ),
                 nulls_distinct=False,
-                name="uniq_open_dismissal_per_check",
+                name="uniq_standing_dismissal_per_check",
             ),
             models.UniqueConstraint(
                 fields=["scan", "anchor_pdf_page", "ordinal"],
                 condition=(
-                    models.Q(applied_at__isnull=True)
-                    & models.Q(withdrawn_at__isnull=True)
+                    models.Q(withdrawn_at__isnull=True)
                     & models.Q(kind="insert_page")
                 ),
-                name="uniq_open_insert_per_gap",
+                name="uniq_standing_insert_per_gap",
             ),
         ]
 
@@ -1479,11 +1500,190 @@ class PageEdit(AbstractDateTimeModel):
         )
         value = f" = {self.value!r}" if self.value else ""
         state = ""
-        if self.applied_at is not None:
-            state = " [applied]"
-        elif self.withdrawn_at is not None:
+        if self.withdrawn_at is not None:
             state = " [withdrawn]"
+        elif self.applied_at is not None:
+            state = " [applied]"
         return f"{self.get_kind_display()} {where}{value}{state}"
+
+
+class ApplyRun(AbstractDateTimeModel):
+    """One build of the final volume from the original plus the page
+    edits (issue #224), ``a{number}`` in the S3 keys.
+
+    Review 1 ends when a curator approves the page completeness. The
+    ``PageEdit`` rows plus the original then describe the complete
+    volume, and this row records one attempt to build it and to glue
+    the paid per-shard results into its page space. **The apply
+    assembles; it does not recompute.** A page nobody touched keeps its
+    conversion, its OCR read and its detections; only a page a curator
+    added or changed enters a queue, as a one-page shard whose
+    ``ExternalJob`` rows point back here through ``apply_run``.
+
+    Why a row of its own, rather than a mark on a job row like the
+    glue and apply ledgers of the volume stages:
+
+    - A run may have **no job rows** at all -- a volume with only
+      deletes, or with no structural edit -- so there is no shard-0
+      row to carry a ledger.
+    - One run spans **three stages** whose glues finish at different
+      times, and a mark on one stage's head row cannot say which of
+      the three is written.
+    - The trigger asks every 15 seconds, for every approved scan, "is
+      there a run for this edit set, is it built, which glues are
+      written, how many attempts are spent". That is one query here,
+      and five S3 HEADs otherwise.
+
+    The offset map is stored here **once**, at build time, and every
+    glue reads it. Nothing derives it again. The original stays the
+    source of record: ``source_fingerprint`` is copied from the scan
+    so a glue can refuse a document from another original, and the
+    apply never writes ``Scan.source_fingerprint``.
+
+    A run with no structural edit aliases the review-1 artifacts: its
+    ``final_pdf_key`` is the original's key and its ``bitonal_key``
+    the volume ``bitonal.pdf``, with no copy. The printed-page map is
+    written for every run, because it is a product.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="apply_runs",
+    )
+    number = models.PositiveSmallIntegerField(
+        help_text="The n in a{n}: 1 for the first build of this scan.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the run was built. "
+            "Every glue checks its inputs against it."
+        ),
+    )
+    page_map = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "The offset map, written once at build time: one entry per "
+            "final page naming its source (an original page, with its "
+            "rotation, or a page of an edit's file), plus the deleted "
+            "pages and the original's page count."
+        ),
+    )
+    edit_ids = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "The standing structural PageEdit rows the build read, in "
+            "primary-key order. The trigger compares it with the "
+            "current set to decide whether a new run is due."
+        ),
+    )
+    final_pdf_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the final PDF, or of the original when no "
+            "structural edit exists. Blank until the build commits."
+        ),
+    )
+    bitonal_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text="S3 key of the final bitonal copy. Blank until glued.",
+    )
+    ocr_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text="S3 key of the final OCR volume JSON. Blank until glued.",
+    )
+    printed_pages_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the frozen printed-page map, in the final page "
+            "space. Blank until the OCR glue writes it."
+        ),
+    )
+    detections_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the final detections volume JSON. Blank until "
+            "glued, which waits for a volume detection run."
+        ),
+    )
+    built_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the final PDF, the map and the job rows were committed.",
+    )
+    superseded_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When a later run replaced this one: the review was "
+            "reopened, or an admin gave up on a dead row. Its outputs "
+            "stay in S3."
+        ),
+    )
+    attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Failed attempts at the current phase.",
+    )
+    last_error = models.TextField(
+        blank=True,
+        default="",
+        help_text="What the last failed attempt raised.",
+    )
+    last_attempt_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["scan", "number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scan", "number"],
+                name="uniq_apply_run_number_per_scan",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Apply run a{self.number} of scan {self.scan_id}"
+
+    @property
+    def label(self) -> str:
+        """Return the run's name in the S3 keys and the logs.
+
+        :returns: ``a{number}``.
+        :rtype: str
+        """
+        return f"a{self.number}"
+
+    @property
+    def is_built(self) -> bool:
+        """Return whether phase 1 committed."""
+        return self.built_at is not None
+
+    @property
+    def is_glued(self) -> bool:
+        """Return whether every glue that can be written is written.
+
+        The detections glue waits for a volume detection run, so it is
+        not part of this: a run whose bitonal and OCR outputs exist is
+        complete for review 1's purposes, and the trigger judges the
+        detections glue on its own inputs.
+        """
+        return bool(
+            self.bitonal_key and self.ocr_key and self.printed_pages_key
+        )
 
 
 class ExtractionStatus(models.TextChoices):
@@ -1927,6 +2127,20 @@ class ExternalJob(AbstractDateTimeModel):
             "wasteful when it did not, which is why preserving "
             "unchanged opinion rows (issue #165) has to land before we "
             "pay for hundreds of jobs a volume."
+        ),
+    )
+    apply_run = models.ForeignKey(
+        ApplyRun,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="jobs",
+        help_text=(
+            "The apply run this row works for (issue #224): a one-page "
+            "shard of a page a curator added or changed. Null for the "
+            "volume runs. Every reader of 'the live volume run' filters "
+            "these rows out, and the apply reads its rows through this "
+            "key and never by run number."
         ),
     )
     stage = models.CharField(

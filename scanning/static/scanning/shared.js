@@ -357,6 +357,9 @@ function deletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelete) {
             if (typeof window.onPageEditSaved === 'function') {
                 window.onPageEditSaved();
             }
+        } else {
+            // A locked review answers 409 with the reason (#224).
+            showToast(data.error || 'Could not mark this page for deletion.');
         }
     });
 }
@@ -433,6 +436,8 @@ function undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelet
             if (typeof window.onPageEditSaved === 'function') {
                 window.onPageEditSaved();
             }
+        } else {
+            showToast(data.error || 'Could not take the deletion back.');
         }
     });
 }
