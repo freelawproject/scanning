@@ -177,6 +177,9 @@ class Command(BaseCommand):
             # It parks the scan itself and raises nothing, so the
             # generic ERROR arm below never sees it.
             QueuedAction.COMPUTE_REDACTIONS: services.run_compute_redactions,
+            # Issue #224. Same shape: it pulls and writes whole volumes,
+            # parks the scan itself and raises nothing.
+            QueuedAction.APPLY_PAGE_EDITS: services.run_apply_page_edits,
         }
 
         # Legacy actions whose pipelines were disconnected (issue #173).

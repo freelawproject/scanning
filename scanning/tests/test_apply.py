@@ -326,10 +326,9 @@ class TestBuildFinalPdf(ApplyTestCase):
         # The shard the stages read and the final PDF come from one
         # rule, so page k of the shard is the map's entry k.
         turn = self.edit(PageEdit.Kind.ROTATE_PAGE, pdf_page=2, value="180")
-        plan = apply.plan_run(self.scan)
 
         with fitz.open(str(self.original)) as source:
-            with apply.build_edit_shard(source, turn, plan, None) as shard:
+            with apply.build_edit_shard(source, turn, None) as shard:
                 self.assertEqual(shard.page_count, 1)
                 self.assertEqual(shard[0].rotation, 180)
 

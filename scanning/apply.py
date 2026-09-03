@@ -42,14 +42,31 @@ The pieces, and the rules that hold them together:
 from __future__ import annotations
 
 import logging
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import fitz
+from django.db import transaction
 from django.utils import timezone
 
 from scanning import page_edits, s3_sync
-from scanning.models import ApplyRun, PageEdit, Scan
+from scanning.models import (
+    DEAD_JOB_STATUSES,
+    IN_FLIGHT_JOB_STATUSES,
+    ApplyRun,
+    ExternalJob,
+    JobEngine,
+    JobProvider,
+    JobStage,
+    JobStatus,
+    PageEdit,
+    QueuedAction,
+    Scan,
+    Status,
+)
+from scanning.utils import local_original_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +229,22 @@ def final_page_of(page_map: dict, pdf_page: int) -> int | None:
     return None
 
 
+def reference_page(edit: PageEdit, page_count: int) -> int:
+    """Return the original page whose MediaBox an uploaded image takes.
+
+    The page it replaces, or the page it follows (page 1 for anchor 0,
+    the last page for an anchor past the end). One rule for the plan
+    and the shard, so the two agree.
+
+    :param edit: An insert or a replacement row.
+    :param page_count: Pages in the original.
+    :returns: A 1-based page of the original.
+    :rtype: int
+    """
+    page = edit.pdf_page if edit.pdf_page else (edit.anchor_pdf_page or 0)
+    return min(max(page, 1), page_count)
+
+
 def edit_page_count(edit: PageEdit) -> int:
     """Return how many pages one edit contributes to the final PDF.
 
@@ -286,14 +319,14 @@ def plan_run(
     def emit(source: dict) -> None:
         pages.append({"final_page": len(pages) + 1, "source": source})
 
-    def emit_upload(edit: PageEdit, reference: int) -> None:
+    def emit_upload(edit: PageEdit) -> None:
         for k in range(count_of(edit)):
             source = {
                 "kind": "edit",
                 "edit_id": edit.pk,
                 "edit_kind": str(edit.kind),
                 "page": k,
-                "reference_pdf_page": reference,
+                "reference_pdf_page": reference_page(edit, last),
             }
             if edit.kind == PageEdit.Kind.REPLACE_PAGE:
                 source["pdf_page"] = edit.pdf_page
@@ -301,12 +334,12 @@ def plan_run(
 
     last = scan.page_count
     for edit in gaps.get(0, []):
-        emit_upload(edit, 1)
+        emit_upload(edit)
     for pdf_page in range(1, last + 1):
         if pdf_page in deleted:
             pass
         elif pdf_page in replacements:
-            emit_upload(replacements[pdf_page], pdf_page)
+            emit_upload(replacements[pdf_page])
         elif pdf_page in rotations:
             edit = next(
                 e
@@ -327,13 +360,13 @@ def plan_run(
         else:
             emit({"kind": "original", "pdf_page": pdf_page})
         for edit in gaps.get(pdf_page, []):
-            emit_upload(edit, pdf_page)
+            emit_upload(edit)
     # An insert anchored past the last page has no gap to fill. It is
     # placed last rather than dropped: a curator uploaded it, and the
     # viewer shows it there too (``page_edits.project_inserts``).
     for anchor in sorted(anchor for anchor in gaps if anchor > last):
         for edit in gaps[anchor]:
-            emit_upload(edit, last)
+            emit_upload(edit)
 
     return ApplyPlan(
         source_page_count=scan.page_count,
@@ -400,7 +433,7 @@ def _place_image(
 
 
 def build_edit_shard(
-    source: fitz.Document, edit: PageEdit, plan: ApplyPlan, data: bytes | None
+    source: fitz.Document, edit: PageEdit, data: bytes | None
 ) -> fitz.Document:
     """Build the one-page shard the stages read for one edit.
 
@@ -415,7 +448,6 @@ def build_edit_shard(
 
     :param source: The original.
     :param edit: The row.
-    :param plan: The plan, for the reference page of an image.
     :param data: The uploaded file's bytes, or None for a rotation.
     :returns: The shard document. The caller closes it.
     :rtype: fitz.Document
@@ -430,12 +462,7 @@ def build_edit_shard(
         return out
     if data is None:
         raise ApplyError(f"edit {edit.pk} has no file to build a shard from")
-    reference = next(
-        entry["source"]["reference_pdf_page"]
-        for entry in plan.pages
-        if entry["source"].get("edit_id") == edit.pk
-    )
-    _place_image(out, source, reference, data)
+    _place_image(out, source, reference_page(edit, source.page_count), data)
     return out
 
 
@@ -484,7 +511,7 @@ def build_final_pdf(
                     if edit.kind == PageEdit.Kind.ROTATE_PAGE
                     else read_file(edit)
                 )
-                shards[edit.pk] = build_edit_shard(source, edit, plan, data)
+                shards[edit.pk] = build_edit_shard(source, edit, data)
             shard = shards[edit.pk]
             if src["page"] >= shard.page_count:
                 raise ApplyError(
@@ -560,10 +587,12 @@ def supersede_runs(scan: Scan, reason: str) -> int:
     """Close every standing apply run of a scan, and cancel its jobs.
 
     The reopen of a page review and the admin's way out of a run with
-    a dead row. The run's outputs stay in S3; only its open job rows
-    are cancelled, scoped to the run so the volume runs stay alive. The
-    next build starts ``a{n+1}`` and carries every paid result the
-    edits did not change.
+    a dead row. The run's outputs stay in S3, and so do its paid
+    results: only the rows still waiting or in flight are cancelled,
+    scoped to the run so the volume runs stay alive. A ``COMPLETED``
+    row is left as it is, because the next build starts ``a{n+1}`` and
+    carries every paid result the edits did not change -- which is
+    exactly the row a cancel would have written off.
 
     :param scan: The scan.
     :param reason: Recorded on each cancelled job row.
@@ -574,8 +603,9 @@ def supersede_runs(scan: Scan, reason: str) -> int:
 
     now = timezone.now()
     count = 0
+    unstarted = frozenset({JobStatus.PENDING}) | IN_FLIGHT_JOB_STATUSES
     for run in scan.apply_runs.filter(superseded_at__isnull=True):
-        jobs.abandon_open(scan, reason, apply_run=run)
+        jobs.abandon_open(scan, reason, statuses=unstarted, apply_run=run)
         ApplyRun.objects.filter(pk=run.pk, superseded_at__isnull=True).update(
             superseded_at=now
         )
@@ -584,3 +614,553 @@ def supersede_runs(scan: Scan, reason: str) -> int:
         )
         count += 1
     return count
+
+
+# ── the build phase ────────────────────────────────────────────────
+def _ensure_page_shard(
+    scan: Scan, source: fitz.Document, edit: PageEdit, tmp_dir: Path
+) -> dict:
+    """Make sure one edit's shard is in the bucket, and describe it.
+
+    Built once per edit: a shard already at its key is described, not
+    rebuilt, so a second run costs no upload and its rows keep the
+    identity the carry matches on.
+
+    :param scan: The scan.
+    :param source: The original, open.
+    :param edit: An insert, a replacement or a rotation row.
+    :param tmp_dir: Scratch space for the shard file.
+    :returns: ``{"key", "page_count", "size_bytes"}``.
+    :rtype: dict
+    :raises ApplyError: If the upload failed.
+    """
+    key = page_shard_key(scan, edit)
+    if s3_sync.object_exists(key):
+        return {
+            "key": key,
+            "page_count": edit_page_count(edit),
+            "size_bytes": s3_sync.object_size(key) or 0,
+        }
+    data = (
+        None
+        if edit.kind == PageEdit.Kind.ROTATE_PAGE
+        else read_edit_file(edit)
+    )
+    local = tmp_dir / f"e{edit.pk}.pdf"
+    with build_edit_shard(source, edit, data) as shard:
+        page_count = shard.page_count
+        shard.save(str(local), garbage=3, deflate=True)
+    if not s3_sync.upload_file_object(key, local, "application/pdf"):
+        raise ApplyError(f"could not upload the shard of edit {edit.pk}")
+    # The size the bucket reports, on the first build as on every later
+    # one: the row identity carries it, and a value read two ways would
+    # read as two shards and re-pay the read.
+    return {
+        "key": key,
+        "page_count": page_count,
+        "size_bytes": s3_sync.object_size(key) or local.stat().st_size,
+    }
+
+
+def shard_manifest(
+    scan: Scan, plan: ApplyPlan, shards: dict[int, dict]
+) -> dict:
+    """Describe the run's one-page shards the way ``ensure_shard_jobs`` reads.
+
+    The same shape as the volume manifest, with two additions per entry
+    that :func:`scanning.jobs._shard_specs` honours: the shard's own
+    ``key`` (under ``jobs/apply/pages/``, not ``shards/``) and the
+    ``edit_id`` it was built from. Each entry's ``source_page_count`` is
+    its own page count, so the identity of one edit's row never changes
+    when another edit joins the run -- that is what lets the carry
+    match it.
+
+    :param scan: The scan.
+    :param plan: The plan, for the shard order.
+    :param shards: :func:`_ensure_page_shard`'s answer per edit pk.
+    :returns: The manifest.
+    :rtype: dict
+    """
+    entries = []
+    for index, edit in enumerate(plan.shard_edits):
+        info = shards[edit.pk]
+        entries.append(
+            {
+                "name": f"e{edit.pk}.pdf",
+                "index": index,
+                "key": info["key"],
+                "edit_id": edit.pk,
+                "from_page": 0,
+                "to_page": info["page_count"] - 1,
+                "page_count": info["page_count"],
+                "size_bytes": info["size_bytes"],
+                "source_page_count": info["page_count"],
+            }
+        )
+    return {
+        "version": 1,
+        "source": {
+            "name": "page edits",
+            "size_bytes": sum(e["size_bytes"] for e in entries),
+            "page_count": sum(e["page_count"] for e in entries),
+        },
+        "shards": entries,
+    }
+
+
+def _ensure_rows(
+    scan: Scan, run: ApplyRun, plan: ApplyPlan, shards: dict[int, dict]
+) -> list[ExternalJob]:
+    """Create the run's job rows, one per stage per shard, behind the gates.
+
+    The gates mirror the pipeline's (``services._can_convert``,
+    ``services._can_analyze``, and ``yolo.enabled`` with S3 active), so
+    the new rows ride the same daemon, the same backpressure (#218) and
+    the same concurrency caps. Every stage carries prior results
+    (``reuse_results``), because the apply keeps its results where the
+    volume bitonal merge deletes its own.
+
+    :param scan: The scan.
+    :param run: The apply run the rows work for.
+    :param plan: The plan.
+    :param shards: :func:`_ensure_page_shard`'s answer per edit pk.
+    :returns: The rows created or found.
+    :rtype: list[ExternalJob]
+    """
+    from scanning import dots_mocr, jobs, services, yolo
+
+    if not plan.shard_edits:
+        return []
+    manifest = shard_manifest(scan, plan, shards)
+    rows: list[ExternalJob] = []
+    if services._can_convert(scan.pk, manifest):
+        rows += jobs.ensure_shard_jobs(
+            scan,
+            manifest,
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            reuse_results=True,
+            apply_run=run,
+        )
+    if services._can_analyze(scan.pk, manifest):
+        rows += dots_mocr.ensure_analyze_jobs(scan, manifest, apply_run=run)
+    if yolo.enabled() and s3_sync.s3_active():
+        rows += yolo.ensure_detect_jobs(scan, manifest, apply_run=run)
+    return rows
+
+
+def _build(scan: Scan, run: ApplyRun) -> None:
+    """Phase 1: the shards, the final PDF, the map, the rows, the stamps.
+
+    Idempotent for a re-queue after a SIGTERM: a shard already in the
+    bucket is described rather than rebuilt, the final PDF is written
+    over the same key, and ``ensure_shard_jobs`` hands back the live
+    rows when they still describe the specs.
+
+    :param scan: The scan.
+    :param run: The run to build, not yet built.
+    :return: None.
+    :raises ApplyError: If an input is missing or an upload failed.
+    """
+    started = time.monotonic()
+    original = local_original_pdf(scan)
+    if not original:
+        raise ApplyError(f"the original of scan {scan.pk} is not available")
+
+    prefix = run_prefix(scan, run)
+    with tempfile.TemporaryDirectory(
+        prefix=f"{BUILD_TMP_PREFIX}{scan.pk}-"
+    ) as tmp:
+        tmp_dir = Path(tmp)
+        with fitz.open(original) as source:
+            if scan.page_count != source.page_count:
+                raise ApplyError(
+                    f"scan {scan.pk} has {scan.page_count} page(s) on the "
+                    f"row and {source.page_count} in the original"
+                )
+            shards = {
+                edit.pk: _ensure_page_shard(scan, source, edit, tmp_dir)
+                for edit in page_edits.current_edits(scan, *SHARD_KINDS)
+            }
+            plan = plan_run(
+                scan,
+                page_counts={
+                    pk: info["page_count"] for pk, info in shards.items()
+                },
+            )
+            if plan.is_identity:
+                # No copy of gigabytes for a volume nobody changed: the
+                # final PDF is the original.
+                final_key = s3_sync.s3_original_key(scan) or ""
+            else:
+                final_path = tmp_dir / "final.pdf"
+                with build_final_pdf(source, plan) as out:
+                    out.save(str(final_path), garbage=3, deflate=True)
+                final_key = f"{prefix}final.pdf"
+                if not s3_sync.upload_file_object(
+                    final_key, final_path, "application/pdf"
+                ):
+                    raise ApplyError("could not upload the final PDF")
+    page_map = plan.to_map()
+    if not s3_sync.upload_json_object(f"{prefix}page_map.json", page_map):
+        raise ApplyError("could not upload the page map")
+
+    rows = _ensure_rows(scan, run, plan, shards)
+
+    now = timezone.now()
+    edit_ids = [edit.pk for edit in plan.edits]
+    numbers = [
+        edit.pk
+        for edit in page_edits.current_edits(scan, PageEdit.Kind.SET_NUMBER)
+    ]
+    with transaction.atomic():
+        PageEdit.objects.filter(
+            pk__in=edit_ids + numbers, withdrawn_at__isnull=True
+        ).update(applied_at=now, applied_run=run, date_modified=now)
+        ApplyRun.objects.filter(pk=run.pk).update(
+            edit_ids=edit_ids,
+            page_map=page_map,
+            final_pdf_key=final_key,
+            built_at=now,
+            attempts=0,
+            last_error="",
+        )
+    run.refresh_from_db()
+    logger.info(
+        "apply: scan %s: run %s built in %.1fs: %d final page(s) from %d, "
+        "%d edit(s), %d shard(s), %d job row(s)",
+        scan.pk,
+        run.label,
+        time.monotonic() - started,
+        plan.final_page_count,
+        plan.source_page_count,
+        len(plan.edits),
+        len(shards),
+        len(rows),
+    )
+
+
+def record_failure(run: ApplyRun, exc: Exception) -> bool:
+    """Count one failed attempt at the run's current phase.
+
+    The same loud-then-quiet ledger as ``yolo.record_apply_failure``:
+    the crossing into "out of tries" is the one ERROR-level event, and
+    the way back is the admin action that supersedes the run.
+
+    :param run: The run.
+    :param exc: What the phase raised.
+    :returns: Whether this failure spent the last attempt.
+    :rtype: bool
+    """
+    attempts = run.attempts + 1
+    ApplyRun.objects.filter(pk=run.pk).update(
+        attempts=attempts,
+        last_error=str(exc)[:2000],
+        last_attempt_at=timezone.now(),
+    )
+    run.attempts = attempts
+    gave_up = attempts >= APPLY_MAX_ATTEMPTS
+    if gave_up:
+        logger.exception(
+            "apply: scan %s: run %s failed; giving up after %d attempt(s). "
+            "Supersede the run from the admin to try again.",
+            run.scan_id,
+            run.label,
+            attempts,
+        )
+    else:
+        logger.warning(
+            "apply: scan %s: run %s failed (attempt %d of %d): %s",
+            run.scan_id,
+            run.label,
+            attempts,
+            APPLY_MAX_ATTEMPTS,
+            exc,
+        )
+    return gave_up
+
+
+def build_run(scan: Scan) -> ApplyRun:
+    """Run phase 1 for a scan: build the run that is due.
+
+    A run not yet built is retried in place. A built run whose edit set
+    no longer matches the standing rows is superseded, and the next
+    number is built: that is the reopen path, and the carry keeps the
+    paid results of the edits that did not change.
+
+    :param scan: The scan, in the daemon's claim.
+    :returns: The built run.
+    :rtype: ApplyRun
+    :raises ApplyError: If the build failed. The failure is counted on
+        the run before it is raised.
+    """
+    edit_ids = [
+        edit.pk
+        for edit in sorted(
+            page_edits.current_edits(scan, *PageEdit.STRUCTURAL_KINDS),
+            key=lambda edit: edit.pk,
+        )
+    ]
+    run = current_run(scan)
+    if run is not None and run.is_built:
+        if run.edit_ids == edit_ids:
+            return run
+        supersede_runs(scan, "the page edits changed after the build")
+        run = None
+    if run is None:
+        latest = latest_run(scan)
+        run = ApplyRun.objects.create(
+            scan=scan,
+            number=latest.number + 1 if latest else 1,
+            source_fingerprint=scan.source_fingerprint,
+        )
+    try:
+        _build(scan, run)
+    except Exception as exc:
+        gave_up = record_failure(run, exc)
+        raise ApplyError(
+            f"Building the corrected volume failed: {exc}. "
+            + (
+                "It has stopped; ask a staff member."
+                if gave_up
+                else "It runs again by itself."
+            )
+        ) from exc
+    return run
+
+
+# ── the trigger ────────────────────────────────────────────────────
+#: The one status the apply takes a scan from, and gives it back to.
+APPLY_STATUS = Status.PAGE_COMPLETENESS_REVIEW_DONE
+
+
+def _current_edit_ids(scan: Scan) -> list[int]:
+    """Return the standing structural rows' pks, sorted.
+
+    :param scan: The scan.
+    :returns: What ``ApplyRun.edit_ids`` must equal for a run to be
+        current.
+    """
+    return sorted(
+        edit.pk
+        for edit in page_edits.current_edits(scan, *PageEdit.STRUCTURAL_KINDS)
+    )
+
+
+def phase_due(scan: Scan) -> str | None:
+    """Return which phase the scan's apply owes, if any.
+
+    ``"build"`` when no run stands, the standing run is not built and
+    has attempts left, or the built run's edit set no longer matches
+    the standing rows. ``"glue"`` when the built run's job rows are all
+    finished and a glue with ready inputs is not written. None while
+    the rows are in flight, when a row is dead (the bar shows it, and
+    the admin supersedes the run), or when the attempts are spent.
+
+    :param scan: The scan.
+    :returns: ``"build"``, ``"glue"`` or None.
+    :rtype: str | None
+    """
+    run = current_run(scan)
+    if run is None:
+        return "build"
+    if not run.is_built:
+        return "build" if run.attempts < APPLY_MAX_ATTEMPTS else None
+    if run.edit_ids != _current_edit_ids(scan):
+        return "build"
+    if run.attempts >= APPLY_MAX_ATTEMPTS:
+        return None
+    rows = list(run.jobs.all())
+    if any(row.status in DEAD_JOB_STATUSES for row in rows):
+        return None
+    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
+    if any(row.status in unfinished for row in rows):
+        return None
+    if glue_due(scan, run, rows):
+        return "glue"
+    return None
+
+
+def glue_due(scan: Scan, run: ApplyRun, rows: list[ExternalJob]) -> bool:
+    """Return whether a glue of a built run can be written now.
+
+    Filled in by the glue phase. Until it lands, no glue is due.
+
+    :param scan: The scan.
+    :param run: A built run whose rows are all finished.
+    :param rows: The run's rows.
+    :returns: Whether :func:`glue_run` has something to write.
+    :rtype: bool
+    """
+    return False
+
+
+def _needs_attention(scan: Scan) -> bool:
+    """Return whether the trigger should look at this scan at all.
+
+    The cheap pre-check over every approved scan on every tick: a run
+    that is built, fully glued and untouched since costs one query.
+
+    :param scan: An approved scan.
+    :returns: Whether :func:`phase_due` is worth computing.
+    :rtype: bool
+    """
+    run = current_run(scan)
+    if run is None or not run.is_built or not run.is_glued:
+        return True
+    if not run.detections_key:
+        return True
+    return scan.page_edits.filter(
+        kind__in=PageEdit.STRUCTURAL_KINDS, date_modified__gt=run.built_at
+    ).exists()
+
+
+def queue_ready_scans() -> int:
+    """Queue the apply for every approved scan that owes a phase.
+
+    A pass on the collect tick, and a trigger rather than the work: it
+    writes one status and returns. The build pulls the original and
+    the glue pulls the volume bitonal copy, minutes of work on a large
+    volume, and the tick's scheduler is serial (#156). So this queues
+    ``APPLY_PAGE_EDITS`` and ``process_next_scan`` runs it where the
+    long stages already run (the #196 shape).
+
+    Only ``PAGE_COMPLETENESS_REVIEW_DONE`` is taken, with a
+    compare-and-swap. A scan in any other status is deferred without a
+    mark: it comes back when it holds that status again.
+
+    :returns: How many scans were queued.
+    :rtype: int
+    """
+    if not s3_sync.s3_active():
+        return 0
+    queued = 0
+    for scan in Scan.objects.filter(status=APPLY_STATUS).select_related(
+        "reporter"
+    ):
+        if not _needs_attention(scan):
+            continue
+        phase = phase_due(scan)
+        if phase is None:
+            continue
+        claimed = Scan.objects.filter(pk=scan.pk, status=APPLY_STATUS).update(
+            status=Status.QUEUED,
+            queued_action=QueuedAction.APPLY_PAGE_EDITS,
+            progress_message=(
+                "Building the corrected volume from the page edits."
+                if phase == "build"
+                else "Assembling the corrected volume."
+            ),
+            progress_current=0,
+            progress_total=0,
+        )
+        if claimed:
+            logger.info("apply: scan %s: queued the %s phase", scan.pk, phase)
+            queued += claimed
+    return queued
+
+
+def run_due_phases(scan: Scan) -> str:
+    """Do every phase the scan owes, in order, and say what happened.
+
+    The worker behind ``QueuedAction.APPLY_PAGE_EDITS``. A build is
+    followed at once by the glue when the run has no job rows to wait
+    for -- a volume with no structural edit, or with deletes only.
+    Raises nothing: the failure is counted on the run and the message
+    tells the curator whether it runs again by itself.
+
+    :param scan: The scan, in the daemon's claim.
+    :returns: The progress message to park the scan with.
+    :rtype: str
+    """
+    try:
+        phase = phase_due(scan)
+        if phase == "build":
+            build_run(scan)
+            phase = phase_due(scan)
+        if phase == "glue":
+            glue_run(scan)
+    except ApplyError as exc:
+        return str(exc)
+    run = current_run(scan)
+    if run is None:
+        return "The corrected volume is not built yet."
+    state = run_state(scan, run)
+    return state["message"] if state else "The corrected volume is built."
+
+
+def glue_run(scan: Scan) -> None:
+    """Phase 2. Filled in by the glue phase.
+
+    :param scan: The scan.
+    :return: None.
+    """
+    raise ApplyError("the glue is not built yet")
+
+
+def run_state(scan: Scan, run: ApplyRun | None = None) -> dict | None:
+    """Describe the scan's standing apply run for the step-1 bar.
+
+    The scan stays in DONE while the run works, so the rows and the run
+    row are the only place the progress lives, and this is how a viewer
+    sees it.
+
+    :param scan: The scan.
+    :param run: The run, when the caller has it.
+    :returns: ``{"label", "message", "summary", "failed", "open"}``, or
+        None when no run stands.
+    :rtype: dict | None
+    """
+    run = run or current_run(scan)
+    if run is None:
+        return None
+    rows = list(run.jobs.all())
+    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
+    open_rows = sum(1 for row in rows if row.status in unfinished)
+    dead = [row for row in rows if row.status in DEAD_JOB_STATUSES]
+    done = len(rows) - open_rows - len(dead)
+    if not run.is_built:
+        if run.attempts >= APPLY_MAX_ATTEMPTS:
+            message = (
+                "The corrected volume could not be built; ask a staff member."
+            )
+        elif run.attempts:
+            message = (
+                "Building the corrected volume failed; it is tried again."
+            )
+        else:
+            message = "The corrected volume is being built."
+    elif dead:
+        message = (
+            f"Corrected volume: {len(dead)} page part(s) failed: "
+            f"{dead[0].error_code}"
+        )
+    elif open_rows:
+        message = (
+            f"Corrected volume: {done} of {len(rows)} page part(s) processed"
+        )
+    elif not run.is_glued:
+        if run.attempts >= APPLY_MAX_ATTEMPTS:
+            message = "The corrected volume could not be assembled; ask a staff member."
+        else:
+            message = "Corrected volume: assembling"
+    elif not run.detections_key:
+        message = "Corrected volume built; detections pending"
+    else:
+        message = "Corrected volume built"
+    return {
+        "label": run.label,
+        "message": message,
+        "summary": (
+            f"{len(rows)} page part(s), {done} done, {open_rows} open, "
+            f"{len(dead)} failed; attempts {run.attempts}"
+            + (
+                f"; last error: {run.last_error[:120]}"
+                if run.last_error
+                else ""
+            )
+        ),
+        "failed": bool(dead) or run.attempts >= APPLY_MAX_ATTEMPTS,
+        "open": open_rows,
+    }

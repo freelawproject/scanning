@@ -74,7 +74,9 @@ class Command(BaseCommand):
         "scan whose conversion jobs have all finished, then glue any "
         "finished dots.mocr run into its volume document, then apply "
         "every glued run (page numbers and Issues), then merge every "
-        "finished detection run and queue its redaction computation."
+        "finished detection run, queue the page edit apply of every "
+        "approved scan that owes one, and queue every merged detection "
+        "run's redaction computation."
     )
 
     def handle(self, *args, **options):
@@ -86,7 +88,7 @@ class Command(BaseCommand):
         """
         from django.db import OperationalError, connections
 
-        from scanning import bitonal, dots_mocr, jobs, yolo
+        from scanning import apply, bitonal, dots_mocr, jobs, yolo
 
         for attempt in range(MAX_DB_RETRIES):
             connections.close_all()
@@ -96,6 +98,7 @@ class Command(BaseCommand):
                 glued = dots_mocr.finish_ready_runs()
                 applied = dots_mocr.apply_ready_runs()
                 detected = yolo.finish_ready_runs()
+                applied_edits = apply.queue_ready_scans()
                 queued = yolo.queue_ready_runs()
                 break
             except OperationalError as exc:
@@ -121,6 +124,7 @@ class Command(BaseCommand):
                 glued,
                 applied,
                 detected,
+                applied_edits,
                 queued,
             )
         ):
@@ -129,6 +133,7 @@ class Command(BaseCommand):
                 f"failed {summary.failed}, still waiting {summary.pending}, "
                 f"check errors {summary.errors}; finished {finished} "
                 f"scan(s), glued {glued} OCR run(s), applied {applied}, "
-                f"merged {detected} detection run(s), queued {queued} "
+                f"merged {detected} detection run(s), queued "
+                f"{applied_edits} page edit apply(s) and {queued} "
                 f"redaction computation(s)"
             )

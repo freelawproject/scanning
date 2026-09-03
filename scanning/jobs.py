@@ -934,7 +934,9 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
             "to_page": entry["to_page"],
             "page_count": entry["page_count"],
             "size_bytes": entry["size_bytes"],
-            "source_page_count": source_page_count,
+            "source_page_count": entry.get(
+                "source_page_count", source_page_count
+            ),
         }
         if "edit_id" in entry:
             identity["edit_id"] = entry["edit_id"]

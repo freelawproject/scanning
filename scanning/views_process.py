@@ -911,16 +911,18 @@ def _review_flags(scan: Scan) -> dict:
         template context.
     :rtype: dict
     """
-    from scanning import services
+    from scanning import apply, services
 
+    done = scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
     return {
         "page_review_ready": (
             scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
         ),
-        "page_review_done": (
-            scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
-        ),
+        "page_review_done": done,
         "has_legacy_ocr": services.has_legacy_ocr(scan),
+        # The apply writes no scan status while its rows run (#224), so
+        # the run row is the only place its progress lives.
+        "apply_run": apply.run_state(scan) if done else None,
         **page_edits.pending_edit_flags(scan),
     }
 

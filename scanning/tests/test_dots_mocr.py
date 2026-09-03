@@ -1727,6 +1727,13 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 # Detection: the staff button alone (#195). Nothing in
                 # the pipeline may appear here until #211 says so.
                 ("scanning/views_process.py", "ensure_detect_jobs"),
+                # The apply of the page edits (#224): one-page shards of
+                # the pages a curator added or changed, on all three
+                # stages, after the review-1 approval. Behind the same
+                # gates as the pipeline.
+                ("scanning/apply.py", "ensure_shard_jobs"),
+                ("scanning/apply.py", "ensure_analyze_jobs"),
+                ("scanning/apply.py", "ensure_detect_jobs"),
                 # The generic creator's three wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
                 ("scanning/yolo.py", "ensure_shard_jobs"),

@@ -6,8 +6,9 @@ from django.urls import NoReverseMatch, reverse
 from django.utils.html import format_html
 from django.utils.text import capfirst
 
-from scanning import jobs
+from scanning import apply, jobs
 from scanning.models import (
+    ApplyRun,
     Detection,
     ExternalJob,
     Issue,
@@ -431,6 +432,10 @@ class ScanAdmin(admin.ModelAdmin):
             jobs.abandon_open(
                 scan, "Re-queued from the admin", stage=JobStage.CONVERT
             )
+            # The pipeline runs again from the original, so a build of
+            # the final volume in flight describes nothing any more
+            # (#224). Its shards stay, and the next build reuses them.
+            apply.supersede_runs(scan, "Re-queued from the admin")
 
         # Re-point every recovered scan at the (interim) full pipeline.
         # The other queued actions were disconnected by issue #173, so a
@@ -693,6 +698,69 @@ class PageEditAdmin(admin.ModelAdmin):
         "date_created",
         "date_modified",
     ]
+
+
+@admin.register(ApplyRun)
+class ApplyRunAdmin(admin.ModelAdmin):
+    """One build of the final volume from the page edits (issue #224).
+
+    Read-only: the row is the daemon's ledger. The one thing an
+    operator does here is give up on a run -- a dead job row, or
+    attempts spent -- with the supersede action, after which the
+    trigger builds the next number and carries every paid result.
+    """
+
+    list_display = [
+        "scan",
+        "number",
+        "built_at",
+        "bitonal_key",
+        "ocr_key",
+        "detections_key",
+        "attempts",
+        "superseded_at",
+        "date_modified",
+    ]
+    list_filter = ["superseded_at", "built_at"]
+    search_fields = ["scan__id", "last_error"]
+    raw_id_fields = ["scan"]
+    readonly_fields = [
+        "scan",
+        "number",
+        "source_fingerprint",
+        "page_map",
+        "edit_ids",
+        "final_pdf_key",
+        "bitonal_key",
+        "ocr_key",
+        "printed_pages_key",
+        "detections_key",
+        "built_at",
+        "superseded_at",
+        "attempts",
+        "last_error",
+        "last_attempt_at",
+        "date_created",
+        "date_modified",
+    ]
+    list_select_related = ["scan__reporter"]
+    actions = ["supersede_runs"]
+
+    @admin.action(description="Supersede: give up on this run and rebuild")
+    def supersede_runs(self, request, queryset):
+        """Close the selected runs, so the trigger builds the next number.
+
+        :param request: The admin request.
+        :param queryset: The selected runs.
+        :return: None.
+        """
+        count = 0
+        for run in queryset.filter(superseded_at__isnull=True):
+            count += apply.supersede_runs(
+                run.scan,
+                f"Superseded from the admin by user {request.user.pk}",
+            )
+        self.message_user(request, f"Superseded {count} apply run(s).")
 
 
 @admin.register(PendingUpload)

@@ -215,8 +215,13 @@ def s3_job_attempt_key(job, suffix: str = ".json") -> str:
     :rtype: str
     """
     target = f"op{job.opinion_id}/" if job.opinion_id else ""
+    # The one-page shards of an apply run (#224) write under the run's
+    # own prefix, so a human reading the bucket sees them beside the
+    # final PDF they feed, and the volume stages' prefixes hold volume
+    # results only.
+    run_dir = f"apply/a{job.apply_run.number}/" if job.apply_run_id else ""
     return (
-        f"{s3_processing_prefix(job.scan)}{JOB_RESULTS_SUBDIR}"
+        f"{s3_processing_prefix(job.scan)}{JOB_RESULTS_SUBDIR}{run_dir}"
         f"{job.stage}/{job.engine}/{target}"
         f"r{job.run}-s{job.shard_index}-a{job.attempt}{suffix}"
     )

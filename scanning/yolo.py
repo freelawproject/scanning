@@ -180,7 +180,9 @@ def build_payload(job: ExternalJob, input_url: str, output_url: str) -> dict:
     }
 
 
-def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
+def ensure_detect_jobs(
+    scan, manifest: dict, *, apply_run=None
+) -> list[ExternalJob]:
     """Return the live detection jobs for ``scan``, creating them if the
     current run does not describe today's shard set.
 
@@ -199,6 +201,8 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
 
     :param scan: The scan to detect over.
     :param manifest: The committed shard manifest.
+    :param apply_run: The apply run (#224) whose one-page shards the
+        manifest describes, or None for the volume.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -209,6 +213,7 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
         engine=JobEngine.BLACKLETTER,
         provider=JobProvider.RUNPOD,
         reuse_results=True,
+        apply_run=apply_run,
     )
 
 
