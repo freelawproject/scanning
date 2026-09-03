@@ -381,26 +381,19 @@ def repair_queue(request: HttpRequest) -> HttpResponse:
     if reporter_filter:
         rows = rows.filter(scan__reporter__short_name=reporter_filter)
 
-    # Group by scan, in the order the query gives (newest scan first).
-    # The rows of one scan are adjacent, so one pass is enough.
-    groups: list[dict] = []
-    by_scan: dict[int, dict] = {}
-    for row in rows:
-        group = by_scan.get(row.scan_id)
-        if group is None:
-            group = {"scan": row.scan, "requests": []}
-            by_scan[row.scan_id] = group
-            groups.append(group)
-        group["requests"].append(row)
-
-    paginator = Paginator(groups, 50)
+    # Paginate the scans, then fetch the rows of the scans on the page.
+    # A row is never deleted, so a page that loaded every row first
+    # would grow with the history of the corpus.
+    paginator = Paginator(repairs.queue_scan_ids(rows), 50)
     page_obj = paginator.get_page(request.GET.get("page"))
+    groups = repairs.group_by_scan(rows, list(page_obj.object_list))
 
     return render(
         request,
         "scanning/repair_queue.html",
         {
             "page_obj": page_obj,
+            "groups": groups,
             "state": state,
             "states": repairs.QUEUE_STATES,
             "reporters": Reporter.objects.all(),

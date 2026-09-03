@@ -59,7 +59,6 @@ from scanning.views_process import (
     dismiss_page_repair,
     glued_output_index,
     page_edit_file,
-    page_repairs,
     process_actions,
     progress_api,
     recalculate,
@@ -212,9 +211,8 @@ urlpatterns = [
     ),
     path("scans/<int:pk>/rotate-page/", rotate_page, name="rotate_page"),
     path("scans/<int:pk>/dismiss-issue/", dismiss_issue, name="dismiss_issue"),
-    # The repair requests of a reviewer with no book (#249): ask, dismiss,
-    # and read back.
-    path("scans/<int:pk>/repair/", page_repairs, name="page_repairs"),
+    # The repair requests of a reviewer with no book (#249): ask, and
+    # dismiss.
     path(
         "scans/<int:pk>/repair/request/",
         request_page_repair,

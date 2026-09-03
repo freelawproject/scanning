@@ -311,11 +311,13 @@ is #206.
 A reviewer with no book finds a blurry page or a missing leaf, and
 cannot fix it. `models.PageRepairRequest` keeps the finding until a
 scanner does the work. The pieces: the model, `repairs.py` (queries
-and the derived state), three endpoints in `views_process.py`
-(`request_page_repair`, `dismiss_page_repair`, `page_repairs`), the
+and the derived state), two endpoints in `views_process.py`
+(`request_page_repair`, `dismiss_page_repair`), the
 `views.repair_queue` page at `/repairs/`, and the "Ask for a rescan"
-and "Ask for this page" buttons of step 1 (`viewer_step1.js`). What
-must not be broken:
+and "Ask for this page" buttons of step 1 (`viewer_step1.js`). A
+read-back endpoint was written and deleted before it shipped: nothing
+called it, and an endpoint nobody reaches still carries its surface
+(#219). What must not be broken:
 
 - **A request is not a `PageEdit`.** A `PageEdit` is a decision the
   apply builds into the volume; a request is work for a person. It
@@ -330,11 +332,18 @@ must not be broken:
   endpoint resolves both through `_pdf_page_of` and `_anchor_of`, so
   a page outside the volume is 404.
 - **Fulfilled is derived, never stamped.** `repairs.annotate_fulfilled`
-  marks a request whose address carries a standing `REPLACE_PAGE` or
-  `INSERT_PAGE` edit (neither stamp, same fingerprint or a blank one).
-  So the upload cannot race a stamp, an undo of the upload (#232)
-  reopens the request with no second writer, and the "Fulfilled" tab
-  of the queue costs one `Exists` subquery.
+  marks a request whose address carries a `REPLACE_PAGE` or
+  `INSERT_PAGE` edit that is **later than the request**, not
+  withdrawn, and either applied (#206) or made against the current
+  original. The date is load-bearing: a reviewer who finds the
+  replacement blurry too asks again, and without it that request is
+  born fulfilled and no scanner ever sees it. The applied clause is
+  too: the apply changes the fingerprint, so its own edits never match
+  the new original, and a rule on the fingerprint alone would reopen
+  every request the apply had just answered. So the upload cannot race
+  a stamp, an undo of the upload (#232) reopens the request with no
+  second writer, and the "Fulfilled" tab of the queue costs one
+  `Exists` subquery.
 - **Dismissed, never deleted.** `repairs.dismiss` stamps `dismissed_at`
   and `dismissed_by` (and writes `date_modified`, since `update()`
   skips `auto_now`). Any logged-in user may dismiss, the rule of every
@@ -342,14 +351,25 @@ must not be broken:
   address (`uniq_open_repair_request_per_address`, partial over
   `dismissed_at IS NULL`, `nulls_distinct=False`): a second request
   answers the first row with `created: false`.
-- **A stale request is marked, not dropped**: `repairs.is_stale` is
-  the fingerprint rule of `page_edits.is_stale`, and the viewer and
-  the queue show "earlier upload". Nothing applies a request, so
+- **A stale request is marked, not dropped**: `PageRepairRequest.is_stale`
+  (and `repairs.is_stale` for a caller holding the scan) is the
+  fingerprint rule of `page_edits.is_stale`. The step-1 viewer and the
+  queue page both show "EARLIER UPLOAD". Nothing applies a request, so
   nothing needs to refuse one.
 - **The note is escaped where it is drawn**: `escapeHtml` in the
-  viewer and the auto-escape in the templates. It is not narrowed,
-  because it is prose, not a page number; the label goes through
-  `_page_label` like every other label.
+  viewer, the auto-escape in the templates, and `json_script` for the
+  script block. It is not narrowed, because it is prose, not a page
+  number. The label goes through `_page_label` like every other label,
+  the fallback read off `ocr_results` included: a reading the
+  narrowing refuses is dropped, not stored.
+- **The queue page paginates scans, not rows** (`repairs.queue_scan_ids`
+  then `repairs.group_by_scan`): a row is never deleted, so the `all`
+  and `dismissed` states grow for good, and a page that loaded every
+  row first would grow with them.
+- **A missing leaf can be asked for only where a placeholder is
+  drawn**: the button sits on the `missing` entry the sequence
+  analysis produced. A gap the page numbers do not reveal has no
+  button yet.
 - **Step 1 draws everything from one list** (`SCAN_CONFIG.repairRequests`):
   the note on the page (with Dismiss while it waits), the `NEED`
   sidebar badge, the "Repairs requested" section and the header badge.

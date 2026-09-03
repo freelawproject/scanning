@@ -20,9 +20,9 @@ Three rules run through it:
 
 from __future__ import annotations
 
-from django.db.models import Exists, OuterRef, Q, QuerySet
+from django.db.models import Exists, F, OuterRef, Q, QuerySet
 from django.db.models.functions import Coalesce
-from django.utils import timezone
+from django.utils import formats, timezone
 
 from scanning.models import PageEdit, PageRepairRequest, Scan
 
@@ -38,11 +38,22 @@ QUEUE_STATES = ("waiting", "fulfilled", "dismissed", "all")
 def _fulfilling_edits():
     """Return the ``PageEdit`` rows that fulfil the outer request.
 
-    A standing insert in the gap fulfils an INSERT; a standing
-    replacement of the page fulfils a REPLACE. Standing means neither
-    stamp (#214, #232), and made against the same original: a stale
-    edit is not applied, so it fulfils nothing. A blank fingerprint on
-    either side matches anything, the rule of ``page_edits.is_stale``.
+    An insert in the gap fulfils an INSERT; a replacement of the page
+    fulfils a REPLACE. Three conditions, all needed:
+
+    - **The edit is later than the request.** A reviewer who finds the
+      replacement blurry too asks again, and an edit that was already
+      there when they asked answers nothing. Without the date, a
+      request over an address that holds an edit is born fulfilled and
+      no scanner ever sees it.
+    - **A curator has not taken it back** (#232).
+    - **The apply built it in, or it was made against the current
+      original.** An applied edit (#206) is done work, whatever the
+      fingerprint says: the apply changes the original, so its own
+      edits never match the new one. A standing edit against another
+      original is not applied and fulfils nothing. A blank fingerprint
+      on either side matches anything, the rule of
+      ``page_edits.is_stale``.
 
     :returns: A queryset for an ``Exists`` annotation.
     :rtype: QuerySet
@@ -52,6 +63,7 @@ def _fulfilling_edits():
         | Q(scan__source_fingerprint="")
         | Q(source_fingerprint=OuterRef("scan__source_fingerprint"))
     )
+    done_or_current = Q(applied_at__isnull=False) | same_original
     at_the_address = Q(
         kind=PageEdit.Kind.REPLACE_PAGE,
         pdf_page=OuterRef("pdf_page"),
@@ -60,11 +72,11 @@ def _fulfilling_edits():
         anchor_pdf_page=OuterRef("anchor_pdf_page"),
     )
     return PageEdit.objects.filter(
-        same_original,
+        done_or_current,
         at_the_address,
         scan=OuterRef("scan"),
-        applied_at__isnull=True,
         withdrawn_at__isnull=True,
+        date_created__gt=OuterRef("date_created"),
     )
 
 
@@ -72,7 +84,10 @@ def annotate_fulfilled(rows: QuerySet) -> QuerySet:
     """Add the derived ``fulfilled`` flag, and order by address.
 
     The address is whichever column the action uses, so the order
-    reads like the volume: a gap after page 1 sits before page 2.
+    reads like the volume: page 1, then the gap after page 1, then
+    page 2. A page sorts at twice its number and a gap one past the
+    page it follows, so the gap comes after that page and before the
+    next.
 
     :param rows: ``PageRepairRequest`` rows.
     :returns: The same rows, each with a boolean ``fulfilled`` and an
@@ -81,8 +96,8 @@ def annotate_fulfilled(rows: QuerySet) -> QuerySet:
     """
     return rows.annotate(
         fulfilled=Exists(_fulfilling_edits()),
-        sort_address=Coalesce("pdf_page", "anchor_pdf_page"),
-    ).order_by("scan_id", "sort_address", "action", "pk")
+        sort_address=Coalesce(F("pdf_page") * 2, F("anchor_pdf_page") * 2 + 1),
+    ).order_by("scan_id", "sort_address", "pk")
 
 
 def open_requests(scan: Scan) -> QuerySet:
@@ -109,6 +124,9 @@ def waiting_requests(scan: Scan) -> list[PageRepairRequest]:
 
 def is_stale(row: PageRepairRequest, scan: Scan) -> bool:
     """Return whether a request describes an earlier upload of the scan.
+
+    The same rule as ``PageRepairRequest.is_stale``, for a caller that
+    holds the scan already and does not want the row to load it.
 
     :param row: The request to judge.
     :param scan: The scan it belongs to.
@@ -157,7 +175,11 @@ def as_dict(row: PageRepairRequest, scan: Scan) -> dict:
         "logical_page": row.logical_page,
         "note": row.note,
         "requested_by": row.requested_by.username,
-        "date_created": row.date_created.strftime("%Y-%m-%d"),
+        # The queue template writes the same date with ``|date``, which
+        # localizes; so does this, or one request shows two dates.
+        "date_created": formats.date_format(
+            timezone.localtime(row.date_created), "Y-m-d"
+        ),
         "fulfilled": bool(getattr(row, "fulfilled", False)),
         "stale": is_stale(row, scan),
         "nav_pdf_index": row.nav_pdf_index,
@@ -200,7 +222,45 @@ def queue(state: str = "waiting") -> QuerySet:
         pass
     else:
         rows = rows.filter(dismissed_at__isnull=True, fulfilled=False)
-    return rows.order_by("-scan_id", "sort_address", "action", "pk")
+    return rows.order_by("-scan_id", "sort_address", "pk")
+
+
+def queue_scan_ids(rows: QuerySet) -> QuerySet:
+    """Return the ids of the scans the rows belong to, newest first.
+
+    The queue page is paginated by scan, not by row: one page of the
+    queue is one trip to the shelf. The ids are what the paginator
+    slices, so the database bounds the work by page size, and the rows
+    of one page are fetched by these ids alone. A row is never
+    deleted, so the ``all`` and ``dismissed`` states grow for good and
+    a page that loaded every row would grow with them.
+
+    :param rows: A queryset from :func:`queue`.
+    :returns: Distinct scan ids, one per group, newest first.
+    :rtype: QuerySet
+    """
+    return (
+        rows.order_by("-scan_id").values_list("scan_id", flat=True).distinct()
+    )
+
+
+def group_by_scan(rows: QuerySet, scan_ids: list[int]) -> list[dict]:
+    """Return the rows of the given scans, grouped and in id order.
+
+    :param rows: A queryset from :func:`queue`.
+    :param scan_ids: One page of :func:`queue_scan_ids`, in order.
+    :returns: ``[{"scan": scan, "requests": [row, ...]}, ...]`` in the
+        order of ``scan_ids``. A scan with no row on this page is left
+        out, which cannot happen for ids the same queryset produced.
+    :rtype: list[dict]
+    """
+    by_scan: dict[int, dict] = {}
+    for row in rows.filter(scan_id__in=scan_ids):
+        group = by_scan.setdefault(
+            row.scan_id, {"scan": row.scan, "requests": []}
+        )
+        group["requests"].append(row)
+    return [by_scan[pk] for pk in scan_ids if pk in by_scan]
 
 
 def waiting_count() -> int:

@@ -2480,7 +2480,10 @@ def _printed_number_of(scan: Scan, pdf_page: int) -> str:
 
     Read off the cached ``ocr_results``, which carries the curator's
     own numbers too (#214). A label only: the scanner reads it on the
-    Repairs page to find the leaf in the book.
+    Repairs page to find the leaf in the book. It goes through
+    ``_page_label`` like every other label, and a reading the narrowing
+    refuses is dropped: the narrowing is the first of the two layers,
+    and the blob is not a trusted source.
 
     :param scan: The scan.
     :param pdf_page: The 1-based page.
@@ -2489,7 +2492,7 @@ def _printed_number_of(scan: Scan, pdf_page: int) -> str:
     """
     for entry in scan.ocr_results or []:
         if entry.get("pdf_page") == pdf_page:
-            return str(entry.get("detected") or "")[:32]
+            return _page_label(str(entry.get("detected") or "")) or ""
     return ""
 
 
@@ -2585,20 +2588,12 @@ def dismiss_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-    rows = scan.repair_requests.filter(pk=data.get("request_id"))
+    try:
+        request_id = int(data.get("request_id"))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "Unknown request."}, status=404)
+    rows = scan.repair_requests.filter(pk=request_id)
     if not rows.exists():
         return JsonResponse({"error": "Unknown request."}, status=404)
     repairs.dismiss(rows, request.user)
     return JsonResponse({"status": "ok"})
-
-
-@login_required
-def page_repairs(request: HttpRequest, pk: int) -> JsonResponse:
-    """Return the scan's open repair requests, for a refresh in place.
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: JSON response with the open requests and their state.
-    """
-    scan = get_object_or_404(Scan, pk=pk)
-    return JsonResponse({"requests": repairs.viewer_payload(scan)})

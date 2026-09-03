@@ -1514,7 +1514,8 @@ class PageRepairRequest(AbstractDateTimeModel):
       reviewer asked for and who judged it unnecessary.
     - **Fulfilled is derived, not stamped.** A request is fulfilled
       when a standing ``INSERT_PAGE`` or ``REPLACE_PAGE`` edit exists
-      at its address (``repairs.fulfilled_edits``). No writer stamps
+      at its address (``repairs._fulfilling_edits``), and made after
+      the request. No writer stamps
       it, so the upload cannot race a stamp, and an undo of the upload
       (#232) reopens the request with no second writer.
     - **One open request per address.** The unique key is partial over
@@ -1659,6 +1660,21 @@ class PageRepairRequest(AbstractDateTimeModel):
         if self.action == self.Action.INSERT:
             return self.anchor_pdf_page
         return self.pdf_page
+
+    @property
+    def is_stale(self) -> bool:
+        """Return whether this request names an earlier upload of the scan.
+
+        A person judges a stale request; nothing applies it, so it is
+        marked and never dropped. Reads ``self.scan``, so a caller that
+        lists many rows joins the scan first.
+
+        :returns: Whether the fingerprints differ. A blank on either
+            side matches anything, the rule of ``page_edits.is_stale``.
+        :rtype: bool
+        """
+        mine, theirs = self.source_fingerprint, self.scan.source_fingerprint
+        return bool(mine and theirs and mine != theirs)
 
     @property
     def nav_pdf_index(self) -> int:

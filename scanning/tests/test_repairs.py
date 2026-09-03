@@ -12,6 +12,7 @@ import tempfile
 from django.db import IntegrityError, transaction
 from django.test import override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 from scanning import page_edits, repairs
 from scanning.factories import (
@@ -242,6 +243,16 @@ class TestRequestEndpoint(RepairTestCase):
             len(self.scan.repair_requests.get().note), repairs.NOTE_MAX_CHARS
         )
 
+    def test_a_reading_the_narrowing_refuses_is_dropped(self):
+        results = self.scan.ocr_results
+        results[1]["detected"] = "<img src=x onerror=alert(1)>"
+        self.scan.ocr_results = results
+        self.scan.save(update_fields=["ocr_results"])
+
+        self._replace(pdf_page=2)
+
+        self.assertEqual(self.scan.repair_requests.get().logical_page, "")
+
     def test_a_request_is_taken_in_any_status(self):
         self.scan.status = Status.PAGE_COMPLETENESS_REVIEW_DONE
         self.scan.save(update_fields=["status"])
@@ -292,6 +303,8 @@ class TestDismissEndpoint(RepairTestCase):
 
     def test_an_unknown_request_is_404(self):
         self.assertEqual(self._dismiss(999).status_code, 404)
+        self.assertEqual(self._dismiss("abc").status_code, 404)
+        self.assertEqual(self._dismiss(None).status_code, 404)
 
     def test_a_request_of_another_scan_is_404(self):
         other = ScanFactory(page_count=2)
@@ -397,6 +410,58 @@ class TestFulfilledIsDerived(RepairTestCase):
 
         self.assertTrue(repairs.open_requests(self.scan).get().fulfilled)
 
+    def test_an_edit_already_there_answers_nothing(self):
+        # A curator replaced the page; the reviewer finds the
+        # replacement blurry too and asks again. That request waits.
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+            source_fingerprint="100:3",
+        )
+
+        data = json.loads(self._replace(pdf_page=2).content)
+
+        self.assertTrue(data["created"])
+        self.assertFalse(data["request"]["fulfilled"])
+        self.assertEqual(len(repairs.waiting_requests(self.scan)), 1)
+        self.assertEqual(repairs.waiting_count(), 1)
+
+    def test_a_second_upload_after_the_request_fulfils_it(self):
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+            source_fingerprint="100:3",
+        )
+        self._replace(pdf_page=2)
+
+        self.client.post(
+            reverse("replace_page", kwargs={"pk": self.scan.pk}),
+            data={"image": self.make_image(), "pdf_page": 2},
+        )
+
+        self.assertEqual(repairs.waiting_requests(self.scan), [])
+
+    def test_an_applied_edit_fulfils_whatever_the_fingerprint(self):
+        # The apply (#206) rewrites the original, so its own edits
+        # never match the new fingerprint. They are done work.
+        self._replace(pdf_page=2)
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+            source_fingerprint="100:3",
+            applied_at=timezone.now(),
+        )
+        self.scan.source_fingerprint = "777:3"
+        self.scan.save(update_fields=["source_fingerprint"])
+
+        self.assertTrue(repairs.open_requests(self.scan).get().fulfilled)
+
     def test_a_request_is_not_a_page_edit(self):
         self._replace(pdf_page=2)
         self._insert(anchor=1)
@@ -440,6 +505,7 @@ class TestStepOneShowsTheRequests(RepairTestCase):
 
         response = self._step_one()
 
+        # Volume order: the gap after page 1 sits before page 2.
         rows = response.context["repair_requests"]
         self.assertEqual(
             [(r["action"], r["pdf_page"], r["anchor_pdf_page"]) for r in rows],
@@ -481,6 +547,18 @@ class TestStepOneShowsTheRequests(RepairTestCase):
         self.assertTrue(response.context["repair_requests"][0]["fulfilled"])
         self.assertNotContains(response, "NEED")
 
+    def test_a_gap_sorts_after_the_page_it_follows(self):
+        self._insert(anchor=2, label="3a")
+        self._replace(pdf_page=2)
+        self._replace(pdf_page=3)
+
+        rows = repairs.viewer_payload(self.scan)
+
+        self.assertEqual(
+            [(r["action"], r["pdf_page"], r["anchor_pdf_page"]) for r in rows],
+            [("replace", 2, None), ("insert", None, 2), ("replace", 3, None)],
+        )
+
     def test_a_dismissed_request_is_absent(self):
         row_id = json.loads(self._replace(pdf_page=2).content)["request"]["id"]
         self._dismiss(row_id)
@@ -488,18 +566,6 @@ class TestStepOneShowsTheRequests(RepairTestCase):
         response = self._step_one()
 
         self.assertEqual(response.context["repair_requests"], [])
-
-    def test_the_read_back_endpoint(self):
-        self._replace(pdf_page=2)
-
-        response = self.client.get(
-            reverse("page_repairs", kwargs={"pk": self.scan.pk})
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            json.loads(response.content)["requests"][0]["pdf_page"], 2
-        )
 
 
 class TestRepairQueue(RepairTestCase):
@@ -538,7 +604,7 @@ class TestRepairQueue(RepairTestCase):
 
         self.assertEqual(response.status_code, 200)
         # Newest scan first, so a scanner sees the volume last worked on.
-        groups = list(response.context["page_obj"])
+        groups = response.context["groups"]
         self.assertEqual(
             [g["scan"].pk for g in groups], [self.other.pk, self.scan.pk]
         )
@@ -560,11 +626,11 @@ class TestRepairQueue(RepairTestCase):
         dismissed = self._queue(state="dismissed")
 
         self.assertEqual(
-            [g["scan"].pk for g in waiting.context["page_obj"]],
+            [g["scan"].pk for g in waiting.context["groups"]],
             [self.other.pk],
         )
         self.assertEqual(
-            [g["scan"].pk for g in dismissed.context["page_obj"]],
+            [g["scan"].pk for g in dismissed.context["groups"]],
             [self.scan.pk],
         )
         self.assertContains(dismissed, "Dismissed")
@@ -583,11 +649,11 @@ class TestRepairQueue(RepairTestCase):
         fulfilled = self._queue(state="fulfilled")
 
         self.assertEqual(
-            [g["scan"].pk for g in waiting.context["page_obj"]],
+            [g["scan"].pk for g in waiting.context["groups"]],
             [self.other.pk],
         )
         self.assertEqual(
-            [g["scan"].pk for g in fulfilled.context["page_obj"]],
+            [g["scan"].pk for g in fulfilled.context["groups"]],
             [self.scan.pk],
         )
         self.assertContains(fulfilled, "Fulfilled")
@@ -598,9 +664,44 @@ class TestRepairQueue(RepairTestCase):
         response = self._queue(reporter=self.scan.reporter.short_name)
 
         self.assertEqual(
-            [g["scan"].pk for g in response.context["page_obj"]],
+            [g["scan"].pk for g in response.context["groups"]],
             [self.scan.pk],
         )
+
+    def test_a_stale_request_is_marked_on_the_queue_page(self):
+        self._replace(pdf_page=2)
+        self.scan.source_fingerprint = "200:3"
+        self.scan.save(update_fields=["source_fingerprint"])
+
+        response = self._queue()
+
+        self.assertContains(response, "EARLIER UPLOAD", count=1)
+        self.assertTrue(
+            [r for r in response.context["groups"][1]["requests"]][0].is_stale
+        )
+
+    def test_the_queue_paginates_scans_and_reads_one_page_of_rows(self):
+        # Fifty-one scans with one waiting request each, plus the two
+        # of setUp: the second page holds the oldest three.
+        for _ in range(51):
+            scan = ScanFactory(page_count=1)
+            PageRepairRequest.objects.create(
+                scan=scan,
+                requested_by=self.user,
+                action=PageRepairRequest.Action.REPLACE,
+                pdf_page=1,
+            )
+        self._replace(pdf_page=2)
+
+        first = self._queue()
+        second = self._queue(page=2)
+
+        self.assertEqual(len(first.context["groups"]), 50)
+        self.assertEqual(
+            [g["scan"].pk for g in second.context["groups"]][-2:],
+            [self.other.pk, self.scan.pk],
+        )
+        self.assertEqual(second.context["page_obj"].paginator.num_pages, 2)
 
     def test_an_unknown_state_reads_as_waiting(self):
         response = self._queue(state="bogus")
