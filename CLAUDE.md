@@ -334,16 +334,21 @@ called it, and an endpoint nobody reaches still carries its surface
 - **Fulfilled is derived, never stamped.** `repairs.annotate_fulfilled`
   marks a request whose address carries a `REPLACE_PAGE` or
   `INSERT_PAGE` edit that is **later than the request**, not
-  withdrawn, and either applied (#206) or made against the current
-  original. The date is load-bearing: a reviewer who finds the
+  withdrawn, and made against the **same upload** (same fingerprint,
+  or a blank one). The date is load-bearing: a reviewer who finds the
   replacement blurry too asks again, and without it that request is
-  born fulfilled and no scanner ever sees it. The applied clause is
-  too: the apply changes the fingerprint, so its own edits never match
-  the new original, and a rule on the fingerprint alone would reopen
-  every request the apply had just answered. So the upload cannot race
-  a stamp, an undo of the upload (#232) reopens the request with no
-  second writer, and the "Fulfilled" tab of the queue costs one
+  born fulfilled and no scanner ever sees it. `applied_at` is **not**
+  read: it says whether a decision is built into an output, and the
+  fingerprint says which upload it is counted against. The two are
+  independent, and neither overrides the other. So the upload cannot
+  race a stamp, an undo of the upload (#232) reopens the request with
+  no second writer, and the "Fulfilled" tab of the queue costs one
   `Exists` subquery.
+- **The original never changes.** Every address is a page of the
+  original as uploaded, and the apply (#206) writes another file and
+  leaves it alone. So an apply never invalidates an address, and a
+  request goes stale for one reason only: somebody re-uploaded the
+  volume. The same holds for `PageEdit.source_fingerprint`.
 - **Dismissed, never deleted.** `repairs.dismiss` stamps `dismissed_at`
   and `dismissed_by` (and writes `date_modified`, since `update()`
   skips `auto_now`). Any logged-in user may dismiss, the rule of every

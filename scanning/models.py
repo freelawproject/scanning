@@ -1522,9 +1522,10 @@ class PageRepairRequest(AbstractDateTimeModel):
       the rows with no dismissal. A second request for the same page
       answers the first row. A dismissed row frees the address.
     - **``source_fingerprint`` is the scan's** at the time of the
-      request. A request made against an earlier upload is shown with
-      a mark, never dropped: it is for a person, and the person judges
-      it.
+      request. The original never changes (the apply writes another
+      file), so it moves only when somebody re-uploads the volume. A
+      request made against an earlier upload is shown with a mark,
+      never dropped: it is for a person, and the person judges it.
     """
 
     class Action(models.TextChoices):

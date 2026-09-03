@@ -445,10 +445,11 @@ class TestFulfilledIsDerived(RepairTestCase):
 
         self.assertEqual(repairs.waiting_requests(self.scan), [])
 
-    def test_an_applied_edit_fulfils_whatever_the_fingerprint(self):
-        # The apply (#206) rewrites the original, so its own edits
-        # never match the new fingerprint. They are done work.
-        self._replace(pdf_page=2)
+    def test_an_applied_edit_against_an_earlier_upload_fulfils_nothing(self):
+        # The original never changes: the apply (#206) writes another
+        # file. So the fingerprint moves only on a re-upload, and an
+        # edit applied against the earlier upload names a leaf of
+        # another book, whatever its stamp says.
         PageEditFactory(
             scan=self.scan,
             kind=PageEdit.Kind.REPLACE_PAGE,
@@ -459,6 +460,30 @@ class TestFulfilledIsDerived(RepairTestCase):
         )
         self.scan.source_fingerprint = "777:3"
         self.scan.save(update_fields=["source_fingerprint"])
+        self._replace(pdf_page=2)
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+            source_fingerprint="100:3",
+            applied_at=timezone.now(),
+        )
+
+        self.assertFalse(repairs.open_requests(self.scan).get().fulfilled)
+
+    def test_an_applied_edit_against_this_upload_fulfils(self):
+        # ``applied_at`` answers "is it built into an output?", not
+        # "which upload is it counted against?". Done work fulfils.
+        self._replace(pdf_page=2)
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+            source_fingerprint="100:3",
+            applied_at=timezone.now(),
+        )
 
         self.assertTrue(repairs.open_requests(self.scan).get().fulfilled)
 

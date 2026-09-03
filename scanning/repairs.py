@@ -47,13 +47,17 @@ def _fulfilling_edits():
       request over an address that holds an edit is born fulfilled and
       no scanner ever sees it.
     - **A curator has not taken it back** (#232).
-    - **The apply built it in, or it was made against the current
-      original.** An applied edit (#206) is done work, whatever the
-      fingerprint says: the apply changes the original, so its own
-      edits never match the new one. A standing edit against another
-      original is not applied and fulfils nothing. A blank fingerprint
-      on either side matches anything, the rule of
-      ``page_edits.is_stale``.
+    - **It was made against the same upload of the original.** Every
+      address is a page of the original as uploaded, and the original
+      never changes: the apply (#206) writes another file and leaves
+      it alone. So the fingerprint moves for one reason only, a
+      re-upload, and an edit counted against the earlier upload names
+      a leaf of another book. A blank fingerprint on either side
+      matches anything, the rule of ``page_edits.is_stale``.
+
+    ``applied_at`` is not read. It answers a different question, "is
+    this decision built into an output?", and an applied edit against
+    the current upload is done work that fulfils like a standing one.
 
     :returns: A queryset for an ``Exists`` annotation.
     :rtype: QuerySet
@@ -63,7 +67,6 @@ def _fulfilling_edits():
         | Q(scan__source_fingerprint="")
         | Q(source_fingerprint=OuterRef("scan__source_fingerprint"))
     )
-    done_or_current = Q(applied_at__isnull=False) | same_original
     at_the_address = Q(
         kind=PageEdit.Kind.REPLACE_PAGE,
         pdf_page=OuterRef("pdf_page"),
@@ -72,7 +75,7 @@ def _fulfilling_edits():
         anchor_pdf_page=OuterRef("anchor_pdf_page"),
     )
     return PageEdit.objects.filter(
-        done_or_current,
+        same_original,
         at_the_address,
         scan=OuterRef("scan"),
         withdrawn_at__isnull=True,
