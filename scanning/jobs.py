@@ -198,9 +198,10 @@ def _providers() -> dict[str, ProviderSpec]:
 
     **Insertion order is wave order.** :func:`submit_pending` walks this
     dict: the non-blocking RunPod wave goes first, Mistral's wave (it
-    renders and uploads, so it blocks for tens of seconds a shard)
-    second, and doctor's wave, which holds a socket for a whole
-    conversion, last. See :func:`submit_pending` for why.
+    renders and uploads one shard per tick, which blocks for as long
+    as that shard takes) second, and doctor's wave, which holds a
+    socket for a whole conversion, last. See :func:`submit_pending`
+    for why.
 
     Rebuilt on each call, and deliberately not cached: the entries read
     functions off the stage modules at build time, so a test that

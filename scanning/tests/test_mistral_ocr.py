@@ -154,6 +154,23 @@ class TestEnsureExtractJobs(ScanningTestCase):
         self.assertNotEqual(first.input_manifest["rects_digest"], empty)
         self.assertEqual(second.input_manifest["rects_digest"], empty)
 
+    def test_the_row_carries_its_shard_s_rects(self):
+        # The render reads the row, never the scan, so the row holds
+        # the rects its digest names -- restricted to its own pages,
+        # keyed by the volume page as a string (JSON has no int keys).
+        scan = ScanFactory(redaction_rects=RECTS)
+        first, second = mistral_ocr.ensure_extract_jobs(
+            scan, make_manifest(shard_count=2, pages_per_shard=10)
+        )
+        self.assertEqual(
+            first.input_manifest["rects"], {"1": RECTS[0]["rects"]}
+        )
+        self.assertEqual(second.input_manifest["rects"], {})
+        self.assertEqual(
+            mistral_ocr.shard_rects(first), {1: RECTS[0]["rects"]}
+        )
+        self.assertEqual(mistral_ocr.shard_rects(second), {})
+
     def test_the_same_rects_give_the_same_digest(self):
         by_page = mistral_ocr.page_rects(ScanFactory(redaction_rects=RECTS))
         self.assertEqual(
@@ -412,6 +429,27 @@ class TestSubmitWave(ScanningTestCase):
         png = mocks["upload"].call_args_list[0].args[1]
         self.assertEqual(png_image(png).getpixel((400, 400)), (255, 255, 255))
 
+    def test_a_box_edited_after_the_press_does_not_reach_this_run(self):
+        # Shards queue behind MAX_CONCURRENCY, so a curator can edit a
+        # box between the press and the submit tick. The row's identity
+        # names the rects at the press; the pages must carry those, or
+        # the identity would describe an input the PNG did not have.
+        moved = [
+            {
+                "page_index": 1,
+                "rects": [{**RECTS[0]["rects"][0], "x0": 1000, "x1": 1400}],
+            }
+        ]
+        self.scan.redaction_rects = moved
+        self.scan.save(update_fields=["redaction_rects"])
+
+        _, mocks = self._tick()
+
+        png = png_image(mocks["upload"].call_args_list[1].args[1])
+        # The old box, from the row: black. The new one: untouched.
+        self.assertEqual(png.getpixel((400, 400)), (0, 0, 0))
+        self.assertEqual(png.getpixel((1200, 400)), (255, 255, 255))
+
     def test_a_row_may_override_the_model(self):
         job = extract_jobs(self.scan)[0]
         ExternalJob.objects.filter(pk=job.pk).update(
@@ -509,15 +547,41 @@ class TestSubmitWave(ScanningTestCase):
         mocks["cancel"].assert_called_once_with("batch-1")
         self.assertEqual(mocks["delete"].call_count, 3)
 
-    def test_the_wave_is_capped_by_the_module_constant(self):
+    def test_one_shard_per_tick(self):
+        # The wave blocks the serial scheduler for as long as a shard
+        # takes, so a tick renders and submits one shard, whatever the
+        # in-flight room.
         scan = ScanFactory(redaction_rects=RECTS)
         mistral_ocr.ensure_extract_jobs(
             scan, make_manifest(shard_count=3, pages_per_shard=2)
         )
-        with patch.object(mistral_ocr, "MAX_CONCURRENCY", 2):
+        summary, _ = self._tick(upload=["f"] * 12, create="batch-1")
+        self.assertEqual(summary.submitted, 1)
+        # The next tick takes the next shard: the per-tick cap is not
+        # the in-flight cap, so a volume keeps draining while its
+        # batches wait at Mistral.
+        summary, _ = self._tick(upload=["f"] * 12, create="batch-2")
+        self.assertEqual(summary.submitted, 1)
+        statuses = [
+            job.status
+            for job in ExternalJob.objects.filter(engine=JobEngine.MISTRAL_OCR)
+        ]
+        self.assertEqual(statuses.count(JobStatus.SUBMITTED), 2)
+
+    def test_the_in_flight_cap_holds_a_tick_back(self):
+        scan = ScanFactory(redaction_rects=RECTS)
+        mistral_ocr.ensure_extract_jobs(
+            scan, make_manifest(shard_count=3, pages_per_shard=2)
+        )
+        with (
+            patch.object(mistral_ocr, "MAX_CONCURRENCY", 2),
+            patch.object(mistral_ocr, "MAX_SUBMITS_PER_TICK", 10),
+        ):
             summary, _ = self._tick(upload=["f"] * 12, create="batch-1")
-        # One shard from setUp plus two of the three new ones.
-        self.assertEqual(summary.submitted, 2)
+            self.assertEqual(summary.submitted, 2)
+            summary, _ = self._tick(upload=["f"] * 12, create="batch-2")
+        # Two in flight at a cap of two: nothing more this tick.
+        self.assertEqual(summary.submitted, 0)
 
 
 # ── the sweep ───────────────────────────────────────────────────────

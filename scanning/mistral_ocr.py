@@ -30,10 +30,13 @@ Mistral, and must not be broken:
   by its black placeholder. Our rects are 200 dpi pixels and the
   branch's space is 1700x2200; those are one space on a US letter page
   and the rect is scaled on any other.
-- **The rects are part of the shard identity** (``rects_digest`` in
-  ``input_manifest``): a curator who moves a box changes the identity,
-  so the next run re-reads that shard alone and the carry keeps the
-  rest.
+- **The rects are part of the shard identity, and the row carries
+  them** (``rects_digest`` and ``rects`` in ``input_manifest``): a
+  curator who moves a box changes the identity, so the next run
+  re-reads that shard alone and the carry keeps the rest. The render
+  reads the row's rects, never the scan's, so a box edited between the
+  press and the submit tick reaches the next run and not this row's
+  pages.
 - **The deadline is Mistral's own timeout**, stamped once at the first
   claim and never restamped on ``RUNNING``: a batch is queued and run
   inside one budget Mistral enforces.
@@ -41,6 +44,10 @@ Mistral, and must not be broken:
   Every page image, the manifest and the two output files live at
   Mistral until we delete them, so every path that writes a row off
   deletes what it uploaded.
+- **The wave blocks the serial scheduler, so it takes one shard per
+  tick** (``MAX_SUBMITS_PER_TICK``). A full shard is minutes of render
+  and sequential upload; the in-flight cap (``MAX_CONCURRENCY``) is a
+  separate number, so a volume keeps draining while its batches wait.
 - **The source is the original scan, never the bitonal copy.** Rachel's
   tests all ran on non-bitonal images (#case-law-extraction,
   2026-08-04), and the shards are cut from the original. ``SOURCE`` is
@@ -105,8 +112,21 @@ TABLE_FORMAT = "html"
 
 #: Batch jobs in flight at once, not pages. A debug guard on blast
 #: radius, not a cost control: Mistral bills per page whatever the
-#: parallelism.
+#: parallelism. A batch waits at Mistral for hours, so this must stay
+#: well above ``MAX_SUBMITS_PER_TICK`` or a volume drains one batch
+#: latency at a time.
 MAX_CONCURRENCY = 4
+
+#: Shards rendered, uploaded and submitted on one submit tick. **One,
+#: because the wave blocks the daemon's serial scheduler** (#156) for
+#: as long as the slowest shard takes: a 100-page shard is 100 renders
+#: (about 160 ms each for a synthetic page, more for a 200 dpi scan)
+#: and 100 uploads of 2-4 MB in sequence -- minutes, not seconds --
+#: and every poll, the glue and both applies wait behind it. One shard
+#: per tick caps that wait at one shard. Raising it, or parallel
+#: uploads inside a shard, or a render off the tick (as #196 did for
+#: its geometry), waits for a measurement on a real volume.
+MAX_SUBMITS_PER_TICK = 1
 
 #: Submissions a row gets before it is failed. Two, because a lost
 #: create may have made a job nothing we hold names, and every attempt
@@ -206,16 +226,43 @@ def rects_digest(
 def _rects_identity(scan, identity: dict) -> dict:
     """Return the identity keys this engine adds to one shard.
 
+    The digest names the input, and the rects themselves ride beside
+    it, so the render reads the row and never the scan: a curator who
+    edits a box between the button press and the submit tick (shards
+    queue behind ``MAX_CONCURRENCY``, so that window is minutes on a
+    large volume) changes the *next* run, not the pages this row paints.
+    Without the snapshot the identity would describe rects the PNG did
+    not carry.
+
     :param scan: The scan the shard belongs to.
     :param identity: The shard's base identity (pages, size).
-    :returns: ``{"rects_digest": ...}``.
+    :returns: ``{"rects_digest": ..., "rects": {page_index: [...]}}``,
+        the rects restricted to the shard's pages, keyed by the volume
+        page index as a string (JSON has no integer keys).
     :rtype: dict
     """
+    by_page = page_rects(scan)
+    from_page, to_page = identity["from_page"], identity["to_page"]
     return {
-        "rects_digest": rects_digest(
-            page_rects(scan), identity["from_page"], identity["to_page"]
-        )
+        "rects_digest": rects_digest(by_page, from_page, to_page),
+        "rects": {
+            str(index): by_page[index]
+            for index in range(from_page, to_page + 1)
+            if index in by_page
+        },
     }
+
+
+def shard_rects(job: ExternalJob) -> dict[int, list[dict]]:
+    """Return the rects a row's pages are painted with, off the row.
+
+    :param job: The row.
+    :returns: ``{volume_page_index: [rect, ...]}`` from
+        ``input_manifest["rects"]``; empty for a row with none.
+    :rtype: dict[int, list[dict]]
+    """
+    stored = (job.input_manifest or {}).get("rects") or {}
+    return {int(index): list(rects) for index, rects in stored.items()}
 
 
 def ensure_extract_jobs(
@@ -433,19 +480,18 @@ def _manifest_line(page_no: int, file_id: str, model: str) -> str:
     )
 
 
-def _prepare_and_submit(
-    job: ExternalJob, rects_by_page: dict[int, list[dict]]
-) -> _Submission:
+def _prepare_and_submit(job: ExternalJob) -> _Submission:
     """Render, upload and submit one shard. Runs on a worker thread.
 
     No database access here: the row's fields were read on the main
-    thread, and every write happens there afterwards. On any failure
-    the files uploaded so far are deleted, because nothing will name
-    them: a failed create left no job, and a lost create left a job
-    nothing we hold names.
+    thread, and every write happens there afterwards. The rects come
+    off the row (:func:`shard_rects`), never off the scan, so the pages
+    carry exactly what the row's identity says. On any failure the
+    files uploaded so far are deleted, because nothing will name them:
+    a failed create left no job, and a lost create left a job nothing
+    we hold names.
 
     :param job: The claimed row.
-    :param rects_by_page: The scan's rects, from :func:`page_rects`.
     :returns: The submission.
     :raises Exception: Whatever the download, the render or the API
         raised; classified by :func:`_apply_outcome`.
@@ -453,6 +499,7 @@ def _prepare_and_submit(
     started = time.monotonic()
     manifest = job.input_manifest or {}
     from_page = int(manifest.get("from_page") or 0)
+    rects_by_page = shard_rects(job)
     model = model_for(job)
     files: list[str] = []
     try:
@@ -591,9 +638,16 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
     pool can start them at once, so a SUBMITTED row is genuinely in
     flight.
 
+    Two caps, on purpose. :data:`MAX_CONCURRENCY` bounds the batches in
+    flight at Mistral; :data:`MAX_SUBMITS_PER_TICK` bounds how many
+    shards this tick renders and uploads, which is what blocks the
+    serial scheduler. The first keeps a volume draining while batches
+    wait for hours; the second keeps every other daemon task waiting
+    for one shard at most.
+
     :param summary: Counts to update.
-    :param limit: Concurrency override; defaults to
-        :data:`MAX_CONCURRENCY`.
+    :param limit: In-flight override; defaults to
+        :data:`MAX_CONCURRENCY`. The per-tick cap is not overridden.
     :return: None.
     """
     ours = ExternalJob.objects.filter(
@@ -604,7 +658,7 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
     room = jobs._room_for(ours, int(limit or MAX_CONCURRENCY), "Mistral OCR")
     if not room:
         return
-    pending = jobs._pending_slice(ours, room)
+    pending = jobs._pending_slice(ours, min(room, MAX_SUBMITS_PER_TICK))
     if not pending:
         return
 
@@ -613,15 +667,12 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
     if not claimed:
         return
 
-    # Read on this thread: the rects come off the scan row.
-    rects = {job.pk: page_rects(job.scan) for job, _ in claimed}
     logger.info(
         "rendering and submitting %d shard(s) to Mistral", len(claimed)
     )
     with ThreadPoolExecutor(max_workers=len(claimed)) as pool:
         futures = [
-            (job, pool.submit(_prepare_and_submit, job, rects[job.pk]))
-            for job, _ in claimed
+            (job, pool.submit(_prepare_and_submit, job)) for job, _ in claimed
         ]
     for job, future in futures:
         exc: Exception | None = None

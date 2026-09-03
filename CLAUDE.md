@@ -695,6 +695,15 @@ broken:
   them on any other size (the branch does not, and is wrong there).
   The source is the **original** scan: Rachel's tests all ran on
   non-bitonal images, and the shards are cut from it.
+- **The wave takes one shard per tick** (`MAX_SUBMITS_PER_TICK` = 1),
+  because it blocks the serial scheduler (#156) for as long as the
+  shard takes: 100 renders (about 160 ms each for a synthetic page,
+  more for a 200 dpi scan) plus 100 uploads of 2-4 MB in sequence is
+  minutes, and every poll, the glue and both applies wait behind it.
+  `MAX_CONCURRENCY` (batches in flight) is a separate number and must
+  stay above it, or a volume drains one batch latency at a time.
+  Parallel uploads inside a shard, or a render off the tick as #196
+  did for its geometry, wait for a measurement on a real volume.
 - **The harvest stores everything Mistral returned, whole.** The
   result document at `result_key` holds every output line and every
   error line verbatim, plus the batch job object; the only thing read
@@ -705,11 +714,15 @@ broken:
   `_complete`. Nothing presigned is handed out (`presigned_ttl=None` in
   the table, and `_claim` signs nothing). A failed PUT leaves the row
   in flight and the next tick downloads the output again.
-- **The rects are part of the shard identity** (`rects_digest`,
-  through the `extend_identity` hook of `ensure_shard_jobs`). A moved
-  box changes one shard's identity, so the next run re-reads that
-  shard alone and carries the rest. `page_rects` is the one reader of
-  where the rects live, for #241.
+- **The rects are part of the shard identity, and the row carries
+  them** (`rects_digest` and `rects` in `input_manifest`, through the
+  `extend_identity` hook of `ensure_shard_jobs`). A moved box changes
+  one shard's identity, so the next run re-reads that shard alone and
+  carries the rest. The render reads `shard_rects(job)`, never the
+  scan: shards queue behind `MAX_CONCURRENCY`, so a box edited between
+  the press and the submit tick must reach the next run, not this
+  row's pages under an identity that says otherwise. `page_rects` is
+  the one reader of where the rects live on the scan, for #241.
 - **The deadline is Mistral's own `timeout_hours` plus one hour**,
   stamped at the first claim and never restamped on `RUNNING`
   (`run_deadline=None`): a batch is queued and run inside one budget
@@ -1107,7 +1120,7 @@ difference between the two outputs: a third engine is one entry.
   down, so the top mtime is only the creation time.
 - The sweep also reclaims leaked `TemporaryDirectory` scratch dirs
   (`bitonal.MERGE_TMP_PREFIX`, `dots_mocr.GLUE_TMP_PREFIX`,
-  `yolo.MERGE_TMP_PREFIX`) that a
+  `yolo.MERGE_TMP_PREFIX`, `mistral_ocr.RENDER_TMP_PREFIX`) that a
   SIGKILL orphans in the system temp dir. Off under TESTING; the
   command's tests point `gettempdir` at a scratch root.
 
