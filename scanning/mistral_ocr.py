@@ -72,12 +72,10 @@ from PIL import Image
 
 from scanning import jobs, mistral_client, s3_sync
 from scanning.models import (
-    DEAD_JOB_STATUSES,
     ExternalJob,
     JobEngine,
     JobProvider,
     JobStage,
-    JobStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -536,25 +534,21 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
         :data:`MAX_CONCURRENCY`. The per-tick cap is not overridden.
     :return: None.
     """
-    ours = ExternalJob.objects.filter(
-        provider=JobProvider.MISTRAL,
-        stage=JobStage.EXTRACT,
-        engine=JobEngine.MISTRAL_OCR,
+    claimed = jobs.claim_for_wave(
+        ExternalJob.objects.filter(
+            provider=JobProvider.MISTRAL,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+        ),
+        int(limit or MAX_CONCURRENCY),
+        "Mistral OCR",
+        summary,
+        per_tick=MAX_SUBMITS_PER_TICK,
+        # DEBUG for the "cap reached" line: a batch waits at Mistral
+        # for hours, so at INFO a full cap would write one line per
+        # tick (every 5 s) for the whole wait.
+        level=logging.DEBUG,
     )
-    # DEBUG for the "cap reached" line: a batch waits at Mistral for
-    # hours, so at INFO a full cap would write one line per tick (every
-    # 5 s) for the whole wait.
-    room = jobs._room_for(
-        ours, int(limit or MAX_CONCURRENCY), "Mistral OCR", logging.DEBUG
-    )
-    if not room:
-        return
-    pending = jobs._pending_slice(ours, min(room, MAX_SUBMITS_PER_TICK))
-    if not pending:
-        return
-
-    now = timezone.now()
-    claimed = jobs._claim_wave(pending, now, summary)
     if not claimed:
         return
 
@@ -577,17 +571,6 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
 
 
 # ── the sweep ───────────────────────────────────────────────────────
-def _count(summary: jobs.SweepSummary, result: str) -> None:
-    """Add one retry or failure outcome to a sweep summary.
-
-    :param summary: Counts to update.
-    :param result: What ``_retry_or_fail`` or ``_fail`` answered.
-    :return: None.
-    """
-    if result in ("retried", "failed"):
-        setattr(summary, result, getattr(summary, result) + 1)
-
-
 def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     """Poll one batch and apply what it said.
 
@@ -603,7 +586,7 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     :return: None.
     """
     if not job.external_id:
-        _count(
+        jobs.count_sweep_outcome(
             summary,
             jobs._retry_or_fail(
                 job,
@@ -617,65 +600,52 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     outcome = mistral_client.poll_batch(
         job.external_id, label=f"scan {job.scan_id} shard {job.shard_index}"
     )
+    jobs.apply_poll_outcome(
+        job,
+        outcome,
+        now,
+        summary,
+        on_complete=_harvest_outcome,
+        on_progress=_record_progress,
+    )
 
-    if outcome.status is None:
-        # We learned nothing, which is not the same as learning it
-        # failed. The deadline check below still ends a row whose
-        # status call is permanently unhappy. A lost write means another
-        # writer took the row: it is theirs to judge now.
-        if not jobs._write(job, last_polled_at=now):
-            return
-        summary.pending += 1
-    elif outcome.status == JobStatus.COMPLETED:
-        if harvest(job, outcome, now):
-            summary.completed += 1
-        else:
-            # The output is still at Mistral; the next tick downloads
-            # it again. Counted as a check error, like an S3 blip.
-            summary.errors += 1
-        return
-    elif outcome.status in DEAD_JOB_STATUSES:
-        if outcome.retriable:
-            result = jobs._retry_or_fail(
-                job, outcome.error_code, outcome.error_message, now
-            )
-        else:
-            result = (
-                "failed"
-                if jobs._fail(job, outcome.error_code, outcome.error_message)
-                else "skipped"
-            )
-        _count(summary, result)
-        return
-    else:
-        meta = dict(job.provider_meta or {})
-        meta["progress"] = {
-            "status": outcome.provider_status,
-            "total": outcome.total,
-            "succeeded": outcome.succeeded,
-            "failed": outcome.failed,
-        }
-        if not jobs._write(
-            job,
-            status=outcome.status,
-            last_polled_at=now,
-            provider_meta=meta,
-        ):
-            return
-        summary.pending += 1
 
-    if job.is_overdue(now):
-        summary.pending -= 1
-        _count(
-            summary,
-            jobs._retry_or_fail(
-                job,
-                "DEADLINE_EXCEEDED",
-                f"still {outcome.provider_status or job.status} at "
-                f"{job.deadline}",
-                now,
-            ),
-        )
+def _harvest_outcome(job: ExternalJob, outcome, now) -> str:
+    """Apply a finished batch: nothing wrote our result object but us.
+
+    :param job: The row Mistral reports finished.
+    :param outcome: The poll result.
+    :param now: Completion timestamp.
+    :returns: The outcome label to count. A failed harvest counts as a
+        check error, like an S3 blip: the output is still at Mistral
+        and the next tick downloads it again.
+    :rtype: str
+    """
+    return "completed" if harvest(job, outcome, now) else "errors"
+
+
+def _record_progress(job: ExternalJob, outcome, now) -> bool:
+    """Store a running batch's line counts on the row.
+
+    :param job: The in-flight row.
+    :param outcome: The poll result.
+    :param now: Current time.
+    :returns: Whether the write won its compare-and-swap.
+    :rtype: bool
+    """
+    meta = dict(job.provider_meta or {})
+    meta["progress"] = {
+        "status": outcome.provider_status,
+        "total": outcome.total,
+        "succeeded": outcome.succeeded,
+        "failed": outcome.failed,
+    }
+    return jobs._write(
+        job,
+        status=outcome.status,
+        last_polled_at=now,
+        provider_meta=meta,
+    )
 
 
 def harvest(

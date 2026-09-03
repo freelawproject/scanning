@@ -36,7 +36,13 @@ trade stands: about 600 of the lines here are provider-agnostic and
 stay in one place -- every compare-and-swap, the attempt bookkeeping,
 the run reuse, the carry -- and a provider entry holds only what its
 transport forces. **Do not answer a fourth provider by copying a wave
-or a sweep**: add an entry.
+or a sweep**: add an entry, and call the three shared pieces the
+entry's own functions are built from --- :func:`claim_for_wave` (the
+prologue of every wave), :func:`apply_poll_outcome` (the cascade of
+every poll) and :func:`count_sweep_outcome` (the one spelling of
+counting one). Mistral arrived by copying the poll cascade whole, and
+the ``summary.pending`` order and the "we learned nothing is not we
+learned it failed" rule then lived in two places.
 
 Four properties are load-bearing and easy to break:
 
@@ -1825,6 +1831,50 @@ def _claim_wave(
     return claimed
 
 
+def claim_for_wave(
+    queryset,
+    cap: int,
+    label: str,
+    summary: SubmitSummary,
+    *,
+    per_tick: int | None = None,
+    level: int = logging.INFO,
+) -> list[tuple[ExternalJob, tuple]]:
+    """Claim the rows one submit wave may send, and return them.
+
+    The prologue every wave runs: count what is in flight, take what
+    the cap leaves, claim it. Written out three times before, once per
+    provider, which put the "a wave is not a queue drain" rule and the
+    per-tick rule in three places.
+
+    :param queryset: This provider and stage's rows.
+    :param cap: How many of them may be in flight at once.
+    :param label: What to call the work in the log lines.
+    :param summary: Counts to update for the rows a claim lost.
+    :param per_tick: Ceiling on the rows this one tick claims, below
+        the in-flight cap. For a wave whose own work blocks the serial
+        scheduler (#156): Mistral renders and uploads a whole shard
+        before it returns, so it claims one. ``None`` claims whatever
+        the cap leaves.
+    :param level: Level of the "cap reached" line. INFO for a provider
+        that holds rows for minutes; a provider that holds them for
+        hours (Mistral's batches) passes DEBUG, or the line repeats on
+        every tick for the whole wait.
+    :returns: ``(row, urls)`` per claimed row, empty when there is
+        nothing to send.
+    :rtype: list[tuple[ExternalJob, tuple]]
+    """
+    room = _room_for(queryset, int(cap), label, level)
+    if not room:
+        return []
+    if per_tick is not None:
+        room = min(room, per_tick)
+    pending = _pending_slice(queryset, room)
+    if not pending:
+        return []
+    return _claim_wave(pending, timezone.now(), summary)
+
+
 def _room_for(
     queryset, limit: int, label: str, level: int = logging.INFO
 ) -> int:
@@ -1859,6 +1909,30 @@ def _room_for(
         )
         return 0
     return room
+
+
+#: Fields of :class:`SweepSummary` an outcome label may name. A label
+#: outside this set counts nothing: ``"skipped"`` means another writer
+#: took the row, so it is that writer's outcome to record, not ours.
+SWEEP_OUTCOMES = frozenset(
+    {"completed", "retried", "failed", "pending", "errors"}
+)
+
+
+def count_sweep_outcome(summary: SweepSummary, result: str) -> None:
+    """Add one outcome label to a sweep summary.
+
+    One spelling of the idiom, for every provider. It was written out
+    at each of the four places an outcome was counted, and two of them
+    spelled it differently.
+
+    :param summary: Counts to update.
+    :param result: What :func:`_retry_or_fail`, :func:`_fail` or a
+        completion callback answered.
+    :return: None.
+    """
+    if result in SWEEP_OUTCOMES:
+        setattr(summary, result, getattr(summary, result) + 1)
 
 
 def _pending_slice(queryset, room: int) -> list[ExternalJob]:
@@ -2028,20 +2102,14 @@ def _submit_doctor_wave(summary: SubmitSummary, limit: int | None) -> None:
     """
     if not doctor_client.enabled():
         return
-    ours = ExternalJob.objects.filter(
-        provider=JobProvider.DOCTOR, stage=JobStage.CONVERT
+    claimed = claim_for_wave(
+        ExternalJob.objects.filter(
+            provider=JobProvider.DOCTOR, stage=JobStage.CONVERT
+        ),
+        int(limit or settings.DOCTOR_MAX_CONCURRENCY),
+        "bitonal",
+        summary,
     )
-    room = _room_for(
-        ours, int(limit or settings.DOCTOR_MAX_CONCURRENCY), "bitonal"
-    )
-    if not room:
-        return
-    pending = _pending_slice(ours, room)
-    if not pending:
-        return
-
-    now = timezone.now()
-    claimed = _claim_wave(pending, now, summary)
     if not claimed:
         return
 
@@ -2101,21 +2169,16 @@ def _submit_runpod_engine_wave(
         concurrency setting.
     :return: None.
     """
-    ours = ExternalJob.objects.filter(
-        provider=JobProvider.RUNPOD,
-        stage=spec.stage,
-        engine=spec.engine,
+    claimed = claim_for_wave(
+        ExternalJob.objects.filter(
+            provider=JobProvider.RUNPOD,
+            stage=spec.stage,
+            engine=spec.engine,
+        ),
+        int(limit or getattr(settings, spec.concurrency_setting)),
+        spec.label,
+        summary,
     )
-    cap = limit or getattr(settings, spec.concurrency_setting)
-    room = _room_for(ours, int(cap), spec.label)
-    if not room:
-        return
-    pending = _pending_slice(ours, room)
-    if not pending:
-        return
-
-    now = timezone.now()
-    claimed = _claim_wave(pending, now, summary)
     if not claimed:
         return
 
@@ -2202,6 +2265,87 @@ def _any_runpod_engine_enabled() -> bool:
 
 
 # ── confirming ──────────────────────────────────────────────────────
+def apply_poll_outcome(
+    job: ExternalJob,
+    outcome,
+    now,
+    summary: SweepSummary,
+    *,
+    on_complete: Callable[[ExternalJob, object, datetime], str],
+    on_progress: Callable[[ExternalJob, object, datetime], bool],
+) -> None:
+    """Apply one status answer to its row, and count what it did.
+
+    The cascade every provider that polls runs, in one place. Two
+    rules live here and nowhere else:
+
+    - **"We learned nothing" is not "we learned it failed."**
+      ``outcome.status is None`` leaves the row as it was and falls
+      through to the deadline, so a status endpoint that is
+      permanently unhappy still ends the job rather than holding it
+      open for good.
+    - **The overdue check decrements ``pending`` before it retries**,
+      because the two branches above it already counted the row as
+      still waiting.
+
+    A lost compare-and-swap ends the tick for the row on every path:
+    another writer took it, so it is theirs to judge and ours to leave
+    alone.
+
+    :param job: An in-flight row, already polled.
+    :param outcome: The provider's answer. Any object carrying
+        ``status``, ``provider_status``, ``retriable``, ``error_code``
+        and ``error_message``.
+    :param now: Comparison time.
+    :param summary: Counts to update.
+    :param on_complete: What finishing means for this provider --
+        :func:`_complete` for a worker that wrote its own result
+        object, a download for one that did not. Returns the outcome
+        label to count (``"completed"``, ``"errors"``, or
+        ``"skipped"`` to count nothing).
+    :param on_progress: What a still-running answer writes. Returns
+        whether the write won its compare-and-swap.
+    :return: None.
+    """
+    if outcome.status is None:
+        if not _write(job, last_polled_at=now):
+            return
+        summary.pending += 1
+    elif outcome.status == JobStatus.COMPLETED:
+        count_sweep_outcome(summary, on_complete(job, outcome, now))
+        return
+    elif outcome.status in DEAD_JOB_STATUSES:
+        if outcome.retriable:
+            result = _retry_or_fail(
+                job, outcome.error_code, outcome.error_message, now
+            )
+        else:
+            result = (
+                "failed"
+                if _fail(job, outcome.error_code, outcome.error_message)
+                else "skipped"
+            )
+        count_sweep_outcome(summary, result)
+        return
+    else:
+        if not on_progress(job, outcome, now):
+            return
+        summary.pending += 1
+
+    if job.is_overdue(now):
+        summary.pending -= 1
+        count_sweep_outcome(
+            summary,
+            _retry_or_fail(
+                job,
+                "DEADLINE_EXCEEDED",
+                f"still {outcome.provider_status or job.status} at "
+                f"{job.deadline}",
+                now,
+            ),
+        )
+
+
 def _sweep_doctor_job(job: ExternalJob, now, summary: SweepSummary) -> None:
     """Confirm one conversion against its result object.
 
@@ -2240,14 +2384,15 @@ def _sweep_doctor_job(job: ExternalJob, now, summary: SweepSummary) -> None:
             summary.completed += 1
         return
     if job.is_overdue(now):
-        result = _retry_or_fail(
-            job,
-            "DEADLINE_EXCEEDED",
-            f"no result at {job.result_key} by {job.deadline}",
-            now,
+        count_sweep_outcome(
+            summary,
+            _retry_or_fail(
+                job,
+                "DEADLINE_EXCEEDED",
+                f"no result at {job.result_key} by {job.deadline}",
+                now,
+            ),
         )
-        if result in ("retried", "failed"):
-            setattr(summary, result, getattr(summary, result) + 1)
         return
     _write(job, last_polled_at=now)
     summary.pending += 1
@@ -2293,47 +2438,31 @@ def _sweep_runpod_job(job: ExternalJob, now, summary: SweepSummary) -> None:
         result_key=job.result_key,
     )
 
-    if outcome.status is None:
-        # We learned nothing, which is not the same as learning it
-        # failed. Fall through to the deadline check so a job whose
-        # status endpoint is permanently unhappy still ends.
-        _write(job, last_polled_at=now)
-        summary.pending += 1
-    elif outcome.status == JobStatus.COMPLETED:
-        if _complete(job, outcome.output, now, outcome.confirmed_by):
-            summary.completed += 1
-        return
-    elif outcome.status in DEAD_JOB_STATUSES:
-        if outcome.retriable:
-            result = _retry_or_fail(
-                job, outcome.error_code, outcome.error_message, now
-            )
-        else:
-            result = (
-                "failed"
-                if _fail(job, outcome.error_code, outcome.error_message)
-                else "skipped"
-            )
-        if result in ("retried", "failed"):
-            setattr(summary, result, getattr(summary, result) + 1)
-        return
-    else:
-        _record_progress(job, outcome, now)
-        summary.pending += 1
-
-    if job.is_overdue(now):
-        summary.pending -= 1
-        result = _retry_or_fail(
-            job,
-            "DEADLINE_EXCEEDED",
-            f"still {outcome.provider_status or job.status} at {job.deadline}",
-            now,
-        )
-        if result in ("retried", "failed"):
-            setattr(summary, result, getattr(summary, result) + 1)
+    apply_poll_outcome(
+        job,
+        outcome,
+        now,
+        summary,
+        on_complete=_complete_runpod_job,
+        on_progress=_record_progress,
+    )
 
 
-def _record_progress(job: ExternalJob, outcome, now) -> None:
+def _complete_runpod_job(job: ExternalJob, outcome, now) -> str:
+    """Apply a finished RunPod job: the worker wrote its own result.
+
+    :param job: The row RunPod reports finished.
+    :param outcome: The poll result.
+    :param now: Completion timestamp.
+    :returns: The outcome label to count.
+    :rtype: str
+    """
+    if _complete(job, outcome.output, now, outcome.confirmed_by):
+        return "completed"
+    return "skipped"
+
+
+def _record_progress(job: ExternalJob, outcome, now) -> bool:
     """Store a still-running job's state, and start its run budget.
 
     Crossing into ``IN_PROGRESS`` is when the deadline stops being a
@@ -2345,7 +2474,8 @@ def _record_progress(job: ExternalJob, outcome, now) -> None:
     :param job: The in-flight row.
     :param outcome: The poll result.
     :param now: Current time.
-    :return: None.
+    :returns: Whether the write won its compare-and-swap.
+    :rtype: bool
     """
     fields = {"status": outcome.status, "last_polled_at": now}
     run_deadline = _provider(job).run_deadline
@@ -2362,7 +2492,7 @@ def _record_progress(job: ExternalJob, outcome, now) -> None:
             job.shard_index,
             fields["deadline"],
         )
-    _write(job, **fields)
+    return _write(job, **fields)
 
 
 def sweep_jobs(now=None) -> SweepSummary:

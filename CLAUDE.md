@@ -661,8 +661,16 @@ trained on), tracked on `ExternalJob` rows at
   compare-and-swap, the attempt bookkeeping, the run reuse, the carry.
   **Insertion order is wave order** (RunPod, doctor, Mistral: what a
   person waits behind first, the wave nothing waits behind last). Do
-  not answer a fourth provider by copying a
-  wave or a sweep: add an entry. YOLO on RunPod was exactly a payload
+  not answer a fourth provider by copying a wave or a sweep: add an
+  entry, and build its wave and its sweep out of the three shared
+  pieces --- `jobs.claim_for_wave` (the prologue of every wave: count
+  what is in flight, take what the cap leaves, claim it, with
+  `per_tick` for a wave whose own work blocks the scheduler),
+  `jobs.apply_poll_outcome` (the cascade of every poll, which owns the
+  `summary.pending` order and the "we learned nothing is not we
+  learned it failed" rule) and `jobs.count_sweep_outcome` (the one
+  spelling of counting an outcome). Mistral first arrived by copying
+  the cascade whole, which put those two rules in two places. YOLO on RunPod was exactly a payload
   builder, an endpoint id and a cap, which is what `jobs.RunpodEngine`
   tabulates (#195) inside the RunPod entry; it shares `submit_job` and
   `poll_once` unchanged.
