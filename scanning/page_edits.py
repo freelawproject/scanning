@@ -88,6 +88,12 @@ def supersede(
       the audit shows the decision the final volume carries beside
       the one that replaces it.
 
+    Two requests for one address at the same moment -- a double click,
+    a second tab -- both read no standing row and both insert. The
+    partial unique key refuses the second, and it must answer with the
+    winner's row, not a 500: the ``get_or_create`` this replaced caught
+    that race inside a savepoint and read again, so this does the same.
+
     :param scan: The scan the decision is about.
     :param kind: A ``PageEdit.Kind`` value.
     :param address: The columns that locate the row, ``pdf_page`` and
@@ -95,12 +101,6 @@ def supersede(
     :param defaults: The columns a new row carries, and an open row
         takes when ``refresh_open`` is true.
     :param user: Who decided.
-    Two requests for one address at the same moment -- a double click,
-    a second tab -- both read no standing row and both insert. The
-    partial unique key refuses the second, and it must answer with the
-    winner's row, not a 500: the ``get_or_create`` this replaced caught
-    that race inside a savepoint and read again, so this does the same.
-
     :param refresh_open: Whether an open row at the address takes
         ``defaults``. A deletion has nothing to refresh; a page number
         does.

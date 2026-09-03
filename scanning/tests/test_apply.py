@@ -145,6 +145,15 @@ class TestPlanRun(ApplyTestCase):
         )
         self.assertEqual(plan.to_map()["deleted_pages"], [])
 
+    def test_the_identity_is_read_off_the_map(self):
+        plan = apply.plan_run(self.scan)
+        self.assertTrue(apply.is_identity_map(plan.to_map()))
+
+        self.edit(PageEdit.Kind.ROTATE_PAGE, pdf_page=1, value="90")
+        plan = apply.plan_run(self.scan)
+        self.assertFalse(plan.is_identity)
+        self.assertFalse(apply.is_identity_map(plan.to_map()))
+
     def test_a_deleted_page_is_dropped(self):
         self.edit(PageEdit.Kind.DELETE_PAGE, pdf_page=3)
 

@@ -336,8 +336,12 @@ the `reopen_page_review` view. What must not be broken:
   glues finish at different times, and is asked about every 15
   seconds. Failures count on it (`attempts`, `APPLY_MAX_ATTEMPTS`,
   loud-then-quiet); the way back is the admin `supersede_runs` action,
-  after which the trigger builds `a{n+1}`. `_needs_attention` is the
-  cheap pre-check that keeps a fully glued run to one query per tick.
+  after which the trigger builds `a{n+1}`. `_candidate_scan_ids` is
+  the pre-check: one query per reason a scan may owe a phase, over the
+  whole corpus, so the steady state is six queries a tick whatever the
+  corpus size (until #211, every approved volume waits for its
+  detection run, and a per-scan check would cost five queries each).
+  `phase_due` then judges the candidates exactly.
 - **The offset map is written once**, on the run and at
   `jobs/apply/a{n}/page_map.json`, by `plan_run`. One entry per final
   page: `{"kind": "original", "pdf_page": p}` for a kept page, or
@@ -360,8 +364,9 @@ the `reopen_page_review` view. What must not be broken:
   immutable, so `a{n+1}` finds the same key and identity and
   `_reusable_results` carries the paid result. Two things keep that
   true: `_ensure_page_shard` describes an existing shard instead of
-  rebuilding it, with the size the bucket reports (a size read two
-  ways would read as two shards), and `supersede_runs` cancels only
+  rebuilding it, with the size the bucket reports and only that
+  (`_stored_size` refuses a missing one, since a size read two ways
+  would read as two shards), and `supersede_runs` cancels only
   the PENDING and in-flight rows — a COMPLETED row is exactly what the
   next build carries. The apply glues **keep** their one-page results
   (rows go to CONSUMED), unlike the volume bitonal merge.

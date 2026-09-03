@@ -8,10 +8,13 @@ would be uploaded, so the tests see the keys and never the bucket.
 
 from unittest.mock import patch
 
+from django.db import connection
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from scanning import apply, bitonal, dots_mocr, jobs, services, yolo
+from scanning.factories import ScanFactory
 from scanning.models import (
     ApplyRun,
     ExternalJob,
@@ -295,6 +298,19 @@ class TestBuildRun(BuildTestCase):
         self.assertEqual(second.number, 2)
         self.assertEqual(apply.current_run(self.scan), second)
 
+    def test_a_shard_the_bucket_cannot_size_fails_the_build(self):
+        self.three_edits()
+        with patch("scanning.s3_sync.object_size", return_value=None):
+            with self.assertRaises(apply.ApplyError) as caught:
+                apply.build_run(self.scan)
+        self.assertIn("reports no shard", str(caught.exception))
+
+    def test_a_scan_with_no_original_key_fails_the_build(self):
+        with patch("scanning.s3_sync.s3_original_key", return_value=None):
+            with self.assertRaises(apply.ApplyError):
+                apply.build_run(self.scan)
+        self.assertEqual(apply.current_run(self.scan).final_pdf_key, "")
+
     def test_a_failed_build_counts_an_attempt_and_says_so(self):
         with patch("scanning.s3_sync.upload_json_object", return_value=False):
             with self.assertRaises(apply.ApplyError) as caught:
@@ -406,6 +422,51 @@ class TestTriggerAndWorker(BuildTestCase):
         self.assertIn("runs again by itself", self.scan.progress_message)
         # The trigger picks it up again.
         self.assertEqual(apply.queue_ready_scans(), 1)
+
+    def test_the_tick_costs_the_same_over_a_larger_corpus(self):
+        # Every approved volume waits for its detection run until #211,
+        # so the pre-check must not grow with the corpus.
+        def waiting_scan():
+            scan = ScanFactory(
+                page_count=2, status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+            )
+            ApplyRun.objects.create(
+                scan=scan,
+                number=1,
+                built_at=timezone.now(),
+                bitonal_key="b",
+                ocr_key="o",
+                printed_pages_key="p",
+            )
+            return scan
+
+        Scan.objects.filter(pk=self.scan.pk).delete()
+        waiting_scan()
+        with CaptureQueriesContext(connection) as small:
+            self.assertEqual(apply.queue_ready_scans(), 0)
+        for _ in range(5):
+            waiting_scan()
+        with CaptureQueriesContext(connection) as large:
+            self.assertEqual(apply.queue_ready_scans(), 0)
+
+        self.assertEqual(len(small), len(large))
+
+    def test_a_run_with_spent_attempts_or_a_dead_row_is_not_a_candidate(
+        self,
+    ):
+        self.three_edits()
+        run = apply.build_run(self.scan)
+        ExternalJob.objects.filter(
+            pk=self.rows(run, JobStage.CONVERT)[0].pk
+        ).update(status=JobStatus.FAILED)
+        self.assertNotIn(self.scan.pk, apply._candidate_scan_ids())
+
+        run.jobs.update(status=JobStatus.COMPLETED)
+        self.assertIn(self.scan.pk, apply._candidate_scan_ids())
+        ApplyRun.objects.filter(pk=run.pk).update(
+            attempts=apply.APPLY_MAX_ATTEMPTS
+        )
+        self.assertNotIn(self.scan.pk, apply._candidate_scan_ids())
 
     def test_a_scan_with_a_glued_run_is_left_alone(self):
         run = apply.build_run(self.scan)

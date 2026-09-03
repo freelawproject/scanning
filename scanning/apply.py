@@ -171,10 +171,11 @@ class ApplyPlan:
     def is_identity(self) -> bool:
         """Return whether the final PDF is the original, page for page.
 
-        True when no structural edit stands. Such a run copies nothing:
-        it aliases the original and the review-1 artifacts.
+        Read off the map, as every glue reads it, so the build and the
+        glues take the same branch by construction. Such a run copies
+        nothing: it aliases the original and the review-1 artifacts.
         """
-        return not self.edits
+        return is_identity_map(self.to_map())
 
     @property
     def shard_edits(self) -> list[PageEdit]:
@@ -220,6 +221,24 @@ class ApplyPlan:
             "deleted_pages": list(self.deleted_pages),
             "pages": list(self.pages),
         }
+
+
+def is_identity_map(page_map: dict) -> bool:
+    """Return whether a stored map keeps every original page in place.
+
+    The one test of "nothing to build", for the plan and the three
+    glues alike: every final page is an original page, and there are
+    as many as the original has. Written once, because three copies of
+    the expression and a fourth over the rows could disagree.
+
+    :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
+    :returns: Whether the final PDF is the original, page for page.
+    :rtype: bool
+    """
+    entries = page_map.get("pages", [])
+    return len(entries) == page_map.get("source_page_count") and all(
+        entry["source"]["kind"] == "original" for entry in entries
+    )
 
 
 def final_page_of(page_map: dict, pdf_page: int) -> int | None:
@@ -678,7 +697,7 @@ def _ensure_page_shard(
         return {
             "key": key,
             "page_count": edit_page_count(edit),
-            "size_bytes": s3_sync.object_size(key) or 0,
+            "size_bytes": _stored_size(key, edit),
         }
     data = (
         None
@@ -691,14 +710,35 @@ def _ensure_page_shard(
         shard.save(str(local), garbage=3, deflate=True)
     if not s3_sync.upload_file_object(key, local, "application/pdf"):
         raise ApplyError(f"could not upload the shard of edit {edit.pk}")
-    # The size the bucket reports, on the first build as on every later
-    # one: the row identity carries it, and a value read two ways would
-    # read as two shards and re-pay the read.
     return {
         "key": key,
         "page_count": page_count,
-        "size_bytes": s3_sync.object_size(key) or local.stat().st_size,
+        "size_bytes": _stored_size(key, edit),
     }
+
+
+def _stored_size(key: str, edit: PageEdit) -> int:
+    """Return the size the bucket reports for one shard, or refuse.
+
+    Read one way only, on the first build as on every later one: the
+    row identity carries the size, and a value read from the local
+    file once and from the bucket the next time would read as two
+    shards and re-pay three stages for a page that did not change. A
+    size the bucket cannot report is a failed upload, and the attempt
+    counts as one.
+
+    :param key: The shard's key.
+    :param edit: The row, for the message.
+    :returns: The object's size in bytes.
+    :rtype: int
+    :raises ApplyError: If the bucket reports no object at the key.
+    """
+    size = s3_sync.object_size(key)
+    if not size:
+        raise ApplyError(
+            f"the bucket reports no shard for edit {edit.pk} at {key}"
+        )
+    return size
 
 
 def shard_manifest(
@@ -829,7 +869,7 @@ def _build(scan: Scan, run: ApplyRun) -> None:
             if plan.is_identity:
                 # No copy of gigabytes for a volume nobody changed: the
                 # final PDF is the original.
-                final_key = s3_sync.s3_original_key(scan) or ""
+                final_key = _original_key(scan)
             else:
                 final_path = tmp_dir / "final.pdf"
                 with build_final_pdf(source, plan) as out:
@@ -985,7 +1025,12 @@ def _current_edit_ids(scan: Scan) -> list[int]:
     )
 
 
-def phase_due(scan: Scan) -> str | None:
+#: "No run was passed": None is a valid answer, so the parameter needs
+#: a marker of its own.
+_UNSET = object()
+
+
+def phase_due(scan: Scan, run=_UNSET) -> str | None:
     """Return which phase the scan's apply owes, if any.
 
     ``"build"`` when no run stands, the standing run is not built and
@@ -996,10 +1041,13 @@ def phase_due(scan: Scan) -> str | None:
     the admin supersedes the run), or when the attempts are spent.
 
     :param scan: The scan.
+    :param run: The standing run, when the caller has it (the trigger
+        reads it once per scan). Read here otherwise.
     :returns: ``"build"``, ``"glue"`` or None.
     :rtype: str | None
     """
-    run = current_run(scan)
+    if run is _UNSET:
+        run = current_run(scan)
     if run is None:
         return "build"
     if not run.is_built:
@@ -1044,24 +1092,84 @@ def glue_due(scan: Scan, run: ApplyRun, rows: list[ExternalJob]) -> bool:
     return False
 
 
-def _needs_attention(scan: Scan) -> bool:
-    """Return whether the trigger should look at this scan at all.
+def _candidate_scan_ids() -> set[int]:
+    """Return the approved scans that may owe a phase, in a few queries.
 
-    The cheap pre-check over every approved scan on every tick: a run
-    that is built, fully glued and untouched since costs one query.
+    The pre-check of the trigger, over the whole corpus at once rather
+    than scan by scan. Until #211 automates detection, every approved
+    volume waits for its detection run with a blank ``detections_key``,
+    so a per-scan check would compute :func:`phase_due` for all of
+    them on every tick -- five queries each, growing with the corpus.
+    Here each reason a scan may owe a phase is one query joined through
+    the scan, and a run with a dead row or spent attempts drops out at
+    the query. The steady state is six queries a tick, whatever the
+    corpus size; :func:`phase_due` then judges the candidates exactly.
 
-    :param scan: An approved scan.
-    :returns: Whether :func:`phase_due` is worth computing.
-    :rtype: bool
+    At most one run stands per scan: :func:`build_run` supersedes the
+    standing one before it creates the next.
+
+    :returns: The primary keys of the candidate scans.
+    :rtype: set[int]
     """
-    run = current_run(scan)
-    if run is None or not run.is_built or not run.is_glued:
-        return True
-    if not run.detections_key:
-        return True
-    return scan.page_edits.filter(
-        kind__in=PageEdit.STRUCTURAL_KINDS, date_modified__gt=run.built_at
-    ).exists()
+    from django.db.models import F, Q
+
+    done = Scan.objects.filter(status=APPLY_STATUS)
+    standing = ApplyRun.objects.filter(
+        superseded_at__isnull=True,
+        scan__status=APPLY_STATUS,
+        attempts__lt=APPLY_MAX_ATTEMPTS,
+    )
+    built = standing.filter(built_at__isnull=False)
+    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
+    settled = built.exclude(jobs__status__in=DEAD_JOB_STATUSES).exclude(
+        jobs__status__in=unfinished
+    )
+    volume_consumed = {
+        "scan__jobs__status": JobStatus.CONSUMED,
+        "scan__jobs__apply_run__isnull": True,
+    }
+    ids: set[int] = set()
+    # No standing run at all. A subquery, not a reverse-relation
+    # ``isnull`` filter: on a LEFT JOIN a scan with no run at all reads
+    # as ``superseded_at IS NULL`` too, and the exclude would drop it.
+    ids.update(
+        done.exclude(
+            pk__in=ApplyRun.objects.filter(superseded_at__isnull=True).values(
+                "scan_id"
+            )
+        ).values_list("pk", flat=True)
+    )
+    # A run to build, or to build again.
+    ids.update(
+        standing.filter(built_at__isnull=True).values_list(
+            "scan_id", flat=True
+        )
+    )
+    ids.update(
+        built.filter(
+            scan__page_edits__kind__in=PageEdit.STRUCTURAL_KINDS,
+            scan__page_edits__date_modified__gt=F("built_at"),
+        ).values_list("scan_id", flat=True)
+    )
+    # A glue whose inputs are there.
+    ids.update(
+        settled.filter(bitonal_key="").values_list("scan_id", flat=True)
+    )
+    ids.update(
+        settled.filter(
+            Q(ocr_key="") | Q(printed_pages_key=""),
+            scan__jobs__stage=JobStage.ANALYZE,
+            **volume_consumed,
+        ).values_list("scan_id", flat=True)
+    )
+    ids.update(
+        settled.filter(
+            detections_key="",
+            scan__jobs__stage=JobStage.DETECT,
+            **volume_consumed,
+        ).values_list("scan_id", flat=True)
+    )
+    return ids
 
 
 def queue_ready_scans() -> int:
@@ -1084,12 +1192,13 @@ def queue_ready_scans() -> int:
     if not s3_sync.s3_active():
         return 0
     queued = 0
-    for scan in Scan.objects.filter(status=APPLY_STATUS).select_related(
-        "reporter"
-    ):
-        if not _needs_attention(scan):
-            continue
-        phase = phase_due(scan)
+    candidates = _candidate_scan_ids()
+    if not candidates:
+        return 0
+    for scan in Scan.objects.filter(
+        pk__in=candidates, status=APPLY_STATUS
+    ).select_related("reporter"):
+        phase = phase_due(scan, current_run(scan))
         if phase is None:
             continue
         claimed = Scan.objects.filter(pk=scan.pk, status=APPLY_STATUS).update(
@@ -1200,7 +1309,26 @@ def _volume_bitonal_key(scan: Scan) -> str:
     key = f"{s3_sync.s3_processing_prefix(scan)}{s3_sync.PIPELINE_INPUT_NAME}"
     if s3_sync.object_exists(key):
         return key
-    return s3_sync.s3_original_key(scan) or ""
+    return _original_key(scan)
+
+
+def _original_key(scan: Scan) -> str:
+    """Return the original's key, or refuse.
+
+    A blank key must never reach a run row: ``bitonal_key`` and
+    ``final_pdf_key`` read as "not written" when blank, so a glue that
+    stored one would report success and be due again on every tick,
+    with no failure counted to stop it.
+
+    :param scan: The scan.
+    :returns: The key of the original.
+    :rtype: str
+    :raises ApplyError: If the scan has no original.
+    """
+    key = s3_sync.s3_original_key(scan)
+    if not key:
+        raise ApplyError(f"scan {scan.pk} has no original in the bucket")
+    return key
 
 
 def _glue_bitonal(
@@ -1228,9 +1356,7 @@ def _glue_bitonal(
     if not page_map.get("pages"):
         raise ApplyError(f"run {run.label} of scan {scan.pk} has no page map")
     entries = page_map["pages"]
-    if all(entry["source"]["kind"] == "original" for entry in entries) and (
-        len(entries) == page_map["source_page_count"]
-    ):
+    if is_identity_map(page_map):
         return _volume_bitonal_key(scan)
 
     converted = _rows_by_edit(rows, JobStage.CONVERT)
@@ -1341,9 +1467,7 @@ def _glue_ocr(
     entries = page_map["pages"]
     prefix = run_prefix(scan, run)
 
-    if all(entry["source"]["kind"] == "original" for entry in entries) and (
-        len(entries) == page_map["source_page_count"]
-    ):
+    if is_identity_map(page_map):
         ocr_key = volume_key
         document = volume
     else:
@@ -1504,9 +1628,7 @@ def _glue_detections(
     volume_key = yolo.merged_result_key(scan, volume_rows[0].run)
     page_map = run.page_map
     entries = page_map["pages"]
-    if all(entry["source"]["kind"] == "original" for entry in entries) and (
-        len(entries) == page_map["source_page_count"]
-    ):
+    if is_identity_map(page_map):
         return volume_key
 
     volume = yolo.load_merged_document(scan, volume_rows[0].run)
