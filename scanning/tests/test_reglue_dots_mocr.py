@@ -149,7 +149,8 @@ class TestReglueDotsMocr(TestCase):
             out,
         )
         self.assertIn("volume page 4 (shard 2 page 1)", out)
-        self.assertIn("2 filtered page(s): 2 repairable (escape_quote 2)", out)
+        self.assertIn("2 filtered page(s) in 4 page(s)", out)
+        self.assertIn("2 repairable (escape_quote 2), 0 not", out)
         self.assertIn("1 scan(s) surveyed", out)
         # Nothing moved: the run is still applied, the rows still say
         # they hold a hole.
@@ -166,7 +167,7 @@ class TestReglueDotsMocr(TestCase):
         out, _ = self._call("--dry-run")
 
         self.assertIn("cannot repair: Unterminated string", out)
-        self.assertIn("1 filtered page(s): 0 repairable, 1 not", out)
+        self.assertIn("0 repairable, 1 not", out)
 
     def test_a_dry_run_names_a_page_with_no_stored_answer(self):
         scan = self._glued_scan(filtered=(0,))
@@ -183,19 +184,73 @@ class TestReglueDotsMocr(TestCase):
         # Item 3 of #242: the share of filtered answers the retry rung
         # of #238 saves is what says whether it is worth 90s of GPU.
         scan = self._glued_scan(filtered=(0,))
-        recovered = make_page(0)
-        recovered.update(
+        self._rewrite(
+            scan, 0, [self._rung_recovered(0), make_filtered_page(1)]
+        )
+
+        out, _ = self._call("--dry-run")
+
+        self.assertIn("recovered 1 filtered answer(s)", out)
+
+    def test_a_dry_run_surveys_a_volume_with_no_filtered_page_left(self):
+        # The bias this avoids: a volume whose retry rung recovered
+        # every filtered answer carries no filtered page, so a survey
+        # that skipped on the rows would never count the very evidence
+        # that the rung works -- nor the volume's pages, which the rate
+        # divides by.
+        scan = self._glued_scan(filtered=())
+        self._rewrite(scan, 0, [self._rung_recovered(0), make_page(1)])
+
+        out, _ = self._call("--dry-run")
+
+        self.assertIn("recovered 1 filtered answer(s)", out)
+        self.assertIn("0 filtered page(s) in 4 page(s) of 1 volume(s)", out)
+        self.assertIn("1 scan(s) surveyed", out)
+        # Still a survey: nothing was written.
+        self.upload.assert_not_called()
+        rows = dots_mocr.live_analyze_jobs(scan)
+        self.assertTrue(dots_mocr._apply_state(rows).get("applied_at"))
+
+    def test_a_dry_run_reports_the_rate(self):
+        # Item 1 of #242 asks for the true rate, so the summary names
+        # the total and the one-in-N form, not only the counts.
+        self._glued_scan(filtered=(0,))
+
+        out, _ = self._call("--dry-run")
+
+        self.assertIn(
+            "1 filtered page(s) in 4 page(s) of 1 volume(s), about one in 4",
+            out,
+        )
+
+    def test_the_writing_pass_still_skips_on_the_rows(self):
+        # Only the survey reads every volume: the writing pass must not
+        # download and re-upload a document for a volume with nothing
+        # to repair.
+        scan = self._glued_scan(filtered=())
+
+        out, err = self._call(str(scan.pk))
+
+        self.upload.assert_not_called()
+        self.download.assert_not_called()
+        self.assertIn("no shard of the live run reports a filtered", err)
+
+    def _rung_recovered(self, page_no: int) -> dict:
+        """Build a page the threshold rung of #238 saved from a filter.
+
+        :param page_no: 0-based index inside the shard.
+        :returns: A page dict.
+        :rtype: dict
+        """
+        page = make_page(page_no)
+        page.update(
             {
                 "recovered_by": 2,
                 "render": "threshold",
                 "errors": ["model output was not layout JSON"],
             }
         )
-        self._rewrite(scan, 0, [recovered, make_filtered_page(1)])
-
-        out, _ = self._call("--dry-run")
-
-        self.assertIn("recovered 1 filtered answer(s)", out)
+        return page
 
     def test_an_approved_volume_is_left_alone(self):
         scan = self._glued_scan(

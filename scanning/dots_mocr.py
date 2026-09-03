@@ -476,22 +476,29 @@ def survey_repairs(scan, analyze_jobs: list[ExternalJob]) -> dict:
     report is the corpus survey issue #242 asks for -- the rate of the
     fault, the share each arm answers, and the pages no arm reaches.
 
-    It also counts the filtered answers the threshold rung of #238
-    recovered (a page marked ``recovered_by`` whose first rung error
-    was "not layout JSON"), which is the measurement that says whether
-    that rung is worth 90 seconds of GPU time on this class of fault.
+    It also counts the pages it walked and the filtered answers the
+    threshold rung of #238 recovered (a page marked ``recovered_by``
+    whose first rung error was "not layout JSON"). The page count is
+    the denominator of the rate item 1 of the issue asks for, and the
+    rung count is what says whether that rung is worth 90 seconds of
+    GPU time on this class of fault. Both are why the caller must
+    survey a volume whose rows report **no** filtered page: a run
+    whose rung recovered every one of them is exactly the evidence
+    that the rung works, and it carries no filtered page to be found
+    by.
 
     :param scan: The scan to survey.
     :param analyze_jobs: Its live run's rows, ordered by shard index.
-    :returns: ``{"reports": list[dict], "rung_recoveries": int}``. Each
-        report names ``shard_index``, ``page_no`` (shard-local, as the
-        worker counts), ``pdf_page`` (1-based, of the volume),
-        ``edits`` (``None`` when nothing repaired it), ``fault`` and
-        ``no_raw``.
+    :returns: ``{"reports": list[dict], "pages": int,
+        "rung_recoveries": int}``. Each report names ``shard_index``,
+        ``page_no`` (shard-local, as the worker counts), ``pdf_page``
+        (1-based, of the volume), ``edits`` (``None`` when nothing
+        repaired it), ``fault`` and ``no_raw``.
     :rtype: dict
     """
     reports: list[dict] = []
     rung_recoveries = 0
+    page_count = 0
     with tempfile.TemporaryDirectory(
         prefix=f"{GLUE_TMP_PREFIX}{scan.pk}-"
     ) as tmp:
@@ -504,6 +511,7 @@ def survey_repairs(scan, analyze_jobs: list[ExternalJob]) -> dict:
             payload = _check_envelope(scan, job, json.loads(local.read_text()))
             from_page = (job.input_manifest or {}).get("from_page") or 0
             for page in payload.get("pages") or []:
+                page_count += 1
                 errors = page.get("errors") or []
                 if page.get("recovered_by") and any(
                     "not layout JSON" in str(error) for error in errors
@@ -529,7 +537,11 @@ def survey_repairs(scan, analyze_jobs: list[ExternalJob]) -> dict:
                         "no_raw": result is None,
                     }
                 )
-    return {"reports": reports, "rung_recoveries": rung_recoveries}
+    return {
+        "reports": reports,
+        "pages": page_count,
+        "rung_recoveries": rung_recoveries,
+    }
 
 
 def _stamp_page_lists(job: ExternalJob, shard_pages: list[dict]) -> None:

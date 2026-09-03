@@ -46,13 +46,36 @@ EXCERPT_RADIUS = 40
 
 #: The parser messages that mark a string closed too early: the value
 #: ended at a quotation mark the model did not escape, and the parser
-#: reads the rest of the text as syntax.
+#: reads the rest of the text as syntax. Which message arrives depends
+#: only on what follows the stray quotation mark, so all three name one
+#: fault:
+#:
+#: - ``out[.]" and she felt`` -> ``Expecting ',' delimiter``
+#: - ``out[.]", and she felt`` -> the parser takes the comma as the
+#:   member separator and then wants a key, so
+#:   ``Expecting property name enclosed in double quotes``
+#: - a stray quotation mark inside a *key* -> ``Expecting ':' delimiter``
 _EARLY_CLOSE_MESSAGES = (
     "Expecting ',' delimiter",
     "Expecting ':' delimiter",
     "Expecting property name enclosed in double quotes",
 )
 
+#: The one early-close message the parser reports **after** eating a
+#: comma, so the arm has to step back over that comma to find the
+#: quotation mark. A comma after a quotation is ordinary in an
+#: opinion (``... out[.]", and she felt ...``), and without this the
+#: arm reached only the pages whose stray quotation mark happened to
+#: be followed by a space.
+_AFTER_COMMA_MESSAGE = "Expecting property name enclosed in double quotes"
+
+#: CPython's C scanner reports this exactly, and puts the offset **on**
+#: the backslash. The pure-Python fallback says ``Invalid \escape:
+#: ')'`` and points one character further. Both worker and daemon
+#: images run CPython with the C scanner, and on the fallback this arm
+#: simply does not fire: the message does not match, and
+#: :func:`_restore_quote` checks the character under the offset anyway.
+#: So a scanner change costs a repair, never a wrong edit.
 _INVALID_ESCAPE_MESSAGE = "Invalid \\escape"
 _EXTRA_DATA_MESSAGE = "Extra data"
 
@@ -169,7 +192,9 @@ def _apply_arm(text: str, exc: json.JSONDecodeError) -> tuple[str, str] | None:
     :rtype: tuple[str, str] | None
     """
     if exc.msg in _EARLY_CLOSE_MESSAGES:
-        return _escape_quote(text, exc.pos)
+        return _escape_quote(
+            text, exc.pos, after_comma=exc.msg == _AFTER_COMMA_MESSAGE
+        )
     if exc.msg == _INVALID_ESCAPE_MESSAGE:
         return _restore_quote(text, exc.pos)
     if exc.msg == _EXTRA_DATA_MESSAGE:
@@ -177,22 +202,51 @@ def _apply_arm(text: str, exc: json.JSONDecodeError) -> tuple[str, str] | None:
     return None
 
 
-def _escape_quote(text: str, pos: int) -> tuple[str, str] | None:
+def _escape_quote(
+    text: str, pos: int, after_comma: bool = False
+) -> tuple[str, str] | None:
     """Put a backslash before the quotation mark that closed a string
     too early.
 
-    The parser reports the first character after the string and the
-    spaces that follow it, so the quotation mark is the nearest
-    non-space character before ``pos``. A quotation mark that a
-    backslash already escapes cannot have closed the string, so the
-    arm does not fit there.
+    The parser reports the first character it could not use, so the
+    quotation mark is the nearest non-space character before ``pos``.
+    With ``after_comma`` the parser had already taken one comma as a
+    member separator, so the walk steps over that comma too --
+    ``_AFTER_COMMA_MESSAGE`` says when.
+
+    A quotation mark that a backslash already escapes cannot have
+    closed the string, so the arm does not fit there. Nor does it fit
+    a genuinely missing comma (``} {``), an unquoted key
+    (``, category:``) or a doubled comma: the walk then lands on
+    something that is not a quotation mark, and the page stays
+    filtered.
+
+    :param text: The text that failed to parse.
+    :param pos: The offset the parser reported.
+    :param after_comma: Whether to step over one member separator.
+    :returns: ``(repaired text, edit name)``, or ``None``.
+    :rtype: tuple[str, str] | None
     """
-    i = pos - 1
-    while i >= 0 and text[i].isspace():
-        i -= 1
+    i = _back_over_space(text, pos - 1)
+    if after_comma and i >= 0 and text[i] == ",":
+        i = _back_over_space(text, i - 1)
     if i < 0 or text[i] != '"' or _is_escaped(text, i):
         return None
     return text[:i] + "\\" + text[i:], f"escape_quote@{i}"
+
+
+def _back_over_space(text: str, i: int) -> int:
+    """Return the offset of the nearest non-space character at or before
+    ``i``, or ``-1``.
+
+    :param text: The text to walk.
+    :param i: Where to start, walking backwards.
+    :returns: The offset, or ``-1`` when only spaces precede it.
+    :rtype: int
+    """
+    while i >= 0 and text[i].isspace():
+        i -= 1
+    return i
 
 
 def _restore_quote(text: str, pos: int) -> tuple[str, str] | None:
@@ -244,6 +298,13 @@ def _check_cells(value) -> str | None:
     """
     if not isinstance(value, list):
         return f"the answer is a {type(value).__name__}, not an array"
+    if not value:
+        # Upstream refuses an empty array too (``post_process_cells``
+        # asserts a first cell), so a page whose repair produced one is
+        # filtered on both sides. Without this the glue would call such
+        # a page repaired, drop it out of ``filtered_pages`` and hand
+        # the reader a page with no cell to read a number from.
+        return "the repaired array holds no cell"
     for index, cell in enumerate(value):
         if not isinstance(cell, dict):
             return f"cell {index} is a {type(cell).__name__}, not an object"

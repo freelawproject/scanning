@@ -17,14 +17,29 @@ and re-stamps the rows, and then clears the apply stamp
 (``dots_mocr.reopen_apply``) so the next collect tick reads the page
 numbers again. It starts no GPU job and creates no row.
 
+**Run this before ``reread_failed_pages``.** That command reads
+``filtered_pages`` off the row (``jobs.has_unread_pages``), and a run
+glued before this deploy still carries them. So a re-read started
+first pays RunPod for the very shards this command repairs from the
+stored results for nothing. Re-glue first; whatever still reports a
+filtered page afterwards is a shape no arm reaches, and only then is
+a paid re-read worth considering.
+
 ``--dry-run`` downloads the shard results, runs the repair in memory
 and writes nothing. Its report is the survey the issue asks for: one
 line per filtered page saying which arm repairs it, or the parser
 message with an excerpt of the answer when none does, or that the
-result was written before the worker kept ``raw``. It also counts the
-filtered answers the threshold rung of #238 recovered, which is the
-measurement that says whether that rung is worth paying for this class
-of fault.
+result was written before the worker kept ``raw``. Then the rate, the
+share each arm answers, and the count of filtered answers the
+threshold rung of #238 recovered -- the measurement that says whether
+that rung is worth paying for this class of fault.
+
+The dry run reads **every** glued volume in review 1, including the
+ones whose rows report no filtered page: a volume whose rung recovered
+every filtered answer holds no filtered page to be found by, and it is
+exactly the evidence the rung works. It is also the page total the
+rate divides by. So the survey costs one download per shard of the
+corpus, and it changes nothing.
 
 Safe by the two properties of ``reapply_page_numbers``: a volume in
 ``READY_FOR_PAGE_COMPLETENESS_REVIEW`` is a recompute and keeps its
@@ -115,7 +130,15 @@ class Command(BaseCommand):
                     scan, wanted, "the live dots.mocr run is not glued yet"
                 )
                 continue
-            if not any(jobs.page_lists(row)["filtered_pages"] for row in rows):
+            if not dry_run and not any(
+                jobs.page_lists(row)["filtered_pages"] for row in rows
+            ):
+                # Only the writing pass may skip on the rows. A survey
+                # that skipped here would never look at a volume whose
+                # retry rung recovered every filtered answer -- exactly
+                # the population that says the rung works -- and its
+                # page total, the denominator of the rate, would count
+                # only the volumes that still hold a hole.
                 skipped += 1
                 self._say_skip(
                     scan,
@@ -204,6 +227,8 @@ class Command(BaseCommand):
         """
         result = dots_mocr.survey_repairs(scan, rows)
         survey.rung_recoveries += result["rung_recoveries"]
+        survey.pages += result["pages"]
+        survey.volumes += 1
         for report in result["reports"]:
             where = (
                 f"scan {scan.pk} volume page {report['pdf_page']} "
@@ -258,6 +283,8 @@ class _Survey:
         self.unrepaired = 0
         self.no_raw = 0
         self.rung_recoveries = 0
+        self.pages = 0
+        self.volumes = 0
         self.arms: dict[str, int] = {}
 
     def count_repair(self, edits: list[str]) -> None:
@@ -272,7 +299,11 @@ class _Survey:
             self.arms[arm] = self.arms.get(arm, 0) + 1
 
     def summary(self) -> str:
-        """Return the one line that answers items 1 to 3 of issue #242.
+        """Return the lines that answer items 1 to 3 of issue #242.
+
+        The rate is the point of the first line, so it names both
+        numbers and the one-in-N form the issue reports: "17 filtered
+        page(s) in 13159, about one in 774".
 
         :returns: The rate of the fault, the share each arm answers,
             and what the threshold rung of #238 recovered.
@@ -281,9 +312,20 @@ class _Survey:
         by_arm = ", ".join(
             f"{arm} {n}" for arm, n in sorted(self.arms.items())
         )
-        return (
-            f"{self.filtered} filtered page(s): {self.repaired} repairable"
-            f"{f' ({by_arm})' if by_arm else ''}, {self.unrepaired} not, "
-            f"{self.no_raw} with no stored answer; the threshold rung of "
-            f"#238 recovered {self.rung_recoveries} filtered answer(s)"
+        rate = (
+            f", about one in {round(self.pages / self.filtered)}"
+            if self.filtered
+            else ""
+        )
+        return "\n".join(
+            [
+                f"{self.filtered} filtered page(s) in {self.pages} page(s) "
+                f"of {self.volumes} volume(s){rate}",
+                f"  {self.repaired} repairable"
+                f"{f' ({by_arm})' if by_arm else ''}, "
+                f"{self.unrepaired} not, "
+                f"{self.no_raw} with no stored answer",
+                "  the threshold rung of #238 recovered "
+                f"{self.rung_recoveries} filtered answer(s)",
+            ]
         )

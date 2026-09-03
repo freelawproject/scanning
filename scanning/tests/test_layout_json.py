@@ -80,6 +80,111 @@ class TestRepair(SimpleTestCase):
         self.assertEqual(json.dumps(result.cells), good)
         self.assertEqual(result.edits, [f"cut_extra@{len(good)}"])
 
+    def test_a_comma_after_the_stray_quotation_mark_is_repaired(self):
+        # The same fault as scan 2726, with a comma where that page had
+        # a space. The parser then takes the comma as the member
+        # separator and asks for a key, so the arm has to step back
+        # over it. A comma after a quotation is ordinary in an opinion,
+        # so without this the arm reached only half of shape 1.
+        good = _array('her death "almost took [her] out[.]", and she felt')
+        broken = good.replace('out[.]\\"', 'out[.]"')
+        self.assertNotEqual(good, broken)
+
+        result = layout_json.repair(broken)
+
+        self.assertEqual(json.dumps(result.cells), good)
+        self.assertEqual(len(result.edits), 1)
+        self.assertTrue(result.edits[0].startswith("escape_quote@"))
+
+    def test_a_comma_after_it_and_another_member_behind(self):
+        # The stray quotation mark closes the *last* member's value, so
+        # the parser reads the object's own closing brace as the key it
+        # wanted. Same arm, same one edit.
+        good = json.dumps(
+            [
+                {
+                    "category": "Text",
+                    "text": 'she said "no", and left',
+                    "bbox": [100, 200, 900, 280],
+                }
+            ]
+        )
+        broken = good.replace('no\\"', 'no"')
+
+        result = layout_json.repair(broken)
+
+        self.assertEqual(json.dumps(result.cells), good)
+        self.assertEqual(len(result.edits), 1)
+
+    def test_a_stray_quotation_mark_inside_a_key_is_repaired(self):
+        # ``Expecting ':' delimiter``: the third early-close message,
+        # and the only one that names a key rather than a value.
+        good = json.dumps(
+            [
+                {
+                    "bbox": [100, 200, 900, 280],
+                    "category": "Text",
+                    'te"xt': "x",
+                }
+            ]
+        )
+        broken = good.replace('te\\"xt', 'te"xt')
+
+        result = layout_json.repair(broken)
+
+        self.assertEqual(json.dumps(result.cells), good)
+        self.assertEqual(len(result.edits), 1)
+
+    def test_a_doubled_comma_is_refused(self):
+        # The message matches the arm and the text does not: behind the
+        # comma the walk finds another comma, not a quotation mark.
+        broken = _array("a").replace('], "category"', '],, "category"', 1)
+        self.assertNotEqual(broken, _array("a"))
+
+        result = layout_json.repair(broken)
+
+        self.assertIsNone(result.cells)
+        self.assertEqual(result.edits, [])
+
+    def test_a_comma_before_the_first_key_is_refused(self):
+        broken = _array("a").replace("[{", "[{,", 1)
+
+        result = layout_json.repair(broken)
+
+        self.assertIsNone(result.cells)
+        self.assertEqual(result.edits, [])
+
+    def test_an_unquoted_key_is_refused(self):
+        broken = _array("a").replace('"category": "Page-header"', "cat: 1", 1)
+        self.assertNotEqual(broken, _array("a"))
+
+        result = layout_json.repair(broken)
+
+        self.assertIsNone(result.cells)
+        self.assertEqual(result.edits, [])
+
+    def test_a_missing_comma_between_objects_is_refused(self):
+        # The nearest non-space character behind the fault is a closing
+        # brace, so nothing is escaped and the page stays filtered.
+        broken = _array("a").replace("}, {", "} {", 1)
+        self.assertNotEqual(broken, _array("a"))
+
+        result = layout_json.repair(broken)
+
+        self.assertIsNone(result.cells)
+        self.assertEqual(result.edits, [])
+
+    def test_an_empty_array_is_refused(self):
+        # Upstream refuses one too (``post_process_cells`` asserts a
+        # first cell), and a page called repaired with no cell would
+        # leave ``filtered_pages`` while still offering the reader
+        # nothing.
+        for raw in ("[]", '[]"}]'):
+            with self.subTest(raw=raw):
+                result = layout_json.repair(raw)
+                self.assertIsNone(result.cells)
+                self.assertIn("no cell", result.fault)
+
     def test_two_faults_take_two_edits(self):
         good = _array('she said "no" twice', 'and "yes" once')
         broken = good.replace('no\\"', 'no"').replace('yes\\"', 'yes"')

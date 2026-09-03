@@ -797,11 +797,19 @@ words, so the page reached the reader with no cell and no number.
   no shell on the pod.
 - **`reglue_dots_mocr` is the backfill**, and it costs no GPU time: it
   glues a run again over the stored results and clears the apply stamp
-  (`reopen_apply`). Its `--dry-run` is the corpus survey of items 1 to
-  3 of the issue. Safe by the two properties of
+  (`reopen_apply`). Safe by the two properties of
   `reapply_page_numbers`: a READY volume is a recompute that keeps its
   status, the numbers a curator typed are `PageEdit` rows and survive,
-  and an approved volume is not in `APPLY_STATUSES`.
+  and an approved volume is not in `APPLY_STATUSES`. **Run it before
+  `reread_failed_pages`**: that command reads `filtered_pages` off the
+  row, a run glued before the deploy still carries them, and a re-read
+  started first pays RunPod for the shards this repairs for nothing.
+- **The `--dry-run` is the corpus survey** of items 1 to 3 of the
+  issue, and it reads *every* glued volume in review 1, not only the
+  ones whose rows report a filtered page. A volume whose retry rung
+  recovered every filtered answer carries no filtered page to be found
+  by, and it is exactly the evidence that the rung works; it is also
+  part of the page total the rate divides by.
 - Upstream has no repair, and `main` is byte-identical to the pin
   `23f3e56` on `layout_utils.py` (checked 2026-09-03), so a pin bump
   buys nothing here. Constrained decoding on the vLLM call
