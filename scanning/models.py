@@ -1740,12 +1740,11 @@ class JobStage(models.TextChoices):
     expresses. ``CONVERT``, ``DETECT`` and ``ANALYZE`` run once over
     the volume, before review. ``TIEBREAK`` runs after file
     generation, once per opinion PDF. ``EXTRACT`` takes either shape
-    (#191): the Mistral read fans out over the volume's original shards
-    after the redaction review, with the redaction rects painted onto
-    the pages, and an engine that reads opinion PDFs instead keys its
-    rows by opinion, so 300 opinions read by three engines is 900
-    rows. The two unique constraints below are conditional on
-    ``opinion`` for exactly this reason.
+    (#191): the Mistral read fans out over the volume's original shards,
+    and an engine that reads opinion PDFs instead keys its rows by
+    opinion, so 300 opinions read by three engines is 900 rows. The
+    two unique constraints below are conditional on ``opinion`` for
+    exactly this reason.
 
     Two things the daemon has to respect. Local steps own no rows and
     sit between stages: reconciling two engines' text, pairing, rect

@@ -738,9 +738,8 @@ be broken:
   review state: it refuses only a missing key, an open run and a
   missing shard set. The creator set is pinned in
   `TestKnownEnqueuePaths`; the daemon trigger and the glue are
-  follow-ups, and the trigger is where the question of *when* the
-  volume is read (Rachel's order puts every OCR engine after the
-  redaction review) gets answered.
+  follow-ups, and the trigger is where the question of *when* a
+  volume is read gets answered.
 
 ## Reading the page number (issue #228)
 

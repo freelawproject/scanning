@@ -1728,8 +1728,8 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 # Detection: the staff button alone (#195). Nothing in
                 # the pipeline may appear here until #211 says so.
                 ("scanning/views_process.py", "ensure_detect_jobs"),
-                # Mistral OCR: the staff button alone (#191), until the
-                # trigger on the second review's approval lands.
+                # Mistral OCR: the staff button alone (#191), until a
+                # daemon trigger lands.
                 ("scanning/views_process.py", "ensure_extract_jobs"),
                 # The generic creator's four wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
