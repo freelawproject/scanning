@@ -984,6 +984,38 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   branch now says what the view says. The staff "Run detection" button
   is the one that pays, and the only one with a confirm.
 
+## The glued outputs, by scan id (issue #243)
+
+Three routes under `scans/<pk>/glued/<output>/`, for `dots-mocr` and
+`yolo`, so a developer needs no shell on the daemon pod to read a
+run. `views_process.GLUED_OUTPUTS` maps the slug to the stage, the
+engine and the glued key function, and that table is the whole
+difference between the two outputs: a third engine is one entry.
+
+- **The index reads the rows only.** `glued_output_index` lists every
+  run newest first with its shards, their 1-based volume page ranges
+  (the manifest holds fitz indexes), their states, the dots.mocr page
+  lists (shard-local, as the worker reports them), and the URL of
+  each file. No S3 call, so it answers in every environment, and a
+  scan nothing read gets `runs: []`, not an error. `glued` is "every
+  row CONSUMED"; the volume route still checks the object.
+- **The file routes redirect, never stream.** `serve_glued_volume`
+  presigns the run's glued key and `serve_glued_shard` the row's own
+  `result_key` (the worker's answer, `raw` included, which the glue
+  leaves out). A glued document of a long volume is tens of MB, and
+  #185 already took the large stream out of the preview endpoint.
+  The presign carries `Content-Disposition: attachment` so the
+  browser saves a named file.
+- **One HEAD before the redirect**, or a run that is not glued yet
+  would send the browser to an S3 XML error. A non-missing S3 error
+  propagates. Without S3 the file routes answer 404: the glue returns
+  before any work when S3 is off, and the workers write into the
+  bucket.
+- `@login_required` like `/pdf/`; the "files" link in the step-1 bar
+  is staff-only. `GLUED_OUTPUT_PRESIGN_TTL` is ten minutes, one
+  download; `ORIGINAL_VIEW_PRESIGN_TTL` serves a viewer that scrolls
+  for hours and is the wrong size.
+
 ## Local disk hygiene (issue #215)
 
 - The daemon frees `/tmp/scanning/{pk}`

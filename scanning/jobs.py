@@ -1107,10 +1107,7 @@ def run_summary(scan, stage: str, engine: str) -> dict | None:
     if not rows:
         return None
 
-    statuses: dict[str, int] = {}
-    for row in rows:
-        statuses[row.status] = statuses.get(row.status, 0) + 1
-
+    statuses = _status_counts(rows)
     failed = [
         row
         for row in rows
@@ -1123,10 +1120,6 @@ def run_summary(scan, stage: str, engine: str) -> dict | None:
     )
     unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     first_failure = failed[0] if failed else None
-    label = ", ".join(
-        f"{count} {ExternalJob(status=status).get_status_display().lower()}"
-        for status, count in sorted(statuses.items())
-    )
     return {
         "run": rows[0].run,
         "total": len(rows),
@@ -1134,10 +1127,41 @@ def run_summary(scan, stage: str, engine: str) -> dict | None:
         "open": sum(1 for row in rows if row.status in unfinished),
         "failed": len(failed),
         "statuses": statuses,
-        "label": label,
+        "label": rows_label(rows),
         "error_code": first_failure.error_code if first_failure else "",
         "error_message": first_failure.error_message if first_failure else "",
     }
+
+
+def _status_counts(rows: list[ExternalJob]) -> dict[str, int]:
+    """Count the rows of one run by status.
+
+    :param rows: The rows of one run.
+    :returns: ``{status: count}``.
+    :rtype: dict[str, int]
+    """
+    statuses: dict[str, int] = {}
+    for row in rows:
+        statuses[row.status] = statuses.get(row.status, 0) + 1
+    return statuses
+
+
+def rows_label(rows: list[ExternalJob]) -> str:
+    """Return the status counts of some rows as one readable phrase.
+
+    ``"2 consumed, 1 failed"``: what :func:`run_summary` shows the
+    process page, and what the glued-output index (#243) shows for
+    every run, live or not. A template rendering the counts dict
+    directly would print a Python dict.
+
+    :param rows: The rows of one run.
+    :returns: The counts, one per status, in status order.
+    :rtype: str
+    """
+    return ", ".join(
+        f"{count} {ExternalJob(status=status).get_status_display().lower()}"
+        for status, count in sorted(_status_counts(rows).items())
+    )
 
 
 #: The per-shard page lists a dots.mocr summary carries (shard-local

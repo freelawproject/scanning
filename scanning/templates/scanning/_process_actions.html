@@ -40,6 +40,9 @@ reach step 2.
     {% else %}
     OCR done: {{ dots_run.total }} part(s)
     {% endif %}
+    {% if user.is_staff %}
+    &middot; <a href="{% url 'glued_output_index' scan.pk 'dots-mocr' %}" class="underline" title="The runs, the shards and the result files of the dots.mocr read">files</a>
+    {% endif %}
   </span>
   {% endif %}
   {% if user.is_staff and not dots_run.open %}
@@ -56,6 +59,9 @@ reach step 2.
     Detection running: {{ yolo_run.done }} of {{ yolo_run.total }} part(s) done
     {% else %}
     Detection done: {{ yolo_run.total }} part(s)
+    {% endif %}
+    {% if user.is_staff %}
+    &middot; <a href="{% url 'glued_output_index' scan.pk 'yolo' %}" class="underline" title="The runs, the shards and the result files of the detection">files</a>
     {% endif %}
   </span>
   {% endif %}

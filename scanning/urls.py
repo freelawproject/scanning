@@ -55,6 +55,7 @@ from scanning.views_process import (
     assign_page,
     delete_page,
     dismiss_issue,
+    glued_output_index,
     page_edit_file,
     process_actions,
     progress_api,
@@ -65,6 +66,8 @@ from scanning.views_process import (
     rotate_page,
     scan_original_url,
     scan_process_view,
+    serve_glued_shard,
+    serve_glued_volume,
     serve_original_crop,
     serve_scan_original,
     serve_scan_pdf,
@@ -139,6 +142,23 @@ urlpatterns = [
         "scans/<int:pk>/original-crop/",
         serve_original_crop,
         name="serve_original_crop",
+    ),
+    # The glued outputs of the GPU stages (#243): an index of the runs
+    # and their shards, then one redirect per file.
+    path(
+        "scans/<int:pk>/glued/<str:output>/",
+        glued_output_index,
+        name="glued_output_index",
+    ),
+    path(
+        "scans/<int:pk>/glued/<str:output>/r<int:run>/volume/",
+        serve_glued_volume,
+        name="serve_glued_volume",
+    ),
+    path(
+        "scans/<int:pk>/glued/<str:output>/r<int:run>/shards/<int:shard>/",
+        serve_glued_shard,
+        name="serve_glued_shard",
     ),
     path(
         "scans/<int:pk>/start-validate/", start_validate, name="start_validate"
