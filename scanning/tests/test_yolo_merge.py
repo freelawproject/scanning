@@ -23,7 +23,7 @@ from django.test import TestCase
 
 from scanning import s3_sync, yolo
 from scanning.factories import ScanFactory
-from scanning.models import ExternalJob, JobStatus
+from scanning.models import ExternalJob, JobStatus, Scan, Status
 from scanning.tests.test_jobs import make_manifest
 
 
@@ -404,6 +404,35 @@ class TestFinishReadyRuns(DetectJobsMixin, TestCase):
 
         scan.refresh_from_db()
         self.assertEqual(scan.status, before)
+
+    def test_the_glue_runs_during_review_one_and_the_apply_waits(self):
+        """Issue #250: the merge follows the rows, not the scan. A run
+        that finishes while the scan is still in review 1 -- or still
+        AWAITING its conversion -- is merged on the tick, and the
+        redaction computation waits for the approval."""
+        for status in (
+            Status.AWAITING,
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+        ):
+            with self.subTest(status=status):
+                scan, _ = self.build(shard_count=2, pages_per_shard=1)
+                Scan.objects.filter(pk=scan.pk).update(status=status)
+
+                self.assertEqual(yolo.finish_ready_runs(), 1)
+                rows = yolo.live_detect_jobs(scan)
+                self.assertEqual(
+                    {job.status for job in rows}, {JobStatus.CONSUMED}
+                )
+                self.assertEqual(yolo.queue_ready_runs(), 0)
+                scan.refresh_from_db()
+                self.assertEqual(scan.status, status)
+
+                Scan.objects.filter(pk=scan.pk).update(
+                    status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+                )
+                self.assertEqual(yolo.queue_ready_runs(), 1)
+                scan.refresh_from_db()
+                self.assertEqual(scan.status, Status.QUEUED)
 
     def test_a_run_still_in_flight_is_left_alone(self):
         _, rows = self.build(shard_count=3, pages_per_shard=1)

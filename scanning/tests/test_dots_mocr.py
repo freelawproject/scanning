@@ -1706,9 +1706,9 @@ class TestKnownEnqueuePaths(ScanningTestCase):
     """Every path that creates paid GPU work, pinned.
 
     dots.mocr has two: the pipeline (#207) and the button that remains
-    as the re-run and backfill path (#190). YOLO detection has one, its
-    staff button (#195); the pipeline deliberately does not enqueue it
-    until the stage has been exercised on real volumes (#211).
+    as the re-run and backfill path (#190). YOLO detection has one, the
+    daemon's sweep (#250), which starts one run per shard set and
+    replaced the staff button of #195.
 
     Row creation is what costs GPU money, so a new caller of the
     creators must be a deliberate decision that updates this set -- not
@@ -1749,9 +1749,11 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                     "scanning/management/commands/reread_failed_pages.py",
                     "ensure_analyze_jobs",
                 ),
-                # Detection: the staff button alone (#195). Nothing in
-                # the pipeline may appear here until #211 says so.
-                ("scanning/views_process.py", "ensure_detect_jobs"),
+                # Detection: the daemon's sweep alone (#250), which is
+                # in yolo.py itself. No view and no pipeline arm may
+                # appear here: the sweep's rule -- one run per shard
+                # set, ever -- is what bounds the spend.
+                ("scanning/yolo.py", "ensure_detect_jobs"),
                 # The generic creator's three wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
                 ("scanning/yolo.py", "ensure_shard_jobs"),

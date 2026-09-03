@@ -71,7 +71,7 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from scanning import doctor_client, runpod_client, s3_sync
+from scanning import doctor_client, runpod_client, s3_sync, sharding
 from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
@@ -1445,6 +1445,12 @@ def ensure_shard_jobs(
     reusable = (
         _reusable_results(scan, stage, engine, specs) if reuse_results else {}
     )
+    # The set the run is cut for, as one string. Not in the identity:
+    # ``_still_describes`` compares ``input_manifest`` exactly, so a new
+    # key there would read every live run as stale and re-pay it. The
+    # column is what lets the detection sweep ask "has this set been
+    # detected" in one query (#250).
+    fingerprint = sharding.fingerprint_value(manifest["source"])
     rows = []
     for index, (key, identity) in enumerate(specs):
         row = ExternalJob(
@@ -1461,6 +1467,7 @@ def ensure_shard_jobs(
             # merge read what was actually processed rather than a
             # manifest that may since have changed.
             input_manifest=identity,
+            source_fingerprint=fingerprint,
             # No deadline: a row in our own queue has no clock. The
             # queue ceiling is stamped at the attempt's first claim,
             # when the row is handed to the provider (issue #218).

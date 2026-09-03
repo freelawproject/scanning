@@ -29,6 +29,26 @@ class TestSubmitCommand(TestCase):
 
         submit.assert_called_once_with(limit=None)
 
+    def test_the_detection_sweep_runs_before_the_wave(self):
+        """So the rows the sweep creates go out on the same tick (#250)."""
+        order = []
+        with (
+            patch(
+                "scanning.yolo.enqueue_missing_runs",
+                side_effect=lambda: order.append("sweep") or 2,
+            ),
+            patch(
+                "scanning.jobs.submit_pending",
+                side_effect=lambda limit=None: (
+                    order.append("wave") or SubmitSummary(submitted=2)
+                ),
+            ),
+            patch("django.db.connections.close_all"),
+        ):
+            call_command("submit_external_jobs")
+
+        self.assertEqual(order, ["sweep", "wave"])
+
     def test_the_limit_is_passed_through(self):
         with patch(
             "scanning.jobs.submit_pending", return_value=SubmitSummary()

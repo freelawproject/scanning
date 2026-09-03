@@ -74,9 +74,8 @@ file generation (#206), so:
   banner in HTML views. `start_validate` splits by scan (#151): only a
   legacy row hears "paused", because a new-pipeline volume is refused
   permanently, not temporarily. `start_detect` left that set with #196:
-  detection works, so a volume with no detections is told that a staff
-  member starts the run (`NO_DETECTIONS_MESSAGE`), not that a pipeline
-  is paused. The daemon parks pre-cutover queued rows
+  detection works, so a volume with no detections is told where its
+  run stands (`detection_message`), not that a pipeline is paused. The daemon parks pre-cutover queued rows
   carrying a legacy `queued_action` back to PENDING_REVIEW with the
   same message; admin re-queue resets `queued_action` to
   FULL_PIPELINE.
@@ -906,17 +905,35 @@ button). It reuses the whole #190 machinery — the claim, the poll, the
 deadlines, the cancel, the retry, the carry-over — so what follows is
 only what is new or specific:
 
-- **One staff button starts it, and nothing else.** `run_full_pipeline`
-  enqueues no `DETECT` row: the rebuilt image has to be tried on a few
-  volumes before it runs over the corpus (#211). That is structural —
-  `yolo.ensure_detect_jobs` is the only creator, and
-  `TestKnownEnqueuePaths` pins its one caller — so an automatic caller
-  has to delete a test line rather than slip in. The button is **not**
-  "Next: Detect": that one only walks to step 2 when detections exist
-  (#196). Since #196 the button also refuses a volume review 1 has not
-  approved, because the apply takes a scan from
-  `PAGE_COMPLETENESS_REVIEW_DONE` alone — a run started earlier would
-  be paid for and never read.
+- **The daemon starts it, once per shard set (#250).**
+  `yolo.enqueue_missing_runs` is the submit tick's first pass, before
+  the wave, so the rows it creates go out on the same tick. Its rule:
+  a scan whose current shard set (`Scan.source_fingerprint`) has
+  **no** detection row, alive or dead, gets exactly one run. So a new
+  upload, a volume from before the sweep and a volume uploaded while
+  the stage was off are one case, and a dead run is **not** re-run by
+  a tick -- `YOLO_MAX_ATTEMPTS` were spent on a shard, and a fourth
+  attempt is a staff decision (a one-off `yolo.ensure_detect_jobs` in
+  a shell, which carries every good shard). The rule is one query
+  through `ExternalJob.source_fingerprint`, stamped by
+  `ensure_shard_jobs` on every row of every stage from the manifest's
+  source; it is **not** in the `input_manifest` identity, which
+  `_still_describes` compares exactly, and a blank (pre-column) row
+  matches anything, so no button-era run is re-paid. Candidates come
+  from the database (`SWEEP_STATUSES`: the parked states between the
+  pipeline and the end of review 2; QUEUED/PROCESSING are the
+  pipeline's, ERROR and beyond come back through the re-queue), and
+  only then does each cost one HEAD (`sharding.committed_manifest`).
+  `yolo.ensure_detect_jobs` is the only creator and the sweep its
+  only caller, pinned by `TestKnownEnqueuePaths`. The staff button of
+  #195 is deleted: it started nothing the sweep does not, and a
+  whole-volume re-run over an edited volume belongs to #224. "Next:
+  Detect" only walks to step 2 when detections exist (#196), and
+  otherwise says where the run stands (`views_process.detection_message`,
+  shared by the flash and the button title). The run is usually merged
+  during review 1 (the glue reads the rows, not the status) and waits
+  there at no cost; `queue_ready_runs` takes it on the tick after the
+  approval, because the apply reads `bitonal.pdf` and moves the scan.
 - **Each RunPod engine is its own endpoint, and `jobs.RunpodEngine` is
   where that lives.** dots.mocr's endpoint id, concurrency cap, attempt
   cap and per-page allowance used to be read by name for every RunPod
@@ -970,6 +987,9 @@ only what is new or specific:
   later checkpoint is a payload change and not a new engine.
 - `YOLO_SECONDS_PER_PAGE = 2.0` is a first guess, deliberately
   generous. #211 replaces it with a measured value.
+  `YOLO_MAX_CONCURRENCY` is 3 since #250; the endpoint's own
+  `max_workers` must be at least that, or the extra rows wait in the
+  provider's queue with the ceiling clock running.
 
 ## Redactions from the detection run (issue #196)
 
@@ -1070,10 +1090,12 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
 - **"Next: Detect" carries no paid confirm when there are no
   detections.** `start_detect` starts nothing since #195: it walks to
   step 2 when detections exist and otherwise flashes
-  `NO_DETECTIONS_MESSAGE`. The button's confirm used to name RunPod and
-  a cost for a run the view then did not start; the no-detections
-  branch now says what the view says. The staff "Run detection" button
-  is the one that pays, and the only one with a confirm.
+  `detection_message(yolo.run_summary(scan))` -- running, failed,
+  finished-and-waiting, or `NO_DETECTIONS_MESSAGE` for a volume with
+  no run. The button's confirm used to name RunPod and a cost for a
+  run the view then did not start; the no-detections branch now says
+  what the view says. Nothing in the viewer pays since #250: the
+  daemon starts the one run.
 
 ## The glued outputs, by scan id (issue #243)
 

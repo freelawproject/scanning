@@ -127,14 +127,50 @@ REPLACEMENT_IS_ONE_PAGE_MESSAGE = (
     "A replacement stands for one page, and this PDF holds {pages}. "
     "Upload the one page that replaces it."
 )
-# What a curator sees when they ask for step 2 on a volume nobody has
-# run detection over. Since #195/#196 that is no longer a paused
-# pipeline: the stage works, and a staff member starts it, because each
-# run costs GPU time.
+# What a curator sees when they ask for step 2 on a volume with no
+# detections and no detection run. Since #250 the daemon starts the
+# run by itself once per shard set, so a volume with no run at all is
+# a legacy volume with no shard set, an environment with the stage
+# off, or a sweep that has not ticked yet.
 NO_DETECTIONS_MESSAGE = (
-    "This volume has no detections yet. A staff member starts the "
-    "detection run, and the redactions appear here when it finishes."
+    "This volume has no detections yet. Detection starts by itself "
+    "after the upload, and the redactions appear here when it "
+    "finishes. If nothing shows after a few minutes, ask a staff "
+    "member."
 )
+
+
+def detection_message(summary: dict | None) -> str:
+    """Say where a volume's detection stands, for a curator (#250).
+
+    One text for the "Next: Detect" title and the flash the view sends
+    when it cannot walk to step 2, so the bar and the view agree.
+    ``summary`` is ``yolo.run_summary(scan)``: ``None`` when the stage
+    has never run, else the counts of the live run.
+
+    :param summary: The run summary, or ``None``.
+    :returns: The message.
+    :rtype: str
+    """
+    if not summary:
+        return NO_DETECTIONS_MESSAGE
+    if summary["failed"]:
+        code = summary["error_code"] or "no error code"
+        return (
+            f"Detection failed on {summary['failed']} of "
+            f"{summary['total']} part(s) ({code}). Ask a staff member "
+            "to look into it."
+        )
+    if summary["open"]:
+        return (
+            f"Detection is running: {summary['done']} of "
+            f"{summary['total']} part(s) done. The redactions appear "
+            "here when it finishes."
+        )
+    return (
+        "Detection finished. The redactions are computed within a "
+        "minute of the page completeness approval."
+    )
 
 
 def _unmatched_detection_dict(
@@ -520,6 +556,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "is_processing": is_processing,
             "dots_run": dots_run,
             "yolo_run": yolo_run,
+            "detect_message": detection_message(yolo_run),
             **_review_flags(scan),
             "opinions": opinions,
             "opinions_json": json.dumps(opinions),
@@ -1277,6 +1314,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
     if step < 1 or step > 3:
         step = 1
 
+    yolo_run = yolo.run_summary(scan)
     context = {
         "scan": scan,
         "step": step,
@@ -1286,7 +1324,8 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "has_detections": Detection.objects.filter(scan=scan).exists(),
         "opinions": scan.opinions_json,
         "dots_run": dots_mocr.run_summary(scan),
-        "yolo_run": yolo.run_summary(scan),
+        "yolo_run": yolo_run,
+        "detect_message": detection_message(yolo_run),
         **_review_flags(scan),
     }
     html = render_to_string(
@@ -1343,10 +1382,10 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     """Skip to review 2 when detections exist; otherwise explain.
 
     The only thing left of this action is its shortcut: a scan that has
-    detections goes straight to step 2. It starts nothing itself --
-    since #195 the detection run has its own staff button, because each
-    run costs GPU time -- so a volume with no detections is told who
-    starts one.
+    detections goes straight to step 2. It starts nothing itself -- the
+    daemon starts the detection run once per shard set (#250) -- so a
+    volume with no detections is told where its run stands
+    (:func:`detection_message`).
 
     Approval is the gate (#151), in the view and not only in the bar:
     a scan still in READY_FOR_PAGE_COMPLETENESS_REVIEW is sent back to
@@ -1378,7 +1417,7 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
         )
 
-    messages.info(request, NO_DETECTIONS_MESSAGE)
+    messages.info(request, detection_message(yolo.run_summary(scan)))
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -1471,121 +1510,6 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
             request,
             f"This volume was already read: run {created[0].run} covers "
             f"all {len(created)} part(s). Nothing new was queued.",
-        )
-    return back
-
-
-@login_required
-@require_POST
-def start_yolo_detect(request: HttpRequest, pk: int) -> HttpResponse:
-    """Start YOLO detection over a scan's original shards (#195).
-
-    Staff only, and the **only** way into this stage. The pipeline
-    deliberately does not enqueue it: the rebuilt worker image (#194)
-    has to be exercised on a few volumes before it runs over the
-    corpus (#211). Every press can start real graphics processing unit
-    (GPU) work on RunPod that costs money.
-
-    Review 2 follows review 1, so the volume must be approved first
-    (``PAGE_COMPLETENESS_REVIEW_DONE``). The gate is here and not only
-    in the template: the run ends in an apply that imports detections
-    and rewrites the redaction geometry (#196), and a volume whose page
-    set a curator is still editing would be detected twice.
-
-    Detection reads the **original** shards, not the converted ones.
-    bl-warm was trained on greyscale renders, and its large region
-    classes collapse on 1-bit pages (#167).
-
-    **This request makes no call to RunPod.** It writes one
-    ``ExternalJob`` row per shard and returns; the daemon's next
-    ``submit_external_jobs`` tick sends them, and ``collect_external_jobs``
-    polls and retries them. That keeps a request thread off a slow HTTP
-    call, and it is what makes the run survive a redeployed web pod.
-
-    It also never cuts shards. ``sharding.committed_manifest`` verifies
-    the stored set against the original with one ``head_object``, so this
-    view neither downloads a multi-gigabyte PDF nor reads ``shards/``
-    directly. A stale or missing set is refused, because re-cutting is
-    the pipeline's job.
-
-    The daemon reads the output. Once every row is ``COMPLETED``, the
-    collect tick merges the run into one volume document and queues the
-    redaction computation, which imports the detections, pairs the
-    opinions and measures the geometry review 2 shows (#196).
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: Redirect to the scan processing page.
-    """
-    from scanning import sharding
-
-    scan = get_object_or_404(Scan, pk=pk)
-    back = redirect("scan_process", pk=scan.pk)
-
-    if not request.user.is_staff:
-        messages.error(
-            request,
-            "Only staff can start detection: each run costs GPU time.",
-        )
-        return back
-
-    if scan.status != Status.PAGE_COMPLETENESS_REVIEW_DONE:
-        messages.warning(
-            request,
-            "Detection runs after the page completeness review is "
-            "approved. This volume is not approved yet.",
-        )
-        return back
-
-    if not yolo.enabled():
-        messages.warning(
-            request,
-            "YOLO detection is not switched on in this environment. Set "
-            "YOLO_ENABLED and RUNPOD_YOLO_ENDPOINT_ID first.",
-        )
-        return back
-
-    # An open run means the daemon is still working on the last press.
-    # A finished run is reused rather than refused, which is what keeps
-    # ``ensure_detect_jobs`` from paying twice for shards already read.
-    summary = yolo.run_summary(scan)
-    if summary and summary["open"]:
-        messages.info(
-            request,
-            f"Detection run {summary['run']} is already going: "
-            f"{summary['done']} of {summary['total']} part(s) done.",
-        )
-        return back
-
-    manifest, reason = sharding.committed_manifest(scan)
-    if manifest is None:
-        messages.warning(request, reason)
-        return back
-
-    created = yolo.ensure_detect_jobs(scan, manifest)
-    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
-    logger.info(
-        "start_yolo_detect: scan=%s user=%s run=%s shards=%d queued=%d",
-        scan.pk,
-        request.user.pk,
-        created[0].run if created else "?",
-        len(created),
-        queued,
-    )
-    if queued:
-        messages.success(
-            request,
-            f"Queued detection for {queued} part(s) of this volume. The "
-            "daemon sends them to RunPod within a few seconds.",
-        )
-    else:
-        # ``ensure_detect_jobs`` reused a run that is already done, so
-        # nothing was queued and nothing will be sent. Saying otherwise
-        # would have staff waiting on a dispatch that is not coming.
-        messages.info(
-            request,
-            f"This volume was already detected: run {created[0].run} "
-            f"covers all {len(created)} part(s). Nothing new was queued.",
         )
     return back
 

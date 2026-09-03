@@ -1592,7 +1592,8 @@ def run_compute_redactions(scan_pk: int) -> None:
         )
         _park_after_redactions(
             scan_pk,
-            "No detections to work from. Run detection first.",
+            "No detections to work from. The detection run has not "
+            "reached this volume yet.",
             park,
         )
         return

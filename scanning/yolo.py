@@ -15,21 +15,27 @@ worker image is issue #194; this module is the caller it was waiting
 for.
 
 The run ends when every shard answers, with the rows at ``COMPLETED``
--- the provider is done, and we have applied nothing. There is
-deliberately **no** glue and no ``CONSUMED`` here: issue #196 reads the
+-- the provider is done, and we have applied nothing. The collect tick
+then merges the run (:func:`finish_ready_runs`, #196): it reads the
 per-shard results, offsets each ``page_index`` by its shard's own
-``from_page``, and turns the rows into ``Detection`` records and
-redaction geometry. Until it lands, a finished run is a set of JSON
-objects in S3 and nothing else.
+``from_page``, writes one volume document and flips the rows to
+``CONSUMED``. That follows the rows alone, so it happens while the scan
+is still in review 1. Only the apply (:func:`queue_ready_runs`) waits
+for the approval, because it imports the ``Detection`` records and
+measures the redaction geometry on the bitonal copy.
 
-Who starts it: the staff-only button
-(``views_process.start_yolo_detect``), and nothing else. The pipeline
-does **not** enqueue it. That is the whole point of this issue -- the
-stage must be exercised on a few volumes before it runs over the corpus
-(#211) -- and it is structural rather than a promise, because
-:func:`ensure_detect_jobs` is the only creator of ``DETECT`` rows and an
-abstract syntax tree (AST) test pins its caller set. The web process
-only writes rows; the daemon submits, polls and retries them.
+Who starts it: the daemon, once per shard set, and nothing else
+(#250). :func:`enqueue_missing_runs` runs on every submit tick before
+the wave, and creates the rows for every fingerprinted shard set that
+has no detection run yet -- alive or dead -- so a new upload, a volume
+uploaded before the sweep existed and a volume uploaded while the
+stage was off are all one case. A dead run over the same set is not
+re-run by the daemon: that is a deliberate act. The staff button of
+#195 is deleted; it started nothing the sweep does not. The rule is
+structural rather than a promise, because :func:`ensure_detect_jobs`
+is the only creator of ``DETECT`` rows and an abstract syntax tree
+(AST) test pins its caller set. The web process writes no detection
+rows at all; the daemon creates, submits, polls and retries them.
 """
 
 from __future__ import annotations
@@ -117,6 +123,22 @@ APPLY_MAX_ATTEMPTS = 3
 #: Every other status is deferred, never marked: a scan approved into
 #: step 3, errored or re-queued comes back through the admin re-queue.
 APPLY_STATUS = Status.PAGE_COMPLETENESS_REVIEW_DONE
+
+#: The statuses the sweep starts a run from (#250): the parked states
+#: between the pipeline and the end of review 2. QUEUED and PROCESSING
+#: are out, because the pipeline owns the scan and may re-cut its set;
+#: ERROR and every status past review 2 are out, because they come
+#: back through the admin re-queue. The sweep is the one automatic
+#: creator of paid GPU work outside ``run_full_pipeline``, so the set
+#: is spelled out rather than derived.
+SWEEP_STATUSES = frozenset(
+    {
+        Status.AWAITING,
+        Status.AWAITING_VALIDATION,
+        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+        Status.PAGE_COMPLETENESS_REVIEW_DONE,
+    }
+)
 
 
 class DetectMergeError(Exception):
@@ -210,6 +232,81 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
         provider=JobProvider.RUNPOD,
         reuse_results=True,
     )
+
+
+def enqueue_missing_runs() -> int:
+    """Start detection over every shard set that has no run yet.
+
+    The submit tick's first pass (#250), before ``jobs.submit_pending``
+    so the rows it creates go out on the same tick. This is what
+    connects detection to the pipeline, and it is a sweep rather than
+    an arm in ``run_full_pipeline`` because one rule then covers three
+    cases: a new upload, a volume uploaded before this existed, and a
+    volume uploaded while the stage was switched off.
+
+    **The rule: a shard set is detected once.** A run is started only
+    for a scan whose current shard set -- named by
+    ``Scan.source_fingerprint``, stamped by ``sharding.ensure_shards``
+    -- has no detection row at all, alive or dead. A dead run over the
+    same set is left alone: ``YOLO_MAX_ATTEMPTS`` were spent on a shard,
+    and a fourth attempt is a staff decision, not a tick. A re-cut set
+    has a new fingerprint, so it gets a run, and
+    :func:`ensure_detect_jobs` carries every unchanged shard forward.
+    A row written before the column is blank and matches anything, so
+    a button-era run is never re-paid.
+
+    The candidates come from the database alone. Only then does each
+    one cost an S3 HEAD (``sharding.committed_manifest``), which
+    verifies the stored set against the original without reading a
+    shard; a refused set is logged and looked at again next tick,
+    until a re-queue re-cuts it. The pass makes no call to RunPod.
+
+    :returns: How many runs were started.
+    :rtype: int
+    """
+    from django.db.models import Exists, OuterRef, Q
+
+    from scanning import sharding
+
+    if not enabled() or not s3_sync.s3_active():
+        return 0
+
+    detected = ExternalJob.objects.filter(
+        scan=OuterRef("pk"),
+        stage=JobStage.DETECT,
+        engine=JobEngine.BLACKLETTER,
+        opinion=None,
+    ).filter(
+        Q(source_fingerprint=OuterRef("source_fingerprint"))
+        | Q(source_fingerprint="")
+    )
+    candidates = (
+        Scan.objects.filter(status__in=SWEEP_STATUSES)
+        .exclude(source_fingerprint="")
+        .annotate(detected=Exists(detected))
+        .filter(detected=False)
+        .order_by("pk")
+    )
+
+    started = 0
+    for scan in candidates:
+        manifest, reason = sharding.committed_manifest(scan)
+        if manifest is None:
+            logger.info(
+                "Scan %s is not swept for detection: %s", scan.pk, reason
+            )
+            continue
+        rows = ensure_detect_jobs(scan, manifest)
+        logger.info(
+            "Started detection run %s for scan %s over %d shard(s) "
+            "(%d carried)",
+            rows[0].run,
+            scan.pk,
+            len(rows),
+            sum(1 for row in rows if row.status == JobStatus.COMPLETED),
+        )
+        started += 1
+    return started
 
 
 def live_detect_jobs(scan) -> list[ExternalJob]:

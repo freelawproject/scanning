@@ -74,7 +74,6 @@ from scanning.views_process import (
     start_detect,
     start_dots_mocr,
     start_validate,
-    start_yolo_detect,
     undo_delete_page,
     undo_replace_page,
 )
@@ -168,11 +167,6 @@ urlpatterns = [
         "scans/<int:pk>/start-ocr/",
         start_dots_mocr,
         name="start_dots_mocr",
-    ),
-    path(
-        "scans/<int:pk>/start-yolo/",
-        start_yolo_detect,
-        name="start_yolo_detect",
     ),
     path("scans/<int:pk>/recalculate/", recalculate, name="recalculate"),
     path(

@@ -1,11 +1,11 @@
-"""Tests for the YOLO detection stage: switches, rows, payload, button.
+"""Tests for the YOLO detection stage: switches, rows, payload, sweep.
 
 Short on purpose. Everything that separates an asynchronous provider
 from doctor -- the claim, the poll, the deadlines, the cancel, the
 retry -- is shared with dots.mocr and covered in ``test_dots_mocr.py``.
 What is tested here is what detection does *differently*: its own
-endpoint, its own caps, its own payload, and a button that no pipeline
-may replace.
+endpoint, its own caps, its own payload, and the sweep that starts one
+run per shard set (#250).
 
 No HTTP and no S3 -- ``runpod_client`` and the S3 helpers are patched.
 """
@@ -24,6 +24,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    Scan,
     Status,
 )
 from scanning.tests.test_jobs import make_manifest
@@ -355,156 +356,324 @@ class TestPerEngineKnobs(ScanningTestCase):
             jobs._runpod_endpoint(row)
 
 
-# ── the start button ────────────────────────────────────────────────
-@override_settings(**YOLO)
-class TestStartButton(ScanningTestCase):
-    """Staff-only, and it writes rows rather than calling RunPod."""
+# ── the sweep ───────────────────────────────────────────────────────
+FINGERPRINT = "3072:30"
+
+
+def sweep_manifest(shard_count=3, pages_per_shard=10):
+    """A manifest whose source fingerprint is :data:`FINGERPRINT`.
+
+    ``make_manifest`` sizes the source at 1024 bytes per shard, so three
+    shards of ten pages give ``3072:30``.
+
+    :param shard_count: How many shards to describe.
+    :param pages_per_shard: Pages in each shard.
+    :returns: A manifest dict.
+    :rtype: dict
+    """
+    return make_manifest(shard_count, pages_per_shard)
+
+
+class TestEnqueueMissingRuns(ScanningTestCase):
+    """One run per shard set, started by the daemon, and never a second.
+
+    The rule the sweep enforces (#250): a scan whose current shard set
+    (``Scan.source_fingerprint``) has no detection row -- alive or dead
+    -- gets exactly one run. Everything else is left alone.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.manifest = sweep_manifest()
+
+    def _scan(
+        self, status=Status.AWAITING_VALIDATION, fingerprint=FINGERPRINT
+    ):
+        return ScanFactory(
+            page_count=30, status=status, source_fingerprint=fingerprint
+        )
+
+    _UNSET = object()
+
+    def _sweep(self, manifest=_UNSET, reason=""):
+        """Run the sweep with S3 on and the manifest check answered."""
+        with (
+            override_settings(**YOLO),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch(
+                "scanning.sharding.committed_manifest",
+                return_value=(
+                    self.manifest if manifest is self._UNSET else manifest,
+                    reason,
+                ),
+            ) as committed,
+            patch("scanning.runpod_client.submit_job") as submit,
+        ):
+            started = yolo.enqueue_missing_runs()
+        self.committed = committed
+        self.submit = submit
+        return started
+
+    def test_a_fingerprinted_scan_with_no_run_gets_one_row_per_shard(self):
+        for status in sorted(yolo.SWEEP_STATUSES):
+            with self.subTest(status=status):
+                scan = self._scan(status=status)
+                self.assertEqual(self._sweep(), 1)
+                rows = detect_jobs(scan)
+                self.assertEqual(len(rows), 3)
+                self.assertEqual(
+                    {row.status for row in rows}, {JobStatus.PENDING}
+                )
+                self.assertEqual(
+                    {row.source_fingerprint for row in rows}, {FINGERPRINT}
+                )
+
+    def test_the_sweep_makes_no_call_to_runpod(self):
+        self._scan()
+        self._sweep()
+        self.submit.assert_not_called()
+
+    def test_a_second_tick_starts_nothing(self):
+        scan = self._scan()
+        self.assertEqual(self._sweep(), 1)
+        self.assertEqual(self._sweep(), 0)
+        self.assertEqual(len(detect_jobs(scan)), 3)
+
+    def test_a_live_run_over_the_same_set_is_left_alone(self):
+        scan = self._scan()
+        yolo.ensure_detect_jobs(scan, self.manifest)
+        self.assertEqual(self._sweep(), 0)
+        self.committed.assert_not_called()
+
+    def test_a_dead_run_over_the_same_set_is_not_re_run(self):
+        """A FAILED row means the attempts are spent. A fourth is a
+        staff decision, not a tick."""
+        scan = self._scan()
+        rows = yolo.ensure_detect_jobs(scan, self.manifest)
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.FAILED
+        )
+        self.assertEqual(self._sweep(), 0)
+        self.assertEqual(len(detect_jobs(scan)), 3)
+
+    def test_a_consumed_run_over_the_same_set_is_left_alone(self):
+        scan = self._scan()
+        rows = yolo.ensure_detect_jobs(scan, self.manifest)
+        ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
+            status=JobStatus.CONSUMED
+        )
+        self.assertEqual(self._sweep(), 0)
+
+    def test_rows_with_a_blank_fingerprint_match_anything(self):
+        """A button-era run (before the column) is over the current set
+        unless the original was re-cut, and re-cutting stamps every
+        later row. Never re-pay it."""
+        scan = self._scan()
+        rows = yolo.ensure_detect_jobs(scan, self.manifest)
+        ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
+            source_fingerprint=""
+        )
+        self.assertEqual(self._sweep(), 0)
+
+    def test_a_re_cut_set_gets_a_new_run_and_carries_unchanged_shards(self):
+        scan = self._scan(fingerprint="2048:20")
+        old_manifest = make_manifest(shard_count=2, pages_per_shard=10)
+        old = yolo.ensure_detect_jobs(scan, old_manifest)
+        self.assertEqual(old[0].source_fingerprint, "2048:20")
+        for index, row in enumerate(old):
+            ExternalJob.objects.filter(pk=row.pk).update(
+                status=JobStatus.CONSUMED,
+                result_key=f"jobs/detect/blackletter/r1-s{index}-a1.json",
+                completed_at=timezone.now(),
+            )
+        # The original was re-uploaded: shard 1 changed, shard 0 did not.
+        new_manifest = make_manifest(shard_count=2, pages_per_shard=10)
+        new_manifest["shards"][1]["size_bytes"] = 4096
+        new_manifest["source"]["size_bytes"] = 1024 + 4096
+        Scan.objects.filter(pk=scan.pk).update(source_fingerprint="5120:20")
+        self.manifest = new_manifest
+
+        with patch("scanning.s3_sync.object_exists", return_value=True):
+            self.assertEqual(self._sweep(), 1)
+
+        fresh = yolo.live_detect_jobs(scan)
+        self.assertEqual(fresh[0].run, 2)
+        self.assertEqual(
+            {row.source_fingerprint for row in fresh}, {"5120:20"}
+        )
+        self.assertEqual(fresh[0].status, JobStatus.COMPLETED)
+        self.assertEqual(
+            fresh[0].provider_meta["carried_from"]["job"], old[0].pk
+        )
+        self.assertEqual(fresh[1].status, JobStatus.PENDING)
+
+    def test_only_the_parked_review_statuses_are_swept(self):
+        for status in (
+            Status.UPLOADED,
+            Status.QUEUED,
+            Status.PROCESSING,
+            Status.ERROR,
+            Status.CANCELLED,
+            Status.APPROVED,
+            Status.PENDING_REVIEW,
+        ):
+            with self.subTest(status=status):
+                scan = self._scan(status=status)
+                self.assertEqual(self._sweep(), 0)
+                self.assertEqual(detect_jobs(scan), [])
+
+    def test_a_scan_with_no_shard_set_is_not_swept(self):
+        self._scan(fingerprint="")
+        self.assertEqual(self._sweep(), 0)
+        self.committed.assert_not_called()
+
+    def test_a_refused_manifest_is_skipped_and_logged(self):
+        scan = self._scan()
+        with self.assertLogs("scanning.yolo", level="INFO") as logs:
+            started = self._sweep(
+                manifest=None, reason="The original PDF has changed"
+            )
+        self.assertEqual(started, 0)
+        self.assertEqual(detect_jobs(scan), [])
+        self.assertIn("The original PDF has changed", "".join(logs.output))
+
+    def test_the_stage_switch_stops_the_sweep(self):
+        scan = self._scan()
+        with (
+            override_settings(**{**YOLO, "YOLO_ENABLED": False}),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.sharding.committed_manifest") as committed,
+        ):
+            self.assertEqual(yolo.enqueue_missing_runs(), 0)
+        committed.assert_not_called()
+        self.assertEqual(detect_jobs(scan), [])
+
+    def test_no_s3_no_sweep(self):
+        scan = self._scan()
+        with (
+            override_settings(**YOLO),
+            patch("scanning.s3_sync.s3_active", return_value=False),
+            patch("scanning.sharding.committed_manifest") as committed,
+        ):
+            self.assertEqual(yolo.enqueue_missing_runs(), 0)
+        committed.assert_not_called()
+        self.assertEqual(detect_jobs(scan), [])
+
+    def test_the_sweep_writes_no_scan_status(self):
+        scan = self._scan(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
+        self._sweep()
+        scan.refresh_from_db()
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+
+
+# ── what the viewer shows ───────────────────────────────────────────
+class TestViewerShowsTheRun(ScanningTestCase):
+    """The stage writes no scan status, so the rows are the only place a
+    viewer can see it happening -- and there is no button to start it
+    (#250)."""
 
     def setUp(self):
         super().setUp()
         self.staff = self.make_staff_user()
-        # Review 2 follows review 1, so only an approved volume may be
-        # detected (#196): the apply that reads the run takes a scan
-        # from this status alone.
         self.scan = ScanFactory(
-            page_count=30,
-            status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
-        )
-        self.url = reverse("start_yolo_detect", kwargs={"pk": self.scan.pk})
-        self.manifest = make_manifest(shard_count=3, pages_per_shard=10)
-
-    _UNSET = object()
-
-    def _committed(self, manifest=_UNSET, reason=""):
-        """Patch the manifest check to answer without S3."""
-        return patch(
-            "scanning.sharding.committed_manifest",
-            return_value=(
-                self.manifest if manifest is self._UNSET else manifest,
-                reason,
-            ),
+            page_count=30, status=Status.PAGE_COMPLETENESS_REVIEW_DONE
         )
 
-    def _press(self, user=None):
-        self.client.force_login(user or self.staff)
-        return self.client.post(self.url)
-
-    def test_staff_press_creates_one_row_per_shard(self):
-        with self._committed():
-            response = self._press()
-
-        self.assertRedirects(
-            response,
-            reverse("scan_process", kwargs={"pk": self.scan.pk}),
-            fetch_redirect_response=False,
-        )
-        rows = detect_jobs(self.scan)
-        self.assertEqual(len(rows), 3)
-        self.assertEqual({row.status for row in rows}, {JobStatus.PENDING})
-
-    def test_the_request_never_calls_runpod(self):
-        # The web pod writes rows; the daemon sends them. That keeps a
-        # request off a slow HTTP call and survives a redeployed pod.
-        with (
-            self._committed(),
-            patch("scanning.runpod_client.submit_job") as submit,
-        ):
-            self._press()
-        submit.assert_not_called()
-
-    def test_the_request_never_cuts_shards(self):
-        # A stale set is refused, not re-cut: re-cutting reads a
-        # multi-gigabyte original, which is the pipeline's work.
-        with (
-            self._committed(),
-            patch("scanning.sharding.ensure_shards") as cut,
-        ):
-            self._press()
-        cut.assert_not_called()
-
-    def test_a_non_staff_user_is_refused(self):
-        with self._committed():
-            response = self._press(self.make_user())
-        self.assertEqual(detect_jobs(self.scan), [])
-        messages = list(response.wsgi_request._messages)
-        self.assertIn("Only staff", str(messages[0]))
-
-    def test_an_anonymous_user_is_redirected_to_login(self):
-        response = self.client.post(self.url)
-        self.assertEqual(response.status_code, 302)
-        self.assertIn("/login", response["Location"])
-        self.assertEqual(detect_jobs(self.scan), [])
-
-    def test_a_get_is_rejected(self):
-        self.client.force_login(self.staff)
-        self.assertEqual(self.client.get(self.url).status_code, 405)
-
-    def test_a_disabled_stage_is_refused(self):
-        with override_settings(YOLO_ENABLED=False), self._committed():
-            response = self._press()
-        self.assertEqual(detect_jobs(self.scan), [])
-        messages = list(response.wsgi_request._messages)
-        self.assertIn("YOLO_ENABLED", str(messages[0]))
-
-    def test_a_volume_review_one_has_not_approved_is_refused(self):
-        # The apply that reads the run takes a scan from
-        # PAGE_COMPLETENESS_REVIEW_DONE alone, so a run started earlier
-        # would be paid for and never applied.
-        self.scan.status = Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
-        self.scan.save(update_fields=["status"])
-        with self._committed():
-            response = self._press()
-        self.assertEqual(detect_jobs(self.scan), [])
-        messages = list(response.wsgi_request._messages)
-        self.assertIn("not approved", str(messages[0]))
-
-    def test_no_committed_shard_set_is_refused(self):
-        with self._committed(manifest=None, reason="no shard set"):
-            response = self._press()
-        self.assertEqual(detect_jobs(self.scan), [])
-        messages = list(response.wsgi_request._messages)
-        self.assertIn("no shard set", str(messages[0]))
-
-    def test_a_second_press_while_a_run_is_open_is_refused(self):
-        with self._committed():
-            self._press()
-            first = [row.pk for row in detect_jobs(self.scan)]
-            response = self._press()
-
-        self.assertEqual([row.pk for row in detect_jobs(self.scan)], first)
-        messages = list(response.wsgi_request._messages)
-        self.assertIn("already going", str(messages[-1]))
-
-    def test_a_press_after_a_finished_run_reuses_it(self):
-        # Idempotent rather than refused: a YOLO run is costly, so a
-        # second press must not pay for shards already detected.
-        with self._committed():
-            self._press()
-            rows = detect_jobs(self.scan)
-            ExternalJob.objects.filter(pk__in=[row.pk for row in rows]).update(
-                status=JobStatus.COMPLETED
-            )
-            with (
-                patch("scanning.s3_sync.s3_active", return_value=True),
-                patch("scanning.s3_sync.object_exists", return_value=True),
-            ):
-                response = self._press()
-
-        self.assertEqual(len(detect_jobs(self.scan)), 3)
-        self.assertEqual(
-            {row.status for row in detect_jobs(self.scan)},
-            {JobStatus.COMPLETED},
-        )
-        messages = list(response.wsgi_request._messages)
-        self.assertIn("already detected", str(messages[-1]))
-
-    def test_the_run_shows_on_the_process_page(self):
-        # The stage writes no scan status, so the rows are the only
-        # place a viewer can see it happening.
-        with self._committed():
-            self._press()
+    def _bar(self):
         self.client.force_login(self.staff)
         response = self.client.get(
             reverse("process_actions", kwargs={"pk": self.scan.pk})
         )
-        self.assertIn("Detection running", response.json()["html"])
+        return response.json()["html"]
+
+    def test_the_run_shows_on_the_process_page(self):
+        yolo.ensure_detect_jobs(self.scan, make_manifest(shard_count=3))
+        self.assertIn("Detection running", self._bar())
+
+    def test_there_is_no_start_button(self):
+        from django.urls import NoReverseMatch
+
+        html = self._bar()
+        self.assertNotIn("Run detection", html)
+        self.assertNotIn("start-yolo", html)
+        with self.assertRaises(NoReverseMatch):
+            reverse("start_yolo_detect", kwargs={"pk": self.scan.pk})
+
+    def test_next_detect_says_where_the_run_stands(self):
+        from scanning.views_process import NO_DETECTIONS_MESSAGE
+
+        self.assertIn(NO_DETECTIONS_MESSAGE, self._bar())
+        rows = yolo.ensure_detect_jobs(self.scan, make_manifest(shard_count=3))
+        self.assertIn("Detection is running: 0 of 3", self._bar())
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.FAILED, error_code="WORKER_DEAD"
+        )
+        self.assertIn("Detection failed on 1 of 3", self._bar())
+        self.assertIn("WORKER_DEAD", self._bar())
+        ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
+            status=JobStatus.CONSUMED, error_code=""
+        )
+        self.assertIn("Detection finished", self._bar())
+
+
+class TestDetectionMessage(ScanningTestCase):
+    """The one text the flash and the button title share."""
+
+    def _summary(self, **overrides):
+        base = {
+            "run": 1,
+            "total": 3,
+            "done": 0,
+            "open": 3,
+            "failed": 0,
+            "error_code": "",
+        }
+        return {**base, **overrides}
+
+    def test_no_run(self):
+        from scanning.views_process import (
+            NO_DETECTIONS_MESSAGE,
+            detection_message,
+        )
+
+        self.assertEqual(detection_message(None), NO_DETECTIONS_MESSAGE)
+
+    def test_a_failure_wins_over_progress_and_names_the_code(self):
+        from scanning.views_process import detection_message
+
+        text = detection_message(
+            self._summary(open=1, failed=1, done=1, error_code="OOM")
+        )
+        self.assertIn("failed on 1 of 3", text)
+        self.assertIn("OOM", text)
+
+    def test_progress(self):
+        from scanning.views_process import detection_message
+
+        text = detection_message(self._summary(open=2, done=1))
+        self.assertIn("running: 1 of 3", text)
+
+    def test_finished_waits_for_the_approval(self):
+        from scanning.views_process import detection_message
+
+        text = detection_message(self._summary(open=0, done=3))
+        self.assertIn("finished", text)
+        self.assertIn("approval", text)
+
+    def test_start_detect_flashes_the_same_text(self):
+        user = self.make_user()
+        scan = ScanFactory(
+            page_count=30, status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+        yolo.ensure_detect_jobs(scan, make_manifest(shard_count=3))
+        self.client.force_login(user)
+        response = self.client.post(
+            reverse("start_detect", kwargs={"pk": scan.pk}), follow=True
+        )
+        flashed = [str(m) for m in response.context["messages"]]
+        self.assertTrue(
+            any("Detection is running: 0 of 3" in m for m in flashed),
+            flashed,
+        )

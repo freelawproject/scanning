@@ -2035,6 +2035,21 @@ class ExternalJob(AbstractDateTimeModel):
             '{"dpi": 400}.'
         ),
     )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The shard set this row was cut for: '{size_bytes}:"
+            "{page_count}' of the original, the value "
+            "sharding.ensure_shards stamps on Scan.source_fingerprint. "
+            "Stamped by jobs.ensure_shard_jobs on every row of every "
+            "stage, so 'has this set been detected' is one query "
+            "(#250). Not part of the shard identity in input_manifest. "
+            "Blank on a row written before the column, which matches "
+            "anything."
+        ),
+    )
 
     # ── result ───────────────────────────────────────────────────────
     result_key = models.CharField(
