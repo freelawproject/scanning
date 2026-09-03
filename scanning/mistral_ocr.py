@@ -150,8 +150,12 @@ TUNING_KEYS = ("model",)
 PAGE_FILE_PURPOSE = "ocr"
 MANIFEST_FILE_PURPOSE = "batch"
 
-#: Prefix of the scratch directory one submission renders in, so the
-#: cleanup sweep can reclaim one a SIGKILL orphans.
+#: Prefix of the scratch directory one submission renders in. The
+#: directory holds the downloaded shard PDF (up to ``SHARD_TARGET_BYTES``)
+#: while its pages are rendered and uploaded; the PNGs never touch the
+#: disk. A normal exit and an exception both remove it; a SIGKILL
+#: orphans it, and ``cleanup_processing_tmp`` reclaims it by this prefix
+#: (#215), as it does the other stages' scratch dirs.
 RENDER_TMP_PREFIX = "mistralocr-"
 
 
@@ -503,7 +507,13 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     model = model_for(job)
     files: list[str] = []
     try:
-        with tempfile.TemporaryDirectory(prefix=RENDER_TMP_PREFIX) as tmp:
+        # Named after the scan and the shard, as the other stages name
+        # theirs: an orphan of a SIGKILL holds a shard PDF of up to
+        # SHARD_TARGET_BYTES, and the #215 sweep reclaims it by prefix,
+        # so whoever finds one first can tell whose it is.
+        with tempfile.TemporaryDirectory(
+            prefix=f"{RENDER_TMP_PREFIX}{job.scan_id}-s{job.shard_index}-"
+        ) as tmp:
             pdf_path = Path(tmp) / "shard.pdf"
             s3_sync.download_object(job.input_key, pdf_path)
             lines = []

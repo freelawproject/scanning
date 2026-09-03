@@ -429,6 +429,46 @@ class TestSubmitWave(ScanningTestCase):
         png = mocks["upload"].call_args_list[0].args[1]
         self.assertEqual(png_image(png).getpixel((400, 400)), (255, 255, 255))
 
+    def test_the_scratch_dir_names_the_scan_and_is_removed(self):
+        # The shard PDF is rendered in a system temp dir the #215 sweep
+        # reclaims by prefix; the name carries the scan and the shard,
+        # as the other stages' do, and a normal exit removes it.
+        real = tempfile.TemporaryDirectory
+        seen = {}
+
+        def spy(*args, **kwargs):
+            tmp = real(*args, **kwargs)
+            seen["prefix"] = kwargs.get("prefix")
+            seen["path"] = Path(tmp.name)
+            return tmp
+
+        job = extract_jobs(self.scan)[0]
+        with patch("scanning.mistral_ocr.tempfile.TemporaryDirectory", spy):
+            self._tick()
+
+        self.assertEqual(
+            seen["prefix"],
+            f"{mistral_ocr.RENDER_TMP_PREFIX}{self.scan.pk}-s{job.shard_index}-",
+        )
+        self.assertFalse(seen["path"].exists())
+
+    def test_the_scratch_dir_is_removed_on_a_failure_too(self):
+        real = tempfile.TemporaryDirectory
+        seen = {}
+
+        def spy(*args, **kwargs):
+            tmp = real(*args, **kwargs)
+            seen["path"] = Path(tmp.name)
+            return tmp
+
+        with patch("scanning.mistral_ocr.tempfile.TemporaryDirectory", spy):
+            self._tick(
+                upload_error=[
+                    mistral_client.MistralError("bad", "HTTP_400", 400)
+                ]
+            )
+        self.assertFalse(seen["path"].exists())
+
     def test_a_box_edited_after_the_press_does_not_reach_this_run(self):
         # Shards queue behind MAX_CONCURRENCY, so a curator can edit a
         # box between the press and the submit tick. The row's identity
