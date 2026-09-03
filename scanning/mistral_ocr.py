@@ -41,6 +41,9 @@ and must not be broken:
   Every page image, the manifest and the two output files live at
   Mistral until we delete them, so every path that writes a row off
   deletes what it uploaded.
+- **A result with a hole is never carried.** The stable-hole rule of
+  #238 trusts a deterministic worker; a Mistral batch line can fail
+  from a transient fault, so the carry re-reads the shard instead.
 - **The source is the original scan, never the bitonal copy.** The
   ensemble's tests all ran on non-bitonal images, and the shards are
   cut from the original. ``SOURCE`` is a constant with no per-row
@@ -67,7 +70,7 @@ from django.conf import settings
 from django.utils import timezone
 from PIL import Image
 
-from scanning import jobs, mistral_client, runpod_client, s3_sync
+from scanning import jobs, mistral_client, s3_sync
 from scanning.models import (
     DEAD_JOB_STATUSES,
     ExternalJob,
@@ -99,10 +102,13 @@ TABLE_FORMAT = "html"
 
 #: Batch jobs in flight at once, not pages. A debug guard on blast
 #: radius, not a cost control: Mistral bills per page whatever the
-#: parallelism. A batch waits at Mistral for hours, so this must stay
-#: well above ``MAX_SUBMITS_PER_TICK`` or a volume drains one batch
-#: latency at a time.
-MAX_CONCURRENCY = 4
+#: parallelism, and the batch API is built for a deep queue. A batch
+#: waits at Mistral for hours, so this is the throughput limit of a
+#: volume: with one submit per tick and N in flight, a volume of more
+#: than N shards needs a second round of that latency. Sixteen covers
+#: a normal volume (1100 pages at 100 a shard is 11-14 shards) in one
+#: round. It must stay well above ``MAX_SUBMITS_PER_TICK``.
+MAX_CONCURRENCY = 16
 
 #: Shards rendered, uploaded and submitted on one submit tick. **One,
 #: because the wave blocks the daemon's serial scheduler** (#156) for
@@ -179,6 +185,12 @@ def ensure_extract_jobs(
     unchanged and whose result object is still on S3, so a re-cut that
     moved a few page ranges re-pays only the shards that moved.
 
+    A result with a hole is never carried, stable or not
+    (``carry_stable_holes=False``). The stable-hole rule of #238 trusts
+    a deterministic worker to give the same answer twice; a Mistral
+    batch line can fail from a transient fault at Mistral, so two
+    unlucky runs must not freeze a page as unread for good.
+
     :param scan: The scan to read.
     :param manifest: The committed shard manifest.
     :param force_new_run: Replace a whole, reusable live run.
@@ -193,6 +205,7 @@ def ensure_extract_jobs(
         provider=JobProvider.MISTRAL,
         reuse_results=True,
         force_new_run=force_new_run,
+        carry_stable_holes=False,
     )
 
 
@@ -528,7 +541,12 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
         stage=JobStage.EXTRACT,
         engine=JobEngine.MISTRAL_OCR,
     )
-    room = jobs._room_for(ours, int(limit or MAX_CONCURRENCY), "Mistral OCR")
+    # DEBUG for the "cap reached" line: a batch waits at Mistral for
+    # hours, so at INFO a full cap would write one line per tick (every
+    # 5 s) for the whole wait.
+    room = jobs._room_for(
+        ours, int(limit or MAX_CONCURRENCY), "Mistral OCR", logging.DEBUG
+    )
     if not room:
         return
     pending = jobs._pending_slice(ours, min(room, MAX_SUBMITS_PER_TICK))
@@ -603,8 +621,10 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     if outcome.status is None:
         # We learned nothing, which is not the same as learning it
         # failed. The deadline check below still ends a row whose
-        # status call is permanently unhappy.
-        jobs._write(job, last_polled_at=now)
+        # status call is permanently unhappy. A lost write means another
+        # writer took the row: it is theirs to judge now.
+        if not jobs._write(job, last_polled_at=now):
+            return
         summary.pending += 1
     elif outcome.status == JobStatus.COMPLETED:
         if harvest(job, outcome, now):
@@ -635,12 +655,13 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
             "succeeded": outcome.succeeded,
             "failed": outcome.failed,
         }
-        jobs._write(
+        if not jobs._write(
             job,
             status=outcome.status,
             last_polled_at=now,
             provider_meta=meta,
-        )
+        ):
+            return
         summary.pending += 1
 
     if job.is_overdue(now):
@@ -729,7 +750,7 @@ def harvest(
     failed_pages = sorted(failed)
 
     document = {
-        "schema_version": runpod_client.RESULT_SCHEMA_VERSION,
+        "schema_version": jobs.RESULT_SCHEMA_VERSION,
         "action": ACTION,
         "scan_pk": job.scan_id,
         "result_key": job.result_key,
@@ -771,6 +792,7 @@ def harvest(
         else None,
     }
     files = [str(f) for f in (job.provider_meta or {}).get("files") or []]
+    outputs = [f for f in (outcome.output_file, outcome.error_file) if f]
     # The files are about to be deleted, so the row stops naming them.
     job.provider_meta = {
         key: value
@@ -778,10 +800,12 @@ def harvest(
         if key != "files"
     }
     if not jobs._complete(job, summary, now):
+        # Another writer took the row. Its cancel deletes the files the
+        # row names -- the pages and the manifest -- but nothing names
+        # the two output files except this call, so delete them here.
+        _delete_files(outputs)
         return False
-    _delete_files(
-        files + [f for f in (outcome.output_file, outcome.error_file) if f]
-    )
+    _delete_files(files + outputs)
     return True
 
 

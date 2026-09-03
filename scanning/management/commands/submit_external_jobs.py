@@ -21,12 +21,14 @@ queueing on RunPod's side while doctor converts. The other way round,
 a wave of bitonal shards would leave the GPU endpoint idle for a minute
 or more per tick.
 
-The Mistral wave (issue #191) sits between the two: it renders a
-shard's pages and uploads them before it creates the batch, which
-blocks for as long as the shard takes -- minutes for a full one. It
-therefore takes one shard per tick (``mistral_ocr.MAX_SUBMITS_PER_TICK``),
-so every other task waits for one shard at most. The order is the
-insertion order of ``jobs._providers()``.
+The Mistral wave (issue #191) goes last: it renders a shard's pages
+and uploads them before it creates the batch, which blocks for as long
+as the shard takes -- minutes for a full one -- and it gates nothing
+until its glue lands, while the bitonal conversion gates review 1,
+where a person waits. It takes one shard per tick
+(``mistral_ocr.MAX_SUBMITS_PER_TICK``), so every other task waits for
+one shard at most. The order is the insertion order of
+``jobs._providers()``.
 
 Examples:
 

@@ -606,12 +606,14 @@ class TestProviderTable(ScanningTestCase):
         for provider, spec in table.items():
             self.assertEqual(spec.provider, provider)
 
-    def test_the_wave_order_is_non_blocking_first(self):
-        # RunPod returns as soon as a job is queued; Mistral renders and
-        # uploads; doctor holds a socket for a whole conversion.
+    def test_the_wave_order_follows_what_waits_behind_each(self):
+        # RunPod returns as soon as a job is queued. Doctor holds a
+        # socket for a whole conversion, but the conversion gates review
+        # 1, where a person waits. Mistral blocks for minutes a shard and
+        # gates nothing until its glue lands, so it goes last.
         self.assertEqual(
             list(jobs._providers()),
-            [JobProvider.RUNPOD, JobProvider.MISTRAL, JobProvider.DOCTOR],
+            [JobProvider.RUNPOD, JobProvider.DOCTOR, JobProvider.MISTRAL],
         )
 
     def test_a_row_with_no_entry_is_left_alone_by_the_sweep(self):

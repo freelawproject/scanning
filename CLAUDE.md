@@ -659,8 +659,9 @@ trained on), tracked on `ExternalJob` rows at
   the deadline rules, whether a claim signs URLs, and the result
   suffix. ~600 lines stay provider-agnostic and shared: every
   compare-and-swap, the attempt bookkeeping, the run reuse, the carry.
-  **Insertion order is wave order** (RunPod, Mistral, doctor:
-  non-blocking first). Do not answer a fourth provider by copying a
+  **Insertion order is wave order** (RunPod, doctor, Mistral: what a
+  person waits behind first, the wave nothing waits behind last). Do
+  not answer a fourth provider by copying a
   wave or a sweep: add an entry. YOLO on RunPod was exactly a payload
   builder, an endpoint id and a cap, which is what `jobs.RunpodEngine`
   tabulates (#195) inside the RunPod entry; it shares `submit_job` and
@@ -684,10 +685,10 @@ be broken:
   `MISTRAL_MODEL`, the two the ai-research runner reads
   (`runpod/mistral/.env.example` on `extraction_align`). A set key is
   the switch. Every other knob is a module constant in
-  `mistral_ocr.py` (`RENDER_W`/`RENDER_H` = 1700x2200, `DPI` = 200,
-  `MAX_CONCURRENCY` = 4 batch jobs, `MAX_ATTEMPTS` = 2,
-  `BATCH_TIMEOUT_HOURS` = 24), and `input_manifest["model"]` is the
-  one per-row override.
+  `mistral_ocr.py` (`RENDER_W`/`RENDER_H` = 1700x2200,
+  `MAX_SUBMITS_PER_TICK` = 1, `MAX_CONCURRENCY` = 16 batch jobs,
+  `MAX_ATTEMPTS` = 2, `BATCH_TIMEOUT_HOURS` = 24), and
+  `input_manifest["model"]` is the one per-row override.
 - **The daemon renders, in the submit pass, with the branch's render**
   (`pipeline/core/render.py`, line for line): zoom to 1700 wide, RGB,
   resize to exactly 1700x2200. Every engine of the ensemble saw that
@@ -700,10 +701,19 @@ be broken:
   shard takes: 100 renders (about 160 ms each for a synthetic page,
   more for a 200 dpi scan) plus 100 uploads of 2-4 MB in sequence is
   minutes, and every poll, the glue and both applies wait behind it.
-  `MAX_CONCURRENCY` (batches in flight) is a separate number and must
-  stay above it, or a volume drains one batch latency at a time.
-  Parallel uploads inside a shard, or a render off the tick as #196
-  did for its geometry, wait for a measurement on a real volume.
+  `MAX_CONCURRENCY` (batches in flight, 16) is a separate number and
+  the throughput limit: a batch waits at Mistral for hours, so a
+  volume of more shards than that needs a second round of the latency.
+  Sixteen covers a normal volume in one round. Parallel uploads inside
+  a shard, or a render off the tick as #196 did for its geometry, wait
+  for a measurement on a real volume. The full-cap line of `_room_for`
+  is logged at DEBUG for this provider, or it would repeat every tick
+  for the whole wait.
+- **A result with a hole is never carried** (`carry_stable_holes=False`
+  on `ensure_shard_jobs`). The stable-hole rule of #238 trusts
+  dots.mocr's deterministic decoder; a Mistral batch line can fail from
+  a transient fault, and two unlucky runs would freeze a page as unread
+  for good.
 - **The harvest stores everything Mistral returned, whole.** The
   result document at `result_key` holds every output line and every
   error line verbatim, plus the batch job object; the only thing read

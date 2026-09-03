@@ -190,6 +190,34 @@ class TestEnsureExtractJobs(ScanningTestCase):
         self.assertEqual(fresh[0].run, 2)
         self.assertEqual(fresh[0].status, JobStatus.PENDING)
 
+    def test_a_stable_hole_is_not_carried_either(self):
+        # The stable-hole rule of #238 trusts a deterministic worker. A
+        # Mistral batch line can fail from a transient fault, so two
+        # runs with the same hole are two unlucky runs, not an answer.
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=1, pages_per_shard=2)
+        for run in (1, 2):
+            rows = mistral_ocr.ensure_extract_jobs(
+                scan, manifest, force_new_run=run == 2
+            )
+            ExternalJob.objects.filter(pk=rows[0].pk).update(
+                status=JobStatus.CONSUMED,
+                result_key=f"jobs/extract/mistral_ocr/r{run}-s0-a1.json",
+                provider_meta={"output": {"failed_pages": [1]}},
+            )
+        row = extract_jobs(scan)[-1]
+        self.assertTrue(jobs.hole_is_stable(row))
+
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+        ):
+            fresh = mistral_ocr.ensure_extract_jobs(
+                scan, manifest, force_new_run=True
+            )
+        self.assertEqual(fresh[0].run, 3)
+        self.assertEqual(fresh[0].status, JobStatus.PENDING)
+
 
 # ── the render ──────────────────────────────────────────────────────
 class TestRender(ScanningTestCase):
@@ -684,6 +712,24 @@ class TestSweep(ScanningTestCase):
         self._sweep(outcome, output=self.OUTPUT[:1])
         self.assertEqual(self.job.status, JobStatus.COMPLETED)
         self.assertEqual(self.job.provider_meta["output"]["failed_pages"], [1])
+
+    def test_a_lost_completion_still_deletes_the_output_files(self):
+        # Another writer took the row between the poll and the
+        # completion. Its cancel deletes the files the row names; the
+        # two output files are named by nothing else, so the harvest
+        # deletes them itself.
+        outcome = mistral_client.BatchOutcome(
+            status=JobStatus.COMPLETED,
+            provider_status="SUCCESS",
+            output_file="out-1",
+            error_file="err-1",
+            job={},
+        )
+        with patch("scanning.jobs._complete", return_value=False):
+            summary, mocks = self._sweep(outcome, output=self.OUTPUT)
+        self.assertEqual(summary.errors, 1)
+        deleted = [c.args[0] for c in mocks["delete"].call_args_list]
+        self.assertEqual(deleted, ["out-1", "err-1"])
 
     def test_a_failed_put_leaves_the_row_in_flight(self):
         outcome = mistral_client.BatchOutcome(

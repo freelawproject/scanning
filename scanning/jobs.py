@@ -91,6 +91,15 @@ from scanning.models import (
 
 logger = logging.getLogger(__name__)
 
+#: The result-envelope contract every stage's result object follows:
+#: the schema version and the content type. Defined by the worker
+#: scaffold (``runpod_common``) and carried by ``runpod_client``; named
+#: here so a stage whose result the *daemon* writes (Mistral) reads the
+#: contract off the lifecycle module rather than off another
+#: provider's transport.
+RESULT_SCHEMA_VERSION = runpod_client.RESULT_SCHEMA_VERSION
+RESULT_CONTENT_TYPE = runpod_client.RESULT_CONTENT_TYPE
+
 
 @dataclass
 class SubmitSummary:
@@ -196,11 +205,12 @@ def _providers() -> dict[str, ProviderSpec]:
     """Return every provider this module serves, keyed by provider.
 
     **Insertion order is wave order.** :func:`submit_pending` walks this
-    dict: the non-blocking RunPod wave goes first, Mistral's wave (it
-    renders and uploads one shard per tick, which blocks for as long
-    as that shard takes) second, and doctor's wave, which holds a
-    socket for a whole conversion, last. See :func:`submit_pending`
-    for why.
+    dict: the non-blocking RunPod wave goes first; doctor's wave, which
+    holds a socket for a whole conversion (25-45 s a shard) but gates
+    review 1, where a person waits, second; and Mistral's wave last,
+    because it blocks for as long as a shard's render and uploads take
+    (minutes) and gates nothing until its glue lands. See
+    :func:`submit_pending` for why.
 
     Rebuilt on each call, and deliberately not cached: the entries read
     functions off the stage modules at build time, so a test that
@@ -230,23 +240,6 @@ def _providers() -> dict[str, ProviderSpec]:
             run_deadline=runpod_execution_deadline,
             describe_failure=_no_failure_details,
         ),
-        JobProvider.MISTRAL: ProviderSpec(
-            provider=JobProvider.MISTRAL,
-            label="Mistral",
-            is_enabled=mistral_ocr.enabled,
-            submit_wave=mistral_ocr.submit_wave,
-            sweep_job=mistral_ocr.sweep_job,
-            cancel=mistral_ocr.cancel_job,
-            max_attempts=lambda job: int(mistral_ocr.MAX_ATTEMPTS),
-            # Nothing presigned: the daemon downloads the shard itself
-            # and writes the result object itself.
-            presigned_ttl=None,
-            result_suffix=".json",
-            result_content_type=runpod_client.RESULT_CONTENT_TYPE,
-            claim_deadline=mistral_ocr.claim_deadline,
-            run_deadline=None,
-            describe_failure=_no_failure_details,
-        ),
         JobProvider.DOCTOR: ProviderSpec(
             provider=JobProvider.DOCTOR,
             label="doctor",
@@ -261,6 +254,23 @@ def _providers() -> dict[str, ProviderSpec]:
             claim_deadline=_doctor_claim_deadline,
             run_deadline=None,
             describe_failure=_doctor_failure_details,
+        ),
+        JobProvider.MISTRAL: ProviderSpec(
+            provider=JobProvider.MISTRAL,
+            label="Mistral",
+            is_enabled=mistral_ocr.enabled,
+            submit_wave=mistral_ocr.submit_wave,
+            sweep_job=mistral_ocr.sweep_job,
+            cancel=mistral_ocr.cancel_job,
+            max_attempts=lambda job: int(mistral_ocr.MAX_ATTEMPTS),
+            # Nothing presigned: the daemon downloads the shard itself
+            # and writes the result object itself.
+            presigned_ttl=None,
+            result_suffix=".json",
+            result_content_type=RESULT_CONTENT_TYPE,
+            claim_deadline=mistral_ocr.claim_deadline,
+            run_deadline=None,
+            describe_failure=_no_failure_details,
         ),
     }
 
@@ -1460,7 +1470,11 @@ def hole_is_stable(job: ExternalJob) -> bool:
 
 
 def _reusable_results(
-    scan, stage: str, engine: str, specs: list[tuple[str, dict]]
+    scan,
+    stage: str,
+    engine: str,
+    specs: list[tuple[str, dict]],
+    carry_stable_holes: bool = True,
 ) -> dict[int, ExternalJob]:
     """Map today's shard indexes to prior rows whose results still serve.
 
@@ -1493,6 +1507,12 @@ def _reusable_results(
     :param stage: A :class:`~scanning.models.JobStage` value.
     :param engine: A :class:`~scanning.models.JobEngine` value.
     :param specs: Today's work, from :func:`_shard_specs`.
+    :param carry_stable_holes: Whether :func:`hole_is_stable` may carry
+        a result with unread pages. True for a deterministic worker
+        (dots.mocr's greedy decoder, #238), whose second read of a
+        shard is its first read again. False for a provider whose
+        failed line may be a transient fault (Mistral's batch API): two
+        unlucky runs would otherwise freeze a page as unread for good.
     :returns: ``{shard_index: prior_row}`` for every reusable shard.
     :rtype: dict[int, ExternalJob]
     """
@@ -1513,7 +1533,9 @@ def _reusable_results(
     for row in prior_rows:
         if not row.result_key:
             continue
-        if has_unread_pages(row) and not hole_is_stable(row):
+        if has_unread_pages(row) and not (
+            carry_stable_holes and hole_is_stable(row)
+        ):
             # A result with a hole is not a result to carry (#238): the
             # new run exists to read the pages the old one could not,
             # so this shard is re-paid while its clean siblings ride
@@ -1560,6 +1582,7 @@ def ensure_shard_jobs(
     provider: str,
     reuse_results: bool = False,
     force_new_run: bool = False,
+    carry_stable_holes: bool = True,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``scan``'s shards,
     creating them if the current run does not describe today's shard set.
@@ -1603,6 +1626,8 @@ def ensure_shard_jobs(
         with ``reuse_results`` the carry re-pays only the shards with a
         hole. A deliberate way to spend GPU money, which is why no tick
         passes it.
+    :param carry_stable_holes: See :func:`_reusable_results`. Pass
+        False for a provider whose failed pages are not reproducible.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -1638,7 +1663,9 @@ def ensure_shard_jobs(
     run = ExternalJob.next_run(scan, stage, engine)
     now = timezone.now()
     reusable = (
-        _reusable_results(scan, stage, engine, specs) if reuse_results else {}
+        _reusable_results(scan, stage, engine, specs, carry_stable_holes)
+        if reuse_results
+        else {}
     )
     rows = []
     for index, (key, identity) in enumerate(specs):
@@ -1798,7 +1825,9 @@ def _claim_wave(
     return claimed
 
 
-def _room_for(queryset, limit: int, label: str) -> int:
+def _room_for(
+    queryset, limit: int, label: str, level: int = logging.INFO
+) -> int:
     """Return how many more jobs of one kind may be started.
 
     A wave, not a queue drain: the cap bounds the jobs running at once,
@@ -1810,13 +1839,18 @@ def _room_for(queryset, limit: int, label: str) -> int:
     :param queryset: This provider and stage's rows.
     :param limit: The concurrency ceiling.
     :param label: What to call the work in the log line.
+    :param level: Level of the "cap reached" line. INFO for a provider
+        that holds rows for minutes; a provider that holds them for
+        hours (Mistral's batches) passes DEBUG, or the line repeats on
+        every tick for the whole wait.
     :returns: How many rows to claim, possibly zero.
     :rtype: int
     """
     in_flight = queryset.filter(status__in=IN_FLIGHT_JOB_STATUSES).count()
     room = limit - in_flight
     if room < 1:
-        logger.info(
+        logger.log(
+            level,
             "%d %s shard(s) already in flight at a cap of %d; submitting "
             "none this tick",
             in_flight,
@@ -2115,15 +2149,17 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
     its replica count; each RunPod engine's is that engine's own
     serverless endpoint, which scales on its own.
 
-    **The non-blocking waves go first, and the blocking one goes last.**
-    A RunPod submit is a fast ``POST /run`` that returns as soon as the
-    job is queued, while a doctor submit holds the socket open for the
-    whole conversion (~25-45s per shard) -- and the daemon's scheduler
-    is serial (issue #156), so whatever runs first delays everything
-    after it. Ordered the other way, a wave of bitonal shards would keep
-    RunPod's queue empty for a minute or more at a time, wasting exactly
-    the queue depth a narrow worker pool depends on. Reversed, the GPU
-    work is already queueing at RunPod while doctor converts.
+    **The waves run in order of what waits behind them.** The daemon's
+    scheduler is serial (issue #156), so whatever runs first delays
+    everything after it. A RunPod submit is a fast ``POST /run`` that
+    returns as soon as the job is queued, so it goes first: ordered
+    otherwise, a wave of bitonal shards would keep RunPod's queue empty
+    for a minute or more at a time, wasting exactly the queue depth a
+    narrow worker pool depends on. A doctor submit holds the socket
+    open for the whole conversion (~25-45s per shard), but the
+    conversion gates review 1, where a person waits, so it goes second.
+    Mistral's wave renders and uploads one shard (minutes) and gates
+    nothing until its glue lands, so it goes last.
 
     :param limit: Concurrency override applied to **each** wave.
         Defaults to each provider's own setting.
@@ -2147,10 +2183,9 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
             )
         return summary
 
-    # Non-blocking first: the table's insertion order is the wave order
-    # (see ``_providers``). The serial scheduler makes this ordering the
-    # difference between RunPod queueing during a conversion and
-    # waiting for one.
+    # The table's insertion order is the wave order (see
+    # ``_providers``): what a person waits behind goes first, and the
+    # wave nothing waits behind goes last.
     for spec in providers.values():
         if spec.is_enabled():
             spec.submit_wave(summary, limit)
