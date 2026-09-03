@@ -44,7 +44,7 @@ from pathlib import Path
 from django.conf import settings
 from django.utils import timezone
 
-from scanning import jobs, runpod_client, s3_sync
+from scanning import jobs, layout_json, runpod_client, s3_sync
 from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
@@ -308,20 +308,25 @@ def _check_envelope(scan, job: ExternalJob, envelope) -> dict:
 
 
 #: The per-shard page lists the daemon acts on, and the page-dict key
-#: that puts a page in each (``"error"`` and ``"recovered_by"`` by
-#: presence, ``"filtered"`` by truth). The names are
+#: that puts a page in each (``"error"``, ``"recovered_by"`` and
+#: ``"repaired"`` by presence, ``"filtered"`` by truth). The names are
 #: ``jobs.PAGE_LIST_NAMES``; this is the one place the membership rule
 #: lives, for the row summary and the volume document alike.
+#:
+#: The order matters for a reader, not for the code: a page counted in
+#: ``repaired_pages`` is **not** in ``filtered_pages``, because the
+#: repair clears ``filtered`` on the page dict it repaired (#242).
 PAGE_LISTS = (
     ("failed_pages", lambda page: "error" in page),
     ("filtered_pages", lambda page: bool(page.get("filtered"))),
     ("recovered_pages", lambda page: "recovered_by" in page),
+    ("repaired_pages", lambda page: "repaired" in page),
 )
 assert tuple(name for name, _ in PAGE_LISTS) == jobs.PAGE_LIST_NAMES
 
 
 def _page_lists(pages: list[dict], key: str) -> dict[str, list]:
-    """Sort ``pages`` into the three lists, naming each by ``key``.
+    """Sort ``pages`` into the four lists, naming each by ``key``.
 
     :param pages: Page dicts, shard-local or volume-level.
     :param key: The page-number field to list: ``"page_no"`` for a
@@ -333,6 +338,198 @@ def _page_lists(pages: list[dict], key: str) -> dict[str, list]:
         name: [page[key] for page in pages if member(page)]
         for name, member in PAGE_LISTS
     }
+
+
+def _repair_filtered_page(page: dict) -> layout_json.Repair | None:
+    """Give a filtered page its cells back, from the answer as written.
+
+    Issue #242: the model wrote good layout JSON and misplaced one
+    character, so upstream's parser threw the whole array away and kept
+    the words. The answer survives in ``raw`` (#238), and
+    :func:`scanning.layout_json.repair` moves the one character back.
+    The bboxes are then rescaled from the model's pixel space to the
+    render's, exactly as upstream's ``post_process_cells`` would have
+    done inside the worker.
+
+    Mutates ``page``: ``cells`` is set, ``filtered`` goes false, and
+    ``repaired`` (the edits) plus ``repaired_by`` say what happened.
+    ``raw`` and ``md`` are left alone -- ``md`` holds upstream's cleaned
+    text, the glue has no page image to build markdown from, and the
+    apply reads ``cells`` only.
+
+    :param page: One shard-local page dict, filtered.
+    :returns: The repair attempt, or ``None`` when the result was
+        written before the worker kept ``raw`` (nothing to repair).
+    :rtype: layout_json.Repair | None
+    """
+    raw = page.get("raw")
+    if not isinstance(raw, str) or not raw:
+        return None
+    result = layout_json.repair(raw)
+    if result.cells is None:
+        return result
+    dimensions = [
+        page.get(name)
+        for name in (
+            "input_width",
+            "input_height",
+            "origin_width",
+            "origin_height",
+        )
+    ]
+    if not all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value > 0
+        for value in dimensions
+    ):
+        # A box rescaled by a missing or absurd dimension lands
+        # somewhere else on the page, and a wrong box is worse than no
+        # box: the reader would take a number off the wrong band.
+        return layout_json.Repair(
+            None,
+            result.edits,
+            f"the page reports no usable dimensions: {dimensions}",
+        )
+    page["cells"] = layout_json.rescale(result.cells, *dimensions)
+    page["filtered"] = False
+    page["repaired"] = result.edits
+    page["repaired_by"] = "glue"
+    return result
+
+
+def _repair_shard(scan, job: ExternalJob, shard_pages: list[dict]) -> None:
+    """Repair every filtered page of one shard, and log what is left.
+
+    Runs before :func:`_stamp_page_lists`, so a shard whose every hole
+    the repair closed is stamped clean: ``jobs.has_unread_pages`` then
+    reads false, the carry keeps the shard's paid result and the
+    backfill leaves the volume alone.
+
+    A page still filtered gets one WARNING naming the volume page, the
+    parser's own message and an excerpt of the answer around the fault
+    (#242). That is the whole triage path for a new shape of the fault:
+    no S3 read, no shell on the pod.
+
+    :param scan: The scan being glued.
+    :param job: The shard's row, for its page offset.
+    :param shard_pages: The shard's page dicts, mutated in place.
+    :return: None.
+    """
+    from_page = (job.input_manifest or {}).get("from_page") or 0
+    repaired: list[int] = []
+    for page in shard_pages:
+        if not page.get("filtered"):
+            continue
+        volume_page = from_page + page.get("page_no", 0) + 1
+        result = _repair_filtered_page(page)
+        if result is None:
+            logger.warning(
+                "scan %s shard %d/%d volume page %d: the layout JSON was "
+                "not read and the answer was not stored, so nothing can "
+                "repair it (read before the worker kept it)",
+                scan.pk,
+                job.shard_index + 1,
+                job.shard_count,
+                volume_page,
+            )
+            continue
+        if result.cells is None:
+            logger.warning(
+                "scan %s shard %d/%d volume page %d: the layout JSON is "
+                "broken and no repair arm reached it: %s",
+                scan.pk,
+                job.shard_index + 1,
+                job.shard_count,
+                volume_page,
+                result.fault,
+            )
+            continue
+        repaired.append(volume_page)
+        logger.info(
+            "scan %s shard %d/%d volume page %d: repaired the layout JSON "
+            "by %s, %d cell(s) recovered",
+            scan.pk,
+            job.shard_index + 1,
+            job.shard_count,
+            volume_page,
+            ", ".join(result.edits),
+            len(page["cells"]),
+        )
+    if repaired:
+        logger.info(
+            "scan %s shard %d/%d: repaired %d filtered page(s): %s",
+            scan.pk,
+            job.shard_index + 1,
+            job.shard_count,
+            len(repaired),
+            repaired,
+        )
+
+
+def survey_repairs(scan, analyze_jobs: list[ExternalJob]) -> dict:
+    """Say what the repair would reach on a run, and change nothing.
+
+    The read-only half of ``reglue_dots_mocr``: it downloads the same
+    stored results the glue would, runs the same repair in memory, and
+    reports per filtered page instead of writing a document. That
+    report is the corpus survey issue #242 asks for -- the rate of the
+    fault, the share each arm answers, and the pages no arm reaches.
+
+    It also counts the filtered answers the threshold rung of #238
+    recovered (a page marked ``recovered_by`` whose first rung error
+    was "not layout JSON"), which is the measurement that says whether
+    that rung is worth 90 seconds of GPU time on this class of fault.
+
+    :param scan: The scan to survey.
+    :param analyze_jobs: Its live run's rows, ordered by shard index.
+    :returns: ``{"reports": list[dict], "rung_recoveries": int}``. Each
+        report names ``shard_index``, ``page_no`` (shard-local, as the
+        worker counts), ``pdf_page`` (1-based, of the volume),
+        ``edits`` (``None`` when nothing repaired it), ``fault`` and
+        ``no_raw``.
+    :rtype: dict
+    """
+    reports: list[dict] = []
+    rung_recoveries = 0
+    with tempfile.TemporaryDirectory(
+        prefix=f"{GLUE_TMP_PREFIX}{scan.pk}-"
+    ) as tmp:
+        tmp_dir = Path(tmp)
+        for job in analyze_jobs:
+            if not job.result_key:
+                continue
+            local = tmp_dir / f"{job.shard_index:04d}.json"
+            s3_sync.download_object(job.result_key, local)
+            payload = _check_envelope(scan, job, json.loads(local.read_text()))
+            from_page = (job.input_manifest or {}).get("from_page") or 0
+            for page in payload.get("pages") or []:
+                errors = page.get("errors") or []
+                if page.get("recovered_by") and any(
+                    "not layout JSON" in str(error) for error in errors
+                ):
+                    rung_recoveries += 1
+                if not page.get("filtered"):
+                    continue
+                # A copy: a survey must not change what it reads, and
+                # the repair mutates the page it is given.
+                result = _repair_filtered_page(dict(page))
+                edits = (
+                    result.edits
+                    if result is not None and result.cells is not None
+                    else None
+                )
+                reports.append(
+                    {
+                        "shard_index": job.shard_index,
+                        "page_no": page.get("page_no"),
+                        "pdf_page": from_page + (page.get("page_no") or 0) + 1,
+                        "edits": edits,
+                        "fault": None if result is None else result.fault,
+                        "no_raw": result is None,
+                    }
+                )
+    return {"reports": reports, "rung_recoveries": rung_recoveries}
 
 
 def _stamp_page_lists(job: ExternalJob, shard_pages: list[dict]) -> None:
@@ -379,9 +576,18 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
     glue that will re-read the per-shard objects this one leaves in
     place.
 
+    One page-level repair happens here (issue #242): a page upstream
+    filtered because its layout JSON broke on one character gets its
+    cells back from the answer as the model wrote it. That belongs to
+    the glue and not only to the worker, because the shard results are
+    kept for good and no new worker image reaches the ones already in
+    the bucket. ``reglue_dots_mocr`` is what hands a glued run back to
+    this function after the repair changes.
+
     Idempotent: it rebuilds from the result objects every time, so a
     daemon killed between the upload and the CONSUMED write just glues
-    again.
+    again, and a second run of the repair over a repaired result finds
+    the same edits (the source is ``raw``, which nothing overwrites).
 
     :param scan: The scan whose run finished.
     :param analyze_jobs: The live run's rows, ordered by shard index.
@@ -438,6 +644,10 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
                     f"scan {scan.pk} shard {index} answered page(s) "
                     f"{answered}, the shard has {page_count}"
                 )
+            # Before the stamp, on purpose (#242): a shard whose every
+            # hole the repair closed must be stamped clean, or the
+            # carry would re-pay a shard whose result is now whole.
+            _repair_shard(scan, job, shard_pages)
             _stamp_page_lists(job, shard_pages)
             for page in shard_pages:
                 page_index = from_page + page["page_no"]
@@ -490,11 +700,12 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
         "generated_at": timezone.now().isoformat(),
         "shards": shards,
         "pages": pages,
-        # The same three lists as each row's summary, in volume
-        # numbering. The apply reads only ``failed_pages``; the other
-        # two are for the survey of #238: a filtered page has no cells
-        # and so no page number either, and a recovered page is one a
-        # retry rung saved.
+        # The same four lists as each row's summary, in volume
+        # numbering. The apply reads only ``failed_pages``; the others
+        # are for the surveys of #238 and #242: a filtered page has no
+        # cells and so no page number either, a recovered page is one a
+        # retry rung saved, and a repaired page is one whose layout
+        # JSON broke on one character and was put back together.
         **_page_lists(pages, "page_index"),
     }
     key = glued_result_key(scan, run)
@@ -505,7 +716,8 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
         )
     logger.info(
         "Glued %d dots.mocr shard(s) for scan %s into %s (%d page(s), "
-        "%d unread, %d filtered, %d recovered on a retry) in %.1fs",
+        "%d unread, %d filtered, %d recovered on a retry, %d repaired) "
+        "in %.1fs",
         len(analyze_jobs),
         scan.pk,
         key,
@@ -513,6 +725,7 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
         len(document["failed_pages"]),
         len(document["filtered_pages"]),
         len(document["recovered_pages"]),
+        len(document["repaired_pages"]),
         time.monotonic() - started,
     )
     return key

@@ -11,6 +11,9 @@ DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py test scan
 # Run a single test class
 DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py test scanning.tests.TestScanUpload -v 2
 
+# Survey the layout-JSON repair over the corpus, changing nothing (#242)
+docker exec scanning-daemon python manage.py reglue_dots_mocr --dry-run
+
 # Generate migrations
 DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py makemigrations scanning
 
@@ -567,7 +570,10 @@ trained on), tracked on `ExternalJob` rows at
   logged at INFO beside the WARNING. **A filtered page is a hole
   too**: the answer was text but not layout JSON, so there is no cell
   to place a number in; the page keeps upstream's cleaned text in
-  `md`. **Every page keeps the answer as the model wrote it in
+  `md`. Since #242 (its own section below) the repair runs first and
+  most such pages are given back, so a page that is still filtered is
+  a shape nobody has measured, and it is a WARNING.
+  **Every page keeps the answer as the model wrote it in
   `raw`** (a failed page: the last truncated answer): `cells` is
   upstream's parsed and rescaled copy with `int()` on every
   coordinate, and the cleaner discards a broken JSON, so `raw` is the
@@ -725,6 +731,83 @@ that shows "Large gap" is a volume whose range nobody read.
   `info` and rewords it. The card stays: the range is a fact about the
   volume the next reader must see. A range the *model* read keeps the
   warning and its "Verify this is expected".
+
+## The layout JSON that broke on one character (issue #242)
+
+A `filtered` dots.mocr page is a page whose answer was **good** and
+whose JSON broke on one character. Measured on four production volumes
+(scans 2726, 2702, 2665, 2705): one filtered page each, one edit each,
+and the printed page number recovered every time. Upstream
+`post_process_output` throws the whole array away and returns the
+words, so the page reached the reader with no cell and no number.
+`scanning/layout_json.py` moves the character back.
+
+- **Three arms, one per measured shape**, and each moves one
+  character: `Expecting ',' delimiter` at a lone `"` inside a string
+  (put a backslash in front of it), `Invalid \escape` at a lone `\`
+  (put a quotation mark after it), `Extra data` at a doubled closer
+  (cut at the first complete parse). `MAX_EDITS` is 3, so a page with
+  two faults still repairs and a rewrite of a different answer cannot
+  run away. An arm whose message matches but whose text does not
+  refuses, and the page stays filtered.
+- **One module, two callers, and that is the point.** The **worker**
+  (`handler._repair_layout_json`) stops the next filtered page, and
+  the **glue** (`dots_mocr._repair_shard`) recovers the shard results
+  already in the bucket, which no new worker image reaches. The
+  Dockerfile copies `layout_json.py` next to `handler.py` (so it
+  imports it as a top-level module, like `runpod_common`) and the
+  build workflow watches it, because one arm that drifted between the
+  two sides would repair a page differently depending on which side
+  read it. No Django import in that module, ever.
+- **A repaired page is checked, not trusted.** `_check_cells` demands
+  a list of objects, a `bbox` of four numbers, a legal box
+  (upstream's `is_legal_bbox`) and a `category`. The worker hands the
+  repaired array back through upstream's own `post_process_output`,
+  so a repaired page reaches the caller by the path every other page
+  takes, bboxes included, and upstream refusing it again reads as
+  "not repaired". The glue has no page image, so it rescales with
+  `layout_json.rescale` (upstream's `post_process_cells` arithmetic)
+  and keeps upstream's cleaned text as `md` — the apply reads `cells`
+  only.
+- **`raw` is never written over.** It is the answer as the model wrote
+  it (#238), the only thing a later post-processor can start from, and
+  the reason `reglue_dots_mocr` can be run again after a new arm
+  lands. A repaired page carries `repaired` (the edits, with their
+  offsets) and `repaired_by`, `"worker"` or `"glue"`.
+- **The repair runs before the ladder climbs.** The fault is in the
+  escape and not in the render, so a second render makes the same
+  mistake: on each of the four measured pages rung 2 spent 90 to 120
+  seconds and recovered nothing. The climb is **kept** for a page the
+  arms do not reach, because that is an unmeasured shape and nothing
+  says the render is innocent there. `reglue_dots_mocr --dry-run`
+  counts what the rung recovers on those, and that number is what may
+  retire the climb.
+- **`repaired_pages` is the fourth page list** (`jobs.PAGE_LIST_NAMES`,
+  `dots_mocr.PAGE_LISTS`, `_SUMMARY_FIELDS`), and a repaired page is
+  **not** in `filtered_pages`: the repair clears `filtered` on the
+  page dict. So `jobs.has_unread_pages` reads false, the carry keeps
+  the shard's paid result and `reread_failed_pages` leaves the volume
+  alone. The glue repairs **before** `_stamp_page_lists`, which is
+  what makes that true of the rows too.
+- **A page still filtered is a WARNING**, not an INFO. Issue #242 asks
+  for it by name: every measured shape is repaired now, so a survivor
+  is a new shape, and the log line is the whole triage path. The
+  glue's line carries the parser's own message and an excerpt of `raw`
+  around the fault, so classifying the next one needs no S3 read and
+  no shell on the pod.
+- **`reglue_dots_mocr` is the backfill**, and it costs no GPU time: it
+  glues a run again over the stored results and clears the apply stamp
+  (`reopen_apply`). Its `--dry-run` is the corpus survey of items 1 to
+  3 of the issue. Safe by the two properties of
+  `reapply_page_numbers`: a READY volume is a recompute that keeps its
+  status, the numbers a curator typed are `PageEdit` rows and survive,
+  and an approved volume is not in `APPLY_STATUSES`.
+- Upstream has no repair, and `main` is byte-identical to the pin
+  `23f3e56` on `layout_utils.py` (checked 2026-09-03), so a pin bump
+  buys nothing here. Constrained decoding on the vLLM call
+  (`extra_body={"structured_outputs": {"json": ...}}`; `guided_json`
+  went in 0.12) would remove two of the three shapes at the source and
+  is the next step, gated and measured.
 
 ## Generalized YOLO worker image (issue #194)
 
