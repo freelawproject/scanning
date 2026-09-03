@@ -24,7 +24,7 @@ from django.template.loader import render_to_string
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
-from scanning import dots_mocr, jobs, page_edits, s3_sync, yolo
+from scanning import dots_mocr, jobs, mistral_ocr, page_edits, s3_sync, yolo
 from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
@@ -252,10 +252,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
 
     issues = list(scan.issues.all())
 
-    # Neither GPU stage writes a scan status by design (#190, #195), so
-    # their rows are the only place their progress lives.
+    # No external stage writes a scan status by design (#190, #195,
+    # #191), so their rows are the only place their progress lives.
     dots_run = dots_mocr.run_summary(scan)
     yolo_run = yolo.run_summary(scan)
+    mistral_run = mistral_ocr.run_summary(scan)
 
     # Each uploaded image is shown at the gap its row names, and every
     # remaining placeholder is stamped with the physical page it
@@ -520,6 +521,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "is_processing": is_processing,
             "dots_run": dots_run,
             "yolo_run": yolo_run,
+            "mistral_run": mistral_run,
             **_review_flags(scan),
             "opinions": opinions,
             "opinions_json": json.dumps(opinions),
@@ -576,6 +578,9 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     yolo_run = yolo.run_summary(scan)
     if yolo_run:
         data["yolo_run"] = yolo_run
+    mistral_run = mistral_ocr.run_summary(scan)
+    if mistral_run:
+        data["mistral_run"] = mistral_run
     return JsonResponse(data)
 
 
@@ -1197,8 +1202,8 @@ def _review_flags(scan: Scan) -> dict:
 
     :param scan: The scan the bar is rendered for.
     :returns: ``page_review_ready``, ``page_review_done``,
-        ``has_legacy_ocr`` and the two pending-edit flags, for the
-        template context.
+        ``scan_approved``, ``has_legacy_ocr`` and the two pending-edit
+        flags, for the template context.
     :rtype: dict
     """
     from scanning import services
@@ -1210,6 +1215,10 @@ def _review_flags(scan: Scan) -> dict:
         "page_review_done": (
             scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
         ),
+        # The status the second review's approval writes
+        # (views_api.approve_scan). The Mistral control (#191) reads it
+        # beside page_review_done.
+        "scan_approved": scan.status == Status.APPROVED,
         "has_legacy_ocr": services.has_legacy_ocr(scan),
         **page_edits.pending_edit_flags(scan),
     }
@@ -1287,6 +1296,8 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "opinions": scan.opinions_json,
         "dots_run": dots_mocr.run_summary(scan),
         "yolo_run": yolo.run_summary(scan),
+        "mistral_run": mistral_ocr.run_summary(scan),
+        "has_redaction_rects": bool(scan.redaction_rects),
         **_review_flags(scan),
     }
     html = render_to_string(
@@ -1586,6 +1597,133 @@ def start_yolo_detect(request: HttpRequest, pk: int) -> HttpResponse:
             request,
             f"This volume was already detected: run {created[0].run} "
             f"covers all {len(created)} part(s). Nothing new was queued.",
+        )
+    return back
+
+
+#: The statuses the Mistral read may be started from (#191): review 1
+#: done with the redactions computed, or the volume approved by the
+#: second review. Rachel's order for the ensemble runs every OCR engine
+#: on the *redacted* pages after the redaction review; the portal has no
+#: status for "review 2 done" yet, so the earlier status is accepted and
+#: the staff member decides when the boxes are final. A later box edit
+#: changes the rects digest, and the next run re-reads only the shards
+#: whose rects moved.
+MISTRAL_START_STATUSES = (
+    Status.PAGE_COMPLETENESS_REVIEW_DONE,
+    Status.APPROVED,
+)
+
+
+@login_required
+@require_POST
+def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
+    """Start the Mistral OCR read over a scan's original shards (#191).
+
+    Staff only, and the only way into this stage until the trigger on
+    the second review's approval lands. Every press can start real
+    paid work on Mistral's batch API.
+
+    The pages go out with the redaction rects painted black, so the
+    rects must exist: a run before them would send the headnotes to a
+    third party. Hence the status gate (``MISTRAL_START_STATUSES``) and
+    the rects check, both here and not only in the template.
+
+    **This request makes no call to Mistral.** It writes one
+    ``ExternalJob`` row per shard and returns; the daemon's next
+    ``submit_external_jobs`` tick renders, uploads and submits them,
+    and ``collect_external_jobs`` polls, harvests and retries them.
+    The render is the daemon's work, so a web pod never opens the
+    volume.
+
+    It also never cuts shards. ``sharding.committed_manifest`` verifies
+    the stored set against the original with one ``head_object``, and a
+    stale or missing set is refused, because re-cutting is the
+    pipeline's job.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page.
+    """
+    from scanning import sharding
+
+    scan = get_object_or_404(Scan, pk=pk)
+    back = redirect("scan_process", pk=scan.pk)
+
+    if not request.user.is_staff:
+        messages.error(
+            request,
+            "Only staff can start Mistral OCR: each run costs money.",
+        )
+        return back
+
+    if scan.status not in MISTRAL_START_STATUSES:
+        messages.warning(
+            request,
+            "Mistral OCR runs after the page completeness review is "
+            "approved and the redactions are computed. This volume is "
+            "not there yet.",
+        )
+        return back
+
+    if not scan.redaction_rects:
+        messages.warning(
+            request,
+            "Mistral OCR reads the pages with their redactions painted, "
+            "and this volume has no redactions computed yet. Run the "
+            "detection first.",
+        )
+        return back
+
+    if not mistral_ocr.enabled():
+        messages.warning(
+            request,
+            "Mistral OCR is not switched on in this environment. Set "
+            "MISTRAL_API_KEY first.",
+        )
+        return back
+
+    # An open run means the daemon is still working on the last press.
+    # A finished run is reused rather than refused, which is what keeps
+    # ``ensure_extract_jobs`` from paying twice for shards already read.
+    summary = mistral_ocr.run_summary(scan)
+    if summary and summary["open"]:
+        messages.info(
+            request,
+            f"Mistral OCR run {summary['run']} is already going: "
+            f"{summary['done']} of {summary['total']} part(s) done.",
+        )
+        return back
+
+    manifest, reason = sharding.committed_manifest(scan)
+    if manifest is None:
+        messages.warning(request, reason)
+        return back
+
+    created = mistral_ocr.ensure_extract_jobs(scan, manifest)
+    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
+    logger.info(
+        "start_mistral_ocr: scan=%s user=%s run=%s shards=%d queued=%d",
+        scan.pk,
+        request.user.pk,
+        created[0].run if created else "?",
+        len(created),
+        queued,
+    )
+    if queued:
+        messages.success(
+            request,
+            f"Queued Mistral OCR for {queued} part(s) of this volume. The "
+            "daemon renders and sends them within a few seconds.",
+        )
+    else:
+        # ``ensure_extract_jobs`` reused a run that is already done, so
+        # nothing was queued and nothing will be sent.
+        messages.info(
+            request,
+            f"This volume was already read: run {created[0].run} covers "
+            f"all {len(created)} part(s) with these redactions. Nothing "
+            "new was queued.",
         )
     return back
 

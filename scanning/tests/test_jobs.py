@@ -597,6 +597,60 @@ class TestSweepJobs(ScanningTestCase):
         self.assertEqual(stranded.error_code, "QUEUE_TIMEOUT")
 
 
+class TestProviderTable(ScanningTestCase):
+    """Every provider a row can name has an entry, and no other."""
+
+    def test_every_provider_value_has_an_entry(self):
+        table = jobs._providers()
+        self.assertEqual(set(table), {p.value for p in JobProvider})
+        for provider, spec in table.items():
+            self.assertEqual(spec.provider, provider)
+
+    def test_the_wave_order_is_non_blocking_first(self):
+        # RunPod returns as soon as a job is queued; Mistral renders and
+        # uploads; doctor holds a socket for a whole conversion.
+        self.assertEqual(
+            list(jobs._providers()),
+            [JobProvider.RUNPOD, JobProvider.MISTRAL, JobProvider.DOCTOR],
+        )
+
+    def test_a_row_with_no_entry_is_left_alone_by_the_sweep(self):
+        job = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        ExternalJob.objects.filter(pk=job.pk).update(
+            status=JobStatus.SUBMITTED, provider="abacus"
+        )
+        with self.assertLogs("scanning.jobs", level="WARNING"):
+            summary = jobs.sweep_jobs()
+        job.refresh_from_db()
+        self.assertEqual(summary.errors, 1)
+        self.assertEqual(job.status, JobStatus.SUBMITTED)
+        self.assertEqual(job.attempt, 1)
+
+    def test_doctor_s_knobs_read_through_the_table(self):
+        job = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        with override_settings(DOCTOR_MAX_ATTEMPTS=9, DOCTOR_PRESIGNED_TTL=7):
+            self.assertEqual(jobs._max_attempts(job), 9)
+            self.assertEqual(jobs._presigned_ttl(job), 7)
+        self.assertEqual(jobs._result_suffix(job), ".pdf")
+        self.assertEqual(
+            jobs._result_content_type(job), doctor_client.RESULT_CONTENT_TYPE
+        )
+
+    def test_a_provider_handed_no_url_refuses_a_ttl(self):
+        from scanning import mistral_ocr
+
+        job = mistral_ocr.ensure_extract_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        with self.assertRaises(jobs.UnknownProvider):
+            jobs._presigned_ttl(job)
+        self.assertEqual(jobs._result_suffix(job), ".json")
+
+
 class TestConcurrentWriters(ScanningTestCase):
     """Two daemon replicas may look at one row; only one may write it."""
 

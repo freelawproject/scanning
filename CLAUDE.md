@@ -651,16 +651,93 @@ trained on), tracked on `ExternalJob` rows at
   status alone, so the pass retries next tick. The bands and token
   rules of the adapter come from ai-research `pipeline/core/order.py`
   and issue #149.
-- **No provider abstraction, deliberately.** `jobs.py` branches on
-  `job.provider`; ~600 of its lines are provider-agnostic and stay
-  shared, and only the submit call and the in-flight check fork. Do not
-  answer a third provider by copying a wave or a sweep. **Mistral is the
-  point to promote the branches**, because it changes the shape again:
-  opinion-level `EXTRACT`, no shard fan-out, rate limits rather than a
-  worker pool, and no presigned PUT at all. YOLO on RunPod was exactly
-  a payload builder, an endpoint id and a cap, which is what
-  `jobs.RunpodEngine` now tabulates (#195); it shares `submit_job` and
+- **One provider table, `jobs.ProviderSpec`, and no deeper abstraction
+  (#191).** Until Mistral arrived, `jobs.py` branched on `job.provider`
+  in thirteen places; the third provider promoted those branches to one
+  table (`jobs._providers()`), keyed by `JobProvider`, holding only
+  what a transport forces: the wave, the sweep, the cancel, the caps,
+  the deadline rules, whether a claim signs URLs, and the result
+  suffix. ~600 lines stay provider-agnostic and shared: every
+  compare-and-swap, the attempt bookkeeping, the run reuse, the carry.
+  **Insertion order is wave order** (RunPod, Mistral, doctor:
+  non-blocking first). Do not answer a fourth provider by copying a
+  wave or a sweep: add an entry. YOLO on RunPod was exactly a payload
+  builder, an endpoint id and a cap, which is what `jobs.RunpodEngine`
+  tabulates (#195) inside the RunPod entry; it shares `submit_job` and
   `poll_once` unchanged.
+
+## Mistral OCR via the batch API (issue #191)
+
+The third provider, and the first the daemon prepares the input for.
+One `ExternalJob` row per **original** shard at
+`EXTRACT`/`MISTRAL_OCR`/`MISTRAL`, one Mistral batch job per row. The
+pieces: `mistral_client.py` (transport), `mistral_ocr.py` (the stage:
+render, wave, sweep, harvest, cancel), `settings/project/mistral.py`
+(two variables), the `MISTRAL` entry of `jobs._providers()`, and
+`views_process.start_mistral_ocr` (the button). What must not be
+broken:
+
+- **Two settings, and no other**: `MISTRAL_API_KEY` and
+  `MISTRAL_MODEL`, the two the ai-research runner reads
+  (`runpod/mistral/.env.example` on `extraction_align`). A set key is
+  the switch. Every other knob is a module constant in
+  `mistral_ocr.py` (`RENDER_W`/`RENDER_H` = 1700x2200, `DPI` = 200,
+  `MAX_CONCURRENCY` = 4 batch jobs, `MAX_ATTEMPTS` = 2,
+  `BATCH_TIMEOUT_HOURS` = 24), and `input_manifest["model"]` is the
+  one per-row override.
+- **The daemon renders, in the submit pass, with the branch's render**
+  (`pipeline/core/render.py`, line for line): zoom to 1700 wide, RGB,
+  resize to exactly 1700x2200, every redaction rect painted **black**
+  whatever its `fill` says. The downstream reads of the ensemble
+  detect a redaction by its black placeholder, so do not paint the
+  rect's own fill and do not render grey. Our rects are 200 dpi
+  pixels; that is 1700x2200 on a letter page, and `render_page` scales
+  them on any other size (the branch does not, and is wrong there).
+  The source is the **original** scan: Rachel's tests all ran on
+  non-bitonal images, and the shards are cut from it.
+- **The harvest stores everything Mistral returned, whole.** The
+  result document at `result_key` holds every output line and every
+  error line verbatim, plus the batch job object; the only thing read
+  out of a line is its `custom_id`, to name the holes
+  (`failed_pages`). No `parse()`, no reshaping, before the glue (a
+  follow-up): a better transform must be a re-glue at no API cost.
+- **Our code writes `result_key`**, after the download and before
+  `_complete`. Nothing presigned is handed out (`presigned_ttl=None` in
+  the table, and `_claim` signs nothing). A failed PUT leaves the row
+  in flight and the next tick downloads the output again.
+- **The rects are part of the shard identity** (`rects_digest`,
+  through the `extend_identity` hook of `ensure_shard_jobs`). A moved
+  box changes one shard's identity, so the next run re-reads that
+  shard alone and carries the rest. `page_rects` is the one reader of
+  where the rects live, for #241.
+- **The deadline is Mistral's own `timeout_hours` plus one hour**,
+  stamped at the first claim and never restamped on `RUNNING`
+  (`run_deadline=None`): a batch is queued and run inside one budget
+  Mistral enforces. The 6 h RunPod queue ceiling does not apply.
+- **A row with no `external_id` at sweep time is a lost claim**, and is
+  retried at once (`LOST_CLAIM`): the scheduler is serial, so no wave
+  is running while the sweep runs. There is no "unanswered" branch on
+  the create either -- a create that did not answer minted no id we
+  can find, so the row retries and the attempt is spent.
+- **A 429 defers, and deletes what was uploaded.** Every page image,
+  the manifest and the two output files live at Mistral until we
+  delete them: the harvest deletes them once the object is in S3, and
+  every path that writes a row off (`cancel_job`) deletes the row's
+  `provider_meta["files"]`. A row cancelled while its thread works
+  has its batch cancelled from the wave, as the RunPod wave does.
+- **`EXTRACT` takes either shape** (`EITHER_LEVEL_STAGES`, migration
+  0020): a shard row with `opinion` NULL for Mistral, an opinion row
+  for an engine that reads opinion PDFs. The two conditional unique
+  keys sort them; only `TIEBREAK` still requires an opinion.
+- **One staff button starts it, and nothing else.** It accepts
+  `PAGE_COMPLETENESS_REVIEW_DONE` or `APPROVED`, and only with
+  redaction rects: the pages go out with the rects painted, so a run
+  before them sends the headnotes to a third party. Rachel's order
+  runs every OCR engine on the redacted pages after the second review,
+  and the portal has no status for that review yet, so the staff
+  member decides when the boxes are final. The creator set is pinned
+  in `TestKnownEnqueuePaths`; the trigger on the approval and the glue
+  are follow-ups.
 
 ## Reading the page number (issue #228)
 

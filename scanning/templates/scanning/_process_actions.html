@@ -5,10 +5,13 @@ Rendered both inline by scan_process.html and standalone by the
 process_actions view (fetched by the step-1/step-2 viewers to refresh the
 buttons in place after a page is marked for or restored from deletion).
 
-The OCR (dots.mocr) and detection (YOLO) controls are staff-only and
-move no scan status, so their state comes from `dots_run` and
-`yolo_run` -- summaries of the ExternalJob rows (issues #190 and #195)
--- rather than from `is_processing`.
+The OCR (dots.mocr), detection (YOLO) and Mistral OCR controls are
+staff-only and move no scan status, so their state comes from
+`dots_run`, `yolo_run` and `mistral_run` -- summaries of the
+ExternalJob rows (issues #190, #195 and #191) -- rather than from
+`is_processing`. The Mistral control lives in _mistral_actions.html
+and is included by the step-2 and step-3 bars: it runs after the
+redactions, so it belongs where the redacted volume is reviewed.
 
 The detection control is not "Next: Detect". It runs the stage and
 stores its output in S3, and nothing reads that output until #196. It
@@ -149,11 +152,13 @@ reach step 2.
    plus this button:
    <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()">Re-pair Opinions</button>
 #}
+  {% include "scanning/_mistral_actions.html" %}
   {% if opinions %}
   <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
   {% endif %}
 
 {% elif step == 3 %}
+  {% include "scanning/_mistral_actions.html" %}
   <form method="post" action="{% url 'generate_files' scan.pk %}" class="inline">
     {% csrf_token %}
     <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Create redacted and unredacted PDF files for each opinion">{% if opinion_scans %}Regenerate{% else %}Generate{% endif %} Files</button>

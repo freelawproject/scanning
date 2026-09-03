@@ -48,6 +48,12 @@ dependencies = [
   # itself measures geometry from the page ink and needs no text.
   "pdfplumber>=0.11",
   "pymupdf>=1.25",
+  # The Mistral OCR stage (#191) talks to Mistral's files, OCR and batch
+  # APIs through the official SDK. The 2.x line moved the package to the
+  # `mistralai.client` namespace, which mistral_client imports; 3.x is
+  # excluded until someone reads its changelog. Imported lazily, so an
+  # environment with no MISTRAL_API_KEY never loads it.
+  "mistralai>=2.9,<3",
   # runpod_client imports it directly to talk to the RunPod API. Declared
   # because until now it arrived only as a transitive dependency of the
   # `local-ml` extra (ultralytics/paddleocr), so a plain `uv sync` -- what

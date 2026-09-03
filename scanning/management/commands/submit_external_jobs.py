@@ -21,6 +21,11 @@ queueing on RunPod's side while doctor converts. The other way round,
 a wave of bitonal shards would leave the GPU endpoint idle for a minute
 or more per tick.
 
+The Mistral wave (issue #191) sits between the two: it renders a
+shard's pages and uploads them before it creates the batch, so it
+blocks for tens of seconds a shard, less than a conversion. The order
+is the insertion order of ``jobs._providers()``.
+
 Examples:
 
     # Submit one wave and exit (useful for local debugging).

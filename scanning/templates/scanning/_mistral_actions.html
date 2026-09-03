@@ -1,0 +1,31 @@
+{% comment %}
+The Mistral OCR control (issue #191), staff-only, included by the
+step-2 and step-3 bars of _process_actions.html.
+
+The stage moves no scan status, so its state comes from `mistral_run`,
+a summary of the ExternalJob rows. The button is offered once the
+redaction rects exist and review 1 is done or the scan is approved:
+the pages go to Mistral with the rects painted black, so a run before
+the rects exist would send the headnotes to a third party. The
+identity of every shard carries a digest of its rects, so a later box
+edit re-reads only the shards whose rects moved.
+{% endcomment %}
+{% if mistral_run %}
+<span class="text-sm text-gray-600 mr-2" title="Mistral OCR run {{ mistral_run.run }}: {{ mistral_run.label }}">
+  {% if mistral_run.failed %}
+  Mistral OCR failed on {{ mistral_run.failed }} of {{ mistral_run.total }} part(s): {{ mistral_run.error_code }}
+  {% elif mistral_run.open %}
+  Mistral OCR running: {{ mistral_run.done }} of {{ mistral_run.total }} part(s) done
+  {% else %}
+  Mistral OCR done: {{ mistral_run.total }} part(s)
+  {% endif %}
+</span>
+{% endif %}
+{% if user.is_staff and has_redaction_rects and not mistral_run.open %}
+  {% if page_review_done or scan_approved %}
+<form method="post" action="{% url 'start_mistral_ocr' scan.pk %}" class="inline">
+  {% csrf_token %}
+  <button type="submit" class="btn-outline text-sm" title="Read every page of this volume with Mistral OCR, with the redactions painted black, on Mistral's batch API (incurs costs $$$)" onclick="return confirm('This sends every page of this volume, with its redactions painted black, to the Mistral OCR batch API. This will incur costs $$$. Continue?');">{% if mistral_run %}Re-run Mistral OCR{% else %}Run Mistral OCR{% endif %}</button>
+</form>
+  {% endif %}
+{% endif %}

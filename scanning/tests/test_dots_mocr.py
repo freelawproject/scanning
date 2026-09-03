@@ -1708,6 +1708,7 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 if name in (
                     "ensure_analyze_jobs",
                     "ensure_detect_jobs",
+                    "ensure_extract_jobs",
                     "ensure_shard_jobs",
                 ):
                     callers.add((str(path), name))
@@ -1727,9 +1728,13 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 # Detection: the staff button alone (#195). Nothing in
                 # the pipeline may appear here until #211 says so.
                 ("scanning/views_process.py", "ensure_detect_jobs"),
-                # The generic creator's three wrappers.
+                # Mistral OCR: the staff button alone (#191), until the
+                # trigger on the second review's approval lands.
+                ("scanning/views_process.py", "ensure_extract_jobs"),
+                # The generic creator's four wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
                 ("scanning/yolo.py", "ensure_shard_jobs"),
+                ("scanning/mistral_ocr.py", "ensure_shard_jobs"),
                 ("scanning/jobs.py", "ensure_shard_jobs"),
             },
             "Something new creates external-job rows. Row creation "
