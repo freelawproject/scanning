@@ -112,7 +112,7 @@
       {% endcomment %}
       <div id="pending-banner" class="sticky top-0 z-10 -mx-3 px-3 py-2 rounded-t shadow-sm bg-yellow-100 dark:bg-yellow-900/30 text-yellow-800 dark:text-yellow-200 text-xs"{% if not has_pending_changes %} hidden{% endif %}>
         <p class="font-bold m-0">Your page changes are saved.</p>
-        <p class="m-0">We do not build the corrected volume from them yet. Each inserted or replaced page must go through the conversion and the OCR on its own, and that pass is not built (#206). Approve this volume when the pages are complete. We apply your changes for you when the pass is ready.</p>
+        <p class="m-0">They are not built into the volume yet. Approve this volume when the pages are complete: the corrected volume is then built from your changes, and each inserted, replaced or rotated page goes through the conversion and the OCR on its own.</p>
       </div>
 
       {% if ocr_results %}

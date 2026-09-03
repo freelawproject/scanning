@@ -116,15 +116,26 @@ class TestPageEditConstraints(TestCase):
         PageEditFactory(scan=other, pdf_page=7, value="700")
         self.assertEqual(PageEdit.objects.count(), 2)
 
-    def test_an_applied_decision_frees_its_address(self):
-        # The apply closes a row and produces a new original. A curator
-        # editing the same page again writes a new row, so the unique
-        # key must count only the open ones.
+    def test_an_applied_decision_keeps_its_address(self):
+        # The apply stamp is a ledger entry, not a close (#224): an
+        # applied row stands, so the address is still taken. A curator
+        # who decides again supersedes it (``page_edits.supersede``),
+        # which withdraws the applied row first.
         PageEditFactory(
             scan=self.scan,
             pdf_page=7,
             value="700",
             applied_at=timezone.now(),
+        )
+        self._refused(pdf_page=7, value="701")
+
+    def test_a_withdrawn_decision_frees_its_address(self):
+        PageEditFactory(
+            scan=self.scan,
+            pdf_page=7,
+            value="700",
+            applied_at=timezone.now(),
+            withdrawn_at=timezone.now(),
         )
         again = PageEditFactory(scan=self.scan, pdf_page=7, value="701")
         self.assertIsNone(again.applied_at)
@@ -1062,7 +1073,10 @@ class TestReplaceButton(ScanningTestCase):
         response = self._step_one()
 
         self.assertContains(response, "Your page changes are saved.")
-        self.assertContains(response, "#206")
+        self.assertContains(
+            response, "Approve this volume when the pages are complete"
+        )
+        self.assertNotContains(response, "#206")
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -1441,13 +1455,28 @@ class TestExportPdfAppliesTheEdits(ScanningTestCase):
 
         self.assertEqual(self._export(), 5)
 
-    def test_an_applied_edit_is_not_applied_again(self):
+    def test_an_applied_edit_still_stands(self):
+        # An applied deletion is still a deletion (#224): the next
+        # build must see it, or the second final PDF would restore the
+        # page in silence. Only a withdrawal takes a decision back.
         PageEditFactory(
             scan=self.scan,
             kind=PageEdit.Kind.DELETE_PAGE,
             pdf_page=2,
             value="",
             applied_at=timezone.now(),
+        )
+
+        self.assertEqual(self._export(), 3)
+
+    def test_a_withdrawn_edit_is_not_applied(self):
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+            applied_at=timezone.now(),
+            withdrawn_at=timezone.now(),
         )
 
         self.assertEqual(self._export(), 4)

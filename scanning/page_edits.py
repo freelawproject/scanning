@@ -11,10 +11,16 @@ Two rules run through it:
   on every recompute. Nothing edits one entry of it in place any more,
   so two curators working on two pages of one volume cannot write each
   other's decision away.
-- **A decision is closed, never deleted.** A curator who takes an
-  edit back stamps ``withdrawn_at``, and a second file uploaded for
-  one page withdraws the row before it (#232). So the rows carry
-  every decision a person made about the volume, in order.
+- **A decision stands until it is withdrawn, and it is never
+  deleted.** A curator who takes an edit back stamps ``withdrawn_at``,
+  and a second file uploaded for one page withdraws the row before it
+  (#232). The apply (#224) stamps ``applied_at`` and ``applied_run``
+  when it builds a decision into a final volume, but that is a ledger
+  entry, not a close: the row keeps standing, so a reopened review
+  shows an applied deletion as deleted and the next apply run builds
+  it again. So the rows carry every decision a person made about the
+  volume, in order, and one standing row per address is the
+  supersede rule (:func:`supersede`).
 - **An edit whose original is gone is reported, never guessed at.**
   Every address names a page of the original as it was when the edit
   was made (``PageEdit.source_fingerprint``). An edit made against
@@ -28,6 +34,7 @@ from __future__ import annotations
 
 import logging
 
+from django.db import transaction
 from django.urls import reverse
 from django.utils import timezone
 
@@ -36,27 +43,78 @@ from scanning.models import CheckName, Issue, PageEdit, Scan
 logger = logging.getLogger(__name__)
 
 
-def open_edits(scan: Scan, *kinds: str):
+def standing_edits(scan: Scan, *kinds: str):
     """Return the scan's standing edits of the given kinds.
 
-    A decision stands until one of two stamps closes it: the apply
-    (#206) writes ``applied_at``, and a curator who takes it back
-    writes ``withdrawn_at`` (#232). Neither stamp deletes anything, so
-    the closed rows stay as the audit of what a person decided and
-    when. Both are filtered here, once, because every reader of these
-    rows comes through this function.
+    A decision stands until a curator takes it back, which writes
+    ``withdrawn_at`` (#232). That is the one stamp that closes a row.
+    The apply stamp (``applied_at``, #224) is a ledger entry: an
+    applied deletion is still a deletion, and a reader that dropped it
+    would show the page as live while the next build deletes it again.
+    Nothing deletes a row, so the withdrawn ones stay as the audit of
+    what a person decided and when. The filter lives here, once,
+    because every reader of these rows comes through this function.
 
     :param scan: The scan whose edits are wanted.
     :param kinds: ``PageEdit.Kind`` values. All kinds when empty.
-    :returns: A queryset of open rows, in address order.
+    :returns: A queryset of standing rows, in address order.
     :rtype: django.db.models.QuerySet
     """
-    rows = scan.page_edits.filter(
-        applied_at__isnull=True, withdrawn_at__isnull=True
-    )
+    rows = scan.page_edits.filter(withdrawn_at__isnull=True)
     if kinds:
         rows = rows.filter(kind__in=kinds)
     return rows
+
+
+def supersede(
+    scan: Scan,
+    kind: str,
+    address: dict,
+    defaults: dict,
+    user,
+    refresh_open: bool = True,
+) -> PageEdit:
+    """Record a decision at one address, over whatever stands there.
+
+    The one write path for the kinds that live on a page (#224). The
+    unique keys hold one standing row per address, so a curator who
+    decides about a page again finds one of three things:
+
+    - nothing: a new row is written;
+    - an open row (not yet applied): it is updated in place, as the
+      endpoints always did, when ``refresh_open`` asks for it;
+    - an applied row: it is withdrawn and a new row is written. An
+      applied row is history, so it is never rewritten (#214), and
+      the audit shows the decision the final volume carries beside
+      the one that replaces it.
+
+    :param scan: The scan the decision is about.
+    :param kind: A ``PageEdit.Kind`` value.
+    :param address: The columns that locate the row, ``pdf_page`` and
+        for a dismissal also ``logical_page`` and ``value``.
+    :param defaults: The columns a new row carries, and an open row
+        takes when ``refresh_open`` is true.
+    :param user: Who decided.
+    :param refresh_open: Whether an open row at the address takes
+        ``defaults``. A deletion has nothing to refresh; a page number
+        does.
+    :returns: The standing row after the write.
+    :rtype: PageEdit
+    """
+    with transaction.atomic():
+        row = standing_edits(scan, kind).filter(**address).first()
+        if row is not None and row.applied_at is None:
+            if refresh_open:
+                for field, value in defaults.items():
+                    setattr(row, field, value)
+                row.author = user
+                row.save()
+            return row
+        if row is not None:
+            withdraw(PageEdit.objects.filter(pk=row.pk), user)
+        return PageEdit.objects.create(
+            scan=scan, kind=kind, author=user, **address, **defaults
+        )
 
 
 def withdraw(rows, user) -> int:
@@ -97,7 +155,7 @@ def is_stale(edit: PageEdit, scan: Scan) -> bool:
 
 
 def current_edits(scan: Scan, *kinds: str) -> list[PageEdit]:
-    """Return the unapplied edits that describe *this* original.
+    """Return the standing edits that describe *this* original.
 
     What every consumer that **acts** on an edit must read. A row whose
     fingerprint does not match the scan's was made against another
@@ -106,42 +164,61 @@ def current_edits(scan: Scan, *kinds: str) -> list[PageEdit]:
 
     :param scan: The scan whose edits are wanted.
     :param kinds: ``PageEdit.Kind`` values. All kinds when empty.
-    :returns: The open rows that still describe this original.
+    :returns: The standing rows that still describe this original.
     :rtype: list[PageEdit]
     """
     return [
-        edit for edit in open_edits(scan, *kinds) if not is_stale(edit, scan)
+        edit
+        for edit in standing_edits(scan, *kinds)
+        if not is_stale(edit, scan)
     ]
 
 
-def stale_open_edits(scan: Scan, *kinds: str) -> list[PageEdit]:
-    """Return the unapplied edits that describe another original.
+def stale_edits(scan: Scan, *kinds: str) -> list[PageEdit]:
+    """Return the standing edits that describe another original.
 
     The other half of :func:`current_edits`, for the reader that has to
     *report* them. They are never applied and never silently dropped.
 
     :param scan: The scan whose edits are wanted.
     :param kinds: ``PageEdit.Kind`` values. All kinds when empty.
-    :returns: The open rows made against another original.
+    :returns: The standing rows made against another original.
     :rtype: list[PageEdit]
     """
-    return [edit for edit in open_edits(scan, *kinds) if is_stale(edit, scan)]
+    return [
+        edit for edit in standing_edits(scan, *kinds) if is_stale(edit, scan)
+    ]
+
+
+def pending_edits(scan: Scan) -> list[PageEdit]:
+    """Return the structural edits no apply run has built yet.
+
+    Only the structural kinds count. A page number and a dismissal need
+    no apply: every recompute reads them off the rows, and the
+    printed-page map reads them at glue time.
+
+    :param scan: The scan to check.
+    :returns: The current structural rows with no ``applied_at``.
+    :rtype: list[PageEdit]
+    """
+    # The current ones only: a stale row can never be applied, so
+    # counting it would hold the review open for good. It is reported
+    # as an issue instead, which is the channel a person can act on.
+    return [
+        edit
+        for edit in current_edits(scan, *PageEdit.STRUCTURAL_KINDS)
+        if edit.applied_at is None
+    ]
 
 
 def has_pending_changes(scan: Scan) -> bool:
     """Return whether the scan carries edits the apply has not built in.
 
-    Only the structural kinds count. A page number and a dismissal need
-    no apply: every recompute reads them off the rows.
-
     :param scan: The scan to check.
     :returns: Whether an unapplied structural edit exists.
     :rtype: bool
     """
-    # The current ones only: a stale row can never be applied, so
-    # counting it would hold the review open for good. It is reported
-    # as an issue instead, which is the channel a person can act on.
-    return bool(current_edits(scan, *PageEdit.STRUCTURAL_KINDS))
+    return bool(pending_edits(scan))
 
 
 def pending_edit_flags(scan: Scan) -> dict:
@@ -154,16 +231,15 @@ def pending_edit_flags(scan: Scan) -> dict:
     insert the other refused.
 
     Only ``has_pending_changes`` has a reader today: it raises the
-    banner and the badge of step 1. ``has_pending_inserts`` is kept
-    for the apply of #206, whose button is the one that must warn
-    about a paid run; the button that used to read it applied nothing
-    and was deleted with the bar branch that held it (#232).
+    banner and the badge of step 1. ``has_pending_inserts`` says
+    whether the apply that follows the approval pays for a GPU run
+    (#224).
 
     :param scan: The scan the bar is rendered for.
     :returns: ``has_pending_changes`` and ``has_pending_inserts``.
     :rtype: dict
     """
-    pending = current_edits(scan, *PageEdit.STRUCTURAL_KINDS)
+    pending = pending_edits(scan)
     with_an_image = (PageEdit.Kind.INSERT_PAGE, PageEdit.Kind.REPLACE_PAGE)
     return {
         "has_pending_changes": bool(pending),
@@ -177,7 +253,7 @@ def deleted_pages(scan: Scan) -> set[int]:
     """Return the 1-based original pages marked for deletion.
 
     :param scan: The scan to read.
-    :returns: The pages a curator marked: unapplied, and against this
+    :returns: The pages a curator marked: standing, and against this
         original.
     :rtype: set[int]
     """
@@ -202,6 +278,19 @@ def replacements_by_page(scan: Scan) -> dict[int, PageEdit]:
     return {
         edit.pdf_page: edit
         for edit in current_edits(scan, PageEdit.Kind.REPLACE_PAGE)
+    }
+
+
+def rotations_by_page(scan: Scan) -> dict[int, int]:
+    """Return the standing rotations, keyed by the page they turn.
+
+    :param scan: The scan to read.
+    :returns: ``{pdf_page: clockwise degrees}``, the current rows only.
+    :rtype: dict[int, int]
+    """
+    return {
+        edit.pdf_page: int(edit.value)
+        for edit in current_edits(scan, PageEdit.Kind.ROTATE_PAGE)
     }
 
 
@@ -354,7 +443,7 @@ def project_inserts(scan: Scan, page_map: list[dict]) -> list[dict]:
 
     out.extend(
         _inserted_entry(edit, None, unplaced=True)
-        for edit in open_edits(scan, PageEdit.Kind.INSERT_PAGE)
+        for edit in standing_edits(scan, PageEdit.Kind.INSERT_PAGE)
         if edit.pk not in placed
     )
     return out
@@ -379,7 +468,7 @@ def overlay_page_numbers(
     """
     by_page = {entry["pdf_page"]: entry for entry in results}
     stale: list[PageEdit] = []
-    for edit in open_edits(scan, PageEdit.Kind.SET_NUMBER):
+    for edit in standing_edits(scan, PageEdit.Kind.SET_NUMBER):
         entry = by_page.get(edit.pdf_page)
         if entry is None or is_stale(edit, scan):
             logger.warning(
@@ -447,7 +536,7 @@ def drop_dismissed(scan: Scan, issues: list[dict]) -> list[dict]:
     """
     dismissals = [
         edit
-        for edit in open_edits(scan, PageEdit.Kind.DISMISS_ISSUE)
+        for edit in standing_edits(scan, PageEdit.Kind.DISMISS_ISSUE)
         if not is_stale(edit, scan)
     ]
     if not dismissals:

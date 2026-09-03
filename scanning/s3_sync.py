@@ -505,6 +505,39 @@ def upload_json_object(key: str, data: dict) -> bool:
     return True
 
 
+def upload_file_object(key: str, path: Path, content_type: str) -> bool:
+    """Upload one local file to an exact key, bypassing the sync.
+
+    The file-shaped twin of :func:`upload_json_object`, for the apply's
+    artifacts under ``jobs/apply/`` (issue #224): the final PDF, the
+    one-page shards and the final bitonal copy. ``upload_file_to_s3``
+    cannot serve those, since it keys off a path under the scan's
+    output directory and everything there comes back down with the
+    next generic pull.
+
+    :param key: Object key inside the private bucket.
+    :param path: The local file.
+    :param content_type: The ``ContentType`` to store, which a presigned
+        GET hands to the reader.
+    :returns: Whether the object was uploaded. False when S3 is off or
+        the PUT failed; the caller decides whether that is fatal.
+    :rtype: bool
+    """
+    if not _s3_enabled():
+        return False
+    try:
+        _s3_client().upload_file(
+            str(path),
+            settings.AWS_PRIVATE_STORAGE_BUCKET_NAME,
+            key,
+            ExtraArgs={"ContentType": content_type},
+        )
+    except (BotoCoreError, ClientError):
+        logger.warning("Could not upload %s to %s", path, key, exc_info=True)
+        return False
+    return True
+
+
 def download_json_object(key: str) -> dict:
     """Download and parse one JSON document by key.
 

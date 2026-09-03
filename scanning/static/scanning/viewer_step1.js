@@ -426,7 +426,10 @@ document.addEventListener('DOMContentLoaded', function () {
             })
             .then(function (r) { return r.json(); })
             .then(function (data) {
-                if (data.status !== 'ok') { return; }
+                if (data.status !== 'ok') {
+                    showToast(data.error || 'Could not remove this page.');
+                    return;
+                }
                 if (typeof window.refreshProcessActionBar === 'function') {
                     window.refreshProcessActionBar();
                 }

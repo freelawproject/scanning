@@ -96,10 +96,21 @@ reach step 2.
   {% if page_review_ready %}
   <form method="post" action="{% url 'approve_page_completeness' scan.pk %}" class="inline">
     {% csrf_token %}
-    <button type="submit" class="btn-primary text-sm" title="Confirm this volume is page complete: no missing, duplicated, mislabeled or blurry pages.{% if has_pending_changes %} Your saved page changes are applied for you when the pass that builds the corrected volume is ready (#206).{% endif %}"{% if issues or missing_pages %} onclick="return confirm('This scan still lists issues or missing pages. Approve it as page complete anyway?');"{% elif has_pending_changes %} onclick="return confirm('Your page changes are saved. We apply them to the volume later, when that pass is ready. Approve this scan as page complete?');"{% endif %}>I reviewed this scan and it is complete</button>
+    <button type="submit" class="btn-primary text-sm" title="Confirm this volume is page complete: no missing, duplicated, mislabeled or blurry pages.{% if has_pending_changes %} The corrected volume is then built from your saved page changes{% if has_pending_inserts %}, and each inserted or replaced page is converted and read on its own (incurs costs $$$){% endif %}.{% endif %}"{% if issues or missing_pages %} onclick="return confirm('This scan still lists issues or missing pages. Approve it as page complete anyway?');"{% elif has_pending_inserts %} onclick="return confirm('The corrected volume is built from your page changes after this approval. Each inserted or replaced page is converted and read on its own, which incurs costs $$$. Approve this scan as page complete?');"{% elif has_pending_changes %} onclick="return confirm('The corrected volume is built from your page changes after this approval. Approve this scan as page complete?');"{% endif %}>I reviewed this scan and it is complete</button>
   </form>
   {% elif page_review_done %}
-  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed this volume is page complete">&#10003; Page review done</span>
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed this volume is page complete. Its pages are locked; a staff member can reopen the review.">&#10003; Page review done</span>
+  {% if apply_run %}
+  <span class="text-sm text-gray-600 mr-2" title="Apply run {{ apply_run.label }}: {{ apply_run.summary }}">{{ apply_run.message }}</span>
+  {% endif %}
+  {# Staff only (#224): the reopen throws away a paid build, and the
+     curators' own step is the approval, not its reversal. #}
+  {% if user.is_staff %}
+  <form method="post" action="{% url 'reopen_page_review' scan.pk %}" class="inline">
+    {% csrf_token %}
+    <button type="submit" class="btn-outline text-sm" title="Open the page review again so its pages can be edited. The corrected volume in progress is discarded and rebuilt after the next approval." onclick="return confirm('Reopen the page review? The corrected volume in progress is discarded, and it is rebuilt after the next approval. Pages already converted and read are reused.');">Reopen page review</button>
+  </form>
+  {% endif %}
   {% endif %}
   {% if has_legacy_ocr %}
   <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">

@@ -590,6 +590,7 @@ def finish_ready_runs() -> int:
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.COMPLETED,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()
@@ -774,6 +775,7 @@ def queue_ready_runs() -> int:
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()

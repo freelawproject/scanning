@@ -613,6 +613,7 @@ def finish_ready_runs() -> int:
             jobs__engine=JobEngine.DOTS_MOCR,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.COMPLETED,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()
@@ -773,6 +774,7 @@ def apply_ready_runs() -> int:
             jobs__engine=JobEngine.DOTS_MOCR,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()

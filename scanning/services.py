@@ -1286,7 +1286,7 @@ def recalculate_issues(scan: "Scan") -> None:
             stale_edits
             + [
                 edit
-                for edit in page_edits.stale_open_edits(scan)
+                for edit in page_edits.stale_edits(scan)
                 if edit.kind != PageEdit.Kind.SET_NUMBER
             ]
         )
