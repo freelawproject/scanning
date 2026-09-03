@@ -187,13 +187,16 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
   the image follows (0 = before page 1), `ordinal` orders one gap.
   `project_inserts` stamps the anchor on every `missing` placeholder,
   and the upload sends it back.
-- **Two stamps close an edit, and neither rewrites or deletes it**:
-  `applied_at` (the apply, #206) and `withdrawn_at` (the curator took
-  it back, #232). So every unique key is partial over the rows that
-  carry neither (`applied_at__isnull=True &
-  withdrawn_at__isnull=True`) — else a page could not be edited again
-  — and so is every lookup of `get_or_create` / `update_or_create` in
-  `views_process`, or one would match a row that decides nothing.
+- **One stamp closes an edit, and nothing rewrites or deletes it**:
+  `withdrawn_at` (the curator took it back, #232). The apply stamp
+  (`applied_at` plus `applied_run`, #224) is a ledger entry, not a
+  close: an applied deletion is still a deletion, so a reopened
+  review shows it and the next build deletes the page again. So every
+  unique key is partial over the **standing** rows
+  (`withdrawn_at__isnull=True`), one decision per address, and every
+  page-kind endpoint writes through `page_edits.supersede`: an open
+  row is updated in place, an applied row is withdrawn and a new one
+  is written.
 - **A dismissal is unique per check, not per page**: rebuilds give
   `Issue` rows new PKs, so the check name is the only stable handle.
   Its address space follows `models.PHYSICAL_PAGE_CHECKS`;
@@ -207,9 +210,9 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
   `Scan.source_fingerprint` mismatch (stamped by `ensure_shards`,
   copied onto each row; blank = legacy, matches anything) or an absent
   page raises a `stale_page_edit` issue. Every acting reader
-  (`deleted_pages`, `inserts_by_gap`, `has_pending_changes`,
+  (`deleted_pages`, `inserts_by_gap`, `pending_edits`,
   `overlay_page_numbers`) goes through `current_edits`, never
-  `open_edits`. A stale row does not hold the review open.
+  `standing_edits`. A stale row does not hold the review open.
 - **Every open insert reaches the viewer**: `project_inserts` appends
   an unplaceable one flagged `unplaced` — Remove is the only way to
   take an insert back, so a dropped image would strand its row.
@@ -223,12 +226,12 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
   a person made and every page they sent. It replaced three hard
   deletes and the `update_or_create` of `replace_page`, which wrote
   over `image` and left the first object with no row naming it.
-- **`has_pending_changes` counts `STRUCTURAL_KINDS` only** — a number
-  or a dismissal needs no apply. It raises the step-1 banner and
-  badge; `has_pending_inserts` comes from the same read
-  (`page_edits.pending_edit_flags` via `_review_flags`) and waits for
-  #206, whose apply button is the one that must warn about a paid
-  run. Computed apart, the two disagreed on stale rows.
+- **`has_pending_changes` counts `STRUCTURAL_KINDS` with no
+  `applied_at`** — a number or a dismissal needs no apply. It raises
+  the step-1 banner and badge; `has_pending_inserts` comes from the
+  same read (`page_edits.pending_edit_flags` via `_review_flags`) and
+  puts the paid-run confirm on the approve button (#224). Computed
+  apart, the two disagreed on stale rows.
 - **The image is on the default storage** under the scan's
   `page_edits/` prefix: excluded from the generic sync, swept by admin
   deletion, presignable for #206. `PageInsert` used
@@ -253,8 +256,9 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
   `objects.create` the losing request left an object in the bucket
   that no row named.
 - `rotate_page` is an endpoint without a button (the interface belongs
-  to #206/#151). `replace_page` has one since #232. `export_pdf`
-  applies deletes and inserts only.
+  to #151). `replace_page` has one since #232. `export_pdf` runs the
+  apply's own walk (`apply.build_final_pdf`, #224), so it applies all
+  four structural kinds.
 - Data migrations: 0013 (manual readings), 0015 (the retired models),
   0016 (the drop). Run `migrate_page_insert_images` on the pod holding
   the files; until then a migrated insert names an absent S3 key.
@@ -266,18 +270,19 @@ It writes a `REPLACE_PAGE` row (#214) and shows a note on the page and
 a `REPL` badge in the sidebar row; the note's "View" link goes through
 `page_edit_file`, a redirect that signs a URL at the moment of the
 click (the storage's own URL expires within the hour, and a review
-page stays open longer). Nothing builds the row into the volume: that
-is #206.
+page stays open longer). The apply (#224, below) builds the row into
+the volume after the approval.
 
 - **The approve button no longer waits for an apply.** The step-1 bar
   answered one open structural edit with "Rebuild & Validate" alone,
   and hid the recompute and approve buttons while it did. That branch
   is deleted. Two things had made it a dead end: `reprocess` refuses
-  for every scan since #173, and nothing stamps `PageEdit.applied_at`,
-  so "pending" lasted for the rest of the review rather than until the
-  next rebuild. One deleted duplicate page therefore ended a curator's
-  review. The apply runs *after* the approval by design, so a bar that
-  waited for it waited for the button it was hiding.
+  for every scan since #173, and nothing stamped `PageEdit.applied_at`
+  before #224, so "pending" lasted for the rest of the review rather
+  than until the next rebuild. One deleted duplicate page therefore
+  ended a curator's review. The apply runs *after* the approval by
+  design, so a bar that waited for it waited for the button it was
+  hiding.
 - **The pending banner says the whole truth**, and
   `PENDING_EDITS_SAVED_MESSAGE` says the same words: the changes are
   saved, the corrected volume is not built from them yet, each
@@ -302,6 +307,122 @@ is #206.
   link stands whatever the render does: a cross-origin read of the
   bucket needs the CORS rule of #185, which a deployment may not carry
   yet.
+
+## Apply the page edits (issue #224)
+
+The concrete form of #206. Review 1 ends at the approval
+(`PAGE_COMPLETENESS_REVIEW_DONE`), and the `PageEdit` rows plus the
+original then describe the complete volume. The apply builds it and
+glues the paid per-shard results into its page space. **The apply
+assembles; it does not recompute**: a page nobody touched keeps its
+conversion, its OCR read and its detections, and only a page a curator
+added or changed enters a queue. The pieces: `apply.py` (the plan, the
+walk, the build, the glues, the trigger), `models.ApplyRun`,
+`ExternalJob.apply_run`, `PageEdit.applied_run`,
+`services.run_apply_page_edits`, `QueuedAction.APPLY_PAGE_EDITS`, and
+the `reopen_page_review` view. What must not be broken:
+
+- **Queued work in two phases, and the scan stays in DONE between
+  them.** `apply.queue_ready_scans` runs on the collect tick (before
+  `yolo.queue_ready_runs`) and queues `APPLY_PAGE_EDITS` with one
+  compare-and-swap on DONE; `run_apply_page_edits` does the phase that
+  is due (`phase_due`: build, then glue), parks the scan back in DONE
+  guarded on PROCESSING alone, and never writes ERROR. A lost claim
+  supersedes the run. The build pulls the original and the bitonal
+  glue pulls the volume `bitonal.pdf`, minutes on a large volume, so
+  neither may run on the serial tick (#156) — the #196 shape.
+- **`ApplyRun` is the ledger, not a job row.** A run may have no job
+  rows (deletes only, or no edit at all), spans three stages whose
+  glues finish at different times, and is asked about every 15
+  seconds. Failures count on it (`attempts`, `APPLY_MAX_ATTEMPTS`,
+  loud-then-quiet); the way back is the admin `supersede_runs` action,
+  after which the trigger builds `a{n+1}`. `_needs_attention` is the
+  cheap pre-check that keeps a fully glued run to one query per tick.
+- **The offset map is written once**, on the run and at
+  `jobs/apply/a{n}/page_map.json`, by `plan_run`. One entry per final
+  page: `{"kind": "original", "pdf_page": p}` for a kept page, or
+  `{"kind": "edit", "edit_id", "edit_kind", "page": k, ...}` for page
+  `k` of an edit's shard (a rotation carries `pdf_page` and
+  `rotation`; an image carries `reference_pdf_page`). `final_page_of`
+  answers for kept pages only — a replaced page's content is new —
+  and `final_slot_of` for the position, which a typed page number
+  follows. Every glue reads the map; nothing derives it again.
+- **The final PDF is a derived artifact, not a new source.**
+  `Scan.source_fingerprint` stays the original's, forever; the run
+  copies it and the detections glue refuses a document from another
+  original. A run with no structural edit aliases the original
+  (`final_pdf_key`), the volume `bitonal.pdf` and the volume glued
+  documents, and copies nothing — but it still writes
+  `printed_pages.json`, which is a product.
+- **The page shards are keyed by edit**
+  (`jobs/apply/pages/e{pk}.pdf`), never by run, and each row's
+  identity carries `edit_id` and its own `source_page_count`. A row is
+  immutable, so `a{n+1}` finds the same key and identity and
+  `_reusable_results` carries the paid result. Two things keep that
+  true: `_ensure_page_shard` describes an existing shard instead of
+  rebuilding it, with the size the bucket reports (a size read two
+  ways would read as two shards), and `supersede_runs` cancels only
+  the PENDING and in-flight rows — a COMPLETED row is exactly what the
+  next build carries. The apply glues **keep** their one-page results
+  (rows go to CONSUMED), unlike the volume bitonal merge.
+- **The apply rows are a target of their own.** `jobs.live_run`,
+  `run_summary` and every volume candidate query filter
+  `apply_run__isnull=True`; the apply reads its rows through the FK
+  and never by run number (the numbers share `next_run`'s one
+  sequence, so the unique key holds unchanged). A stage-scoped
+  `abandon_open` reaches the volume rows only; the admin deletion's
+  unscoped call reaches everything. `s3_job_attempt_key` puts an
+  apply row's result under `jobs/apply/a{n}/{stage}/{engine}/`.
+  `TestKnownEnqueuePaths` pins `apply.py` as a creator on all three
+  stages, behind the pipeline's own gates (`_can_convert`,
+  `_can_analyze`, `yolo.enabled` plus S3).
+- **A shard is one rule, twice.** `build_edit_shard` and
+  `build_final_pdf` place an uploaded PDF as it is, an image on a page
+  with the MediaBox of its reference page (`reference_page`: the
+  replaced page, or the anchor page), and a rotation as the original
+  page with its `/Rotate` turned — doctor and dots.mocr render through
+  fitz, which honours it. So page `k` of a shard is the final PDF's
+  page for map entry `k`, and the glues can splice by index. A
+  deletion outranks a replacement of the same page. An uploaded PDF
+  may hold several pages; the map places them all.
+- **Each glue is judged on its own inputs** (`glue_due`). The bitonal
+  copy needs the run's CONVERT rows only (an edit whose stage was off
+  at build time contributes its unconverted shard). The OCR volume and
+  `printed_pages.json` need the volume's glued OCR run too; the
+  detections need the volume's merged detection run, which the staff
+  button starts. The first two never wait for the third, and a
+  volume detection run merged before the apply glues still waits:
+  **`yolo.queue_ready_runs` requires the standing run's `bitonal_key`
+  and `detections_key`** (`_apply_ready`), or the redaction compute
+  would measure the space of the original.
+- **The printed-page map is the curator's over the model's.**
+  `printed_pages` runs `page_numbers.ocr_results_from_volume` over the
+  final OCR document, then lands each standing `SET_NUMBER` row on its
+  slot (`final_slot_of`, so a replaced or rotated page keeps the
+  number typed for it) and each inserted page's `logical_page`. A page
+  the worker could not read keeps its `error`, and a page whose stage
+  was off is a hole too (`"not read"`).
+- **DONE locks the nine edit endpoints** (`_refuse_locked_edits`,
+  `LOCKED_STATUSES`: DONE, the busy statuses, APPROVED, EXTRACTED),
+  with 409 and `EDITS_LOCKED_MESSAGE`; the viewer shows it in the
+  toast. A row written after the build would address a source the
+  pipeline has left behind. The staff **Reopen page review** button
+  supersedes the run in flight and moves DONE back to READY with one
+  compare-and-swap; the edits unlock, and the next approval builds
+  `a{n+1}`. The admin re-queue supersedes runs too, since the pipeline
+  runs again from the original.
+- **The review-1 artifacts are never written over.** Every output goes
+  under `jobs/apply/a{n}/` (the final PDF, `bitonal.pdf`,
+  `ocr-volume.json`, `printed_pages.json`, `detections-volume.json`),
+  which the generic sync never carries and the admin deletion sweeps.
+  The first `bitonal.pdf`, the `r{run}-volume.json` and the stored
+  page map stay, so the page review renders after a reopen. Step 2
+  and step 3 still read the review-1 artifacts; switching them to the
+  final space (`ApplyRun.bitonal_key`, `detections_key`,
+  `printed_pages_key`) is the follow-up PR, and every volume with no
+  structural edit is correct either way because the run aliases them.
+- The scratch prefix `apply.BUILD_TMP_PREFIX` is in the
+  `cleanup_processing_tmp` leak sweep.
 
 ## Bitonal via doctor (issue #176)
 
