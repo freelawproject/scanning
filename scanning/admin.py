@@ -746,6 +746,21 @@ class ApplyRunAdmin(admin.ModelAdmin):
     list_select_related = ["scan__reporter"]
     actions = ["supersede_runs"]
 
+    def has_delete_permission(self, request, obj=None):
+        """Refuse the delete: a run is a ledger, and its rows cascade.
+
+        ``ExternalJob.apply_run`` is CASCADE, so a plain delete would
+        take a PENDING or in-flight row with it and leave its RunPod
+        job running with no handle to cancel it. The supersede action
+        cancels first; the scan deletion cancels every row of the scan
+        before its own cascade. Nothing else needs a run gone.
+
+        :param request: The admin request.
+        :param obj: The run, on a change page.
+        :returns: False.
+        """
+        return False
+
     @admin.action(description="Supersede: give up on this run and rebuild")
     def supersede_runs(self, request, queryset):
         """Close the selected runs, so the trigger builds the next number.

@@ -178,8 +178,21 @@ class ApplyPlan:
 
     @property
     def shard_edits(self) -> list[PageEdit]:
-        """Return the rows that need a one-page shard and a job row."""
-        return [edit for edit in self.edits if edit.kind in SHARD_KINDS]
+        """Return the rows that need a one-page shard and a job row.
+
+        The rows a map entry names, not every row of a shard kind: a
+        rotation of a page that a deletion or a replacement outranks,
+        or a replacement of a deleted page, holds no final page. It is
+        still one of the plan's edits -- considered, and stamped -- but
+        cutting a shard for it would pay three stages for a page no
+        glue reads.
+        """
+        named = {
+            entry["source"]["edit_id"]
+            for entry in self.pages
+            if entry["source"]["kind"] == "edit"
+        }
+        return [edit for edit in self.edits if edit.pk in named]
 
     def edit_by_id(self, edit_id: int) -> PageEdit:
         """Return one of the plan's rows by primary key.
@@ -308,7 +321,11 @@ def plan_run(
 
     A page both deleted and replaced is deleted: the deletion is the
     stronger decision, and a curator who wants the replacement takes
-    the deletion back.
+    the deletion back. A rotation of a deleted or replaced page is
+    outranked the same way. The losing row stays in ``edits`` -- the
+    build stamps it, and the trigger compares that set with the
+    standing rows -- but it is not in :attr:`ApplyPlan.shard_edits`,
+    so no shard is cut and nothing is paid for it.
 
     :param scan: The scan whose rows to read.
     :param page_counts: ``{edit pk: pages}`` for the uploaded files,
@@ -801,16 +818,14 @@ def _build(scan: Scan, run: ApplyRun) -> None:
                     f"scan {scan.pk} has {scan.page_count} page(s) on the "
                     f"row and {source.page_count} in the original"
                 )
+            # The plan first, off the rows and the uploaded files, so
+            # only the edits it places get a shard. A shard's page
+            # count is the file's, so the plan needs no second pass.
+            plan = plan_run(scan)
             shards = {
                 edit.pk: _ensure_page_shard(scan, source, edit, tmp_dir)
-                for edit in page_edits.current_edits(scan, *SHARD_KINDS)
+                for edit in plan.shard_edits
             }
-            plan = plan_run(
-                scan,
-                page_counts={
-                    pk: info["page_count"] for pk, info in shards.items()
-                },
-            )
             if plan.is_identity:
                 # No copy of gigabytes for a volume nobody changed: the
                 # final PDF is the original.

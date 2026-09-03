@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.urls import reverse
 from django.utils import timezone
 
@@ -95,26 +95,45 @@ def supersede(
     :param defaults: The columns a new row carries, and an open row
         takes when ``refresh_open`` is true.
     :param user: Who decided.
+    Two requests for one address at the same moment -- a double click,
+    a second tab -- both read no standing row and both insert. The
+    partial unique key refuses the second, and it must answer with the
+    winner's row, not a 500: the ``get_or_create`` this replaced caught
+    that race inside a savepoint and read again, so this does the same.
+
     :param refresh_open: Whether an open row at the address takes
         ``defaults``. A deletion has nothing to refresh; a page number
         does.
     :returns: The standing row after the write.
     :rtype: PageEdit
     """
+
+    def refresh(row: PageEdit) -> PageEdit:
+        if refresh_open:
+            for field, value in defaults.items():
+                setattr(row, field, value)
+            row.author = user
+            row.save()
+        return row
+
     with transaction.atomic():
         row = standing_edits(scan, kind).filter(**address).first()
         if row is not None and row.applied_at is None:
-            if refresh_open:
-                for field, value in defaults.items():
-                    setattr(row, field, value)
-                row.author = user
-                row.save()
-            return row
+            return refresh(row)
         if row is not None:
             withdraw(PageEdit.objects.filter(pk=row.pk), user)
-        return PageEdit.objects.create(
-            scan=scan, kind=kind, author=user, **address, **defaults
-        )
+        try:
+            # A savepoint of its own, so the refused insert does not
+            # poison the transaction the re-read runs in.
+            with transaction.atomic():
+                return PageEdit.objects.create(
+                    scan=scan, kind=kind, author=user, **address, **defaults
+                )
+        except IntegrityError:
+            row = standing_edits(scan, kind).filter(**address).first()
+            if row is None:
+                raise
+            return refresh(row)
 
 
 def withdraw(rows, user) -> int:

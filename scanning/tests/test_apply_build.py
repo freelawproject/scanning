@@ -182,6 +182,30 @@ class TestBuildRun(BuildTestCase):
             ),
         )
 
+    def test_a_shadowed_edit_gets_no_shard_and_no_row(self):
+        # A rotation of a page the curator then replaced: the map holds
+        # the replacement, and the rotation must not pay three stages.
+        turn = self.edit(PageEdit.Kind.ROTATE_PAGE, pdf_page=4, value="90")
+        swap = self.upload_edit(
+            PageEdit.Kind.REPLACE_PAGE, "r.png", png_bytes(), pdf_page=4
+        )
+
+        run = apply.build_run(self.scan)
+
+        self.assertNotIn(apply.page_shard_key(self.scan, turn), self.uploads)
+        self.assertIn(apply.page_shard_key(self.scan, swap), self.uploads)
+        self.assertEqual(
+            set(run.jobs.values_list("input_manifest__edit_id", flat=True)),
+            {swap.pk},
+        )
+        turn.refresh_from_db()
+        self.assertEqual(turn.applied_run, run)
+        self.assertEqual(sorted(run.edit_ids), sorted([turn.pk, swap.pk]))
+        # The trigger sees a current run that waits on its rows, not a
+        # rebuild: the stamped set and the standing set agree.
+        self.assertIsNone(apply.phase_due(self.scan))
+        self.assertEqual(run.edit_ids, apply._current_edit_ids(self.scan))
+
     def test_the_volume_readers_ignore_the_apply_rows(self):
         self.three_edits()
         run = apply.build_run(self.scan)

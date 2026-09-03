@@ -10,6 +10,7 @@ import io
 import json
 import pathlib
 import tempfile
+from unittest import mock
 
 import fitz
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -218,6 +219,19 @@ class TestPlanRun(ApplyTestCase):
 
         self.assertEqual(plan.final_page_count, self.PAGES - 1)
         self.assertNotIn(("e", swap.pk, 0), self.sources(plan))
+        # Considered and stamped, but no shard is cut for it.
+        self.assertIn(swap, plan.edits)
+        self.assertEqual(plan.shard_edits, [])
+
+    def test_a_replacement_outranks_a_rotation(self):
+        turn = self.edit(PageEdit.Kind.ROTATE_PAGE, pdf_page=4, value="90")
+        swap = self.edit(PageEdit.Kind.REPLACE_PAGE, pdf_page=4)
+
+        plan = apply.plan_run(self.scan, page_counts={swap.pk: 1})
+
+        self.assertEqual(self.sources(plan)[3], ("e", swap.pk, 0))
+        self.assertIn(turn, plan.edits)
+        self.assertEqual(plan.shard_edits, [swap])
 
     def test_a_stale_edit_is_not_planned(self):
         self.edit(
@@ -406,6 +420,28 @@ class TestSupersede(ApplyTestCase):
         self.assertEqual(applied.value, "300")
         self.assertEqual(applied.withdrawn_by, self.user)
         self.assertEqual(list(page_edits.standing_edits(self.scan)), [again])
+
+    def test_a_lost_insert_race_answers_the_winner(self):
+        # Two requests read no standing row; the second insert loses to
+        # the unique key and must hand back the first one's row.
+        real = page_edits.standing_edits
+        winner = self.edit(PageEdit.Kind.SET_NUMBER, pdf_page=3, value="300")
+        with mock.patch.object(
+            page_edits,
+            "standing_edits",
+            side_effect=[PageEdit.objects.none(), real(self.scan)],
+        ):
+            row = page_edits.supersede(
+                self.scan,
+                PageEdit.Kind.SET_NUMBER,
+                {"pdf_page": 3},
+                {"value": "301"},
+                self.user,
+            )
+
+        self.assertEqual(row.pk, winner.pk)
+        self.assertEqual(row.value, "301")
+        self.assertEqual(self.scan.page_edits.count(), 1)
 
     def test_a_deletion_is_not_refreshed(self):
         first = page_edits.supersede(
