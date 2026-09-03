@@ -810,9 +810,9 @@ document.addEventListener('DOMContentLoaded', function () {
             body.anchor_pdf_page = parseInt(btn.dataset.anchorPdfPage, 10);
             body.logical_page = btn.dataset.logicalPage || '';
         } else {
+            // The server reads the printed number off its own copy of
+            // the OCR results; a label sent from here would be ignored.
             body.pdf_page = parseInt(btn.dataset.pdfPage, 10);
-            var ocr = ocrByPage[body.pdf_page];
-            body.logical_page = ocr && ocr.detected ? String(ocr.detected) : '';
         }
         fetch('/scans/' + documentId + '/repair/request/', {
             method: 'POST',
@@ -830,6 +830,12 @@ document.addEventListener('DOMContentLoaded', function () {
             replaceRepair(res.data.request);
             drawRepairNote(pageDiv, res.data.request);
             renderRepairsSection();
+            if (res.data.already_fulfilled) {
+                // The open row is answered, and the key matched it. Say
+                // the way out; a "saved" toast here would lose the ask.
+                showToast(res.data.message);
+                return;
+            }
             showToast(res.data.created
                 ? 'Saved. A scanner sees this on the Repairs page.'
                 : 'This page was already requested.', 'success');
@@ -882,6 +888,12 @@ document.addEventListener('DOMContentLoaded', function () {
                 ? 'A scanner was asked for this page, and a new scan is saved. '
                 : (row.action === 'insert' ? 'A scanner was asked for this page. '
                                            : 'A scanner was asked to scan this page again. ');
+            // A fulfilled request keeps its Dismiss: the row is still
+            // open and holds the address, so a reviewer who finds the
+            // new scan bad too dismisses it and asks again.
+            var dismissTitle = row.fulfilled
+                ? 'Close this answered request. Then you can ask again.'
+                : 'The page is fine, or the request no longer applies';
             note.innerHTML =
                 escapeHtml(text) +
                 '<span class="repair-note-text">' +
@@ -889,9 +901,9 @@ document.addEventListener('DOMContentLoaded', function () {
                 '(' + escapeHtml(row.requested_by) + ', ' + escapeHtml(row.date_created) + ')' +
                 (row.stale ? ', made on an earlier upload of this scan' : '') +
                 '</span>' +
-                (row.fulfilled ? '' :
-                    ' <button class="dismiss-repair-btn" data-request-id="' + row.id + '" ' +
-                    'title="The page is fine, or the request no longer applies">Dismiss</button>');
+                (row.fulfilled ? ' Still bad? Dismiss this request and ask again.' : '') +
+                ' <button class="dismiss-repair-btn" data-request-id="' + row.id + '" ' +
+                'title="' + dismissTitle + '">Dismiss</button>';
             if (host === label) { label.appendChild(note); }
             else { host.insertBefore(note, host.firstChild); }
         }

@@ -398,7 +398,8 @@ def repair_queue(request: HttpRequest) -> HttpResponse:
             "states": repairs.QUEUE_STATES,
             "reporters": Reporter.objects.all(),
             "selected_reporter": reporter_filter,
-            "waiting_total": repairs.waiting_count(),
+            # The waiting total is ``waiting_repairs_count``, from the
+            # context processor that feeds the header badge: one query.
         },
     )
 

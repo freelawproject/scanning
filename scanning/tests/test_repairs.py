@@ -14,7 +14,7 @@ from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from scanning import page_edits, repairs
+from scanning import page_edits, repairs, views_process
 from scanning.factories import (
     PageEditFactory,
     ReporterFactory,
@@ -249,9 +249,22 @@ class TestRequestEndpoint(RepairTestCase):
         self.scan.ocr_results = results
         self.scan.save(update_fields=["ocr_results"])
 
-        self._replace(pdf_page=2)
-
+        # With and without a label from the viewer: the label of a
+        # rescan is the server's to read, and a junk reading must not
+        # make the button fail on the one page that needs it.
+        sent = self._request(action="replace", pdf_page=2, logical_page="<b>x")
+        self.assertEqual(sent.status_code, 200)
         self.assertEqual(self.scan.repair_requests.get().logical_page, "")
+
+        self._dismiss(json.loads(sent.content)["request"]["id"])
+        self.assertEqual(self._replace(pdf_page=2).status_code, 200)
+
+    def test_the_label_of_a_rescan_is_read_by_the_server(self):
+        response = self._request(
+            action="replace", pdf_page=2, logical_page="999"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.scan.repair_requests.get().logical_page, "3")
 
     def test_a_request_is_taken_in_any_status(self):
         self.scan.status = Status.PAGE_COMPLETENESS_REVIEW_DONE
@@ -471,6 +484,48 @@ class TestFulfilledIsDerived(RepairTestCase):
         )
 
         self.assertFalse(repairs.open_requests(self.scan).get().fulfilled)
+
+    def test_asking_again_over_an_answered_request_is_told_so(self):
+        # The mirror of ``test_an_edit_already_there_answers_nothing``:
+        # here the request came first. The key matches the fulfilled
+        # row, so nothing new is created, and the answer must say so.
+        first = json.loads(self._replace(pdf_page=2).content)["request"]
+        self.client.post(
+            reverse("replace_page", kwargs={"pk": self.scan.pk}),
+            data={"image": self.make_image(), "pdf_page": 2},
+        )
+
+        data = json.loads(self._replace(pdf_page=2).content)
+
+        self.assertFalse(data["created"])
+        self.assertTrue(data["already_fulfilled"])
+        self.assertEqual(data["request"]["id"], first["id"])
+        self.assertTrue(data["request"]["fulfilled"])
+        self.assertEqual(
+            data["message"], views_process.REPAIR_ALREADY_FULFILLED_MESSAGE
+        )
+        self.assertEqual(self.scan.repair_requests.count(), 1)
+
+    def test_a_dismissal_of_the_answered_request_frees_the_ask(self):
+        first = json.loads(self._replace(pdf_page=2).content)["request"]
+        self.client.post(
+            reverse("replace_page", kwargs={"pk": self.scan.pk}),
+            data={"image": self.make_image(), "pdf_page": 2},
+        )
+        self._dismiss(first["id"])
+
+        data = json.loads(self._replace(pdf_page=2).content)
+
+        self.assertTrue(data["created"])
+        self.assertFalse(data["already_fulfilled"])
+        self.assertFalse(data["request"]["fulfilled"])
+        self.assertEqual(len(repairs.waiting_requests(self.scan)), 1)
+        self.assertEqual(self.scan.repair_requests.count(), 2)
+
+    def test_a_first_request_is_not_already_fulfilled(self):
+        data = json.loads(self._replace(pdf_page=2).content)
+        self.assertFalse(data["already_fulfilled"])
+        self.assertNotIn("message", data)
 
     def test_an_applied_edit_against_this_upload_fulfils(self):
         # ``applied_at`` answers "is it built into an output?", not

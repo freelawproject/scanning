@@ -77,6 +77,16 @@ REVALIDATE_UNAVAILABLE_MESSAGE = (
 PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE = (
     "Approve the page completeness review first. Then continue to detection."
 )
+#: Answered to a request over a page a scanner already rescanned after
+#: an earlier request (#249). The unique key matches the open row, and
+#: the row reads fulfilled, so nothing new is created: say so, and say
+#: the way out. Silence here is the fault the date rule removed, one
+#: step later.
+REPAIR_ALREADY_FULFILLED_MESSAGE = (
+    "This page was already requested, and a new scan of it is saved. If "
+    "the new scan is bad too, dismiss the old request on the page and ask "
+    "again, or upload a better scan with Replace."
+)
 PENDING_EDITS_SAVED_MESSAGE = (
     "Your page changes are saved. We do not build the corrected "
     "volume from them yet. Each inserted or replaced page must go "
@@ -2508,6 +2518,15 @@ def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
     page answers the first row, with ``created`` false, so two
     reviewers who find one page do not stack two requests.
 
+    **A fulfilled row is still an open row**, and the key matches it
+    too. The derivation refuses an edit older than the request, but
+    SQL cannot index a derived flag, so the key cannot. So when the
+    matched row is fulfilled the answer says so
+    (``already_fulfilled``, ``REPAIR_ALREADY_FULFILLED_MESSAGE``): the
+    reviewer dismisses the answered request and asks again, or uses
+    Replace. A toast that said "already requested" here would lose the
+    ask, which is the silence this feature exists to remove.
+
     The note is free text a person typed. It is cut at
     ``repairs.NOTE_MAX_CHARS`` here and escaped where it is drawn: in
     the viewer through ``escapeHtml``, in the templates by the
@@ -2528,20 +2547,27 @@ def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
     action = data.get("action")
     if action not in PageRepairRequest.Action.values:
         return JsonResponse({"error": "Unknown action."}, status=400)
-    label = _page_label(str(data.get("logical_page") or ""))
-    if label is None:
-        return JsonResponse({"error": "Invalid page number."}, status=400)
     note = str(data.get("note") or "").strip()[: repairs.NOTE_MAX_CHARS]
 
     address = {}
     if action == PageRepairRequest.Action.REPLACE:
+        # The label is a hint for the scanner, not the reviewer's
+        # typing, so the server reads it off ``ocr_results`` itself and
+        # drops a reading the narrowing refuses. A label sent by the
+        # viewer is ignored: refusing it would make the button fail on
+        # exactly the page whose reading is junk.
         pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
         if pdf_page is None:
             return JsonResponse({"error": "Unknown PDF page."}, status=404)
         address["pdf_page"] = pdf_page
-        if not label:
-            label = _printed_number_of(scan, pdf_page)
+        label = _printed_number_of(scan, pdf_page)
     else:
+        # An older viewer places the gap by the label alone
+        # (``_anchor_of``), so here the label is an address and a
+        # refused one is an error.
+        label = _page_label(str(data.get("logical_page") or ""))
+        if label is None:
+            return JsonResponse({"error": "Invalid page number."}, status=400)
         anchor = _anchor_of(scan, data.get("anchor_pdf_page"), label)
         if anchor is None:
             return JsonResponse({"error": "Unknown gap."}, status=404)
@@ -2560,13 +2586,15 @@ def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
         },
     )
     row = repairs.open_requests(scan).get(pk=row.pk)
-    return JsonResponse(
-        {
-            "status": "ok",
-            "created": created,
-            "request": repairs.as_dict(row, scan),
-        }
-    )
+    answer = {
+        "status": "ok",
+        "created": created,
+        "already_fulfilled": bool(not created and row.fulfilled),
+        "request": repairs.as_dict(row, scan),
+    }
+    if answer["already_fulfilled"]:
+        answer["message"] = REPAIR_ALREADY_FULFILLED_MESSAGE
+    return JsonResponse(answer)
 
 
 @login_required

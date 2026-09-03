@@ -349,6 +349,15 @@ called it, and an endpoint nobody reaches still carries its surface
   leaves it alone. So an apply never invalidates an address, and a
   request goes stale for one reason only: somebody re-uploaded the
   volume. The same holds for `PageEdit.source_fingerprint`.
+- **A fulfilled row is still an open row, and the key matches it.**
+  SQL cannot index a derived flag, so the partial unique key cannot
+  exclude a fulfilled request, and a reviewer who finds the new scan
+  bad too gets `created: false` from `get_or_create`. The endpoint
+  says so (`already_fulfilled`, `REPAIR_ALREADY_FULFILLED_MESSAGE`),
+  the viewer shows that message and not "already requested", and the
+  fulfilled note keeps its Dismiss button so the reviewer can close
+  the answered request and ask again. Do not let that path go quiet:
+  it is the mirror of the born-fulfilled case, one step later.
 - **Dismissed, never deleted.** `repairs.dismiss` stamps `dismissed_at`
   and `dismissed_by` (and writes `date_modified`, since `update()`
   skips `auto_now`). Any logged-in user may dismiss, the rule of every
@@ -364,9 +373,13 @@ called it, and an endpoint nobody reaches still carries its surface
 - **The note is escaped where it is drawn**: `escapeHtml` in the
   viewer, the auto-escape in the templates, and `json_script` for the
   script block. It is not narrowed, because it is prose, not a page
-  number. The label goes through `_page_label` like every other label,
-  the fallback read off `ocr_results` included: a reading the
-  narrowing refuses is dropped, not stored.
+  number. The label goes through `_page_label` like every other label.
+  For a rescan the server reads it off `ocr_results` itself and drops
+  a reading the narrowing refuses; a label sent by the viewer is
+  ignored, since refusing it would fail the button on exactly the page
+  whose reading is junk. For a missing leaf the label is an address
+  (`_anchor_of` places an older viewer's gap by it), so a refused one
+  is a 400.
 - **The queue page paginates scans, not rows** (`repairs.queue_scan_ids`
   then `repairs.group_by_scan`): a row is never deleted, so the `all`
   and `dismissed` states grow for good, and a page that loaded every
