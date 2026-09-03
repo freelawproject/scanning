@@ -1202,8 +1202,8 @@ def _review_flags(scan: Scan) -> dict:
 
     :param scan: The scan the bar is rendered for.
     :returns: ``page_review_ready``, ``page_review_done``,
-        ``scan_approved``, ``has_legacy_ocr`` and the two pending-edit
-        flags, for the template context.
+        ``has_legacy_ocr`` and the two pending-edit flags, for the
+        template context.
     :rtype: dict
     """
     from scanning import services
@@ -1215,10 +1215,6 @@ def _review_flags(scan: Scan) -> dict:
         "page_review_done": (
             scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
         ),
-        # The status the second review's approval writes
-        # (views_api.approve_scan). The Mistral control (#191) reads it
-        # beside page_review_done.
-        "scan_approved": scan.status == Status.APPROVED,
         "has_legacy_ocr": services.has_legacy_ocr(scan),
         **page_edits.pending_edit_flags(scan),
     }
@@ -1297,7 +1293,6 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "dots_run": dots_mocr.run_summary(scan),
         "yolo_run": yolo.run_summary(scan),
         "mistral_run": mistral_ocr.run_summary(scan),
-        "has_redaction_rects": bool(scan.redaction_rects),
         **_review_flags(scan),
     }
     html = render_to_string(
@@ -1601,33 +1596,16 @@ def start_yolo_detect(request: HttpRequest, pk: int) -> HttpResponse:
     return back
 
 
-#: The statuses the Mistral read may be started from (#191): review 1
-#: done with the redactions computed, or the volume approved by the
-#: second review. Rachel's order for the ensemble runs every OCR engine
-#: on the *redacted* pages after the redaction review; the portal has no
-#: status for "review 2 done" yet, so the earlier status is accepted and
-#: the staff member decides when the boxes are final. A later box edit
-#: changes the rects digest, and the next run re-reads only the shards
-#: whose rects moved.
-MISTRAL_START_STATUSES = (
-    Status.PAGE_COMPLETENESS_REVIEW_DONE,
-    Status.APPROVED,
-)
-
-
 @login_required
 @require_POST
 def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
     """Start the Mistral OCR read over a scan's original shards (#191).
 
-    Staff only, and the only way into this stage until the trigger on
-    the second review's approval lands. Every press can start real
-    paid work on Mistral's batch API.
-
-    The pages go out with the redaction rects painted black, so the
-    rects must exist: a run before them would send the headnotes to a
-    third party. Hence the status gate (``MISTRAL_START_STATUSES``) and
-    the rects check, both here and not only in the template.
+    Staff only, and the only way into this stage until a daemon trigger
+    lands. Every press can start real paid work on Mistral's batch API.
+    Like the dots.mocr button, it reads the original shards and needs
+    no review state: where the stage is called from is a separate
+    question from what it does.
 
     **This request makes no call to Mistral.** It writes one
     ``ExternalJob`` row per shard and returns; the daemon's next
@@ -1654,24 +1632,6 @@ def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
         messages.error(
             request,
             "Only staff can start Mistral OCR: each run costs money.",
-        )
-        return back
-
-    if scan.status not in MISTRAL_START_STATUSES:
-        messages.warning(
-            request,
-            "Mistral OCR runs after the page completeness review is "
-            "approved and the redactions are computed. This volume is "
-            "not there yet.",
-        )
-        return back
-
-    if not scan.redaction_rects:
-        messages.warning(
-            request,
-            "Mistral OCR reads the pages with their redactions painted, "
-            "and this volume has no redactions computed yet. Run the "
-            "detection first.",
         )
         return back
 
@@ -1722,8 +1682,7 @@ def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
         messages.info(
             request,
             f"This volume was already read: run {created[0].run} covers "
-            f"all {len(created)} part(s) with these redactions. Nothing "
-            "new was queued.",
+            f"all {len(created)} part(s). Nothing new was queued.",
         )
     return back
 

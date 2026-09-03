@@ -1,12 +1,12 @@
 """Tests for the Mistral OCR stage (issue #191).
 
 What is tested here is what Mistral does *differently* from the two
-RunPod engines: the render the daemon does itself, the rects in the
-shard identity, a wave that uploads and creates a batch, a sweep that
-polls a batch and stores its output whole, and a cancel that deletes
-what it uploaded. The shared lifecycle -- the claim, the
-compare-and-swap, the retry ledger, the carry -- is covered in
-``test_jobs.py`` and ``test_dots_mocr.py``.
+RunPod engines: the render the daemon does itself, a wave that uploads
+and creates a batch one shard per tick, a sweep that polls a batch and
+stores its output whole, and a cancel that deletes what it uploaded.
+The shared lifecycle -- the claim, the compare-and-swap, the retry
+ledger, the carry -- is covered in ``test_jobs.py`` and
+``test_dots_mocr.py``.
 
 No HTTP and no S3: ``mistral_client`` and the S3 helpers are patched.
 The render is real, over a synthetic PDF.
@@ -50,23 +50,6 @@ MISTRAL = {
     "DOCTOR_ENABLED": False,
 }
 
-#: A rect on volume page 1, in 200 dpi pixels of a letter page.
-RECTS = [
-    {
-        "page_index": 1,
-        "rects": [
-            {
-                "x0": 200,
-                "y0": 300,
-                "x1": 600,
-                "y1": 500,
-                "fill": "black",
-                "type": "headnote",
-            }
-        ],
-    }
-]
-
 
 def extract_jobs(scan):
     """Return a scan's Mistral rows in shard order.
@@ -85,7 +68,7 @@ def extract_jobs(scan):
 
 
 def write_pdf(path: Path, pages: int = 2, size=(612, 792)) -> None:
-    """Write a PDF of ``pages`` white pages with a line of text each.
+    """Write a PDF of ``pages`` white pages with a black box on each.
 
     :param path: Where to write it.
     :param pages: How many pages.
@@ -95,6 +78,15 @@ def write_pdf(path: Path, pages: int = 2, size=(612, 792)) -> None:
         for index in range(pages):
             page = doc.new_page(width=size[0], height=size[1])
             page.insert_text((72, 72), f"Page {index + 1}", fontsize=12)
+            # A box in the top-left quarter, so a test can tell a
+            # rendered page from a blank one.
+            page.draw_rect(
+                fitz.Rect(
+                    size[0] * 0.1, size[1] * 0.1, size[0] * 0.4, size[1] * 0.4
+                ),
+                fill=(0, 0, 0),
+                width=0,
+            )
         doc.save(str(path))
 
 
@@ -121,12 +113,12 @@ class TestEnabled(ScanningTestCase):
         self.assertFalse(yolo.enabled())
 
 
-# ── the rows and their identity ─────────────────────────────────────
+# ── the rows ────────────────────────────────────────────────────────
 class TestEnsureExtractJobs(ScanningTestCase):
-    """One row per original shard, with the rects in the identity."""
+    """One row per original shard, at EXTRACT/MISTRAL_OCR/MISTRAL."""
 
     def test_one_row_per_shard_at_extract_mistral(self):
-        scan = ScanFactory(redaction_rects=RECTS)
+        scan = ScanFactory()
         created = mistral_ocr.ensure_extract_jobs(
             scan, make_manifest(shard_count=2, pages_per_shard=10)
         )
@@ -139,70 +131,31 @@ class TestEnsureExtractJobs(ScanningTestCase):
             self.assertEqual(job.status, JobStatus.PENDING)
             self.assertIsNone(job.opinion)
             self.assertEqual(job.shard_index, index)
-            self.assertIn("rects_digest", job.input_manifest)
+            self.assertEqual(job.input_manifest["from_page"], index * 10)
             self.assertIn("shards/", job.input_key)
             self.assertNotIn("bitonal", job.input_key)
 
-    def test_the_digest_covers_the_shard_s_own_pages_only(self):
-        # The rect is on page 1, inside shard 0. Shard 1 has no rect,
-        # so its digest is the digest of nothing.
-        scan = ScanFactory(redaction_rects=RECTS)
-        first, second = mistral_ocr.ensure_extract_jobs(
-            scan, make_manifest(shard_count=2, pages_per_shard=10)
-        )
-        empty = mistral_ocr.rects_digest({}, 0, 9)
-        self.assertNotEqual(first.input_manifest["rects_digest"], empty)
-        self.assertEqual(second.input_manifest["rects_digest"], empty)
-
-    def test_the_row_carries_its_shard_s_rects(self):
-        # The render reads the row, never the scan, so the row holds
-        # the rects its digest names -- restricted to its own pages,
-        # keyed by the volume page as a string (JSON has no int keys).
-        scan = ScanFactory(redaction_rects=RECTS)
-        first, second = mistral_ocr.ensure_extract_jobs(
-            scan, make_manifest(shard_count=2, pages_per_shard=10)
-        )
-        self.assertEqual(
-            first.input_manifest["rects"], {"1": RECTS[0]["rects"]}
-        )
-        self.assertEqual(second.input_manifest["rects"], {})
-        self.assertEqual(
-            mistral_ocr.shard_rects(first), {1: RECTS[0]["rects"]}
-        )
-        self.assertEqual(mistral_ocr.shard_rects(second), {})
-
-    def test_the_same_rects_give_the_same_digest(self):
-        by_page = mistral_ocr.page_rects(ScanFactory(redaction_rects=RECTS))
-        self.assertEqual(
-            mistral_ocr.rects_digest(by_page, 0, 9),
-            mistral_ocr.rects_digest(by_page, 0, 9),
-        )
-
     def test_a_second_call_reuses_the_run(self):
-        scan = ScanFactory(redaction_rects=RECTS)
+        scan = ScanFactory()
         manifest = make_manifest(shard_count=2)
         first = mistral_ocr.ensure_extract_jobs(scan, manifest)
         second = mistral_ocr.ensure_extract_jobs(scan, manifest)
         self.assertEqual([r.pk for r in first], [r.pk for r in second])
 
-    def test_a_moved_box_re_reads_its_shard_and_carries_the_rest(self):
-        # The rect sits on page 1 (shard 0). Both shards are read. Then
-        # the curator moves the box: shard 0's identity changes, shard
-        # 1's does not, so a new run re-pays shard 0 alone.
-        scan = ScanFactory(redaction_rects=RECTS)
+    def test_an_unchanged_shard_is_carried_into_a_replacement_run(self):
+        # The results are kept, so a run replaced for one dead shard
+        # re-pays that shard alone.
+        scan = ScanFactory()
         manifest = make_manifest(shard_count=2, pages_per_shard=10)
         rows = mistral_ocr.ensure_extract_jobs(scan, manifest)
-        for row in rows:
-            ExternalJob.objects.filter(pk=row.pk).update(
-                status=JobStatus.CONSUMED,
-                result_key=f"jobs/extract/mistral_ocr/r1-s{row.shard_index}-a1.json",
-                completed_at=timezone.now(),
-            )
-        moved = [
-            {"page_index": 1, "rects": [{**RECTS[0]["rects"][0], "x0": 210}]}
-        ]
-        scan.redaction_rects = moved
-        scan.save(update_fields=["redaction_rects"])
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.CONSUMED,
+            result_key="jobs/extract/mistral_ocr/r1-s0-a1.json",
+            completed_at=timezone.now(),
+        )
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.FAILED
+        )
 
         with (
             patch("scanning.s3_sync.s3_active", return_value=True),
@@ -211,21 +164,17 @@ class TestEnsureExtractJobs(ScanningTestCase):
             fresh = mistral_ocr.ensure_extract_jobs(scan, manifest)
 
         self.assertEqual(fresh[0].run, 2)
-        self.assertEqual(fresh[0].status, JobStatus.PENDING)
-        self.assertEqual(fresh[1].status, JobStatus.COMPLETED)
+        self.assertEqual(fresh[0].status, JobStatus.COMPLETED)
         self.assertEqual(
-            fresh[1].result_key, "jobs/extract/mistral_ocr/r1-s1-a1.json"
+            fresh[0].result_key, "jobs/extract/mistral_ocr/r1-s0-a1.json"
         )
-        self.assertEqual(fresh[1].external_id, "")
+        self.assertEqual(fresh[0].external_id, "")
+        self.assertEqual(fresh[1].status, JobStatus.PENDING)
 
     def test_a_result_with_a_hole_is_not_carried(self):
-        scan = ScanFactory(redaction_rects=RECTS)
+        scan = ScanFactory()
         manifest = make_manifest(shard_count=1, pages_per_shard=2)
         (row,) = mistral_ocr.ensure_extract_jobs(scan, manifest)
-        ExternalJob.objects.filter(pk=row.pk).update(
-            status=JobStatus.FAILED,
-        )
-        # A prior completed attempt with a failed page: a hole.
         ExternalJob.objects.filter(pk=row.pk).update(
             status=JobStatus.CONSUMED,
             result_key="jobs/extract/mistral_ocr/r1-s0-a1.json",
@@ -244,7 +193,7 @@ class TestEnsureExtractJobs(ScanningTestCase):
 
 # ── the render ──────────────────────────────────────────────────────
 class TestRender(ScanningTestCase):
-    """The ensemble's canonical render: 1700x2200 RGB, rects black."""
+    """The ensemble's canonical render: 1700x2200 RGB, nothing else."""
 
     def setUp(self):
         super().setUp()
@@ -255,69 +204,49 @@ class TestRender(ScanningTestCase):
         pdf = self.tmp / "letter.pdf"
         write_pdf(pdf, pages=1)
         with fitz.open(str(pdf)) as doc:
-            png = mistral_ocr.render_page(doc[0], [])
+            png = mistral_ocr.render_page(doc[0])
         img = png_image(png)
         self.assertEqual(img.size, (1700, 2200))
-        # White paper, black text: no grey conversion happened.
+        # The box the fixture draws, and white paper beside it: no
+        # grey conversion and no threshold happened.
+        self.assertEqual(img.getpixel((400, 400)), (0, 0, 0))
         self.assertEqual(img.getpixel((1600, 2100)), (255, 255, 255))
 
-    def test_a_rect_is_painted_black_in_its_own_pixels(self):
-        pdf = self.tmp / "letter.pdf"
-        write_pdf(pdf, pages=1)
-        rect = RECTS[0]["rects"][0]
-        with fitz.open(str(pdf)) as doc:
-            png = mistral_ocr.render_page(doc[0], [rect])
-        img = png_image(png)
-        # Inside the rect (200 dpi pixels are the render's pixels on a
-        # letter page): black. Just outside: white.
-        self.assertEqual(img.getpixel((400, 400)), (0, 0, 0))
-        self.assertEqual(img.getpixel((199, 400)), (255, 255, 255))
-        self.assertEqual(img.getpixel((400, 501)), (255, 255, 255))
-
-    def test_another_page_size_is_resized_and_its_rect_scaled(self):
-        # A4: 595x842 points, 1653x2339 pixels at 200 dpi. The branch
-        # resizes the render to 1700x2200; the rect is scaled with it,
-        # or a box in the top-left quarter would drift.
+    def test_another_page_size_is_resized_to_the_canonical_size(self):
+        # A4 is 595x842 points. The branch resizes every render to
+        # 1700x2200, so every bbox of every engine lives in one space.
         pdf = self.tmp / "a4.pdf"
         write_pdf(pdf, pages=1, size=(595, 842))
-        width_px = 595 * 200 / 72
-        height_px = 842 * 200 / 72
-        rect = {"x0": 0, "y0": 0, "x1": width_px / 2, "y1": height_px / 2}
         with fitz.open(str(pdf)) as doc:
-            png = mistral_ocr.render_page(doc[0], [rect])
+            png = mistral_ocr.render_page(doc[0])
         img = png_image(png)
         self.assertEqual(img.size, (1700, 2200))
-        self.assertEqual(img.getpixel((840, 1090)), (0, 0, 0))
-        self.assertEqual(img.getpixel((860, 1110)), (255, 255, 255))
+        self.assertEqual(img.getpixel((400, 400)), (0, 0, 0))
+        self.assertEqual(img.getpixel((1600, 2100)), (255, 255, 255))
 
-    def test_shard_pages_are_rendered_in_order_with_volume_rects(self):
+    def test_shard_pages_are_rendered_in_order(self):
         pdf = self.tmp / "shard.pdf"
         write_pdf(pdf, pages=3)
-        by_page = mistral_ocr.page_rects(ScanFactory(redaction_rects=RECTS))
-        # The shard starts at volume page 0, so volume page 1 is the
-        # shard's second page.
-        pages = list(mistral_ocr.render_shard_pages(pdf, by_page, 0))
+        pages = list(mistral_ocr.render_shard_pages(pdf))
         self.assertEqual([no for no, _ in pages], [0, 1, 2])
-        self.assertEqual(
-            png_image(pages[1][1]).getpixel((400, 400)), (0, 0, 0)
-        )
-        self.assertEqual(
-            png_image(pages[0][1]).getpixel((400, 400)), (255, 255, 255)
-        )
+        for _, png in pages:
+            self.assertEqual(png_image(png).size, (1700, 2200))
 
 
 # ── the deadline ────────────────────────────────────────────────────
 class TestClaimDeadline(ScanningTestCase):
     def test_the_first_claim_stamps_mistral_s_timeout_plus_slack(self):
-        scan = ScanFactory(redaction_rects=RECTS)
-        (job,) = mistral_ocr.ensure_extract_jobs(scan, make_manifest(1))
+        (job,) = mistral_ocr.ensure_extract_jobs(
+            ScanFactory(), make_manifest(1)
+        )
         now = timezone.now()
         fields = mistral_ocr.claim_deadline(job, now)
         self.assertEqual(fields["deadline"] - now, timedelta(hours=25))
 
     def test_a_re_claim_writes_nothing(self):
-        scan = ScanFactory(redaction_rects=RECTS)
-        (job,) = mistral_ocr.ensure_extract_jobs(scan, make_manifest(1))
+        (job,) = mistral_ocr.ensure_extract_jobs(
+            ScanFactory(), make_manifest(1)
+        )
         job.deadline = timezone.now()
         self.assertEqual(mistral_ocr.claim_deadline(job, timezone.now()), {})
 
@@ -333,7 +262,7 @@ class TestSubmitWave(ScanningTestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.pdf = self.tmp / "shard.pdf"
         write_pdf(self.pdf, pages=2)
-        self.scan = ScanFactory(redaction_rects=RECTS)
+        self.scan = ScanFactory()
         self.rows = mistral_ocr.ensure_extract_jobs(
             self.scan, make_manifest(shard_count=1, pages_per_shard=2)
         )
@@ -400,6 +329,8 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(calls[0].args[2], "ocr")
         self.assertEqual(calls[1].args[0], "p1.png")
         self.assertEqual(calls[2].args[2], "batch")
+        # The pages are the canonical render.
+        self.assertEqual(png_image(calls[0].args[1]).size, (1700, 2200))
         # The manifest names the uploaded pages, the model and the
         # branch's two request options.
         lines = [
@@ -420,14 +351,6 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(kwargs["metadata"]["scan"], str(self.scan.pk))
         self.assertEqual(kwargs["metadata"]["job"], str(job.pk))
         mocks["delete"].assert_not_called()
-
-    def test_the_uploaded_page_carries_the_painted_rect(self):
-        _, mocks = self._tick()
-        # Page 1 of the shard is volume page 1, where the rect is.
-        png = mocks["upload"].call_args_list[1].args[1]
-        self.assertEqual(png_image(png).getpixel((400, 400)), (0, 0, 0))
-        png = mocks["upload"].call_args_list[0].args[1]
-        self.assertEqual(png_image(png).getpixel((400, 400)), (255, 255, 255))
 
     def test_the_scratch_dir_names_the_scan_and_is_removed(self):
         # The shard PDF is rendered in a system temp dir the #215 sweep
@@ -468,27 +391,6 @@ class TestSubmitWave(ScanningTestCase):
                 ]
             )
         self.assertFalse(seen["path"].exists())
-
-    def test_a_box_edited_after_the_press_does_not_reach_this_run(self):
-        # Shards queue behind MAX_CONCURRENCY, so a curator can edit a
-        # box between the press and the submit tick. The row's identity
-        # names the rects at the press; the pages must carry those, or
-        # the identity would describe an input the PNG did not have.
-        moved = [
-            {
-                "page_index": 1,
-                "rects": [{**RECTS[0]["rects"][0], "x0": 1000, "x1": 1400}],
-            }
-        ]
-        self.scan.redaction_rects = moved
-        self.scan.save(update_fields=["redaction_rects"])
-
-        _, mocks = self._tick()
-
-        png = png_image(mocks["upload"].call_args_list[1].args[1])
-        # The old box, from the row: black. The new one: untouched.
-        self.assertEqual(png.getpixel((400, 400)), (0, 0, 0))
-        self.assertEqual(png.getpixel((1200, 400)), (255, 255, 255))
 
     def test_a_row_may_override_the_model(self):
         job = extract_jobs(self.scan)[0]
@@ -568,9 +470,9 @@ class TestSubmitWave(ScanningTestCase):
     def test_a_row_cancelled_mid_submission_cancels_its_batch(self):
         # The row is taken away while the thread works: the id has
         # nowhere to live, so the batch is cancelled and the files
-        # deleted, or Mistral bills for output nobody will read.
-        # The other writer is simulated at the compare-and-swap: the
-        # write of the id matches nothing, as it would after a cancel.
+        # deleted, or Mistral bills for output nobody will read. The
+        # other writer is simulated at the compare-and-swap: the write
+        # of the id matches nothing, as it would after a cancel.
         real_write = jobs._write
 
         def write(job, **fields):
@@ -591,7 +493,7 @@ class TestSubmitWave(ScanningTestCase):
         # The wave blocks the serial scheduler for as long as a shard
         # takes, so a tick renders and submits one shard, whatever the
         # in-flight room.
-        scan = ScanFactory(redaction_rects=RECTS)
+        scan = ScanFactory()
         mistral_ocr.ensure_extract_jobs(
             scan, make_manifest(shard_count=3, pages_per_shard=2)
         )
@@ -609,7 +511,7 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(statuses.count(JobStatus.SUBMITTED), 2)
 
     def test_the_in_flight_cap_holds_a_tick_back(self):
-        scan = ScanFactory(redaction_rects=RECTS)
+        scan = ScanFactory()
         mistral_ocr.ensure_extract_jobs(
             scan, make_manifest(shard_count=3, pages_per_shard=2)
         )
@@ -661,7 +563,7 @@ class TestSweep(ScanningTestCase):
 
     def setUp(self):
         super().setUp()
-        self.scan = ScanFactory(redaction_rects=RECTS)
+        self.scan = ScanFactory()
         (self.job,) = mistral_ocr.ensure_extract_jobs(
             self.scan, make_manifest(shard_count=1, pages_per_shard=2)
         )
@@ -764,11 +666,9 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(payload["errors"], self.ERRORS)
         self.assertEqual(payload["batch"]["id"], "batch-1")
         self.assertEqual(payload["failed_pages"], [1])
-        self.assertEqual(payload["render"]["width"], 1700)
-        self.assertEqual(payload["render"]["redactions"], "black")
         self.assertEqual(
-            payload["render"]["rects_digest"],
-            self.job.input_manifest["rects_digest"],
+            payload["render"],
+            {"width": 1700, "height": 2200, "source": "original"},
         )
         # Every file at Mistral is deleted once the object is in S3.
         deleted = [c.args[0] for c in mocks["delete"].call_args_list]
@@ -912,15 +812,13 @@ class TestSweep(ScanningTestCase):
 # ── the start button ────────────────────────────────────────────────
 @override_settings(**MISTRAL)
 class TestStartButton(ScanningTestCase):
-    """Staff-only, gated on the rects, and it writes rows only."""
+    """Staff-only, like the dots.mocr button, and it writes rows only."""
 
     def setUp(self):
         super().setUp()
         self.staff = self.make_staff_user()
         self.scan = ScanFactory(
-            page_count=20,
-            status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
-            redaction_rects=RECTS,
+            page_count=20, status=Status.AWAITING_VALIDATION
         )
         self.url = reverse("start_mistral_ocr", kwargs={"pk": self.scan.pk})
         self.manifest = make_manifest(shard_count=2, pages_per_shard=10)
@@ -956,12 +854,21 @@ class TestStartButton(ScanningTestCase):
         self.assertEqual({r.status for r in rows}, {JobStatus.PENDING})
         self.assertIn("Queued Mistral OCR for 2", self._messages(response)[0])
 
-    def test_an_approved_volume_is_accepted_too(self):
-        self.scan.status = Status.APPROVED
-        self.scan.save(update_fields=["status"])
-        with self._committed():
-            self._press()
-        self.assertEqual(len(extract_jobs(self.scan)), 2)
+    def test_no_review_state_is_required(self):
+        # The stage reads the original shards; where it is called from
+        # is a separate question. Any status a scan can hold is fine.
+        for status in (
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+            Status.APPROVED,
+        ):
+            scan = ScanFactory(page_count=20, status=status)
+            self.client.force_login(self.staff)
+            with self._committed():
+                self.client.post(
+                    reverse("start_mistral_ocr", kwargs={"pk": scan.pk})
+                )
+            self.assertEqual(len(extract_jobs(scan)), 2, status)
 
     def test_the_request_never_calls_mistral(self):
         with (
@@ -995,24 +902,6 @@ class TestStartButton(ScanningTestCase):
     def test_a_get_is_rejected(self):
         self.client.force_login(self.staff)
         self.assertEqual(self.client.get(self.url).status_code, 405)
-
-    def test_a_volume_before_the_reviews_is_refused(self):
-        self.scan.status = Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
-        self.scan.save(update_fields=["status"])
-        with self._committed():
-            response = self._press()
-        self.assertEqual(extract_jobs(self.scan), [])
-        self.assertIn("not there yet", self._messages(response)[0])
-
-    def test_a_volume_with_no_rects_is_refused(self):
-        # The pages go out with the rects painted. No rects, no run: a
-        # third party would see the headnotes.
-        self.scan.redaction_rects = []
-        self.scan.save(update_fields=["redaction_rects"])
-        with self._committed():
-            response = self._press()
-        self.assertEqual(extract_jobs(self.scan), [])
-        self.assertIn("no redactions computed", self._messages(response)[0])
 
     def test_no_key_is_refused(self):
         with override_settings(MISTRAL_API_KEY=""), self._committed():
@@ -1054,18 +943,20 @@ class TestStartButton(ScanningTestCase):
             self._press()
         self.client.force_login(self.staff)
         response = self.client.get(
-            reverse("process_actions", kwargs={"pk": self.scan.pk}) + "?step=2"
+            reverse("process_actions", kwargs={"pk": self.scan.pk})
         )
         self.assertIn("Mistral OCR running", response.json()["html"])
 
-    def test_the_button_is_offered_only_with_rects(self):
-        self.client.force_login(self.staff)
+    def test_the_button_sits_on_the_step_one_bar_for_staff(self):
         url = reverse("process_actions", kwargs={"pk": self.scan.pk})
+        self.client.force_login(self.staff)
         self.assertIn(
-            "Run Mistral OCR", self.client.get(url + "?step=2").json()["html"]
+            "Run Mistral OCR", self.client.get(url + "?step=1").json()["html"]
         )
-        self.scan.redaction_rects = []
-        self.scan.save(update_fields=["redaction_rects"])
         self.assertNotIn(
             "Run Mistral OCR", self.client.get(url + "?step=2").json()["html"]
+        )
+        self.client.force_login(self.make_user())
+        self.assertNotIn(
+            "Run Mistral OCR", self.client.get(url + "?step=1").json()["html"]
         )

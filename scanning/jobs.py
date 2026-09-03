@@ -71,7 +71,6 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
@@ -1115,11 +1114,7 @@ def _retry_or_fail(
 
 
 # ── creating the work ───────────────────────────────────────────────
-def _shard_specs(
-    scan,
-    manifest: dict,
-    extend_identity: Callable[[Any, dict], dict] | None = None,
-) -> list[tuple[str, dict]]:
+def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
     """Describe the work today's shard set asks for, in page order.
 
     One ``(input_key, identity)`` pair per shard. The identity is what
@@ -1133,37 +1128,27 @@ def _shard_specs(
     before this field existed match leniently in
     :func:`_still_describes` and never in :func:`_reusable_results`.
 
-    An engine whose input is more than the shard's bytes adds the rest
-    through ``extend_identity`` (issue #191: the Mistral read paints
-    the redaction rects onto the pages, so the rects' digest joins the
-    identity). The extra keys ride in ``input_manifest`` like the
-    others, so :func:`_still_describes` and :func:`_reusable_results`
-    compare them with no further code: a changed digest is a changed
-    shard.
-
     :param scan: The scan the shards belong to.
     :param manifest: The shard manifest from :mod:`scanning.sharding`.
-    :param extend_identity: Called with ``(scan, identity)`` per shard;
-        returns the keys to merge into that shard's identity.
     :returns: ``(key, identity)`` per shard, ordered by shard index.
     :rtype: list[tuple[str, dict]]
     """
     prefix = s3_sync.shards_prefix(scan)
     source_page_count = manifest["source"]["page_count"]
-    specs = []
-    for entry in sorted(manifest["shards"], key=lambda e: e["index"]):
-        identity = {
-            "name": entry["name"],
-            "from_page": entry["from_page"],
-            "to_page": entry["to_page"],
-            "page_count": entry["page_count"],
-            "size_bytes": entry["size_bytes"],
-            "source_page_count": source_page_count,
-        }
-        if extend_identity is not None:
-            identity.update(extend_identity(scan, identity))
-        specs.append((f"{prefix}{entry['name']}", identity))
-    return specs
+    return [
+        (
+            f"{prefix}{entry['name']}",
+            {
+                "name": entry["name"],
+                "from_page": entry["from_page"],
+                "to_page": entry["to_page"],
+                "page_count": entry["page_count"],
+                "size_bytes": entry["size_bytes"],
+                "source_page_count": source_page_count,
+            },
+        )
+        for entry in sorted(manifest["shards"], key=lambda e: e["index"])
+    ]
 
 
 def _identity_matches(stored: dict | None, identity: dict) -> bool:
@@ -1575,7 +1560,6 @@ def ensure_shard_jobs(
     provider: str,
     reuse_results: bool = False,
     force_new_run: bool = False,
-    extend_identity: Callable[[Any, dict], dict] | None = None,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``scan``'s shards,
     creating them if the current run does not describe today's shard set.
@@ -1619,12 +1603,10 @@ def ensure_shard_jobs(
         with ``reuse_results`` the carry re-pays only the shards with a
         hole. A deliberate way to spend GPU money, which is why no tick
         passes it.
-    :param extend_identity: Extra identity keys per shard, see
-        :func:`_shard_specs`.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
-    specs = _shard_specs(scan, manifest, extend_identity)
+    specs = _shard_specs(scan, manifest)
 
     existing = list(
         ExternalJob.objects.filter(

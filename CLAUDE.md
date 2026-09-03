@@ -674,8 +674,11 @@ One `ExternalJob` row per **original** shard at
 pieces: `mistral_client.py` (transport), `mistral_ocr.py` (the stage:
 render, wave, sweep, harvest, cancel), `settings/project/mistral.py`
 (two variables), the `MISTRAL` entry of `jobs._providers()`, and
-`views_process.start_mistral_ocr` (the button). What must not be
-broken:
+`views_process.start_mistral_ocr` (the button). **The job reads the
+original scan and nothing else**: no redaction, no detection, no
+review state. Where it is called from is a separate question from what
+it does; the button answers it today, a trigger later. What must not
+be broken:
 
 - **Two settings, and no other**: `MISTRAL_API_KEY` and
   `MISTRAL_MODEL`, the two the ai-research runner reads
@@ -687,14 +690,11 @@ broken:
   one per-row override.
 - **The daemon renders, in the submit pass, with the branch's render**
   (`pipeline/core/render.py`, line for line): zoom to 1700 wide, RGB,
-  resize to exactly 1700x2200, every redaction rect painted **black**
-  whatever its `fill` says. The downstream reads of the ensemble
-  detect a redaction by its black placeholder, so do not paint the
-  rect's own fill and do not render grey. Our rects are 200 dpi
-  pixels; that is 1700x2200 on a letter page, and `render_page` scales
-  them on any other size (the branch does not, and is wrong there).
-  The source is the **original** scan: Rachel's tests all ran on
-  non-bitonal images, and the shards are cut from it.
+  resize to exactly 1700x2200. Every engine of the ensemble saw that
+  image, and every bbox of every engine lives in that pixel space, so
+  do not render grey and do not threshold. The source is the
+  **original** scan: the ensemble's tests all ran on non-bitonal
+  images, and the shards are cut from it.
 - **The wave takes one shard per tick** (`MAX_SUBMITS_PER_TICK` = 1),
   because it blocks the serial scheduler (#156) for as long as the
   shard takes: 100 renders (about 160 ms each for a synthetic page,
@@ -714,15 +714,6 @@ broken:
   `_complete`. Nothing presigned is handed out (`presigned_ttl=None` in
   the table, and `_claim` signs nothing). A failed PUT leaves the row
   in flight and the next tick downloads the output again.
-- **The rects are part of the shard identity, and the row carries
-  them** (`rects_digest` and `rects` in `input_manifest`, through the
-  `extend_identity` hook of `ensure_shard_jobs`). A moved box changes
-  one shard's identity, so the next run re-reads that shard alone and
-  carries the rest. The render reads `shard_rects(job)`, never the
-  scan: shards queue behind `MAX_CONCURRENCY`, so a box edited between
-  the press and the submit tick must reach the next run, not this
-  row's pages under an identity that says otherwise. `page_rects` is
-  the one reader of where the rects live on the scan, for #241.
 - **The deadline is Mistral's own `timeout_hours` plus one hour**,
   stamped at the first claim and never restamped on `RUNNING`
   (`run_deadline=None`): a batch is queued and run inside one budget
@@ -742,15 +733,14 @@ broken:
   0020): a shard row with `opinion` NULL for Mistral, an opinion row
   for an engine that reads opinion PDFs. The two conditional unique
   keys sort them; only `TIEBREAK` still requires an opinion.
-- **One staff button starts it, and nothing else.** It accepts
-  `PAGE_COMPLETENESS_REVIEW_DONE` or `APPROVED`, and only with
-  redaction rects: the pages go out with the rects painted, so a run
-  before them sends the headnotes to a third party. Rachel's order
-  runs every OCR engine on the redacted pages after the second review,
-  and the portal has no status for that review yet, so the staff
-  member decides when the boxes are final. The creator set is pinned
-  in `TestKnownEnqueuePaths`; the trigger on the approval and the glue
-  are follow-ups.
+- **One staff button starts it, and nothing else.** It sits on the
+  step-1 bar beside the dots.mocr button and, like that one, needs no
+  review state: it refuses only a missing key, an open run and a
+  missing shard set. The creator set is pinned in
+  `TestKnownEnqueuePaths`; the daemon trigger and the glue are
+  follow-ups, and the trigger is where the question of *when* the
+  volume is read (Rachel's order puts every OCR engine after the
+  redaction review) gets answered.
 
 ## Reading the page number (issue #228)
 

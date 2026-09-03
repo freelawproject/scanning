@@ -5,17 +5,19 @@ One :class:`~scanning.models.ExternalJob` row per **original** shard at
 row. The daemon does the intermediate step Mistral needs: it renders
 every page of the shard the way every engine of the ai-research
 ensemble saw it (``pipeline/core/render.py`` on the ``extraction_align``
-branch -- 1700x2200 RGB, the redaction rects painted black), uploads
-each page as an ``ocr`` file, uploads a JSONL manifest naming them, and
-creates the batch. The confirm tick polls the batch, and on ``SUCCESS``
-downloads the output and stores it, **whole**, at the row's
-``result_key``.
+branch: 1700x2200 RGB), uploads each page as an ``ocr`` file, uploads
+a JSONL manifest naming them, and creates the batch. The confirm tick
+polls the batch, and on ``SUCCESS`` downloads the output and stores it,
+**whole**, at the row's ``result_key``.
 
 This module is the Mistral entry of :func:`jobs._providers`. It uses
 the lifecycle primitives of :mod:`scanning.jobs` -- the claim, the
 compare-and-swap writes, the retry ledger -- rather than copying them,
-which is what the provider table exists for. What is specific to
-Mistral, and must not be broken:
+which is what the provider table exists for. It reads the original
+scan and nothing else: no redaction, no detection, no review state.
+Where the stage is called from is a separate question, answered by
+the button today and by a trigger later. What is specific to Mistral,
+and must not be broken:
 
 - **The harvest stores every byte Mistral returned, and nothing else
   transforms it.** The result document holds the output lines and the
@@ -25,39 +27,29 @@ Mistral, and must not be broken:
   ``parse()`` and every other transform run, so a better transform is a
   re-glue at no API cost, never a re-paid read.
 - **The render is the branch's, line for line.** RGB, ``zoom = 1700 /
-  page width``, a resize to exactly 1700x2200, every rect black
-  whatever its ``fill`` says: the downstream reads detect a redaction
-  by its black placeholder. Our rects are 200 dpi pixels and the
-  branch's space is 1700x2200; those are one space on a US letter page
-  and the rect is scaled on any other.
-- **The rects are part of the shard identity, and the row carries
-  them** (``rects_digest`` and ``rects`` in ``input_manifest``): a
-  curator who moves a box changes the identity, so the next run
-  re-reads that shard alone and the carry keeps the rest. The render
-  reads the row's rects, never the scan's, so a box edited between the
-  press and the submit tick reaches the next run and not this row's
-  pages.
+  page width``, a resize to exactly 1700x2200. Every engine of the
+  ensemble saw that image, and every bbox of every engine lives in
+  that pixel space.
 - **The deadline is Mistral's own timeout**, stamped once at the first
   claim and never restamped on ``RUNNING``: a batch is queued and run
   inside one budget Mistral enforces.
-- **A job nothing will read is cancelled, and its files deleted.**
-  Every page image, the manifest and the two output files live at
-  Mistral until we delete them, so every path that writes a row off
-  deletes what it uploaded.
 - **The wave blocks the serial scheduler, so it takes one shard per
   tick** (``MAX_SUBMITS_PER_TICK``). A full shard is minutes of render
   and sequential upload; the in-flight cap (``MAX_CONCURRENCY``) is a
   separate number, so a volume keeps draining while its batches wait.
-- **The source is the original scan, never the bitonal copy.** Rachel's
-  tests all ran on non-bitonal images (#case-law-extraction,
-  2026-08-04), and the shards are cut from the original. ``SOURCE`` is
-  a constant with no per-row override yet, because the bitonal copy is
-  one merged file with no shard set to read.
+- **A job nothing will read is cancelled, and its files deleted.**
+  Every page image, the manifest and the two output files live at
+  Mistral until we delete them, so every path that writes a row off
+  deletes what it uploaded.
+- **The source is the original scan, never the bitonal copy.** The
+  ensemble's tests all ran on non-bitonal images, and the shards are
+  cut from the original. ``SOURCE`` is a constant with no per-row
+  override, because the bitonal copy is one merged file with no shard
+  set to read.
 """
 
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import logging
@@ -73,7 +65,7 @@ import fitz
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.utils import timezone
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from scanning import jobs, mistral_client, runpod_client, s3_sync
 from scanning.models import (
@@ -93,15 +85,10 @@ ACTION = "extract"
 
 #: The canonical render of the ai-research ensemble
 #: (``pipeline/core/config.py``): every engine saw this size, and every
-#: bbox of every engine lives in this pixel space.
+#: bbox of every engine lives in this pixel space. US letter at 200 dpi,
+#: the resolution the rest of the corpus is measured at.
 RENDER_W = 1700
 RENDER_H = 2200
-
-#: The resolution ``Scan.redaction_rects`` are measured at
-#: (``blackletter.scanner.DPI``). US letter at this dpi is exactly
-#: ``RENDER_W`` x ``RENDER_H``, which is why the two spaces are one on
-#: the pages the corpus is made of.
-DPI = 200
 
 #: What the pages are rendered from. See the module docstring.
 SOURCE = "original"
@@ -180,106 +167,17 @@ def model_for(job: ExternalJob) -> str:
     return str(override) if override else str(settings.MISTRAL_MODEL)
 
 
-def page_rects(scan) -> dict[int, list[dict]]:
-    """Return the redaction rects of a scan, by physical page index.
-
-    The one reader of where the rects live, so #241 (rects as rows)
-    changes one function. Pages with no rect are absent.
-
-    :param scan: The scan.
-    :returns: ``{page_index: [{x0, y0, x1, y1, ...}, ...]}`` in 200 dpi
-        pixels.
-    :rtype: dict[int, list[dict]]
-    """
-    by_page: dict[int, list[dict]] = {}
-    for entry in scan.redaction_rects or []:
-        if not isinstance(entry, dict):
-            continue
-        index = entry.get("page_index")
-        rects = entry.get("rects") or []
-        if isinstance(index, int) and rects:
-            by_page[index] = list(rects)
-    return by_page
-
-
-def rects_digest(
-    rects_by_page: dict[int, list[dict]], from_page: int, to_page: int
-) -> str:
-    """Return a digest of the rects painted onto one shard's pages.
-
-    Part of the shard identity: the input Mistral reads is the shard
-    plus these rects, so a moved box is a changed shard. Stable across
-    key order, and it names the page of each rect, so a rect that
-    moves to another page changes it too.
-
-    :param rects_by_page: From :func:`page_rects`.
-    :param from_page: First page of the shard (fitz index).
-    :param to_page: Last page of the shard (fitz index).
-    :returns: A hex sha256.
-    :rtype: str
-    """
-    payload = {
-        str(index): rects_by_page[index]
-        for index in range(from_page, to_page + 1)
-        if index in rects_by_page
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _rects_identity(scan, identity: dict) -> dict:
-    """Return the identity keys this engine adds to one shard.
-
-    The digest names the input, and the rects themselves ride beside
-    it, so the render reads the row and never the scan: a curator who
-    edits a box between the button press and the submit tick (shards
-    queue behind ``MAX_CONCURRENCY``, so that window is minutes on a
-    large volume) changes the *next* run, not the pages this row paints.
-    Without the snapshot the identity would describe rects the PNG did
-    not carry.
-
-    :param scan: The scan the shard belongs to.
-    :param identity: The shard's base identity (pages, size).
-    :returns: ``{"rects_digest": ..., "rects": {page_index: [...]}}``,
-        the rects restricted to the shard's pages, keyed by the volume
-        page index as a string (JSON has no integer keys).
-    :rtype: dict
-    """
-    by_page = page_rects(scan)
-    from_page, to_page = identity["from_page"], identity["to_page"]
-    return {
-        "rects_digest": rects_digest(by_page, from_page, to_page),
-        "rects": {
-            str(index): by_page[index]
-            for index in range(from_page, to_page + 1)
-            if index in by_page
-        },
-    }
-
-
-def shard_rects(job: ExternalJob) -> dict[int, list[dict]]:
-    """Return the rects a row's pages are painted with, off the row.
-
-    :param job: The row.
-    :returns: ``{volume_page_index: [rect, ...]}`` from
-        ``input_manifest["rects"]``; empty for a row with none.
-    :rtype: dict[int, list[dict]]
-    """
-    stored = (job.input_manifest or {}).get("rects") or {}
-    return {int(index): list(rects) for index, rects in stored.items()}
-
-
 def ensure_extract_jobs(
     scan, manifest: dict, *, force_new_run: bool = False
 ) -> list[ExternalJob]:
     """Return the live Mistral jobs for ``scan``, creating them if the
-    current run does not describe today's shard set and rects.
+    current run does not describe today's shard set.
 
     Idempotent, so a second press of the button is a no-op rather than
     a second run over pages already read. A run holding a dead row is
-    replaced. A replacement run carries every shard whose identity --
-    bytes *and* rects -- is unchanged and whose result object is still
-    on S3, so a curator who moves one box re-pays one shard.
+    replaced. A replacement run carries every shard whose identity is
+    unchanged and whose result object is still on S3, so a re-cut that
+    moved a few page ranges re-pays only the shards that moved.
 
     :param scan: The scan to read.
     :param manifest: The committed shard manifest.
@@ -295,7 +193,6 @@ def ensure_extract_jobs(
         provider=JobProvider.MISTRAL,
         reuse_results=True,
         force_new_run=force_new_run,
-        extend_identity=_rects_identity,
     )
 
 
@@ -346,19 +243,14 @@ def page_no_of(line_id) -> int | None:
 
 
 # ── the render ──────────────────────────────────────────────────────
-def render_page(page: fitz.Page, rects: list[dict]) -> bytes:
+def render_page(page: fitz.Page) -> bytes:
     """Render one page as the ensemble's canonical PNG.
 
     ``pipeline/core/render.py`` line for line: zoom the page to
     ``RENDER_W`` wide, render RGB with no alpha, resize to exactly
-    ``RENDER_W`` x ``RENDER_H`` when the page is another size, then
-    paint every rect black. One addition: the rects arrive in 200 dpi
-    pixels of the page's own size, so they are scaled into the render's
-    space first -- a no-op on a letter page, and the difference between
-    a redaction and a black box beside it on any other.
+    ``RENDER_W`` x ``RENDER_H`` when the page is another size.
 
     :param page: The fitz page.
-    :param rects: ``[{x0, y0, x1, y1, ...}, ...]`` in 200 dpi pixels.
     :returns: PNG bytes.
     :rtype: bytes
     """
@@ -367,44 +259,22 @@ def render_page(page: fitz.Page, rects: list[dict]) -> bytes:
     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     if img.size != (RENDER_W, RENDER_H):
         img = img.resize((RENDER_W, RENDER_H))
-    if rects:
-        width_px = page.rect.width * DPI / 72
-        height_px = page.rect.height * DPI / 72
-        scale_x = RENDER_W / width_px
-        scale_y = RENDER_H / height_px
-        draw = ImageDraw.Draw(img)
-        for rect in rects:
-            draw.rectangle(
-                [
-                    float(rect["x0"]) * scale_x,
-                    float(rect["y0"]) * scale_y,
-                    float(rect["x1"]) * scale_x,
-                    float(rect["y1"]) * scale_y,
-                ],
-                fill=(0, 0, 0),
-            )
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     return buffer.getvalue()
 
 
-def render_shard_pages(
-    pdf_path: Path, rects_by_page: dict[int, list[dict]], from_page: int
-) -> Iterator[tuple[int, bytes]]:
+def render_shard_pages(pdf_path: Path) -> Iterator[tuple[int, bytes]]:
     """Render every page of one shard, in order.
 
     :param pdf_path: The downloaded shard.
-    :param rects_by_page: From :func:`page_rects`, keyed by *volume*
-        page index.
-    :param from_page: The volume page the shard starts at.
     :returns: ``(page_no, png)`` per page, ``page_no`` counted from
         zero inside the shard.
     :rtype: Iterator[tuple[int, bytes]]
     """
     with fitz.open(str(pdf_path)) as doc:
         for page_no, page in enumerate(doc):
-            rects = rects_by_page.get(from_page + page_no, [])
-            yield page_no, render_page(page, rects)
+            yield page_no, render_page(page)
 
 
 # ── the deadline ────────────────────────────────────────────────────
@@ -488,12 +358,10 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     """Render, upload and submit one shard. Runs on a worker thread.
 
     No database access here: the row's fields were read on the main
-    thread, and every write happens there afterwards. The rects come
-    off the row (:func:`shard_rects`), never off the scan, so the pages
-    carry exactly what the row's identity says. On any failure the
-    files uploaded so far are deleted, because nothing will name them:
-    a failed create left no job, and a lost create left a job nothing
-    we hold names.
+    thread, and every write happens there afterwards. On any failure
+    the files uploaded so far are deleted, because nothing will name
+    them: a failed create left no job, and a lost create left a job
+    nothing we hold names.
 
     :param job: The claimed row.
     :returns: The submission.
@@ -501,9 +369,6 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
         raised; classified by :func:`_apply_outcome`.
     """
     started = time.monotonic()
-    manifest = job.input_manifest or {}
-    from_page = int(manifest.get("from_page") or 0)
-    rects_by_page = shard_rects(job)
     model = model_for(job)
     files: list[str] = []
     try:
@@ -517,9 +382,7 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
             pdf_path = Path(tmp) / "shard.pdf"
             s3_sync.download_object(job.input_key, pdf_path)
             lines = []
-            for page_no, png in render_shard_pages(
-                pdf_path, rects_by_page, from_page
-            ):
+            for page_no, png in render_shard_pages(pdf_path):
                 file_id = mistral_client.upload_file(
                     f"{custom_id(page_no)}.png", png, PAGE_FILE_PURPOSE
                 )
@@ -876,15 +739,12 @@ def harvest(
             "errors": errors,
             "batch": outcome.job,
             # What was sent, so a reader knows the space the bboxes
-            # are in and what was painted onto the pages.
+            # are in and which copy of the volume was read.
             "model": model_for(job),
             "render": {
                 "width": RENDER_W,
                 "height": RENDER_H,
-                "dpi": DPI,
                 "source": SOURCE,
-                "redactions": "black",
-                "rects_digest": (job.input_manifest or {}).get("rects_digest"),
             },
             "page_count": page_count,
             "failed_pages": failed_pages,
