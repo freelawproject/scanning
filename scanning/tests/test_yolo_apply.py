@@ -14,10 +14,12 @@ Two halves, and the split between them is the point of the design:
 from unittest.mock import patch
 
 from django.test import TestCase
+from django.utils import timezone
 
 from scanning import services, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
+    ApplyRun,
     Detection,
     ExternalJob,
     JobStatus,
@@ -79,6 +81,18 @@ def merged_scan(status=Status.PAGE_COMPLETENESS_REVIEW_DONE, **kwargs):
     scan = ScanFactory(page_count=2, status=status, **kwargs)
     yolo.ensure_detect_jobs(scan, make_manifest(2, 1))
     ExternalJob.objects.filter(scan=scan).update(status=JobStatus.CONSUMED)
+    # The redaction compute reads the final volume (#224), so the
+    # trigger waits for a glued apply run. This one aliases the
+    # review-1 artifacts, as a volume with no page edit does.
+    ApplyRun.objects.create(
+        scan=scan,
+        number=1,
+        built_at=timezone.now(),
+        bitonal_key="bitonal.pdf",
+        ocr_key="ocr.json",
+        printed_pages_key="printed.json",
+        detections_key="detections.json",
+    )
     return scan, yolo.live_detect_jobs(scan)
 
 

@@ -259,7 +259,8 @@ class TestBuildRun(BuildTestCase):
 
     def test_a_changed_edit_set_supersedes_the_built_run(self):
         first = apply.build_run(self.scan)
-        self.assertIsNone(apply.phase_due(self.scan))
+        # A built run owes its glue next; a changed edit set outranks it.
+        self.assertEqual(apply.phase_due(self.scan), "glue")
 
         self.edit(PageEdit.Kind.DELETE_PAGE, pdf_page=1)
 

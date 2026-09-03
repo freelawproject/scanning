@@ -745,6 +745,20 @@ def record_apply_failure(scan, detect_jobs: list[ExternalJob], exc) -> bool:
     return gave_up
 
 
+def _apply_ready(scan) -> bool:
+    """Return whether the page edit apply has glued this volume (#224).
+
+    :param scan: An approved scan with a merged detection run.
+    :returns: Whether the standing apply run has its bitonal copy and
+        its detections in the final page space.
+    :rtype: bool
+    """
+    from scanning import apply
+
+    run = apply.current_run(scan)
+    return bool(run and run.bitonal_key and run.detections_key)
+
+
 def queue_ready_runs() -> int:
     """Queue the apply for every merged run that has none.
 
@@ -798,6 +812,12 @@ def queue_ready_runs() -> int:
             continue
         state = apply_state(rows)
         if state.get("applied_at"):
+            continue
+        # The redactions are measured on the final volume (#224): the
+        # apply's bitonal copy and its detections in the final page
+        # space. Until the apply has glued both, the compute would read
+        # the space of the original.
+        if not _apply_ready(scan):
             continue
         # ``queued_at`` is an audit stamp, never a guard. A scan whose
         # apply is really pending has left this status, so the filter
