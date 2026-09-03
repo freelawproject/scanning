@@ -27,7 +27,7 @@ from django.urls import reverse
 from django.utils import timezone
 from PIL import Image
 
-from scanning import jobs, mistral_client, mistral_ocr
+from scanning import jobs, mistral_client, mistral_ocr, views_process
 from scanning.factories import ScanFactory
 from scanning.models import (
     ExternalJob,
@@ -49,6 +49,29 @@ MISTRAL = {
     "RUNPOD_ENABLED": False,
     "DOCTOR_ENABLED": False,
 }
+
+
+def ready():
+    """Lift the redacted-source lock (#191, #206) for a test or a class.
+
+    A factory rather than one shared patcher: a class decorator wraps
+    the test methods alone, so a class whose ``setUp`` creates rows
+    lifts the lock there instead, with ``self.enterContext(ready())``.
+    What the lock itself does is tested in ``TestSwitchedOff``.
+
+    :returns: The patcher.
+    """
+    return patch.object(mistral_ocr, "REDACTED_SOURCE_READY", True)
+
+
+def on_request():
+    """Lift the start-button lock (#191) for a test or a class.
+
+    :returns: The patcher.
+    """
+    return patch.object(
+        views_process, "MISTRAL_START_ON_REQUEST_ENABLED", True
+    )
 
 
 def extract_jobs(scan):
@@ -114,8 +137,9 @@ class TestEnabled(ScanningTestCase):
 
 
 # ── the rows ────────────────────────────────────────────────────────
+@ready()
 class TestEnsureExtractJobs(ScanningTestCase):
-    """One row per original shard, at EXTRACT/MISTRAL_OCR/MISTRAL."""
+    """One row per shard, at EXTRACT/MISTRAL_OCR/MISTRAL."""
 
     def test_one_row_per_shard_at_extract_mistral(self):
         scan = ScanFactory()
@@ -262,6 +286,7 @@ class TestRender(ScanningTestCase):
 
 
 # ── the deadline ────────────────────────────────────────────────────
+@ready()
 class TestClaimDeadline(ScanningTestCase):
     def test_the_first_claim_stamps_mistral_s_timeout_plus_slack(self):
         (job,) = mistral_ocr.ensure_extract_jobs(
@@ -286,6 +311,7 @@ class TestSubmitWave(ScanningTestCase):
 
     def setUp(self):
         super().setUp()
+        self.enterContext(ready())
         self.tmp = Path(tempfile.mkdtemp(prefix="mistral-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.pdf = self.tmp / "shard.pdf"
@@ -591,6 +617,7 @@ class TestSweep(ScanningTestCase):
 
     def setUp(self):
         super().setUp()
+        self.enterContext(ready())
         self.scan = ScanFactory()
         (self.job,) = mistral_ocr.ensure_extract_jobs(
             self.scan, make_manifest(shard_count=1, pages_per_shard=2)
@@ -856,6 +883,8 @@ class TestSweep(ScanningTestCase):
 
 
 # ── the start button ────────────────────────────────────────────────
+@ready()
+@on_request()
 @override_settings(**MISTRAL)
 class TestStartButton(ScanningTestCase):
     """Staff-only, like the dots.mocr button, and it writes rows only."""
@@ -901,8 +930,9 @@ class TestStartButton(ScanningTestCase):
         self.assertIn("Queued Mistral OCR for 2", self._messages(response)[0])
 
     def test_no_review_state_is_required(self):
-        # The stage reads the original shards; where it is called from
-        # is a separate question. Any status a scan can hold is fine.
+        # The button gates on the two locks and the shard set, not on
+        # a status: where the stage is called from is a separate
+        # question. Any status a scan can hold is fine.
         for status in (
             Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
             Status.PAGE_COMPLETENESS_REVIEW_DONE,
@@ -993,16 +1023,76 @@ class TestStartButton(ScanningTestCase):
         )
         self.assertIn("Mistral OCR running", response.json()["html"])
 
-    def test_the_button_sits_on_the_step_one_bar_for_staff(self):
+    def test_the_bar_still_offers_no_button_to_staff(self):
+        # The two locks are lifted for this class, and the button is
+        # still gone: it is commented out in the template, so nothing
+        # a flag says can put it back. TestSwitchedOff covers the bar
+        # with the locks down.
         url = reverse("process_actions", kwargs={"pk": self.scan.pk})
         self.client.force_login(self.staff)
-        self.assertIn(
-            "Run Mistral OCR", self.client.get(url + "?step=1").json()["html"]
-        )
-        self.assertNotIn(
-            "Run Mistral OCR", self.client.get(url + "?step=2").json()["html"]
-        )
+        for step in (1, 2):
+            self.assertNotIn(
+                "Run Mistral OCR",
+                self.client.get(f"{url}?step={step}").json()["html"],
+            )
+
+
+# ── the two locks ───────────────────────────────────────────────────
+@override_settings(**MISTRAL)
+class TestSwitchedOff(ScanningTestCase):
+    """The stage is off until a redacted volume exists (#191, #206).
+
+    Two locks, and each is tested on its own, because they fail
+    differently on purpose. The button refuses a person, with a
+    message. ``ensure_extract_jobs`` raises, because a caller that
+    reached it skipped the button and must not quietly send
+    unredacted pages to a third party.
+    """
+
+    def test_the_creator_refuses_and_writes_no_row(self):
+        scan = ScanFactory()
+        with self.assertRaises(mistral_ocr.UnredactedSource):
+            mistral_ocr.ensure_extract_jobs(scan, make_manifest(2))
+        self.assertEqual(extract_jobs(scan), [])
+
+    def test_the_creator_names_the_flag_to_lift(self):
+        with self.assertRaises(mistral_ocr.UnredactedSource) as caught:
+            mistral_ocr.ensure_extract_jobs(ScanFactory(), make_manifest(1))
+        self.assertIn("REDACTED_SOURCE_READY", str(caught.exception))
+
+    def test_the_button_refuses_and_calls_nothing(self):
+        staff = self.make_staff_user()
+        scan = ScanFactory(page_count=20)
+        self.client.force_login(staff)
+        with patch("scanning.sharding.committed_manifest") as committed:
+            response = self.client.post(
+                reverse("start_mistral_ocr", kwargs={"pk": scan.pk})
+            )
+        # Refused before the shard set is even looked up.
+        committed.assert_not_called()
+        self.assertEqual(extract_jobs(scan), [])
+        message = str(list(response.wsgi_request._messages)[0])
+        self.assertIn("not available yet", message)
+        self.assertIn("redacted", message)
+
+    def test_a_non_staff_user_is_still_refused_first(self):
+        # The staff gate stays ahead of the switch, so the message a
+        # curator sees is about permission, not about a stage they
+        # were never offered.
         self.client.force_login(self.make_user())
-        self.assertNotIn(
-            "Run Mistral OCR", self.client.get(url + "?step=1").json()["html"]
+        response = self.client.post(
+            reverse("start_mistral_ocr", kwargs={"pk": ScanFactory().pk})
         )
+        self.assertIn(
+            "Only staff", str(list(response.wsgi_request._messages)[0])
+        )
+
+    def test_the_bar_offers_no_button(self):
+        staff = self.make_staff_user()
+        scan = ScanFactory(page_count=20, status=Status.PENDING_REVIEW)
+        self.client.force_login(staff)
+        page = self.client.get(
+            reverse("scan_process", kwargs={"pk": scan.pk})
+        ).content.decode()
+        self.assertNotIn("Run Mistral OCR", page)
+        self.assertNotIn("start-mistral", page)

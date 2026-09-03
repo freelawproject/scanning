@@ -678,16 +678,39 @@ trained on), tracked on `ExternalJob` rows at
 ## Mistral OCR via the batch API (issue #191)
 
 The third provider, and the first the daemon prepares the input for.
-One `ExternalJob` row per **original** shard at
-`EXTRACT`/`MISTRAL_OCR`/`MISTRAL`, one Mistral batch job per row. The
-pieces: `mistral_client.py` (transport), `mistral_ocr.py` (the stage:
-render, wave, sweep, harvest, cancel), `settings/project/mistral.py`
-(two variables), the `MISTRAL` entry of `jobs._providers()`, and
-`views_process.start_mistral_ocr` (the button). **The job reads the
-original scan and nothing else**: no redaction, no detection, no
-review state. Where it is called from is a separate question from what
-it does; the button answers it today, a trigger later. What must not
-be broken:
+One `ExternalJob` row per shard at `EXTRACT`/`MISTRAL_OCR`/`MISTRAL`,
+one Mistral batch job per row. The pieces: `mistral_client.py`
+(transport), `mistral_ocr.py` (the stage: render, wave, sweep,
+harvest, cancel), `settings/project/mistral.py` (two variables), the
+`MISTRAL` entry of `jobs._providers()`, and
+`views_process.start_mistral_ocr` (the button).
+
+**The stage is off, and it stays off until a redacted volume exists.**
+The ai-research ensemble reads the **redacted** pages: the read runs
+after the redaction review, over a volume whose boxes are applied.
+Step 3 writes that volume (`services.run_generate_files`, #206) and
+#173 paused step 3, and the one shard set we hold is cut from the
+original — so a run today would send the headnotes this project exists
+to remove to a third party. Two locks say so in code, and they fail
+differently on purpose:
+
+- `mistral_ocr.REDACTED_SOURCE_READY = False` makes
+  `ensure_extract_jobs` **raise** `UnredactedSource`. It gates row
+  creation, not the button, so a future trigger that skips the button
+  cannot send unredacted pages by forgetting a check.
+- `views_process.MISTRAL_START_ON_REQUEST_ENABLED = False` makes the
+  view refuse with a message, and the button in
+  `_mistral_actions.html` is commented out beside it — the shape
+  `views_api.REPAIR_ON_REQUEST_ENABLED` uses (#196).
+
+Turning the stage on is **not** flipping the flags. It is: a redacted
+volume exists for the scan; `sharding` cuts a shard set from *that*
+volume and `ensure_extract_jobs` is given its manifest, so `input_key`
+names a redacted shard and `SOURCE` becomes `"redacted"`; then the two
+flags and the button. The flags are the last lock, not the work.
+
+Everything below is kept whole and tested, so that day is a
+configuration change rather than a rewrite. What must not be broken:
 
 - **Two settings, and no other**: `MISTRAL_API_KEY` and
   `MISTRAL_MODEL`, the two the ai-research runner reads
@@ -701,9 +724,11 @@ be broken:
   (`pipeline/core/render.py`, line for line): zoom to 1700 wide, RGB,
   resize to exactly 1700x2200. Every engine of the ensemble saw that
   image, and every bbox of every engine lives in that pixel space, so
-  do not render grey and do not threshold. The source is the
-  **original** scan: the ensemble's tests all ran on non-bitonal
-  images, and the shards are cut from it.
+  do not render grey and do not threshold. The source must be the
+  **redacted** volume, never the bitonal copy: the ensemble's tests
+  all ran on non-bitonal images. `SOURCE` records what the render
+  reads *today*, which is a shard of the original, and that is exactly
+  why the stage is off.
 - **The wave takes one shard per tick** (`MAX_SUBMITS_PER_TICK` = 1),
   because it blocks the serial scheduler (#156) for as long as the
   shard takes: 100 renders (about 160 ms each for a synthetic page,
@@ -751,13 +776,15 @@ be broken:
   0020): a shard row with `opinion` NULL for Mistral, an opinion row
   for an engine that reads opinion PDFs. The two conditional unique
   keys sort them; only `TIEBREAK` still requires an opinion.
-- **One staff button starts it, and nothing else.** It sits on the
-  step-1 bar beside the dots.mocr button and, like that one, needs no
-  review state: it refuses only a missing key, an open run and a
-  missing shard set. The creator set is pinned in
+- **One staff button is the only way in, and it is switched off.**
+  It sits on the step-1 bar beside the dots.mocr button. With both
+  locks lifted it refuses a non-staff user, a missing key, an open run
+  and a missing shard set, and nothing else — it needs no review
+  state, because *when* a volume is read is the trigger's question,
+  not the button's. The creator set is pinned in
   `TestKnownEnqueuePaths`; the daemon trigger and the glue are
-  follow-ups, and the trigger is where the question of *when* a
-  volume is read gets answered.
+  follow-ups, and the trigger is what must not land before the
+  redacted source does.
 
 ## Reading the page number (issue #228)
 

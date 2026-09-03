@@ -645,9 +645,12 @@ class TestProviderTable(ScanningTestCase):
     def test_a_provider_handed_no_url_refuses_a_ttl(self):
         from scanning import mistral_ocr
 
-        job = mistral_ocr.ensure_extract_jobs(
-            ScanFactory(), make_manifest(shard_count=1)
-        )[0]
+        # The stage is off until a redacted volume exists (#191); the
+        # table it registers in is not.
+        with patch.object(mistral_ocr, "REDACTED_SOURCE_READY", True):
+            job = mistral_ocr.ensure_extract_jobs(
+                ScanFactory(), make_manifest(shard_count=1)
+            )[0]
         with self.assertRaises(jobs.UnknownProvider):
             jobs._presigned_ttl(job)
         self.assertEqual(jobs._result_suffix(job), ".json")

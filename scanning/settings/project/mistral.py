@@ -1,9 +1,12 @@
 """Mistral OCR settings (issue #191).
 
 The Mistral read runs on Mistral's batch API: the daemon renders the
-pages of one original shard, uploads them, and submits one batch job
-per shard (see ``scanning/mistral_ocr.py`` and
-``scanning/mistral_client.py``).
+pages of one shard, uploads them, and submits one batch job per shard
+(see ``scanning/mistral_ocr.py`` and ``scanning/mistral_client.py``).
+
+A set key is not enough to run the stage. It reads the **redacted**
+volume, nothing builds one yet, and ``mistral_ocr`` refuses row
+creation until one does. See ``mistral_ocr.REDACTED_SOURCE_READY``.
 
 Two variables, deliberately, and the same two the ai-research runner
 reads (``runpod/mistral/.env.example`` on its ``extraction_align``

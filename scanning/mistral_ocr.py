@@ -1,6 +1,6 @@
 """The Mistral OCR stage (issue #191): rows, render, submit, poll, harvest.
 
-One :class:`~scanning.models.ExternalJob` row per **original** shard at
+One :class:`~scanning.models.ExternalJob` row per shard at
 ``EXTRACT``/``MISTRAL_OCR``/``MISTRAL``, and one Mistral batch job per
 row. The daemon does the intermediate step Mistral needs: it renders
 every page of the shard the way every engine of the ai-research
@@ -10,14 +10,22 @@ a JSONL manifest naming them, and creates the batch. The confirm tick
 polls the batch, and on ``SUCCESS`` downloads the output and stores it,
 **whole**, at the row's ``result_key``.
 
+**The stage is off, and this is the reason.** The ensemble reads the
+**redacted** pages: the read runs after the redaction review, over a
+volume whose boxes are applied. Nothing builds that volume today --
+step 3 writes it (``services.run_generate_files``) and #173 paused
+step 3 -- and the one shard set we hold is cut from the original. So
+a run today would send the headnotes this project exists to remove to
+a third party. :data:`REDACTED_SOURCE_READY` is ``False`` and
+:func:`ensure_extract_jobs` refuses while it is, so no row can be
+created and nothing can be sent. See that constant for what has to be
+true to turn the stage on.
+
 This module is the Mistral entry of :func:`jobs._providers`. It uses
 the lifecycle primitives of :mod:`scanning.jobs` -- the claim, the
 compare-and-swap writes, the retry ledger -- rather than copying them,
-which is what the provider table exists for. It reads the original
-scan and nothing else: no redaction, no detection, no review state.
-Where the stage is called from is a separate question, answered by
-the button today and by a trigger later. What is specific to Mistral,
-and must not be broken:
+which is what the provider table exists for. What is specific to
+Mistral, and must not be broken:
 
 - **The harvest stores every byte Mistral returned, and nothing else
   transforms it.** The result document holds the output lines and the
@@ -44,11 +52,12 @@ and must not be broken:
 - **A result with a hole is never carried.** The stable-hole rule of
   #238 trusts a deterministic worker; a Mistral batch line can fail
   from a transient fault, so the carry re-reads the shard instead.
-- **The source is the original scan, never the bitonal copy.** The
-  ensemble's tests all ran on non-bitonal images, and the shards are
-  cut from the original. ``SOURCE`` is a constant with no per-row
-  override, because the bitonal copy is one merged file with no shard
-  set to read.
+- **The source is the redacted volume, never the bitonal copy.** The
+  ensemble's tests all ran on non-bitonal images, so the render must
+  read a greyscale document. That document is the redacted volume,
+  which does not exist yet; :data:`SOURCE` records what the render
+  reads **today**, which is why it says ``"original"`` and why the
+  stage is off. It has no per-row override.
 """
 
 from __future__ import annotations
@@ -80,6 +89,19 @@ from scanning.models import (
 
 logger = logging.getLogger(__name__)
 
+
+class UnredactedSource(RuntimeError):
+    """The stage was asked to run with no redacted document to read.
+
+    Raised by :func:`ensure_extract_jobs` while
+    :data:`REDACTED_SOURCE_READY` is ``False``. An internal fault, not
+    an operator's: the button refuses first, and no daemon tick
+    creates these rows. It is the last lock, so a future caller that
+    skips the button cannot send unredacted pages to Mistral by
+    forgetting a check.
+    """
+
+
 #: The action the result envelope names, so ``jobs.check_result_envelope``
 #: can refuse an object of another stage at this key.
 ACTION = "extract"
@@ -91,8 +113,39 @@ ACTION = "extract"
 RENDER_W = 1700
 RENDER_H = 2200
 
-#: What the pages are rendered from. See the module docstring.
+#: What the render reads today, recorded on every stored result so a
+#: reader knows which copy of the volume was read. It says
+#: ``"original"`` because ``input_key`` names a shard of the original,
+#: and that is exactly why :data:`REDACTED_SOURCE_READY` is ``False``.
+#: Turning the stage on changes both together.
 SOURCE = "original"
+
+#: Whether a redacted document exists for this stage to read.
+#:
+#: **False, and it gates row creation, not just the button.** The
+#: ai-research ensemble reads the redacted pages, so this stage must
+#: too: a run over the original sends the headnotes to a third party.
+#: Step 3 (``services.run_generate_files``, issue #206) is what writes
+#: a redacted volume, and #173 paused it; #241 moves the rects to rows
+#: and may change where the redacted copy comes from. Until one of
+#: them lands there is no redacted document and no shard set cut from
+#: one.
+#:
+#: Three things must be true together to turn the stage on, and each
+#: is a change in this module or beside it:
+#:
+#: 1. a redacted volume exists for the scan,
+#: 2. ``sharding`` cuts a shard set from **that** volume, and
+#:    ``ensure_extract_jobs`` is given its manifest, so ``input_key``
+#:    names a redacted shard and :data:`SOURCE` becomes ``"redacted"``,
+#: 3. this flag and
+#:    ``views_process.MISTRAL_START_ON_REQUEST_ENABLED`` are both
+#:    ``True``, and the button in ``_mistral_actions.html`` is
+#:    uncommented.
+#:
+#: Do not flip this one alone. It is the last lock, and the two above
+#: it are what make a run correct rather than merely possible.
+REDACTED_SOURCE_READY = False
 
 #: What every manifest line asks for, as the branch did.
 INCLUDE_BLOCKS = True
@@ -189,12 +242,24 @@ def ensure_extract_jobs(
     batch line can fail from a transient fault at Mistral, so two
     unlucky runs must not freeze a page as unread for good.
 
+    Refuses while :data:`REDACTED_SOURCE_READY` is ``False``: the
+    ensemble reads the redacted pages, nothing builds a redacted
+    volume yet, and row creation is what turns into a paid read of
+    whatever ``input_key`` names.
+
     :param scan: The scan to read.
     :param manifest: The committed shard manifest.
     :param force_new_run: Replace a whole, reusable live run.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
+    :raises UnredactedSource: If no redacted document exists to read.
     """
+    if not REDACTED_SOURCE_READY:
+        raise UnredactedSource(
+            "the Mistral read runs over the redacted volume, and nothing "
+            "builds one yet (#206/#241); see "
+            "mistral_ocr.REDACTED_SOURCE_READY"
+        )
     return jobs.ensure_shard_jobs(
         scan,
         manifest,

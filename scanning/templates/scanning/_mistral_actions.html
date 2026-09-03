@@ -2,10 +2,23 @@
 The Mistral OCR control (issue #191), staff-only, included by the
 step-1 bar of _process_actions.html beside the dots.mocr control.
 
-The stage reads the original shards and moves no scan status, so its
-state comes from `mistral_run`, a summary of the ExternalJob rows.
-Like the dots.mocr button, it is the manual way in: every press can
-start paid work on Mistral's batch API.
+The stage moves no scan status, so its state comes from `mistral_run`,
+a summary of the ExternalJob rows. That summary still renders, so a
+historical run stays readable.
+
+The button below is switched off, the shape the "Re-pair Opinions"
+button uses (#196). The read runs over the **redacted** volume, and
+nothing builds one until the file generation returns (#206), so a
+press today would send unredacted pages to a third party. Two flags
+say the same thing in code: `views_process.MISTRAL_START_ON_REQUEST_ENABLED`
+refuses the request, and `mistral_ocr.REDACTED_SOURCE_READY` refuses
+the row. Turning the stage on is those two, the redacted shard set
+they describe, and this block.
+
+Switched off with `{% templatetag openblock %} comment {% templatetag closeblock %}`,
+never with a multi-line `{% templatetag openvariable %}# ... #{% templatetag closevariable %}`:
+Django's lexer matches that form on one line only, so a multi-line one
+renders its own prose and every tag inside it.
 {% endcomment %}
 {% if mistral_run %}
 <span class="text-sm text-gray-600 mr-2" title="Mistral OCR run {{ mistral_run.run }}: {{ mistral_run.label }}">
@@ -18,9 +31,11 @@ start paid work on Mistral's batch API.
   {% endif %}
 </span>
 {% endif %}
+{% comment %} The button, kept for the day the redacted volume exists:
 {% if user.is_staff and not mistral_run.open %}
 <form method="post" action="{% url 'start_mistral_ocr' scan.pk %}" class="inline">
   {% csrf_token %}
-  <button type="submit" class="btn-outline text-sm" title="Read every page of the original with Mistral OCR on Mistral's batch API (incurs costs $$$)" onclick="return confirm('This sends every page of this volume to the Mistral OCR batch API. This will incur costs $$$. Continue?');">{% if mistral_run %}Re-run Mistral OCR{% else %}Run Mistral OCR{% endif %}</button>
+  <button type="submit" class="btn-outline text-sm" title="Read every page of the redacted volume with Mistral OCR on Mistral's batch API (incurs costs $$$)" onclick="return confirm('This sends every page of this volume to the Mistral OCR batch API. This will incur costs $$$. Continue?');">{% if mistral_run %}Re-run Mistral OCR{% else %}Run Mistral OCR{% endif %}</button>
 </form>
 {% endif %}
+{% endcomment %}
