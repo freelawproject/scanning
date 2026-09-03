@@ -3502,7 +3502,11 @@ class TestGluedOutputs(ScanningTestCase):
                 "page_count": 200,
             },
             provider_meta={
-                "output": {"failed_pages": [7], "recovered_pages": [2]}
+                "output": {
+                    "failed_pages": [7],
+                    "recovered_pages": [2],
+                    "repaired_pages": [5],
+                }
             },
         )
         self._dots_row(
@@ -3553,6 +3557,11 @@ class TestGluedOutputs(ScanningTestCase):
         self.assertEqual(second["failed_pages"], [7])
         self.assertEqual(second["filtered_pages"], [])
         self.assertEqual(second["recovered_pages"], [2])
+        self.assertEqual(
+            second["repaired_pages"],
+            [5],
+            "the repaired pages of #242 reach the index too",
+        )
         self.assertEqual(
             second["url"],
             reverse(

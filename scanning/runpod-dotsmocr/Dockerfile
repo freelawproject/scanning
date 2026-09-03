@@ -97,7 +97,12 @@ COPY runpod-dotsmocr/pyproject.toml runpod-dotsmocr/uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     /bin/uv sync --frozen --python python3
 
-COPY runpod_common.py runpod-dotsmocr/handler.py ./
+# ``layout_json.py`` next to the handler, under the top-level name it
+# imports: the layout-JSON repair of #242 is shared with the daemon's
+# glue, which repairs the results already in the bucket, and one arm
+# that drifted between the two would repair a page differently
+# depending on which side read it.
+COPY runpod_common.py layout_json.py runpod-dotsmocr/handler.py ./
 
 # The base image's entrypoint launches the vLLM API server directly;
 # this worker instead boots the RunPod handler, which spawns and

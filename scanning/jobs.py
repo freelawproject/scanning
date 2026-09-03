@@ -617,12 +617,16 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
     of the *volume* -- the worker counts from zero inside the shard it
     was given.
 
-    The pages a retry rung saved, and the pages whose answer was not
-    layout JSON (``filtered``: text but no cell, so no page number
-    either), are logged too, at INFO, so the ladder's recovery rate and
-    the size of each hole class can be read off the logs. The numbers
-    survive in ``provider_meta["output"]`` either way; ``_complete``
-    stores the whole summary.
+    The pages a retry rung saved, and the pages whose broken layout
+    JSON the repair of issue #242 gave back, are logged at INFO, so the
+    ladder's recovery rate and the repair's reach can be read off the
+    logs. A page whose answer was not layout JSON and which nothing
+    repaired (``filtered``: text but no cell, so no page number either)
+    is a **WARNING**, like a failed page: issue #242 asks for it by
+    name, because each such page is a new shape of the fault and the
+    log line is what makes the next one visible. The numbers survive in
+    ``provider_meta["output"]`` either way; ``_complete`` stores the
+    whole summary.
 
     :param job: The row just completed.
     :param output: The provider's summary.
@@ -641,13 +645,23 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
             return f"volume page(s) {volume}"
         return f"shard page(s) {pages}"
 
-    for field, verb in (
-        ("recovered_pages", "recovered %d page(s) on a retry"),
-        ("filtered_pages", "answered %d page(s) with no layout JSON"),
+    for field, verb, level in (
+        ("recovered_pages", "recovered %d page(s) on a retry", logging.INFO),
+        (
+            "repaired_pages",
+            "repaired the layout JSON of %d page(s)",
+            logging.INFO,
+        ),
+        (
+            "filtered_pages",
+            "answered %d page(s) with layout JSON nothing could repair",
+            logging.WARNING,
+        ),
     ):
         pages = output.get(field)
         if pages and isinstance(pages, list):
-            logger.info(
+            logger.log(
+                level,
                 "%s/%s shard %d/%d of scan %s " + verb + ": %s",
                 job.stage,
                 job.engine,
@@ -1166,8 +1180,14 @@ def rows_label(rows: list[ExternalJob]) -> str:
 
 #: The per-shard page lists a dots.mocr summary carries (shard-local
 #: indexes). The first two are holes to the page-number reader; the
-#: third is the pages a retry rung saved.
-PAGE_LIST_NAMES = ("failed_pages", "filtered_pages", "recovered_pages")
+#: third is the pages a retry rung saved, and the fourth the pages
+#: whose layout JSON broke on one character and was repaired (#242).
+PAGE_LIST_NAMES = (
+    "failed_pages",
+    "filtered_pages",
+    "recovered_pages",
+    "repaired_pages",
+)
 
 
 def page_lists(job: ExternalJob) -> dict[str, list]:

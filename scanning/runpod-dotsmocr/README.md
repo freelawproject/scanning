@@ -57,6 +57,14 @@ batching turns the concurrent requests into efficient GPU batches.
   client deps, so `dots_mocr`'s pins can never fight vLLM's stack.
 - `dots_mocr` pinned to an exact upstream commit for prompts, page
   rendering, bbox rescaling, and markdown conversion.
+- `runpod_common.py` and `layout_json.py`, copied from `scanning/`
+  next to `handler.py` and imported as top-level modules. Both are
+  shared with the daemon on purpose: the first is the result envelope
+  and the error codes it classifies, the second is the layout-JSON
+  repair of #242, which the daemon's glue also runs over the shard
+  results already in the bucket. An arm that drifted between the two
+  sides would repair a page differently depending on which side read
+  it, so `layout_json.py` imports nothing but the standard library.
 
 ### Upstream packaging quirks (read before bumping the pin)
 
@@ -133,15 +141,27 @@ misprovisioned RunPod worker.
      show-through that causes the loops. The render is the only
      change: same greedy decoding, so the stage stays deterministic.
      Good pages never take the retry. A page filtered on both rungs
-     (an answer that was not layout JSON) keeps upstream's cleaned
-     text in `md`; the summary lists it in `filtered_pages` beside
-     `failed_pages` and `recovered_pages`.
+     (an answer that was not layout JSON, and one the repair below
+     could not put back together) keeps upstream's cleaned text in
+     `md`; the summary lists it in `filtered_pages` beside
+     `failed_pages`, `recovered_pages` and `repaired_pages`.
+   - The layout-JSON repair of scanning #242 has no env var: it always
+     runs, and it costs microseconds. A page whose answer was good
+     layout JSON with one character wrong — a lone quotation mark
+     inside a string, a lone backslash where `\"` belongs, a doubled
+     closer — is put back together before the retry rung is spent,
+     because the fault is in the escape and not in the render. The
+     page then carries `repaired` (the edits) and
+     `repaired_by: "worker"`, and it is **not** filtered. The arms
+     live in `layout_json.py`, which the Dockerfile copies next to
+     `handler.py`: the daemon's glue shares it, to repair the shard
+     results already in the bucket.
    - Every page that got an answer carries `raw`, the answer as the
      model wrote it (about 6 KB a page). `cells` is upstream's parsed
      and rescaled copy, so `raw` is what a later post-processor
-     starts from. On a failed page it is the last truncated answer.
-     It lives in the shard result object on S3 only; the glue leaves
-     it out of the volume document.
+     starts from — the repair above reads it. On a failed page it is
+     the last truncated answer. It lives in the shard result object on
+     S3 only; the glue leaves it out of the volume document.
    - `VLLM_GPU_MEMORY_UTILIZATION` (default 0.9),
      `VLLM_STARTUP_TIMEOUT` (default 900 s), `VLLM_EXTRA_ARGS`
      (extra `vllm serve` flags, e.g. `--max-model-len 16384`).

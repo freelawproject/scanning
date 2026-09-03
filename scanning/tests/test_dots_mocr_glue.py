@@ -53,6 +53,53 @@ def make_page(page_no: int, text: str = "98") -> dict:
     }
 
 
+#: A layout array of the shape the model answers with, valid.
+GOOD_RAW = json.dumps(
+    [
+        {
+            "bbox": [276, 93, 426, 129],
+            "category": "Page-header",
+            "text": "878 N. C.",
+        },
+        {
+            "bbox": [100, 200, 900, 800],
+            "category": "Text",
+            "text": 'her death "almost took [her] out[.]" and she felt',
+        },
+    ]
+)
+
+#: The same array with the closing quotation mark of the quotation
+#: unescaped: the fault measured on scan 2726 page 44 (#242).
+BROKEN_RAW = GOOD_RAW.replace('out[.]\\"', 'out[.]"')
+assert BROKEN_RAW != GOOD_RAW
+
+
+def make_filtered_page(page_no: int) -> dict:
+    """Build a page upstream filtered because its JSON broke (#242).
+
+    ``cells`` is gone, ``md`` holds upstream's cleaned text, and ``raw``
+    is the answer as the model wrote it -- which is what the repair
+    reads.
+
+    :param page_no: 0-based index inside the shard.
+    :returns: A page dict.
+    :rtype: dict
+    """
+    page = make_page(page_no)
+    page.update(
+        {
+            "filtered": True,
+            "cells": None,
+            "md": "878 N. C. her death almost took [her] out",
+            "raw": BROKEN_RAW,
+            "attempts": 2,
+            "errors": ["model output was not layout JSON"] * 2,
+        }
+    )
+    return page
+
+
 def make_envelope(job: ExternalJob, pages: list[dict], **overrides) -> dict:
     """Build the result envelope one worker attempt PUTs to S3.
 
@@ -322,6 +369,115 @@ class TestMergeDotsmocrResults(AnalyzeJobsMixin, TestCase):
         self.assertEqual(document["failed_pages"], [])
         self.assertEqual(document["filtered_pages"], [1])
         self.assertEqual(document["recovered_pages"], [2])
+
+    def test_a_filtered_page_is_repaired_from_the_stored_answer(self):
+        """#242: the answer was good and one character broke it. The
+        glue puts the character back, so the page has cells again."""
+        from scanning import jobs
+
+        scan, rows = self.build(shard_count=1, pages_per_shard=2)
+        self.write_envelope(
+            0, make_envelope(rows[0], [make_page(0), make_filtered_page(1)])
+        )
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        document = self.upload.call_args[0][1]
+        page = document["pages"][1]
+        self.assertIs(page["filtered"], False)
+        self.assertEqual(page["repaired_by"], "glue")
+        self.assertEqual(len(page["repaired"]), 1)
+        self.assertTrue(page["repaired"][0].startswith("escape_quote@"))
+        # The cells are back, rescaled into the render's pixel space:
+        # the model wrote 276 on a 1024-wide input, the render is 1700.
+        self.assertEqual(len(page["cells"]), 2)
+        self.assertEqual(page["cells"][0]["text"], "878 N. C.")
+        self.assertEqual(page["cells"][0]["bbox"][0], int(276 / (1024 / 1700)))
+        # The lists say repaired, not filtered, in both places.
+        self.assertEqual(document["filtered_pages"], [])
+        self.assertEqual(document["repaired_pages"], [1])
+        rows[0].refresh_from_db()
+        output = rows[0].provider_meta["output"]
+        self.assertEqual(output["filtered_pages"], [])
+        self.assertEqual(output["repaired_pages"], [1])
+        # And so the carry keeps the shard instead of re-paying it.
+        self.assertFalse(jobs.has_unread_pages(rows[0]))
+
+    def test_a_filtered_page_with_no_stored_answer_stays_filtered(self):
+        """A page read before the worker kept ``raw`` has nothing to
+        repair; it stays a hole and the log says why."""
+        from scanning import jobs
+
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+        page = make_filtered_page(0)
+        page.pop("raw")
+        self.write_envelope(0, make_envelope(rows[0], [page]))
+
+        with self.assertLogs("scanning.dots_mocr", level="INFO") as logs:
+            dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        lines = [line for line in logs.output if "volume page 1" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("WARNING"))
+        self.assertIn("was not stored", lines[0])
+        document = self.upload.call_args[0][1]
+        self.assertEqual(document["filtered_pages"], [0])
+        self.assertEqual(document["repaired_pages"], [])
+        rows[0].refresh_from_db()
+        self.assertTrue(jobs.has_unread_pages(rows[0]))
+
+    def test_an_unrepairable_page_names_the_fault_and_the_text(self):
+        """A shape no arm reaches is the next thing to look at, so the
+        WARNING carries the parser's message and an excerpt (#242)."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+        page = make_filtered_page(0)
+        # A truncated array: the fault of #238, not of #242.
+        page["raw"] = page["raw"][:40]
+        self.write_envelope(0, make_envelope(rows[0], [page]))
+
+        with self.assertLogs("scanning.dots_mocr", level="INFO") as logs:
+            dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        line = next(line for line in logs.output if "no repair arm" in line)
+        self.assertTrue(line.startswith("WARNING"))
+        self.assertIn("Unterminated string", line)
+        self.assertIn(">>", line, "the excerpt marks where it broke")
+        self.assertEqual(
+            self.upload.call_args[0][1]["filtered_pages"],
+            [0],
+        )
+
+    def test_a_repair_that_gives_an_illegal_bbox_is_refused(self):
+        """The check is upstream's ``is_legal_bbox``, in one place for
+        both callers."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+        page = make_filtered_page(0)
+        page["raw"] = page["raw"].replace(
+            "[276, 93, 426, 129]", "[9, 9, 1, 1]"
+        )
+        self.write_envelope(0, make_envelope(rows[0], [page]))
+
+        with self.assertLogs("scanning.dots_mocr", level="INFO") as logs:
+            dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        line = next(line for line in logs.output if "no repair arm" in line)
+        self.assertIn("illegal bbox", line)
+        self.assertEqual(self.upload.call_args[0][1]["filtered_pages"], [0])
+
+    def test_a_repair_needs_the_page_dimensions(self):
+        """No dimensions, no rescale: the cells would land in the wrong
+        pixel space, and a wrong box is worse than none."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+        page = make_filtered_page(0)
+        page["origin_width"] = None
+        self.write_envelope(0, make_envelope(rows[0], [page]))
+
+        with self.assertLogs("scanning.dots_mocr", level="INFO") as logs:
+            dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        line = next(line for line in logs.output if "no repair arm" in line)
+        self.assertIn("no usable dimensions", line)
+        self.assertEqual(self.upload.call_args[0][1]["filtered_pages"], [0])
 
     def test_gluing_twice_gives_the_same_document(self):
         """Idempotent, so a crash before the CONSUMED write costs
