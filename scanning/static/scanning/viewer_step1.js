@@ -305,17 +305,31 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // --- Missing / Inserted pages (rendered immediately, they're lightweight) ---
+    // One placeholder stands for one gap. A range missing at the end of
+    // the volume is one gap too (#256), so that placeholder carries the
+    // range as its label and says the plural: the upload takes a PDF of
+    // the whole range, and the button asks a scanner for all of it.
     function renderMissingPage(entry) {
         var pageDiv = document.createElement('div');
         pageDiv.className = 'page-container missing-page';
         pageDiv.id = 'page-' + entry.logical_number;
         pageDiv.style.width = defaultPageWidth + 'px';
         var missingLabel = escapeHtml(entry.logical_number);
+        var range = entry.missing_range;
+        // The stored label carries the hyphen every reader of a range
+        // parses (#233); the heading shows the dash a book prints.
+        var heading = range
+            ? 'Pages ' + escapeHtml(range[0] + '\u2013' + range[1])
+            : 'Page ' + missingLabel;
         pageDiv.innerHTML =
-            '<div class="page-label">Page ' + missingLabel + ' &mdash; MISSING</div>' +
+            '<div class="page-label">' + heading + ' &mdash; MISSING</div>' +
             '<div class="missing-placeholder">' +
-            '  <p>This page was not found in the document.</p>' +
-            '  <p>Upload an image or a PDF to fill this gap:</p>' +
+            '  <p>' + (range
+                ? 'These pages were not found in the document.'
+                : 'This page was not found in the document.') + '</p>' +
+            '  <p>' + (range
+                ? 'Upload a PDF of the missing pages, or an image of one:'
+                : 'Upload an image or a PDF to fill this gap:') + '</p>' +
             '  <form class="insert-form" enctype="multipart/form-data">' +
             '    <input type="hidden" name="page_number" value="' + missingLabel + '">' +
             '    <label class="upload-btn">' +
@@ -326,10 +340,14 @@ document.addEventListener('DOMContentLoaded', function () {
             '  <button class="repair-btn" data-action="insert" ' +
             'data-anchor-pdf-page="' + entry.anchor_pdf_page + '" ' +
             'data-logical-page="' + missingLabel + '" ' +
-            'title="Ask a scanner with the book to scan this page">Ask for this page</button>' +
+            (range ? 'data-repair-what="scan the missing pages" ' : '') +
+            'title="Ask a scanner with the book to scan ' +
+            (range ? 'these pages">Ask for these pages' : 'this page">Ask for this page') +
+            '</button>' +
             '</div>';
         container.appendChild(pageDiv);
         pageDiv.dataset.anchorPdfPage = entry.anchor_pdf_page;
+        if (range) { pageDiv.dataset.missingRange = '1'; }
         drawRepairNote(pageDiv, findRepair('insert', entry.anchor_pdf_page));
 
         var fileInput = pageDiv.querySelector('input[type="file"]');
@@ -802,7 +820,8 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function askForRepair(btn, pageDiv) {
         var action = btn.dataset.action;
-        var what = action === 'insert' ? 'scan this missing page' : 'scan this page again';
+        var what = btn.dataset.repairWhat ||
+            (action === 'insert' ? 'scan this missing page' : 'scan this page again');
         var note = prompt('Ask a scanner to ' + what + '.\nWhat did you see? (optional)', '');
         if (note === null) { return; }
         var body = { action: action, note: note.trim() };
@@ -884,9 +903,10 @@ document.addEventListener('DOMContentLoaded', function () {
         if (row) {
             var note = document.createElement('span');
             note.className = 'repair-note' + (row.fulfilled ? ' fulfilled' : '');
+            var pages = pageDiv.dataset.missingRange ? 'these pages' : 'this page';
             var text = row.fulfilled
-                ? 'A scanner was asked for this page, and a new scan is saved. '
-                : (row.action === 'insert' ? 'A scanner was asked for this page. '
+                ? 'A scanner was asked for ' + pages + ', and a new scan is saved. '
+                : (row.action === 'insert' ? 'A scanner was asked for ' + pages + '. '
                                            : 'A scanner was asked to scan this page again. ');
             // A fulfilled request keeps its Dismiss: the row is still
             // open and holds the address, so a reviewer who finds the
