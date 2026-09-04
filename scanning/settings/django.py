@@ -94,6 +94,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.template.context_processors.static",
                 "scanning.context_processors.inject_settings",
+                "scanning.context_processors.waiting_repairs",
             ),
             "debug": DEBUG,
         },

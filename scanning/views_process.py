@@ -24,7 +24,7 @@ from django.template.loader import render_to_string
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
-from scanning import dots_mocr, jobs, page_edits, s3_sync, yolo
+from scanning import dots_mocr, jobs, page_edits, repairs, s3_sync, yolo
 from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
@@ -38,6 +38,7 @@ from scanning.models import (
     JobStatus,
     OpinionScan,
     PageEdit,
+    PageRepairRequest,
     Scan,
     Stage,
     Status,
@@ -75,6 +76,16 @@ REVALIDATE_UNAVAILABLE_MESSAGE = (
 )
 PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE = (
     "Approve the page completeness review first. Then continue to detection."
+)
+#: Answered to a request over a page a scanner already rescanned after
+#: an earlier request (#249). The unique key matches the open row, and
+#: the row reads fulfilled, so nothing new is created: say so, and say
+#: the way out. Silence here is the fault the date rule removed, one
+#: step later.
+REPAIR_ALREADY_FULFILLED_MESSAGE = (
+    "This page was already requested, and a new scan of it is saved. If "
+    "the new scan is bad too, dismiss the old request on the page and ask "
+    "again, or upload a better scan with Replace."
 )
 PENDING_EDITS_SAVED_MESSAGE = (
     "Your page changes are saved. We do not build the corrected "
@@ -303,6 +314,16 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # each one, with a link that opens the file the curator uploaded.
     replaced_pages = page_edits.replacements_by_page(scan)
 
+    # The pages a reviewer asked a scanner to scan again, or the gaps
+    # they asked a scanner to fill (#249). The waiting ones raise the
+    # sidebar badge and the section; every open one reaches the viewer,
+    # so a fulfilled request shows as fulfilled on its page.
+    repair_requests = repairs.viewer_payload(scan)
+    waiting_repairs = [r for r in repair_requests if not r["fulfilled"]]
+    pages_needing_repair = {
+        r["pdf_page"] for r in waiting_repairs if r["pdf_page"] is not None
+    }
+
     # Map pdf_index → logical page number for navigation
     idx_to_logical = {}
     logical_to_indices: dict[int, list[int]] = {}
@@ -362,6 +383,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         r["seq_issue"] = ""
         r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
         r["is_replaced"] = r["pdf_page"] in replaced_pages
+        r["needs_repair"] = r["pdf_page"] in pages_needing_repair
         if not r.get("detected") or r.get("type") == "range":
             prev_num = None
             continue
@@ -568,6 +590,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "deleted_pages_json": json.dumps(
                 sorted(page_edits.deleted_pages(scan))
             ),
+            "repair_requests": repair_requests,
+            "waiting_repairs": waiting_repairs,
             "replaced_pages_json": json.dumps(
                 {
                     str(page): {
@@ -2382,4 +2406,146 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
         },
     )
     issue.delete()
+    return JsonResponse({"status": "ok"})
+
+
+def _printed_number_of(scan: Scan, pdf_page: int) -> str:
+    """Return the printed number the page shows, as a label.
+
+    Read off the cached ``ocr_results``, which carries the curator's
+    own numbers too (#214). A label only: the scanner reads it on the
+    Repairs page to find the leaf in the book. It goes through
+    ``_page_label`` like every other label, and a reading the narrowing
+    refuses is dropped: the narrowing is the first of the two layers,
+    and the blob is not a trusted source.
+
+    :param scan: The scan.
+    :param pdf_page: The 1-based page.
+    :returns: The printed number, or the empty string.
+    :rtype: str
+    """
+    for entry in scan.ocr_results or []:
+        if entry.get("pdf_page") == pdf_page:
+            return _page_label(str(entry.get("detected") or "")) or ""
+    return ""
+
+
+@login_required
+@require_POST
+def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
+    """Record that a page needs a scanner, and what the scanner must do.
+
+    The button of a reviewer who has no book (#249). A REPLACE names
+    the page to scan again; an INSERT names the gap a missing leaf
+    goes in, by the page it follows, the address an insert uses
+    (#214). One open row per address: a second request for the same
+    page answers the first row, with ``created`` false, so two
+    reviewers who find one page do not stack two requests.
+
+    **A fulfilled row is still an open row**, and the key matches it
+    too. The derivation refuses an edit older than the request, but
+    SQL cannot index a derived flag, so the key cannot. So when the
+    matched row is fulfilled the answer says so
+    (``already_fulfilled``, ``REPAIR_ALREADY_FULFILLED_MESSAGE``): the
+    reviewer dismisses the answered request and asks again, or uses
+    Replace. A toast that said "already requested" here would lose the
+    ask, which is the silence this feature exists to remove.
+
+    The note is free text a person typed. It is cut at
+    ``repairs.NOTE_MAX_CHARS`` here and escaped where it is drawn: in
+    the viewer through ``escapeHtml``, in the templates by the
+    auto-escape. Both layers, on purpose.
+
+    :param request: The HTTP request (JSON body with ``action``,
+        ``pdf_page`` or ``anchor_pdf_page``, ``logical_page``,
+        ``note``).
+    :param pk: Scan primary key.
+    :return: JSON response with the request, and whether it is new.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    action = data.get("action")
+    if action not in PageRepairRequest.Action.values:
+        return JsonResponse({"error": "Unknown action."}, status=400)
+    note = str(data.get("note") or "").strip()[: repairs.NOTE_MAX_CHARS]
+
+    address = {}
+    if action == PageRepairRequest.Action.REPLACE:
+        # The label is a hint for the scanner, not the reviewer's
+        # typing, so the server reads it off ``ocr_results`` itself and
+        # drops a reading the narrowing refuses. A label sent by the
+        # viewer is ignored: refusing it would make the button fail on
+        # exactly the page whose reading is junk.
+        pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
+        if pdf_page is None:
+            return JsonResponse({"error": "Unknown PDF page."}, status=404)
+        address["pdf_page"] = pdf_page
+        label = _printed_number_of(scan, pdf_page)
+    else:
+        # An older viewer places the gap by the label alone
+        # (``_anchor_of``), so here the label is an address and a
+        # refused one is an error.
+        label = _page_label(str(data.get("logical_page") or ""))
+        if label is None:
+            return JsonResponse({"error": "Invalid page number."}, status=400)
+        anchor = _anchor_of(scan, data.get("anchor_pdf_page"), label)
+        if anchor is None:
+            return JsonResponse({"error": "Unknown gap."}, status=404)
+        address["anchor_pdf_page"] = anchor
+
+    row, created = PageRepairRequest.objects.get_or_create(
+        scan=scan,
+        action=action,
+        dismissed_at=None,
+        **address,
+        defaults={
+            "requested_by": request.user,
+            "logical_page": label,
+            "note": note,
+            "source_fingerprint": scan.source_fingerprint,
+        },
+    )
+    row = repairs.open_requests(scan).get(pk=row.pk)
+    answer = {
+        "status": "ok",
+        "created": created,
+        "already_fulfilled": bool(not created and row.fulfilled),
+        "request": repairs.as_dict(row, scan),
+    }
+    if answer["already_fulfilled"]:
+        answer["message"] = REPAIR_ALREADY_FULFILLED_MESSAGE
+    return JsonResponse(answer)
+
+
+@login_required
+@require_POST
+def dismiss_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
+    """Close a repair request without deleting it.
+
+    Any logged-in user may dismiss, the rule of every review-1 button.
+    The row is stamped with who and when. A second dismissal of the
+    same row is a no-op, not an error, like ``undo_delete_page``: a
+    second tab must not fail on a request that is already closed.
+
+    :param request: The HTTP request (JSON body with ``request_id``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the dismissal.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    try:
+        request_id = int(data.get("request_id"))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "Unknown request."}, status=404)
+    rows = scan.repair_requests.filter(pk=request_id)
+    if not rows.exists():
+        return JsonResponse({"error": "Unknown request."}, status=404)
+    repairs.dismiss(rows, request.user)
     return JsonResponse({"status": "ok"})

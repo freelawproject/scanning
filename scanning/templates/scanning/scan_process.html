@@ -44,6 +44,7 @@
       <span class="text-xs text-gray-500 dark:text-gray-400">{{ scan.page_count }} pages</span>
       {% if missing_pages %}<span class="badge-error text-xs">{{ missing_pages|length }} missing</span>{% endif %}
       <span id="pending-badge" class="text-xs font-medium rounded px-2 py-0.5 bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-200"{% if not has_pending_changes %} hidden{% endif %}>Pending Changes</span>
+      {% if step == 1 %}<span id="repairs-badge" class="text-xs font-medium rounded px-2 py-0.5 bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-200" title="Pages a scanner must scan again or scan anew"{% if not waiting_repairs %} hidden{% endif %}><span class="repairs-count">{{ waiting_repairs|length }}</span> repairs requested</span>{% endif %}
       {% if scan.s3_uploaded %}<span class="badge-s3 text-xs" title="Files uploaded to S3">S3</span>{% endif %}
     </div>
   </div>
@@ -151,6 +152,30 @@
       </div>
       {% endif %}
 
+      {% comment %}
+        The pages a reviewer with no book asked a scanner to scan (#249).
+        Not issue cards: an issue card has its own dismiss, and one
+        finding must have one. The viewer redraws this list after a
+        request or a dismissal (renderRepairsSection in viewer_step1.js).
+      {% endcomment %}
+      <div id="repairs-section"{% if not waiting_repairs %} hidden{% endif %}>
+      <h2 class="text-sm font-bold mt-3 mb-1">Repairs requested (<span class="repairs-count">{{ waiting_repairs|length }}</span>)</h2>
+      <p class="text-[10px] text-gray-500 dark:text-gray-400 mb-1">A scanner with the book must do these. The <a href="{% url 'repair_queue' %}" class="underline">Repairs</a> page lists them for every volume.</p>
+      <div id="repairs-list">
+      {% for r in waiting_repairs %}
+      <div class="repair-card rounded border border-orange-300 bg-orange-50 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/20 dark:hover:bg-orange-900/40 px-2 py-1.5 mb-1 cursor-pointer text-xs" data-request-id="{{ r.id }}" data-pdf-index="{{ r.nav_pdf_index }}" onclick="goToPage(this)">
+        <div class="flex items-center gap-1.5">
+          <span class="font-bold uppercase text-[10px]">{{ r.action_label }}</span>
+          <span class="text-gray-500 dark:text-gray-400">{% if r.action == 'insert' %}after PDF p.{{ r.anchor_pdf_page }}{% else %}PDF p.{{ r.pdf_page }}{% endif %}{% if r.logical_page %} (#{{ r.logical_page }}){% endif %}</span>
+          {% if r.stale %}<span class="text-[9px] font-bold text-gray-500" title="Made on an earlier upload of this scan">EARLIER UPLOAD</span>{% endif %}
+        </div>
+        {% if r.note %}<p class="mt-0.5 text-gray-700 dark:text-gray-300">{{ r.note }}</p>{% endif %}
+        <p class="mt-0.5 text-[10px] text-gray-500 dark:text-gray-400">{{ r.requested_by }}, {{ r.date_created }}</p>
+      </div>
+      {% endfor %}
+      </div>
+      </div>
+
       {% if ocr_results %}
       <h2 class="text-sm font-bold mt-3 mb-1">Pages ({{ scan.page_count }})</h2>
       <div id="pages-list">
@@ -184,6 +209,7 @@
           {% endif %}
           {% if r.is_duplicate %}<span class="text-[9px] font-bold text-orange-600 dark:text-orange-400 ml-1">DUP</span>{% endif %}
           {% if r.is_replaced %}<span class="page-repl-badge text-[9px] font-bold text-purple-600 dark:text-purple-400 ml-1" title="A curator replaced this page">REPL</span>{% endif %}
+          {% if r.needs_repair %}<span class="page-need-badge text-[9px] font-bold text-orange-600 dark:text-orange-400 ml-1" title="A reviewer asked a scanner to scan this page again">NEED</span>{% endif %}
         </span>
         {% if r.type == 'range' %}<span class="text-[9px] text-blue-500">range</span>{% endif %}
         {% if r.zone == 'manual' %}<span class="text-[9px] text-purple-500">manual</span>{% endif %}
@@ -335,6 +361,7 @@
 
 {% block footer_scripts %}
 <script id="opinions-data" type="application/json">{% if opinions_json %}{{ opinions_json|safe }}{% else %}[]{% endif %}</script>
+{{ repair_requests|json_script:"repair-requests-data" }}
 <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 <script src="{% static 'scanning/shared.js' %}"></script>
 {% if step == 1 %}
@@ -349,6 +376,9 @@ var SCAN_CONFIG = {
     step: {{ step }},
     deletedPages: {{ deleted_pages_json|safe }},
     replacedPages: {{ replaced_pages_json|safe }},
+    // json_script, not |safe: the note is free text a person typed, and
+    // a "</script>" inside it would end this block (#249).
+    repairRequests: JSON.parse(document.getElementById('repair-requests-data').textContent),
     {% if is_processing %}progressUrl: '{% url "progress_api" scan.pk %}',{% endif %}
 };
 // Backward-compatible globals used by viewer_step1.js and shared.js
