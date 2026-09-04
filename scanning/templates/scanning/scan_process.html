@@ -377,7 +377,9 @@ var SCAN_CONFIG = {
     deletedPages: {{ deleted_pages_json|safe }},
     replacedPages: {{ replaced_pages_json|safe }},
     // json_script, not |safe: the note is free text a person typed, and
-    // a "</script>" inside it would end this block (#249).
+    // a closing script tag inside it would end this block (#249). Do not
+    // write that tag here either: the HTML parser ends the element at it,
+    // comment or not, and SCAN_CONFIG is then never defined.
     repairRequests: JSON.parse(document.getElementById('repair-requests-data').textContent),
     {% if is_processing %}progressUrl: '{% url "progress_api" scan.pk %}',{% endif %}
 };
@@ -424,10 +426,12 @@ document.addEventListener('DOMContentLoaded', function () {
 {% if is_processing %}
 <script src="{% static 'scanning/viewer_progress.js' %}"></script>
 {% endif %}
-{# No auto-computation on page load any more (#196). The daemon computes
-   the geometry when a detection run finishes, and the measurement
-   renders every page of the volume, so a page view must never start it
-   on its own: a volume whose apply failed would start one on every
-   reload. The "Re-pair Opinions" button queues it, once, on purpose. #}
+{% comment %}
+  No auto-computation on page load any more (#196). The daemon computes
+  the geometry when a detection run finishes, and the measurement
+  renders every page of the volume, so a page view must never start it
+  on its own: a volume whose apply failed would start one on every
+  reload. The "Re-pair Opinions" button queues it, once, on purpose.
+{% endcomment %}
 {% endblock %}
 {% block footer %}{% endblock %}

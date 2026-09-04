@@ -3790,3 +3790,47 @@ class TestGluedOutputs(ScanningTestCase):
             ),
             body["html"],
         )
+
+
+class TestTemplateScriptBlocks(TestCase):
+    """No inline script may contain a closing script tag.
+
+    The HTML parser ends a script element at the first `</script`, in a
+    comment and in a string too. One such text in a comment of
+    scan_process.html cut the SCAN_CONFIG block in two and left the
+    step-1 viewer with no configuration (#249).
+    """
+
+    def test_no_template_closes_a_script_block_early(self):
+        block = re.compile(r"<script\b[^>]*>(.*?)</script\s*>", re.S | re.I)
+        root = pathlib.Path(__file__).resolve().parent.parent
+        faults = []
+        for path in root.rglob("*.html"):
+            if "node_modules" in str(path):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for match in block.finditer(text):
+                if re.search(r"</script", match.group(1), re.I):
+                    line = text[: match.start()].count("\n") + 1
+                    faults.append(f"{path}:{line}")
+
+        self.assertEqual(faults, [])
+
+    def test_no_template_opens_a_comment_it_does_not_close(self):
+        """`{# ... #}` holds one line only.
+
+        Django renders a `{#` with no `#}` on the same line as text, so
+        the note reached the interface. A note over several lines needs
+        `{% comment %}`.
+        """
+        root = pathlib.Path(__file__).resolve().parent.parent
+        faults = []
+        for path in root.rglob("*.html"):
+            if "node_modules" in str(path):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for number, line in enumerate(text.splitlines(), 1):
+                if "{#" in line and "#}" not in line:
+                    faults.append(f"{path}:{number}")
+
+        self.assertEqual(faults, [])
