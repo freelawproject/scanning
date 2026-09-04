@@ -334,6 +334,31 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         if indices:
             i.nav_pdf_index = indices[0]
 
+    # The card of a range missing at the end names the placeholder
+    # ("ask a scanner for them at the placeholder at the end of the
+    # volume", #256), so the card must reach it. Its own address is a
+    # printed number the volume does not show, which resolves to no
+    # page above, and the placeholder carries the range as its label,
+    # so neither of ``goToPage``'s lookups finds it. The physical
+    # address does: the page the gap follows, with the placeholder
+    # drawn right below it -- the route a repair request already takes
+    # (``PageRepairRequest.nav_pdf_index``).
+    #
+    # After the loop, and outside ``flagged_indices`` on purpose: the
+    # last page of the volume is not itself at fault, so it keeps no
+    # red border. The projected entry keeps both keys after a curator
+    # uploads into the gap, because ``_inserted_entry`` copies it.
+    trailing = next((e for e in page_map if e.get("missing_range")), None)
+    if trailing:
+        for i in issues:
+            if (
+                i.check_name == CheckName.LARGE_GAP
+                and i.page_number == trailing["missing_range"][0]
+            ):
+                i.nav_pdf_index = max(
+                    trailing.get("anchor_pdf_page", 0) - 1, 0
+                )
+
     ocr_results = scan.ocr_results
     ocr_by_page = {}
     for r in ocr_results:

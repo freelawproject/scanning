@@ -398,8 +398,9 @@ called it, and an endpoint nobody reaches still carries its surface
   row first would grow with them.
 - **A missing leaf can be asked for only where a placeholder is
   drawn**: the button sits on the `missing` entry the sequence
-  analysis produced. A gap the page numbers do not reveal has no
-  button yet.
+  analysis produced. A run of more than 6 pages carries one placeholder
+  for the whole range, and only at the end of the volume (#256, below).
+  A gap the page numbers do not reveal has no button yet.
 - **Step 1 draws everything from one list** (`SCAN_CONFIG.repairRequests`):
   the note on the page (with Dismiss while it waits), the `NEED`
   sidebar badge, the "Repairs requested" section and the header badge.
@@ -411,6 +412,70 @@ called it, and an endpoint nobody reaches still carries its surface
   scrolls to the placeholder once it exists (`goToRequestedPage`).
   The header count (`context_processors.waiting_repairs`) is one
   query for a logged-in user.
+
+## A range missing at the end (issue #256)
+
+`blackletter.validate.build_issues` collapses a contiguous run of more
+than 6 missing pages into one `large_gap` card **and drops every page
+of the run** from `actually_missing`, which is the only source of a
+`missing` entry in `page_map`. So the 41-page run of scan 2532 had a
+warning and nothing a reviewer could act on: no upload form, and no
+gap to ask a scanner for (#249). `services._project_trailing_gap` is
+the answer: a scanning-side pass over what `build_issues` returned,
+the shape of `_note_curator_ranges` (#233) and of #227 — no blackletter
+change.
+
+- **One placeholder per gap, because the gap is the address.** An
+  insert and an INSERT repair request are both addressed by
+  `anchor_pdf_page` (#214/#249) and one open row may exist per address,
+  so a placeholder per missing number would put 41 buttons on one row
+  and every ask after the first would answer "already requested". The
+  label is the range instead (`4-13`), with the hyphen every reader of
+  a range parses (#233); the viewer's heading shows the en dash.
+- **A run at the end only.** Inside a volume those pages are almost
+  always in the book with a number nobody read, so the card stands
+  alone there — a button would send a scanner to the shelf for
+  nothing. A run at the start is out for the same reason, and front
+  matter carries no printed numbers at all. The qualifying test is
+  `missing[-1] == exp_end`; every number the volume shows is out of
+  `missing`, so a run that ends there also starts above the last number
+  read.
+- **The collapse threshold is not copied.** The pass asks whether the
+  run's first page survived into `result["missing_pages"]`: if it did,
+  blackletter drew one placeholder per page itself. A retune upstream
+  can therefore not give one page two placeholders.
+- **Both builders of `page_map` call it** (`recalculate_issues` and
+  `rebuild_page_map`), or a page-number edit would drop the placeholder
+  from under the reviewer. In `recalculate_issues` it runs beside
+  `_note_curator_ranges`, before the dismissal filter, so a dismissal
+  matches the card as it reads.
+- **The card is reworded, and its key does not move.** "Likely an OCR
+  misread rather than genuinely missing pages" names no action, so the
+  card now says the pages are not in the volume, what the last number
+  read was, and the two ways out: ask a scanner at the placeholder, or
+  correct a page number and recompute. It stays a `warning`. A card
+  that is not there changes nothing — the placeholder stands on the run
+  alone.
+- **The reviewer judges.** The pages may be an index nobody numbered
+  rather than absent leaves. The placeholder offers the upload and the
+  ask; it decides nothing, the rule of the approve button (#151).
+- **The card reaches the placeholder by the physical address.** Its own
+  address is a printed number the volume does not show, so
+  `logical_to_indices` resolves it to nothing, and the placeholder
+  carries the range as its label, so neither of `goToPage`'s label
+  lookups (`[data-logical-number]`, then `page-<n>`) finds it either. So
+  `scan_process_view` stamps `nav_pdf_index` = the gap's anchor page,
+  the route a repair request already takes, and the template's
+  `data-pdf-index` branch resolves it by position. Not by a matching id
+  or label: an unnumbered page falls back to `logical = pdf_page`, so a
+  physical page 1276 would answer for the printed 1276 and win, being
+  earlier in the document. The stamp is written **after** the flagged
+  loop and stays out of `flagged_indices`: the last page of the volume
+  is not itself at fault and keeps no red border.
+- `missing_pages` is untouched, so the header badge keeps counting what
+  blackletter reports. Nothing runs over the corpus by itself: the
+  placeholder appears at the next apply, recompute or page-number edit,
+  or after `reapply_page_numbers`.
 
 ## Bitonal via doctor (issue #176)
 

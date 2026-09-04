@@ -278,6 +278,65 @@ class TestRequestEndpoint(RepairTestCase):
         self.assertFalse(self.scan.repair_requests.exists())
 
 
+class TestARangeMissingAtTheEnd(RepairTestCase):
+    """The placeholder of issue #256 asks like any other gap.
+
+    A range missing at the end of the volume is **one** gap: its
+    address is the last physical page, so the range is one row and the
+    printed range rides along as the label.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.scan.start_page = 1
+        self.scan.end_page = 13
+        self.scan.ocr_results = _ocr_results([1, 2, 3])
+        self.scan.page_map = [
+            {"type": "pdf_page", "pdf_index": 0, "logical_number": 1},
+            {"type": "pdf_page", "pdf_index": 1, "logical_number": 2},
+            {"type": "pdf_page", "pdf_index": 2, "logical_number": 3},
+            {
+                "type": "missing",
+                "logical_number": "4-13",
+                "missing_range": [4, 13],
+            },
+        ]
+        self.scan.save()
+
+    def test_the_range_becomes_one_row_after_the_last_page(self):
+        response = self._insert(anchor=3, label="4-13")
+
+        self.assertEqual(response.status_code, 200)
+        row = self.scan.repair_requests.get()
+        self.assertEqual(row.action, PageRepairRequest.Action.INSERT)
+        self.assertEqual(row.anchor_pdf_page, 3)
+        self.assertEqual(row.logical_page, "4-13")
+        self.assertEqual(
+            json.loads(response.content)["request"]["nav_pdf_index"], 2
+        )
+
+    def test_a_second_ask_answers_the_same_row(self):
+        first = json.loads(self._insert(anchor=3, label="4-13").content)
+        second = json.loads(self._insert(anchor=3, label="4-13").content)
+
+        self.assertFalse(second["created"])
+        self.assertEqual(second["request"]["id"], first["request"]["id"])
+
+    def test_an_older_viewer_places_the_range_by_its_label(self):
+        response = self._request(action="insert", logical_page="4-13")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.scan.repair_requests.get().anchor_pdf_page, 3)
+
+    def test_the_viewer_draws_the_placeholder_and_the_request(self):
+        self._insert(anchor=3, label="4-13")
+
+        page = self._step_one().content.decode()
+
+        self.assertIn("missing_range", page)
+        self.assertIn("4-13", page)
+
+
 class TestDismissEndpoint(RepairTestCase):
     """``dismiss_page_repair`` stamps, and never deletes."""
 

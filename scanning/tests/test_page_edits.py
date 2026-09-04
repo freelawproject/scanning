@@ -799,6 +799,26 @@ class TestPageInsertEndpoints(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.scan.page_edits.get().anchor_pdf_page, 1)
 
+    def test_a_range_missing_at_the_end_takes_one_upload(self):
+        # The placeholder of a collapsed trailing run is labelled with
+        # the range it stands for (#256), and an insert may be several
+        # pages, so one PDF of the whole range fills it.
+        self.scan.page_map = self.scan.page_map + [
+            {
+                "type": "missing",
+                "logical_number": "4-13",
+                "missing_range": [4, 13],
+            }
+        ]
+        self.scan.save(update_fields=["page_map"])
+
+        response = self._upload(anchor_pdf_page=2, page_number="4-13")
+
+        self.assertEqual(response.status_code, 200)
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.anchor_pdf_page, 2)
+        self.assertEqual(edit.logical_page, "4-13")
+
     def test_a_printed_number_may_hold_letters(self):
         # A printed page number is not always a whole number: front
         # matter prints roman numerals, and an inserted leaf prints a

@@ -1154,6 +1154,92 @@ def _note_curator_ranges(issues: list[dict], ocr_results: list[dict]) -> None:
         )
 
 
+def _project_trailing_gap(
+    result: dict, analysis: dict, exp_end: int | None
+) -> None:
+    """Draw one placeholder for a page range missing at the end (#256).
+
+    ``build_issues`` collapses a run of more than 6 missing pages into
+    one ``large_gap`` card and drops every page of the run from
+    ``actually_missing``, which is the only source of a ``missing``
+    entry in ``page_map``. So a volume that stops 41 pages before its
+    recorded last page carries a card and nothing a reviewer can act
+    on: no upload form, and no button to ask a scanner for the leaves
+    (#249).
+
+    The collapse is right **inside** a volume, where the pages are
+    almost always in the book with a number nobody read. It is wrong at
+    the end, where the expected last page says the pages should be
+    there and the volume stops before them. So this appends one
+    placeholder for the trailing run, and only for that one.
+
+    **One placeholder per gap, because the gap is the address.** An
+    insert and an INSERT repair request are both addressed by
+    ``anchor_pdf_page``, the physical page the leaf follows
+    (#214/#249), and one open row may exist per address. So a
+    placeholder per missing number would put 41 buttons on one row.
+    The label is the range instead, with the hyphen every reader of a
+    range parses (#233).
+
+    The threshold is deliberately not repeated here: the run qualifies
+    when its first page did **not** survive into
+    ``result["missing_pages"]``, which is the proof that the collapse
+    took it. A retune upstream can therefore not give one page two
+    placeholders.
+
+    :param result: What ``build_issues`` returned, edited in place.
+    :param analysis: What ``build_analysis`` returned. Its
+        ``missing_pages`` still holds the collapsed pages.
+    :param exp_end: The scan's recorded last printed page. Without one
+        there is no trailing gap to find (issue #209).
+    :returns: None.
+    """
+    missing = analysis.get("missing_pages") or []
+    all_nums = analysis.get("all_nums") or []
+    # The run must reach the recorded last page, or it is not the end
+    # of the volume. Every number the volume shows is out of
+    # ``missing``, so a run that ends there also starts above the last
+    # number read.
+    if not exp_end or not missing or not all_nums or missing[-1] != exp_end:
+        return
+    first = exp_end
+    for page in reversed(missing[:-1]):
+        if page != first - 1:
+            break
+        first = page
+    if first in set(result["missing_pages"]):
+        # Not collapsed: blackletter drew one placeholder per page.
+        return
+
+    result["page_map"].append(
+        {
+            "type": "missing",
+            "logical_number": f"{first}-{exp_end}",
+            "missing_range": [first, exp_end],
+        }
+    )
+
+    # The card of that run, reworded: it reads "likely an OCR misread
+    # rather than genuinely missing pages", which says nothing about
+    # what a reviewer does next. The key does not move, so a dismissal
+    # still matches the card. A card that is not there changes nothing:
+    # the placeholder stands on the run alone.
+    for issue in result["issues"]:
+        if (
+            issue["check_name"] == CheckName.LARGE_GAP
+            and issue["page_number"] == first
+        ):
+            issue["message"] = (
+                f"Pages {first}\u2013{exp_end} "
+                f"({exp_end - first + 1} pages) are not in this volume. "
+                f"The last page number read is {max(all_nums)}. If the "
+                f"book has these pages, ask a scanner for them at the "
+                f"placeholder at the end of the volume. If the pages "
+                f"are there with a number nobody read, correct a page "
+                f"number and recompute."
+            )
+
+
 def rebuild_page_map(scan: "Scan") -> None:
     """Rebuild ``page_map`` and ``missing_pages`` from current ocr_results.
 
@@ -1179,6 +1265,9 @@ def rebuild_page_map(scan: "Scan") -> None:
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
+    # Both builders of ``page_map`` must agree, or a page-number edit
+    # would drop the placeholder from under the reviewer (#256).
+    _project_trailing_gap(result, analysis, exp_end)
     scan.ocr_results = ocr_results
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
@@ -1276,6 +1365,10 @@ def recalculate_issues(scan: "Scan") -> None:
     # Before the cards scanning appends below, and before the
     # dismissal filter, so a dismissal matches the card as it reads.
     _note_curator_ranges(result["issues"], ocr_results)
+
+    # A range missing at the end of the volume gets a placeholder, so a
+    # reviewer can upload the pages or ask a scanner for them (#256).
+    _project_trailing_gap(result, analysis, exp_end)
 
     # Every open edit this volume cannot take, not only the page
     # numbers: a delete or an insert made against another original is
