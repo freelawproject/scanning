@@ -126,6 +126,25 @@ class Status(models.TextChoices):
         "page_completeness_review_done",
         "Page review done",
     )
+    # The two redaction review states (#263), the same shape as the
+    # two above. ``review_states.redaction_review_ready`` is the whole
+    # rule behind READY -- review 1 approved, the page complete volume
+    # built (#224), and the redactions computed from the detection run
+    # -- and it has two callers: the redaction apply parks in READY
+    # (``services._park_after_redactions``), and
+    # ``review_states.promote_ready_scans`` catches on the collect tick
+    # what the apply could not see yet. ``approve_redaction_review``
+    # (#263, views_process) is the only writer of
+    # REDACTION_REVIEW_DONE, and that approval is the gate of step 3.
+    # Parked human states again: no polling, no sweep.
+    READY_FOR_REDACTION_REVIEW = (
+        "ready_for_redaction_review",
+        "Ready for redaction review",
+    )
+    REDACTION_REVIEW_DONE = (
+        "redaction_review_done",
+        "Redaction review done",
+    )
     PENDING_REVIEW = "pending_review", "Pending Review"
     APPROVED = "approved", "Approved"
     EXTRACTED = "extracted", "Extracted"
@@ -146,6 +165,22 @@ class Status(models.TextChoices):
 #: Deliberately not a substitute for the narrower ``status=PROCESSING``
 #: guards: only PROCESSING may be swept as stale.
 BUSY_STATUSES = frozenset({Status.QUEUED, Status.PROCESSING, Status.AWAITING})
+
+#: The parked human states of the two reviews (#154, #263). None of
+#: them is busy: nothing polls them and the stale sweep never touches
+#: them. A recompute that rebuilds data underneath a review must
+#: preserve whichever one the scan holds, which is what this set is
+#: read for (``services.recalculate_issues``). The legacy
+#: ``PENDING_REVIEW`` is not here: it is the status such a recompute
+#: writes for the rows that never entered this flow.
+REVIEW_STATUSES = frozenset(
+    {
+        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+        Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        Status.READY_FOR_REDACTION_REVIEW,
+        Status.REDACTION_REVIEW_DONE,
+    }
+)
 
 
 class Stage(models.TextChoices):

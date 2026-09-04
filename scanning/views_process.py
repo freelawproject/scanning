@@ -29,6 +29,7 @@ from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
     PHYSICAL_PAGE_CHECKS,
+    REVIEW_STATUSES,
     CheckName,
     Detection,
     ExternalJob,
@@ -62,6 +63,19 @@ PAGE_REVIEW_ALREADY_DONE_MESSAGE = (
 )
 PAGE_REVIEW_NOT_READY_MESSAGE = (
     "This scan is not ready for the page completeness review."
+)
+#: Flashed by the review-2 approval of issue #263, and constants for
+#: the same reason as the three above.
+REDACTION_REVIEW_APPROVED_MESSAGE = (
+    "Thank you. The redactions of this scan are marked as reviewed."
+)
+REDACTION_REVIEW_ALREADY_DONE_MESSAGE = (
+    "The redactions of this scan are already marked as reviewed."
+)
+REDACTION_REVIEW_NOT_READY_MESSAGE = (
+    "This scan is not ready for the redaction review. The redactions "
+    "are computed after the page completeness approval, and this page "
+    "shows them when they are there."
 )
 LEGACY_OCR_RECOMPUTE_MESSAGE = (
     "The old OCR engine that read this scan no longer runs here. Run "
@@ -276,10 +290,20 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             step = 1
         elif scan.stage == Stage.APPROVED:
             step = 3
-        elif scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE:
+        elif scan.status in (
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+            Status.READY_FOR_REDACTION_REVIEW,
+            Status.REDACTION_REVIEW_DONE,
+        ):
             # Review 1 is done (#154), so land on the detection review
             # when detections exist. The detection stage (#195) writes
             # no scan status, so its output is the only signal.
+            #
+            # The two #263 states land there as well, review 2 done
+            # included: step 3 is paused (#173/#206), and step 2 is
+            # where that state is shown and where its "Next: Generate"
+            # link waits. Send nobody to a step whose only button
+            # refuses.
             if Detection.objects.filter(scan=scan).exists():
                 step = 2
             else:
@@ -795,13 +819,11 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
             status=202,
         )
 
-    if scan.status in (
-        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
-        Status.PAGE_COMPLETENESS_REVIEW_DONE,
-    ):
-        # These statuses guarantee a stored preview (#154): #149 sets
-        # the first one only after the bitonal merge. Landing here means
-        # the S3 pull above just failed, and a reload retries it.
+    if scan.status in REVIEW_STATUSES:
+        # Every review state guarantees a stored preview (#154/#263):
+        # #149 sets the first one only after the bitonal merge, and the
+        # two review-2 states come after it. Landing here means the S3
+        # pull above just failed, and a reload retries it.
         message = (
             "The preview did not load. Reload the page to try again, "
             "or load the original scan instead."
@@ -1282,7 +1304,12 @@ def _review_flags(scan: Scan) -> dict:
     refuses, or hide the one it accepts.
 
     :param scan: The scan the bar is rendered for.
+    The two review-2 flags (#263) ride along for the same reason: the
+    step-2 bar is rendered by the same two callers, and its approve
+    button is the gate of step 3.
+
     :returns: ``page_review_ready``, ``page_review_done``,
+        ``redaction_review_ready``, ``redaction_review_done``,
         ``has_legacy_ocr`` and the two pending-edit flags, for the
         template context.
     :rtype: dict
@@ -1296,6 +1323,10 @@ def _review_flags(scan: Scan) -> dict:
         "page_review_done": (
             scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
         ),
+        "redaction_review_ready": (
+            scan.status == Status.READY_FOR_REDACTION_REVIEW
+        ),
+        "redaction_review_done": (scan.status == Status.REDACTION_REVIEW_DONE),
         "has_legacy_ocr": services.has_legacy_ocr(scan),
         **page_edits.pending_edit_flags(scan),
     }
@@ -1647,6 +1678,56 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
             messages.warning(request, PAGE_REVIEW_NOT_READY_MESSAGE)
     return redirect(
         reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+    )
+
+
+@login_required
+@require_POST
+def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Record that a person reviewed the redactions of this scan.
+
+    The approve button of review 2 (#263), and the only writer of
+    ``REDACTION_REVIEW_DONE``. Every logged-in user may press it, which
+    is the rule of the review-1 approve button (#151): both are the
+    same kind of human decision, and the log line below is the only
+    record of who made this one.
+
+    The write is one compare-and-swap on ``READY_FOR_REDACTION_REVIEW``,
+    never a full instance save. The collect tick and the redaction
+    apply both write that status over the same row
+    (``review_states``), and a scan that was re-queued, errored, or
+    whose geometry is being measured again must not be approved from a
+    stale page a curator left open.
+
+    Open detections or unpaired opinions do not block it. The curator
+    is the judge of the geometry, exactly as they are the judge of a
+    page-completeness suspicion (#151).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to step 2 of the scan processing page.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    approved = Scan.objects.filter(
+        pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
+    ).update(status=Status.REDACTION_REVIEW_DONE)
+    if approved:
+        logger.info(
+            "approve_redaction_review: scan=%s approved by user=%s",
+            scan.pk,
+            request.user.pk,
+        )
+        messages.success(request, REDACTION_REVIEW_APPROVED_MESSAGE)
+    else:
+        # The write lost, so the fetch above is stale. Re-read the row
+        # so the message describes it as it is.
+        scan.refresh_from_db()
+        if scan.status == Status.REDACTION_REVIEW_DONE:
+            messages.info(request, REDACTION_REVIEW_ALREADY_DONE_MESSAGE)
+        else:
+            messages.warning(request, REDACTION_REVIEW_NOT_READY_MESSAGE)
+    return redirect(
+        reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
     )
 
 
