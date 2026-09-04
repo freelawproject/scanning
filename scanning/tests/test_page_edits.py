@@ -515,6 +515,93 @@ class TestDismissIssueWritesAnEdit(TestCase):
         )
 
 
+class TestADeletionAnswersItsCards(TestCase):
+    """A card about a page marked for deletion goes away (#255)."""
+
+    def setUp(self):
+        self.user = UserFactory()
+        self.scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            start_page=1,
+            end_page=2,
+            page_count=2,
+            source_fingerprint="100:2",
+            ocr_results=[
+                {"pdf_page": 1, "detected": None, "type": None, "zone": None},
+                {
+                    "pdf_page": 2,
+                    "detected": "2",
+                    "type": "single",
+                    "zone": "dots-header",
+                },
+            ],
+        )
+
+    def _delete_page_1(self, **fields):
+        """Mark PDF page 1 for deletion.
+
+        :param fields: Values that overwrite the row's defaults.
+        :returns: The new edit.
+        :rtype: PageEdit
+        """
+        defaults = {
+            "kind": PageEdit.Kind.DELETE_PAGE,
+            "pdf_page": 1,
+            "value": "",
+            "source_fingerprint": self.scan.source_fingerprint,
+        }
+        return PageEditFactory(scan=self.scan, **{**defaults, **fields})
+
+    def _checks(self):
+        """Read the checks the rebuild wrote.
+
+        :returns: One name per issue row of the scan.
+        :rtype: list[str]
+        """
+        from scanning import services
+
+        services.recalculate_issues(self.scan)
+        return list(
+            self.scan.issues.values_list("check_name", flat=True).order_by(
+                "check_name"
+            )
+        )
+
+    def test_the_card_of_a_deleted_page_goes(self):
+        self._delete_page_1()
+
+        self.assertNotIn(CheckName.NO_PAGE_NUMBER, self._checks())
+
+    def test_the_card_of_a_live_page_stays(self):
+        # The same volume, with no deletion on it.
+        self.assertIn(CheckName.NO_PAGE_NUMBER, self._checks())
+
+    def test_a_printed_number_card_stays(self):
+        # "Page 1 is missing" names the printed number 1, not PDF page
+        # 1. To answer it the sequence analysis must run again over the
+        # volume without the deleted pages, which this pass does not do.
+        self._delete_page_1()
+
+        self.assertIn(CheckName.MISSING_PAGE, self._checks())
+
+    def test_an_undone_deletion_brings_the_card_back(self):
+        edit = self._delete_page_1()
+        self.assertNotIn(CheckName.NO_PAGE_NUMBER, self._checks())
+
+        page_edits.withdraw(PageEdit.objects.filter(pk=edit.pk), self.user)
+
+        self.assertIn(CheckName.NO_PAGE_NUMBER, self._checks())
+
+    def test_a_deletion_of_another_original_hides_nothing(self):
+        # The row names a page nobody chose, so it answers no card and
+        # it keeps the warning that says it did not land.
+        self._delete_page_1(source_fingerprint="999:9")
+
+        checks = self._checks()
+        self.assertIn(CheckName.NO_PAGE_NUMBER, checks)
+        self.assertIn(CheckName.STALE_PAGE_EDIT, checks)
+
+
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestManualReadingMigration(TestCase):
     """The #214 data migration, run against the live app registry.

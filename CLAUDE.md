@@ -232,6 +232,18 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
   (`page_edits.pending_edit_flags` via `_review_flags`) and waits for
   #206, whose apply button is the one that must warn about a paid
   run. Computed apart, the two disagreed on stale rows.
+- **A deletion answers the cards of the page it names** (#255,
+  `page_edits.drop_deleted_pages`, called by `recalculate_issues`
+  before `drop_dismissed`). The cards are built from `ocr_results`,
+  which still holds the page until the apply, so "No page number
+  detected on PDF page 12" came back on every press of the recompute
+  button. Only `models.CHECKS_A_DELETION_ANSWERS` — the physical space
+  of `PHYSICAL_PAGE_CHECKS` less `stale_page_edit`, which must always
+  be heard. A `duplicate_page` or a `missing_page` card names a
+  printed number and stays: to answer one the sequence analysis has to
+  run again over the volume without the deleted pages, which is a
+  different pass. The filter reads `deleted_pages`, so a withdrawn row
+  (#232) and a row of another original (#214) hide nothing.
 - **The image is on the default storage** under the scan's
   `page_edits/` prefix: excluded from the generic sync, swept by admin
   deletion, presignable for #206. `PageInsert` used
