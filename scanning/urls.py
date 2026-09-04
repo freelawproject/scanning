@@ -23,6 +23,7 @@ from scanning.views import (
     scan_detail,
     scan_list,
     scan_pages_list,
+    stats_view,
     update_scan_status,
 )
 from scanning.views_api import (
@@ -96,6 +97,7 @@ urlpatterns = [
     path("profile/password/", password_change, name="password_change"),
     path("queue/", queue_view, name="queue"),
     path("repairs/", repair_queue, name="repair_queue"),
+    path("stats/", stats_view, name="stats"),
     path(
         "queue/<str:reporter_slug>/<int:vol>/",
         queue_detail_view,

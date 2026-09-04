@@ -275,3 +275,18 @@ def waiting_count() -> int:
     :rtype: int
     """
     return queue("waiting").count()
+
+
+def waiting_totals() -> tuple[int, int]:
+    """Return how many requests wait, and over how many scans (#260).
+
+    The stats page prints "X repairs over Y scans", and the two
+    numbers come from one read: two queries could disagree, because a
+    reviewer may add a request between them. The waiting set holds
+    only the open requests nobody has answered, so it is small.
+
+    :returns: The number of requests, then the number of scans.
+    :rtype: tuple[int, int]
+    """
+    scan_ids = list(queue("waiting").values_list("scan_id", flat=True))
+    return len(scan_ids), len(set(scan_ids))
