@@ -120,12 +120,11 @@ reach step 2.
     <button type="submit" class="btn-primary text-sm" title="Detections already exist. Skip directly to review (no RunPod, no cost).">Next: Detect &rarr;</button>
     {% else %}
     {% comment %}
-       No paid confirm here (#196): this button starts nothing.
-       start_detect walks to step 2 when detections exist and otherwise
-       says where the run stands; the daemon is what pays (#250). A
-       confirm that named RunPod and a cost here promised a run the
-       view then did not start. (A `{# #}` comment must fit one line,
-       or Django renders it as text -- which this one used to be.)
+      No paid confirm here (#196): this button starts nothing.
+      start_detect walks to step 2 when detections exist and otherwise
+      says where the run stands; the daemon is what pays (#250). A
+      confirm that named RunPod and a cost here promised a run the
+      view then did not start.
     {% endcomment %}
     <button type="submit" class="btn-outline text-sm" title="{{ detect_message }}">Next: Detect &rarr;</button>
     {% endif %}
@@ -135,14 +134,14 @@ reach step 2.
 
 {% elif step == 2 %}
 {% comment %}
-   No "Re-pair Opinions" button for now (#196). The computation behind
-   it renders every page of the volume on the daemon and takes the scan
-   out of review for a minute or more, so until the stage has been
-   watched on a few volumes (#211) the daemon's one run after detection
-   is the only one wanted. The endpoints refuse too
-   (views_api.REPAIR_ON_REQUEST_ENABLED); turning it back on is that flag
-   plus this button:
-   <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()">Re-pair Opinions</button>
+  No "Re-pair Opinions" button for now (#196). The computation behind
+  it renders every page of the volume on the daemon and takes the scan
+  out of review for a minute or more, so until the stage has been
+  watched on a few volumes (#211) the daemon's one run after detection
+  is the only one wanted. The endpoints refuse too
+  (views_api.REPAIR_ON_REQUEST_ENABLED); turning it back on is that flag
+  plus this button:
+  <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()">Re-pair Opinions</button>
 {% endcomment %}
   {% if opinions %}
   <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
