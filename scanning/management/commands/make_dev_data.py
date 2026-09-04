@@ -74,12 +74,14 @@ class Command(BaseCommand):
         to_create = count - existing
         scans = ScanFactory.create_batch(to_create, uploaded_by=scanner)
 
-        # Seed one example of each page-completeness review state
-        # (#154) so the badges and the step selection are visible in
-        # dev; the rest get the legacy PENDING_REVIEW.
+        # Seed one example of each review state (#154, #263) so the
+        # badges and the step selection are visible in dev; the rest
+        # get the legacy PENDING_REVIEW.
         statuses = [
             Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
             Status.PAGE_COMPLETENESS_REVIEW_DONE,
+            Status.READY_FOR_REDACTION_REVIEW,
+            Status.REDACTION_REVIEW_DONE,
         ]
         seeded = 0
         for i, scan in enumerate(scans):

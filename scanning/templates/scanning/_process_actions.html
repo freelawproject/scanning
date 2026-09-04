@@ -143,7 +143,31 @@ reach step 2.
   plus this button:
   <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()">Re-pair Opinions</button>
 {% endcomment %}
-  {% if opinions %}
+{% comment %}
+  The review-2 controls (issue #263) read `redaction_review_ready` /
+  `redaction_review_done`, the two new statuses, from the same
+  `_review_flags` the step-1 bar reads. Approving is the gate for
+  "Next: Generate", the mirror of how the review-1 approval reveals
+  "Next: Detect".
+
+  No confirm dialog and no cost warning: this button starts nothing and
+  pays nothing. Open detections do not hide it either -- the curator
+  judges the geometry, as they judge a page-completeness suspicion
+  (#151).
+
+  A legacy volume keeps its link. Its step 2 lives in PENDING_REVIEW,
+  so it can hold neither #263 status, and a gate on the approval alone
+  would strand it here.
+{% endcomment %}
+  {% if redaction_review_ready %}
+  <form method="post" action="{% url 'approve_redaction_review' scan.pk %}" class="inline">
+    {% csrf_token %}
+    <button type="submit" class="btn-primary text-sm" title="Confirm the redactions of this volume are correct: every headnote and key number is covered, and no opinion text is.">I reviewed the redactions and they are correct</button>
+  </form>
+  {% elif redaction_review_done %}
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed the redactions of this volume">&#10003; Redaction review done</span>
+  {% endif %}
+  {% if opinions and redaction_review_done or opinions and has_legacy_ocr %}
   <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
   {% endif %}
 

@@ -111,7 +111,9 @@ from DONE and hands it straight back (`_park_after_redactions`), so
 neither review is ever blocked by redaction work. Both are parked human states outside
 `BUSY_STATUSES` (no polling, no sweep); `AWAITING_VALIDATION` now means
 "review-1 prerequisites outstanding". `recalculate_issues` preserves
-both (`PENDING_REVIEW` remains for legacy rows and step 2 only) with a
+both -- and the two review-2 states of #263 with them, through
+`models.REVIEW_STATUSES` (`PENDING_REVIEW` remains for legacy rows and
+step 2 only) -- with a
 conditional DB update over the row's *current* status, never a full
 save — a full save off a stale instance would silently write READY
 back over a concurrent approval — and
@@ -1217,10 +1219,14 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   writes `queued_at` so it does not queue the same scan on every tick;
   the work drops it as it starts, so a failed apply is queued again.
   `applied_at` closes the run for good.
-- **Only `PAGE_COMPLETENESS_REVIEW_DONE` is taken**, with a
-  compare-and-swap: review 2 follows review 1. The run itself may
+- **Only `yolo.APPLY_STATUSES` is taken**, with a compare-and-swap:
+  review 2 follows review 1, so a merged run waits for the review-1
+  approval. Since #263 that set also holds
+  `READY_FOR_REDACTION_REVIEW`, for the second run over a volume
+  already in review 2. The run itself may
   start earlier (#250 starts it at upload); it is the apply that waits,
-  because it moves the scan and reads the bitonal copy.
+  because it moves the scan and reads the bitonal copy. Where it parks
+  the scan is #263's, below.
 - **The detections are imported once per run.** A run already stamped
   is a *recompute*, which a curator asks for after they edit a box: it
   keeps every row in the database and measures again from those.
@@ -1287,6 +1293,88 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   run the view then did not start; the no-detections branch now says
   what the view says. Nothing in the viewer pays since #250: the
   daemon starts the one run.
+
+## The two redaction review states (issue #263)
+
+Review 2 had no status of its own. A volume sat in
+`PAGE_COMPLETENESS_REVIEW_DONE` before its redactions were measured,
+while a curator judged them, and after the curator agreed, so one value
+said three things. `READY_FOR_REDACTION_REVIEW` and
+`REDACTION_REVIEW_DONE` are the same two edges #154 gave review 1. The
+pieces: the values in `models.Status`, `review_states.py` (the rule and
+the collect tick's pass), the park in `services.run_compute_redactions`,
+`views_process.approve_redaction_review`, and the step-2 half of
+`_process_actions.html`.
+
+- **The status is the state, and the state is derived.** The issue
+  lists conditions, not events, so `review_states.redaction_review_ready`
+  is the whole rule and every writer calls it -- the shape of
+  `_review_flags` (#151), and for the same reason: a second copy would
+  answer a different question on some volume, and nobody would know
+  which one was right.
+- **"The redactions are computed" is the run's `applied_at` stamp**
+  (`yolo.apply_state`), **not `Scan.redaction_rects`.** A volume with
+  no headnote to hide gets an empty rect list out of a computation
+  that fully succeeded, and it still needs a curator to judge its
+  pairing.
+- **The corrected volume is one function.** `final_volume_ready` says
+  yes for every scan until #224 lands, and that issue changes its body
+  and nothing else here.
+- **Two writers of READY, and the apply is the usual one.**
+  `services._park_after_redactions` parks a successful run straight in
+  the new status: the viewer reloads the page the moment the scan
+  parks (`viewer_progress.js`), so a park in the approved status would
+  show the curator a step 2 whose approve button appears a tick later,
+  from nothing they did. `record_apply_success` therefore runs
+  **before** the edge is read, or the rule reads no stamp.
+  `review_states.promote_ready_scans` is pass 7 of the collect tick and
+  the safety net: the volume whose corrected build lands after its
+  geometry (#224), and every volume already approved and measured when
+  this shipped.
+- **Every failure arm parks in `PAGE_COMPLETENESS_REVIEW_DONE`.** A
+  curator must not be sent to judge geometry nobody measured. The
+  apply still writes no ERROR (#196): the ledger on the run bounds the
+  retries.
+- **A legacy volume is out of both.** Its step 2 lives in
+  `PENDING_REVIEW`, because the #154 and #263 states describe a flow it
+  never went through, and `_park_after_redactions` already made that
+  split.
+- **`approve_redaction_review` is the only writer of DONE**, a
+  compare-and-swap on READY and never a full save, open to every
+  logged-in user (the rule of #151). Open detections do not block it:
+  the curator judges the geometry, as they judge a page-completeness
+  suspicion. Its log line is the only record of who decided.
+- **The approval is the gate of step 3.** The "Next: Generate" link
+  reads the flag, the mirror of how the review-1 approval reveals
+  "Next: Detect". A legacy volume keeps its link, or a gate on the
+  approval alone would strand it in step 2. When #206 brings the file
+  generation back, put the same gate in the view as well:
+  `start_detect` does that for review 1, and a template gate alone
+  cannot refuse a direct POST.
+- **`yolo.APPLY_STATUSES` holds READY too.** A *second* detection run
+  over a volume already in review 2 -- an operator's
+  `enqueue_yolo_detect --dead-runs`, or a re-cut shard set -- must
+  reach its apply, and the apply parks it back in review 2.
+  `REDACTION_REVIEW_DONE` is in neither that set nor
+  `services.REDACTION_COMPUTE_STATUSES`: a closed review is not
+  recomputed under the person who closed it, and the way back is the
+  admin re-queue.
+- **Both are parked human states**, like the #154 pair: not in
+  `BUSY_STATUSES`, so no polling and no stale sweep. READY is in
+  `yolo.SWEEP_STATUSES` (a volume in review 2 whose original was
+  re-cut still needs a detection run); DONE is not, because the sweep
+  stops at the end of review 2. `models.REVIEW_STATUSES` is the four
+  of them together, and `recalculate_issues` reads it: the recompute
+  button of step 1 is reachable from a volume in review 2, and a
+  rebuild of the page-number issues says nothing about the redactions.
+- The step chooser sends DONE to **step 2**, not step 3: step 3 is
+  paused (#173/#206), and step 2 is where the state is shown and where
+  its link waits. Send nobody to a step whose only button refuses.
+- A report reads these values directly. The stats page (#260) was
+  drafted against "DONE and a `Detection` row exists"; with #263 that
+  row is `status = READY_FOR_REDACTION_REVIEW`, and "redaction review
+  complete" is `status in (REDACTION_REVIEW_DONE, APPROVED,
+  EXTRACTED)`.
 
 ## The glued outputs, by scan id (issue #243)
 

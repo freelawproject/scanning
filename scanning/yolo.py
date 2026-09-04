@@ -120,11 +120,19 @@ MERGE_TMP_PREFIX = "yolodetect-"
 #: would queue an hour of page rendering, forever.
 APPLY_MAX_ATTEMPTS = 3
 
-#: The one status the apply is queued from. Review 2 follows review 1,
-#: so a merged run waits for the approval rather than overtaking it.
-#: Every other status is deferred, never marked: a scan approved into
-#: step 3, errored or re-queued comes back through the admin re-queue.
-APPLY_STATUS = Status.PAGE_COMPLETENESS_REVIEW_DONE
+#: The statuses the apply is queued from. Review 2 follows review 1,
+#: so a merged run waits for the review-1 approval rather than
+#: overtaking it. ``READY_FOR_REDACTION_REVIEW`` is here as well
+#: (#263): a *second* detection run over a volume already in review 2
+#: -- an operator's ``enqueue_yolo_detect --dead-runs``, or a re-cut
+#: shard set -- must reach its apply too, and the apply parks it back
+#: in review 2. Every other status is deferred, never marked: a scan
+#: whose redaction review is done, approved into step 3, errored or
+#: re-queued comes back through the admin re-queue.
+APPLY_STATUSES = (
+    Status.PAGE_COMPLETENESS_REVIEW_DONE,
+    Status.READY_FOR_REDACTION_REVIEW,
+)
 
 #: The statuses the sweep starts a run from (#250): the parked states
 #: between the pipeline and the end of review 2. QUEUED and PROCESSING
@@ -139,6 +147,7 @@ SWEEP_STATUSES = frozenset(
         Status.AWAITING_VALIDATION,
         Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
         Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        Status.READY_FOR_REDACTION_REVIEW,
     }
 )
 
@@ -919,10 +928,12 @@ def queue_ready_runs() -> int:
     (#204), which stays off the queue because it is seconds of work
     over a JSON file.
 
-    Only ``PAGE_COMPLETENESS_REVIEW_DONE`` is taken, with a
-    compare-and-swap: review 2 follows review 1, and a scan that is
-    approved, errored or busy is deferred without a mark, so it comes
-    back when it holds that status again.
+    Only ``APPLY_STATUSES`` is taken, with a compare-and-swap: review 2
+    follows review 1, and a scan that is approved, errored or busy is
+    deferred without a mark, so it comes back when it holds one of
+    those statuses again. A volume already in review 2 is in that set
+    (#263) because a second detection run must reach its apply as
+    well.
 
     :returns: How many scans were queued.
     :rtype: int
@@ -942,7 +953,7 @@ def queue_ready_runs() -> int:
     )
     queued = 0
     for scan in Scan.objects.filter(
-        pk__in=list(scan_ids), status=APPLY_STATUS
+        pk__in=list(scan_ids), status__in=APPLY_STATUSES
     ).select_related("reporter"):
         rows = live_detect_jobs(scan)
         if not rows:
@@ -963,7 +974,9 @@ def queue_ready_runs() -> int:
         if int(state.get("attempts") or 0) >= APPLY_MAX_ATTEMPTS:
             continue
 
-        claimed = Scan.objects.filter(pk=scan.pk, status=APPLY_STATUS).update(
+        claimed = Scan.objects.filter(
+            pk=scan.pk, status__in=APPLY_STATUSES
+        ).update(
             status=Status.QUEUED,
             queued_action=QueuedAction.COMPUTE_REDACTIONS,
             progress_message=(
