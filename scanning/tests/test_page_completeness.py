@@ -11,6 +11,9 @@ and #151 gives that question a button. Under test:
   fragment must render the same way
 """
 
+import json
+import pathlib
+
 from django.contrib.messages import get_messages
 from django.urls import reverse
 
@@ -21,6 +24,7 @@ from scanning.factories import (
     ScanFactory,
 )
 from scanning.models import (
+    CheckName,
     Detection,
     JobEngine,
     JobStage,
@@ -704,3 +708,60 @@ class TestStepOneGoal(ScanningTestCase):
 
         self.assertContains(response, "Goal: make sure this volume is page")
         self.assertContains(response, "missing, duplicated, mislabeled")
+
+
+class TestTheCardOfARangeMissingAtTheEnd(ScanningTestCase):
+    """The card of a trailing gap must reach its placeholder (#256).
+
+    The card says "ask a scanner for them at the placeholder at the end
+    of the volume", so the click has to land there. Its own address is a
+    printed number the volume does not show, and the placeholder carries
+    the range as its label, so neither of ``goToPage``'s label lookups
+    finds it. The physical address does.
+    """
+
+    def _step_one(self):
+        """Render step 1 of a volume that stops 10 pages early.
+
+        :returns: The response.
+        """
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            page_count=10,
+            start_page=1,
+            end_page=20,
+            ocr_results=dots_results(10),
+        )
+        # As in production, where the recompute runs on a web pod that
+        # never pulled the original: the page count stands as stored.
+        pathlib.Path(scan.original_pdf.path).unlink()
+        services.recalculate_issues(scan)
+        return self.client.get(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+        )
+
+    def test_the_card_navigates_to_the_page_the_volume_stops_at(self):
+        response = self._step_one()
+
+        card = next(
+            i
+            for i in response.context["issues"]
+            if i.check_name == CheckName.LARGE_GAP
+        )
+        self.assertEqual(card.page_number, 11)
+        self.assertEqual(card.nav_pdf_index, 9)
+
+    def test_the_last_page_of_the_volume_keeps_no_red_border(self):
+        """It is not itself at fault; the card only navigates to it."""
+        response = self._step_one()
+
+        flagged = json.loads(response.context["flagged_indices_json"])
+        self.assertNotIn(9, flagged)
+
+    def test_the_placeholder_reaches_the_viewer(self):
+        response = self._step_one()
+
+        self.assertContains(response, "missing_range")
+        self.assertContains(response, "11-20")

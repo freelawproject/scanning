@@ -447,6 +447,19 @@ change.
 - **The reviewer judges.** The pages may be an index nobody numbered
   rather than absent leaves. The placeholder offers the upload and the
   ask; it decides nothing, the rule of the approve button (#151).
+- **The card reaches the placeholder by the physical address.** Its own
+  address is a printed number the volume does not show, so
+  `logical_to_indices` resolves it to nothing, and the placeholder
+  carries the range as its label, so neither of `goToPage`'s label
+  lookups (`[data-logical-number]`, then `page-<n>`) finds it either. So
+  `scan_process_view` stamps `nav_pdf_index` = the gap's anchor page,
+  the route a repair request already takes, and the template's
+  `data-pdf-index` branch resolves it by position. Not by a matching id
+  or label: an unnumbered page falls back to `logical = pdf_page`, so a
+  physical page 1276 would answer for the printed 1276 and win, being
+  earlier in the document. The stamp is written **after** the flagged
+  loop and stays out of `flagged_indices`: the last page of the volume
+  is not itself at fault and keeps no red border.
 - `missing_pages` is untouched, so the header badge keeps counting what
   blackletter reports. Nothing runs over the corpus by itself: the
   placeholder appears at the next apply, recompute or page-number edit,
