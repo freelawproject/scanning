@@ -385,6 +385,10 @@ class TestEnqueueMissingRuns(ScanningTestCase):
     def setUp(self):
         super().setUp()
         self.manifest = sweep_manifest()
+        # The refusal memo lives in the module for the daemon's
+        # lifetime; a test starts with the daemon's first tick.
+        yolo._REFUSED.clear()
+        self.addCleanup(yolo._REFUSED.clear)
 
     def _scan(
         self, status=Status.AWAITING_VALIDATION, fingerprint=FINGERPRINT
@@ -395,10 +399,17 @@ class TestEnqueueMissingRuns(ScanningTestCase):
 
     _UNSET = object()
 
-    def _sweep(self, manifest=_UNSET, reason=""):
-        """Run the sweep with S3 on and the manifest check answered."""
+    def _sweep(self, manifest=_UNSET, reason="", batch=None):
+        """Run the sweep with S3 on and the manifest check answered.
+
+        ``batch`` overrides ``YOLO_MAX_CONCURRENCY``, which the sweep
+        reads as its per-tick volume count.
+        """
+        settings_ = dict(YOLO)
+        if batch is not None:
+            settings_["YOLO_MAX_CONCURRENCY"] = batch
         with (
-            override_settings(**YOLO),
+            override_settings(**settings_),
             patch("scanning.s3_sync.s3_active", return_value=True),
             patch(
                 "scanning.sharding.committed_manifest",
@@ -536,6 +547,64 @@ class TestEnqueueMissingRuns(ScanningTestCase):
         self.assertEqual(started, 0)
         self.assertEqual(detect_jobs(scan), [])
         self.assertIn("The original PDF has changed", "".join(logs.output))
+
+    def test_one_batch_per_tick_newest_first(self):
+        """At most YOLO_MAX_CONCURRENCY volumes pay their S3 calls on one
+        tick, and a fresh upload goes before the backlog."""
+        scans = [self._scan() for _ in range(5)]
+        self.assertEqual(self._sweep(batch=2), 2)
+        swept = [scan for scan in scans if detect_jobs(scan)]
+        self.assertEqual(
+            [scan.pk for scan in swept], [scans[3].pk, scans[4].pk]
+        )
+        self.assertEqual(self.committed.call_count, 2)
+        # The next ticks take the rest; nothing is swept twice.
+        self.assertEqual(self._sweep(batch=2), 2)
+        self.assertEqual(self._sweep(batch=2), 1)
+        self.assertEqual(self._sweep(batch=2), 0)
+        self.assertTrue(all(len(detect_jobs(scan)) == 3 for scan in scans))
+
+    def test_a_refused_scan_is_left_alone_for_an_hour_and_logged_once(self):
+        """Two S3 calls and a log line every 5 seconds, for as long as a
+        re-queue takes, is the cost this memo removes."""
+        scan = self._scan()
+        with self.assertLogs("scanning.yolo", level="DEBUG") as logs:
+            self._sweep(manifest=None, reason="The original PDF has changed")
+            self.assertEqual(self.committed.call_count, 1)
+            self._sweep(manifest=None, reason="The original PDF has changed")
+            self.assertEqual(self.committed.call_count, 0)
+        info = [line for line in logs.output if line.startswith("INFO")]
+        self.assertEqual(len(info), 1)
+        self.assertIn(str(scan.pk), info[0])
+
+        # The hour passes: one more look, at DEBUG.
+        retry_at, times = yolo._REFUSED[scan.pk]
+        self.assertEqual(times, 1)
+        with (
+            patch("scanning.yolo.time.monotonic", return_value=retry_at + 1),
+            self.assertLogs("scanning.yolo", level="DEBUG") as logs,
+        ):
+            self._sweep(manifest=None, reason="still changed")
+        self.assertEqual(self.committed.call_count, 1)
+        self.assertTrue(logs.output[0].startswith("DEBUG"))
+        self.assertEqual(yolo._REFUSED[scan.pk][1], 2)
+
+    def test_a_refused_scan_does_not_hold_a_place_in_the_batch(self):
+        """With a batch of one, a permanently refused volume must not
+        starve every later upload."""
+        refused = self._scan()
+        self._sweep(manifest=None, reason="no original", batch=1)
+        fresh = self._scan()
+        self.assertEqual(self._sweep(batch=1), 1)
+        self.assertEqual(len(detect_jobs(fresh)), 3)
+        self.assertEqual(detect_jobs(refused), [])
+
+    def test_a_scan_that_recovers_leaves_the_memo(self):
+        scan = self._scan()
+        self._sweep(manifest=None, reason="no original")
+        yolo._REFUSED[scan.pk] = (0.0, 1)  # the hour is up
+        self.assertEqual(self._sweep(), 1)
+        self.assertNotIn(scan.pk, yolo._REFUSED)
 
     def test_the_stage_switch_stops_the_sweep(self):
         scan = self._scan()

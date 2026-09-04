@@ -234,6 +234,21 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
     )
 
 
+#: How long the sweep leaves a scan alone after ``committed_manifest``
+#: refused its shard set. The submit tick is every 5 seconds, and a
+#: refusal lasts until an admin re-queue re-cuts the set (a re-uploaded
+#: or missing original, a ``MANIFEST_VERSION`` bump over the whole
+#: corpus), so looked at on every tick each such scan would cost two S3
+#: calls and one log line 17,000 times a day. The memo lives in the
+#: daemon process: a restart forgets it, which buys one fresh look per
+#: deploy and nothing worse, because a duplicate run is prevented by
+#: the rows in the database, never by this.
+REFUSAL_RETRY_SECONDS = 3600
+
+#: ``scan pk -> (retry at, times refused)``, see above. Tests clear it.
+_REFUSED: dict[int, tuple[float, int]] = {}
+
+
 def enqueue_missing_runs() -> int:
     """Start detection over every shard set that has no run yet.
 
@@ -255,11 +270,25 @@ def enqueue_missing_runs() -> int:
     A row written before the column is blank and matches anything, so
     a button-era run is never re-paid.
 
-    The candidates come from the database alone. Only then does each
-    one cost an S3 HEAD (``sharding.committed_manifest``), which
-    verifies the stored set against the original without reading a
-    shard; a refused set is logged and looked at again next tick,
-    until a re-queue re-cuts it. The pass makes no call to RunPod.
+    The rows are the whole state, so a daemon killed mid-sweep starts
+    nothing twice: a scan whose rows landed (one ``bulk_create``, one
+    transaction) is no candidate on the next tick, and a scan whose
+    rows did not land is, which is right.
+
+    **One batch per tick.** The candidates come from the database
+    alone, newest first, and at most ``YOLO_MAX_CONCURRENCY`` of them
+    are looked at: each one costs two S3 calls
+    (``sharding.committed_manifest`` reads the manifest and HEADs the
+    original, and reads no shard), and the scheduler is serial, so an
+    unbounded first tick over a corpus of parked volumes would hold
+    every poll and every claim for minutes. The cap counts shards in
+    flight and this counts volumes per tick, but one value serves both
+    without a knob nobody would tune: the backlog only takes more
+    ticks to turn into rows, and nothing waits on that. A refused set
+    is logged once at INFO, then at DEBUG, and left alone for
+    :data:`REFUSAL_RETRY_SECONDS` (see :data:`_REFUSED`), so a
+    permanent refusal neither fills the log nor holds a place in the
+    batch. The pass makes no call to RunPod.
 
     :returns: How many runs were started.
     :rtype: int
@@ -270,6 +299,9 @@ def enqueue_missing_runs() -> int:
 
     if not enabled() or not s3_sync.s3_active():
         return 0
+
+    now = time.monotonic()
+    skipped = [pk for pk, (retry_at, _) in _REFUSED.items() if retry_at > now]
 
     detected = ExternalJob.objects.filter(
         scan=OuterRef("pk"),
@@ -283,19 +315,29 @@ def enqueue_missing_runs() -> int:
     candidates = (
         Scan.objects.filter(status__in=SWEEP_STATUSES)
         .exclude(source_fingerprint="")
+        .exclude(pk__in=skipped)
         .annotate(detected=Exists(detected))
         .filter(detected=False)
-        .order_by("pk")
+        .order_by("-pk")[: settings.YOLO_MAX_CONCURRENCY]
     )
 
     started = 0
     for scan in candidates:
         manifest, reason = sharding.committed_manifest(scan)
         if manifest is None:
-            logger.info(
-                "Scan %s is not swept for detection: %s", scan.pk, reason
+            _, times = _REFUSED.get(scan.pk, (0.0, 0))
+            _REFUSED[scan.pk] = (now + REFUSAL_RETRY_SECONDS, times + 1)
+            logger.log(
+                logging.INFO if times == 0 else logging.DEBUG,
+                "Scan %s is not swept for detection (refusal %d, next look "
+                "in %ds): %s",
+                scan.pk,
+                times + 1,
+                REFUSAL_RETRY_SECONDS,
+                reason,
             )
             continue
+        _REFUSED.pop(scan.pk, None)
         rows = ensure_detect_jobs(scan, manifest)
         logger.info(
             "Started detection run %s for scan %s over %d shard(s) "

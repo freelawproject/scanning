@@ -61,6 +61,13 @@ RUNPOD_YOLO_ENDPOINT_ID = env.str("RUNPOD_YOLO_ENDPOINT_ID", default="")
 # the endpoint's own ``max_workers``, which must be at least this value
 # or the extra rows wait in the provider's queue with the ceiling clock
 # running on them (#250 raised this from 2 to 3).
+#
+# The detection sweep (``yolo.enqueue_missing_runs``) reads it too, as
+# the number of volumes it looks at per submit tick. The two count
+# different things -- shards in flight, volumes per tick -- but one
+# value serves both, and a second knob would be one nobody tunes: a
+# smaller batch only means the backlog takes more ticks to become
+# rows, and nothing waits on that.
 YOLO_MAX_CONCURRENCY = env.int("YOLO_MAX_CONCURRENCY", default=3)
 
 # Attempts per shard before its job is failed. Serverless workers are

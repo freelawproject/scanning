@@ -1016,8 +1016,20 @@ only what is new or specific:
   matches anything, so no button-era run is re-paid. Candidates come
   from the database (`SWEEP_STATUSES`: the parked states between the
   pipeline and the end of review 2; QUEUED/PROCESSING are the
-  pipeline's, ERROR and beyond come back through the re-queue), and
-  only then does each cost one HEAD (`sharding.committed_manifest`).
+  pipeline's, ERROR and beyond come back through the re-queue), newest
+  first and **at most `YOLO_MAX_CONCURRENCY` per tick** -- each costs
+  two S3 calls (`sharding.committed_manifest`: the manifest and a HEAD
+  of the original) and the scheduler is serial, so an unbounded first
+  tick over the corpus would hold every poll for minutes. One value
+  for shards in flight and volumes per tick, on purpose: a second knob
+  would be one nobody tunes, and a small batch only means the rows are
+  created over more ticks. A refused set (re-uploaded or missing
+  original, a `MANIFEST_VERSION` bump) is memoed in the daemon process
+  for `REFUSAL_RETRY_SECONDS` and logged once at INFO, then DEBUG --
+  looked at every 5 s it would cost two S3 calls and a line 17,000
+  times a day, and it would hold a place in the batch. The memo is a
+  cost saver only: the rows are what prevent a second run, so a
+  restart that forgets it starts nothing twice.
   `yolo.ensure_detect_jobs` is the only creator and the sweep its
   only caller, pinned by `TestKnownEnqueuePaths`. The staff button of
   #195 is deleted: it started nothing the sweep does not, and a
