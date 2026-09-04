@@ -37,7 +37,7 @@ Four properties are load-bearing and easy to break:
 - **Every write is a compare-and-swap** (:func:`_write`), so no lock is
   held across an HTTP call. The other writer is the web process, not a
   second daemon: the admin re-queue, the admin scan deletion and the
-  two start buttons all call into this module from a request, and the
+  dots.mocr start button all call into this module from a request, and the
   loser's update simply matches nothing.
 - **A resubmission bumps ``attempt``**, re-addressing the result
   object. Doctor finishes a conversion after we stop listening, and
@@ -71,7 +71,7 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from scanning import doctor_client, runpod_client, s3_sync
+from scanning import doctor_client, runpod_client, s3_sync, sharding
 from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
@@ -617,12 +617,16 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
     of the *volume* -- the worker counts from zero inside the shard it
     was given.
 
-    The pages a retry rung saved, and the pages whose answer was not
-    layout JSON (``filtered``: text but no cell, so no page number
-    either), are logged too, at INFO, so the ladder's recovery rate and
-    the size of each hole class can be read off the logs. The numbers
-    survive in ``provider_meta["output"]`` either way; ``_complete``
-    stores the whole summary.
+    The pages a retry rung saved, and the pages whose broken layout
+    JSON the repair of issue #242 gave back, are logged at INFO, so the
+    ladder's recovery rate and the repair's reach can be read off the
+    logs. A page whose answer was not layout JSON and which nothing
+    repaired (``filtered``: text but no cell, so no page number either)
+    is a **WARNING**, like a failed page: issue #242 asks for it by
+    name, because each such page is a new shape of the fault and the
+    log line is what makes the next one visible. The numbers survive in
+    ``provider_meta["output"]`` either way; ``_complete`` stores the
+    whole summary.
 
     :param job: The row just completed.
     :param output: The provider's summary.
@@ -641,13 +645,23 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
             return f"volume page(s) {volume}"
         return f"shard page(s) {pages}"
 
-    for field, verb in (
-        ("recovered_pages", "recovered %d page(s) on a retry"),
-        ("filtered_pages", "answered %d page(s) with no layout JSON"),
+    for field, verb, level in (
+        ("recovered_pages", "recovered %d page(s) on a retry", logging.INFO),
+        (
+            "repaired_pages",
+            "repaired the layout JSON of %d page(s)",
+            logging.INFO,
+        ),
+        (
+            "filtered_pages",
+            "answered %d page(s) with layout JSON nothing could repair",
+            logging.WARNING,
+        ),
     ):
         pages = output.get(field)
         if pages and isinstance(pages, list):
-            logger.info(
+            logger.log(
+                level,
                 "%s/%s shard %d/%d of scan %s " + verb + ": %s",
                 job.stage,
                 job.engine,
@@ -1132,10 +1146,7 @@ def run_summary(scan, stage: str, engine: str, apply_run=None) -> dict | None:
     if not rows:
         return None
 
-    statuses: dict[str, int] = {}
-    for row in rows:
-        statuses[row.status] = statuses.get(row.status, 0) + 1
-
+    statuses = _status_counts(rows)
     failed = [
         row
         for row in rows
@@ -1148,10 +1159,6 @@ def run_summary(scan, stage: str, engine: str, apply_run=None) -> dict | None:
     )
     unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     first_failure = failed[0] if failed else None
-    label = ", ".join(
-        f"{count} {ExternalJob(status=status).get_status_display().lower()}"
-        for status, count in sorted(statuses.items())
-    )
     return {
         "run": rows[0].run,
         "total": len(rows),
@@ -1159,16 +1166,53 @@ def run_summary(scan, stage: str, engine: str, apply_run=None) -> dict | None:
         "open": sum(1 for row in rows if row.status in unfinished),
         "failed": len(failed),
         "statuses": statuses,
-        "label": label,
+        "label": rows_label(rows),
         "error_code": first_failure.error_code if first_failure else "",
         "error_message": first_failure.error_message if first_failure else "",
     }
 
 
+def _status_counts(rows: list[ExternalJob]) -> dict[str, int]:
+    """Count the rows of one run by status.
+
+    :param rows: The rows of one run.
+    :returns: ``{status: count}``.
+    :rtype: dict[str, int]
+    """
+    statuses: dict[str, int] = {}
+    for row in rows:
+        statuses[row.status] = statuses.get(row.status, 0) + 1
+    return statuses
+
+
+def rows_label(rows: list[ExternalJob]) -> str:
+    """Return the status counts of some rows as one readable phrase.
+
+    ``"2 consumed, 1 failed"``: what :func:`run_summary` shows the
+    process page, and what the glued-output index (#243) shows for
+    every run, live or not. A template rendering the counts dict
+    directly would print a Python dict.
+
+    :param rows: The rows of one run.
+    :returns: The counts, one per status, in status order.
+    :rtype: str
+    """
+    return ", ".join(
+        f"{count} {ExternalJob(status=status).get_status_display().lower()}"
+        for status, count in sorted(_status_counts(rows).items())
+    )
+
+
 #: The per-shard page lists a dots.mocr summary carries (shard-local
 #: indexes). The first two are holes to the page-number reader; the
-#: third is the pages a retry rung saved.
-PAGE_LIST_NAMES = ("failed_pages", "filtered_pages", "recovered_pages")
+#: third is the pages a retry rung saved, and the fourth the pages
+#: whose layout JSON broke on one character and was repaired (#242).
+PAGE_LIST_NAMES = (
+    "failed_pages",
+    "filtered_pages",
+    "recovered_pages",
+    "repaired_pages",
+)
 
 
 def page_lists(job: ExternalJob) -> dict[str, list]:
@@ -1436,6 +1480,12 @@ def ensure_shard_jobs(
     reusable = (
         _reusable_results(scan, stage, engine, specs) if reuse_results else {}
     )
+    # The set the run is cut for, as one string. Not in the identity:
+    # ``_still_describes`` compares ``input_manifest`` exactly, so a new
+    # key there would read every live run as stale and re-pay it. The
+    # column is what lets the detection sweep ask "has this set been
+    # detected" in one query (#250).
+    fingerprint = sharding.fingerprint_value(manifest["source"])
     rows = []
     for index, (key, identity) in enumerate(specs):
         row = ExternalJob(
@@ -1453,6 +1503,7 @@ def ensure_shard_jobs(
             # merge read what was actually processed rather than a
             # manifest that may since have changed.
             input_manifest=identity,
+            source_fingerprint=fingerprint,
             # No deadline: a row in our own queue has no clock. The
             # queue ceiling is stamped at the attempt's first claim,
             # when the row is handed to the provider (issue #218).

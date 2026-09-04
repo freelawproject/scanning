@@ -884,6 +884,28 @@ class TestPresignHelpers(SimpleTestCase):
         )
 
     @override_settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket", TESTING=True)
+    def test_presign_get_can_name_the_download(self):
+        """The glued-output routes (#243) hand the URL to a browser, and
+        a signed Content-Disposition makes it save a named file."""
+        client = MagicMock()
+        with patch("scanning.s3_sync._signing_s3_client", return_value=client):
+            s3_sync.presign_get(
+                "jobs/r1-volume.json",
+                600,
+                content_disposition='attachment; filename="a.json"',
+            )
+
+        client.generate_presigned_url.assert_called_once_with(
+            "get_object",
+            Params={
+                "Bucket": "bucket",
+                "Key": "jobs/r1-volume.json",
+                "ResponseContentDisposition": 'attachment; filename="a.json"',
+            },
+            ExpiresIn=600,
+        )
+
+    @override_settings(AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket", TESTING=True)
     def test_presign_put_signs_the_content_type(self):
         """Doctor sends application/pdf; an unsigned PUT gets a 403."""
         client = MagicMock()

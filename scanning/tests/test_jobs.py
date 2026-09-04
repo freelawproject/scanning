@@ -118,6 +118,30 @@ class TestEnsureConvertJobs(ScanningTestCase):
             self.assertEqual(job.provider, JobProvider.DOCTOR)
             self.assertEqual(job.run, 1)
 
+    def test_rows_carry_the_source_fingerprint_of_their_set(self):
+        """The set as one string, beside the per-shard identity (#250).
+
+        The detection sweep asks "has this set been detected" with it,
+        so it is stamped for every stage; and it is not in
+        ``input_manifest``, which ``_still_describes`` compares exactly.
+        """
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=2, pages_per_shard=7)
+
+        created = jobs.ensure_convert_jobs(scan, manifest)
+
+        self.assertEqual(
+            {job.source_fingerprint for job in created}, {"2048:14"}
+        )
+        self.assertNotIn("source_fingerprint", created[0].input_manifest)
+        # The same value ``ensure_shards`` stamps on the scan.
+        from scanning import sharding
+
+        self.assertEqual(
+            created[0].source_fingerprint,
+            sharding.fingerprint_value(manifest["source"]),
+        )
+
     def test_rows_carry_the_shard_identity_they_were_cut_from(self):
         """So the merge checks what ran, not a live manifest.
 

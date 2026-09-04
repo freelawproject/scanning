@@ -569,6 +569,48 @@ a.doc-name:hover { text-decoration: underline; }
 }
 .undo-replace-btn:hover { background: #92400e; }
 
+/* Ask a scanner for the page (issue #249). Orange: it is work for a
+   person with the book, not a change to the volume. */
+.repair-btn {
+    padding: 3px 10px;
+    font-size: 11px;
+    background: #fff7ed;
+    color: #9a3412;
+    border: 1px solid #fdba74;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.repair-btn:hover { background: #ffedd5; }
+.missing-placeholder .repair-btn {
+    margin-top: 10px;
+    padding: 6px 14px;
+    font-size: 13px;
+}
+
+/* The note that says a scanner was asked for this page. */
+.repair-note {
+    flex-basis: 100%;
+    font-size: 11px;
+    color: #9a3412;
+}
+.repair-note.fulfilled { color: #166534; }
+.repair-note .repair-note-text { font-style: italic; }
+.dismiss-repair-btn {
+    cursor: pointer;
+    background: #c2410c;
+    color: white;
+    border: none;
+    border-radius: 3px;
+    padding: 1px 6px;
+    font-size: 10px;
+    margin-left: 4px;
+}
+.dismiss-repair-btn:hover { background: #9a3412; }
+.missing-placeholder .repair-note {
+    margin-bottom: 10px;
+    font-size: 13px;
+}
+
 /* An inserted page uploaded as a PDF. */
 .inserted-pdf { display: block; max-width: 100%; }
 .inserted-pdf-note {

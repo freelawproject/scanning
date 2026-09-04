@@ -27,9 +27,16 @@ therefore stable (``jobs.hole_is_stable``): the command skips a volume
 whose every hole is stable, and the carry keeps such a shard instead of
 re-paying it. So the command may be run again after a new worker image,
 and reads only what that image has not yet tried. Without a new image
-a second run buys nothing, and says so per named scan. If the fix for
-a filtered page turns out to be a JSON repair in the worker (#242), no
-re-read helps until that image ships.
+a second run buys nothing, and says so per named scan.
+
+**Run ``reglue_dots_mocr`` first.** A filtered page is usually good
+layout JSON with one character wrong (#242), and the glue repairs it
+from the stored answer at no GPU cost. This command reads
+``filtered_pages`` off the row, and a run glued before that deploy
+still carries them -- so a re-read started first pays RunPod for the
+very shards a re-glue fixes for free. Whatever still reports a
+filtered page after the re-glue is a shape no repair arm reaches, and
+only then is a paid re-read worth considering.
 
 An approved volume is not touched: the command takes only the
 statuses ``apply_ready_runs`` reads, and

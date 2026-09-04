@@ -11,6 +11,9 @@ DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py test scan
 # Run a single test class
 DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py test scanning.tests.TestScanUpload -v 2
 
+# Survey the layout-JSON repair over the corpus, changing nothing (#242)
+docker exec scanning-daemon python manage.py reglue_dots_mocr --dry-run
+
 # Generate migrations
 DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py makemigrations scanning
 
@@ -57,7 +60,7 @@ with the staff button kept for re-runs), the page numbers plus Issues
 as an apply pass on the collect tick (#149/#204), review 1 got its
 approve button (#151) and one model for its human page edits (#214),
 and YOLO detection came back as a rebuilt worker image (#194) with its
-job rows and its staff button (#195) and the redaction work that reads
+job rows (#195; the staff button went with #250) and the redaction work that reads
 its output (#196), all below; what is still missing is step 3, the
 file generation (#206), so:
 
@@ -71,9 +74,8 @@ file generation (#206), so:
   banner in HTML views. `start_validate` splits by scan (#151): only a
   legacy row hears "paused", because a new-pipeline volume is refused
   permanently, not temporarily. `start_detect` left that set with #196:
-  detection works, so a volume with no detections is told that a staff
-  member starts the run (`NO_DETECTIONS_MESSAGE`), not that a pipeline
-  is paused. The daemon parks pre-cutover queued rows
+  detection works, so a volume with no detections is told where its
+  run stands (`detection_message`), not that a pipeline is paused. The daemon parks pre-cutover queued rows
   carrying a legacy `queued_action` back to PENDING_REVIEW with the
   same message; admin re-queue resets `queued_action` to
   FULL_PIPELINE.
@@ -232,6 +234,18 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
   same read (`page_edits.pending_edit_flags` via `_review_flags`) and
   puts the paid-run confirm on the approve button (#224). Computed
   apart, the two disagreed on stale rows.
+- **A deletion answers the cards of the page it names** (#255,
+  `page_edits.drop_deleted_pages`, called by `recalculate_issues`
+  before `drop_dismissed`). The cards are built from `ocr_results`,
+  which still holds the page until the apply, so "No page number
+  detected on PDF page 12" came back on every press of the recompute
+  button. Only `models.CHECKS_A_DELETION_ANSWERS` — the physical space
+  of `PHYSICAL_PAGE_CHECKS` less `stale_page_edit`, which must always
+  be heard. A `duplicate_page` or a `missing_page` card names a
+  printed number and stays: to answer one the sequence analysis has to
+  run again over the volume without the deleted pages, which is a
+  different pass. The filter reads `deleted_pages`, so a withdrawn row
+  (#232) and a row of another original (#214) hide nothing.
 - **The image is on the default storage** under the scan's
   `page_edits/` prefix: excluded from the generic sync, swept by admin
   deletion, presignable for #206. `PageInsert` used
@@ -307,6 +321,165 @@ the volume after the approval.
   link stands whatever the render does: a cross-origin read of the
   bucket needs the CORS rule of #185, which a deployment may not carry
   yet.
+
+## Page repair requests (issue #249)
+
+A reviewer with no book finds a blurry page or a missing leaf, and
+cannot fix it. `models.PageRepairRequest` keeps the finding until a
+scanner does the work. The pieces: the model, `repairs.py` (queries
+and the derived state), two endpoints in `views_process.py`
+(`request_page_repair`, `dismiss_page_repair`), the
+`views.repair_queue` page at `/repairs/`, and the "Ask for a rescan"
+and "Ask for this page" buttons of step 1 (`viewer_step1.js`). A
+read-back endpoint was written and deleted before it shipped: nothing
+called it, and an endpoint nobody reaches still carries its surface
+(#219). What must not be broken:
+
+- **A request is not a `PageEdit`.** A `PageEdit` is a decision the
+  apply builds into the volume; a request is work for a person. It
+  needs a free-text `note` (500 characters, `repairs.NOTE_MAX_CHARS`)
+  and it has an end state a decision does not have. A reader of
+  `page_edits.open_edits` never sees one, so the apply cannot mistake
+  it for a decision, and `has_pending_changes` ignores it.
+- **The address is the `PageEdit` address**: `pdf_page` for a rescan
+  (REPLACE), `anchor_pdf_page` for a missing leaf (INSERT, 0 = before
+  page 1), both in the physical space of the original as uploaded.
+  The printed number rides along in `logical_page` as a label. The
+  endpoint resolves both through `_pdf_page_of` and `_anchor_of`, so
+  a page outside the volume is 404.
+- **Fulfilled is derived, never stamped.** `repairs.annotate_fulfilled`
+  marks a request whose address carries a `REPLACE_PAGE` or
+  `INSERT_PAGE` edit that is **later than the request**, not
+  withdrawn, and made against the **same upload** (same fingerprint,
+  or a blank one). The date is load-bearing: a reviewer who finds the
+  replacement blurry too asks again, and without it that request is
+  born fulfilled and no scanner ever sees it. `applied_at` is **not**
+  read: it says whether a decision is built into an output, and the
+  fingerprint says which upload it is counted against. The two are
+  independent, and neither overrides the other. So the upload cannot
+  race a stamp, an undo of the upload (#232) reopens the request with
+  no second writer, and the "Fulfilled" tab of the queue costs one
+  `Exists` subquery.
+- **The original never changes.** Every address is a page of the
+  original as uploaded, and the apply (#206) writes another file and
+  leaves it alone. So an apply never invalidates an address, and a
+  request goes stale for one reason only: somebody re-uploaded the
+  volume. The same holds for `PageEdit.source_fingerprint`.
+- **A fulfilled row is still an open row, and the key matches it.**
+  SQL cannot index a derived flag, so the partial unique key cannot
+  exclude a fulfilled request, and a reviewer who finds the new scan
+  bad too gets `created: false` from `get_or_create`. The endpoint
+  says so (`already_fulfilled`, `REPAIR_ALREADY_FULFILLED_MESSAGE`),
+  the viewer shows that message and not "already requested", and the
+  fulfilled note keeps its Dismiss button so the reviewer can close
+  the answered request and ask again. Do not let that path go quiet:
+  it is the mirror of the born-fulfilled case, one step later.
+- **Dismissed, never deleted.** `repairs.dismiss` stamps `dismissed_at`
+  and `dismissed_by` (and writes `date_modified`, since `update()`
+  skips `auto_now`). Any logged-in user may dismiss, the rule of every
+  review-1 button. A second dismissal is a no-op. One open row per
+  address (`uniq_open_repair_request_per_address`, partial over
+  `dismissed_at IS NULL`, `nulls_distinct=False`): a second request
+  answers the first row with `created: false`.
+- **A stale request is marked, not dropped**: `PageRepairRequest.is_stale`
+  (and `repairs.is_stale` for a caller holding the scan) is the
+  fingerprint rule of `page_edits.is_stale`. The step-1 viewer and the
+  queue page both show "EARLIER UPLOAD". Nothing applies a request, so
+  nothing needs to refuse one.
+- **The note is escaped where it is drawn**: `escapeHtml` in the
+  viewer, the auto-escape in the templates, and `json_script` for the
+  script block. It is not narrowed, because it is prose, not a page
+  number. The label goes through `_page_label` like every other label.
+  For a rescan the server reads it off `ocr_results` itself and drops
+  a reading the narrowing refuses; a label sent by the viewer is
+  ignored, since refusing it would fail the button on exactly the page
+  whose reading is junk. For a missing leaf the label is an address
+  (`_anchor_of` places an older viewer's gap by it), so a refused one
+  is a 400.
+- **The queue page paginates scans, not rows** (`repairs.queue_scan_ids`
+  then `repairs.group_by_scan`): a row is never deleted, so the `all`
+  and `dismissed` states grow for good, and a page that loaded every
+  row first would grow with them.
+- **A missing leaf can be asked for only where a placeholder is
+  drawn**: the button sits on the `missing` entry the sequence
+  analysis produced. A run of more than 6 pages carries one placeholder
+  for the whole range, and only at the end of the volume (#256, below).
+  A gap the page numbers do not reveal has no button yet.
+- **Step 1 draws everything from one list** (`SCAN_CONFIG.repairRequests`):
+  the note on the page (with Dismiss while it waits), the `NEED`
+  sidebar badge, the "Repairs requested" section and the header badge.
+  A request is not an `Issue` row: an issue card has its own dismiss,
+  and one finding must have one. The buttons bind by delegation on
+  the container, as Replace does (#232), and `refreshSavedLabel` runs
+  after a note is added or removed.
+- **The queue links to a page**: `scan_process?step=1&goto=<pdf_index>`
+  scrolls to the placeholder once it exists (`goToRequestedPage`).
+  The header count (`context_processors.waiting_repairs`) is one
+  query for a logged-in user.
+
+## A range missing at the end (issue #256)
+
+`blackletter.validate.build_issues` collapses a contiguous run of more
+than 6 missing pages into one `large_gap` card **and drops every page
+of the run** from `actually_missing`, which is the only source of a
+`missing` entry in `page_map`. So the 41-page run of scan 2532 had a
+warning and nothing a reviewer could act on: no upload form, and no
+gap to ask a scanner for (#249). `services._project_trailing_gap` is
+the answer: a scanning-side pass over what `build_issues` returned,
+the shape of `_note_curator_ranges` (#233) and of #227 — no blackletter
+change.
+
+- **One placeholder per gap, because the gap is the address.** An
+  insert and an INSERT repair request are both addressed by
+  `anchor_pdf_page` (#214/#249) and one open row may exist per address,
+  so a placeholder per missing number would put 41 buttons on one row
+  and every ask after the first would answer "already requested". The
+  label is the range instead (`4-13`), with the hyphen every reader of
+  a range parses (#233); the viewer's heading shows the en dash.
+- **A run at the end only.** Inside a volume those pages are almost
+  always in the book with a number nobody read, so the card stands
+  alone there — a button would send a scanner to the shelf for
+  nothing. A run at the start is out for the same reason, and front
+  matter carries no printed numbers at all. The qualifying test is
+  `missing[-1] == exp_end`; every number the volume shows is out of
+  `missing`, so a run that ends there also starts above the last number
+  read.
+- **The collapse threshold is not copied.** The pass asks whether the
+  run's first page survived into `result["missing_pages"]`: if it did,
+  blackletter drew one placeholder per page itself. A retune upstream
+  can therefore not give one page two placeholders.
+- **Both builders of `page_map` call it** (`recalculate_issues` and
+  `rebuild_page_map`), or a page-number edit would drop the placeholder
+  from under the reviewer. In `recalculate_issues` it runs beside
+  `_note_curator_ranges`, before the dismissal filter, so a dismissal
+  matches the card as it reads.
+- **The card is reworded, and its key does not move.** "Likely an OCR
+  misread rather than genuinely missing pages" names no action, so the
+  card now says the pages are not in the volume, what the last number
+  read was, and the two ways out: ask a scanner at the placeholder, or
+  correct a page number and recompute. It stays a `warning`. A card
+  that is not there changes nothing — the placeholder stands on the run
+  alone.
+- **The reviewer judges.** The pages may be an index nobody numbered
+  rather than absent leaves. The placeholder offers the upload and the
+  ask; it decides nothing, the rule of the approve button (#151).
+- **The card reaches the placeholder by the physical address.** Its own
+  address is a printed number the volume does not show, so
+  `logical_to_indices` resolves it to nothing, and the placeholder
+  carries the range as its label, so neither of `goToPage`'s label
+  lookups (`[data-logical-number]`, then `page-<n>`) finds it either. So
+  `scan_process_view` stamps `nav_pdf_index` = the gap's anchor page,
+  the route a repair request already takes, and the template's
+  `data-pdf-index` branch resolves it by position. Not by a matching id
+  or label: an unnumbered page falls back to `logical = pdf_page`, so a
+  physical page 1276 would answer for the printed 1276 and win, being
+  earlier in the document. The stamp is written **after** the flagged
+  loop and stays out of `flagged_indices`: the last page of the volume
+  is not itself at fault and keeps no red border.
+- `missing_pages` is untouched, so the header badge keeps counting what
+  blackletter reports. Nothing runs over the corpus by itself: the
+  placeholder appears at the next apply, recompute or page-number edit,
+  or after `reapply_page_numbers`.
 
 ## Apply the page edits (issue #224)
 
@@ -693,7 +866,10 @@ trained on), tracked on `ExternalJob` rows at
   logged at INFO beside the WARNING. **A filtered page is a hole
   too**: the answer was text but not layout JSON, so there is no cell
   to place a number in; the page keeps upstream's cleaned text in
-  `md`. **Every page keeps the answer as the model wrote it in
+  `md`. Since #242 (its own section below) the repair runs first and
+  most such pages are given back, so a page that is still filtered is
+  a shape nobody has measured, and it is a WARNING.
+  **Every page keeps the answer as the model wrote it in
   `raw`** (a failed page: the last truncated answer): `cells` is
   upstream's parsed and rescaled copy with `int()` on every
   coordinate, and the cleaner discards a broken JSON, so `raw` is the
@@ -852,15 +1028,100 @@ that shows "Large gap" is a volume whose range nobody read.
   volume the next reader must see. A range the *model* read keeps the
   warning and its "Verify this is expected".
 
+## The layout JSON that broke on one character (issue #242)
+
+A `filtered` dots.mocr page is a page whose answer was **good** and
+whose JSON broke on one character. Measured on four production volumes
+(scans 2726, 2702, 2665, 2705): one filtered page each, one edit each,
+and the printed page number recovered every time. Upstream
+`post_process_output` throws the whole array away and returns the
+words, so the page reached the reader with no cell and no number.
+`scanning/layout_json.py` moves the character back.
+
+- **Three arms, one per measured shape**, and each moves one
+  character: `Expecting ',' delimiter` at a lone `"` inside a string
+  (put a backslash in front of it), `Invalid \escape` at a lone `\`
+  (put a quotation mark after it), `Extra data` at a doubled closer
+  (cut at the first complete parse). `MAX_EDITS` is 3, so a page with
+  two faults still repairs and a rewrite of a different answer cannot
+  run away. An arm whose message matches but whose text does not
+  refuses, and the page stays filtered.
+- **One module, two callers, and that is the point.** The **worker**
+  (`handler._repair_layout_json`) stops the next filtered page, and
+  the **glue** (`dots_mocr._repair_shard`) recovers the shard results
+  already in the bucket, which no new worker image reaches. The
+  Dockerfile copies `layout_json.py` next to `handler.py` (so it
+  imports it as a top-level module, like `runpod_common`) and the
+  build workflow watches it, because one arm that drifted between the
+  two sides would repair a page differently depending on which side
+  read it. No Django import in that module, ever.
+- **A repaired page is checked, not trusted.** `_check_cells` demands
+  a list of objects, a `bbox` of four numbers, a legal box
+  (upstream's `is_legal_bbox`) and a `category`. The worker hands the
+  repaired array back through upstream's own `post_process_output`,
+  so a repaired page reaches the caller by the path every other page
+  takes, bboxes included, and upstream refusing it again reads as
+  "not repaired". The glue has no page image, so it rescales with
+  `layout_json.rescale` (upstream's `post_process_cells` arithmetic)
+  and keeps upstream's cleaned text as `md` — the apply reads `cells`
+  only.
+- **`raw` is never written over.** It is the answer as the model wrote
+  it (#238), the only thing a later post-processor can start from, and
+  the reason `reglue_dots_mocr` can be run again after a new arm
+  lands. A repaired page carries `repaired` (the edits, with their
+  offsets) and `repaired_by`, `"worker"` or `"glue"`.
+- **The repair runs before the ladder climbs.** The fault is in the
+  escape and not in the render, so a second render makes the same
+  mistake: on each of the four measured pages rung 2 spent 90 to 120
+  seconds and recovered nothing. The climb is **kept** for a page the
+  arms do not reach, because that is an unmeasured shape and nothing
+  says the render is innocent there. `reglue_dots_mocr --dry-run`
+  counts what the rung recovers on those, and that number is what may
+  retire the climb.
+- **`repaired_pages` is the fourth page list** (`jobs.PAGE_LIST_NAMES`,
+  `dots_mocr.PAGE_LISTS`, `_SUMMARY_FIELDS`), and a repaired page is
+  **not** in `filtered_pages`: the repair clears `filtered` on the
+  page dict. So `jobs.has_unread_pages` reads false, the carry keeps
+  the shard's paid result and `reread_failed_pages` leaves the volume
+  alone. The glue repairs **before** `_stamp_page_lists`, which is
+  what makes that true of the rows too.
+- **A page still filtered is a WARNING**, not an INFO. Issue #242 asks
+  for it by name: every measured shape is repaired now, so a survivor
+  is a new shape, and the log line is the whole triage path. The
+  glue's line carries the parser's own message and an excerpt of `raw`
+  around the fault, so classifying the next one needs no S3 read and
+  no shell on the pod.
+- **`reglue_dots_mocr` is the backfill**, and it costs no GPU time: it
+  glues a run again over the stored results and clears the apply stamp
+  (`reopen_apply`). Safe by the two properties of
+  `reapply_page_numbers`: a READY volume is a recompute that keeps its
+  status, the numbers a curator typed are `PageEdit` rows and survive,
+  and an approved volume is not in `APPLY_STATUSES`. **Run it before
+  `reread_failed_pages`**: that command reads `filtered_pages` off the
+  row, a run glued before the deploy still carries them, and a re-read
+  started first pays RunPod for the shards this repairs for nothing.
+- **The `--dry-run` is the corpus survey** of items 1 to 3 of the
+  issue, and it reads *every* glued volume in review 1, not only the
+  ones whose rows report a filtered page. A volume whose retry rung
+  recovered every filtered answer carries no filtered page to be found
+  by, and it is exactly the evidence that the rung works; it is also
+  part of the page total the rate divides by.
+- Upstream has no repair, and `main` is byte-identical to the pin
+  `23f3e56` on `layout_utils.py` (checked 2026-09-03), so a pin bump
+  buys nothing here. Constrained decoding on the vLLM call
+  (`extra_body={"structured_outputs": {"json": ...}}`; `guided_json`
+  went in 0.12) would remove two of the three shapes at the source and
+  is the next step, gated and measured.
+
 ## Generalized YOLO worker image (issue #194)
 
 `scanning/runpod/` is the RunPod Serverless image that runs detection
 with `bl_warm`, one 18-class checkpoint that replaced the
 small/medium/large trio (blackletter #73). It is the image only: the job
 rows and the daemon path are #195 (below), and the redaction work that
-reads its output is #196 (below). One staff button is still the only
-way in — the pipeline enqueues no detection until #211. What must not
-be broken:
+reads its output is #196 (below). Since #250 the daemon starts the
+run itself, once per shard set (the #195 section). What must not be
+broken:
 
 - **Only `bl_warm.pt` is baked.** `api.detect` calls `ensure_weights`
   itself, so an unbaked name would reach Hugging Face from inside a paid
@@ -936,22 +1197,60 @@ The caller the #194 image was waiting for. Detection runs on RunPod
 Serverless, one job per **original** shard, tracked on `ExternalJob`
 rows at `DETECT`/`BLACKLETTER`/`RUNPOD`. The pieces: `yolo.py` (the
 stage), `settings/project/yolo.py` (five variables), the
-`jobs.RunpodEngine` table, and `views_process.start_yolo_detect` (the
-button). It reuses the whole #190 machinery — the claim, the poll, the
+`jobs.RunpodEngine` table, and since #250 the sweep
+`yolo.enqueue_missing_runs` plus the `enqueue_yolo_detect` command (the
+staff button of #195 is deleted). It reuses the whole #190 machinery — the claim, the poll, the
 deadlines, the cancel, the retry, the carry-over — so what follows is
 only what is new or specific:
 
-- **One staff button starts it, and nothing else.** `run_full_pipeline`
-  enqueues no `DETECT` row: the rebuilt image has to be tried on a few
-  volumes before it runs over the corpus (#211). That is structural —
-  `yolo.ensure_detect_jobs` is the only creator, and
-  `TestKnownEnqueuePaths` pins its one caller — so an automatic caller
-  has to delete a test line rather than slip in. The button is **not**
-  "Next: Detect": that one only walks to step 2 when detections exist
-  (#196). Since #196 the button also refuses a volume review 1 has not
-  approved, because the apply takes a scan from
-  `PAGE_COMPLETENESS_REVIEW_DONE` alone — a run started earlier would
-  be paid for and never read.
+- **The daemon starts it, once per shard set (#250).**
+  `yolo.enqueue_missing_runs` is the submit tick's first pass, before
+  the wave, so the rows it creates go out on the same tick. Its rule:
+  a scan whose current shard set (`Scan.source_fingerprint`) has
+  **no** detection row, alive or dead, gets exactly one run. So a new
+  upload, a volume from before the sweep and a volume uploaded while
+  the stage was off are one case, and a dead run is **not** re-run by
+  a tick -- `YOLO_MAX_ATTEMPTS` were spent on a shard, and a fourth
+  attempt is a staff decision: `enqueue_yolo_detect --dead-runs` (or
+  named scans), a command beside `reread_failed_pages` in the pinned
+  caller set, which replaces the dead run and carries every good
+  shard. The rule is one query
+  through `ExternalJob.source_fingerprint`, stamped by
+  `ensure_shard_jobs` on every row of every stage from the manifest's
+  source; it is **not** in the `input_manifest` identity, which
+  `_still_describes` compares exactly. A blank (pre-column) row does
+  **not** exclude its scan: the sweep hands it to `ensure_detect_jobs`,
+  which reuses a blank run that still describes today's set, and the
+  sweep then stamps the fingerprint on it ("adopted"), so it is looked
+  at once and never re-paid; a blank arm in the query would have hidden
+  a re-uploaded button-era volume for good. Candidates come
+  from the database (`SWEEP_STATUSES`: the parked states between the
+  pipeline and the end of review 2; QUEUED/PROCESSING are the
+  pipeline's, ERROR and beyond come back through the re-queue), newest
+  first and **at most `YOLO_MAX_CONCURRENCY` per tick** -- each costs
+  two S3 calls (`sharding.committed_manifest`: the manifest and a HEAD
+  of the original) and the scheduler is serial, so an unbounded first
+  tick over the corpus would hold every poll for minutes. One value
+  for shards in flight and volumes per tick, on purpose: a second knob
+  would be one nobody tunes, and a small batch only means the rows are
+  created over more ticks. A refused set (re-uploaded or missing
+  original, a `MANIFEST_VERSION` bump) is memoed in the daemon process
+  for `REFUSAL_RETRY_SECONDS` and logged once at INFO, then DEBUG --
+  looked at every 5 s it would cost two S3 calls and a line 17,000
+  times a day, and it would hold a place in the batch. The memo is a
+  cost saver only: the rows are what prevent a second run, so a
+  restart that forgets it starts nothing twice.
+  `yolo.ensure_detect_jobs` is the only creator; the sweep and the
+  command are its callers, pinned by `TestKnownEnqueuePaths`. The
+  staff button of
+  #195 is deleted: it started nothing the sweep does not, and a
+  whole-volume re-run over an edited volume belongs to #224. "Next:
+  Detect" only walks to step 2 when detections exist (#196), and
+  otherwise says where the run stands (`views_process.detection_message`,
+  shared by the flash and the button title). The run is usually merged
+  during review 1 (the glue reads the rows, not the status) and waits
+  there at no cost; `queue_ready_runs` takes it on the tick after the
+  approval, because the apply reads `bitonal.pdf` and moves the scan.
 - **Each RunPod engine is its own endpoint, and `jobs.RunpodEngine` is
   where that lives.** dots.mocr's endpoint id, concurrency cap, attempt
   cap and per-page allowance used to be read by name for every RunPod
@@ -1005,6 +1304,9 @@ only what is new or specific:
   later checkpoint is a payload change and not a new engine.
 - `YOLO_SECONDS_PER_PAGE = 2.0` is a first guess, deliberately
   generous. #211 replaces it with a measured value.
+  `YOLO_MAX_CONCURRENCY` is 3 since #250; the endpoint's own
+  `max_workers` must be at least that, or the extra rows wait in the
+  provider's queue with the ceiling clock running.
 
 ## Redactions from the detection run (issue #196)
 
@@ -1042,9 +1344,9 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   the work drops it as it starts, so a failed apply is queued again.
   `applied_at` closes the run for good.
 - **Only `PAGE_COMPLETENESS_REVIEW_DONE` is taken**, with a
-  compare-and-swap, and the staff button refuses every other status for
-  the same reason: review 2 follows review 1, and a run started earlier
-  would be paid for and never read.
+  compare-and-swap: review 2 follows review 1. The run itself may
+  start earlier (#250 starts it at upload); it is the apply that waits,
+  because it moves the scan and reads the bitonal copy.
 - **The detections are imported once per run.** A run already stamped
   is a *recompute*, which a curator asks for after they edit a box: it
   keeps every row in the database and measures again from those.
@@ -1105,10 +1407,44 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
 - **"Next: Detect" carries no paid confirm when there are no
   detections.** `start_detect` starts nothing since #195: it walks to
   step 2 when detections exist and otherwise flashes
-  `NO_DETECTIONS_MESSAGE`. The button's confirm used to name RunPod and
-  a cost for a run the view then did not start; the no-detections
-  branch now says what the view says. The staff "Run detection" button
-  is the one that pays, and the only one with a confirm.
+  `detection_message(yolo.run_summary(scan))` -- running, failed,
+  finished-and-waiting, or `NO_DETECTIONS_MESSAGE` for a volume with
+  no run. The button's confirm used to name RunPod and a cost for a
+  run the view then did not start; the no-detections branch now says
+  what the view says. Nothing in the viewer pays since #250: the
+  daemon starts the one run.
+
+## The glued outputs, by scan id (issue #243)
+
+Three routes under `scans/<pk>/glued/<output>/`, for `dots-mocr` and
+`yolo`, so a developer needs no shell on the daemon pod to read a
+run. `views_process.GLUED_OUTPUTS` maps the slug to the stage, the
+engine and the glued key function, and that table is the whole
+difference between the two outputs: a third engine is one entry.
+
+- **The index reads the rows only.** `glued_output_index` lists every
+  run newest first with its shards, their 1-based volume page ranges
+  (the manifest holds fitz indexes), their states, the dots.mocr page
+  lists (shard-local, as the worker reports them), and the URL of
+  each file. No S3 call, so it answers in every environment, and a
+  scan nothing read gets `runs: []`, not an error. `glued` is "every
+  row CONSUMED"; the volume route still checks the object.
+- **The file routes redirect, never stream.** `serve_glued_volume`
+  presigns the run's glued key and `serve_glued_shard` the row's own
+  `result_key` (the worker's answer, `raw` included, which the glue
+  leaves out). A glued document of a long volume is tens of MB, and
+  #185 already took the large stream out of the preview endpoint.
+  The presign carries `Content-Disposition: attachment` so the
+  browser saves a named file.
+- **One HEAD before the redirect**, or a run that is not glued yet
+  would send the browser to an S3 XML error. A non-missing S3 error
+  propagates. Without S3 the file routes answer 404: the glue returns
+  before any work when S3 is off, and the workers write into the
+  bucket.
+- `@login_required` like `/pdf/`; the "files" link in the step-1 bar
+  is staff-only. `GLUED_OUTPUT_PRESIGN_TTL` is ten minutes, one
+  download; `ORIGINAL_VIEW_PRESIGN_TTL` serves a viewer that scrolls
+  for hours and is the wrong size.
 
 ## Local disk hygiene (issue #215)
 

@@ -9,7 +9,7 @@ services:
     container_name: scanning-postgres
     image: postgres:16-alpine
     ports:
-      - "5434:5432"
+      - "127.0.0.1:5434:5432"
     environment:
       POSTGRES_USER: "postgres"
       POSTGRES_PASSWORD: "postgres"
@@ -74,7 +74,7 @@ services:
       scanning-postgres:
         condition: service_healthy
     ports:
-      - "8002:8000"
+      - "127.0.0.1:8002:8000"
     user: root
     volumes:
       - ${SCANNING_BASE_DIR:-../../}:/opt/scanning

@@ -2217,6 +2217,171 @@ class TestRecalculateIssues(TestCase):
         self.assertFalse(scan.issues.exists())
 
 
+class TestTrailingGapPlaceholder(TestCase):
+    """A range missing at the end of the volume (issue #256).
+
+    ``build_issues`` collapses a run of more than 6 missing pages into
+    one ``large_gap`` card and drops its pages, so the reviewer got a
+    warning and no placeholder: nothing to upload to, and no gap to ask
+    a scanner for. One placeholder now stands for the whole run, and
+    only when the run reaches the scan's recorded last page.
+    """
+
+    def _make_scan(self, **kwargs):
+        """Create a scan whose original PDF is absent locally, as in prod.
+
+        :param kwargs: Fields for the factory.
+        :returns: The scan.
+        """
+        scan = ScanFactory(status=Status.PENDING_REVIEW, **kwargs)
+        pathlib.Path(scan.original_pdf.path).unlink()
+        return scan
+
+    def _read(self, pages, **kwargs):
+        """Create a scan that read one number per page.
+
+        :param pages: The printed numbers, in PDF page order.
+        :param kwargs: Fields for the factory.
+        :returns: The scan.
+        """
+        return self._make_scan(
+            page_count=len(pages),
+            ocr_results=[
+                {"pdf_page": i + 1, "detected": str(n), "type": "single"}
+                for i, n in enumerate(pages)
+            ],
+            **kwargs,
+        )
+
+    def _placeholders(self, scan):
+        """Return the missing entries of the scan's page map.
+
+        :param scan: The scan to read.
+        :returns: The ``missing`` entries, in order.
+        :rtype: list[dict]
+        """
+        scan.refresh_from_db()
+        return [e for e in scan.page_map if e.get("type") == "missing"]
+
+    def test_a_range_missing_at_the_end_gets_one_placeholder(self):
+        """Ten pages the volume stops before are one gap, so one
+        placeholder, labelled with the range."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(
+            self._placeholders(scan),
+            [
+                {
+                    "type": "missing",
+                    "logical_number": "11-20",
+                    "missing_range": [11, 20],
+                }
+            ],
+        )
+
+    def test_the_card_of_the_run_says_what_to_do(self):
+        """The card read "likely an OCR misread" and named no action."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+
+        services.recalculate_issues(scan)
+
+        card = scan.issues.get(check_name=CheckName.LARGE_GAP)
+        self.assertEqual(card.page_number, 11)
+        self.assertEqual(card.severity, Issue.Severity.WARNING)
+        self.assertIn("Pages 11\u201320 (10 pages)", card.message)
+        self.assertIn("The last page number read is 10", card.message)
+        self.assertIn("ask a scanner", card.message)
+
+    def test_the_placeholder_follows_the_last_page_of_the_volume(self):
+        """The gap's address is the physical page it follows, which the
+        viewer's projection stamps (#214)."""
+        from scanning import page_edits, services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        entry = page_edits.project_inserts(scan, scan.page_map)[-1]
+        self.assertEqual(entry["type"], "missing")
+        self.assertEqual(entry["anchor_pdf_page"], 10)
+
+    def test_a_short_run_keeps_the_placeholder_of_each_page(self):
+        """Three missing pages are not collapsed, so blackletter draws
+        one placeholder each and this pass adds none."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=13)
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(
+            [e["logical_number"] for e in self._placeholders(scan)],
+            [11, 12, 13],
+        )
+
+    def test_a_gap_inside_the_volume_gets_no_placeholder(self):
+        """Those pages are almost always in the book with a number
+        nobody read, so the card stands alone."""
+        from scanning import services
+
+        scan = self._read(
+            list(range(1, 6)) + list(range(20, 26)), start_page=1, end_page=25
+        )
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(self._placeholders(scan), [])
+        self.assertTrue(
+            scan.issues.filter(check_name=CheckName.LARGE_GAP).exists()
+        )
+
+    def test_a_scan_with_no_recorded_last_page_gets_no_placeholder(self):
+        """Without an end page there is no trailing gap to find (#209)."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=None, end_page=None)
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(self._placeholders(scan), [])
+
+    def test_a_printed_range_over_the_end_gets_no_placeholder(self):
+        """A compressed page carries the pages it prints (#233), so they
+        are not missing at all."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+        scan.ocr_results = scan.ocr_results + [
+            {"pdf_page": 11, "detected": "11-20", "type": "range"}
+        ]
+        scan.page_count = 11
+        scan.save(update_fields=["ocr_results", "page_count"])
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(self._placeholders(scan), [])
+
+    def test_a_page_number_edit_keeps_the_placeholder(self):
+        """``rebuild_page_map`` is the other builder of the page map, and
+        the two must agree."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+
+        services.rebuild_page_map(scan)
+
+        self.assertEqual(
+            self._placeholders(scan)[0]["missing_range"], [11, 20]
+        )
+
+
 class TestRunComputeIssues(TestCase):
     """The apply of the glued dots.mocr output (#149/#204, #212).
 

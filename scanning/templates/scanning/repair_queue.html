@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% load query_params %}
+
+{% block title %}Repairs - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+{% comment %}
+  The queue of pages a scanner must scan again or scan anew (#249). A
+  reviewer with no book records the finding in step 1; this page is
+  where a scanner with the book finds it. Grouped by scan, so one trip
+  to the shelf fixes every page of a volume.
+{% endcomment %}
+<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4">
+  <h1 class="text-2xl font-bold">Repairs</h1>
+  <div class="text-sm text-gray-500 dark:text-gray-400">
+    <span class="text-orange-600 dark:text-orange-400">{{ waiting_repairs_count }} page{{ waiting_repairs_count|pluralize }} waiting for a scanner</span>
+  </div>
+</div>
+
+<p class="text-sm text-gray-600 dark:text-gray-300 mb-4">
+  A reviewer found these pages and could not fix them. Each one needs a person with the book.
+  Open the page, then upload the new scan with the <em>Replace</em> button, or in the gap for a missing page.
+  The request closes by itself when the upload is saved.
+</p>
+
+<!-- State tabs -->
+<div class="flex flex-wrap gap-2 mb-4">
+  <a href="{% url 'repair_queue' %}{% url_replace state='' page='' %}"
+     class="{% if state == 'waiting' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Waiting</a>
+  <a href="{% url 'repair_queue' %}{% url_replace state='fulfilled' page='' %}"
+     class="{% if state == 'fulfilled' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Fulfilled</a>
+  <a href="{% url 'repair_queue' %}{% url_replace state='dismissed' page='' %}"
+     class="{% if state == 'dismissed' %}btn-primary{% else %}btn-outline{% endif %} text-sm">Dismissed</a>
+  <a href="{% url 'repair_queue' %}{% url_replace state='all' page='' %}"
+     class="{% if state == 'all' %}btn-primary{% else %}btn-outline{% endif %} text-sm">All</a>
+</div>
+
+<!-- Filters -->
+<div class="card mb-6">
+  <form method="get">
+    {% if state != 'waiting' %}<input type="hidden" name="state" value="{{ state }}">{% endif %}
+    <div class="flex flex-col sm:flex-row gap-3">
+      <div class="flex-1">
+        <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
+        <select id="filter-reporter" name="reporter" class="input-text w-full">
+          <option value="">All reporters</option>
+          {% for r in reporters %}
+          <option value="{{ r.short_name }}" {% if selected_reporter == r.short_name %}selected{% endif %}>
+            {{ r.full_name }} ({{ r.short_name }})
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="flex items-center justify-end gap-2 mt-3">
+      <a href="{% url 'repair_queue' %}" class="btn-ghost text-sm"><i class="fa-solid fa-xmark"></i> Clear filters</a>
+      <button type="submit" class="btn-outline"><i class="fa-solid fa-magnifying-glass"></i> Filter</button>
+    </div>
+  </form>
+</div>
+
+{% if groups %}
+<div class="space-y-4">
+  {% for group in groups %}
+  {% with scan=group.scan %}
+  <div class="card p-0 overflow-hidden">
+    <div class="flex flex-wrap items-center justify-between gap-2 px-4 py-3 bg-gray-50 dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
+      <div class="flex items-center gap-3">
+        <a href="{% url 'scan_process' scan.pk %}?step=1" class="font-medium text-blue-600 dark:text-blue-400 hover:underline">
+          {% if scan.reporter %}{{ scan.reporter.short_name|upper }} vol. {{ scan.volume }}{% else %}Scan #{{ scan.pk }}{% endif %}
+        </a>
+        <span class="text-xs text-gray-500 dark:text-gray-400">scan #{{ scan.pk }}{% if scan.part_label %} &middot; {{ scan.part_label }}{% endif %}</span>
+        <span class="badge-{{ scan.status }}" title="Scan status">{{ scan.get_status_display }}</span>
+      </div>
+      <div class="text-xs text-gray-500 dark:text-gray-400">
+        {% if scan.uploaded_by %}Scanned by <span class="font-medium">{{ scan.uploaded_by.username }}</span>{% endif %}
+        {% if scan.volume_obj and scan.volume_obj.assigned_to %} &middot; Volume assigned to <span class="font-medium">{{ scan.volume_obj.assigned_to.username }}</span>{% endif %}
+      </div>
+    </div>
+    <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+      <thead>
+        <tr class="text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+          <th class="px-4 py-2">Action</th>
+          <th class="px-4 py-2">Page</th>
+          <th class="px-4 py-2">Note</th>
+          <th class="px-4 py-2">Asked by</th>
+          <th class="px-4 py-2">State</th>
+          <th class="px-4 py-2"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in group.requests %}
+        <tr class="border-t border-gray-100 dark:border-gray-800 text-sm">
+          <td class="px-4 py-2 whitespace-nowrap">{{ r.get_action_display }}</td>
+          <td class="px-4 py-2 whitespace-nowrap">
+            {% if r.action == 'insert' %}after PDF p.{{ r.anchor_pdf_page }}{% else %}PDF p.{{ r.pdf_page }}{% endif %}
+            {% if r.logical_page %}<span class="text-gray-500 dark:text-gray-400">(printed #{{ r.logical_page }})</span>{% endif %}
+            {% if r.is_stale %}<span class="ml-1 text-[10px] font-bold text-gray-500 dark:text-gray-400" title="This request was made on an earlier upload of the scan. The page may have moved.">EARLIER UPLOAD</span>{% endif %}
+          </td>
+          <td class="px-4 py-2 text-gray-700 dark:text-gray-300">{{ r.note|default:"—" }}</td>
+          <td class="px-4 py-2 whitespace-nowrap text-gray-500 dark:text-gray-400">{{ r.requested_by.username }}, {{ r.date_created|date:"Y-m-d" }}</td>
+          <td class="px-4 py-2 whitespace-nowrap">
+            {% if r.dismissed_at %}
+              <span class="text-xs font-medium rounded px-2 py-0.5 bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300" title="Dismissed by {{ r.dismissed_by.username }} on {{ r.dismissed_at|date:'Y-m-d' }}">Dismissed</span>
+            {% elif r.fulfilled %}
+              <span class="text-xs font-medium rounded px-2 py-0.5 bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200" title="A new scan of this page is saved">Fulfilled</span>
+            {% else %}
+              <span class="text-xs font-medium rounded px-2 py-0.5 bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-200">Waiting</span>
+            {% endif %}
+          </td>
+          <td class="px-4 py-2 text-right whitespace-nowrap">
+            <a href="{% url 'scan_process' scan.pk %}?step=1&amp;goto={{ r.nav_pdf_index }}" class="btn-outline text-xs px-2 py-1">Open page</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endwith %}
+  {% endfor %}
+</div>
+
+{% if page_obj.has_other_pages %}
+<div class="flex items-center justify-center gap-3 mt-6">
+  {% if page_obj.has_previous %}
+  <a href="{% url 'repair_queue' %}{% url_replace page=page_obj.previous_page_number %}" class="btn-outline text-sm">&laquo; Previous</a>
+  {% endif %}
+  <span class="text-sm text-gray-500 dark:text-gray-400">
+    Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}
+  </span>
+  {% if page_obj.has_next %}
+  <a href="{% url 'repair_queue' %}{% url_replace page=page_obj.next_page_number %}" class="btn-outline text-sm">Next &raquo;</a>
+  {% endif %}
+</div>
+{% endif %}
+
+{% else %}
+<div class="card text-center py-12">
+  <p class="text-gray-500 dark:text-gray-400">{% if state == 'waiting' %}No page waits for a scanner.{% else %}No request matches your filters.{% endif %}</p>
+</div>
+{% endif %}
+{% endblock %}

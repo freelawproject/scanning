@@ -19,6 +19,7 @@ from scanning.views import (
     queue_detail_view,
     queue_upload,
     queue_view,
+    repair_queue,
     scan_detail,
     scan_list,
     scan_pages_list,
@@ -55,6 +56,8 @@ from scanning.views_process import (
     assign_page,
     delete_page,
     dismiss_issue,
+    dismiss_page_repair,
+    glued_output_index,
     page_edit_file,
     process_actions,
     progress_api,
@@ -63,16 +66,18 @@ from scanning.views_process import (
     reopen_page_review,
     replace_page,
     reprocess,
+    request_page_repair,
     rotate_page,
     scan_original_url,
     scan_process_view,
+    serve_glued_shard,
+    serve_glued_volume,
     serve_original_crop,
     serve_scan_original,
     serve_scan_pdf,
     start_detect,
     start_dots_mocr,
     start_validate,
-    start_yolo_detect,
     undo_delete_page,
     undo_replace_page,
 )
@@ -91,6 +96,7 @@ urlpatterns = [
     path("profile/", profile, name="profile"),
     path("profile/password/", password_change, name="password_change"),
     path("queue/", queue_view, name="queue"),
+    path("repairs/", repair_queue, name="repair_queue"),
     path(
         "queue/<str:reporter_slug>/<int:vol>/",
         queue_detail_view,
@@ -141,6 +147,23 @@ urlpatterns = [
         serve_original_crop,
         name="serve_original_crop",
     ),
+    # The glued outputs of the GPU stages (#243): an index of the runs
+    # and their shards, then one redirect per file.
+    path(
+        "scans/<int:pk>/glued/<str:output>/",
+        glued_output_index,
+        name="glued_output_index",
+    ),
+    path(
+        "scans/<int:pk>/glued/<str:output>/r<int:run>/volume/",
+        serve_glued_volume,
+        name="serve_glued_volume",
+    ),
+    path(
+        "scans/<int:pk>/glued/<str:output>/r<int:run>/shards/<int:shard>/",
+        serve_glued_shard,
+        name="serve_glued_shard",
+    ),
     path(
         "scans/<int:pk>/start-validate/", start_validate, name="start_validate"
     ),
@@ -149,11 +172,6 @@ urlpatterns = [
         "scans/<int:pk>/start-ocr/",
         start_dots_mocr,
         name="start_dots_mocr",
-    ),
-    path(
-        "scans/<int:pk>/start-yolo/",
-        start_yolo_detect,
-        name="start_yolo_detect",
     ),
     path("scans/<int:pk>/recalculate/", recalculate, name="recalculate"),
     path(
@@ -193,6 +211,18 @@ urlpatterns = [
     ),
     path("scans/<int:pk>/rotate-page/", rotate_page, name="rotate_page"),
     path("scans/<int:pk>/dismiss-issue/", dismiss_issue, name="dismiss_issue"),
+    # The repair requests of a reviewer with no book (#249): ask, and
+    # dismiss.
+    path(
+        "scans/<int:pk>/repair/request/",
+        request_page_repair,
+        name="request_page_repair",
+    ),
+    path(
+        "scans/<int:pk>/repair/dismiss/",
+        dismiss_page_repair,
+        name="dismiss_page_repair",
+    ),
     # views_api.py
     path(
         "scans/<int:pk>/detections/", serve_detections, name="serve_detections"

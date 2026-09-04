@@ -23,13 +23,14 @@ stripping.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from unittest import mock
 
 from django.test import SimpleTestCase
 
-from scanning import runpod_common
+from scanning import layout_json, runpod_common
 
 _HANDLER_PATH = (
     Path(__file__).resolve().parent.parent / "runpod-dotsmocr" / "handler.py"
@@ -44,9 +45,12 @@ def _load_handler():
     stub_runpod.serverless.register_fitness_check.side_effect = lambda f: f
     stubs = {
         "runpod": stub_runpod,
-        # The real shared module, under the top-level name the worker
-        # image gives it.
+        # The real shared modules, under the top-level names the worker
+        # image gives them: the Dockerfile copies both next to
+        # handler.py. ``layout_json`` is the layout-JSON repair of
+        # #242, shared with the daemon's glue.
         "runpod_common": runpod_common,
+        "layout_json": layout_json,
     }
     # ``shutil.which("nvidia-smi")`` -> None makes ``_preload()`` take
     # the no-GPU path regardless of the machine running the tests.
@@ -605,12 +609,136 @@ class TestParsePageInference(SimpleTestCase):
 class TestSummaryFields(SimpleTestCase):
     """What the response keeps when the payload goes to S3."""
 
-    def test_the_three_page_lists_travel_in_the_summary(self):
-        # The daemon acts on all three; a list only the S3 object
+    def test_the_four_page_lists_travel_in_the_summary(self):
+        # The daemon acts on all four; a list only the S3 object
         # carried was invisible to it.
-        for field in ("failed_pages", "filtered_pages", "recovered_pages"):
+        for field in (
+            "failed_pages",
+            "filtered_pages",
+            "recovered_pages",
+            "repaired_pages",
+        ):
             self.assertIn(field, handler._SUMMARY_FIELDS)
         self.assertNotIn("pages", handler._SUMMARY_FIELDS)
+
+
+class TestLayoutJsonRepair(SimpleTestCase):
+    """A page whose layout JSON broke on one character (issue #242).
+
+    The repair runs inside the rung, before the ladder climbs, so a
+    measured fault costs one inference and no GPU retry. Upstream's
+    ``post_process_output`` is the stub here, called twice per repaired
+    page: once with the model's answer, once with the repaired array.
+    """
+
+    #: The array as the model meant to write it.
+    GOOD = json.dumps(
+        [
+            {
+                "bbox": [276, 93, 426, 129],
+                "category": "Page-header",
+                "text": 'she said "no" and left',
+            }
+        ]
+    )
+    #: The same array with the closing quotation mark of the quotation
+    #: unescaped: the fault of scan 2726 page 44 (#242).
+    BROKEN = GOOD.replace('no\\"', 'no"')
+
+    def _run(self, raw, post_process, pages=1):
+        """Parse one page whose answer is ``raw``."""
+        stubs = _renderer_stubs()
+        stubs[
+            "dots_mocr.utils.layout_utils"
+        ].post_process_output.side_effect = post_process
+        self.post_process = stubs["dots_mocr.utils.layout_utils"]
+        with (
+            mock.patch.dict(sys.modules, stubs),
+            mock.patch.object(handler, "download_pdf"),
+            mock.patch.object(handler, "validate_pdf", return_value=pages),
+            mock.patch.object(
+                handler, "_vllm_inference", return_value=(raw, "stop", 500)
+            ) as infer,
+        ):
+            result = handler._action_parse(
+                {"id": "job-1"},
+                {
+                    "pdf_url": "https://x/y.pdf",
+                    "prompt_mode": "prompt_layout_only_en",
+                    "num_threads": 1,
+                },
+                Path("/nonexistent"),
+            )
+        return result, infer
+
+    def test_a_broken_answer_is_repaired_inside_the_rung(self):
+        cells = [{"bbox": [458, 199, 707, 277], "category": "Page-header"}]
+        result, infer = self._run(
+            self.BROKEN,
+            # Upstream filters the model's answer and accepts the
+            # repaired one.
+            [("cleaned words", True), (cells, False)],
+        )
+
+        page = result["pages"][0]
+        self.assertIs(page["filtered"], False)
+        self.assertEqual(page["cells"], cells)
+        self.assertEqual(page["repaired_by"], "worker")
+        self.assertEqual(len(page["repaired"]), 1)
+        self.assertTrue(page["repaired"][0].startswith("escape_quote@"))
+        # The answer as the model wrote it is kept, untouched.
+        self.assertEqual(page["raw"], self.BROKEN)
+        self.assertEqual(result["repaired_pages"], [0])
+        self.assertEqual(result["filtered_pages"], [])
+        # One inference, so no rung was spent: that is the whole point.
+        self.assertEqual(infer.call_count, 1)
+        self.assertEqual(page["attempts"], 1)
+        self.assertNotIn("recovered_by", page)
+        # Upstream did the rescale, on the repaired array.
+        second = self.post_process.post_process_output.call_args_list[1]
+        self.assertEqual(json.loads(second[0][0]), json.loads(self.GOOD))
+
+    def test_a_shape_no_arm_reaches_still_climbs_the_ladder(self):
+        # A truncated array is the fault of #238, not of #242, and the
+        # render may yet matter, so the rung is still worth spending.
+        result, infer = self._run(
+            self.BROKEN[:20], [("cleaned words", True)] * 2
+        )
+
+        page = result["pages"][0]
+        self.assertIs(page["filtered"], True)
+        self.assertIsNone(page["cells"])
+        self.assertEqual(result["filtered_pages"], [0])
+        self.assertEqual(result["repaired_pages"], [])
+        self.assertNotIn("repaired", page)
+        self.assertEqual(infer.call_count, 2)
+
+    def test_upstream_refusing_the_repaired_array_is_not_a_repair(self):
+        # An empty array trips upstream's own asserts. A page must
+        # never be reported as repaired unless it came out whole.
+        result, _ = self._run(
+            self.BROKEN,
+            [("cleaned words", True), ("cleaned words", True)] * 2,
+        )
+
+        page = result["pages"][0]
+        self.assertIs(page["filtered"], True)
+        self.assertNotIn("repaired", page)
+        self.assertEqual(result["filtered_pages"], [0])
+
+    def test_a_valid_answer_calls_upstream_once(self):
+        cells = [{"bbox": [1, 1, 2, 2], "category": "Text"}]
+        result, infer = self._run(self.GOOD, [(cells, False)])
+
+        page = result["pages"][0]
+        self.assertNotIn("repaired", page)
+        self.assertEqual(page["cells"], cells)
+        self.assertEqual(
+            self.post_process.post_process_output.call_count,
+            1,
+            "no repair is attempted on an answer that parses",
+        )
+        self.assertEqual(infer.call_count, 1)
 
 
 class TestThresholdRender(SimpleTestCase):

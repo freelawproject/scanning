@@ -21,6 +21,7 @@ handles the per-page fan-out.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -33,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+import layout_json
 import requests
 import runpod
 import runpod_common
@@ -526,6 +528,68 @@ def _threshold_render(image):
     )
 
 
+def _repair_layout_json(
+    raw: str,
+    post_process_output,
+    prompt_mode: str,
+    page_image,
+    image,
+    min_pixels,
+    max_pixels,
+) -> tuple[list, list[str]] | None:
+    """Give a filtered answer its cells back, if one character did it.
+
+    Issue #242, measured on four production volumes: the model writes
+    the layout array correctly on hundreds of pages of a shard and
+    misplaces one escape on the page that nests quotation marks most
+    often. Upstream's parser then throws the whole array away.
+    :func:`layout_json.repair` moves the character back.
+
+    The repaired array goes back through upstream's own
+    ``post_process_output``, not through a rescale of our own: a
+    repaired page must reach the caller by exactly the path every
+    other page takes, bboxes included. Upstream refusing it again --
+    an empty array, a shape its own asserts reject -- reads here as
+    "not repaired", so a page is never reported as repaired unless it
+    really came out whole.
+
+    :param raw: The answer as the model wrote it.
+    :param post_process_output: Upstream's function, passed in so the
+        tests keep their one patch point.
+    :param prompt_mode: The prompt mode of this job.
+    :param page_image: The render, for the rescale.
+    :param image: The image the model saw, for the rescale.
+    :param min_pixels: As given to the first call.
+    :param max_pixels: As given to the first call.
+    :returns: ``(cells, edits)``, or ``None`` when nothing repaired it.
+    :rtype: tuple[list, list[str]] | None
+    """
+    repair = layout_json.repair(raw)
+    if repair.cells is None:
+        logger.info("no repair arm reached the layout JSON: %s", repair.fault)
+        return None
+    cells, filtered = post_process_output(
+        json.dumps(repair.cells),
+        prompt_mode,
+        page_image,
+        image,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+    if filtered:
+        logger.info(
+            "the layout JSON was repaired by %s and upstream refused it again",
+            ", ".join(repair.edits),
+        )
+        return None
+    logger.info(
+        "repaired the layout JSON by %s: %d cell(s) recovered",
+        ", ".join(repair.edits),
+        len(cells),
+    )
+    return cells, repair.edits
+
+
 def _strip_data_uris(md: str) -> str:
     """Replace inline base64 markdown images with an empty placeholder.
 
@@ -565,7 +629,8 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     :param tmp_dir: Per-job scratch directory.
     :returns: ``{"pages": list[dict], "page_count": int,
         "failed_pages": list[int], "filtered_pages": list[int],
-        "recovered_pages": list[int], "duration_ms": int}``. Each page
+        "recovered_pages": list[int], "repaired_pages": list[int],
+        "duration_ms": int}``. Each page
         dict carries ``page_no``, ``input_width``/``input_height``
         (model-input dims for interpreting bboxes),
         ``origin_width``/``origin_height`` (actual render dims — the
@@ -577,7 +642,12 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         so ``raw`` is what a later post-processor starts from. On a
         failed page it is the last truncated answer, when there was one.
         ``filtered: true`` marks pages where the model output wasn't
-        valid JSON and ``md`` holds the cleaned text fallback.
+        valid JSON, no repair reached it, and ``md`` holds the cleaned
+        text fallback. ``repaired`` (the edits, e.g.
+        ``["escape_quote@3698"]``) and ``repaired_by: "worker"`` mark a
+        page whose layout JSON broke on one character and was put back
+        together (#242); such a page is **not** filtered, and
+        ``repaired_pages`` lists them.
         The retry ladder (#238) adds ``attempts`` (rungs spent),
         ``recovered_by`` (the rung that gave usable output, absent on
         a first-try success and on a filtered page),
@@ -818,13 +888,39 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                     min_pixels=min_pixels,
                     max_pixels=max_pixels,
                 )
-                result["filtered"] = bool(filtered)
+                edits = None
                 if filtered:
-                    # Model output wasn't valid JSON; ``cells`` is
-                    # upstream's cleaned-text fallback, usable only as
-                    # markdown. ``raw`` above is what says which
-                    # character failed the parse: upstream's cleaner
-                    # consumes the broken JSON and returns the words.
+                    # The answer was good layout JSON with one
+                    # character wrong (issue #242): a lone quotation
+                    # mark, a lone backslash, a doubled closer. Move
+                    # the character back and the page is whole. This
+                    # runs before the ladder climbs, because the fault
+                    # is in the escape and not in the render, so a
+                    # second render makes the same mistake -- and the
+                    # repair costs microseconds against a rung's ~90s.
+                    repaired = _repair_layout_json(
+                        response,
+                        post_process_output,
+                        prompt_mode,
+                        page_image,
+                        image,
+                        min_pixels,
+                        max_pixels,
+                    )
+                    if repaired is not None:
+                        cells, edits = repaired
+                        filtered = False
+                result["filtered"] = bool(filtered)
+                if edits is not None:
+                    result["repaired"] = edits
+                    result["repaired_by"] = "worker"
+                if filtered:
+                    # Model output wasn't valid JSON and no repair arm
+                    # reached it; ``cells`` is upstream's cleaned-text
+                    # fallback, usable only as markdown. ``raw`` above
+                    # is what says which character failed the parse:
+                    # upstream's cleaner consumes the broken JSON and
+                    # returns the words.
                     result["cells"] = None
                     result["md"] = cells if isinstance(cells, str) else None
                 else:
@@ -867,6 +963,15 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             result.update(marks)
             result["attempts"] = rung
             if result.get("filtered"):
+                # Still filtered after the repair of #242, so this is
+                # a shape the arms do not answer -- a truncation, or
+                # something nobody has measured. The climb is kept for
+                # exactly that reason: on the four measured pages the
+                # repair returns at rung 1 and the rung is never
+                # reached, and on an unmeasured shape we do not know
+                # that the render is innocent. ``reglue_dots_mocr
+                # --dry-run`` counts what the rung recovers here, and
+                # that number is what may retire the climb.
                 errors.append("model output was not layout JSON")
                 if fallback is None:
                     fallback = result
@@ -951,6 +1056,7 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     failed = [r["page_no"] for r in results if "error" in r]
     filtered = [r["page_no"] for r in results if r.get("filtered")]
     recovered = [r["page_no"] for r in results if "recovered_by" in r]
+    repaired = [r["page_no"] for r in results if "repaired" in r]
     if len(failed) == pages:
         raise RuntimeError(
             f"all {pages} pages failed; first error: {results[0].get('error')}"
@@ -959,11 +1065,12 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     duration_ms = int((time.monotonic() - t0) * 1000)
     logger.info(
         "parse OK: %d pages (%d failed, %d filtered, %d recovered on a "
-        "retry) in %d ms (mode=%s, dpi=%d)",
+        "retry, %d repaired) in %d ms (mode=%s, dpi=%d)",
         pages,
         len(failed),
         len(filtered),
         len(recovered),
+        len(repaired),
         duration_ms,
         prompt_mode,
         dpi,
@@ -974,6 +1081,7 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         "failed_pages": failed,
         "filtered_pages": filtered,
         "recovered_pages": recovered,
+        "repaired_pages": repaired,
         "duration_ms": duration_ms,
     }
 
@@ -984,12 +1092,15 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
 # which is the whole reason the payload travels through S3. The three
 # page lists are small and are what the daemon acts on: a filtered page
 # is as much a hole to the page-number reader as a failed one (#238),
-# and a list that only the S3 object carried was invisible to it.
+# and a list that only the S3 object carried was invisible to it. The
+# fourth counts the pages the repair of #242 gave back, which is what
+# says how far a new worker image reaches.
 _SUMMARY_FIELDS = (
     "page_count",
     "failed_pages",
     "filtered_pages",
     "recovered_pages",
+    "repaired_pages",
     "duration_ms",
 )
 

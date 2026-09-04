@@ -1,9 +1,11 @@
 """Process viewer and scan processing action views."""
 
+import itertools
 import json
 import logging
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import fitz
@@ -22,17 +24,21 @@ from django.template.loader import render_to_string
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
-from scanning import page_edits
+from scanning import dots_mocr, jobs, page_edits, repairs, s3_sync, yolo
 from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
     PHYSICAL_PAGE_CHECKS,
     CheckName,
     Detection,
+    ExternalJob,
     Issue,
+    JobEngine,
+    JobStage,
     JobStatus,
     OpinionScan,
     PageEdit,
+    PageRepairRequest,
     Scan,
     Stage,
     Status,
@@ -70,6 +76,16 @@ REVALIDATE_UNAVAILABLE_MESSAGE = (
 )
 PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE = (
     "Approve the page completeness review first. Then continue to detection."
+)
+#: Answered to a request over a page a scanner already rescanned after
+#: an earlier request (#249). The unique key matches the open row, and
+#: the row reads fulfilled, so nothing new is created: say so, and say
+#: the way out. Silence here is the fault the date rule removed, one
+#: step later.
+REPAIR_ALREADY_FULFILLED_MESSAGE = (
+    "This page was already requested, and a new scan of it is saved. If "
+    "the new scan is bad too, dismiss the old request on the page and ask "
+    "again, or upload a better scan with Replace."
 )
 PENDING_EDITS_SAVED_MESSAGE = (
     "Your page changes are saved, and not built into the volume yet. "
@@ -151,14 +167,50 @@ REPLACEMENT_IS_ONE_PAGE_MESSAGE = (
     "A replacement stands for one page, and this PDF holds {pages}. "
     "Upload the one page that replaces it."
 )
-# What a curator sees when they ask for step 2 on a volume nobody has
-# run detection over. Since #195/#196 that is no longer a paused
-# pipeline: the stage works, and a staff member starts it, because each
-# run costs GPU time.
+# What a curator sees when they ask for step 2 on a volume with no
+# detections and no detection run. Since #250 the daemon starts the
+# run by itself once per shard set, so a volume with no run at all is
+# a legacy volume with no shard set, an environment with the stage
+# off, or a sweep that has not ticked yet.
 NO_DETECTIONS_MESSAGE = (
-    "This volume has no detections yet. A staff member starts the "
-    "detection run, and the redactions appear here when it finishes."
+    "This volume has no detections yet. Detection starts by itself "
+    "after the upload, and the redactions appear here when it "
+    "finishes. If nothing shows after a few minutes, ask a staff "
+    "member."
 )
+
+
+def detection_message(summary: dict | None) -> str:
+    """Say where a volume's detection stands, for a curator (#250).
+
+    One text for the "Next: Detect" title and the flash the view sends
+    when it cannot walk to step 2, so the bar and the view agree.
+    ``summary`` is ``yolo.run_summary(scan)``: ``None`` when the stage
+    has never run, else the counts of the live run.
+
+    :param summary: The run summary, or ``None``.
+    :returns: The message.
+    :rtype: str
+    """
+    if not summary:
+        return NO_DETECTIONS_MESSAGE
+    if summary["failed"]:
+        code = summary["error_code"] or "no error code"
+        return (
+            f"Detection failed on {summary['failed']} of "
+            f"{summary['total']} part(s) ({code}). Ask a staff member "
+            "to look into it."
+        )
+    if summary["open"]:
+        return (
+            f"Detection is running: {summary['done']} of "
+            f"{summary['total']} part(s) done. The redactions appear "
+            "here when it finishes."
+        )
+    return (
+        "Detection finished. The redactions are computed within a "
+        "minute of the page completeness approval."
+    )
 
 
 def _unmatched_detection_dict(
@@ -278,8 +330,6 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
 
     # Neither GPU stage writes a scan status by design (#190, #195), so
     # their rows are the only place their progress lives.
-    from scanning import dots_mocr, yolo
-
     dots_run = dots_mocr.run_summary(scan)
     yolo_run = yolo.run_summary(scan)
 
@@ -292,6 +342,16 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # The pages a curator replaced (#232). The viewer draws a note on
     # each one, with a link that opens the file the curator uploaded.
     replaced_pages = page_edits.replacements_by_page(scan)
+
+    # The pages a reviewer asked a scanner to scan again, or the gaps
+    # they asked a scanner to fill (#249). The waiting ones raise the
+    # sidebar badge and the section; every open one reaches the viewer,
+    # so a fulfilled request shows as fulfilled on its page.
+    repair_requests = repairs.viewer_payload(scan)
+    waiting_repairs = [r for r in repair_requests if not r["fulfilled"]]
+    pages_needing_repair = {
+        r["pdf_page"] for r in waiting_repairs if r["pdf_page"] is not None
+    }
 
     # Map pdf_index → logical page number for navigation
     idx_to_logical = {}
@@ -339,6 +399,31 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         if indices:
             i.nav_pdf_index = indices[0]
 
+    # The card of a range missing at the end names the placeholder
+    # ("ask a scanner for them at the placeholder at the end of the
+    # volume", #256), so the card must reach it. Its own address is a
+    # printed number the volume does not show, which resolves to no
+    # page above, and the placeholder carries the range as its label,
+    # so neither of ``goToPage``'s lookups finds it. The physical
+    # address does: the page the gap follows, with the placeholder
+    # drawn right below it -- the route a repair request already takes
+    # (``PageRepairRequest.nav_pdf_index``).
+    #
+    # After the loop, and outside ``flagged_indices`` on purpose: the
+    # last page of the volume is not itself at fault, so it keeps no
+    # red border. The projected entry keeps both keys after a curator
+    # uploads into the gap, because ``_inserted_entry`` copies it.
+    trailing = next((e for e in page_map if e.get("missing_range")), None)
+    if trailing:
+        for i in issues:
+            if (
+                i.check_name == CheckName.LARGE_GAP
+                and i.page_number == trailing["missing_range"][0]
+            ):
+                i.nav_pdf_index = max(
+                    trailing.get("anchor_pdf_page", 0) - 1, 0
+                )
+
     ocr_results = scan.ocr_results
     ocr_by_page = {}
     for r in ocr_results:
@@ -352,6 +437,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         r["seq_issue"] = ""
         r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
         r["is_replaced"] = r["pdf_page"] in replaced_pages
+        r["needs_repair"] = r["pdf_page"] in pages_needing_repair
         if not r.get("detected") or r.get("type") == "range":
             prev_num = None
             continue
@@ -546,6 +632,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "is_processing": is_processing,
             "dots_run": dots_run,
             "yolo_run": yolo_run,
+            "detect_message": detection_message(yolo_run),
             **_review_flags(scan),
             "opinions": opinions,
             "opinions_json": json.dumps(opinions),
@@ -557,6 +644,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "deleted_pages_json": json.dumps(
                 sorted(page_edits.deleted_pages(scan))
             ),
+            "repair_requests": repair_requests,
+            "waiting_repairs": waiting_repairs,
             "replaced_pages_json": json.dumps(
                 {
                     str(page): {
@@ -596,8 +685,6 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
         data["ocr_results"] = scan.ocr_results
     # Neither GPU stage moves a scan status, so a viewer polling this
     # would otherwise see nothing happen for a whole run (#190, #195).
-    from scanning import dots_mocr, yolo
-
     dots_run = dots_mocr.run_summary(scan)
     if dots_run:
         data["dots_run"] = dots_run
@@ -713,8 +800,6 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
 
     # 2. Not local: pull only the preview PDF(s) from S3 and re-check.
     try:
-        from scanning import s3_sync
-
         s3_sync.download_preview_pdf(scan)
     except Exception:
         logger.exception("Lazy S3 preview pull failed for scan %s", scan.pk)
@@ -799,8 +884,6 @@ def scan_original_url(request: HttpRequest, pk: int) -> JsonResponse:
             {"error": "This scan has no original PDF."}, status=404
         )
 
-    from scanning import s3_sync
-
     url = s3_sync.presign_original_get(scan)
     if url:
         return JsonResponse({"url": url, "embedded_whole": False})
@@ -832,8 +915,6 @@ def serve_scan_original(request: HttpRequest, pk: int) -> FileResponse:
     """
     scan = get_object_or_404(Scan, pk=pk)
 
-    from scanning import s3_sync
-
     if s3_sync.s3_active():
         raise Http404("The original PDF is read from storage, not from here.")
 
@@ -845,6 +926,330 @@ def serve_scan_original(request: HttpRequest, pk: int) -> FileResponse:
     )
     response["X-Scan-Preview"] = "original"
     return response
+
+
+#: Lifetime of a presigned GET minted by the glued-output routes (#243).
+#: One click is one download, so ten minutes is ample.
+#: ``ORIGINAL_VIEW_PRESIGN_TTL`` (8h) serves a viewer that scrolls for
+#: hours and is the wrong size here.
+GLUED_OUTPUT_PRESIGN_TTL = 600
+
+#: Slug -> (stage, engine, glued key function): the two glued documents
+#: of issue #243. The outputs differ in nothing else, so a third engine
+#: is one more entry, not a view.
+GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
+    "dots-mocr": (
+        JobStage.ANALYZE,
+        JobEngine.DOTS_MOCR,
+        dots_mocr.glued_result_key,
+    ),
+    "yolo": (JobStage.DETECT, JobEngine.BLACKLETTER, yolo.merged_result_key),
+}
+
+NO_S3_GLUED_OUTPUT_MESSAGE = (
+    "No glued output exists without S3: the daemon glues into the "
+    "bucket, and the workers write their results there."
+)
+
+
+def _json_404(message: str, **fields) -> JsonResponse:
+    """Answer a 404 as JSON, the shape every answer of these routes has.
+
+    ``Http404`` renders an HTML page, and a ``curl`` user would get two
+    formats from one API. The scan lookup keeps ``get_object_or_404``
+    on purpose: a missing scan looks the same on every scan route.
+
+    :param message: What is missing.
+    :param fields: More keys for the body (``run``, ``label``).
+    :returns: The response.
+    """
+    return JsonResponse({"error": message, **fields}, status=404)
+
+
+def _unknown_output(output: str) -> JsonResponse:
+    """Answer for a slug :data:`GLUED_OUTPUTS` does not know."""
+    return _json_404(
+        f"Unknown glued output {output!r}. "
+        f"Known: {', '.join(sorted(GLUED_OUTPUTS))}."
+    )
+
+
+def _glued_run_rows(
+    scan: Scan, stage: str, engine: str, run: int
+) -> list[ExternalJob]:
+    """Return one run's rows in shard order; empty for a run nobody made.
+
+    :param scan: The scan.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param run: The run number.
+    :returns: The rows ordered by ``shard_index``.
+    """
+    return list(
+        ExternalJob.objects.filter(
+            scan=scan, stage=stage, engine=engine, opinion=None, run=run
+        ).order_by("shard_index")
+    )
+
+
+def _redirect_to_object(
+    scan: Scan,
+    output: str,
+    run: int,
+    key: str,
+    *,
+    filename: str,
+    missing_message: str,
+    label: str,
+) -> HttpResponse:
+    """Send the browser to one object of the bucket, or say why not.
+
+    A redirect to a presigned GET, not a stream (#243): a glued
+    document of a long volume holds every cell and the text of every
+    page, and #185 already took the large stream out of the preview
+    endpoint for the gunicorn timeout. The bytes never cross the web
+    pod. A navigation to S3 needs no CORS rule.
+
+    One ``head_object`` first. Without it a run that is not glued yet,
+    or a shard that never completed, would send the browser to an S3
+    XML error. A non-missing S3 error is left to raise: a throttle or
+    an IAM fault must reach Sentry, not read as "not there".
+
+    :param scan: The scan the object belongs to.
+    :param output: The slug, for the log line.
+    :param run: The run number, for the log line and the answer.
+    :param key: Object key inside the private bucket.
+    :param filename: The name the browser saves the file under.
+    :param missing_message: The 404 message when the object is absent.
+    :param label: The run's status counts, for the 404 body.
+    :returns: A 302 to the presigned URL, or a 404 JSON response.
+    """
+    if not s3_sync.s3_active():
+        return _json_404(NO_S3_GLUED_OUTPUT_MESSAGE, run=run, label=label)
+    if not s3_sync.object_exists(key):
+        return _json_404(missing_message, run=run, label=label)
+    logger.info(
+        "glued output: scan=%s output=%s run=%s key=%s",
+        scan.pk,
+        output,
+        run,
+        key,
+    )
+    url = s3_sync.presign_get(
+        key,
+        GLUED_OUTPUT_PRESIGN_TTL,
+        content_disposition=f'attachment; filename="{filename}"',
+    )
+    return redirect(url)
+
+
+def _shard_entry(scan: Scan, output: str, row: ExternalJob) -> dict:
+    """Describe one shard row for the glued-output index.
+
+    ``from_page`` and ``to_page`` are 1-based volume pages, the
+    convention of the log lines (``jobs._failure_location``); the
+    stored manifest holds fitz indexes. The dots.mocr page lists stay
+    shard-local, as the worker reports them: an offset would put two
+    conventions in one document. An absent key means "not known" and
+    an empty value means "none", twice: ``url`` is absent on a row
+    with no result, and the page lists are absent on a row with no
+    stored summary -- a row an S3 HEAD completed stores ``output=None``
+    until the glue stamps the lists, and a carried row copies none. The
+    index is the triage tool for #242, so "no holes" must not be
+    inferred from "nothing recorded".
+
+    :param scan: The scan.
+    :param output: The slug the row is listed under.
+    :param row: The row.
+    :returns: One entry of the ``shards`` list.
+    """
+    manifest = row.input_manifest or {}
+    from_page = manifest.get("from_page")
+    to_page = manifest.get("to_page")
+    entry = {
+        "shard_index": row.shard_index,
+        "shard_count": row.shard_count,
+        "attempt": row.attempt,
+        "status": row.status,
+        "error_code": row.error_code,
+        "from_page": from_page + 1 if isinstance(from_page, int) else None,
+        "to_page": to_page + 1 if isinstance(to_page, int) else None,
+        "page_count": manifest.get("page_count"),
+    }
+    has_summary = isinstance((row.provider_meta or {}).get("output"), dict)
+    if row.engine == JobEngine.DOTS_MOCR and has_summary:
+        entry.update(jobs.page_lists(row))
+    if row.result_key:
+        entry["url"] = reverse(
+            "serve_glued_shard",
+            kwargs={
+                "pk": scan.pk,
+                "output": output,
+                "run": row.run,
+                "shard": row.shard_index,
+            },
+        )
+    return entry
+
+
+@login_required
+def glued_output_index(
+    request: HttpRequest, pk: int, output: str
+) -> JsonResponse:
+    """List every run and every shard of one glued output (#243).
+
+    The answer to "how many shards are there, and which one failed":
+    the runs newest first, each with its shards, their page ranges,
+    their states, and the URL of each file. Every fact is on the rows,
+    so the index makes no S3 call and answers in every environment.
+    ``glued`` is "every row of the run is CONSUMED", which the glue and
+    the merge write; the volume route still checks the object before
+    it redirects. A scan with no rows gets an empty list, not an
+    error: nothing ran is a fact.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param output: A key of :data:`GLUED_OUTPUTS`.
+    :return: JSON with ``scan``, ``output``, ``stage``, ``engine``,
+        ``live_run`` and ``runs``.
+    """
+    spec = GLUED_OUTPUTS.get(output)
+    if spec is None:
+        return _unknown_output(output)
+    stage, engine, _key_fn = spec
+    scan = get_object_or_404(Scan, pk=pk)
+    rows = ExternalJob.objects.filter(
+        scan=scan, stage=stage, engine=engine, opinion=None
+    ).order_by("-run", "shard_index")
+    runs = []
+    for run, group in itertools.groupby(rows, key=lambda row: row.run):
+        group = list(group)
+        runs.append(
+            {
+                "run": run,
+                "glued": all(
+                    row.status == JobStatus.CONSUMED for row in group
+                ),
+                "label": jobs.rows_label(group),
+                "volume_url": reverse(
+                    "serve_glued_volume",
+                    kwargs={"pk": scan.pk, "output": output, "run": run},
+                ),
+                "shards": [_shard_entry(scan, output, row) for row in group],
+            }
+        )
+    return JsonResponse(
+        {
+            "scan": scan.pk,
+            "output": output,
+            "stage": stage,
+            "engine": engine,
+            "live_run": runs[0]["run"] if runs else None,
+            "runs": runs,
+        }
+    )
+
+
+@login_required
+def serve_glued_volume(
+    request: HttpRequest, pk: int, output: str, run: int
+) -> HttpResponse:
+    """Send the browser to one run's glued volume document (#243).
+
+    The 404 for an absent object follows the rows: an open run is "not
+    glued yet", while a run whose every row is CONSUMED was glued and
+    has lost its object (swept, or expired), and saying "not glued yet:
+    2 result applied" would contradict itself.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param output: A key of :data:`GLUED_OUTPUTS`.
+    :param run: The run number.
+    :return: A 302 to a presigned GET, or a 404 JSON response when the
+        run is not glued yet or no S3 is active.
+    """
+    spec = GLUED_OUTPUTS.get(output)
+    if spec is None:
+        return _unknown_output(output)
+    stage, engine, key_fn = spec
+    scan = get_object_or_404(Scan, pk=pk)
+    rows = _glued_run_rows(scan, stage, engine, run)
+    if not rows:
+        return _json_404(f"Run {run} does not exist for this scan.", run=run)
+    label = jobs.rows_label(rows)
+    if all(row.status == JobStatus.CONSUMED for row in rows):
+        missing = (
+            f"Run {run} was glued, but its document is not in the bucket "
+            f"({label})."
+        )
+    else:
+        missing = f"Run {run} is not glued yet: {label}."
+    return _redirect_to_object(
+        scan,
+        output,
+        run,
+        key_fn(scan, run),
+        filename=f"scan-{scan.pk}-{output}-r{run}.json",
+        missing_message=missing,
+        label=label,
+    )
+
+
+@login_required
+def serve_glued_shard(
+    request: HttpRequest, pk: int, output: str, run: int, shard: int
+) -> HttpResponse:
+    """Send the browser to one shard's result object (#243).
+
+    The worker's own answer, at the row's ``result_key``: for dots.mocr
+    it holds ``raw``, the answer as the model wrote it, which the glue
+    leaves out of the volume document (#238) and which #242 needs. A
+    carried row (#190) names the previous attempt's object, and that
+    is the right file.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param output: A key of :data:`GLUED_OUTPUTS`.
+    :param run: The run number.
+    :param shard: The ``shard_index`` inside the run.
+    :return: A 302 to a presigned GET, or a 404 JSON response when the
+        shard has no result or no S3 is active.
+    """
+    spec = GLUED_OUTPUTS.get(output)
+    if spec is None:
+        return _unknown_output(output)
+    stage, engine, _key_fn = spec
+    scan = get_object_or_404(Scan, pk=pk)
+    rows = _glued_run_rows(scan, stage, engine, run)
+    if not rows:
+        return _json_404(f"Run {run} does not exist for this scan.", run=run)
+    label = jobs.rows_label(rows)
+    row = next((row for row in rows if row.shard_index == shard), None)
+    if row is None:
+        return _json_404(
+            f"Run {run} has no shard {shard}: it has {len(rows)} shard(s).",
+            run=run,
+            label=label,
+        )
+    status = row.get_status_display().lower()
+    if not row.result_key:
+        return _json_404(
+            f"Shard {shard} of run {run} has no result ({status}).",
+            run=run,
+            label=label,
+        )
+    return _redirect_to_object(
+        scan,
+        output,
+        run,
+        row.result_key,
+        filename=f"scan-{scan.pk}-{output}-r{run}-s{shard}.json",
+        missing_message=(
+            f"The result of shard {shard} of run {run} is not in the "
+            f"bucket ({status})."
+        ),
+        label=label,
+    )
 
 
 @login_required
@@ -1009,8 +1414,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
     if step < 1 or step > 3:
         step = 1
 
-    from scanning import dots_mocr, yolo
-
+    yolo_run = yolo.run_summary(scan)
     context = {
         "scan": scan,
         "step": step,
@@ -1020,7 +1424,8 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "has_detections": Detection.objects.filter(scan=scan).exists(),
         "opinions": scan.opinions_json,
         "dots_run": dots_mocr.run_summary(scan),
-        "yolo_run": yolo.run_summary(scan),
+        "yolo_run": yolo_run,
+        "detect_message": detection_message(yolo_run),
         **_review_flags(scan),
     }
     html = render_to_string(
@@ -1077,10 +1482,10 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     """Skip to review 2 when detections exist; otherwise explain.
 
     The only thing left of this action is its shortcut: a scan that has
-    detections goes straight to step 2. It starts nothing itself --
-    since #195 the detection run has its own staff button, because each
-    run costs GPU time -- so a volume with no detections is told who
-    starts one.
+    detections goes straight to step 2. It starts nothing itself -- the
+    daemon starts the detection run once per shard set (#250) -- so a
+    volume with no detections is told where its run stands
+    (:func:`detection_message`).
 
     Approval is the gate (#151), in the view and not only in the bar:
     a scan still in READY_FOR_PAGE_COMPLETENESS_REVIEW is sent back to
@@ -1112,7 +1517,7 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
         )
 
-    messages.info(request, NO_DETECTIONS_MESSAGE)
+    messages.info(request, detection_message(yolo.run_summary(scan)))
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -1144,7 +1549,7 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
-    from scanning import dots_mocr, sharding
+    from scanning import sharding
 
     scan = get_object_or_404(Scan, pk=pk)
     back = redirect("scan_process", pk=scan.pk)
@@ -1205,121 +1610,6 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
             request,
             f"This volume was already read: run {created[0].run} covers "
             f"all {len(created)} part(s). Nothing new was queued.",
-        )
-    return back
-
-
-@login_required
-@require_POST
-def start_yolo_detect(request: HttpRequest, pk: int) -> HttpResponse:
-    """Start YOLO detection over a scan's original shards (#195).
-
-    Staff only, and the **only** way into this stage. The pipeline
-    deliberately does not enqueue it: the rebuilt worker image (#194)
-    has to be exercised on a few volumes before it runs over the
-    corpus (#211). Every press can start real graphics processing unit
-    (GPU) work on RunPod that costs money.
-
-    Review 2 follows review 1, so the volume must be approved first
-    (``PAGE_COMPLETENESS_REVIEW_DONE``). The gate is here and not only
-    in the template: the run ends in an apply that imports detections
-    and rewrites the redaction geometry (#196), and a volume whose page
-    set a curator is still editing would be detected twice.
-
-    Detection reads the **original** shards, not the converted ones.
-    bl-warm was trained on greyscale renders, and its large region
-    classes collapse on 1-bit pages (#167).
-
-    **This request makes no call to RunPod.** It writes one
-    ``ExternalJob`` row per shard and returns; the daemon's next
-    ``submit_external_jobs`` tick sends them, and ``collect_external_jobs``
-    polls and retries them. That keeps a request thread off a slow HTTP
-    call, and it is what makes the run survive a redeployed web pod.
-
-    It also never cuts shards. ``sharding.committed_manifest`` verifies
-    the stored set against the original with one ``head_object``, so this
-    view neither downloads a multi-gigabyte PDF nor reads ``shards/``
-    directly. A stale or missing set is refused, because re-cutting is
-    the pipeline's job.
-
-    The daemon reads the output. Once every row is ``COMPLETED``, the
-    collect tick merges the run into one volume document and queues the
-    redaction computation, which imports the detections, pairs the
-    opinions and measures the geometry review 2 shows (#196).
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: Redirect to the scan processing page.
-    """
-    from scanning import sharding, yolo
-
-    scan = get_object_or_404(Scan, pk=pk)
-    back = redirect("scan_process", pk=scan.pk)
-
-    if not request.user.is_staff:
-        messages.error(
-            request,
-            "Only staff can start detection: each run costs GPU time.",
-        )
-        return back
-
-    if scan.status != Status.PAGE_COMPLETENESS_REVIEW_DONE:
-        messages.warning(
-            request,
-            "Detection runs after the page completeness review is "
-            "approved. This volume is not approved yet.",
-        )
-        return back
-
-    if not yolo.enabled():
-        messages.warning(
-            request,
-            "YOLO detection is not switched on in this environment. Set "
-            "YOLO_ENABLED and RUNPOD_YOLO_ENDPOINT_ID first.",
-        )
-        return back
-
-    # An open run means the daemon is still working on the last press.
-    # A finished run is reused rather than refused, which is what keeps
-    # ``ensure_detect_jobs`` from paying twice for shards already read.
-    summary = yolo.run_summary(scan)
-    if summary and summary["open"]:
-        messages.info(
-            request,
-            f"Detection run {summary['run']} is already going: "
-            f"{summary['done']} of {summary['total']} part(s) done.",
-        )
-        return back
-
-    manifest, reason = sharding.committed_manifest(scan)
-    if manifest is None:
-        messages.warning(request, reason)
-        return back
-
-    created = yolo.ensure_detect_jobs(scan, manifest)
-    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
-    logger.info(
-        "start_yolo_detect: scan=%s user=%s run=%s shards=%d queued=%d",
-        scan.pk,
-        request.user.pk,
-        created[0].run if created else "?",
-        len(created),
-        queued,
-    )
-    if queued:
-        messages.success(
-            request,
-            f"Queued detection for {queued} part(s) of this volume. The "
-            "daemon sends them to RunPod within a few seconds.",
-        )
-    else:
-        # ``ensure_detect_jobs`` reused a run that is already done, so
-        # nothing was queued and nothing will be sent. Saying otherwise
-        # would have staff waiting on a dispatch that is not coming.
-        messages.info(
-            request,
-            f"This volume was already detected: run {created[0].run} "
-            f"covers all {len(created)} part(s). Nothing new was queued.",
         )
     return back
 
@@ -2260,4 +2550,146 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
         request.user,
     )
     issue.delete()
+    return JsonResponse({"status": "ok"})
+
+
+def _printed_number_of(scan: Scan, pdf_page: int) -> str:
+    """Return the printed number the page shows, as a label.
+
+    Read off the cached ``ocr_results``, which carries the curator's
+    own numbers too (#214). A label only: the scanner reads it on the
+    Repairs page to find the leaf in the book. It goes through
+    ``_page_label`` like every other label, and a reading the narrowing
+    refuses is dropped: the narrowing is the first of the two layers,
+    and the blob is not a trusted source.
+
+    :param scan: The scan.
+    :param pdf_page: The 1-based page.
+    :returns: The printed number, or the empty string.
+    :rtype: str
+    """
+    for entry in scan.ocr_results or []:
+        if entry.get("pdf_page") == pdf_page:
+            return _page_label(str(entry.get("detected") or "")) or ""
+    return ""
+
+
+@login_required
+@require_POST
+def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
+    """Record that a page needs a scanner, and what the scanner must do.
+
+    The button of a reviewer who has no book (#249). A REPLACE names
+    the page to scan again; an INSERT names the gap a missing leaf
+    goes in, by the page it follows, the address an insert uses
+    (#214). One open row per address: a second request for the same
+    page answers the first row, with ``created`` false, so two
+    reviewers who find one page do not stack two requests.
+
+    **A fulfilled row is still an open row**, and the key matches it
+    too. The derivation refuses an edit older than the request, but
+    SQL cannot index a derived flag, so the key cannot. So when the
+    matched row is fulfilled the answer says so
+    (``already_fulfilled``, ``REPAIR_ALREADY_FULFILLED_MESSAGE``): the
+    reviewer dismisses the answered request and asks again, or uses
+    Replace. A toast that said "already requested" here would lose the
+    ask, which is the silence this feature exists to remove.
+
+    The note is free text a person typed. It is cut at
+    ``repairs.NOTE_MAX_CHARS`` here and escaped where it is drawn: in
+    the viewer through ``escapeHtml``, in the templates by the
+    auto-escape. Both layers, on purpose.
+
+    :param request: The HTTP request (JSON body with ``action``,
+        ``pdf_page`` or ``anchor_pdf_page``, ``logical_page``,
+        ``note``).
+    :param pk: Scan primary key.
+    :return: JSON response with the request, and whether it is new.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    action = data.get("action")
+    if action not in PageRepairRequest.Action.values:
+        return JsonResponse({"error": "Unknown action."}, status=400)
+    note = str(data.get("note") or "").strip()[: repairs.NOTE_MAX_CHARS]
+
+    address = {}
+    if action == PageRepairRequest.Action.REPLACE:
+        # The label is a hint for the scanner, not the reviewer's
+        # typing, so the server reads it off ``ocr_results`` itself and
+        # drops a reading the narrowing refuses. A label sent by the
+        # viewer is ignored: refusing it would make the button fail on
+        # exactly the page whose reading is junk.
+        pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
+        if pdf_page is None:
+            return JsonResponse({"error": "Unknown PDF page."}, status=404)
+        address["pdf_page"] = pdf_page
+        label = _printed_number_of(scan, pdf_page)
+    else:
+        # An older viewer places the gap by the label alone
+        # (``_anchor_of``), so here the label is an address and a
+        # refused one is an error.
+        label = _page_label(str(data.get("logical_page") or ""))
+        if label is None:
+            return JsonResponse({"error": "Invalid page number."}, status=400)
+        anchor = _anchor_of(scan, data.get("anchor_pdf_page"), label)
+        if anchor is None:
+            return JsonResponse({"error": "Unknown gap."}, status=404)
+        address["anchor_pdf_page"] = anchor
+
+    row, created = PageRepairRequest.objects.get_or_create(
+        scan=scan,
+        action=action,
+        dismissed_at=None,
+        **address,
+        defaults={
+            "requested_by": request.user,
+            "logical_page": label,
+            "note": note,
+            "source_fingerprint": scan.source_fingerprint,
+        },
+    )
+    row = repairs.open_requests(scan).get(pk=row.pk)
+    answer = {
+        "status": "ok",
+        "created": created,
+        "already_fulfilled": bool(not created and row.fulfilled),
+        "request": repairs.as_dict(row, scan),
+    }
+    if answer["already_fulfilled"]:
+        answer["message"] = REPAIR_ALREADY_FULFILLED_MESSAGE
+    return JsonResponse(answer)
+
+
+@login_required
+@require_POST
+def dismiss_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
+    """Close a repair request without deleting it.
+
+    Any logged-in user may dismiss, the rule of every review-1 button.
+    The row is stamped with who and when. A second dismissal of the
+    same row is a no-op, not an error, like ``undo_delete_page``: a
+    second tab must not fail on a request that is already closed.
+
+    :param request: The HTTP request (JSON body with ``request_id``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the dismissal.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    try:
+        request_id = int(data.get("request_id"))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "Unknown request."}, status=404)
+    rows = scan.repair_requests.filter(pk=request_id)
+    if not rows.exists():
+        return JsonResponse({"error": "Unknown request."}, status=404)
+    repairs.dismiss(rows, request.user)
     return JsonResponse({"status": "ok"})

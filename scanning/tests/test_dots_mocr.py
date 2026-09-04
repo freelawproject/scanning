@@ -875,21 +875,46 @@ class TestFailedPages(ScanningTestCase):
         self.job.refresh_from_db()
         self.assertTrue(jobs.has_unread_pages(self.job))
 
-    def test_a_filtered_page_is_a_hole_too_and_is_logged(self):
+    def test_a_filtered_page_is_a_hole_too_and_is_warned_about(self):
         # An answer that was not layout JSON has no cell, so the
-        # page-number reader gets nothing from it either.
+        # page-number reader gets nothing from it either. A WARNING and
+        # not an INFO since #242: the repair reaches every measured
+        # shape of the fault, so a page that survives it is a new shape
+        # somebody has to look at.
         with self.assertLogs("scanning.jobs", level="INFO") as logs:
             jobs._complete(
                 self.job,
                 {"page_count": 10, "failed_pages": [], "filtered_pages": [5]},
                 timezone.now(),
             )
-        lines = [line for line in logs.output if "no layout JSON" in line]
+        lines = [line for line in logs.output if "could repair" in line]
         self.assertEqual(len(lines), 1)
-        self.assertIn("answered 1 page(s) with no layout JSON", lines[0])
+        self.assertTrue(lines[0].startswith("WARNING"))
+        self.assertIn(
+            "answered 1 page(s) with layout JSON nothing could repair",
+            lines[0],
+        )
         self.assertIn("[16]", lines[0])
         self.job.refresh_from_db()
         self.assertTrue(jobs.has_unread_pages(self.job))
+
+    def test_a_repaired_page_is_logged_at_info_and_is_no_hole(self):
+        # #242: the glue or the worker put one character back, so the
+        # page has its cells and its number. Worth a line, not a
+        # warning, and never a re-read.
+        with self.assertLogs("scanning.jobs", level="INFO") as logs:
+            jobs._complete(
+                self.job,
+                {"page_count": 10, "failed_pages": [], "repaired_pages": [5]},
+                timezone.now(),
+            )
+        lines = [line for line in logs.output if "repaired the layout" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith("INFO"))
+        self.assertIn("repaired the layout JSON of 1 page(s)", lines[0])
+        self.assertIn("[16]", lines[0])
+        self.job.refresh_from_db()
+        self.assertFalse(jobs.has_unread_pages(self.job))
 
 
 # ── run completion ──────────────────────────────────────────────────
@@ -1681,9 +1706,9 @@ class TestKnownEnqueuePaths(ScanningTestCase):
     """Every path that creates paid GPU work, pinned.
 
     dots.mocr has two: the pipeline (#207) and the button that remains
-    as the re-run and backfill path (#190). YOLO detection has one, its
-    staff button (#195); the pipeline deliberately does not enqueue it
-    until the stage has been exercised on real volumes (#211).
+    as the re-run and backfill path (#190). YOLO detection has one, the
+    daemon's sweep (#250), which starts one run per shard set and
+    replaced the staff button of #195.
 
     Row creation is what costs GPU money, so a new caller of the
     creators must be a deliberate decision that updates this set -- not
@@ -1724,9 +1749,17 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                     "scanning/management/commands/reread_failed_pages.py",
                     "ensure_analyze_jobs",
                 ),
-                # Detection: the staff button alone (#195). Nothing in
-                # the pipeline may appear here until #211 says so.
-                ("scanning/views_process.py", "ensure_detect_jobs"),
+                # Detection: the daemon's sweep (#250), in yolo.py
+                # itself, and the command that re-runs a dead run --
+                # deliberate and staff-run, like reread_failed_pages.
+                # No view and no pipeline arm may appear here: the
+                # sweep's rule -- one run per shard set, ever -- is
+                # what bounds the spend.
+                ("scanning/yolo.py", "ensure_detect_jobs"),
+                (
+                    "scanning/management/commands/enqueue_yolo_detect.py",
+                    "ensure_detect_jobs",
+                ),
                 # The apply of the page edits (#224): one-page shards of
                 # the pages a curator added or changed, on all three
                 # stages, after the review-1 approval. Behind the same

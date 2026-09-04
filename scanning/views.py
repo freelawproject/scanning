@@ -19,7 +19,7 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
-from scanning import s3_sync
+from scanning import repairs, s3_sync
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
@@ -355,6 +355,51 @@ def queue_view(request: HttpRequest) -> HttpResponse:
             },
             "queue_statuses": QueueStatus.choices,
             "priorities": Priority.choices,
+        },
+    )
+
+
+@login_required
+def repair_queue(request: HttpRequest) -> HttpResponse:
+    """The queue of pages a scanner must scan again or scan anew (#249).
+
+    Every user sees it. The rows are grouped by scan, so a scanner
+    with the book fixes every page of a volume in one trip. Each row
+    links to the page in step 1. The ``state`` filter reads
+    ``repairs.QUEUE_STATES``; the default shows the requests that
+    wait, which is the work.
+
+    :param request: The current HTTP request.
+    :return: The rendered repair queue page.
+    """
+    state = request.GET.get("state", "waiting")
+    if state not in repairs.QUEUE_STATES:
+        state = "waiting"
+    reporter_filter = request.GET.get("reporter", "")
+
+    rows = repairs.queue(state)
+    if reporter_filter:
+        rows = rows.filter(scan__reporter__short_name=reporter_filter)
+
+    # Paginate the scans, then fetch the rows of the scans on the page.
+    # A row is never deleted, so a page that loaded every row first
+    # would grow with the history of the corpus.
+    paginator = Paginator(repairs.queue_scan_ids(rows), 50)
+    page_obj = paginator.get_page(request.GET.get("page"))
+    groups = repairs.group_by_scan(rows, list(page_obj.object_list))
+
+    return render(
+        request,
+        "scanning/repair_queue.html",
+        {
+            "page_obj": page_obj,
+            "groups": groups,
+            "state": state,
+            "states": repairs.QUEUE_STATES,
+            "reporters": Reporter.objects.all(),
+            "selected_reporter": reporter_filter,
+            # The waiting total is ``waiting_repairs_count``, from the
+            # context processor that feeds the header badge: one query.
         },
     )
 
