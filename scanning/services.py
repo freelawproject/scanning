@@ -1306,6 +1306,12 @@ def recalculate_issues(scan: "Scan") -> None:
             }
         )
 
+    # A page the curator marked for deletion answers its own cards
+    # (#255): the cards are built from ocr_results, which still holds
+    # the page, so the "No page number detected" card of a page on its
+    # way out came back on every press of the recompute button.
+    result["issues"] = page_edits.drop_deleted_pages(scan, result["issues"])
+
     # A dismissal is a curator decision, so it is a PageEdit row, not
     # the absence of an Issue row: the rebuild below gives every issue
     # it writes a new primary key, and a deleted row came back on the

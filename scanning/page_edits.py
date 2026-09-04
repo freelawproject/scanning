@@ -459,6 +459,42 @@ def drop_dismissed(scan: Scan, issues: list[dict]) -> list[dict]:
     ]
 
 
+def drop_deleted_pages(scan: Scan, issues: list[dict]) -> list[dict]:
+    """Remove the cards about a page marked for deletion.
+
+    A curator marks a page for deletion and the "No page number
+    detected" card of that page stays, because the cards are built from
+    ``Scan.ocr_results`` and nothing removes the page from that list
+    until the apply (#206). The page goes away, so the finding goes
+    with it (#255).
+
+    Only the checks of ``models.CHECKS_A_DELETION_ANSWERS``: a deletion
+    names a physical page, and a card outside that set names a printed
+    number. ``deleted_pages`` reads the current rows, so a withdrawn
+    row (#232) and a row made against another original (#214) hide no
+    card -- the second keeps its own ``stale_page_edit`` card, which
+    the set excepts.
+
+    :param scan: The scan being rebuilt.
+    :param issues: The rebuilt issue dicts.
+    :returns: The dicts about a page the volume keeps.
+    :rtype: list[dict]
+    """
+    from scanning.models import CHECKS_A_DELETION_ANSWERS
+
+    pages = deleted_pages(scan)
+    if not pages:
+        return issues
+    return [
+        issue
+        for issue in issues
+        if not (
+            issue["check_name"] in CHECKS_A_DELETION_ANSWERS
+            and issue.get("page_number") in pages
+        )
+    ]
+
+
 def stale_edit_issues(stale: list[PageEdit]) -> list[dict]:
     """Describe edits that were not applied, as issues for the curator.
 

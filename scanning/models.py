@@ -1011,6 +1011,16 @@ PHYSICAL_PAGE_CHECKS = frozenset(
     }
 )
 
+#: The checks a page deletion answers (#255). A card about a page the
+#: curator marked for deletion is noise: the page goes away, and the
+#: finding goes with it. Only the physical space, because a deletion
+#: names a physical page while every other check names a printed
+#: number, whose cards (a duplicate, a gap) count numbers over the
+#: whole volume and need the sequence analysis to run again without
+#: those pages. ``STALE_PAGE_EDIT`` is excepted: it says that a
+#: decision did not land, and a curator must always hear that.
+CHECKS_A_DELETION_ANSWERS = PHYSICAL_PAGE_CHECKS - {CheckName.STALE_PAGE_EDIT}
+
 
 class Issue(AbstractDateTimeModel):
     """A validation or processing issue found in a scan."""
