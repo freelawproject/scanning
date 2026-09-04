@@ -607,7 +607,7 @@ class TestStepOneButtonBar(ScanningTestCase):
 
     def test_an_approved_scan_without_detections_is_promised_no_run(self):
         """start_detect starts nothing (#195/#196), so the button must not
-        confirm a paid RunPod run; it says who starts one."""
+        confirm a paid RunPod run; it says where the run stands (#250)."""
         scan = ScanFactory(
             status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
             page_count=2,
@@ -618,7 +618,10 @@ class TestStepOneButtonBar(ScanningTestCase):
 
         self.assertIn(self.DETECT, html)
         self.assertNotIn("incur costs", html.split("start_detect")[-1])
-        self.assertIn("A staff member starts the detection run", html)
+        self.assertIn("Detection starts by itself after the upload", html)
+        # A multi-line ``{# #}`` is not a comment to Django; it used to
+        # render this text into the bar.
+        self.assertNotIn("No paid confirm here", html)
 
     def test_open_issues_do_not_hide_the_approval(self):
         """The old bar hid the way forward until the issue list was

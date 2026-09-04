@@ -10,10 +10,11 @@ move no scan status, so their state comes from `dots_run` and
 `yolo_run` -- summaries of the ExternalJob rows (issues #190 and #195)
 -- rather than from `is_processing`.
 
-The detection control is not "Next: Detect". It runs the stage and
-stores its output in S3, and nothing reads that output until #196. It
-is here so the rebuilt worker image can be tried on a few volumes
-before it runs over the corpus (#211).
+There is no detection button (#250). The daemon starts the run by
+itself once per shard set, right after the upload, and this bar only
+shows its state. "Next: Detect" starts nothing either: it walks to
+step 2 when detections exist and otherwise explains, with the same
+text as its title (`detect_message`).
 
 The review-1 controls (issue #151) read `page_review_ready` /
 `page_review_done`, the two #154 statuses. Approving is the gate: it is
@@ -64,18 +65,6 @@ reach step 2.
     &middot; <a href="{% url 'glued_output_index' scan.pk 'yolo' %}" class="underline" title="The runs, the shards and the result files of the detection">files</a>
     {% endif %}
   </span>
-  {% endif %}
-  {% comment %}
-    Only an approved volume: the run ends in an apply that rewrites the
-    detections and the redaction geometry (#196), and the queue pass
-    takes a scan from PAGE_COMPLETENESS_REVIEW_DONE alone -- so a
-    button offered earlier would pay for a run nothing applies.
-  {% endcomment %}
-  {% if user.is_staff and page_review_done and not yolo_run.open %}
-  <form method="post" action="{% url 'start_yolo_detect' scan.pk %}" class="inline">
-    {% csrf_token %}
-    <button type="submit" class="btn-outline text-sm" title="Detect captions, key icons and headnotes on every page of the original with YOLO on RunPod, then compute the redactions of review 2 (incurs costs $$$)" onclick="return confirm('This runs YOLO detection on RunPod over every page of this volume. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}{% if yolo_run %}Re-run detection{% else %}Run detection{% endif %}</button>
-  </form>
   {% endif %}
   {% comment %}
     There is no "Rebuild & Validate" branch here any more (#232). It
@@ -133,11 +122,11 @@ reach step 2.
     {% comment %}
       No paid confirm here (#196): this button starts nothing.
       start_detect walks to step 2 when detections exist and otherwise
-      says who starts the run; the staff button above is the one that
-      pays. A confirm that named RunPod and a cost here promised a run
-      the view then did not start.
+      says where the run stands; the daemon is what pays (#250). A
+      confirm that named RunPod and a cost here promised a run the
+      view then did not start.
     {% endcomment %}
-    <button type="submit" class="btn-outline text-sm" title="This volume has no detections yet. A staff member starts the detection run, and the redactions appear here when it finishes.">Next: Detect &rarr;</button>
+    <button type="submit" class="btn-outline text-sm" title="{{ detect_message }}">Next: Detect &rarr;</button>
     {% endif %}
   </form>
   {% endif %}

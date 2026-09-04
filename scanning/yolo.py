@@ -15,21 +15,29 @@ worker image is issue #194; this module is the caller it was waiting
 for.
 
 The run ends when every shard answers, with the rows at ``COMPLETED``
--- the provider is done, and we have applied nothing. There is
-deliberately **no** glue and no ``CONSUMED`` here: issue #196 reads the
+-- the provider is done, and we have applied nothing. The collect tick
+then merges the run (:func:`finish_ready_runs`, #196): it reads the
 per-shard results, offsets each ``page_index`` by its shard's own
-``from_page``, and turns the rows into ``Detection`` records and
-redaction geometry. Until it lands, a finished run is a set of JSON
-objects in S3 and nothing else.
+``from_page``, writes one volume document and flips the rows to
+``CONSUMED``. That follows the rows alone, so it happens while the scan
+is still in review 1. Only the apply (:func:`queue_ready_runs`) waits
+for the approval, because it imports the ``Detection`` records and
+measures the redaction geometry on the bitonal copy.
 
-Who starts it: the staff-only button
-(``views_process.start_yolo_detect``), and nothing else. The pipeline
-does **not** enqueue it. That is the whole point of this issue -- the
-stage must be exercised on a few volumes before it runs over the corpus
-(#211) -- and it is structural rather than a promise, because
-:func:`ensure_detect_jobs` is the only creator of ``DETECT`` rows and an
-abstract syntax tree (AST) test pins its caller set. The web process
-only writes rows; the daemon submits, polls and retries them.
+Who starts it: the daemon, once per shard set, and nothing else
+(#250). :func:`enqueue_missing_runs` runs on every submit tick before
+the wave, and creates the rows for every fingerprinted shard set that
+has no detection run yet -- alive or dead -- so a new upload, a volume
+uploaded before the sweep existed and a volume uploaded while the
+stage was off are all one case. A dead run over the same set is not
+re-run by the daemon: that is a deliberate act, and the
+``enqueue_yolo_detect`` command is the operator's way to make it. The
+staff button of #195 is deleted; it started nothing the sweep does not.
+The rule is
+structural rather than a promise, because :func:`ensure_detect_jobs`
+is the only creator of ``DETECT`` rows and an abstract syntax tree
+(AST) test pins its caller set. The web process writes no detection
+rows at all; the daemon creates, submits, polls and retries them.
 """
 
 from __future__ import annotations
@@ -118,6 +126,22 @@ APPLY_MAX_ATTEMPTS = 3
 #: step 3, errored or re-queued comes back through the admin re-queue.
 APPLY_STATUS = Status.PAGE_COMPLETENESS_REVIEW_DONE
 
+#: The statuses the sweep starts a run from (#250): the parked states
+#: between the pipeline and the end of review 2. QUEUED and PROCESSING
+#: are out, because the pipeline owns the scan and may re-cut its set;
+#: ERROR and every status past review 2 are out, because they come
+#: back through the admin re-queue. The sweep is the one automatic
+#: creator of paid GPU work outside ``run_full_pipeline``, so the set
+#: is spelled out rather than derived.
+SWEEP_STATUSES = frozenset(
+    {
+        Status.AWAITING,
+        Status.AWAITING_VALIDATION,
+        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+        Status.PAGE_COMPLETENESS_REVIEW_DONE,
+    }
+)
+
 
 class DetectMergeError(Exception):
     """A completed detection run could not be merged into one document."""
@@ -184,10 +208,10 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
     """Return the live detection jobs for ``scan``, creating them if the
     current run does not describe today's shard set.
 
-    Idempotent, so a second press of the start button is a no-op rather
-    than a second run over shards already read. A run holding a dead row
-    (failed, cancelled, expired) is replaced instead, since nothing will
-    move it again.
+    Idempotent, so the sweep and the ``enqueue_yolo_detect`` command
+    meeting on one scan is a no-op rather than a second run over shards
+    already read. A run holding a dead row (failed, cancelled, expired)
+    is replaced instead, since nothing will move it again.
 
     A replacement run does not re-detect shards already detected:
     ``reuse_results`` carries a prior result forward whenever the
@@ -210,6 +234,143 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
         provider=JobProvider.RUNPOD,
         reuse_results=True,
     )
+
+
+#: How long the sweep leaves a scan alone after ``committed_manifest``
+#: refused its shard set. The submit tick is every 5 seconds, and a
+#: refusal lasts until an admin re-queue re-cuts the set (a re-uploaded
+#: or missing original, a ``MANIFEST_VERSION`` bump over the whole
+#: corpus), so looked at on every tick each such scan would cost two S3
+#: calls and one log line 17,000 times a day. The memo lives in the
+#: daemon process: a restart forgets it, which buys one fresh look per
+#: deploy and nothing worse, because a duplicate run is prevented by
+#: the rows in the database, never by this.
+REFUSAL_RETRY_SECONDS = 3600
+
+#: ``scan pk -> (retry at, times refused)``, see above. Tests clear it.
+_REFUSED: dict[int, tuple[float, int]] = {}
+
+
+def enqueue_missing_runs() -> int:
+    """Start detection over every shard set that has no run yet.
+
+    The submit tick's first pass (#250), before ``jobs.submit_pending``
+    so the rows it creates go out on the same tick. This is what
+    connects detection to the pipeline, and it is a sweep rather than
+    an arm in ``run_full_pipeline`` because one rule then covers three
+    cases: a new upload, a volume uploaded before this existed, and a
+    volume uploaded while the stage was switched off.
+
+    **The rule: a shard set is detected once.** A run is started only
+    for a scan whose current shard set -- named by
+    ``Scan.source_fingerprint``, stamped by ``sharding.ensure_shards``
+    -- has no detection row at all, alive or dead. A dead run over the
+    same set is left alone: ``YOLO_MAX_ATTEMPTS`` were spent on a shard,
+    and a fourth attempt is a staff decision, not a tick. A re-cut set
+    has a new fingerprint, so it gets a run, and
+    :func:`ensure_detect_jobs` carries every unchanged shard forward.
+    A row written before the column is blank. Such a scan **is** a
+    candidate, and :func:`ensure_detect_jobs` decides: when the blank
+    run still describes today's set (``jobs._still_describes``) it is
+    handed back unchanged, and this pass stamps the fingerprint on it
+    -- the two checks it just passed are exactly what the stamp
+    asserts -- so it is looked at once and never re-paid. A blank run
+    over another set, or a dead one, is replaced with a carry, as any
+    other. Excluding a blank row outright would hide a re-uploaded
+    button-era volume from the sweep for good, and silently.
+
+    The rows are the whole state, so a daemon killed mid-sweep starts
+    nothing twice: a scan whose rows landed (one ``bulk_create``, one
+    transaction) is no candidate on the next tick, and a scan whose
+    rows did not land is, which is right.
+
+    **One batch per tick.** The candidates come from the database
+    alone, newest first, and at most ``YOLO_MAX_CONCURRENCY`` of them
+    are looked at: each one costs two S3 calls
+    (``sharding.committed_manifest`` reads the manifest and HEADs the
+    original, and reads no shard), and the scheduler is serial, so an
+    unbounded first tick over a corpus of parked volumes would hold
+    every poll and every claim for minutes. The cap counts shards in
+    flight and this counts volumes per tick, but one value serves both
+    without a knob nobody would tune: the backlog only takes more
+    ticks to turn into rows, and nothing waits on that. A refused set
+    is logged once at INFO, then at DEBUG, and left alone for
+    :data:`REFUSAL_RETRY_SECONDS` (see :data:`_REFUSED`), so a
+    permanent refusal neither fills the log nor holds a place in the
+    batch. The pass makes no call to RunPod.
+
+    :returns: How many runs were started.
+    :rtype: int
+    """
+    from django.db.models import Exists, OuterRef
+
+    from scanning import sharding
+
+    if not enabled() or not s3_sync.s3_active():
+        return 0
+
+    now = time.monotonic()
+    skipped = [pk for pk, (retry_at, _) in _REFUSED.items() if retry_at > now]
+
+    detected = ExternalJob.objects.filter(
+        scan=OuterRef("pk"),
+        stage=JobStage.DETECT,
+        engine=JobEngine.BLACKLETTER,
+        opinion=None,
+    ).filter(source_fingerprint=OuterRef("source_fingerprint"))
+    candidates = (
+        Scan.objects.filter(status__in=SWEEP_STATUSES)
+        .exclude(source_fingerprint="")
+        .exclude(pk__in=skipped)
+        .annotate(detected=Exists(detected))
+        .filter(detected=False)
+        .order_by("-pk")[: settings.YOLO_MAX_CONCURRENCY]
+    )
+
+    started = 0
+    for scan in candidates:
+        manifest, reason = sharding.committed_manifest(scan)
+        if manifest is None:
+            _, times = _REFUSED.get(scan.pk, (0.0, 0))
+            _REFUSED[scan.pk] = (now + REFUSAL_RETRY_SECONDS, times + 1)
+            logger.log(
+                logging.INFO if times == 0 else logging.DEBUG,
+                "Scan %s is not swept for detection (refusal %d, next look "
+                "in %ds): %s",
+                scan.pk,
+                times + 1,
+                REFUSAL_RETRY_SECONDS,
+                reason,
+            )
+            continue
+        _REFUSED.pop(scan.pk, None)
+        rows = ensure_detect_jobs(scan, manifest)
+        blank = [row.pk for row in rows if not row.source_fingerprint]
+        if blank:
+            # A run from before the column, handed back because it
+            # still describes today's set. Stamp it, so the next tick
+            # does not pay two S3 calls to learn the same thing.
+            ExternalJob.objects.filter(pk__in=blank).update(
+                source_fingerprint=scan.source_fingerprint
+            )
+            logger.info(
+                "Adopted detection run %s of scan %s (%d row(s) from "
+                "before the fingerprint column)",
+                rows[0].run,
+                scan.pk,
+                len(blank),
+            )
+            continue
+        logger.info(
+            "Started detection run %s for scan %s over %d shard(s) "
+            "(%d carried)",
+            rows[0].run,
+            scan.pk,
+            len(rows),
+            sum(1 for row in rows if row.status == JobStatus.COMPLETED),
+        )
+        started += 1
+    return started
 
 
 def live_detect_jobs(scan) -> list[ExternalJob]:
@@ -565,7 +726,8 @@ def finish_ready_runs() -> int:
     run is finished when no row of it waits to be submitted or is in
     flight, and none is dead: a dead row means the run can never cover
     the volume, ``run_summary`` already shows it on the process page,
-    and the way forward is the staff button, which opens a fresh run.
+    and the way forward is the ``enqueue_yolo_detect`` command, which
+    opens a fresh run (#250).
 
     Like the detection stage itself, this pass writes **no scan
     status** (#195). With no status to latch on, the rows are the

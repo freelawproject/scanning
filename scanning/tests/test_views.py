@@ -2733,9 +2733,9 @@ class TestPipelinePausedViews(ScanningTestCase):
     def test_start_detect_explains_itself_without_detections(self):
         """Not "paused" any more: detection works since #195/#196.
 
-        The action still starts nothing -- a run costs GPU time, so a
-        staff member starts it -- but it says who does, instead of
-        blaming a pipeline that is back.
+        The action still starts nothing -- the daemon starts the run
+        by itself (#250) -- and a volume with no run at all hears
+        that, instead of blaming a pipeline that is back.
         """
         from scanning.views_process import NO_DETECTIONS_MESSAGE
 

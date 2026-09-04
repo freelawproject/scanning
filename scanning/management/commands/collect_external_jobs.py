@@ -43,7 +43,11 @@ merge from them.
 **6. ``yolo.queue_ready_runs()`` queues the redaction computation.**
 It is a trigger, not the work: it takes a scan in
 ``PAGE_COMPLETENESS_REVIEW_DONE`` to ``QUEUED`` with
-``COMPUTE_REDACTIONS``, and ``process_next_scan`` runs it. The
+``COMPUTE_REDACTIONS``, and ``process_next_scan`` runs it. Since the
+daemon starts detection right after the upload (#250), the run is
+usually merged by pass 5 while the scan is still in review 1, and it
+waits there at no cost until the approval; this pass takes it on the
+tick after. The
 computation renders every page of the volume three times (83s for 1364
 pages, measured), and this tick's scheduler is serial (#156), so it
 must not run here.
