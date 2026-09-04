@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% load humanize %}
+
+{% block title %}Stats - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+{% comment %}
+  How much work is done, and where the rest of it waits (#260). Two
+  tables, because one cannot be both: the first says where the scans
+  are now and its rows add up to the total; the second is the review
+  funnel, whose rows are cumulative and overlap by design.
+{% endcomment %}
+<div class="flex flex-col sm:flex-row sm:items-end sm:justify-between mb-6 gap-4">
+  <h1 class="text-2xl font-bold">Stats</h1>
+  <div class="text-sm text-gray-500 dark:text-gray-400 tabular-nums">
+    <span class="font-medium text-gray-900 dark:text-white">{{ totals.scans|intcomma }}</span> scan{{ totals.scans|pluralize }} uploaded &middot;
+    <span class="font-medium text-gray-900 dark:text-white">{{ totals.volumes|intcomma }}</span> volume{{ totals.volumes|pluralize }}
+  </div>
+</div>
+
+<p class="text-sm text-gray-600 dark:text-gray-300 mb-6">
+  Every count reads the status of the scan, because nothing else records a review.
+  A scan with no uploaded file is left out: it is an upload a browser never finished.
+  A volume is one reporter and one volume number, and several scans can make up one volume.
+</p>
+
+<!-- Where the scans are now -->
+<h2 class="text-lg font-semibold mb-2">Where the scans are now</h2>
+<p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
+  Each scan is in one row, so the scans add up to the total.
+</p>
+<div class="card overflow-x-auto p-0 mb-8">
+  <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+    <thead class="bg-gray-50 dark:bg-gray-800">
+      <tr>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Group</th>
+        <th class="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Scans</th>
+        <th class="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Volumes</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in status_groups %}
+      <tr class="border-t border-gray-200 dark:border-gray-700">
+        <td class="px-4 py-3 text-sm">{{ row.label }}</td>
+        <td class="px-4 py-3 text-sm text-right tabular-nums">{{ row.scans|intcomma }}</td>
+        <td class="px-4 py-3 text-sm text-right tabular-nums text-gray-500 dark:text-gray-400">{{ row.volumes|intcomma }}</td>
+      </tr>
+      {% endfor %}
+      <tr class="border-t-2 border-gray-300 dark:border-gray-600 font-medium">
+        <td class="px-4 py-3 text-sm">All scans</td>
+        <td class="px-4 py-3 text-sm text-right tabular-nums">{{ totals.scans|intcomma }}</td>
+        <td class="px-4 py-3 text-sm text-right tabular-nums text-gray-500 dark:text-gray-400">{{ totals.volumes|intcomma }}</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- The review funnel -->
+<h2 class="text-lg font-semibold mb-2">The review funnel</h2>
+<p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
+  These rows are cumulative, and one scan can be in two of them.
+  The legacy rows of the retired pipeline are not here; the table above counts them.
+</p>
+<div class="card overflow-x-auto p-0 mb-4">
+  <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+    <thead class="bg-gray-50 dark:bg-gray-800">
+      <tr>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Step</th>
+        <th class="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Scans</th>
+        <th class="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Volumes</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in funnel %}
+      <tr class="border-t border-gray-200 dark:border-gray-700">
+        <td class="px-4 py-3 text-sm">
+          {{ row.label }}
+          {% if row.note %}<div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{{ row.note }}</div>{% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm text-right tabular-nums">{{ row.scans|intcomma }}</td>
+        <td class="px-4 py-3 text-sm text-right tabular-nums text-gray-500 dark:text-gray-400">{{ row.volumes|intcomma }}</td>
+      </tr>
+      {% endfor %}
+      <tr class="border-t border-gray-200 dark:border-gray-700">
+        <td class="px-4 py-3 text-sm">
+          <a href="{% url 'repair_queue' %}">Pages that wait for a scanner</a>
+          <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">A reviewer asked for these pages and a person with the book must scan them.</div>
+        </td>
+        <td class="px-4 py-3 text-sm text-right tabular-nums">{{ repairs.requests|intcomma }} page{{ repairs.requests|pluralize }}</td>
+        <td class="px-4 py-3 text-sm text-right tabular-nums text-gray-500 dark:text-gray-400">over {{ repairs.scans|intcomma }} scan{{ repairs.scans|pluralize }}</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="text-xs text-gray-500 dark:text-gray-400 space-y-1">
+  <p>
+    <strong>The volume column does not add up.</strong>
+    A volume with two scans in two different rows is counted in both rows.
+  </p>
+  <p>
+    <strong>A count is the status of today.</strong>
+    A scan that a member of the staff puts through the pipeline again leaves its
+    row, and it comes back when a person reviews it again.
+  </p>
+</div>
+{% endblock %}
