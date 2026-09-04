@@ -3790,3 +3790,89 @@ class TestGluedOutputs(ScanningTestCase):
             ),
             body["html"],
         )
+
+
+class TestTemplateScriptBlocks(TestCase):
+    """No inline script may contain a closing script tag.
+
+    The HTML parser ends a script element at the first `</script`, in a
+    comment and in a string too. One such text in a comment of
+    scan_process.html cut the SCAN_CONFIG block in two and left the
+    step-1 viewer with no configuration (#249).
+    """
+
+    #: An open or a closing script tag, as the HTML parser reads it.
+    SCRIPT_TAG = re.compile(r"</?script\b", re.I)
+
+    @classmethod
+    def script_tag_faults(cls, text):
+        """Walk the script tags of one template and report the bad ones.
+
+        The walk is the parser's own rule: a closing tag ends the
+        element, whatever it stands in. So an open tag while the walk is
+        inside an element says the element ended too early, and a
+        closing tag while it is outside says the same one line later.
+        Do not look for a closing tag *inside* a matched block: a
+        non-greedy match ends at the first one, so the block it gives
+        can never hold one and the test can never fail.
+
+        :param text: The template's text.
+        :returns: The 1-based line number of each bad tag.
+        """
+        faults = []
+        inside = False
+        for match in cls.SCRIPT_TAG.finditer(text):
+            closing = match.group().startswith("</")
+            if closing != inside:
+                faults.append(text[: match.start()].count("\n") + 1)
+            inside = not closing
+        if inside:
+            faults.append(text.count("\n") + 1)
+        return faults
+
+    def test_no_template_closes_a_script_block_early(self):
+        root = pathlib.Path(__file__).resolve().parent.parent
+        faults = []
+        for path in root.rglob("*.html"):
+            if "node_modules" in str(path):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            faults += [
+                f"{path}:{line}" for line in self.script_tag_faults(text)
+            ]
+
+        self.assertEqual(faults, [])
+
+    def test_the_walk_finds_the_tag_that_broke_the_page(self):
+        """The guard must fail on the text of issue #249.
+
+        The first guard read the block a non-greedy match gave it, which
+        ends at the first closing tag. It could not fail.
+        """
+        broken = (
+            '<script>\nvar A = {  // a "</script>" in a note\n};\n</script>\n'
+        )
+
+        self.assertEqual(self.script_tag_faults(broken), [4])
+        self.assertEqual(
+            self.script_tag_faults(broken.replace("</s", "<\\/s", 1)), []
+        )
+
+    def test_no_template_opens_a_comment_it_does_not_close(self):
+        """`{# ... #}` holds one line only.
+
+        Django renders a `{#` with no `#}` on the same line as text, so
+        the note reached the interface. A note over several lines needs
+        `{% comment %}`.
+        """
+        root = pathlib.Path(__file__).resolve().parent.parent
+        faults = []
+        for path in root.rglob("*.html"):
+            if "node_modules" in str(path):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for number, line in enumerate(text.splitlines(), 1):
+                if "{#" in line and "#}" not in line:
+                    faults.append(f"{path}:{number}")
+
+        self.assertEqual(faults, [])
