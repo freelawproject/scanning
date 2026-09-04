@@ -475,16 +475,42 @@ class TestEnqueueMissingRuns(ScanningTestCase):
         )
         self.assertEqual(self._sweep(), 0)
 
-    def test_rows_with_a_blank_fingerprint_match_anything(self):
-        """A button-era run (before the column) is over the current set
-        unless the original was re-cut, and re-cutting stamps every
-        later row. Never re-pay it."""
+    def test_a_blank_run_over_the_same_set_is_adopted_not_re_paid(self):
+        """A run from before the column. ``ensure_detect_jobs`` proves it
+        still describes today's set and hands it back; the sweep stamps
+        it, so the next tick pays nothing to learn the same thing."""
         scan = self._scan()
         rows = yolo.ensure_detect_jobs(scan, self.manifest)
         ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
             source_fingerprint=""
         )
+        with self.assertLogs("scanning.yolo", level="INFO") as logs:
+            self.assertEqual(self._sweep(), 0)
+        self.assertIn("Adopted", "".join(logs.output))
+        self.assertEqual(self.committed.call_count, 1)
+        fresh = detect_jobs(scan)
+        self.assertEqual([r.pk for r in fresh], [r.pk for r in rows])
+        self.assertEqual({r.source_fingerprint for r in fresh}, {FINGERPRINT})
         self.assertEqual(self._sweep(), 0)
+        self.assertEqual(self.committed.call_count, 0)
+
+    def test_a_blank_run_over_another_set_does_not_hide_the_scan(self):
+        """The re-uploaded button-era volume: a blank arm in the query
+        would have hidden it for good."""
+        scan = self._scan(fingerprint="2048:20")
+        old = yolo.ensure_detect_jobs(
+            scan, make_manifest(shard_count=2, pages_per_shard=10)
+        )
+        ExternalJob.objects.filter(pk__in=[r.pk for r in old]).update(
+            source_fingerprint="", status=JobStatus.CONSUMED
+        )
+        Scan.objects.filter(pk=scan.pk).update(source_fingerprint=FINGERPRINT)
+
+        self.assertEqual(self._sweep(), 1)
+        fresh = yolo.live_detect_jobs(scan)
+        self.assertEqual(fresh[0].run, 2)
+        self.assertEqual(len(fresh), 3)
+        self.assertEqual({r.source_fingerprint for r in fresh}, {FINGERPRINT})
 
     def test_a_re_cut_set_gets_a_new_run_and_carries_unchanged_shards(self):
         scan = self._scan(fingerprint="2048:20")

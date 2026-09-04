@@ -30,8 +30,10 @@ the wave, and creates the rows for every fingerprinted shard set that
 has no detection run yet -- alive or dead -- so a new upload, a volume
 uploaded before the sweep existed and a volume uploaded while the
 stage was off are all one case. A dead run over the same set is not
-re-run by the daemon: that is a deliberate act. The staff button of
-#195 is deleted; it started nothing the sweep does not. The rule is
+re-run by the daemon: that is a deliberate act, and the
+``enqueue_yolo_detect`` command is the operator's way to make it. The
+staff button of #195 is deleted; it started nothing the sweep does not.
+The rule is
 structural rather than a promise, because :func:`ensure_detect_jobs`
 is the only creator of ``DETECT`` rows and an abstract syntax tree
 (AST) test pins its caller set. The web process writes no detection
@@ -206,10 +208,10 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
     """Return the live detection jobs for ``scan``, creating them if the
     current run does not describe today's shard set.
 
-    Idempotent, so a second press of the start button is a no-op rather
-    than a second run over shards already read. A run holding a dead row
-    (failed, cancelled, expired) is replaced instead, since nothing will
-    move it again.
+    Idempotent, so the sweep and the ``enqueue_yolo_detect`` command
+    meeting on one scan is a no-op rather than a second run over shards
+    already read. A run holding a dead row (failed, cancelled, expired)
+    is replaced instead, since nothing will move it again.
 
     A replacement run does not re-detect shards already detected:
     ``reuse_results`` carries a prior result forward whenever the
@@ -267,8 +269,15 @@ def enqueue_missing_runs() -> int:
     and a fourth attempt is a staff decision, not a tick. A re-cut set
     has a new fingerprint, so it gets a run, and
     :func:`ensure_detect_jobs` carries every unchanged shard forward.
-    A row written before the column is blank and matches anything, so
-    a button-era run is never re-paid.
+    A row written before the column is blank. Such a scan **is** a
+    candidate, and :func:`ensure_detect_jobs` decides: when the blank
+    run still describes today's set (``jobs._still_describes``) it is
+    handed back unchanged, and this pass stamps the fingerprint on it
+    -- the two checks it just passed are exactly what the stamp
+    asserts -- so it is looked at once and never re-paid. A blank run
+    over another set, or a dead one, is replaced with a carry, as any
+    other. Excluding a blank row outright would hide a re-uploaded
+    button-era volume from the sweep for good, and silently.
 
     The rows are the whole state, so a daemon killed mid-sweep starts
     nothing twice: a scan whose rows landed (one ``bulk_create``, one
@@ -293,7 +302,7 @@ def enqueue_missing_runs() -> int:
     :returns: How many runs were started.
     :rtype: int
     """
-    from django.db.models import Exists, OuterRef, Q
+    from django.db.models import Exists, OuterRef
 
     from scanning import sharding
 
@@ -308,10 +317,7 @@ def enqueue_missing_runs() -> int:
         stage=JobStage.DETECT,
         engine=JobEngine.BLACKLETTER,
         opinion=None,
-    ).filter(
-        Q(source_fingerprint=OuterRef("source_fingerprint"))
-        | Q(source_fingerprint="")
-    )
+    ).filter(source_fingerprint=OuterRef("source_fingerprint"))
     candidates = (
         Scan.objects.filter(status__in=SWEEP_STATUSES)
         .exclude(source_fingerprint="")
@@ -339,6 +345,22 @@ def enqueue_missing_runs() -> int:
             continue
         _REFUSED.pop(scan.pk, None)
         rows = ensure_detect_jobs(scan, manifest)
+        blank = [row.pk for row in rows if not row.source_fingerprint]
+        if blank:
+            # A run from before the column, handed back because it
+            # still describes today's set. Stamp it, so the next tick
+            # does not pay two S3 calls to learn the same thing.
+            ExternalJob.objects.filter(pk__in=blank).update(
+                source_fingerprint=scan.source_fingerprint
+            )
+            logger.info(
+                "Adopted detection run %s of scan %s (%d row(s) from "
+                "before the fingerprint column)",
+                rows[0].run,
+                scan.pk,
+                len(blank),
+            )
+            continue
         logger.info(
             "Started detection run %s for scan %s over %d shard(s) "
             "(%d carried)",
@@ -704,7 +726,8 @@ def finish_ready_runs() -> int:
     run is finished when no row of it waits to be submitted or is in
     flight, and none is dead: a dead row means the run can never cover
     the volume, ``run_summary`` already shows it on the process page,
-    and the way forward is the staff button, which opens a fresh run.
+    and the way forward is the ``enqueue_yolo_detect`` command, which
+    opens a fresh run (#250).
 
     Like the detection stage itself, this pass writes **no scan
     status** (#195). With no status to latch on, the rows are the

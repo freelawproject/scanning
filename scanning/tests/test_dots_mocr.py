@@ -1749,11 +1749,17 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                     "scanning/management/commands/reread_failed_pages.py",
                     "ensure_analyze_jobs",
                 ),
-                # Detection: the daemon's sweep alone (#250), which is
-                # in yolo.py itself. No view and no pipeline arm may
-                # appear here: the sweep's rule -- one run per shard
-                # set, ever -- is what bounds the spend.
+                # Detection: the daemon's sweep (#250), in yolo.py
+                # itself, and the command that re-runs a dead run --
+                # deliberate and staff-run, like reread_failed_pages.
+                # No view and no pipeline arm may appear here: the
+                # sweep's rule -- one run per shard set, ever -- is
+                # what bounds the spend.
                 ("scanning/yolo.py", "ensure_detect_jobs"),
+                (
+                    "scanning/management/commands/enqueue_yolo_detect.py",
+                    "ensure_detect_jobs",
+                ),
                 # The generic creator's three wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
                 ("scanning/yolo.py", "ensure_shard_jobs"),

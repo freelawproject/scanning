@@ -37,7 +37,7 @@ Four properties are load-bearing and easy to break:
 - **Every write is a compare-and-swap** (:func:`_write`), so no lock is
   held across an HTTP call. The other writer is the web process, not a
   second daemon: the admin re-queue, the admin scan deletion and the
-  two start buttons all call into this module from a request, and the
+  dots.mocr start button all call into this module from a request, and the
   loser's update simply matches nothing.
 - **A resubmission bumps ``attempt``**, re-addressing the result
   object. Doctor finishes a conversion after we stop listening, and

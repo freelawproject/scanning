@@ -60,7 +60,7 @@ with the staff button kept for re-runs), the page numbers plus Issues
 as an apply pass on the collect tick (#149/#204), review 1 got its
 approve button (#151) and one model for its human page edits (#214),
 and YOLO detection came back as a rebuilt worker image (#194) with its
-job rows and its staff button (#195) and the redaction work that reads
+job rows (#195; the staff button went with #250) and the redaction work that reads
 its output (#196), all below; what is still missing is step 3, the
 file generation (#206), so:
 
@@ -916,9 +916,9 @@ words, so the page reached the reader with no cell and no number.
 with `bl_warm`, one 18-class checkpoint that replaced the
 small/medium/large trio (blackletter #73). It is the image only: the job
 rows and the daemon path are #195 (below), and the redaction work that
-reads its output is #196 (below). One staff button is still the only
-way in — the pipeline enqueues no detection until #211. What must not
-be broken:
+reads its output is #196 (below). Since #250 the daemon starts the
+run itself, once per shard set (the #195 section). What must not be
+broken:
 
 - **Only `bl_warm.pt` is baked.** `api.detect` calls `ensure_weights`
   itself, so an unbaked name would reach Hugging Face from inside a paid
@@ -994,8 +994,9 @@ The caller the #194 image was waiting for. Detection runs on RunPod
 Serverless, one job per **original** shard, tracked on `ExternalJob`
 rows at `DETECT`/`BLACKLETTER`/`RUNPOD`. The pieces: `yolo.py` (the
 stage), `settings/project/yolo.py` (five variables), the
-`jobs.RunpodEngine` table, and `views_process.start_yolo_detect` (the
-button). It reuses the whole #190 machinery — the claim, the poll, the
+`jobs.RunpodEngine` table, and since #250 the sweep
+`yolo.enqueue_missing_runs` plus the `enqueue_yolo_detect` command (the
+staff button of #195 is deleted). It reuses the whole #190 machinery — the claim, the poll, the
 deadlines, the cancel, the retry, the carry-over — so what follows is
 only what is new or specific:
 
@@ -1007,13 +1008,19 @@ only what is new or specific:
   upload, a volume from before the sweep and a volume uploaded while
   the stage was off are one case, and a dead run is **not** re-run by
   a tick -- `YOLO_MAX_ATTEMPTS` were spent on a shard, and a fourth
-  attempt is a staff decision (a one-off `yolo.ensure_detect_jobs` in
-  a shell, which carries every good shard). The rule is one query
+  attempt is a staff decision: `enqueue_yolo_detect --dead-runs` (or
+  named scans), a command beside `reread_failed_pages` in the pinned
+  caller set, which replaces the dead run and carries every good
+  shard. The rule is one query
   through `ExternalJob.source_fingerprint`, stamped by
   `ensure_shard_jobs` on every row of every stage from the manifest's
   source; it is **not** in the `input_manifest` identity, which
-  `_still_describes` compares exactly, and a blank (pre-column) row
-  matches anything, so no button-era run is re-paid. Candidates come
+  `_still_describes` compares exactly. A blank (pre-column) row does
+  **not** exclude its scan: the sweep hands it to `ensure_detect_jobs`,
+  which reuses a blank run that still describes today's set, and the
+  sweep then stamps the fingerprint on it ("adopted"), so it is looked
+  at once and never re-paid; a blank arm in the query would have hidden
+  a re-uploaded button-era volume for good. Candidates come
   from the database (`SWEEP_STATUSES`: the parked states between the
   pipeline and the end of review 2; QUEUED/PROCESSING are the
   pipeline's, ERROR and beyond come back through the re-queue), newest
@@ -1030,8 +1037,9 @@ only what is new or specific:
   times a day, and it would hold a place in the batch. The memo is a
   cost saver only: the rows are what prevent a second run, so a
   restart that forgets it starts nothing twice.
-  `yolo.ensure_detect_jobs` is the only creator and the sweep its
-  only caller, pinned by `TestKnownEnqueuePaths`. The staff button of
+  `yolo.ensure_detect_jobs` is the only creator; the sweep and the
+  command are its callers, pinned by `TestKnownEnqueuePaths`. The
+  staff button of
   #195 is deleted: it started nothing the sweep does not, and a
   whole-volume re-run over an edited volume belongs to #224. "Next:
   Detect" only walks to step 2 when detections exist (#196), and
@@ -1133,9 +1141,9 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   the work drops it as it starts, so a failed apply is queued again.
   `applied_at` closes the run for good.
 - **Only `PAGE_COMPLETENESS_REVIEW_DONE` is taken**, with a
-  compare-and-swap, and the staff button refuses every other status for
-  the same reason: review 2 follows review 1, and a run started earlier
-  would be paid for and never read.
+  compare-and-swap: review 2 follows review 1. The run itself may
+  start earlier (#250 starts it at upload); it is the apply that waits,
+  because it moves the scan and reads the bitonal copy.
 - **The detections are imported once per run.** A run already stamped
   is a *recompute*, which a curator asks for after they edit a box: it
   keeps every row in the database and measures again from those.
