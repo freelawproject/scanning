@@ -837,40 +837,49 @@ def _build(scan: Scan, run: ApplyRun) -> None:
     over the same key, and ``ensure_shard_jobs`` hands back the live
     rows when they still describe the specs.
 
+    The plan comes first, and a volume nobody changed never opens the
+    original. The plan reads the rows and the uploaded files only, and
+    an identity map has no edit entry, so there is no shard to cut and
+    the final PDF is the original itself. That matters on the first
+    ticks after a deploy, which apply the whole approved corpus: a pull
+    of every multi-gigabyte original, to count its pages, would fill
+    the daemon pod's disk.
+
     :param scan: The scan.
     :param run: The run to build, not yet built.
     :return: None.
     :raises ApplyError: If an input is missing or an upload failed.
     """
     started = time.monotonic()
-    original = local_original_pdf(scan)
-    if not original:
-        raise ApplyError(f"the original of scan {scan.pk} is not available")
-
     prefix = run_prefix(scan, run)
+    plan = plan_run(scan)
+    shards: dict[int, dict] = {}
     with tempfile.TemporaryDirectory(
         prefix=f"{BUILD_TMP_PREFIX}{scan.pk}-"
     ) as tmp:
         tmp_dir = Path(tmp)
-        with fitz.open(original) as source:
-            if scan.page_count != source.page_count:
+        if plan.is_identity:
+            # No copy of gigabytes, and no pull, for a volume nobody
+            # changed: the final PDF is the original.
+            final_key = _original_key(scan)
+        else:
+            original = local_original_pdf(scan)
+            if not original:
                 raise ApplyError(
-                    f"scan {scan.pk} has {scan.page_count} page(s) on the "
-                    f"row and {source.page_count} in the original"
+                    f"the original of scan {scan.pk} is not available"
                 )
-            # The plan first, off the rows and the uploaded files, so
-            # only the edits it places get a shard. A shard's page
-            # count is the file's, so the plan needs no second pass.
-            plan = plan_run(scan)
-            shards = {
-                edit.pk: _ensure_page_shard(scan, source, edit, tmp_dir)
-                for edit in plan.shard_edits
-            }
-            if plan.is_identity:
-                # No copy of gigabytes for a volume nobody changed: the
-                # final PDF is the original.
-                final_key = _original_key(scan)
-            else:
+            with fitz.open(original) as source:
+                if scan.page_count != source.page_count:
+                    raise ApplyError(
+                        f"scan {scan.pk} has {scan.page_count} page(s) on "
+                        f"the row and {source.page_count} in the original"
+                    )
+                # A shard's page count is the file's, so the plan needs
+                # no second pass.
+                shards = {
+                    edit.pk: _ensure_page_shard(scan, source, edit, tmp_dir)
+                    for edit in plan.shard_edits
+                }
                 final_path = tmp_dir / "final.pdf"
                 with build_final_pdf(source, plan) as out:
                     out.save(str(final_path), garbage=3, deflate=True)
@@ -1010,6 +1019,13 @@ def build_run(scan: Scan) -> ApplyRun:
 # ── the trigger ────────────────────────────────────────────────────
 #: The one status the apply takes a scan from, and gives it back to.
 APPLY_STATUS = Status.PAGE_COMPLETENESS_REVIEW_DONE
+
+#: How many scans one tick may queue, the rule of
+#: ``yolo.enqueue_missing_runs`` (#250). The worker is serial, so a
+#: tick that queued the whole approved corpus would take every one of
+#: those volumes out of review 2 at once and give them back one at a
+#: time. A small batch only spreads the same work over more ticks.
+MAX_SCANS_PER_TICK = 5
 
 
 def _current_edit_ids(scan: Scan) -> list[int]:
@@ -1186,6 +1202,10 @@ def queue_ready_scans() -> int:
     compare-and-swap. A scan in any other status is deferred without a
     mark: it comes back when it holds that status again.
 
+    At most ``MAX_SCANS_PER_TICK`` scans are queued, newest first. The
+    first ticks after a deploy see the whole approved corpus, and a
+    queued scan leaves review 2 until the serial worker gives it back.
+
     :returns: How many scans were queued.
     :rtype: int
     """
@@ -1195,9 +1215,11 @@ def queue_ready_scans() -> int:
     candidates = _candidate_scan_ids()
     if not candidates:
         return 0
-    for scan in Scan.objects.filter(
-        pk__in=candidates, status=APPLY_STATUS
-    ).select_related("reporter"):
+    for scan in (
+        Scan.objects.filter(pk__in=candidates, status=APPLY_STATUS)
+        .select_related("reporter")
+        .order_by("-pk")[:MAX_SCANS_PER_TICK]
+    ):
         phase = phase_due(scan, current_run(scan))
         if phase is None:
             continue
@@ -1386,14 +1408,26 @@ def _glue_bitonal(
                     f"the volume bitonal copy has {volume.page_count} "
                     f"page(s), the original {page_map['source_page_count']}"
                 )
-            for entry in entries:
-                src = entry["source"]
+            # A run of kept pages goes in one call, as
+            # ``build_final_pdf`` does: a volume of 1300 pages with two
+            # edits is three ranges, not 1300 calls.
+            i = 0
+            while i < len(entries):
+                src = entries[i]["source"]
                 if src["kind"] == "original":
+                    first = src["pdf_page"]
+                    last = first
+                    while (
+                        i + 1 < len(entries)
+                        and entries[i + 1]["source"]["kind"] == "original"
+                        and entries[i + 1]["source"]["pdf_page"] == last + 1
+                    ):
+                        i += 1
+                        last += 1
                     out.insert_pdf(
-                        volume,
-                        from_page=src["pdf_page"] - 1,
-                        to_page=src["pdf_page"] - 1,
+                        volume, from_page=first - 1, to_page=last - 1
                     )
+                    i += 1
                     continue
                 shard = shard_of(src["edit_id"])
                 if src["page"] >= shard.page_count:
@@ -1405,6 +1439,7 @@ def _glue_bitonal(
                 out.insert_pdf(
                     shard, from_page=src["page"], to_page=src["page"]
                 )
+                i += 1
             if out.page_count != page_map["final_page_count"]:
                 raise ApplyError(
                     f"the final bitonal copy has {out.page_count} page(s), "

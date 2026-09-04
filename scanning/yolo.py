@@ -322,6 +322,11 @@ def enqueue_missing_runs() -> int:
         stage=JobStage.DETECT,
         engine=JobEngine.BLACKLETTER,
         opinion=None,
+        # The volume run only. An apply run's rows (#224) are one-page
+        # shards of the pages a curator changed, and they answer for
+        # no shard set, so a volume that has them and no run of its
+        # own must still get one.
+        apply_run__isnull=True,
     ).filter(source_fingerprint=OuterRef("source_fingerprint"))
     candidates = (
         Scan.objects.filter(status__in=SWEEP_STATUSES)

@@ -644,6 +644,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "deleted_pages_json": json.dumps(
                 sorted(page_edits.deleted_pages(scan))
             ),
+            # The rule of the step-1 bar (#151): the viewer must not
+            # offer a control the endpoint refuses. Step 2 runs while
+            # a new-pipeline volume is in DONE, which locks every page
+            # edit (#224), and a legacy PENDING_REVIEW volume is not
+            # locked and keeps its page-number control.
+            "page_edits_locked": scan.status in LOCKED_STATUSES,
             "repair_requests": repair_requests,
             "waiting_repairs": waiting_repairs,
             "replaced_pages_json": json.dumps(

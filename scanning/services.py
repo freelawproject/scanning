@@ -1897,10 +1897,17 @@ def run_apply_page_edits(scan_pk: int) -> None:
     the rows it created are cancelled and the next claim builds the
     next number from the same shards.
 
+    The local tree goes at the end, as it does on every other terminal
+    path (#215). The build pulls the original and the glue pulls the
+    volume bitonal copy, and the first ticks after a deploy apply the
+    whole approved corpus. Without this the daemon pod would hold every
+    one of those volumes until ``cleanup_processing_tmp`` reached its
+    cutoff.
+
     :param scan_pk: Primary key of the scan to apply.
     :return: None.
     """
-    from scanning import apply
+    from scanning import apply, s3_sync
 
     django.db.connections.close_all()
     scan = Scan.objects.get(pk=scan_pk)
@@ -1919,6 +1926,8 @@ def run_apply_page_edits(scan_pk: int) -> None:
         apply.supersede_runs(
             scan, "the daemon lost its claim during the apply"
         )
+    if s3_sync.s3_active():
+        s3_sync.release_local_processing(scan)
 
 
 def run_full_pipeline(scan_pk: int) -> None:

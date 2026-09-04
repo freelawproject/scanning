@@ -1032,9 +1032,13 @@ def export_pdf(
     tmp.close()
     tmp_path = tmp.name
     try:
-        if not scan.page_count:
-            with fitz.open(original) as pdf_doc:
-                scan.page_count = pdf_doc.page_count
+        with fitz.open(original) as pdf_doc:
+            # The plan is built over ``Scan.page_count``, so a row that
+            # disagrees with the file would address a page the walk
+            # cannot reach and raise inside ``build_final_pdf``. The
+            # old walk clamped every index; this reads the file, which
+            # is what ``apply._build`` checks too.
+            scan.page_count = pdf_doc.page_count
         plan = apply.plan_run(scan)
         with fitz.open(original) as source:
             with apply.build_final_pdf(source, plan) as pdf_doc:

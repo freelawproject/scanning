@@ -19,6 +19,7 @@ from django.utils import timezone
 from scanning import jobs, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
+    ApplyRun,
     ExternalJob,
     JobEngine,
     JobProvider,
@@ -455,6 +456,34 @@ class TestEnqueueMissingRuns(ScanningTestCase):
         yolo.ensure_detect_jobs(scan, self.manifest)
         self.assertEqual(self._sweep(), 0)
         self.committed.assert_not_called()
+
+    def test_an_apply_runs_rows_do_not_answer_for_the_volume(self):
+        """The apply (#224) cuts one-page shards of the pages a curator
+        changed, and its rows are DETECT rows of the same scan. They
+        answer for no shard set, so a volume that carries them and no
+        run of its own must still get one."""
+        scan = self._scan()
+        run = ApplyRun.objects.create(scan=scan, number=1)
+        rows = yolo.ensure_detect_jobs(scan, self.manifest, apply_run=run)
+        self.assertEqual(len(rows), 3)
+
+        self.assertEqual(self._sweep(), 1)
+
+        volume = [row for row in detect_jobs(scan) if row.apply_run_id is None]
+        self.assertEqual(len(volume), 3)
+        self.assertEqual(
+            {row.source_fingerprint for row in volume}, {FINGERPRINT}
+        )
+
+    def test_an_apply_runs_rows_carry_no_fingerprint(self):
+        """The apply manifest describes the pages a curator changed,
+        not an original, so its sum names no shard set."""
+        scan = self._scan()
+        run = ApplyRun.objects.create(scan=scan, number=1)
+
+        rows = yolo.ensure_detect_jobs(scan, self.manifest, apply_run=run)
+
+        self.assertEqual({row.source_fingerprint for row in rows}, {""})
 
     def test_a_dead_run_over_the_same_set_is_not_re_run(self):
         """A FAILED row means the attempts are spent. A fourth is a

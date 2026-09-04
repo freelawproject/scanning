@@ -375,6 +375,7 @@ var SCAN_CONFIG = {
     docId: {{ scan.pk }},
     step: {{ step }},
     deletedPages: {{ deleted_pages_json|safe }},
+    pageEditsLocked: {{ page_edits_locked|yesno:'true,false' }},
     replacedPages: {{ replaced_pages_json|safe }},
     // json_script, not |safe: the note is free text a person typed, and
     // a closing script tag inside it would end this block (#249). Do not

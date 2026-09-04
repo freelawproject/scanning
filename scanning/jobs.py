@@ -705,8 +705,10 @@ def _log_run_complete(job: ExternalJob) -> None:
     # Not ``OPEN_JOB_STATUSES``: COMPLETED belongs to that set on
     # purpose (the provider is done, we have applied nothing), and a run
     # of COMPLETED rows is exactly the case this logs. What must be
-    # empty is the work still to come.
-    rows = live_run(job.scan_id, job.stage, job.engine)
+    # empty is the work still to come. The row's own target, not the
+    # volume's: an apply run (#224) is a run of its own, and reading
+    # the volume's rows here would time and name the wrong one.
+    rows = live_run(job.scan_id, job.stage, job.engine, job.apply_run)
     unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     if not rows or any(row.status in unfinished for row in rows):
         return
@@ -1485,7 +1487,16 @@ def ensure_shard_jobs(
     # key there would read every live run as stale and re-pay it. The
     # column is what lets the detection sweep ask "has this set been
     # detected" in one query (#250).
-    fingerprint = sharding.fingerprint_value(manifest["source"])
+    #
+    # An apply run (#224) is not a shard set of an original: its
+    # manifest source is the sum over the one-page shards of the pages
+    # a curator changed. So it carries no fingerprint, and the sweep's
+    # question stays about the volume alone.
+    fingerprint = (
+        ""
+        if apply_run is not None
+        else sharding.fingerprint_value(manifest["source"])
+    )
     rows = []
     for index, (key, identity) in enumerate(specs):
         row = ExternalJob(

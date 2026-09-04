@@ -20,6 +20,7 @@ from django.utils import timezone
 from scanning import doctor_client, jobs
 from scanning.factories import ExternalJobFactory, ScanFactory
 from scanning.models import (
+    ApplyRun,
     ExternalJob,
     JobEngine,
     JobProvider,
@@ -925,6 +926,47 @@ class TestDurationLogging(ScanningTestCase):
         self.assertIn("completed in 10.0s", line)
         self.assertIn("confirmed by s3_head", line)
         self.assertNotIn("doctor", line)
+
+    def test_an_apply_row_is_timed_against_its_own_run(self):
+        """An apply run (#224) is a run of its own. Reading the
+        volume's rows here would time and name the wrong run, and the
+        volume's rows are CONSUMED, so the line would come out on
+        every one-page shard."""
+        scan = ScanFactory()
+        run = ApplyRun.objects.create(scan=scan, number=1)
+        for index in range(3):
+            ExternalJobFactory(
+                scan=scan,
+                stage=JobStage.CONVERT,
+                engine=JobEngine.BITONAL,
+                provider=JobProvider.DOCTOR,
+                status=JobStatus.CONSUMED,
+                run=1,
+                shard_index=index,
+                shard_count=3,
+            )
+        job = ExternalJobFactory(
+            scan=scan,
+            apply_run=run,
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            status=JobStatus.SUBMITTED,
+            run=2,
+            shard_index=0,
+            shard_count=1,
+        )
+        submitted = timezone.now() - timedelta(seconds=5)
+        ExternalJob.objects.filter(pk=job.pk).update(submitted_at=submitted)
+        job.submitted_at = submitted
+
+        with self.assertLogs("scanning.jobs", level="INFO") as logs:
+            jobs._complete(job, None, timezone.now())
+
+        line = "\n".join(logs.output)
+        self.assertIn("run 2 done", line)
+        # The apply run has one shard; the volume run has three.
+        self.assertIn("1 shard(s)", line)
 
     def test_nothing_is_logged_when_the_write_loses_the_race(self):
         job = ExternalJobFactory(status=JobStatus.SUBMITTED)

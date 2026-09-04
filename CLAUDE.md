@@ -503,7 +503,20 @@ the `reopen_page_review` view. What must not be broken:
   guarded on PROCESSING alone, and never writes ERROR. A lost claim
   supersedes the run. The build pulls the original and the bitonal
   glue pulls the volume `bitonal.pdf`, minutes on a large volume, so
-  neither may run on the serial tick (#156) — the #196 shape.
+  neither may run on the serial tick (#156) — the #196 shape. The
+  worker frees the local tree at the end (`release_local_processing`,
+  #215): nothing else removes what those two pulls left.
+- **One tick queues at most `MAX_SCANS_PER_TICK` scans**, newest
+  first, the rule of `yolo.enqueue_missing_runs` (#250). The first
+  ticks after a deploy see the whole approved corpus, the worker is
+  serial, and a queued scan leaves review 2 until it comes back. A
+  small batch only spreads the same work over more ticks.
+- **A volume nobody changed never opens the original.** `plan_run`
+  reads the rows and the uploaded files, never the original, and an
+  identity map has no edit entry, so `_build` skips the pull whole.
+  Otherwise the first ticks after a deploy would pull every
+  multi-gigabyte original of the corpus, to count its pages, and fill
+  the daemon pod's disk.
 - **`ApplyRun` is the ledger, not a job row.** A run may have no job
   rows (deletes only, or no edit at all), spans three stages whose
   glues finish at different times, and is asked about every 15
@@ -553,7 +566,11 @@ the `reopen_page_review` view. What must not be broken:
   apply row's result under `jobs/apply/a{n}/{stage}/{engine}/`.
   `TestKnownEnqueuePaths` pins `apply.py` as a creator on all three
   stages, behind the pipeline's own gates (`_can_convert`,
-  `_can_analyze`, `yolo.enabled` plus S3).
+  `_can_analyze`, `yolo.enabled` plus S3). An apply row carries **no**
+  `source_fingerprint`: its manifest source is the sum over the
+  one-page shards, which names no original. `yolo.enqueue_missing_runs`
+  filters `apply_run__isnull=True` as well, so a volume that carries
+  apply rows and no detection run of its own still gets one.
 - **A shard is one rule, twice.** `build_edit_shard` and
   `build_final_pdf` place an uploaded PDF as it is, an image on a page
   with the MediaBox of its reference page (`reference_page`: the
@@ -563,12 +580,16 @@ the `reopen_page_review` view. What must not be broken:
   page for map entry `k`, and the glues can splice by index. A
   deletion outranks a replacement of the same page. An uploaded PDF
   may hold several pages; the map places them all.
+- **A run of kept pages is one call.** `build_final_pdf` and the
+  bitonal glue both collapse a contiguous run before `insert_pdf`: a
+  volume of 1300 pages with two edits is three ranges, not 1300 calls,
+  and the glue runs inside the daemon's serial claim.
 - **Each glue is judged on its own inputs** (`glue_due`). The bitonal
   copy needs the run's CONVERT rows only (an edit whose stage was off
   at build time contributes its unconverted shard). The OCR volume and
   `printed_pages.json` need the volume's glued OCR run too; the
-  detections need the volume's merged detection run, which the staff
-  button starts. The first two never wait for the third, and a
+  detections need the volume's merged detection run, which the daemon
+  sweep starts (#250). The first two never wait for the third, and a
   volume detection run merged before the apply glues still waits:
   **`yolo.queue_ready_runs` requires the standing run's `bitonal_key`
   and `detections_key`** (`_apply_ready`), or the redaction compute
@@ -588,7 +609,12 @@ the `reopen_page_review` view. What must not be broken:
   supersedes the run in flight and moves DONE back to READY with one
   compare-and-swap; the edits unlock, and the next approval builds
   `a{n+1}`. The admin re-queue supersedes runs too, since the pipeline
-  runs again from the original.
+  runs again from the original. **The viewer follows the lock**
+  (`page_edits_locked` in `SCAN_CONFIG`): step 2 draws the page-number
+  tag with no `editable-page` class while the scan is locked, the rule
+  of the step-1 bar (#151) — an interface that offered the control
+  would fail on every click. A legacy `PENDING_REVIEW` volume is not
+  locked and keeps the control.
 - **The review-1 artifacts are never written over.** Every output goes
   under `jobs/apply/a{n}/` (the final PDF, `bitonal.pdf`,
   `ocr-volume.json`, `printed_pages.json`, `detections-volume.json`),
@@ -1216,9 +1242,12 @@ only what is new or specific:
   caller set, which replaces the dead run and carries every good
   shard. The rule is one query
   through `ExternalJob.source_fingerprint`, stamped by
-  `ensure_shard_jobs` on every row of every stage from the manifest's
-  source; it is **not** in the `input_manifest` identity, which
-  `_still_describes` compares exactly. A blank (pre-column) row does
+  `ensure_shard_jobs` on every row of every **volume** stage from the
+  manifest's source; it is **not** in the `input_manifest` identity,
+  which `_still_describes` compares exactly. An apply row (#224)
+  carries none, and the query filters `apply_run__isnull=True` too:
+  those rows are one-page shards of the pages a curator changed, and
+  they answer for no shard set. A blank (pre-column) row does
   **not** exclude its scan: the sweep hands it to `ensure_detect_jobs`,
   which reuses a blank run that still describes today's set, and the
   sweep then stamps the fingerprint on it ("adopted"), so it is looked
@@ -1453,7 +1482,10 @@ difference between the two outputs: a third engine is one entry.
   `run_full_pipeline`'s push (only on push success), on every exit from
   `AWAITING` in `bitonal.finish_ready_scans` (only when the park won
   the row), and on the terminal failures (ERROR, ERROR_MAX_RETRIES) in
-  `_handle_pipeline_exception`. Never on a re-queue — the retry reads
+  `_handle_pipeline_exception`. The two queued workers free it at the
+  end of their own run as well: `run_compute_redactions` (#196) and
+  `run_apply_page_edits` (#224), which pull the volume `bitonal.pdf`
+  and the original. Never on a re-queue — the retry reads
   the local files. No-ops in DEVELOPMENT and when S3 is inactive.
 - The `cleanup_processing_tmp` sweep judges staleness on the newest
   mtime in the whole tree (`_tree_mtime`) — writes land three levels

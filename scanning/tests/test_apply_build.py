@@ -134,6 +134,29 @@ class TestBuildRun(BuildTestCase):
         self.scan.refresh_from_db()
         self.assertEqual(self.scan.source_fingerprint, "100:6")
 
+    def test_a_volume_with_no_edit_never_opens_the_original(self):
+        """The plan reads the rows and the uploaded files only, so an
+        identity run needs no pull. The first ticks after a deploy
+        apply the whole approved corpus, and a pull of every
+        multi-gigabyte original would fill the daemon pod's disk."""
+        self.edit(PageEdit.Kind.SET_NUMBER, pdf_page=2, value="12")
+
+        with patch.object(apply, "local_original_pdf") as pull:
+            run = apply.build_run(self.scan)
+
+        pull.assert_not_called()
+        self.assertEqual(run.final_pdf_key, ORIGINAL_KEY)
+
+    def test_a_volume_with_one_edit_still_opens_the_original(self):
+        self.edit(PageEdit.Kind.DELETE_PAGE, pdf_page=2)
+
+        with patch.object(
+            apply, "local_original_pdf", return_value=str(self.original)
+        ) as pull:
+            apply.build_run(self.scan)
+
+        pull.assert_called_once()
+
     def test_edits_make_shards_rows_and_a_final_pdf(self):
         turn, swap, leaf = self.three_edits()
 
@@ -372,6 +395,20 @@ class TestTriggerAndWorker(BuildTestCase):
         )
         self.assertEqual(apply.queue_ready_scans(), 0)
 
+    def test_one_tick_queues_no_more_than_the_batch(self):
+        """The rule of the detection sweep (#250). The worker is
+        serial, and a queued scan leaves review 2 until it comes back,
+        so the first tick after a deploy must not take the whole
+        approved corpus at once."""
+        for _ in range(apply.MAX_SCANS_PER_TICK + 2):
+            ScanFactory(
+                page_count=self.PAGES,
+                status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
+                source_fingerprint="100:6",
+            )
+
+        self.assertEqual(apply.queue_ready_scans(), apply.MAX_SCANS_PER_TICK)
+
     def test_a_scan_still_in_review_is_not_queued(self):
         Scan.objects.filter(pk=self.scan.pk).update(
             status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
@@ -395,6 +432,17 @@ class TestTriggerAndWorker(BuildTestCase):
         run = apply.current_run(self.scan)
         self.assertTrue(run.is_built)
         self.assertIn("Corrected volume", self.scan.progress_message)
+
+    def test_the_worker_frees_the_local_tree(self):
+        """The rule of every other terminal path (#215): the build
+        pulled the original and the glue pulls the volume bitonal
+        copy, and nothing else removes them."""
+        Scan.objects.filter(pk=self.scan.pk).update(status=Status.PROCESSING)
+
+        with patch("scanning.s3_sync.release_local_processing") as release:
+            services.run_apply_page_edits(self.scan.pk)
+
+        release.assert_called_once()
 
     def test_a_lost_claim_supersedes_the_run(self):
         # The daemon's shutdown re-queued the scan while it built.

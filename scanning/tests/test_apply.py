@@ -383,6 +383,18 @@ class TestExportUsesTheWalk(ApplyTestCase):
         self.assertEqual(count, self.PAGES)
         self.assertEqual(rotations[3], 270)
 
+    def test_a_page_count_the_file_does_not_carry_still_exports(self):
+        """The old walk clamped every index to the open document. The
+        walk plans over the page count, so the view reads it off the
+        file, or a row that disagrees would raise a 500 in place of a
+        download."""
+        Scan.objects.filter(pk=self.scan.pk).update(page_count=self.PAGES + 40)
+        self.scan.refresh_from_db()
+
+        count, _ = self.export()
+
+        self.assertEqual(count, self.PAGES)
+
 
 class TestSupersede(ApplyTestCase):
     """One standing row per address."""
@@ -603,6 +615,32 @@ class TestEditLock(ApplyTestCase):
                     content_type="application/json",
                 )
                 self.assertEqual(response.status_code, 200)
+
+    def test_step_two_offers_no_page_number_control_under_done(self):
+        """The rule of the step-1 bar (#151): the viewer must not offer
+        a control the endpoint refuses. Step 2 runs while a
+        new-pipeline volume is in DONE, and ``assign_page`` answers
+        409 there."""
+        self.lock()
+
+        response = self.client.get(
+            reverse("scan_process", kwargs={"pk": self.scan.pk}),
+            {"step": 2},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"pageEditsLocked: true", response.content)
+
+    def test_step_two_of_a_legacy_volume_keeps_the_control(self):
+        self.lock(Status.PENDING_REVIEW)
+
+        response = self.client.get(
+            reverse("scan_process", kwargs={"pk": self.scan.pk}),
+            {"step": 2},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"pageEditsLocked: false", response.content)
 
     def test_a_dismissal_under_done_keeps_the_issue(self):
         issue = Issue.objects.create(
