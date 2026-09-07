@@ -20,7 +20,7 @@ Three rules run through it:
 
 from __future__ import annotations
 
-from django.db.models import Exists, F, OuterRef, Q, QuerySet
+from django.db.models import Count, Exists, F, OuterRef, Q, QuerySet
 from django.db.models.functions import Coalesce
 from django.utils import formats, timezone
 
@@ -281,12 +281,14 @@ def waiting_totals() -> tuple[int, int]:
     """Return how many requests wait, and over how many scans (#260).
 
     The stats page prints "X repairs over Y scans", and the two
-    numbers come from one read: two queries could disagree, because a
-    reviewer may add a request between them. The waiting set holds
-    only the open requests nobody has answered, so it is small.
+    numbers come from one aggregate: two queries could disagree,
+    because a reviewer may add a request between them, and no row
+    crosses into Python for a count the database gives.
 
     :returns: The number of requests, then the number of scans.
     :rtype: tuple[int, int]
     """
-    scan_ids = list(queue("waiting").values_list("scan_id", flat=True))
-    return len(scan_ids), len(set(scan_ids))
+    totals = queue("waiting").aggregate(
+        requests=Count("pk"), scans=Count("scan_id", distinct=True)
+    )
+    return totals["requests"], totals["scans"]

@@ -1446,6 +1446,12 @@ the rest of it wait? Every user who is logged in sees it, as they see
 - **A row that reads zero for a named reason is a report; a row that is
   absent is a question.** The text review row stays, with the note that
   #191 is switched off.
+- **The repair pair is one aggregate, and its row names its units.**
+  `repairs.waiting_totals` counts the waiting rows and the scans they
+  name in one query, because two queries could disagree: a reviewer may
+  add a request between them. Its row is the one row of the funnel
+  whose two cells are not scans and volumes, so the note under the
+  label says what they are.
 - Ten counts, each one `COUNT`, pinned by `assertNumQueries`, and no
   cache: a cache would make the numbers older than the page that shows
   them.
