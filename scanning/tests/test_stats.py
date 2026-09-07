@@ -83,13 +83,15 @@ class TestStatusMap(StatsTestCase):
         ScanFactory(status=Status.AWAITING)
         ScanFactory(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
         ScanFactory(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
+        ScanFactory(status=Status.REDACTION_REVIEW_DONE)
         ScanFactory(status=Status.ERROR_MAX_RETRIES)
         ScanFactory(status=Status.PENDING_REVIEW)
 
         rows = stats.status_groups()
         total = stats._totals(stats.uploaded_scans())
         self.assertEqual(sum(row["scans"] for row in rows), total["scans"])
-        self.assertEqual(total["scans"], 6)
+        self.assertEqual(total["scans"], 8)
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -154,44 +156,71 @@ class TestTheFunnel(StatsTestCase):
         self.assertEqual(self._row(rows, "page_review_ready")["scans"], 1)
         self.assertEqual(self._row(rows, "page_review_passed")["scans"], 1)
 
-    def test_the_redaction_row_needs_a_detection(self):
-        """The same rule as the "Next: Detect" button."""
-        with_rows = ScanFactory(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
+    def test_the_approval_of_review_one_holds_down_the_funnel(self):
+        """A scan in review 2 also passed review 1 (#263)."""
         ScanFactory(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
-        _detection(with_rows)
+        ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
+        ScanFactory(status=Status.REDACTION_REVIEW_DONE)
 
-        row = self._row(stats.funnel(), "redaction_review_ready")
-        self.assertEqual(row["scans"], 1)
-        self.assertEqual(row["volumes"], 1)
+        rows = stats.funnel()
+        self.assertEqual(self._row(rows, "page_review_passed")["scans"], 3)
+        self.assertEqual(self._row(rows, "page_review_ready")["scans"], 0)
 
-    def test_a_detection_of_a_scan_in_review_one_does_not_count(self):
-        """Review 2 follows review 1, and the count follows the status."""
-        scan = ScanFactory(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
-        _detection(scan)
+    def test_the_redaction_rows_read_the_status(self):
+        """#263 gave review 2 the two statuses the count reads."""
+        ScanFactory(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
+        ScanFactory(status=Status.REDACTION_REVIEW_DONE)
 
-        row = self._row(stats.funnel(), "redaction_review_ready")
-        self.assertEqual(row["scans"], 0)
+        rows = stats.funnel()
+        ready = self._row(rows, "redaction_review_ready")
+        done = self._row(rows, "redaction_review_done")
+        self.assertEqual(ready["scans"], 1)
+        self.assertEqual(ready["volumes"], 1)
+        self.assertEqual(done["scans"], 1)
 
-    def test_a_legacy_scan_is_in_the_legacy_row_only(self):
-        """The retired pipeline has one counter, not a stage."""
+    def test_a_detection_row_moves_no_count(self):
+        """The status is the state (#263): the rows are not read.
+
+        Before #263 this row asked for a ``Detection`` row, because
+        the status could not tell a measured volume from an unmeasured
+        one. It can now, and a scan the apply has not finished stays
+        out of the count until the apply parks it.
+        """
+        waiting = ScanFactory(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        _detection(waiting)
+        in_review_one = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        _detection(in_review_one)
+
+        rows = stats.funnel()
+        self.assertEqual(self._row(rows, "redaction_review_ready")["scans"], 0)
+        self.assertEqual(self._row(rows, "redaction_review_done")["scans"], 0)
+
+    def test_a_legacy_scan_is_out_of_every_row_but_the_last(self):
+        """The retired pipeline had a redaction review of its own.
+
+        ``APPROVED`` and ``EXTRACTED`` are past it, so they are in
+        "Redaction review complete". The other two legacy statuses are
+        in no row of the funnel at all.
+        """
         for status in stats.LEGACY_STATUSES:
             ScanFactory(status=status)
 
         legacy = self._row(stats.status_groups(), "legacy")
         self.assertEqual(legacy["scans"], len(stats.LEGACY_STATUSES))
         for row in stats.funnel():
-            self.assertEqual(row["scans"], 0, row["key"])
+            expected = 2 if row["key"] == "redaction_review_done" else 0
+            self.assertEqual(row["scans"], expected, row["key"])
 
-    def test_the_two_rows_that_wait_for_a_stage_read_zero(self):
-        """Step 3 (#206) and the text stage (#191) write no count yet."""
-        ScanFactory(status=Status.APPROVED)
-        ScanFactory(status=Status.EXTRACTED)
+    def test_the_row_that_waits_for_a_stage_reads_zero(self):
+        """The text stage (#191) writes no count yet, and says so."""
+        ScanFactory(status=Status.REDACTION_REVIEW_DONE)
 
-        rows = stats.funnel()
-        for key in ("redaction_review_done", "text_review_ready"):
-            row = self._row(rows, key)
-            self.assertEqual(row["scans"], 0)
-            self.assertTrue(row["note"])
+        row = self._row(stats.funnel(), "text_review_ready")
+        self.assertEqual(row["scans"], 0)
+        self.assertTrue(row["note"])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

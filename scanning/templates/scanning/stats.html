@@ -8,7 +8,8 @@
   How much work is done, and where the rest of it waits (#260). Two
   tables, because one cannot be both: the first says where the scans
   are now and its rows add up to the total; the second is the review
-  funnel, whose rows are cumulative and overlap by design.
+  funnel, whose rows overlap by design. Every row of both tables is a
+  set of Scan.status values, because #263 made the status the state.
 {% endcomment %}
 <div class="flex flex-col sm:flex-row sm:items-end sm:justify-between mb-6 gap-4">
   <h1 class="text-2xl font-bold">Stats</h1>
@@ -58,8 +59,8 @@
 <!-- The review funnel -->
 <h2 class="text-lg font-semibold mb-2">The review funnel</h2>
 <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
-  These rows are cumulative, and one scan can be in two of them.
-  The legacy rows of the retired pipeline are not here; the table above counts them.
+  These rows overlap, and one scan can be in two of them.
+  The rows of the retired pipeline are in the last row only, because that pipeline had a redaction review too.
 </p>
 <div class="card overflow-x-auto p-0 mb-4">
   <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">

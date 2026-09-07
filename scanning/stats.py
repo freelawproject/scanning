@@ -1,10 +1,11 @@
 """The counts of the stats page (issue #260).
 
-The portal has no column that stamps a review: the approve button of
-review 1 writes ``PAGE_COMPLETENESS_REVIEW_DONE`` and one log line,
-and nothing else records the decision. So every count here is a set of
-``Scan.status`` values, and one count adds a condition on the
-``Detection`` rows.
+The portal has no column that stamps a review: a review is a status.
+The approve button of review 1 writes
+``PAGE_COMPLETENESS_REVIEW_DONE`` and the approve button of review 2
+writes ``REDACTION_REVIEW_DONE`` (#263), and neither writes a date or
+a name. So every count here is a set of ``Scan.status`` values, and
+none of them reads another table.
 
 Three rules run through the module:
 
@@ -19,7 +20,8 @@ Three rules run through the module:
 - **The retired pipeline gets one counter, not a stage.** Its review 1
   and its end are gone, so :data:`LEGACY_STATUSES` holds the four
   statuses no new scan can reach, and :data:`FUNNEL_ROWS` counts the
-  new pipeline alone.
+  new pipeline alone. The one exception is the last row of the funnel,
+  which the retired pipeline can also fill; the row says so.
 """
 
 from __future__ import annotations
@@ -27,15 +29,13 @@ from __future__ import annotations
 from django.db.models import (
     CharField,
     Count,
-    Exists,
-    OuterRef,
     QuerySet,
     Value,
 )
 from django.db.models.functions import Concat
 
 from scanning import repairs
-from scanning.models import Detection, Scan, Status
+from scanning.models import PAGE_REVIEW_APPROVED_STATUSES, Scan, Status
 
 #: The statuses of the retired pipeline (#173). No new scan reaches
 #: any of the four, so the status alone tells a legacy row from a live
@@ -46,9 +46,8 @@ from scanning.models import Detection, Scan, Status
 #: - ``APPROVED`` comes from ``views_api.approve_scan``, which first
 #:   demands ``Stage.APPROVED`` from the file generation of step 3.
 #:   Step 3 is absent (#206). **When #206 lands, move this value out
-#:   of here**: it becomes a live status, and it then belongs to
-#:   "passed the page completeness review" and to "redaction review
-#:   complete".
+#:   of here**: it becomes a live status, and the first table must
+#:   then count it as a stage of the new pipeline.
 #: - ``EXTRACTED`` has no writer at all. The text stage (#191) is
 #:   switched off behind two locks.
 #: - ``CANCELLED`` lost its writer with the user cancel (#219).
@@ -59,11 +58,24 @@ LEGACY_STATUSES = (
     Status.CANCELLED,
 )
 
+#: The statuses that say "the redaction review is over", for the last
+#: row of the funnel. ``REDACTION_REVIEW_DONE`` is where the approve
+#: button of review 2 puts a scan (#263). The two legacy values are
+#: further along the same road: the retired pipeline had a redaction
+#: review of its own, and a scan could not reach either value without
+#: passing it. When #206 lands, ``APPROVED`` becomes the status of a
+#: new scan that passed step 3, which the review 2 approval gates, so
+#: the row keeps its meaning without a change here.
+REDACTION_REVIEW_COMPLETE_STATUSES = (
+    Status.REDACTION_REVIEW_DONE,
+    Status.APPROVED,
+    Status.EXTRACTED,
+)
+
 #: The rows of the first table: where the scans are now. The groups do
 #: not overlap, and together they hold every ``Status`` value, so the
-#: rows add up to the total. ``TestStatusGroups`` pins both
-#: properties, or a status added later would drop off the page in
-#: silence.
+#: rows add up to the total. ``TestStatusMap`` pins both properties,
+#: or a status added later would drop off the page in silence.
 STATUS_GROUPS = (
     ("waiting_to_start", "Uploaded, not started", (Status.UPLOADED,)),
     (
@@ -83,8 +95,18 @@ STATUS_GROUPS = (
     ),
     (
         "page_review_done",
-        "Page completeness review done",
+        "Page completeness review done, redactions not measured",
         (Status.PAGE_COMPLETENESS_REVIEW_DONE,),
+    ),
+    (
+        "redaction_review",
+        "Ready for redaction review",
+        (Status.READY_FOR_REDACTION_REVIEW,),
+    ),
+    (
+        "redaction_review_done",
+        "Redaction review done",
+        (Status.REDACTION_REVIEW_DONE,),
     ),
     (
         "failed",
@@ -102,50 +124,58 @@ STATUS_GROUPS = (
 )
 
 #: The rows of the second table: the review funnel of issue #260. The
-#: rows are cumulative and they overlap by design, because a scan that
-#: passed review 1 also waits for review 2.
+#: rows overlap by design, because a scan that passed review 1 also
+#: waits for review 2: ``page_review_passed`` holds every scan of the
+#: two rows below it.
 #:
-#: Each entry is ``(key, label, statuses, needs_detections, note)``.
-#: An empty ``statuses`` tuple means the stage that would write the
-#: count is absent, so the row reads zero and needs no query. The note
-#: says why.
+#: Each entry is ``(key, label, statuses, note)``. An empty
+#: ``statuses`` tuple means the stage that would write the count is
+#: absent, so the row reads zero and needs no query. The note says
+#: why.
 #:
-#: The funnel holds no legacy row, and it needs no filter for one: a
-#: legacy scan reaches neither of the two #154 statuses.
+#: **Every row is a set of statuses, because #263 made the status the
+#: state.** The ``redaction_review_ready`` row asked for a
+#: ``Detection`` row before that issue, which was the only signal
+#: available then. It is not the signal now:
+#: ``review_states.redaction_review_ready`` is the whole rule, and
+#: ``READY_FOR_REDACTION_REVIEW`` is where its two writers put a scan
+#: that passes it. The "Next: Detect" button still walks to step 2 on
+#: a ``Detection`` row alone, which is a shortcut into a page and not
+#: a statement about the state.
+#:
+#: The funnel holds no legacy row, except in the last row that counts
+#: one (:data:`REDACTION_REVIEW_COMPLETE_STATUSES`), and it needs no
+#: filter for one: a legacy scan reaches none of the four review
+#: statuses.
 FUNNEL_ROWS = (
     (
         "page_review_ready",
         "Ready for page completeness review",
         (Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,),
-        False,
         "",
     ),
     (
         "page_review_passed",
         "Passed the page completeness review",
-        (Status.PAGE_COMPLETENESS_REVIEW_DONE,),
-        False,
-        "",
+        tuple(sorted(PAGE_REVIEW_APPROVED_STATUSES)),
+        "Every scan of the two rows below is here too.",
     ),
     (
         "redaction_review_ready",
         "Ready for redaction review",
-        (Status.PAGE_COMPLETENESS_REVIEW_DONE,),
-        True,
-        "The detection run is merged into rows a curator can edit.",
+        (Status.READY_FOR_REDACTION_REVIEW,),
+        "The detection run is merged and its geometry is measured.",
     ),
     (
         "redaction_review_done",
         "Redaction review complete",
-        (),
-        False,
-        "Nothing writes this count yet: step 3 is absent (#206).",
+        REDACTION_REVIEW_COMPLETE_STATUSES,
+        "The legacy rows that passed the retired review are here too.",
     ),
     (
         "text_review_ready",
         "Ready for text review",
         (),
-        False,
         "Nothing writes this count yet: the text stage is off (#191).",
     ),
 )
@@ -232,7 +262,7 @@ def funnel() -> list[dict]:
     :rtype: list[dict]
     """
     rows = []
-    for key, label, statuses, needs_detections, note in FUNNEL_ROWS:
+    for key, label, statuses, note in FUNNEL_ROWS:
         if not statuses:
             rows.append(
                 {
@@ -245,15 +275,6 @@ def funnel() -> list[dict]:
             )
             continue
         queryset = uploaded_scans().filter(status__in=statuses)
-        if needs_detections:
-            # The same rule as the "Next: Detect" button, which walks
-            # to step 2 when a Detection row exists
-            # (``views_process.start_detect``) -- and with no filter on
-            # ``active`` either, or the number and the button would
-            # disagree.
-            queryset = queryset.filter(
-                Exists(Detection.objects.filter(scan=OuterRef("pk")))
-            )
         rows.append(_row(key, label, queryset, note))
     return rows
 
