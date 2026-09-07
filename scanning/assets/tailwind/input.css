@@ -169,6 +169,14 @@
            dark:bg-cyan-900/50 dark:text-cyan-300;
   }
 
+  /* A volume that waits for a scanner (#266). Orange, the colour the
+     repair cards and the repair badge of step 1 already use, so one
+     kind of work keeps one colour. */
+  .badge-repair {
+    @apply badge bg-orange-100 text-orange-800
+           dark:bg-orange-900/50 dark:text-orange-300;
+  }
+
   /* Queue status badges */
   .badge-needs_scanning {
     @apply badge bg-red-100 text-red-800

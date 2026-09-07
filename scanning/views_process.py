@@ -65,6 +65,16 @@ PAGE_REVIEW_ALREADY_DONE_MESSAGE = (
 PAGE_REVIEW_NOT_READY_MESSAGE = (
     "This scan is not ready for the page completeness review."
 )
+#: Flashed when the approval is refused because a scanner was asked
+#: for a page (#266). It names the two ways out: the new scan arrives,
+#: or somebody dismisses the request. A refusal with no way out would
+#: strand the review.
+REPAIRS_WAITING_MESSAGE = (
+    "This scan waits for a scanner. Somebody asked for a page that is "
+    "missing or bad, so the volume is not page complete yet. Wait for "
+    "the new scan, or dismiss the request on the page if it no longer "
+    "applies."
+)
 #: Flashed by the review-2 approval of issue #263, and constants for
 #: the same reason as the three above.
 REDACTION_REVIEW_APPROVED_MESSAGE = (
@@ -629,7 +639,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "dots_run": dots_run,
             "yolo_run": yolo_run,
             "detect_message": detection_message(yolo_run),
-            **_review_flags(scan),
+            **_review_flags(scan, repairs_waiting=bool(waiting_repairs)),
             "opinions": opinions,
             "opinions_json": json.dumps(opinions),
             "has_redaction_rects": has_redaction_rects,
@@ -1296,7 +1306,7 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     return resp
 
 
-def _review_flags(scan: Scan) -> dict:
+def _review_flags(scan: Scan, repairs_waiting: bool | None = None) -> dict:
     """Return the review flags the step-1 and step-2 button bars read.
 
     Both :func:`scan_process_view` and the :func:`process_actions`
@@ -1321,15 +1331,27 @@ def _review_flags(scan: Scan) -> dict:
     ``PENDING_REVIEW`` is where a legacy step 2 lives (the park of
     ``run_compute_redactions`` and the step chooser both say so).
 
+    ``repairs_waiting`` is the gate of the review-1 approval (#266): a
+    volume whose pages a scanner must still scan is not page complete,
+    so the bar shows a note in place of the approve button and
+    ``approve_page_completeness`` refuses the POST. The caller may pass
+    the answer it already holds -- ``scan_process_view`` reads the
+    requests for the sidebar anyway -- and the flag is queried only for
+    a caller that does not (the ``process_actions`` fragment).
+
     :param scan: The scan the bars are rendered for.
+    :param repairs_waiting: Whether a scanner still has to act on this
+        scan. ``None`` asks :func:`repairs.has_waiting`.
     :returns: ``page_review_ready``, ``page_review_done``,
         ``redaction_review_ready``, ``redaction_review_done``,
-        ``legacy_review``, ``has_legacy_ocr`` and the two pending-edit
-        flags, for the template context.
+        ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting`` and
+        the two pending-edit flags, for the template context.
     :rtype: dict
     """
     from scanning import services
 
+    if repairs_waiting is None:
+        repairs_waiting = repairs.has_waiting(scan)
     return {
         "page_review_ready": (
             scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
@@ -1341,6 +1363,7 @@ def _review_flags(scan: Scan) -> dict:
         "redaction_review_done": (scan.status == Status.REDACTION_REVIEW_DONE),
         "legacy_review": scan.status == Status.PENDING_REVIEW,
         "has_legacy_ocr": services.has_legacy_ocr(scan),
+        "repairs_waiting": repairs_waiting,
         **page_edits.pending_edit_flags(scan),
     }
 
@@ -1663,11 +1686,30 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
     cancelled, errored, or still waiting on its inputs must not be
     approved by a stale page a curator left open.
 
+    **A waiting repair request refuses the approval** (#266). A page a
+    scanner must still scan is a page the volume does not have, so the
+    volume is not page complete, and the step-1 bar shows a note in
+    place of the button. The gate is here as well as in the bar,
+    because a template gate alone cannot refuse a direct POST -- the
+    rule ``start_detect`` follows for the review it gates. Open
+    *issues* still do not block: a suspicion is the curator's to
+    judge, and a missing page is not (#151).
+
+    The gate is a read, then the compare-and-swap. A request made
+    between the two does not block that approval, and the plan accepts
+    it: both acts are decisions of a person, seconds apart, and the way
+    back from a wrong approval is the admin re-queue whichever wins.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to step 1 of the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if repairs.has_waiting(scan):
+        messages.warning(request, REPAIRS_WAITING_MESSAGE)
+        return redirect(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+        )
     approved = Scan.objects.filter(
         pk=scan.pk, status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
     ).update(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)

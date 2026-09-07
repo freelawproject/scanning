@@ -5,7 +5,7 @@ One finding a reviewer cannot fix is one ``PageRepairRequest`` row
 and the one derivation the rows do not store: whether a request is
 fulfilled.
 
-Three rules run through it:
+Four rules run through it:
 
 - **A request is dismissed, never deleted.** ``dismiss`` stamps the
   row. The row stays as the audit.
@@ -16,6 +16,11 @@ Three rules run through it:
 - **A stale request is marked, never dropped.** A request made
   against an earlier upload of the original names a page the
   reviewer saw then. A person judges it; nothing applies it.
+- **A waiting request holds the review open** (#266). One term serves
+  the badge of the scan list, the badge and the section of step 1, the
+  header count and the gate of the review-1 approval: open, and no
+  fulfilling edit. A second definition would let two of those readers
+  disagree on one volume.
 """
 
 from __future__ import annotations
@@ -142,6 +147,67 @@ def waiting_requests(scan: Scan) -> list[PageRepairRequest]:
     :rtype: list[PageRepairRequest]
     """
     return [row for row in open_requests(scan) if not row.fulfilled]
+
+
+def has_waiting(scan: Scan) -> bool:
+    """Return whether a scanner still has to act on this scan (#266).
+
+    The gate of the review-1 approval, and the same term as every
+    other reader: open, and no fulfilling edit. A **stale** request
+    waits too, unlike a stale ``PageEdit``, which does not hold the
+    review open (#214). The two rows differ: an apply cannot place a
+    stale edit, but a request is work for a person, and a person
+    judges a stale request and dismisses it with one click. A
+    **fulfilled** request never waits, because the scanner did the
+    work; the row stays open so the reviewer can judge the new page
+    and ask again (#249).
+
+    No row crosses into Python: the database evaluates the ``Exists``
+    of the derivation. The ordering of :func:`annotate_fulfilled` is
+    cleared, because an ``EXISTS`` needs none.
+
+    :param scan: The scan the reviewer wants to approve.
+    :returns: Whether one open request has no fulfilling edit.
+    :rtype: bool
+    """
+    return (
+        annotate_fulfilled(
+            scan.repair_requests.filter(dismissed_at__isnull=True)
+        )
+        .filter(fulfilled=False)
+        .order_by()
+        .exists()
+    )
+
+
+def waiting_counts(scan_ids) -> dict[int, int]:
+    """Return how many requests wait, per scan, in one query (#266).
+
+    The badge of the scan list. The list paginates 25 scans, and the
+    caller asks for the ids of one page only, so the work is bound by
+    the page size and not by the size of the corpus. One grouped
+    count, never a subquery per row.
+
+    **The ordering is cleared before the grouping.** Django puts the
+    ordering columns of the queryset into ``GROUP BY``, and
+    :func:`annotate_fulfilled` orders by ``sort_address``, which is a
+    per-row expression. Without the clear the database groups by the
+    address as well, and a scan with two waiting requests reads 1
+    twice instead of 2 once.
+
+    :param scan_ids: The scans to count, usually one page of a list.
+    :returns: The number of waiting requests, by scan id. A scan with
+        none is absent.
+    :rtype: dict[int, int]
+    """
+    rows = (
+        queue("waiting")
+        .filter(scan_id__in=scan_ids)
+        .order_by()
+        .values("scan_id")
+        .annotate(waiting=Count("pk"))
+    )
+    return {row["scan_id"]: row["waiting"] for row in rows}
 
 
 def is_stale(row: PageRepairRequest, scan: Scan) -> bool:
