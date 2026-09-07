@@ -405,7 +405,10 @@ class TestExportUsesTheWalk(ApplyTestCase):
             )
 
         self.assertEqual(response.status_code, 409)
-        self.assertIn(b"edit 7 has no file", response.content)
+        # The fault is logged, not sent (CodeQL: exception text is not
+        # for an external user).
+        self.assertNotIn(b"edit 7", response.content)
+        self.assertIn(b"cannot be built", response.content)
 
     def test_a_page_count_the_file_does_not_carry_still_exports(self):
         """The old walk clamped every index to the open document. The

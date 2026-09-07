@@ -1001,6 +1001,14 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     )
 
 
+#: The 409 of ``export_pdf``: the standing page edits cannot be built
+#: into a volume. The fault itself is logged, never sent.
+EXPORT_NOT_BUILDABLE_MESSAGE = (
+    "The corrected PDF cannot be built from the page edits as they "
+    "stand. Check the step-1 page changes, or ask a staff member."
+)
+
+
 def _unlink_quietly(path: str) -> None:
     """Remove a temp file, and swallow a file that is already gone.
 
@@ -1063,9 +1071,16 @@ def export_pdf(
     except apply.ApplyError as exc:
         # The rows do not build into a volume: a shard with fewer pages
         # than the map asks for, a file that is gone. The apply counts
-        # the same fault on its run; the export names it.
+        # the same fault on its run. The detail goes to the log and not
+        # to the browser (CodeQL: an exception's text is not for an
+        # external user); the answer says what to do.
         _unlink_quietly(tmp_path)
-        return HttpResponse(str(exc), status=409, content_type="text/plain")
+        logger.warning(
+            "export_pdf: scan %s: the page edits do not build: %s", pk, exc
+        )
+        return HttpResponse(
+            EXPORT_NOT_BUILDABLE_MESSAGE, status=409, content_type="text/plain"
+        )
     except Exception:
         _unlink_quietly(tmp_path)
         raise
