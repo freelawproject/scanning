@@ -553,6 +553,19 @@ class TestTriggerAndWorker(BuildTestCase):
         owed.refresh_from_db()
         self.assertEqual(owed.status, Status.QUEUED)
 
+    def test_a_volume_whose_live_ocr_run_is_open_is_no_candidate(self):
+        """The pre-check reads the live run, as the exact test does: a
+        CONSUMED row of an older run named the scan on every tick."""
+        refused = self._refused_candidate()
+
+        self.assertNotIn(refused.pk, apply._candidate_scan_ids())
+
+        # Its live run glues; now it is a candidate, and it owes the glue.
+        ExternalJob.objects.filter(scan=refused, run=2).update(
+            status=JobStatus.CONSUMED
+        )
+        self.assertIn(refused.pk, apply._candidate_scan_ids())
+
     def test_a_withdrawn_stale_row_is_no_candidate(self):
         """A stale row is in no edit set before or after its withdrawal,
         so its date must not make its scan a candidate on every tick."""
@@ -620,22 +633,33 @@ class TestTriggerAndWorker(BuildTestCase):
         self.assertEqual(self.uploads, {})
 
     def test_a_dead_row_is_noted_once(self):
+        """Once, whatever the two other writers of ``last_error`` do: a
+        glue that succeeds after the note clears that field, and a glue
+        that failed before it filled that field."""
         self.three_edits()
         run = apply.build_run(self.scan)
         run.jobs.update(status=JobStatus.COMPLETED)
         ExternalJob.objects.filter(
             pk=self.rows(run, JobStage.DETECT)[0].pk
         ).update(status=JobStatus.FAILED, error_code="BAD_INPUT")
+        # A glue already failed on this run.
+        ApplyRun.objects.filter(pk=run.pk).update(
+            attempts=1, last_error="could not upload the final bitonal copy"
+        )
 
         with self.assertLogs("scanning.apply", level="WARNING") as logs:
             apply.queue_ready_scans()
 
         self.assertEqual(len(logs.output), 1)
         self.assertIn("detections glue", logs.output[0])
+        self.assertIn("BAD_INPUT", logs.output[0])
         run.refresh_from_db()
-        self.assertIn("BAD_INPUT", run.last_error)
-        self.assertIn("BAD_INPUT", apply.run_state(self.scan)["summary"])
+        self.assertIsNotNone(run.dead_row_noted_at)
+        self.assertIn("1 failed", apply.run_state(self.scan)["summary"])
+        # A later glue succeeds and clears last_error; the note stands.
+        ApplyRun.objects.filter(pk=run.pk).update(attempts=0, last_error="")
         with self.assertNoLogs("scanning.apply", level="WARNING"):
+            apply.queue_ready_scans()
             apply.queue_ready_scans()
 
     def test_a_scan_still_in_review_is_not_queued(self):

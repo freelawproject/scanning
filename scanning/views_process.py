@@ -1380,6 +1380,8 @@ def _review_flags(scan: Scan) -> dict:
     from scanning import apply, services
 
     done = scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
+    # One read of the standing apply run for the two readers below.
+    run = apply.current_run(scan)
     return {
         "page_review_ready": (
             scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
@@ -1397,8 +1399,8 @@ def _review_flags(scan: Scan) -> dict:
         "has_legacy_ocr": services.has_legacy_ocr(scan),
         # The apply writes no scan status while its rows run (#224), so
         # the run row is the only place its progress lives.
-        "apply_run": apply.run_state(scan) if done else None,
-        **page_edits.pending_edit_flags(scan),
+        "apply_run": apply.run_state(scan, run) if done else None,
+        **page_edits.pending_edit_flags(scan, run),
     }
 
 

@@ -164,8 +164,8 @@ class TestPlanRun(ApplyTestCase):
             [("o", 1), ("o", 2), ("o", 4), ("o", 5), ("o", 6)],
         )
         self.assertEqual(plan.deleted_pages, [3])
-        self.assertEqual(apply.final_page_of(plan.to_map(), 4), 3)
-        self.assertIsNone(apply.final_page_of(plan.to_map(), 3))
+        self.assertEqual(apply.originals_to_final(plan.to_map()).get(4), 3)
+        self.assertIsNone(apply.originals_to_final(plan.to_map()).get(3))
 
     def test_inserts_follow_their_anchor_in_ordinal_order(self):
         second = self.edit(
@@ -209,7 +209,7 @@ class TestPlanRun(ApplyTestCase):
 
         self.assertEqual(self.sources(plan)[3], ("e", swap.pk, 0))
         self.assertEqual(plan.pages[3]["source"]["reference_pdf_page"], 4)
-        self.assertIsNone(apply.final_page_of(plan.to_map(), 4))
+        self.assertIsNone(apply.originals_to_final(plan.to_map()).get(4))
 
     def test_a_rotation_keeps_its_slot_as_a_shard(self):
         turn = self.edit(PageEdit.Kind.ROTATE_PAGE, pdf_page=2, value="90")
@@ -344,6 +344,18 @@ class TestBuildFinalPdf(ApplyTestCase):
 
         with self.assertRaises(apply.ApplyError):
             self.build(plan, {leaf.pk: pdf_bytes(1)})
+
+    def test_a_pdf_edit_with_no_file_is_refused_not_crashed(self):
+        """The guard runs before the PDF branch: a missing file is an
+        ``ApplyError`` the run counts, not a fitz error on ``None``."""
+        leaf = self.edit(PageEdit.Kind.INSERT_PAGE, anchor_pdf_page=1)
+        PageEdit.objects.filter(pk=leaf.pk).update(image="x.pdf")
+        leaf.refresh_from_db()
+
+        with fitz.open(str(self.original)) as source:
+            with self.assertRaises(apply.ApplyError) as caught:
+                apply.build_edit_shard(source, leaf, None)
+        self.assertIn("no file", str(caught.exception))
 
     def test_the_shard_of_an_edit_matches_its_final_pages(self):
         # The shard the stages read and the final PDF come from one

@@ -209,7 +209,12 @@ def stale_edits(scan: Scan, *kinds: str) -> list[PageEdit]:
     ]
 
 
-def pending_edits(scan: Scan) -> list[PageEdit]:
+#: "No run was passed": None is a valid answer, so the parameter needs
+#: a marker of its own.
+_UNSET = object()
+
+
+def pending_edits(scan: Scan, run=_UNSET) -> list[PageEdit]:
     """Return the structural edits the standing apply run has not built.
 
     Only the structural kinds count. A page number and a dismissal need
@@ -224,12 +229,16 @@ def pending_edits(scan: Scan) -> list[PageEdit]:
     quiet exactly then.
 
     :param scan: The scan to check.
+    :param run: The standing apply run, when the caller has it
+        (``views_process._review_flags`` reads it once for the bar).
+        Read here otherwise.
     :returns: The current structural rows that no standing run carries.
     :rtype: list[PageEdit]
     """
     from scanning import apply
 
-    run = apply.current_run(scan)
+    if run is _UNSET:
+        run = apply.current_run(scan)
     standing = run.pk if run is not None else None
     # The current ones only: a stale row can never be applied, so
     # counting it would hold the review open for good. It is reported
@@ -251,7 +260,7 @@ def has_pending_changes(scan: Scan) -> bool:
     return bool(pending_edits(scan))
 
 
-def pending_edit_flags(scan: Scan) -> dict:
+def pending_edit_flags(scan: Scan, run=_UNSET) -> dict:
     """Return the two pending-edit flags the step-1 bar reads.
 
     One read for both, because they answer one question about one set
@@ -266,10 +275,11 @@ def pending_edit_flags(scan: Scan) -> dict:
     (#224).
 
     :param scan: The scan the bar is rendered for.
+    :param run: The standing apply run, when the caller has it.
     :returns: ``has_pending_changes`` and ``has_pending_inserts``.
     :rtype: dict
     """
-    pending = pending_edits(scan)
+    pending = pending_edits(scan, run)
     with_an_image = (PageEdit.Kind.INSERT_PAGE, PageEdit.Kind.REPLACE_PAGE)
     return {
         "has_pending_changes": bool(pending),

@@ -298,33 +298,24 @@ def slots_to_final(page_map: dict) -> dict[int, int]:
     """Return ``{original pdf_page: final page}`` for every held slot.
 
     Like :func:`originals_to_final`, but a replaced or rotated page
-    answers too: its slot is taken by the shard built for it.
+    answers too: its slot is taken by the shard built for it. The
+    readers that carry a curator's decision about a *position* -- a
+    typed page number -- use this one; the readers that carry a paid
+    result about the page's *content* use the other, since a replaced
+    page's content is new. A page named by several entries (a
+    replacement of several pages, which the endpoint refuses) keeps the
+    first.
 
     :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
     :returns: Every original page that still holds a final slot.
     :rtype: dict[int, int]
     """
-    return {
-        entry["source"]["pdf_page"]: entry["final_page"]
-        for entry in page_map.get("pages", [])
-        if entry["source"].get("pdf_page") is not None
-    }
-
-
-def final_page_of(page_map: dict, pdf_page: int) -> int | None:
-    """Return where one original page landed in the final PDF.
-
-    The inverse lookup over a stored map, for the readers that carry a
-    row addressed in the original's space -- a ``SET_NUMBER`` row, a
-    detection -- into the final space.
-
-    :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
-    :param pdf_page: A 1-based page of the original.
-    :returns: The 1-based final page, or None when the page was
-        deleted or replaced.
-    :rtype: int | None
-    """
-    return originals_to_final(page_map).get(pdf_page)
+    slots: dict[int, int] = {}
+    for entry in page_map.get("pages", []):
+        pdf_page = entry["source"].get("pdf_page")
+        if pdf_page is not None:
+            slots.setdefault(pdf_page, entry["final_page"])
+    return slots
 
 
 def reference_page(edit: PageEdit, page_count: int) -> int:
@@ -341,25 +332,6 @@ def reference_page(edit: PageEdit, page_count: int) -> int:
     """
     page = edit.pdf_page if edit.pdf_page else (edit.anchor_pdf_page or 0)
     return min(max(page, 1), page_count)
-
-
-def final_slot_of(page_map: dict, pdf_page: int) -> int | None:
-    """Return the final page that stands where one original page stood.
-
-    Unlike :func:`final_page_of`, a replaced or a rotated page answers
-    too: its slot is taken by the shard built for it. The readers that
-    carry a curator's decision about a *position* -- a typed page
-    number -- use this one; the readers that carry a paid result about
-    the page's *content* use :func:`final_page_of`, since a replaced
-    page's content is new.
-
-    :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
-    :param pdf_page: A 1-based page of the original.
-    :returns: The 1-based final page, or None when the page was
-        deleted.
-    :rtype: int | None
-    """
-    return slots_to_final(page_map).get(pdf_page)
 
 
 def edit_page_count(edit: PageEdit) -> int:
@@ -489,6 +461,9 @@ def plan_run(
                 source["pdf_page"] = edit.pdf_page
             emit(source)
 
+    rotation_rows = {
+        e.pdf_page: e for e in edits if e.kind == PageEdit.Kind.ROTATE_PAGE
+    }
     last = scan.page_count
     for edit in gaps.get(0, []):
         emit_upload(edit)
@@ -498,12 +473,11 @@ def plan_run(
         elif pdf_page in replacements:
             emit_upload(replacements[pdf_page])
         elif pdf_page in rotations:
-            edit = next(
-                e
-                for e in edits
-                if e.kind == PageEdit.Kind.ROTATE_PAGE
-                and e.pdf_page == pdf_page
-            )
+            edit = rotation_rows.get(pdf_page)
+            if edit is None:
+                raise ApplyError(
+                    f"page {pdf_page} has a rotation and no row for it"
+                )
             emit(
                 {
                     "kind": "edit",
@@ -613,12 +587,12 @@ def build_edit_shard(
     if edit.kind == PageEdit.Kind.ROTATE_PAGE:
         _turned_copy(out, source, edit.pdf_page, int(edit.value))
         return out
+    if data is None:
+        raise ApplyError(f"edit {edit.pk} has no file to build a shard from")
     if page_edits.uploaded_kind(edit) == "pdf":
         with fitz.open(stream=data, filetype="pdf") as uploaded:
             out.insert_pdf(uploaded)
         return out
-    if data is None:
-        raise ApplyError(f"edit {edit.pk} has no file to build a shard from")
     _place_image(out, source, reference_page(edit, source.page_count), data)
     return out
 
@@ -686,33 +660,6 @@ def build_final_pdf(
             f"{plan.final_page_count}"
         )
     return out
-
-
-def write_final_pdf(
-    scan: Scan, plan: ApplyPlan, source_path: Path, dest: Path
-) -> Path:
-    """Build the final PDF from the original on disk and save it.
-
-    :param scan: The scan, for the log line.
-    :param plan: The plan.
-    :param source_path: The original PDF.
-    :param dest: Where to save the final PDF.
-    :returns: ``dest``.
-    :rtype: Path
-    """
-    with fitz.open(str(source_path)) as source:
-        with build_final_pdf(source, plan) as out:
-            out.save(str(dest), garbage=3, deflate=True)
-    logger.info(
-        "apply: scan %s: built the final PDF, %d page(s) from %d (%d "
-        "deleted, %d edit(s))",
-        scan.pk,
-        plan.final_page_count,
-        plan.source_page_count,
-        len(plan.deleted_pages),
-        len(plan.edits),
-    )
-    return dest
 
 
 # ── the runs ───────────────────────────────────────────────────────
@@ -1389,12 +1336,16 @@ def _candidate_scan_ids() -> set[int]:
     not merged yet waits with a blank ``detections_key``, so a per-scan
     check would compute :func:`phase_due` for every one of them on
     every tick -- five queries each, growing with the corpus.
-    Here each reason a scan may owe a phase is one query joined through
-    the scan. A run with spent attempts drops out at the query, and so
-    does a glue whose own stage holds an unstarted or a dead row
-    (:func:`glues_due` judges the same way, row by row). The steady
-    state is six queries a tick, whatever the corpus size;
-    :func:`phase_due` then judges the candidates exactly.
+    Here each reason a scan may owe a phase is one query. A run with
+    spent attempts drops out at the query, and so does a glue whose own
+    stage holds an unstarted or a dead row (:func:`glues_due` judges the
+    same way, row by row). The two glues that need a volume run read
+    the *live* one through :func:`_glued_volume_scan_ids`, the rule of
+    :func:`_volume_ocr_run`: an arm that took any CONSUMED row named a
+    scan whose live run was still open, and the exact test refused it
+    on every tick for good. The steady state is eight queries a tick,
+    whatever the corpus size; :func:`phase_due` then judges the
+    candidates exactly.
 
     At most one run stands per scan: :func:`build_run` supersedes the
     standing one before it creates the next.
@@ -1420,10 +1371,6 @@ def _candidate_scan_ids() -> set[int]:
             status__in=BLOCKING_JOB_STATUSES,
         ).values("apply_run_id")
 
-    volume_consumed = {
-        "scan__jobs__status": JobStatus.CONSUMED,
-        "scan__jobs__apply_run__isnull": True,
-    }
     ids: set[int] = set()
     # No standing run at all. A subquery, not a reverse-relation
     # ``isnull`` filter: on a LEFT JOIN a scan with no run at all reads
@@ -1446,7 +1393,10 @@ def _candidate_scan_ids() -> set[int]:
     # it made its scan a candidate the exact test refused on every tick.
     ids.update(
         built.filter(
+            # The three arms of ``page_edits.is_stale``: a blank on
+            # either side matches anything.
             Q(scan__page_edits__source_fingerprint="")
+            | Q(scan__source_fingerprint="")
             | Q(
                 scan__page_edits__source_fingerprint=F(
                     "scan__source_fingerprint"
@@ -1465,8 +1415,9 @@ def _candidate_scan_ids() -> set[int]:
     ids.update(
         built.filter(
             Q(ocr_key="") | Q(printed_pages_key=""),
-            scan__jobs__stage=JobStage.ANALYZE,
-            **volume_consumed,
+            scan_id__in=_glued_volume_scan_ids(
+                JobStage.ANALYZE, JobEngine.DOTS_MOCR
+            ),
         )
         .exclude(pk__in=blocked(GLUE_STAGES["ocr"]))
         .values_list("scan_id", flat=True)
@@ -1474,13 +1425,51 @@ def _candidate_scan_ids() -> set[int]:
     ids.update(
         built.filter(
             detections_key="",
-            scan__jobs__stage=JobStage.DETECT,
-            **volume_consumed,
+            scan_id__in=_glued_volume_scan_ids(
+                JobStage.DETECT, JobEngine.BLACKLETTER
+            ),
         )
         .exclude(pk__in=blocked(GLUE_STAGES["detections"]))
         .values_list("scan_id", flat=True)
     )
     return ids
+
+
+def _glued_volume_scan_ids(stage: str, engine: str) -> set[int]:
+    """Return the approved scans whose live volume run of one stage is glued.
+
+    The rule of :func:`_volume_ocr_run` and :func:`_volume_detect_run`
+    -- the rows at the highest run number, all ``CONSUMED`` -- over the
+    whole corpus in one query, for the pre-check. Only the volume rows:
+    the apply's own rows share the stage and the engine.
+
+    :param stage: A ``JobStage`` value.
+    :param engine: A ``JobEngine`` value.
+    :returns: The scan ids.
+    :rtype: set[int]
+    """
+    from collections import defaultdict
+
+    by_scan: dict[int, list[tuple[int, str]]] = defaultdict(list)
+    rows = ExternalJob.objects.filter(
+        stage=stage,
+        engine=engine,
+        opinion=None,
+        apply_run__isnull=True,
+        scan__status=APPLY_STATUS,
+    ).values_list("scan_id", "run", "status")
+    for scan_id, run, status in rows:
+        by_scan[scan_id].append((run, status))
+    glued = set()
+    for scan_id, items in by_scan.items():
+        live = max(run for run, _ in items)
+        if all(
+            status == JobStatus.CONSUMED
+            for run, status in items
+            if run == live
+        ):
+            glued.add(scan_id)
+    return glued
 
 
 def _note_dead_rows() -> int:
@@ -1489,25 +1478,24 @@ def _note_dead_rows() -> int:
     A dead row is terminal for its stage: :func:`glues_due` drops that
     glue for good, ``is_complete`` never turns true and review 2 never
     opens, until an operator supersedes the run. ``jobs`` logs the
-    row's own failure, but nothing said the run had stopped, and the
-    bar's summary showed a blank ledger. So the crossing is logged here
-    with the run named, and ``last_error`` carries it -- once, because
-    a blank ``last_error`` is what selects the run.
+    row's own failure, but nothing said the run had stopped. So the
+    crossing is logged here with the run named, once, and
+    ``dead_row_noted_at`` is the stamp that says it was. A stamp of its
+    own, because ``last_error`` has two other writers: the failed
+    attempts fill it, and a successful glue clears it, so a note kept
+    there was repeated after every later glue and never written on a
+    run whose glue had also failed.
 
     :returns: How many runs were noted.
     :rtype: int
     """
     noted = 0
-    runs = (
-        ApplyRun.objects.filter(
-            superseded_at__isnull=True,
-            built_at__isnull=False,
-            last_error="",
-            jobs__status__in=DEAD_JOB_STATUSES,
-        )
-        .distinct()
-        .select_related("scan")
-    )
+    runs = ApplyRun.objects.filter(
+        superseded_at__isnull=True,
+        built_at__isnull=False,
+        dead_row_noted_at__isnull=True,
+        jobs__status__in=DEAD_JOB_STATUSES,
+    ).distinct()
     for run in runs:
         dead = (
             run.jobs.filter(status__in=DEAD_JOB_STATUSES)
@@ -1520,9 +1508,9 @@ def _note_dead_rows() -> int:
             f"{dead.stage} row s{dead.shard_index} {dead.status}: "
             f"{dead.error_code or 'no error code'}"
         )
-        ApplyRun.objects.filter(pk=run.pk, last_error="").update(
-            last_error=note, last_attempt_at=timezone.now()
-        )
+        ApplyRun.objects.filter(
+            pk=run.pk, dead_row_noted_at__isnull=True
+        ).update(dead_row_noted_at=timezone.now())
         logger.warning(
             "apply: scan %s: run %s has a dead row (%s); its %s glue is "
             "not written and review 2 waits. Supersede the run from the "
@@ -1850,8 +1838,7 @@ def _glue_ocr(
     The kept pages come from the volume's glued ``r{run}-volume.json``
     (#202), the new pages from the one-page results, each page
     renumbered to its final page and stamped with its source. A page
-    the worker could not read keeps its ``error``; a page whose stage
-    was off at build time is a hole too. A run with no structural edit
+    the worker could not read keeps its ``error``. A run with no structural edit
     aliases the volume document and writes only the printed pages.
 
     :param scan: The scan.

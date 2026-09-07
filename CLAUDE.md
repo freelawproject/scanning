@@ -518,20 +518,24 @@ the `reopen_page_review` view. What must not be broken:
   an uncapped trigger would take every old approved volume out of
   review 2 at once; a cap *per tick* let the in-flight set grow by five every
   15 seconds and spent its places on candidates the exact test
-  refused. Two refused shapes exist, and both are cheap now: a volume
-  whose OCR or detection run has a CONSUMED row from an old run and a
-  live run still open (the candidate query asks for one CONSUMED row,
-  `_volume_ocr_run` for every live one), and a withdrawn stale row,
-  which the candidate query no longer counts. **The worker claims by
+  refused. Two refused shapes existed, and neither is a candidate now:
+  the OCR and detection arms read the *live* volume run through
+  `_glued_volume_scan_ids` (the rule of `_volume_ocr_run`, over the
+  corpus in one query), and a withdrawn stale row is out of the
+  edit-set arm, with the three cases of `page_edits.is_stale`. **The worker claims by
   action before age** (`process_next_scan.CLAIM_PRIORITY`): the full
   pipeline, then the redaction compute, then the apply. A volunteer's
   upload never waits behind the five applies the trigger may hold, and
   a curator's approval never waits behind a backfill nobody watches.
 - **A dead row is noted once** (`_note_dead_rows`, on the trigger
-  tick): a dead row is terminal for its stage, so `is_complete` never
-  turns true and review 2 never opens until an operator supersedes the
-  run. `jobs` logs the row; the apply logs the run, and writes the row
-  into the run's blank `last_error`, which the bar's summary shows.
+  tick, stamped in `ApplyRun.dead_row_noted_at`): a dead row is
+  terminal for its stage, so `is_complete` never turns true and review
+  2 never opens until an operator supersedes the run. `jobs` logs the
+  row; the apply logs the run, once. Its own stamp, because
+  `last_error` has two other writers — the failed attempts fill it and
+  a successful glue clears it — so a note kept there repeated after
+  every later glue and was never written on a run whose glue had also
+  failed. The bar's summary counts the dead rows itself.
 - **A volume nobody changed never opens the original.** `plan_run`
   reads the rows and the uploaded files, never the original, and an
   identity map has no edit entry, so `_build` skips the pull whole.
@@ -549,7 +553,7 @@ the `reopen_page_review` view. What must not be broken:
   created them would leave rows that run and bill for a run no glue
   reads. `_candidate_scan_ids` is
   the pre-check: one query per reason a scan may owe a phase, over the
-  whole corpus, so the steady state is six queries a tick whatever the
+  whole corpus, so the steady state is eight queries a tick whatever the
   corpus size (an approved volume whose detection run is not merged
   waits with a blank `detections_key`, and a per-scan check would cost
   five queries each).
@@ -559,9 +563,10 @@ the `reopen_page_review` view. What must not be broken:
   page: `{"kind": "original", "pdf_page": p}` for a kept page, or
   `{"kind": "edit", "edit_id", "edit_kind", "page": k, ...}` for page
   `k` of an edit's shard (a rotation carries `pdf_page` and
-  `rotation`; an image carries `reference_pdf_page`). `final_page_of`
-  answers for kept pages only — a replaced page's content is new —
-  and `final_slot_of` for the position, which a typed page number
+  `rotation`; an image carries `reference_pdf_page`). The two inverse
+  maps are built once per reader: `originals_to_final` answers for
+  kept pages only — a replaced page's content is new — and
+  `slots_to_final` for the position, which a typed page number
   follows. Every glue reads the map; nothing derives it again.
 - **The final PDF is a derived artifact, not a new source.**
   `Scan.source_fingerprint` stays the original's, forever; the run
@@ -652,7 +657,7 @@ the `reopen_page_review` view. What must not be broken:
 - **The printed-page map is the curator's over the model's.**
   `printed_pages` runs `page_numbers.ocr_results_from_volume` over the
   final OCR document, then lands each standing `SET_NUMBER` row on its
-  slot (`final_slot_of`, so a replaced or rotated page keeps the
+  slot (`slots_to_final`, so a replaced or rotated page keeps the
   number typed for it) and each inserted page's `logical_page`. A page
   the worker could not read keeps its `error`, and a page whose stage
   was off is a hole too (`"not read"`).

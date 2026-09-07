@@ -158,6 +158,10 @@ def promote_ready_scans() -> int:
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
+            # The volume run only: a page edit apply's one-page shards
+            # (#224) share the stage, and the rule would refuse them
+            # anyway, at the cost of a read per tick.
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()

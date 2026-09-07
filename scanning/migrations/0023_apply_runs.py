@@ -33,6 +33,7 @@ class Migration(migrations.Migration):
                 ('attempts', models.PositiveSmallIntegerField(default=0, help_text='Failed attempts at the current phase.')),
                 ('last_error', models.TextField(blank=True, default='', help_text='What the last failed attempt raised.')),
                 ('last_attempt_at', models.DateTimeField(blank=True, null=True)),
+                ('dead_row_noted_at', models.DateTimeField(blank=True, help_text='When the trigger first saw a dead job row on this run and logged it. Its own stamp: last_error is written by the failed attempts and cleared by a successful glue, so a note kept there was repeated after every glue and lost behind a failed one.', null=True)),
             ],
             options={
                 'ordering': ['scan', 'number'],
