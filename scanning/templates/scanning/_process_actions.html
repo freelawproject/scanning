@@ -17,10 +17,12 @@ step 2 when detections exist and otherwise explains, with the same
 text as its title (`detect_message`).
 
 The review-1 controls (issue #151) read `page_review_ready` /
-`page_review_done`, the two #154 statuses. Approving is the gate: it is
+`page_review_done`. Approving is the gate: it is
 what reveals "Next: Detect". Open page edits do not hide it (#232):
 the apply runs after the approval, so a bar that waited for the apply
-waited for a button it was hiding.
+waited for a button it was hiding. `page_review_done` covers the whole
+of review 2 as well (#263): a curator who walks back here from the
+redaction review must find the bar they left.
 
 "Validate" and "Re-validate" are offered to a legacy scan only
 (`has_legacy_ocr`). A new-pipeline volume needs no re-run: sharding,
@@ -102,9 +104,11 @@ reach step 2.
   {% endif %}
   {% comment %}
     Staff only (#224): the reopen throws away a paid build, and the
-    curators' own step is the approval, not its reversal.
+    curators' own step is the approval, not its reversal. Only while
+    the scan is still in DONE: the view's compare-and-swap reads that
+    status, and a volume in review 2 (#263) is not reopened here.
   {% endcomment %}
-  {% if user.is_staff %}
+  {% if user.is_staff and page_review_reopenable %}
   <form method="post" action="{% url 'reopen_page_review' scan.pk %}" class="inline">
     {% csrf_token %}
     <button type="submit" class="btn-outline text-sm" title="Open the page review again so its pages can be edited. The corrected volume in progress is discarded and rebuilt after the next approval." onclick="return confirm('Reopen the page review? The corrected volume in progress is discarded, and it is rebuilt after the next approval. Pages already converted and read are reused.');">Reopen page review</button>
@@ -156,7 +160,34 @@ reach step 2.
   plus this button:
   <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()">Re-pair Opinions</button>
 {% endcomment %}
-  {% if opinions %}
+{% comment %}
+  The review-2 controls (issue #263) read `redaction_review_ready` /
+  `redaction_review_done`, the two new statuses, from the same
+  `_review_flags` the step-1 bar reads. Approving is the gate for
+  "Next: Generate", the mirror of how the review-1 approval reveals
+  "Next: Detect".
+
+  No confirm dialog and no cost warning: this button starts nothing and
+  pays nothing. Open detections do not hide it either -- the curator
+  judges the geometry, as they judge a page-completeness suspicion
+  (#151).
+
+  A legacy volume keeps its link. Its step 2 lives in PENDING_REVIEW,
+  so it can hold neither #263 status, and a gate on the approval alone
+  would strand it here. That clause reads `legacy_review`, the status,
+  and not `has_legacy_ocr`: a backfill dots.mocr run over an old volume
+  turns the second one false while the volume is still in the legacy
+  step 2, and the link would go with it.
+{% endcomment %}
+  {% if redaction_review_ready %}
+  <form method="post" action="{% url 'approve_redaction_review' scan.pk %}" class="inline">
+    {% csrf_token %}
+    <button type="submit" class="btn-primary text-sm" title="Confirm the redactions of this volume are correct: every headnote and key number is covered, and no opinion text is.">I reviewed the redactions and they are correct</button>
+  </form>
+  {% elif redaction_review_done %}
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed the redactions of this volume">&#10003; Redaction review done</span>
+  {% endif %}
+  {% if opinions and redaction_review_done or opinions and legacy_review %}
   <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
   {% endif %}
 

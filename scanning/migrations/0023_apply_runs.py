@@ -8,7 +8,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('scanning', '0021_external_job_source_fingerprint'),
+        ('scanning', '0022_alter_scan_status_redaction_review'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 

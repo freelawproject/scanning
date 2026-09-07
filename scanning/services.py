@@ -54,6 +54,7 @@ from django.db.models import Case, F, Value, When
 from scanning.models import (
     BUSY_STATUSES,
     DEAD_JOB_STATUSES,
+    REVIEW_STATUSES,
     CheckName,
     Detection,
     ExternalJob,
@@ -1460,15 +1461,16 @@ def recalculate_issues(scan: "Scan") -> None:
             "progress_message",
         ]
     )
-    # A recheck must not move a scan between review states (#154): a
-    # scan in a page-completeness review state keeps it. The write to
-    # PENDING_REVIEW stays for the legacy rows that already carry it.
-    Scan.objects.filter(pk=scan.pk).exclude(
-        status__in=(
-            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
-            Status.PAGE_COMPLETENESS_REVIEW_DONE,
-        )
-    ).update(status=Status.PENDING_REVIEW)
+    # A recheck must not move a scan between review states (#154/#263):
+    # a scan in a review state keeps it. The recompute button of step 1
+    # is reachable from a volume already in review 2, so the two #263
+    # states are here for the same reason as the two #154 ones -- a
+    # rebuild of the page-number issues says nothing about the
+    # redactions. The write to PENDING_REVIEW stays for the legacy rows
+    # that already carry it.
+    Scan.objects.filter(pk=scan.pk).exclude(status__in=REVIEW_STATUSES).update(
+        status=Status.PENDING_REVIEW
+    )
     scan.refresh_from_db(fields=["status"])
 
     # Suppression flags are curator decisions stored as Issue rows, not
@@ -1653,8 +1655,12 @@ def run_compute_redactions(scan_pk: int) -> None:
     curator's edits away, which is the whole reason they pressed the
     button.
 
-    The scan goes back to the review it came from whatever happens,
-    and this function raises nothing. An ``ERROR`` status on
+    The scan goes back to a review whatever happens, and this function
+    raises nothing. On success that review is review 2
+    (``READY_FOR_REDACTION_REVIEW``, #263), because this pass is
+    usually the last of its three conditions; on every failure it is
+    the review-1 approval, because a curator must not be sent to judge
+    geometry that was not measured. An ``ERROR`` status on
     an approved volume would need an admin re-queue, and that re-queue
     runs the whole pipeline again. A failure is counted on the run
     instead (``yolo.record_apply_failure``), which bounds the retries.
@@ -1662,7 +1668,7 @@ def run_compute_redactions(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to compute redactions for.
     :return: None.
     """
-    from scanning import s3_sync, yolo
+    from scanning import review_states, s3_sync, yolo
 
     django.db.connections.close_all()
     scan = Scan.objects.get(pk=scan_pk)
@@ -1671,15 +1677,34 @@ def run_compute_redactions(scan_pk: int) -> None:
         row.status == JobStatus.CONSUMED for row in rows
     )
     has_rows = Detection.objects.filter(scan_id=scan_pk, active=True).exists()
-    # Where to hand the scan back. A volume with detections but no
-    # detection *run* is a legacy one, and its step 2 lives in
-    # PENDING_REVIEW, since the #154 states describe a review it never
-    # had. Every other volume came from review 1, dead run or not.
-    park = (
-        Status.PENDING_REVIEW
-        if has_rows and not rows
-        else Status.PAGE_COMPLETENESS_REVIEW_DONE
-    )
+    # A volume with detections but no detection *run* is a legacy one,
+    # and its step 2 lives in PENDING_REVIEW, since the #154 and #263
+    # states describe a review it never had. Every other volume came
+    # from review 1, dead run or not.
+    legacy = has_rows and not rows
+
+    def park() -> str:
+        """Return where the scan belongs, read at the moment of the park.
+
+        Derived at each exit rather than chosen once, so that one rule
+        answers for every one of them (#263). A first apply that fails
+        writes no ``applied_at``, so the rule gives review 1 back --
+        nobody may be sent to judge geometry that was never measured. A
+        *recompute* that fails keeps the stamp of the run that worked,
+        so the rule gives review 2 back, and the failure message stands
+        where the curator can read it. A park chosen up front sent that
+        second case to review 1, and ``promote_ready_scans`` wrote its
+        own message over the failure one tick later.
+
+        :returns: The status to park the scan in.
+        :rtype: str
+        """
+        if legacy:
+            return Status.PENDING_REVIEW
+        if review_states.redaction_review_ready(scan, rows):
+            return Status.READY_FOR_REDACTION_REVIEW
+        return Status.PAGE_COMPLETENESS_REVIEW_DONE
+
     if not merged and not has_rows:
         # Nothing to measure: no merged run, and no detections from an
         # earlier one. Park the scan back rather than fail it -- the
@@ -1693,7 +1718,7 @@ def run_compute_redactions(scan_pk: int) -> None:
             scan_pk,
             "No detections to work from. The detection run has not "
             "reached this volume yet.",
-            park,
+            park(),
         )
         return
 
@@ -1784,13 +1809,23 @@ def run_compute_redactions(scan_pk: int) -> None:
                 "The redaction computation failed. The detections are "
                 "safe; ask a staff member to look at it."
             )
-        _park_after_redactions(scan_pk, message, park)
+        _park_after_redactions(scan_pk, message, park())
         return
 
     if merged:
+        # Before the park, never after: the review-2 edge in ``park``
+        # reads this very stamp to decide that the redactions are
+        # computed (#263), so the other order would park a finished
+        # volume one tick short of its own review. The apply is usually
+        # the last of the three conditions, and it takes the scan over
+        # the edge itself rather than leaving it to
+        # ``review_states.promote_ready_scans``: the viewer reloads the
+        # page the moment the scan parks, and a park in the approved
+        # status would show the curator a step 2 whose approve button
+        # appears a tick later, from nothing they did.
         yolo.record_apply_success(rows)
     _park_after_redactions(
-        scan_pk, "Detection review is ready: check the redactions.", park
+        scan_pk, "Detection review is ready: check the redactions.", park()
     )
     logger.info(
         "compute_redactions: scan %s: %d detection(s), %d opinion(s), "
@@ -1806,12 +1841,17 @@ def run_compute_redactions(scan_pk: int) -> None:
         s3_sync.release_local_processing(scan)
 
 
-#: The statuses a redaction computation may be queued from. The
-#: approved volume of the new flow, and the legacy ``PENDING_REVIEW``
-#: rows, which reached review 2 before the #154 statuses existed. A
-#: busy scan is refused: it holds a claim already.
+#: The statuses a redaction computation may be queued from: the
+#: approved volume of the new flow, the volume already in review 2
+#: (#263) -- a recompute starts from the review the curator is looking
+#: at -- and the legacy ``PENDING_REVIEW`` rows, which reached review 2
+#: before the #154 statuses existed. A busy scan is refused: it holds a
+#: claim already. ``REDACTION_REVIEW_DONE`` is deliberately absent: a
+#: closed review is not recomputed under the person who closed it, and
+#: the way back is the admin re-queue.
 REDACTION_COMPUTE_STATUSES = (
     Status.PAGE_COMPLETENESS_REVIEW_DONE,
+    Status.READY_FOR_REDACTION_REVIEW,
     Status.PENDING_REVIEW,
 )
 
@@ -1867,9 +1907,10 @@ def _park_after_redactions(
     :param scan_pk: Primary key of the scan.
     :param message: What to show under the progress bar.
     :param status: Where to park it. Defaults to review 1's finished
-        state; a legacy volume goes back to ``PENDING_REVIEW``, which
-        is where its own step 2 lives, because the #154 states describe
-        a review it never had.
+        state; a successful run passes ``READY_FOR_REDACTION_REVIEW``
+        (#263), and a legacy volume goes back to ``PENDING_REVIEW``,
+        which is where its own step 2 lives, because the #154 and #263
+        states describe a review it never had.
     :return: None.
     """
     Scan.objects.filter(

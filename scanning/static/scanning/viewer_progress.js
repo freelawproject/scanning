@@ -134,7 +134,9 @@
                     data.status === "pending_review" ||
                     data.status === "awaiting_validation" ||
                     data.status === "ready_for_page_completeness_review" ||
-                    data.status === "page_completeness_review_done"
+                    data.status === "page_completeness_review_done" ||
+                    data.status === "ready_for_redaction_review" ||
+                    data.status === "redaction_review_done"
                 ) {
                     window.location.reload();
                 } else if (data.status === "error") {

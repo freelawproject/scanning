@@ -1089,9 +1089,8 @@ def glue_due(scan: Scan, run: ApplyRun, rows: list[ExternalJob]) -> bool:
     Each glue has its own inputs, and each is judged alone: the
     bitonal copy needs the run's CONVERT rows only; the OCR volume and
     the printed pages need the volume's glued OCR run too; the
-    detections need the volume's merged detection run, which the staff
-    button starts and #211 will automate. The first two do not wait for
-    the third.
+    detections need the volume's merged detection run, which the daemon
+    starts at upload (#250). The first two do not wait for the third.
 
     :param scan: The scan.
     :param run: A built run whose rows are all finished.
@@ -1112,10 +1111,10 @@ def _candidate_scan_ids() -> set[int]:
     """Return the approved scans that may owe a phase, in a few queries.
 
     The pre-check of the trigger, over the whole corpus at once rather
-    than scan by scan. Until #211 automates detection, every approved
-    volume waits for its detection run with a blank ``detections_key``,
-    so a per-scan check would compute :func:`phase_due` for all of
-    them on every tick -- five queries each, growing with the corpus.
+    than scan by scan. An approved volume whose detection run (#250) is
+    not merged yet waits with a blank ``detections_key``, so a per-scan
+    check would compute :func:`phase_due` for every one of them on
+    every tick -- five queries each, growing with the corpus.
     Here each reason a scan may owe a phase is one query joined through
     the scan, and a run with a dead row or spent attempts drops out at
     the query. The steady state is six queries a tick, whatever the

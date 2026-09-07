@@ -53,6 +53,7 @@ from scanning.views_api import (
 from scanning.views_process import (
     add_page_insert,
     approve_page_completeness,
+    approve_redaction_review,
     assign_page,
     delete_page,
     dismiss_issue,
@@ -178,6 +179,11 @@ urlpatterns = [
         "scans/<int:pk>/approve-pages/",
         approve_page_completeness,
         name="approve_page_completeness",
+    ),
+    path(
+        "scans/<int:pk>/approve-redactions/",
+        approve_redaction_review,
+        name="approve_redaction_review",
     ),
     path(
         "scans/<int:pk>/reopen-pages/",
