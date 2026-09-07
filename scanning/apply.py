@@ -1,0 +1,2259 @@
+"""Apply the page edits: build the final volume, and glue the paid
+results into its page space (issue #224).
+
+Review 1 ends when a curator approves the page completeness
+(``PAGE_COMPLETENESS_REVIEW_DONE``, #151). The ``PageEdit`` rows (#214)
+plus the original then describe the complete volume, and this module
+builds it. **The apply assembles; it does not recompute.** A page nobody
+touched keeps its paid conversion, its paid OCR read and its paid
+detections. Only a page a curator added or changed enters a queue, as a
+one-page shard.
+
+The pieces, and the rules that hold them together:
+
+- **The plan** (:func:`plan_run`) reads the current structural rows and
+  computes the offset map: one entry per final page naming its source,
+  an original page or a page of an edit's file. The map is stored on
+  the ``ApplyRun`` row once, at build time, and every glue reads it.
+  Nothing derives it again.
+- **The walk** (:func:`build_final_pdf`) turns the plan into the final
+  PDF. ``views_api.export_pdf`` runs the same walk, so the export shows
+  what the apply builds.
+- **The final PDF is a derived artifact, not a new source.** The
+  original stays the source of record and ``Scan.source_fingerprint``
+  stays the original's. Every edit keeps its address in the original's
+  page space; the map is the bridge.
+- **The page shards are keyed by edit**, not by run
+  (``jobs/apply/pages/e{pk}.pdf``). A row is immutable, so the next run
+  finds the same key and the same identity, and ``jobs._reusable_results``
+  carries the paid result for free. The apply's glues keep their
+  results for the same reason, where the volume bitonal merge deletes
+  its own.
+- **Every output goes under ``jobs/apply/a{n}/``**, which the generic
+  sync never carries and the admin deletion sweeps. The review-1
+  artifacts -- the first ``bitonal.pdf``, the ``r{run}-volume.json``,
+  the stored page map -- are never written over, so the page review
+  still renders if the review is reopened.
+- **A run is a row of its own** (``models.ApplyRun``), because a run
+  may have no job rows at all, spans three stages, and is asked about
+  on every collect tick.
+"""
+
+from __future__ import annotations
+
+import logging
+import tempfile
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import fitz
+from django.db import transaction
+from django.utils import timezone
+
+from scanning import page_edits, s3_sync
+from scanning.models import (
+    DEAD_JOB_STATUSES,
+    IN_FLIGHT_JOB_STATUSES,
+    ApplyRun,
+    ExternalJob,
+    JobEngine,
+    JobProvider,
+    JobStage,
+    JobStatus,
+    PageEdit,
+    QueuedAction,
+    Scan,
+    Status,
+)
+from scanning.utils import local_original_pdf
+
+logger = logging.getLogger(__name__)
+
+#: The shape of ``ApplyRun.page_map`` and of ``page_map.json``.
+MAP_SCHEMA_VERSION = 1
+
+#: Where the apply's scratch files go in the system temp dir, so the
+#: ``cleanup_processing_tmp`` sweep reclaims what a SIGKILL orphans.
+BUILD_TMP_PREFIX = "pageapply-"
+
+#: How many failed attempts a phase gets before the trigger stops
+#: queueing the run. The same loud-then-quiet ledger the volume glues
+#: use; the way back is the admin action that supersedes the run.
+APPLY_MAX_ATTEMPTS = 3
+
+#: The kinds that need a one-page shard of their own: an image or a PDF
+#: the curator sent, or a page of the original turned the right way up.
+#: A deletion costs no job -- the glue drops the page's slice.
+SHARD_KINDS = (
+    PageEdit.Kind.INSERT_PAGE,
+    PageEdit.Kind.REPLACE_PAGE,
+    PageEdit.Kind.ROTATE_PAGE,
+)
+
+#: The kinds that carry a file a curator uploaded.
+UPLOAD_KINDS = (PageEdit.Kind.INSERT_PAGE, PageEdit.Kind.REPLACE_PAGE)
+
+#: A job row nobody has answered yet: waiting in our queue, or handed
+#: to the provider. What a supersede cancels, and what a run that gave
+#: up cancels too, or the rows would run and bill for a run nobody
+#: glues.
+UNSTARTED_JOB_STATUSES = (
+    frozenset({JobStatus.PENDING}) | IN_FLIGHT_JOB_STATUSES
+)
+
+#: A row of one stage that keeps that stage's glue from being written:
+#: still unstarted, or dead. A stage's glue is judged on that stage's
+#: rows alone (:func:`glues_due`).
+BLOCKING_JOB_STATUSES = UNSTARTED_JOB_STATUSES | DEAD_JOB_STATUSES
+
+#: The glues, each with the stage whose rows it reads.
+GLUE_STAGES = {
+    "bitonal": JobStage.CONVERT,
+    "ocr": JobStage.ANALYZE,
+    "detections": JobStage.DETECT,
+}
+
+
+class ApplyError(Exception):
+    """The apply could not build or glue a run."""
+
+
+class GateClosedError(ApplyError):
+    """A stage the edited pages need is off in this environment.
+
+    Not a failure of the run: nothing is wrong with the volume, and the
+    build is right as soon as the flag or the credentials return. So
+    :func:`build_run` re-raises it without counting an attempt, and
+    :func:`phase_due` reads the gates first so the scan is not queued
+    at all while one is closed.
+    """
+
+
+# ── keys ───────────────────────────────────────────────────────────
+def apply_prefix(scan: Scan) -> str:
+    """Return the S3 prefix that holds every apply artifact of a scan.
+
+    Under ``jobs/`` so the generic sync never carries it and the admin
+    deletion sweeps it with the job results.
+
+    :param scan: The scan.
+    :returns: ``{processing prefix}jobs/apply/``.
+    :rtype: str
+    """
+    return f"{s3_sync.s3_processing_prefix(scan)}{s3_sync.JOB_RESULTS_SUBDIR}apply/"
+
+
+def run_prefix(scan: Scan, run: ApplyRun) -> str:
+    """Return the S3 prefix of one run's outputs.
+
+    :param scan: The scan.
+    :param run: The apply run.
+    :returns: ``{apply prefix}a{n}/``.
+    :rtype: str
+    """
+    return f"{apply_prefix(scan)}{run.label}/"
+
+
+def page_shard_key(scan: Scan, edit: PageEdit) -> str:
+    """Return the S3 key of the one-page shard built from one edit.
+
+    Named by the edit and not by the run, on purpose: a row is
+    immutable, so a later run finds the same shard under the same key
+    with the same identity, and the carry of prior results
+    (``jobs._reusable_results``) hands it the paid read at no cost.
+
+    :param scan: The scan.
+    :param edit: An insert, a replacement or a rotation row.
+    :returns: ``{apply prefix}pages/e{pk}.pdf``.
+    :rtype: str
+    """
+    return f"{apply_prefix(scan)}pages/e{edit.pk}.pdf"
+
+
+# ── the plan ───────────────────────────────────────────────────────
+@dataclass
+class ApplyPlan:
+    """What one apply run builds: the final page order and its sources.
+
+    :ivar source_page_count: Pages in the original.
+    :ivar deleted_pages: The 1-based original pages the final PDF drops.
+    :ivar edits: The current structural rows the plan read, in primary
+        key order. These are the rows a build stamps.
+    :ivar pages: One entry per final page, in order. Each is
+        ``{"final_page": n, "source": {...}}`` where the source is one
+        of two shapes: ``{"kind": "original", "pdf_page": p}`` for a
+        page kept as scanned, or ``{"kind": "edit", "edit_id": id,
+        "edit_kind": kind, "page": k, ...}`` for page ``k`` of the
+        shard built from one edit -- an uploaded image or PDF, or the
+        original page ``pdf_page`` turned by ``rotation`` degrees. An
+        image entry also names the ``reference_pdf_page`` whose
+        MediaBox it takes.
+    """
+
+    source_page_count: int
+    deleted_pages: list[int] = field(default_factory=list)
+    edits: list[PageEdit] = field(default_factory=list)
+    pages: list[dict] = field(default_factory=list)
+
+    @property
+    def final_page_count(self) -> int:
+        """Return how many pages the final PDF has."""
+        return len(self.pages)
+
+    @property
+    def is_identity(self) -> bool:
+        """Return whether the final PDF is the original, page for page.
+
+        Read off the map, as every glue reads it, so the build and the
+        glues take the same branch by construction. Such a run copies
+        nothing: it aliases the original and the review-1 artifacts.
+        """
+        return is_identity_map(self.to_map())
+
+    @property
+    def shard_edits(self) -> list[PageEdit]:
+        """Return the rows that need a one-page shard and a job row.
+
+        The rows a map entry names, not every row of a shard kind: a
+        rotation of a page that a deletion or a replacement outranks,
+        or a replacement of a deleted page, holds no final page. It is
+        still one of the plan's edits -- considered, and stamped -- but
+        cutting a shard for it would pay three stages for a page no
+        glue reads.
+        """
+        named = {
+            entry["source"]["edit_id"]
+            for entry in self.pages
+            if entry["source"]["kind"] == "edit"
+        }
+        return [edit for edit in self.edits if edit.pk in named]
+
+    def edit_by_id(self, edit_id: int) -> PageEdit:
+        """Return one of the plan's rows by primary key.
+
+        :param edit_id: The row's pk, as a map entry names it.
+        :returns: The row.
+        :raises KeyError: If the plan holds no such row.
+        """
+        for edit in self.edits:
+            if edit.pk == edit_id:
+                return edit
+        raise KeyError(edit_id)
+
+    def to_map(self) -> dict:
+        """Return the offset map as the run stores it.
+
+        :returns: ``schema_version``, ``source_page_count``,
+            ``final_page_count``, ``deleted_pages`` and ``pages``.
+        :rtype: dict
+        """
+        return {
+            "schema_version": MAP_SCHEMA_VERSION,
+            "source_page_count": self.source_page_count,
+            "final_page_count": self.final_page_count,
+            "deleted_pages": list(self.deleted_pages),
+            "pages": list(self.pages),
+        }
+
+
+def is_identity_map(page_map: dict) -> bool:
+    """Return whether a stored map keeps every original page in place.
+
+    The one test of "nothing to build", for the plan and the three
+    glues alike: every final page is an original page, and there are
+    as many as the original has. Written once, because three copies of
+    the expression and a fourth over the rows could disagree.
+
+    :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
+    :returns: Whether the final PDF is the original, page for page.
+    :rtype: bool
+    """
+    entries = page_map.get("pages", [])
+    return len(entries) == page_map.get("source_page_count") and all(
+        entry["source"]["kind"] == "original" for entry in entries
+    )
+
+
+def originals_to_final(page_map: dict) -> dict[int, int]:
+    """Return ``{original pdf_page: final page}`` for the kept pages.
+
+    The inverse of the map, built once for a reader that carries many
+    rows -- every detection of a volume -- so the glue is linear in the
+    detections and not in detections times pages.
+
+    :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
+    :returns: The kept pages only: a deleted or replaced page is absent.
+    :rtype: dict[int, int]
+    """
+    return {
+        entry["source"]["pdf_page"]: entry["final_page"]
+        for entry in page_map.get("pages", [])
+        if entry["source"]["kind"] == "original"
+    }
+
+
+def slots_to_final(page_map: dict) -> dict[int, int]:
+    """Return ``{original pdf_page: final page}`` for every held slot.
+
+    Like :func:`originals_to_final`, but a replaced or rotated page
+    answers too: its slot is taken by the shard built for it. The
+    readers that carry a curator's decision about a *position* -- a
+    typed page number -- use this one; the readers that carry a paid
+    result about the page's *content* use the other, since a replaced
+    page's content is new. A page named by several entries (a
+    replacement of several pages, which the endpoint refuses) keeps the
+    first.
+
+    :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
+    :returns: Every original page that still holds a final slot.
+    :rtype: dict[int, int]
+    """
+    slots: dict[int, int] = {}
+    for entry in page_map.get("pages", []):
+        pdf_page = entry["source"].get("pdf_page")
+        if pdf_page is not None:
+            slots.setdefault(pdf_page, entry["final_page"])
+    return slots
+
+
+def reference_page(edit: PageEdit, page_count: int) -> int:
+    """Return the original page whose MediaBox an uploaded image takes.
+
+    The page it replaces, or the page it follows (page 1 for anchor 0,
+    the last page for an anchor past the end). One rule for the plan
+    and the shard, so the two agree.
+
+    :param edit: An insert or a replacement row.
+    :param page_count: Pages in the original.
+    :returns: A 1-based page of the original.
+    :rtype: int
+    """
+    page = edit.pdf_page if edit.pdf_page else (edit.anchor_pdf_page or 0)
+    return min(max(page, 1), page_count)
+
+
+def edit_page_count(edit: PageEdit) -> int:
+    """Return how many pages one edit contributes to the final PDF.
+
+    An image is one page. A PDF holds what it holds: a missing leaf is
+    often two pages, and the insert endpoint takes them all (#232). A
+    rotation turns one page of the original.
+
+    :param edit: A structural row.
+    :returns: The page count. A deletion contributes none.
+    :rtype: int
+    """
+    if edit.kind == PageEdit.Kind.DELETE_PAGE:
+        return 0
+    if edit.kind == PageEdit.Kind.ROTATE_PAGE:
+        return 1
+    if page_edits.uploaded_kind(edit) != "pdf":
+        return 1
+    return _pdf_page_count(read_edit_file(edit))
+
+
+def _pdf_page_count(data: bytes) -> int:
+    """Return how many pages an uploaded PDF holds.
+
+    :param data: The file's bytes.
+    :returns: The page count.
+    :rtype: int
+    """
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        return doc.page_count
+
+
+def preload_edit_files(scan: Scan) -> tuple[dict[int, bytes], dict[int, int]]:
+    """Read each uploaded file of the scan once, for the plan and the walk.
+
+    The plan needs a PDF's page count and the walk needs its bytes, so
+    a caller that runs both -- the build, the export -- would otherwise
+    pull every file from the bucket twice. The plan takes the counts
+    through ``page_counts`` and the walk the bytes through
+    ``read_file``.
+
+    :param scan: The scan whose standing inserts and replacements to
+        read.
+    :returns: ``({edit pk: bytes}, {edit pk: pages})`` over the current
+        rows of :data:`UPLOAD_KINDS`.
+    :rtype: tuple[dict[int, bytes], dict[int, int]]
+    """
+    files: dict[int, bytes] = {}
+    counts: dict[int, int] = {}
+    for edit in page_edits.current_edits(scan, *UPLOAD_KINDS):
+        data = read_edit_file(edit)
+        files[edit.pk] = data
+        counts[edit.pk] = (
+            _pdf_page_count(data)
+            if page_edits.uploaded_kind(edit) == "pdf"
+            else 1
+        )
+    return files, counts
+
+
+def plan_run(
+    scan: Scan, page_counts: dict[int, int] | None = None
+) -> ApplyPlan:
+    """Compute the final page order from the current structural rows.
+
+    Pure over its inputs: the rows, the original's page count and the
+    page count of each uploaded file. The walk is the one
+    ``views_api.export_pdf`` proved for the deletes and the inserts,
+    plus the two kinds the export used to skip:
+
+    - a deleted page is dropped;
+    - a replaced page gives its slot to the pages of the uploaded file;
+    - a rotated page keeps its slot, as a shard of its own;
+    - the images of a gap follow the page the gap names, in ``ordinal``
+      order, and anchor 0 goes before page 1.
+
+    A page both deleted and replaced is deleted: the deletion is the
+    stronger decision, and a curator who wants the replacement takes
+    the deletion back. A rotation of a deleted or replaced page is
+    outranked the same way. The losing row stays in ``edits`` -- the
+    build stamps it, and the trigger compares that set with the
+    standing rows -- but it is not in :attr:`ApplyPlan.shard_edits`,
+    so no shard is cut and nothing is paid for it.
+
+    :param scan: The scan whose rows to read.
+    :param page_counts: ``{edit pk: pages}`` for the uploaded files,
+        when the caller has them (the build has just cut the shards).
+        A missing entry is read off the file.
+    :returns: The plan.
+    :rtype: ApplyPlan
+    :raises ApplyError: If the scan has no page count yet.
+    """
+    if not scan.page_count:
+        raise ApplyError(f"scan {scan.pk} has no page count to plan over")
+    page_counts = dict(page_counts or {})
+
+    deleted = page_edits.deleted_pages(scan)
+    replacements = page_edits.replacements_by_page(scan)
+    rotations = page_edits.rotations_by_page(scan)
+    gaps = page_edits.inserts_by_gap(scan)
+    edits = sorted(
+        page_edits.current_edits(scan, *PageEdit.STRUCTURAL_KINDS),
+        key=lambda edit: edit.pk,
+    )
+
+    def count_of(edit: PageEdit) -> int:
+        if edit.pk not in page_counts:
+            page_counts[edit.pk] = edit_page_count(edit)
+        return page_counts[edit.pk]
+
+    pages: list[dict] = []
+
+    def emit(source: dict) -> None:
+        pages.append({"final_page": len(pages) + 1, "source": source})
+
+    def emit_upload(edit: PageEdit) -> None:
+        for k in range(count_of(edit)):
+            source = {
+                "kind": "edit",
+                "edit_id": edit.pk,
+                "edit_kind": str(edit.kind),
+                "page": k,
+                "reference_pdf_page": reference_page(edit, last),
+            }
+            if edit.kind == PageEdit.Kind.REPLACE_PAGE:
+                source["pdf_page"] = edit.pdf_page
+            emit(source)
+
+    rotation_rows = {
+        e.pdf_page: e for e in edits if e.kind == PageEdit.Kind.ROTATE_PAGE
+    }
+    last = scan.page_count
+    for edit in gaps.get(0, []):
+        emit_upload(edit)
+    for pdf_page in range(1, last + 1):
+        if pdf_page in deleted:
+            pass
+        elif pdf_page in replacements:
+            emit_upload(replacements[pdf_page])
+        elif pdf_page in rotations:
+            edit = rotation_rows.get(pdf_page)
+            if edit is None:
+                raise ApplyError(
+                    f"page {pdf_page} has a rotation and no row for it"
+                )
+            emit(
+                {
+                    "kind": "edit",
+                    "edit_id": edit.pk,
+                    "edit_kind": str(edit.kind),
+                    "page": 0,
+                    "pdf_page": pdf_page,
+                    "rotation": rotations[pdf_page],
+                }
+            )
+        else:
+            emit({"kind": "original", "pdf_page": pdf_page})
+        for edit in gaps.get(pdf_page, []):
+            emit_upload(edit)
+    # An insert anchored past the last page has no gap to fill. It is
+    # placed last rather than dropped: a curator uploaded it, and the
+    # viewer shows it there too (``page_edits.project_inserts``).
+    for anchor in sorted(anchor for anchor in gaps if anchor > last):
+        for edit in gaps[anchor]:
+            emit_upload(edit)
+
+    return ApplyPlan(
+        source_page_count=scan.page_count,
+        deleted_pages=sorted(deleted),
+        edits=edits,
+        pages=pages,
+    )
+
+
+# ── the walk ───────────────────────────────────────────────────────
+def read_edit_file(edit: PageEdit) -> bytes:
+    """Return the bytes of the file a curator uploaded for one edit.
+
+    The file lives on the default storage since #214, so it is read as
+    bytes: a remote file has no path for fitz to open.
+
+    :param edit: An insert or a replacement row.
+    :returns: The file's bytes.
+    :rtype: bytes
+    """
+    with edit.image.open("rb") as fh:
+        return fh.read()
+
+
+def _turned_copy(
+    out: fitz.Document, source: fitz.Document, pdf_page: int, degrees: int
+) -> None:
+    """Append one page of the original to ``out``, turned by ``degrees``.
+
+    The turn is added to the page's own ``/Rotate``: the curator judged
+    the page as it displays, and that display already includes the
+    rotation the scanner wrote.
+
+    :param out: The document being built.
+    :param source: The original.
+    :param pdf_page: The 1-based page to copy.
+    :param degrees: Clockwise quarter turns, in degrees.
+    :return: None.
+    """
+    out.insert_pdf(source, from_page=pdf_page - 1, to_page=pdf_page - 1)
+    page = out[-1]
+    page.set_rotation((page.rotation + degrees) % 360)
+
+
+def _place_image(
+    out: fitz.Document, source: fitz.Document, reference: int, data: bytes
+) -> None:
+    """Append an uploaded image as a page the size of a reference page.
+
+    The reference is the page the image replaces or follows, so the
+    render at 200 dpi describes the same pixel space as the rest of
+    the volume. The rule ``export_pdf`` always applied.
+
+    :param out: The document being built.
+    :param source: The original, for the reference MediaBox.
+    :param reference: The 1-based original page to take the size from.
+    :param data: The image bytes.
+    :return: None.
+    """
+    reference = min(max(reference, 1), source.page_count)
+    rect = source[reference - 1].rect
+    page = out.new_page(width=rect.width, height=rect.height)
+    page.insert_image(page.rect, stream=data)
+
+
+def build_edit_shard(
+    source: fitz.Document, edit: PageEdit, data: bytes | None
+) -> fitz.Document:
+    """Build the one-page shard the stages read for one edit.
+
+    What the external workers get for a page a curator added or
+    changed: a PDF, like every other shard, because doctor and dots.mocr
+    read PDFs. An uploaded PDF is copied as it is. An uploaded image
+    goes on a page the size of its reference page. A rotation is the
+    original page with its ``/Rotate`` turned; doctor and dots.mocr
+    render through fitz, which honours it, so the page is re-read the
+    right way up. The same three rules the final PDF walk applies, so
+    the shard's page ``k`` is the final PDF's page for map entry ``k``.
+
+    :param source: The original.
+    :param edit: The row.
+    :param data: The uploaded file's bytes, or None for a rotation.
+    :returns: The shard document. The caller closes it.
+    :rtype: fitz.Document
+    """
+    out = fitz.open()
+    if edit.kind == PageEdit.Kind.ROTATE_PAGE:
+        _turned_copy(out, source, edit.pdf_page, int(edit.value))
+        return out
+    if data is None:
+        raise ApplyError(f"edit {edit.pk} has no file to build a shard from")
+    if page_edits.uploaded_kind(edit) == "pdf":
+        with fitz.open(stream=data, filetype="pdf") as uploaded:
+            out.insert_pdf(uploaded)
+        return out
+    _place_image(out, source, reference_page(edit, source.page_count), data)
+    return out
+
+
+def build_final_pdf(
+    source: fitz.Document, plan: ApplyPlan, read_file=read_edit_file
+) -> fitz.Document:
+    """Build the final PDF from the original and the plan.
+
+    One pass over the map. Runs of untouched pages are copied in one
+    ``insert_pdf`` each, since a volume of 1300 pages with two edits is
+    three ranges, not 1300 calls. An edit's pages come from the same
+    rules :func:`build_edit_shard` applies, so the final PDF and the
+    shards agree page for page.
+
+    :param source: The original, open.
+    :param plan: The plan.
+    :param read_file: Returns the bytes of an edit's uploaded file.
+        Injected so the tests need no storage.
+    :returns: The final document. The caller saves and closes it.
+    :rtype: fitz.Document
+    """
+    out = fitz.open()
+    shards: dict[int, fitz.Document] = {}
+    try:
+        entries = plan.pages
+        i = 0
+        while i < len(entries):
+            src = entries[i]["source"]
+            if src["kind"] == "original":
+                first = src["pdf_page"]
+                last = first
+                while (
+                    i + 1 < len(entries)
+                    and entries[i + 1]["source"]["kind"] == "original"
+                    and entries[i + 1]["source"]["pdf_page"] == last + 1
+                ):
+                    i += 1
+                    last += 1
+                out.insert_pdf(source, from_page=first - 1, to_page=last - 1)
+                i += 1
+                continue
+            edit = plan.edit_by_id(src["edit_id"])
+            if edit.pk not in shards:
+                data = (
+                    None
+                    if edit.kind == PageEdit.Kind.ROTATE_PAGE
+                    else read_file(edit)
+                )
+                shards[edit.pk] = build_edit_shard(source, edit, data)
+            shard = shards[edit.pk]
+            if src["page"] >= shard.page_count:
+                raise ApplyError(
+                    f"edit {edit.pk} has {shard.page_count} page(s); the "
+                    f"map asks for page {src['page']}"
+                )
+            out.insert_pdf(shard, from_page=src["page"], to_page=src["page"])
+            i += 1
+    finally:
+        for shard in shards.values():
+            shard.close()
+    if out.page_count != plan.final_page_count:
+        raise ApplyError(
+            f"the final PDF has {out.page_count} page(s), the plan "
+            f"{plan.final_page_count}"
+        )
+    return out
+
+
+# ── the runs ───────────────────────────────────────────────────────
+def latest_run(scan: Scan) -> ApplyRun | None:
+    """Return the scan's newest apply run, superseded or not.
+
+    :param scan: The scan.
+    :returns: The run with the highest number, or None.
+    :rtype: ApplyRun | None
+    """
+    return scan.apply_runs.order_by("-number").first()
+
+
+def current_run(scan: Scan) -> ApplyRun | None:
+    """Return the scan's newest apply run that still stands.
+
+    :param scan: The scan.
+    :returns: The newest run without ``superseded_at``, or None.
+    :rtype: ApplyRun | None
+    """
+    return (
+        scan.apply_runs.filter(superseded_at__isnull=True)
+        .order_by("-number")
+        .first()
+    )
+
+
+def supersede_runs(scan: Scan, reason: str) -> int:
+    """Close every standing apply run of a scan, and cancel its jobs.
+
+    The reopen of a page review and the admin's way out of a run with
+    a dead row. The run's outputs stay in S3, and so do its paid
+    results: only the rows still waiting or in flight are cancelled,
+    scoped to the run so the volume runs stay alive. A ``COMPLETED``
+    row is left as it is, because the next build starts ``a{n+1}`` and
+    carries every paid result the edits did not change -- which is
+    exactly the row a cancel would have written off.
+
+    :param scan: The scan.
+    :param reason: Recorded on each cancelled job row.
+    :returns: How many runs were superseded.
+    :rtype: int
+    """
+    from scanning import jobs
+
+    now = timezone.now()
+    count = 0
+    for run in scan.apply_runs.filter(superseded_at__isnull=True):
+        jobs.abandon_open(
+            scan, reason, statuses=UNSTARTED_JOB_STATUSES, apply_run=run
+        )
+        ApplyRun.objects.filter(pk=run.pk, superseded_at__isnull=True).update(
+            superseded_at=now
+        )
+        logger.info(
+            "apply: scan %s: run %s superseded: %s", scan.pk, run.label, reason
+        )
+        count += 1
+    return count
+
+
+# ── the build phase ────────────────────────────────────────────────
+def _ensure_page_shard(
+    scan: Scan,
+    source: fitz.Document,
+    edit: PageEdit,
+    tmp_dir: Path,
+    data: bytes | None = None,
+    page_count: int | None = None,
+) -> dict:
+    """Make sure one edit's shard is in the bucket, and describe it.
+
+    Built once per edit: a shard already at its key is described, not
+    rebuilt, so a second run costs no upload and its rows keep the
+    identity the carry matches on.
+
+    :param scan: The scan.
+    :param source: The original, open.
+    :param edit: An insert, a replacement or a rotation row.
+    :param tmp_dir: Scratch space for the shard file.
+    :param data: The uploaded file's bytes, when the caller has read
+        them (:func:`preload_edit_files`). Read here otherwise.
+    :param page_count: The edit's page count, when the caller has it.
+    :returns: ``{"key", "page_count", "size_bytes"}``.
+    :rtype: dict
+    :raises ApplyError: If the upload failed.
+    """
+    key = page_shard_key(scan, edit)
+    if s3_sync.object_exists(key):
+        return {
+            "key": key,
+            "page_count": (
+                page_count if page_count is not None else edit_page_count(edit)
+            ),
+            "size_bytes": _stored_size(key, edit),
+        }
+    if data is None and edit.kind != PageEdit.Kind.ROTATE_PAGE:
+        data = read_edit_file(edit)
+    local = tmp_dir / f"e{edit.pk}.pdf"
+    with build_edit_shard(source, edit, data) as shard:
+        page_count = shard.page_count
+        shard.save(str(local), garbage=3, deflate=True)
+    if not s3_sync.upload_file_object(key, local, "application/pdf"):
+        raise ApplyError(f"could not upload the shard of edit {edit.pk}")
+    return {
+        "key": key,
+        "page_count": page_count,
+        "size_bytes": _stored_size(key, edit),
+    }
+
+
+def _stored_size(key: str, edit: PageEdit) -> int:
+    """Return the size the bucket reports for one shard, or refuse.
+
+    Read one way only, on the first build as on every later one: the
+    row identity carries the size, and a value read from the local
+    file once and from the bucket the next time would read as two
+    shards and re-pay three stages for a page that did not change. A
+    size the bucket cannot report is a failed upload, and the attempt
+    counts as one.
+
+    :param key: The shard's key.
+    :param edit: The row, for the message.
+    :returns: The object's size in bytes.
+    :rtype: int
+    :raises ApplyError: If the bucket reports no object at the key.
+    """
+    size = s3_sync.object_size(key)
+    if not size:
+        raise ApplyError(
+            f"the bucket reports no shard for edit {edit.pk} at {key}"
+        )
+    return size
+
+
+def shard_manifest(
+    scan: Scan, plan: ApplyPlan, shards: dict[int, dict]
+) -> dict:
+    """Describe the run's one-page shards the way ``ensure_shard_jobs`` reads.
+
+    The same shape as the volume manifest, with two additions per entry
+    that :func:`scanning.jobs._shard_specs` honours: the shard's own
+    ``key`` (under ``jobs/apply/pages/``, not ``shards/``) and the
+    ``edit_id`` it was built from. Each entry's ``source_page_count`` is
+    its own page count, so the identity of one edit's row never changes
+    when another edit joins the run -- that is what lets the carry
+    match it.
+
+    :param scan: The scan.
+    :param plan: The plan, for the shard order.
+    :param shards: :func:`_ensure_page_shard`'s answer per edit pk.
+    :returns: The manifest.
+    :rtype: dict
+    """
+    entries = []
+    for index, edit in enumerate(plan.shard_edits):
+        info = shards[edit.pk]
+        entries.append(
+            {
+                "name": f"e{edit.pk}.pdf",
+                "index": index,
+                "key": info["key"],
+                "edit_id": edit.pk,
+                "from_page": 0,
+                "to_page": info["page_count"] - 1,
+                "page_count": info["page_count"],
+                "size_bytes": info["size_bytes"],
+                "source_page_count": info["page_count"],
+            }
+        )
+    return {
+        "version": 1,
+        "source": {
+            "name": "page edits",
+            "size_bytes": sum(e["size_bytes"] for e in entries),
+            "page_count": sum(e["page_count"] for e in entries),
+        },
+        "shards": entries,
+    }
+
+
+def _ensure_rows(
+    scan: Scan, run: ApplyRun, plan: ApplyPlan, shards: dict[int, dict]
+) -> list[ExternalJob]:
+    """Create the run's job rows, one per stage per shard, behind the gates.
+
+    The gates mirror the pipeline's (``services._can_convert``,
+    ``services._can_analyze``, and ``yolo.enabled`` with S3 active), so
+    the new rows ride the same daemon, the same backpressure (#218) and
+    the same concurrency caps. Every stage carries prior results
+    (``reuse_results``), because the apply keeps its results where the
+    volume bitonal merge deletes its own.
+
+    :param scan: The scan.
+    :param run: The apply run the rows work for.
+    :param plan: The plan.
+    :param shards: :func:`_ensure_page_shard`'s answer per edit pk.
+    :returns: The rows created or found.
+    :rtype: list[ExternalJob]
+    """
+    from scanning import dots_mocr, jobs, services, yolo
+
+    if not plan.shard_edits:
+        return []
+    manifest = shard_manifest(scan, plan, shards)
+    # ``_build`` read the gates before any upload; this is the same
+    # question through the pipeline's own functions, with the manifest.
+    gates = {
+        "convert": services._can_convert(scan.pk, manifest),
+        "analyze": services._can_analyze(scan.pk, manifest),
+        "detect": yolo.enabled() and s3_sync.s3_active(),
+    }
+    closed = [name for name, open_ in gates.items() if not open_]
+    if closed:
+        raise GateClosedError(
+            f"The corrected volume waits: the {', '.join(closed)} stage(s) "
+            f"are off in this environment."
+        )
+    rows: list[ExternalJob] = []
+    if gates["convert"]:
+        rows += jobs.ensure_shard_jobs(
+            scan,
+            manifest,
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            reuse_results=True,
+            apply_run=run,
+        )
+    if gates["analyze"]:
+        rows += dots_mocr.ensure_analyze_jobs(scan, manifest, apply_run=run)
+    if gates["detect"]:
+        rows += yolo.ensure_detect_jobs(scan, manifest, apply_run=run)
+    return rows
+
+
+def _build(scan: Scan, run: ApplyRun) -> None:
+    """Phase 1: the shards, the final PDF, the map, the rows, the stamps.
+
+    Idempotent for a re-queue after a SIGTERM: a shard already in the
+    bucket is described rather than rebuilt, the final PDF is written
+    over the same key, and ``ensure_shard_jobs`` hands back the live
+    rows when they still describe the specs.
+
+    The plan comes first, and a volume nobody changed never opens the
+    original. The plan reads the rows and the uploaded files only, and
+    an identity map has no edit entry, so there is no shard to cut and
+    the final PDF is the original itself. That matters on the first
+    ticks after a deploy, which apply the whole approved corpus: a pull
+    of every multi-gigabyte original, to count its pages, would fill
+    the daemon pod's disk.
+
+    :param scan: The scan.
+    :param run: The run to build, not yet built.
+    :return: None.
+    :raises ApplyError: If an input is missing or an upload failed.
+    """
+    started = time.monotonic()
+    prefix = run_prefix(scan, run)
+    # Each uploaded file is read once: the plan takes its page count,
+    # the shard and the final PDF take its bytes.
+    files, counts = preload_edit_files(scan)
+    plan = plan_run(scan, counts)
+    # The backstop of the trigger's gate check: a gate that closed
+    # between the queue and the claim refuses here, before the shards
+    # and the final PDF are cut and uploaded for nothing. A stage
+    # skipped in silence would still glue -- the greyscale shard into
+    # the bitonal copy, a hole into the OCR volume, nothing into the
+    # detections -- read complete, and open review 2 on a bad page.
+    if plan.shard_edits:
+        closed = gates_closed(scan)
+        if closed:
+            raise GateClosedError(
+                f"The corrected volume waits: the {', '.join(closed)} "
+                f"stage(s) are off in this environment, and "
+                f"{len(plan.shard_edits)} edited page(s) need them."
+            )
+    shards: dict[int, dict] = {}
+    with tempfile.TemporaryDirectory(
+        prefix=f"{BUILD_TMP_PREFIX}{scan.pk}-"
+    ) as tmp:
+        tmp_dir = Path(tmp)
+        if plan.is_identity:
+            # No copy of gigabytes, and no pull, for a volume nobody
+            # changed: the final PDF is the original.
+            final_key = _original_key(scan)
+        else:
+            original = local_original_pdf(scan)
+            if not original:
+                raise ApplyError(
+                    f"the original of scan {scan.pk} is not available"
+                )
+            with fitz.open(original) as source:
+                if scan.page_count != source.page_count:
+                    raise ApplyError(
+                        f"scan {scan.pk} has {scan.page_count} page(s) on "
+                        f"the row and {source.page_count} in the original"
+                    )
+                # A shard's page count is the file's, so the plan needs
+                # no second pass.
+                shards = {
+                    edit.pk: _ensure_page_shard(
+                        scan,
+                        source,
+                        edit,
+                        tmp_dir,
+                        data=files.get(edit.pk),
+                        page_count=counts.get(edit.pk),
+                    )
+                    for edit in plan.shard_edits
+                }
+                final_path = tmp_dir / "final.pdf"
+                with build_final_pdf(
+                    source, plan, read_file=lambda edit: files[edit.pk]
+                ) as out:
+                    out.save(str(final_path), garbage=3, deflate=True)
+                final_key = f"{prefix}final.pdf"
+                if not s3_sync.upload_file_object(
+                    final_key, final_path, "application/pdf"
+                ):
+                    raise ApplyError("could not upload the final PDF")
+    page_map = plan.to_map()
+    if not s3_sync.upload_json_object(f"{prefix}page_map.json", page_map):
+        raise ApplyError("could not upload the page map")
+
+    rows = _ensure_rows(scan, run, plan, shards)
+
+    now = timezone.now()
+    edit_ids = [edit.pk for edit in plan.edits]
+    numbers = [
+        edit.pk
+        for edit in page_edits.current_edits(scan, PageEdit.Kind.SET_NUMBER)
+    ]
+    with transaction.atomic():
+        PageEdit.objects.filter(
+            pk__in=edit_ids + numbers, withdrawn_at__isnull=True
+        ).update(applied_at=now, applied_run=run, date_modified=now)
+        ApplyRun.objects.filter(pk=run.pk).update(
+            edit_ids=edit_ids,
+            page_map=page_map,
+            final_pdf_key=final_key,
+            built_at=now,
+            attempts=0,
+            last_error="",
+        )
+    run.refresh_from_db()
+    logger.info(
+        "apply: scan %s: run %s built in %.1fs: %d final page(s) from %d, "
+        "%d edit(s), %d shard(s), %d job row(s)",
+        scan.pk,
+        run.label,
+        time.monotonic() - started,
+        plan.final_page_count,
+        plan.source_page_count,
+        len(plan.edits),
+        len(shards),
+        len(rows),
+    )
+
+
+def record_failure(run: ApplyRun, exc: Exception) -> bool:
+    """Count one failed attempt at the run's current phase.
+
+    The same loud-then-quiet ledger as ``yolo.record_apply_failure``:
+    the crossing into "out of tries" is the one ERROR-level event, and
+    the way back is the admin action that supersedes the run.
+
+    The crossing also cancels the run's unstarted rows. A build that
+    failed after it created its rows leaves them PENDING, and nothing
+    else stops them: they would ride the daemon, run and bill for a run
+    that no glue reads. A COMPLETED row is kept, as the supersede keeps
+    it, because the next build carries it.
+
+    :param run: The run.
+    :param exc: What the phase raised.
+    :returns: Whether this failure spent the last attempt.
+    :rtype: bool
+    """
+    from scanning import jobs
+
+    attempts = run.attempts + 1
+    ApplyRun.objects.filter(pk=run.pk).update(
+        attempts=attempts,
+        last_error=str(exc)[:2000],
+        last_attempt_at=timezone.now(),
+    )
+    run.attempts = attempts
+    gave_up = attempts >= APPLY_MAX_ATTEMPTS
+    if gave_up:
+        cancelled = jobs.abandon_open(
+            run.scan,
+            f"the apply of run {run.label} gave up",
+            statuses=UNSTARTED_JOB_STATUSES,
+            apply_run=run,
+        )
+        logger.exception(
+            "apply: scan %s: run %s failed; giving up after %d attempt(s) "
+            "and cancelling %d unstarted row(s). Supersede the run from "
+            "the admin to try again.",
+            run.scan_id,
+            run.label,
+            attempts,
+            cancelled,
+        )
+    else:
+        logger.warning(
+            "apply: scan %s: run %s failed (attempt %d of %d): %s",
+            run.scan_id,
+            run.label,
+            attempts,
+            APPLY_MAX_ATTEMPTS,
+            exc,
+        )
+    return gave_up
+
+
+def build_run(scan: Scan) -> ApplyRun:
+    """Run phase 1 for a scan: build the run that is due.
+
+    A run not yet built is retried in place. A built run whose edit set
+    no longer matches the standing rows is superseded, and the next
+    number is built: that is the reopen path, and the carry keeps the
+    paid results of the edits that did not change.
+
+    :param scan: The scan, in the daemon's claim.
+    :returns: The built run.
+    :rtype: ApplyRun
+    :raises ApplyError: If the build failed. The failure is counted on
+        the run before it is raised.
+    """
+    edit_ids = [
+        edit.pk
+        for edit in sorted(
+            page_edits.current_edits(scan, *PageEdit.STRUCTURAL_KINDS),
+            key=lambda edit: edit.pk,
+        )
+    ]
+    run = current_run(scan)
+    if run is not None and run.is_built:
+        if run.edit_ids == edit_ids:
+            return run
+        supersede_runs(scan, "the page edits changed after the build")
+        run = None
+    if run is None:
+        latest = latest_run(scan)
+        run = ApplyRun.objects.create(
+            scan=scan,
+            number=latest.number + 1 if latest else 1,
+            source_fingerprint=scan.source_fingerprint,
+        )
+    try:
+        _build(scan, run)
+    except GateClosedError:
+        # Not the run's fault, and nothing to retry: the build is right
+        # the moment the stage returns, and the trigger asks the gates
+        # before it queues. Counting it would spend the attempts on a
+        # configuration and leave every edited volume to an admin.
+        raise
+    except Exception as exc:
+        gave_up = record_failure(run, exc)
+        raise ApplyError(
+            f"Building the corrected volume failed: {exc}. "
+            + (
+                "It has stopped; ask a staff member."
+                if gave_up
+                else "It runs again by itself."
+            )
+        ) from exc
+    return run
+
+
+# ── the gates ──────────────────────────────────────────────────────
+#: The stage each edited page must pass, and how to ask whether it is
+#: open here. The same three checks the pipeline makes before it
+#: creates a row (``services._can_convert``, ``_can_analyze``, and
+#: ``yolo.enabled`` with S3), minus the shard set, which the apply cuts
+#: itself.
+def _gate_probes() -> dict[str, Callable[[], bool]]:
+    from scanning import services, yolo
+
+    return {
+        "convert": services.convert_stage_open,
+        "analyze": services.analyze_stage_open,
+        "detect": lambda: yolo.enabled() and s3_sync.s3_active(),
+    }
+
+
+#: The closed gates last logged per scan, so the crossing is logged
+#: once and not every 15 seconds. Cleared when the gates open again.
+_GATES_LOGGED: dict[int, tuple[str, ...]] = {}
+
+
+def gates_closed(scan: Scan) -> list[str]:
+    """Return the stages an edited page needs that are off right now.
+
+    :param scan: The scan, for the log line.
+    :returns: Stage names, in :data:`GLUE_STAGES` order; empty when
+        every gate is open.
+    :rtype: list[str]
+    """
+    closed = [name for name, probe in _gate_probes().items() if not probe()]
+    if closed:
+        if _GATES_LOGGED.get(scan.pk) != tuple(closed):
+            _GATES_LOGGED[scan.pk] = tuple(closed)
+            logger.warning(
+                "apply: scan %s: the %s stage(s) are off in this "
+                "environment, and its edited pages need them; the build "
+                "waits until they return",
+                scan.pk,
+                ", ".join(closed),
+            )
+    else:
+        _GATES_LOGGED.pop(scan.pk, None)
+    return closed
+
+
+def needs_gates(scan: Scan) -> bool:
+    """Return whether a build of this scan would cut a one-page shard.
+
+    A standing edit of a shard kind is the test: a volume with deletes
+    alone, or with no structural edit, needs no stage and builds with
+    every gate closed. A shadowed edit (a rotation of a deleted page)
+    counts here and not in ``plan.shard_edits``; the over-refusal is
+    harmless, since the stage returns for both.
+
+    :param scan: The scan.
+    :returns: Whether the gates must be open for the build.
+    :rtype: bool
+    """
+    return bool(page_edits.current_edits(scan, *SHARD_KINDS))
+
+
+def _build_or_wait(scan: Scan) -> str | None:
+    """Answer ``"build"``, or None while a needed stage is off.
+
+    :param scan: The scan that owes a build.
+    :returns: ``"build"`` or None.
+    :rtype: str | None
+    """
+    if needs_gates(scan) and gates_closed(scan):
+        return None
+    return "build"
+
+
+# ── the trigger ────────────────────────────────────────────────────
+#: The one status the apply takes a scan from, and gives it back to.
+APPLY_STATUS = Status.PAGE_COMPLETENESS_REVIEW_DONE
+
+#: How many scans may be QUEUED or PROCESSING for the apply at once.
+#: The worker is serial and claims QUEUED scans oldest first, so a
+#: trigger that queued the whole approved corpus would put every old
+#: volume ahead of the one a volunteer uploads today, and take them all
+#: out of review 2 until the worker gave them back one at a time. The
+#: trigger tops the in-flight set up to this number on every tick and
+#: counts only the scans it queues, so a candidate the exact test
+#: refuses (:func:`phase_due`) holds no place. A cap per tick did both
+#: things wrong: it let the in-flight set grow by five every 15
+#: seconds, and it spent its places on refused candidates.
+MAX_SCANS_IN_FLIGHT = 5
+
+
+def _current_edit_ids(scan: Scan) -> list[int]:
+    """Return the standing structural rows' pks, sorted.
+
+    :param scan: The scan.
+    :returns: What ``ApplyRun.edit_ids`` must equal for a run to be
+        current.
+    """
+    return sorted(
+        edit.pk
+        for edit in page_edits.current_edits(scan, *PageEdit.STRUCTURAL_KINDS)
+    )
+
+
+#: "No run was passed": None is a valid answer, so the parameter needs
+#: a marker of its own.
+_UNSET = object()
+
+
+def phase_due(scan: Scan, run=_UNSET) -> str | None:
+    """Return which phase the scan's apply owes, if any.
+
+    ``"build"`` when no run stands, the standing run is not built and
+    has attempts left, or the built run's edit set no longer matches
+    the standing rows -- unless a stage the edited pages need is off
+    (:func:`gates_closed`), in which case the scan waits unqueued and
+    spends no attempt. ``"glue"`` when a glue of the built run can be
+    written now (:func:`glues_due`). None when no glue can: its rows are
+    unstarted or dead (the bar shows a dead row, and the admin
+    supersedes the run), its volume inputs are not there, or the
+    attempts are spent.
+
+    :param scan: The scan.
+    :param run: The standing run, when the caller has it (the trigger
+        reads it once per scan). Read here otherwise.
+    :returns: ``"build"``, ``"glue"`` or None.
+    :rtype: str | None
+    """
+    if run is _UNSET:
+        run = current_run(scan)
+    if run is None:
+        return _build_or_wait(scan)
+    if not run.is_built:
+        return (
+            _build_or_wait(scan) if run.attempts < APPLY_MAX_ATTEMPTS else None
+        )
+    if run.edit_ids != _current_edit_ids(scan):
+        return _build_or_wait(scan)
+    if run.attempts >= APPLY_MAX_ATTEMPTS:
+        return None
+    if glues_due(scan, run, list(run.jobs.all())):
+        return "glue"
+    return None
+
+
+def _stage_blocked(rows: list[ExternalJob], stage: str) -> bool:
+    """Return whether one stage's rows keep that stage's glue waiting.
+
+    :param rows: The run's rows.
+    :param stage: A ``JobStage`` value.
+    :returns: Whether a row of the stage is unstarted or dead.
+    :rtype: bool
+    """
+    return any(
+        row.stage == stage and row.status in BLOCKING_JOB_STATUSES
+        for row in rows
+    )
+
+
+def glues_due(scan: Scan, run: ApplyRun, rows: list[ExternalJob]) -> list[str]:
+    """Return the glues of a built run that can be written now.
+
+    Each glue has its own inputs, and each is judged alone, on the rows
+    of its own stage (:data:`GLUE_STAGES`): the bitonal copy needs the
+    run's CONVERT rows; the OCR volume and the printed pages need the
+    ANALYZE rows and the volume's glued OCR run; the detections need
+    the DETECT rows and the volume's merged detection run, which the
+    daemon starts at upload (#250). A row of one stage that is unstarted
+    or dead holds that stage's glue and no other, so a detection worker
+    that is slow or down never keeps the bitonal copy from being
+    written. The three names are the order :func:`_glue` writes them in.
+
+    :param scan: The scan.
+    :param run: A built run.
+    :param rows: The run's rows.
+    :returns: The names of the glues :func:`glue_run` can write.
+    :rtype: list[str]
+    """
+    due = []
+    if not run.bitonal_key and not _stage_blocked(
+        rows, GLUE_STAGES["bitonal"]
+    ):
+        due.append("bitonal")
+    if (
+        not (run.ocr_key and run.printed_pages_key)
+        and not _stage_blocked(rows, GLUE_STAGES["ocr"])
+        and _volume_ocr_run(scan)
+    ):
+        due.append("ocr")
+    if (
+        not run.detections_key
+        and not _stage_blocked(rows, GLUE_STAGES["detections"])
+        and _volume_detect_run(scan)
+    ):
+        due.append("detections")
+    return due
+
+
+def _candidate_scan_ids() -> set[int]:
+    """Return the approved scans that may owe a phase, in a few queries.
+
+    The pre-check of the trigger, over the whole corpus at once rather
+    than scan by scan. An approved volume whose detection run (#250) is
+    not merged yet waits with a blank ``detections_key``, so a per-scan
+    check would compute :func:`phase_due` for every one of them on
+    every tick -- five queries each, growing with the corpus.
+    Here each reason a scan may owe a phase is one query. A run with
+    spent attempts drops out at the query, and so does a glue whose own
+    stage holds an unstarted or a dead row (:func:`glues_due` judges the
+    same way, row by row). The two glues that need a volume run read
+    the *live* one through :func:`_glued_volume_scan_ids`, the rule of
+    :func:`_volume_ocr_run`: an arm that took any CONSUMED row named a
+    scan whose live run was still open, and the exact test refused it
+    on every tick for good. The steady state is eight queries a tick,
+    whatever the corpus size; :func:`phase_due` then judges the
+    candidates exactly.
+
+    At most one run stands per scan: :func:`build_run` supersedes the
+    standing one before it creates the next.
+
+    :returns: The primary keys of the candidate scans.
+    :rtype: set[int]
+    """
+    from django.db.models import F, Q
+
+    done = Scan.objects.filter(status=APPLY_STATUS)
+    standing = ApplyRun.objects.filter(
+        superseded_at__isnull=True,
+        scan__status=APPLY_STATUS,
+        attempts__lt=APPLY_MAX_ATTEMPTS,
+    )
+    built = standing.filter(built_at__isnull=False)
+
+    def blocked(stage: str):
+        """The runs whose rows of ``stage`` hold that stage's glue."""
+        return ExternalJob.objects.filter(
+            apply_run__isnull=False,
+            stage=stage,
+            status__in=BLOCKING_JOB_STATUSES,
+        ).values("apply_run_id")
+
+    ids: set[int] = set()
+    # No standing run at all. A subquery, not a reverse-relation
+    # ``isnull`` filter: on a LEFT JOIN a scan with no run at all reads
+    # as ``superseded_at IS NULL`` too, and the exclude would drop it.
+    ids.update(
+        done.exclude(
+            pk__in=ApplyRun.objects.filter(superseded_at__isnull=True).values(
+                "scan_id"
+            )
+        ).values_list("pk", flat=True)
+    )
+    # A run to build, or to build again.
+    ids.update(
+        standing.filter(built_at__isnull=True).values_list(
+            "scan_id", flat=True
+        )
+    )
+    # A stale row (another original's) is in no edit set, before or
+    # after its withdrawal, so its date moves nothing; without this arm
+    # it made its scan a candidate the exact test refused on every tick.
+    ids.update(
+        built.filter(
+            # The three arms of ``page_edits.is_stale``: a blank on
+            # either side matches anything.
+            Q(scan__page_edits__source_fingerprint="")
+            | Q(scan__source_fingerprint="")
+            | Q(
+                scan__page_edits__source_fingerprint=F(
+                    "scan__source_fingerprint"
+                )
+            ),
+            scan__page_edits__kind__in=PageEdit.STRUCTURAL_KINDS,
+            scan__page_edits__date_modified__gt=F("built_at"),
+        ).values_list("scan_id", flat=True)
+    )
+    # A glue whose inputs are there, judged on its own stage's rows.
+    ids.update(
+        built.filter(bitonal_key="")
+        .exclude(pk__in=blocked(GLUE_STAGES["bitonal"]))
+        .values_list("scan_id", flat=True)
+    )
+    owing_ocr = built.filter(Q(ocr_key="") | Q(printed_pages_key=""))
+    ids.update(
+        owing_ocr.filter(
+            scan_id__in=_glued_volume_scan_ids(
+                JobStage.ANALYZE,
+                JobEngine.DOTS_MOCR,
+                owing_ocr.values("scan_id"),
+            ),
+        )
+        .exclude(pk__in=blocked(GLUE_STAGES["ocr"]))
+        .values_list("scan_id", flat=True)
+    )
+    owing_detections = built.filter(detections_key="")
+    ids.update(
+        owing_detections.filter(
+            scan_id__in=_glued_volume_scan_ids(
+                JobStage.DETECT,
+                JobEngine.BLACKLETTER,
+                owing_detections.values("scan_id"),
+            ),
+        )
+        .exclude(pk__in=blocked(GLUE_STAGES["detections"]))
+        .values_list("scan_id", flat=True)
+    )
+    return ids
+
+
+def _glued_volume_scan_ids(stage: str, engine: str, scan_ids) -> set[int]:
+    """Return the scans, among ``scan_ids``, whose live volume run is glued.
+
+    The rule of :func:`_volume_ocr_run` and :func:`_volume_detect_run`
+    -- the rows at the highest run number, all ``CONSUMED`` -- in one
+    query, for the pre-check. Only the volume rows: the apply's own
+    rows share the stage and the engine. Scoped to the scans whose
+    standing run still owes that glue, so the rows that cross the wire
+    grow with the runs waiting on a glue and not with the approved
+    corpus: over every approved scan the two calls moved about twenty
+    rows a volume per tick.
+
+    :param stage: A ``JobStage`` value.
+    :param engine: A ``JobEngine`` value.
+    :param scan_ids: The scans to judge, a queryset or an iterable of
+        primary keys.
+    :returns: The scan ids whose live run is glued.
+    :rtype: set[int]
+    """
+    from collections import defaultdict
+
+    by_scan: dict[int, list[tuple[int, str]]] = defaultdict(list)
+    rows = ExternalJob.objects.filter(
+        stage=stage,
+        engine=engine,
+        opinion=None,
+        apply_run__isnull=True,
+        scan_id__in=scan_ids,
+    ).values_list("scan_id", "run", "status")
+    for scan_id, run, status in rows:
+        by_scan[scan_id].append((run, status))
+    glued = set()
+    for scan_id, items in by_scan.items():
+        live = max(run for run, _ in items)
+        if all(
+            status == JobStatus.CONSUMED
+            for run, status in items
+            if run == live
+        ):
+            glued.add(scan_id)
+    return glued
+
+
+def _note_dead_rows() -> int:
+    """Write the first dead row of a standing run into its ledger, once.
+
+    A dead row is terminal for its stage: :func:`glues_due` drops that
+    glue for good, ``is_complete`` never turns true and review 2 never
+    opens, until an operator supersedes the run. ``jobs`` logs the
+    row's own failure, but nothing said the run had stopped. So the
+    crossing is logged here with the run named, once, and
+    ``dead_row_noted_at`` is the stamp that says it was. A stamp of its
+    own, because ``last_error`` has two other writers: the failed
+    attempts fill it, and a successful glue clears it, so a note kept
+    there was repeated after every later glue and never written on a
+    run whose glue had also failed.
+
+    :returns: How many runs were noted.
+    :rtype: int
+    """
+    noted = 0
+    runs = ApplyRun.objects.filter(
+        superseded_at__isnull=True,
+        built_at__isnull=False,
+        dead_row_noted_at__isnull=True,
+        jobs__status__in=DEAD_JOB_STATUSES,
+    ).distinct()
+    for run in runs:
+        dead = (
+            run.jobs.filter(status__in=DEAD_JOB_STATUSES)
+            .order_by("pk")
+            .first()
+        )
+        if dead is None:
+            continue
+        note = (
+            f"{dead.stage} row s{dead.shard_index} {dead.status}: "
+            f"{dead.error_code or 'no error code'}"
+        )
+        ApplyRun.objects.filter(
+            pk=run.pk, dead_row_noted_at__isnull=True
+        ).update(dead_row_noted_at=timezone.now())
+        logger.warning(
+            "apply: scan %s: run %s has a dead row (%s); its %s glue is "
+            "not written and review 2 waits. Supersede the run from the "
+            "admin to try again.",
+            run.scan_id,
+            run.label,
+            note,
+            next(
+                (
+                    name
+                    for name, stage in GLUE_STAGES.items()
+                    if stage == dead.stage
+                ),
+                dead.stage,
+            ),
+        )
+        noted += 1
+    return noted
+
+
+def queue_ready_scans() -> int:
+    """Queue the apply for every approved scan that owes a phase.
+
+    A pass on the collect tick, and a trigger rather than the work: it
+    writes one status and returns. The build pulls the original and
+    the glue pulls the volume bitonal copy, minutes of work on a large
+    volume, and the tick's scheduler is serial (#156). So this queues
+    ``APPLY_PAGE_EDITS`` and ``process_next_scan`` runs it where the
+    long stages already run (the #196 shape).
+
+    Only ``PAGE_COMPLETENESS_REVIEW_DONE`` is taken, with a
+    compare-and-swap. A scan in any other status is deferred without a
+    mark: it comes back when it holds that status again.
+
+    The in-flight set is topped up to ``MAX_SCANS_IN_FLIGHT``, newest
+    scan first, and only a scan actually queued counts: the candidates
+    are walked until the room is used, so a candidate the exact test
+    refuses costs nothing but its test. The first ticks after a deploy
+    see the whole approved corpus, and a queued scan leaves review 2
+    until the serial worker gives it back, so the cap bounds how many
+    are out at once.
+
+    :returns: How many scans were queued.
+    :rtype: int
+    """
+    if not s3_sync.s3_active():
+        return 0
+    _note_dead_rows()
+    in_flight = Scan.objects.filter(
+        status__in=(Status.QUEUED, Status.PROCESSING),
+        queued_action=QueuedAction.APPLY_PAGE_EDITS,
+    ).count()
+    room = MAX_SCANS_IN_FLIGHT - in_flight
+    if room <= 0:
+        return 0
+    candidates = _candidate_scan_ids()
+    if not candidates:
+        return 0
+    queued = 0
+    for scan in (
+        Scan.objects.filter(pk__in=candidates, status=APPLY_STATUS)
+        .select_related("reporter")
+        .order_by("-pk")
+    ):
+        if queued >= room:
+            break
+        phase = phase_due(scan, current_run(scan))
+        if phase is None:
+            continue
+        claimed = Scan.objects.filter(pk=scan.pk, status=APPLY_STATUS).update(
+            status=Status.QUEUED,
+            queued_action=QueuedAction.APPLY_PAGE_EDITS,
+            progress_message=(
+                "Waiting for the worker to build the corrected volume "
+                "from the page edits."
+                if phase == "build"
+                else "Waiting for the worker to assemble the corrected volume."
+            ),
+            progress_current=0,
+            progress_total=0,
+            # ``update()`` skips ``auto_now``; this is the queue time
+            # the worker's age lift reads (``process_next_scan.CLAIM_LIFT_SECONDS``).
+            date_modified=timezone.now(),
+        )
+        if claimed:
+            logger.info("apply: scan %s: queued the %s phase", scan.pk, phase)
+            queued += claimed
+    return queued
+
+
+def run_due_phases(scan: Scan) -> str:
+    """Do every phase the scan owes, in order, and say what happened.
+
+    The worker behind ``QueuedAction.APPLY_PAGE_EDITS``. A build is
+    followed at once by the glue when the run has no job rows to wait
+    for -- a volume with no structural edit, or with deletes only.
+    Raises nothing: the failure is counted on the run and the message
+    tells the curator whether it runs again by itself.
+
+    :param scan: The scan, in the daemon's claim.
+    :returns: The progress message to park the scan with.
+    :rtype: str
+    """
+    try:
+        phase = phase_due(scan)
+        if phase == "build":
+            build_run(scan)
+            phase = phase_due(scan)
+        if phase == "glue":
+            glue_run(scan)
+    except ApplyError as exc:
+        return str(exc)
+    run = current_run(scan)
+    if run is None:
+        return "The corrected volume is not built yet."
+    state = run_state(scan, run)
+    return state["message"] if state else "The corrected volume is built."
+
+
+def _volume_ocr_run(scan: Scan) -> list[ExternalJob]:
+    """Return the volume's glued dots.mocr run, or nothing.
+
+    :param scan: The scan.
+    :returns: The live volume ANALYZE rows when every one is CONSUMED
+        (the glue wrote ``r{run}-volume.json``), else an empty list.
+    :rtype: list[ExternalJob]
+    """
+    from scanning import dots_mocr
+
+    rows = dots_mocr.live_analyze_jobs(scan)
+    if rows and all(row.status == JobStatus.CONSUMED for row in rows):
+        return rows
+    return []
+
+
+def _volume_detect_run(scan: Scan) -> list[ExternalJob]:
+    """Return the volume's merged detection run, or nothing.
+
+    :param scan: The scan.
+    :returns: The live volume DETECT rows when every one is CONSUMED
+        (the merge wrote its volume JSON), else an empty list.
+    :rtype: list[ExternalJob]
+    """
+    from scanning import yolo
+
+    rows = yolo.live_detect_jobs(scan)
+    if rows and all(row.status == JobStatus.CONSUMED for row in rows):
+        return rows
+    return []
+
+
+def _rows_by_edit(
+    rows: list[ExternalJob], stage: str
+) -> dict[int, ExternalJob]:
+    """Return one stage's rows of a run, keyed by the edit they read.
+
+    :param rows: The run's rows.
+    :param stage: A ``JobStage`` value.
+    :returns: ``{edit pk: row}``.
+    :rtype: dict[int, ExternalJob]
+    """
+    return {
+        row.input_manifest["edit_id"]: row
+        for row in rows
+        if row.stage == stage and "edit_id" in (row.input_manifest or {})
+    }
+
+
+def _volume_bitonal_key(scan: Scan) -> str:
+    """Return the key of the review-1 bitonal copy, or of the original.
+
+    A volume that skipped the conversion (its source is already 1-bit)
+    has no ``bitonal.pdf``; the original is then the bitonal copy.
+
+    :param scan: The scan.
+    :returns: The key the kept pages are sliced out of.
+    :rtype: str
+    """
+    key = f"{s3_sync.s3_processing_prefix(scan)}{s3_sync.PIPELINE_INPUT_NAME}"
+    if s3_sync.object_exists(key):
+        return key
+    return _original_key(scan)
+
+
+def _original_key(scan: Scan) -> str:
+    """Return the original's key, or refuse.
+
+    A blank key must never reach a run row: ``bitonal_key`` and
+    ``final_pdf_key`` read as "not written" when blank, so a glue that
+    stored one would report success and be due again on every tick,
+    with no failure counted to stop it.
+
+    :param scan: The scan.
+    :returns: The key of the original.
+    :rtype: str
+    :raises ApplyError: If the scan has no original.
+    """
+    key = s3_sync.s3_original_key(scan)
+    if not key:
+        raise ApplyError(f"scan {scan.pk} has no original in the bucket")
+    return key
+
+
+def _glue_bitonal(
+    scan: Scan, run: ApplyRun, rows: list[ExternalJob], tmp_dir: Path
+) -> str:
+    """Write the final bitonal copy: kept pages sliced out of the
+    review-1 ``bitonal.pdf``, new pages from the one-page results.
+
+    The per-shard conversion results of the volume were deleted at the
+    first merge, but the volume ``bitonal.pdf`` holds every byte of
+    them, so the kept pages come from there. The one-page results are
+    **kept** after this, unlike the volume merge's: the next run
+    carries them. A run with no structural edit aliases the review-1
+    copy and writes nothing.
+
+    :param scan: The scan.
+    :param run: The built run.
+    :param rows: The run's rows.
+    :param tmp_dir: Scratch space.
+    :returns: The key of the final bitonal copy.
+    :rtype: str
+    :raises ApplyError: If a result is missing or a page count is off.
+    """
+    page_map = run.page_map
+    if not page_map.get("pages"):
+        raise ApplyError(f"run {run.label} of scan {scan.pk} has no page map")
+    entries = page_map["pages"]
+    if is_identity_map(page_map):
+        return _volume_bitonal_key(scan)
+
+    converted = _rows_by_edit(rows, JobStage.CONVERT)
+    volume_path = tmp_dir / "volume-bitonal.pdf"
+    s3_sync.download_object(_volume_bitonal_key(scan), volume_path)
+    shards: dict[int, fitz.Document] = {}
+
+    def shard_of(edit_id: int) -> fitz.Document:
+        if edit_id not in shards:
+            local = tmp_dir / f"convert-e{edit_id}.pdf"
+            row = converted.get(edit_id)
+            if row is not None and row.result_key:
+                s3_sync.download_object(row.result_key, local)
+            else:
+                # The stage was off at build time: the shard itself
+                # stands in, unconverted, rather than a hole.
+                edit = PageEdit.objects.get(pk=edit_id)
+                s3_sync.download_object(page_shard_key(scan, edit), local)
+            shards[edit_id] = fitz.open(str(local))
+        return shards[edit_id]
+
+    destination = tmp_dir / "final-bitonal.pdf"
+    try:
+        with fitz.open(str(volume_path)) as volume, fitz.open() as out:
+            if volume.page_count != page_map["source_page_count"]:
+                raise ApplyError(
+                    f"the volume bitonal copy has {volume.page_count} "
+                    f"page(s), the original {page_map['source_page_count']}"
+                )
+            # A run of kept pages goes in one call, as
+            # ``build_final_pdf`` does: a volume of 1300 pages with two
+            # edits is three ranges, not 1300 calls.
+            i = 0
+            while i < len(entries):
+                src = entries[i]["source"]
+                if src["kind"] == "original":
+                    first = src["pdf_page"]
+                    last = first
+                    while (
+                        i + 1 < len(entries)
+                        and entries[i + 1]["source"]["kind"] == "original"
+                        and entries[i + 1]["source"]["pdf_page"] == last + 1
+                    ):
+                        i += 1
+                        last += 1
+                    out.insert_pdf(
+                        volume, from_page=first - 1, to_page=last - 1
+                    )
+                    i += 1
+                    continue
+                shard = shard_of(src["edit_id"])
+                if src["page"] >= shard.page_count:
+                    raise ApplyError(
+                        f"the converted shard of edit {src['edit_id']} has "
+                        f"{shard.page_count} page(s); the map asks for "
+                        f"page {src['page']}"
+                    )
+                out.insert_pdf(
+                    shard, from_page=src["page"], to_page=src["page"]
+                )
+                i += 1
+            if out.page_count != page_map["final_page_count"]:
+                raise ApplyError(
+                    f"the final bitonal copy has {out.page_count} page(s), "
+                    f"the map {page_map['final_page_count']}"
+                )
+            out.save(str(destination), garbage=3, deflate=True)
+    finally:
+        for shard in shards.values():
+            shard.close()
+    key = f"{run_prefix(scan, run)}{s3_sync.PIPELINE_INPUT_NAME}"
+    if not s3_sync.upload_file_object(key, destination, "application/pdf"):
+        raise ApplyError("could not upload the final bitonal copy")
+    return key
+
+
+def _result_payload(scan: Scan, row: ExternalJob, action: str) -> dict:
+    """Download and check one apply row's result envelope.
+
+    :param scan: The scan.
+    :param row: A COMPLETED or CONSUMED apply row.
+    :param action: The handler action the envelope must name.
+    :returns: The payload.
+    :rtype: dict
+    :raises ApplyError: If the object is missing or is not this row's.
+    """
+    from scanning import jobs
+
+    if not row.result_key:
+        raise ApplyError(f"job {row.pk} of scan {scan.pk} has no result key")
+    envelope = s3_sync.download_json_object(row.result_key)
+    return jobs.check_result_envelope(scan, row, envelope, action, ApplyError)
+
+
+def _glue_ocr(
+    scan: Scan, run: ApplyRun, rows: list[ExternalJob]
+) -> tuple[str, str]:
+    """Write the final OCR volume and the frozen printed-page map.
+
+    The kept pages come from the volume's glued ``r{run}-volume.json``
+    (#202), the new pages from the one-page results, each page
+    renumbered to its final page and stamped with its source. A page
+    the worker could not read keeps its ``error``. A run with no structural edit
+    aliases the volume document and writes only the printed pages.
+
+    :param scan: The scan.
+    :param run: The built run.
+    :param rows: The run's rows.
+    :returns: The OCR key and the printed-pages key.
+    :rtype: tuple[str, str]
+    """
+    from scanning import dots_mocr
+
+    volume_rows = _volume_ocr_run(scan)
+    if not volume_rows:
+        raise ApplyError(f"scan {scan.pk} has no glued OCR run to read")
+    volume_key = dots_mocr.glued_result_key(scan, volume_rows[0].run)
+    volume = s3_sync.download_json_object(volume_key)
+    page_map = run.page_map
+    entries = page_map["pages"]
+    prefix = run_prefix(scan, run)
+
+    if is_identity_map(page_map):
+        ocr_key = volume_key
+        document = volume
+    else:
+        by_pdf_page = {page["pdf_page"]: page for page in volume["pages"]}
+        read = _rows_by_edit(rows, JobStage.ANALYZE)
+        edit_pages: dict[int, dict[int, dict]] = {}
+        for edit_id, row in read.items():
+            payload = _result_payload(scan, row, dots_mocr.ACTION)
+            edit_pages[edit_id] = {
+                page["page_no"]: page for page in payload.get("pages") or []
+            }
+        pages = []
+        for entry in entries:
+            src = entry["source"]
+            if src["kind"] == "original":
+                page = by_pdf_page.get(src["pdf_page"])
+                if page is None:
+                    raise ApplyError(
+                        f"the volume OCR document has no page {src['pdf_page']}"
+                    )
+                page = dict(page)
+            else:
+                page = edit_pages.get(src["edit_id"], {}).get(src["page"])
+                if page is None:
+                    page = {
+                        "cells": [],
+                        "md": "",
+                        "error": "not read: no result for this page",
+                    }
+                page = {k: v for k, v in page.items() if k != "raw"}
+            page.pop("shard_index", None)
+            page.pop("page_no", None)
+            page["page_index"] = entry["final_page"] - 1
+            page["pdf_page"] = entry["final_page"]
+            page["source"] = src
+            pages.append(page)
+        document = {
+            "schema_version": dots_mocr.GLUE_SCHEMA_VERSION,
+            "engine": str(JobEngine.DOTS_MOCR),
+            "action": dots_mocr.ACTION,
+            "scan_pk": scan.pk,
+            "run": volume["run"],
+            "apply_run": run.label,
+            "source_page_count": page_map["final_page_count"],
+            "source_fingerprint": run.source_fingerprint,
+            "dpi": volume.get("dpi", dots_mocr.DPI),
+            "prompt_mode": volume.get("prompt_mode", dots_mocr.PROMPT_MODE),
+            "generated_at": timezone.now().isoformat(),
+            "pages": pages,
+            **dots_mocr._page_lists(pages, "page_index"),
+        }
+        ocr_key = f"{prefix}ocr-volume.json"
+        if not s3_sync.upload_json_object(ocr_key, document):
+            raise ApplyError("could not upload the final OCR volume")
+
+    printed = printed_pages(scan, run, document)
+    printed_key = f"{prefix}printed_pages.json"
+    if not s3_sync.upload_json_object(printed_key, printed):
+        raise ApplyError("could not upload the printed pages")
+    return ocr_key, printed_key
+
+
+def printed_pages(scan: Scan, run: ApplyRun, document: dict) -> dict:
+    """Return the frozen printed-page map, in the final page space.
+
+    The glued read, through the same reading as review 1
+    (``page_numbers.ocr_results_from_volume``), overlaid with the
+    curator's decisions: a ``SET_NUMBER`` row lands on the slot its
+    original page holds (a replaced or rotated page included), and an
+    inserted page carries the label its row was uploaded under. The
+    curator outranks the model. Citations use printed pages, so this
+    map is a product of the apply, not review scaffolding.
+
+    :param scan: The scan.
+    :param run: The built run.
+    :param document: The final OCR volume, or the volume's own when the
+        run aliases it.
+    :returns: ``pages`` of ``final_page``, ``printed``, ``type``,
+        ``by`` (``model``, ``curator`` or None) and ``source``.
+    :rtype: dict
+    """
+    from scanning import page_numbers
+
+    page_map = run.page_map
+    results = page_numbers.ocr_results_from_volume(document)
+    by_final = {entry["pdf_page"]: entry for entry in results}
+    pages = []
+    for entry in page_map["pages"]:
+        final = entry["final_page"]
+        read = by_final.get(final, {})
+        pages.append(
+            {
+                "final_page": final,
+                "printed": read.get("detected"),
+                "type": read.get("type"),
+                "by": "model" if read.get("detected") else None,
+                "source": entry["source"],
+            }
+        )
+    by_final_out = {page["final_page"]: page for page in pages}
+
+    def curator(page: dict, value: str) -> None:
+        page["printed"] = value or None
+        page["type"] = (
+            None if not value else ("range" if "-" in value else "single")
+        )
+        page["by"] = "curator"
+
+    slots = slots_to_final(page_map)
+    for edit in page_edits.current_edits(scan, PageEdit.Kind.SET_NUMBER):
+        final = slots.get(edit.pdf_page)
+        if final is not None:
+            curator(by_final_out[final], edit.value)
+    for page in pages:
+        src = page["source"]
+        if src["kind"] == "edit" and src["edit_kind"] == str(
+            PageEdit.Kind.INSERT_PAGE
+        ):
+            label = (
+                PageEdit.objects.filter(pk=src["edit_id"])
+                .values_list("logical_page", flat=True)
+                .first()
+            )
+            if label:
+                curator(page, label)
+    return {
+        "schema_version": MAP_SCHEMA_VERSION,
+        "scan_pk": scan.pk,
+        "apply_run": run.label,
+        "source_fingerprint": run.source_fingerprint,
+        "final_page_count": page_map["final_page_count"],
+        "generated_at": timezone.now().isoformat(),
+        "pages": pages,
+    }
+
+
+def _glue_detections(
+    scan: Scan, run: ApplyRun, rows: list[ExternalJob]
+) -> str:
+    """Write the final detections volume, in the final page space.
+
+    The kept pages' detections come from the volume's merged document
+    (#196), renumbered through the map; a deleted, replaced or rotated
+    page's detections are dropped, and the one-page results supply the
+    new pages'. One model family for the whole volume, as the merge
+    checks. A run with no structural edit aliases the merged document.
+
+    :param scan: The scan.
+    :param run: The built run.
+    :param rows: The run's rows.
+    :returns: The key of the final detections document.
+    :rtype: str
+    """
+    from scanning import yolo
+
+    volume_rows = _volume_detect_run(scan)
+    if not volume_rows:
+        raise ApplyError(f"scan {scan.pk} has no merged detection run to read")
+    volume_key = yolo.merged_result_key(scan, volume_rows[0].run)
+    page_map = run.page_map
+    entries = page_map["pages"]
+    if is_identity_map(page_map):
+        return volume_key
+
+    volume = yolo.load_merged_document(scan, volume_rows[0].run)
+    if (
+        run.source_fingerprint
+        and volume.get("source_fingerprint")
+        and volume["source_fingerprint"] != run.source_fingerprint
+    ):
+        raise ApplyError(
+            "the merged detection document describes another original"
+        )
+    detections = []
+    kept = originals_to_final(page_map)
+    for det in volume.get("detections", []):
+        final = kept.get(det["pdf_page"])
+        if final is None:
+            continue
+        detections.append(
+            {
+                **{k: v for k, v in det.items() if k != "shard_index"},
+                "page_index": final - 1,
+                "pdf_page": final,
+                "source": {"kind": "original", "pdf_page": det["pdf_page"]},
+            }
+        )
+    slots = {
+        (entry["source"]["edit_id"], entry["source"]["page"]): entry
+        for entry in entries
+        if entry["source"]["kind"] == "edit"
+    }
+    models = volume.get("models")
+    for edit_id, row in _rows_by_edit(rows, JobStage.DETECT).items():
+        payload = _result_payload(scan, row, yolo.ACTION)
+        if models is not None and payload.get("models") not in (None, models):
+            raise ApplyError(
+                f"edit {edit_id} was detected with {payload.get('models')}, "
+                f"the volume with {models}"
+            )
+        for det in payload.get("detections") or []:
+            entry = slots.get((edit_id, det["page_index"]))
+            if entry is None:
+                raise ApplyError(
+                    f"edit {edit_id} answered page {det['page_index']}, "
+                    "which the map does not hold"
+                )
+            detections.append(
+                {
+                    **det,
+                    "page_index": entry["final_page"] - 1,
+                    "pdf_page": entry["final_page"],
+                    "source": entry["source"],
+                }
+            )
+    document = {
+        "schema_version": yolo.MERGE_SCHEMA_VERSION,
+        "engine": str(JobEngine.BLACKLETTER),
+        "action": yolo.ACTION,
+        "scan_pk": scan.pk,
+        "run": volume.get("run"),
+        "apply_run": run.label,
+        "source_page_count": page_map["final_page_count"],
+        "source_fingerprint": run.source_fingerprint,
+        "dpi": volume.get("dpi", yolo.DPI),
+        "models": models,
+        "confidence": volume.get("confidence", yolo.CONFIDENCE),
+        "generated_at": timezone.now().isoformat(),
+        "detections": detections,
+        "pages_with_detections": len({d["page_index"] for d in detections}),
+    }
+    key = f"{run_prefix(scan, run)}detections-volume.json"
+    if not s3_sync.upload_json_object(key, document):
+        raise ApplyError("could not upload the final detections")
+    return key
+
+
+def _glue(scan: Scan, run: ApplyRun, rows: list[ExternalJob]) -> list[str]:
+    """Phase 2: write every glue that is due (:func:`glues_due`), once each.
+
+    :param scan: The scan.
+    :param run: The built run.
+    :param rows: The run's rows.
+    :returns: The names of the glues written.
+    :rtype: list[str]
+    """
+    due = glues_due(scan, run, rows)
+    written = []
+    consumed: list[str] = []
+    with tempfile.TemporaryDirectory(
+        prefix=f"{BUILD_TMP_PREFIX}{scan.pk}-glue-"
+    ) as tmp:
+        tmp_dir = Path(tmp)
+        if "bitonal" in due:
+            run.bitonal_key = _glue_bitonal(scan, run, rows, tmp_dir)
+            ApplyRun.objects.filter(pk=run.pk).update(
+                bitonal_key=run.bitonal_key
+            )
+            written.append("bitonal")
+            consumed.append(JobStage.CONVERT)
+    if "ocr" in due:
+        run.ocr_key, run.printed_pages_key = _glue_ocr(scan, run, rows)
+        ApplyRun.objects.filter(pk=run.pk).update(
+            ocr_key=run.ocr_key, printed_pages_key=run.printed_pages_key
+        )
+        written.append("ocr")
+        consumed.append(JobStage.ANALYZE)
+    if "detections" in due:
+        run.detections_key = _glue_detections(scan, run, rows)
+        ApplyRun.objects.filter(pk=run.pk).update(
+            detections_key=run.detections_key
+        )
+        written.append("detections")
+        consumed.append(JobStage.DETECT)
+    if consumed:
+        # Consumed, and kept: the next run carries them.
+        ExternalJob.objects.filter(
+            apply_run=run, stage__in=consumed, status=JobStatus.COMPLETED
+        ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+    return written
+
+
+def glue_run(scan: Scan) -> ApplyRun:
+    """Run phase 2 for a scan: write the glues that are due.
+
+    :param scan: The scan, in the daemon's claim.
+    :returns: The run.
+    :rtype: ApplyRun
+    :raises ApplyError: If a glue failed. The failure is counted on the
+        run before it is raised.
+    """
+    run = current_run(scan)
+    if run is None or not run.is_built:
+        raise ApplyError(f"scan {scan.pk} has no built run to glue")
+    started = time.monotonic()
+    try:
+        written = _glue(scan, run, list(run.jobs.all()))
+    except Exception as exc:
+        gave_up = record_failure(run, exc)
+        raise ApplyError(
+            f"Assembling the corrected volume failed: {exc}. "
+            + (
+                "It has stopped; ask a staff member."
+                if gave_up
+                else "It runs again by itself."
+            )
+        ) from exc
+    ApplyRun.objects.filter(pk=run.pk).update(attempts=0, last_error="")
+    run.attempts = 0
+    logger.info(
+        "apply: scan %s: run %s glued %s in %.1fs",
+        scan.pk,
+        run.label,
+        ", ".join(written) or "nothing",
+        time.monotonic() - started,
+    )
+    return run
+
+
+def run_state(scan: Scan, run: ApplyRun | None = None) -> dict | None:
+    """Describe the scan's standing apply run for the step-1 bar.
+
+    The scan stays in DONE while the run works, so the rows and the run
+    row are the only place the progress lives, and this is how a viewer
+    sees it.
+
+    :param scan: The scan.
+    :param run: The run, when the caller has it.
+    :returns: ``{"label", "message", "summary", "failed", "open"}``, or
+        None when no run stands.
+    :rtype: dict | None
+    """
+    run = run or current_run(scan)
+    if run is None:
+        return None
+    rows = list(run.jobs.all())
+    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
+    open_rows = sum(1 for row in rows if row.status in unfinished)
+    dead = [row for row in rows if row.status in DEAD_JOB_STATUSES]
+    done = len(rows) - open_rows - len(dead)
+    if not run.is_built:
+        if run.attempts >= APPLY_MAX_ATTEMPTS:
+            message = (
+                "The corrected volume could not be built; ask a staff member."
+            )
+        elif run.attempts:
+            message = (
+                "Building the corrected volume failed; it is tried again."
+            )
+        else:
+            message = "The corrected volume is being built."
+    elif dead:
+        message = (
+            f"Corrected volume: {len(dead)} page part(s) failed: "
+            f"{dead[0].error_code}"
+        )
+    elif open_rows:
+        message = (
+            f"Corrected volume: {done} of {len(rows)} page part(s) processed"
+        )
+    elif not run.is_glued:
+        if run.attempts >= APPLY_MAX_ATTEMPTS:
+            message = "The corrected volume could not be assembled; ask a staff member."
+        else:
+            message = "Corrected volume: assembling"
+    elif not run.detections_key:
+        message = "Corrected volume built; detections pending"
+    else:
+        message = "Corrected volume built"
+    return {
+        "label": run.label,
+        "message": message,
+        "summary": (
+            f"{len(rows)} page part(s), {done} done, {open_rows} open, "
+            f"{len(dead)} failed; attempts {run.attempts}"
+            + (
+                f"; last error: {run.last_error[:120]}"
+                if run.last_error
+                else ""
+            )
+        ),
+        "failed": bool(dead) or run.attempts >= APPLY_MAX_ATTEMPTS,
+        "open": open_rows,
+    }

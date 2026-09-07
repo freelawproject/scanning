@@ -213,7 +213,9 @@ def build_payload(job: ExternalJob, input_url: str, output_url: str) -> dict:
     }
 
 
-def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
+def ensure_detect_jobs(
+    scan, manifest: dict, *, apply_run=None
+) -> list[ExternalJob]:
     """Return the live detection jobs for ``scan``, creating them if the
     current run does not describe today's shard set.
 
@@ -232,6 +234,8 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
 
     :param scan: The scan to detect over.
     :param manifest: The committed shard manifest.
+    :param apply_run: The apply run (#224) whose one-page shards the
+        manifest describes, or None for the volume.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -242,6 +246,7 @@ def ensure_detect_jobs(scan, manifest: dict) -> list[ExternalJob]:
         engine=JobEngine.BLACKLETTER,
         provider=JobProvider.RUNPOD,
         reuse_results=True,
+        apply_run=apply_run,
     )
 
 
@@ -326,6 +331,11 @@ def enqueue_missing_runs() -> int:
         stage=JobStage.DETECT,
         engine=JobEngine.BLACKLETTER,
         opinion=None,
+        # The volume run only. An apply run's rows (#224) are one-page
+        # shards of the pages a curator changed, and they answer for
+        # no shard set, so a volume that has them and no run of its
+        # own must still get one.
+        apply_run__isnull=True,
     ).filter(source_fingerprint=OuterRef("source_fingerprint"))
     candidates = (
         Scan.objects.filter(status__in=SWEEP_STATUSES)
@@ -761,6 +771,7 @@ def finish_ready_runs() -> int:
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.COMPLETED,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()
@@ -938,6 +949,8 @@ def queue_ready_runs() -> int:
     :returns: How many scans were queued.
     :rtype: int
     """
+    from scanning import review_states
+
     if not s3_sync.s3_active():
         return 0
 
@@ -947,6 +960,7 @@ def queue_ready_runs() -> int:
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()
@@ -964,6 +978,15 @@ def queue_ready_runs() -> int:
             continue
         state = apply_state(rows)
         if state.get("applied_at"):
+            continue
+        # The compute waits for every glue of the standing apply run
+        # (``review_states.final_volume_ready``, #224). Today it still
+        # reads the merged document and the review-1 bitonal copy, in
+        # the page space of the original; the follow-up PR moves those
+        # readers to the run's outputs. The gate is here first, so the
+        # order holds the day they move and review 2 never opens on a
+        # volume whose corrected build is not finished.
+        if not review_states.final_volume_ready(scan):
             continue
         # ``queued_at`` is an audit stamp, never a guard. A scan whose
         # apply is really pending has left this status, so the filter

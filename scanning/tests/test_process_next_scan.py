@@ -12,6 +12,7 @@ from django.utils import timezone
 
 from scanning.factories import ExternalJobFactory, ScanFactory
 from scanning.management.commands.process_next_scan import (
+    CLAIM_LIFT_SECONDS,
     MAX_DB_RETRIES,
     Command,
 )
@@ -20,6 +21,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    QueuedAction,
     Scan,
     Status,
 )
@@ -277,3 +279,64 @@ class TestUncappedIntake(TestCase):
         queued.refresh_from_db()
         self.assertEqual(queued.status, Status.PROCESSING)
         pipeline.assert_called_once_with(queued.pk)
+
+
+class TestClaimPriority(TestCase):
+    """The worker claims by action before age (#224)."""
+
+    def test_an_upload_is_claimed_before_a_compute_before_an_apply(self):
+        """The loop is serial, so the queue puts a person's wait first:
+        the volunteer's upload, then the curator's approval waiting on
+        its redaction compute, then the apply nobody watches -- whatever
+        their ages."""
+        apply_scan = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.APPLY_PAGE_EDITS
+        )
+        compute_scan = ScanFactory(
+            status=Status.QUEUED,
+            queued_action=QueuedAction.COMPUTE_REDACTIONS,
+        )
+        blank_scan = ScanFactory(status=Status.QUEUED, queued_action="")
+        upload_scan = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.FULL_PIPELINE
+        )
+        # Oldest first: the apply, then the compute, then the two uploads.
+        for offset, scan in enumerate(
+            (apply_scan, compute_scan, blank_scan, upload_scan)
+        ):
+            Scan.objects.filter(pk=scan.pk).update(
+                date_created=timezone.now() + timedelta(minutes=offset)
+            )
+
+        claimed = [Command()._claim_next()[0].pk for _ in range(4)]
+
+        self.assertEqual(
+            claimed,
+            [blank_scan.pk, upload_scan.pk, compute_scan.pk, apply_scan.pk],
+        )
+        self.assertIsNone(Command()._claim_next())
+
+    def test_an_apply_that_has_waited_is_claimed_next(self):
+        """The rank and the apply's in-flight cap stall each other: the
+        cap counts a QUEUED apply, and while uploads keep coming the
+        rank never reaches one. So an apply that has waited
+        ``CLAIM_LIFT_SECONDS`` goes next, and the drain goes on around it."""
+        waiting = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.APPLY_PAGE_EDITS
+        )
+        fresh = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.APPLY_PAGE_EDITS
+        )
+        upload = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.FULL_PIPELINE
+        )
+        now = timezone.now()
+        # The trigger writes date_modified when it queues (#224).
+        Scan.objects.filter(pk=waiting.pk).update(
+            date_modified=now - timedelta(seconds=CLAIM_LIFT_SECONDS + 60)
+        )
+        Scan.objects.filter(pk=fresh.pk).update(date_modified=now)
+
+        claimed = [Command()._claim_next()[0].pk for _ in range(3)]
+
+        self.assertEqual(claimed, [waiting.pk, upload.pk, fresh.pk])

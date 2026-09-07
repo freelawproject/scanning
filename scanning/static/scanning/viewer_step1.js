@@ -304,6 +304,14 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 
+    // The page edits are locked once review 1 is approved (#224), the
+    // rule step 2 already follows: offer no control the endpoint
+    // refuses. The repair requests are not page edits and stay.
+    var pageEditsLocked = typeof SCAN_CONFIG !== 'undefined'
+        && SCAN_CONFIG.pageEditsLocked === true;
+    var lockedTitle = 'The page review of this volume is approved, so its ' +
+        'pages are fixed. A staff member can reopen the review.';
+
     // --- Missing / Inserted pages (rendered immediately, they're lightweight) ---
     // One placeholder stands for one gap. A range missing at the end of
     // the volume is one gap too (#256), so that placeholder carries the
@@ -327,16 +335,18 @@ document.addEventListener('DOMContentLoaded', function () {
             '  <p>' + (range
                 ? 'These pages were not found in the document.'
                 : 'This page was not found in the document.') + '</p>' +
-            '  <p>' + (range
-                ? 'Upload a PDF of the missing pages, or an image of one:'
-                : 'Upload an image or a PDF to fill this gap:') + '</p>' +
-            '  <form class="insert-form" enctype="multipart/form-data">' +
-            '    <input type="hidden" name="page_number" value="' + missingLabel + '">' +
-            '    <label class="upload-btn">' +
-            '      Choose a file' +
-            '      <input type="file" name="image" accept="image/*,application/pdf" style="display:none">' +
-            '    </label>' +
-            '  </form>' +
+            (pageEditsLocked
+                ? '  <p title="' + lockedTitle + '">The page review is approved, so no page can be added here.</p>'
+                : '  <p>' + (range
+                    ? 'Upload a PDF of the missing pages, or an image of one:'
+                    : 'Upload an image or a PDF to fill this gap:') + '</p>' +
+                  '  <form class="insert-form" enctype="multipart/form-data">' +
+                  '    <input type="hidden" name="page_number" value="' + missingLabel + '">' +
+                  '    <label class="upload-btn">' +
+                  '      Choose a file' +
+                  '      <input type="file" name="image" accept="image/*,application/pdf" style="display:none">' +
+                  '    </label>' +
+                  '  </form>') +
             '  <button class="repair-btn" data-action="insert" ' +
             'data-anchor-pdf-page="' + entry.anchor_pdf_page + '" ' +
             'data-logical-page="' + missingLabel + '" ' +
@@ -351,6 +361,7 @@ document.addEventListener('DOMContentLoaded', function () {
         drawRepairNote(pageDiv, findRepair('insert', entry.anchor_pdf_page));
 
         var fileInput = pageDiv.querySelector('input[type="file"]');
+        if (!fileInput) { return; }
         fileInput.addEventListener('change', function () {
             if (fileInput.files.length > 0) {
                 // The anchor is the physical position the server
@@ -420,7 +431,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var label = unplaced
             ? 'Page ' + printed + ' &mdash; UPLOADED, BUT THIS VOLUME HAS NO PLACE FOR IT'
             : 'Page ' + printed + ' &mdash; INSERTED';
-        var button = editId
+        var button = editId && !pageEditsLocked
             ? ' <button class="remove-insert-btn" style="cursor:pointer;' +
               'background:#dc2626;color:white;border:none;border-radius:3px;' +
               'padding:1px 6px;font-size:10px;margin-left:4px">Remove</button>'
@@ -451,7 +462,10 @@ document.addEventListener('DOMContentLoaded', function () {
             })
             .then(function (r) { return r.json(); })
             .then(function (data) {
-                if (data.status !== 'ok') { return; }
+                if (data.status !== 'ok') {
+                    showToast(data.error || 'Could not remove this page.');
+                    return;
+                }
                 if (typeof window.refreshProcessActionBar === 'function') {
                     window.refreshProcessActionBar();
                 }
@@ -473,16 +487,22 @@ document.addEventListener('DOMContentLoaded', function () {
         var ocr = ocrByPage[String(pdfPage)];
         var ocrLabel = '';
         if (ocr) {
+            var editable = pageEditsLocked ? '' : ' editable-page';
             if (ocr.detected) {
                 var tag = ocr.type === 'range' ? RANGE_TAG : '#';
-                ocrLabel = '<span class="ocr-tag editable-page" data-pdf-page="' + pdfPage + '" ' +
-                    'title="Click to correct page number">' + tag + ocr.detected +
+                ocrLabel = '<span class="ocr-tag' + editable + '" data-pdf-page="' + pdfPage + '" ' +
+                    'title="' + (pageEditsLocked ? lockedTitle : 'Click to correct page number') + '">' + tag + ocr.detected +
                     ' <small>(' + ocr.zone + ' ' + (ocr.score ? ocr.score.toFixed(2) : '') + ')</small></span>';
             } else {
-                ocrLabel = '<span class="ocr-tag miss editable-page" data-pdf-page="' + pdfPage + '" ' +
-                    'title="Click to assign a page number">[no page # found — click to assign]</span>';
+                ocrLabel = '<span class="ocr-tag miss' + editable + '" data-pdf-page="' + pdfPage + '" ' +
+                    'title="' + (pageEditsLocked ? lockedTitle : 'Click to assign a page number') + '">' +
+                    (pageEditsLocked ? '[no page # found]' : '[no page # found — click to assign]') + '</span>';
             }
         }
+        var editTools = pageEditsLocked ? '' :
+            '    <button class="replace-btn" data-pdf-page="' + pdfPage + '" ' +
+            'title="Upload an image or a PDF that stands in for this page">Replace</button>' +
+            '    <button class="delete-btn" title="Delete this page">Delete</button>';
 
         div.innerHTML =
             '<div class="page-label">' +
@@ -491,9 +511,7 @@ document.addEventListener('DOMContentLoaded', function () {
             // Redact/whiteout buttons are only functional in step 2 (process_viewer.js)
             // '    <button class="redact-btn" data-fill="black" title="Draw a black redaction">Redact</button>' +
             // '    <button class="whiteout-btn" data-fill="white" title="Draw a white redaction">Whiteout</button>' +
-            '    <button class="replace-btn" data-pdf-page="' + pdfPage + '" ' +
-            'title="Upload an image or a PDF that stands in for this page">Replace</button>' +
-            '    <button class="delete-btn" title="Delete this page">Delete</button>' +
+            editTools +
             '    <button class="repair-btn" data-action="replace" data-pdf-page="' + pdfPage + '" ' +
             'title="Ask a scanner with the book to scan this page again">Ask for a rescan</button>' +
             '    <input type="file" class="replace-input" accept="image/*,application/pdf" hidden>' +
@@ -592,9 +610,11 @@ document.addEventListener('DOMContentLoaded', function () {
         }
 
         var deleteBtn = div.querySelector('.delete-btn');
-        deleteBtn.addEventListener('click', function () {
-            deletePageAndResolve(pdfPage, div);
-        });
+        if (deleteBtn) {
+            deleteBtn.addEventListener('click', function () {
+                deletePageAndResolve(pdfPage, div);
+            });
+        }
 
         // A page a curator already replaced carries its note before the
         // deletion mark is drawn: markPageAsDeleted saves the label it
@@ -701,11 +721,13 @@ document.addEventListener('DOMContentLoaded', function () {
         if (old) { old.remove(); }
         var note = document.createElement('span');
         note.className = 'replaced-note';
+        // No Undo on a locked volume (#224): the endpoint refuses it.
         note.innerHTML =
             'This page has been replaced. ' +
             '<a href="' + escapeHtml(replaced.url) + '" target="_blank" rel="noopener">View</a>' +
+            (pageEditsLocked ? '' :
             ' <button class="undo-replace-btn" data-pdf-page="' + pdfPage + '" ' +
-            'title="Take this replacement back">Undo</button>';
+            'title="Take this replacement back">Undo</button>');
         label.appendChild(note);
         refreshSavedLabel(label);
     }
@@ -1431,6 +1453,10 @@ document.addEventListener('DOMContentLoaded', function () {
             return;
         }
 
+        // Each answer is read (#224): a locked volume refuses with 409
+        // and writes no row, and a page must be marked only when the
+        // server marked it. The old blind ``then`` told the curator a
+        // duplicate was handled that the corrected volume kept.
         var promises = toDelete.map(function (pdfPage) {
             return fetch('/scans/' + documentId + '/delete-page/', {
                 method: 'POST',
@@ -1439,22 +1465,35 @@ document.addEventListener('DOMContentLoaded', function () {
                     'X-CSRFToken': csrfToken,
                 },
                 body: JSON.stringify({ pdf_page: pdfPage }),
-            }).then(function (r) { return r.json(); });
+            }).then(function (r) {
+                return r.json().then(function (data) {
+                    return { pdfPage: pdfPage, ok: r.ok && data.status === 'ok', error: data.error };
+                });
+            }).catch(function () {
+                return { pdfPage: pdfPage, ok: false, error: 'Could not reach the server.' };
+            });
         });
 
-        Promise.all(promises).then(function () {
-            toDelete.forEach(function (pdfPage) {
+        Promise.all(promises).then(function (results) {
+            var refused = results.filter(function (res) { return !res.ok; });
+            results.filter(function (res) { return res.ok; }).forEach(function (res) {
                 var containers = document.querySelectorAll('.page-container');
                 containers.forEach(function (c) {
                     var label = c.querySelector('.page-label');
-                    if (label && label.textContent.indexOf('PDF p.' + pdfPage) !== -1) {
+                    if (label && label.textContent.indexOf('PDF p.' + res.pdfPage) !== -1) {
                         c.style.opacity = '0.3';
                         c.style.pointerEvents = 'none';
-                        label.innerHTML = '<span>PDF p.' + pdfPage + ' &mdash; MARKED FOR DELETION</span>';
+                        label.innerHTML = '<span>PDF p.' + res.pdfPage + ' &mdash; MARKED FOR DELETION</span>';
                     }
                 });
             });
-
+            if (refused.length) {
+                showToast(refused[0].error || 'Could not mark ' + refused.length + ' page(s) for deletion.');
+                return;
+            }
+            if (typeof window.onPageEditSaved === 'function') {
+                window.onPageEditSaved();
+            }
             btn.textContent = 'Deleted';
             btn.disabled = true;
             btn.closest('.issue-card').style.opacity = '0.5';

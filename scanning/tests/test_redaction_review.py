@@ -15,10 +15,12 @@ from unittest.mock import patch
 from django.contrib.messages import get_messages
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 
 from scanning import review_states, services, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
+    ApplyRun,
     Detection,
     ExternalJob,
     JobStatus,
@@ -84,14 +86,76 @@ class TestRedactionReviewReady(TestCase):
         self.assertFalse(review_states.redaction_review_ready(scan))
 
     def test_the_corrected_volume_is_a_condition(self):
-        """The #224 hook. It says yes for every scan today, and the
-        rule must ask it rather than assume it."""
+        """The #224 hook. The rule must ask it rather than assume it."""
         scan, rows = applied_scan()
 
         with patch.object(
             review_states, "final_volume_ready", return_value=False
         ):
             self.assertFalse(review_states.redaction_review_ready(scan, rows))
+
+
+class TestFinalVolumeReady(TestCase):
+    """The #224 hook: the standing apply run, with review 2's glues."""
+
+    def _run(self, **fields):
+        scan, _ = merged_scan()
+        ApplyRun.objects.filter(scan=scan).update(**fields)
+        return scan
+
+    def test_a_glued_run_is_ready(self):
+        scan, _ = merged_scan()
+
+        self.assertTrue(review_states.final_volume_ready(scan))
+
+    def test_a_scan_with_no_run_waits(self):
+        scan = ScanFactory(page_count=2)
+
+        self.assertFalse(review_states.final_volume_ready(scan))
+
+    def test_a_run_without_its_detections_waits(self):
+        """The redaction compute reads the detections in the final page
+        space, so a run glued without them is not the volume yet."""
+        scan = self._run(detections_key="")
+
+        self.assertFalse(review_states.final_volume_ready(scan))
+
+    def test_a_run_without_its_bitonal_copy_waits(self):
+        scan = self._run(bitonal_key="")
+
+        self.assertFalse(review_states.final_volume_ready(scan))
+
+    def test_a_run_without_its_ocr_volume_waits(self):
+        """Every glue is the precondition of review 2, the OCR volume
+        and the printed pages included: the review judges the corrected
+        volume, and no output of it may still be missing."""
+        scan = self._run(ocr_key="")
+
+        self.assertFalse(review_states.final_volume_ready(scan))
+
+    def test_a_run_without_its_printed_pages_waits(self):
+        scan = self._run(printed_pages_key="")
+
+        self.assertFalse(review_states.final_volume_ready(scan))
+
+    def test_a_superseded_run_does_not_count(self):
+        """A reopened review closes the run; the next build is owed."""
+        scan = self._run(superseded_at=timezone.now())
+
+        self.assertFalse(review_states.final_volume_ready(scan))
+
+    def test_a_run_of_another_original_does_not_count(self):
+        scan, _ = merged_scan(source_fingerprint="200:2")
+        ApplyRun.objects.filter(scan=scan).update(source_fingerprint="100:2")
+
+        self.assertFalse(review_states.final_volume_ready(scan))
+
+    def test_a_blank_fingerprint_matches_anything(self):
+        """The legacy rule of ``page_edits.is_stale``."""
+        scan, _ = merged_scan(source_fingerprint="200:2")
+        ApplyRun.objects.filter(scan=scan).update(source_fingerprint="")
+
+        self.assertTrue(review_states.final_volume_ready(scan))
 
 
 class TestPromoteReadyScans(TestCase):
@@ -264,6 +328,17 @@ class TestTheApplyOpensReviewTwo(ComputeMixin, TestCase):
         )
         yolo.ensure_detect_jobs(scan, make_manifest(2, 1))
         ExternalJob.objects.filter(scan=scan).update(status=JobStatus.CONSUMED)
+        # The compute also waits for the page edit apply (#224); this
+        # run aliases the review-1 artifacts, as ``merged_scan`` does.
+        ApplyRun.objects.create(
+            scan=scan,
+            number=1,
+            built_at=timezone.now(),
+            bitonal_key="bitonal.pdf",
+            ocr_key="ocr.json",
+            printed_pages_key="printed.json",
+            detections_key="detections.json",
+        )
 
         with patch("scanning.s3_sync.s3_active", return_value=True):
             self.assertEqual(yolo.queue_ready_runs(), 1)

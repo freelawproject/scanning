@@ -26,6 +26,7 @@ from scanning.factories import (
     VolumeFactory,
 )
 from scanning.models import (
+    ApplyRun,
     Detection,
     JobEngine,
     JobStage,
@@ -3546,6 +3547,26 @@ class TestGluedOutputs(ScanningTestCase):
         response = self._index()
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("login"), response["Location"])
+
+    def test_index_lists_no_apply_rows(self):
+        """The one-page shards of a page edit apply (#224) share the
+        stage, the engine and the run sequence, but no glued volume
+        document is written for them: the index must not offer one."""
+        self._dots_row()
+        self._dots_row(shard_index=1)
+        run = ApplyRun.objects.create(scan=self.scan, number=1)
+        self._dots_row(
+            run=2,
+            shard_index=0,
+            shard_count=1,
+            apply_run=run,
+            result_key="jobs/apply/a1/analyze/dots_mocr/r2-s0-a1.json",
+        )
+
+        data = self._index().json()
+
+        self.assertEqual([entry["run"] for entry in data["runs"]], [1])
+        self.assertEqual(data["live_run"], 1)
 
     def test_index_refuses_an_unknown_output_as_json(self):
         """Every answer of these routes is JSON, the 404s included: a

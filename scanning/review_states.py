@@ -19,9 +19,9 @@ The three conditions, and what answers each one:
   rule does not read it: the apply is claimed from that status, and
   the pass filters on it.
 - **The page complete volume exists.** :func:`final_volume_ready` is
-  the hook, and it says yes for every scan until issue #224 lands. The
-  build of the corrected volume is that issue's, and one function is
-  its whole surface here.
+  the hook, and one function is the whole surface of issue #224 here:
+  the standing ``ApplyRun`` has every glue written
+  (``ApplyRun.is_complete``), for this original.
 - **The redactions are computed from the detection run.** That is the
   run's own ``applied_at`` stamp (``yolo.apply_state``), **not**
   ``Scan.redaction_rects``: a volume with no headnote to hide gets an
@@ -64,21 +64,35 @@ logger = logging.getLogger(__name__)
 def final_volume_ready(scan: Scan) -> bool:
     """Return whether the page complete volume of this scan is built.
 
-    The hook for issue #224, and its whole surface in this module. That
-    issue builds the corrected volume from the approved page edits as
-    an ``ApplyRun``; until it lands, no scan has one and no scan can
-    wait for one, so every scan passes this condition.
+    The hook for issue #224, and its whole surface in this module. The
+    corrected volume is the standing ``ApplyRun`` of the scan
+    (``apply.current_run``), and it exists when **every** glue is
+    written (``ApplyRun.is_complete``): the final ``bitonal.pdf``, the
+    OCR volume with its printed pages, and the detections in the final
+    page space. Review 2 judges the redactions of the corrected volume,
+    so no output of that volume may still be missing when the review
+    opens. The redaction compute (``yolo.queue_ready_runs``) reads the
+    same answer before it queues. Its readers still measure the review-1
+    artifacts, in the page space of the original; the follow-up PR
+    points them at the run's outputs, and this gate is what makes that
+    order hold from the first day.
 
-    **What #224 changes here:** ask the model for a glued run of this
-    scan's ``source_fingerprint``, and return that. Nothing else in
-    this module moves, because every reader of the rule goes through
-    :func:`redaction_review_ready`.
+    The run must describe this original: a run built before a
+    re-upload carries the old fingerprint, and a blank on either side
+    is a legacy value that matches anything (the rule of
+    ``page_edits.is_stale``).
 
     :param scan: The scan to judge.
     :returns: Whether the corrected volume exists.
     :rtype: bool
     """
-    return True
+    from scanning import apply
+
+    run = apply.current_run(scan)
+    if run is None or not run.is_complete:
+        return False
+    mine, theirs = run.source_fingerprint, scan.source_fingerprint
+    return not (mine and theirs and mine != theirs)
 
 
 def redaction_review_ready(scan: Scan, rows: list | None = None) -> bool:
@@ -144,6 +158,10 @@ def promote_ready_scans() -> int:
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
+            # The volume run only: a page edit apply's one-page shards
+            # (#224) share the stage, and the rule would refuse them
+            # anyway, at the cost of a read per tick.
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()

@@ -113,11 +113,42 @@ REPAIR_ALREADY_FULFILLED_MESSAGE = (
     "again, or upload a better scan with Replace."
 )
 PENDING_EDITS_SAVED_MESSAGE = (
-    "Your page changes are saved. We do not build the corrected "
-    "volume from them yet. Each inserted or replaced page must go "
-    "through the conversion and the OCR on its own, and that pass is "
-    "not built (#206). Approve this volume when the pages are "
-    "complete. We apply your changes for you when the pass is ready."
+    "Your page changes are saved, and not built into the volume yet. "
+    "Approve this volume when the pages are complete. The corrected "
+    "volume is then built from your changes, and each inserted, "
+    "replaced or rotated page goes through the conversion and the OCR "
+    "on its own."
+)
+#: The review-1 edits are locked once the review is approved (#224):
+#: the apply builds the final volume from the rows as they stand at
+#: the approval, so a row written after it would address a source the
+#: pipeline has left behind. A late correction reopens the review.
+EDITS_LOCKED_MESSAGE = (
+    "The page review of this volume is approved, so its pages cannot "
+    "be edited. Ask a staff member to reopen the page review first."
+)
+PAGE_REVIEW_REOPENED_MESSAGE = (
+    "The page review is open again. Make the corrections, then approve "
+    "the volume once more; the corrected volume is rebuilt from them."
+)
+PAGE_REVIEW_NOT_REOPENABLE_MESSAGE = (
+    "Only an approved page review can be reopened, and this volume's "
+    "is not approved."
+)
+#: The statuses under which a page edit endpoint refuses a write: an
+#: approved review (DONE), a scan the daemon holds -- the apply may be
+#: building from the rows at that moment -- and every post-review
+#: state. A scan before or outside the review keeps its rows editable:
+#: nothing reads them until the review runs.
+LOCKED_STATUSES = frozenset(
+    {
+        Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        Status.READY_FOR_REDACTION_REVIEW,
+        Status.REDACTION_REVIEW_DONE,
+        Status.APPROVED,
+        Status.EXTRACTED,
+        *BUSY_STATUSES,
+    }
 )
 
 #: The largest page file a curator may upload (#232). One page is one
@@ -650,6 +681,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "deleted_pages_json": json.dumps(
                 sorted(page_edits.deleted_pages(scan))
             ),
+            # The rule of the step-1 bar (#151): the viewer must not
+            # offer a control the endpoint refuses. Step 2 runs while
+            # a new-pipeline volume is in DONE, which locks every page
+            # edit (#224), and a legacy PENDING_REVIEW volume is not
+            # locked and keeps its page-number control.
+            "page_edits_locked": scan.status in LOCKED_STATUSES,
             "repair_requests": repair_requests,
             "waiting_repairs": waiting_repairs,
             "replaced_pages_json": json.dumps(
@@ -991,7 +1028,12 @@ def _glued_run_rows(
     """
     return list(
         ExternalJob.objects.filter(
-            scan=scan, stage=stage, engine=engine, opinion=None, run=run
+            scan=scan,
+            stage=stage,
+            engine=engine,
+            opinion=None,
+            run=run,
+            apply_run__isnull=True,
         ).order_by("shard_index")
     )
 
@@ -1122,8 +1164,15 @@ def glued_output_index(
         return _unknown_output(output)
     stage, engine, _key_fn = spec
     scan = get_object_or_404(Scan, pk=pk)
+    # The volume runs only: the one-page shards of a page edit apply
+    # (#224) share the stage and the engine, and their run numbers, but
+    # no glued volume document is written for them.
     rows = ExternalJob.objects.filter(
-        scan=scan, stage=stage, engine=engine, opinion=None
+        scan=scan,
+        stage=stage,
+        engine=engine,
+        opinion=None,
+        apply_run__isnull=True,
     ).order_by("-run", "shard_index")
     runs = []
     for run, group in itertools.groupby(rows, key=lambda row: row.run):
@@ -1348,8 +1397,11 @@ def _review_flags(scan: Scan, repairs_waiting: bool | None = None) -> dict:
         the two pending-edit flags, for the template context.
     :rtype: dict
     """
-    from scanning import services
+    from scanning import apply, services
 
+    done = scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
+    # One read of the standing apply run for the two readers below.
+    run = apply.current_run(scan)
     if repairs_waiting is None:
         repairs_waiting = repairs.has_waiting(scan)
     return {
@@ -1362,10 +1414,38 @@ def _review_flags(scan: Scan, repairs_waiting: bool | None = None) -> dict:
         ),
         "redaction_review_done": (scan.status == Status.REDACTION_REVIEW_DONE),
         "legacy_review": scan.status == Status.PENDING_REVIEW,
+        # The reopen is a compare-and-swap on DONE (#224), so the
+        # button shows only there: a volume in review 2 keeps its
+        # badge and loses the button.
+        "page_review_reopenable": done,
         "has_legacy_ocr": services.has_legacy_ocr(scan),
+        # The apply writes no scan status while its rows run (#224), so
+        # the run row is the only place its progress lives.
+        "apply_run": apply.run_state(scan, run) if done else None,
         "repairs_waiting": repairs_waiting,
-        **page_edits.pending_edit_flags(scan),
+        **page_edits.pending_edit_flags(scan, run),
     }
+
+
+def _refuse_locked_edits(scan: Scan) -> JsonResponse | None:
+    """Refuse a page edit on a volume whose review is not open.
+
+    The first thing every page edit endpoint does (#224), the dismissal
+    of an issue excepted: it is built into nothing. Once the page
+    review is approved the apply builds the final volume from the rows
+    as they stand, so a row written after that addresses a source the
+    pipeline has left behind: it would be applied by no run, or by the
+    wrong one. A late correction reopens the review first
+    (:func:`reopen_page_review`), which supersedes the run in flight.
+
+    :param scan: The scan the edit is about.
+    :returns: A 409 answer naming the reason, or None when the edit
+        may proceed.
+    :rtype: JsonResponse | None
+    """
+    if scan.status not in LOCKED_STATUSES:
+        return None
+    return JsonResponse({"error": EDITS_LOCKED_MESSAGE}, status=409)
 
 
 def _block_if_pending_changes(
@@ -1375,7 +1455,7 @@ def _block_if_pending_changes(
 
     The detect action ignores the structural page edits -- a delete, an
     insert, a replacement, a rotation -- so running it would silently
-    strand the curator's work. They must be applied first (#206), and
+    strand the curator's work. They must be applied first (#224), and
     the apply runs after the review-1 approval.
 
     Only ``start_detect`` calls this, which is step 2, and it checks
@@ -1397,8 +1477,8 @@ def _block_if_pending_changes(
         messages.warning(
             request,
             "Your page changes are not built into the volume yet, so "
-            "this step would ignore them. The pass that builds them "
-            "(#206) is not ready.",
+            "this step would ignore them. The corrected volume is "
+            "built after the approval; wait for that to finish.",
         )
         return redirect(
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
@@ -1738,6 +1818,59 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
 
 @login_required
 @require_POST
+def reopen_page_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Open the page review again, after an approval.
+
+    The way back for a late correction (#224). The approval locks the
+    page edit endpoints, because the apply builds the final volume from
+    the rows as they stand at the approval. A curator who then finds a
+    page review 1 missed asks a staff member to press this. It
+    supersedes the apply run in flight -- its open job rows are
+    cancelled, its outputs stay in S3 -- and moves the scan back to
+    READY with one compare-and-swap. The next approval writes DONE
+    again, and the trigger builds ``a{n+1}`` from every standing row,
+    reusing every paid result the edits did not change.
+
+    Staff only: the reopen throws away a paid build, and the curators'
+    own step is the approval, not its reversal.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to step 1 of the scan processing page.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    if not request.user.is_staff:
+        messages.warning(request, "Only a staff member can reopen a review.")
+        return redirect(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+        )
+    from scanning import apply
+
+    reopened = Scan.objects.filter(
+        pk=scan.pk, status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+    ).update(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
+    if reopened:
+        # After the status write, not before: an apply worker that
+        # claims the scan between the two would build a run this
+        # reopen then supersedes, and the status is what stops it.
+        apply.supersede_runs(
+            scan, f"Page review reopened by user {request.user.pk}"
+        )
+        logger.info(
+            "reopen_page_review: scan=%s reopened by user=%s",
+            scan.pk,
+            request.user.pk,
+        )
+        messages.success(request, PAGE_REVIEW_REOPENED_MESSAGE)
+    else:
+        messages.warning(request, PAGE_REVIEW_NOT_REOPENABLE_MESSAGE)
+    return redirect(
+        reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+    )
+
+
+@login_required
+@require_POST
 def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     """Record that a person reviewed the redactions of this scan.
 
@@ -1868,6 +2001,9 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with the stored value and duplicate flag.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -1897,14 +2033,11 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
     if entry is None:
         return JsonResponse({"error": "Unknown PDF page."}, status=404)
 
-    PageEdit.objects.update_or_create(
-        scan=scan,
-        kind=PageEdit.Kind.SET_NUMBER,
-        pdf_page=pdf_page,
-        applied_at=None,
-        withdrawn_at=None,
-        defaults={
-            "author": request.user,
+    page_edits.supersede(
+        scan,
+        PageEdit.Kind.SET_NUMBER,
+        {"pdf_page": pdf_page},
+        {
             "value": page_value,
             # The reading this number overrules. It is rebuilt from
             # the run on every recompute, so this row is the only
@@ -1912,6 +2045,7 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
             "previous_value": str(entry.get("detected") or ""),
             "source_fingerprint": scan.source_fingerprint,
         },
+        request.user,
     )
 
     # Clear the page's no-page-number flag; the rebuild does not touch Issue
@@ -2161,6 +2295,9 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     :return: JSON response confirming the deletion record.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -2168,19 +2305,16 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
     if pdf_page is None:
         return JsonResponse({"error": "Unknown PDF page."}, status=404)
-    # Both stamps are in the lookup, not just the apply's (#232): a
-    # withdrawn row is history, and matching it would hand the caller
-    # a row that marks nothing.
-    PageEdit.objects.get_or_create(
-        scan=scan,
-        kind=PageEdit.Kind.DELETE_PAGE,
-        pdf_page=pdf_page,
-        applied_at=None,
-        withdrawn_at=None,
-        defaults={
-            "author": request.user,
-            "source_fingerprint": scan.source_fingerprint,
-        },
+    # A standing deletion is left as it is: a second click has nothing
+    # to refresh. An applied one is superseded, so the new decision is
+    # a row of its own (#224).
+    page_edits.supersede(
+        scan,
+        PageEdit.Kind.DELETE_PAGE,
+        {"pdf_page": pdf_page},
+        {"source_fingerprint": scan.source_fingerprint},
+        request.user,
+        refresh_open=False,
     )
     return JsonResponse({"status": "ok"})
 
@@ -2199,12 +2333,15 @@ def undo_delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     :return: JSON response confirming the undo.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
     page_edits.withdraw(
-        page_edits.open_edits(scan, PageEdit.Kind.DELETE_PAGE).filter(
+        page_edits.standing_edits(scan, PageEdit.Kind.DELETE_PAGE).filter(
             pdf_page=data.get("pdf_page")
         ),
         request.user,
@@ -2242,6 +2379,9 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with the insert URL and page number.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     image_file = request.FILES.get("image")
     kind, refusal = _accept_page_upload(image_file, one_page=False)
     if kind is None:
@@ -2313,19 +2453,22 @@ def remove_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response confirming the removal.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
     edit = (
-        page_edits.open_edits(scan, PageEdit.Kind.INSERT_PAGE)
+        page_edits.standing_edits(scan, PageEdit.Kind.INSERT_PAGE)
         .filter(pk=data.get("edit_id"))
         .first()
     )
     if edit is None:
         return JsonResponse({"error": "Unknown page insert."}, status=404)
     page_edits.withdraw(
-        page_edits.open_edits(scan, PageEdit.Kind.INSERT_PAGE).filter(
+        page_edits.standing_edits(scan, PageEdit.Kind.INSERT_PAGE).filter(
             pk=edit.pk
         ),
         request.user,
@@ -2361,6 +2504,9 @@ def replace_page(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with the edit id and the file URL.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     image_file = request.FILES.get("image")
     kind, refusal = _accept_page_upload(image_file, one_page=True)
     if kind is None:
@@ -2372,7 +2518,7 @@ def replace_page(request: HttpRequest, pk: int) -> JsonResponse:
     def withdraw_earlier():
         """Close the replacement this one supersedes, if any."""
         page_edits.withdraw(
-            page_edits.open_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
+            page_edits.standing_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
                 pdf_page=pdf_page
             ),
             request.user,
@@ -2422,12 +2568,15 @@ def undo_replace_page(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response confirming the undo.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
     page_edits.withdraw(
-        page_edits.open_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
+        page_edits.standing_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
             pdf_page=data.get("pdf_page")
         ),
         request.user,
@@ -2471,8 +2620,8 @@ def rotate_page(request: HttpRequest, pk: int) -> JsonResponse:
     raise but never resolve. The value is clockwise degrees, and only a
     quarter turn is a legal one.
 
-    The endpoint lands with the model; the button belongs with #206 and
-    #151.
+    The endpoint lands with the model; the button belongs with #151.
+    The apply (#224) re-renders a rotated page as a one-page shard.
 
     :param request: The HTTP request (JSON body with ``pdf_page`` and
         ``degrees``).
@@ -2480,6 +2629,9 @@ def rotate_page(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response confirming the rotation.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -2498,17 +2650,12 @@ def rotate_page(request: HttpRequest, pk: int) -> JsonResponse:
             },
             status=400,
         )
-    PageEdit.objects.update_or_create(
-        scan=scan,
-        kind=PageEdit.Kind.ROTATE_PAGE,
-        pdf_page=pdf_page,
-        applied_at=None,
-        withdrawn_at=None,
-        defaults={
-            "author": request.user,
-            "value": degrees,
-            "source_fingerprint": scan.source_fingerprint,
-        },
+    page_edits.supersede(
+        scan,
+        PageEdit.Kind.ROTATE_PAGE,
+        {"pdf_page": pdf_page},
+        {"value": degrees, "source_fingerprint": scan.source_fingerprint},
+        request.user,
     )
     return JsonResponse({"status": "ok"})
 
@@ -2540,6 +2687,9 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response confirming dismissal.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    # Not locked with the page edits (#224): a dismissal is built into
+    # nothing, and the recompute button stays reachable after the
+    # approval, so a curator must be able to answer the cards it raises.
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -2549,22 +2699,20 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
         return JsonResponse({"error": "Unknown issue."}, status=404)
 
     physical = issue.check_name in PHYSICAL_PAGE_CHECKS
-    PageEdit.objects.update_or_create(
-        scan=scan,
-        kind=PageEdit.Kind.DISMISS_ISSUE,
-        pdf_page=issue.page_number if physical else None,
-        logical_page=(
-            ""
-            if physical or issue.page_number is None
-            else str(issue.page_number)
-        ),
-        value=issue.check_name,
-        applied_at=None,
-        withdrawn_at=None,
-        defaults={
-            "author": request.user,
-            "source_fingerprint": scan.source_fingerprint,
+    page_edits.supersede(
+        scan,
+        PageEdit.Kind.DISMISS_ISSUE,
+        {
+            "pdf_page": issue.page_number if physical else None,
+            "logical_page": (
+                ""
+                if physical or issue.page_number is None
+                else str(issue.page_number)
+            ),
+            "value": issue.check_name,
         },
+        {"source_fingerprint": scan.source_fingerprint},
+        request.user,
     )
     issue.delete()
     return JsonResponse({"status": "ok"})

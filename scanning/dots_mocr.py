@@ -176,7 +176,7 @@ def build_payload(job: ExternalJob, input_url: str, output_url: str) -> dict:
 
 
 def ensure_analyze_jobs(
-    scan, manifest: dict, *, force_new_run: bool = False
+    scan, manifest: dict, *, force_new_run: bool = False, apply_run=None
 ) -> list[ExternalJob]:
     """Return the live dots.mocr jobs for ``scan``, creating them if
     the current run does not describe today's shard set.
@@ -200,6 +200,8 @@ def ensure_analyze_jobs(
     :param manifest: The committed shard manifest.
     :param force_new_run: Replace a whole, reusable live run. Only the
         ``reread_failed_pages`` command passes it.
+    :param apply_run: The apply run (#224) whose one-page shards the
+        manifest describes, or None for the volume.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -211,6 +213,7 @@ def ensure_analyze_jobs(
         provider=JobProvider.RUNPOD,
         reuse_results=True,
         force_new_run=force_new_run,
+        apply_run=apply_run,
     )
 
 
@@ -838,6 +841,7 @@ def finish_ready_runs() -> int:
             jobs__engine=JobEngine.DOTS_MOCR,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.COMPLETED,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()
@@ -998,6 +1002,7 @@ def apply_ready_runs() -> int:
             jobs__engine=JobEngine.DOTS_MOCR,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
+            jobs__apply_run__isnull=True,
         )
         .values_list("pk", flat=True)
         .distinct()

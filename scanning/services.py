@@ -1380,7 +1380,7 @@ def recalculate_issues(scan: "Scan") -> None:
             stale_edits
             + [
                 edit
-                for edit in page_edits.stale_open_edits(scan)
+                for edit in page_edits.stale_edits(scan)
                 if edit.kind != PageEdit.Kind.SET_NUMBER
             ]
         )
@@ -1921,6 +1921,56 @@ def _park_after_redactions(
     )
 
 
+def run_apply_page_edits(scan_pk: int) -> None:
+    """Build the corrected volume from the page edits, or glue it.
+
+    The worker behind ``QueuedAction.APPLY_PAGE_EDITS`` (issue #224),
+    which ``apply.queue_ready_scans`` writes on the collect tick.
+    Queued work, like the redaction compute (#196): the build pulls the
+    original and the glue pulls the volume bitonal copy, minutes on a
+    large volume, and the tick's scheduler is serial.
+
+    The scan goes back to ``PAGE_COMPLETENESS_REVIEW_DONE`` whatever
+    happens, and this raises nothing: a failure is counted on the
+    ``ApplyRun`` row, which bounds the retries. The park is guarded on
+    PROCESSING alone. A lost claim -- the daemon's own shutdown
+    re-queued the scan, or an admin moved it -- supersedes the run, so
+    the rows it created are cancelled and the next claim builds the
+    next number from the same shards.
+
+    The local tree goes at the end, as it does on every other terminal
+    path (#215). The build pulls the original and the glue pulls the
+    volume bitonal copy, and the first ticks after a deploy apply the
+    whole approved corpus. Without this the daemon pod would hold every
+    one of those volumes until ``cleanup_processing_tmp`` reached its
+    cutoff.
+
+    :param scan_pk: Primary key of the scan to apply.
+    :return: None.
+    """
+    from scanning import apply, s3_sync
+
+    django.db.connections.close_all()
+    scan = Scan.objects.get(pk=scan_pk)
+    try:
+        message = apply.run_due_phases(scan)
+    except Exception as exc:  # pragma: no cover - run_due_phases catches
+        logger.exception("apply: scan %s: unexpected failure", scan_pk)
+        message = f"Building the corrected volume failed: {exc}"
+    parked = Scan.objects.filter(pk=scan_pk, status=Status.PROCESSING).update(
+        status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        progress_message=message[:255],
+        progress_current=0,
+        progress_total=0,
+    )
+    if not parked:
+        apply.supersede_runs(
+            scan, "the daemon lost its claim during the apply"
+        )
+    if s3_sync.s3_active():
+        s3_sync.release_local_processing(scan)
+
+
 def run_full_pipeline(scan_pk: int) -> None:
     """Run the upload pipeline: shard the original, then hand it to doctor.
 
@@ -2114,6 +2164,35 @@ def _can_convert(scan_pk: int, manifest: dict | None) -> bool:
         )
         return False
     return True
+
+
+def convert_stage_open() -> bool:
+    """Return whether doctor can be handed a shard in this environment.
+
+    The two checks of :func:`_can_convert` that need no shard set:
+    doctor configured, and S3 active for the presigned GET. The page
+    edit apply (#224) asks this before it queues a build, so a closed
+    stage costs no attempt and no upload.
+
+    :returns: Whether the conversion stage is open.
+    :rtype: bool
+    """
+    from scanning import doctor_client, s3_sync
+
+    return doctor_client.enabled() and s3_sync.s3_active()
+
+
+def analyze_stage_open() -> bool:
+    """Return whether dots.mocr can be handed a shard in this environment.
+
+    The mirror of :func:`convert_stage_open` for :func:`_can_analyze`.
+
+    :returns: Whether the OCR stage is open.
+    :rtype: bool
+    """
+    from scanning import dots_mocr, s3_sync
+
+    return dots_mocr.enabled() and s3_sync.s3_active()
 
 
 def _can_analyze(scan_pk: int, manifest: dict | None) -> bool:

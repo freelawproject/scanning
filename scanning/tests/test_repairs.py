@@ -541,6 +541,9 @@ class TestFulfilledIsDerived(RepairTestCase):
         # file. So the fingerprint moves only on a re-upload, and an
         # edit applied against the earlier upload names a leaf of
         # another book, whatever its stamp says.
+        # Withdrawn, because one row only may stand per address
+        # (#224): the second write supersedes the first, which is
+        # what ``page_edits.supersede`` does to an applied row.
         PageEditFactory(
             scan=self.scan,
             kind=PageEdit.Kind.REPLACE_PAGE,
@@ -548,6 +551,7 @@ class TestFulfilledIsDerived(RepairTestCase):
             value="",
             source_fingerprint="100:3",
             applied_at=timezone.now(),
+            withdrawn_at=timezone.now(),
         )
         self.scan.source_fingerprint = "777:3"
         self.scan.save(update_fields=["source_fingerprint"])

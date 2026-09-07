@@ -26,7 +26,6 @@ from django.utils.http import http_date
 from django.views.decorators.clickjacking import xframe_options_sameorigin
 from django.views.decorators.http import require_POST
 
-from scanning import page_edits
 from scanning.models import (
     CheckName,
     Detection,
@@ -1002,24 +1001,48 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     )
 
 
+#: The 409 of ``export_pdf``: the standing page edits cannot be built
+#: into a volume. The fault itself is logged, never sent.
+EXPORT_NOT_BUILDABLE_MESSAGE = (
+    "The corrected PDF cannot be built from the page edits as they "
+    "stand. Check the step-1 page changes, or ask a staff member."
+)
+
+
+def _unlink_quietly(path: str) -> None:
+    """Remove a temp file, and swallow a file that is already gone.
+
+    :param path: The file.
+    :return: None.
+    """
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 @login_required
 def export_pdf(
     request: HttpRequest, pk: int
 ) -> StreamingHttpResponse | HttpResponse:
-    """Export a corrected PDF with the deletions and inserts applied.
+    """Export the corrected PDF, as the apply builds it.
 
     Reads the curator's decisions off the ``PageEdit`` rows (#214), in
-    the physical space of the original: a page marked for deletion is
-    dropped, and each uploaded image is placed in the gap its row
-    names. A replacement or a rotation is *not* applied here -- those
-    kinds have no interface yet, and the volume-level apply that owns
-    them is #206.
+    the physical space of the original, and runs the walk the apply
+    runs (``apply.build_final_pdf``, #224): a page marked for deletion
+    is dropped, an uploaded page stands in for a replaced one, a
+    rotated page is turned, and each inserted file is placed in the gap
+    its row names. The export and the final PDF are one walk, so what
+    a curator downloads is what the apply builds.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: PDF file download response, or a 404 when the original PDF
-        cannot be made available locally.
+    :return: PDF file download response, a 404 when the original PDF
+        cannot be made available locally, or a 409 naming the fault when
+        the rows cannot be built into a volume.
     """
+    from scanning import apply
+
     scan = get_object_or_404(Scan, pk=pk)
     # Resolve the source PDF before the temp file exists, so a missing
     # original is a clean 404 rather than a leaked temp file.
@@ -1030,53 +1053,36 @@ def export_pdf(
     tmp.close()
     tmp_path = tmp.name
     try:
-        deleted_pages = page_edits.deleted_pages(scan)
-        gaps = page_edits.inserts_by_gap(scan)
         with fitz.open(original) as pdf_doc:
-            for pdf_page in sorted(deleted_pages, reverse=True):
-                pdf_index = pdf_page - 1
-                if 0 <= pdf_index < len(pdf_doc):
-                    pdf_doc.delete_page(pdf_index)
-            offset = 0
-            for anchor in sorted(gaps):
-                # The anchor is a page of the *original*, so the
-                # position it names moves by every page removed before
-                # it and every page inserted before it.
-                surviving = anchor - len(
-                    [p for p in deleted_pages if p <= anchor]
-                )
-                for edit in gaps[anchor]:
-                    pno = min(surviving + offset, len(pdf_doc))
-                    # The image lives in S3 since #214, so it is read as
-                    # bytes: a remote file has no path for fitz to open.
-                    with edit.image.open("rb") as fh:
-                        data = fh.read()
-                    if edit.image.name.lower().endswith(".pdf"):
-                        with fitz.open(stream=data, filetype="pdf") as ins:
-                            pdf_doc.insert_pdf(
-                                ins,
-                                from_page=0,
-                                to_page=ins.page_count - 1,
-                                start_at=pno,
-                            )
-                            offset += ins.page_count
-                        continue
-                    reference = pdf_doc.load_page(
-                        min(pno, len(pdf_doc) - 1)
-                    ).rect
-                    new_page = pdf_doc.new_page(
-                        pno=pno,
-                        width=reference.width,
-                        height=reference.height,
-                    )
-                    new_page.insert_image(new_page.rect, stream=data)
-                    offset += 1
-            pdf_doc.save(tmp_path)
+            # The plan is built over ``Scan.page_count``, so a row that
+            # disagrees with the file would address a page the walk
+            # cannot reach and raise inside ``build_final_pdf``. The
+            # old walk clamped every index; this reads the file, which
+            # is what ``apply._build`` checks too.
+            scan.page_count = pdf_doc.page_count
+        # Each uploaded file is read once, for the plan and the walk.
+        files, counts = apply.preload_edit_files(scan)
+        plan = apply.plan_run(scan, counts)
+        with fitz.open(original) as source:
+            with apply.build_final_pdf(
+                source, plan, read_file=lambda edit: files[edit.pk]
+            ) as pdf_doc:
+                pdf_doc.save(tmp_path)
+    except apply.ApplyError as exc:
+        # The rows do not build into a volume: a shard with fewer pages
+        # than the map asks for, a file that is gone. The apply counts
+        # the same fault on its run. The detail goes to the log and not
+        # to the browser (CodeQL: an exception's text is not for an
+        # external user); the answer says what to do.
+        _unlink_quietly(tmp_path)
+        logger.warning(
+            "export_pdf: scan %s: the page edits do not build: %s", pk, exc
+        )
+        return HttpResponse(
+            EXPORT_NOT_BUILDABLE_MESSAGE, status=409, content_type="text/plain"
+        )
     except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        _unlink_quietly(tmp_path)
         raise
 
     filename = f"{scan.reporter.short_name}_{scan.volume}_corrected.pdf"

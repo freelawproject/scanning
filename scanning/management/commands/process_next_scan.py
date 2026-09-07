@@ -35,6 +35,19 @@ logger = logging.getLogger(__name__)
 MAX_DB_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 0.5
 
+#: The claim order, by action, then by age. The worker is serial, so a
+#: person's wait goes first: an upload (a blank action means the same),
+#: then a redaction compute, then the page edit apply (#224), a
+#: backfill nobody watches. An unlisted action ranks with the compute.
+CLAIM_PRIORITY = ("full_pipeline", "compute_redactions", "apply_page_edits")
+
+#: An apply queued longer than this is claimed next. Without it, a
+#: steady stream of uploads starves the apply: the five queued applies
+#: (``apply.MAX_SCANS_IN_FLIGHT``) are never claimed, and the trigger
+#: queues no more. The wait is measured from the trigger's write of
+#: ``date_modified``.
+CLAIM_LIFT_SECONDS = 15 * 60
+
 
 class Command(BaseCommand):
     help = (
@@ -131,16 +144,39 @@ class Command(BaseCommand):
             scan is queued.
         :rtype: tuple | None
         """
+        from datetime import timedelta
+
         from django.db import transaction
+        from django.db.models import Case, IntegerField, Value, When
         from django.utils import timezone
 
         from scanning.models import QueuedAction, Scan, Status
 
+        # ``CLAIM_PRIORITY``, with an apply that has waited
+        # ``CLAIM_LIFT_SECONDS`` moved to the front.
+        lifted_before = timezone.now() - timedelta(seconds=CLAIM_LIFT_SECONDS)
+        rank = Case(
+            When(
+                queued_action=QueuedAction.APPLY_PAGE_EDITS,
+                date_modified__lt=lifted_before,
+                then=Value(0),
+            ),
+            When(queued_action="", then=Value(0)),
+            *(
+                When(queued_action=action, then=Value(index))
+                for index, action in enumerate(CLAIM_PRIORITY)
+            ),
+            default=Value(
+                CLAIM_PRIORITY.index(QueuedAction.COMPUTE_REDACTIONS)
+            ),
+            output_field=IntegerField(),
+        )
         with transaction.atomic():
             scan = (
                 Scan.objects.select_for_update(skip_locked=True)
                 .filter(status=Status.QUEUED)
-                .order_by("date_created")
+                .annotate(claim_rank=rank)
+                .order_by("claim_rank", "date_created")
                 .first()
             )
             if scan is None:
@@ -177,6 +213,9 @@ class Command(BaseCommand):
             # It parks the scan itself and raises nothing, so the
             # generic ERROR arm below never sees it.
             QueuedAction.COMPUTE_REDACTIONS: services.run_compute_redactions,
+            # Issue #224. Same shape: it pulls and writes whole volumes,
+            # parks the scan itself and raises nothing.
+            QueuedAction.APPLY_PAGE_EDITS: services.run_apply_page_edits,
         }
 
         # Legacy actions whose pipelines were disconnected (issue #173).

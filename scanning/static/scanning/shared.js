@@ -357,6 +357,9 @@ function deletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelete) {
             if (typeof window.onPageEditSaved === 'function') {
                 window.onPageEditSaved();
             }
+        } else {
+            // A locked review answers 409 with the reason (#224).
+            showToast(data.error || 'Could not mark this page for deletion.');
         }
     });
 }
@@ -381,16 +384,24 @@ function markPageAsDeleted(pageDiv, pdfPage, labelPrefix, csrfToken, docId, onDe
         if (!label.dataset.originalHtml) {
             label.dataset.originalHtml = label.innerHTML;
         }
+        // The page edits are locked once review 1 is approved (#224),
+        // and an applied deletion still stands, so this runs on load
+        // for a locked volume too: it must not offer the one control
+        // the endpoint refuses.
+        var locked = typeof SCAN_CONFIG !== 'undefined' && SCAN_CONFIG.pageEditsLocked === true;
         label.innerHTML =
             '<span>' + labelPrefix + ' ' + pdfPage + ' &mdash; MARKED FOR DELETION</span> ' +
+            (locked ? '' :
             '<button class="undo-delete-btn" style="pointer-events:auto;cursor:pointer;' +
             'background:#dc2626;color:white;border:none;border-radius:3px;padding:1px 6px;' +
-            'font-size:10px;margin-left:4px">Undo Delete</button>';
+            'font-size:10px;margin-left:4px">Undo Delete</button>');
         var undoBtn = label.querySelector('.undo-delete-btn');
-        undoBtn.addEventListener('click', function (e) {
-            e.stopPropagation();
-            undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelete);
-        });
+        if (undoBtn) {
+            undoBtn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelete);
+            });
+        }
     }
 }
 
@@ -433,6 +444,8 @@ function undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelet
             if (typeof window.onPageEditSaved === 'function') {
                 window.onPageEditSaved();
             }
+        } else {
+            showToast(data.error || 'Could not take the deletion back.');
         }
     });
 }

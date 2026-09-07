@@ -20,10 +20,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.test import TestCase
+from django.utils import timezone
 
 from scanning import s3_sync, yolo
 from scanning.factories import ScanFactory
-from scanning.models import ExternalJob, JobStatus, Scan, Status
+from scanning.models import (
+    ApplyRun,
+    ExternalJob,
+    JobStatus,
+    Scan,
+    Status,
+)
 from scanning.tests.test_jobs import make_manifest
 
 
@@ -430,6 +437,21 @@ class TestFinishReadyRuns(DetectJobsMixin, TestCase):
                 Scan.objects.filter(pk=scan.pk).update(
                     status=Status.PAGE_COMPLETENESS_REVIEW_DONE
                 )
+                # The approval alone is not enough since #224: the
+                # geometry is measured on the final volume, so the
+                # trigger waits for the apply run's own bitonal copy
+                # and detections.
+                self.assertEqual(yolo.queue_ready_runs(), 0)
+                ApplyRun.objects.create(
+                    scan=scan,
+                    number=1,
+                    built_at=timezone.now(),
+                    bitonal_key="bitonal.pdf",
+                    ocr_key="ocr.json",
+                    printed_pages_key="printed.json",
+                    detections_key="detections.json",
+                )
+
                 self.assertEqual(yolo.queue_ready_runs(), 1)
                 scan.refresh_from_db()
                 self.assertEqual(scan.status, Status.QUEUED)

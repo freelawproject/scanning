@@ -18,6 +18,12 @@ document.addEventListener('DOMContentLoaded', function () {
     var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
     var viewOnly = container.dataset.viewOnly === 'true';
     var opinionEditMode = container.dataset.opinionEdit === 'true';
+    // The page edits are locked once review 1 is approved (#224).
+    // Step 2 must not offer a control the endpoint refuses, the
+    // rule of the step-1 bar (#151). A legacy volume is not locked
+    // and keeps the control.
+    var pageEditsLocked = typeof SCAN_CONFIG !== 'undefined'
+        && SCAN_CONFIG.pageEditsLocked === true;
     var pageMap = JSON.parse(container.dataset.pageMap || '[]');
     var flaggedIndices = JSON.parse(container.dataset.flaggedIndices || '[]');
     var ocrByPage = JSON.parse(container.dataset.ocrByPage || '{}');
@@ -332,14 +338,17 @@ document.addEventListener('DOMContentLoaded', function () {
         var ocr = ocrByPage[String(pdfPage)];
         var ocrLabel = '';
         if (ocr) {
+            var editable = pageEditsLocked ? '' : ' editable-page';
+            var lockedTitle = 'The page review of this volume is approved, ' +
+                'so its page numbers are fixed.';
             if (ocr.detected) {
                 var tag = ocr.type === 'range' ? 'Range ' : '#';
-                ocrLabel = '<span class="ocr-tag editable-page" data-pdf-page="' + pdfPage + '" ' +
-                    'title="Click to correct page number">' + tag + ocr.detected +
+                ocrLabel = '<span class="ocr-tag' + editable + '" data-pdf-page="' + pdfPage + '" ' +
+                    'title="' + (pageEditsLocked ? lockedTitle : 'Click to correct page number') + '">' + tag + ocr.detected +
                     ' <small>(' + ocr.zone + ' ' + (ocr.score ? ocr.score.toFixed(2) : '') + ')</small></span>';
             } else {
-                ocrLabel = '<span class="ocr-tag miss editable-page" data-pdf-page="' + pdfPage + '" ' +
-                    'title="Click to assign a page number">[no page # found]</span>';
+                ocrLabel = '<span class="ocr-tag miss' + editable + '" data-pdf-page="' + pdfPage + '" ' +
+                    'title="' + (pageEditsLocked ? lockedTitle : 'Click to assign a page number') + '">[no page # found]</span>';
             }
         }
 
