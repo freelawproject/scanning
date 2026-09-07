@@ -33,6 +33,7 @@ from scanning.models import (
     OpinionScan,
     OpinionStatus,
     PageEdit,
+    PageRepairRequest,
     PendingUpload,
     QueuedAction,
     QueueStatus,
@@ -183,6 +184,81 @@ class TestScanList(ScanningTestCase):
         self.assertEqual(len(response.context["page_obj"]), 25)
         response = self.client.get(reverse("scan_list"), {"page": 2})
         self.assertEqual(len(response.context["page_obj"]), 5)
+
+    def _ask_for_a_page(self, scan, user, pdf_page=1):
+        """Record one waiting repair request on the scan (#266).
+
+        :param scan: The scan the page belongs to.
+        :param user: Who found the page.
+        :param pdf_page: The page a scanner must scan again.
+        :returns: The new row.
+        """
+        return PageRepairRequest.objects.create(
+            scan=scan,
+            action=PageRepairRequest.Action.REPLACE,
+            requested_by=user,
+            pdf_page=pdf_page,
+            source_fingerprint=scan.source_fingerprint,
+        )
+
+    def test_a_waiting_repair_raises_a_badge(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(uploaded_by=user, page_count=3)
+        self._ask_for_a_page(scan, user, pdf_page=1)
+        self._ask_for_a_page(scan, user, pdf_page=2)
+
+        response = self.client.get(reverse("scan_list"))
+
+        self.assertEqual(response.context["page_obj"][0].waiting_repairs, 2)
+        # One badge in the table, one in the mobile card.
+        self.assertContains(response, "2 repairs requested", count=2)
+
+    def test_a_scan_with_no_request_carries_no_badge(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        ScanFactory(uploaded_by=user, page_count=3)
+
+        response = self.client.get(reverse("scan_list"))
+
+        self.assertEqual(response.context["page_obj"][0].waiting_repairs, 0)
+        self.assertNotContains(response, "repairs requested")
+
+    def test_a_dismissed_request_carries_no_badge(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(uploaded_by=user, page_count=3)
+        row = self._ask_for_a_page(scan, user)
+        row.dismissed_at = timezone.now()
+        row.dismissed_by = user
+        row.save(update_fields=["dismissed_at", "dismissed_by"])
+
+        response = self.client.get(reverse("scan_list"))
+
+        self.assertNotContains(response, "repairs requested")
+
+    def test_the_badge_costs_one_query_whatever_the_page_holds(self):
+        """The count is grouped, never a subquery per row (#266).
+
+        The nine are the session, the user, the page count, the rows,
+        the repair count, the two error counters, the reporters of the
+        filter, and the header count. None of them is per scan, so ten
+        volumes cost what one costs.
+        """
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(uploaded_by=user, page_count=3)
+        self._ask_for_a_page(scan, user)
+
+        with self.assertNumQueries(9):
+            self.client.get(reverse("scan_list"))
+
+        for _ in range(9):
+            other = ScanFactory(uploaded_by=user, page_count=3)
+            self._ask_for_a_page(other, user)
+
+        with self.assertNumQueries(9):
+            self.client.get(reverse("scan_list"))
 
 
 class TestScanDetail(ScanningTestCase):
