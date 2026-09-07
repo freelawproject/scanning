@@ -383,6 +383,18 @@ class TestExportUsesTheWalk(ApplyTestCase):
         self.assertEqual(count, self.PAGES)
         self.assertEqual(rotations[3], 270)
 
+    def test_a_fault_in_the_plan_is_a_409_not_a_500(self):
+        with mock.patch(
+            "scanning.apply.plan_run",
+            side_effect=apply.ApplyError("edit 7 has no file"),
+        ):
+            response = self.client.get(
+                reverse("export_pdf", kwargs={"pk": self.scan.pk})
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn(b"edit 7 has no file", response.content)
+
     def test_a_page_count_the_file_does_not_carry_still_exports(self):
         """The old walk clamped every index to the open document. The
         walk plans over the page count, so the view reads it off the
@@ -488,8 +500,15 @@ class TestSupersede(ApplyTestCase):
         self.assertEqual(again.source_fingerprint, "a")
 
     def test_pending_counts_the_unapplied_structural_rows_only(self):
+        # Applied means built by the standing run, not stamped alone.
+        run = ApplyRun.objects.create(
+            scan=self.scan, number=1, built_at=timezone.now()
+        )
         self.edit(
-            PageEdit.Kind.DELETE_PAGE, pdf_page=2, applied_at=timezone.now()
+            PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            applied_at=timezone.now(),
+            applied_run=run,
         )
         self.edit(PageEdit.Kind.SET_NUMBER, pdf_page=3, value="3")
         self.assertFalse(page_edits.has_pending_changes(self.scan))

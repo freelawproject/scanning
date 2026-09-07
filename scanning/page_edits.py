@@ -210,23 +210,34 @@ def stale_edits(scan: Scan, *kinds: str) -> list[PageEdit]:
 
 
 def pending_edits(scan: Scan) -> list[PageEdit]:
-    """Return the structural edits no apply run has built yet.
+    """Return the structural edits the standing apply run has not built.
 
     Only the structural kinds count. A page number and a dismissal need
     no apply: every recompute reads them off the rows, and the
     printed-page map reads them at glue time.
 
+    The stamp alone is not the answer. ``applied_run`` names the run
+    that built the row in, and that run may be superseded -- the review
+    was reopened, or the daemon lost its claim -- so the row is owed to
+    the next build although it carries ``applied_at``. Read off the
+    stamp alone, the banner and the paid-run confirm of step 1 went
+    quiet exactly then.
+
     :param scan: The scan to check.
-    :returns: The current structural rows with no ``applied_at``.
+    :returns: The current structural rows that no standing run carries.
     :rtype: list[PageEdit]
     """
+    from scanning import apply
+
+    run = apply.current_run(scan)
+    standing = run.pk if run is not None else None
     # The current ones only: a stale row can never be applied, so
     # counting it would hold the review open for good. It is reported
     # as an issue instead, which is the channel a person can act on.
     return [
         edit
         for edit in current_edits(scan, *PageEdit.STRUCTURAL_KINDS)
-        if edit.applied_at is None
+        if edit.applied_run_id is None or edit.applied_run_id != standing
     ]
 
 

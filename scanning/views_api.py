@@ -1001,6 +1001,18 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     )
 
 
+def _unlink_quietly(path: str) -> None:
+    """Remove a temp file, and swallow a file that is already gone.
+
+    :param path: The file.
+    :return: None.
+    """
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 @login_required
 def export_pdf(
     request: HttpRequest, pk: int
@@ -1017,8 +1029,9 @@ def export_pdf(
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: PDF file download response, or a 404 when the original PDF
-        cannot be made available locally.
+    :return: PDF file download response, a 404 when the original PDF
+        cannot be made available locally, or a 409 naming the fault when
+        the rows cannot be built into a volume.
     """
     from scanning import apply
 
@@ -1039,15 +1052,22 @@ def export_pdf(
             # old walk clamped every index; this reads the file, which
             # is what ``apply._build`` checks too.
             scan.page_count = pdf_doc.page_count
-        plan = apply.plan_run(scan)
+        # Each uploaded file is read once, for the plan and the walk.
+        files, counts = apply.preload_edit_files(scan)
+        plan = apply.plan_run(scan, counts)
         with fitz.open(original) as source:
-            with apply.build_final_pdf(source, plan) as pdf_doc:
+            with apply.build_final_pdf(
+                source, plan, read_file=lambda edit: files[edit.pk]
+            ) as pdf_doc:
                 pdf_doc.save(tmp_path)
+    except apply.ApplyError as exc:
+        # The rows do not build into a volume: a shard with fewer pages
+        # than the map asks for, a file that is gone. The apply counts
+        # the same fault on its run; the export names it.
+        _unlink_quietly(tmp_path)
+        return HttpResponse(str(exc), status=409, content_type="text/plain")
     except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        _unlink_quietly(tmp_path)
         raise
 
     filename = f"{scan.reporter.short_name}_{scan.volume}_corrected.pdf"

@@ -1734,16 +1734,26 @@ class ApplyRun(AbstractDateTimeModel):
 
     @property
     def is_glued(self) -> bool:
-        """Return whether every glue that can be written is written.
+        """Return whether the review-1 glues are written.
 
-        The detections glue waits for a volume detection run, so it is
-        not part of this: a run whose bitonal and OCR outputs exist is
-        complete for review 1's purposes, and the trigger judges the
-        detections glue on its own inputs.
+        The bitonal copy, the OCR volume and the printed pages. The
+        detections glue waits for a volume detection run, so it is not
+        part of this; :attr:`is_complete` is the whole set.
         """
         return bool(
             self.bitonal_key and self.ocr_key and self.printed_pages_key
         )
+
+    @property
+    def is_complete(self) -> bool:
+        """Return whether every glue is written, the detections included.
+
+        The precondition of ``READY_FOR_REDACTION_REVIEW``
+        (``review_states.final_volume_ready``, #263): review 2 judges
+        the redactions of the corrected volume, so every output of the
+        corrected volume must exist before the review opens.
+        """
+        return self.is_glued and bool(self.detections_key)
 
 
 class PageRepairRequest(AbstractDateTimeModel):

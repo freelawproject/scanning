@@ -1686,7 +1686,8 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
     """
     return list(
         queryset.filter(status=JobStatus.PENDING)
-        .select_related("scan", "scan__reporter")
+        # ``s3_job_attempt_key`` reads the apply run's number (#224).
+        .select_related("scan", "scan__reporter", "apply_run")
         .order_by("id")[:room]
     )
 

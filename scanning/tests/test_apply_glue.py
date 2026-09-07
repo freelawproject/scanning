@@ -270,11 +270,50 @@ class TestGlueDue(GlueTestCase):
         run, _ = self.built_run()
         self.assertEqual(apply.phase_due(self.scan), "glue")
 
-    def test_open_rows_hold_every_glue(self):
+    def test_an_open_row_holds_the_glue_of_its_own_stage(self):
         run, _ = self.built_run()
-        row = run.jobs.first()
+        row = self.rows(run, JobStage.CONVERT)[0]
         ExternalJob.objects.filter(pk=row.pk).update(status=JobStatus.IN_QUEUE)
         self.assertIsNone(apply.phase_due(self.scan))
+
+    def test_an_open_detect_row_does_not_hold_the_bitonal_glue(self):
+        """A slow detection worker never keeps the bitonal copy from
+        being written: each glue is judged on its own stage's rows."""
+        run, _ = self.built_run()
+        row = self.rows(run, JobStage.DETECT)[0]
+        ExternalJob.objects.filter(pk=row.pk).update(status=JobStatus.IN_QUEUE)
+
+        self.assertEqual(apply.phase_due(self.scan), "glue")
+        self.assertEqual(
+            apply.glues_due(self.scan, run, list(run.jobs.all())),
+            ["bitonal"],
+        )
+
+    def test_a_dead_detect_row_holds_only_the_detections_glue(self):
+        run, _ = self.built_run()
+        self.volume_ocr_run()
+        self.volume_detect_run()
+        row = self.rows(run, JobStage.DETECT)[0]
+        ExternalJob.objects.filter(pk=row.pk).update(
+            status=JobStatus.FAILED, error_code="BAD_INPUT"
+        )
+
+        self.assertEqual(
+            apply.glues_due(self.scan, run, list(run.jobs.all())),
+            ["bitonal", "ocr"],
+        )
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        self.assertTrue(run.bitonal_key)
+        self.assertTrue(run.ocr_key)
+        self.assertEqual(run.detections_key, "")
+        self.assertFalse(run.is_complete)
+        # Nothing more to write until a staff member supersedes the run.
+        self.assertIsNone(apply.phase_due(self.scan))
+        self.assertTrue(apply.run_state(self.scan)["failed"])
+        # The pre-check agrees with the row-by-row judgement.
+        self.assertNotIn(self.scan.pk, apply._candidate_scan_ids())
 
     def test_the_ocr_and_detection_glues_wait_for_the_volume_runs(self):
         run, _ = self.built_run()
@@ -458,6 +497,7 @@ class TestRedactionTriggerGate(GlueTestCase):
     """The redaction compute waits for the apply's outputs (#196 gate)."""
 
     def test_a_merged_detection_run_waits_for_the_apply(self):
+        self.volume_ocr_run()
         self.volume_detect_run()
 
         self.assertEqual(yolo.queue_ready_runs(), 0)
@@ -465,11 +505,24 @@ class TestRedactionTriggerGate(GlueTestCase):
         # The apply glues on the next claim; then the redactions queue.
         apply.build_run(self.scan)
         apply.glue_run(self.scan)
+        self.assertTrue(apply.current_run(self.scan).is_complete)
         self.assertEqual(yolo.queue_ready_runs(), 1)
         self.scan.refresh_from_db()
         self.assertEqual(
             self.scan.queued_action, QueuedAction.COMPUTE_REDACTIONS
         )
+
+    def test_a_run_with_a_glue_still_missing_holds_the_redactions(self):
+        """Every glue is the precondition (#263): with no volume OCR run
+        the OCR glue is not written, and review 2 waits."""
+        self.volume_detect_run()
+        apply.build_run(self.scan)
+        apply.glue_run(self.scan)
+
+        run = apply.current_run(self.scan)
+        self.assertTrue(run.bitonal_key and run.detections_key)
+        self.assertFalse(run.is_complete)
+        self.assertEqual(yolo.queue_ready_runs(), 0)
 
     def test_the_worker_runs_both_phases_for_a_volume_with_no_edit(self):
         from scanning import services

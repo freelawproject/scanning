@@ -230,12 +230,16 @@ three storages in two address spaces. The pieces: `models.PageEdit`,
   a person made and every page they sent. It replaced three hard
   deletes and the `update_or_create` of `replace_page`, which wrote
   over `image` and left the first object with no row naming it.
-- **`has_pending_changes` counts `STRUCTURAL_KINDS` with no
-  `applied_at`** — a number or a dismissal needs no apply. It raises
-  the step-1 banner and badge; `has_pending_inserts` comes from the
-  same read (`page_edits.pending_edit_flags` via `_review_flags`) and
-  puts the paid-run confirm on the approve button (#224). Computed
-  apart, the two disagreed on stale rows.
+- **`has_pending_changes` counts the `STRUCTURAL_KINDS` the standing
+  apply run has not built** (`page_edits.pending_edits`: `applied_run`
+  is not `apply.current_run`) — a number or a dismissal needs no apply.
+  Not the stamp alone: after a reopen or a lost claim the rows still
+  carry the superseded run's `applied_at`, and read off that the
+  banner went quiet while the next build was owed. It raises the
+  step-1 banner and badge; `has_pending_inserts` comes from the same
+  read (`page_edits.pending_edit_flags` via `_review_flags`) and puts
+  the paid-run confirm on the approve button (#224). Computed apart,
+  the two disagreed on stale rows.
 - **A deletion answers the cards of the page it names** (#255,
   `page_edits.drop_deleted_pages`, called by `recalculate_issues`
   before `drop_dismissed`). The cards are built from `ocr_results`,
@@ -524,7 +528,11 @@ the `reopen_page_review` view. What must not be broken:
   glues finish at different times, and is asked about every 15
   seconds. Failures count on it (`attempts`, `APPLY_MAX_ATTEMPTS`,
   loud-then-quiet); the way back is the admin `supersede_runs` action,
-  after which the trigger builds `a{n+1}`. `_candidate_scan_ids` is
+  after which the trigger builds `a{n+1}`. The crossing into "out of
+  tries" cancels the run's unstarted rows (`UNSTARTED_JOB_STATUSES`,
+  the set the supersede cancels), or a build that failed after it
+  created them would leave rows that run and bill for a run no glue
+  reads. `_candidate_scan_ids` is
   the pre-check: one query per reason a scan may owe a phase, over the
   whole corpus, so the steady state is six queries a tick whatever the
   corpus size (an approved volume whose detection run is not merged
@@ -592,14 +600,22 @@ the `reopen_page_review` view. What must not be broken:
   at build time contributes its unconverted shard). The OCR volume and
   `printed_pages.json` need the volume's glued OCR run too; the
   detections need the volume's merged detection run, which the daemon
-  sweep starts (#250). The first two never wait for the third, and a
-  volume detection run merged before the apply glues still waits:
-  **`yolo.queue_ready_runs` requires the standing run's `bitonal_key`
-  and `detections_key`** (`review_states.final_volume_ready`, the #263
-  hook, for this original), or the redaction compute would measure the
-  space of the original. The same rule is the third condition of
-  `redaction_review_ready`, so the promote pass of #263 cannot move a
-  scan out of DONE before its apply is glued.
+  sweep starts (#250). **Each glue is judged on the rows of its own
+  stage** (`glues_due`, `GLUE_STAGES`, `_stage_blocked`; the trigger's
+  pre-check excludes by the same rule, one subquery per stage): a
+  DETECT row that is in flight or dead holds the detections glue and no
+  other, so the bitonal copy and the OCR volume are written while a
+  detection worker is slow or down. The first two never wait for the
+  third, and a volume detection run merged before the apply glues
+  still waits: **`yolo.queue_ready_runs` requires every glue of the
+  standing run** (`ApplyRun.is_complete`, read through
+  `review_states.final_volume_ready`, the #263 hook, for this
+  original), or the redaction compute would measure the space of the
+  original. The same function is the third condition of
+  `redaction_review_ready`, so `READY_FOR_REDACTION_REVIEW` is never
+  written over a volume with a glue still missing, and the promote
+  pass of #263 cannot move a scan out of DONE before its apply is
+  complete.
 - **The printed-page map is the curator's over the model's.**
   `printed_pages` runs `page_numbers.ocr_results_from_volume` over the
   final OCR document, then lands each standing `SET_NUMBER` row on its
@@ -632,6 +648,14 @@ the `reopen_page_review` view. What must not be broken:
   final space (`ApplyRun.bitonal_key`, `detections_key`,
   `printed_pages_key`) is the follow-up PR, and every volume with no
   structural edit is correct either way because the run aliases them.
+- **A legacy volume gets no apply, on purpose.** `APPLY_STATUS` is
+  DONE alone, and a legacy volume's review lives in `PENDING_REVIEW`:
+  the #154 and #263 states describe a flow it never went through, and
+  its step 3 is the legacy path.
+- **The export reads each uploaded file once** (`preload_edit_files`,
+  shared with the build: the plan takes the page counts, the walk the
+  bytes) and answers an `ApplyError` with 409 and the fault, not a
+  500.
 - The scratch prefix `apply.BUILD_TMP_PREFIX` is in the
   `cleanup_processing_tmp` leak sweep.
 
@@ -1478,11 +1502,12 @@ the collect tick's pass), the park in `services.run_compute_redactions`,
   that fully succeeded, and it still needs a curator to judge its
   pairing.
 - **The corrected volume is one function.** `final_volume_ready` asks
-  for the standing `ApplyRun` (#224) with the two glues review 2 reads
-  -- the bitonal copy and the detections in the final page space --
-  for this original. `yolo.queue_ready_runs` reads the same function
-  before it queues the redaction compute, and nothing else here
-  changed for #224.
+  for the standing `ApplyRun` (#224) with every glue written
+  (`ApplyRun.is_complete`: the bitonal copy, the OCR volume with its
+  printed pages, the detections in the final page space), for this
+  original. `yolo.queue_ready_runs` reads the same function before it
+  queues the redaction compute, and nothing else here changed for
+  #224.
 - **Two writers of READY, and the apply is the usual one.**
   `services._park_after_redactions` parks a successful run straight in
   the new status: the viewer reloads the page the moment the scan

@@ -979,10 +979,10 @@ def queue_ready_runs() -> int:
         state = apply_state(rows)
         if state.get("applied_at"):
             continue
-        # The redactions are measured on the final volume (#224): the
-        # apply's bitonal copy and its detections in the final page
-        # space. Until the apply has glued both, the compute would read
-        # the space of the original.
+        # The redactions are measured on the final volume (#224), so
+        # the compute waits for every glue of the standing apply run
+        # (``review_states.final_volume_ready``), or it would read the
+        # space of the original.
         if not review_states.final_volume_ready(scan):
             continue
         # ``queued_at`` is an audit stamp, never a guard. A scan whose

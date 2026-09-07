@@ -125,6 +125,19 @@ class TestFinalVolumeReady(TestCase):
 
         self.assertFalse(review_states.final_volume_ready(scan))
 
+    def test_a_run_without_its_ocr_volume_waits(self):
+        """Every glue is the precondition of review 2, the OCR volume
+        and the printed pages included: the review judges the corrected
+        volume, and no output of it may still be missing."""
+        scan = self._run(ocr_key="")
+
+        self.assertFalse(review_states.final_volume_ready(scan))
+
+    def test_a_run_without_its_printed_pages_waits(self):
+        scan = self._run(printed_pages_key="")
+
+        self.assertFalse(review_states.final_volume_ready(scan))
+
     def test_a_superseded_run_does_not_count(self):
         """A reopened review closes the run; the next build is owed."""
         scan = self._run(superseded_at=timezone.now())
@@ -322,6 +335,8 @@ class TestTheApplyOpensReviewTwo(ComputeMixin, TestCase):
             number=1,
             built_at=timezone.now(),
             bitonal_key="bitonal.pdf",
+            ocr_key="ocr.json",
+            printed_pages_key="printed.json",
             detections_key="detections.json",
         )
 

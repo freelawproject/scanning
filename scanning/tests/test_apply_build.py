@@ -13,7 +13,15 @@ from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
-from scanning import apply, bitonal, dots_mocr, jobs, services, yolo
+from scanning import (
+    apply,
+    bitonal,
+    dots_mocr,
+    jobs,
+    page_edits,
+    services,
+    yolo,
+)
 from scanning.factories import ScanFactory
 from scanning.models import (
     ApplyRun,
@@ -345,6 +353,44 @@ class TestBuildRun(BuildTestCase):
         self.assertEqual(run.attempts, 1)
         self.assertIn("page map", run.last_error)
         self.assertEqual(apply.phase_due(self.scan), "build")
+
+    def test_spent_attempts_cancel_the_unstarted_rows(self):
+        """A build that failed after it created its rows must not leave
+        them PENDING: they would run and bill for a run no glue reads."""
+        self.three_edits()
+        run = apply.build_run(self.scan)
+        self.assertEqual(
+            set(run.jobs.values_list("status", flat=True)),
+            {JobStatus.PENDING},
+        )
+        ExternalJob.objects.filter(
+            pk=self.rows(run, JobStage.CONVERT)[0].pk
+        ).update(status=JobStatus.COMPLETED)
+        run.attempts = apply.APPLY_MAX_ATTEMPTS - 1
+
+        self.assertTrue(apply.record_failure(run, RuntimeError("boom")))
+
+        statuses = list(
+            run.jobs.order_by("pk").values_list("status", flat=True)
+        )
+        self.assertEqual(statuses.count(JobStatus.CANCELLED), 8)
+        # The paid result is kept for the next build to carry.
+        self.assertEqual(statuses.count(JobStatus.COMPLETED), 1)
+
+    def test_a_superseded_run_makes_its_edits_pending_again(self):
+        """The stamp names the run that built the row in. When that run
+        is superseded the next build owes the row, and the step-1 banner
+        must say so again."""
+        self.three_edits()
+        apply.build_run(self.scan)
+        self.assertFalse(page_edits.has_pending_changes(self.scan))
+
+        apply.supersede_runs(self.scan, "reopened")
+
+        self.assertTrue(page_edits.has_pending_changes(self.scan))
+        self.assertTrue(
+            page_edits.pending_edit_flags(self.scan)["has_pending_inserts"]
+        )
 
     def test_spent_attempts_stop_the_trigger(self):
         run = ApplyRun.objects.create(

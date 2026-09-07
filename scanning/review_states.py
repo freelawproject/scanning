@@ -20,8 +20,8 @@ The three conditions, and what answers each one:
   the pass filters on it.
 - **The page complete volume exists.** :func:`final_volume_ready` is
   the hook, and one function is the whole surface of issue #224 here:
-  the standing ``ApplyRun`` has the bitonal copy and the detections of
-  the final volume glued, for this original.
+  the standing ``ApplyRun`` has every glue written
+  (``ApplyRun.is_complete``), for this original.
 - **The redactions are computed from the detection run.** That is the
   run's own ``applied_at`` stamp (``yolo.apply_state``), **not**
   ``Scan.redaction_rects``: a volume with no headnote to hide gets an
@@ -66,13 +66,14 @@ def final_volume_ready(scan: Scan) -> bool:
 
     The hook for issue #224, and its whole surface in this module. The
     corrected volume is the standing ``ApplyRun`` of the scan
-    (``apply.current_run``), and review 2 needs two of its glues: the
-    final ``bitonal.pdf`` and the detections in the final page space,
-    which are what the redaction compute measures. The OCR volume and
-    the printed pages are step 3's inputs and are judged there. The
-    redaction compute (``yolo.queue_ready_runs``) reads the same answer
-    before it queues, so the geometry is never measured in the space of
-    the original.
+    (``apply.current_run``), and it exists when **every** glue is
+    written (``ApplyRun.is_complete``): the final ``bitonal.pdf``, the
+    OCR volume with its printed pages, and the detections in the final
+    page space. Review 2 judges the redactions of the corrected volume,
+    so no output of that volume may still be missing when the review
+    opens. The redaction compute (``yolo.queue_ready_runs``) reads the
+    same answer before it queues, so the geometry is never measured in
+    the space of the original.
 
     The run must describe this original: a run built before a
     re-upload carries the old fingerprint, and a blank on either side
@@ -86,7 +87,7 @@ def final_volume_ready(scan: Scan) -> bool:
     from scanning import apply
 
     run = apply.current_run(scan)
-    if run is None or not (run.bitonal_key and run.detections_key):
+    if run is None or not run.is_complete:
         return False
     mine, theirs = run.source_fingerprint, scan.source_fingerprint
     return not (mine and theirs and mine != theirs)

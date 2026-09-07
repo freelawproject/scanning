@@ -91,6 +91,29 @@ SHARD_KINDS = (
     PageEdit.Kind.ROTATE_PAGE,
 )
 
+#: The kinds that carry a file a curator uploaded.
+UPLOAD_KINDS = (PageEdit.Kind.INSERT_PAGE, PageEdit.Kind.REPLACE_PAGE)
+
+#: A job row nobody has answered yet: waiting in our queue, or handed
+#: to the provider. What a supersede cancels, and what a run that gave
+#: up cancels too, or the rows would run and bill for a run nobody
+#: glues.
+UNSTARTED_JOB_STATUSES = (
+    frozenset({JobStatus.PENDING}) | IN_FLIGHT_JOB_STATUSES
+)
+
+#: A row of one stage that keeps that stage's glue from being written:
+#: still unstarted, or dead. A stage's glue is judged on that stage's
+#: rows alone (:func:`glues_due`).
+BLOCKING_JOB_STATUSES = UNSTARTED_JOB_STATUSES | DEAD_JOB_STATUSES
+
+#: The glues, each with the stage whose rows it reads.
+GLUE_STAGES = {
+    "bitonal": JobStage.CONVERT,
+    "ocr": JobStage.ANALYZE,
+    "detections": JobStage.DETECT,
+}
+
 
 class ApplyError(Exception):
     """The apply could not build or glue a run."""
@@ -316,10 +339,46 @@ def edit_page_count(edit: PageEdit) -> int:
         return 1
     if page_edits.uploaded_kind(edit) != "pdf":
         return 1
-    with edit.image.open("rb") as fh:
-        data = fh.read()
+    return _pdf_page_count(read_edit_file(edit))
+
+
+def _pdf_page_count(data: bytes) -> int:
+    """Return how many pages an uploaded PDF holds.
+
+    :param data: The file's bytes.
+    :returns: The page count.
+    :rtype: int
+    """
     with fitz.open(stream=data, filetype="pdf") as doc:
         return doc.page_count
+
+
+def preload_edit_files(scan: Scan) -> tuple[dict[int, bytes], dict[int, int]]:
+    """Read each uploaded file of the scan once, for the plan and the walk.
+
+    The plan needs a PDF's page count and the walk needs its bytes, so
+    a caller that runs both -- the build, the export -- would otherwise
+    pull every file from the bucket twice. The plan takes the counts
+    through ``page_counts`` and the walk the bytes through
+    ``read_file``.
+
+    :param scan: The scan whose standing inserts and replacements to
+        read.
+    :returns: ``({edit pk: bytes}, {edit pk: pages})`` over the current
+        rows of :data:`UPLOAD_KINDS`.
+    :rtype: tuple[dict[int, bytes], dict[int, int]]
+    """
+    files: dict[int, bytes] = {}
+    counts: dict[int, int] = {}
+    for edit in page_edits.current_edits(scan, *UPLOAD_KINDS):
+        data = read_edit_file(edit)
+        files[edit.pk] = data
+        counts[edit.pk] = (
+            _pdf_page_count(data)
+            if page_edits.uploaded_kind(edit) == "pdf"
+            else 1
+        )
+    return files, counts
 
 
 def plan_run(
@@ -661,9 +720,10 @@ def supersede_runs(scan: Scan, reason: str) -> int:
 
     now = timezone.now()
     count = 0
-    unstarted = frozenset({JobStatus.PENDING}) | IN_FLIGHT_JOB_STATUSES
     for run in scan.apply_runs.filter(superseded_at__isnull=True):
-        jobs.abandon_open(scan, reason, statuses=unstarted, apply_run=run)
+        jobs.abandon_open(
+            scan, reason, statuses=UNSTARTED_JOB_STATUSES, apply_run=run
+        )
         ApplyRun.objects.filter(pk=run.pk, superseded_at__isnull=True).update(
             superseded_at=now
         )
@@ -676,7 +736,12 @@ def supersede_runs(scan: Scan, reason: str) -> int:
 
 # ── the build phase ────────────────────────────────────────────────
 def _ensure_page_shard(
-    scan: Scan, source: fitz.Document, edit: PageEdit, tmp_dir: Path
+    scan: Scan,
+    source: fitz.Document,
+    edit: PageEdit,
+    tmp_dir: Path,
+    data: bytes | None = None,
+    page_count: int | None = None,
 ) -> dict:
     """Make sure one edit's shard is in the bucket, and describe it.
 
@@ -688,6 +753,9 @@ def _ensure_page_shard(
     :param source: The original, open.
     :param edit: An insert, a replacement or a rotation row.
     :param tmp_dir: Scratch space for the shard file.
+    :param data: The uploaded file's bytes, when the caller has read
+        them (:func:`preload_edit_files`). Read here otherwise.
+    :param page_count: The edit's page count, when the caller has it.
     :returns: ``{"key", "page_count", "size_bytes"}``.
     :rtype: dict
     :raises ApplyError: If the upload failed.
@@ -696,14 +764,13 @@ def _ensure_page_shard(
     if s3_sync.object_exists(key):
         return {
             "key": key,
-            "page_count": edit_page_count(edit),
+            "page_count": (
+                page_count if page_count is not None else edit_page_count(edit)
+            ),
             "size_bytes": _stored_size(key, edit),
         }
-    data = (
-        None
-        if edit.kind == PageEdit.Kind.ROTATE_PAGE
-        else read_edit_file(edit)
-    )
+    if data is None and edit.kind != PageEdit.Kind.ROTATE_PAGE:
+        data = read_edit_file(edit)
     local = tmp_dir / f"e{edit.pk}.pdf"
     with build_edit_shard(source, edit, data) as shard:
         page_count = shard.page_count
@@ -852,7 +919,10 @@ def _build(scan: Scan, run: ApplyRun) -> None:
     """
     started = time.monotonic()
     prefix = run_prefix(scan, run)
-    plan = plan_run(scan)
+    # Each uploaded file is read once: the plan takes its page count,
+    # the shard and the final PDF take its bytes.
+    files, counts = preload_edit_files(scan)
+    plan = plan_run(scan, counts)
     shards: dict[int, dict] = {}
     with tempfile.TemporaryDirectory(
         prefix=f"{BUILD_TMP_PREFIX}{scan.pk}-"
@@ -877,11 +947,20 @@ def _build(scan: Scan, run: ApplyRun) -> None:
                 # A shard's page count is the file's, so the plan needs
                 # no second pass.
                 shards = {
-                    edit.pk: _ensure_page_shard(scan, source, edit, tmp_dir)
+                    edit.pk: _ensure_page_shard(
+                        scan,
+                        source,
+                        edit,
+                        tmp_dir,
+                        data=files.get(edit.pk),
+                        page_count=counts.get(edit.pk),
+                    )
                     for edit in plan.shard_edits
                 }
                 final_path = tmp_dir / "final.pdf"
-                with build_final_pdf(source, plan) as out:
+                with build_final_pdf(
+                    source, plan, read_file=lambda edit: files[edit.pk]
+                ) as out:
                     out.save(str(final_path), garbage=3, deflate=True)
                 final_key = f"{prefix}final.pdf"
                 if not s3_sync.upload_file_object(
@@ -934,11 +1013,19 @@ def record_failure(run: ApplyRun, exc: Exception) -> bool:
     the crossing into "out of tries" is the one ERROR-level event, and
     the way back is the admin action that supersedes the run.
 
+    The crossing also cancels the run's unstarted rows. A build that
+    failed after it created its rows leaves them PENDING, and nothing
+    else stops them: they would ride the daemon, run and bill for a run
+    that no glue reads. A COMPLETED row is kept, as the supersede keeps
+    it, because the next build carries it.
+
     :param run: The run.
     :param exc: What the phase raised.
     :returns: Whether this failure spent the last attempt.
     :rtype: bool
     """
+    from scanning import jobs
+
     attempts = run.attempts + 1
     ApplyRun.objects.filter(pk=run.pk).update(
         attempts=attempts,
@@ -948,12 +1035,20 @@ def record_failure(run: ApplyRun, exc: Exception) -> bool:
     run.attempts = attempts
     gave_up = attempts >= APPLY_MAX_ATTEMPTS
     if gave_up:
+        cancelled = jobs.abandon_open(
+            run.scan,
+            f"the apply of run {run.label} gave up",
+            statuses=UNSTARTED_JOB_STATUSES,
+            apply_run=run,
+        )
         logger.exception(
-            "apply: scan %s: run %s failed; giving up after %d attempt(s). "
-            "Supersede the run from the admin to try again.",
+            "apply: scan %s: run %s failed; giving up after %d attempt(s) "
+            "and cancelling %d unstarted row(s). Supersede the run from "
+            "the admin to try again.",
             run.scan_id,
             run.label,
             attempts,
+            cancelled,
         )
     else:
         logger.warning(
@@ -1051,10 +1146,11 @@ def phase_due(scan: Scan, run=_UNSET) -> str | None:
 
     ``"build"`` when no run stands, the standing run is not built and
     has attempts left, or the built run's edit set no longer matches
-    the standing rows. ``"glue"`` when the built run's job rows are all
-    finished and a glue with ready inputs is not written. None while
-    the rows are in flight, when a row is dead (the bar shows it, and
-    the admin supersedes the run), or when the attempts are spent.
+    the standing rows. ``"glue"`` when a glue of the built run can be
+    written now (:func:`glues_due`). None when no glue can: its rows are
+    unstarted or dead (the bar shows a dead row, and the admin
+    supersedes the run), its volume inputs are not there, or the
+    attempts are spent.
 
     :param scan: The scan.
     :param run: The standing run, when the caller has it (the trigger
@@ -1072,39 +1168,62 @@ def phase_due(scan: Scan, run=_UNSET) -> str | None:
         return "build"
     if run.attempts >= APPLY_MAX_ATTEMPTS:
         return None
-    rows = list(run.jobs.all())
-    if any(row.status in DEAD_JOB_STATUSES for row in rows):
-        return None
-    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
-    if any(row.status in unfinished for row in rows):
-        return None
-    if glue_due(scan, run, rows):
+    if glues_due(scan, run, list(run.jobs.all())):
         return "glue"
     return None
 
 
-def glue_due(scan: Scan, run: ApplyRun, rows: list[ExternalJob]) -> bool:
-    """Return whether a glue of a built run can be written now.
+def _stage_blocked(rows: list[ExternalJob], stage: str) -> bool:
+    """Return whether one stage's rows keep that stage's glue waiting.
 
-    Each glue has its own inputs, and each is judged alone: the
-    bitonal copy needs the run's CONVERT rows only; the OCR volume and
-    the printed pages need the volume's glued OCR run too; the
-    detections need the volume's merged detection run, which the daemon
-    starts at upload (#250). The first two do not wait for the third.
-
-    :param scan: The scan.
-    :param run: A built run whose rows are all finished.
     :param rows: The run's rows.
-    :returns: Whether :func:`glue_run` has something to write.
+    :param stage: A ``JobStage`` value.
+    :returns: Whether a row of the stage is unstarted or dead.
     :rtype: bool
     """
-    if not run.bitonal_key:
-        return True
-    if not (run.ocr_key and run.printed_pages_key) and _volume_ocr_run(scan):
-        return True
-    if not run.detections_key and _volume_detect_run(scan):
-        return True
-    return False
+    return any(
+        row.stage == stage and row.status in BLOCKING_JOB_STATUSES
+        for row in rows
+    )
+
+
+def glues_due(scan: Scan, run: ApplyRun, rows: list[ExternalJob]) -> list[str]:
+    """Return the glues of a built run that can be written now.
+
+    Each glue has its own inputs, and each is judged alone, on the rows
+    of its own stage (:data:`GLUE_STAGES`): the bitonal copy needs the
+    run's CONVERT rows; the OCR volume and the printed pages need the
+    ANALYZE rows and the volume's glued OCR run; the detections need
+    the DETECT rows and the volume's merged detection run, which the
+    daemon starts at upload (#250). A row of one stage that is unstarted
+    or dead holds that stage's glue and no other, so a detection worker
+    that is slow or down never keeps the bitonal copy from being
+    written. The three names are the order :func:`_glue` writes them in.
+
+    :param scan: The scan.
+    :param run: A built run.
+    :param rows: The run's rows.
+    :returns: The names of the glues :func:`glue_run` can write.
+    :rtype: list[str]
+    """
+    due = []
+    if not run.bitonal_key and not _stage_blocked(
+        rows, GLUE_STAGES["bitonal"]
+    ):
+        due.append("bitonal")
+    if (
+        not (run.ocr_key and run.printed_pages_key)
+        and not _stage_blocked(rows, GLUE_STAGES["ocr"])
+        and _volume_ocr_run(scan)
+    ):
+        due.append("ocr")
+    if (
+        not run.detections_key
+        and not _stage_blocked(rows, GLUE_STAGES["detections"])
+        and _volume_detect_run(scan)
+    ):
+        due.append("detections")
+    return due
 
 
 def _candidate_scan_ids() -> set[int]:
@@ -1116,9 +1235,11 @@ def _candidate_scan_ids() -> set[int]:
     check would compute :func:`phase_due` for every one of them on
     every tick -- five queries each, growing with the corpus.
     Here each reason a scan may owe a phase is one query joined through
-    the scan, and a run with a dead row or spent attempts drops out at
-    the query. The steady state is six queries a tick, whatever the
-    corpus size; :func:`phase_due` then judges the candidates exactly.
+    the scan. A run with spent attempts drops out at the query, and so
+    does a glue whose own stage holds an unstarted or a dead row
+    (:func:`glues_due` judges the same way, row by row). The steady
+    state is six queries a tick, whatever the corpus size;
+    :func:`phase_due` then judges the candidates exactly.
 
     At most one run stands per scan: :func:`build_run` supersedes the
     standing one before it creates the next.
@@ -1135,10 +1256,15 @@ def _candidate_scan_ids() -> set[int]:
         attempts__lt=APPLY_MAX_ATTEMPTS,
     )
     built = standing.filter(built_at__isnull=False)
-    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
-    settled = built.exclude(jobs__status__in=DEAD_JOB_STATUSES).exclude(
-        jobs__status__in=unfinished
-    )
+
+    def blocked(stage: str):
+        """The runs whose rows of ``stage`` hold that stage's glue."""
+        return ExternalJob.objects.filter(
+            apply_run__isnull=False,
+            stage=stage,
+            status__in=BLOCKING_JOB_STATUSES,
+        ).values("apply_run_id")
+
     volume_consumed = {
         "scan__jobs__status": JobStatus.CONSUMED,
         "scan__jobs__apply_run__isnull": True,
@@ -1166,23 +1292,29 @@ def _candidate_scan_ids() -> set[int]:
             scan__page_edits__date_modified__gt=F("built_at"),
         ).values_list("scan_id", flat=True)
     )
-    # A glue whose inputs are there.
+    # A glue whose inputs are there, judged on its own stage's rows.
     ids.update(
-        settled.filter(bitonal_key="").values_list("scan_id", flat=True)
+        built.filter(bitonal_key="")
+        .exclude(pk__in=blocked(GLUE_STAGES["bitonal"]))
+        .values_list("scan_id", flat=True)
     )
     ids.update(
-        settled.filter(
+        built.filter(
             Q(ocr_key="") | Q(printed_pages_key=""),
             scan__jobs__stage=JobStage.ANALYZE,
             **volume_consumed,
-        ).values_list("scan_id", flat=True)
+        )
+        .exclude(pk__in=blocked(GLUE_STAGES["ocr"]))
+        .values_list("scan_id", flat=True)
     )
     ids.update(
-        settled.filter(
+        built.filter(
             detections_key="",
             scan__jobs__stage=JobStage.DETECT,
             **volume_consumed,
-        ).values_list("scan_id", flat=True)
+        )
+        .exclude(pk__in=blocked(GLUE_STAGES["detections"]))
+        .values_list("scan_id", flat=True)
     )
     return ids
 
@@ -1738,35 +1870,36 @@ def _glue_detections(
 
 
 def _glue(scan: Scan, run: ApplyRun, rows: list[ExternalJob]) -> list[str]:
-    """Phase 2: write every glue whose inputs are ready, once each.
+    """Phase 2: write every glue that is due (:func:`glues_due`), once each.
 
     :param scan: The scan.
-    :param run: The built run, rows all finished.
+    :param run: The built run.
     :param rows: The run's rows.
     :returns: The names of the glues written.
     :rtype: list[str]
     """
+    due = glues_due(scan, run, rows)
     written = []
     consumed: list[str] = []
     with tempfile.TemporaryDirectory(
         prefix=f"{BUILD_TMP_PREFIX}{scan.pk}-glue-"
     ) as tmp:
         tmp_dir = Path(tmp)
-        if not run.bitonal_key:
+        if "bitonal" in due:
             run.bitonal_key = _glue_bitonal(scan, run, rows, tmp_dir)
             ApplyRun.objects.filter(pk=run.pk).update(
                 bitonal_key=run.bitonal_key
             )
             written.append("bitonal")
             consumed.append(JobStage.CONVERT)
-    if not (run.ocr_key and run.printed_pages_key) and _volume_ocr_run(scan):
+    if "ocr" in due:
         run.ocr_key, run.printed_pages_key = _glue_ocr(scan, run, rows)
         ApplyRun.objects.filter(pk=run.pk).update(
             ocr_key=run.ocr_key, printed_pages_key=run.printed_pages_key
         )
         written.append("ocr")
         consumed.append(JobStage.ANALYZE)
-    if not run.detections_key and _volume_detect_run(scan):
+    if "detections" in due:
         run.detections_key = _glue_detections(scan, run, rows)
         ApplyRun.objects.filter(pk=run.pk).update(
             detections_key=run.detections_key
