@@ -6,6 +6,7 @@ the rows it creates. S3 is stood in for by patches that record what
 would be uploaded, so the tests see the keys and never the bucket.
 """
 
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.db import connection
@@ -480,6 +481,20 @@ class TestTriggerAndWorker(BuildTestCase):
                 detections_key="d",
             )
         self.assertEqual(apply.queue_ready_scans(), 2)
+
+    def test_the_trigger_stamps_the_queue_time(self):
+        """``update()`` skips ``auto_now``; the worker's age lift reads
+        ``date_modified`` as the time the scan was queued."""
+        before = timezone.now()
+        Scan.objects.filter(pk=self.scan.pk).update(
+            date_modified=before - timedelta(days=3)
+        )
+
+        self.assertEqual(apply.queue_ready_scans(), 1)
+
+        self.scan.refresh_from_db()
+        self.assertGreaterEqual(self.scan.date_modified, before)
+        self.assertIn("Waiting for the worker", self.scan.progress_message)
 
     def test_a_processing_apply_counts_against_the_room(self):
         self._done_scans(3)

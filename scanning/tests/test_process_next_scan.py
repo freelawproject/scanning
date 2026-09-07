@@ -12,6 +12,7 @@ from django.utils import timezone
 
 from scanning.factories import ExternalJobFactory, ScanFactory
 from scanning.management.commands.process_next_scan import (
+    CLAIM_LIFT_SECONDS,
     MAX_DB_RETRIES,
     Command,
 )
@@ -314,3 +315,28 @@ class TestClaimPriority(TestCase):
             [blank_scan.pk, upload_scan.pk, compute_scan.pk, apply_scan.pk],
         )
         self.assertIsNone(Command()._claim_next())
+
+    def test_an_apply_that_has_waited_is_claimed_next(self):
+        """The rank and the apply's in-flight cap stall each other: the
+        cap counts a QUEUED apply, and while uploads keep coming the
+        rank never reaches one. So an apply that has waited
+        ``CLAIM_LIFT_SECONDS`` goes next, and the drain goes on around it."""
+        waiting = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.APPLY_PAGE_EDITS
+        )
+        fresh = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.APPLY_PAGE_EDITS
+        )
+        upload = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.FULL_PIPELINE
+        )
+        now = timezone.now()
+        # The trigger writes date_modified when it queues (#224).
+        Scan.objects.filter(pk=waiting.pk).update(
+            date_modified=now - timedelta(seconds=CLAIM_LIFT_SECONDS + 60)
+        )
+        Scan.objects.filter(pk=fresh.pk).update(date_modified=now)
+
+        claimed = [Command()._claim_next()[0].pk for _ in range(3)]
+
+        self.assertEqual(claimed, [waiting.pk, upload.pk, fresh.pk])

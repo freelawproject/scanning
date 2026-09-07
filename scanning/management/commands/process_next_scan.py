@@ -46,6 +46,17 @@ RETRY_BACKOFF_SECONDS = 0.5
 #: redaction compute. Within one rank, oldest first, as before.
 CLAIM_PRIORITY = ("full_pipeline", "compute_redactions", "apply_page_edits")
 
+#: How long an apply may wait in the queue before it ranks first. The
+#: rank alone and the apply's in-flight cap stall each other: the cap
+#: counts a QUEUED apply, so five of them fill the set, and while any
+#: upload or compute keeps arriving the worker claims none of them and
+#: the trigger queues no more -- for the length of a 532-scan drain
+#: (#218), with five volumes out of review 2 showing "queued" the whole
+#: time. So an apply that has waited this long is claimed next, one at
+#: a time, and the drain goes on around it. The wait is measured from
+#: the trigger's write of ``date_modified``.
+CLAIM_LIFT_SECONDS = 15 * 60
+
 
 class Command(BaseCommand):
     help = (
@@ -142,15 +153,25 @@ class Command(BaseCommand):
             scan is queued.
         :rtype: tuple | None
         """
+        from datetime import timedelta
+
         from django.db import transaction
         from django.db.models import Case, IntegerField, Value, When
         from django.utils import timezone
 
         from scanning.models import QueuedAction, Scan, Status
 
-        # ``CLAIM_PRIORITY``: an upload first, the apply last. A blank
-        # action is the full pipeline, so it ranks with it.
+        # ``CLAIM_PRIORITY``: an upload first, the apply last -- unless
+        # the apply has waited ``CLAIM_LIFT_SECONDS``, in which case it
+        # is next. A blank action is the full pipeline, so it ranks
+        # with it.
+        lifted_before = timezone.now() - timedelta(seconds=CLAIM_LIFT_SECONDS)
         rank = Case(
+            When(
+                queued_action=QueuedAction.APPLY_PAGE_EDITS,
+                date_modified__lt=lifted_before,
+                then=Value(0),
+            ),
             When(queued_action="", then=Value(0)),
             *(
                 When(queued_action=action, then=Value(index))

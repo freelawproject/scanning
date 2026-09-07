@@ -522,11 +522,18 @@ the `reopen_page_review` view. What must not be broken:
   the OCR and detection arms read the *live* volume run through
   `_glued_volume_scan_ids` (the rule of `_volume_ocr_run`, over the
   corpus in one query), and a withdrawn stale row is out of the
-  edit-set arm, with the three cases of `page_edits.is_stale`. **The worker claims by
-  action before age** (`process_next_scan.CLAIM_PRIORITY`): the full
-  pipeline, then the redaction compute, then the apply. A volunteer's
-  upload never waits behind the five applies the trigger may hold, and
-  a curator's approval never waits behind a backfill nobody watches.
+  edit-set arm, with the three cases of `page_edits.is_stale`. The two
+  volume arms read the rows of the runs that owe the glue only, so the
+  rows they move grow with those runs and not with the corpus. **The
+  worker claims by action before age** (`process_next_scan.CLAIM_PRIORITY`):
+  the full pipeline, then the redaction compute, then the apply. A
+  volunteer's upload never waits behind the five applies the trigger
+  may hold, and a curator's approval never waits behind a backfill
+  nobody watches. **An apply that has waited `CLAIM_LIFT_SECONDS`
+  (15 min, from the trigger's `date_modified` write) is claimed
+  next**: the rank and the cap stall each other otherwise, since the cap
+  counts a QUEUED apply and the rank never reaches one while uploads
+  keep coming, so five volumes sat out of review 2 for a whole drain.
 - **A dead row is noted once** (`_note_dead_rows`, on the trigger
   tick, stamped in `ApplyRun.dead_row_noted_at`): a dead row is
   terminal for its stage, so `is_complete` never turns true and review

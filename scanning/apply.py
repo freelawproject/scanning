@@ -1412,21 +1412,25 @@ def _candidate_scan_ids() -> set[int]:
         .exclude(pk__in=blocked(GLUE_STAGES["bitonal"]))
         .values_list("scan_id", flat=True)
     )
+    owing_ocr = built.filter(Q(ocr_key="") | Q(printed_pages_key=""))
     ids.update(
-        built.filter(
-            Q(ocr_key="") | Q(printed_pages_key=""),
+        owing_ocr.filter(
             scan_id__in=_glued_volume_scan_ids(
-                JobStage.ANALYZE, JobEngine.DOTS_MOCR
+                JobStage.ANALYZE,
+                JobEngine.DOTS_MOCR,
+                owing_ocr.values("scan_id"),
             ),
         )
         .exclude(pk__in=blocked(GLUE_STAGES["ocr"]))
         .values_list("scan_id", flat=True)
     )
+    owing_detections = built.filter(detections_key="")
     ids.update(
-        built.filter(
-            detections_key="",
+        owing_detections.filter(
             scan_id__in=_glued_volume_scan_ids(
-                JobStage.DETECT, JobEngine.BLACKLETTER
+                JobStage.DETECT,
+                JobEngine.BLACKLETTER,
+                owing_detections.values("scan_id"),
             ),
         )
         .exclude(pk__in=blocked(GLUE_STAGES["detections"]))
@@ -1435,17 +1439,23 @@ def _candidate_scan_ids() -> set[int]:
     return ids
 
 
-def _glued_volume_scan_ids(stage: str, engine: str) -> set[int]:
-    """Return the approved scans whose live volume run of one stage is glued.
+def _glued_volume_scan_ids(stage: str, engine: str, scan_ids) -> set[int]:
+    """Return the scans, among ``scan_ids``, whose live volume run is glued.
 
     The rule of :func:`_volume_ocr_run` and :func:`_volume_detect_run`
-    -- the rows at the highest run number, all ``CONSUMED`` -- over the
-    whole corpus in one query, for the pre-check. Only the volume rows:
-    the apply's own rows share the stage and the engine.
+    -- the rows at the highest run number, all ``CONSUMED`` -- in one
+    query, for the pre-check. Only the volume rows: the apply's own
+    rows share the stage and the engine. Scoped to the scans whose
+    standing run still owes that glue, so the rows that cross the wire
+    grow with the runs waiting on a glue and not with the approved
+    corpus: over every approved scan the two calls moved about twenty
+    rows a volume per tick.
 
     :param stage: A ``JobStage`` value.
     :param engine: A ``JobEngine`` value.
-    :returns: The scan ids.
+    :param scan_ids: The scans to judge, a queryset or an iterable of
+        primary keys.
+    :returns: The scan ids whose live run is glued.
     :rtype: set[int]
     """
     from collections import defaultdict
@@ -1456,7 +1466,7 @@ def _glued_volume_scan_ids(stage: str, engine: str) -> set[int]:
         engine=engine,
         opinion=None,
         apply_run__isnull=True,
-        scan__status=APPLY_STATUS,
+        scan_id__in=scan_ids,
     ).values_list("scan_id", "run", "status")
     for scan_id, run, status in rows:
         by_scan[scan_id].append((run, status))
@@ -1584,12 +1594,16 @@ def queue_ready_scans() -> int:
             status=Status.QUEUED,
             queued_action=QueuedAction.APPLY_PAGE_EDITS,
             progress_message=(
-                "Building the corrected volume from the page edits."
+                "Waiting for the worker to build the corrected volume "
+                "from the page edits."
                 if phase == "build"
-                else "Assembling the corrected volume."
+                else "Waiting for the worker to assemble the corrected volume."
             ),
             progress_current=0,
             progress_total=0,
+            # ``update()`` skips ``auto_now``; this is the queue time
+            # the worker's age lift reads (``process_next_scan.CLAIM_LIFT_SECONDS``).
+            date_modified=timezone.now(),
         )
         if claimed:
             logger.info("apply: scan %s: queued the %s phase", scan.pk, phase)
