@@ -470,6 +470,24 @@ class TestFulfilledIsDerived(RepairTestCase):
 
         self.assertFalse(repairs.open_requests(self.scan).get().fulfilled)
 
+    def test_a_scan_with_no_fingerprint_takes_any_edit(self):
+        # The other blank of the rule: the volume was never sharded,
+        # so nothing stamped the scan. The edit carries a fingerprint
+        # of its own and must still fulfil. The test reads the scan
+        # through the outer row, which is where the query reads it.
+        self.scan.source_fingerprint = ""
+        self.scan.save(update_fields=["source_fingerprint"])
+        self._replace(pdf_page=2)
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+            source_fingerprint="100:3",
+        )
+
+        self.assertTrue(repairs.open_requests(self.scan).get().fulfilled)
+
     def test_a_legacy_edit_with_no_fingerprint_fulfils(self):
         self._replace(pdf_page=2)
         PageEditFactory(

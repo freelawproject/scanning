@@ -19,7 +19,7 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
-from scanning import repairs, s3_sync
+from scanning import repairs, s3_sync, stats
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
@@ -402,6 +402,20 @@ def repair_queue(request: HttpRequest) -> HttpResponse:
             # context processor that feeds the header badge: one query.
         },
     )
+
+
+@login_required
+def stats_view(request: HttpRequest) -> HttpResponse:
+    """How much work is done, and where the rest of it waits (#260).
+
+    Every user sees it, as they see ``/repairs/``: the counts are not
+    sensitive, and a scanner reads the same report as a member of the
+    staff. The queries live in ``scanning.stats``.
+
+    :param request: The current HTTP request.
+    :return: The rendered stats page.
+    """
+    return render(request, "scanning/stats.html", stats.collect())
 
 
 @login_required
