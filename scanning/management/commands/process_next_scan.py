@@ -35,26 +35,17 @@ logger = logging.getLogger(__name__)
 MAX_DB_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 0.5
 
-#: The order the worker claims QUEUED scans in, by action, before their
-#: age. The loop is serial (#156), so whatever the worker runs holds
-#: every other task for that long, and the queue must put a person's
-#: wait first: a volunteer's upload (the full pipeline, which a blank
-#: action also means) before a curator's approval waiting on its
-#: redaction compute, before the apply of the page edits (#224), which
-#: is a backfill nobody watches and may hold five volumes at once
-#: (``apply.MAX_SCANS_IN_FLIGHT``). An action not listed ranks with the
-#: redaction compute. Within one rank, oldest first, as before.
+#: The claim order, by action, then by age. The worker is serial, so a
+#: person's wait goes first: an upload (a blank action means the same),
+#: then a redaction compute, then the page edit apply (#224), a
+#: backfill nobody watches. An unlisted action ranks with the compute.
 CLAIM_PRIORITY = ("full_pipeline", "compute_redactions", "apply_page_edits")
 
-#: How long an apply may wait in the queue before it ranks first. The
-#: rank alone and the apply's in-flight cap stall each other: the cap
-#: counts a QUEUED apply, so five of them fill the set, and while any
-#: upload or compute keeps arriving the worker claims none of them and
-#: the trigger queues no more -- for the length of a 532-scan drain
-#: (#218), with five volumes out of review 2 showing "queued" the whole
-#: time. So an apply that has waited this long is claimed next, one at
-#: a time, and the drain goes on around it. The wait is measured from
-#: the trigger's write of ``date_modified``.
+#: An apply queued longer than this is claimed next. Without it, a
+#: steady stream of uploads starves the apply: the five queued applies
+#: (``apply.MAX_SCANS_IN_FLIGHT``) are never claimed, and the trigger
+#: queues no more. The wait is measured from the trigger's write of
+#: ``date_modified``.
 CLAIM_LIFT_SECONDS = 15 * 60
 
 
@@ -161,10 +152,8 @@ class Command(BaseCommand):
 
         from scanning.models import QueuedAction, Scan, Status
 
-        # ``CLAIM_PRIORITY``: an upload first, the apply last -- unless
-        # the apply has waited ``CLAIM_LIFT_SECONDS``, in which case it
-        # is next. A blank action is the full pipeline, so it ranks
-        # with it.
+        # ``CLAIM_PRIORITY``, with an apply that has waited
+        # ``CLAIM_LIFT_SECONDS`` moved to the front.
         lifted_before = timezone.now() - timedelta(seconds=CLAIM_LIFT_SECONDS)
         rank = Case(
             When(

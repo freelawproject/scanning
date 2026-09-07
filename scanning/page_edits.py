@@ -46,14 +46,9 @@ logger = logging.getLogger(__name__)
 def standing_edits(scan: Scan, *kinds: str):
     """Return the scan's standing edits of the given kinds.
 
-    A decision stands until a curator takes it back, which writes
-    ``withdrawn_at`` (#232). That is the one stamp that closes a row.
-    The apply stamp (``applied_at``, #224) is a ledger entry: an
-    applied deletion is still a deletion, and a reader that dropped it
-    would show the page as live while the next build deletes it again.
-    Nothing deletes a row, so the withdrawn ones stay as the audit of
-    what a person decided and when. The filter lives here, once,
-    because every reader of these rows comes through this function.
+    Standing means not withdrawn (the module docstring has the rule).
+    The filter lives here, once: every reader of these rows comes
+    through this function.
 
     :param scan: The scan whose edits are wanted.
     :param kinds: ``PageEdit.Kind`` values. All kinds when empty.
