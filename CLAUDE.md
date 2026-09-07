@@ -908,12 +908,15 @@ trained on), tracked on `ExternalJob` rows at
   re-queues mid-flight scans and returns, so the pipeline continues on
   a scan it no longer holds — and a COMPLETED row is a paid result the
   carry re-reads on that retry. The
-  staff button on `/scan/process/` remains as the manual way in — a
-  re-run over an edited volume, or a backfill for scans uploaded while
-  the stage was button-only. Row creation is what costs GPU money, so
-  the creators' caller set stays pinned by an AST test
-  (`TestKnownEnqueuePaths`): exactly the pipeline and the button.
-  The button's request makes **no** call to RunPod, and it never cuts
+  staff button on `/scan/process/` is gone since #224: a re-read over
+  an edited volume is the apply's, page by page, and a whole-volume
+  re-run paid RunPod for every page again. The endpoint
+  (`views_process.start_dots_mocr`) remains as the manual way in for a
+  staff POST — a backfill for a scan uploaded while the stage was
+  button-only. Row creation is what costs GPU money, so the creators'
+  caller set stays pinned by an AST test (`TestKnownEnqueuePaths`):
+  exactly the pipeline and that endpoint.
+  The endpoint's request makes **no** call to RunPod, and it never cuts
   shards: `sharding.committed_manifest` verifies the stored set with
   one `head_object` on the original (size plus `Scan.page_count` *is*
   the whole fingerprint), so a web pod never pulls a multi-GB PDF and
