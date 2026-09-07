@@ -79,6 +79,8 @@ class BuildTestCase(ApplyTestCase):
             ("scanning.s3_sync.s3_original_key", lambda scan: ORIGINAL_KEY),
             ("scanning.services._can_convert", lambda pk, manifest: True),
             ("scanning.services._can_analyze", lambda pk, manifest: True),
+            ("scanning.services.convert_stage_open", lambda: True),
+            ("scanning.services.analyze_stage_open", lambda: True),
             ("scanning.yolo.enabled", lambda: True),
         ):
             patcher = patch(target, side_effect=side)
@@ -572,19 +574,50 @@ class TestTriggerAndWorker(BuildTestCase):
         self.assertNotIn(self.scan.pk, apply._candidate_scan_ids())
         self.assertIsNone(apply.phase_due(self.scan))
 
-    def test_a_closed_gate_refuses_the_build(self):
+    def test_a_closed_gate_keeps_the_scan_out_of_the_queue(self):
         """A stage skipped in silence would glue a greyscale page into
-        the bitonal copy and open review 2 on it."""
+        the bitonal copy and open review 2 on it; a refusal that counted
+        an attempt wrote every edited volume off after three ticks, with
+        an admin supersede each when the stage came back. So the trigger
+        reads the gates first: the scan waits unqueued, spends nothing,
+        and is queued the tick the stage returns."""
+        apply._GATES_LOGGED.clear()
         self.three_edits()
-        with patch("scanning.services._can_convert", return_value=False):
-            with self.assertRaises(apply.ApplyError) as caught:
+        with patch("scanning.services.convert_stage_open", return_value=False):
+            with self.assertLogs("scanning.apply", level="WARNING") as logs:
+                self.assertIsNone(apply.phase_due(self.scan))
+            self.assertEqual(len(logs.output), 1)
+            self.assertIn("convert stage", logs.output[0])
+            # Once, not every 15 seconds.
+            with self.assertNoLogs("scanning.apply", level="WARNING"):
+                self.assertIsNone(apply.phase_due(self.scan))
+            self.assertEqual(apply.queue_ready_scans(), 0)
+        self.assertIsNone(apply.current_run(self.scan))
+
+        self.assertEqual(apply.phase_due(self.scan), "build")
+        self.assertEqual(apply.queue_ready_scans(), 1)
+
+    def test_a_volume_with_deletes_alone_needs_no_gate(self):
+        self.edit(PageEdit.Kind.DELETE_PAGE, pdf_page=2)
+        with patch("scanning.services.convert_stage_open", return_value=False):
+            self.assertEqual(apply.phase_due(self.scan), "build")
+
+    def test_a_gate_closed_at_build_time_costs_no_attempt_and_no_upload(
+        self,
+    ):
+        """The backstop for a gate that closes between the queue and the
+        claim: it refuses before the shards and the final PDF are cut."""
+        self.three_edits()
+        with patch("scanning.services.convert_stage_open", return_value=False):
+            with self.assertRaises(apply.GateClosedError) as caught:
                 apply.build_run(self.scan)
 
         self.assertIn("convert stage", str(caught.exception))
         run = apply.current_run(self.scan)
         self.assertFalse(run.is_built)
+        self.assertEqual(run.attempts, 0)
         self.assertEqual(run.jobs.count(), 0)
-        self.assertEqual(run.attempts, 1)
+        self.assertEqual(self.uploads, {})
 
     def test_a_dead_row_is_noted_once(self):
         self.three_edits()

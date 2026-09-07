@@ -721,11 +721,13 @@ document.addEventListener('DOMContentLoaded', function () {
         if (old) { old.remove(); }
         var note = document.createElement('span');
         note.className = 'replaced-note';
+        // No Undo on a locked volume (#224): the endpoint refuses it.
         note.innerHTML =
             'This page has been replaced. ' +
             '<a href="' + escapeHtml(replaced.url) + '" target="_blank" rel="noopener">View</a>' +
+            (pageEditsLocked ? '' :
             ' <button class="undo-replace-btn" data-pdf-page="' + pdfPage + '" ' +
-            'title="Take this replacement back">Undo</button>';
+            'title="Take this replacement back">Undo</button>');
         label.appendChild(note);
         refreshSavedLabel(label);
     }
@@ -1444,6 +1446,10 @@ document.addEventListener('DOMContentLoaded', function () {
             return;
         }
 
+        // Each answer is read (#224): a locked volume refuses with 409
+        // and writes no row, and a page must be marked only when the
+        // server marked it. The old blind ``then`` told the curator a
+        // duplicate was handled that the corrected volume kept.
         var promises = toDelete.map(function (pdfPage) {
             return fetch('/scans/' + documentId + '/delete-page/', {
                 method: 'POST',
@@ -1452,22 +1458,35 @@ document.addEventListener('DOMContentLoaded', function () {
                     'X-CSRFToken': csrfToken,
                 },
                 body: JSON.stringify({ pdf_page: pdfPage }),
-            }).then(function (r) { return r.json(); });
+            }).then(function (r) {
+                return r.json().then(function (data) {
+                    return { pdfPage: pdfPage, ok: r.ok && data.status === 'ok', error: data.error };
+                });
+            }).catch(function () {
+                return { pdfPage: pdfPage, ok: false, error: 'Could not reach the server.' };
+            });
         });
 
-        Promise.all(promises).then(function () {
-            toDelete.forEach(function (pdfPage) {
+        Promise.all(promises).then(function (results) {
+            var refused = results.filter(function (res) { return !res.ok; });
+            results.filter(function (res) { return res.ok; }).forEach(function (res) {
                 var containers = document.querySelectorAll('.page-container');
                 containers.forEach(function (c) {
                     var label = c.querySelector('.page-label');
-                    if (label && label.textContent.indexOf('PDF p.' + pdfPage) !== -1) {
+                    if (label && label.textContent.indexOf('PDF p.' + res.pdfPage) !== -1) {
                         c.style.opacity = '0.3';
                         c.style.pointerEvents = 'none';
-                        label.innerHTML = '<span>PDF p.' + pdfPage + ' &mdash; MARKED FOR DELETION</span>';
+                        label.innerHTML = '<span>PDF p.' + res.pdfPage + ' &mdash; MARKED FOR DELETION</span>';
                     }
                 });
             });
-
+            if (refused.length) {
+                showToast(refused[0].error || 'Could not mark ' + refused.length + ' page(s) for deletion.');
+                return;
+            }
+            if (typeof window.onPageEditSaved === 'function') {
+                window.onPageEditSaved();
+            }
             btn.textContent = 'Deleted';
             btn.disabled = true;
             btn.closest('.issue-card').style.opacity = '0.5';

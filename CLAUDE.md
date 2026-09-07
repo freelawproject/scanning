@@ -592,13 +592,21 @@ the `reopen_page_review` view. What must not be broken:
   apply row's result under `jobs/apply/a{n}/{stage}/{engine}/`.
   `TestKnownEnqueuePaths` pins `apply.py` as a creator on all three
   stages, behind the pipeline's own gates (`_can_convert`,
-  `_can_analyze`, `yolo.enabled` plus S3). **A closed gate refuses the
-  build** when the plan has a shard edit, with the stage named: a stage
-  skipped in silence would still glue (the greyscale shard into the
-  bitonal copy, a hole into the OCR volume, nothing into the
+  `_can_analyze`, `yolo.enabled` plus S3). **A closed gate holds the
+  scan out of the queue** (`gates_closed`, read by `phase_due` before
+  it answers "build", through `services.convert_stage_open` and
+  `analyze_stage_open`, the pipeline's own checks minus the shard set):
+  a stage skipped in silence would still glue (the greyscale shard into
+  the bitonal copy, a hole into the OCR volume, nothing into the
   detections), read complete, and open review 2 on a bad page. The
-  refusal counts an attempt, and the bar says "ask a staff member" at
-  the last one. An apply row carries **no**
+  scan waits unqueued, spends no attempt, is logged once per crossing
+  (`_GATES_LOGGED`), and is queued the tick the stage returns. A
+  refusal that counted an attempt wrote every edited volume off after
+  three ticks, with an admin supersede each when the stage came back.
+  `_build` keeps the check as a backstop, right after the plan and
+  before any upload, and raises `GateClosedError`, which `build_run`
+  re-raises without counting. A volume with deletes alone needs no
+  gate. An apply row carries **no**
   `source_fingerprint`: its manifest source is the sum over the
   one-page shards, which names no original. `yolo.enqueue_missing_runs`
   filters `apply_run__isnull=True` as well, so a volume that carries

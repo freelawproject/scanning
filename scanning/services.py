@@ -2166,6 +2166,35 @@ def _can_convert(scan_pk: int, manifest: dict | None) -> bool:
     return True
 
 
+def convert_stage_open() -> bool:
+    """Return whether doctor can be handed a shard in this environment.
+
+    The two checks of :func:`_can_convert` that need no shard set:
+    doctor configured, and S3 active for the presigned GET. The page
+    edit apply (#224) asks this before it queues a build, so a closed
+    stage costs no attempt and no upload.
+
+    :returns: Whether the conversion stage is open.
+    :rtype: bool
+    """
+    from scanning import doctor_client, s3_sync
+
+    return doctor_client.enabled() and s3_sync.s3_active()
+
+
+def analyze_stage_open() -> bool:
+    """Return whether dots.mocr can be handed a shard in this environment.
+
+    The mirror of :func:`convert_stage_open` for :func:`_can_analyze`.
+
+    :returns: Whether the OCR stage is open.
+    :rtype: bool
+    """
+    from scanning import dots_mocr, s3_sync
+
+    return dots_mocr.enabled() and s3_sync.s3_active()
+
+
 def _can_analyze(scan_pk: int, manifest: dict | None) -> bool:
     """Return whether this environment can hand shards to dots.mocr.
 

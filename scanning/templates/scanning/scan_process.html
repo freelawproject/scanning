@@ -133,7 +133,7 @@
         </div>
         <p class="mt-0.5 text-gray-700 dark:text-gray-300">{{ issue.message }}</p>
         <div class="flex gap-1 mt-1">
-          {% if issue.check_name == 'duplicate_page' %}
+          {% if issue.check_name == 'duplicate_page' and not page_edits_locked %}
           <button class="text-[10px] px-2 py-0.5 rounded bg-red-600 text-white" onclick="event.stopPropagation(); deleteDuplicates(this)" data-message="{{ issue.message }}">Delete Duplicates</button>
           {% endif %}
           {% if issue.severity != 'error' %}

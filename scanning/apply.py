@@ -44,6 +44,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -117,6 +118,17 @@ GLUE_STAGES = {
 
 class ApplyError(Exception):
     """The apply could not build or glue a run."""
+
+
+class GateClosedError(ApplyError):
+    """A stage the edited pages need is off in this environment.
+
+    Not a failure of the run: nothing is wrong with the volume, and the
+    build is right as soon as the flag or the credentials return. So
+    :func:`build_run` re-raises it without counting an attempt, and
+    :func:`phase_due` reads the gates first so the scan is not queued
+    at all while one is closed.
+    """
 
 
 # ── keys ───────────────────────────────────────────────────────────
@@ -906,12 +918,8 @@ def _ensure_rows(
     if not plan.shard_edits:
         return []
     manifest = shard_manifest(scan, plan, shards)
-    # Every gate first, and a closed one refuses the build. A stage
-    # skipped in silence would glue all the same: the bitonal copy would
-    # take the greyscale shard, the OCR volume a hole, the detections
-    # nothing, and the run would read complete and open review 2 on a
-    # bad page. The refusal counts an attempt, and after the last one
-    # the bar says "ask a staff member", which is the truth.
+    # ``_build`` read the gates before any upload; this is the same
+    # question through the pipeline's own functions, with the manifest.
     gates = {
         "convert": services._can_convert(scan.pk, manifest),
         "analyze": services._can_analyze(scan.pk, manifest),
@@ -919,9 +927,9 @@ def _ensure_rows(
     }
     closed = [name for name, open_ in gates.items() if not open_]
     if closed:
-        raise ApplyError(
-            f"the {', '.join(closed)} stage(s) are off in this environment, "
-            f"and {len(plan.shard_edits)} edited page(s) need them"
+        raise GateClosedError(
+            f"The corrected volume waits: the {', '.join(closed)} stage(s) "
+            f"are off in this environment."
         )
     rows: list[ExternalJob] = []
     if gates["convert"]:
@@ -968,6 +976,20 @@ def _build(scan: Scan, run: ApplyRun) -> None:
     # the shard and the final PDF take its bytes.
     files, counts = preload_edit_files(scan)
     plan = plan_run(scan, counts)
+    # The backstop of the trigger's gate check: a gate that closed
+    # between the queue and the claim refuses here, before the shards
+    # and the final PDF are cut and uploaded for nothing. A stage
+    # skipped in silence would still glue -- the greyscale shard into
+    # the bitonal copy, a hole into the OCR volume, nothing into the
+    # detections -- read complete, and open review 2 on a bad page.
+    if plan.shard_edits:
+        closed = gates_closed(scan)
+        if closed:
+            raise GateClosedError(
+                f"The corrected volume waits: the {', '.join(closed)} "
+                f"stage(s) are off in this environment, and "
+                f"{len(plan.shard_edits)} edited page(s) need them."
+            )
     shards: dict[int, dict] = {}
     with tempfile.TemporaryDirectory(
         prefix=f"{BUILD_TMP_PREFIX}{scan.pk}-"
@@ -1143,6 +1165,12 @@ def build_run(scan: Scan) -> ApplyRun:
         )
     try:
         _build(scan, run)
+    except GateClosedError:
+        # Not the run's fault, and nothing to retry: the build is right
+        # the moment the stage returns, and the trigger asks the gates
+        # before it queues. Counting it would spend the attempts on a
+        # configuration and leave every edited volume to an admin.
+        raise
     except Exception as exc:
         gave_up = record_failure(run, exc)
         raise ApplyError(
@@ -1154,6 +1182,79 @@ def build_run(scan: Scan) -> ApplyRun:
             )
         ) from exc
     return run
+
+
+# ── the gates ──────────────────────────────────────────────────────
+#: The stage each edited page must pass, and how to ask whether it is
+#: open here. The same three checks the pipeline makes before it
+#: creates a row (``services._can_convert``, ``_can_analyze``, and
+#: ``yolo.enabled`` with S3), minus the shard set, which the apply cuts
+#: itself.
+def _gate_probes() -> dict[str, Callable[[], bool]]:
+    from scanning import services, yolo
+
+    return {
+        "convert": services.convert_stage_open,
+        "analyze": services.analyze_stage_open,
+        "detect": lambda: yolo.enabled() and s3_sync.s3_active(),
+    }
+
+
+#: The closed gates last logged per scan, so the crossing is logged
+#: once and not every 15 seconds. Cleared when the gates open again.
+_GATES_LOGGED: dict[int, tuple[str, ...]] = {}
+
+
+def gates_closed(scan: Scan) -> list[str]:
+    """Return the stages an edited page needs that are off right now.
+
+    :param scan: The scan, for the log line.
+    :returns: Stage names, in :data:`GLUE_STAGES` order; empty when
+        every gate is open.
+    :rtype: list[str]
+    """
+    closed = [name for name, probe in _gate_probes().items() if not probe()]
+    if closed:
+        if _GATES_LOGGED.get(scan.pk) != tuple(closed):
+            _GATES_LOGGED[scan.pk] = tuple(closed)
+            logger.warning(
+                "apply: scan %s: the %s stage(s) are off in this "
+                "environment, and its edited pages need them; the build "
+                "waits until they return",
+                scan.pk,
+                ", ".join(closed),
+            )
+    else:
+        _GATES_LOGGED.pop(scan.pk, None)
+    return closed
+
+
+def needs_gates(scan: Scan) -> bool:
+    """Return whether a build of this scan would cut a one-page shard.
+
+    A standing edit of a shard kind is the test: a volume with deletes
+    alone, or with no structural edit, needs no stage and builds with
+    every gate closed. A shadowed edit (a rotation of a deleted page)
+    counts here and not in ``plan.shard_edits``; the over-refusal is
+    harmless, since the stage returns for both.
+
+    :param scan: The scan.
+    :returns: Whether the gates must be open for the build.
+    :rtype: bool
+    """
+    return bool(page_edits.current_edits(scan, *SHARD_KINDS))
+
+
+def _build_or_wait(scan: Scan) -> str | None:
+    """Answer ``"build"``, or None while a needed stage is off.
+
+    :param scan: The scan that owes a build.
+    :returns: ``"build"`` or None.
+    :rtype: str | None
+    """
+    if needs_gates(scan) and gates_closed(scan):
+        return None
+    return "build"
 
 
 # ── the trigger ────────────────────────────────────────────────────
@@ -1196,7 +1297,9 @@ def phase_due(scan: Scan, run=_UNSET) -> str | None:
 
     ``"build"`` when no run stands, the standing run is not built and
     has attempts left, or the built run's edit set no longer matches
-    the standing rows. ``"glue"`` when a glue of the built run can be
+    the standing rows -- unless a stage the edited pages need is off
+    (:func:`gates_closed`), in which case the scan waits unqueued and
+    spends no attempt. ``"glue"`` when a glue of the built run can be
     written now (:func:`glues_due`). None when no glue can: its rows are
     unstarted or dead (the bar shows a dead row, and the admin
     supersedes the run), its volume inputs are not there, or the
@@ -1211,11 +1314,13 @@ def phase_due(scan: Scan, run=_UNSET) -> str | None:
     if run is _UNSET:
         run = current_run(scan)
     if run is None:
-        return "build"
+        return _build_or_wait(scan)
     if not run.is_built:
-        return "build" if run.attempts < APPLY_MAX_ATTEMPTS else None
+        return (
+            _build_or_wait(scan) if run.attempts < APPLY_MAX_ATTEMPTS else None
+        )
     if run.edit_ids != _current_edit_ids(scan):
-        return "build"
+        return _build_or_wait(scan)
     if run.attempts >= APPLY_MAX_ATTEMPTS:
         return None
     if glues_due(scan, run, list(run.jobs.all())):
