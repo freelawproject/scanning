@@ -370,6 +370,28 @@ class TestMergeDotsmocrResults(AnalyzeJobsMixin, TestCase):
         self.assertEqual(document["filtered_pages"], [1])
         self.assertEqual(document["recovered_pages"], [2])
 
+    def test_a_raw_line_break_is_repaired_from_the_stored_answer(self):
+        """#268 shape 1: the model copied the printed line break into a
+        ``text`` value. The relaxed parse reads it, and the page keeps
+        the character."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=2)
+        page = make_filtered_page(1)
+        page["raw"] = GOOD_RAW.replace("[her] out", "[her] out\n")
+        self.assertNotEqual(page["raw"], GOOD_RAW)
+        self.write_envelope(0, make_envelope(rows[0], [make_page(0), page]))
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        document = self.upload.call_args[0][1]
+        repaired = document["pages"][1]
+        self.assertIs(repaired["filtered"], False)
+        self.assertEqual(repaired["repaired_by"], "glue")
+        self.assertEqual(len(repaired["repaired"]), 1)
+        self.assertTrue(repaired["repaired"][0].startswith("relax_controls@"))
+        self.assertIn("out\n", repaired["cells"][1]["text"])
+        self.assertEqual(document["filtered_pages"], [])
+        self.assertEqual(document["repaired_pages"], [1])
+
     def test_a_filtered_page_is_repaired_from_the_stored_answer(self):
         """#242: the answer was good and one character broke it. The
         glue puts the character back, so the page has cells again."""

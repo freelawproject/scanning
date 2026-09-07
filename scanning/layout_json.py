@@ -17,6 +17,13 @@ fault has three shapes, and each needs one edit:
 - a doubled closer, ``"}]"}]`` (``Extra data``): cut at the first
   complete parse.
 
+The corpus survey of issue #268 measured a fourth shape on 22 pages: a
+raw control character inside a string, where the model copied the line
+break of the printed page in place of ``\n``. That one is answered by
+a parse mode (``strict=False``) rather than by an arm -- see
+:data:`_CONTROL_CHARACTER_MESSAGE` for why -- and it is recorded as the
+edit ``relax_controls``.
+
 :func:`repair` applies one edit per parser message, parses again, and
 stops after :data:`MAX_EDITS`. It never writes over the answer as the
 model wrote it: the callers keep ``raw`` and store the edits beside the
@@ -79,6 +86,34 @@ _AFTER_COMMA_MESSAGE = "Expecting property name enclosed in double quotes"
 _INVALID_ESCAPE_MESSAGE = "Invalid \\escape"
 _EXTRA_DATA_MESSAGE = "Extra data"
 
+#: The model copied the line break of the printed page into a ``text``
+#: value, in place of ``\n``. Measured on 22 pages of the corpus survey
+#: (issue #268): the break always falls at a quotation the page ends a
+#: line with. CPython reports the message with the offset **on** the
+#: control character, and the message ends in "at" -- the parser names
+#: no character, because any of them is illegal there.
+#:
+#: This fault is answered by a parse mode and not by an arm, and that
+#: is deliberate. An edit over the whole text would be wrong: a line
+#: break **between** two tokens is legal whitespace, and only the
+#: parser knows when it is inside a string. ``strict=False`` is that
+#: knowledge, it keeps the character in the value, and it cannot reach
+#: the structure -- a structural fault still raises, and the arms still
+#: take their turn after it. One page in three of the 22 shows a
+#: doubled break, which one edit each would have spent the budget on.
+#:
+#: CPython's C scanner reports this exactly, with the offset **on** the
+#: control character, and names no character in the message: any of
+#: them is illegal there. The pure-Python fallback says ``Invalid
+#: control character '\n' at``, with the character in the message, so
+#: the mode does not fire on that scanner -- the same limit
+#: :data:`_INVALID_ESCAPE_MESSAGE` records, and the same outcome. A
+#: scanner change costs a repair, never a wrong reading: matching a
+#: message that carries a value would mean a prefix test on the branch
+#: that reinterprets a whole page. Both worker and daemon images run
+#: CPython with the C scanner.
+_CONTROL_CHARACTER_MESSAGE = "Invalid control character at"
+
 
 class Repair(NamedTuple):
     """What :func:`repair` answers.
@@ -107,13 +142,24 @@ def repair(raw: str, max_edits: int = MAX_EDITS) -> Repair:
     """
     text = raw
     edits: list[str] = []
+    relaxed = False
     while True:
         try:
-            value = json.loads(text)
+            value = json.loads(text, strict=not relaxed)
         except json.JSONDecodeError as exc:
             if len(edits) >= max_edits:
                 return Repair(None, edits, _describe(text, exc, "edits spent"))
-            repaired = _apply_arm(text, exc)
+            if not relaxed and exc.msg == _CONTROL_CHARACTER_MESSAGE:
+                # The one branch that changes the *mode* and not the
+                # text. Setting the flag is what makes the loop
+                # advance: with no edit to the text, a second strict
+                # parse would raise this again forever. The recorded
+                # edit is what ``max_edits`` counts, so a relaxed page
+                # spends one of its three like any other repair.
+                relaxed = True
+                edits.append(f"relax_controls@{exc.pos}")
+                continue
+            repaired = _apply_arm(text, exc, strict=not relaxed)
             if repaired is None:
                 return Repair(None, edits, _describe(text, exc, "no arm"))
             text, edit = repaired
@@ -167,6 +213,13 @@ def rescale(
 def excerpt(text: str, pos: int, radius: int = EXCERPT_RADIUS) -> str:
     """Return the text around ``pos``, marked with ``>>``.
 
+    Every control character is written as its escape, not the line
+    break alone. The fault of #268 **is** a control character, so this
+    line is where one is read, and a raw carriage return or tab in a
+    log line hides the very text a person came to read. Characters
+    above the control range are kept as they are, so a paragraph mark
+    or an accent survives.
+
     :param text: The answer.
     :param pos: The offset the parser reported.
     :param radius: Characters kept on each side.
@@ -176,17 +229,29 @@ def excerpt(text: str, pos: int, radius: int = EXCERPT_RADIUS) -> str:
     start = max(0, pos - radius)
     end = min(len(text), pos + radius)
     window = text[start:pos] + ">>" + text[pos:end]
-    return window.replace("\n", "\\n")
+    return "".join(
+        character
+        if character >= " "
+        else character.encode("unicode_escape").decode("ascii")
+        for character in window
+    )
 
 
 # ── the arms ──────────────────────────────────────────────────────────
 
 
-def _apply_arm(text: str, exc: json.JSONDecodeError) -> tuple[str, str] | None:
+def _apply_arm(
+    text: str, exc: json.JSONDecodeError, strict: bool = True
+) -> tuple[str, str] | None:
     """Pick the arm for ``exc`` and apply it once.
 
     :param text: The text that failed to parse.
     :param exc: The parser's error.
+    :param strict: The parse mode the caller is in. The two text arms
+        read the text and need no parser; the extra-data arm parses
+        again, and it must parse the way the caller did, or a relaxed
+        page with a doubled closer fails on the control character the
+        mode had already read.
     :returns: ``(repaired text, edit name)``, or ``None`` when no arm
         fits the message and the text at the offset.
     :rtype: tuple[str, str] | None
@@ -198,7 +263,7 @@ def _apply_arm(text: str, exc: json.JSONDecodeError) -> tuple[str, str] | None:
     if exc.msg == _INVALID_ESCAPE_MESSAGE:
         return _restore_quote(text, exc.pos)
     if exc.msg == _EXTRA_DATA_MESSAGE:
-        return _cut_extra(text)
+        return _cut_extra(text, strict=strict)
     return None
 
 
@@ -261,10 +326,16 @@ def _restore_quote(text: str, pos: int) -> tuple[str, str] | None:
     return text[: pos + 1] + '"' + text[pos + 1 :], f"restore_quote@{pos}"
 
 
-def _cut_extra(text: str) -> tuple[str, str] | None:
-    """Keep the first complete value and drop what follows it."""
+def _cut_extra(text: str, strict: bool = True) -> tuple[str, str] | None:
+    """Keep the first complete value and drop what follows it.
+
+    :param text: The text that failed to parse.
+    :param strict: The caller's parse mode, passed to the decoder.
+    :returns: ``(repaired text, edit name)``, or ``None``.
+    :rtype: tuple[str, str] | None
+    """
     try:
-        _, end = json.JSONDecoder().raw_decode(text)
+        _, end = json.JSONDecoder(strict=strict).raw_decode(text)
     except json.JSONDecodeError:
         return None
     return text[:end], f"cut_extra@{end}"
@@ -328,5 +399,12 @@ def _is_number(value) -> bool:
 
 
 def _describe(text: str, exc: json.JSONDecodeError, why: str) -> str:
-    """Build the ``fault`` text for a parse nobody repaired."""
-    return f"{exc.msg} at char {exc.pos} ({why}): {excerpt(text, exc.pos)}"
+    """Build the ``fault`` text for a parse nobody repaired.
+
+    The message keeps the parser's own words, and one of them already
+    ends in "at" (``Invalid control character at``), so the offset is
+    joined without repeating it. That line is the whole triage path
+    for a shape no arm reaches, and it is read by a person.
+    """
+    message = exc.msg.removesuffix(" at")
+    return f"{message} at char {exc.pos} ({why}): {excerpt(text, exc.pos)}"

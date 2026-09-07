@@ -493,6 +493,119 @@ class TestGlues(GlueTestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestReglueOcr(GlueTestCase):
+    """The OCR glue written again, after the volume document changed.
+
+    The backfill of the layout JSON repair (``reglue_dots_mocr``, #268)
+    rewrites the volume document in place, and an approved scan's only
+    reader of it is the OCR glue, which ran once.
+    """
+
+    def test_the_outputs_are_written_again_from_the_current_document(self):
+        ocr_key = self.volume_ocr_run()
+        run, (turn, swap, leaf) = self.built_run()
+        apply.glue_run(self.scan)
+        run.refresh_from_db()
+        before = (run.ocr_key, run.printed_pages_key)
+        # The volume glue repaired page 1: it reads 101 now.
+        self.objects[ocr_key]["pages"][0]["cells"] = [cell("101")]
+        self.uploads.clear()
+
+        self.assertTrue(apply.reglue_ocr(self.scan))
+
+        run.refresh_from_db()
+        self.assertEqual((run.ocr_key, run.printed_pages_key), before)
+        self.assertEqual(set(self.uploads), set(before))
+        printed = self.objects[run.printed_pages_key]
+        by_final = {p["final_page"]: p for p in printed["pages"]}
+        self.assertEqual(by_final[1]["printed"], "101")
+        # The kept pages of the run's own outputs read the new document.
+        self.assertEqual(
+            self.objects[run.ocr_key]["pages"][0]["cells"], [cell("101")]
+        )
+        # No status, no queue, no attempt: the scan is where it was.
+        self.scan.refresh_from_db()
+        self.assertEqual(
+            self.scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+        self.assertEqual(run.attempts, 0)
+        self.assertIsNone(apply.phase_due(self.scan))
+
+    def test_an_aliased_document_gets_its_printed_pages_again(self):
+        # No structural edit: the OCR key is the volume key itself, so
+        # the repaired document is already in place and only the
+        # printed pages are written again.
+        ocr_key = self.volume_ocr_run()
+        self.volume_detect_run()
+        run = apply.build_run(self.scan)
+        apply.glue_run(self.scan)
+        run.refresh_from_db()
+        self.objects[ocr_key]["pages"][1]["cells"] = [cell("202")]
+        self.uploads.clear()
+
+        self.assertTrue(apply.reglue_ocr(self.scan, run))
+
+        self.assertEqual(set(self.uploads), {run.printed_pages_key})
+        printed = self.objects[run.printed_pages_key]
+        self.assertEqual(printed["pages"][1]["printed"], "202")
+
+    def test_a_run_whose_ocr_glue_is_not_written_is_left_to_the_tick(self):
+        self.volume_ocr_run()
+        run, _ = self.built_run()
+
+        self.assertFalse(apply.reglue_ocr(self.scan))
+
+        run.refresh_from_db()
+        self.assertEqual(run.ocr_key, "")
+        self.assertEqual(apply.phase_due(self.scan), "glue")
+
+    def test_a_scan_with_no_run_is_refused(self):
+        self.assertFalse(apply.reglue_ocr(self.scan))
+
+
+class TestEditPageRepair(GlueTestCase):
+    """A filtered page of an edit's one-page read is repaired (#242)."""
+
+    def test_the_ocr_glue_repairs_a_filtered_page_of_an_inserted_leaf(self):
+        from scanning.tests.test_dots_mocr_glue import BROKEN_RAW
+
+        self.volume_ocr_run()
+        run, (turn, swap, leaf) = self.built_run()
+        row = run.jobs.get(
+            stage=JobStage.ANALYZE, input_manifest__edit_id=leaf.pk
+        )
+        self.objects[row.result_key]["payload"]["pages"][0] = {
+            "page_no": 0,
+            "input_width": 1024,
+            "input_height": 1536,
+            "origin_width": 1700,
+            "origin_height": 2200,
+            "filtered": True,
+            "cells": None,
+            "md": "878 N. C. her death almost took [her] out",
+            "raw": BROKEN_RAW,
+        }
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        document = self.objects[run.ocr_key]
+        page = document["pages"][4]
+        self.assertEqual(page["source"]["edit_id"], leaf.pk)
+        self.assertIs(page["filtered"], False)
+        self.assertEqual(page["repaired_by"], "glue")
+        self.assertEqual(len(page["repaired"]), 1)
+        self.assertEqual(page["cells"][0]["text"], "878 N. C.")
+        # Rescaled from the model's space to the render's, as the
+        # volume glue does.
+        self.assertEqual(page["cells"][0]["bbox"][0], int(276 / (1024 / 1700)))
+        self.assertNotIn("raw", page)
+        # The page lists of the final document count from zero, as the
+        # volume document's do: final page 5 is index 4.
+        self.assertEqual(document["filtered_pages"], [])
+        self.assertEqual(document["repaired_pages"], [4])
+
+
 class TestRedactionTriggerGate(GlueTestCase):
     """The redaction compute waits for the apply's outputs (#196 gate)."""
 

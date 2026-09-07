@@ -1884,6 +1884,7 @@ def _glue_ocr(
             edit_pages[edit_id] = {
                 page["page_no"]: page for page in payload.get("pages") or []
             }
+            _repair_edit_pages(scan, edit_id, edit_pages[edit_id])
         pages = []
         for entry in entries:
             src = entry["source"]
@@ -1933,6 +1934,56 @@ def _glue_ocr(
     if not s3_sync.upload_json_object(printed_key, printed):
         raise ApplyError("could not upload the printed pages")
     return ocr_key, printed_key
+
+
+def _repair_edit_pages(
+    scan: Scan, edit_id: int, pages: dict[int, dict]
+) -> None:
+    """Repair the filtered pages of one edit's read, in place.
+
+    The volume glue repairs a filtered page from the stored ``raw``
+    answer before it writes the volume document
+    (``dots_mocr._repair_shard``, #242). The one-page read of an
+    inserted or replaced page is read here, straight from its result
+    object, so without this call a page whose layout JSON broke on one
+    character reached the final volume with no cell and no number until
+    a new worker image read it. The same rule as the volume glue: the
+    page is mutated, ``raw`` is kept, and a page no arm reaches stays
+    filtered and is logged as a WARNING, since it is a shape nobody has
+    measured.
+
+    :param scan: The scan.
+    :param edit_id: The edit whose file the read covers.
+    :param pages: The read's page dicts, keyed by ``page_no``.
+    :return: None.
+    """
+    from scanning import dots_mocr
+
+    for page_no, page in pages.items():
+        if not page.get("filtered"):
+            continue
+        result = dots_mocr._repair_filtered_page(page)
+        if result is None:
+            continue
+        if result.cells is None:
+            logger.warning(
+                "apply: scan %s edit %s page %d: the layout JSON is broken "
+                "and no repair arm reached it: %s",
+                scan.pk,
+                edit_id,
+                page_no + 1,
+                result.fault,
+            )
+            continue
+        logger.info(
+            "apply: scan %s edit %s page %d: repaired the layout JSON by %s, "
+            "%d cell(s) recovered",
+            scan.pk,
+            edit_id,
+            page_no + 1,
+            ", ".join(result.edits),
+            len(page["cells"]),
+        )
 
 
 def printed_pages(scan: Scan, run: ApplyRun, document: dict) -> dict:
@@ -2190,6 +2241,62 @@ def glue_run(scan: Scan) -> ApplyRun:
         time.monotonic() - started,
     )
     return run
+
+
+def reglue_ocr(scan: Scan, run: ApplyRun | None = None) -> bool:
+    """Write the OCR glue of the standing run again, from the volume
+    document as it stands now.
+
+    The backfill of the layout JSON repair (``reglue_dots_mocr``, #242
+    and #268) rewrites the volume ``r{run}-volume.json`` in place. A
+    scan in review 1 reads it again through the page-number apply once
+    its stamp is cleared (``dots_mocr.reopen_apply``). An approved scan
+    has one reader of that document, the OCR glue of this module, which
+    read it once and stored two keys; after that, nothing reads it. So
+    the repaired pages reach the final volume only if the OCR volume
+    and the printed pages are written again, and this does that.
+
+    Inline, with no status write and no queue, on purpose. The glue is
+    seconds of JSON work with no bitonal pull, and the queue takes
+    ``PAGE_COMPLETENESS_REVIEW_DONE`` alone: a scan in review 2 could
+    not be queued, and a blank key on its run would make
+    ``final_volume_ready`` false with nothing to bring it back. There
+    is no concurrent writer either: the daemon glues a run only while
+    a glue is due (:func:`glues_due`), and a run with both keys set is
+    not due.
+
+    Only a built run whose OCR glue is written is taken. A run with no
+    OCR key is due anyway, and the tick glues it from the fresh
+    document. A failure raises: the caller is a command run by a
+    person, and the run's own ledger counts the daemon's attempts, not
+    these.
+
+    :param scan: The scan.
+    :param run: The standing run, when the caller has it.
+    :returns: Whether the two outputs were written again.
+    :rtype: bool
+    """
+    if run is None:
+        run = current_run(scan)
+    if (
+        run is None
+        or not run.is_built
+        or not (run.ocr_key and run.printed_pages_key)
+    ):
+        return False
+    started = time.monotonic()
+    ocr_key, printed_key = _glue_ocr(scan, run, list(run.jobs.all()))
+    ApplyRun.objects.filter(pk=run.pk).update(
+        ocr_key=ocr_key, printed_pages_key=printed_key
+    )
+    run.ocr_key, run.printed_pages_key = ocr_key, printed_key
+    logger.info(
+        "apply: scan %s: run %s glued its OCR volume again in %.1fs",
+        scan.pk,
+        run.label,
+        time.monotonic() - started,
+    )
+    return True
 
 
 def run_state(scan: Scan, run: ApplyRun | None = None) -> dict | None:

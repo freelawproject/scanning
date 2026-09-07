@@ -5,6 +5,10 @@ quotation mark inside a string (scans 2726 and 2665), a lone backslash
 where an escaped quotation mark belongs (scan 2702), and a doubled
 closer (scan 2705). The rest are the refusals: what the arms must not
 turn into cells.
+
+:class:`TestRelaxedControlCharacters` covers the fourth shape, measured
+on 22 pages by the corpus survey of issue #268: a raw control character
+inside a string, answered by a parse mode rather than by an arm.
 """
 
 import json
@@ -297,3 +301,139 @@ class TestExcerpt(SimpleTestCase):
         self.assertIn(">>", out)
         self.assertNotIn("\n", out)
         self.assertLessEqual(len(out), 12 + 2 + 2)
+
+    def test_every_control_character_is_flattened(self):
+        # The fault of #268 is a control character, so this line is
+        # where one is read. A raw carriage return in a log line hides
+        # the text a person came to read.
+        out = layout_json.excerpt("a\rb\tc\x0bd", 4, radius=4)
+
+        self.assertEqual(out, "a\\rb\\t>>c\\x0bd")
+        for character in out:
+            self.assertGreaterEqual(character, " ")
+
+    def test_a_character_above_the_control_range_is_kept(self):
+        # The survey shows paragraph marks and accents in real answers.
+        out = layout_json.excerpt("¶ 40, 273 P.3d", 2, radius=4)
+
+        self.assertIn("¶", out)
+
+
+class TestRelaxedControlCharacters(SimpleTestCase):
+    """The fourth shape (issue #268): a line break inside a string.
+
+    The model copies the line break of the printed page into a ``text``
+    value in place of ``\\n``. Every fixture here has the shape of a
+    measured page: the break falls at a quotation that ends a line.
+    """
+
+    def test_a_raw_line_break_is_read(self):
+        # Scan 2816 page 21: "(brackets in *Sills*<break><break>))".
+        good = _array(
+            "the only thing you have left of [Richard]?\n Julee said"
+        )
+        broken = good.replace("\\n", "\n")
+        self.assertNotEqual(good, broken)
+
+        result = layout_json.repair(broken)
+
+        self.assertEqual(json.dumps(result.cells), good)
+        self.assertEqual(len(result.edits), 1)
+        self.assertTrue(result.edits[0].startswith("relax_controls@"))
+        self.assertIsNone(result.fault)
+
+    def test_the_character_survives_in_the_value(self):
+        # The repair keeps the model's text. It moves no character and
+        # drops none: only the parse mode changes.
+        broken = _array("who is it\n\n)); see also").replace("\\n", "\n")
+
+        result = layout_json.repair(broken)
+
+        self.assertEqual(result.cells[1]["text"], "who is it\n\n)); see also")
+
+    def test_a_doubled_break_costs_one_edit(self):
+        # An arm that escaped one character each would spend two of the
+        # three edits here, and six of the 22 measured pages carry a
+        # doubled break.
+        broken = _array("(brackets in *Sills*\n\n)); see also *id.*").replace(
+            "\\n", "\n"
+        )
+
+        result = layout_json.repair(broken)
+
+        self.assertEqual(len(result.edits), 1)
+        self.assertIsNotNone(result.cells)
+
+    def test_every_break_of_the_page_is_read_by_the_one_edit(self):
+        # The mode holds for the rest of the parse, so a page with
+        # breaks in several cells still costs one edit.
+        broken = _array("first\ncell", "second\ncell", "third\ncell").replace(
+            "\\n", "\n"
+        )
+
+        result = layout_json.repair(broken)
+
+        self.assertEqual(len(result.edits), 1)
+        self.assertEqual(result.cells[1]["text"], "first\ncell")
+        self.assertEqual(result.cells[3]["text"], "third\ncell")
+
+    def test_a_stray_quotation_mark_is_still_escaped_beside_it(self):
+        # The mode reaches the control characters only. The arms keep
+        # answering everything else, on the same page.
+        good = _array('he said "no" to it\nand left')
+        broken = good.replace('no\\"', 'no"').replace("\\n", "\n")
+
+        result = layout_json.repair(broken)
+
+        self.assertEqual(json.dumps(result.cells), good)
+        self.assertEqual(len(result.edits), 2)
+        self.assertEqual(result.edits[0].split("@")[0], "escape_quote")
+        self.assertEqual(result.edits[1].split("@")[0], "relax_controls")
+
+    def test_a_doubled_closer_is_still_cut_beside_it(self):
+        # The extra-data arm parses again to find the end of the first
+        # value. It must parse in the caller's mode: a strict decoder
+        # stops at the control character the mode had already read,
+        # and a page with two known shapes stayed filtered as "no arm".
+        good = _array("a\nb")
+        broken = good.replace("\\n", "\n") + '"}]'
+
+        result = layout_json.repair(broken)
+
+        self.assertEqual(json.dumps(result.cells), good)
+        self.assertEqual(
+            [edit.split("@")[0] for edit in result.edits],
+            ["relax_controls", "cut_extra"],
+        )
+
+    def test_a_relaxed_parse_that_is_not_an_array_is_refused(self):
+        # ``_check_cells`` is still the guard: a page is never called
+        # repaired unless it came out a layout array.
+        broken = '{"category": "Text", "text": "a\nb"}'
+
+        result = layout_json.repair(broken)
+
+        self.assertIsNone(result.cells)
+        self.assertEqual(len(result.edits), 1)
+        self.assertIn("not an array", result.fault)
+
+    def test_the_mode_does_not_leak_to_the_next_call(self):
+        # The flag is local to one call. A later answer that is
+        # genuinely broken must not be read as if it were relaxed.
+        layout_json.repair(_array("a\nb").replace("\\n", "\n"))
+
+        result = layout_json.repair(_array("plain text"))
+
+        self.assertEqual(result.edits, [])
+        self.assertIsNone(result.fault)
+
+    def test_the_fault_line_does_not_double_the_word_at(self):
+        # The parser's own message ends in "at", and this line is the
+        # whole triage path for a shape no arm reaches.
+        broken = _array("a\nb").replace("\\n", "\n")
+
+        result = layout_json.repair(broken, max_edits=0)
+
+        self.assertIsNone(result.cells)
+        self.assertIn("Invalid control character at char ", result.fault)
+        self.assertNotIn("at at", result.fault)
