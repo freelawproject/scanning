@@ -198,12 +198,13 @@ class TestTheFunnel(StatsTestCase):
         self.assertEqual(self._row(rows, "redaction_review_ready")["scans"], 0)
         self.assertEqual(self._row(rows, "redaction_review_done")["scans"], 0)
 
-    def test_a_legacy_scan_is_out_of_every_row_but_the_last(self):
-        """The retired pipeline had a redaction review of its own.
+    def test_a_legacy_scan_is_in_the_legacy_row_only(self):
+        """The retired pipeline has one counter, not a stage.
 
-        ``APPROVED`` and ``EXTRACTED`` are past it, so they are in
-        "Redaction review complete". The other two legacy statuses are
-        in no row of the funnel at all.
+        ``APPROVED`` and ``EXTRACTED`` describe a volume that passed
+        the redaction review of that pipeline, but a funnel row that
+        held them would count a scan of one pipeline under a step of
+        the other.
         """
         for status in stats.LEGACY_STATUSES:
             ScanFactory(status=status)
@@ -211,8 +212,7 @@ class TestTheFunnel(StatsTestCase):
         legacy = self._row(stats.status_groups(), "legacy")
         self.assertEqual(legacy["scans"], len(stats.LEGACY_STATUSES))
         for row in stats.funnel():
-            expected = 2 if row["key"] == "redaction_review_done" else 0
-            self.assertEqual(row["scans"], expected, row["key"])
+            self.assertEqual(row["scans"], 0, row["key"])
 
     def test_the_row_that_waits_for_a_stage_reads_zero(self):
         """The text stage (#191) writes no count yet, and says so."""

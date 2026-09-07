@@ -20,8 +20,8 @@ Three rules run through the module:
 - **The retired pipeline gets one counter, not a stage.** Its review 1
   and its end are gone, so :data:`LEGACY_STATUSES` holds the four
   statuses no new scan can reach, and :data:`FUNNEL_ROWS` counts the
-  new pipeline alone. The one exception is the last row of the funnel,
-  which the retired pipeline can also fill; the row says so.
+  new pipeline alone. A legacy scan is counted in that one row and
+  nowhere else.
 """
 
 from __future__ import annotations
@@ -60,17 +60,16 @@ LEGACY_STATUSES = (
 
 #: The statuses that say "the redaction review is over", for the last
 #: row of the funnel. ``REDACTION_REVIEW_DONE`` is where the approve
-#: button of review 2 puts a scan (#263). The two legacy values are
-#: further along the same road: the retired pipeline had a redaction
-#: review of its own, and a scan could not reach either value without
-#: passing it. When #206 lands, ``APPROVED`` becomes the status of a
-#: new scan that passed step 3, which the review 2 approval gates, so
-#: the row keeps its meaning without a change here.
-REDACTION_REVIEW_COMPLETE_STATUSES = (
-    Status.REDACTION_REVIEW_DONE,
-    Status.APPROVED,
-    Status.EXTRACTED,
-)
+#: button of review 2 puts a scan (#263), and it is the whole list on
+#: purpose: **a legacy status is counted in the legacy row and nowhere
+#: else**. The retired pipeline had a redaction review of its own, so
+#: ``APPROVED`` and ``EXTRACTED`` describe a volume that passed one,
+#: but a funnel row that held them would count a scan of one pipeline
+#: under a step of the other, and the reader could not tell the two
+#: apart. When #206 lands, ``APPROVED`` leaves
+#: :data:`LEGACY_STATUSES` and belongs here, because it then says a
+#: new scan passed step 3, which the review 2 approval gates.
+REDACTION_REVIEW_COMPLETE_STATUSES = (Status.REDACTION_REVIEW_DONE,)
 
 #: The rows of the first table: where the scans are now. The groups do
 #: not overlap, and together they hold every ``Status`` value, so the
@@ -143,10 +142,10 @@ STATUS_GROUPS = (
 #: a ``Detection`` row alone, which is a shortcut into a page and not
 #: a statement about the state.
 #:
-#: The funnel holds no legacy row, except in the last row that counts
-#: one (:data:`REDACTION_REVIEW_COMPLETE_STATUSES`), and it needs no
-#: filter for one: a legacy scan reaches none of the four review
-#: statuses.
+#: The funnel holds no legacy row at all, and it needs no filter for
+#: one: a legacy scan reaches none of the four review statuses. Every
+#: legacy scan is counted in the legacy row of the first table and
+#: nowhere else.
 FUNNEL_ROWS = (
     (
         "page_review_ready",
@@ -170,7 +169,7 @@ FUNNEL_ROWS = (
         "redaction_review_done",
         "Redaction review complete",
         REDACTION_REVIEW_COMPLETE_STATUSES,
-        "The legacy rows that passed the retired review are here too.",
+        "",
     ),
     (
         "text_review_ready",

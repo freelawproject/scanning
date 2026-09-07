@@ -1395,8 +1395,9 @@ the collect tick's pass), the park in `services.run_compute_redactions`,
   below) now does: its "ready for redaction review" row was "DONE and
   a `Detection` row exists" before this issue and is
   `status = READY_FOR_REDACTION_REVIEW` after it, and "redaction
-  review complete" is `status in (REDACTION_REVIEW_DONE, APPROVED,
-  EXTRACTED)`.
+  review complete" is `REDACTION_REVIEW_DONE` alone. **Not** with
+  `APPROVED` and `EXTRACTED`: both are legacy values today, and that
+  page counts a legacy scan in its legacy row and nowhere else.
 
 ## The stats page (issue #260)
 
@@ -1436,13 +1437,15 @@ the rest of it wait? Every user who is logged in sees it, as they see
   accepts NULL. So the volume column does not add up, and the page says
   so: one volume with two scans in two rows is counted in both.
 - **The retired pipeline gets one counter, not a stage**
-  (`LEGACY_STATUSES`, four statuses no new scan reaches). The one
-  exception is the last funnel row: that pipeline had a redaction
-  review too, so `APPROVED` and `EXTRACTED` are past it
-  (`REDACTION_REVIEW_COMPLETE_STATUSES`). **When #206 lands, move
-  `APPROVED` out of `LEGACY_STATUSES`** — it becomes the status of a
-  new scan that passed step 3 — and leave the funnel row alone, since
-  the review 2 approval gates step 3.
+  (`LEGACY_STATUSES`, four statuses no new scan reaches), and a legacy
+  scan is counted there and **nowhere else**. `APPROVED` and
+  `EXTRACTED` do describe a volume past the redaction review of that
+  pipeline, but a funnel row holding them would count a scan of one
+  pipeline under a step of the other, and no reader could tell the two
+  apart. So `REDACTION_REVIEW_COMPLETE_STATUSES` is
+  `REDACTION_REVIEW_DONE` alone. **When #206 lands, move `APPROVED`
+  out of `LEGACY_STATUSES` and into that tuple**: it says a new scan
+  passed step 3 then, which the review 2 approval gates.
 - **A row that reads zero for a named reason is a report; a row that is
   absent is a question.** The text review row stays, with the note that
   #191 is switched off.
