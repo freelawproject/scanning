@@ -17,6 +17,13 @@ fault has three shapes, and each needs one edit:
 - a doubled closer, ``"}]"}]`` (``Extra data``): cut at the first
   complete parse.
 
+The corpus survey of issue #268 measured a fourth shape on 22 pages: a
+raw control character inside a string, where the model copied the line
+break of the printed page in place of ``\n``. That one is answered by
+a parse mode (``strict=False``) rather than by an arm -- see
+:data:`_CONTROL_CHARACTER_MESSAGE` for why -- and it is recorded as the
+edit ``relax_controls``.
+
 :func:`repair` applies one edit per parser message, parses again, and
 stops after :data:`MAX_EDITS`. It never writes over the answer as the
 model wrote it: the callers keep ``raw`` and store the edits beside the
@@ -79,6 +86,23 @@ _AFTER_COMMA_MESSAGE = "Expecting property name enclosed in double quotes"
 _INVALID_ESCAPE_MESSAGE = "Invalid \\escape"
 _EXTRA_DATA_MESSAGE = "Extra data"
 
+#: The model copied the line break of the printed page into a ``text``
+#: value, in place of ``\n``. Measured on 22 pages of the corpus survey
+#: (issue #268): the break always falls at a quotation the page ends a
+#: line with. CPython reports the message with the offset **on** the
+#: control character, and the message ends in "at" -- the parser names
+#: no character, because any of them is illegal there.
+#:
+#: This fault is answered by a parse mode and not by an arm, and that
+#: is deliberate. An edit over the whole text would be wrong: a line
+#: break **between** two tokens is legal whitespace, and only the
+#: parser knows when it is inside a string. ``strict=False`` is that
+#: knowledge, it keeps the character in the value, and it cannot reach
+#: the structure -- a structural fault still raises, and the arms still
+#: take their turn after it. One page in three of the 22 shows a
+#: doubled break, which one edit each would have spent the budget on.
+_CONTROL_CHARACTER_MESSAGE = "Invalid control character at"
+
 
 class Repair(NamedTuple):
     """What :func:`repair` answers.
@@ -107,12 +131,23 @@ def repair(raw: str, max_edits: int = MAX_EDITS) -> Repair:
     """
     text = raw
     edits: list[str] = []
+    relaxed = False
     while True:
         try:
-            value = json.loads(text)
+            value = json.loads(text, strict=not relaxed)
         except json.JSONDecodeError as exc:
             if len(edits) >= max_edits:
                 return Repair(None, edits, _describe(text, exc, "edits spent"))
+            if not relaxed and exc.msg == _CONTROL_CHARACTER_MESSAGE:
+                # The one branch that changes the *mode* and not the
+                # text. Setting the flag is what makes the loop
+                # advance: with no edit to the text, a second strict
+                # parse would raise this again forever. The recorded
+                # edit is what ``max_edits`` counts, so a relaxed page
+                # spends one of its three like any other repair.
+                relaxed = True
+                edits.append(f"relax_controls@{exc.pos}")
+                continue
             repaired = _apply_arm(text, exc)
             if repaired is None:
                 return Repair(None, edits, _describe(text, exc, "no arm"))
@@ -328,5 +363,12 @@ def _is_number(value) -> bool:
 
 
 def _describe(text: str, exc: json.JSONDecodeError, why: str) -> str:
-    """Build the ``fault`` text for a parse nobody repaired."""
-    return f"{exc.msg} at char {exc.pos} ({why}): {excerpt(text, exc.pos)}"
+    """Build the ``fault`` text for a parse nobody repaired.
+
+    The message keeps the parser's own words, and one of them already
+    ends in "at" (``Invalid control character at``), so the offset is
+    joined without repeating it. That line is the whole triage path
+    for a shape no arm reaches, and it is read by a person.
+    """
+    message = exc.msg.removesuffix(" at")
+    return f"{message} at char {exc.pos} ({why}): {excerpt(text, exc.pos)}"

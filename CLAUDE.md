@@ -1222,6 +1222,19 @@ words, so the page reached the reader with no cell and no number.
   two faults still repairs and a rewrite of a different answer cannot
   run away. An arm whose message matches but whose text does not
   refuses, and the page stays filtered.
+- **The fourth shape is a parse mode, not an arm** (#268). The corpus
+  survey found 22 pages carrying a raw control character inside a
+  string, where the model copied the line break of the printed page in
+  place of `\n`. `Invalid control character at` therefore sets
+  `strict=False` for the rest of that page's parse and records one
+  `relax_controls` edit. An edit would have been wrong twice over: a
+  line break *between* two tokens is legal whitespace, so only the
+  parser knows when it is inside a string, and six of the 22 pages
+  carry a doubled break, which one edit each would have spent the
+  budget on. The mode reaches strings only -- a structural fault still
+  raises, and the arms still take their turn after it. The worker needs
+  no other change, because it hands the array back through upstream as
+  `json.dumps`, which escapes the character again.
 - **One module, two callers, and that is the point.** The **worker**
   (`handler._repair_layout_json`) stops the next filtered page, and
   the **glue** (`dots_mocr._repair_shard`) recovers the shard results

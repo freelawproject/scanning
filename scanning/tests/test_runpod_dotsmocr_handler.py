@@ -671,6 +671,33 @@ class TestLayoutJsonRepair(SimpleTestCase):
             )
         return result, infer
 
+    def test_a_raw_line_break_is_repaired_and_upstream_accepts_it(self):
+        # #268 shape 1. The worker hands the repaired array back as
+        # ``json.dumps``, which escapes the control character, so
+        # upstream's own strict parse takes a relaxed page by the path
+        # every other page takes. That round trip is what this pins.
+        broken = self.GOOD.replace("and left", "and\nleft")
+        cells = [{"bbox": [458, 199, 707, 277], "category": "Page-header"}]
+        result, infer = self._run(
+            broken, [("cleaned words", True), (cells, False)]
+        )
+
+        page = result["pages"][0]
+        self.assertIs(page["filtered"], False)
+        self.assertEqual(page["repaired_by"], "worker")
+        self.assertEqual(len(page["repaired"]), 1)
+        self.assertTrue(page["repaired"][0].startswith("relax_controls@"))
+        self.assertEqual(page["raw"], broken)
+        self.assertEqual(result["repaired_pages"], [0])
+        self.assertEqual(result["filtered_pages"], [])
+        self.assertEqual(infer.call_count, 1)
+        # What upstream was handed parses strictly, and the line break
+        # is still in the value.
+        handed = self.post_process.post_process_output.call_args_list[1][0][0]
+        self.assertEqual(
+            json.loads(handed)[0]["text"], 'she said "no" and\nleft'
+        )
+
     def test_a_broken_answer_is_repaired_inside_the_rung(self):
         cells = [{"bbox": [458, 199, 707, 277], "category": "Page-header"}]
         result, infer = self._run(
