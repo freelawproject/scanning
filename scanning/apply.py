@@ -264,6 +264,41 @@ def is_identity_map(page_map: dict) -> bool:
     )
 
 
+def originals_to_final(page_map: dict) -> dict[int, int]:
+    """Return ``{original pdf_page: final page}`` for the kept pages.
+
+    The inverse of the map, built once for a reader that carries many
+    rows -- every detection of a volume -- so the glue is linear in the
+    detections and not in detections times pages.
+
+    :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
+    :returns: The kept pages only: a deleted or replaced page is absent.
+    :rtype: dict[int, int]
+    """
+    return {
+        entry["source"]["pdf_page"]: entry["final_page"]
+        for entry in page_map.get("pages", [])
+        if entry["source"]["kind"] == "original"
+    }
+
+
+def slots_to_final(page_map: dict) -> dict[int, int]:
+    """Return ``{original pdf_page: final page}`` for every held slot.
+
+    Like :func:`originals_to_final`, but a replaced or rotated page
+    answers too: its slot is taken by the shard built for it.
+
+    :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
+    :returns: Every original page that still holds a final slot.
+    :rtype: dict[int, int]
+    """
+    return {
+        entry["source"]["pdf_page"]: entry["final_page"]
+        for entry in page_map.get("pages", [])
+        if entry["source"].get("pdf_page") is not None
+    }
+
+
 def final_page_of(page_map: dict, pdf_page: int) -> int | None:
     """Return where one original page landed in the final PDF.
 
@@ -277,11 +312,7 @@ def final_page_of(page_map: dict, pdf_page: int) -> int | None:
         deleted or replaced.
     :rtype: int | None
     """
-    for entry in page_map.get("pages", []):
-        source = entry["source"]
-        if source["kind"] == "original" and source["pdf_page"] == pdf_page:
-            return entry["final_page"]
-    return None
+    return originals_to_final(page_map).get(pdf_page)
 
 
 def reference_page(edit: PageEdit, page_count: int) -> int:
@@ -316,10 +347,7 @@ def final_slot_of(page_map: dict, pdf_page: int) -> int | None:
         deleted.
     :rtype: int | None
     """
-    for entry in page_map.get("pages", []):
-        if entry["source"].get("pdf_page") == pdf_page:
-            return entry["final_page"]
-    return None
+    return slots_to_final(page_map).get(pdf_page)
 
 
 def edit_page_count(edit: PageEdit) -> int:
@@ -878,8 +906,25 @@ def _ensure_rows(
     if not plan.shard_edits:
         return []
     manifest = shard_manifest(scan, plan, shards)
+    # Every gate first, and a closed one refuses the build. A stage
+    # skipped in silence would glue all the same: the bitonal copy would
+    # take the greyscale shard, the OCR volume a hole, the detections
+    # nothing, and the run would read complete and open review 2 on a
+    # bad page. The refusal counts an attempt, and after the last one
+    # the bar says "ask a staff member", which is the truth.
+    gates = {
+        "convert": services._can_convert(scan.pk, manifest),
+        "analyze": services._can_analyze(scan.pk, manifest),
+        "detect": yolo.enabled() and s3_sync.s3_active(),
+    }
+    closed = [name for name, open_ in gates.items() if not open_]
+    if closed:
+        raise ApplyError(
+            f"the {', '.join(closed)} stage(s) are off in this environment, "
+            f"and {len(plan.shard_edits)} edited page(s) need them"
+        )
     rows: list[ExternalJob] = []
-    if services._can_convert(scan.pk, manifest):
+    if gates["convert"]:
         rows += jobs.ensure_shard_jobs(
             scan,
             manifest,
@@ -889,9 +934,9 @@ def _ensure_rows(
             reuse_results=True,
             apply_run=run,
         )
-    if services._can_analyze(scan.pk, manifest):
+    if gates["analyze"]:
         rows += dots_mocr.ensure_analyze_jobs(scan, manifest, apply_run=run)
-    if yolo.enabled() and s3_sync.s3_active():
+    if gates["detect"]:
         rows += yolo.ensure_detect_jobs(scan, manifest, apply_run=run)
     return rows
 
@@ -1115,12 +1160,17 @@ def build_run(scan: Scan) -> ApplyRun:
 #: The one status the apply takes a scan from, and gives it back to.
 APPLY_STATUS = Status.PAGE_COMPLETENESS_REVIEW_DONE
 
-#: How many scans one tick may queue, the rule of
-#: ``yolo.enqueue_missing_runs`` (#250). The worker is serial, so a
-#: tick that queued the whole approved corpus would take every one of
-#: those volumes out of review 2 at once and give them back one at a
-#: time. A small batch only spreads the same work over more ticks.
-MAX_SCANS_PER_TICK = 5
+#: How many scans may be QUEUED or PROCESSING for the apply at once.
+#: The worker is serial and claims QUEUED scans oldest first, so a
+#: trigger that queued the whole approved corpus would put every old
+#: volume ahead of the one a volunteer uploads today, and take them all
+#: out of review 2 until the worker gave them back one at a time. The
+#: trigger tops the in-flight set up to this number on every tick and
+#: counts only the scans it queues, so a candidate the exact test
+#: refuses (:func:`phase_due`) holds no place. A cap per tick did both
+#: things wrong: it let the in-flight set grow by five every 15
+#: seconds, and it spent its places on refused candidates.
+MAX_SCANS_IN_FLIGHT = 5
 
 
 def _current_edit_ids(scan: Scan) -> list[int]:
@@ -1286,8 +1336,17 @@ def _candidate_scan_ids() -> set[int]:
             "scan_id", flat=True
         )
     )
+    # A stale row (another original's) is in no edit set, before or
+    # after its withdrawal, so its date moves nothing; without this arm
+    # it made its scan a candidate the exact test refused on every tick.
     ids.update(
         built.filter(
+            Q(scan__page_edits__source_fingerprint="")
+            | Q(
+                scan__page_edits__source_fingerprint=F(
+                    "scan__source_fingerprint"
+                )
+            ),
             scan__page_edits__kind__in=PageEdit.STRUCTURAL_KINDS,
             scan__page_edits__date_modified__gt=F("built_at"),
         ).values_list("scan_id", flat=True)
@@ -1319,6 +1378,66 @@ def _candidate_scan_ids() -> set[int]:
     return ids
 
 
+def _note_dead_rows() -> int:
+    """Write the first dead row of a standing run into its ledger, once.
+
+    A dead row is terminal for its stage: :func:`glues_due` drops that
+    glue for good, ``is_complete`` never turns true and review 2 never
+    opens, until an operator supersedes the run. ``jobs`` logs the
+    row's own failure, but nothing said the run had stopped, and the
+    bar's summary showed a blank ledger. So the crossing is logged here
+    with the run named, and ``last_error`` carries it -- once, because
+    a blank ``last_error`` is what selects the run.
+
+    :returns: How many runs were noted.
+    :rtype: int
+    """
+    noted = 0
+    runs = (
+        ApplyRun.objects.filter(
+            superseded_at__isnull=True,
+            built_at__isnull=False,
+            last_error="",
+            jobs__status__in=DEAD_JOB_STATUSES,
+        )
+        .distinct()
+        .select_related("scan")
+    )
+    for run in runs:
+        dead = (
+            run.jobs.filter(status__in=DEAD_JOB_STATUSES)
+            .order_by("pk")
+            .first()
+        )
+        if dead is None:
+            continue
+        note = (
+            f"{dead.stage} row s{dead.shard_index} {dead.status}: "
+            f"{dead.error_code or 'no error code'}"
+        )
+        ApplyRun.objects.filter(pk=run.pk, last_error="").update(
+            last_error=note, last_attempt_at=timezone.now()
+        )
+        logger.warning(
+            "apply: scan %s: run %s has a dead row (%s); its %s glue is "
+            "not written and review 2 waits. Supersede the run from the "
+            "admin to try again.",
+            run.scan_id,
+            run.label,
+            note,
+            next(
+                (
+                    name
+                    for name, stage in GLUE_STAGES.items()
+                    if stage == dead.stage
+                ),
+                dead.stage,
+            ),
+        )
+        noted += 1
+    return noted
+
+
 def queue_ready_scans() -> int:
     """Queue the apply for every approved scan that owes a phase.
 
@@ -1333,24 +1452,38 @@ def queue_ready_scans() -> int:
     compare-and-swap. A scan in any other status is deferred without a
     mark: it comes back when it holds that status again.
 
-    At most ``MAX_SCANS_PER_TICK`` scans are queued, newest first. The
-    first ticks after a deploy see the whole approved corpus, and a
-    queued scan leaves review 2 until the serial worker gives it back.
+    The in-flight set is topped up to ``MAX_SCANS_IN_FLIGHT``, newest
+    scan first, and only a scan actually queued counts: the candidates
+    are walked until the room is used, so a candidate the exact test
+    refuses costs nothing but its test. The first ticks after a deploy
+    see the whole approved corpus, and a queued scan leaves review 2
+    until the serial worker gives it back, so the cap bounds how many
+    are out at once.
 
     :returns: How many scans were queued.
     :rtype: int
     """
     if not s3_sync.s3_active():
         return 0
-    queued = 0
+    _note_dead_rows()
+    in_flight = Scan.objects.filter(
+        status__in=(Status.QUEUED, Status.PROCESSING),
+        queued_action=QueuedAction.APPLY_PAGE_EDITS,
+    ).count()
+    room = MAX_SCANS_IN_FLIGHT - in_flight
+    if room <= 0:
+        return 0
     candidates = _candidate_scan_ids()
     if not candidates:
         return 0
+    queued = 0
     for scan in (
         Scan.objects.filter(pk__in=candidates, status=APPLY_STATUS)
         .select_related("reporter")
-        .order_by("-pk")[:MAX_SCANS_PER_TICK]
+        .order_by("-pk")
     ):
+        if queued >= room:
+            break
         phase = phase_due(scan, current_run(scan))
         if phase is None:
             continue
@@ -1742,8 +1875,9 @@ def printed_pages(scan: Scan, run: ApplyRun, document: dict) -> dict:
         )
         page["by"] = "curator"
 
+    slots = slots_to_final(page_map)
     for edit in page_edits.current_edits(scan, PageEdit.Kind.SET_NUMBER):
-        final = final_slot_of(page_map, edit.pdf_page)
+        final = slots.get(edit.pdf_page)
         if final is not None:
             curator(by_final_out[final], edit.value)
     for page in pages:
@@ -1807,8 +1941,9 @@ def _glue_detections(
             "the merged detection document describes another original"
         )
     detections = []
+    kept = originals_to_final(page_map)
     for det in volume.get("detections", []):
-        final = final_page_of(page_map, det["pdf_page"])
+        final = kept.get(det["pdf_page"])
         if final is None:
             continue
         detections.append(

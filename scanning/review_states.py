@@ -72,8 +72,10 @@ def final_volume_ready(scan: Scan) -> bool:
     page space. Review 2 judges the redactions of the corrected volume,
     so no output of that volume may still be missing when the review
     opens. The redaction compute (``yolo.queue_ready_runs``) reads the
-    same answer before it queues, so the geometry is never measured in
-    the space of the original.
+    same answer before it queues. Its readers still measure the review-1
+    artifacts, in the page space of the original; the follow-up PR
+    points them at the run's outputs, and this gate is what makes that
+    order hold from the first day.
 
     The run must describe this original: a run built before a
     re-upload carries the old fingerprint, and a blank on either side

@@ -22,11 +22,12 @@ from scanning import (
     services,
     yolo,
 )
-from scanning.factories import ScanFactory
+from scanning.factories import ExternalJobFactory, ScanFactory
 from scanning.models import (
     ApplyRun,
     ExternalJob,
     JobEngine,
+    JobProvider,
     JobStage,
     JobStatus,
     PageEdit,
@@ -441,19 +442,168 @@ class TestTriggerAndWorker(BuildTestCase):
         )
         self.assertEqual(apply.queue_ready_scans(), 0)
 
-    def test_one_tick_queues_no_more_than_the_batch(self):
-        """The rule of the detection sweep (#250). The worker is
-        serial, and a queued scan leaves review 2 until it comes back,
-        so the first tick after a deploy must not take the whole
-        approved corpus at once."""
-        for _ in range(apply.MAX_SCANS_PER_TICK + 2):
+    def _done_scans(self, count):
+        """Approve ``count`` volumes with no run, each owing a build."""
+        return [
             ScanFactory(
                 page_count=self.PAGES,
                 status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
                 source_fingerprint="100:6",
             )
+            for _ in range(count)
+        ]
 
-        self.assertEqual(apply.queue_ready_scans(), apply.MAX_SCANS_PER_TICK)
+    def test_the_trigger_tops_the_in_flight_set_up(self):
+        """The worker is serial and claims oldest first, and a queued
+        scan leaves review 2 until it comes back, so the set of scans
+        out for the apply is bounded -- not the number one tick adds."""
+        self._done_scans(apply.MAX_SCANS_IN_FLIGHT + 2)
+
+        self.assertEqual(apply.queue_ready_scans(), apply.MAX_SCANS_IN_FLIGHT)
+        # The next tick adds nothing while the first five are out.
+        self.assertEqual(apply.queue_ready_scans(), 0)
+
+        # Two come back; two more go out.
+        for scan in Scan.objects.filter(status=Status.QUEUED)[:2]:
+            Scan.objects.filter(pk=scan.pk).update(
+                status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+            )
+            ApplyRun.objects.create(
+                scan=scan,
+                number=1,
+                built_at=timezone.now(),
+                bitonal_key="b",
+                ocr_key="o",
+                printed_pages_key="p",
+                detections_key="d",
+            )
+        self.assertEqual(apply.queue_ready_scans(), 2)
+
+    def test_a_processing_apply_counts_against_the_room(self):
+        self._done_scans(3)
+        for scan in self._done_scans(apply.MAX_SCANS_IN_FLIGHT - 1):
+            Scan.objects.filter(pk=scan.pk).update(
+                status=Status.PROCESSING,
+                queued_action=QueuedAction.APPLY_PAGE_EDITS,
+            )
+
+        self.assertEqual(apply.queue_ready_scans(), 1)
+
+    def _refused_candidate(self):
+        """A DONE scan the pre-check names and the exact test refuses.
+
+        Its built run owes the OCR glue, the volume has a CONSUMED OCR
+        row from an old run, and the live OCR run is still open: the
+        candidate query asks for one CONSUMED row, ``_volume_ocr_run``
+        for every live one.
+        """
+        scan = ScanFactory(
+            page_count=self.PAGES,
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
+            source_fingerprint="100:6",
+        )
+        ApplyRun.objects.create(
+            scan=scan,
+            number=1,
+            built_at=timezone.now(),
+            edit_ids=[],
+            page_map={
+                "schema_version": 1,
+                "source_page_count": self.PAGES,
+                "final_page_count": self.PAGES,
+                "deleted_pages": [],
+                "pages": [
+                    {
+                        "final_page": p,
+                        "source": {"kind": "original", "pdf_page": p},
+                    }
+                    for p in range(1, self.PAGES + 1)
+                ],
+            },
+            final_pdf_key="original.pdf",
+            bitonal_key="bitonal.pdf",
+        )
+        for run, status in ((1, JobStatus.CONSUMED), (2, JobStatus.PENDING)):
+            ExternalJobFactory(
+                scan=scan,
+                stage=JobStage.ANALYZE,
+                engine=JobEngine.DOTS_MOCR,
+                provider=JobProvider.RUNPOD,
+                status=status,
+                run=run,
+            )
+        self.assertIsNone(apply.phase_due(scan))
+        return scan
+
+    def test_a_refused_candidate_holds_no_place(self):
+        """Five refused candidates, newer than a scan that owes a build,
+        used to fill the batch and leave that scan in DONE for good."""
+        # The fixture's own scan owes a build too; take it out of play.
+        Scan.objects.filter(pk=self.scan.pk).update(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        owed = self._done_scans(1)[0]
+        for _ in range(apply.MAX_SCANS_IN_FLIGHT):
+            self._refused_candidate()
+
+        self.assertEqual(apply.queue_ready_scans(), 1)
+
+        owed.refresh_from_db()
+        self.assertEqual(owed.status, Status.QUEUED)
+
+    def test_a_withdrawn_stale_row_is_no_candidate(self):
+        """A stale row is in no edit set before or after its withdrawal,
+        so its date must not make its scan a candidate on every tick."""
+        run = apply.build_run(self.scan)
+        # A run with every glue written owes nothing.
+        ApplyRun.objects.filter(pk=run.pk).update(
+            bitonal_key="b",
+            ocr_key="o",
+            printed_pages_key="p",
+            detections_key="d",
+        )
+        self.assertNotIn(self.scan.pk, apply._candidate_scan_ids())
+
+        stale = self.edit(
+            PageEdit.Kind.DELETE_PAGE, pdf_page=2, source_fingerprint="9:9"
+        )
+        page_edits.withdraw(PageEdit.objects.filter(pk=stale.pk), None)
+
+        self.assertNotIn(self.scan.pk, apply._candidate_scan_ids())
+        self.assertIsNone(apply.phase_due(self.scan))
+
+    def test_a_closed_gate_refuses_the_build(self):
+        """A stage skipped in silence would glue a greyscale page into
+        the bitonal copy and open review 2 on it."""
+        self.three_edits()
+        with patch("scanning.services._can_convert", return_value=False):
+            with self.assertRaises(apply.ApplyError) as caught:
+                apply.build_run(self.scan)
+
+        self.assertIn("convert stage", str(caught.exception))
+        run = apply.current_run(self.scan)
+        self.assertFalse(run.is_built)
+        self.assertEqual(run.jobs.count(), 0)
+        self.assertEqual(run.attempts, 1)
+
+    def test_a_dead_row_is_noted_once(self):
+        self.three_edits()
+        run = apply.build_run(self.scan)
+        run.jobs.update(status=JobStatus.COMPLETED)
+        ExternalJob.objects.filter(
+            pk=self.rows(run, JobStage.DETECT)[0].pk
+        ).update(status=JobStatus.FAILED, error_code="BAD_INPUT")
+
+        with self.assertLogs("scanning.apply", level="WARNING") as logs:
+            apply.queue_ready_scans()
+
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("detections glue", logs.output[0])
+        run.refresh_from_db()
+        self.assertIn("BAD_INPUT", run.last_error)
+        self.assertIn("BAD_INPUT", apply.run_state(self.scan)["summary"])
+        with self.assertNoLogs("scanning.apply", level="WARNING"):
+            apply.queue_ready_scans()
 
     def test_a_scan_still_in_review_is_not_queued(self):
         Scan.objects.filter(pk=self.scan.pk).update(

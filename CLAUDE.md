@@ -512,11 +512,23 @@ the `reopen_page_review` view. What must not be broken:
   neither may run on the serial tick (#156) — the #196 shape. The
   worker frees the local tree at the end (`release_local_processing`,
   #215): nothing else removes what those two pulls left.
-- **One tick queues at most `MAX_SCANS_PER_TICK` scans**, newest
-  first, the rule of `yolo.enqueue_missing_runs` (#250). The first
-  ticks after a deploy see the whole approved corpus, the worker is
-  serial, and a queued scan leaves review 2 until it comes back. A
-  small batch only spreads the same work over more ticks.
+- **At most `MAX_SCANS_IN_FLIGHT` scans are QUEUED or PROCESSING for
+  the apply at once**, and the trigger tops that set up, newest scan
+  first, counting only the scans it queues. The worker is serial and
+  claims oldest first, so an uncapped trigger would put every old
+  approved volume ahead of today's upload and take them all out of
+  review 2; a cap *per tick* let the in-flight set grow by five every
+  15 seconds and spent its places on candidates the exact test
+  refused. Two refused shapes exist, and both are cheap now: a volume
+  whose OCR or detection run has a CONSUMED row from an old run and a
+  live run still open (the candidate query asks for one CONSUMED row,
+  `_volume_ocr_run` for every live one), and a withdrawn stale row,
+  which the candidate query no longer counts.
+- **A dead row is noted once** (`_note_dead_rows`, on the trigger
+  tick): a dead row is terminal for its stage, so `is_complete` never
+  turns true and review 2 never opens until an operator supersedes the
+  run. `jobs` logs the row; the apply logs the run, and writes the row
+  into the run's blank `last_error`, which the bar's summary shows.
 - **A volume nobody changed never opens the original.** `plan_run`
   reads the rows and the uploaded files, never the original, and an
   identity map has no edit entry, so `_build` skips the pull whole.
@@ -577,7 +589,13 @@ the `reopen_page_review` view. What must not be broken:
   apply row's result under `jobs/apply/a{n}/{stage}/{engine}/`.
   `TestKnownEnqueuePaths` pins `apply.py` as a creator on all three
   stages, behind the pipeline's own gates (`_can_convert`,
-  `_can_analyze`, `yolo.enabled` plus S3). An apply row carries **no**
+  `_can_analyze`, `yolo.enabled` plus S3). **A closed gate refuses the
+  build** when the plan has a shard edit, with the stage named: a stage
+  skipped in silence would still glue (the greyscale shard into the
+  bitonal copy, a hole into the OCR volume, nothing into the
+  detections), read complete, and open review 2 on a bad page. The
+  refusal counts an attempt, and the bar says "ask a staff member" at
+  the last one. An apply row carries **no**
   `source_fingerprint`: its manifest source is the sum over the
   one-page shards, which names no original. `yolo.enqueue_missing_runs`
   filters `apply_run__isnull=True` as well, so a volume that carries
@@ -615,7 +633,11 @@ the `reopen_page_review` view. What must not be broken:
   `redaction_review_ready`, so `READY_FOR_REDACTION_REVIEW` is never
   written over a volume with a glue still missing, and the promote
   pass of #263 cannot move a scan out of DONE before its apply is
-  complete.
+  complete. The compute's own readers (`load_merged_document`,
+  `processing_pdf_path`) still measure the review-1 artifacts in the
+  original's page space; the follow-up PR points them at the run's
+  outputs, and the gate is here first so that order holds from day
+  one.
 - **The printed-page map is the curator's over the model's.**
   `printed_pages` runs `page_numbers.ocr_results_from_volume` over the
   final OCR document, then lands each standing `SET_NUMBER` row on its
@@ -623,7 +645,7 @@ the `reopen_page_review` view. What must not be broken:
   number typed for it) and each inserted page's `logical_page`. A page
   the worker could not read keeps its `error`, and a page whose stage
   was off is a hole too (`"not read"`).
-- **DONE locks the nine edit endpoints** (`_refuse_locked_edits`,
+- **DONE locks the eight page edit endpoints** (`_refuse_locked_edits`,
   `LOCKED_STATUSES`: DONE, the two review-2 states of #263, the busy
   statuses, APPROVED, EXTRACTED),
   with 409 and `EDITS_LOCKED_MESSAGE`; the viewer shows it in the
@@ -632,12 +654,20 @@ the `reopen_page_review` view. What must not be broken:
   supersedes the run in flight and moves DONE back to READY with one
   compare-and-swap; the edits unlock, and the next approval builds
   `a{n+1}`. The admin re-queue supersedes runs too, since the pipeline
-  runs again from the original. **The viewer follows the lock**
+  runs again from the original. **`dismiss_issue` is not locked**: a
+  dismissal is built into nothing, and the recompute button stays
+  reachable after the approval, so a curator must be able to answer
+  the cards it raises. **The viewer follows the lock**
   (`page_edits_locked` in `SCAN_CONFIG`): step 2 draws the page-number
-  tag with no `editable-page` class while the scan is locked, the rule
-  of the step-1 bar (#151) — an interface that offered the control
-  would fail on every click. A legacy `PENDING_REVIEW` volume is not
-  locked and keeps the control.
+  tag with no `editable-page` class while the scan is locked, and step
+  1 draws no Replace, Delete, Remove or insert form and no editable tag
+  either, the rule of the step-1 bar (#151) — an interface that offered
+  the control would fail on every click. The repair-request buttons
+  stay, since a request is not a page edit (#249). A legacy
+  `PENDING_REVIEW` volume is not locked and keeps every control. The
+  badge promises the reopen only while the scan is still in DONE
+  (`page_review_reopenable`); after the promotion to review 2 (#263)
+  the way back is the admin re-queue.
 - **The review-1 artifacts are never written over.** Every output goes
   under `jobs/apply/a{n}/` (the final PDF, `bitonal.pdf`,
   `ocr-volume.json`, `printed_pages.json`, `detections-volume.json`),

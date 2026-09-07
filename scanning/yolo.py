@@ -979,10 +979,13 @@ def queue_ready_runs() -> int:
         state = apply_state(rows)
         if state.get("applied_at"):
             continue
-        # The redactions are measured on the final volume (#224), so
-        # the compute waits for every glue of the standing apply run
-        # (``review_states.final_volume_ready``), or it would read the
-        # space of the original.
+        # The compute waits for every glue of the standing apply run
+        # (``review_states.final_volume_ready``, #224). Today it still
+        # reads the merged document and the review-1 bitonal copy, in
+        # the page space of the original; the follow-up PR moves those
+        # readers to the run's outputs. The gate is here first, so the
+        # order holds the day they move and review 2 never opens on a
+        # volume whose corrected build is not finished.
         if not review_states.final_volume_ready(scan):
             continue
         # ``queued_at`` is an audit stamp, never a guard. A scan whose

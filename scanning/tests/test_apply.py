@@ -563,7 +563,7 @@ class TestSupersede(ApplyTestCase):
 
 
 class TestEditLock(ApplyTestCase):
-    """DONE locks the nine edit endpoints."""
+    """DONE locks the eight page edit endpoints; the dismissal stays open."""
 
     JSON_ENDPOINTS = (
         ("assign_page", {"pdf_page": 1, "page_number": "7"}),
@@ -572,7 +572,6 @@ class TestEditLock(ApplyTestCase):
         ("remove_page_insert", {"edit_id": 1}),
         ("undo_replace_page", {"pdf_page": 1}),
         ("rotate_page", {"pdf_page": 1, "degrees": "90"}),
-        ("dismiss_issue", {"issue_id": 1}),
     )
 
     def lock(self, status=Status.PAGE_COMPLETENESS_REVIEW_DONE):
@@ -661,7 +660,10 @@ class TestEditLock(ApplyTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"pageEditsLocked: false", response.content)
 
-    def test_a_dismissal_under_done_keeps_the_issue(self):
+    def test_a_dismissal_under_done_is_taken(self):
+        """A dismissal is built into nothing, and the recompute button
+        stays reachable after the approval: the cards it raises must
+        have an answer."""
         issue = Issue.objects.create(
             scan=self.scan,
             check_name="duplicate_page",
@@ -670,12 +672,20 @@ class TestEditLock(ApplyTestCase):
             page_number=1,
         )
         self.lock()
-        self.client.post(
+        response = self.client.post(
             reverse("dismiss_issue", kwargs={"pk": self.scan.pk}),
             data=json.dumps({"issue_id": issue.pk}),
             content_type="application/json",
         )
-        self.assertTrue(Issue.objects.filter(pk=issue.pk).exists())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Issue.objects.filter(pk=issue.pk).exists())
+        self.assertEqual(
+            self.scan.page_edits.filter(
+                kind=PageEdit.Kind.DISMISS_ISSUE
+            ).count(),
+            1,
+        )
 
 
 class TestReopen(ApplyTestCase):

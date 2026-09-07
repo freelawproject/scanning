@@ -1405,7 +1405,8 @@ def _review_flags(scan: Scan) -> dict:
 def _refuse_locked_edits(scan: Scan) -> JsonResponse | None:
     """Refuse a page edit on a volume whose review is not open.
 
-    The first thing every page edit endpoint does (#224). Once the page
+    The first thing every page edit endpoint does (#224), the dismissal
+    of an issue excepted: it is built into nothing. Once the page
     review is approved the apply builds the final volume from the rows
     as they stand, so a row written after that addresses a source the
     pipeline has left behind: it would be applied by no run, or by the
@@ -2642,9 +2643,9 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response confirming dismissal.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    locked = _refuse_locked_edits(scan)
-    if locked is not None:
-        return locked
+    # Not locked with the page edits (#224): a dismissal is built into
+    # nothing, and the recompute button stays reachable after the
+    # approval, so a curator must be able to answer the cards it raises.
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
