@@ -20,6 +20,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    QueuedAction,
     Scan,
     Status,
 )
@@ -277,3 +278,39 @@ class TestUncappedIntake(TestCase):
         queued.refresh_from_db()
         self.assertEqual(queued.status, Status.PROCESSING)
         pipeline.assert_called_once_with(queued.pk)
+
+
+class TestClaimPriority(TestCase):
+    """The worker claims by action before age (#224)."""
+
+    def test_an_upload_is_claimed_before_a_compute_before_an_apply(self):
+        """The loop is serial, so the queue puts a person's wait first:
+        the volunteer's upload, then the curator's approval waiting on
+        its redaction compute, then the apply nobody watches -- whatever
+        their ages."""
+        apply_scan = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.APPLY_PAGE_EDITS
+        )
+        compute_scan = ScanFactory(
+            status=Status.QUEUED,
+            queued_action=QueuedAction.COMPUTE_REDACTIONS,
+        )
+        blank_scan = ScanFactory(status=Status.QUEUED, queued_action="")
+        upload_scan = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.FULL_PIPELINE
+        )
+        # Oldest first: the apply, then the compute, then the two uploads.
+        for offset, scan in enumerate(
+            (apply_scan, compute_scan, blank_scan, upload_scan)
+        ):
+            Scan.objects.filter(pk=scan.pk).update(
+                date_created=timezone.now() + timedelta(minutes=offset)
+            )
+
+        claimed = [Command()._claim_next()[0].pk for _ in range(4)]
+
+        self.assertEqual(
+            claimed,
+            [blank_scan.pk, upload_scan.pk, compute_scan.pk, apply_scan.pk],
+        )
+        self.assertIsNone(Command()._claim_next())

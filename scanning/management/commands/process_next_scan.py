@@ -35,6 +35,17 @@ logger = logging.getLogger(__name__)
 MAX_DB_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 0.5
 
+#: The order the worker claims QUEUED scans in, by action, before their
+#: age. The loop is serial (#156), so whatever the worker runs holds
+#: every other task for that long, and the queue must put a person's
+#: wait first: a volunteer's upload (the full pipeline, which a blank
+#: action also means) before a curator's approval waiting on its
+#: redaction compute, before the apply of the page edits (#224), which
+#: is a backfill nobody watches and may hold five volumes at once
+#: (``apply.MAX_SCANS_IN_FLIGHT``). An action not listed ranks with the
+#: redaction compute. Within one rank, oldest first, as before.
+CLAIM_PRIORITY = ("full_pipeline", "compute_redactions", "apply_page_edits")
+
 
 class Command(BaseCommand):
     help = (
@@ -132,15 +143,30 @@ class Command(BaseCommand):
         :rtype: tuple | None
         """
         from django.db import transaction
+        from django.db.models import Case, IntegerField, Value, When
         from django.utils import timezone
 
         from scanning.models import QueuedAction, Scan, Status
 
+        # ``CLAIM_PRIORITY``: an upload first, the apply last. A blank
+        # action is the full pipeline, so it ranks with it.
+        rank = Case(
+            When(queued_action="", then=Value(0)),
+            *(
+                When(queued_action=action, then=Value(index))
+                for index, action in enumerate(CLAIM_PRIORITY)
+            ),
+            default=Value(
+                CLAIM_PRIORITY.index(QueuedAction.COMPUTE_REDACTIONS)
+            ),
+            output_field=IntegerField(),
+        )
         with transaction.atomic():
             scan = (
                 Scan.objects.select_for_update(skip_locked=True)
                 .filter(status=Status.QUEUED)
-                .order_by("date_created")
+                .annotate(claim_rank=rank)
+                .order_by("claim_rank", "date_created")
                 .first()
             )
             if scan is None:

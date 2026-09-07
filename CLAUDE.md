@@ -514,16 +514,19 @@ the `reopen_page_review` view. What must not be broken:
   #215): nothing else removes what those two pulls left.
 - **At most `MAX_SCANS_IN_FLIGHT` scans are QUEUED or PROCESSING for
   the apply at once**, and the trigger tops that set up, newest scan
-  first, counting only the scans it queues. The worker is serial and
-  claims oldest first, so an uncapped trigger would put every old
-  approved volume ahead of today's upload and take them all out of
-  review 2; a cap *per tick* let the in-flight set grow by five every
+  first, counting only the scans it queues. The worker is serial, so
+  an uncapped trigger would take every old approved volume out of
+  review 2 at once; a cap *per tick* let the in-flight set grow by five every
   15 seconds and spent its places on candidates the exact test
   refused. Two refused shapes exist, and both are cheap now: a volume
   whose OCR or detection run has a CONSUMED row from an old run and a
   live run still open (the candidate query asks for one CONSUMED row,
   `_volume_ocr_run` for every live one), and a withdrawn stale row,
-  which the candidate query no longer counts.
+  which the candidate query no longer counts. **The worker claims by
+  action before age** (`process_next_scan.CLAIM_PRIORITY`): the full
+  pipeline, then the redaction compute, then the apply. A volunteer's
+  upload never waits behind the five applies the trigger may hold, and
+  a curator's approval never waits behind a backfill nobody watches.
 - **A dead row is noted once** (`_note_dead_rows`, on the trigger
   tick): a dead row is terminal for its stage, so `is_complete` never
   turns true and review 2 never opens until an operator supersedes the
@@ -1733,7 +1736,7 @@ difference between the two outputs: a third engine is one entry.
 ## Uncapped intake, and where the queue clock starts (issue #218)
 
 Intake has no cap: `process_next_scan` claims every QUEUED scan in
-order, and the per-engine concurrency limits pace the providers. What
+order (by action first since #224, `CLAIM_PRIORITY`; then by age), and the per-engine concurrency limits pace the providers. What
 makes that safe is where the queue ceiling starts. A job row waiting in
 **our own** queue (PENDING, never claimed) carries no deadline; the
 6-hour `DAEMON_JOB_MAX_QUEUE_SECONDS` ceiling is stamped at the
