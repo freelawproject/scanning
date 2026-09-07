@@ -135,6 +135,20 @@
            dark:bg-teal-900/50 dark:text-teal-300;
   }
 
+  /* Redaction review states (#263). The same pair of colours one step
+     further on: ready keeps the actionable amber, done gets emerald,
+     which reads as finished without borrowing the green of an
+     approved scan. */
+  .badge-ready_for_redaction_review {
+    @apply badge bg-amber-100 text-amber-800
+           dark:bg-amber-900/50 dark:text-amber-300;
+  }
+
+  .badge-redaction_review_done {
+    @apply badge bg-emerald-100 text-emerald-800
+           dark:bg-emerald-900/50 dark:text-emerald-300;
+  }
+
   .badge-pending_review {
     @apply badge bg-yellow-100 text-yellow-800
            dark:bg-yellow-900/50 dark:text-yellow-300;

@@ -1,6 +1,6 @@
 """Confirm in-flight external jobs and finish the scans they belong to.
 
-Six passes, in order.
+Seven passes, in order.
 
 **1. ``jobs.sweep_jobs()`` asks after every job still in flight.** How
 it asks depends on the provider:
@@ -52,6 +52,15 @@ computation renders every page of the volume three times (83s for 1364
 pages, measured), and this tick's scheduler is serial (#156), so it
 must not run here.
 
+**7. ``review_states.promote_ready_scans()`` opens review 2 (#263).**
+It takes an approved scan whose redactions are computed, and whose
+corrected volume is built (#224), to
+``READY_FOR_REDACTION_REVIEW`` with one compare-and-swap. It is the
+safety net rather than the usual writer: pass 6's computation parks a
+scan it just finished in that status itself, so what is left here is
+the volume whose corrected build lands after its geometry, and every
+volume that was already approved and measured when #263 shipped.
+
 Examples:
 
     # Run one confirm tick and exit.
@@ -78,7 +87,9 @@ class Command(BaseCommand):
         "scan whose conversion jobs have all finished, then glue any "
         "finished dots.mocr run into its volume document, then apply "
         "every glued run (page numbers and Issues), then merge every "
-        "finished detection run and queue its redaction computation."
+        "finished detection run and queue its redaction computation, "
+        "then open the redaction review of every scan that is ready "
+        "for it."
     )
 
     def handle(self, *args, **options):
@@ -90,7 +101,13 @@ class Command(BaseCommand):
         """
         from django.db import OperationalError, connections
 
-        from scanning import bitonal, dots_mocr, jobs, yolo
+        from scanning import (
+            bitonal,
+            dots_mocr,
+            jobs,
+            review_states,
+            yolo,
+        )
 
         for attempt in range(MAX_DB_RETRIES):
             connections.close_all()
@@ -101,6 +118,7 @@ class Command(BaseCommand):
                 applied = dots_mocr.apply_ready_runs()
                 detected = yolo.finish_ready_runs()
                 queued = yolo.queue_ready_runs()
+                promoted = review_states.promote_ready_scans()
                 break
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -126,6 +144,7 @@ class Command(BaseCommand):
                 applied,
                 detected,
                 queued,
+                promoted,
             )
         ):
             self.stdout.write(
@@ -134,5 +153,6 @@ class Command(BaseCommand):
                 f"check errors {summary.errors}; finished {finished} "
                 f"scan(s), glued {glued} OCR run(s), applied {applied}, "
                 f"merged {detected} detection run(s), queued {queued} "
-                f"redaction computation(s)"
+                f"redaction computation(s), opened {promoted} redaction "
+                f"review(s)"
             )
