@@ -20,8 +20,17 @@ Three rules run through it:
 
 from __future__ import annotations
 
-from django.db.models import Exists, F, OuterRef, Q, QuerySet
+from django.db.models import (
+    Count,
+    Exists,
+    F,
+    OuterRef,
+    Q,
+    QuerySet,
+    Value,
+)
 from django.db.models.functions import Coalesce
+from django.db.models.lookups import Exact
 from django.utils import formats, timezone
 
 from scanning.models import PageEdit, PageRepairRequest, Scan
@@ -59,12 +68,22 @@ def _fulfilling_edits():
     this decision built into an output?", and an applied edit against
     the current upload is done work that fulfils like a standing one.
 
+    **The scan is read through the outer row, never through the edit.**
+    The subquery already ties the edit to the request's scan, so the
+    two reads land on one row of the table. The database cannot know
+    that, and it joins the table a second time for the inner read: the
+    join was 77% of the buffers this query touched, over 5000 waiting
+    requests and 20000 edits. So the blank test on the scan is an
+    ``Exact`` over the ``OuterRef``, which reads the join the outer
+    query already carries. Do not write it as
+    ``Q(scan__source_fingerprint="")`` again.
+
     :returns: A queryset for an ``Exists`` annotation.
     :rtype: QuerySet
     """
     same_original = (
         Q(source_fingerprint="")
-        | Q(scan__source_fingerprint="")
+        | Q(Exact(OuterRef("scan__source_fingerprint"), Value("")))
         | Q(source_fingerprint=OuterRef("scan__source_fingerprint"))
     )
     at_the_address = Q(
@@ -275,3 +294,20 @@ def waiting_count() -> int:
     :rtype: int
     """
     return queue("waiting").count()
+
+
+def waiting_totals() -> tuple[int, int]:
+    """Return how many requests wait, and over how many scans (#260).
+
+    The stats page prints "X repairs over Y scans", and the two
+    numbers come from one aggregate: two queries could disagree,
+    because a reviewer may add a request between them, and no row
+    crosses into Python for a count the database gives.
+
+    :returns: The number of requests, then the number of scans.
+    :rtype: tuple[int, int]
+    """
+    totals = queue("waiting").aggregate(
+        requests=Count("pk"), scans=Count("scan_id", distinct=True)
+    )
+    return totals["requests"], totals["scans"]

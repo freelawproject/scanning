@@ -1391,11 +1391,73 @@ the collect tick's pass), the park in `services.run_compute_redactions`,
   gives an old volume an `ANALYZE` row, while the gate asks which
   review flow the volume is in. The park and the step chooser already
   say `PENDING_REVIEW` is where a legacy step 2 lives.
-- A report reads these values directly. The stats page (#260) was
-  drafted against "DONE and a `Detection` row exists"; with #263 that
-  row is `status = READY_FOR_REDACTION_REVIEW`, and "redaction review
-  complete" is `status in (REDACTION_REVIEW_DONE, APPROVED,
-  EXTRACTED)`.
+- A report reads these values directly, and the stats page (#260,
+  below) now does: its "ready for redaction review" row was "DONE and
+  a `Detection` row exists" before this issue and is
+  `status = READY_FOR_REDACTION_REVIEW` after it, and "redaction
+  review complete" is `REDACTION_REVIEW_DONE` alone. **Not** with
+  `APPROVED` and `EXTRACTED`: both are legacy values today, and that
+  page counts a legacy scan in its legacy row and nowhere else.
+
+## The stats page (issue #260)
+
+`/stats/` answers one question: how much work is done, and where does
+the rest of it wait? Every user who is logged in sees it, as they see
+`/repairs/`. The pieces: `stats.py` (every count), the
+`views.stats_view` render, `templates/scanning/stats.html`, and
+`repairs.waiting_totals`.
+
+- **A review is a status, so a count is a set of statuses.** Nothing
+  stamps a review: the two approve buttons write
+  `PAGE_COMPLETENESS_REVIEW_DONE` (#151) and `REDACTION_REVIEW_DONE`
+  (#263) and one log line each. So no count reads another table and
+  none needs a migration. The `redaction_review_ready` row asked for a
+  `Detection` row until #263 gave review 2 its own status; do not put
+  that condition back, because `review_states.redaction_review_ready`
+  is the rule and the status is where its writers put the answer. The
+  "Next: Detect" button still walks to step 2 on a `Detection` row
+  alone, which is a shortcut into a page and not a statement about the
+  state.
+- **Two tables, because one cannot be both.** `STATUS_GROUPS` says
+  where the scans are now: the groups do not overlap and together they
+  hold **every** `Status` value, so the rows add up to the total and a
+  test pins both properties. A status added later without a group
+  would drop off the page in silence. `FUNNEL_ROWS` is the funnel of
+  the issue, whose rows overlap on purpose:
+  `models.PAGE_REVIEW_APPROVED_STATUSES` is the "passed review 1" row
+  and holds every scan of the two rows below it.
+- **A row with no file is not an upload.** `presign_scan_upload`
+  creates the row and `confirm_scan_upload` attaches the file, so a
+  browser that dies between the two leaves a row with an empty
+  `original_pdf` that nothing deletes. `uploaded_scans` is where every
+  query starts.
+- **A volume is the pair (reporter, volume number)**, the unique key of
+  the `Volume` model, counted with a `Concat` inside
+  `Count(distinct=True)` and never through `Scan.volume_obj`, which
+  accepts NULL. So the volume column does not add up, and the page says
+  so: one volume with two scans in two rows is counted in both.
+- **The retired pipeline gets one counter, not a stage**
+  (`LEGACY_STATUSES`, four statuses no new scan reaches), and a legacy
+  scan is counted there and **nowhere else**. `APPROVED` and
+  `EXTRACTED` do describe a volume past the redaction review of that
+  pipeline, but a funnel row holding them would count a scan of one
+  pipeline under a step of the other, and no reader could tell the two
+  apart. So `REDACTION_REVIEW_COMPLETE_STATUSES` is
+  `REDACTION_REVIEW_DONE` alone. **When #206 lands, move `APPROVED`
+  out of `LEGACY_STATUSES` and into that tuple**: it says a new scan
+  passed step 3 then, which the review 2 approval gates.
+- **A row that reads zero for a named reason is a report; a row that is
+  absent is a question.** The text review row stays, with the note that
+  #191 is switched off.
+- **The repair pair is one aggregate, and its row names its units.**
+  `repairs.waiting_totals` counts the waiting rows and the scans they
+  name in one query, because two queries could disagree: a reviewer may
+  add a request between them. Its row is the one row of the funnel
+  whose two cells are not scans and volumes, so the note under the
+  label says what they are.
+- Ten counts, each one `COUNT`, pinned by `assertNumQueries`, and no
+  cache: a cache would make the numbers older than the page that shows
+  them.
 
 ## The glued outputs, by scan id (issue #243)
 

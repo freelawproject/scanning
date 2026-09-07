@@ -25,6 +25,7 @@
         <a href="{% url 'queue' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-list-check"></i> Queue</a>
         <a href="{% url 'repair_queue' %}" class="btn-ghost text-sm whitespace-nowrap" title="Pages a scanner must scan again or scan anew"><i class="fa-solid fa-fw fa-screwdriver-wrench"></i> Repairs{% if waiting_repairs_count %} <span class="text-xs font-medium rounded px-2 py-0.5 bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-200">{{ waiting_repairs_count }}</span>{% endif %}</a>
         <a href="{% url 'opinion_list' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-file-lines"></i> Opinions</a>
+        <a href="{% url 'stats' %}" class="btn-ghost text-sm whitespace-nowrap" title="How much work is done, and where the rest of it waits"><i class="fa-solid fa-fw fa-chart-simple"></i> Stats</a>
         <!-- User dropdown -->
         <div class="relative">
           <button
@@ -60,6 +61,7 @@
         <a href="{% url 'queue' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-list-check"></i> Queue</a>
         <a href="{% url 'repair_queue' %}" class="block btn-ghost text-sm" title="Pages a scanner must scan again or scan anew"><i class="fa-solid fa-fw fa-screwdriver-wrench"></i> Repairs{% if waiting_repairs_count %} <span class="text-xs font-medium rounded px-2 py-0.5 bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-200">{{ waiting_repairs_count }}</span>{% endif %}</a>
         <a href="{% url 'opinion_list' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-file-lines"></i> Opinions</a>
+        <a href="{% url 'stats' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-chart-simple"></i> Stats</a>
         <a href="{% url 'profile' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-gear"></i> Profile</a>
         <form method="post" action="{% url 'logout' %}">
           {% csrf_token %}
