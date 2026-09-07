@@ -302,6 +302,22 @@ class TestExcerpt(SimpleTestCase):
         self.assertNotIn("\n", out)
         self.assertLessEqual(len(out), 12 + 2 + 2)
 
+    def test_every_control_character_is_flattened(self):
+        # The fault of #268 is a control character, so this line is
+        # where one is read. A raw carriage return in a log line hides
+        # the text a person came to read.
+        out = layout_json.excerpt("a\rb\tc\x0bd", 4, radius=4)
+
+        self.assertEqual(out, "a\\rb\\t>>c\\x0bd")
+        for character in out:
+            self.assertGreaterEqual(character, " ")
+
+    def test_a_character_above_the_control_range_is_kept(self):
+        # The survey shows paragraph marks and accents in real answers.
+        out = layout_json.excerpt("¶ 40, 273 P.3d", 2, radius=4)
+
+        self.assertIn("¶", out)
+
 
 class TestRelaxedControlCharacters(SimpleTestCase):
     """The fourth shape (issue #268): a line break inside a string.

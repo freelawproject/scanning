@@ -101,6 +101,17 @@ _EXTRA_DATA_MESSAGE = "Extra data"
 #: the structure -- a structural fault still raises, and the arms still
 #: take their turn after it. One page in three of the 22 shows a
 #: doubled break, which one edit each would have spent the budget on.
+#:
+#: CPython's C scanner reports this exactly, with the offset **on** the
+#: control character, and names no character in the message: any of
+#: them is illegal there. The pure-Python fallback says ``Invalid
+#: control character '\n' at``, with the character in the message, so
+#: the mode does not fire on that scanner -- the same limit
+#: :data:`_INVALID_ESCAPE_MESSAGE` records, and the same outcome. A
+#: scanner change costs a repair, never a wrong reading: matching a
+#: message that carries a value would mean a prefix test on the branch
+#: that reinterprets a whole page. Both worker and daemon images run
+#: CPython with the C scanner.
 _CONTROL_CHARACTER_MESSAGE = "Invalid control character at"
 
 
@@ -202,6 +213,13 @@ def rescale(
 def excerpt(text: str, pos: int, radius: int = EXCERPT_RADIUS) -> str:
     """Return the text around ``pos``, marked with ``>>``.
 
+    Every control character is written as its escape, not the line
+    break alone. The fault of #268 **is** a control character, so this
+    line is where one is read, and a raw carriage return or tab in a
+    log line hides the very text a person came to read. Characters
+    above the control range are kept as they are, so a paragraph mark
+    or an accent survives.
+
     :param text: The answer.
     :param pos: The offset the parser reported.
     :param radius: Characters kept on each side.
@@ -211,7 +229,12 @@ def excerpt(text: str, pos: int, radius: int = EXCERPT_RADIUS) -> str:
     start = max(0, pos - radius)
     end = min(len(text), pos + radius)
     window = text[start:pos] + ">>" + text[pos:end]
-    return window.replace("\n", "\\n")
+    return "".join(
+        character
+        if character >= " "
+        else character.encode("unicode_escape").decode("ascii")
+        for character in window
+    )
 
 
 # ── the arms ──────────────────────────────────────────────────────────
