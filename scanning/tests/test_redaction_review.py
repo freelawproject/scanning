@@ -206,6 +206,32 @@ class TestTheApplyOpensReviewTwo(ComputeMixin, TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
 
+    def test_a_failed_recompute_stays_in_review_two(self):
+        """The run keeps the stamp of the apply that worked, so the
+        volume still shows measured geometry. A park in review 1 would
+        take the curator out of a review they may still do, and the
+        collect tick would write its own message over the failure one
+        tick later."""
+        scan, rows = merged_scan()
+        stubs = self.patch_geometry()
+        self.claim(scan)
+        services.run_compute_redactions(scan.pk)
+        stubs["_compute_and_save_redaction_rects"].side_effect = RuntimeError(
+            "no"
+        )
+        self.claim(scan)
+
+        services.run_compute_redactions(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.READY_FOR_REDACTION_REVIEW)
+        self.assertIn("failed", scan.progress_message)
+        # And the pass leaves the message alone, because the scan is
+        # already where it belongs.
+        self.assertEqual(review_states.promote_ready_scans(), 0)
+        scan.refresh_from_db()
+        self.assertIn("failed", scan.progress_message)
+
     def test_a_legacy_volume_goes_back_to_pending_review(self):
         """Its step 2 lives there: the #154 and #263 states describe a
         flow it never went through."""
@@ -244,6 +270,56 @@ class TestTheApplyOpensReviewTwo(ComputeMixin, TestCase):
 
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.QUEUED)
+
+
+class TestTheStepOneBar(ScanningTestCase):
+    """What step 1 shows to a volume that walked on to review 2."""
+
+    def setUp(self):
+        self.user = self.make_user(username="reviewer")
+        self.client.force_login(self.user)
+
+    def _bar(self, scan):
+        """Render the step-1 action bar.
+
+        :param scan: The scan to render it for.
+        :returns: The rendered HTML.
+        :rtype: str
+        """
+        response = self.client.get(
+            reverse("process_actions", kwargs={"pk": scan.pk}),
+            {"step": 1},
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()["html"]
+
+    def test_the_review_one_mark_and_button_survive_review_two(self):
+        """A curator reaches step 1 from review 2 through the step
+        tabs, the repair queue link and the recompute button, and
+        ``start_detect`` accepts all three statuses. A bar that offered
+        nothing there would hide a button the view honours."""
+        for status in (
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+            Status.READY_FOR_REDACTION_REVIEW,
+            Status.REDACTION_REVIEW_DONE,
+        ):
+            with self.subTest(status=status):
+                scan = ScanFactory(status=status, page_count=2)
+
+                bar = self._bar(scan)
+
+                self.assertIn("Page review done", bar)
+                self.assertIn("Next: Detect", bar)
+
+    def test_a_volume_still_in_review_one_is_offered_neither(self):
+        scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW, page_count=2
+        )
+
+        bar = self._bar(scan)
+
+        self.assertNotIn("Page review done", bar)
+        self.assertNotIn("Next: Detect", bar)
 
 
 class TestApproveRedactionReview(ScanningTestCase):
@@ -394,7 +470,19 @@ class TestTheStepTwoBar(ScanningTestCase):
             page_count=2,
         )
 
-        with patch.object(services, "has_legacy_ocr", return_value=True):
+        self.assertIn("Next: Generate", self._bar(scan))
+
+    def test_a_backfilled_legacy_volume_keeps_its_link(self):
+        """The gate reads the status, not ``has_legacy_ocr``: a
+        backfill dots.mocr run turns that false while the volume is
+        still in the legacy step 2."""
+        scan = ScanFactory(
+            status=Status.PENDING_REVIEW,
+            opinions_json=[{"id": 1}],
+            page_count=2,
+        )
+
+        with patch.object(services, "has_legacy_ocr", return_value=False):
             bar = self._bar(scan)
 
         self.assertIn("Next: Generate", bar)

@@ -182,6 +182,21 @@ REVIEW_STATUSES = frozenset(
     }
 )
 
+#: The statuses that say "a person approved the page completeness".
+#: `PAGE_COMPLETENESS_REVIEW_DONE` is where that approval lands, and
+#: the two #263 states are further along the same road, so the approval
+#: holds in all three. Read by the step-1 bar (`_review_flags`), whose
+#: mark and whose "Next: Detect" button describe review 1 alone: a
+#: curator who walks back to step 1 from review 2 must see the same
+#: bar they left, and `start_detect` accepts all three.
+PAGE_REVIEW_APPROVED_STATUSES = frozenset(
+    {
+        Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        Status.READY_FOR_REDACTION_REVIEW,
+        Status.REDACTION_REVIEW_DONE,
+    }
+)
+
 
 class Stage(models.TextChoices):
     VALIDATE = "validate", "Validate"

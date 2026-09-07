@@ -1204,9 +1204,9 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   returns; `process_next_scan` runs the work. This is the one place
   where the shape differs from the page-number apply (#204), which
   stays off the queue because it is seconds of work over a JSON file.
-- **The apply never writes ERROR.** It parks the scan back in
-  `PAGE_COMPLETENESS_REVIEW_DONE` on every path
-  (`_park_after_redactions`, guarded on the busy statuses) and raises
+- **The apply never writes ERROR.** It parks the scan back in a review
+  on every path (`_park_after_redactions`, guarded on the busy
+  statuses; which review is #263's derived rule, below) and raises
   nothing, so the generic ERROR arm in `process_next_scan` never sees
   it. An ERROR on an approved volume needs an admin re-queue, and that
   re-queue runs the whole pipeline again. Failures are counted on the
@@ -1331,9 +1331,16 @@ the collect tick's pass), the park in `services.run_compute_redactions`,
   the safety net: the volume whose corrected build lands after its
   geometry (#224), and every volume already approved and measured when
   this shipped.
-- **Every failure arm parks in `PAGE_COMPLETENESS_REVIEW_DONE`.** A
-  curator must not be sent to judge geometry nobody measured. The
-  apply still writes no ERROR (#196): the ledger on the run bounds the
+- **Every exit derives its park from the one rule**, and none of them
+  chooses a status up front. A first apply that fails wrote no
+  `applied_at`, so the rule gives review 1 back: a curator must not be
+  sent to judge geometry nobody measured. A *recompute* that fails
+  keeps the stamp of the run that worked, so the rule gives review 2
+  back, and the failure message stands where the curator reads it --
+  `record_apply_failure` clears `queued_at` and never `applied_at`, so
+  a park in review 1 there would be undone by `promote_ready_scans` one
+  tick later, with its own message written over the failure. The apply
+  still writes no ERROR (#196): the ledger on the run bounds the
   retries.
 - **A legacy volume is out of both.** Its step 2 lives in
   `PENDING_REVIEW`, because the #154 and #263 states describe a flow it
@@ -1370,6 +1377,20 @@ the collect tick's pass), the park in `services.run_compute_redactions`,
 - The step chooser sends DONE to **step 2**, not step 3: step 3 is
   paused (#173/#206), and step 2 is where the state is shown and where
   its link waits. Send nobody to a step whose only button refuses.
+- **`page_review_done` means "review 1 is approved", and that holds
+  through review 2** (`models.PAGE_REVIEW_APPROVED_STATUSES`, the
+  three post-approval statuses). A curator walks back to step 1 from
+  the redaction review through the step tabs, the repair queue link
+  and the recompute button, and `start_detect` accepts all three, so a
+  flag matching one status alone hid the mark and the "Next: Detect"
+  button of a bar the view still honours.
+- **The legacy clause of "Next: Generate" reads the status**
+  (`legacy_review`, `PENDING_REVIEW`), not `services.has_legacy_ocr`.
+  The two ask different questions: `has_legacy_ocr` asks who read the
+  page numbers and turns false the moment a backfill dots.mocr run
+  gives an old volume an `ANALYZE` row, while the gate asks which
+  review flow the volume is in. The park and the step chooser already
+  say `PENDING_REVIEW` is where a legacy step 2 lives.
 - A report reads these values directly. The stats page (#260) was
   drafted against "DONE and a `Detection` row exists"; with #263 that
   row is `status = READY_FOR_REDACTION_REVIEW`, and "redaction review

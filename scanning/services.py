@@ -1677,15 +1677,34 @@ def run_compute_redactions(scan_pk: int) -> None:
         row.status == JobStatus.CONSUMED for row in rows
     )
     has_rows = Detection.objects.filter(scan_id=scan_pk, active=True).exists()
-    # Where to hand the scan back. A volume with detections but no
-    # detection *run* is a legacy one, and its step 2 lives in
-    # PENDING_REVIEW, since the #154 states describe a review it never
-    # had. Every other volume came from review 1, dead run or not.
-    park = (
-        Status.PENDING_REVIEW
-        if has_rows and not rows
-        else Status.PAGE_COMPLETENESS_REVIEW_DONE
-    )
+    # A volume with detections but no detection *run* is a legacy one,
+    # and its step 2 lives in PENDING_REVIEW, since the #154 and #263
+    # states describe a review it never had. Every other volume came
+    # from review 1, dead run or not.
+    legacy = has_rows and not rows
+
+    def park() -> str:
+        """Return where the scan belongs, read at the moment of the park.
+
+        Derived at each exit rather than chosen once, so that one rule
+        answers for every one of them (#263). A first apply that fails
+        writes no ``applied_at``, so the rule gives review 1 back --
+        nobody may be sent to judge geometry that was never measured. A
+        *recompute* that fails keeps the stamp of the run that worked,
+        so the rule gives review 2 back, and the failure message stands
+        where the curator can read it. A park chosen up front sent that
+        second case to review 1, and ``promote_ready_scans`` wrote its
+        own message over the failure one tick later.
+
+        :returns: The status to park the scan in.
+        :rtype: str
+        """
+        if legacy:
+            return Status.PENDING_REVIEW
+        if review_states.redaction_review_ready(scan, rows):
+            return Status.READY_FOR_REDACTION_REVIEW
+        return Status.PAGE_COMPLETENESS_REVIEW_DONE
+
     if not merged and not has_rows:
         # Nothing to measure: no merged run, and no detections from an
         # earlier one. Park the scan back rather than fail it -- the
@@ -1699,7 +1718,7 @@ def run_compute_redactions(scan_pk: int) -> None:
             scan_pk,
             "No detections to work from. The detection run has not "
             "reached this volume yet.",
-            park,
+            park(),
         )
         return
 
@@ -1790,29 +1809,23 @@ def run_compute_redactions(scan_pk: int) -> None:
                 "The redaction computation failed. The detections are "
                 "safe; ask a staff member to look at it."
             )
-        _park_after_redactions(scan_pk, message, park)
+        _park_after_redactions(scan_pk, message, park())
         return
 
     if merged:
-        # Before the park, never after: the review-2 edge below reads
-        # this very stamp to decide that the redactions are computed
-        # (#263), so the other order would park a finished volume one
-        # tick short of its own review.
+        # Before the park, never after: the review-2 edge in ``park``
+        # reads this very stamp to decide that the redactions are
+        # computed (#263), so the other order would park a finished
+        # volume one tick short of its own review. The apply is usually
+        # the last of the three conditions, and it takes the scan over
+        # the edge itself rather than leaving it to
+        # ``review_states.promote_ready_scans``: the viewer reloads the
+        # page the moment the scan parks, and a park in the approved
+        # status would show the curator a step 2 whose approve button
+        # appears a tick later, from nothing they did.
         yolo.record_apply_success(rows)
-    if park != Status.PENDING_REVIEW and review_states.redaction_review_ready(
-        scan, rows
-    ):
-        # The review-2 edge (#263). The apply is usually the last of
-        # the three conditions, so it takes the scan over itself rather
-        # than leaving it to ``review_states.promote_ready_scans``: the
-        # viewer reloads the page the moment the scan parks, and a park
-        # in the approved status would show the curator a step 2 whose
-        # approve button appears a tick later, from nothing they did.
-        # A legacy volume keeps ``PENDING_REVIEW``, which is where its
-        # own step 2 lives.
-        park = Status.READY_FOR_REDACTION_REVIEW
     _park_after_redactions(
-        scan_pk, "Detection review is ready: check the redactions.", park
+        scan_pk, "Detection review is ready: check the redactions.", park()
     )
     logger.info(
         "compute_redactions: scan %s: %d detection(s), %d opinion(s), "

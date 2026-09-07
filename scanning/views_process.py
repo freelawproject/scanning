@@ -28,6 +28,7 @@ from scanning import dots_mocr, jobs, page_edits, repairs, s3_sync, yolo
 from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
+    PAGE_REVIEW_APPROVED_STATUSES,
     PHYSICAL_PAGE_CHECKS,
     REVIEW_STATUSES,
     CheckName,
@@ -1296,22 +1297,35 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
 
 
 def _review_flags(scan: Scan) -> dict:
-    """Return the review-1 flags the step-1 button bar reads (#151).
+    """Return the review flags the step-1 and step-2 button bars read.
 
     Both :func:`scan_process_view` and the :func:`process_actions`
-    fragment render that bar, so the flags come from one place. A bar
-    that disagreed with itself would offer an approve button the view
-    refuses, or hide the one it accepts.
+    fragment render those bars, so the flags come from one place (#151).
+    A bar that disagreed with itself would offer an approve button the
+    view refuses, or hide the one it accepts. The two review-2 flags
+    (#263) ride along for that same reason, and their approve button is
+    the gate of step 3.
 
-    :param scan: The scan the bar is rendered for.
-    The two review-2 flags (#263) ride along for the same reason: the
-    step-2 bar is rendered by the same two callers, and its approve
-    button is the gate of step 3.
+    ``page_review_done`` says "review 1 is approved", which stays true
+    for the whole of review 2: a curator who walks back to step 1 from
+    there -- through the step tabs, the repair queue link, or the
+    recompute button -- must find the bar they left, with its mark and
+    its "Next: Detect" button. ``start_detect`` accepts all three
+    statuses, so a narrower flag would hide a button the view honours.
 
+    ``legacy_review`` is the status, not
+    :func:`services.has_legacy_ocr`: the two ask different questions.
+    ``has_legacy_ocr`` asks who read the page numbers, and it turns
+    false the moment a backfill run gives an old volume an ``ANALYZE``
+    row; ``legacy_review`` asks which review flow the volume is in, and
+    ``PENDING_REVIEW`` is where a legacy step 2 lives (the park of
+    ``run_compute_redactions`` and the step chooser both say so).
+
+    :param scan: The scan the bars are rendered for.
     :returns: ``page_review_ready``, ``page_review_done``,
         ``redaction_review_ready``, ``redaction_review_done``,
-        ``has_legacy_ocr`` and the two pending-edit flags, for the
-        template context.
+        ``legacy_review``, ``has_legacy_ocr`` and the two pending-edit
+        flags, for the template context.
     :rtype: dict
     """
     from scanning import services
@@ -1320,13 +1334,12 @@ def _review_flags(scan: Scan) -> dict:
         "page_review_ready": (
             scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
         ),
-        "page_review_done": (
-            scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
-        ),
+        "page_review_done": scan.status in PAGE_REVIEW_APPROVED_STATUSES,
         "redaction_review_ready": (
             scan.status == Status.READY_FOR_REDACTION_REVIEW
         ),
         "redaction_review_done": (scan.status == Status.REDACTION_REVIEW_DONE),
+        "legacy_review": scan.status == Status.PENDING_REVIEW,
         "has_legacy_ocr": services.has_legacy_ocr(scan),
         **page_edits.pending_edit_flags(scan),
     }
