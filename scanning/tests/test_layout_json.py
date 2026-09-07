@@ -374,6 +374,22 @@ class TestRelaxedControlCharacters(SimpleTestCase):
         self.assertEqual(result.edits[0].split("@")[0], "escape_quote")
         self.assertEqual(result.edits[1].split("@")[0], "relax_controls")
 
+    def test_a_doubled_closer_is_still_cut_beside_it(self):
+        # The extra-data arm parses again to find the end of the first
+        # value. It must parse in the caller's mode: a strict decoder
+        # stops at the control character the mode had already read,
+        # and a page with two known shapes stayed filtered as "no arm".
+        good = _array("a\nb")
+        broken = good.replace("\\n", "\n") + '"}]'
+
+        result = layout_json.repair(broken)
+
+        self.assertEqual(json.dumps(result.cells), good)
+        self.assertEqual(
+            [edit.split("@")[0] for edit in result.edits],
+            ["relax_controls", "cut_extra"],
+        )
+
     def test_a_relaxed_parse_that_is_not_an_array_is_refused(self):
         # ``_check_cells`` is still the guard: a page is never called
         # repaired unless it came out a layout array.

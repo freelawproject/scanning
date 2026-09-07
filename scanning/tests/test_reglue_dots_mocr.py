@@ -252,16 +252,57 @@ class TestReglueDotsMocr(TestCase):
         )
         return page
 
-    def test_an_approved_volume_is_left_alone(self):
+    def test_an_approved_volume_has_its_final_ocr_glued_again(self):
+        # Past the approval the reader of the volume document is the
+        # apply run's OCR glue (#224), not the page-number apply: the
+        # final OCR volume and the printed pages are written again, and
+        # the scan's status and its dots.mocr apply stamp are left alone.
         scan = self._glued_scan(
             filtered=(0,), status=Status.PAGE_COMPLETENESS_REVIEW_DONE
         )
+        reglue_ocr = self._patch(
+            "scanning.management.commands.reglue_dots_mocr.apply.reglue_ocr",
+            return_value=True,
+        )
+
+        out, _ = self._call()
+
+        document = self.upload.call_args[0][1]
+        self.assertEqual(document["repaired_pages"], [1])
+        reglue_ocr.assert_called_once_with(scan)
+        self.assertIn("the corrected volume's OCR glued again", out)
+        self.assertIn("1 scan(s) glued again", out)
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        rows = dots_mocr.live_analyze_jobs(scan)
+        self.assertTrue(dots_mocr._apply_state(rows).get("applied_at"))
+
+    def test_a_volume_in_review_2_whose_run_is_not_glued_is_left_to_the_tick(
+        self,
+    ):
+        # No standing apply run: nothing to write again, and the tick
+        # glues the run from the new document when it is built.
+        self._glued_scan(
+            filtered=(0,), status=Status.READY_FOR_REDACTION_REVIEW
+        )
+
+        out, _ = self._call()
+
+        self.assertEqual(self.upload.call_args[0][1]["repaired_pages"], [1])
+        self.assertIn("the corrected volume's OCR is not glued yet", out)
+        self.assertIn("1 scan(s) glued again", out)
+
+    def test_an_errored_volume_is_left_alone(self):
+        scan = self._glued_scan(filtered=(0,), status=Status.ERROR)
 
         out, err = self._call(str(scan.pk))
 
         self.upload.assert_not_called()
         self.assertIn("0 scan(s) glued again", out)
-        self.assertIn(f"scan {scan.pk}: no glued run in review 1", err)
+        self.assertIn(
+            f"scan {scan.pk}: no glued run in review 1 or past its approval",
+            err,
+        )
 
     def test_a_ready_volume_is_glued_again(self):
         # A recompute: the apply keeps the status and the curator's own

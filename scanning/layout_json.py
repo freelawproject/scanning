@@ -148,7 +148,7 @@ def repair(raw: str, max_edits: int = MAX_EDITS) -> Repair:
                 relaxed = True
                 edits.append(f"relax_controls@{exc.pos}")
                 continue
-            repaired = _apply_arm(text, exc)
+            repaired = _apply_arm(text, exc, strict=not relaxed)
             if repaired is None:
                 return Repair(None, edits, _describe(text, exc, "no arm"))
             text, edit = repaired
@@ -217,11 +217,18 @@ def excerpt(text: str, pos: int, radius: int = EXCERPT_RADIUS) -> str:
 # ── the arms ──────────────────────────────────────────────────────────
 
 
-def _apply_arm(text: str, exc: json.JSONDecodeError) -> tuple[str, str] | None:
+def _apply_arm(
+    text: str, exc: json.JSONDecodeError, strict: bool = True
+) -> tuple[str, str] | None:
     """Pick the arm for ``exc`` and apply it once.
 
     :param text: The text that failed to parse.
     :param exc: The parser's error.
+    :param strict: The parse mode the caller is in. The two text arms
+        read the text and need no parser; the extra-data arm parses
+        again, and it must parse the way the caller did, or a relaxed
+        page with a doubled closer fails on the control character the
+        mode had already read.
     :returns: ``(repaired text, edit name)``, or ``None`` when no arm
         fits the message and the text at the offset.
     :rtype: tuple[str, str] | None
@@ -233,7 +240,7 @@ def _apply_arm(text: str, exc: json.JSONDecodeError) -> tuple[str, str] | None:
     if exc.msg == _INVALID_ESCAPE_MESSAGE:
         return _restore_quote(text, exc.pos)
     if exc.msg == _EXTRA_DATA_MESSAGE:
-        return _cut_extra(text)
+        return _cut_extra(text, strict=strict)
     return None
 
 
@@ -296,10 +303,16 @@ def _restore_quote(text: str, pos: int) -> tuple[str, str] | None:
     return text[: pos + 1] + '"' + text[pos + 1 :], f"restore_quote@{pos}"
 
 
-def _cut_extra(text: str) -> tuple[str, str] | None:
-    """Keep the first complete value and drop what follows it."""
+def _cut_extra(text: str, strict: bool = True) -> tuple[str, str] | None:
+    """Keep the first complete value and drop what follows it.
+
+    :param text: The text that failed to parse.
+    :param strict: The caller's parse mode, passed to the decoder.
+    :returns: ``(repaired text, edit name)``, or ``None``.
+    :rtype: tuple[str, str] | None
+    """
     try:
-        _, end = json.JSONDecoder().raw_decode(text)
+        _, end = json.JSONDecoder(strict=strict).raw_decode(text)
     except json.JSONDecodeError:
         return None
     return text[:end], f"cut_extra@{end}"

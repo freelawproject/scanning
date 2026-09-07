@@ -1281,17 +1281,35 @@ words, so the page reached the reader with no cell and no number.
   around the fault, so classifying the next one needs no S3 read and
   no shell on the pod.
 - **`reglue_dots_mocr` is the backfill**, and it costs no GPU time: it
-  glues a run again over the stored results and clears the apply stamp
-  (`reopen_apply`). Safe by the two properties of
-  `reapply_page_numbers`: a READY volume is a recompute that keeps its
-  status, the numbers a curator typed are `PageEdit` rows and survive,
-  and an approved volume is not in `APPLY_STATUSES`. **Run it before
-  `reread_failed_pages`**: that command reads `filtered_pages` off the
-  row, a run glued before the deploy still carries them, and a re-read
-  started first pays RunPod for the shards this repairs for nothing.
+  glues a run again over the stored results and hands the new document
+  to the reader the scan has. A scan in review 1 gets its apply stamp
+  cleared (`reopen_apply`). An approved scan (#268) has one reader of
+  the volume document, the OCR glue of its standing apply run (#224),
+  which read it once and stored two keys, so `apply.reglue_ocr` writes
+  the final OCR volume and the printed pages again -- **inline, with no
+  status write and no queue**. The queue takes
+  `PAGE_COMPLETENESS_REVIEW_DONE` alone, so a scan in review 2 could
+  not be queued, and a cleared key on its run would make
+  `final_volume_ready` false with nothing to bring it back; and there
+  is no concurrent writer, because the daemon glues a run only while a
+  glue is due. A run whose OCR glue is not written yet is left to the
+  tick, which glues it from the new document anyway. Safe by the two
+  properties of `reapply_page_numbers`: a READY volume is a recompute
+  that keeps its status, and the numbers a curator typed are `PageEdit`
+  rows and survive. **Run it before `reread_failed_pages`**: that
+  command reads `filtered_pages` off the row, a run glued before the
+  deploy still carries them, and a re-read started first pays RunPod
+  for the shards this repairs for nothing.
+- **The OCR glue of the apply repairs the one-page reads too**
+  (`apply._repair_edit_pages`). The volume glue repairs a filtered page
+  before it writes the volume document; the read of an inserted or
+  replaced page is read straight from its result object, so without
+  that call a page whose JSON broke reached the final volume with no
+  cell until a new worker image read it. Same rule: `raw` is kept, a
+  page no arm reaches stays filtered and is a WARNING.
 - **The `--dry-run` is the corpus survey** of items 1 to 3 of the
-  issue, and it reads *every* glued volume in review 1, not only the
-  ones whose rows report a filtered page. A volume whose retry rung
+  issue, and it reads *every* glued volume in review 1 or past its
+  approval, not only the ones whose rows report a filtered page. A volume whose retry rung
   recovered every filtered answer carries no filtered page to be found
   by, and it is exactly the evidence that the rung works; it is also
   part of the page total the rate divides by.

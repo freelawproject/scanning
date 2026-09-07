@@ -9,13 +9,18 @@ object keeps (``scanning.layout_json``), and the worker does the same
 before it spends a retry rung. Neither reaches a volume already glued:
 the glue ran once, and ``applied_at`` closes the run.
 
-This command hands those volumes back. For every scan in review 1
-whose live run reports a filtered page, it runs the glue again over the
-stored shard results -- the glue is idempotent and the results are kept
-for good -- which rewrites the volume document with the repaired cells
-and re-stamps the rows, and then clears the apply stamp
-(``dots_mocr.reopen_apply``) so the next collect tick reads the page
-numbers again. It starts no GPU job and creates no row.
+This command hands those volumes back. For every scan in review 1 or
+past its approval whose live run reports a filtered page, it runs the
+glue again over the stored shard results -- the glue is idempotent and
+the results are kept for good -- which rewrites the volume document
+with the repaired cells and re-stamps the rows. Then it hands the new
+document to the reader the scan has. A scan in review 1 gets its apply
+stamp cleared (``dots_mocr.reopen_apply``), so the next collect tick
+reads the page numbers again. An approved scan has one reader of the
+volume document, the OCR glue of its standing apply run (#224), which
+read it once and stored two keys; ``apply.reglue_ocr`` writes the
+final OCR volume and the printed pages again from the new document,
+inline, with no status write. It starts no GPU job and creates no row.
 
 **Run this before ``reread_failed_pages``.** That command reads
 ``filtered_pages`` off the row (``jobs.has_unread_pages``), and a run
@@ -43,8 +48,10 @@ corpus, and it changes nothing.
 
 Safe by the two properties of ``reapply_page_numbers``: a volume in
 ``READY_FOR_PAGE_COMPLETENESS_REVIEW`` is a recompute and keeps its
-status, the numbers a curator typed are ``PageEdit`` rows and survive
-every apply, and an approved volume is not in ``APPLY_STATUSES``.
+status, and the numbers a curator typed are ``PageEdit`` rows and
+survive every apply. An approved volume keeps its status too: the
+re-glue of its OCR outputs writes two S3 objects and two keys, and
+touches neither the scan nor the queue.
 
 Examples:
 
@@ -62,8 +69,9 @@ Examples:
 
 from django.core.management.base import BaseCommand, CommandError
 
-from scanning import dots_mocr, jobs, s3_sync
+from scanning import apply, dots_mocr, jobs, s3_sync
 from scanning.models import (
+    PAGE_REVIEW_APPROVED_STATUSES,
     ExternalJob,
     JobEngine,
     JobProvider,
@@ -72,11 +80,18 @@ from scanning.models import (
     Scan,
 )
 
+#: The scans the pass may act on: the review-1 statuses the page-number
+#: apply reads (``dots_mocr.APPLY_STATUSES``), and the three statuses
+#: past the review-1 approval, whose reader is the apply run's OCR
+#: glue. Legacy ``PENDING_REVIEW`` is in the first set.
+REGLUE_STATUSES = (*dots_mocr.APPLY_STATUSES, *PAGE_REVIEW_APPROVED_STATUSES)
+
 
 class Command(BaseCommand):
     help = (
-        "Glue again every dots.mocr run in review 1 whose stored results "
-        "hold a filtered page, so the repaired cells reach the reader."
+        "Glue again every dots.mocr run in review 1 or past its approval "
+        "whose stored results hold a filtered page, so the repaired cells "
+        "reach the reader."
     )
 
     def add_arguments(self, parser):
@@ -162,7 +177,8 @@ class Command(BaseCommand):
 
         for pk in sorted(set(wanted) - {scan.pk for scan in scans}):
             self.stderr.write(
-                f"scan {pk}: no glued run in review 1; nothing to do"
+                f"scan {pk}: no glued run in review 1 or past its "
+                "approval; nothing to do"
             )
 
         if dry_run:
@@ -178,9 +194,9 @@ class Command(BaseCommand):
     def _candidates(self, wanted: list[int]) -> list[Scan]:
         """Return the scans the pass may act on, in pk order.
 
-        The same set as ``reapply_page_numbers``: a glued run, and a
-        status the apply pass reads. An approved volume is not among
-        them.
+        A glued run, and a status in :data:`REGLUE_STATUSES`: the set
+        of ``reapply_page_numbers`` plus the three statuses past the
+        review-1 approval, where the reader is the apply run's OCR glue.
 
         :param wanted: The scan numbers the operator named, if any.
         :returns: The eligible scans.
@@ -197,7 +213,7 @@ class Command(BaseCommand):
             .distinct()
         )
         scans = Scan.objects.filter(
-            pk__in=list(glued), status__in=dots_mocr.APPLY_STATUSES
+            pk__in=list(glued), status__in=REGLUE_STATUSES
         ).order_by("pk")
         if wanted:
             scans = scans.filter(pk__in=wanted)
@@ -252,25 +268,39 @@ class Command(BaseCommand):
                 self.stdout.write(f"{where}: cannot repair: {report['fault']}")
 
     def _reglue_scan(self, scan, rows) -> None:
-        """Glue one scan again and hand it back to the apply.
+        """Glue one scan again and hand the new document to its reader.
+
+        A scan in review 1 is handed back to the page-number apply. An
+        approved scan has its final OCR volume and printed pages written
+        again from the new document (``apply.reglue_ocr``); a run whose
+        OCR glue is not written yet is left to the tick, which glues it
+        from the new document anyway.
 
         :param scan: The scan to glue again.
         :param rows: Its live run's rows.
         :return: None.
         """
         dots_mocr.merge_dotsmocr_results(scan, rows)
-        reopened = dots_mocr.reopen_apply(scan)
+        if scan.status in PAGE_REVIEW_APPROVED_STATUSES:
+            handed = (
+                "the corrected volume's OCR glued again"
+                if apply.reglue_ocr(scan)
+                else "the corrected volume's OCR is not glued yet; the "
+                "tick glues it from the new document"
+            )
+        else:
+            handed = (
+                "handed back to the apply"
+                if dots_mocr.reopen_apply(scan)
+                else "the apply had not run yet"
+            )
         left = sum(
             len(jobs.page_lists(row)["filtered_pages"])
             for row in dots_mocr.live_analyze_jobs(scan)
         )
         self.stdout.write(
             f"scan {scan.pk}: glued again, {left} filtered page(s) left, "
-            + (
-                "handed back to the apply"
-                if reopened
-                else "the apply had not run yet"
-            )
+            + handed
         )
 
 
