@@ -92,7 +92,17 @@ reach step 2.
     {% csrf_token %}
     <button type="submit" class="btn-outline text-sm" title="Read the stored page numbers again and rebuild the list of issues. This does not run OCR.">Recompute page number issues</button>
   </form>
-  {% if page_review_ready %}
+  {% if page_review_ready and repairs_waiting %}
+  {% comment %}
+    A scanner was asked for a page, so the volume is not page complete
+    and there is no approve button (#266). Say why, and name the two
+    ways out: the new scan arrives, or somebody dismisses the request.
+    A bar that only hid the button would be the dead end #232 removed.
+    `approve_page_completeness` refuses the POST as well, because a
+    gate in a template cannot answer a direct POST.
+  {% endcomment %}
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-200" title="Wait for the new scan, or dismiss the request on the page if it no longer applies.">Waiting for a scanner &mdash; see Repairs requested</span>
+  {% elif page_review_ready %}
   <form method="post" action="{% url 'approve_page_completeness' scan.pk %}" class="inline">
     {% csrf_token %}
     <button type="submit" class="btn-primary text-sm" title="Confirm this volume is page complete: no missing, duplicated, mislabeled or blurry pages.{% if has_pending_changes %} The corrected volume is then built from your saved page changes{% if has_pending_inserts %}, and each inserted or replaced page is converted and read on its own (incurs costs $$$){% endif %}.{% endif %}"{% if issues or missing_pages %} onclick="return confirm('This scan still lists issues or missing pages. Approve it as page complete anyway?');"{% elif has_pending_inserts %} onclick="return confirm('The corrected volume is built from your page changes after this approval. Each inserted or replaced page is converted and read on its own, which incurs costs $$$. Approve this scan as page complete?');"{% elif has_pending_changes %} onclick="return confirm('The corrected volume is built from your page changes after this approval. Approve this scan as page complete?');"{% endif %}>I reviewed this scan and it is complete</button>

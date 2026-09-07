@@ -9,6 +9,7 @@ queue view.
 import json
 import tempfile
 
+from django.contrib.messages import get_messages
 from django.db import IntegrityError, transaction
 from django.test import override_settings
 from django.urls import reverse
@@ -728,6 +729,21 @@ class TestStepOneShowsTheRequests(RepairTestCase):
 
         self.assertEqual(response.context["repair_requests"], [])
 
+    def test_the_repairs_come_before_the_issues(self):
+        """The block is a reason the review cannot close (#266).
+
+        Under the issue cards the reviewer had to scroll to find it,
+        and they found it after the work.
+        """
+        self._replace(pdf_page=2)
+
+        html = self._step_one().content.decode()
+
+        self.assertLess(
+            html.index('id="repairs-section"'),
+            html.index('id="issues-section"'),
+        )
+
 
 class TestRepairQueue(RepairTestCase):
     """The queue of repairs, over every scan."""
@@ -884,3 +900,174 @@ class TestRepairQueue(RepairTestCase):
         repairs.dismiss(PageRepairRequest.objects.all(), self.user)
         response = self._queue()
         self.assertContains(response, "No page waits for a scanner.")
+
+
+class TestWaitingCounts(RepairTestCase):
+    """The count the badge of the scan list reads (issue #266)."""
+
+    def test_one_query_counts_every_scan_of_a_page(self):
+        other = ScanFactory(page_count=2, source_fingerprint="50:2")
+        PageRepairRequest.objects.create(
+            scan=other,
+            action=PageRepairRequest.Action.REPLACE,
+            requested_by=self.user,
+            pdf_page=1,
+            source_fingerprint="50:2",
+        )
+        self._replace(pdf_page=2)
+
+        with self.assertNumQueries(1):
+            counts = repairs.waiting_counts([self.scan.pk, other.pk])
+
+        self.assertEqual(counts, {self.scan.pk: 1, other.pk: 1})
+
+    def test_two_requests_of_one_scan_read_two(self):
+        """The grouping is by scan, never by address.
+
+        ``annotate_fulfilled`` orders by ``sort_address``, and Django
+        puts the ordering columns into ``GROUP BY``. Without the
+        cleared ordering this scan would read 1 twice.
+        """
+        self._replace(pdf_page=2)
+        self._insert(anchor=1, label="2")
+
+        self.assertEqual(
+            repairs.waiting_counts([self.scan.pk]), {self.scan.pk: 2}
+        )
+
+    def test_a_scan_with_no_request_is_absent(self):
+        other = ScanFactory(page_count=2)
+
+        self.assertEqual(repairs.waiting_counts([other.pk]), {})
+
+    def test_a_dismissed_request_is_not_counted(self):
+        row_id = json.loads(self._replace(pdf_page=2).content)["request"]["id"]
+        self._dismiss(row_id)
+
+        self.assertEqual(repairs.waiting_counts([self.scan.pk]), {})
+
+    @override_settings(MEDIA_ROOT=MEDIA_ROOT)
+    def test_a_fulfilled_request_is_not_counted(self):
+        self._replace(pdf_page=2)
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+            source_fingerprint="100:3",
+        )
+
+        self.assertEqual(repairs.waiting_counts([self.scan.pk]), {})
+
+    def test_has_waiting_reads_the_same_term(self):
+        self.assertFalse(repairs.has_waiting(self.scan))
+
+        row_id = json.loads(self._replace(pdf_page=2).content)["request"]["id"]
+        self.assertTrue(repairs.has_waiting(self.scan))
+
+        self._dismiss(row_id)
+        self.assertFalse(repairs.has_waiting(self.scan))
+
+    def test_a_stale_request_waits_too(self):
+        """A request against an earlier upload holds the review open.
+
+        This is not the ``PageEdit`` rule: an apply cannot place a
+        stale edit, but a person judges a stale request and dismisses
+        it with one click.
+        """
+        self._replace(pdf_page=2)
+        self.scan.source_fingerprint = "200:3"
+        self.scan.save(update_fields=["source_fingerprint"])
+
+        self.assertTrue(repairs.has_waiting(self.scan))
+        self.assertEqual(
+            repairs.waiting_counts([self.scan.pk]), {self.scan.pk: 1}
+        )
+
+
+class TestTheApprovalWaitsForTheScanner(RepairTestCase):
+    """A waiting request refuses the review-1 approval (issue #266)."""
+
+    def _approve(self):
+        """POST the approve button of review 1.
+
+        :returns: The flashed message strings.
+        :rtype: list[str]
+        """
+        response = self.client.post(
+            reverse("approve_page_completeness", kwargs={"pk": self.scan.pk})
+        )
+        self.assertEqual(response.status_code, 302)
+        self.scan.refresh_from_db()
+        return [str(m) for m in get_messages(response.wsgi_request)]
+
+    def test_a_waiting_request_refuses_the_approval(self):
+        self._replace(pdf_page=2)
+
+        flashed = self._approve()
+
+        self.assertEqual(
+            self.scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        self.assertIn(views_process.REPAIRS_WAITING_MESSAGE, flashed)
+
+    def test_the_bar_shows_a_note_and_no_approve_button(self):
+        self._replace(pdf_page=2)
+
+        response = self._step_one()
+
+        self.assertTrue(response.context["repairs_waiting"])
+        self.assertContains(response, "Waiting for a scanner")
+        self.assertNotContains(
+            response, "I reviewed this scan and it is complete"
+        )
+
+    def test_the_fragment_agrees_with_the_page(self):
+        """One flag serves both, or the bar would offer a refused button."""
+        self._replace(pdf_page=2)
+
+        fragment = self.client.get(
+            reverse("process_actions", kwargs={"pk": self.scan.pk}) + "?step=1"
+        )
+
+        self.assertIn(
+            "Waiting for a scanner", json.loads(fragment.content)["html"]
+        )
+
+    def test_the_approval_passes_after_a_dismissal(self):
+        row_id = json.loads(self._replace(pdf_page=2).content)["request"]["id"]
+        self._dismiss(row_id)
+
+        flashed = self._approve()
+
+        self.assertEqual(
+            self.scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+        self.assertIn(views_process.PAGE_REVIEW_APPROVED_MESSAGE, flashed)
+
+    @override_settings(MEDIA_ROOT=MEDIA_ROOT)
+    def test_a_fulfilled_request_does_not_refuse(self):
+        """The scanner did the work; the row waits for nobody."""
+        self._replace(pdf_page=2)
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            value="",
+            source_fingerprint="100:3",
+        )
+
+        flashed = self._approve()
+
+        self.assertEqual(
+            self.scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+        self.assertIn(views_process.PAGE_REVIEW_APPROVED_MESSAGE, flashed)
+
+    def test_the_bar_offers_the_button_with_no_request(self):
+        response = self._step_one()
+
+        self.assertFalse(response.context["repairs_waiting"])
+        self.assertContains(
+            response, "I reviewed this scan and it is complete"
+        )

@@ -71,11 +71,18 @@ def logout_view(request: HttpRequest) -> HttpResponse:
 def scan_list(request: HttpRequest) -> HttpResponse:
     """List scans with opinion count annotation.
 
+    Each row of the page carries ``waiting_repairs``, the number of
+    pages a scanner must still scan (#266). A volume with one cannot
+    pass the page completeness review, so the badge keeps a reviewer
+    out of it.
+
     :param request: The current HTTP request.
     :return: The rendered scan list page.
     """
     scans = (
-        Scan.objects.select_related("reporter")
+        # ``uploaded_by`` is joined because every row prints the
+        # username: without it the page cost one query per scan.
+        Scan.objects.select_related("reporter", "uploaded_by")
         .annotate(opinion_count=Count("opinions"))
         .order_by("-date_created")
     )
@@ -104,6 +111,15 @@ def scan_list(request: HttpRequest) -> HttpResponse:
     paginator = Paginator(scans, 25)
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
+
+    # The repair badge (#266): a volume whose pages a scanner must
+    # scan cannot pass the page completeness review, so a reviewer
+    # must see that before they open it. The count is stamped after
+    # the pagination, so one grouped query answers the 25 rows of
+    # this page and the size of the corpus never reaches it.
+    waiting = repairs.waiting_counts([scan.pk for scan in page_obj])
+    for scan in page_obj:
+        scan.waiting_repairs = waiting.get(scan.pk, 0)
 
     retry_cap_count = Scan.objects.filter(
         status=Status.ERROR_MAX_RETRIES,

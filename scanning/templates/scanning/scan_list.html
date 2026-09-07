@@ -106,6 +106,7 @@
         <td class="px-4 py-3 text-sm">{{ scan.opinion_count }}</td>
         <td class="px-4 py-3 text-sm">
           <span class="badge-{{ scan.status }}" title="Scan status">{{ scan.get_status_display }}</span>
+          {% if scan.waiting_repairs %}<span class="badge-repair" title="A scanner must still scan these pages. The page completeness review cannot be approved until they are done or dismissed.">{{ scan.waiting_repairs }} repairs requested</span>{% endif %}
           {% if scan.s3_uploaded %}<span class="badge-s3" title="Final files uploaded to S3">S3</span>{% endif %}
         </td>
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{{ scan.date_created|date:"M j, Y g:i A" }}{% if scan.uploaded_by %} by {{ scan.uploaded_by.username }}{% endif %}</td>
@@ -130,6 +131,7 @@
     <div class="flex items-center justify-between mb-2">
       <span class="font-medium text-sm">{{ scan.reporter }}</span>
       <span class="badge-{{ scan.status }}" title="Scan status">{{ scan.get_status_display }}</span>
+      {% if scan.waiting_repairs %}<span class="badge-repair" title="A scanner must still scan these pages. The page completeness review cannot be approved until they are done or dismissed.">{{ scan.waiting_repairs }} repairs requested</span>{% endif %}
       {% if scan.s3_uploaded %}<span class="badge-s3" title="Final files uploaded to S3">S3</span>{% endif %}
     </div>
     <div class="text-sm text-gray-500 dark:text-gray-400">

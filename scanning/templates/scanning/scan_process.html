@@ -116,6 +116,37 @@
         <p class="m-0">They are not built into the volume yet. Approve this volume when the pages are complete: the corrected volume is then built from your changes, and each inserted, replaced or rotated page goes through the conversion and the OCR on its own.</p>
       </div>
 
+      {% comment %}
+        The pages a reviewer with no book asked a scanner to scan (#249).
+        Not issue cards: an issue card has its own dismiss, and one
+        finding must have one. The viewer redraws this list after a
+        request or a dismissal (renderRepairsSection in viewer_step1.js).
+
+        It goes **above** the issues (#266). A waiting request holds
+        the review open, so the reviewer must read it before they work
+        through the issue cards; under them it was one scroll away, and
+        the reviewer learned of the block after the work. It stays
+        outside the `ocr_results` branch below: a volume nobody read
+        yet still shows its requests.
+      {% endcomment %}
+      <div id="repairs-section"{% if not waiting_repairs %} hidden{% endif %}>
+      <h2 class="text-sm font-bold mt-3 mb-1">Repairs requested (<span class="repairs-count">{{ waiting_repairs|length }}</span>)</h2>
+      <p class="text-[10px] text-gray-500 dark:text-gray-400 mb-1">A scanner with the book must do these. The <a href="{% url 'repair_queue' %}" class="underline">Repairs</a> page lists them for every volume.</p>
+      <div id="repairs-list">
+      {% for r in waiting_repairs %}
+      <div class="repair-card rounded border border-orange-300 bg-orange-50 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/20 dark:hover:bg-orange-900/40 px-2 py-1.5 mb-1 cursor-pointer text-xs" data-request-id="{{ r.id }}" data-pdf-index="{{ r.nav_pdf_index }}" onclick="goToPage(this)">
+        <div class="flex items-center gap-1.5">
+          <span class="font-bold uppercase text-[10px]">{{ r.action_label }}</span>
+          <span class="text-gray-500 dark:text-gray-400">{% if r.action == 'insert' %}after PDF p.{{ r.anchor_pdf_page }}{% else %}PDF p.{{ r.pdf_page }}{% endif %}{% if r.logical_page %} (#{{ r.logical_page }}){% endif %}</span>
+          {% if r.stale %}<span class="text-[9px] font-bold text-gray-500" title="Made on an earlier upload of this scan">EARLIER UPLOAD</span>{% endif %}
+        </div>
+        {% if r.note %}<p class="mt-0.5 text-gray-700 dark:text-gray-300">{{ r.note }}</p>{% endif %}
+        <p class="mt-0.5 text-[10px] text-gray-500 dark:text-gray-400">{{ r.requested_by }}, {{ r.date_created }}</p>
+      </div>
+      {% endfor %}
+      </div>
+      </div>
+
       {% if ocr_results %}
       <div id="issues-section"{% if not issues %} hidden{% endif %}>
       <h2 class="text-sm font-bold mb-2 pt-3">Issues (<span id="issues-count">{{ issues|length }}</span>)</h2>
@@ -151,30 +182,6 @@
         Not yet processed
       </div>
       {% endif %}
-
-      {% comment %}
-        The pages a reviewer with no book asked a scanner to scan (#249).
-        Not issue cards: an issue card has its own dismiss, and one
-        finding must have one. The viewer redraws this list after a
-        request or a dismissal (renderRepairsSection in viewer_step1.js).
-      {% endcomment %}
-      <div id="repairs-section"{% if not waiting_repairs %} hidden{% endif %}>
-      <h2 class="text-sm font-bold mt-3 mb-1">Repairs requested (<span class="repairs-count">{{ waiting_repairs|length }}</span>)</h2>
-      <p class="text-[10px] text-gray-500 dark:text-gray-400 mb-1">A scanner with the book must do these. The <a href="{% url 'repair_queue' %}" class="underline">Repairs</a> page lists them for every volume.</p>
-      <div id="repairs-list">
-      {% for r in waiting_repairs %}
-      <div class="repair-card rounded border border-orange-300 bg-orange-50 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/20 dark:hover:bg-orange-900/40 px-2 py-1.5 mb-1 cursor-pointer text-xs" data-request-id="{{ r.id }}" data-pdf-index="{{ r.nav_pdf_index }}" onclick="goToPage(this)">
-        <div class="flex items-center gap-1.5">
-          <span class="font-bold uppercase text-[10px]">{{ r.action_label }}</span>
-          <span class="text-gray-500 dark:text-gray-400">{% if r.action == 'insert' %}after PDF p.{{ r.anchor_pdf_page }}{% else %}PDF p.{{ r.pdf_page }}{% endif %}{% if r.logical_page %} (#{{ r.logical_page }}){% endif %}</span>
-          {% if r.stale %}<span class="text-[9px] font-bold text-gray-500" title="Made on an earlier upload of this scan">EARLIER UPLOAD</span>{% endif %}
-        </div>
-        {% if r.note %}<p class="mt-0.5 text-gray-700 dark:text-gray-300">{{ r.note }}</p>{% endif %}
-        <p class="mt-0.5 text-[10px] text-gray-500 dark:text-gray-400">{{ r.requested_by }}, {{ r.date_created }}</p>
-      </div>
-      {% endfor %}
-      </div>
-      </div>
 
       {% if ocr_results %}
       <h2 class="text-sm font-bold mt-3 mb-1">Pages ({{ scan.page_count }})</h2>

@@ -135,7 +135,9 @@ approve button the view refuses.
   moment. Any logged-in user may press it (review 1 is the scanners'
   own step). Open issues do not block it — the browser asks for a
   confirm and the view obeys, because the curator, not the model, is
-  the judge of a suspicion.
+  the judge of a suspicion. A **waiting repair request** does block it
+  (#266, below): a page a scanner must still scan is a page the volume
+  does not have, which is a fact and not a suspicion.
 - **Approving is the gate for "Next: Detect"**, which is why the button
   cannot be gated on an empty issue list. The view enforces it too:
   `start_detect` sends a scan still in READY back to step 1, so a
@@ -422,6 +424,67 @@ called it, and an endpoint nobody reaches still carries its surface
   scrolls to the placeholder once it exists (`goToRequestedPage`).
   The header count (`context_processors.waiting_repairs`) is one
   query for a logged-in user.
+
+## A waiting repair holds the review (issue #266)
+
+A reviewer used to open a volume that said "Ready for page
+completeness review", work through every issue card, and only then
+scroll far enough to learn that a page waits for a scanner. Three
+changes: the scan list says it before the volume is opened, the
+sidebar says it before the issue cards, and the approval refuses.
+
+- **One term, and `repairs.py` owns it.** A *waiting* request is open
+  and not fulfilled. The badge of the scan list
+  (`repairs.waiting_counts`), the gate of the approval
+  (`repairs.has_waiting`), the badge and the section of step 1
+  (`waiting_repairs` in `scan_process_view`) and the header count
+  (`repairs.waiting_count`) all read that one definition. A second
+  definition would let the badge and the gate disagree on one volume,
+  and nobody could say which one is right.
+- **A stale request waits too**, and this is deliberately **not** the
+  `PageEdit` rule of #214, where a stale row does not hold the review
+  open. The rows differ: an apply cannot place a stale edit, but a
+  request is work for a person, and a person judges a stale request
+  and dismisses it with one click (any logged-in user may). The
+  sidebar and the queue both mark it "EARLIER UPLOAD". The trade: after
+  a re-upload somebody must dismiss the old requests before the review
+  closes.
+- **A fulfilled request never waits.** The scanner did the work. The
+  row stays open so the reviewer can judge the new page and ask again
+  (#249), and it keeps its Dismiss button.
+- **The gate is in the view and in the bar, from one flag.**
+  `_review_flags` carries `repairs_waiting`, so
+  `_process_actions.html` shows a note in place of the approve button,
+  and `approve_page_completeness` refuses the POST -- a gate in a
+  template cannot answer a direct POST, the rule `start_detect`
+  follows for the review it gates. Open *issues* still do not block
+  the approval: a suspicion is the curator's to judge, a missing page
+  is not (#151). The note names the two ways out, because a bar that
+  only hid the button would be the dead end #232 removed.
+- **The flag is passed, not queried twice.** `scan_process_view` reads
+  the requests for the sidebar already and hands the answer to
+  `_review_flags`; the `process_actions` fragment passes nothing and
+  the flag queries. Both render the same bar, which is the #151 rule.
+- **The gate is a read, then the compare-and-swap.** A request made
+  between the two does not block that approval. Both acts are
+  decisions of a person, seconds apart, and the way back from a wrong
+  approval is the admin re-queue whichever wins, so the subquery
+  inside the `update()` filter buys nothing.
+- **`renderRepairsSection` refreshes the action bar.** A request takes
+  the approve button away and the last dismissal gives it back, both
+  without a reload, so a bar left as it was would offer a button the
+  view refuses.
+- **The Repairs section is above the Issues section**, and it stays
+  outside the `ocr_results` branch: a volume nobody read yet still
+  shows its requests.
+- **The badge costs one query per page of the list.**
+  `repairs.waiting_counts` groups by scan over the 25 ids of the page,
+  which the view stamps on the rows **after** the pagination, so the
+  size of the corpus never reaches it. `.order_by()` must clear the
+  ordering of `annotate_fulfilled` before the grouping: Django puts
+  the ordering columns into `GROUP BY`, and `sort_address` is a
+  per-row expression, so a scan with two waiting requests would read 1
+  twice. `scan_list` also joins `uploaded_by`, which every row prints.
 
 ## A range missing at the end (issue #256)
 

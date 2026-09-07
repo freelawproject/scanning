@@ -977,7 +977,11 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // The sidebar section and the header badge, redrawn whole from the
-    // list, so they cannot disagree with the notes on the pages.
+    // list, so they cannot disagree with the notes on the pages. The
+    // action bar is refreshed with them (#266): a waiting request
+    // takes the approve button away, and the last dismissal gives it
+    // back, so a bar left as it was would offer a button the view
+    // refuses, or hide the one it accepts.
     function renderRepairsSection() {
         var waiting = repairRequests.filter(function (r) { return !r.fulfilled; });
         var section = document.getElementById('repairs-section');
@@ -1008,6 +1012,9 @@ document.addEventListener('DOMContentLoaded', function () {
                 escapeHtml(r.requested_by) + ', ' + escapeHtml(r.date_created) + '</p>' +
                 '</div>';
         }).join('');
+        if (typeof window.refreshProcessActionBar === 'function') {
+            window.refreshProcessActionBar();
+        }
     }
 
     // The Repairs page links to one page of step 1 (?goto=<pdf_index>).
