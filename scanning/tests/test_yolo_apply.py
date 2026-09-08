@@ -16,7 +16,7 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.utils import timezone
 
-from scanning import services, yolo
+from scanning import apply, services, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
     ApplyRun,
@@ -70,6 +70,65 @@ DOCUMENT = {
     "pages_with_detections": 2,
 }
 
+#: One printed-page map, as :func:`apply.printed_pages` writes it.
+PRINTED = {
+    "schema_version": 1,
+    "apply_run": "a1",
+    "final_page_count": 2,
+    "pages": [
+        {"final_page": 1, "printed": "101", "type": "single", "by": "model"},
+        {
+            "final_page": 2,
+            "printed": "102-103",
+            "type": "range",
+            "by": "curator",
+        },
+    ],
+}
+
+
+def identity_map(pages: int) -> dict:
+    """Return a stored page map that keeps every original page in place.
+
+    :param pages: The page count.
+    :returns: The map, in the shape of ``ApplyPlan.to_map``.
+    """
+    return {
+        "schema_version": apply.MAP_SCHEMA_VERSION,
+        "source_page_count": pages,
+        "final_page_count": pages,
+        "deleted_pages": [],
+        "pages": [
+            {
+                "final_page": page,
+                "source": {"kind": "original", "pdf_page": page},
+            }
+            for page in range(1, pages + 1)
+        ],
+    }
+
+
+def glued_run(scan, number: int = 1, page_map: dict | None = None) -> ApplyRun:
+    """Create a complete apply run for ``scan``.
+
+    :param scan: The scan.
+    :param number: The run number.
+    :param page_map: The stored map; the identity over the scan's pages
+        when omitted, as a volume with no page edit has.
+    :returns: The run.
+    """
+    return ApplyRun.objects.create(
+        scan=scan,
+        number=number,
+        built_at=timezone.now(),
+        page_map=page_map or identity_map(scan.page_count or 2),
+        final_pdf_key=f"processing/{scan.pk}/final-{number}.pdf",
+        bitonal_key=f"processing/{scan.pk}/bitonal-{number}.pdf",
+        ocr_key=f"processing/{scan.pk}/ocr-{number}.json",
+        printed_pages_key=f"processing/{scan.pk}/printed-{number}.json",
+        detections_key=f"processing/{scan.pk}/detections-{number}.json",
+    )
+
 
 def merged_scan(status=Status.PAGE_COMPLETENESS_REVIEW_DONE, **kwargs):
     """Build a scan whose detection run is merged and consumed.
@@ -84,15 +143,7 @@ def merged_scan(status=Status.PAGE_COMPLETENESS_REVIEW_DONE, **kwargs):
     # The redaction compute reads the final volume (#224), so the
     # trigger waits for a glued apply run. This one aliases the
     # review-1 artifacts, as a volume with no page edit does.
-    ApplyRun.objects.create(
-        scan=scan,
-        number=1,
-        built_at=timezone.now(),
-        bitonal_key="bitonal.pdf",
-        ocr_key="ocr.json",
-        printed_pages_key="printed.json",
-        detections_key="detections.json",
-    )
+    glued_run(scan)
     return scan, yolo.live_detect_jobs(scan)
 
 
@@ -159,8 +210,70 @@ class TestQueueReadyRuns(TestCase):
         self.assertEqual(yolo.apply_state(yolo.live_detect_jobs(scan)), {})
 
     def test_an_applied_run_is_never_queued_again(self):
-        _, rows = merged_scan()
-        yolo.record_apply_success(rows)
+        scan, rows = merged_scan()
+        yolo.record_apply_success(rows, apply.current_run(scan))
+
+        self.assertEqual(yolo.queue_ready_runs(), 0)
+
+    def test_a_run_applied_against_a_superseded_run_is_queued_again(self):
+        """The rows describe the pages of ``a1``; ``a2`` may show other
+        pages (#269). The ledger starts over, so the failures of the
+        new run count against it and the cap still holds."""
+        scan, rows = merged_scan()
+        old = apply.current_run(scan)
+        yolo.record_apply_success(rows, old)
+        yolo.write_apply_state(
+            yolo.live_detect_jobs(scan),
+            {
+                **yolo.apply_state(yolo.live_detect_jobs(scan)),
+                "attempts": yolo.APPLY_MAX_ATTEMPTS,
+            },
+        )
+        apply.supersede_runs(scan, "test")
+        new = glued_run(scan, number=2)
+
+        self.assertEqual(yolo.queue_ready_runs(), 1)
+
+        state = yolo.apply_state(yolo.live_detect_jobs(scan))
+        self.assertEqual(state.get("apply_run"), new.pk)
+        self.assertIsNone(state.get("applied_at"))
+        self.assertEqual(int(state.get("attempts") or 0), 0)
+
+    def test_failures_under_the_new_run_still_reach_the_cap(self):
+        """The ledger is written over, not reset: three failures under
+        ``a2`` stop the queue, or it would re-queue every tick."""
+        scan, rows = merged_scan()
+        yolo.record_apply_success(rows, apply.current_run(scan))
+        apply.supersede_runs(scan, "test")
+        glued_run(scan, number=2)
+        self.assertEqual(yolo.queue_ready_runs(), 1)
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+        for _ in range(yolo.APPLY_MAX_ATTEMPTS):
+            yolo.record_apply_failure(
+                scan, yolo.live_detect_jobs(scan), RuntimeError("no")
+            )
+
+        self.assertEqual(yolo.queue_ready_runs(), 0)
+
+    def test_a_stamp_with_no_run_is_not_current(self):
+        """A stamp written before #269 names no run; the migration
+        stamps the identity runs, and every other one is measured
+        again."""
+        scan, rows = merged_scan()
+        yolo.write_apply_state(rows, {"applied_at": "2026-09-01T00:00:00"})
+
+        self.assertFalse(
+            yolo.redactions_current(
+                yolo.live_detect_jobs(scan), apply.current_run(scan)
+            )
+        )
+        self.assertEqual(yolo.queue_ready_runs(), 1)
+
+    def test_a_volume_whose_corrected_build_is_missing_waits(self):
+        scan, _ = merged_scan()
+        ApplyRun.objects.filter(scan=scan).update(detections_key="")
 
         self.assertEqual(yolo.queue_ready_runs(), 0)
 
@@ -220,18 +333,27 @@ class ComputeMixin:
             stubs[name] = patcher.start()
             self.addCleanup(patcher.stop)
         pdf = patch.object(
-            services, "processing_pdf_path", return_value="/tmp/x.pdf"
+            services, "geometry_pdf_path", return_value="/tmp/x.pdf"
         )
-        stubs["processing_pdf_path"] = pdf.start()
+        stubs["geometry_pdf_path"] = pdf.start()
         self.addCleanup(pdf.stop)
         pair = patch.object(services, "bl_pair", return_value=[{"a": 1}])
         stubs["bl_pair"] = pair.start()
         self.addCleanup(pair.stop)
+        # The compute reads the run's two documents (#269): the glued
+        # detections in the final page space, and the printed pages.
         load = patch.object(
-            yolo, "load_merged_document", return_value=document or DOCUMENT
+            apply,
+            "load_detections_document",
+            return_value=document or DOCUMENT,
         )
-        stubs["load_merged_document"] = load.start()
+        stubs["load_detections_document"] = load.start()
         self.addCleanup(load.stop)
+        printed = patch.object(
+            apply, "load_printed_pages", return_value=PRINTED
+        )
+        stubs["load_printed_pages"] = printed.start()
+        self.addCleanup(printed.stop)
         release = patch("scanning.s3_sync.release_local_processing")
         release.start()
         self.addCleanup(release.stop)
@@ -348,11 +470,82 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         scan, _ = merged_scan()
         stubs = self.patch_geometry()
         services.run_compute_redactions(scan.pk)
-        stubs["load_merged_document"].reset_mock()
+        stubs["load_detections_document"].reset_mock()
 
         services.run_compute_redactions(scan.pk)
 
-        stubs["load_merged_document"].assert_not_called()
+        stubs["load_detections_document"].assert_not_called()
+
+    def test_the_geometry_is_measured_on_the_run_and_labelled_by_it(self):
+        """The compute reads the standing run's corrected volume
+        (#269): the PDF it measures is the run's bitonal copy, and the
+        page numbers written beside each box come from the run's
+        printed pages, in both writes of ``detections.json``."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+
+        services.run_compute_redactions(scan.pk)
+
+        run = apply.current_run(scan)
+        stubs["geometry_pdf_path"].assert_called_once()
+        self.assertEqual(
+            stubs["geometry_pdf_path"].call_args.args[1].pk, run.pk
+        )
+        stubs["load_printed_pages"].assert_called_once()
+        expected = {0: (101, None), 1: (102, 103)}
+        self.assertEqual(
+            stubs["_sync_detections_to_disk"].call_args.kwargs["page_numbers"],
+            expected,
+        )
+        self.assertEqual(
+            stubs["_compute_and_save_redaction_rects"].call_args.kwargs[
+                "page_numbers"
+            ],
+            expected,
+        )
+        # The whole-prefix pull lands the multi-GB original; one key
+        # is enough.
+        stubs["_pull_processing_files_from_s3"].assert_not_called()
+        state = yolo.apply_state(yolo.live_detect_jobs(scan))
+        self.assertEqual(state.get("apply_run"), run.pk)
+
+    def test_a_new_apply_run_imports_the_detections_again(self):
+        """Rows measured against ``a1`` describe pages ``a2`` may not
+        show; the carry of a curator's edits is #241."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        services.run_compute_redactions(scan.pk)
+        Detection.objects.filter(scan=scan).update(active=False)
+        apply.supersede_runs(scan, "test")
+        new = glued_run(scan, number=2)
+        stubs["load_detections_document"].reset_mock()
+
+        services.run_compute_redactions(scan.pk)
+
+        stubs["load_detections_document"].assert_called_once()
+        self.assertEqual(
+            Detection.objects.filter(scan=scan, active=True).count(), 2
+        )
+        state = yolo.apply_state(yolo.live_detect_jobs(scan))
+        self.assertEqual(state.get("apply_run"), new.pk)
+
+    def test_no_corrected_volume_parks_the_scan_and_spends_no_attempt(self):
+        """The queue gate checked it; this is the backstop for an admin
+        supersede between the queue and the claim."""
+        scan, rows = merged_scan(status=Status.PROCESSING)
+        stubs = self.patch_geometry()
+        apply.supersede_runs(scan, "test")
+
+        with self.assertLogs("scanning.services", level="WARNING"):
+            services.run_compute_redactions(scan.pk)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        self.assertIn("not built yet", scan.progress_message)
+        stubs["load_detections_document"].assert_not_called()
+        state = yolo.apply_state(yolo.live_detect_jobs(scan))
+        self.assertEqual(int(state.get("attempts") or 0), 0)
+        self.assertNotIn("queued_at", state)
 
     def test_a_legacy_volume_measures_what_the_database_holds(self):
         """No detect rows at all: the old pipeline wrote its
@@ -376,7 +569,7 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
 
         services.run_compute_redactions(scan.pk)
 
-        stubs["load_merged_document"].assert_not_called()
+        stubs["load_detections_document"].assert_not_called()
         stubs["_compute_and_save_redaction_rects"].assert_called_once()
         self.assertEqual(Detection.objects.filter(scan=scan).count(), 1)
 
@@ -486,8 +679,8 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         self.patch_geometry()
         # The real reader, against a document from other bytes.
         patcher = patch.object(
-            yolo,
-            "load_merged_document",
+            apply,
+            "load_detections_document",
             side_effect=yolo.DetectMergeError("another original"),
         )
         patcher.start()

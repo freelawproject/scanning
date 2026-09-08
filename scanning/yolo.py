@@ -638,7 +638,25 @@ def load_merged_document(scan, run: int) -> dict:
         carries another reader's version, or describes another
         original.
     """
-    key = merged_result_key(scan, run)
+    return load_document_at(scan, merged_result_key(scan, run))
+
+
+def load_document_at(scan, key: str) -> dict:
+    """Read a detections document at ``key``, and refuse a stale one.
+
+    The volume merged document and the apply's glued document
+    (``apply._glue_detections``, #224) share one top level, so one
+    reader checks both: a dict, this reader's schema, and the
+    fingerprint of this original.
+
+    :param scan: The scan the document belongs to.
+    :param key: The S3 key of the document.
+    :returns: The stored document.
+    :rtype: dict
+    :raises DetectMergeError: If the document is absent or unreadable,
+        carries another reader's version, or describes another
+        original.
+    """
     try:
         document = s3_sync.download_json_object(key)
     except Exception as exc:
@@ -819,8 +837,12 @@ def apply_state(detect_jobs: list[ExternalJob]) -> dict:
     ``input_manifest`` is off limits.
 
     The fields: ``queued_at`` while the daemon owes the scan a run of
-    the apply, ``attempts`` and ``last_error`` for the failures, and
-    ``applied_at`` once it worked.
+    the apply, ``attempts`` and ``last_error`` for the failures,
+    ``applied_at`` once it worked, and ``apply_run`` -- the pk of the
+    ``ApplyRun`` the geometry was measured against (#269). The compute
+    reads the run's corrected volume, so a stamp names the run it
+    measured, and a later run makes it stale
+    (:func:`redactions_current`).
 
     :param detect_jobs: The live run's rows, ordered by shard index.
     :returns: The stored state; empty when the apply never ran.
@@ -828,6 +850,34 @@ def apply_state(detect_jobs: list[ExternalJob]) -> dict:
     """
     meta = detect_jobs[0].provider_meta or {}
     return dict(meta.get("apply") or {})
+
+
+def redactions_current(detect_jobs: list[ExternalJob], run) -> bool:
+    """Return whether the redactions are computed against ``run``.
+
+    The one reader of the two stamps, for ``redaction_review_ready``,
+    :func:`queue_ready_runs` and ``services.run_compute_redactions``
+    (#269). "Computed" is ``applied_at`` **and** an ``apply_run`` that
+    names the standing run: the geometry lives in that run's page
+    space, and a run that supersedes it (a reopen, an admin supersede,
+    a changed edit set) leaves the rows describing a volume nobody
+    shows any more. A stamp with no ``apply_run`` was written before
+    the field existed and is not current; the migration
+    ``0024_stamp_redaction_apply_run`` stamps the ones whose result may
+    stand (an identity run, whose final space is the original's).
+
+    :param detect_jobs: The live run's rows, ordered by shard index.
+    :param run: The standing, complete ``ApplyRun``, or ``None`` when
+        the corrected volume is not built.
+    :returns: Whether the rows are measured against ``run``.
+    :rtype: bool
+    """
+    if run is None:
+        return False
+    state = apply_state(detect_jobs)
+    if not state.get("applied_at"):
+        return False
+    return state.get("apply_run") == run.pk
 
 
 def write_apply_state(detect_jobs: list[ExternalJob], state: dict) -> None:
@@ -859,15 +909,19 @@ def record_apply_start(detect_jobs: list[ExternalJob]) -> None:
     write_apply_state(detect_jobs, state)
 
 
-def record_apply_success(detect_jobs: list[ExternalJob]) -> None:
-    """Stamp the run as applied, so nothing queues it again.
+def record_apply_success(detect_jobs: list[ExternalJob], run) -> None:
+    """Stamp the run as applied against ``run``, so nothing queues it again.
 
     :param detect_jobs: The live run's rows, ordered by shard index.
+    :param run: The ``ApplyRun`` whose corrected volume the geometry
+        was measured on (#269). The compute reaches this line only
+        with a complete standing run, so it is never ``None``.
     :return: None.
     """
     state = apply_state(detect_jobs)
     state.pop("queued_at", None)
     state["applied_at"] = timezone.now().isoformat()
+    state["apply_run"] = run.pk
     write_apply_state(detect_jobs, state)
 
 
@@ -976,18 +1030,27 @@ def queue_ready_runs() -> int:
             # The candidate row belongs to an older run; the live one
             # is not merged yet.
             continue
-        state = apply_state(rows)
-        if state.get("applied_at"):
-            continue
         # The compute waits for every glue of the standing apply run
-        # (``review_states.final_volume_ready``, #224). Today it still
-        # reads the merged document and the review-1 bitonal copy, in
-        # the page space of the original; the follow-up PR moves those
-        # readers to the run's outputs. The gate is here first, so the
-        # order holds the day they move and review 2 never opens on a
-        # volume whose corrected build is not finished.
-        if not review_states.final_volume_ready(scan):
+        # (``review_states.final_run``, #224): it reads the run's
+        # detections document and measures the run's bitonal copy
+        # (#269), so review 2 never opens on a volume whose corrected
+        # build is not finished.
+        run = review_states.final_run(scan)
+        if run is None:
             continue
+        state = apply_state(rows)
+        if redactions_current(rows, run):
+            continue
+        stamped = state.get("apply_run")
+        if stamped is not None and stamped != run.pk:
+            # The rows were measured against a run this one supersedes.
+            # New work: the ledger starts over, and later failures count
+            # against this run. A reset of ``attempts`` alone would
+            # loop, because ``record_apply_failure`` never writes the
+            # run, so three failures here would read as "another run"
+            # again on the next tick.
+            state = {"apply_run": run.pk}
+            write_apply_state(rows, state)
         # ``queued_at`` is an audit stamp, never a guard. A scan whose
         # apply is really pending has left this status, so the filter
         # above excludes it; a scan back in this status with the stamp
