@@ -53,6 +53,7 @@ from scanning.views_api import (
 )
 from scanning.views_process import (
     add_page_insert,
+    apply_output_index,
     approve_page_completeness,
     approve_redaction_review,
     assign_page,
@@ -72,6 +73,9 @@ from scanning.views_process import (
     rotate_page,
     scan_original_url,
     scan_process_view,
+    serve_apply_output,
+    serve_apply_shard,
+    serve_final_pdf,
     serve_glued_shard,
     serve_glued_volume,
     serve_original_crop,
@@ -135,6 +139,9 @@ urlpatterns = [
     path("scans/<int:pk>/actions/", process_actions, name="process_actions"),
     path("scans/<int:pk>/progress/", progress_api, name="progress_api"),
     path("scans/<int:pk>/pdf/", serve_scan_pdf, name="serve_scan_pdf"),
+    # The bitonal copy of the corrected volume (#269): what step 2 shows
+    # once the redactions are measured against the standing apply run.
+    path("scans/<int:pk>/pdf/final/", serve_final_pdf, name="serve_final_pdf"),
     path(
         "scans/<int:pk>/original-url/",
         scan_original_url,
@@ -149,6 +156,24 @@ urlpatterns = [
         "scans/<int:pk>/original-crop/",
         serve_original_crop,
         name="serve_original_crop",
+    ),
+    # The outputs of the page edit apply (#224), by run (#269). Before
+    # the generic ``glued/<output>/`` route, so ``apply`` is not read as
+    # a slug of that table.
+    path(
+        "scans/<int:pk>/glued/apply/",
+        apply_output_index,
+        name="apply_output_index",
+    ),
+    path(
+        "scans/<int:pk>/glued/apply/a<int:number>/shards/<int:row_pk>/",
+        serve_apply_shard,
+        name="serve_apply_shard",
+    ),
+    path(
+        "scans/<int:pk>/glued/apply/a<int:number>/<str:output>/",
+        serve_apply_output,
+        name="serve_apply_output",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.

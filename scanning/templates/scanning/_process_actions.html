@@ -191,6 +191,32 @@ reach step 2.
   turns the second one false while the volume is still in the legacy
   step 2, and the link would go with it.
 {% endcomment %}
+{% comment %}
+  Which volume the reviewer sees (#269). Step 2 shows the corrected
+  volume of the standing apply run once the redactions are measured
+  against it (`final_space`); until then it shows the volume as
+  uploaded, and this note says so, because a reviewer who cannot see
+  which pages are in front of them cannot judge the redactions. The
+  staff "files" link opens the run's outputs, the #243 shape.
+{% endcomment %}
+  {% if final_volume %}
+  <span class="text-sm text-gray-600 mr-2" title="Apply run {{ final_volume.label }}: {{ final_volume.final_page_count }} page(s), {{ final_volume.deleted }} deleted, {{ final_volume.inserted }} inserted, {{ final_volume.replaced }} replaced, {{ final_volume.rotated }} rotated">
+    {% if final_volume.measured and final_volume.identity %}
+    Showing the volume as uploaded: the page review made no page edits.
+    {% elif final_volume.measured %}
+    Showing the corrected volume {{ final_volume.label }}: {{ final_volume.final_page_count }} pages ({{ final_volume.deleted }} deleted, {{ final_volume.inserted }} inserted, {{ final_volume.replaced }} replaced, {{ final_volume.rotated }} rotated).
+    {% else %}
+    The corrected volume {{ final_volume.label }} is built. Its redactions are being measured; this is the volume as uploaded until then.
+    {% endif %}
+    {% if user.is_staff %}
+    &middot; <a href="{% url 'apply_output_index' scan.pk %}" class="underline" title="The apply runs, their outputs and their one-page shards">files</a>
+    {% endif %}
+  </span>
+  {% elif not legacy_review %}
+  <span class="text-sm text-gray-600 mr-2">
+    The corrected volume is not built yet. This is the volume as uploaded, before the page edits.{% if apply_run %} {{ apply_run.message }}{% endif %}
+  </span>
+  {% endif %}
   {% if redaction_review_ready %}
   <form method="post" action="{% url 'approve_redaction_review' scan.pk %}" class="inline">
     {% csrf_token %}
