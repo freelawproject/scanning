@@ -1897,7 +1897,10 @@ the apply-outputs routes, and migration 0024. What must not be broken:
   crops the original at its page; an inserted, replaced or rotated page
   (a rotation's boxes are in the rotated space) answers 404, and the
   viewer keeps the bitonal render. A crop from the uploaded file is a
-  follow-up.
+  follow-up. **The viewer does not call the route for now** (#278):
+  `ORIGINAL_CROPS_ENABLED = false` in `viewer_step2.js`, because each
+  crop pulls the multi-GB original to the web pod and renders a page
+  region at up to 300 dpi. The route, its mapping and their tests stay.
 - **The apply outputs have routes** (`scans/<pk>/glued/apply/`,
   `.../a<n>/<output>/`, `.../a<n>/shards/<row_pk>/`), the #243 shape:
   the index reads the rows only, the redirects go through

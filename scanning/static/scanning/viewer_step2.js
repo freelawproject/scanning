@@ -30,6 +30,13 @@ document.addEventListener('DOMContentLoaded', function () {
     var finalSpace = typeof SCAN_CONFIG !== 'undefined'
         && SCAN_CONFIG.finalSpace === true;
     var spaceQuery = finalSpace ? '&space=final' : '';
+    // The full-quality crops of the IMAGE detections are off (#278).
+    // Each one is a request to /original-crop/, which pulls the
+    // multi-GB original to the web pod and renders a page region at up
+    // to 300 dpi; a page with several images fires them all at once.
+    // The route and its code stay; this flag is the only thing that
+    // stops the calls until the route is made cheaper.
+    var ORIGINAL_CROPS_ENABLED = false;
     var pageMap = JSON.parse(container.dataset.pageMap || '[]');
     var flaggedIndices = JSON.parse(container.dataset.flaggedIndices || '[]');
     var ocrByPage = JSON.parse(container.dataset.ocrByPage || '{}');
@@ -672,8 +679,8 @@ document.addEventListener('DOMContentLoaded', function () {
                 drawDetectionOverlay(pageDiv, pdfIndex);
             }
 
-            // Overlay original PDF crops for IMAGE detections
-            if (allDetections && !_viewingOpinion) {
+            // Overlay original PDF crops for IMAGE detections (off, #278)
+            if (ORIGINAL_CROPS_ENABLED && allDetections && !_viewingOpinion) {
                 var pageIdx = parseInt(pageDiv.dataset.pdfIndex);
                 var imgDets = _detectionsForPage(pageIdx).filter(function(d) {
                     return d.label === 'IMAGE';
