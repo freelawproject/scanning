@@ -2422,30 +2422,22 @@ def _advance_scan(
 # ---------------------------------------------------------------------------
 
 
-def _stamp_original_images(
-    scan: "Scan", base_pdf_path: str, source_pdf_path: str | None = None
-) -> str:
+def _stamp_original_images(scan: "Scan", base_pdf_path: str) -> str:
     """Overlay original-quality image regions onto a *copy* of the base PDF.
 
     For each active IMAGE detection, renders the bounding box from the
-    full-quality source PDF and inserts it into a copy of the processing
-    PDF (normally ``bitonal.pdf``) at the same position. This preserves
+    original scan PDF and inserts it into a copy of the processing PDF
+    (normally ``bitonal.pdf``) at the same position. This preserves
     full-quality photographs/illustrations that would otherwise be
     degraded by bitonal conversion.
 
     :param scan: The Scan instance with the original PDF path.
     :param base_pdf_path: Path to the processing PDF to stamp onto.
-    :param source_pdf_path: The full-quality PDF in the same page space
-        as the detections: the corrected volume's final PDF (#269) when
-        the scan has one, else the original (the default).
     :return: Path to the stamped copy. Always a copy, so the processing
         PDF is never modified by downstream steps.
     """
 
-    # Beside the deliverables, not beside the base PDF: the corrected
-    # volume's copy lives under ``jobs/`` (#269), which the generic sync
-    # never pushes, and the stamped copy and the crops must reach S3.
-    stamped_path = os.path.join(scan.output_dir, "stamped.pdf")
+    stamped_path = os.path.join(os.path.dirname(base_pdf_path), "stamped.pdf")
 
     image_dets = list(
         Detection.objects.filter(scan=scan, label="IMAGE", active=True)
@@ -2460,13 +2452,13 @@ def _stamp_original_images(
         return stamped_path
 
     # Save extracted images to images/ directory
-    images_dir = Path(scan.output_dir) / "images"
+    images_dir = Path(os.path.dirname(base_pdf_path)) / "images"
     images_dir.mkdir(exist_ok=True)
     page_numbers = _page_number_lookup(scan)
     img_count_by_page: dict[int, int] = {}
 
     with (
-        fitz.open(source_pdf_path or scan.pdf_path) as original_doc,
+        fitz.open(scan.pdf_path) as original_doc,
         fitz.open(base_pdf_path) as base_doc,
     ):
         for det in image_dets:
@@ -2517,23 +2509,13 @@ def _stamp_original_images(
 def run_generate_files(scan_pk: int) -> None:
     """Generate redacted/split opinion files from existing detections.
 
-    Designed to run in the daemon process. Nothing queues it since #173
-    (#206 brings it back); its readers are kept current so that day
-    needs no change here.
-
-    **The inputs are the frozen outputs of the standing apply run**
-    (#269): the run's bitonal copy is the base PDF, its final PDF is the
-    full-quality source of the image crops, and its printed pages give
-    ``detections.json`` its page numbers (``_page_number_lookup``
-    resolves that by the rows). The ``Detection`` rows, the redaction
-    rects and the margins are in the same final page space after the
-    redaction compute. A volume with no run -- a legacy one -- reads
-    the review-1 copy and the original, as before.
+    Designed to run in the daemon process. Nothing queues it since #173;
+    #206 brings it back over the redacted volume, and it is left as it
+    was until then (#269 moved review 2 and the redaction compute to
+    the corrected volume, not this).
 
     :param scan_pk: Primary key of the scan to generate files for.
     """
-    from scanning import apply, review_states
-
     django.db.connections.close_all()
     _pull_processing_files_from_s3(scan_pk)
 
@@ -2545,20 +2527,14 @@ def run_generate_files(scan_pk: int) -> None:
         )
 
         output = Path(scan.output_dir)
-        run = review_states.final_run(scan)
-        source_pdf = None
-        if run is not None:
-            base_pdf = Path(geometry_pdf_path(scan, run))
-            source_pdf = str(apply.local_copy(scan, run.final_pdf_key))
-        else:
-            base_pdf = find_processing_pdf(str(output))
+        base_pdf = find_processing_pdf(str(output))
         if not base_pdf:
             raise ValueError(
                 "No processing PDF (bitonal.pdf) found in output directory"
             )
 
         # Stamp original-quality images into a copy, leaves base PDF untouched
-        gen_pdf = _stamp_original_images(scan, str(base_pdf), source_pdf)
+        gen_pdf = _stamp_original_images(scan, str(base_pdf))
 
         # Correct the TEXT_COLUMN boxes against the page ink before anything
         # reads them. The upload path used to do this so that step 2 showed

@@ -759,11 +759,11 @@ the `reopen_page_review` view. What must not be broken:
   which the generic sync never carries and the admin deletion sweeps.
   The first `bitonal.pdf`, the `r{run}-volume.json` and the stored
   page map stay, so the page review renders after a reopen. Step 2
-  and step 3 read the final space (`ApplyRun.bitonal_key`,
-  `detections_key`, `printed_pages_key`, `final_pdf_key`) since #269,
-  its own section below; step 1 keeps the review-1 artifacts, where
-  every `PageEdit` address lives, and every volume with no structural
-  edit is correct either way because the run aliases them.
+  reads the final space (`ApplyRun.bitonal_key`, `detections_key`,
+  `printed_pages_key`, `final_pdf_key`) since #269, its own section
+  below; step 1 keeps the review-1 artifacts, where every `PageEdit`
+  address lives, and step 3 waits for #206. Every volume with no
+  structural edit is correct either way because the run aliases them.
 - **A legacy volume gets no apply, on purpose.** `APPLY_STATUS` is
   DONE alone, and a legacy volume's review lives in `PENDING_REVIEW`:
   the #154 and #263 states describe a flow it never went through, and
@@ -1823,7 +1823,7 @@ the apply-outputs routes, and migration 0024. What must not be broken:
   `final_volume_ready` is that as a yes or no. Every reader of the
   final space asks it: the compute before it queues and when it runs,
   the step-2 view, the PDF route, the original-URL route, the crop
-  route, the margin-rect miss path, step 3.
+  route and the margin-rect miss path.
 - **"Computed" means computed against the standing run.** The
   detect-run ledger (`provider_meta["apply"]`) carries `apply_run`
   (the `ApplyRun` pk) beside `applied_at`, and one helper
@@ -1887,7 +1887,7 @@ the apply-outputs routes, and migration 0024. What must not be broken:
   in.** `services._page_number_lookup(scan, printed=None)` resolves by
   the rows: a measured scan reads the run's printed pages, every other
   reads `Scan.ocr_results`. Six callers write that file
-  (`_compute_and_save_redaction_rects`, the compute, step 3 and three
+  (`_compute_and_save_redaction_rects`, the compute, the paused step 3 and three
   `views_api` endpoints); the compute loads the document once and
   hands the lookup to **both** writers, since the second write is the
   one `_push_processing_files_to_s3` ships. `printed_page_span` is the
@@ -1906,16 +1906,13 @@ the apply-outputs routes, and migration 0024. What must not be broken:
   `ApplyRun` row; not `_shard_entry` either, whose URL the #243 shard
   route filters out (`apply_run__isnull=True`). Declared before the
   generic `glued/<output>/` route, or `apply` is read as a slug.
-- **Step 3 reads the frozen outputs.** `run_generate_files` takes the
-  run's bitonal copy as its base PDF, its final PDF as the source of
-  the image crops (`_stamp_original_images(..., source_pdf_path)`), and
-  the printed pages for `detections.json` through the resolver; the
-  stamped copy and the crops are written beside the deliverables under
-  `output_dir`, not beside the base PDF under `jobs/`, which never
-  pushes. Nothing queues it (#173/#206). The review-2 approval is
-  checked in the `generate_files` view before the paused flash, as
-  `start_detect` checks review 1; a legacy `PENDING_REVIEW` volume
-  keeps its way in.
+- **Step 3 is left alone, on purpose.** `run_generate_files` still
+  reads the review-1 `bitonal.pdf`, the original and `Scan.ocr_results`;
+  nothing queues it (#173), and #206 brings it back over the redacted
+  volume, which is another input again. Its one change here is the
+  gate: the review-2 approval is checked in the `generate_files` view
+  before the paused flash, as `start_detect` checks review 1, and a
+  legacy `PENDING_REVIEW` volume keeps its way in.
 - **Migration 0024 stamps `apply_run` on the identity runs only.** A
   stamp written before this issue names no run. A scan whose standing
   run has no structural edit was measured in the space its outputs
