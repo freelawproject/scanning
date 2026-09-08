@@ -590,6 +590,13 @@ def _page_number_lookup(scan: "Scan", printed: dict | None = None) -> dict:
     space. Six callers write that file, so the rule resolves here and
     not in each of them.
 
+    The resolver reads S3 once per call. Three of the callers are the
+    box-edit endpoints of review 2, whose write to the database is
+    already committed when they reach this, so a failed read must not
+    fail the request: it is logged, and the lookup falls back to
+    ``Scan.ocr_results`` for that one write, which the next write
+    corrects.
+
     :param scan: The scan.
     :param printed: The run's printed-page map when the caller already
         loaded it (the compute does, once); resolved here otherwise.
@@ -602,7 +609,15 @@ def _page_number_lookup(scan: "Scan", printed: dict | None = None) -> dict:
         if run is not None and yolo.redactions_current(
             yolo.live_detect_jobs(scan), run
         ):
-            printed = apply.load_printed_pages(scan, run)
+            try:
+                printed = apply.load_printed_pages(scan, run)
+            except apply.ApplyError:
+                logger.exception(
+                    "scan %s: the printed pages of %s did not load; "
+                    "detections.json carries the original's numbers this once",
+                    scan.pk,
+                    run.label,
+                )
     if printed is not None:
         return apply.page_number_lookup(printed)
     lookup = {}

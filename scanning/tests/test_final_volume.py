@@ -196,6 +196,23 @@ class TestPageNumberLookupResolves(TestCase):
         load.assert_not_called()
         self.assertEqual(lookup, {0: (7, None)})
 
+    def test_a_read_that_fails_falls_back_and_does_not_raise(self):
+        """The box-edit endpoints of review 2 reach this after their
+        database write; a transient S3 fault must not 500 them."""
+        scan, _ = applied_scan(
+            ocr_results=[{"pdf_page": 1, "detected": "7", "type": "single"}]
+        )
+
+        with (
+            patch.object(
+                apply, "load_printed_pages", side_effect=apply.ApplyError("x")
+            ),
+            self.assertLogs("scanning.services", level="ERROR"),
+        ):
+            lookup = services._page_number_lookup(scan)
+
+        self.assertEqual(lookup, {0: (7, None)})
+
     def test_a_document_the_caller_holds_wins(self):
         scan = ScanFactory(
             ocr_results=[{"pdf_page": 1, "detected": "7", "type": "single"}]
@@ -606,6 +623,8 @@ class TestApplyOutputs(ScanningTestCase):
             },
         )
         self.assertEqual(entry["shards"][0]["edit_id"], 7)
+        # The text of an exception never reaches a response (CodeQL).
+        self.assertNotIn("last_error", entry)
         self.assertEqual(
             entry["shards"][0]["url"],
             reverse(

@@ -1519,8 +1519,10 @@ def _apply_run_entry(scan: Scan, run, rows: list, measured: bool) -> dict:
         "complete": run.is_complete,
         "measured": measured,
         "source_fingerprint": run.source_fingerprint,
+        # The attempt count and the row states, not ``last_error``: it
+        # holds the text of an exception, and a response must not carry
+        # one (CodeQL). The admin shows it.
         "attempts": run.attempts,
-        "last_error": run.last_error,
         **apply.describe_map(run.page_map),
         "files": files,
         "shards": shards,
