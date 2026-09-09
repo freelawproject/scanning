@@ -7,7 +7,16 @@ dependencies = [
     # GPU stack. torch comes from the cu126 index below, and its
     # nvidia-* dependencies carry the CUDA runtime, which is why the
     # image needs no CUDA base layer (the rule of ../runpod/).
-    "torch",
+    #
+    # Pinned to the version the detection worker has run on RunPod
+    # hosts, on purpose. An open pin resolved to 2.14, which routes
+    # small eager operations (the rotary-embedding outer product among
+    # them) through Triton kernels on CUDA; Triton then compiles a C
+    # helper on first use and the slim base image had no compiler, so
+    # the first GPU job failed with "Failed to find C compiler". The
+    # Dockerfile installs gcc as a backstop; this pin keeps the proven
+    # path. Bump deliberately, with a GPU run.
+    "torch==2.13.0",
 
     # Inference. The checkpoint is saved by transformers 5 (its
     # tokenizer_config names ``TokenizersBackend`` and its config
