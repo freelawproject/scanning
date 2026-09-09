@@ -1,0 +1,42 @@
+[project]
+name = "caselaw-tagger-gpu-worker"
+version = "0.0.1"
+description = "RunPod Serverless handler for the case-law block tagger (ModernBERT token classification)."
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    # GPU stack. torch comes from the cu126 index below, and its
+    # nvidia-* dependencies carry the CUDA runtime, which is why the
+    # image needs no CUDA base layer (the rule of ../runpod/).
+    "torch",
+
+    # Inference. The checkpoint is saved by transformers 5 (its
+    # tokenizer_config names ``TokenizersBackend`` and its config
+    # carries ``rope_parameters``), which transformers 4 cannot read.
+    "transformers>=5,<6",
+    "safetensors>=0.4",
+    # ``snapshot_download`` bakes the weights at build time; transformers
+    # depends on it anyway, so this only pins the floor.
+    "huggingface-hub>=0.30",
+
+    # RunPod plumbing
+    "requests>=2.33,<3",
+    "runpod>=1.9,<2",
+    "sentry-sdk>=2,<3",
+]
+
+# This project is an application (handler.py), not a library. Tell uv
+# not to try to build it as an installable package.
+[tool.uv]
+package = false
+
+# Route the GPU wheels to their vendor index. Other deps come from PyPI
+# by default. ``explicit = true`` means this index is only searched for
+# packages routed to it here, so a plain PyPI package never falls
+# through to it.
+[tool.uv.sources]
+torch = { index = "pytorch-gpu" }
+
+[[tool.uv.index]]
+name = "pytorch-gpu"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
