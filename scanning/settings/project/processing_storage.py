@@ -42,13 +42,3 @@ PENDING_UPLOAD_TTL_HOURS = env.float("PENDING_UPLOAD_TTL_HOURS", default=9.0)
 ORIGINAL_VIEW_PRESIGN_TTL = env.int(
     "ORIGINAL_VIEW_PRESIGN_TTL", default=8 * 3600
 )
-
-# Whether Generate Files adds a Tesseract text layer to the per-page PDFs in
-# ``llm/``. Off by default: the pipeline no longer embeds one anywhere (see
-# scanning #145), and the model that reads these pages reads the page image
-# itself. Turn it on to restore the text crops ``ai.user_prompt`` layers on
-# top of the roadmap (caption first lines, column-top continuations,
-# footnote snippets), at the cost of an OCR pass over every page of the
-# volume. It runs after redaction, so it never OCRs content that a rect is
-# about to cover.
-LLM_PAGE_TEXT_LAYER = env.bool("LLM_PAGE_TEXT_LAYER", default=False)

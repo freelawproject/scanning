@@ -1547,52 +1547,6 @@ class TestBuildCombinedRedactionsStaleRects(TestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestLlmPageTextLayer(TestCase):
-    """The post-redaction text layer is opt-in and never implicit.
-
-    Dropping the Tesseract pre-pass is the point of scanning #145, so
-    Generate Files must not quietly reintroduce an OCR run over every page.
-    """
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.llm = pathlib.Path(self._tmp.name) / "llm"
-        self.llm.mkdir()
-        (self.llm / "page_0001.pdf").write_bytes(b"%PDF-1.4\n")
-        self.scan = ScanFactory(reporter=ReporterFactory(short_name="a3d"))
-
-    def test_off_by_default(self):
-        from scanning.services import _add_llm_page_text_layer
-
-        with patch("blackletter.api.add_text_layer") as ocr:
-            added = _add_llm_page_text_layer(self.scan.pk, self.llm)
-        ocr.assert_not_called()
-        self.assertEqual(added, 0)
-
-    @override_settings(LLM_PAGE_TEXT_LAYER=True)
-    def test_runs_over_the_llm_pages_when_switched_on(self):
-        from scanning.services import _add_llm_page_text_layer
-
-        with patch("blackletter.api.add_text_layer") as ocr:
-            ocr.return_value = [self.llm / "page_0001.pdf"]
-            added = _add_llm_page_text_layer(self.scan.pk, self.llm)
-        ocr.assert_called_once_with(self.llm)
-        self.assertEqual(added, 1)
-
-    @override_settings(LLM_PAGE_TEXT_LAYER=True)
-    def test_skips_a_scan_with_no_llm_directory(self):
-        from scanning.services import _add_llm_page_text_layer
-
-        with patch("blackletter.api.add_text_layer") as ocr:
-            added = _add_llm_page_text_layer(
-                self.scan.pk, self.llm / "missing"
-            )
-        ocr.assert_not_called()
-        self.assertEqual(added, 0)
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestBuildCombinedRedactionsPayload(TestCase):
     """The payload ``generate`` reads mixes two coordinate spaces.
 

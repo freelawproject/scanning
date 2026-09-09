@@ -3330,8 +3330,8 @@ class TestSidebarDuplicateMarkers(ScanningTestCase):
 class TestLazyPullsFetchOneFile(ScanningTestCase):
     """A stale /tmp/ must cost one object, not the whole prefix.
 
-    Both of these views used to call ``download_processing_files``, which
-    pulls every object under the scan's processing prefix: gigabytes for one
+    This view used to call ``download_processing_files``, which pulls
+    every object under the scan's processing prefix: gigabytes for one
     page on a full volume, and because the sync views share a single
     executor under ASGI, it stalled every other request while it ran.
     """
@@ -3351,34 +3351,6 @@ class TestLazyPullsFetchOneFile(ScanningTestCase):
             target.write_bytes(b"%PDF-1.4 pulled")
 
         return _fake
-
-    def test_serve_page_pdf_pulls_only_that_page(self):
-        from scanning.models import Page
-
-        scan = ScanFactory(reporter=ReporterFactory(short_name="tp"), volume=7)
-        page = Page.objects.create(
-            scan=scan, page_index=0, pdf_path="llm/page_0001.pdf"
-        )
-
-        with (
-            override_settings(
-                DEVELOPMENT=False,
-                TESTING=False,
-                PROCESSING_TMP_DIR=self.tmp_root,
-            ),
-            patch(
-                "scanning.s3_sync.download_processing_file",
-                side_effect=self._writes_the_file(lambda key: key),
-            ) as one,
-            patch("scanning.s3_sync.download_processing_files") as everything,
-        ):
-            response = self.client.get(
-                reverse("serve_page_pdf", kwargs={"pk": page.pk})
-            )
-
-        self.assertEqual(response.status_code, 200)
-        one.assert_called_once_with(scan, "llm/page_0001.pdf")
-        everything.assert_not_called()
 
     def test_serve_redacted_pdf_pulls_only_the_redacted_file(self):
         scan = ScanFactory(reporter=ReporterFactory(short_name="tp"), volume=8)

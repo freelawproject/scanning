@@ -113,9 +113,6 @@
         <td class="px-4 py-3 text-sm">
           <div class="flex justify-end gap-1">
             <a href="{% url 'scan_process' pk=scan.pk %}" class="btn-outline text-xs px-2 py-1">View</a>
-            {% if scan.stage == 'approved' %}
-              <a href="{% url 'scan_pages_list' pk=scan.pk %}" class="btn-outline text-xs px-2 py-1" title="Per-page review">Pages</a>
-            {% endif %}
           </div>
         </td>
       </tr>

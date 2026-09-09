@@ -14,7 +14,6 @@ from scanning.models import (
     Issue,
     JobStage,
     OpinionScan,
-    Page,
     PageEdit,
     PageRepairRequest,
     PendingUpload,
@@ -186,7 +185,6 @@ class ScanAdmin(admin.ModelAdmin):
         "date_created",
         "date_modified",
         "processed_at",
-        "pages_link",
     ]
     # Per-page payload fields hold megabytes on a processed scan.
     # Rendering them as editable textareas makes the change view crawl,
@@ -238,7 +236,7 @@ class ScanAdmin(admin.ModelAdmin):
 
         The default admin collector instantiates every related object to
         render the confirmation tree. A processed scan cascades to tens
-        of thousands of ``Detection`` rows (plus ``Page``, ``Issue``,
+        of thousands of ``Detection`` rows (plus ``Issue``, ``PageEdit``,
         etc.), so the collector exhausts memory and takes the server
         down before the user even confirms.
 
@@ -275,7 +273,6 @@ class ScanAdmin(admin.ModelAdmin):
         # the delete outright via the PROTECT above.
         for model in (
             Scan,
-            Page,
             Detection,
             Issue,
             PageEdit,
@@ -292,25 +289,6 @@ class ScanAdmin(admin.ModelAdmin):
         ]
         perms_needed: set[str] = set()
         return deletable_objects, model_count, perms_needed, protected
-
-    @admin.display(description="Pages")
-    def pages_link(self, obj):
-        """Render a link to the filtered Page admin for this scan.
-
-        :param obj: The Scan instance.
-        :return: HTML link or em dash if there are no pages.
-        :rtype: SafeString | str
-        """
-        count = obj.pages.count() if obj.pk else 0
-        if not count:
-            return "—"
-        url = reverse("admin:scanning_page_changelist")
-        return format_html(
-            '<a href="{}?scan__id__exact={}">View {} page(s)</a>',
-            url,
-            obj.pk,
-            count,
-        )
 
     def save_model(self, request, obj, form, change):
         """Save a Scan and refresh affected Volume(s) queue_status.
@@ -831,60 +809,6 @@ class PendingUploadAdmin(admin.ModelAdmin):
     search_fields = ["id", "s3_key", "scan__id"]
     raw_id_fields = ["scan", "created_by"]
     readonly_fields = ["id", "date_created", "date_modified"]
-
-
-@admin.register(Page)
-class PageAdmin(admin.ModelAdmin):
-    list_display = [
-        "scan",
-        "page_index",
-        "book_page",
-        "pdf_link",
-        "is_blank",
-        "status",
-        "extracted_by",
-        "needs_review",
-        "has_prompt",
-        "has_xml",
-        "date_modified",
-    ]
-    list_filter = ["status", "needs_review", "extracted_by", "is_blank"]
-    search_fields = ["scan__id", "book_page", "scan__reporter__short_name"]
-    raw_id_fields = ["scan", "user_prompt"]
-    readonly_fields = [
-        "date_created",
-        "date_modified",
-        "pdf_link",
-    ]
-    ordering = ["scan", "page_index"]
-    list_select_related = ["scan", "user_prompt"]
-
-    @admin.display(description="PDF")
-    def pdf_link(self, obj):
-        """Render ``pdf_path`` as a clickable link to the served file.
-
-        The view resolves the local file first and lazily pulls from S3
-        if it isn't on disk, so this works regardless of which mode the
-        portal is running in.
-        """
-        if not obj.pdf_path or not obj.pk:
-            return "—"
-        url = reverse("serve_page_pdf", kwargs={"pk": obj.pk})
-        return format_html(
-            '<a href="{}" target="_blank" rel="noopener">{}</a>',
-            url,
-            obj.pdf_path,
-        )
-
-    @admin.display(boolean=True, description="Prompt")
-    def has_prompt(self, obj):
-        """Whether this page has a user_prompt FK set."""
-        return obj.user_prompt_id is not None
-
-    @admin.display(boolean=True, description="XML")
-    def has_xml(self, obj):
-        """Whether the page has extracted XML content."""
-        return bool(obj.xml_content)
 
 
 @admin.register(ExternalJob)
