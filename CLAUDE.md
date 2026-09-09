@@ -1998,8 +1998,8 @@ the apply-outputs routes, and migration 0024. What must not be broken:
 A reviewer finds bleedthrough or a blurry page and cannot tell what it
 cost the reading. A toggle in the viewer's zoom toolbar draws the text
 dots.mocr read on each page: one box per cell of the layout JSON, at
-the cell's own position, with the text on a translucent panel. The
-pieces: `dots_mocr.glued_volume_key`, `views_process.scan_ocr_text_url`
+the cell's own position, and the text of the cell under the pointer.
+The pieces: `dots_mocr.glued_volume_key`, `views_process.scan_ocr_text_url`
 and its `dots_run_is_glued` flag, `static/scanning/ocr_text.js`, and
 three call sites in each viewer. Nothing is computed: the cells are the
 ones the glue already stored.
@@ -2037,15 +2037,30 @@ ones the glue already stored.
   `canvas.width / origin_width` -- the rule of the detection boxes
   (#196). The bitonal copy and the original carry the page geometry of
   the original, so the same scale serves the preview and the original.
-- **The model wrote the text, so it enters the DOM with
-  `textContent`.** A panel that overflows its box is shrunk once (at a
-  fixed width a paragraph's height grows with the square of the font
-  size, so one square root fits it), and a panel that still overflows
-  is marked `clipped`.
-- **A box takes no pointer**, or the overlay would swallow a click of
-  the viewer under it -- a redaction drag in step 2 above all. The one
-  exception is a `clipped` box, which takes the pointer so a hover can
-  open it. Turn the overlay off to draw over one.
+- **A box shows its text under the pointer, and not before.** The
+  first version painted a near-opaque panel over every cell and hid
+  the page the reviewer came to read: the judgement is a comparison,
+  the text the model read against the ink it read it from. So a box is
+  an outline, and `.open` draws its panel over the page. The category
+  goes in the panel in words -- it used to ride on the box's `title`,
+  which a box that takes no pointer never shows, and a border colour
+  alone names nothing. The model wrote the text, so it enters the DOM
+  with `textContent`. A panel needs no fit now, so the font ladder and
+  its measure pass over every box of every page are gone.
+- **No box takes the pointer**, or the overlay would swallow a click of
+  the viewer under it -- the detection boxes and the redaction drag of
+  step 2 sit at the same layer. A CSS `:hover` would need one, so
+  `bindHover` runs one `mousemove` hit test on the wrapper instead: the
+  smallest box holding the point wins (a cell inside a text column
+  opens its own text), the rects come from the numbers the boxes were
+  placed by (no layout read per cell per move), and the pointer is
+  placed by `shared.eventToCanvasPixels` -- the conversion the
+  redaction drag already uses, so the zoom transform on the wrapper
+  cannot put the panel one cell out. A cell in the right half opens its
+  panel leftwards (`opens-left`), or a panel as wide as its words would
+  leave the page. `ocrTextClear` removes the listeners with the boxes:
+  they hold the rects of one render, so a pair left behind would open a
+  box of the old scale, and a re-render would stack a second pair.
 - **A failed read says so, and another press retries.** A read the
   bucket refuses reaches the page as an opaque network error, so the
   toast names what the browser gave us and the console carries the
@@ -2060,6 +2075,17 @@ ones the glue already stored.
   (`ocr_text_available`), from the run summary the view reads already,
   so it costs no query. A legacy PaddleOCR volume has no ANALYZE run
   and gets no button.
+- **The wait says so three ways.** The read of a glued volume takes
+  seconds, and `.zoom-toolbar .zoom-btn` had no `:disabled` rule, so the
+  whole signal was one character: the label went from "Text" to
+  "Text…". Now the label reads "Reading…", the button dims (the
+  `:disabled` rule is for every button of the toolbar), and the border
+  pulses, which stands down under `prefers-reduced-motion`. A toast
+  names the size, which is why the wait is long; the number stays off
+  the button, because a label that grows moves every other button of
+  the toolbar on each press. `startWaiting` and `stopWaiting` hold the
+  pair, so the success arm and the failure arm cannot give the button
+  back in two different states.
 - Step 3 has no overlay: it is paused (#173/#206).
 
 ## The glued outputs, by scan id (issue #243)
