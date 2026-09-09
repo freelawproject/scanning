@@ -961,45 +961,62 @@ a.doc-name:hover { text-decoration: underline; }
 .step-line { width: 30px; height: 2px; background: #475569; margin: 0 4px; }
 .step-line.done { background: #059669; }
 
-/* The text overlay (#262): one box per dots.mocr cell, with the text
-   the model read on a translucent panel. The boxes sit at the layer of
+/* The text overlay (#262): one box per dots.mocr cell, at the layer of
    the detection boxes, so the redaction controls stay above them.
 
-   A box takes no pointer, so the overlay never swallows a click of the
-   viewer under it. The exception is a box whose text did not fit even
-   at the smallest size (.clipped): that one takes the pointer, and a
-   hover opens it over its neighbours. */
+   A box is an outline and nothing else, and it opens its text only
+   under the pointer. A reviewer judges a blurry page or one with
+   bleedthrough against the ink, and a panel drawn over every cell hid
+   the very page they came to read.
+
+   No box takes the pointer. A CSS ``:hover`` would need one, and the
+   box would then swallow the clicks of the detection boxes and of the
+   redaction drag, which are at the same layer. So ``ocr_text.js`` runs
+   one hit test on the wrapper and adds ``.open`` to the box under the
+   pointer. */
 .ocr-cell {
     position: absolute;
     border: 1px solid;
     border-radius: 2px;
-    overflow: hidden;
     z-index: 5;
     pointer-events: none;
 }
+.ocr-cell.open {
+    z-index: 20;
+    border-width: 2px;
+}
 .ocr-cell-text {
+    display: none;
+    position: absolute;
+    top: 0;
+    left: 0;
+    min-width: 100%;
+    width: max-content;
+    max-width: 46ch;
     margin: 0;
-    padding: 1px 2px;
+    padding: 2px 4px;
     color: #111827;
-    background: rgba(255, 255, 255, 0.92);
+    background: #fff;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+    border-radius: 2px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    line-height: 1.15;
+    font-size: 11px;
+    line-height: 1.2;
     white-space: pre-wrap;
     word-break: break-word;
 }
-.ocr-cell.clipped {
-    pointer-events: auto;
-    cursor: text;
+.ocr-cell.open .ocr-cell-text { display: block; }
+.ocr-cell.opens-left .ocr-cell-text {
+    left: auto;
+    right: 0;
 }
-.ocr-cell.clipped:hover {
-    overflow: visible;
-    height: auto !important;
-    min-height: 100%;
-    z-index: 20;
-}
-.ocr-cell.clipped:hover .ocr-cell-text {
-    background: #fff;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+/* The category, in words, above the text the model read. */
+.ocr-cell-cat {
+    display: block;
+    color: #6b7280;
+    font-size: 9px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
 }
 /* A page the worker could not read, or one whose layout JSON no arm
    of the repair reached (#242): say so where the reviewer looks, and
