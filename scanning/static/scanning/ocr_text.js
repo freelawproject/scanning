@@ -23,8 +23,21 @@
  * boxes of step 2 follow. The text is the model's, so it enters the
  * DOM with ``textContent``.
  *
+ * **A box shows its text under the pointer, and not before.** The
+ * reviewer came to judge a blurry page against the ink, so a panel
+ * drawn over every cell hid the page they came to read. No box takes
+ * the pointer either -- a CSS ``:hover`` would need one, and the box
+ * would then swallow the clicks of the detection boxes and of the
+ * redaction drag, which sit at the same layer -- so one hit test on
+ * the wrapper opens the box under the pointer.
+ *
  * Both viewers load this file, because one rule that drifted between
  * two copies would draw the text differently in the two steps.
+ *
+ * The read of a glued volume takes seconds, and a toolbar button gives
+ * no signal of its own: a disabled one looks exactly like a live one.
+ * So the wait says so three ways -- the label, a dim, and a pulse --
+ * and a toast names the size, which is why the wait is long.
  */
 
 (function () {
@@ -37,11 +50,8 @@
     var loading = false;
     var enabled = false;
 
-    // The base size of the panel text, and the smallest the fit may
-    // make it. Below the floor a panel clips and a hover shows the
-    // rest.
-    var BASE_FONT_PX = 11;
-    var MIN_FONT_PX = 5;
+    // The box under the pointer, so a move closes the one before it.
+    var openBox = null;
 
     // The border colour of a box, by the category dots.mocr gives the
     // cell. Everything the layout model does not name is grey.
@@ -114,10 +124,19 @@
      * Remove one page's overlay. A discarded page keeps no node: the
      * boxes hold the scale of the render they were drawn for.
      *
+     * The hover listeners go with the boxes. They hold the rects of
+     * that render, so a pair left behind would open a box of the old
+     * scale, and a re-render would stack a second pair.
+     *
      * @param {HTMLElement} pageDiv - The .page-container element.
      */
     window.ocrTextClear = function (pageDiv) {
         if (!pageDiv) return;
+        var wrapper = pageDiv.querySelector('.canvas-wrapper');
+        if (wrapper && wrapper._ocrTextHover) {
+            wrapper._ocrTextHover();
+            wrapper._ocrTextHover = null;
+        }
         pageDiv.querySelectorAll('.ocr-cell, .ocr-page-note').forEach(
             function (el) { el.remove(); }
         );
@@ -130,8 +149,7 @@
         if (!cfg.ocrTextUrlApi) return;
         loading = true;
         var label = button.textContent;
-        button.disabled = true;
-        button.textContent = 'Text…';
+        startWaiting(button, 'Reading…');
         var api = cfg.ocrTextUrlApi + (cfg.finalSpace ? '?space=final' : '');
         var documentUrl = null;
         fetch(api)
@@ -144,8 +162,17 @@
             .then(function (answer) {
                 documentUrl = answer.url;
                 if (answer.size) {
-                    button.title = 'The OCR text of this volume is ' +
-                        Math.round(answer.size / 1048576) + ' MB.';
+                    // The second read is the slow one, and its size is
+                    // why. The number goes in a toast and not on the
+                    // button: a label that grows moves every other
+                    // button of the toolbar on each press.
+                    var mb = Math.max(1, Math.round(answer.size / 1048576));
+                    button.title = 'Reading the OCR text of this volume, ' +
+                        mb + ' MB.';
+                    if (typeof showToast === 'function') {
+                        showToast('Reading the OCR text of this volume, ' +
+                            mb + ' MB. This takes a moment.', 'info');
+                    }
                 }
                 // Straight from the bucket: the web pod reads no byte
                 // of a document that holds every cell of the volume.
@@ -157,17 +184,46 @@
             })
             .then(function (doc) {
                 index = buildIndex(doc);
-                loading = false;
-                button.disabled = false;
-                button.textContent = label;
+                stopWaiting(button, label);
                 setEnabled(button, true);
             })
             .catch(function (err) {
-                loading = false;
-                button.disabled = false;
-                button.textContent = label;
+                stopWaiting(button, label);
                 failed(err, documentUrl);
             });
+    }
+
+    /**
+     * Show that the button is at work.
+     *
+     * The read of a glued volume takes seconds, and the label alone
+     * carried the whole signal: a ``disabled`` button of the zoom
+     * toolbar looks exactly like a live one. So this writes words a
+     * reviewer can read, dims the button and starts the pulse of
+     * ``.loading``.
+     *
+     * @param {HTMLElement} button - The toolbar button.
+     * @param {string} text - What the button says while it waits.
+     */
+    function startWaiting(button, text) {
+        button.disabled = true;
+        button.classList.add('loading');
+        button.textContent = text;
+        button.title = 'Reading the OCR text of this volume…';
+    }
+
+    /**
+     * Give the button back, whatever the read did.
+     *
+     * @param {HTMLElement} button - The toolbar button.
+     * @param {string} label - The label the button carried before.
+     */
+    function stopWaiting(button, label) {
+        loading = false;
+        button.disabled = false;
+        button.classList.remove('loading');
+        button.textContent = label;
+        button.title = 'Show the text the OCR read on each page';
     }
 
     /**
@@ -269,57 +325,171 @@
         }
         var sx = canvas.width / (page.width || canvas.width);
         var sy = canvas.height / (page.height || canvas.height);
-        var boxes = page.cells.map(function (cell) {
-            var box = buildBox(cell, sx, sy);
+        // The rects of the hit test, in the wrapper's own pixels. They
+        // come from the numbers the boxes were placed by, so the test
+        // reads no layout: a ``getBoundingClientRect`` per cell per
+        // move would lay the page out again on every mouse event.
+        var mid = canvas.width / 2;
+        var hits = page.cells.map(function (cell) {
+            var box = buildBox(cell, sx, sy, mid);
             wrapper.appendChild(box);
-            return box;
+            return {
+                box: box,
+                left: cell.bbox[0] * sx,
+                top: cell.bbox[1] * sy,
+                right: cell.bbox[2] * sx,
+                bottom: cell.bbox[3] * sy,
+            };
         });
-        // One measure pass over the page, after every box is placed:
-        // a measure inside the loop would lay the page out again for
-        // each cell.
-        boxes.forEach(fitBox);
+        // The smallest box first, so a cell inside another cell wins
+        // the pointer. One sort per page, never per move.
+        hits.sort(function (a, b) {
+            return area(a) - area(b);
+        });
+        bindHover(wrapper, hits);
     }
 
-    function buildBox(cell, sx, sy) {
+    function area(hit) {
+        return (hit.right - hit.left) * (hit.bottom - hit.top);
+    }
+
+    function buildBox(cell, sx, sy, mid) {
         var box = document.createElement('div');
         box.className = 'ocr-cell';
+        // A panel opens at the left edge of its box and is as wide as
+        // its words, so a cell in the right half opens it leftwards
+        // instead: the page is what the reviewer is looking at, and a
+        // panel that leaves the page may leave the scroll box with it.
+        if (cell.bbox[0] * sx > mid) box.classList.add('opens-left');
         box.style.left = (cell.bbox[0] * sx) + 'px';
         box.style.top = (cell.bbox[1] * sy) + 'px';
         box.style.width = ((cell.bbox[2] - cell.bbox[0]) * sx) + 'px';
         box.style.height = ((cell.bbox[3] - cell.bbox[1]) * sy) + 'px';
         box.style.borderColor = CATEGORY_COLORS[cell.category] || '#6b7280';
-        box.title = cell.category;
         var panel = document.createElement('div');
         panel.className = 'ocr-cell-text';
-        panel.style.fontSize = BASE_FONT_PX + 'px';
+        if (cell.category) {
+            // The border colour says the category and a colour alone
+            // names nothing, so the panel says it in words. It used to
+            // ride on the box's ``title``, which a box that takes no
+            // pointer never shows.
+            var kind = document.createElement('span');
+            kind.className = 'ocr-cell-cat';
+            kind.textContent = cell.category;
+            panel.appendChild(kind);
+        }
+        var words = document.createElement('span');
         // The model wrote this text: textContent, never innerHTML.
-        panel.textContent = cell.text;
+        words.textContent = cell.text;
+        panel.appendChild(words);
         box.appendChild(panel);
         return box;
     }
 
+    // --- The hover, by hit test ---
+
     /**
-     * Make one panel's text fit its box.
+     * Open the box under the pointer while the pointer is on the page.
      *
-     * At a fixed width the height of a paragraph grows with the square
-     * of the font size, so one square root gives the size that fits,
-     * and one measure confirms it. A panel that still overflows keeps
-     * the floor size and clips; it takes the pointer, so a hover shows
-     * the rest of the text.
+     * The listener is on the wrapper and the boxes take no pointer, so
+     * a click still reaches the canvas, the detection boxes and the
+     * redaction drag under it. One listener per page, removed with the
+     * boxes by ``ocrTextClear``.
      *
-     * @param {HTMLElement} box - One .ocr-cell element.
+     * The move only records the position; the read of it happens in
+     * one animation frame, because a mouse move fires far more often
+     * than a browser paints.
+     *
+     * The pointer is in screen pixels and the rects are in the page's
+     * own, which the zoom scales apart with a CSS transform on this
+     * wrapper. ``shared.eventToCanvasPixels`` is that conversion, and
+     * the redaction drag reads a click through it, so the overlay must
+     * not carry a second copy of the rule.
+     *
+     * @param {HTMLElement} wrapper - The .canvas-wrapper of the page.
+     * @param {Array} hits - The cell rects, smallest first.
      */
-    function fitBox(box) {
-        var panel = box.firstChild;
-        var room = box.clientHeight;
-        if (!room || panel.scrollHeight <= room) return;
-        var size = BASE_FONT_PX * Math.sqrt(room / panel.scrollHeight);
-        size = Math.max(MIN_FONT_PX, Math.round(size * 10) / 10);
-        panel.style.fontSize = size + 'px';
-        if (panel.scrollHeight > room) {
-            box.classList.add('clipped');
-            box.title = box.title + ' (hover to read the whole text)';
+    function bindHover(wrapper, hits) {
+        var pending = null;
+        var frame = 0;
+
+        function read() {
+            frame = 0;
+            if (!pending) return;
+            setOpen(hitAt(hits, pointIn(wrapper, pending)));
         }
+
+        function onMove(event) {
+            pending = event;
+            if (!frame) frame = requestAnimationFrame(read);
+        }
+
+        function onLeave() {
+            pending = null;
+            setOpen(null);
+        }
+
+        wrapper.addEventListener('mousemove', onMove);
+        wrapper.addEventListener('mouseleave', onLeave);
+        // ``ocrTextClear`` removes the nodes; the listeners have to go
+        // with them, or a re-render would stack a second pair on the
+        // same wrapper.
+        wrapper._ocrTextHover = function () {
+            wrapper.removeEventListener('mousemove', onMove);
+            wrapper.removeEventListener('mouseleave', onLeave);
+            if (frame) cancelAnimationFrame(frame);
+            setOpen(null);
+        };
+    }
+
+    /**
+     * Put a mouse event in the page's own pixels.
+     *
+     * The canvas is rendered at the wrapper's layout width (both
+     * viewers write ``wrapper.style.width = viewport.width``), so the
+     * page's pixels are the wrapper's, and only the zoom transform
+     * separates them from the screen's.
+     *
+     * @param {HTMLElement} wrapper - The .canvas-wrapper of the page.
+     * @param {MouseEvent} event - The move to place.
+     * @returns {{x: number, y: number}} The point, in page pixels.
+     */
+    function pointIn(wrapper, event) {
+        if (typeof eventToCanvasPixels === 'function') {
+            return eventToCanvasPixels(event, wrapper);
+        }
+        var rect = wrapper.getBoundingClientRect();
+        return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    }
+
+    /**
+     * The smallest cell rect that holds the point, or nothing.
+     *
+     * @param {Array} hits - The cell rects, smallest first.
+     * @param {{x: number, y: number}} point - In the page's pixels.
+     * @returns {HTMLElement|null} The box to open.
+     */
+    function hitAt(hits, point) {
+        for (var i = 0; i < hits.length; i++) {
+            var hit = hits[i];
+            if (point.x >= hit.left && point.x <= hit.right &&
+                point.y >= hit.top && point.y <= hit.bottom) {
+                return hit.box;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Show one box's text, and close the box that was open.
+     *
+     * @param {HTMLElement|null} box - The box to open, or nothing.
+     */
+    function setOpen(box) {
+        if (openBox === box) return;
+        if (openBox) openBox.classList.remove('open');
+        openBox = box;
+        if (box) box.classList.add('open');
     }
 
     function pageNote(page) {
