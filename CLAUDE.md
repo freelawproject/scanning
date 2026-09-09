@@ -1320,6 +1320,68 @@ words, so the page reached the reader with no cell and no number.
   went in 0.12) would remove two of the three shapes at the source and
   is the next step, gated and measured.
 
+## The case-law block tagger worker image
+
+`scanning/runpod-caselaw-tagger/` is the third RunPod Serverless image,
+beside `runpod/` (bl_warm) and `runpod-dotsmocr/`. It runs
+`freelawproject/caselaw-block-tagger`, a ModernBERT-large token
+classifier with an 8,192-token context, and answers one action, `tag`:
+sequences in, labelled character spans out (party, separator,
+docketnumber, court, attorneys, judges, datefiled, otherdate, history,
+disposition, author, heading). It is the image only; nothing in the
+daemon submits to it yet, and the `RunpodEngine` row plus the
+`RUNPOD_TAGGER_ENDPOINT_ID` setting are the next PR. What must not be
+broken:
+
+- **The worker tags; it does not build its input.** A sequence is one
+  case as the minimal HTML the model was trained on (`<p>` per block,
+  `<blockquote>`/`<em>`/`<sup>`, footnote content omitted). Building
+  that from the dots.mocr cells and the detection run is the caller's,
+  because it reads two volume documents the worker never sees. The
+  worker handles the token limit internally.
+- **A case that fits the context runs whole; a longer one uses
+  overlapping windows** of the full 8,192-token context (special tokens
+  included, capped by the loaded model's `max_position_embeddings`)
+  with approximately 800 tokens of overlap. The window is the trained
+  context on purpose: a smaller one would split cases the model can
+  read in one pass. Paragraphs
+  stay whole when they fit; oversized paragraphs use token slices.
+  Tokenization happens once, preserving original offsets. Each block
+  or fallback slice takes predictions from the window where it is
+  most interior; labels are merged before span decoding. The result
+  remains one entry per case with `window_count`, and one document per
+  job. Long cases are never truncated or rejected for their length.
+- **Spans are character offsets over the input `text`**, `end`
+  exclusive, trimmed to the text they cover, in text order.
+  `decode_spans` is pure and lenient in one way: an `I-x` that follows
+  nothing or another class opens a span. Special tokens, markup, and
+  whitespace neither open nor split one; mixed tokens snap to text;
+  the bytes of one multi-byte character (same offsets under byte-level
+  BPE) extend the span they share a character with, whatever their
+  label, or a West key symbol split a heading in two.
+  Output keeps the input order whatever
+  order the length-sorted batches ran in.
+- **Input has two shapes**, `input_url` (a presigned GET of a JSON
+  document, `{"sequences": [...]}` or the bare list) or `sequences`
+  inline, exactly one. The download goes through the shared
+  `download_pdf` (a resumable, size-checked GET; nothing in it reads
+  the bytes) and a document that will not parse is `BAD_INPUT`. Ids
+  are strings or integers, unique per job; `bool` is refused.
+- **GPU-only by default**, the sibling rule: no device is `NO_GPU` with
+  `refresh_worker`. `HANDLER_ALLOW_CPU=1` puts the model on the CPU for
+  a laptop smoke test and must not be set on the endpoint.
+- **The checkpoint needs transformers 5** (its tokenizer class is
+  `TokenizersBackend`); the snapshot is baked into `/opt/model` and
+  opened once at build time so a config the installed version cannot
+  read fails the build, not the first paid job. `HF_HUB_OFFLINE=1` at
+  run time; a new checkpoint is a rebuild through the `TAGGER_MODEL`
+  build arg.
+- The build workflow pushes `freelawproject/caselaw-tagger-gpu-worker`
+  and patches the template in `RUNPOD_CASELAW_TAGGER_TEMPLATE_ID`, a
+  new secret for a new endpoint. Tested without the worker stack in
+  `scanning/tests/test_runpod_caselaw_tagger_handler.py`: only
+  `_predict_batch` is stubbed, the tokenizer is a whitespace fake.
+
 ## Generalized YOLO worker image (issue #194)
 
 `scanning/runpod/` is the RunPod Serverless image that runs detection
