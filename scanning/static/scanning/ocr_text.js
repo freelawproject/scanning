@@ -25,6 +25,11 @@
  *
  * Both viewers load this file, because one rule that drifted between
  * two copies would draw the text differently in the two steps.
+ *
+ * The read of a glued volume takes seconds, and a toolbar button gives
+ * no signal of its own: a disabled one looks exactly like a live one.
+ * So the wait says so three ways -- the label, a dim, and a pulse --
+ * and a toast names the size, which is why the wait is long.
  */
 
 (function () {
@@ -130,8 +135,7 @@
         if (!cfg.ocrTextUrlApi) return;
         loading = true;
         var label = button.textContent;
-        button.disabled = true;
-        button.textContent = 'Text…';
+        startWaiting(button, 'Reading…');
         var api = cfg.ocrTextUrlApi + (cfg.finalSpace ? '?space=final' : '');
         var documentUrl = null;
         fetch(api)
@@ -144,8 +148,17 @@
             .then(function (answer) {
                 documentUrl = answer.url;
                 if (answer.size) {
-                    button.title = 'The OCR text of this volume is ' +
-                        Math.round(answer.size / 1048576) + ' MB.';
+                    // The second read is the slow one, and its size is
+                    // why. The number goes in a toast and not on the
+                    // button: a label that grows moves every other
+                    // button of the toolbar on each press.
+                    var mb = Math.max(1, Math.round(answer.size / 1048576));
+                    button.title = 'Reading the OCR text of this volume, ' +
+                        mb + ' MB.';
+                    if (typeof showToast === 'function') {
+                        showToast('Reading the OCR text of this volume, ' +
+                            mb + ' MB. This takes a moment.', 'info');
+                    }
                 }
                 // Straight from the bucket: the web pod reads no byte
                 // of a document that holds every cell of the volume.
@@ -157,17 +170,46 @@
             })
             .then(function (doc) {
                 index = buildIndex(doc);
-                loading = false;
-                button.disabled = false;
-                button.textContent = label;
+                stopWaiting(button, label);
                 setEnabled(button, true);
             })
             .catch(function (err) {
-                loading = false;
-                button.disabled = false;
-                button.textContent = label;
+                stopWaiting(button, label);
                 failed(err, documentUrl);
             });
+    }
+
+    /**
+     * Show that the button is at work.
+     *
+     * The read of a glued volume takes seconds, and the label alone
+     * carried the whole signal: a ``disabled`` button of the zoom
+     * toolbar looks exactly like a live one. So this writes words a
+     * reviewer can read, dims the button and starts the pulse of
+     * ``.loading``.
+     *
+     * @param {HTMLElement} button - The toolbar button.
+     * @param {string} text - What the button says while it waits.
+     */
+    function startWaiting(button, text) {
+        button.disabled = true;
+        button.classList.add('loading');
+        button.textContent = text;
+        button.title = 'Reading the OCR text of this volume…';
+    }
+
+    /**
+     * Give the button back, whatever the read did.
+     *
+     * @param {HTMLElement} button - The toolbar button.
+     * @param {string} label - The label the button carried before.
+     */
+    function stopWaiting(button, label) {
+        loading = false;
+        button.disabled = false;
+        button.classList.remove('loading');
+        button.textContent = label;
+        button.title = 'Show the text the OCR read on each page';
     }
 
     /**
