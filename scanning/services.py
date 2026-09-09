@@ -550,31 +550,81 @@ def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
 _PAGE_RANGE_RE = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
 
 
-def _page_number_lookup(scan: "Scan") -> dict:
-    """Build {page_index: (page_number, page_number_end)} from ocr_results.
+def printed_page_span(value, kind) -> tuple[int, int | None] | None:
+    """Parse one stored printed number into ``(start, end)``.
 
-    For range pages like "677-685", returns (677, 685).
-    For single pages like "677", returns (677, None).
+    A range page like ``"677-685"`` gives ``(677, 685)``; a single page
+    like ``"677"`` gives ``(677, None)``; a blank or unparsable value
+    gives ``None``. One parser for the two readers of a stored number:
+    :func:`_page_number_lookup` over ``Scan.ocr_results`` (the
+    original's space) and ``apply.page_number_lookup`` over a run's
+    printed-page map (the final space, #269).
 
-    :param scan: The Scan instance whose ocr_results to parse.
-    :return: Mapping of page index to (start, end) page number tuple.
+    :param value: The stored number, as ``detected`` or ``printed``.
+    :param kind: The stored type, ``"range"`` or anything else.
+    :returns: The span, or ``None``.
+    :rtype: tuple[int, int | None] | None
     """
-    ocr_results = scan.ocr_results
+    if not value:
+        return None
+    if kind == "range":
+        m = _PAGE_RANGE_RE.match(str(value))
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+        return None
+    try:
+        return (int(value), None)
+    except (ValueError, TypeError):
+        return None
+
+
+def _page_number_lookup(scan: "Scan", printed: dict | None = None) -> dict:
+    """Build ``{page_index: (page_number, page_number_end)}`` for a scan.
+
+    The numbers ``detections.json`` carries beside each box, so they
+    must be in the space the boxes are in. Since #269 the boxes of a
+    volume whose redactions are measured against its standing apply run
+    are final pages, so the lookup comes from the run's printed-page map
+    then; every other volume -- a legacy one, a compute in progress, a
+    run not yet measured -- reads ``Scan.ocr_results``, the original's
+    space. Six callers write that file, so the rule resolves here and
+    not in each of them.
+
+    The resolver reads S3 once per call. Three of the callers are the
+    box-edit endpoints of review 2, whose write to the database is
+    already committed when they reach this, so a failed read must not
+    fail the request: it is logged, and the lookup falls back to
+    ``Scan.ocr_results`` for that one write, which the next write
+    corrects.
+
+    :param scan: The scan.
+    :param printed: The run's printed-page map when the caller already
+        loaded it (the compute does, once); resolved here otherwise.
+    :return: Mapping of 0-based page index to a page span.
+    """
+    from scanning import apply, review_states, yolo
+
+    if printed is None:
+        run = review_states.final_run(scan)
+        if run is not None and yolo.redactions_current(
+            yolo.live_detect_jobs(scan), run
+        ):
+            try:
+                printed = apply.load_printed_pages(scan, run)
+            except apply.ApplyError:
+                logger.exception(
+                    "scan %s: the printed pages of %s did not load; "
+                    "detections.json carries the original's numbers this once",
+                    scan.pk,
+                    run.label,
+                )
+    if printed is not None:
+        return apply.page_number_lookup(printed)
     lookup = {}
-    for r in ocr_results:
-        pdf_idx = r["pdf_page"] - 1
-        detected = r.get("detected")
-        if not detected:
-            continue
-        if r.get("type") == "range":
-            m = _PAGE_RANGE_RE.match(str(detected))
-            if m:
-                lookup[pdf_idx] = (int(m.group(1)), int(m.group(2)))
-            continue
-        try:
-            lookup[pdf_idx] = (int(detected), None)
-        except (ValueError, TypeError):
-            pass
+    for r in scan.ocr_results:
+        span = printed_page_span(r.get("detected"), r.get("type"))
+        if span is not None:
+            lookup[r["pdf_page"] - 1] = span
     return lookup
 
 
@@ -639,13 +689,19 @@ def _pull_processing_files_from_s3(scan_pk: int) -> None:
         )
 
 
-def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
+def _sync_detections_to_disk(
+    scan_pk: int, upload: bool = True, page_numbers: dict | None = None
+) -> list | None:
     """Write current DB detections to detections.json on disk.
 
     :param scan_pk: Primary key of the scan whose detections to sync.
     :param upload: If ``True`` (default), also push detections.json to S3.
         Pass ``False`` when a subsequent ``_push_processing_files_to_s3``
         call will cover the upload, to avoid redundant round-trips.
+    :param page_numbers: The ``{page_index: (start, end)}`` lookup, when
+        the caller holds it (the redaction compute loads the run's
+        printed pages once, #269). Resolved by
+        :func:`_page_number_lookup` otherwise.
     :return: The detection data written, or None if no output_dir.
     """
     scan = Scan.objects.get(pk=scan_pk)
@@ -653,8 +709,8 @@ def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
     if not output_dir.is_dir():
         return
 
-    # Build page_number lookup from ocr_results
-    page_numbers = _page_number_lookup(scan)
+    if page_numbers is None:
+        page_numbers = _page_number_lookup(scan)
 
     all_saved = Detection.objects.filter(
         scan_id=scan_pk, active=True
@@ -769,16 +825,22 @@ def _build_document_from_detections(
     return document
 
 
-def _compute_and_save_redaction_rects(scan_pk: int, pdf_path: str) -> list:
+def _compute_and_save_redaction_rects(
+    scan_pk: int, pdf_path: str, page_numbers: dict | None = None
+) -> list:
     """Compute redaction rects and save to the Scan model.
 
     :param scan_pk: Primary key of the scan to compute rects for.
     :param pdf_path: Path to the PDF used for page dimensions.
+    :param page_numbers: The page-number lookup for ``detections.json``,
+        when the caller holds it; see :func:`_sync_detections_to_disk`.
     :return: The computed rects list.
     """
     scan = Scan.objects.get(pk=scan_pk)
 
-    det_data = _sync_detections_to_disk(scan_pk, upload=False)
+    det_data = _sync_detections_to_disk(
+        scan_pk, upload=False, page_numbers=page_numbers
+    )
     if not det_data:
         return []
 
@@ -1628,6 +1690,38 @@ def _import_detections(scan_pk: int, detections: list) -> int:
     return len(rows)
 
 
+_UNSET_RUN = object()
+
+
+def geometry_pdf_path(scan: "Scan", run=_UNSET_RUN) -> str:
+    """Return the PDF the redaction geometry of ``scan`` is measured on.
+
+    The one rule for "which PDF the geometry reads" (#269). With a
+    complete standing apply run it is the run's bitonal copy
+    (``ApplyRun.bitonal_key``), pulled to its local mirror by
+    ``apply.local_copy``; the final page space, where the imported
+    detections live. Without one it is :func:`processing_pdf_path`, the
+    review-1 copy of the original's space: a legacy volume, or a scan
+    the apply has not reached. An identity run's key is the volume
+    ``bitonal.pdf`` itself, so the two answers name the same file; for
+    a 1-bit original it is the original, which ``processing_pdf_path``
+    also falls back to.
+
+    :param scan: The scan.
+    :param run: The standing run when the caller has it (``None`` for
+        none); ``review_states.final_run`` is asked otherwise.
+    :returns: A local path.
+    :rtype: str
+    """
+    from scanning import apply, review_states
+
+    if run is _UNSET_RUN:
+        run = review_states.final_run(scan)
+    if run is None:
+        return processing_pdf_path(scan)
+    return str(apply.local_copy(scan, run.bitonal_key))
+
+
 def run_compute_redactions(scan_pk: int) -> None:
     """Turn a merged detection run into the geometry review 2 reads.
 
@@ -1641,19 +1735,26 @@ def run_compute_redactions(scan_pk: int) -> None:
     copy. The collect tick runs every 15 seconds on a serial scheduler
     (#156), so this belongs where the other long stages already run.
 
-    **The model read the original; the geometry reads the bitonal
-    copy.** bl-warm collapses on 1-bit pages, so detection fans out
-    over the original shards (#167/#194), while the rects are stamped
-    on the bitonal copy and must be measured against its ink. Both
-    files have the page geometry of the original, so the two spaces
-    agree.
+    **The model read the original; the geometry reads the corrected
+    bitonal copy.** bl-warm collapses on 1-bit pages, so detection fans
+    out over the original shards (#167/#194), while the rects are
+    stamped on the bitonal copy and must be measured against its ink.
+    Since #269 both are in the page space of the standing apply run
+    (#224): the detections come from the run's glued document
+    (``ApplyRun.detections_key``), which the apply moved through its
+    page map, and the copy is the run's ``bitonal_key``. A volume with
+    no page edit has an identity run, whose keys alias the review-1
+    artifacts, so nothing changes for it.
 
-    **The detections are imported once per run.** A run the apply has
-    already stamped is a *recompute*, which a curator asks for after
-    they add or delete a box: it keeps every row in the database and
-    measures again from those. Importing again there would throw the
-    curator's edits away, which is the whole reason they pressed the
-    button.
+    **The detections are imported once per run**, and the run is the
+    apply run. Rows measured against the standing run are a
+    *recompute*, which a curator asks for after they add or delete a
+    box: it keeps every row in the database and measures again from
+    those. Importing again there would throw the curator's edits away,
+    which is the whole reason they pressed the button. Rows measured
+    against a run this one supersedes (a reopen and a second approval)
+    describe pages the volume no longer shows, so they are imported
+    again; the carry of a curator's edits across runs is #241.
 
     The scan goes back to a review whatever happens, and this function
     raises nothing. On success that review is review 2
@@ -1668,7 +1769,7 @@ def run_compute_redactions(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to compute redactions for.
     :return: None.
     """
-    from scanning import review_states, s3_sync, yolo
+    from scanning import apply, review_states, s3_sync, yolo
 
     django.db.connections.close_all()
     scan = Scan.objects.get(pk=scan_pk)
@@ -1690,11 +1791,14 @@ def run_compute_redactions(scan_pk: int) -> None:
         answers for every one of them (#263). A first apply that fails
         writes no ``applied_at``, so the rule gives review 1 back --
         nobody may be sent to judge geometry that was never measured. A
-        *recompute* that fails keeps the stamp of the run that worked,
-        so the rule gives review 2 back, and the failure message stands
-        where the curator can read it. A park chosen up front sent that
-        second case to review 1, and ``promote_ready_scans`` wrote its
-        own message over the failure one tick later.
+        *recompute* that fails under the same apply run keeps the stamp
+        of the run that worked, so the rule gives review 2 back, and the
+        failure message stands where the curator can read it. A park
+        chosen up front sent that second case to review 1, and
+        ``promote_ready_scans`` wrote its own message over the failure
+        one tick later. A compute that fails under a *new* apply run has
+        no stamp for it (#269), so the rule gives review 1 back: the old
+        geometry describes pages the volume no longer shows.
 
         :returns: The status to park the scan in.
         :rtype: str
@@ -1722,33 +1826,68 @@ def run_compute_redactions(scan_pk: int) -> None:
         )
         return
 
-    # A merged run that was never applied brings its detections in. Any
-    # other case measures what the database already holds: a recompute
-    # after a curator's edit, or a legacy volume whose rows the old
-    # pipeline wrote.
-    importing = merged and not yolo.apply_state(rows).get("applied_at")
     if merged:
         yolo.record_apply_start(rows)
+    # After the claim is dropped, never before: a lost claim must not
+    # keep ``queued_at``. A merged run reads the corrected volume of the
+    # standing apply run (#269). The queue gate checked that it exists;
+    # this is the backstop for an admin supersede between the queue and
+    # the claim, and it spends no attempt, like a closed gate does in
+    # the apply. The rule parks the scan in review 1, and the next
+    # complete run queues it again.
+    run = review_states.final_run(scan) if merged else None
+    if merged and run is None:
+        logger.warning(
+            "compute_redactions: scan %s has no complete apply run; the "
+            "corrected volume is not built",
+            scan_pk,
+        )
+        _park_after_redactions(
+            scan_pk,
+            "The corrected volume is not built yet. The redactions are "
+            "computed when it is.",
+            park(),
+        )
+        return
+
+    # A merged run whose rows are not measured against the standing
+    # apply run brings its detections in. Any other case measures what
+    # the database already holds: a recompute after a curator's edit, or
+    # a legacy volume whose rows the old pipeline wrote.
+    importing = merged and not yolo.redactions_current(rows, run)
     started = time.monotonic()
     try:
         detections = []
+        page_numbers = None
+        if merged:
+            _update_progress(scan_pk, "Reading the corrected volume...")
+            page_numbers = _page_number_lookup(
+                scan, apply.load_printed_pages(scan, run)
+            )
         if importing:
             _update_progress(
                 scan_pk, "Reading the detections of this volume..."
             )
-            document = yolo.load_merged_document(scan, rows[0].run)
+            document = apply.load_detections_document(scan, run)
             detections = document.get("detections") or []
             if not detections:
                 raise RuntimeError(
-                    f"scan {scan_pk}: the merged detection run holds no "
-                    f"detections"
+                    f"scan {scan_pk}: the detection run holds no "
+                    f"detections in the corrected volume"
                 )
 
-        _pull_processing_files_from_s3(scan_pk)
-        scan.refresh_from_db()
-        ensure_output_dir(scan)
+        if merged:
+            # One key, not the prefix: the whole-prefix pull lands the
+            # multi-GB original, which nothing here reads.
+            scan.refresh_from_db()
+            ensure_output_dir(scan)
+            pdf_path = geometry_pdf_path(scan, run)
+        else:
+            _pull_processing_files_from_s3(scan_pk)
+            scan.refresh_from_db()
+            ensure_output_dir(scan)
+            pdf_path = geometry_pdf_path(scan, None)
         output_dir = scan.output_dir
-        pdf_path = processing_pdf_path(scan)
 
         if importing:
             with _log_stage("Import detections"):
@@ -1760,7 +1899,9 @@ def run_compute_redactions(scan_pk: int) -> None:
             with _log_stage("Column correction"):
                 _snap_text_columns_to_ink(scan_pk, pdf_path)
 
-        det_data = _sync_detections_to_disk(scan_pk, upload=False)
+        det_data = _sync_detections_to_disk(
+            scan_pk, upload=False, page_numbers=page_numbers
+        )
         _update_progress(scan_pk, "Pairing the opinions...")
         with _log_stage("Opinion pairing"):
             opinions = bl_pair(
@@ -1773,7 +1914,9 @@ def run_compute_redactions(scan_pk: int) -> None:
         Scan.objects.filter(pk=scan_pk).update(opinions_json=opinions)
 
         _update_progress(scan_pk, "Computing the redactions...")
-        rects = _compute_and_save_redaction_rects(scan_pk, pdf_path)
+        rects = _compute_and_save_redaction_rects(
+            scan_pk, pdf_path, page_numbers=page_numbers
+        )
 
         _update_progress(scan_pk, "Measuring the page margins...")
         margins = _compute_and_save_margin_rects(
@@ -1823,7 +1966,7 @@ def run_compute_redactions(scan_pk: int) -> None:
         # page the moment the scan parks, and a park in the approved
         # status would show the curator a step 2 whose approve button
         # appears a tick later, from nothing they did.
-        yolo.record_apply_success(rows)
+        yolo.record_apply_success(rows, run)
     _park_after_redactions(
         scan_pk, "Detection review is ready: check the redactions.", park()
     )
@@ -2381,7 +2524,10 @@ def _stamp_original_images(scan: "Scan", base_pdf_path: str) -> str:
 def run_generate_files(scan_pk: int) -> None:
     """Generate redacted/split opinion files from existing detections.
 
-    Designed to run in the daemon process.
+    Designed to run in the daemon process. Nothing queues it since #173;
+    #206 brings it back over the redacted volume, and it is left as it
+    was until then (#269 moved review 2 and the redaction compute to
+    the corrected volume, not this).
 
     :param scan_pk: Primary key of the scan to generate files for.
     """

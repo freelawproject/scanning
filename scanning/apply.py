@@ -2364,3 +2364,215 @@ def run_state(scan: Scan, run: ApplyRun | None = None) -> dict | None:
         "failed": bool(dead) or run.attempts >= APPLY_MAX_ATTEMPTS,
         "open": open_rows,
     }
+
+
+# ---------------------------------------------------------------------------
+# Readers of the run's outputs (issue #269)
+#
+# Review 2 and the redaction compute read the corrected volume, never the
+# review-1 artifacts, once ``review_states.final_run`` answers. These are
+# the readers: one local mirror rule, the two documents, and the shapes
+# the step-2 viewer draws from.
+# ---------------------------------------------------------------------------
+
+
+def local_copy(scan: Scan, key: str) -> Path:
+    """Return a local path holding the object at ``key``, pulled if needed.
+
+    The local tree mirrors the processing prefix: an output at
+    ``{prefix}jobs/apply/a2/bitonal.pdf`` lands at
+    ``output_dir/jobs/apply/a2/bitonal.pdf``. The generic sync excludes
+    ``jobs/`` in both directions, so the mirror is never pushed back,
+    and ``release_local_processing`` removes the whole tree. An identity
+    run's ``bitonal_key`` is the volume ``bitonal.pdf``, so its mirror
+    is ``output_dir/bitonal.pdf``, the path the viewer served before.
+
+    The root is ``Scan.output_dir`` and not ``s3_sync.tmp_output_dir``:
+    under ``DEVELOPMENT`` the two differ, and every reader of the tree
+    reads ``output_dir``.
+
+    :param scan: The scan the key belongs to.
+    :param key: An S3 key under the scan's processing prefix.
+    :returns: The local path.
+    :rtype: Path
+    :raises ApplyError: If the key is outside the prefix, or the file is
+        absent and cannot be pulled.
+    """
+    prefix = s3_sync.s3_processing_prefix(scan)
+    if not key or not key.startswith(prefix):
+        raise ApplyError(
+            f"scan {scan.pk}: key {key!r} is not under the processing "
+            f"prefix {prefix!r}"
+        )
+    dest = Path(scan.output_dir) / key[len(prefix) :]
+    if dest.is_file():
+        return dest
+    if not s3_sync.s3_active():
+        raise ApplyError(
+            f"scan {scan.pk}: {dest} is absent and S3 is not active"
+        )
+    try:
+        s3_sync.download_object(key, dest)
+    except Exception as exc:
+        raise ApplyError(
+            f"scan {scan.pk}: could not pull {key}: {exc}"
+        ) from exc
+    return dest
+
+
+def load_detections_document(scan: Scan, run: ApplyRun) -> dict:
+    """Read the run's glued detections document (the final page space).
+
+    :param scan: The scan.
+    :param run: The standing, complete run.
+    :returns: The document ``_glue_detections`` wrote.
+    :rtype: dict
+    :raises yolo.DetectMergeError: If the document is absent, of another
+        schema, or describes another original.
+    """
+    from scanning import yolo
+
+    return yolo.load_document_at(scan, run.detections_key)
+
+
+def load_printed_pages(scan: Scan, run: ApplyRun) -> dict:
+    """Read the run's printed-page map (the final page space).
+
+    :param scan: The scan.
+    :param run: The standing, complete run.
+    :returns: The document :func:`printed_pages` wrote.
+    :rtype: dict
+    :raises ApplyError: If the document cannot be read.
+    """
+    try:
+        document = s3_sync.download_json_object(run.printed_pages_key)
+    except Exception as exc:
+        raise ApplyError(
+            f"scan {scan.pk}: the printed pages of {run.label} at "
+            f"{run.printed_pages_key} could not be read: {exc}"
+        ) from exc
+    if not isinstance(document, dict) or "pages" not in document:
+        raise ApplyError(
+            f"scan {scan.pk}: the object at {run.printed_pages_key} is "
+            f"not a printed-page map"
+        )
+    return document
+
+
+def viewer_pages(printed: dict) -> tuple[list[dict], dict[int, dict]]:
+    """Return the step-2 page map and page-number labels of a run.
+
+    The viewer draws one placeholder per ``page_map`` entry
+    (``{"type": "pdf_page", "pdf_index", "logical_number"}``) and one
+    label per ``ocr_by_page`` entry, keyed by the 1-based page and
+    shaped like a ``Scan.ocr_results`` row: ``detected``, ``type``,
+    ``zone`` and ``score``. Here the page is a page of the corrected
+    volume, the number is the printed one the run stored, and the zone
+    says who read it (``"typed"`` for a curator, ``"read"`` for the
+    model); there is no score.
+
+    :param printed: The document of :func:`load_printed_pages`.
+    :returns: ``(page_map, ocr_by_page)``.
+    :rtype: tuple[list[dict], dict[int, dict]]
+    """
+    page_map: list[dict] = []
+    ocr_by_page: dict[int, dict] = {}
+    for entry in printed.get("pages", []):
+        final = int(entry["final_page"])
+        number = entry.get("printed")
+        page_map.append(
+            {
+                "type": "pdf_page",
+                "pdf_index": final - 1,
+                "logical_number": number if number else final,
+            }
+        )
+        ocr_by_page[final] = {
+            "pdf_page": final,
+            "detected": number,
+            "type": entry.get("type"),
+            "zone": "typed" if entry.get("by") == "curator" else "read",
+            "score": None,
+        }
+    return page_map, ocr_by_page
+
+
+def positional_pages(run: ApplyRun) -> tuple[list[dict], dict[int, dict]]:
+    """Return the step-2 page map of a run with no printed numbers.
+
+    The fallback of :func:`viewer_pages` when the printed-page map could
+    not be read: the count comes from the stored ``page_map``, so no
+    S3 round trip is needed, and no label is drawn.
+
+    :param run: The standing, complete run.
+    :returns: ``(page_map, {})``.
+    :rtype: tuple[list[dict], dict[int, dict]]
+    """
+    count = int(run.page_map.get("final_page_count") or 0)
+    return (
+        [
+            {
+                "type": "pdf_page",
+                "pdf_index": index,
+                "logical_number": index + 1,
+            }
+            for index in range(count)
+        ],
+        {},
+    )
+
+
+def page_number_lookup(printed: dict) -> dict[int, tuple[int, int | None]]:
+    """Return ``{final page index: (start, end)}`` from a printed-page map.
+
+    The shape ``services._page_number_lookup`` builds from
+    ``Scan.ocr_results`` for the original's space, built here for the
+    final space: ``detections.json`` carries a printed number beside
+    each box, and after the compute the boxes are final pages.
+
+    :param printed: The document of :func:`load_printed_pages`.
+    :returns: Mapping of 0-based final page index to a page span.
+    :rtype: dict[int, tuple[int, int | None]]
+    """
+    from scanning.services import printed_page_span
+
+    lookup: dict[int, tuple[int, int | None]] = {}
+    for entry in printed.get("pages", []):
+        span = printed_page_span(entry.get("printed"), entry.get("type"))
+        if span is not None:
+            lookup[int(entry["final_page"]) - 1] = span
+    return lookup
+
+
+def describe_map(page_map: dict) -> dict:
+    """Count what a stored map changed, for the bar and the outputs index.
+
+    :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
+    :returns: ``final_page_count``, ``deleted``, ``inserted`` (edits,
+        not pages: one insert may hold several), ``replaced``,
+        ``rotated`` and ``identity``.
+    :rtype: dict
+    """
+    inserted: set[int] = set()
+    replaced: set[int] = set()
+    rotated: set[int] = set()
+    kinds = {
+        str(PageEdit.Kind.INSERT_PAGE): inserted,
+        str(PageEdit.Kind.REPLACE_PAGE): replaced,
+        str(PageEdit.Kind.ROTATE_PAGE): rotated,
+    }
+    for entry in page_map.get("pages", []):
+        source = entry.get("source") or {}
+        if source.get("kind") != "edit":
+            continue
+        bucket = kinds.get(source.get("edit_kind"))
+        if bucket is not None:
+            bucket.add(source.get("edit_id"))
+    return {
+        "final_page_count": int(page_map.get("final_page_count") or 0),
+        "deleted": len(page_map.get("deleted_pages") or []),
+        "inserted": len(inserted),
+        "replaced": len(replaced),
+        "rotated": len(rotated),
+        "identity": is_identity_map(page_map),
+    }

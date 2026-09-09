@@ -190,8 +190,11 @@ function showViewerWait(container, message, opts) {
  * @param {Function} cb.onFail - (error, url) => void; url is the direct
  *   link to offer (null when even the URL fetch failed).
  */
-function loadOriginalPdf(docId, cb) {
-    fetch('/scans/' + docId + '/original-url/')
+function loadOriginalPdf(docId, cb, opts) {
+    // opts.final asks for the corrected volume of the standing apply
+    // run (#269), which step 2 shows; the review-1 space otherwise.
+    var query = (opts && opts.final) ? '?space=final' : '';
+    fetch('/scans/' + docId + '/original-url/' + query)
         .then(function (resp) {
             if (!resp.ok) throw new Error('HTTP ' + resp.status);
             return resp.json();

@@ -22,11 +22,12 @@ The three conditions, and what answers each one:
   the hook, and one function is the whole surface of issue #224 here:
   the standing ``ApplyRun`` has every glue written
   (``ApplyRun.is_complete``), for this original.
-- **The redactions are computed from the detection run.** That is the
-  run's own ``applied_at`` stamp (``yolo.apply_state``), **not**
-  ``Scan.redaction_rects``: a volume with no headnote to hide gets an
-  empty rect list from a computation that fully succeeded, and it
-  still needs a curator to judge its pairing.
+- **The redactions are computed from the detection run, against the
+  standing apply run.** That is the run's own ``applied_at`` stamp
+  plus the ``apply_run`` it names (``yolo.redactions_current``, #269),
+  **not** ``Scan.redaction_rects``: a volume with no headnote to hide
+  gets an empty rect list from a computation that fully succeeded, and
+  it still needs a curator to judge its pairing.
 
 Two callers, deliberately:
 
@@ -61,8 +62,11 @@ from scanning.models import (
 logger = logging.getLogger(__name__)
 
 
-def final_volume_ready(scan: Scan) -> bool:
-    """Return whether the page complete volume of this scan is built.
+_UNSET = object()
+
+
+def final_run(scan: Scan, run=_UNSET):
+    """Return the standing apply run when the corrected volume is built.
 
     The hook for issue #224, and its whole surface in this module. The
     corrected volume is the standing ``ApplyRun`` of the scan
@@ -71,11 +75,9 @@ def final_volume_ready(scan: Scan) -> bool:
     OCR volume with its printed pages, and the detections in the final
     page space. Review 2 judges the redactions of the corrected volume,
     so no output of that volume may still be missing when the review
-    opens. The redaction compute (``yolo.queue_ready_runs``) reads the
-    same answer before it queues. Its readers still measure the review-1
-    artifacts, in the page space of the original; the follow-up PR
-    points them at the run's outputs, and this gate is what makes that
-    order hold from the first day.
+    opens. Every reader of the final space asks this one function
+    (#269): the redaction compute before it queues and when it runs,
+    the step-2 view, the PDF route and the crop route.
 
     The run must describe this original: a run built before a
     re-upload carries the old fingerprint, and a blank on either side
@@ -83,19 +85,40 @@ def final_volume_ready(scan: Scan) -> bool:
     ``page_edits.is_stale``).
 
     :param scan: The scan to judge.
-    :returns: Whether the corrected volume exists.
-    :rtype: bool
+    :param run: The standing run, when the caller already read it
+        (``views_process._review_flags`` does); ``None`` for a scan
+        with no run. Read here otherwise.
+    :returns: The run, or ``None`` when no corrected volume exists.
+    :rtype: ApplyRun | None
     """
     from scanning import apply
 
-    run = apply.current_run(scan)
+    if run is _UNSET:
+        run = apply.current_run(scan)
     if run is None or not run.is_complete:
-        return False
+        return None
     mine, theirs = run.source_fingerprint, scan.source_fingerprint
-    return not (mine and theirs and mine != theirs)
+    if mine and theirs and mine != theirs:
+        return None
+    return run
 
 
-def redaction_review_ready(scan: Scan, rows: list | None = None) -> bool:
+def final_volume_ready(scan: Scan) -> bool:
+    """Return whether the page complete volume of this scan is built.
+
+    :func:`final_run` as a yes or no, for the callers that do not need
+    the run itself.
+
+    :param scan: The scan to judge.
+    :returns: Whether the corrected volume exists.
+    :rtype: bool
+    """
+    return final_run(scan) is not None
+
+
+def redaction_review_ready(
+    scan: Scan, rows: list | None = None, run=_UNSET
+) -> bool:
     """Return whether this scan's redaction review may begin.
 
     The rule of issue #263, minus the scan's status: every caller holds
@@ -103,9 +126,16 @@ def redaction_review_ready(scan: Scan, rows: list | None = None) -> bool:
     for the apply (which is claimed *out* of the status) than for the
     pass (which filters *on* it).
 
+    "The redactions are computed" means computed against the standing
+    run (``yolo.redactions_current``, #269): a run that supersedes the
+    one the rows were measured on makes the geometry stale, and the
+    review must wait for the compute that follows it.
+
     :param scan: The scan to judge.
     :param rows: The live detection rows, when the caller has them --
         the apply reads them anyway, and this saves the query. Read
+        here otherwise.
+    :param run: The standing apply run, when the caller has it. Read
         here otherwise.
     :returns: Whether the two derivable conditions hold.
     :rtype: bool
@@ -121,9 +151,8 @@ def redaction_review_ready(scan: Scan, rows: list | None = None) -> bool:
     if any(row.status != JobStatus.CONSUMED for row in rows):
         # The run is not merged, so nothing measured its geometry.
         return False
-    if not yolo.apply_state(rows).get("applied_at"):
-        return False
-    return final_volume_ready(scan)
+    run = final_run(scan, run)
+    return yolo.redactions_current(rows, run)
 
 
 def promote_ready_scans() -> int:

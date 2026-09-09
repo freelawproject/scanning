@@ -21,6 +21,7 @@ from django.http import (
     StreamingHttpResponse,
 )
 from django.shortcuts import get_object_or_404, redirect
+from django.urls import reverse
 from django.utils.cache import get_conditional_response
 from django.utils.http import http_date
 from django.views.decorators.clickjacking import xframe_options_sameorigin
@@ -134,16 +135,38 @@ def serve_margin_rects(request: HttpRequest, pk: int) -> JsonResponse:
     if scan.margin_rects:
         return JsonResponse(scan.margin_rects, safe=False)
     output_base = Path(scan.output_dir)
-    base_pdf = (
-        find_processing_pdf(output_base) if output_base.is_dir() else None
-    )
-    if not base_pdf:
-        return JsonResponse([], safe=False)
     # Shared with the pipeline rather than reimplemented: computing these
     # here with its own detection lookup is how a viewer request that
     # arrived before this machine had detections.json cached margins with
-    # no top strips, permanently.
-    from scanning.services import _compute_and_save_margin_rects
+    # no top strips, permanently. The PDF is the one the geometry reads
+    # (#269): the corrected volume's copy when the rows are measured
+    # against the standing apply run, the review-1 copy otherwise.
+    from scanning import apply, review_states, yolo
+    from scanning.services import (
+        _compute_and_save_margin_rects,
+        geometry_pdf_path,
+    )
+
+    run = review_states.final_run(scan)
+    if run is not None and yolo.redactions_current(
+        yolo.live_detect_jobs(scan), run
+    ):
+        try:
+            base_pdf = geometry_pdf_path(scan, run)
+        except apply.ApplyError:
+            logger.exception(
+                "serve_margin_rects: the corrected volume of scan %s did "
+                "not load",
+                scan.pk,
+            )
+            return JsonResponse([], safe=False)
+        output_base.mkdir(parents=True, exist_ok=True)
+    else:
+        base_pdf = (
+            find_processing_pdf(output_base) if output_base.is_dir() else None
+        )
+    if not base_pdf:
+        return JsonResponse([], safe=False)
 
     rects = _compute_and_save_margin_rects(pk, str(base_pdf), str(output_base))
     return JsonResponse(rects, safe=False)
@@ -301,6 +324,13 @@ REPAIR_DISABLED_MESSAGE = (
     "once, when the detection run finishes."
 )
 
+#: The gate of step 3 in the view (#263/#269): a volume of the new
+#: pipeline reaches the file generation through the review-2 approval.
+GENERATE_REQUIRES_REDACTION_REVIEW_MESSAGE = (
+    "The redaction review of this volume is not approved yet. Approve "
+    "it in step 2 before the files are generated."
+)
+
 
 @login_required
 @require_POST
@@ -375,11 +405,26 @@ def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
     code (``services.run_generate_files``) is kept, but nothing queues
     it; this view fails with the unified pipeline-paused message.
 
+    The review-2 approval is the gate of step 3 (#263), and it is
+    checked here first (#269), before the paused flash: a template gate
+    alone cannot refuse a direct POST, the rule ``start_detect`` follows
+    for review 1. A legacy volume (``PENDING_REVIEW``) never holds the
+    approval and keeps its way in. The order holds the day #206
+    connects the generation.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if scan.status not in (
+        Status.REDACTION_REVIEW_DONE,
+        Status.PENDING_REVIEW,
+    ):
+        messages.warning(request, GENERATE_REQUIRES_REDACTION_REVIEW_MESSAGE)
+        return redirect(
+            f"{reverse('scan_process', kwargs={'pk': scan.pk})}?step=2"
+        )
     messages.warning(request, PIPELINE_PAUSED_MESSAGE)
     return redirect("scan_process", pk=scan.pk)
 

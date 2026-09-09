@@ -24,6 +24,19 @@ document.addEventListener('DOMContentLoaded', function () {
     // and keeps the control.
     var pageEditsLocked = typeof SCAN_CONFIG !== 'undefined'
         && SCAN_CONFIG.pageEditsLocked === true;
+    // The page shows the corrected volume of the standing apply run
+    // (#269): the original load and the crops address its pages, so
+    // both routes are told which space the index is in.
+    var finalSpace = typeof SCAN_CONFIG !== 'undefined'
+        && SCAN_CONFIG.finalSpace === true;
+    var spaceQuery = finalSpace ? '&space=final' : '';
+    // The full-quality crops of the IMAGE detections are off (#278).
+    // Each one is a request to /original-crop/, which pulls the
+    // multi-GB original to the web pod and renders a page region at up
+    // to 300 dpi; a page with several images fires them all at once.
+    // The route and its code stay; this flag is the only thing that
+    // stops the calls until the route is made cheaper.
+    var ORIGINAL_CROPS_ENABLED = false;
     var pageMap = JSON.parse(container.dataset.pageMap || '[]');
     var flaggedIndices = JSON.parse(container.dataset.flaggedIndices || '[]');
     var ocrByPage = JSON.parse(container.dataset.ocrByPage || '{}');
@@ -250,7 +263,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 if (currentUrl !== '__original__') return;
                 showOriginalLoadFailure(container, url);
             },
-        });
+        }, { final: finalSpace });
     }
 
     function loadPdf(url) {
@@ -343,9 +356,12 @@ document.addEventListener('DOMContentLoaded', function () {
                 'so its page numbers are fixed.';
             if (ocr.detected) {
                 var tag = ocr.type === 'range' ? 'Range ' : '#';
+                // The corrected volume's labels carry who read the
+                // number and no score (#269).
+                var detail = ocr.score ? ocr.zone + ' ' + ocr.score.toFixed(2) : ocr.zone;
                 ocrLabel = '<span class="ocr-tag' + editable + '" data-pdf-page="' + pdfPage + '" ' +
                     'title="' + (pageEditsLocked ? lockedTitle : 'Click to correct page number') + '">' + tag + ocr.detected +
-                    ' <small>(' + ocr.zone + ' ' + (ocr.score ? ocr.score.toFixed(2) : '') + ')</small></span>';
+                    ' <small>(' + detail + ')</small></span>';
             } else {
                 ocrLabel = '<span class="ocr-tag miss' + editable + '" data-pdf-page="' + pdfPage + '" ' +
                     'title="' + (pageEditsLocked ? lockedTitle : 'Click to assign a page number') + '">[no page # found]</span>';
@@ -663,8 +679,8 @@ document.addEventListener('DOMContentLoaded', function () {
                 drawDetectionOverlay(pageDiv, pdfIndex);
             }
 
-            // Overlay original PDF crops for IMAGE detections
-            if (allDetections && !_viewingOpinion) {
+            // Overlay original PDF crops for IMAGE detections (off, #278)
+            if (ORIGINAL_CROPS_ENABLED && allDetections && !_viewingOpinion) {
                 var pageIdx = parseInt(pageDiv.dataset.pdfIndex);
                 var imgDets = _detectionsForPage(pageIdx).filter(function(d) {
                     return d.label === 'IMAGE';
@@ -707,7 +723,7 @@ document.addEventListener('DOMContentLoaded', function () {
                             '&y0=' + ptY0.toFixed(2) +
                             '&x1=' + ptX1.toFixed(2) +
                             '&y1=' + ptY1.toFixed(2) +
-                            '&dpi=' + dpi;
+                            '&dpi=' + dpi + spaceQuery;
                         wrapper.appendChild(img);
                     });
                 }

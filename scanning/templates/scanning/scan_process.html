@@ -348,7 +348,7 @@
         <button type="button" class="zoom-btn zoom-reset" data-zoom-action="reset" title="Reset zoom">Reset</button>
       </div>
       <div id="pdf-viewer"
-           data-pdf-url="{% if step == 3 %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
+           data-pdf-url="{% if step == 3 %}{% elif final_space %}{% url 'serve_final_pdf' scan.pk %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
            data-document-id="{{ scan.pk }}"
            data-page-map='{{ page_map_json }}'
            data-flagged-indices='{{ flagged_indices_json }}'
@@ -383,6 +383,9 @@ var SCAN_CONFIG = {
     step: {{ step }},
     deletedPages: {{ deleted_pages_json|safe }},
     pageEditsLocked: {{ page_edits_locked|yesno:'true,false' }},
+    // Step 2 shows the corrected volume of the standing apply run
+    // (#269): the original load and the crops then address its pages.
+    finalSpace: {{ final_space|yesno:'true,false' }},
     replacedPages: {{ replaced_pages_json|safe }},
     // json_script, not |safe: the note is free text a person typed, and
     // a closing script tag inside it would end this block (#249). Do not

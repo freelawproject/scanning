@@ -17,7 +17,7 @@ from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
-from scanning import review_states, services, yolo
+from scanning import apply, review_states, services, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
     ApplyRun,
@@ -29,7 +29,11 @@ from scanning.models import (
 )
 from scanning.tests.test_jobs import make_manifest
 from scanning.tests.test_views import ScanningTestCase
-from scanning.tests.test_yolo_apply import ComputeMixin, merged_scan
+from scanning.tests.test_yolo_apply import (
+    ComputeMixin,
+    glued_run,
+    merged_scan,
+)
 from scanning.views_process import (
     REDACTION_REVIEW_ALREADY_DONE_MESSAGE,
     REDACTION_REVIEW_APPROVED_MESSAGE,
@@ -47,7 +51,7 @@ def applied_scan(status=Status.PAGE_COMPLETENESS_REVIEW_DONE, **kwargs):
     :returns: ``(scan, rows)``.
     """
     scan, rows = merged_scan(status=status, **kwargs)
-    yolo.record_apply_success(rows)
+    yolo.record_apply_success(rows, apply.current_run(scan))
     return scan, yolo.live_detect_jobs(scan)
 
 
@@ -89,10 +93,33 @@ class TestRedactionReviewReady(TestCase):
         """The #224 hook. The rule must ask it rather than assume it."""
         scan, rows = applied_scan()
 
-        with patch.object(
-            review_states, "final_volume_ready", return_value=False
-        ):
+        with patch.object(review_states, "final_run", return_value=None):
             self.assertFalse(review_states.redaction_review_ready(scan, rows))
+
+    def test_a_run_applied_against_another_apply_run_is_not_ready(self):
+        """The rows describe the pages of the run they were measured on
+        (#269); a run that supersedes it makes them stale, and the
+        review waits for the compute that follows."""
+        scan, rows = applied_scan()
+        apply.supersede_runs(scan, "test")
+        glued_run(scan, number=2)
+
+        self.assertFalse(review_states.redaction_review_ready(scan))
+        # And the pass leaves the scan where it is.
+        self.assertEqual(review_states.promote_ready_scans(), 0)
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
+
+    def test_the_caller_may_pass_the_run(self):
+        scan, rows = applied_scan()
+
+        with patch.object(apply, "current_run") as current:
+            self.assertTrue(
+                review_states.redaction_review_ready(
+                    scan, rows, run=ApplyRun.objects.get(scan=scan)
+                )
+            )
+        current.assert_not_called()
 
 
 class TestFinalVolumeReady(TestCase):
@@ -201,9 +228,7 @@ class TestPromoteReadyScans(TestCase):
         after the geometry, and the apply is long over."""
         scan, _ = applied_scan()
 
-        with patch.object(
-            review_states, "final_volume_ready", return_value=False
-        ):
+        with patch.object(review_states, "final_run", return_value=None):
             self.assertEqual(review_states.promote_ready_scans(), 0)
 
         self.assertEqual(review_states.promote_ready_scans(), 1)
@@ -330,15 +355,7 @@ class TestTheApplyOpensReviewTwo(ComputeMixin, TestCase):
         ExternalJob.objects.filter(scan=scan).update(status=JobStatus.CONSUMED)
         # The compute also waits for the page edit apply (#224); this
         # run aliases the review-1 artifacts, as ``merged_scan`` does.
-        ApplyRun.objects.create(
-            scan=scan,
-            number=1,
-            built_at=timezone.now(),
-            bitonal_key="bitonal.pdf",
-            ocr_key="ocr.json",
-            printed_pages_key="printed.json",
-            detections_key="detections.json",
-        )
+        glued_run(scan)
 
         with patch("scanning.s3_sync.s3_active", return_value=True):
             self.assertEqual(yolo.queue_ready_runs(), 1)
