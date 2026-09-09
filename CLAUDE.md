@@ -1931,6 +1931,75 @@ the apply-outputs routes, and migration 0024. What must not be broken:
   `redaction_rects` entry keep the space of the run they were made
   under); `upload_approved_files` does not carry `jobs/apply/` (#206).
 
+## Draw the read text on the scan (issue #262)
+
+A reviewer finds bleedthrough or a blurry page and cannot tell what it
+cost the reading. A toggle in the viewer's zoom toolbar draws the text
+dots.mocr read on each page: one box per cell of the layout JSON, at
+the cell's own position, with the text on a translucent panel. The
+pieces: `dots_mocr.glued_volume_key`, `views_process.scan_ocr_text_url`
+and its `dots_run_is_glued` flag, `static/scanning/ocr_text.js`, and
+three call sites in each viewer. Nothing is computed: the cells are the
+ones the glue already stored.
+
+- **The browser reads the document, and the pod mints one URL.**
+  `scan_ocr_text_url` answers `{"url", "space", "size"}` after one
+  `head_object`, and reads no byte. A glued volume of 1300 pages holds
+  every cell and the text of every page, so a download plus a parse per
+  press would spend that memory on the pod that also takes the uploads.
+  The twin of `scan_original_url` (#185), and it needs the same bucket
+  CORS rule.
+- **The URL comes as JSON, not as a redirect.** #243 and #269 both have
+  a redirect route for these documents, and they stay as they are, for
+  a developer with a browser. A browser judges the CORS rules of a
+  redirected request differently from a direct one, and the viewer
+  reads this URL with `fetch` -- the path pdf.js already takes for the
+  original.
+- **The space follows the drawn pages, and there is no fallback.** The
+  viewer asks for `space=final` when, and only when,
+  `SCAN_CONFIG.finalSpace` is true, and the endpoint answers 409 when
+  that space has no document (`review_states.final_run`, `ocr_key`).
+  Every other page reads the live run's glued volume document. The
+  other way round the text would sit one page out from the first
+  deletion onwards, the fault #269 removed for the boxes. A volume with
+  no structural edit has one file under both names.
+- **The three performance rules of the issue.** The first enable
+  fetches the URL, then the document, then builds one index of
+  `pdf_page` to `{width, height, cells}` and drops the parsed copy; a
+  disable removes the DOM nodes and keeps the index; the paint runs at
+  the end of a page render (`ocrTextPaint`), and a page renders only
+  when the lazy observer brings it near the viewport, so that **is**
+  the viewport rule and the zoom re-render needs no hook of its own.
+  `discardPage` clears the boxes, which hold the scale of their render.
+- **The cells are in the 200-dpi render space**, so a box scales by
+  `canvas.width / origin_width` -- the rule of the detection boxes
+  (#196). The bitonal copy and the original carry the page geometry of
+  the original, so the same scale serves the preview and the original.
+- **The model wrote the text, so it enters the DOM with
+  `textContent`.** A panel that overflows its box is shrunk once (at a
+  fixed width a paragraph's height grows with the square of the font
+  size, so one square root fits it), and a panel that still overflows
+  is marked `clipped`.
+- **A box takes no pointer**, or the overlay would swallow a click of
+  the viewer under it -- a redaction drag in step 2 above all. The one
+  exception is a `clipped` box, which takes the pointer so a hover can
+  open it. Turn the overlay off to draw over one.
+- **A failed read says so, and another press retries.** A read the
+  bucket refuses reaches the page as an opaque network error, so the
+  toast names what the browser gave us and the console carries the
+  URL. A second press mints a new signature, which is also the way out
+  of one that expired (the presign lives ten minutes, and the fetch
+  starts at once).
+- **A page with no cell says so** where the reviewer looks: one note
+  with its `error` (or "filtered") and the `md` upstream kept. That
+  page is the one the reviewer hunts, and after #242 a page still
+  without cells is a shape nobody has measured.
+- **The button appears only when a document exists**
+  (`ocr_text_available`), from the run summary the view reads already,
+  so it costs no query. A legacy PaddleOCR volume has no ANALYZE run
+  and gets no button.
+- Step 3 has no overlay: it is paused (#173/#206).
+
 ## The glued outputs, by scan id (issue #243)
 
 Three routes under `scans/<pk>/glued/<output>/`, for `dots-mocr` and

@@ -266,9 +266,15 @@ document.addEventListener('DOMContentLoaded', function () {
         }, { final: finalSpace });
     }
 
+    if (window.ocrTextInit) ocrTextInit();
+
     function loadPdf(url) {
         if (url === currentUrl && url.indexOf('?t=') === -1) return;
         currentUrl = url;
+        // The text overlay reads the volume, so it must not draw on
+        // the pages of one opinion's PDF (#262). One flag on the
+        // container, because the module knows nothing of the tabs.
+        container.dataset.ocrText = _viewingOpinion ? 'off' : 'on';
 
         if (_pdfLoadHandle) { _pdfLoadHandle.cancel(); _pdfLoadHandle = null; }
         if (observer) { observer.disconnect(); observer = null; }
@@ -581,6 +587,9 @@ document.addEventListener('DOMContentLoaded', function () {
         }
         pageDiv.style.width = '';
         pageDiv.style.height = '';
+        // The overlay boxes hold the scale of the render they were
+        // drawn for (#262).
+        if (window.ocrTextClear) ocrTextClear(pageDiv);
     }
 
     function rerenderForCurrentZoom() {
@@ -729,6 +738,10 @@ document.addEventListener('DOMContentLoaded', function () {
                 }
             }
             applyZoomToPage(pageDiv);
+            // The text overlay (#262). Here and not in the observer:
+            // a page is rendered only near the viewport, so this is
+            // the viewport rule, and the zoom re-render follows it.
+            if (window.ocrTextPaint) ocrTextPaint(pageDiv, pdfIndex);
         });
     }
 

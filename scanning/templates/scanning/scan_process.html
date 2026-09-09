@@ -346,6 +346,17 @@
         <span id="zoom-pct" class="zoom-pct" aria-live="polite">100%</span>
         <button type="button" class="zoom-btn" data-zoom-action="in" title="Zoom in" aria-label="Zoom in">+</button>
         <button type="button" class="zoom-btn zoom-reset" data-zoom-action="reset" title="Reset zoom">Reset</button>
+        {% comment %}
+          The text overlay (#262). It draws the text dots.mocr read on
+          each page of the viewport, so a reviewer can judge what a
+          blurry page or a page with bleedthrough cost the reading. The
+          button is here and not in the page label, which carries four
+          buttons already, and it holds for the whole document.
+        {% endcomment %}
+        {% if ocr_text_available %}
+        <button type="button" class="zoom-btn ocr-text-btn" id="ocr-text-toggle"
+                title="Show the text the OCR read on each page">Text</button>
+        {% endif %}
       </div>
       <div id="pdf-viewer"
            data-pdf-url="{% if step == 3 %}{% elif final_space %}{% url 'serve_final_pdf' scan.pk %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
@@ -371,6 +382,7 @@
 {{ repair_requests|json_script:"repair-requests-data" }}
 <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 <script src="{% static 'scanning/shared.js' %}"></script>
+<script src="{% static 'scanning/ocr_text.js' %}"></script>
 {% if step == 1 %}
 <script src="{% static 'scanning/viewer_step1.js' %}"></script>
 {% else %}
@@ -392,6 +404,11 @@ var SCAN_CONFIG = {
     // write that tag here either: the HTML parser ends the element at it,
     // comment or not, and SCAN_CONFIG is then never defined.
     repairRequests: JSON.parse(document.getElementById('repair-requests-data').textContent),
+    // The text overlay of #262 asks this endpoint for a presigned GET
+    // on the OCR document, then reads the document from the bucket.
+    // Whether one exists is the button's presence, which the view
+    // decides: a second flag here would be a surface nobody reads.
+    ocrTextUrlApi: '{% url "scan_ocr_text_url" scan.pk %}',
     {% if is_processing %}progressUrl: '{% url "progress_api" scan.pk %}',{% endif %}
 };
 // Backward-compatible globals used by viewer_step1.js and shared.js

@@ -219,6 +219,17 @@ FINAL_VOLUME_NOT_READY_MESSAGE = (
     "The corrected volume of this scan is not ready yet. Reload the "
     "page in a minute."
 )
+#: The 404 of ``scan_ocr_text_url`` for a volume nobody has read yet
+#: (#262): no dots.mocr run of this scan is glued.
+NO_READ_TEXT_MESSAGE = (
+    "The OCR has not read this volume yet, so there is no text to show."
+)
+#: The 404 of ``scan_ocr_text_url`` when the document was written and
+#: is not in the bucket any more (#262).
+OCR_TEXT_OBJECT_GONE_MESSAGE = (
+    "The OCR text of this volume is not in the bucket. Ask a staff "
+    "member to glue the run again."
+)
 #: The 409 of ``serve_final_pdf`` when the run's bitonal copy is the
 #: original itself: a 1-bit upload skips the conversion, and the
 #: preview route never streams the original (#185).
@@ -226,6 +237,24 @@ FINAL_VOLUME_IS_ORIGINAL_MESSAGE = (
     "This scan is already black-and-white, so its corrected volume is "
     "the original. Load the original scan to see it."
 )
+
+
+def dots_run_is_glued(summary: dict | None) -> bool:
+    """Say whether a scan's live dots.mocr run is glued (#262).
+
+    Off the summary the process view reads already
+    (``dots_mocr.run_summary``), so the text overlay's button costs no
+    query. The glue writes the document and flips every row to
+    ``CONSUMED`` in one pass, so "every row consumed" is the same test
+    :func:`dots_mocr.glued_volume_key` makes against the rows.
+
+    :param summary: The run summary, or None when the stage never ran.
+    :returns: Whether a glued volume document exists for the live run.
+    :rtype: bool
+    """
+    if not summary:
+        return False
+    return summary["statuses"].get(JobStatus.CONSUMED) == summary["total"]
 
 
 def detection_message(summary: dict | None) -> str:
@@ -723,6 +752,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "detect_message": detection_message(yolo_run),
             **flags,
             "final_space": final_space,
+            # The text overlay's button (#262). The final space always
+            # has its OCR document (``ApplyRun.is_complete`` counts
+            # it), and every other page reads the volume document, so
+            # a legacy PaddleOCR volume gets no button.
+            "ocr_text_available": bool(final_space)
+            or dots_run_is_glued(dots_run),
             "opinions": opinions,
             "opinions_json": json.dumps(opinions),
             "has_redaction_rects": has_redaction_rects,
@@ -1003,6 +1038,68 @@ def scan_original_url(request: HttpRequest, pk: int) -> JsonResponse:
             "embedded_whole": True,
         }
     )
+
+
+@login_required
+def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
+    """Return a URL the browser can read the OCR document from (#262).
+
+    The twin of :func:`scan_original_url`, for the text overlay of the
+    viewer. The browser reads the document straight from the bucket, so
+    the web pod mints one presigned GET and reads no byte of it: a
+    glued volume of 1300 pages holds every cell and the text of every
+    page, and a download plus a parse per press of the button would
+    cost the pod that memory on the pod that also takes the uploads.
+
+    The answer is JSON and not a redirect, although #243 and #269 both
+    have a redirect route for these documents. A browser judges the
+    CORS rules of a redirected request differently from a direct one,
+    and the viewer reads this URL with ``fetch``; pdf.js reads the URL
+    of :func:`scan_original_url` the same way, and that is the path
+    the bucket rule is known to serve.
+
+    Which document depends on the space the viewer draws (#269), and
+    there is no fallback between the two: the text of the original over
+    the pages of the corrected volume would sit one page out from the
+    first deletion onwards.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON with ``url``, ``space`` and ``size``; a 409 when the
+        final space has no document, a 404 when nothing was read, when
+        the object is gone, or when S3 is off.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    space = "original"
+    if request.GET.get("space") == "final":
+        from scanning import review_states
+
+        run = review_states.final_run(scan)
+        if run is None or not run.ocr_key:
+            return JsonResponse(
+                {"error": FINAL_VOLUME_NOT_READY_MESSAGE}, status=409
+            )
+        space, key = "final", run.ocr_key
+    else:
+        key = dots_mocr.glued_volume_key(scan)
+        if not key:
+            return JsonResponse({"error": NO_READ_TEXT_MESSAGE}, status=404)
+
+    if not s3_sync.s3_active():
+        return JsonResponse({"error": NO_S3_GLUED_OUTPUT_MESSAGE}, status=404)
+    # One head_object. It says the object is really there -- a run
+    # glued before a sweep is not -- and its size lets the button say
+    # how much it reads before it reads it.
+    size = s3_sync.object_size(key)
+    if size is None:
+        return JsonResponse(
+            {"error": OCR_TEXT_OBJECT_GONE_MESSAGE}, status=404
+        )
+    # No ``content_disposition``: that header makes a browser save a
+    # named file, which is what the routes of #243 want and the
+    # opposite of what a ``fetch`` wants.
+    url = s3_sync.presign_get(key, GLUED_OUTPUT_PRESIGN_TTL)
+    return JsonResponse({"url": url, "space": space, "size": size})
 
 
 @login_required

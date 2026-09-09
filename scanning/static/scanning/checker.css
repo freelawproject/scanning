@@ -952,3 +952,76 @@ a.doc-name:hover { text-decoration: underline; }
 .step.done .step-label { color: #6ee7b7; }
 .step-line { width: 30px; height: 2px; background: #475569; margin: 0 4px; }
 .step-line.done { background: #059669; }
+
+/* The text overlay (#262): one box per dots.mocr cell, with the text
+   the model read on a translucent panel. The boxes sit at the layer of
+   the detection boxes, so the redaction controls stay above them.
+
+   A box takes no pointer, so the overlay never swallows a click of the
+   viewer under it. The exception is a box whose text did not fit even
+   at the smallest size (.clipped): that one takes the pointer, and a
+   hover opens it over its neighbours. */
+.ocr-cell {
+    position: absolute;
+    border: 1px solid;
+    border-radius: 2px;
+    overflow: hidden;
+    z-index: 5;
+    pointer-events: none;
+}
+.ocr-cell-text {
+    margin: 0;
+    padding: 1px 2px;
+    color: #111827;
+    background: rgba(255, 255, 255, 0.92);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    line-height: 1.15;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.ocr-cell.clipped {
+    pointer-events: auto;
+    cursor: text;
+}
+.ocr-cell.clipped:hover {
+    overflow: visible;
+    height: auto !important;
+    min-height: 100%;
+    z-index: 20;
+}
+.ocr-cell.clipped:hover .ocr-cell-text {
+    background: #fff;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+/* A page the worker could not read, or one whose layout JSON no arm
+   of the repair reached (#242): say so where the reviewer looks, and
+   show the words upstream kept. */
+.ocr-page-note {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    right: 8px;
+    z-index: 6;
+    padding: 6px 8px;
+    border: 1px solid #f59e0b;
+    border-radius: 3px;
+    background: rgba(255, 251, 235, 0.95);
+    color: #92400e;
+    font-size: 12px;
+    line-height: 1.3;
+    pointer-events: none;
+}
+.ocr-page-note-text {
+    margin-top: 4px;
+    max-height: 220px;
+    overflow: hidden;
+    color: #451a03;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    white-space: pre-wrap;
+}
+.zoom-toolbar .ocr-text-btn.active {
+    background: #059669;
+    color: white;
+    border-color: #059669;
+}
