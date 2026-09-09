@@ -2209,6 +2209,82 @@ attempt's first claim, when the row is handed to the provider.
   it shallow: at most the concurrency cap is in flight, so a healthy
   endpoint's queue wait sits far under the ceiling.
 
+## Detection provenance and the curator's decisions (issue #240, PR A)
+
+The first of the four PRs of the #240 plan (the comment of 2026-09-09
+on the issue). Two families of rows share the `Detection` table, and
+one rule holds for each. The pieces: the new columns on `Detection`,
+`models.DetectionDecision`, `scanning/detections.py` (the address, the
+decisions, the resolution), `services._import_detections` and
+`services.detection_entries`, and the four box endpoints of
+`views_api.py`. What must not be broken:
+
+- **Model rows are disposable; human rows are withdrawn.** Every import
+  deletes the scan's model rows and writes the merged run again, as it
+  always did. A hand-drawn row (`model_name = MANUAL`) is never deleted
+  by automation: `detections.withdraw_manual` stamps `withdrawn_at` and
+  `withdrawn_by`, and `active` reads False. A second withdrawal is a
+  no-op.
+- **A decision about a model row is a `DetectionDecision`, addressed,
+  never a write on the row.** The row is deleted at the next import, so
+  the decision stores the target's address (the source page, the
+  label) and a copy of the model's box (`target_*`) with its confidence.
+  `Detection.decision` is the resolution, and `confidence = 1.0` /
+  `active = False` are the derived reads every consumer keeps using.
+  Only `detections.py` and the import write them now. One decision
+  stands per target: `decide` withdraws an earlier one of another kind
+  and gives the row its own values back first.
+- **The address is the source page** the apply's page map names:
+  `source_edit` (NULL = the original as uploaded) and `source_page`
+  (1-based page of that document; an edit shard's `page` is 0-based in
+  the map and stored plus one). The import reads it off the glued
+  document's `source` entry, which `_import_detections` used to drop, or
+  off `pdf_page` for a volume document (`detections.source_of_entry`).
+  An endpoint turns a viewer's `page_index` into an address through
+  `detections.measured_run` (the #269 rule, `redactions_current`) and
+  the run's `page_map` (`source_for_index`); the original's space is
+  the identity. `page_index` stays the row's position in the space it
+  was imported in, and `apply_run` says which space; `detect_run` is the
+  `ExternalJob.run` that found it. A row imported before this PR has no
+  address and is placed by position when a decision is made on it.
+- **The import resolves the standing decisions** (`detections.resolve`,
+  called at the end of `_import_detections`): for each decision that is
+  not withdrawn and not stale (`is_stale`, the fingerprint rule of
+  `page_edits.is_stale`), the model rows at its address with its label
+  and no decision yet, the best IoU against the copied box, at least
+  `IOU_THRESHOLD` (0.5, settled in #241; same model and same original
+  give the same box, and the threshold covers the column snap). Each
+  row is taken once. An unresolved decision is **left standing and
+  logged** as a WARNING naming its pk; PR D raises it as an issue.
+  Nothing withdraws a decision but a person.
+- **A move of a model box is a deactivation plus a hand-drawn row**
+  (`detections.move_model_row`): the model row is not written, the
+  hand-drawn row names the deactivation in `replaces`, and withdrawing
+  the hand-drawn row gives the model box back. `update_detection`
+  answers with the `detection_id` that holds the box now, and
+  `viewer_step2.js` follows it, or the next drag would 404. A move of a
+  hand-drawn row is written in place: it is the curator's own row.
+- **`add_single_detection` approves the model box it lands on**, within
+  `BOOST_TOLERANCE_PX` (15) with the same label, else writes a
+  hand-drawn row through `detections.add_manual`, addressed and with no
+  `found_by` (#196). It reads and writes no file, and answers the id.
+- **`detections.json` is retired.** `services.detection_entries` is the
+  in-memory list it used to hold (the live rows, the printed number
+  beside each box), and every reader takes the list: `bl_pair` accepts
+  one, `_compute_and_save_redaction_rects` and `_detections_for_geometry`
+  read the rows, `run_generate_files` (paused) too. Nothing writes the
+  file or pushes it, and the compute pushes nothing at all: every output
+  of the pass is a row, and `redaction_rects` / `margin_rects` /
+  `opinions_json` stay on `Scan` until PRs B and C. The `--files
+  detections.json` example of `reupload_scan_files` names a file that
+  no longer exists.
+- **No data migration.** Migration 0026 adds the columns and the table.
+  Existing rows keep a blank address, and the boost and deactivation
+  marks on them (`confidence = 1.0`, `active = False`) are not turned
+  into decisions: the next import deletes those rows, as it did before.
+  Decided in the #240 plan review: the data came from the legacy YOLO
+  trio.
+
 ## Detection Workflow
 
 YOLO models detect elements on each page (captions, key icons, headnotes, etc.) and store them as `Detection` records with a confidence score. Users review detections in the process viewer (step 2) and can:

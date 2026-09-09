@@ -16,11 +16,12 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.utils import timezone
 
-from scanning import apply, services, yolo
+from scanning import apply, detections, services, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
     ApplyRun,
     Detection,
+    DetectionDecision,
     ExternalJob,
     JobStatus,
     QueuedAction,
@@ -323,7 +324,7 @@ class ComputeMixin:
             ("_pull_processing_files_from_s3", None),
             ("_push_processing_files_to_s3", True),
             ("_snap_text_columns_to_ink", 0),
-            ("_sync_detections_to_disk", []),
+            ("detection_entries", []),
             ("_compute_and_save_redaction_rects", []),
             ("_compute_and_save_margin_rects", []),
         ):
@@ -480,7 +481,7 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         """The compute reads the standing run's corrected volume
         (#269): the PDF it measures is the run's bitonal copy, and the
         page numbers written beside each box come from the run's
-        printed pages, in both writes of ``detections.json``."""
+        printed pages, in both reads of the detection entries."""
         scan, _ = merged_scan()
         stubs = self.patch_geometry()
 
@@ -494,7 +495,7 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         stubs["load_printed_pages"].assert_called_once()
         expected = {0: (101, None), 1: (102, 103)}
         self.assertEqual(
-            stubs["_sync_detections_to_disk"].call_args.kwargs["page_numbers"],
+            stubs["detection_entries"].call_args.kwargs["page_numbers"],
             expected,
         )
         self.assertEqual(
@@ -511,7 +512,8 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
 
     def test_a_new_apply_run_imports_the_detections_again(self):
         """Rows measured against ``a1`` describe pages ``a2`` may not
-        show; the carry of a curator's edits is #241."""
+        show. A write on the rows themselves does not survive it; a
+        decision does (``test_a_decision_survives_the_re_import``)."""
         scan, _ = merged_scan()
         stubs = self.patch_geometry()
         services.run_compute_redactions(scan.pk)
@@ -528,6 +530,121 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         )
         state = yolo.apply_state(yolo.live_detect_jobs(scan))
         self.assertEqual(state.get("apply_run"), new.pk)
+
+    def test_the_import_stamps_the_address_and_the_runs(self):
+        """Every row names its source page, the apply run whose space
+        ``page_index`` is in, and the detection run (#240)."""
+        scan, rows = merged_scan()
+        self.patch_geometry()
+
+        services.run_compute_redactions(scan.pk)
+
+        run = apply.current_run(scan)
+        imported = list(
+            Detection.objects.filter(scan=scan).order_by("page_index")
+        )
+        self.assertEqual([d.source_page for d in imported], [1, 2])
+        self.assertEqual({d.source_edit for d in imported}, {None})
+        self.assertEqual({d.apply_run for d in imported}, {run})
+        self.assertEqual({d.detect_run for d in imported}, {rows[0].run})
+        self.assertEqual(
+            {d.source_fingerprint for d in imported}, {scan.source_fingerprint}
+        )
+
+    def test_a_decision_survives_the_re_import(self):
+        """The curator deleted one box and approved another under ``a1``;
+        ``a2`` imports the run again, and both decisions land on the new
+        rows with the same box (#240)."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        services.run_compute_redactions(scan.pk)
+        header = Detection.objects.get(scan=scan, label="PAGE_HEADER")
+        caption = Detection.objects.get(scan=scan, label="CASE_CAPTION")
+        detections.decide(
+            scan, header, DetectionDecision.Kind.DEACTIVATE, None
+        )
+        detections.decide(scan, caption, DetectionDecision.Kind.APPROVE, None)
+        apply.supersede_runs(scan, "test")
+        glued_run(scan, number=2)
+        stubs["load_detections_document"].reset_mock()
+
+        services.run_compute_redactions(scan.pk)
+
+        stubs["load_detections_document"].assert_called_once()
+        self.assertFalse(Detection.objects.filter(pk=header.pk).exists())
+        new_header = Detection.objects.get(scan=scan, label="PAGE_HEADER")
+        new_caption = Detection.objects.get(scan=scan, label="CASE_CAPTION")
+        self.assertFalse(new_header.active)
+        self.assertEqual(
+            new_header.decision.kind, DetectionDecision.Kind.DEACTIVATE
+        )
+        self.assertEqual(new_caption.confidence, 1.0)
+        self.assertEqual(
+            new_caption.decision.kind, DetectionDecision.Kind.APPROVE
+        )
+        self.assertEqual(
+            DetectionDecision.objects.filter(
+                scan=scan, withdrawn_at__isnull=True
+            ).count(),
+            2,
+        )
+
+    def test_a_decision_on_a_box_that_moved_is_left_standing_and_logged(self):
+        """A model that draws the box elsewhere is another finding: the
+        decision lands on nothing, and it is not deleted."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        services.run_compute_redactions(scan.pk)
+        header = Detection.objects.get(scan=scan, label="PAGE_HEADER")
+        decision = detections.decide(
+            scan, header, DetectionDecision.Kind.DEACTIVATE, None
+        )
+        moved = {
+            **DOCUMENT,
+            "detections": [
+                {
+                    **DOCUMENT["detections"][0],
+                    "bbox": [500.0, 500.0, 520.0, 520.0],
+                },
+                DOCUMENT["detections"][1],
+            ],
+        }
+        stubs["load_detections_document"].return_value = moved
+        apply.supersede_runs(scan, "test")
+        glued_run(scan, number=2)
+
+        with self.assertLogs("scanning.detections", level="WARNING") as logs:
+            services.run_compute_redactions(scan.pk)
+
+        new_header = Detection.objects.get(scan=scan, label="PAGE_HEADER")
+        self.assertTrue(new_header.active)
+        self.assertIsNone(new_header.decision)
+        decision.refresh_from_db()
+        self.assertIsNone(decision.withdrawn_at)
+        self.assertIn(f"#{decision.pk}", logs.output[0])
+
+    def test_a_decision_of_another_original_lands_on_nothing(self):
+        scan, _ = merged_scan()
+        Scan.objects.filter(pk=scan.pk).update(source_fingerprint="10:2")
+        stubs = self.patch_geometry()
+        services.run_compute_redactions(scan.pk)
+        header = Detection.objects.get(scan=scan, label="PAGE_HEADER")
+        decision = detections.decide(
+            scan, header, DetectionDecision.Kind.DEACTIVATE, None
+        )
+        DetectionDecision.objects.filter(pk=decision.pk).update(
+            source_fingerprint="999:2"
+        )
+        apply.supersede_runs(scan, "test")
+        glued_run(scan, number=2)
+        stubs["load_detections_document"].reset_mock()
+
+        with self.assertLogs("scanning.detections", level="WARNING"):
+            services.run_compute_redactions(scan.pk)
+
+        self.assertTrue(
+            Detection.objects.get(scan=scan, label="PAGE_HEADER").active
+        )
 
     def test_no_corrected_volume_parks_the_scan_and_spends_no_attempt(self):
         """The queue gate checked it; this is the backstop for an admin

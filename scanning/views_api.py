@@ -29,6 +29,7 @@ from django.views.decorators.http import require_POST
 from scanning.models import (
     CheckName,
     Detection,
+    DetectionDecision,
     Issue,
     OpinionScan,
     Scan,
@@ -37,7 +38,6 @@ from scanning.models import (
 )
 from scanning.utils import (
     PIPELINE_PAUSED_MESSAGE,
-    find_json_file,
     find_processing_pdf,
     local_original_pdf,
 )
@@ -83,8 +83,11 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with a list of detection dicts.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    dets = Detection.objects.filter(scan=scan, active=True).order_by(
-        "page_index", "y0"
+    dets = (
+        Detection.objects.live()
+        .filter(scan=scan)
+        .select_related("decision")
+        .order_by("page_index", "y0")
     )
     data = [
         {
@@ -102,6 +105,9 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
             # reviewer draws the box, so until it came from here a
             # hand-added box lost both on the next page load (PR #167).
             "manual": d.model_name == Detection.ModelName.MANUAL,
+            # The standing curator decision on a model row (#240):
+            # "approve" here is why the confidence reads 1.0.
+            "decision": d.decision.kind if d.decision_id else None,
         }
         for d in dets
     ]
@@ -768,37 +774,38 @@ def remove_flag(request: HttpRequest, pk: int, flag_id: int) -> JsonResponse:
 @login_required
 @require_POST
 def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Deactivate a detection in the database and sync the JSON file.
+    """Take a detection out of the volume.
+
+    A model row gets a ``deactivate`` decision (#240): the row is
+    deleted and written again at the next import, and the decision is
+    what carries the curator's choice onto the new row. A hand-drawn
+    row is withdrawn, and gives back the model box it replaced, if any.
+    Nothing is deleted.
 
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk)).
     :param pk: Scan primary key.
     :return: JSON response with ``deleted`` count, or 404 if not found.
     """
-    from scanning.services import _sync_detections_to_disk
+    from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    detection_id = data["detection_id"]
-    page_index = (
-        Detection.objects.filter(pk=detection_id, scan=scan)
-        .values_list("page_index", flat=True)
-        .first()
-    )
-    count = Detection.objects.filter(pk=detection_id, scan=scan).update(
-        active=False
-    )
-    if count == 0:
+    row = Detection.objects.filter(pk=data["detection_id"], scan=scan).first()
+    if row is None:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
-    _drop_orphaned_redaction_rects(scan, page_index)
-    output_dir = Path(scan.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _sync_detections_to_disk(scan.pk)
-    return JsonResponse({"status": "ok", "deleted": count})
+    if row.model_name == Detection.ModelName.MANUAL:
+        detections.withdraw_manual(row, request.user)
+    else:
+        detections.decide(
+            scan, row, DetectionDecision.Kind.DEACTIVATE, request.user
+        )
+    _drop_orphaned_redaction_rects(scan, row.page_index)
+    return JsonResponse({"status": "ok", "deleted": 1})
 
 
 def _drop_orphaned_redaction_rects(scan: Scan, page_index: int | None) -> None:
@@ -841,150 +848,155 @@ def _drop_orphaned_redaction_rects(scan: Scan, page_index: int | None) -> None:
 @login_required
 @require_POST
 def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Update the bounding box of an existing detection.
+    """Move or resize a detection box.
 
-    Looks up the detection by its DB primary key, updates the bbox
-    columns, then rebuilds ``detections.json`` from the DB via
-    ``_sync_detections_to_disk`` so the file and S3 stay in sync.
+    A hand-drawn row is the curator's own and is written in place. A
+    model row is not written (#240): it is deactivated by a decision
+    and a hand-drawn row is created where the curator put the box, so
+    the move survives the next import. The response names the row that
+    now holds the box, and the viewer must address that one from then
+    on.
 
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk) and ``new_bbox`` (list[float], ``[x0,y0,x1,y1]``)).
     :param pk: Scan primary key.
-    :return: JSON response with ``updated`` count, or 404 if not found.
+    :return: JSON response with ``updated`` count and ``detection_id``,
+        or 404 if not found.
     """
-    from scanning.services import _sync_detections_to_disk
+    from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    detection_id = data["detection_id"]
     new_bbox = data["new_bbox"]
-    count = Detection.objects.filter(pk=detection_id, scan=scan).update(
-        x0=new_bbox[0],
-        y0=new_bbox[1],
-        x1=new_bbox[2],
-        y1=new_bbox[3],
-    )
-    if count == 0:
+    row = Detection.objects.filter(pk=data["detection_id"], scan=scan).first()
+    if row is None:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
-    output_dir = Path(scan.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _sync_detections_to_disk(scan.pk)
-    return JsonResponse({"status": "ok", "updated": count})
+    if row.model_name == Detection.ModelName.MANUAL:
+        Detection.objects.filter(pk=row.pk).update(
+            x0=new_bbox[0], y0=new_bbox[1], x1=new_bbox[2], y1=new_bbox[3]
+        )
+        holder = row
+    else:
+        holder = detections.move_model_row(scan, row, new_bbox, request.user)
+    return JsonResponse(
+        {"status": "ok", "updated": 1, "detection_id": holder.pk}
+    )
+
+
+#: How far, in image pixels, a drawn box may sit from a model box and
+#: still mean "that one": the add endpoint then approves the model box
+#: rather than draw a second one over it.
+BOOST_TOLERANCE_PX = 15
 
 
 @login_required
 @require_POST
 def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Add a new detection or boost an existing one.
+    """Add a detection by hand, or approve the model box it lands on.
 
-    If a detection with the same label and approximate position already
-    exists, its confidence is "boosted" to 1.0 (confirmed by the user).
-    Otherwise a new detection is created with confidence 1.0 and
-    model_name "manual".
-
-    Updates both the Detection DB record and detections.json on disk.
+    A box drawn within ``BOOST_TOLERANCE_PX`` of a live model box with
+    the same label is that box, and the model box gets an ``approve``
+    decision (#240). Otherwise a hand-drawn row is written, addressed
+    by its source page. The rows are the only store; nothing here reads
+    or writes a file.
 
     :param request: The HTTP request (JSON body with page_index,
         label_id, bbox, img_width, and img_height).
     :param pk: Scan primary key.
-    :return: JSON response with ``added=True`` if new, ``added=False``
-        if an existing detection was boosted.
+    :return: JSON response with ``added=True`` and the new row's
+        ``detection_id`` if new, ``added=False`` and the approved row's
+        id if an existing detection was approved.
     """
+    from blackletter.models import Label
+
+    from scanning import detections
+
     scan = get_object_or_404(Scan, pk=pk)
     det = _parse_json_body(request)
     if isinstance(det, JsonResponse):
         return det
-    output_base = Path(scan.output_dir)
-    det_path = find_json_file(output_base, "detections.json")
-    if not det_path:
-        return JsonResponse({"error": "No detections.json"}, status=404)
-    existing = json.loads(det_path.read_text())
-    boosted = False
-    for e in existing:
-        if e["page_index"] != det["page_index"]:
-            continue
-        if e["label_id"] != det["label_id"]:
-            continue
-        if (
-            abs(e["bbox"][0] - det["bbox"][0]) < 15
-            and abs(e["bbox"][1] - det["bbox"][1]) < 15
-        ):
-            e["confidence"] = 1.0
-            boosted = True
-            Detection.objects.filter(
-                scan=scan,
-                page_index=det["page_index"],
-                label_id=det["label_id"],
-                x0__gte=det["bbox"][0] - 15,
-                x0__lte=det["bbox"][0] + 15,
-                y0__gte=det["bbox"][1] - 15,
-                y0__lte=det["bbox"][1] + 15,
-            ).update(confidence=1.0)
-            break
-    if not boosted:
-        det["confidence"] = 1.0
-        existing.append(det)
-        from blackletter.models import Label
+    try:
+        page_index = int(det["page_index"])
+        label_id = int(det["label_id"])
+        bbox = [float(v) for v in det["bbox"]]
+        if len(bbox) != 4:
+            raise ValueError("bbox needs four numbers")
+        label_name = Label(label_id).name
+    except (KeyError, TypeError, ValueError) as exc:
+        return JsonResponse({"error": f"Bad detection: {exc}"}, status=400)
 
-        try:
-            label_name = Label(det["label_id"]).name
-            Detection.objects.create(
-                scan=scan,
-                page_index=det["page_index"],
-                label=label_name,
-                label_id=det["label_id"],
-                confidence=1.0,
-                x0=det["bbox"][0],
-                y0=det["bbox"][1],
-                x1=det["bbox"][2],
-                y1=det["bbox"][3],
-                img_width=det.get("img_width", 0),
-                img_height=det.get("img_height", 0),
-                model_name=Detection.ModelName.MANUAL,
-                model_count=1,
-                # No provenance, on purpose (#196): the confidence gates
-                # are per model family, and a second family in the file
-                # sends the whole volume back to the legacy gates.
-                found_by=[],
-            )
-        except Exception:
-            logger.exception("Failed to create manual detection")
-    det_path.write_text(json.dumps(existing))
-    return JsonResponse({"status": "ok", "added": not boosted})
+    run = detections.measured_run(scan)
+    near = (
+        Detection.objects.live()
+        .model_rows()
+        .filter(
+            scan=scan,
+            page_index=page_index,
+            label_id=label_id,
+            x0__gte=bbox[0] - BOOST_TOLERANCE_PX,
+            x0__lte=bbox[0] + BOOST_TOLERANCE_PX,
+            y0__gte=bbox[1] - BOOST_TOLERANCE_PX,
+            y0__lte=bbox[1] + BOOST_TOLERANCE_PX,
+        )
+        .order_by("pk")
+        .first()
+    )
+    if near is not None:
+        detections.decide(
+            scan, near, DetectionDecision.Kind.APPROVE, request.user, run=run
+        )
+        return JsonResponse(
+            {"status": "ok", "added": False, "detection_id": near.pk}
+        )
+    row = detections.add_manual(
+        scan,
+        page_index,
+        label_name,
+        label_id,
+        bbox,
+        int(det.get("img_width") or 0),
+        int(det.get("img_height") or 0),
+        run=run,
+    )
+    return JsonResponse(
+        {"status": "ok", "added": True, "detection_id": row.pk}
+    )
 
 
 @login_required
 @require_POST
 def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Set a detection's confidence to 1.0 in the DB and sync the JSON file.
+    """Approve a detection: its confidence reads 1.0 from now on.
+
+    A model row gets an ``approve`` decision (#240), which the next
+    import lands on the same box again. A hand-drawn row is the
+    curator's already and needs none.
 
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk)).
     :param pk: Scan primary key.
     :return: JSON response with ``updated`` count, or 404 if not found.
     """
-    from scanning.services import _sync_detections_to_disk
+    from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    detection_id = data["detection_id"]
-    count = Detection.objects.filter(pk=detection_id, scan=scan).update(
-        confidence=1.0
-    )
-    if count == 0:
+    row = Detection.objects.filter(pk=data["detection_id"], scan=scan).first()
+    if row is None:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
-    output_dir = Path(scan.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _sync_detections_to_disk(scan.pk)
-    return JsonResponse({"status": "ok", "updated": count})
+    if row.model_name != Detection.ModelName.MANUAL:
+        detections.decide(
+            scan, row, DetectionDecision.Kind.APPROVE, request.user
+        )
+    return JsonResponse({"status": "ok", "updated": 1})
 
 
 @login_required

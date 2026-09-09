@@ -1282,16 +1282,19 @@ document.addEventListener('DOMContentLoaded', function () {
             img_height: imgH,
         };
 
-        // Save directly to detections.json
+        // The rows are the only store (#240): the server answers with
+        // the id of the row that holds the box, new or approved, so
+        // the next edit of this box can address it.
         fetch('/scans/' + documentId + '/add-single-detection/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
             body: JSON.stringify(detData),
         }).then(function (r) { return r.json(); })
         .then(function (data) {
+            if (data.detection_id !== undefined) detData.id = data.detection_id;
             // Add to allDetections so it shows in overlay
             if (!allDetections) allDetections = [];
-            detData.manual = true;
+            detData.manual = data.added !== false;
             allDetections.push(detData);
             _cancelDetDraw();
             detectionsVisible[pdfIndex] = true;
@@ -2074,6 +2077,13 @@ document.addEventListener('DOMContentLoaded', function () {
                 det.bbox[1] = newBbox[1];
                 det.bbox[2] = newBbox[2];
                 det.bbox[3] = newBbox[3];
+                // A moved model box becomes a hand-drawn row (#240):
+                // the server names the row that holds it now, and every
+                // later edit of this box must address that one.
+                if (data.detection_id !== undefined && data.detection_id !== det.id) {
+                    det.id = data.detection_id;
+                    det.manual = true;
+                }
             }
         }).catch(function() {
             console.error('Failed to save detection bbox');

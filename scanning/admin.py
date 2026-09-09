@@ -10,6 +10,7 @@ from scanning import apply, jobs
 from scanning.models import (
     ApplyRun,
     Detection,
+    DetectionDecision,
     ExternalJob,
     Issue,
     JobStage,
@@ -626,14 +627,52 @@ class DetectionAdmin(admin.ModelAdmin):
     list_display = [
         "scan",
         "page_index",
+        "source_page",
         "label",
         "confidence",
         "model_name",
         "active",
+        "decision",
+        "withdrawn_at",
     ]
     list_filter = ["label", "active", "model_name"]
     search_fields = ["label"]
-    raw_id_fields = ["scan"]
+    raw_id_fields = [
+        "scan",
+        "source_edit",
+        "apply_run",
+        "decision",
+        "replaces",
+    ]
+
+
+@admin.register(DetectionDecision)
+class DetectionDecisionAdmin(admin.ModelAdmin):
+    """One curator decision about one model detection (issue #240).
+
+    Read-only: a row records what a person decided, and the way to
+    change a decision is the review page. Nothing here deletes.
+    """
+
+    list_display = [
+        "scan",
+        "kind",
+        "label",
+        "source_page",
+        "source_edit",
+        "author",
+        "withdrawn_at",
+        "date_created",
+    ]
+    list_filter = ["kind", "withdrawn_at", "label"]
+    raw_id_fields = ["scan", "source_edit", "author", "withdrawn_by"]
+    readonly_fields = [f.name for f in DetectionDecision._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(PageEdit)

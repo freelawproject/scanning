@@ -1,7 +1,7 @@
 """Sync intermediate processing files between MEDIA_ROOT, S3, and /tmp/.
 
-Files produced by the scanning pipeline (bitonal PDF, detections.json,
-stamped PDF, page images, original PDF) are small
+Files produced by the scanning pipeline (bitonal PDF, stamped PDF,
+page images, original PDF) are small
 enough that re-running the pipeline to regenerate them is expensive.
 Pushing them to S3 lets us recover after pod redeploys without a full
 re-run. Pulling them to /tmp/ when the viewer opens gives editing
@@ -685,8 +685,7 @@ def _is_approved_deliverable(relative_path: str) -> bool:
     Approved deliverables are opinion PDFs under ``redacted/``,
     extracted figure images under ``images/``, plus the full-book
     original and redacted PDFs. Everything else (bitonal,
-    detections.json, unredacted/, stamped, llm/) stays under
-    processing/.
+    unredacted/, stamped, llm/) stays under processing/.
 
     :param relative_path: Path relative to the scan's processing prefix.
     :returns: Whether to copy this file into approved/.
@@ -1217,8 +1216,8 @@ def _delete_prefix(scan: Scan, prefix: str, kind: str) -> int:
 def upload_file_to_s3(scan: Scan, relative_path: str) -> bool:
     """Upload a single file (relative to the scan's local root) to S3.
 
-    Used when a viewer edit rewrites a file on disk (e.g.
-    ``detections.json``). Overwrites unconditionally.
+    For a single file a caller wrote on disk (the pipeline input copy,
+    the ``reupload_scan_files`` command). Overwrites unconditionally.
 
     :param scan: The scan the file belongs to.
     :param relative_path: Path relative to the scan's output dir.

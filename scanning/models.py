@@ -1115,12 +1115,59 @@ class Issue(AbstractDateTimeModel):
         return f"[{self.severity}] {page}: {self.message}"
 
 
-class Detection(AbstractDateTimeModel):
-    """YOLO detection stored in DB.
+class DetectionQuerySet(AutoNowQuerySet):
+    """The reads every consumer of the detections shares (issue #240)."""
 
-    Each row is one bounding box from one model.
-    Coordinates are in image pixels.
+    def live(self):
+        """Return the rows a reader may act on.
+
+        A model row that no ``deactivate`` decision hides, and a
+        hand-drawn row that is not withdrawn. ``active`` is the derived
+        flag both write, so one filter answers for both.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(active=True)
+
+    def model_rows(self):
+        """Return the rows the model wrote, live or not.
+
+        :returns: The filtered queryset.
+        """
+        return self.exclude(model_name=Detection.ModelName.MANUAL)
+
+
+class Detection(AbstractDateTimeModel):
+    """One bounding box on one page (YOLO, or a curator's hand).
+
+    Coordinates are in image pixels of the 200 dpi render the model
+    read, and ``img_width``/``img_height`` say how big that render was.
+
+    **Two families of rows, and one rule for each (issue #240).** A
+    model row is disposable: every import (``services._import_detections``)
+    deletes the scan's model rows and writes the merged run again, so
+    nothing supersedes one and nothing keeps an old one. A hand-drawn
+    row (``model_name`` ``MANUAL``) is a human addition, and automation
+    never deletes it; a curator takes it back with ``withdrawn_at``.
+
+    **A curator's decision about a model row is a `DetectionDecision`**,
+    not a write on the row: the row will be deleted at the next import,
+    so the decision names its target by address (the source page, the
+    label, a copy of the box), and the import resolves it onto the new
+    row with the same box. ``decision`` is that resolution, and
+    ``confidence = 1.0`` / ``active = False`` are the derived reads
+    blackletter and the viewer want. Nothing writes those two by hand
+    any more.
+
+    **The address is the source page** (``source_edit``, ``source_page``),
+    the document and page the apply's page map names: the original as
+    uploaded, or the one-page shard of a page edit. ``page_index`` is
+    the row's position in the space it was imported in, and
+    ``apply_run`` says which space that is (#269); a legacy row has
+    neither.
     """
+
+    objects = DetectionQuerySet.as_manager()
 
     scan = models.ForeignKey(
         Scan,
@@ -1171,12 +1218,100 @@ class Detection(AbstractDateTimeModel):
     )
     active = models.BooleanField(default=True)
 
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="detections",
+        help_text=(
+            "The page edit whose one-page shard this box is on. Null "
+            "means the original as uploaded (issue #240)."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "1-based page of the source document: of the original, or "
+            "of the edit's shard. Null on a row imported before #240."
+        ),
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint at import. Blank on a legacy "
+            "row, which matches anything."
+        ),
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="detections",
+        help_text=(
+            "The apply run whose final page space ``page_index`` is in "
+            "(#269). Null on a legacy row and on a hand-drawn row of "
+            "a volume with no run: the original's space."
+        ),
+    )
+    detect_run = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="The detection run (``ExternalJob.run``) that found it.",
+    )
+    decision = models.ForeignKey(
+        "DetectionDecision",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="detections",
+        help_text=(
+            "The standing curator decision resolved onto this model row: "
+            "the reason its confidence is 1.0 or it is inactive."
+        ),
+    )
+    replaces = models.ForeignKey(
+        "DetectionDecision",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replacements",
+        help_text=(
+            "Hand-drawn rows only: the deactivation this box was drawn "
+            "in place of, when a curator moved a model box."
+        ),
+    )
+    withdrawn_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Hand-drawn rows only: when the curator took the box back. "
+            "The row stays; ``active`` reads False."
+        ),
+    )
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_detections",
+        help_text="Who took the box back. Null while it stands.",
+    )
+
     class Meta:
         ordering = ["page_index", "y0", "x0"]
         indexes = [
             models.Index(
                 fields=["scan", "page_index"],
                 name="idx_det_scan_page",
+            ),
+            models.Index(
+                fields=["scan", "source_edit", "source_page"],
+                name="idx_det_scan_source",
             ),
             models.Index(
                 fields=["scan", "label"],
@@ -1194,6 +1329,119 @@ class Detection(AbstractDateTimeModel):
             f"{self.label} p.{self.page_index}"
             f" conf={self.confidence:.2f}{state}"
         )
+
+
+class DetectionDecision(AbstractDateTimeModel):
+    """One curator decision about one model detection (issue #240).
+
+    The model rows are deleted and written again at every import, so a
+    decision cannot point at one. It names its target by **address**
+    instead: the source page (``source_edit``, ``source_page``), the
+    label, and a copy of the box as the model drew it when the curator
+    decided (``target_*``). After each import
+    ``detections.resolve`` looks for the new model row on that page
+    with that label whose box overlaps the copy (IoU at least
+    ``detections.IOU_THRESHOLD``), sets ``Detection.decision`` on it,
+    and writes the derived read: ``confidence = 1.0`` for an approval,
+    ``active = False`` for a deactivation. A decision that finds no row
+    is stale, and is logged; #240 PR D raises it as an issue.
+
+    Never deleted by automation. A curator takes one back with
+    ``withdrawn_at``, which also gives the row back its own values. A
+    later decision on the same row withdraws the earlier one, so one
+    decision stands per target.
+
+    A curator who *moves* a model box makes two rows: a deactivation
+    here, and a hand-drawn ``Detection`` that names it in ``replaces``.
+    """
+
+    class Kind(models.TextChoices):
+        APPROVE = "approve", "Approve (confidence 1.0)"
+        DEACTIVATE = "deactivate", "Deactivate"
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="detection_decisions",
+    )
+    kind = models.CharField(max_length=12, choices=Kind.choices)
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="detection_decisions",
+        help_text="The page edit whose shard holds the page; null = the original.",
+    )
+    source_page = models.PositiveIntegerField(
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the decision was made. "
+            "Blank matches anything."
+        ),
+    )
+    label = models.CharField(max_length=50)
+    label_id = models.SmallIntegerField()
+    target_x0 = models.FloatField()
+    target_y0 = models.FloatField()
+    target_x1 = models.FloatField()
+    target_y1 = models.FloatField()
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+    target_confidence = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The model's own confidence when the decision was made, so "
+            "a withdrawn approval gives it back."
+        ),
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="detection_decisions",
+    )
+    withdrawn_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="When the curator took the decision back. Never rewritten.",
+    )
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_detection_decisions",
+    )
+
+    class Meta:
+        ordering = ["scan", "source_page", "target_y0", "target_x0"]
+        indexes = [
+            models.Index(
+                fields=["scan", "withdrawn_at"],
+                name="idx_det_decision_scan_open",
+            ),
+        ]
+
+    @property
+    def target_bbox(self) -> list[float]:
+        """The copied box, in the ``[x0, y0, x1, y1]`` shape every reader uses.
+
+        :returns: The box.
+        """
+        return [self.target_x0, self.target_y0, self.target_x1, self.target_y1]
+
+    def __str__(self):
+        state = " [withdrawn]" if self.withdrawn_at else ""
+        return f"{self.kind} {self.label} src p.{self.source_page}{state}"
 
 
 def page_edit_image_path(instance: "PageEdit", filename: str) -> str:
