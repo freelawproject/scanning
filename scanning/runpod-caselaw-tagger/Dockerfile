@@ -34,10 +34,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
-# System deps: ca-certificates for HTTPS. Nothing renders a page here,
-# so no graphics libraries and no PyMuPDF.
+# System deps: ca-certificates for HTTPS, and gcc for Triton. Nothing
+# renders a page here, so no graphics libraries and no PyMuPDF.
+#
+# gcc is load-bearing on the GPU, though no build step uses it: torch
+# runs some eager operations through Triton kernels on CUDA (2.14
+# routed the rotary-embedding outer product that way), and Triton
+# compiles a small C helper on its first call, at run time, inside the
+# worker. The slim base carries no compiler, so the first GPU job on
+# RunPod failed with "Failed to find C compiler" after a clean boot and
+# model load. The torch pin in pyproject.toml keeps to the version that
+# does not take that path; the compiler is the backstop for the next
+# version that does. About 60 MB.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates \
+      ca-certificates gcc \
  && rm -rf /var/lib/apt/lists/*
 
 # Install uv (same tag as the other worker images for parity).
