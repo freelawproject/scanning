@@ -9,13 +9,9 @@ dependencies = [
     # image needs no CUDA base layer (the rule of ../runpod/).
     #
     # Pinned to the version the detection worker has run on RunPod
-    # hosts, on purpose. An open pin resolved to 2.14, which routes
-    # small eager operations (the rotary-embedding outer product among
-    # them) through Triton kernels on CUDA; Triton then compiles a C
-    # helper on first use and the slim base image had no compiler, so
-    # the first GPU job failed with "Failed to find C compiler". The
-    # Dockerfile installs gcc as a backstop; this pin keeps the proven
-    # path. Bump deliberately, with a GPU run.
+    # hosts, so a bump is a deliberate act with a GPU run behind it.
+    # The pin is not what keeps the worker off run-time kernel
+    # compilation; the triton override below is (see [tool.uv]).
     "torch==2.13.0",
 
     # Inference. The checkpoint is saved by transformers 5 (its
@@ -37,6 +33,25 @@ dependencies = [
 # not to try to build it as an installable package.
 [tool.uv]
 package = false
+# No Triton in the image, on purpose. torch 2.13+ carries
+# ``torch._native``: when Triton is importable it swaps some eager CUDA
+# operations (the rotary-embedding outer product among them) for Triton
+# kernels, and Triton compiles a C helper at first use, at run time,
+# inside the worker. The first GPU jobs on RunPod died there three
+# times: no compiler, then a compile that failed on the host, then the
+# TORCH_DISABLE_NATIVE_JIT switch not reaching the process. With no
+# ``triton`` package, ``torch._native.triton_utils`` reports the
+# runtime unavailable and registers nothing, and every operation runs
+# through torch's ordinary CUDA kernels -- the ones the model was
+# trained and evaluated on. Eager inference needs nothing from Triton;
+# only ``torch.compile`` does, and this worker never compiles. The
+# impossible marker (python_version < '0' is provably false, so uv
+# drops the package from the lock entirely) is the shape the dots.mocr
+# worker uses for the same purpose. The Dockerfile asserts the absence
+# at build time.
+override-dependencies = [
+    "triton; python_version < '0'",
+]
 
 # Route the GPU wheels to their vendor index. Other deps come from PyPI
 # by default. ``explicit = true`` means this index is only searched for

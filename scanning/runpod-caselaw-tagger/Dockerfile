@@ -34,21 +34,25 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
-# System deps: ca-certificates for HTTPS, and gcc for Triton. Nothing
-# renders a page here, so no graphics libraries and no PyMuPDF.
-#
-# gcc is load-bearing on the GPU, though no build step uses it: torch
-# runs some eager operations through Triton kernels on CUDA (2.14
-# routed the rotary-embedding outer product that way), and Triton
-# compiles a small C helper on its first call, at run time, inside the
-# worker. The slim base carries no compiler, so the first GPU job on
-# RunPod failed with "Failed to find C compiler" after a clean boot and
-# model load. The torch pin in pyproject.toml keeps to the version that
-# does not take that path; the compiler is the backstop for the next
-# version that does. About 60 MB.
+# System deps: ca-certificates for HTTPS. Nothing renders a page here,
+# so no graphics libraries and no PyMuPDF; and no compiler, because
+# nothing in this image may compile anything at run time (below).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates gcc \
+      ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+
+# ── No run-time kernel compilation ──────────────────────────────────
+# torch 2.13 and later carry ``torch._native``: when Triton is
+# importable it swaps some eager CUDA operations (the rotary-embedding
+# outer product among them) for Triton kernels, and Triton compiles a C
+# helper at first use, at run time, inside the worker. The first GPU
+# jobs on RunPod died there. The fix is in pyproject.toml: the lock
+# carries no ``triton`` package, so torch reports the native runtime
+# unavailable and registers nothing. This switch is the second layer,
+# read where those kernels would be registered, in case a future lock
+# brings Triton back. Set in the image, not on the template: a template
+# variable did not reach a worker on the third GPU attempt.
+ENV TORCH_DISABLE_NATIVE_JIT=1
 
 # Install uv (same tag as the other worker images for parity).
 COPY --from=ghcr.io/astral-sh/uv:0.9.22 /uv /uvx /bin/
@@ -121,6 +125,13 @@ limit = m.config.max_position_embeddings; \
 n = len(tok('word ' * (limit * 2), truncation=False)['input_ids']); \
 assert n > limit, f'tokenizer cut a long input to {n} tokens: truncation=False did not turn off the saved rule'; \
 print(f'model OK: labels={len(m.config.id2label)}, max_tokens={limit}, vocab={len(tok)}, long input={n} tokens untruncated')" \
+ && python -c "\
+import importlib.util; \
+assert importlib.util.find_spec('triton') is None, 'triton is in the image: the uv override in pyproject.toml no longer holds'; \
+from torch._native import triton_utils; \
+available, _ = triton_utils._check_runtime_available(); \
+assert not available, 'torch reports the Triton native runtime available; it would compile kernels at run time'; \
+print('no triton: torch native kernels unavailable, nothing compiles at run time')" \
  && rm -rf /opt/hf
 
 # Nothing may reach Hugging Face at run time now: the snapshot is on
