@@ -8,8 +8,6 @@ import pdfplumber
 if TYPE_CHECKING:
     from pdfplumber.page import Page as PdfPage
 
-    from scanning.models import Page
-
 DETECTION_IMG_W = 1700
 DETECTION_IMG_H = 2200
 _FOOTNOTE_CONF_FLOOR = 0.80
@@ -375,10 +373,14 @@ _BLANK_PAGE_INSTRUCTION = (
 )
 
 
-def build_user_prompt(page: Page) -> str | None:
-    """Build the per-page user prompt text from a ``Page`` row.
+def build_user_prompt(page: Any) -> str | None:
+    """Build the per-page user prompt text from a page object.
 
-    Inputs come from the ``Page`` row plus its parent ``Scan``:
+    This function has no caller. ``scanning.models.Page`` was its
+    one input and issue #280 deleted the model, so the parameter is
+    now any object that carries the attributes below.
+
+    Inputs come from the page object plus its parent ``Scan``:
 
       * ``page.is_blank`` short-circuits to a fixed instruction (the
         body is entirely covered by headnote redactions, so we tell
@@ -393,10 +395,10 @@ def build_user_prompt(page: Page) -> str | None:
       * ``page.pdf_path`` (resolved against ``page.scan.output_dir``)
         is opened only for caption / footnote text crops.
 
-    :param page: The ``scanning.models.Page`` row to build a prompt
-        for. The Page must have ``detections``, ``is_blank``,
-        ``page_index``, ``pdf_path``, and a ``scan`` with
-        ``output_dir`` + ``opinions_json``.
+    :param page: The page object to build a prompt for. It must
+        have ``detections``, ``is_blank``, ``page_index``,
+        ``pdf_path``, and a ``scan`` with ``output_dir`` +
+        ``opinions_json``.
     :return: The prompt text, or ``None`` if there's nothing useful
         to say about the page (no detections, no opinions touching
         it, and it isn't blank).

@@ -2062,6 +2062,43 @@ ones the glue already stored.
   and gets no button.
 - Step 3 has no overlay: it is paused (#173/#206).
 
+## The `Page` model is gone (issue #280)
+
+`scanning.models.Page` was one row per physical page and the unit of
+the LLM extraction alone. The extraction is dropped, so the model, its
+two choice classes (`ExtractionStatus`, `ExtractedBy`), the pass that
+wrote it, and the read-only interface over it are deleted. Migration
+0025 drops the table.
+
+- **It was never a page space of the pipeline.** Review 1 and review 2
+  address the original themselves: `Detection.page_index`,
+  `PageEdit.pdf_page` and the apply's page map (#224). No viewer read a
+  `Page` row. So the deletion reaches no review and no geometry.
+- **The set was closed.** One writer, `services._sync_pages_for_scan`,
+  called by `run_generate_files` (step 3) alone, and nothing has queued
+  step 3 since #173, so no row had been written for months. The readers
+  were two views (`scan_pages_list`, `page_detail`), one file route
+  (`serve_page_pdf`), the admin, and `ai.user_prompt.build_user_prompt`.
+- **The blank-page rule went with it**: `_page_has_headnote`,
+  `_page_body_covered`, `_blank_page_xml`, `_is_blank_via_sandwich`.
+  Do not reinstate any of it for #206. The rule read `redactions.json`
+  and the `llm/` per-page PDFs in the page space of the volume step 3
+  built, and #206 builds another volume again, so a port would carry a
+  pass with no reader into a third page space. `services.Page` is
+  blackletter's dataclass and stays: the redaction geometry reads it.
+- **`LLM_PAGE_TEXT_LAYER` and `_add_llm_page_text_layer` went with it
+  too**, which #155 asked for by name. They existed to give the prompt
+  builder's text crops something to read. `ocrmypdf`, `pytesseract` and
+  the `tesseract-ocr` apt lines of both Dockerfile tiers still stand;
+  dropping them is #155.
+- **The `ai` app is now unused and harmless.**
+  `ai.user_prompt.build_user_prompt` lost its one caller (its `page`
+  parameter is `Any` now, since the model it named is gone), and
+  `ai.LLMTask` and `ai.LLMBatch` had no writer anywhere already.
+  `ai.LLMTask` reached `Page` through a generic relation, so the
+  database held no constraint into the table. Removing the app is a
+  separate decision.
+
 ## The glued outputs, by scan id (issue #243)
 
 Three routes under `scans/<pk>/glued/<output>/`, for `dots-mocr` and

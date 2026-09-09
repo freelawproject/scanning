@@ -24,7 +24,6 @@ from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
 from django.utils.cache import get_conditional_response
 from django.utils.http import http_date
-from django.views.decorators.clickjacking import xframe_options_sameorigin
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
@@ -552,45 +551,6 @@ def serve_opinionscan_pdf(
     response["ETag"] = etag
     response["Last-Modified"] = http_date(last_modified)
     return response
-
-
-@login_required
-@xframe_options_sameorigin
-def serve_page_pdf(request: HttpRequest, pk: int) -> FileResponse:
-    """Serve the per-page PDF for a ``Page`` row.
-
-    Resolves ``page.pdf_path`` (relative to ``scan.output_dir``) to a
-    local file, falling back to an S3 pull when the file is missing
-    locally — same pattern as ``serve_opinionscan_pdf``.
-
-    :param request: The HTTP request.
-    :param pk: Page primary key.
-    :return: File response streaming the PDF.
-    :raises Http404: When the page or its file can't be found.
-    """
-    from scanning.models import Page
-
-    page = get_object_or_404(Page.objects.select_related("scan"), pk=pk)
-    if not page.pdf_path or not page.scan:
-        raise Http404
-
-    candidate = Path(page.scan.output_dir) / page.pdf_path
-    if candidate.is_file():
-        return FileResponse(
-            candidate.open("rb"), content_type="application/pdf"
-        )
-    try:
-        from scanning import s3_sync
-
-        # Just this page's file, not the scan's whole prefix.
-        s3_sync.download_processing_file(page.scan, page.pdf_path)
-    except Exception:
-        logger.exception("Lazy S3 pull failed for page %s", page.pk)
-    if candidate.is_file():
-        return FileResponse(
-            candidate.open("rb"), content_type="application/pdf"
-        )
-    raise Http404
 
 
 def _apply_rect_to_pdf(

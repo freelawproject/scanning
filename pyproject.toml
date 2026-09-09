@@ -39,13 +39,15 @@ dependencies = [
   # which the generalized YOLO stage needs (#193 and its parts). The worker
   # image (#194) resolves the same floor from its own lock file.
   "blackletter>=0.3.0",
-  # No longer called directly: the pipeline embeds no text layer. Declared
-  # so LLM_PAGE_TEXT_LAYER (blackletter's add_text_layer) has an engine, and
-  # because base blackletter requires it anyway.
+  # Not called anywhere: the pipeline embeds no text layer, and issue #280
+  # deleted the one switch (LLM_PAGE_TEXT_LAYER) that called blackletter's
+  # add_text_layer. Declared because base blackletter requires it anyway.
+  # Dropping the package is scanning #155.
   "ocrmypdf>=17",
-  # Used by ai.user_prompt to crop text off the generated LLM pages. Those
-  # crops only return anything when LLM_PAGE_TEXT_LAYER is on; the pipeline
-  # itself measures geometry from the page ink and needs no text.
+  # Used by ai.user_prompt to crop text off the generated LLM pages.
+  # ai.user_prompt has had no caller since issue #280 deleted the Page
+  # model, and the pipeline measures geometry from the page ink and needs
+  # no text. Dropping the package is scanning #155.
   "pdfplumber>=0.11",
   "pymupdf>=1.25",
   # runpod_client imports it directly to talk to the RunPod API. Declared
