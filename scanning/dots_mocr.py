@@ -290,6 +290,26 @@ def glued_result_key(scan, run: int) -> str:
     )
 
 
+def glued_volume_key(scan) -> str | None:
+    """Return the key of a scan's glued volume document, or nothing.
+
+    The live run is glued when every one of its rows is ``CONSUMED``:
+    the glue writes the document and flips the rows in one pass. The
+    same test :func:`apply._volume_ocr_run` makes, said outside
+    ``apply`` for the readers that want the key alone -- the text
+    overlay of issue #262 and the flag that shows its button.
+
+    :param scan: The scan (or its pk) to look up.
+    :returns: The key :func:`glued_result_key` gives the live run, or
+        None when no run is glued.
+    :rtype: str | None
+    """
+    rows = live_analyze_jobs(scan)
+    if rows and all(row.status == JobStatus.CONSUMED for row in rows):
+        return glued_result_key(scan, rows[0].run)
+    return None
+
+
 def _check_envelope(scan, job: ExternalJob, envelope) -> dict:
     """Return an envelope's payload, or refuse the envelope.
 

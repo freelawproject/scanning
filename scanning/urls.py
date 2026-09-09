@@ -71,6 +71,7 @@ from scanning.views_process import (
     reprocess,
     request_page_repair,
     rotate_page,
+    scan_ocr_text_url,
     scan_original_url,
     scan_process_view,
     serve_apply_output,
@@ -146,6 +147,14 @@ urlpatterns = [
         "scans/<int:pk>/original-url/",
         scan_original_url,
         name="scan_original_url",
+    ),
+    # The URL of the document the text overlay reads (#262). JSON, not
+    # a redirect: the viewer reads it with ``fetch``, as pdf.js reads
+    # the URL of ``scan_original_url``.
+    path(
+        "scans/<int:pk>/ocr-text-url/",
+        scan_ocr_text_url,
+        name="scan_ocr_text_url",
     ),
     path(
         "scans/<int:pk>/original/",

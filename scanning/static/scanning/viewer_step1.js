@@ -58,6 +58,8 @@ document.addEventListener('DOMContentLoaded', function () {
         goToRequestedPage();
     }
 
+    if (window.ocrTextInit) ocrTextInit();
+
     // Swap the viewer to the original scan (issue #185). Stops the
     // preview polling first: the user chose the original, so a bitonal
     // that finishes later must not render over it.
@@ -212,6 +214,9 @@ document.addEventListener('DOMContentLoaded', function () {
         }
         pageDiv.style.width = '';
         pageDiv.style.height = '';
+        // The overlay boxes hold the scale of the render they were
+        // drawn for (#262).
+        if (window.ocrTextClear) ocrTextClear(pageDiv);
     }
 
     function rerenderForCurrentZoom() {
@@ -289,6 +294,10 @@ document.addEventListener('DOMContentLoaded', function () {
             pageDiv.dataset.pdfWidth = origViewport.width;
             pageDiv.dataset.pdfHeight = origViewport.height;
             applyZoomToPage(pageDiv);
+            // The text overlay (#262). Here and not in the observer:
+            // a page is rendered only near the viewport, so this is
+            // the viewport rule, and the zoom re-render follows it.
+            if (window.ocrTextPaint) ocrTextPaint(pageDiv, pdfIndex);
         });
     }
 
