@@ -421,6 +421,84 @@ def _repair_filtered_page(page: dict) -> layout_json.Repair | None:
     return result
 
 
+def _legalize_page(page: dict) -> list[str]:
+    """Put a page's boxes in order, and drop the cells with no box.
+
+    Issue #297. The rule is
+    :func:`scanning.layout_json.legalize`, and the glue runs it for the
+    same reason it runs the repair of #242: the shard results are kept
+    for good, and no new worker image reaches the ones already in the
+    bucket. A box in the wrong order reaches the page-number reader,
+    the overlay and the redaction rows, and one on a ``Picture`` cell
+    failed a whole page in the worker.
+
+    Mutates ``page`` only when something changed: ``cells`` is
+    replaced, and ``legalized`` plus ``legalized_by`` say what
+    happened. A page whose every cell was dropped keeps the empty list
+    -- it is the answer the model gave, and the reader already treats
+    a page with no cell as a hole.
+
+    :param page: One page dict, shard-local or volume-level.
+    :returns: The changes, empty when every box was already legal.
+    :rtype: list[str]
+    """
+    cells = page.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return []
+    result = layout_json.legalize(
+        cells, page.get("origin_width"), page.get("origin_height")
+    )
+    if not result.edits:
+        return []
+    page["cells"] = result.cells
+    page["legalized"] = result.edits
+    page["legalized_by"] = "glue"
+    return result.edits
+
+
+def _legalize_shard(scan, job: ExternalJob, shard_pages: list[dict]) -> None:
+    """Run the legality rule over every page of one shard, and log it.
+
+    Runs after :func:`_repair_shard`, so a page the repair gave its
+    cells back is judged on those cells too: the repair rescales in
+    the worker's own arithmetic, and a box legal in the model's space
+    can lose its area to the truncation.
+
+    :param scan: The scan being glued.
+    :param job: The shard's row, for its page offset.
+    :param shard_pages: The shard's page dicts, mutated in place.
+    :return: None.
+    """
+    from_page = (job.input_manifest or {}).get("from_page") or 0
+    changed: list[int] = []
+    for page in shard_pages:
+        edits = _legalize_page(page)
+        if not edits:
+            continue
+        volume_page = from_page + page.get("page_no", 0) + 1
+        changed.append(volume_page)
+        logger.warning(
+            "scan %s shard %d/%d volume page %d: %d cell(s) had an "
+            "unusable box (%s); %d cell(s) left",
+            scan.pk,
+            job.shard_index + 1,
+            job.shard_count,
+            volume_page,
+            len(edits),
+            ", ".join(edits),
+            len(page["cells"]),
+        )
+    if changed:
+        logger.info(
+            "scan %s shard %d/%d: put the boxes of %d page(s) in order: %s",
+            scan.pk,
+            job.shard_index + 1,
+            job.shard_count,
+            len(changed),
+            changed,
+        )
+
+
 def _repair_shard(scan, job: ExternalJob, shard_pages: list[dict]) -> None:
     """Repair every filtered page of one shard, and log what is left.
 
@@ -499,6 +577,11 @@ def survey_repairs(scan, analyze_jobs: list[ExternalJob]) -> dict:
     report is the corpus survey issue #242 asks for -- the rate of the
     fault, the share each arm answers, and the pages no arm reaches.
 
+    It reports the pages whose boxes the legality rule of #297 would
+    change as well, which is the corpus count that issue asks for: a
+    page already glued keeps its wrong box until a re-glue, and only
+    this pass says which volumes hold one.
+
     It also counts the pages it walked and the filtered answers the
     threshold rung of #238 recovered (a page marked ``recovered_by``
     whose first rung error was "not layout JSON"). The page count is
@@ -512,14 +595,17 @@ def survey_repairs(scan, analyze_jobs: list[ExternalJob]) -> dict:
 
     :param scan: The scan to survey.
     :param analyze_jobs: Its live run's rows, ordered by shard index.
-    :returns: ``{"reports": list[dict], "pages": int,
-        "rung_recoveries": int}``. Each report names ``shard_index``,
-        ``page_no`` (shard-local, as the worker counts), ``pdf_page``
-        (1-based, of the volume), ``edits`` (``None`` when nothing
-        repaired it), ``fault`` and ``no_raw``.
+    :returns: ``{"reports": list[dict], "illegal": list[dict],
+        "pages": int, "rung_recoveries": int}``. Each report names
+        ``shard_index``, ``page_no`` (shard-local, as the worker
+        counts), ``pdf_page`` (1-based, of the volume), ``edits``
+        (``None`` when nothing repaired it), ``fault`` and ``no_raw``.
+        ``illegal`` is the pages a box of #297 would change, with the
+        same three addresses and the changes.
     :rtype: dict
     """
     reports: list[dict] = []
+    illegal: list[dict] = []
     rung_recoveries = 0
     page_count = 0
     with tempfile.TemporaryDirectory(
@@ -540,6 +626,21 @@ def survey_repairs(scan, analyze_jobs: list[ExternalJob]) -> dict:
                     "not layout JSON" in str(error) for error in errors
                 ):
                     rung_recoveries += 1
+                # A copy again: the rule mutates the page it is given,
+                # and the boxes of a page the survey walks must stay as
+                # the bucket holds them (#297).
+                edits = _legalize_page(dict(page))
+                if edits:
+                    illegal.append(
+                        {
+                            "shard_index": job.shard_index,
+                            "page_no": page.get("page_no"),
+                            "pdf_page": from_page
+                            + (page.get("page_no") or 0)
+                            + 1,
+                            "edits": edits,
+                        }
+                    )
                 if not page.get("filtered"):
                     continue
                 # A copy: a survey must not change what it reads, and
@@ -562,6 +663,7 @@ def survey_repairs(scan, analyze_jobs: list[ExternalJob]) -> dict:
                 )
     return {
         "reports": reports,
+        "illegal": illegal,
         "pages": page_count,
         "rung_recoveries": rung_recoveries,
     }
@@ -611,13 +713,14 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
     glue that will re-read the per-shard objects this one leaves in
     place.
 
-    One page-level repair happens here (issue #242): a page upstream
-    filtered because its layout JSON broke on one character gets its
-    cells back from the answer as the model wrote it. That belongs to
-    the glue and not only to the worker, because the shard results are
-    kept for good and no new worker image reaches the ones already in
-    the bucket. ``reglue_dots_mocr`` is what hands a glued run back to
-    this function after the repair changes.
+    Two page-level repairs happen here, and both for the same reason:
+    the shard results are kept for good and no new worker image
+    reaches the ones already in the bucket. A page upstream filtered
+    because its layout JSON broke on one character gets its cells back
+    from the answer as the model wrote it (issue #242), and every
+    page's boxes are put in order (issue #297). ``reglue_dots_mocr``
+    is what hands a glued run back to this function after either rule
+    changes.
 
     Idempotent: it rebuilds from the result objects every time, so a
     daemon killed between the upload and the CONSUMED write just glues
@@ -683,6 +786,7 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
             # hole the repair closed must be stamped clean, or the
             # carry would re-pay a shard whose result is now whole.
             _repair_shard(scan, job, shard_pages)
+            _legalize_shard(scan, job, shard_pages)
             _stamp_page_lists(job, shard_pages)
             for page in shard_pages:
                 page_index = from_page + page["page_no"]

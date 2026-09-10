@@ -30,6 +30,16 @@ stored results for nothing. Re-glue first; whatever still reports a
 filtered page afterwards is a shape no arm reaches, and only then is
 a paid re-read worth considering.
 
+The glue puts every box in order as well (issue #297): the model
+writes the four coordinates in the order it likes, upstream checks
+none of them, and a box in the wrong order fails the page in
+upstream's markdown or moves a region on the page for every later
+reader. A volume already glued keeps such a box until this command
+hands it back. No row reports one -- the four page lists have no place
+for it -- so a corpus pass reaches only the volumes that also report a
+filtered page. **Name the volumes the dry run lists** to glue the
+rest: a named volume is glued whatever its rows report.
+
 ``--dry-run`` downloads the shard results, runs the repair in memory
 and writes nothing. Its report is the survey the issue asks for: one
 line per filtered page saying which arm repairs it, or the parser
@@ -37,7 +47,9 @@ message with an excerpt of the answer when none does, or that the
 result was written before the worker kept ``raw``. Then the rate, the
 share each arm answers, and the count of filtered answers the
 threshold rung of #238 recovered -- the measurement that says whether
-that rung is worth paying for this class of fault.
+that rung is worth paying for this class of fault. It also names every
+page holding a box the legality rule of #297 would change, and counts
+them, which is the corpus rate that issue asks for.
 
 The dry run reads **every** glued volume in review 1, including the
 ones whose rows report no filtered page: a volume whose rung recovered
@@ -145,8 +157,12 @@ class Command(BaseCommand):
                     scan, wanted, "the live dots.mocr run is not glued yet"
                 )
                 continue
-            if not dry_run and not any(
-                jobs.page_lists(row)["filtered_pages"] for row in rows
+            if (
+                not dry_run
+                and not wanted
+                and not any(
+                    jobs.page_lists(row)["filtered_pages"] for row in rows
+                )
             ):
                 # Only the writing pass may skip on the rows. A survey
                 # that skipped here would never look at a volume whose
@@ -154,6 +170,11 @@ class Command(BaseCommand):
                 # the population that says the rung works -- and its
                 # page total, the denominator of the rate, would count
                 # only the volumes that still hold a hole.
+                #
+                # A named volume is never skipped here (#297): a wrong
+                # box reaches no row, so the rows cannot say which
+                # volume holds one. The dry run names them, and the
+                # operator hands those numbers back to this command.
                 skipped += 1
                 self._say_skip(
                     scan,
@@ -245,6 +266,15 @@ class Command(BaseCommand):
         survey.rung_recoveries += result["rung_recoveries"]
         survey.pages += result["pages"]
         survey.volumes += 1
+        for report in result["illegal"]:
+            survey.count_illegal(report["edits"])
+            self.stdout.write(
+                f"scan {scan.pk} volume page {report['pdf_page']} "
+                f"(shard {report['shard_index'] + 1} page "
+                f"{report['page_no']}): would put "
+                f"{len(report['edits'])} box(es) in order or drop them "
+                f"({', '.join(report['edits'])})"
+            )
         for report in result["reports"]:
             where = (
                 f"scan {scan.pk} volume page {report['pdf_page']} "
@@ -316,6 +346,21 @@ class _Survey:
         self.pages = 0
         self.volumes = 0
         self.arms: dict[str, int] = {}
+        self.illegal_pages = 0
+        self.illegal_cells = 0
+        self.box_arms: dict[str, int] = {}
+
+    def count_illegal(self, edits: list[str]) -> None:
+        """Count one page whose boxes the rule of #297 would change.
+
+        :param edits: The changes, each ``<arm>@<cell index>``.
+        :return: None.
+        """
+        self.illegal_pages += 1
+        self.illegal_cells += len(edits)
+        for edit in edits:
+            arm = edit.split("@", 1)[0]
+            self.box_arms[arm] = self.box_arms.get(arm, 0) + 1
 
     def count_repair(self, edits: list[str]) -> None:
         """Count one repaired page and the arms it took.
@@ -336,7 +381,8 @@ class _Survey:
         page(s) in 13159, about one in 774".
 
         :returns: The rate of the fault, the share each arm answers,
-            and what the threshold rung of #238 recovered.
+            what the threshold rung of #238 recovered, and the pages
+            holding a box the rule of #297 would change.
         :rtype: str
         """
         by_arm = ", ".join(
@@ -345,6 +391,14 @@ class _Survey:
         rate = (
             f", about one in {round(self.pages / self.filtered)}"
             if self.filtered
+            else ""
+        )
+        by_box_arm = ", ".join(
+            f"{arm} {n}" for arm, n in sorted(self.box_arms.items())
+        )
+        box_rate = (
+            f", about one in {round(self.pages / self.illegal_pages)}"
+            if self.illegal_pages
             else ""
         )
         return "\n".join(
@@ -357,5 +411,8 @@ class _Survey:
                 f"{self.no_raw} with no stored answer",
                 "  the threshold rung of #238 recovered "
                 f"{self.rung_recoveries} filtered answer(s)",
+                f"{self.illegal_pages} page(s) hold {self.illegal_cells} "
+                f"unusable box(es) (#297){box_rate}"
+                f"{f': {by_box_arm}' if by_box_arm else ''}",
             ]
         )

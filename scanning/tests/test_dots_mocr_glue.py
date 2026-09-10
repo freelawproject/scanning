@@ -597,6 +597,106 @@ class TestMergeDotsmocrResults(AnalyzeJobsMixin, TestCase):
             dots_mocr.merge_dotsmocr_results(scan, [])
 
 
+class TestLegalizeBoxes(AnalyzeJobsMixin, TestCase):
+    """The glue puts every stored box in order (issue #297).
+
+    The worker does the same before it builds the markdown, but the
+    shard results are kept for good and no new worker image reaches
+    the ones already in the bucket. So a volume glued again is how the
+    corpus is answered.
+    """
+
+    def _page_with(self, bbox, category="Picture"):
+        """Build a page whose one cell carries ``bbox``."""
+        page = make_page(0)
+        page["cells"] = [{"bbox": list(bbox), "category": category}]
+        return page
+
+    def test_a_box_upside_down_is_glued_in_order(self):
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+        self.write_envelope(
+            0,
+            make_envelope(rows[0], [self._page_with([1504, 1705, 1538, 10])]),
+        )
+
+        with self.assertLogs("scanning.dots_mocr", level="INFO") as logs:
+            dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        page = self.upload.call_args[0][1]["pages"][0]
+        self.assertEqual(page["cells"][0]["bbox"], [1504, 10, 1538, 1705])
+        self.assertEqual(page["legalized"], ["swap_y@0"])
+        self.assertEqual(page["legalized_by"], "glue")
+        line = next(line for line in logs.output if "unusable box" in line)
+        self.assertTrue(line.startswith("WARNING"))
+        self.assertIn("volume page 1", line)
+        self.assertIn("swap_y@0", line)
+
+    def test_a_legal_page_is_left_alone(self):
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        page = self.upload.call_args[0][1]["pages"][0]
+        self.assertEqual(page["cells"], make_page(0)["cells"])
+        self.assertNotIn("legalized", page)
+        self.assertNotIn("legalized_by", page)
+
+    def test_a_cell_off_the_page_is_dropped_by_the_stored_dimensions(self):
+        # The render is 1700x2200 on the stored page, and that is what
+        # the glue judges by: it has no page image of its own.
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+        page = self._page_with([1800, 10, 1900, 60])
+        page["cells"].append(
+            {"bbox": [100, 200, 900, 800], "category": "Text"}
+        )
+        self.write_envelope(0, make_envelope(rows[0], [page]))
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        glued = self.upload.call_args[0][1]["pages"][0]
+        self.assertEqual(glued["legalized"], ["off_page@0"])
+        self.assertEqual(len(glued["cells"]), 1)
+        self.assertEqual(glued["cells"][0]["category"], "Text")
+
+    def test_a_page_left_with_no_cell_is_not_called_filtered(self):
+        # It is the answer the model gave, and a page with no cell is
+        # already a hole to every reader. Calling it filtered would put
+        # it in a list that means "the JSON broke".
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+        self.write_envelope(
+            0, make_envelope(rows[0], [self._page_with([10, 20, 10, 60])])
+        )
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        document = self.upload.call_args[0][1]
+        self.assertEqual(document["pages"][0]["cells"], [])
+        self.assertEqual(document["filtered_pages"], [])
+        self.assertEqual(document["failed_pages"], [])
+
+    def test_a_repaired_page_is_judged_on_its_repaired_cells(self):
+        # The repair of #242 runs first, and its cells go through the
+        # same rule: the rescale truncates, so a box one pixel tall in
+        # the model's space can come out flat. This page was read at
+        # four times the render, which is what makes two neighbouring
+        # pixels one.
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+        page = make_filtered_page(0)
+        page["input_width"] = 4 * page["origin_width"]
+        page["input_height"] = 4 * page["origin_height"]
+        page["raw"] = page["raw"].replace(
+            "[276, 93, 426, 129]", "[276, 93, 426, 94]"
+        )
+        self.write_envelope(0, make_envelope(rows[0], [page]))
+
+        dots_mocr.merge_dotsmocr_results(scan, rows)
+
+        glued = self.upload.call_args[0][1]["pages"][0]
+        self.assertEqual(glued["repaired_by"], "glue")
+        self.assertEqual(glued["legalized"], ["flat_box@0"])
+        self.assertEqual(len(glued["cells"]), 1)
+
+
 class TestFinishReadyRuns(AnalyzeJobsMixin, TestCase):
     """The daemon pass that applies finished runs."""
 
