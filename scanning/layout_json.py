@@ -29,6 +29,12 @@ stops after :data:`MAX_EDITS`. It never writes over the answer as the
 model wrote it: the callers keep ``raw`` and store the edits beside the
 repaired cells.
 
+The module owns one more rule, and for the same reason: the legality
+of a box (:func:`legalize`, issue #297). Upstream checks none, and a
+box in the wrong order failed a whole page in production. Both callers
+run the rule, the worker on the answer and the glue on the stored
+result.
+
 Two callers share this module, and it must stay importable by both:
 the worker image (``scanning/runpod-dotsmocr/handler.py``, which the
 Dockerfile copies this file next to, so it imports it as a top-level
@@ -131,6 +137,19 @@ class Repair(NamedTuple):
     fault: str | None
 
 
+class Legal(NamedTuple):
+    """What :func:`legalize` answers.
+
+    ``cells`` is the list a reader can use: every box in order, and
+    the cells whose box says nothing left out. ``edits`` names each
+    change, in cell order, as ``<arm>@<cell index>`` -- the shape
+    :class:`Repair` uses, so one counter reads both.
+    """
+
+    cells: list
+    edits: list[str]
+
+
 def repair(raw: str, max_edits: int = MAX_EDITS) -> Repair:
     """Parse ``raw`` as a layout array, moving one character per fault.
 
@@ -208,6 +227,96 @@ def rescale(
         ]
         out.append(copy)
     return out
+
+
+def legalize(
+    cells: list,
+    origin_width: float | None = None,
+    origin_height: float | None = None,
+) -> Legal:
+    """Order every box, and drop the cells no reader can use.
+
+    Issue #297. The model writes the four coordinates of a box in the
+    order it likes, and upstream checks none of them: its own
+    ``is_legal_bbox`` is never called on the success path, and
+    ``post_process_cells`` divides both ends of an axis by the same
+    scale, so a box that arrives upside down stays upside down. One
+    such box on a ``Picture`` cell failed a whole page in production:
+    upstream crops the page image for the markdown, and Pillow refuses
+    a box whose bottom is above its top.
+
+    So the rule runs on the first-pass cells as well, in the render's
+    pixel space, and both callers share it: the worker before it builds
+    the markdown, and the glue over every stored result, which no new
+    worker image reaches.
+
+    :func:`_check_cells` holds the same rule for a repaired array and
+    answers it differently: there the whole array is refused. The two
+    questions are not the same. A repair has already moved one
+    character of the answer, and an array that then holds a box in the
+    wrong order is evidence the edit landed wrong, so it is refused. An
+    answer the parser took as written is the model's own layout of the
+    page, and the two corners describe the region it meant whichever
+    order they arrive in.
+
+    A cell is dropped when nothing can be read from its box: no box of
+    four numbers, no area after the order, or no overlap with the page.
+    A dropped cell is one region of the page, and the page keeps every
+    other one; the caller decides what an empty answer means.
+
+    :param cells: The cells, in the render's pixel space.
+    :param origin_width: Width of the render, for the page test. The
+        test is skipped when either dimension is missing.
+    :param origin_height: Height of the render.
+    :returns: The :class:`Legal`. On legal cells ``edits`` is empty and
+        ``cells`` is the list as given.
+    :rtype: Legal
+    """
+    out: list = []
+    edits: list[str] = []
+    on_page = (
+        isinstance(origin_width, (int, float))
+        and isinstance(origin_height, (int, float))
+        and origin_width > 0
+        and origin_height > 0
+    )
+    for index, cell in enumerate(cells):
+        bbox = cell.get("bbox") if isinstance(cell, dict) else None
+        if (
+            not isinstance(bbox, list)
+            or len(bbox) != 4
+            or not all(_is_number(value) for value in bbox)
+        ):
+            edits.append(f"no_bbox@{index}")
+            continue
+        x1, y1, x2, y2 = bbox
+        marks = []
+        if x2 < x1:
+            x1, x2 = x2, x1
+            marks.append(f"swap_x@{index}")
+        if y2 < y1:
+            y1, y2 = y2, y1
+            marks.append(f"swap_y@{index}")
+        if x2 <= x1 or y2 <= y1:
+            edits.append(f"flat_box@{index}")
+            continue
+        if on_page and (
+            x1 >= origin_width or y1 >= origin_height or x2 <= 0 or y2 <= 0
+        ):
+            edits.append(f"off_page@{index}")
+            continue
+        if marks:
+            edits.extend(marks)
+            copy = dict(cell)
+            copy["bbox"] = [x1, y1, x2, y2]
+            out.append(copy)
+            continue
+        out.append(cell)
+    if not edits:
+        # The list as given, so a caller can tell "nothing to do" from
+        # "every cell was rebuilt" by identity as well as by ``edits``.
+        return Legal(cells, [])
+    return Legal(out, edits)
 
 
 def excerpt(text: str, pos: int, radius: int = EXCERPT_RADIUS) -> str:

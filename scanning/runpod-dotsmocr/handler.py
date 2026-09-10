@@ -487,14 +487,33 @@ class TruncatedOutput(RuntimeError):
         super().__init__(message)
 
 
+class PostProcessFailed(RuntimeError):
+    """The answer arrived, and the step after the model refused it.
+
+    Issue #297. The model answered, and the parse, the legality rule or
+    the markdown then failed. The answer is evidence: it parsed far
+    enough to reach these steps, so a later pass over the stored result
+    can read the page again with no GPU time at all. Without this the
+    ``except Exception`` arm of the ladder threw the answer away with
+    the rung.
+
+    :ivar raw: The answer as the model wrote it.
+    """
+
+    def __init__(self, message: str, raw: str | None = None):
+        self.raw = raw
+        super().__init__(message)
+
+
 class PageFailed(RuntimeError):
     """Every rung of the retry ladder failed on one page (#238).
 
     :ivar errors: One error text per rung, in rung order.
     :ivar last: The last rung's text, which is what the page's
         ``error`` field carries -- the shape every reader knows.
-    :ivar raw: The last truncated answer any rung produced, or None
-        when no rung produced text at all.
+    :ivar raw: The last answer a rung kept -- a truncated one, or one
+        the post-process refused -- or None when no rung produced text
+        at all.
     """
 
     def __init__(self, errors: list[str], raw: str | None = None):
@@ -526,6 +545,25 @@ def _threshold_render(image):
     return grey.point(lambda v: 255 if v > RETRY_THRESHOLD else 0).convert(
         "RGB"
     )
+
+
+def _no_picture():
+    """Return the 1x1 white image the markdown takes no picture from.
+
+    Upstream's ``layoutjson2md`` crops the page image for every
+    ``Picture`` cell and encodes the crop as a data URI. A picture
+    reaches the caller only when it asks for one
+    (``include_pictures``), and :func:`_strip_data_uris` removes the
+    URIs otherwise, so the default path pays a crop and an encode per
+    picture for a string it then throws away. This image gives the
+    crop nothing to copy: the placeholder in the markdown is the same,
+    and the work is not.
+
+    :returns: A 1x1 white RGB image.
+    """
+    from PIL import Image
+
+    return Image.new("RGB", (1, 1), (255, 255, 255))
 
 
 def _repair_layout_json(
@@ -640,14 +678,18 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         Every page that got an answer also carries ``raw``, the answer
         as the model wrote it: ``cells`` is a parsed and rescaled copy,
         so ``raw`` is what a later post-processor starts from. On a
-        failed page it is the last truncated answer, when there was one.
+        failed page it is the last answer a rung kept: a truncated one,
+        or one the post-process refused (#297).
         ``filtered: true`` marks pages where the model output wasn't
         valid JSON, no repair reached it, and ``md`` holds the cleaned
         text fallback. ``repaired`` (the edits, e.g.
         ``["escape_quote@3698"]``) and ``repaired_by: "worker"`` mark a
         page whose layout JSON broke on one character and was put back
         together (#242); such a page is **not** filtered, and
-        ``repaired_pages`` lists them.
+        ``repaired_pages`` lists them. ``legalized`` (the changes, e.g.
+        ``["swap_y@11"]``) and ``legalized_by: "worker"`` mark a page
+        whose boxes were put in order, or whose unusable cells were
+        left out (#297); a page with no usable cell fails the rung.
         The retry ladder (#238) adds ``attempts`` (rungs spent),
         ``recovered_by`` (the rung that gave usable output, absent on
         a first-try success and on a filtered page),
@@ -880,56 +922,106 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 "prompt_layout_all_en",
                 "prompt_layout_only_en",
             ):
-                cells, filtered = post_process_output(
-                    response,
-                    prompt_mode,
-                    page_image,
-                    image,
-                    min_pixels=min_pixels,
-                    max_pixels=max_pixels,
-                )
-                edits = None
-                if filtered:
-                    # The answer was good layout JSON with one
-                    # character wrong (issue #242): a lone quotation
-                    # mark, a lone backslash, a doubled closer. Move
-                    # the character back and the page is whole. This
-                    # runs before the ladder climbs, because the fault
-                    # is in the escape and not in the render, so a
-                    # second render makes the same mistake -- and the
-                    # repair costs microseconds against a rung's ~90s.
-                    repaired = _repair_layout_json(
+                # Everything from here to the markdown runs on an
+                # answer the model already paid for, so a failure keeps
+                # it (#297): the answer is what a pass over the stored
+                # result reads the page from, for free.
+                try:
+                    cells, filtered = post_process_output(
                         response,
-                        post_process_output,
                         prompt_mode,
                         page_image,
                         image,
-                        min_pixels,
-                        max_pixels,
+                        min_pixels=min_pixels,
+                        max_pixels=max_pixels,
                     )
-                    if repaired is not None:
-                        cells, edits = repaired
-                        filtered = False
-                result["filtered"] = bool(filtered)
-                if edits is not None:
-                    result["repaired"] = edits
-                    result["repaired_by"] = "worker"
-                if filtered:
-                    # Model output wasn't valid JSON and no repair arm
-                    # reached it; ``cells`` is upstream's cleaned-text
-                    # fallback, usable only as markdown. ``raw`` above
-                    # is what says which character failed the parse:
-                    # upstream's cleaner consumes the broken JSON and
-                    # returns the words.
-                    result["cells"] = None
-                    result["md"] = cells if isinstance(cells, str) else None
-                else:
-                    result["cells"] = cells
-                    if prompt_mode == "prompt_layout_all_en":
-                        md = layoutjson2md(page_image, cells, text_key="text")
-                        if not include_pictures:
-                            md = _strip_data_uris(md)
-                        result["md"] = md
+                    edits = None
+                    if filtered:
+                        # The answer was good layout JSON with one
+                        # character wrong (issue #242): a lone
+                        # quotation mark, a lone backslash, a doubled
+                        # closer. Move the character back and the page
+                        # is whole. This runs before the ladder climbs,
+                        # because the fault is in the escape and not in
+                        # the render, so a second render makes the same
+                        # mistake -- and the repair costs microseconds
+                        # against a rung's ~90s.
+                        repaired = _repair_layout_json(
+                            response,
+                            post_process_output,
+                            prompt_mode,
+                            page_image,
+                            image,
+                            min_pixels,
+                            max_pixels,
+                        )
+                        if repaired is not None:
+                            cells, edits = repaired
+                            filtered = False
+                    result["filtered"] = bool(filtered)
+                    if edits is not None:
+                        result["repaired"] = edits
+                        result["repaired_by"] = "worker"
+                    if filtered:
+                        # Model output wasn't valid JSON and no repair
+                        # arm reached it; ``cells`` is upstream's
+                        # cleaned-text fallback, usable only as
+                        # markdown. ``raw`` above is what says which
+                        # character failed the parse: upstream's
+                        # cleaner consumes the broken JSON and returns
+                        # the words.
+                        result["cells"] = None
+                        result["md"] = (
+                            cells if isinstance(cells, str) else None
+                        )
+                    else:
+                        # One box in the wrong order fails the whole
+                        # page in upstream's markdown (#297), and a box
+                        # with no area is a region no reader can use.
+                        # The rule is shared with the glue, so a result
+                        # already in the bucket is answered by the same
+                        # one.
+                        legal = layout_json.legalize(
+                            cells, page_image.width, page_image.height
+                        )
+                        if legal.edits:
+                            logger.warning(
+                                "page %d: %d cell(s) had an unusable box "
+                                "(%s); %d cell(s) left",
+                                page_idx,
+                                len(legal.edits),
+                                ", ".join(legal.edits),
+                                len(legal.cells),
+                            )
+                            result["legalized"] = legal.edits
+                            result["legalized_by"] = "worker"
+                        if not legal.cells:
+                            # Not one region survived, so the answer is
+                            # not a layout of this page. Fail the rung:
+                            # the other render may answer, and the
+                            # ladder keeps the answer either way.
+                            raise PostProcessFailed(
+                                "no cell of the answer had a usable box: "
+                                + ", ".join(legal.edits),
+                                raw=response,
+                            )
+                        cells = legal.cells
+                        result["cells"] = cells
+                        if prompt_mode == "prompt_layout_all_en":
+                            md = layoutjson2md(
+                                page_image
+                                if include_pictures
+                                else _no_picture(),
+                                cells,
+                                text_key="text",
+                            )
+                            if not include_pictures:
+                                md = _strip_data_uris(md)
+                            result["md"] = md
+                except PostProcessFailed:
+                    raise
+                except Exception as exc:
+                    raise PostProcessFailed(str(exc), raw=response) from exc
             else:  # prompt_ocr: plain text extraction, no layout JSON
                 result["md"] = response
             return result
@@ -939,9 +1031,12 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         # The render is the only difference, so the stage stays
         # deterministic. A rung fails on a loop, an exhausted transient
         # error, an exhausted empty answer, a post-process exception,
-        # or a filtered answer. The filtered answer is kept as the
-        # fallback result in case the later rung does no better: it is
-        # not an error, only an answer the layout reader cannot use.
+        # or a filtered answer. A loop and a post-process exception
+        # both keep the answer they failed on (#238, #297), so a later
+        # pass over the stored result can read the page for free. The
+        # filtered answer is kept as the fallback result in case the
+        # later rung does no better: it is not an error, only an answer
+        # the layout reader cannot use.
         # The threshold render is built lazily: most pages never need it.
         rungs = (
             (lambda: origin_image, {}),
@@ -953,7 +1048,7 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         for rung, (render, marks) in enumerate(rungs, start=1):
             try:
                 result = _infer(render())
-            except TruncatedOutput as exc:
+            except (TruncatedOutput, PostProcessFailed) as exc:
                 errors.append(str(exc))
                 last_raw = exc.raw
                 continue
@@ -1011,8 +1106,9 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         except PageFailed as exc:
             # Out of rungs. Keep the last rung's text as ``error`` (the
             # shape every reader knows) and the whole history beside it,
-            # plus the last truncated answer when a rung produced one:
-            # it is the only evidence of what the loop repeated.
+            # plus the last answer a rung kept when there was one: the
+            # evidence of what the loop repeated, or the answer the
+            # post-process refused.
             logger.error("page %d failed: %s", page_idx, exc)
             page = {
                 "page_no": page_idx,

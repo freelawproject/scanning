@@ -158,6 +158,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - The scaffold is in `runpod_common`, once: Sentry, the result envelope, `execute_action`. Only `BadInputError` maps to `BAD_INPUT`. Without `result_url` a worker answers inline
 - YOLO: only `bl_warm.pt` is baked, and the handler passes no `imgsz` (the checkpoint carries 1024). No CUDA base layer
 - dots.mocr: `DPI = 200` and `PROMPT_MODE` are module constants; `HANDLER_MAX_COMPLETION_TOKENS = 6144`; the retry ladder changes only the render (deterministic); the layout repair (`layout_json.py`, no Django import, copied into the image) runs before the ladder; `raw` is never written over
+- A layout box is legal by one rule (`layout_json.legalize`, #297): the worker runs it before the markdown, the glue over every stored result. A page left with no cell is not filtered, and a step after the model that refuses an answer keeps `raw` (`PostProcessFailed`)
 - Tagger: GPU-only (`HANDLER_ALLOW_CPU=1` for a laptop only), transformers 5, model baked and opened at build time
 - One build workflow per image, and each PATCHes its own template id
 
