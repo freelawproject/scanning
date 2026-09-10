@@ -69,6 +69,7 @@ from datetime import timedelta
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from scanning import doctor_client, runpod_client, s3_sync, sharding
@@ -1679,16 +1680,45 @@ def _room_for(queryset, limit: int, label: str) -> int:
 def _pending_slice(queryset, room: int) -> list[ExternalJob]:
     """Return the PENDING rows a wave will claim.
 
+    **An apply row goes first** (issue #291). A row carrying an
+    ``apply_run`` is a single page of a volume a curator already
+    approved in review 1 (#224), and it is by construction one of the
+    newest rows, so a queue drained in creation order alone put it
+    behind every volume shard of every volume nobody has looked at yet.
+    A volunteer rescanned a page, a curator approved the review, and the
+    corrected volume then waited for the whole backlog.
+
+    Four properties make the rank safe, and each one is a reason not to
+    replace it with a cap or a queue of its own:
+
+    - An apply row is **one page**, so it leaves the head of the queue
+      in seconds and delays a volume shard very little.
+    - The apply set **cannot grow without a limit**:
+      ``apply.MAX_SCANS_IN_FLIGHT`` bounds the scans out at once, and a
+      run makes rows for the changed pages only.
+    - A row that loses its place **cannot fail from the wait**: a
+      PENDING row nobody claimed carries no deadline (#218), because the
+      queue ceiling starts at the attempt's first claim.
+    - The rank decides who takes a free place and **preempts nothing**;
+      :func:`_room_for` counts the in-flight rows against the cap.
+
+    The id stays the second key: inside one class the creation order is
+    what keeps the drain fair. The rank reads the row and not
+    ``Scan.status``, which would cost a join on every tick and would
+    move under a row that is already waiting.
+
     :param queryset: This provider and stage's rows.
     :param room: How many rows the cap allows.
-    :returns: Rows in creation order, at most ``room`` of them.
+    :returns: The apply rows first, each class in creation order, at
+        most ``room`` of them.
     :rtype: list[ExternalJob]
     """
     return list(
         queryset.filter(status=JobStatus.PENDING)
         # ``s3_job_attempt_key`` reads the apply run's number (#224).
         .select_related("scan", "scan__reporter", "apply_run")
-        .order_by("id")[:room]
+        .annotate(is_apply=Q(apply_run__isnull=False))
+        .order_by("-is_apply", "id")[:room]
     )
 
 

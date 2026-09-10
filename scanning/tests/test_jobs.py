@@ -447,6 +447,208 @@ class TestSubmitPending(ScanningTestCase):
         self.assertEqual(summary.submitted, 3)
 
 
+#: Every engine on at once, so one tick exercises all three waves.
+#: The caps are 1, which makes each wave claim exactly one row and the
+#: rank the only thing that decides which.
+EVERY_ENGINE = {
+    **DOCTOR,
+    "DOCTOR_MAX_CONCURRENCY": 1,
+    "RUNPOD_ENABLED": True,
+    "RUNPOD_API_KEY": "key-1",
+    "RUNPOD_PRESIGNED_TTL": 3600,
+    "RUNPOD_REQUEST_TIMEOUT": 600,
+    "DOTS_MOCR_ENABLED": True,
+    "RUNPOD_DOTSMOCR_ENDPOINT_ID": "ep-dots",
+    "DOTS_MOCR_MAX_CONCURRENCY": 1,
+    "DOTS_MOCR_MAX_ATTEMPTS": 3,
+    "DOTS_MOCR_SECONDS_PER_PAGE": 4.0,
+    "YOLO_ENABLED": True,
+    "RUNPOD_YOLO_ENDPOINT_ID": "ep-yolo",
+    "YOLO_MAX_CONCURRENCY": 1,
+    "YOLO_MAX_ATTEMPTS": 3,
+    "YOLO_SECONDS_PER_PAGE": 2.0,
+}
+
+#: One entry per engine a wave sends for: the row shape and the stage.
+ENGINE_SHAPES = (
+    (JobStage.CONVERT, JobEngine.BITONAL, JobProvider.DOCTOR),
+    (JobStage.ANALYZE, JobEngine.DOTS_MOCR, JobProvider.RUNPOD),
+    (JobStage.DETECT, JobEngine.BLACKLETTER, JobProvider.RUNPOD),
+)
+
+
+@override_settings(**EVERY_ENGINE)
+class TestApplyRowsGoFirst(ScanningTestCase):
+    """The queue rank of issue #291.
+
+    An apply row (#224) is one page of a volume a curator already
+    approved, and it is one of the newest rows in the table. In creation
+    order alone it therefore waited behind every volume shard of every
+    volume nobody had opened yet.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.presign = patch.multiple(
+            "scanning.s3_sync",
+            s3_active=lambda: True,
+            presign_get=lambda key, ttl: f"https://s3/{key}?get",
+            presign_put=lambda key, ct, ttl: f"https://s3/{key}?put",
+        )
+        self.presign.start()
+        self.addCleanup(self.presign.stop)
+
+    def _tick(self, **kwargs):
+        """Run one submit tick with every provider call patched.
+
+        Doctor answers with a completion and RunPod with a job id, so a
+        row that was sent leaves PENDING whichever engine took it.
+
+        :param kwargs: Passed to ``submit_pending``.
+        :return: None.
+        """
+        with (
+            patch(
+                "scanning.doctor_client.convert_bitonal",
+                return_value={"pages": 1},
+            ),
+            patch("scanning.runpod_client.submit_job", return_value="job-1"),
+        ):
+            jobs.submit_pending(**kwargs)
+
+    def _apply_row(
+        self,
+        scan,
+        stage,
+        engine,
+        provider,
+        run=None,
+        shard_index=0,
+        shard_count=1,
+    ):
+        """Create one PENDING apply row.
+
+        An apply row is one page of the volume, so its shard set holds
+        one row per page a curator changed.
+
+        :param scan: The scan it belongs to.
+        :param stage: Its stage.
+        :param engine: Its engine.
+        :param provider: Its provider.
+        :param run: The ``ApplyRun`` to hang it on; one is made if not
+            given.
+        :param shard_index: Its place in the apply's shard set.
+        :param shard_count: How many one-page shards the run holds.
+        :returns: The row.
+        :rtype: ExternalJob
+        """
+        if run is None:
+            run = ApplyRun.objects.create(
+                scan=scan, number=ApplyRun.objects.count() + 1
+            )
+        return ExternalJobFactory(
+            scan=scan,
+            apply_run=run,
+            stage=stage,
+            engine=engine,
+            provider=provider,
+            status=JobStatus.PENDING,
+            run=2,
+            shard_index=shard_index,
+            shard_count=shard_count,
+        )
+
+    def _sent(self, row):
+        """Return whether the wave sent one row.
+
+        :param row: The row to re-read.
+        :returns: Whether it left PENDING.
+        :rtype: bool
+        """
+        row.refresh_from_db()
+        return row.status != JobStatus.PENDING
+
+    def test_the_apply_row_is_claimed_before_older_volume_shards(self):
+        """The whole point: the newest row goes first."""
+        scan = ScanFactory()
+        volume = jobs.ensure_convert_jobs(scan, make_manifest(shard_count=3))
+        apply_row = self._apply_row(
+            scan, JobStage.CONVERT, JobEngine.BITONAL, JobProvider.DOCTOR
+        )
+        self.assertGreater(apply_row.pk, max(row.pk for row in volume))
+
+        self._tick()
+
+        self.assertTrue(self._sent(apply_row))
+        for row in volume:
+            self.assertFalse(self._sent(row))
+
+    def test_the_rank_holds_for_every_engine(self):
+        """Each engine reads its own queue, so each needs the rank."""
+        for stage, engine, provider in ENGINE_SHAPES:
+            with self.subTest(engine=engine):
+                scan = ScanFactory()
+                volume = ExternalJobFactory(
+                    scan=scan,
+                    stage=stage,
+                    engine=engine,
+                    provider=provider,
+                    status=JobStatus.PENDING,
+                )
+                apply_row = self._apply_row(scan, stage, engine, provider)
+
+                self._tick()
+
+                self.assertTrue(self._sent(apply_row))
+                self.assertFalse(self._sent(volume))
+
+    def test_two_apply_rows_keep_the_creation_order(self):
+        """The id stays the second key: one class drains fairly."""
+        scan = ScanFactory()
+        run = ApplyRun.objects.create(scan=scan, number=1)
+        first = self._apply_row(
+            scan,
+            JobStage.CONVERT,
+            JobEngine.BITONAL,
+            JobProvider.DOCTOR,
+            run=run,
+            shard_index=0,
+            shard_count=2,
+        )
+        second = self._apply_row(
+            scan,
+            JobStage.CONVERT,
+            JobEngine.BITONAL,
+            JobProvider.DOCTOR,
+            run=run,
+            shard_index=1,
+            shard_count=2,
+        )
+
+        self._tick()
+
+        self.assertTrue(self._sent(first))
+        self.assertFalse(self._sent(second))
+
+    def test_the_cap_still_bounds_the_wave(self):
+        """The rank picks who takes a free place; it preempts nothing."""
+        scan = ScanFactory()
+        ExternalJobFactory(
+            scan=scan,
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            status=JobStatus.SUBMITTED,
+        )
+        apply_row = self._apply_row(
+            scan, JobStage.CONVERT, JobEngine.BITONAL, JobProvider.DOCTOR
+        )
+
+        self._tick()
+
+        self.assertFalse(self._sent(apply_row))
+
+
 @override_settings(**DOCTOR)
 class TestRetryCeiling(ScanningTestCase):
     """How many times one shard may be attempted."""
