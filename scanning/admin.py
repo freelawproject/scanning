@@ -14,6 +14,7 @@ from scanning.models import (
     ExternalJob,
     Issue,
     JobStage,
+    OpinionBoundary,
     OpinionScan,
     PageEdit,
     PageRepairRequest,
@@ -193,7 +194,6 @@ class ScanAdmin(admin.ModelAdmin):
     # pipeline).
     exclude = [
         "ocr_results",
-        "opinions_json",
         "page_map",
         "missing_pages",
         "margin_rects",
@@ -277,6 +277,7 @@ class ScanAdmin(admin.ModelAdmin):
             Detection,
             Issue,
             PageEdit,
+            OpinionBoundary,
             PendingUpload,
             ExternalJob,
         ):
@@ -667,6 +668,50 @@ class DetectionDecisionAdmin(admin.ModelAdmin):
     list_filter = ["kind", "withdrawn_at", "label"]
     raw_id_fields = ["scan", "source_edit", "author", "withdrawn_by"]
     readonly_fields = [f.name for f in DetectionDecision._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(OpinionBoundary)
+class OpinionBoundaryAdmin(admin.ModelAdmin):
+    """One opinion, or one curator decision about one (issue #240, PR C).
+
+    Read-only: a computed row is rebuilt at each compute and a human
+    row records what a person decided, and the way to change either is
+    the review page. Nothing here deletes.
+    """
+
+    list_display = [
+        "scan",
+        "origin",
+        "kind",
+        "start_page_index",
+        "end_page_index",
+        "start_source_page",
+        "end_source_page",
+        "apply_run",
+        "author",
+        "withdrawn_at",
+        "date_created",
+    ]
+    list_filter = ["origin", "kind", "withdrawn_at"]
+    raw_id_fields = [
+        "scan",
+        "start_source_edit",
+        "end_source_edit",
+        "apply_run",
+        "start_detection",
+        "end_detection",
+        "decision",
+        "replaces",
+        "author",
+        "withdrawn_by",
+    ]
+    readonly_fields = [f.name for f in OpinionBoundary._meta.fields]
 
     def has_add_permission(self, request):
         return False

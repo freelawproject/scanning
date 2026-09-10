@@ -16,7 +16,7 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.utils import timezone
 
-from scanning import apply, detections, services, yolo
+from scanning import apply, boundaries, detections, services, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
     ApplyRun,
@@ -338,8 +338,11 @@ class ComputeMixin:
         )
         stubs["geometry_pdf_path"] = pdf.start()
         self.addCleanup(pdf.stop)
-        pair = patch.object(services, "bl_pair", return_value=[{"a": 1}])
-        stubs["bl_pair"] = pair.start()
+        # The pairing writes the boundary rows (#240 PR C); the
+        # document it reads needs a PDF, which the stubbed
+        # ``detection_entries`` leaves empty, so stub the write.
+        pair = patch.object(boundaries, "write_computed", return_value=[])
+        stubs["write_computed"] = pair.start()
         self.addCleanup(pair.stop)
         # The compute reads the run's two documents (#269): the glued
         # detections in the final page space, and the printed pages.
@@ -406,8 +409,20 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         services.run_compute_redactions(scan.pk)
 
         scan.refresh_from_db()
-        self.assertEqual(scan.opinions_json, [{"a": 1}])
+        # One pairing, in the run's space, from the merged detection
+        # run; the rects are measured from the same pairs.
+        stubs["write_computed"].assert_called_once()
+        args = stubs["write_computed"].call_args.args
+        self.assertEqual(args[0].pk, scan.pk)
+        self.assertEqual(args[3], apply.current_run(scan))
+        self.assertEqual(args[4], 1)
         stubs["_compute_and_save_redaction_rects"].assert_called_once()
+        self.assertEqual(
+            stubs["_compute_and_save_redaction_rects"].call_args.kwargs[
+                "pairs"
+            ],
+            [],
+        )
         # force=True: the strips are measured from the detections, so a
         # fresh run must replace the stored ones.
         self.assertTrue(
@@ -794,7 +809,7 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         # keep the message it had.
         scan, rows = merged_scan(status=Status.PROCESSING)
         stubs = self.patch_geometry()
-        stubs["bl_pair"].side_effect = RuntimeError("boom")
+        stubs["write_computed"].side_effect = RuntimeError("boom")
 
         with self.assertLogs("scanning", level="WARNING"):
             services.run_compute_redactions(scan.pk)
@@ -809,7 +824,7 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         scan, rows = merged_scan(status=Status.PROCESSING)
         yolo.write_apply_state(rows, {"attempts": yolo.APPLY_MAX_ATTEMPTS - 1})
         stubs = self.patch_geometry()
-        stubs["bl_pair"].side_effect = RuntimeError("boom")
+        stubs["write_computed"].side_effect = RuntimeError("boom")
 
         with self.assertLogs("scanning", level="ERROR"):
             services.run_compute_redactions(scan.pk)
@@ -824,7 +839,7 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
     def test_a_failed_apply_is_queued_again(self):
         scan, rows = merged_scan()
         stubs = self.patch_geometry()
-        stubs["bl_pair"].side_effect = RuntimeError("boom")
+        stubs["write_computed"].side_effect = RuntimeError("boom")
         with self.assertLogs("scanning", level="WARNING"):
             services.run_compute_redactions(scan.pk)
 

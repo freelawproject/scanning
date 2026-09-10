@@ -2299,16 +2299,116 @@ decisions, the resolution), `services._import_detections` and
   one, `_compute_and_save_redaction_rects` and `_pages_for_geometry`
   read the rows, `run_generate_files` (paused) too. Nothing writes the
   file or pushes it, and the compute pushes nothing at all: every output
-  of the pass is a row, and `redaction_rects` / `margin_rects` /
-  `opinions_json` stay on `Scan` until PRs B and C. The `--files
-  detections.json` example of `reupload_scan_files` names a file that
-  no longer exists.
+  of the pass is a row, and `redaction_rects` / `margin_rects` stay on
+  `Scan` until PR B (`opinions_json` went with PR C, below). The
+  `--files detections.json` example of `reupload_scan_files` names a
+  file that no longer exists.
 - **No data migration.** Migration 0026 adds the columns and the table.
   Existing rows keep a blank address, and the boost and deactivation
   marks on them (`confidence = 1.0`, `active = False`) are not turned
   into decisions: the next import deletes those rows, as it did before.
   Decided in the #240 plan review: the data came from the legacy YOLO
   trio.
+
+## The opinion boundaries (issue #240, PR C)
+
+The third PR of the #240 plan. `Scan.opinions_json` held the output of
+`blackletter.api.pair` as a list of dicts with no identity, no
+provenance and no address; `models.OpinionBoundary` replaces it, one
+row per opinion and one per curator decision, and `OpinionScan` gets a
+FK to the boundary its file was cut from (#165). The pieces: the model,
+`scanning/boundaries.py` (the compute's write, the resolution, the
+decisions, the readers), the pairing in `services.run_compute_redactions`,
+the three endpoints in `views_api.py`, and the step-2 sidebar. What
+must not be broken:
+
+- **The address is the two anchors.** The start is the top-left corner
+  of the caption, the end the bottom-right corner of the key icon, each
+  a point in **PDF points** on a source page (`*_source_edit`,
+  `*_source_page`, the rule of `Detection`) with its 0-based index in
+  the space of `apply_run` (`*_page_index`, the #269 rule). The index
+  is stored, as PR A stores it, and `relocate_human_rows` moves the
+  curator's additions through the map after each compute under a run,
+  the `relocate_manual_rows` rule. `Detection` keeps its pixels;
+  `boundaries.to_points` converts with the page size when the compute
+  has it and with `yolo.DPI` otherwise, and the two differ by less than
+  a point.
+- **Computed rows are rebuilt, human rows are withdrawn.** Every
+  compute deletes the scan's computed rows and writes the pairing again
+  (`write_computed`); a human row (`ADD`, or `DISMISS`) is never
+  deleted by automation, and a curator takes it back with
+  `withdrawn_at` (`withdraw`, which also writes `date_modified`). A
+  second withdrawal is a no-op.
+- **A dismissal names its target by its anchors, in the anchor
+  columns**, and not in a copy: for a boundary the anchors *are* the
+  address, so the posted plan's `target_*` columns were not added.
+  `resolve` lands each standing, non-stale dismissal on the rebuilt
+  row with the same start address whose start point is nearest and
+  within `ANCHOR_TOLERANCE_PT` (12 pt, about one line; measure it on a
+  few recomputes), each row taken once, and sets `decision`. An
+  unresolved dismissal is logged as a WARNING and left standing; PR D
+  raises it as `stale_boundary_edit`. `resolve` reads no computed row
+  when no dismissal stands. `dismiss` sets the FK on the current row
+  at once, so the viewer needs no compute, and `restore` withdraws the
+  dismissal and clears it, so an undo needs none either.
+- **A move of an anchor is a dismissal plus an addition** that names it
+  in `replaces` (`add(..., replaces=row)`, one transaction), and
+  dismissing the addition withdraws both, so the computed boundary
+  comes back. The endpoints compose a merge (one add, two dismissals)
+  and a split (one dismissal, two adds) as well; the viewer of this PR
+  offers dismiss and move only, the minimal set decided on 2026-09-09,
+  and the rest is #287's viewer work. If the full set comes, `replaces`
+  must move to the dismissal as `replaced_by`, since a merge has two
+  dismissals for one add.
+- **The compute pairs once.** `_compute_and_save_redaction_rects` used
+  to pair for the rects and `bl_pair` paired again for `opinions_json`.
+  Now `services._snapped_document` builds the corrected document once
+  and returns `{id(bl_detection): Detection pk}` (from the `"id"`
+  `detection_entries` puts on each entry, which blackletter ignores),
+  `boundaries.write_computed` runs `_pair_opinions` on it and writes
+  the rows with **exact** `start_detection` and `end_detection` FKs,
+  and the same pairs go to `compute_redaction_rects`. `bl_pair` is not
+  imported any more. The FKs are `SET_NULL`: the model rows are deleted
+  at every import, and the anchors carry the position on their own.
+- **Every consumer reads `boundaries.standing`** (the computed rows,
+  dismissed or not, plus the additions not withdrawn, in reading order:
+  page, then column from the page's `TEXT_COLUMN` rows, then y) through
+  `viewer_payload`, which emits the legacy dict shape (`caption_page`,
+  `key_page`, `end_page`, `page_count`, `has_image`,
+  `first_page_number`, `last_page_number`, `outside_rects`) plus `id`,
+  `origin`, `kind`, `dismissed`, `dismissal_id`, `caption_detection_id`,
+  `key_detection_id`, `start` and `end`. `caption_bbox` and `key_bbox`
+  are gone: the unmatched-key cards of step 2 now read the detection
+  ids. `outside_rects` are derived, unwidened (blackletter's
+  `_outside_opinion_rects` with no page: the ink growth needs the PDF,
+  which step 3 has and the viewer does not). The printed numbers come
+  from the lookup the caller holds (`scan_process_view` passes the page
+  map it built; `serve_opinions` reads `_page_number_lookup`).
+- **A dismissed boundary keeps its card and draws nothing.** The
+  sidebar shows it muted with "Undo"; `_buildBoundsCache` in
+  `viewer_step2.js` skips it, so the bounds overlay and the coverage
+  gaps (`utils.compute_coverage_gaps`) ignore it. The card's Dismiss,
+  Undo and the two anchor buttons post to `boundaries/dismiss/`,
+  `boundaries/restore/` and `boundaries/add/` and reload, as
+  `pairOpinions` does: the cards are rendered by the server. The pick
+  mode (`pickBoundaryAnchor` in `viewer_sidebar.js`) waits for a click
+  on a caption or a key icon box; the box's click handler in
+  `viewer_step2.js` yields to `window.boundaryPickTarget` first, or the
+  click would fall through to the page. A refusal (a 409 on a page with
+  no address, `BOUNDARY_UNADDRESSABLE_MESSAGE`) reaches the toast.
+- **Step 3 (paused) reads the rows** through `viewer_payload` in
+  `_build_combined_redactions` and `run_generate_files`, and sets
+  `OpinionScan.boundary` from the dict's `id`. `page_start`,
+  `caption_page_index`, `key_page_index` and `has_image` stay until
+  #275.
+- **Migration 0027 copies no data**, the plan's decision: the lists
+  came from the legacy YOLO trio. It blanks the `apply_run` of the
+  detect ledger for every scan in `PAGE_COMPLETENESS_REVIEW_DONE` or
+  `READY_FOR_REDACTION_REVIEW`, so `yolo.queue_ready_runs` recomputes
+  them on its next tick and the rows are written in the measured space.
+  A `REDACTION_REVIEW_DONE` scan and a legacy scan get nothing (#263,
+  #271). PR B needs the same blank; whichever lands second blanks
+  again, which costs one more compute per scan in review.
 
 ## Detection Workflow
 

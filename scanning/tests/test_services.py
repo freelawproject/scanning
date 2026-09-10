@@ -741,23 +741,25 @@ class TestServeOpinions(TestCase):
     """Test that serve_opinions reads from DB, not disk."""
 
     def test_returns_opinions_from_db(self):
+        from scanning.factories import OpinionBoundaryFactory
+
         user = UserFactory()
         self.client.force_login(user)
-        opinions_data = [{"caption_page": 0, "key_page": 0}]
-        scan = ScanFactory(
-            uploaded_by=user,
-            opinions_json=opinions_data,
+        scan = ScanFactory(uploaded_by=user, page_count=2)
+        row = OpinionBoundaryFactory(
+            scan=scan, start_page_index=0, end_page_index=0
         )
         response = self.client.get(f"/scans/{scan.pk}/opinions-json/")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(len(data), 1)
         self.assertEqual(data[0]["caption_page"], 0)
+        self.assertEqual(data[0]["id"], row.pk)
 
     def test_returns_empty_list_without_opinions(self):
         user = UserFactory()
         self.client.force_login(user)
-        scan = ScanFactory(uploaded_by=user, opinions_json="")
+        scan = ScanFactory(uploaded_by=user)
         response = self.client.get(f"/scans/{scan.pk}/opinions-json/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [])
@@ -1170,17 +1172,11 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
         output = pathlib.Path(scan.output_dir)
         bitonal = output / "bitonal.pdf"
         _write_bitonal_copy(bitonal)
-        scan.opinions_json = [
-            {
-                "caption_page": 0,
-                "key_page": 0,
-                "end_page": 0,
-                "page_count": 1,
-                "first_page_number": 1,
-                "last_page_number": 1,
-            }
-        ]
-        scan.save(update_fields=["opinions_json"])
+        from scanning.factories import OpinionBoundaryFactory
+
+        boundary = OpinionBoundaryFactory(
+            scan=scan, start_page_index=0, end_page_index=0
+        )
 
         with (
             # close_all() resets connections for daemon-process forking;
@@ -1207,6 +1203,8 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.stage, Stage.APPROVED)
         self.assertEqual(scan.status, Status.PENDING_REVIEW)
+        # The file row names the boundary it was cut from (#240 PR C).
+        self.assertEqual(scan.opinions.get().boundary_id, boundary.pk)
 
     def test_computes_margins_when_absent(self):
         """Whiteouts must not depend on the viewer having asked for them.

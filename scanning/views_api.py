@@ -31,6 +31,7 @@ from scanning.models import (
     Detection,
     DetectionDecision,
     Issue,
+    OpinionBoundary,
     OpinionScan,
     Scan,
     Stage,
@@ -116,16 +117,225 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
 
 @login_required
 def serve_opinions(request: HttpRequest, pk: int) -> JsonResponse:
-    """Return paired opinion data for a scan as JSON.
+    """Return the opinion boundaries of a scan as JSON.
+
+    The rows, in the dict shape ``blackletter.api.pair`` produced plus
+    their ids (#240 PR C, ``boundaries.viewer_payload``). A dismissed
+    computed boundary is in the list with ``dismissed`` true, so the
+    sidebar can offer its undo; the overlays skip it.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: JSON response with a list of opinion dicts.
     """
+    from scanning import boundaries
+
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.opinions_json:
-        return JsonResponse(scan.opinions_json, safe=False)
-    return JsonResponse([], safe=False)
+    return JsonResponse(boundaries.viewer_payload(scan), safe=False)
+
+
+#: The 409 of a boundary anchor on a page no address can be written for
+#: (``boundaries.UnaddressableBoundary``).
+BOUNDARY_UNADDRESSABLE_MESSAGE = (
+    "This page cannot be addressed in the current volume, so the "
+    "boundary cannot be kept. Reload the page; if it stays, ask a staff "
+    "member."
+)
+
+
+def _boundary_or_404(scan: Scan, data: dict):
+    """Return the boundary ``data`` names, or the 404 response.
+
+    :param scan: The scan.
+    :param data: The parsed body, with ``boundary_id``.
+    :returns: The row, or a ``JsonResponse``.
+    """
+    row = OpinionBoundary.objects.filter(
+        pk=data.get("boundary_id"), scan=scan
+    ).first()
+    if row is None:
+        return JsonResponse(
+            {"status": "error", "message": "Opinion boundary not found"},
+            status=404,
+        )
+    return row
+
+
+@login_required
+@require_POST
+def dismiss_boundary(request: HttpRequest, pk: int) -> JsonResponse:
+    """Take an opinion boundary out of the volume.
+
+    A computed row gets a ``dismiss`` row that copies its anchors (#240
+    PR C): the row is rebuilt at the next compute, and the dismissal is
+    what carries the curator's choice onto the new row. A boundary the
+    curator added is withdrawn, and gives back the computed one it
+    replaced, if any. Nothing is deleted.
+
+    :param request: The HTTP request (JSON body with ``boundary_id``).
+    :param pk: Scan primary key.
+    :return: ``dismissal_id`` for a computed row, null for a withdrawn
+        addition; 404 when the row is not the scan's.
+    """
+    from scanning import boundaries
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = _boundary_or_404(scan, data)
+    if isinstance(row, JsonResponse):
+        return row
+    dismissal = boundaries.dismiss(scan, row, request.user)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "boundary_id": row.pk,
+            "dismissal_id": dismissal.pk if dismissal else None,
+            "withdrawn": dismissal is None,
+        }
+    )
+
+
+@login_required
+@require_POST
+def restore_boundary(request: HttpRequest, pk: int) -> JsonResponse:
+    """Give a dismissed computed boundary back.
+
+    Withdraws the standing dismissal; the boundary is drawn again with
+    no compute. A withdrawn addition is not restored: the curator adds
+    again.
+
+    :param request: The HTTP request (JSON body with ``boundary_id``).
+    :param pk: Scan primary key.
+    :return: ``restored`` says whether a dismissal stood.
+    """
+    from scanning import boundaries
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = _boundary_or_404(scan, data)
+    if isinstance(row, JsonResponse):
+        return row
+    restored = boundaries.restore(scan, row, request.user)
+    return JsonResponse(
+        {"status": "ok", "boundary_id": row.pk, "restored": restored}
+    )
+
+
+def _anchor_spec(scan: Scan, spec) -> "Detection | tuple | JsonResponse":
+    """Turn one anchor of the ``add`` body into what ``boundaries.add`` takes.
+
+    :param scan: The scan.
+    :param spec: ``{"detection_id": n}`` or ``{"page_index", "x", "y"}``
+        with the point in PDF points.
+    :returns: The detection row, the point, or a 400/404 response.
+    """
+    if not isinstance(spec, dict):
+        return JsonResponse(
+            {"status": "error", "message": "An anchor must be an object"},
+            status=400,
+        )
+    if spec.get("detection_id") is not None:
+        row = Detection.objects.filter(
+            pk=spec["detection_id"], scan=scan
+        ).first()
+        if row is None:
+            return JsonResponse(
+                {"status": "error", "message": "Detection not found"},
+                status=404,
+            )
+        return row
+    try:
+        return (int(spec["page_index"]), float(spec["x"]), float(spec["y"]))
+    except (KeyError, TypeError, ValueError):
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "An anchor needs a detection_id, or a "
+                "page_index with x and y",
+            },
+            status=400,
+        )
+
+
+@login_required
+@require_POST
+def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
+    """Write an opinion boundary the curator drew.
+
+    Each anchor is a detection the curator picked (the caption for the
+    start, the key icon for the end) or a point in PDF points.
+    ``replaces`` names a computed boundary the new one stands in place
+    of (a moved anchor): the view dismisses it and writes the addition
+    in one transaction, and withdrawing the addition gives it back.
+
+    :param request: The HTTP request (JSON body with ``start``, ``end``
+        and optionally ``replaces``).
+    :param pk: Scan primary key.
+    :return: The new ``boundary_id`` and the ``dismissal_id`` it
+        replaces; 409 when a page has no address; 400 when the end page
+        is before the start.
+    """
+    from scanning import boundaries, detections
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    start = _anchor_spec(scan, data.get("start"))
+    if isinstance(start, JsonResponse):
+        return start
+    end = _anchor_spec(scan, data.get("end"))
+    if isinstance(end, JsonResponse):
+        return end
+    replaces = None
+    if data.get("replaces") is not None:
+        replaces = (
+            OpinionBoundary.objects.computed()
+            .filter(pk=data["replaces"], scan=scan)
+            .first()
+        )
+        if replaces is None:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "The boundary to replace was not found",
+                },
+                status=404,
+            )
+    try:
+        row = boundaries.add(
+            scan,
+            start,
+            end,
+            request.user,
+            detections.measured_run(scan),
+            replaces=replaces,
+        )
+    except boundaries.UnaddressableBoundary:
+        return JsonResponse(
+            {"status": "error", "message": BOUNDARY_UNADDRESSABLE_MESSAGE},
+            status=409,
+        )
+    except boundaries.MisorderedBoundary:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "The end of an opinion cannot be on a page "
+                "before its start.",
+            },
+            status=400,
+        )
+    return JsonResponse(
+        {
+            "status": "ok",
+            "boundary_id": row.pk,
+            "dismissal_id": row.replaces_id,
+        }
+    )
 
 
 @login_required

@@ -25,7 +25,15 @@ from django.template.loader import render_to_string
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
-from scanning import dots_mocr, jobs, page_edits, repairs, s3_sync, yolo
+from scanning import (
+    boundaries,
+    dots_mocr,
+    jobs,
+    page_edits,
+    repairs,
+    s3_sync,
+    yolo,
+)
 from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
@@ -39,6 +47,7 @@ from scanning.models import (
     JobEngine,
     JobStage,
     JobStatus,
+    OpinionBoundary,
     OpinionScan,
     PageEdit,
     PageRepairRequest,
@@ -365,7 +374,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     )
 
     # No eager S3 pull here: this page renders entirely from the DB
-    # (page_map, ocr_results, opinions_json, detections, redaction_rects),
+    # (page_map, ocr_results, the boundaries, detections, redaction_rects),
     # so it never reads the processing files off disk. Pulling them here
     # blocked the response on I/O it doesn't need -- worst right after a
     # fresh upload, when the only object in the prefix is the multi-GB
@@ -400,7 +409,10 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 step = 2
             else:
                 step = 1
-        elif scan.stage == Stage.PROCESS or scan.opinions_json:
+        elif (
+            scan.stage == Stage.PROCESS
+            or OpinionBoundary.objects.computed().filter(scan=scan).exists()
+        ):
             # Stay on step 1 if there are unresolved issues
             has_issues = scan.issues.exclude(
                 check_name=CheckName.SUPPRESS_DETECTION
@@ -570,7 +582,14 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
 
     has_detections = Detection.objects.filter(scan=scan).exists()
 
-    opinions = scan.opinions_json
+    # The boundaries are rows since #240 PR C, read in the legacy dict
+    # shape plus their ids. The printed numbers come from the page map
+    # the view built above, which is already in the space the rows are
+    # drawn in (the final space when the redactions are measured against
+    # the standing run, #269).
+    opinions = boundaries.viewer_payload(
+        scan, {idx: (num, None) for idx, num in idx_to_logical.items()}
+    )
 
     # Build a set of page indices that contain IMAGE detections
     image_page_indices = set(
@@ -661,22 +680,25 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                     )
                 )
 
-        paired_caption_keys = set()
+        # The rows name the caption and the key they were paired from
+        # (#240 PR C), so a paired detection is one an open boundary
+        # points at; a dismissed boundary frees its two, and a boundary
+        # drawn from a point names none.
+        paired_caption_ids = set()
+        paired_key_ids = set()
         paired_key_keys = set()
         for op in opinions:
-            cb = op.get("caption_bbox", [0, 0, 0, 0])
-            kb = op.get("key_bbox", [0, 0, 0, 0])
-            paired_caption_keys.add(
-                (op.get("caption_page", 0), round(cb[0]), round(cb[1]))
-            )
-            paired_key_keys.add(
-                (op.get("key_page", 0), round(kb[0]), round(kb[1]))
-            )
+            if op.get("dismissed"):
+                continue
+            if op.get("caption_detection_id"):
+                paired_caption_ids.add(op["caption_detection_id"])
+            if op.get("key_detection_id"):
+                paired_key_ids.add(op["key_detection_id"])
 
         for d in Detection.objects.filter(
             scan=scan, active=True, label="KEY_ICON"
         ).order_by("page_index"):
-            if (d.page_index, round(d.x0), round(d.y0)) not in paired_key_keys:
+            if d.pk not in paired_key_ids:
                 if (
                     d.page_index,
                     d.label_id,
@@ -690,13 +712,18 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # Build sorted list of paired key icon positions so we can
         # determine which key-icon span an unmatched caption falls in.
         # If a span already has a paired caption, extra captions in
-        # that span are continuations — not missed opinions.
+        # that span are continuations — not missed opinions. The test
+        # compares pixels, so the positions come off the key rows the
+        # boundaries name; a boundary drawn from a point names none and
+        # adds no span.
+        for d in Detection.objects.filter(pk__in=paired_key_ids):
+            paired_key_keys.add((d.page_index, round(d.x0), round(d.y0)))
         paired_keys_sorted = sorted(paired_key_keys)
 
         for d in Detection.objects.filter(
             scan=scan, active=True, label="CASE_CAPTION"
         ).order_by("page_index", "y0"):
-            if (d.page_index, round(d.x0), round(d.y0)) in paired_caption_keys:
+            if d.pk in paired_caption_ids:
                 continue
             if (
                 d.page_index,
@@ -2038,7 +2065,10 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "issues": scan.issues.all(),
         "missing_pages": scan.missing_pages,
         "has_detections": Detection.objects.filter(scan=scan).exists(),
-        "opinions": scan.opinions_json,
+        # The bar reads truthiness alone ("Next: Generate").
+        "opinions": OpinionBoundary.objects.computed()
+        .filter(scan=scan)
+        .exists(),
         "dots_run": dots_mocr.run_summary(scan),
         "yolo_run": yolo_run,
         "detect_message": detection_message(yolo_run),

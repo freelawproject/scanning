@@ -18,6 +18,7 @@ from PIL import Image
 
 from scanning.factories import (
     ExternalJobFactory,
+    OpinionBoundaryFactory,
     OpinionScanFactory,
     PageEditFactory,
     ReporterFactory,
@@ -3014,7 +3015,9 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
             uploaded_by=self.user,
             status=Status.PENDING_REVIEW,
             page_count=1,
-            opinions_json=[{"dummy": True}],
+        )
+        OpinionBoundaryFactory(
+            scan=self.scan, start_page_index=0, end_page_index=0
         )
         pathlib.Path(self.scan.original_pdf.path).unlink()
         # An output dir with no bitonal/OCR PDF in it: the API views get
