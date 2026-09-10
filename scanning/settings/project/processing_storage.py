@@ -22,6 +22,24 @@ PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS = env.int(
 # Configured in whole GB via MAX_UPLOAD_SIZE_GB (default 3 GB).
 MAX_ORIGINAL_UPLOAD_SIZE = env.int("MAX_UPLOAD_SIZE_GB", default=3) * 1024**3
 
+# Maximum accepted size (in bytes) of one page-edit upload of review 1: a
+# replacement of one page, or an insert of a missing leaf (#232). The
+# default is a sixth of MAX_ORIGINAL_UPLOAD_SIZE (512 MiB at the 3 GB
+# default): an insert is a part of a volume and never the whole, and a
+# file above it is a whole volume sent by mistake. PAGE_UPLOAD_MAX_MB,
+# in whole MB, overrides it. The cap was 50 MB, which refused a rescan
+# of 90 pages (138 MB) that a scanner made for a real gap; a gap takes
+# one insert (#256), so the file could not be split. The web pod reads
+# the file from its temporary file, not into memory, so the cap costs
+# no RAM there. The apply (#224) makes one job shard of each uploaded
+# file, so a large insert is one shard above SHARD_TARGET_BYTES.
+_page_upload_max_mb = env.int("PAGE_UPLOAD_MAX_MB", default=None)
+PAGE_UPLOAD_MAX_BYTES = (
+    _page_upload_max_mb * 1024**2
+    if _page_upload_max_mb
+    else MAX_ORIGINAL_UPLOAD_SIZE // 6
+)
+
 # How long a presigned direct-to-S3 upload (PendingUpload) may sit
 # unconfirmed before cleanup_processing_tmp deletes it -- and, if the
 # upload never landed, its fileless scan. Covers users who close the tab
