@@ -4,29 +4,28 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('scanning', '0024_stamp_redaction_apply_run'),
+        ("scanning", "0024_stamp_redaction_apply_run"),
     ]
 
     operations = [
         migrations.RemoveIndex(
-            model_name='page',
-            name='idx_page_scan_idx',
+            model_name="page",
+            name="idx_page_scan_idx",
         ),
         migrations.RemoveIndex(
-            model_name='page',
-            name='idx_page_status',
+            model_name="page",
+            name="idx_page_status",
         ),
         migrations.RemoveIndex(
-            model_name='page',
-            name='idx_page_review',
+            model_name="page",
+            name="idx_page_review",
         ),
         migrations.RemoveConstraint(
-            model_name='page',
-            name='unique_page_scan_index',
+            model_name="page",
+            name="unique_page_scan_index",
         ),
         migrations.DeleteModel(
-            name='Page',
+            name="Page",
         ),
     ]

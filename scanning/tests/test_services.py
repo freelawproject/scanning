@@ -27,6 +27,7 @@ from scanning.models import (
     Issue,
     PageEdit,
     QueueStatus,
+    Redaction,
     Scan,
     Stage,
     Status,
@@ -301,7 +302,7 @@ class TestModelProvenanceSurvives(TestCase):
             reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
             data=json.dumps(
                 {
-                    "page_index": 3,
+                    "page_index": 0,
                     "label_id": 1,
                     "bbox": [100, 100, 140, 140],
                     "img_width": 1700,
@@ -319,7 +320,7 @@ class TestModelProvenanceSurvives(TestCase):
         self.assertEqual(added.found_by, [])
         self.assertEqual(added.pk, response.json()["detection_id"])
         # Addressed by its source page (#240): no run, so the original's.
-        self.assertEqual(added.source_page, 4)
+        self.assertEqual(added.source_page, 1)
         self.assertIsNone(added.source_edit)
 
     def test_a_second_add_on_the_curator_s_own_box_is_a_no_op(self):
@@ -329,7 +330,7 @@ class TestModelProvenanceSurvives(TestCase):
 
         self.client.force_login(UserFactory())
         body = {
-            "page_index": 3,
+            "page_index": 0,
             "label_id": 1,
             "bbox": [100, 100, 140, 140],
             "img_width": 1700,
@@ -451,38 +452,13 @@ class TestDetectionEntries(TestCase):
         self.assertEqual(detection_entries(scan.pk), [])
 
 
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestComputeAndSaveRedactionRects(TestCase):
-    """Test _compute_and_save_redaction_rects."""
+class TestMeasureRedactionRects(TestCase):
+    """``_measure_redaction_rects`` measures and writes nothing (#240 PR B)."""
 
     def setUp(self):
         _require_fixture(self)
 
-    def test_writes_redaction_rects_json(self):
-        from scanning.services import _compute_and_save_redaction_rects
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            _run_detect_on_fixture(tmpdir)
-            _import_detections(scan.pk, tmpdir)
-
-            rects = _compute_and_save_redaction_rects(scan.pk, str(PDF_PATH))
-            self.assertGreater(len(rects), 0)
-
-            scan.refresh_from_db()
-            self.assertTrue(scan.redaction_rects)
-
-    def test_corrects_the_column_boxes_before_measuring(self):
-        """The rects and the margins must read the same column boxes.
-
-        Margin strips are computed from ink-corrected columns. A reviewer
-        who hand-draws a missed ``TEXT_COLUMN`` puts it in the DB exactly as
-        drawn, so without this the headnote rects on that page would snap to
-        the raw box while the margins used the corrected one.
-        """
+    def test_returns_the_rects_in_pixels(self):
         from scanning import services
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -492,19 +468,66 @@ class TestComputeAndSaveRedactionRects(TestCase):
             )
             _run_detect_on_fixture(tmpdir)
             _import_detections(scan.pk, tmpdir)
+            document, _ids, _entries = services._snapped_document(
+                scan, str(PDF_PATH)
+            )
 
-            with patch.object(services, "snap_document_columns") as snap:
-                services._compute_and_save_redaction_rects(
-                    scan.pk, str(PDF_PATH)
-                )
-            snap.assert_called_once()
-            document = snap.call_args.args[0]
-            self.assertTrue(document.pages, "snapped an empty document")
+            rects = services._measure_redaction_rects(document, None)
+
+            self.assertGreater(len(rects), 0)
+            self.assertEqual(Redaction.objects.filter(scan=scan).count(), 0)
+
+    def test_nothing_without_pages(self):
+        from types import SimpleNamespace
+
+        from scanning import services
+
+        self.assertEqual(
+            services._measure_redaction_rects(SimpleNamespace(pages=[]), None),
+            [],
+        )
+
+    def test_the_snapped_document_corrects_the_columns_in_memory(self):
+        """The correction is applied to the document and never written
+        back: ``_snap_text_columns_to_ink`` owns persistence, and a
+        reviewer's hand-drawn column must reach the geometry corrected
+        while its row stays as drawn."""
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir, reporter=ReporterFactory(short_name="a3d")
+            )
+            pdf = pathlib.Path(scan.output_dir) / "bitonal.pdf"
+            write_two_column_page(pdf, tmp_dir=pathlib.Path(tmpdir))
+            det = Detection.objects.create(
+                scan=scan,
+                page_index=0,
+                label="TEXT_COLUMN",
+                label_id=16,
+                confidence=0.95,
+                x0=COLUMN_LEFT.x0 + 6,
+                y0=COLUMN_LEFT.y0,
+                x1=COLUMN_LEFT.x1 - 6,
+                y1=COLUMN_LEFT.y1,
+                img_width=PAGE_W,
+                img_height=PAGE_H,
+            )
+
+            document, _ids, _entries = services._snapped_document(
+                scan, str(pdf)
+            )
+
+            box = document.pages[0].detections[0].bbox
+            self.assertAlmostEqual(box.x1, COLUMN_LEFT.x0, delta=2.0)
+            self.assertAlmostEqual(box.x2, COLUMN_LEFT.x1, delta=2.0)
+            det.refresh_from_db()
+            self.assertEqual(det.x0, COLUMN_LEFT.x0 + 6, "persisted the snap")
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestComputeAndSaveMarginRects(TestCase):
-    """Test _compute_and_save_margin_rects."""
+class TestMeasureMarginRects(TestCase):
+    """``_measure_margin_rects`` measures against the document's pages."""
 
     def setUp(self):
         _require_fixture(self)
@@ -526,8 +549,18 @@ class TestComputeAndSaveMarginRects(TestCase):
             img_height=2200,
         )
 
-    def test_writes_margin_rects_to_model(self):
-        from scanning.services import _compute_and_save_margin_rects
+    def _document(self, scan):
+        from scanning.services import (
+            _build_document_from_detections,
+            detection_entries,
+        )
+
+        return _build_document_from_detections(
+            scan, detection_entries(scan.pk, page_numbers={}), str(PDF_PATH)
+        )
+
+    def test_measures_the_strips_in_points(self):
+        from scanning.services import _measure_margin_rects
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(
@@ -535,59 +568,31 @@ class TestComputeAndSaveMarginRects(TestCase):
                 reporter=ReporterFactory(short_name="a3d"),
             )
             self._with_column(scan)
-            rects = _compute_and_save_margin_rects(
-                scan.pk, str(PDF_PATH), tmpdir
+
+            margins = _measure_margin_rects(
+                str(PDF_PATH), self._document(scan)
             )
-            self.assertIsNotNone(rects)
 
-            scan.refresh_from_db()
-            self.assertTrue(scan.margin_rects)
+            self.assertTrue(margins)
+            self.assertEqual(margins[0]["page_index"], 0)
+            self.assertEqual(Redaction.objects.filter(scan=scan).count(), 0)
 
-    def test_returns_cached_on_second_call(self):
-        from scanning.services import _compute_and_save_margin_rects
+    def test_does_not_measure_anything_without_detections(self):
+        """Without detections the bounds would come from the page's marks
+        alone, so bleed-through at a page edge suppresses that page's top
+        strip: a worse answer than none."""
+        from types import SimpleNamespace
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
+        from scanning import services
+
+        with patch.object(services, "compute_margin_rects") as measure:
+            self.assertEqual(
+                services._measure_margin_rects(
+                    str(PDF_PATH), SimpleNamespace(pages=[])
+                ),
+                [],
             )
-            self._with_column(scan)
-            first = _compute_and_save_margin_rects(
-                scan.pk, str(PDF_PATH), tmpdir
-            )
-            second = _compute_and_save_margin_rects(
-                scan.pk, str(PDF_PATH), tmpdir
-            )
-            self.assertEqual(first, second)
-
-    def test_does_not_cache_a_result_computed_without_detections(self):
-        """Margins measured from marks alone lose a page's top strip.
-
-        detections.json belongs to whichever process ran the pipeline, and
-        ``/tmp`` is per-container in dev and per-pod in production, so a
-        viewer request can arrive before this machine has it. Caching that
-        answer means it is never recomputed once the detections land.
-        """
-        from scanning.services import _compute_and_save_margin_rects
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            rects = _compute_and_save_margin_rects(
-                scan.pk, str(PDF_PATH), tmpdir
-            )
-            self.assertIsNotNone(rects)
-
-            scan.refresh_from_db()
-            self.assertFalse(scan.margin_rects, "cached a detection-less run")
-
-            # ...and once the detections exist, the next call caches.
-            self._with_column(scan)
-            _compute_and_save_margin_rects(scan.pk, str(PDF_PATH), tmpdir)
-            scan.refresh_from_db()
-            self.assertTrue(scan.margin_rects)
+        measure.assert_not_called()
 
     def test_reads_detections_from_the_db_not_the_file(self):
         """The DB is the source of truth, and is always reachable."""
@@ -606,28 +611,6 @@ class TestComputeAndSaveMarginRects(TestCase):
             dets = detection_entries(scan.pk, page_numbers={})
             self.assertEqual([d["label"] for d in dets], ["TEXT_COLUMN"])
             self.assertEqual(dets[0]["bbox"], [100, 200, 1600, 2000])
-
-    def test_does_not_measure_anything_without_detections(self):
-        """Refuse before rendering, not after.
-
-        The viewer asks for these on a sync request and does not cache the
-        reply, so measuring a result that is then thrown away un-cached
-        renders the whole volume at 100 dpi on every poll, in the executor
-        every other sync view shares.
-        """
-        from scanning import services
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            with patch.object(services, "compute_margin_rects") as measure:
-                rects = services._compute_and_save_margin_rects(
-                    scan.pk, str(PDF_PATH), tmpdir
-                )
-            measure.assert_not_called()
-            self.assertEqual(rects, [])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -1212,65 +1195,10 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
         # The file row names the boundary it was cut from (#240 PR C).
         self.assertEqual(scan.opinions.get().boundary_id, boundary.pk)
 
-    def test_computes_margins_when_absent(self):
-        """Whiteouts must not depend on the viewer having asked for them.
-
-        Margin rects are computed on demand elsewhere, so a scan taken
-        straight from review to Generate used to ship with no whiteouts at
-        all -- platen bands, fold shadows and corner bleed left in the
-        deliverable.
-        """
-        from scanning import services
-
-        scan = _make_scan_with_output(
-            reporter=ReporterFactory(short_name="a3d"),
-        )
-        output = pathlib.Path(scan.output_dir)
-        shutil.copy2(PDF_PATH, output / "bitonal.pdf")
-        self.assertFalse(scan.margin_rects)
-        # A scan reaching Generate has been detected, and the margin bounds
-        # are only cached once detections back them up.
-        Detection.objects.create(
-            scan=scan,
-            page_index=0,
-            label="TEXT_COLUMN",
-            label_id=16,
-            confidence=0.95,
-            x0=100,
-            y0=200,
-            x1=1600,
-            y1=2000,
-            img_width=1700,
-            img_height=2200,
-        )
-
-        with (
-            patch("django.db.connections.close_all"),
-            patch("blackletter.api.generate") as generate,
-            patch.object(services, "_push_processing_files_to_s3"),
-            patch.object(services, "_pull_processing_files_from_s3"),
-        ):
-            generate.return_value = {
-                "opinion_count": 0,
-                "full_redacted": "",
-                "redacted_dir": str(output / "redacted"),
-            }
-            services.run_generate_files(scan.pk)
-
-        scan.refresh_from_db()
-        self.assertTrue(scan.margin_rects, "no margin rects computed")
-        self.assertTrue(
-            any(e["rects"] for e in scan.margin_rects),
-            "margin rects are all empty",
-        )
-
-    def test_computes_redaction_rects_when_absent(self):
-        """Generate is self-sufficient now that the upload path skips rects.
-
-        ``run_full_pipeline`` no longer computes them, and the step 2
-        overlay only asks for them if a reviewer opens it, so Generate
-        cannot assume they exist.
-        """
+    def test_writes_redactions_json_from_the_rows(self):
+        """The rows are the store (#240 PR B): a computed box and a drawn
+        one both reach ``redactions.json`` in points, and nothing is
+        measured here."""
         from scanning import services
 
         scan = _make_scan_with_output(
@@ -1278,79 +1206,31 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
         )
         output = pathlib.Path(scan.output_dir)
         _write_bitonal_copy(output / "bitonal.pdf")
-        self.assertFalse(scan.redaction_rects)
-
-        with (
-            patch("django.db.connections.close_all"),
-            patch("blackletter.api.generate") as generate,
-            patch.object(services, "_push_processing_files_to_s3"),
-            patch.object(services, "_pull_processing_files_from_s3"),
-            patch.object(
-                services, "_snap_text_columns_to_ink", return_value=0
-            ) as snap,
-            patch.object(
-                services, "_compute_and_save_redaction_rects", return_value=[]
-            ) as rects,
-        ):
-            generate.return_value = {
-                "opinion_count": 0,
-                "full_redacted": "",
-                "redacted_dir": str(output / "redacted"),
-            }
-            services.run_generate_files(scan.pk)
-
-        rects.assert_called_once()
-        self.assertEqual(rects.call_args.args[1], str(output / "bitonal.pdf"))
-        # The columns are corrected first: the rects and the margin strips
-        # are both measured against them.
-        snap.assert_called_once()
-        self.assertEqual(snap.call_args.args[1], str(output / "bitonal.pdf"))
-
-    def test_keeps_redaction_rects_a_reviewer_edited(self):
-        """Stored rects win, because a reviewer may have moved them.
-
-        ``save_redaction_rect`` writes straight into ``redaction_rects``,
-        so recomputing here would throw away every drag, delete and
-        hand-added box from step 3.
-        """
-        from scanning import services
-
-        scan = _make_scan_with_output(
-            reporter=ReporterFactory(short_name="a3d"),
+        common = {
+            "scan": scan,
+            "source_page": 1,
+            "page_index": 0,
+        }
+        Redaction.objects.create(
+            origin=Redaction.Origin.COMPUTED,
+            rect_type="headnote",
+            fill="black",
+            x0=10.0,
+            y0=20.0,
+            x1=30.0,
+            y1=40.0,
+            **common,
         )
-        output = pathlib.Path(scan.output_dir)
-        _write_bitonal_copy(output / "bitonal.pdf")
-        edited = [
-            {
-                "page_index": 0,
-                "rects": [
-                    {
-                        "x0": 10,
-                        "y0": 20,
-                        "x1": 30,
-                        "y1": 40,
-                        "fill": "black",
-                        "type": "headnote",
-                    }
-                ],
-            }
-        ]
-        scan.redaction_rects = edited
-        scan.save(update_fields=["redaction_rects"])
-        # The rects are stored in image pixels, so the page they name has to
-        # still have a detection to scale them by.
-        Detection.objects.create(
-            scan=scan,
-            page_index=0,
-            label="TEXT_COLUMN",
-            label_id=16,
-            confidence=0.95,
-            x0=100,
-            y0=200,
-            x1=1600,
-            y1=2000,
-            img_width=1700,
-            img_height=2200,
+        Redaction.objects.create(
+            origin=Redaction.Origin.HUMAN,
+            kind=Redaction.Kind.ADD,
+            rect_type="manual",
+            fill="white",
+            x0=1.0,
+            y0=2.0,
+            x1=3.0,
+            y1=4.0,
+            **common,
         )
 
         with (
@@ -1361,9 +1241,7 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
             patch.object(
                 services, "_snap_text_columns_to_ink", return_value=0
             ),
-            patch.object(
-                services, "_compute_and_save_redaction_rects"
-            ) as rects,
+            patch.object(services, "_measure_redaction_rects") as measure,
         ):
             generate.return_value = {
                 "opinion_count": 0,
@@ -1372,26 +1250,15 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
             }
             services.run_generate_files(scan.pk)
 
-        rects.assert_not_called()
-        scan.refresh_from_db()
-        self.assertEqual(scan.redaction_rects, edited)
-
-    def test_raises_without_any_processing_pdf(self):
-        """An empty output dir is still an error, just a clearer one."""
-        from scanning import services
-
-        scan = _make_scan_with_output(
-            reporter=ReporterFactory(short_name="a3d"),
+        measure.assert_not_called()
+        payload = json.loads(
+            pathlib.Path(generate.call_args.kwargs["redactions"]).read_text()
         )
-        with (
-            patch("django.db.connections.close_all"),
-            patch.object(services, "_pull_processing_files_from_s3"),
-            patch.object(services, "_handle_pipeline_exception") as handler,
-        ):
-            services.run_generate_files(scan.pk)
-
-        handler.assert_called_once()
-        self.assertIn("bitonal.pdf", str(handler.call_args.args[1]))
+        rects = payload["pages"]["0"]
+        self.assertEqual(
+            sorted((r["type"], r["x0"]) for r in rects),
+            [("headnote", 10.0), ("manual", 1.0)],
+        )
 
 
 class TestRedactionGeometryFromInk(SimpleTestCase):
@@ -1548,66 +1415,13 @@ class TestSnapTextColumnsToInk(TestCase):
         )
 
 
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestBuildCombinedRedactionsStaleRects(TestCase):
-    """Saved rects and live detections can disagree about which pages exist.
-
-    ``redaction_rects`` is a snapshot on the Scan; the pages come from the
-    detections as they stand now. Deactivating the last detection on a page
-    that a multi-page headnote block still has rects for leaves a page whose
-    pixel coordinates cannot be scaled to points.
-    """
-
-    def setUp(self):
-        _require_fixture(self)
-
-    def test_says_what_to_do_about_it(self):
-        from scanning import services
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            shutil.copy2(PDF_PATH, pathlib.Path(tmpdir) / "bitonal.pdf")
-            # Rects for page 0, and no detection anywhere to scale them by.
-            scan.redaction_rects = [
-                {
-                    "page_index": 0,
-                    "rects": [
-                        {
-                            "x0": 100,
-                            "y0": 200,
-                            "x1": 800,
-                            "y1": 400,
-                            "fill": "black",
-                            "type": "headnote",
-                        }
-                    ],
-                }
-            ]
-            scan.save(update_fields=["redaction_rects"])
-
-            with self.assertRaises(RuntimeError) as caught:
-                services._build_combined_redactions(scan.pk)
-            self.assertIn(
-                "Re-add a detection on that page", str(caught.exception)
-            )
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestBuildCombinedRedactionsPayload(TestCase):
-    """The payload ``generate`` reads mixes two coordinate spaces.
-
-    Redaction rects are stored in image pixels and margin rects in PDF
-    points, and both come out of this step in points. Getting that backwards
-    puts every blackout in the wrong place, and nothing downstream notices.
-    """
+    """The payload ``generate`` reads comes from the rows, in points (#240)."""
 
     def setUp(self):
         _require_fixture(self)
 
-    def test_pixel_rects_are_scaled_and_point_rects_are_not(self):
+    def test_rows_reach_the_pages_as_they_are(self):
         from scanning import services
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1615,46 +1429,49 @@ class TestBuildCombinedRedactionsPayload(TestCase):
                 tmpdir,
                 reporter=ReporterFactory(short_name="a3d"),
             )
-            output = pathlib.Path(scan.output_dir)
-            with fitz.open(str(output / "bitonal.pdf")) as doc:
-                page_w = doc[0].rect.width
-            # An image twice the page's width in points, so the scale is 1:2
-            # and a mistake cannot hide behind a factor of one.
-            Detection.objects.create(
-                scan=scan,
-                page_index=0,
-                label="TEXT_COLUMN",
-                label_id=16,
-                confidence=0.95,
-                x0=100,
-                y0=200,
-                x1=800,
-                y1=400,
-                img_width=int(page_w * 2),
-                img_height=2200,
+            common = {"scan": scan, "source_page": 1, "page_index": 0}
+            Redaction.objects.create(
+                origin=Redaction.Origin.COMPUTED,
+                rect_type="headnote",
+                fill="black",
+                x0=50.0,
+                y0=100.0,
+                x1=400.0,
+                y1=200.0,
+                **common,
             )
-            scan.redaction_rects = [
-                {
-                    "page_index": 0,
-                    "rects": [
-                        {
-                            "x0": 100,
-                            "y0": 200,
-                            "x1": 800,
-                            "y1": 400,
-                            "fill": "black",
-                            "type": "headnote",
-                        }
-                    ],
-                }
-            ]
-            scan.margin_rects = [
-                {
-                    "page_index": 0,
-                    "rects": [{"x0": 0.0, "y0": 0.0, "x1": 20.0, "y1": 50.0}],
-                }
-            ]
-            scan.save(update_fields=["redaction_rects", "margin_rects"])
+            Redaction.objects.create(
+                origin=Redaction.Origin.COMPUTED,
+                rect_type="margin",
+                fill="white",
+                x0=0.0,
+                y0=0.0,
+                x1=20.0,
+                y1=50.0,
+                **common,
+            )
+            hidden = Redaction.objects.create(
+                origin=Redaction.Origin.COMPUTED,
+                rect_type="KEY_ICON",
+                fill="black",
+                x0=5.0,
+                y0=5.0,
+                x1=6.0,
+                y1=6.0,
+                **common,
+            )
+            dismiss = Redaction.objects.create(
+                origin=Redaction.Origin.HUMAN,
+                kind=Redaction.Kind.DISMISS,
+                rect_type="KEY_ICON",
+                fill="black",
+                target_x0=5.0,
+                target_y0=5.0,
+                target_x1=6.0,
+                target_y1=6.0,
+                **common,
+            )
+            Redaction.objects.filter(pk=hidden.pk).update(decision=dismiss)
 
             payload = json.loads(
                 services._build_combined_redactions(scan.pk).read_text()
@@ -1662,68 +1479,12 @@ class TestBuildCombinedRedactionsPayload(TestCase):
             page_rects = payload["pages"]["0"]
 
             headnote = next(r for r in page_rects if r["type"] == "headnote")
-            self.assertAlmostEqual(headnote["x0"], 50.0, delta=0.2)
-            self.assertAlmostEqual(headnote["x1"], 400.0, delta=0.2)
-
+            self.assertEqual(headnote["x0"], 50.0)
+            self.assertEqual(headnote["x1"], 400.0)
             margin = next(r for r in page_rects if r["type"] == "margin")
-            self.assertEqual(
-                margin["x1"], 20.0, "margin rects are already points"
-            )
+            self.assertEqual(margin["x1"], 20.0)
             self.assertEqual(margin["fill"], "white")
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestServeMarginRectsView(TestCase):
-    """The endpoint the margin work exists for.
-
-    It must go through the service helper rather than measuring on its own:
-    computing here with a separate detection lookup is how the viewer once
-    cached margins with no top strips, permanently.
-    """
-
-    def setUp(self):
-        _require_fixture(self)
-        self.user = UserFactory()
-        self.client.force_login(self.user)
-
-    def test_computes_through_the_service_helper(self):
-        from scanning import services
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                uploaded_by=self.user,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            output = pathlib.Path(scan.output_dir)
-            with patch.object(
-                services, "_compute_and_save_margin_rects", return_value=[]
-            ) as compute:
-                response = self.client.get(f"/scans/{scan.pk}/margin-rects/")
-            self.assertEqual(response.status_code, 200)
-            compute.assert_called_once_with(
-                scan.pk, str(output / "bitonal.pdf"), str(output)
-            )
-
-    def test_a_detection_less_scan_is_not_cached(self):
-        """It must stay recomputable once the detections land."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                uploaded_by=self.user,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            response = self.client.get(f"/scans/{scan.pk}/margin-rects/")
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json(), [])
-            scan.refresh_from_db()
-            self.assertFalse(scan.margin_rects)
-
-    def test_returns_empty_without_a_processing_pdf(self):
-        scan = ScanFactory(uploaded_by=self.user)
-        response = self.client.get(f"/scans/{scan.pk}/margin-rects/")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), [])
+            self.assertNotIn("KEY_ICON", [r["type"] for r in page_rects])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -1763,69 +1524,21 @@ class TestMarginRectsUseTheDetections(TestCase):
                 img_width=1700,
                 img_height=2200,
             )
+            document = services._build_document_from_detections(
+                scan,
+                services.detection_entries(scan.pk, page_numbers={}),
+                str(PDF_PATH),
+            )
             with patch.object(
                 services, "compute_margin_rects", return_value=[]
             ) as measure:
-                services._compute_and_save_margin_rects(
-                    scan.pk, str(PDF_PATH), tmpdir
-                )
+                services._measure_margin_rects(str(PDF_PATH), document)
             pages = measure.call_args.kwargs["pages"]
             self.assertTrue(pages, "measured with no detected pages")
             self.assertIn(
                 Label.TEXT_COLUMN,
                 [d.label for d in pages[0].detections],
             )
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestPagesForGeometry(TestCase):
-    """The correction is applied in memory and never written back here.
-
-    ``_snap_text_columns_to_ink`` owns persistence. This helper exists for
-    boxes that reached the DB uncorrected, which is what a reviewer's
-    hand-drawn column is, and it must leave the row alone.
-    """
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.tmp = pathlib.Path(self._tmp.name)
-        self.scan = ScanFactory(reporter=ReporterFactory(short_name="a3d"))
-        output = pathlib.Path(self.scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        self.pdf = output / "bitonal.pdf"
-        write_two_column_page(self.pdf, tmp_dir=self.tmp)
-        self.det = Detection.objects.create(
-            scan=self.scan,
-            page_index=0,
-            label="TEXT_COLUMN",
-            label_id=16,
-            confidence=0.95,
-            x0=COLUMN_LEFT.x0 + 6,
-            y0=COLUMN_LEFT.y0,
-            x1=COLUMN_LEFT.x1 - 6,
-            y1=COLUMN_LEFT.y1,
-            img_width=PAGE_W,
-            img_height=PAGE_H,
-        )
-
-    def test_widens_an_uncorrected_box_without_persisting_it(self):
-        from scanning.services import _pages_for_geometry
-
-        pages = _pages_for_geometry(self.scan, str(self.pdf))
-        box = pages[0].detections[0].bbox
-        self.assertAlmostEqual(box.x1, COLUMN_LEFT.x0, delta=2.0)
-        self.assertAlmostEqual(box.x2, COLUMN_LEFT.x1, delta=2.0)
-
-        self.det.refresh_from_db()
-        self.assertEqual(self.det.x0, COLUMN_LEFT.x0 + 6, "persisted the snap")
-
-    def test_snap_false_leaves_the_box_as_stored(self):
-        """The steps that never read a column box must not pay to fix one."""
-        from scanning.services import _pages_for_geometry
-
-        pages = _pages_for_geometry(self.scan, str(self.pdf), snap=False)
-        self.assertEqual(pages[0].detections[0].bbox.x1, COLUMN_LEFT.x0 + 6)
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

@@ -134,10 +134,15 @@ def source_for_index(
     :param scan: The scan.
     :param page_index: A 0-based page of the rows' space.
     :param run: :func:`measured_run`, or None for the original's space.
-    :returns: ``(edit_id, source_page)``; ``(None, None)`` when the map
-        has no such page.
+    :returns: ``(edit_id, source_page)``; ``(None, None)`` when the map,
+        or the original, has no such page.
     """
     if run is None:
+        # The original's space is the identity, within the original.
+        if page_index < 0 or (
+            scan.page_count and page_index >= scan.page_count
+        ):
+            return None, None
         return None, page_index + 1
     pages = (run.page_map or {}).get("pages") or []
     if not 0 <= page_index < len(pages):
@@ -527,36 +532,36 @@ def resolve(scan: Scan) -> tuple[int, list[DetectionDecision]]:
 # ---------------------------------------------------------------------------
 
 
-def relocate_manual_rows(
-    scan: Scan, run: ApplyRun
-) -> tuple[int, list[Detection]]:
-    """Put every standing hand-drawn row at its page in ``run``'s space.
+def relocate_rows(
+    rows, scan: Scan, run: ApplyRun, what: str
+) -> tuple[int, list]:
+    """Put every row of ``rows`` at its page in ``run``'s space.
 
-    The import writes the model rows in the new run's space and keeps
-    the hand-drawn rows as they are, so after a reopen that deletes a
-    page a box drawn under ``a1`` would paint one page out under
-    ``a2``. The row's address says where it belongs: an original page
-    goes through ``originals_to_final`` (a replaced page has new
-    content, so a box on it does not carry), an edit page through the
-    ``(edit_id, page)`` slots of the map. A row the map does not hold,
-    a row of another original, or a row with no address (imported
-    before #240) is left as it is and logged; #240 PR D raises it as
-    a stale finding.
+    The compute writes its own rows in the new run's space and keeps the
+    human rows as they are, so after a reopen that deletes a page a box
+    drawn under ``a1`` would paint one page out under ``a2``. The row's
+    address says where it belongs: an original page goes through
+    ``originals_to_final`` (a replaced page has new content, so a box on
+    it does not carry), an edit page through the ``(edit_id, page)``
+    slots of the map. A row the map does not hold, a row of another
+    original, or a row with no address is left as it is and logged;
+    #240 PR D raises it as a stale finding.
 
+    Shared by the hand-drawn detections and the human redactions: both
+    carry ``source_edit``, ``source_page``, ``source_fingerprint``,
+    ``page_index`` and ``apply_run``.
+
+    :param rows: A queryset of rows with those columns.
     :param scan: The scan.
-    :param run: The run whose space the model rows were just imported in.
+    :param run: The run whose space the computed rows were just written in.
+    :param what: The rows' name for the log line.
     :returns: How many rows were written, and the rows left unplaced.
     """
     from scanning import apply
 
     place = apply.index_placer(run.page_map or {})
     moved = 0
-    unplaced: list[Detection] = []
-    rows = Detection.objects.filter(
-        scan=scan,
-        model_name=Detection.ModelName.MANUAL,
-        withdrawn_at__isnull=True,
-    )
+    unplaced = []
     for row in rows:
         stale = (
             row.source_fingerprint
@@ -571,20 +576,36 @@ def relocate_manual_rows(
             unplaced.append(row)
             continue
         if row.page_index != final or row.apply_run_id != run.pk:
-            Detection.objects.filter(pk=row.pk).update(
+            type(row).objects.filter(pk=row.pk).update(
                 page_index=final, apply_run=run
             )
             moved += 1
     if unplaced:
         logger.warning(
-            "scan %s: %d hand-drawn detection(s) have no page in %s and keep "
-            "their old position: %s",
+            "scan %s: %d %s have no page in %s and keep their old position: %s",
             scan.pk,
             len(unplaced),
+            what,
             run.label,
-            ", ".join(
-                f"#{r.pk} {r.label} src p.{r.source_page}"
-                for r in unplaced[:20]
-            ),
+            ", ".join(f"#{r.pk} src p.{r.source_page}" for r in unplaced[:20]),
         )
     return moved, unplaced
+
+
+def relocate_manual_rows(
+    scan: Scan, run: ApplyRun
+) -> tuple[int, list[Detection]]:
+    """Put every standing hand-drawn detection at its page in ``run``'s space.
+
+    See :func:`relocate_rows`.
+
+    :param scan: The scan.
+    :param run: The run whose space the model rows were just imported in.
+    :returns: How many rows were written, and the rows left unplaced.
+    """
+    rows = Detection.objects.filter(
+        scan=scan,
+        model_name=Detection.ModelName.MANUAL,
+        withdrawn_at__isnull=True,
+    )
+    return relocate_rows(rows, scan, run, "hand-drawn detection(s)")

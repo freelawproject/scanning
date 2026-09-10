@@ -65,8 +65,8 @@ document.addEventListener('DOMContentLoaded', function () {
     // `data-box-id` is greppable in a screenshot or a bug report.
     //
     // The page number matches the on-screen "PDF p.N" label (1-based);
-    // `data-pdf-index` carries the 0-based index used by
-    // scan.redaction_rects / margin_rects / detections.
+    // `data-pdf-index` carries the 0-based index used by the
+    // Redaction rows and the detections.
     function _boxSlug(value) {
         return String(value || 'box').toLowerCase().replace(/[^a-z0-9]+/g, '_');
     }
@@ -87,10 +87,12 @@ document.addEventListener('DOMContentLoaded', function () {
                 .map(function (v) { return Math.round(v); })
                 .join(',');
             el.dataset.rect = coords;
-            // Redaction and detection rects are stored in image pixels,
-            // margin rects in PDF points; say which so a reported number
-            // can be matched against the JSON without guessing.
+            // Detection rects are stored in image pixels, redaction rows
+            // in PDF points (#240); say which so a reported number can
+            // be matched against the JSON without guessing.
             el.dataset.units = units || 'px';
+            // The row's primary key, when the box is one (#240).
+            if (rect.id !== undefined) el.dataset.id = rect.id;
         }
         return boxId + (coords ? '  [' + coords + ' ' + (units || 'px') + ']' : '');
     }
@@ -133,7 +135,6 @@ document.addEventListener('DOMContentLoaded', function () {
     var activeRedactionFill = 'black';
     var isDrawing = false;
     var startX = 0, startY = 0;
-    var redactions = {};
 
     // Detection overlay state
     var allDetections = null; // loaded once from API
@@ -222,13 +223,11 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                 })
                 .catch(function() {});
-            fetch('/scans/' + documentId + '/redaction-rects/')
+            // One list, in PDF points, rects and margin strips together
+            // (#240): the rows the compute wrote and the curator edited.
+            fetch('/scans/' + documentId + '/redactions/')
                 .then(function(r) { if (r.ok) return r.json(); return []; })
                 .then(function(data) { redactionRects = data; if (redactionsVisible) drawRedactionOverlays(); })
-                .catch(function() {});
-            fetch('/scans/' + documentId + '/margin-rects/')
-                .then(function(r) { if (r.ok) return r.json(); return []; })
-                .then(function(data) { marginRects = data; if (marginsVisible) drawMarginOverlays(); })
                 .catch(function() {});
         })();
     }
@@ -280,7 +279,6 @@ document.addEventListener('DOMContentLoaded', function () {
         if (observer) { observer.disconnect(); observer = null; }
         renderedPages = {};
         pdfDoc = null;
-        redactions = {};
         // Hide the previous document's banner now, not only on success:
         // a failed or pending load (an opinion tab mid-regeneration)
         // must not keep the old bitonal banner visible over it.
@@ -666,17 +664,10 @@ document.addEventListener('DOMContentLoaded', function () {
                     overlay.height = viewport.height;
                 }
 
-                var pageRedactions = redactions[String(pdfIndex)] || [];
-                if (overlay) drawExistingRedactions(overlay, pageRedactions, effScale);
-                rebuildRedactionDivs(pageDiv, pdfIndex);
-
                 // Redraw overlays (skip when viewing individual opinion PDFs)
                 if (!_viewingOpinion) {
                     if (redactionsVisible && redactionRects) {
                         drawRedactionOverlaysForPage(pdfIndex);
-                    }
-                    if (marginsVisible && marginRects) {
-                        drawMarginsForPage(pdfIndex);
                     }
                     if (overlayMode === 'bounds' && _boundsPageOwners) {
                         _drawBoundsForPage(pageDiv);
@@ -794,7 +785,6 @@ document.addEventListener('DOMContentLoaded', function () {
             var curY = pt.y;
             var ctx = overlay.getContext('2d');
             ctx.clearRect(0, 0, overlay.width, overlay.height);
-            drawExistingRedactions(overlay, redactions[String(pdfIndex)] || [], pageScale(pageDiv, SCALE));
             ctx.fillStyle = activeRedactionFill === 'white' ? 'rgba(255,255,255,0.5)' : 'rgba(255,0,0,0.3)';
             ctx.strokeStyle = activeRedactionFill === 'white' ? '#3b82f6' : 'red';
             ctx.lineWidth = 2;
@@ -818,7 +808,6 @@ document.addEventListener('DOMContentLoaded', function () {
             if (pdfW < 5 || pdfH < 5) {
                 var ctx = overlay.getContext('2d');
                 ctx.clearRect(0, 0, overlay.width, overlay.height);
-                drawExistingRedactions(overlay, redactions[String(pdfIndex)] || [], scale);
                 return;
             }
 
@@ -846,84 +835,30 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                 });
             } else {
-                // Steps 2-3: save to redaction_rects.json
-                var fillVal = activeRedactionFill;
-                var imgW = cachedImgW || 1, imgH = cachedImgH || 1;
-                if (allDetections) {
-                    for (var di = 0; di < allDetections.length; di++) {
-                        if (allDetections[di].page_index === pdfIndex) {
-                            imgW = allDetections[di].img_width || imgW;
-                            imgH = allDetections[di].img_height || imgH;
-                            break;
-                        }
-                    }
-                }
-                var pxPerPtX = imgW / (overlay.width / scale);
-                var pxPerPtY = imgH / (overlay.height / scale);
-
-                fetch('/scans/' + documentId + '/save-redaction-rect/', {
+                // Step 2: one human row, in the PDF points the drag already
+                // gave us (#240). No render size is needed any more.
+                var ctxDone = overlay.getContext('2d');
+                ctxDone.clearRect(0, 0, overlay.width, overlay.height);
+                fetch('/scans/' + documentId + '/redactions/add/', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
                     body: JSON.stringify({
                         page_index: pdfIndex,
-                        action: 'add',
-                        adjusted: {
-                            x0: Math.round(pdfX * pxPerPtX),
-                            y0: Math.round(pdfY * pxPerPtY),
-                            x1: Math.round((pdfX + pdfW) * pxPerPtX),
-                            y1: Math.round((pdfY + pdfH) * pxPerPtY),
-                        },
-                        fill: fillVal,
-                        type: fillVal === 'white' ? 'whiteout' : 'manual_redact',
+                        x0: pdfX, y0: pdfY, x1: pdfX + pdfW, y1: pdfY + pdfH,
+                        fill: activeRedactionFill,
                     }),
                 })
                 .then(function (r) { return r.json(); })
                 .then(function (data) {
-                    refreshOverlays();
-                    if (redactionsVisible) {
-                        clearOverlaysByClass('redaction-overlay-box');
-                        fetch('/scans/' + documentId + '/redaction-rects/')
-                            .then(function(r2) { return r2.json(); })
-                            .then(function(d2) { redactionRects = d2; drawRedactionOverlays(); });
+                    if (!data || data.status !== 'ok') {
+                        showToast((data && data.message) || 'Failed to save the box');
+                        return;
                     }
+                    showToast('Saved. The redactions are not recomputed from this yet.', 'success');
+                    refreshOverlays();
                 });
             }
         };
-    }
-
-    // Defined in shared.js: drawExistingRedactions(overlay, pageRedactions, scale)
-
-    function rebuildRedactionDivs(pageDiv, pdfIndex) {
-        var wrapper = pageDiv.querySelector('.canvas-wrapper');
-        wrapper.querySelectorAll('.redaction-delete-btn').forEach(function (el) { el.remove(); });
-        var scale = pageScale(pageDiv, SCALE);
-        var pageRedactions = redactions[String(pdfIndex)] || [];
-        pageRedactions.forEach(function (r, idx) {
-            var btn = document.createElement('button');
-            btn.className = 'redaction-delete-btn';
-            btn.title = 'Remove this ' + (r.fill === 'white' ? 'whiteout' : 'redaction');
-            btn.textContent = '\u00d7';
-            btn.style.left = ((r.x + r.width) * scale - 18) + 'px';
-            btn.style.top = (r.y * scale + 2) + 'px';
-            btn.addEventListener('click', function (e) {
-                e.stopPropagation();
-                fetch('/scans/' + documentId + '/redaction/' + r.id + '/delete/', {
-                    method: 'POST',
-                    headers: { 'X-CSRFToken': csrfToken },
-                }).then(function (resp) { return resp.json(); })
-                .then(function (data) {
-                    if (data.status === 'ok') {
-                        redactions[String(pdfIndex)].splice(idx, 1);
-                        var overlay = pageDiv.querySelector('.redaction-overlay');
-                        var ctx = overlay.getContext('2d');
-                        ctx.clearRect(0, 0, overlay.width, overlay.height);
-                        drawExistingRedactions(overlay, redactions[String(pdfIndex)], scale);
-                        rebuildRedactionDivs(pageDiv, pdfIndex);
-                    }
-                });
-            });
-            wrapper.appendChild(btn);
-        });
     }
 
     // --- Detection overlay ---
@@ -1160,7 +1095,6 @@ document.addEventListener('DOMContentLoaded', function () {
             var curX = pt.x, curY = pt.y;
             var ctx = overlay.getContext('2d');
             ctx.clearRect(0, 0, overlay.width, overlay.height);
-            drawExistingRedactions(overlay, redactions[String(pdfIndex)] || [], pageScale(pageDiv, SCALE));
             var x = Math.min(detDrawStartX, curX), y = Math.min(detDrawStartY, curY);
             ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 2; ctx.setLineDash([6, 3]);
             ctx.strokeRect(x, y, Math.abs(curX - detDrawStartX), Math.abs(curY - detDrawStartY));
@@ -1175,7 +1109,6 @@ document.addEventListener('DOMContentLoaded', function () {
             var w = Math.abs(endX - detDrawStartX), h = Math.abs(endY - detDrawStartY);
             var ctx = overlay.getContext('2d');
             ctx.clearRect(0, 0, overlay.width, overlay.height);
-            drawExistingRedactions(overlay, redactions[String(pdfIndex)] || [], pageScale(pageDiv, SCALE));
             if (w < 10 || h < 10) return;
             _showDetDrawPreview(pageDiv, pdfIndex, x, y, w, h);
         };
@@ -1397,8 +1330,8 @@ document.addEventListener('DOMContentLoaded', function () {
     window.refreshOverlays = refreshOverlays;
     function refreshOverlays() {
         redactionRects = null;
-        marginRects = null;
-        // Reload detections first (needed for img dimensions), then overlays
+        // The detections carry the render size the detection overlay
+        // scales by; the redaction rows are in points and need none.
         fetch('/scans/' + documentId + '/detections/')
             .then(function(r) { if (r.ok) return r.json(); return []; })
             .then(function(data) {
@@ -1408,12 +1341,16 @@ document.addEventListener('DOMContentLoaded', function () {
                     cachedImgH = data[0].img_height || cachedImgH;
                 }
             }).catch(function() {});
-        fetch('/scans/' + documentId + '/redaction-rects/')
+        loadRedactionRows(function() { if (redactionsVisible) drawRedactionOverlays(); });
+    }
+
+    // One GET for the rects and the margin strips (#240): the rows the
+    // compute wrote and the curator edited, in PDF points.
+    function loadRedactionRows(done) {
+        fetch('/scans/' + documentId + '/redactions/')
             .then(function(r) { if (r.ok) return r.json(); return []; })
-            .then(function(data) { redactionRects = data; if (redactionsVisible) drawRedactionOverlays(); });
-        fetch('/scans/' + documentId + '/margin-rects/')
-            .then(function(r) { if (r.ok) return r.json(); return []; })
-            .then(function(data) { marginRects = data; if (marginsVisible) drawMarginOverlays(); });
+            .then(function(data) { redactionRects = data; if (done) done(); })
+            .catch(function() { redactionRects = []; if (done) done(); });
     }
 
     // ── Unified overlay toggle ──
@@ -1550,26 +1487,13 @@ document.addEventListener('DOMContentLoaded', function () {
         } else if (overlayMode === 'bounds') {
             overlayMode = 'transparent';
             clearOverlaysByClass('opinion-bounds-overlay');
-            // Load rects if needed
+            // Load the rows if needed; the margin strips are in the same list.
+            redactionsVisible = true;
+            marginsVisible = true;
             if (!redactionRects) {
-                fetch('/scans/' + documentId + '/redaction-rects/')
-                    .then(function(r) { if (r.ok) return r.json(); return []; })
-                    .then(function(data) {
-                        redactionRects = data;
-                        redactionsVisible = true;
-                        drawRedactionOverlays();
-                    });
+                loadRedactionRows(drawRedactionOverlays);
             } else {
-                redactionsVisible = true;
                 drawRedactionOverlays();
-            }
-            if (!marginRects) {
-                fetch('/scans/' + documentId + '/margin-rects/')
-                    .then(function(r) { if (r.ok) return r.json(); return []; })
-                    .then(function(data) { marginRects = data; marginsVisible = true; drawMarginOverlays(); });
-            } else {
-                marginsVisible = true;
-                drawMarginOverlays();
             }
         } else if (overlayMode === 'transparent') {
             overlayMode = 'solid';
@@ -1608,65 +1532,10 @@ document.addEventListener('DOMContentLoaded', function () {
     };
 
     // ── Margin overlay ──
-    var marginRects = null;
+    // The strips are rows of the same list as the rects (#240), drawn by
+    // the redaction draw paths with their own class and colour so the
+    // solid mode and the "r" cycle keep telling them apart.
     var marginsVisible = true;
-
-    window.toggleMargins = function() {
-        marginsVisible = !marginsVisible;
-        var btn = document.getElementById('toggle-margins-btn');
-        btn.style.background = marginsVisible ? '#2563eb' : '#6b7280';
-
-        if (marginsVisible && !marginRects) {
-            fetch('/scans/' + documentId + '/margin-rects/')
-                .then(function(r) { return r.json(); })
-                .then(function(data) {
-                    marginRects = data;
-                    drawMarginOverlays();
-                });
-        } else if (marginsVisible) {
-            drawMarginOverlays();
-        } else {
-            clearOverlaysByClass('margin-overlay-box');
-        }
-    };
-
-    // Per-page margin index so each render looks up its page in O(1) instead
-    // of scanning marginRects. Rebuilt when marginRects is reassigned or grows.
-    var _marginIndex = null, _marginIndexSrc = null, _marginIndexLen = -1;
-    function _marginsForPage(pageIndex) {
-        if (!marginRects) return null;
-        if (_marginIndexSrc !== marginRects || _marginIndexLen !== marginRects.length) {
-            _marginIndex = {};
-            for (var i = 0; i < marginRects.length; i++) {
-                _marginIndex[marginRects[i].page_index] = marginRects[i];
-            }
-            _marginIndexSrc = marginRects;
-            _marginIndexLen = marginRects.length;
-        }
-        return _marginIndex[pageIndex] || null;
-    }
-
-    // Image-pixel dimensions for a page, read off its detections, with a
-    // document-wide fallback cache. Redaction rects are stored in those
-    // pixels, so this is what scales them onto the canvas.
-    function _imgDimsForPage(pdfIndex) {
-        var imgW = cachedImgW || 1, imgH = cachedImgH || 1;
-        if (allDetections) {
-            for (var di = 0; di < allDetections.length; di++) {
-                if (allDetections[di].page_index === pdfIndex) {
-                    imgW = allDetections[di].img_width || imgW;
-                    imgH = allDetections[di].img_height || imgH;
-                    break;
-                }
-            }
-            if (imgW <= 1 && allDetections.length > 0) {
-                imgW = allDetections[0].img_width || 1;
-                imgH = allDetections[0].img_height || 1;
-            }
-            if (imgW > 1) { cachedImgW = imgW; cachedImgH = imgH; }
-        }
-        return [imgW, imgH];
-    }
 
     // Build one redaction / whiteout overlay box.
     //
@@ -1679,8 +1548,9 @@ document.addEventListener('DOMContentLoaded', function () {
     // `seqs` accumulates a per-type counter for the page being drawn, which
     // becomes the box id's ordinal.
     function _makeRedactionBox(r, pdfIndex, dsx, dsy, seqs) {
+        var isMargin = (r.rect_type === 'margin');
         var div = document.createElement('div');
-        div.className = 'redaction-overlay-box';
+        div.className = isMargin ? 'margin-overlay-box' : 'redaction-overlay-box';
         div.dataset.fill = r.fill || 'black';
         div.style.position = 'absolute';
         div.style.left = (r.x0 * dsx) + 'px';
@@ -1688,7 +1558,10 @@ document.addEventListener('DOMContentLoaded', function () {
         div.style.width = ((r.x1 - r.x0) * dsx) + 'px';
         div.style.height = ((r.y1 - r.y0) * dsy) + 'px';
         var solid = (overlayMode === 'solid');
-        if (r.fill === 'black') {
+        if (isMargin) {
+            div.style.background = solid ? 'rgba(255, 255, 255, 1)' : 'rgba(200, 200, 255, 0.3)';
+            div.style.border = solid ? 'none' : '1px dashed rgba(100, 100, 200, 0.5)';
+        } else if (r.fill === 'black') {
             div.style.background = solid ? 'rgba(0, 0, 0, 1)' : 'rgba(0, 0, 0, 0.4)';
             div.style.border = solid ? 'none' : '1px solid rgba(0, 0, 0, 0.7)';
         } else {
@@ -1697,20 +1570,24 @@ document.addEventListener('DOMContentLoaded', function () {
         }
         div.style.pointerEvents = 'auto';
         div.style.cursor = 'pointer';
-        div.style.zIndex = '6';
+        div.style.zIndex = isMargin ? '5' : '6';
 
         var kind = (r.fill === 'white') ? 'whiteout' : 'redaction';
-        seqs[r.type] = (seqs[r.type] || 0) + 1;
-        div.title = (r.type || r.fill) + '\n' + _tagOverlayBox(
-            div, kind, r.type, pdfIndex, seqs[r.type], r
+        var typeName = r.rect_type || r.fill;
+        seqs[typeName] = (seqs[typeName] || 0) + 1;
+        var who = r.origin === 'human' ? ' (drawn by hand)' : '';
+        div.title = typeName + who + '\n' + _tagOverlayBox(
+            div, kind, typeName, pdfIndex, seqs[typeName], r, 'pt'
         );
 
-        // Type label, hidden in solid mode so the preview stays faithful.
-        var label = document.createElement('span');
-        label.style.cssText = 'position:absolute;top:0;left:0;font-size:9px;padding:1px 3px;color:black;background:rgba(255,255,255,0.7);pointer-events:none;';
-        label.textContent = r.type || r.fill;
-        if (solid) label.style.display = 'none';
-        div.appendChild(label);
+        if (!isMargin) {
+            // Type label, hidden in solid mode so the preview stays faithful.
+            var label = document.createElement('span');
+            label.style.cssText = 'position:absolute;top:0;left:0;font-size:9px;padding:1px 3px;color:black;background:rgba(255,255,255,0.7);pointer-events:none;';
+            label.textContent = typeName;
+            if (solid) label.style.display = 'none';
+            div.appendChild(label);
+        }
 
         div.addEventListener('dblclick', function(e) {
             e.stopPropagation();
@@ -1719,78 +1596,31 @@ document.addEventListener('DOMContentLoaded', function () {
         return div;
     }
 
-    // Draw the margin boxes for a single page's data. Clears only that page's
-    // boxes so it can be called per-render without touching other pages.
-    function _drawMarginsForPageData(pageData) {
+    // The scale of a page's boxes: rows are in PDF points, so the pdf.js
+    // viewport gives the factor, and no render size is needed (#240).
+    function _pointScale(pageIndex, canvas) {
+        var pdfPage = pdfPages[pageIndex];
+        if (!pdfPage) return null;
+        var vp = pdfPage.getViewport({scale: 1});
+        return [canvas.offsetWidth / vp.width, canvas.offsetHeight / vp.height];
+    }
+
+    // The boxes of one page, drawn into its wrapper; clears that page first.
+    function _drawPageBoxes(pageData) {
         var pageEl = _pageDivForIndex(pageData.page_index);
         if (!pageEl) return;
         var wrapper = pageEl.querySelector('.canvas-wrapper');
         var canvas = pageEl.querySelector('.pdf-canvas');
-        if (!wrapper || !canvas) return;
-        wrapper.querySelectorAll('.margin-overlay-box').forEach(function (el) { el.remove(); });
-
-        // Margin rects are in PDF points — scale via viewport
-        var pdfPage = pdfPages[pageData.page_index];
-        if (!pdfPage) return;
-        var vp = pdfPage.getViewport({scale: 1});
-        var msx = canvas.offsetWidth / vp.width;
-        var msy = canvas.offsetHeight / vp.height;
-
-        var marginSeq = 0;
+        if (!wrapper || !canvas || !canvas.width || canvas.width < 10) return;
+        wrapper.querySelectorAll('.redaction-overlay-box, .margin-overlay-box').forEach(function (el) { el.remove(); });
+        var scale = _pointScale(pageData.page_index, canvas);
+        if (!scale) return;
+        var seqs = {};
         pageData.rects.forEach(function(r) {
-                var div = document.createElement('div');
-                div.className = 'margin-overlay-box';
-                marginSeq += 1;
-                div.title = 'margin whiteout\n' + _tagOverlayBox(
-                    div, 'whiteout', 'margin', pageData.page_index,
-                    marginSeq, r, 'pt'
-                );
-                div.style.position = 'absolute';
-                div.style.left = (r.x0 * msx) + 'px';
-                div.style.top = (r.y0 * msy) + 'px';
-                div.style.width = ((r.x1 - r.x0) * msx) + 'px';
-                div.style.height = ((r.y1 - r.y0) * msy) + 'px';
-                var solid = (overlayMode === 'solid');
-                div.style.background = solid ? 'rgba(255, 255, 255, 1)' : 'rgba(200, 200, 255, 0.3)';
-                div.style.border = solid ? 'none' : '1px dashed rgba(100, 100, 200, 0.5)';
-                div.style.pointerEvents = 'auto';
-                div.style.cursor = 'pointer';
-                div.style.zIndex = '5';
-
-                // Double-click to resize margin
-                (function(marginRect, marginDiv, pageIdx, scaleX, scaleY) {
-                    marginDiv.addEventListener('dblclick', function(e) {
-                        e.stopPropagation();
-                        _selectMarginBox(marginDiv, pageIdx, marginRect, scaleX, scaleY);
-                    });
-                })(r, div, pageData.page_index, msx, msy);
-
-                wrapper.appendChild(div);
-            });
-    }
-
-    // Redraw the whole document's margin overlays (used when toggling on).
-    function drawMarginOverlays() {
-        clearOverlaysByClass('margin-overlay-box');
-        if (!marginRects || !marginsVisible) return;
-        marginRects.forEach(_drawMarginsForPageData);
-    }
-
-    // Redraw margins for a single page (used on each lazy page render so we
-    // don't re-clear and re-draw the entire document's margins per page).
-    function drawMarginsForPage(pageIndex) {
-        if (!marginRects || !marginsVisible) return;
-        var pageData = _marginsForPage(pageIndex);
-        if (pageData) {
-            _drawMarginsForPageData(pageData);
-            return;
-        }
-        // No margins on this page: clear any stale boxes left on it.
-        var pageEl = _pageDivForIndex(pageIndex);
-        if (pageEl) {
-            var w = pageEl.querySelector('.canvas-wrapper');
-            if (w) w.querySelectorAll('.margin-overlay-box').forEach(function (el) { el.remove(); });
-        }
+            var isMargin = (r.rect_type === 'margin');
+            if (isMargin && !marginsVisible) return;
+            wrapper.appendChild(_makeRedactionBox(r, pageData.page_index, scale[0], scale[1], seqs));
+        });
     }
 
     // ── Redaction overlay ──
@@ -1800,60 +1630,22 @@ document.addEventListener('DOMContentLoaded', function () {
     window.toggleRedactions = function() {
         redactionsVisible = !redactionsVisible;
         var btn = document.getElementById('toggle-redactions-btn');
-        btn.style.background = redactionsVisible ? '#dc2626' : '#6b7280';
-
+        if (btn) btn.style.background = redactionsVisible ? '#dc2626' : '#6b7280';
         if (redactionsVisible && !redactionRects) {
-            btn.textContent = 'Loading...';
-            // Ensure detections are loaded for img dimensions
-            loadDetections(function() {});
-            fetch('/scans/' + documentId + '/redaction-rects/')
-                .then(function(r) {
-                    if (!r.ok) throw new Error('HTTP ' + r.status);
-                    return r.json();
-                })
-                .then(function(data) {
-                    redactionRects = data;
-                    btn.textContent = 'Redactions';
-                    drawRedactionOverlays();
-                })
-                .catch(function(err) {
-                    btn.textContent = 'Redactions';
-                    alert('Failed to load redaction rects: ' + err);
-                    redactionsVisible = false;
-                    btn.style.background = '#6b7280';
-                });
+            loadRedactionRows(drawRedactionOverlays);
         } else if (redactionsVisible) {
             drawRedactionOverlays();
         } else {
             clearOverlaysByClass('redaction-overlay-box');
+            clearOverlaysByClass('margin-overlay-box');
         }
     };
 
     function drawRedactionOverlays() {
         clearOverlaysByClass('redaction-overlay-box');
+        clearOverlaysByClass('margin-overlay-box');
         if (!redactionRects || !redactionsVisible) return;
-
-        redactionRects.forEach(function(pageData) {
-            var pageEl = _pageDivForIndex(pageData.page_index);
-            if (!pageEl) return;
-            var wrapper = pageEl.querySelector('.canvas-wrapper');
-            var canvas = pageEl.querySelector('.pdf-canvas');
-            if (!wrapper || !canvas) return;
-            // Skip pages that haven't rendered yet (canvas has no real size)
-            if (!canvas.width || canvas.width < 10) return;
-
-            // Rects are in image pixel coords — same scaling as detection overlay
-            var dims = _imgDimsForPage(pageData.page_index);
-            var dsx = canvas.offsetWidth / dims[0];
-            var dsy = canvas.offsetHeight / dims[1];
-
-            var seqs = {};
-            pageData.rects.forEach(function(r) {
-                wrapper.appendChild(
-                    _makeRedactionBox(r, pageData.page_index, dsx, dsy, seqs)
-                );
-            });
-        });
+        redactionRects.forEach(_drawPageBoxes);
     }
 
     var _selectedRedactionBox = null;
@@ -1873,35 +1665,31 @@ document.addEventListener('DOMContentLoaded', function () {
         delBtn.style.cssText = 'position:absolute;top:-28px;right:0;background:#ef4444;color:white;border:none;padding:4px 10px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;z-index:21;white-space:nowrap;line-height:1;';
         delBtn.addEventListener('click', function(e) {
             e.stopPropagation();
-            if (!confirm('Delete this ' + (rectData.type || 'redaction') + '?')) return;
+            if (!confirm('Delete this ' + (rectData.rect_type || 'redaction') + '?')) return;
 
-            // Remove rect directly from redaction_rects.json
+            // A dismiss of a computed box, a withdrawal of a drawn one
+            // (#240). The row is addressed by its id, and the answer is
+            // read: a refusal must not remove a box the server kept.
             var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
-            fetch('/scans/' + documentId + '/save-redaction-rect/', {
+            fetch('/scans/' + documentId + '/redactions/' + rectData.id + '/dismiss/', {
                 method: 'POST',
                 headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    page_index: pdfIndex,
-                    action: 'delete',
-                    original: {x0: rectData.x0, y0: rectData.y0, x1: rectData.x1, y1: rectData.y1},
-                    type: rectData.type,
-                    fill: rectData.fill,
-                }),
             }).then(function(r) { return r.json(); })
             .then(function(data) {
+                if (!data || data.status !== 'ok') {
+                    showToast((data && data.message) || 'Failed to delete the box');
+                    return;
+                }
                 div.remove();
                 _selectedRedactionBox = null;
-                // Update cached rects
                 if (redactionRects) {
                     redactionRects.forEach(function(pd) {
                         if (pd.page_index === pdfIndex) {
-                            pd.rects = pd.rects.filter(function(r) {
-                                return !(Math.abs(r.x0 - rectData.x0) < 2 && Math.abs(r.y0 - rectData.y0) < 2);
-                            });
+                            pd.rects = pd.rects.filter(function(r) { return r.id !== rectData.id; });
                         }
                     });
                 }
-            });
+            }).catch(function() { showToast('Failed to delete the box'); });
         });
         div.appendChild(delBtn);
 
@@ -1955,24 +1743,12 @@ document.addEventListener('DOMContentLoaded', function () {
                 var nT = parseFloat(div.style.top);
                 var nW = parseFloat(div.style.width);
                 var nH = parseFloat(div.style.height);
-                var oldX0 = rectData.x0, oldY0 = rectData.y0;
-                var oldX1 = rectData.x1, oldY1 = rectData.y1;
-                rectData.x0 = Math.round(nL / dsx * 10) / 10;
-                rectData.y0 = Math.round(nT / dsy * 10) / 10;
-                rectData.x1 = Math.round((nL + nW) / dsx * 10) / 10;
-                rectData.y1 = Math.round((nT + nH) / dsy * 10) / 10;
-                var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
-                fetch('/scans/' + documentId + '/save-redaction-rect/', {
-                    method: 'POST',
-                    headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        page_index: pdfIndex,
-                        original: {x0: oldX0, y0: oldY0, x1: oldX1, y1: oldY1},
-                        adjusted: {x0: rectData.x0, y0: rectData.y0, x1: rectData.x1, y1: rectData.y1},
-                        type: rectData.type,
-                        fill: rectData.fill,
-                    }),
-                });
+                _saveRedactionBox(div, rectData, {
+                    x0: Math.round(nL / dsx * 10) / 10,
+                    y0: Math.round(nT / dsy * 10) / 10,
+                    x1: Math.round((nL + nW) / dsx * 10) / 10,
+                    y1: Math.round((nT + nH) / dsy * 10) / 10,
+                }, dsx, dsy);
             }
 
             document.addEventListener('mousemove', onMove);
@@ -2030,66 +1806,66 @@ document.addEventListener('DOMContentLoaded', function () {
             document.removeEventListener('mouseup', onUp);
             if (!hasMoved) return;
 
-            // Update rectData with new position in PDF coordinates
             var newLeft = parseFloat(div.style.left);
             var newTop = parseFloat(div.style.top);
             var newW = parseFloat(div.style.width);
             var newH = parseFloat(div.style.height);
-            rectData.x0 = Math.round(newLeft / dsx * 10) / 10;
-            rectData.y0 = Math.round(newTop / dsy * 10) / 10;
-            rectData.x1 = Math.round((newLeft + newW) / dsx * 10) / 10;
-            rectData.y1 = Math.round((newTop + newH) / dsy * 10) / 10;
-
-            // Save the adjusted rect directly to redaction_rects.json
-            var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
-            fetch('/scans/' + documentId + '/save-redaction-rect/', {
-                method: 'POST',
-                headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    page_index: pdfIndex,
-                    original: {x0: startLeft / dsx, y0: startTop / dsy,
-                               x1: (startLeft + startW) / dsx, y1: (startTop + startH) / dsy},
-                    adjusted: {x0: rectData.x0, y0: rectData.y0, x1: rectData.x1, y1: rectData.y1},
-                    type: rectData.type,
-                    fill: rectData.fill,
-                }),
-            });
+            _saveRedactionBox(div, rectData, {
+                x0: Math.round(newLeft / dsx * 10) / 10,
+                y0: Math.round(newTop / dsy * 10) / 10,
+                x1: Math.round((newLeft + newW) / dsx * 10) / 10,
+                y1: Math.round((newTop + newH) / dsy * 10) / 10,
+            }, dsx, dsy);
         }
 
         document.addEventListener('mousemove', onMove);
         document.addEventListener('mouseup', onUp);
     }
 
+    // Save a moved or resized box by its id (#240). A computed box
+    // becomes a hand-drawn row: the server answers the id that holds it
+    // now, and the box follows it. A refusal puts the box back where the
+    // server has it and shows the message.
+    function _saveRedactionBox(div, rectData, bbox, dsx, dsy) {
+        var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
+        fetch('/scans/' + documentId + '/redactions/' + rectData.id + '/move/', {
+            method: 'POST',
+            headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
+            body: JSON.stringify(bbox),
+        }).then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (!data || data.status !== 'ok') {
+                showToast((data && data.message) || 'Failed to save the box');
+                div.style.left = (rectData.x0 * dsx) + 'px';
+                div.style.top = (rectData.y0 * dsy) + 'px';
+                div.style.width = ((rectData.x1 - rectData.x0) * dsx) + 'px';
+                div.style.height = ((rectData.y1 - rectData.y0) * dsy) + 'px';
+                return;
+            }
+            rectData.x0 = bbox.x0; rectData.y0 = bbox.y0;
+            rectData.x1 = bbox.x1; rectData.y1 = bbox.y1;
+            if (data.id !== undefined && data.id !== rectData.id) {
+                rectData.id = data.id;
+                rectData.origin = 'human';
+                div.dataset.id = data.id;
+            }
+        }).catch(function() { showToast('Failed to save the box'); });
+    }
+
     function drawRedactionOverlaysForPage(pdfIndex) {
         if (!redactionRects || !redactionsVisible) return;
-        var pageData = null;
         for (var i = 0; i < redactionRects.length; i++) {
             if (redactionRects[i].page_index === pdfIndex) {
-                pageData = redactionRects[i];
-                break;
+                _drawPageBoxes(redactionRects[i]);
+                return;
             }
         }
-        if (!pageData) return;
-
+        // No boxes on this page: clear any stale ones left on it.
         var pageEl = _pageDivForIndex(pdfIndex);
-        if (!pageEl) return;
-        var wrapper = pageEl.querySelector('.canvas-wrapper');
-        var canvas = pageEl.querySelector('.pdf-canvas');
-        if (!wrapper || !canvas || canvas.width < 10) return;
-
-        // Remove existing boxes for this page
-        wrapper.querySelectorAll('.redaction-overlay-box').forEach(function(el) { el.remove(); });
-
-        var dims = _imgDimsForPage(pdfIndex);
-        var dsx = canvas.offsetWidth / dims[0];
-        var dsy = canvas.offsetHeight / dims[1];
-
-        var seqs = {};
-        pageData.rects.forEach(function(r) {
-            wrapper.appendChild(
-                _makeRedactionBox(r, pdfIndex, dsx, dsy, seqs)
-            );
-        });
+        if (pageEl) {
+            var w = pageEl.querySelector('.canvas-wrapper');
+            if (w) w.querySelectorAll('.redaction-overlay-box, .margin-overlay-box').forEach(function (el) { el.remove(); });
+        }
     }
 
     // ── Detection box editing ──
@@ -2286,130 +2062,6 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     });
 
-    // ── Margin box editing ──
-    var _selectedMarginBox = null;
-
-    function _selectMarginBox(div, pageIdx, rectData, scaleX, scaleY) {
-        _deselectMarginBox();
-        _selectedMarginBox = div;
-        div.style.outline = '2px solid #2563eb';
-        div.style.zIndex = '20';
-        div.style.background = 'rgba(200, 200, 255, 0.5)';
-
-        // Add delete button
-        var delBtn = document.createElement('button');
-        delBtn.className = 'margin-resize-handle';
-        delBtn.textContent = 'Delete';
-        delBtn.style.cssText = 'position:absolute;top:-24px;right:0;background:#ef4444;color:white;border:none;padding:10px 8px;font-size:11px;border-radius:3px;cursor:pointer;z-index:23;';
-        delBtn.addEventListener('click', function(e) {
-            e.stopPropagation();
-            if (!confirm('Delete this margin?')) return;
-            fetch('/scans/' + documentId + '/save-margin-rect/', {
-                method: 'POST',
-                headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-                body: JSON.stringify({page_index: pageIdx, action: 'delete', original: rectData}),
-            }).then(function() {
-                div.remove();
-                _selectedMarginBox = null;
-                // Update cached margin rects
-                if (marginRects) {
-                    marginRects.forEach(function(pd) {
-                        if (pd.page_index === pageIdx) {
-                            pd.rects = pd.rects.filter(function(r) {
-                                return !(Math.abs(r.x0 - rectData.x0) < 2 && Math.abs(r.y0 - rectData.y0) < 2);
-                            });
-                        }
-                    });
-                }
-            });
-        });
-        div.appendChild(delBtn);
-
-        // Add resize handles
-        var handles = ['nw','n','ne','w','e','sw','s','se'];
-        handles.forEach(function(pos) {
-            var h = document.createElement('div');
-            h.className = 'margin-resize-handle';
-            h.dataset.pos = pos;
-            h.style.cssText = 'position:absolute;width:8px;height:8px;background:#2563eb;border:1px solid #fff;z-index:22;cursor:' + pos + '-resize;';
-            if (pos.indexOf('n') >= 0) h.style.top = '-4px';
-            if (pos.indexOf('s') >= 0) h.style.bottom = '-4px';
-            if (pos.indexOf('w') >= 0) h.style.left = '-4px';
-            if (pos.indexOf('e') >= 0) h.style.right = '-4px';
-            if (pos === 'n' || pos === 's') h.style.left = 'calc(50% - 4px)';
-            if (pos === 'w' || pos === 'e') h.style.top = 'calc(50% - 4px)';
-
-            h.addEventListener('mousedown', function(e) {
-                e.stopPropagation();
-                e.preventDefault();
-                var startX = e.clientX, startY = e.clientY;
-                var startLeft = parseFloat(div.style.left);
-                var startTop = parseFloat(div.style.top);
-                var startW = parseFloat(div.style.width);
-                var startH = parseFloat(div.style.height);
-
-                var hasMoved = false;
-                function onMove(ev) {
-                    hasMoved = true;
-                    var z = cssToVisualScale(div);
-                    var dx = (ev.clientX - startX) / z, dy = (ev.clientY - startY) / z;
-                    var nL = startLeft, nT = startTop, nW = startW, nH = startH;
-                    if (pos.indexOf('e') >= 0) nW = startW + dx;
-                    if (pos.indexOf('w') >= 0) { nW = startW - dx; nL = startLeft + dx; }
-                    if (pos.indexOf('s') >= 0) nH = startH + dy;
-                    if (pos.indexOf('n') >= 0) { nH = startH - dy; nT = startTop + dy; }
-                    if (nW > 5) { div.style.left = nL + 'px'; div.style.width = nW + 'px'; }
-                    if (nH > 5) { div.style.top = nT + 'px'; div.style.height = nH + 'px'; }
-                }
-                function onUp() {
-                    document.removeEventListener('mousemove', onMove);
-                    document.removeEventListener('mouseup', onUp);
-                    if (!hasMoved) return;
-                    // Save updated margin rect (PDF points)
-                    var nL = parseFloat(div.style.left);
-                    var nT = parseFloat(div.style.top);
-                    var nW = parseFloat(div.style.width);
-                    var nH = parseFloat(div.style.height);
-                    var updated = {
-                        x0: Math.round(nL / scaleX * 10) / 10,
-                        y0: Math.round(nT / scaleY * 10) / 10,
-                        x1: Math.round((nL + nW) / scaleX * 10) / 10,
-                        y1: Math.round((nT + nH) / scaleY * 10) / 10,
-                    };
-                    fetch('/scans/' + documentId + '/save-margin-rect/', {
-                        method: 'POST',
-                        headers: {'X-CSRFToken': csrfToken, 'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            page_index: pageIdx,
-                            original: rectData,
-                            adjusted: updated,
-                        }),
-                    });
-                    rectData.x0 = updated.x0;
-                    rectData.y0 = updated.y0;
-                    rectData.x1 = updated.x1;
-                    rectData.y1 = updated.y1;
-                }
-                document.addEventListener('mousemove', onMove);
-                document.addEventListener('mouseup', onUp);
-            });
-            div.appendChild(h);
-        });
-    }
-
-    function _deselectMarginBox() {
-        if (!_selectedMarginBox) return;
-        _selectedMarginBox.style.outline = '';
-        _selectedMarginBox.style.zIndex = '5';
-        _selectedMarginBox.querySelectorAll('.margin-resize-handle').forEach(function(el) { el.remove(); });
-        _selectedMarginBox = null;
-    }
-
-    document.addEventListener('click', function(e) {
-        if (_selectedMarginBox && !_selectedMarginBox.contains(e.target)) {
-            _deselectMarginBox();
-        }
-    });
 
     function clearOverlaysByClass(className) {
         document.querySelectorAll('.' + className).forEach(function(el) {

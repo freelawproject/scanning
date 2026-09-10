@@ -11,12 +11,13 @@ Two halves, and the split between them is the point of the design:
   geometry itself is blackletter's, and is patched out.
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
 
-from scanning import apply, boundaries, detections, services, yolo
+from scanning import apply, boundaries, detections, redactions, services, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
     ApplyRun,
@@ -25,6 +26,7 @@ from scanning.models import (
     ExternalJob,
     JobStatus,
     QueuedAction,
+    Redaction,
     Scan,
     Status,
 )
@@ -325,8 +327,8 @@ class ComputeMixin:
             ("_push_processing_files_to_s3", True),
             ("_snap_text_columns_to_ink", 0),
             ("detection_entries", []),
-            ("_compute_and_save_redaction_rects", []),
-            ("_compute_and_save_margin_rects", []),
+            ("_measure_redaction_rects", []),
+            ("_measure_margin_rects", []),
         ):
             patcher = patch.object(
                 services, name, return_value=value, autospec=True
@@ -343,6 +345,19 @@ class ComputeMixin:
         # ``detection_entries`` leaves empty, so stub the write.
         pair = patch.object(boundaries, "write_computed", return_value=[])
         stubs["write_computed"] = pair.start()
+        self.addCleanup(pair.stop)
+        # The snapped document the pairing and the geometry read; the
+        # stubbed ``detection_entries`` would leave it with no pages, and
+        # the redaction rows need the page scales (#240 PR B).
+        snapped = patch.object(
+            services,
+            "_snapped_document",
+            return_value=(SimpleNamespace(pages=[]), {}, []),
+        )
+        stubs["_snapped_document"] = snapped.start()
+        self.addCleanup(snapped.stop)
+        stamp = patch.object(boundaries, "stamp_uncovered", return_value=0)
+        stubs["stamp_uncovered"] = stamp.start()
         self.addCleanup(pair.stop)
         # The compute reads the run's two documents (#269): the glued
         # detections in the final page space, and the printed pages.
@@ -416,18 +431,174 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         self.assertEqual(args[0].pk, scan.pk)
         self.assertEqual(args[3], apply.current_run(scan))
         self.assertEqual(args[4], 1)
-        stubs["_compute_and_save_redaction_rects"].assert_called_once()
+        stubs["_measure_redaction_rects"].assert_called_once()
         self.assertEqual(
-            stubs["_compute_and_save_redaction_rects"].call_args.kwargs[
-                "pairs"
+            stubs["_measure_redaction_rects"].call_args.args[1], []
+        )
+        stubs["_measure_margin_rects"].assert_called_once()
+
+    def _measured(self, stubs, rects_px, margins_pt=None):
+        """Make the geometry stubs answer one page of boxes.
+
+        The fake document has two pages with a scale of 0.5 point per
+        pixel, so a pixel box of 100 reads as 50 points.
+
+        :param stubs: The patched callables.
+        :param rects_px: blackletter's redaction rects, in pixels.
+        :param margins_pt: blackletter's strips, in points.
+        """
+        pages = [
+            SimpleNamespace(index=0, scale_x=0.5, scale_y=0.5),
+            SimpleNamespace(index=1, scale_x=0.5, scale_y=0.5),
+        ]
+        stubs["_snapped_document"].return_value = (
+            SimpleNamespace(pages=pages),
+            {},
+            [{"page_index": 0}],
+        )
+        stubs["_measure_redaction_rects"].return_value = rects_px
+        stubs["_measure_margin_rects"].return_value = margins_pt or []
+
+    def test_the_compute_writes_the_rows_in_points(self):
+        """One computed row per rect and per strip, addressed, in the
+        run's space, in points (#240 PR B); nothing on the scan."""
+        scan, rows = merged_scan()
+        stubs = self.patch_geometry()
+        self._measured(
+            stubs,
+            [
+                {
+                    "page_index": 0,
+                    "rects": [
+                        {
+                            "x0": 100,
+                            "y0": 200,
+                            "x1": 300,
+                            "y1": 400,
+                            "fill": "black",
+                            "type": "headnote",
+                        }
+                    ],
+                }
             ],
-            [],
+            [
+                {
+                    "page_index": 1,
+                    "rects": [{"x0": 0, "y0": 0, "x1": 20, "y1": 50}],
+                }
+            ],
         )
-        # force=True: the strips are measured from the detections, so a
-        # fresh run must replace the stored ones.
-        self.assertTrue(
-            stubs["_compute_and_save_margin_rects"].call_args.kwargs["force"]
+
+        services.run_compute_redactions(scan.pk)
+
+        run = apply.current_run(scan)
+        written = list(
+            Redaction.objects.filter(scan=scan).order_by("page_index")
         )
+        self.assertEqual(len(written), 2)
+        head, margin = written
+        self.assertEqual(head.origin, Redaction.Origin.COMPUTED)
+        self.assertEqual(head.rect_type, "headnote")
+        self.assertEqual(head.bbox, [50.0, 100.0, 150.0, 200.0])
+        self.assertEqual((head.source_page, head.page_index), (1, 0))
+        self.assertEqual(head.apply_run, run)
+        self.assertEqual(head.detect_run, rows[0].run)
+        self.assertEqual(margin.rect_type, "margin")
+        self.assertEqual(margin.fill, "white")
+        self.assertEqual(margin.bbox, [0.0, 0.0, 20.0, 50.0])
+        self.assertEqual((margin.source_page, margin.page_index), (2, 1))
+
+    def test_a_recompute_rewrites_the_computed_rows_and_keeps_the_human_ones(
+        self,
+    ):
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        rect = {
+            "x0": 100,
+            "y0": 200,
+            "x1": 300,
+            "y1": 400,
+            "fill": "black",
+            "type": "headnote",
+        }
+        self._measured(stubs, [{"page_index": 0, "rects": [rect]}])
+        services.run_compute_redactions(scan.pk)
+        first = Redaction.objects.get(scan=scan)
+        drawn = redactions.add(scan, 0, [1.0, 2.0, 3.0, 4.0], "white", None)
+        dismissed = redactions.dismiss(scan, first, None)
+
+        services.run_compute_redactions(scan.pk)
+
+        self.assertFalse(Redaction.objects.filter(pk=first.pk).exists())
+        second = Redaction.objects.computed().get(scan=scan)
+        self.assertEqual(second.decision, dismissed)
+        drawn.refresh_from_db()
+        self.assertIsNone(drawn.withdrawn_at)
+        self.assertEqual(
+            [
+                r["id"]
+                for e in redactions.visible_by_page(scan)
+                for r in e["rects"]
+            ],
+            [drawn.pk],
+        )
+
+    def test_a_drawn_box_follows_the_page_space_of_the_new_run(self):
+        """Drawn on final page 2 under ``a1`` (original page 2); ``a2``
+        deletes page 1, and the box is on final page 1."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        self._measured(stubs, [])
+        services.run_compute_redactions(scan.pk)
+        drawn = redactions.add(scan, 1, [1.0, 2.0, 3.0, 4.0], "black", None)
+        apply.supersede_runs(scan, "test")
+        new = glued_run(
+            scan,
+            number=2,
+            page_map={
+                **identity_map(2),
+                "final_page_count": 1,
+                "deleted_pages": [1],
+                "pages": [
+                    {
+                        "final_page": 1,
+                        "source": {"kind": "original", "pdf_page": 2},
+                    }
+                ],
+            },
+        )
+
+        services.run_compute_redactions(scan.pk)
+
+        drawn.refresh_from_db()
+        self.assertEqual(drawn.page_index, 0)
+        self.assertEqual(drawn.apply_run, new)
+        self.assertEqual(drawn.source_page, 2)
+
+    def test_the_uncovered_headnotes_are_stamped_on_the_boundaries(self):
+        """A confident HEADNOTE box no headnote rect covers is measured
+        in pixels, before the rows are converted, and handed to the
+        boundaries (#240 PR B)."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        stubs["load_detections_document"].return_value = {
+            **DOCUMENT,
+            "detections": [
+                {
+                    **DOCUMENT["detections"][0],
+                    "label": "HEADNOTE",
+                    "label_id": 5,
+                    "confidence": 0.95,
+                    "bbox": [100.0, 100.0, 200.0, 200.0],
+                }
+            ],
+        }
+        self._measured(stubs, [{"page_index": 0, "rects": []}])
+
+        services.run_compute_redactions(scan.pk)
+
+        stubs["stamp_uncovered"].assert_called_once()
+        self.assertEqual(stubs["stamp_uncovered"].call_args.args[1], {0})
 
     def test_a_hand_made_detection_survives_the_import(self):
         """A curator's box costs curator time, and it addresses the
@@ -509,15 +680,10 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         )
         stubs["load_printed_pages"].assert_called_once()
         expected = {0: (101, None), 1: (102, 103)}
+        # The snapped document is built with the run's numbers, and the
+        # measurers read it (#240 PR B).
         self.assertEqual(
-            stubs["detection_entries"].call_args.kwargs["page_numbers"],
-            expected,
-        )
-        self.assertEqual(
-            stubs["_compute_and_save_redaction_rects"].call_args.kwargs[
-                "page_numbers"
-            ],
-            expected,
+            stubs["_snapped_document"].call_args.args[2], expected
         )
         # The whole-prefix pull lands the multi-GB original; one key
         # is enough.
@@ -744,7 +910,7 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         services.run_compute_redactions(scan.pk)
 
         stubs["load_detections_document"].assert_not_called()
-        stubs["_compute_and_save_redaction_rects"].assert_called_once()
+        stubs["_measure_redaction_rects"].assert_called_once()
         self.assertEqual(Detection.objects.filter(scan=scan).count(), 1)
 
     def test_a_legacy_volume_goes_back_to_pending_review(self):
@@ -789,9 +955,7 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         re-queue runs the whole pipeline again."""
         scan, rows = merged_scan()
         stubs = self.patch_geometry()
-        stubs["_compute_and_save_redaction_rects"].side_effect = RuntimeError(
-            "boom"
-        )
+        stubs["_measure_redaction_rects"].side_effect = RuntimeError("boom")
 
         with self.assertLogs("scanning", level="WARNING"):
             services.run_compute_redactions(scan.pk)

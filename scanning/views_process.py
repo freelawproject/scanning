@@ -374,7 +374,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     )
 
     # No eager S3 pull here: this page renders entirely from the DB
-    # (page_map, ocr_results, the boundaries, detections, redaction_rects),
+    # (page_map, ocr_results, the boundaries, detections, the redactions),
     # so it never reads the processing files off disk. Pulling them here
     # blocked the response on I/O it doesn't need -- worst right after a
     # fresh upload, when the only object in the prefix is the multi-GB
@@ -620,38 +620,10 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             if idx in image_page_indices
         ]
 
-    has_redaction_rects = bool(scan.redaction_rects)
-
-    # Find HEADNOTE detections not covered by headnote redaction rects
-    uncovered_hn_pages = set()
-    if has_redaction_rects:
-        rects_data = scan.redaction_rects
-        hn_rects_by_page = {}
-        for entry in rects_data:
-            hn_rects_by_page[entry["page_index"]] = [
-                r for r in entry["rects"] if r.get("type") == "headnote"
-            ]
-        for d in Detection.objects.filter(
-            scan=scan, label="HEADNOTE", active=True
-        ).filter(confidence__gte=0.8):
-            page_rects = hn_rects_by_page.get(d.page_index, [])
-            cx = (d.x0 + d.x1) / 2
-            cy = (d.y0 + d.y1) / 2
-            covered = any(
-                r["x0"] <= cx <= r["x1"] and r["y0"] <= cy <= r["y1"]
-                for r in page_rects
-            )
-            if not covered:
-                uncovered_hn_pages.add(d.page_index)
-
-    for op in opinions:
-        cp = op.get("caption_page", 0)
-        ep = op.get("page_end", op.get("key_page", cp))
-        op["uncovered_headnote_pages"] = [
-            {"num": idx_to_logical.get(idx, idx + 1), "idx": idx}
-            for idx in range(cp, ep + 1)
-            if idx in uncovered_hn_pages
-        ]
+    # ``uncovered_headnote_pages`` rides on each opinion since #240 PR B:
+    # the compute stamps it, in the render's pixels where the detections
+    # and the rects both were. The rows are in points now, so a request
+    # cannot measure it here any more.
 
     opinion_scans = []
     if step == 3:
@@ -798,7 +770,6 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "opinions": opinions,
             "opinion_count": opinion_count,
             "opinions_json": json.dumps(opinions),
-            "has_redaction_rects": has_redaction_rects,
             "opinion_scans": opinion_scans,
             "detect_warnings": detect_warnings,
             "unmatched_keys": unmatched_keys,

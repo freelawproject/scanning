@@ -64,7 +64,9 @@ def stamp_apply_runs(apps, schema_editor):
         if state.get("apply_run") is not None:
             continue
         run = (
-            ApplyRun.objects.filter(scan_id=head.scan_id, superseded_at__isnull=True)
+            ApplyRun.objects.filter(
+                scan_id=head.scan_id, superseded_at__isnull=True
+            )
             .order_by("-number")
             .first()
         )
@@ -75,9 +77,17 @@ def stamp_apply_runs(apps, schema_editor):
             and run.detections_key
         ):
             continue
-        scan = Scan.objects.filter(pk=head.scan_id).only("source_fingerprint").first()
+        scan = (
+            Scan.objects.filter(pk=head.scan_id)
+            .only("source_fingerprint")
+            .first()
+        )
         theirs = scan.source_fingerprint if scan else ""
-        if run.source_fingerprint and theirs and run.source_fingerprint != theirs:
+        if (
+            run.source_fingerprint
+            and theirs
+            and run.source_fingerprint != theirs
+        ):
             continue
         if not _is_identity(run.page_map):
             continue

@@ -95,6 +95,22 @@ class TestSourceForIndex(TestCase):
         scan = ScanFactory(page_count=3)
         self.assertEqual(detections.source_for_index(scan, 2, None), (None, 3))
 
+    def test_the_original_has_no_page_past_its_count(self):
+        """A page the original does not hold has no address either
+        (#240 PR B), so a box there is refused, not written."""
+        scan = ScanFactory(page_count=3)
+        self.assertEqual(
+            detections.source_for_index(scan, 3, None), (None, None)
+        )
+        self.assertEqual(
+            detections.source_for_index(scan, -1, None), (None, None)
+        )
+        # An unknown count bounds nothing.
+        self.assertEqual(
+            detections.source_for_index(ScanFactory(page_count=0), 9, None),
+            (None, 10),
+        )
+
     def test_a_final_space_reads_the_map(self):
         scan = ScanFactory(page_count=3, source_fingerprint="10:3")
         edit = PageEdit.objects.create(

@@ -2,14 +2,14 @@
 
 import django.core.validators
 import django.db.models.deletion
-import scanning.models
-import scanning.storage
 from django.conf import settings
 from django.db import migrations, models
 
+import scanning.models
+import scanning.storage
+
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("scanning", "0001_initial"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
@@ -54,7 +54,20 @@ class Migration(migrations.Migration):
                 ("y1", models.FloatField()),
                 ("img_width", models.PositiveIntegerField(default=0)),
                 ("img_height", models.PositiveIntegerField(default=0)),
-                ("model_name", models.CharField(blank=True, choices=[("small", "Small"), ("medium", "Medium"), ("large", "Large"), ("manual", "Manual")], default="", max_length=20)),
+                (
+                    "model_name",
+                    models.CharField(
+                        blank=True,
+                        choices=[
+                            ("small", "Small"),
+                            ("medium", "Medium"),
+                            ("large", "Large"),
+                            ("manual", "Manual"),
+                        ],
+                        default="",
+                        max_length=20,
+                    ),
+                ),
                 ("model_count", models.PositiveSmallIntegerField(default=1)),
                 (
                     "found_by",
@@ -98,8 +111,36 @@ class Migration(migrations.Migration):
                         help_text="The last moment when the item was modified.",
                     ),
                 ),
-                ("page_number", models.PositiveIntegerField(blank=True, null=True)),
-                ("check_name", models.CharField(choices=[("no_page_number", "No page number detected"), ("missing_page", "Missing page in sequence"), ("duplicate_page", "Duplicate page number"), ("backward_page", "Page number goes backward"), ("large_gap", "Large gap in page numbers"), ("suspicious_reading", "Suspicious OCR reading"), ("page_range", "Page range detected"), ("mislabeled_document", "Mislabeled document type"), ("auto_corrected", "Auto-corrected page number"), ("blank_page", "Blank page detected"), ("orientation", "Page orientation issue"), ("process_flag", "User-flagged issue"), ("suppress_detection", "Suppress a detection"), ("add_detection", "Add a detection"), ("approve_detection", "Approve a detection")], max_length=100)),
+                (
+                    "page_number",
+                    models.PositiveIntegerField(blank=True, null=True),
+                ),
+                (
+                    "check_name",
+                    models.CharField(
+                        choices=[
+                            ("no_page_number", "No page number detected"),
+                            ("missing_page", "Missing page in sequence"),
+                            ("duplicate_page", "Duplicate page number"),
+                            ("backward_page", "Page number goes backward"),
+                            ("large_gap", "Large gap in page numbers"),
+                            ("suspicious_reading", "Suspicious OCR reading"),
+                            ("page_range", "Page range detected"),
+                            (
+                                "mislabeled_document",
+                                "Mislabeled document type",
+                            ),
+                            ("auto_corrected", "Auto-corrected page number"),
+                            ("blank_page", "Blank page detected"),
+                            ("orientation", "Page orientation issue"),
+                            ("process_flag", "User-flagged issue"),
+                            ("suppress_detection", "Suppress a detection"),
+                            ("add_detection", "Add a detection"),
+                            ("approve_detection", "Approve a detection"),
+                        ],
+                        max_length=100,
+                    ),
+                ),
                 (
                     "severity",
                     models.CharField(
@@ -156,7 +197,9 @@ class Migration(migrations.Migration):
                 ),
                 (
                     "pdf_page",
-                    models.PositiveIntegerField(help_text="1-based PDF page number."),
+                    models.PositiveIntegerField(
+                        help_text="1-based PDF page number."
+                    ),
                 ),
             ],
         ),
@@ -229,7 +272,9 @@ class Migration(migrations.Migration):
                 (
                     "volume_number",
                     models.PositiveIntegerField(
-                        validators=[django.core.validators.MinValueValidator(1)]
+                        validators=[
+                            django.core.validators.MinValueValidator(1)
+                        ]
                     ),
                 ),
                 (
@@ -394,7 +439,9 @@ class Migration(migrations.Migration):
             model_name="scan",
             name="progress_log",
             field=models.TextField(
-                blank=True, default="", help_text="Captured stdout from processing."
+                blank=True,
+                default="",
+                help_text="Captured stdout from processing.",
             ),
         ),
         migrations.AddField(
@@ -412,7 +459,13 @@ class Migration(migrations.Migration):
             name="queued_action",
             field=models.CharField(
                 blank=True,
-                choices=[("full_pipeline", "Full Pipeline"), ("validate", "Validate"), ("detect", "Detect"), ("reprocess", "Reprocess"), ("generate_files", "Generate Files")],
+                choices=[
+                    ("full_pipeline", "Full Pipeline"),
+                    ("validate", "Validate"),
+                    ("detect", "Detect"),
+                    ("reprocess", "Reprocess"),
+                    ("generate_files", "Generate Files"),
+                ],
                 default="",
                 help_text="Action for the daemon to run when status is queued.",
                 max_length=30,
@@ -627,15 +680,21 @@ class Migration(migrations.Migration):
         ),
         migrations.AddIndex(
             model_name="detection",
-            index=models.Index(fields=["scan", "page_index"], name="idx_det_scan_page"),
+            index=models.Index(
+                fields=["scan", "page_index"], name="idx_det_scan_page"
+            ),
         ),
         migrations.AddIndex(
             model_name="detection",
-            index=models.Index(fields=["scan", "label"], name="idx_det_scan_label"),
+            index=models.Index(
+                fields=["scan", "label"], name="idx_det_scan_label"
+            ),
         ),
         migrations.AddIndex(
             model_name="detection",
-            index=models.Index(fields=["scan", "active"], name="idx_det_scan_active"),
+            index=models.Index(
+                fields=["scan", "active"], name="idx_det_scan_active"
+            ),
         ),
         migrations.AlterUniqueTogether(
             name="pagedeletion",
@@ -653,13 +712,21 @@ class Migration(migrations.Migration):
             ),
         ),
         migrations.AddField(
-            model_name='scan',
-            name='s3_path',
-            field=models.CharField(blank=True, default='', help_text='Relative S3 key prefix for approved files, e.g. approved/a3d/218/1/', max_length=512),
+            model_name="scan",
+            name="s3_path",
+            field=models.CharField(
+                blank=True,
+                default="",
+                help_text="Relative S3 key prefix for approved files, e.g. approved/a3d/218/1/",
+                max_length=512,
+            ),
         ),
         migrations.AddField(
-            model_name='scan',
-            name='s3_uploaded',
-            field=models.BooleanField(default=False, help_text='Whether final files have been uploaded to S3.'),
+            model_name="scan",
+            name="s3_uploaded",
+            field=models.BooleanField(
+                default=False,
+                help_text="Whether final files have been uploaded to S3.",
+            ),
         ),
     ]

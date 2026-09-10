@@ -4,20 +4,39 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('scanning', '0002_detection_issue_llmscan_pagedeletion_pageinsert_and_more'),
+        (
+            "scanning",
+            "0002_detection_issue_llmscan_pagedeletion_pageinsert_and_more",
+        ),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='scan',
-            name='retry_count',
-            field=models.PositiveIntegerField(default=0, help_text='Number of transient RunPod failures before the current run.'),
+            model_name="scan",
+            name="retry_count",
+            field=models.PositiveIntegerField(
+                default=0,
+                help_text="Number of transient RunPod failures before the current run.",
+            ),
         ),
         migrations.AlterField(
-            model_name='scan',
-            name='status',
-            field=models.CharField(choices=[('uploaded', 'Uploaded'), ('queued', 'Queued'), ('processing', 'Processing'), ('pending_review', 'Pending Review'), ('approved', 'Approved'), ('extracted', 'Extracted'), ('error', 'Error'), ('error_max_retries', 'Error (retry cap hit)'), ('cancelled', 'Cancelled')], default='uploaded', max_length=20),
+            model_name="scan",
+            name="status",
+            field=models.CharField(
+                choices=[
+                    ("uploaded", "Uploaded"),
+                    ("queued", "Queued"),
+                    ("processing", "Processing"),
+                    ("pending_review", "Pending Review"),
+                    ("approved", "Approved"),
+                    ("extracted", "Extracted"),
+                    ("error", "Error"),
+                    ("error_max_retries", "Error (retry cap hit)"),
+                    ("cancelled", "Cancelled"),
+                ],
+                default="uploaded",
+                max_length=20,
+            ),
         ),
     ]
