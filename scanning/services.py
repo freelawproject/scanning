@@ -707,9 +707,10 @@ def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
         :func:`_page_number_lookup` otherwise.
     :return: The detection dicts, empty when the scan has none.
     """
-    scan = Scan.objects.get(pk=scan_pk)
     if page_numbers is None:
-        page_numbers = _page_number_lookup(scan)
+        # The one reader of the scan row; the geometry passes ``{}``
+        # and reads none.
+        page_numbers = _page_number_lookup(Scan.objects.get(pk=scan_pk))
 
     all_saved = (
         Detection.objects.live()

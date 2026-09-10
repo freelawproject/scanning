@@ -996,16 +996,19 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
             {"status": "ok", "added": False, "detection_id": near.pk}
         )
     run = detections.measured_run(scan)
-    row = detections.add_manual(
-        scan,
-        page_index,
-        label_name,
-        label_id,
-        bbox,
-        int(det.get("img_width") or 0),
-        int(det.get("img_height") or 0),
-        run=run,
-    )
+    try:
+        row = detections.add_manual(
+            scan,
+            page_index,
+            label_name,
+            label_id,
+            bbox,
+            int(det.get("img_width") or 0),
+            int(det.get("img_height") or 0),
+            run=run,
+        )
+    except detections.UnaddressableDetection:
+        return _unaddressable()
     return JsonResponse(
         {"status": "ok", "added": True, "detection_id": row.pk}
     )

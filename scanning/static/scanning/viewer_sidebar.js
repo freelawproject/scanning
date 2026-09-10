@@ -356,6 +356,13 @@ function approveDetection(btn) {
             return r.json();
         })
         .then(function (data) {
+            // A refusal (409, 404) must not read as work done (#240).
+            if (!data || data.status === "error") {
+                btn.disabled = false;
+                btn.textContent = "Approve";
+                showToast((data && data.message) || "Failed to approve detection");
+                return;
+            }
             var row = btn.closest("[data-unmatched-page]");
             row.style.opacity = "0.3";
             row.style.pointerEvents = "none";
@@ -391,6 +398,12 @@ function deleteUnmatchedDetection(btn) {
             return r.json();
         })
         .then(function (data) {
+            if (!data || data.status === "error") {
+                btn.disabled = false;
+                btn.textContent = "Delete";
+                showToast((data && data.message) || "Failed to delete detection");
+                return;
+            }
             var row = btn.closest("[data-unmatched-page]");
             row.style.opacity = "0.3";
             row.style.pointerEvents = "none";

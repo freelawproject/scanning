@@ -288,6 +288,24 @@ class TestMoveAndManual(TestCase):
         self.assertIsNone(row.decision)
         self.assertFalse(detections.withdraw_manual(holder, self.user))
 
+    def test_add_manual_refuses_a_page_the_map_lacks(self):
+        run = glued_run(self.scan)
+
+        with self.assertLogs("scanning.detections", level="WARNING"):
+            with self.assertRaises(detections.UnaddressableDetection):
+                detections.add_manual(
+                    self.scan,
+                    7,
+                    "KEY_ICON",
+                    1,
+                    [1.0, 2.0, 3.0, 4.0],
+                    1,
+                    1,
+                    run=run,
+                )
+
+        self.assertEqual(Detection.objects.count(), 0)
+
     def test_add_manual_is_addressed_and_carries_no_family(self):
         row = detections.add_manual(
             self.scan, 1, "KEY_ICON", 1, [1.0, 2.0, 3.0, 4.0], 1700, 2200

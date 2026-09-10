@@ -2273,7 +2273,11 @@ decisions, the resolution), `services._import_detections` and
   `DETECTION_UNADDRESSABLE_MESSAGE` from the four endpoints): a pre-#240
   row outside the standing map, or a map without that page. A decision
   with no address could never land, and one written anyway stood for
-  good and was logged after every import.
+  good and was logged after every import. `add_manual` refuses the
+  same way. **The five viewer handlers read the refusal** (`status ==
+  "error"`) and show `message` in a toast; the sidebar row and the
+  drawn box stay as they were. Before that a 409 dimmed the row and
+  drew a check mark, which is a lie about work not done.
 - **`resolve` reads no model row when no decision stands**, and only
   the rows at the pages and labels the decisions name otherwise: a
   volume holds tens of thousands of rows, most volumes hold no

@@ -2709,9 +2709,10 @@ class TestApproveDetection(DetectionEndpointMixin, ScanningTestCase):
             DetectionDecision.objects.filter(scan=scan).count(), 2
         )
 
-    def test_a_row_with_no_address_answers_409(self):
+    def test_a_row_with_no_address_answers_409_on_every_endpoint(self):
         """A pre-#240 row outside the standing map: the decision cannot
-        land, so it is refused, not written (PR #288 review)."""
+        land, so it is refused, not written (PR #288 review). The four
+        arms are copies, so one loop pins them all."""
         from unittest.mock import patch
 
         from scanning import detections
@@ -2722,20 +2723,53 @@ class TestApproveDetection(DetectionEndpointMixin, ScanningTestCase):
             page_index=9, source_page=None
         )
         run = glued_run(scan)
-
-        with patch.object(detections, "measured_run", return_value=run):
-            with self.assertLogs("scanning.detections", level="WARNING"):
-                response = self._post(
-                    "approve_detection", scan, {"detection_id": det.pk}
+        posts = [
+            ("approve_detection", {"detection_id": det.pk}),
+            ("delete_detection", {"detection_id": det.pk}),
+            (
+                "update_detection",
+                {"detection_id": det.pk, "new_bbox": [1.0, 1.0, 2.0, 2.0]},
+            ),
+            (
+                "add_single_detection",
+                {
+                    "page_index": 9,
+                    "label_id": det.label_id,
+                    "bbox": [100.0, 100.0, 200.0, 200.0],
+                    "img_width": 1200,
+                    "img_height": 1600,
+                },
+            ),
+            (
+                "add_single_detection",
+                {
+                    "page_index": 9,
+                    "label_id": 7,
+                    "bbox": [500.0, 500.0, 600.0, 600.0],
+                    "img_width": 1200,
+                    "img_height": 1600,
+                },
+            ),
+        ]
+        for name, body in posts:
+            with self.subTest(name=name, body=body):
+                with patch.object(
+                    detections, "measured_run", return_value=run
+                ):
+                    with self.assertLogs(
+                        "scanning.detections", level="WARNING"
+                    ):
+                        response = self._post(name, scan, body)
+                self.assertEqual(response.status_code, 409)
+                self.assertIn(
+                    "cannot be addressed",
+                    json.loads(response.content)["message"],
                 )
-
-        self.assertEqual(response.status_code, 409)
-        self.assertIn(
-            "cannot be addressed", json.loads(response.content)["message"]
-        )
         self.assertEqual(DetectionDecision.objects.count(), 0)
+        self.assertEqual(Detection.objects.filter(scan=scan).count(), 1)
         det.refresh_from_db()
         self.assertEqual(det.confidence, 0.9)
+        self.assertTrue(det.active)
 
     def test_a_hand_drawn_row_needs_no_decision(self):
         self.client.force_login(self.make_staff_user())

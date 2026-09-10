@@ -377,6 +377,19 @@ def add_manual(
     if run is None:
         run = measured_run(scan)
     edit_id, page = source_for_index(scan, page_index, run)
+    if not page:
+        # The same refusal as ``decide``: a row with no address could
+        # never follow the page space, and would be logged after every
+        # import instead.
+        logger.warning(
+            "scan %s: page_index %s has no address in the standing map; "
+            "the hand-drawn box is refused",
+            scan.pk,
+            page_index,
+        )
+        raise UnaddressableDetection(
+            f"page_index {page_index} of scan {scan.pk} has no address"
+        )
     return Detection.objects.create(
         scan=scan,
         page_index=page_index,
@@ -537,7 +550,7 @@ def relocate_manual_rows(
     from scanning import apply
 
     page_map = run.page_map or {}
-    kept = apply.originals_to_final(page_map)
+    originals = apply.originals_to_final(page_map)
     slots = {
         (entry["source"]["edit_id"], entry["source"]["page"]): entry[
             "final_page"
@@ -562,7 +575,7 @@ def relocate_manual_rows(
             unplaced.append(row)
             continue
         if row.source_edit_id is None:
-            final = kept.get(row.source_page)
+            final = originals.get(row.source_page)
         else:
             final = slots.get((row.source_edit_id, row.source_page - 1))
         if final is None:

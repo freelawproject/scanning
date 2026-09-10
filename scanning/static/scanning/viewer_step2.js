@@ -1291,6 +1291,12 @@ document.addEventListener('DOMContentLoaded', function () {
             body: JSON.stringify(detData),
         }).then(function (r) { return r.json(); })
         .then(function (data) {
+            // A refusal (409, 400) must not draw a box no row backs (#240).
+            if (!data || data.status === 'error' || data.error) {
+                _cancelDetDraw();
+                showToast((data && (data.message || data.error)) || 'Failed to add detection');
+                return;
+            }
             if (!allDetections) allDetections = [];
             if (data.added === false) {
                 // The server approved a box that is in the list already:
@@ -2082,6 +2088,14 @@ document.addEventListener('DOMContentLoaded', function () {
             headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
             body: JSON.stringify({detection_id: det.id, new_bbox: newBbox}),
         }).then(function(r) { return r.json(); }).then(function(data) {
+            if (!data || data.status !== 'ok') {
+                // The box goes back where it was, and the server's word
+                // is shown: a box left where it was dropped would say the
+                // move was kept (#240).
+                showToast((data && data.message) || 'Failed to save detection bbox');
+                refreshOverlays();
+                return;
+            }
             if (data.status === 'ok') {
                 det.bbox[0] = newBbox[0];
                 det.bbox[1] = newBbox[1];
@@ -2129,6 +2143,10 @@ document.addEventListener('DOMContentLoaded', function () {
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
                 body: JSON.stringify({detection_id: det.id}),
             }).then(function(r) { return r.json(); }).then(function(data) {
+                if (!data || data.status !== 'ok') {
+                    showToast((data && data.message) || 'Failed to delete detection');
+                    return;
+                }
                 if (data.status === 'ok') {
                     div.remove();
                     _selectedDetBox = null;
