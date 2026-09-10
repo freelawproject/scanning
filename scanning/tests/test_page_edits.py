@@ -13,8 +13,12 @@ import tempfile
 from unittest import mock
 
 import fitz
+from django.conf import settings
 from django.core.files.storage import default_storage
-from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.files.uploadedfile import (
+    SimpleUploadedFile,
+    TemporaryUploadedFile,
+)
 from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
@@ -1278,17 +1282,59 @@ class TestPageUploadsTakeAPdf(ScanningTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertFalse(self.scan.page_edits.exists())
 
+    @override_settings(PAGE_UPLOAD_MAX_BYTES=2 * 1024 * 1024)
     def test_a_file_over_the_cap_is_refused(self):
+        """The cap is the setting, and the refusal names its value in MB."""
         upload = SimpleUploadedFile(
             "page.png",
-            b"x" * (views_process.PAGE_UPLOAD_MAX_BYTES + 1),
+            b"x" * (2 * 1024 * 1024 + 1),
             content_type="image/png",
         )
 
         response = self._replace(upload)
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("50 MB", json.loads(response.content)["error"])
+        self.assertIn("2 MB", json.loads(response.content)["error"])
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_the_default_cap_takes_a_rescan_of_a_whole_gap(self):
+        """A 90-page rescan of 138 MB was refused at 50 MB (so3d vol 361).
+
+        A gap takes one insert (#256), so the file could not be split;
+        the default is a sixth of the original upload cap instead.
+        """
+        self.assertEqual(
+            settings.PAGE_UPLOAD_MAX_BYTES,
+            settings.MAX_ORIGINAL_UPLOAD_SIZE // 6,
+        )
+        self.assertEqual(settings.PAGE_UPLOAD_MAX_BYTES, 512 * 1024 * 1024)
+        self.assertGreater(settings.PAGE_UPLOAD_MAX_BYTES, 138 * 1024 * 1024)
+        self.assertIn("512 MB", views_process.upload_too_large_message())
+
+    def test_a_pdf_on_disk_is_counted_from_its_temporary_file(self):
+        """A large upload lands in a temporary file; fitz opens that path.
+
+        The bytes are not read into memory a second time, and the
+        upload is left rewound for the storage write that follows.
+        """
+        with fitz.open() as doc:
+            for _ in range(3):
+                doc.new_page()
+            pdf = doc.tobytes()
+        upload = TemporaryUploadedFile(
+            "leaf.pdf", "application/pdf", len(pdf), None
+        )
+        upload.write(pdf)
+        upload.seek(0)
+        with mock.patch.object(
+            views_process.fitz, "open", wraps=fitz.open
+        ) as opened:
+            self.assertEqual(views_process._pdf_page_count(upload), 3)
+        opened.assert_called_once_with(
+            upload.temporary_file_path(), filetype="pdf"
+        )
+        self.assertEqual(upload.tell(), 0)
+        upload.close()
 
     def test_an_image_keeps_its_own_extension(self):
         self._replace(self.make_image())

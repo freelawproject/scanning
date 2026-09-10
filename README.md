@@ -267,6 +267,7 @@ trailing slash or path).
 | `STATIC_URL` | Static file URL prefix | `static/` |
 | `NUM_WORKERS` | Gunicorn worker count | `4` |
 | `MAX_UPLOAD_SIZE_GB` | Max size (whole GB) for a direct-to-S3 original PDF upload. Enforced by the presigned POST policy so S3 rejects anything larger. | `3` |
+| `PAGE_UPLOAD_MAX_MB` | Max size (whole MB) of one page-edit upload in review 1: a replacement of one page, or an insert of a missing leaf. Unset, the cap is a sixth of `MAX_UPLOAD_SIZE_GB`. | a sixth of the original cap (512 MiB) |
 
 
 ### Step 2: Build the Docker Image

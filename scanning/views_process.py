@@ -161,11 +161,6 @@ LOCKED_STATUSES = frozenset(
     }
 )
 
-#: The largest page file a curator may upload (#232). One page is one
-#: image or a short PDF. A bigger file is a whole volume sent by
-#: mistake, and the web pod would read it into memory to check it.
-PAGE_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
-
 #: What a page file may start with, and the extension that says what
 #: it is. The content type is the browser's word, and the stored
 #: extension decides how ``views_api.export_pdf`` and the apply (#206)
@@ -186,8 +181,11 @@ _IMAGE_MAGIC = (
 )
 _MAGIC_LENGTH = max(len(_PDF_MAGIC), *(len(m) for m, _ in _IMAGE_MAGIC))
 
+#: The refusal of a page file over the cap. ``{mb}`` is the cap in MB,
+#: from ``settings.PAGE_UPLOAD_MAX_BYTES``; see
+#: :func:`upload_too_large_message`.
 UPLOAD_TOO_LARGE_MESSAGE = (
-    "This file is larger than 50 MB. Upload one page, not a volume."
+    "This file is larger than {mb} MB. Upload the scanned pages, not a volume."
 )
 UPLOAD_WRONG_TYPE_MESSAGE = (
     "Upload an image of the page (PNG, JPEG, GIF, TIFF or BMP), or a "
@@ -2654,17 +2652,39 @@ def _uploaded_page_file(upload) -> str | None:
     return kind
 
 
+def upload_too_large_message() -> str:
+    """Return the refusal of a page file over the cap, with the cap in MB.
+
+    :returns: :data:`UPLOAD_TOO_LARGE_MESSAGE` with the current
+        ``settings.PAGE_UPLOAD_MAX_BYTES``.
+    :rtype: str
+    """
+    return UPLOAD_TOO_LARGE_MESSAGE.format(
+        mb=settings.PAGE_UPLOAD_MAX_BYTES // (1024 * 1024)
+    )
+
+
 def _pdf_page_count(upload) -> int | None:
     """Return how many pages an uploaded PDF holds, or None.
+
+    Django writes an upload over ``FILE_UPLOAD_MAX_MEMORY_SIZE`` to a
+    temporary file, and fitz opens that file by its path. So a file at
+    the cap is not read into the web pod's memory a second time: the
+    cap is 512 MiB by default, and one worker that held one file
+    would take more than the pod asks for.
 
     :param upload: The ``UploadedFile``, rewound by
         :func:`_uploaded_page_file`.
     :returns: The page count, or None when the file will not open.
     :rtype: int | None
     """
-    data = upload.read()
-    upload.seek(0)
+    temporary_file_path = getattr(upload, "temporary_file_path", None)
     try:
+        if temporary_file_path is not None:
+            with fitz.open(temporary_file_path(), filetype="pdf") as doc:
+                return doc.page_count
+        data = upload.read()
+        upload.seek(0)
         with fitz.open(stream=data, filetype="pdf") as doc:
             return doc.page_count
     except Exception:
@@ -2686,8 +2706,8 @@ def _accept_page_upload(upload, one_page: bool) -> tuple[str | None, str]:
     """
     if upload is None:
         return None, "Missing file"
-    if upload.size and upload.size > PAGE_UPLOAD_MAX_BYTES:
-        return None, UPLOAD_TOO_LARGE_MESSAGE
+    if upload.size and upload.size > settings.PAGE_UPLOAD_MAX_BYTES:
+        return None, upload_too_large_message()
     kind = _uploaded_page_file(upload)
     if kind is None:
         return None, UPLOAD_WRONG_TYPE_MESSAGE
