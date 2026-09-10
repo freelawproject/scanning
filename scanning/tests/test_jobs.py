@@ -481,7 +481,7 @@ ENGINE_SHAPES = (
 class TestApplyRowsGoFirst(ScanningTestCase):
     """The queue rank of issue #291.
 
-    An apply row (#224) is one page of a volume a curator already
+    An apply row (#224) holds one edit of a volume a curator already
     approved, and it is one of the newest rows in the table. In creation
     order alone it therefore waited behind every volume shard of every
     volume nobody had opened yet.
@@ -528,8 +528,8 @@ class TestApplyRowsGoFirst(ScanningTestCase):
     ):
         """Create one PENDING apply row.
 
-        An apply row is one page of the volume, so its shard set holds
-        one row per page a curator changed.
+        An apply row holds the pages of one edit, so the run's shard
+        set holds one row per edit a curator made.
 
         :param scan: The scan it belongs to.
         :param stage: Its stage.

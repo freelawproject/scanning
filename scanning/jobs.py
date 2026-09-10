@@ -1681,31 +1681,41 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
     """Return the PENDING rows a wave will claim.
 
     **An apply row goes first** (issue #291). A row carrying an
-    ``apply_run`` is a single page of a volume a curator already
-    approved in review 1 (#224), and it is by construction one of the
-    newest rows, so a queue drained in creation order alone put it
-    behind every volume shard of every volume nobody has looked at yet.
+    ``apply_run`` holds one edit of a volume a curator already approved
+    in review 1 (#224), and it is by construction one of the newest
+    rows, so a queue drained in creation order alone put it behind
+    every volume shard of every volume nobody has looked at yet.
     A volunteer rescanned a page, a curator approved the review, and the
     corrected volume then waited for the whole backlog.
 
     Four properties make the rank safe, and each one is a reason not to
     replace it with a cap or a queue of its own:
 
-    - An apply row is **one page**, so it leaves the head of the queue
-      in seconds and delays a volume shard very little.
+    - An apply row carries **the pages of one edit**
+      (``apply.edit_page_count``: an image is one page, an inserted PDF
+      holds what a scanner sent, and a missing leaf is often two). In
+      practice that is far smaller than a volume shard, so it delays one
+      very little.
     - The apply set **cannot grow without a limit**:
       ``apply.MAX_SCANS_IN_FLIGHT`` bounds the scans out at once, and a
-      run makes rows for the changed pages only.
-    - A row that loses its place **cannot fail from the wait**: a
-      PENDING row nobody claimed carries no deadline (#218), because the
-      queue ceiling starts at the attempt's first claim.
+      run makes one row per edit.
+    - A row that loses its place **waits, and almost never fails from
+      the wait**: a PENDING row nobody claimed carries no deadline
+      (#218), because the queue ceiling starts at the attempt's first
+      claim. One exception, named here so the next reader of
+      :func:`sweep_jobs` finds no contradiction: a row a RunPod endpoint
+      declined is back in PENDING with its ceiling intact
+      (:func:`_defer`), and the sweep fails it ``QUEUE_TIMEOUT`` at that
+      ceiling. The apply set is small, so the added wait is minutes
+      against a six-hour ceiling.
     - The rank decides who takes a free place and **preempts nothing**;
       :func:`_room_for` counts the in-flight rows against the cap.
 
     The id stays the second key: inside one class the creation order is
     what keeps the drain fair. The rank reads the row and not
-    ``Scan.status``, which would cost a join on every tick and would
-    move under a row that is already waiting.
+    ``Scan.status``, which moves under a row that is already waiting.
+    (It would cost no join: the slice already reaches ``scan`` through
+    ``select_related``.)
 
     :param queryset: This provider and stage's rows.
     :param room: How many rows the cap allows.
