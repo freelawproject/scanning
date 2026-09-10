@@ -425,6 +425,21 @@ class TestDismissAndResolve(TestCase):
         self.assertEqual(len(decisions), 2)
         self.assertNotIn(None, decisions)
 
+    def test_a_dismissal_of_an_unaddressed_boundary_is_refused(self):
+        """It could never land: ``resolve`` matches by the start address
+        (the ``detections.decide`` rule)."""
+        OpinionBoundary.objects.filter(pk=self.row.pk).update(
+            start_source_page=None
+        )
+        self.row.refresh_from_db()
+
+        with self.assertRaises(boundaries.UnaddressableBoundary):
+            boundaries.dismiss(self.scan, self.row, self.user)
+
+        self.assertFalse(
+            OpinionBoundary.objects.human().filter(scan=self.scan).exists()
+        )
+
     def test_resolve_reads_no_row_when_no_dismissal_stands(self):
         with self.assertNumQueries(1):
             self.assertEqual(boundaries.resolve(self.scan), (0, []))
@@ -566,6 +581,38 @@ class TestAdd(TestCase):
                 None,
                 replaces=dismissal,
             )
+
+    def test_an_end_above_the_start_on_one_page_is_refused(self):
+        with self.assertRaises(boundaries.MisorderedBoundary):
+            boundaries.add(
+                self.scan, (1, 50.0, 500.0), (1, 50.0, 100.0), self.user, None
+            )
+
+    def test_an_end_high_in_the_right_column_follows_a_low_start_at_left(
+        self,
+    ):
+        """Reading order walks the left column first, so a key high in
+        the right column closes a caption low in the left one."""
+        for x0, x1 in ((100, 800), (900, 1600)):
+            model_row(
+                self.scan,
+                label="TEXT_COLUMN",
+                label_id=int(Label.TEXT_COLUMN),
+                page_index=1,
+                source_page=2,
+                x0=x0,
+                y0=100,
+                x1=x1,
+                y1=2100,
+                img_width=IMG_W,
+                img_height=IMG_H,
+            )
+
+        row = boundaries.add(
+            self.scan, (1, 50.0, 500.0), (1, 400.0, 100.0), self.user, None
+        )
+
+        self.assertEqual(row.start_page_index, row.end_page_index)
 
     def test_a_page_outside_the_map_is_refused(self):
         with self.assertRaises(boundaries.UnaddressableBoundary):
@@ -868,6 +915,30 @@ class TestViewerPayload(TestCase):
         last = [r for r in rects if r["page_index"] == 1][0]
         self.assertGreater(last["x0"], 306.0)
 
+    def test_live_only_leaves_the_dismissed_rows_out(self):
+        user = UserFactory()
+        scan = ScanFactory(page_count=2)
+        row = OpinionBoundaryFactory(scan=scan)
+        boundaries.dismiss(scan, row, user)
+
+        self.assertEqual(len(boundaries.viewer_payload(scan, {})), 1)
+        self.assertEqual(
+            boundaries.viewer_payload(scan, {}, live_only=True), []
+        )
+
+    def test_has_live_reads_the_dismissals_and_the_additions(self):
+        user = UserFactory()
+        scan = ScanFactory(page_count=3)
+        self.assertFalse(boundaries.has_live(scan))
+        row = OpinionBoundaryFactory(scan=scan)
+        self.assertTrue(boundaries.has_live(scan))
+        boundaries.dismiss(scan, row, user)
+        self.assertFalse(boundaries.has_live(scan))
+        added = boundaries.add(scan, (0, 1.0, 1.0), (2, 1.0, 1.0), user, None)
+        self.assertTrue(boundaries.has_live(scan))
+        boundaries.dismiss(scan, added, user)
+        self.assertFalse(boundaries.has_live(scan))
+
     def test_no_rows_is_an_empty_list_with_no_lookup(self):
         scan = ScanFactory(page_count=2)
         with self.assertNumQueries(1):
@@ -1035,6 +1106,14 @@ class TestEndpoints(TestCase):
                     "end": {"page_index": 40, "x": 1, "y": 1},
                 },
             )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["status"], "error")
+
+    def test_a_dismissal_of_an_unaddressed_boundary_is_409(self):
+        OpinionBoundary.objects.filter(pk=self.row.pk).update(
+            end_source_page=None
+        )
+        response = self._post("dismiss", {"boundary_id": self.row.pk})
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["status"], "error")
 

@@ -1172,11 +1172,17 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
         output = pathlib.Path(scan.output_dir)
         bitonal = output / "bitonal.pdf"
         _write_bitonal_copy(bitonal)
+        from scanning import boundaries
         from scanning.factories import OpinionBoundaryFactory
 
         boundary = OpinionBoundaryFactory(
             scan=scan, start_page_index=0, end_page_index=0
         )
+        # A dismissed boundary is no opinion to cut (#240 PR C).
+        dismissed = OpinionBoundaryFactory(
+            scan=scan, start_page_index=0, end_page_index=0, start_y=300.0
+        )
+        boundaries.dismiss(scan, dismissed, None)
 
         with (
             # close_all() resets connections for daemon-process forking;

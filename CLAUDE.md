@@ -2406,11 +2406,33 @@ must not be broken:
   `viewer_step2.js` yields to `window.boundaryPickTarget` first, or the
   click would fall through to the page. A refusal (a 409 on a page with
   no address, `BOUNDARY_UNADDRESSABLE_MESSAGE`) reaches the toast.
-- **Step 3 (paused) reads the rows** through `viewer_payload` in
-  `_build_combined_redactions` and `run_generate_files`, and sets
-  `OpinionScan.boundary` from the dict's `id`. `page_start`,
-  `caption_page_index`, `key_page_index` and `has_image` stay until
-  #275.
+- **Step 3 (paused) reads the live rows** through
+  `viewer_payload(scan, live_only=True)` in `_build_combined_redactions`
+  and `run_generate_files`: a dismissed boundary is a card the sidebar
+  shows, not an opinion to cut, and the old column held no dismissed
+  entry. It sets `OpinionScan.boundary` from the dict's `id`.
+  `page_start`, `caption_page_index`, `key_page_index` and `has_image`
+  stay until #275. **Its masks are narrower than before**: the
+  `outside_rects` of the payload are unwidened, and `bl_pair` grew them
+  over the page ink. #206 rebuilds that input over the redacted volume
+  and should widen them there, where it holds the PDF.
+- **The action bar reads one flag.** `_review_flags` carries
+  `has_opinions` (`boundaries.has_live`: a computed row under no
+  dismissal, or a curator's addition not withdrawn), and both renders
+  of `_process_actions.html` read it for "Next: Generate" (#151). The
+  sidebar's `opinion_count` counts the same rows.
+- **A dismissal of an unaddressed boundary is refused** (409,
+  `BOUNDARY_UNADDRESSABLE_MESSAGE`), the `detections.decide` rule: it
+  could never land, since `resolve` matches by the start address, and
+  one written anyway was logged as stale after every compute. `add`
+  refuses an end before the start in reading order: by page, and on one
+  page by the column of the page's `TEXT_COLUMN` rows, then y.
+- **The page reads its own payload.** `scan_process_view` writes the
+  list into `#opinions-data` with the printed spans of the page map it
+  built (a range page gives its end to the opinion that starts there),
+  and both viewer scripts read that tag; `serve_opinions` stays for a
+  developer with a browser, and it may read the run's printed pages
+  from S3.
 - **Migration 0027 copies no data**, the plan's decision: the lists
   came from the legacy YOLO trio. It blanks the `apply_run` of the
   detect ledger for every scan in `PAGE_COMPLETENESS_REVIEW_DONE` or

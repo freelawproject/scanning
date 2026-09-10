@@ -310,7 +310,7 @@ body.boundary-pick .opinion-nav.picking {
       {% endfor %}
       {% endif %}
       {% if opinions %}
-      <h2 class="text-sm font-bold mb-2">Opinions ({{ opinions|length }})</h2>
+      <h2 class="text-sm font-bold mb-2">Opinions ({{ opinion_count }})</h2>
       {% comment %}
         One card per boundary row (#240 PR C). A dismissed computed
         boundary stays in the list, muted, with its undo; a boundary the

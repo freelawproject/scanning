@@ -123,10 +123,8 @@ def placer(
 ) -> Callable[[int | None, int | None], int | None]:
     """Return a function from a source address to a 0-based final index.
 
-    Built once per caller from the run's page map: an original page
-    goes through ``apply.originals_to_final`` (a replaced page has new
-    content, so a boundary anchored on it does not carry), an edit page
-    through the ``(edit_id, page)`` slots of the map. Without a run the
+    ``apply.index_placer`` over the run's map, the arithmetic
+    ``detections.relocate_manual_rows`` uses too. Without a run the
     space is the original's and the address is the index plus one.
 
     :param run: The standing apply run, or None for the original's space.
@@ -144,26 +142,7 @@ def placer(
 
     from scanning import apply
 
-    page_map = run.page_map or {}
-    originals = apply.originals_to_final(page_map)
-    slots = {
-        (entry["source"]["edit_id"], entry["source"]["page"]): entry[
-            "final_page"
-        ]
-        for entry in page_map.get("pages") or []
-        if entry["source"]["kind"] == "edit"
-    }
-
-    def place(edit_id, page):
-        if not page:
-            return None
-        if edit_id is None:
-            final = originals.get(page)
-        else:
-            final = slots.get((edit_id, page - 1))
-        return None if final is None else final - 1
-
-    return place
+    return apply.index_placer(run.page_map or {})
 
 
 def is_stale(row: OpinionBoundary, scan: Scan) -> bool:
@@ -473,6 +452,7 @@ def dismiss(scan: Scan, row: OpinionBoundary, user) -> OpinionBoundary | None:
     :param user: The curator. May be None.
     :returns: The standing dismissal for a computed row; None for a
         withdrawn addition.
+    :raises UnaddressableBoundary: For a computed row with no address.
     """
     with transaction.atomic():
         row = (
@@ -490,6 +470,20 @@ def dismiss(scan: Scan, row: OpinionBoundary, user) -> OpinionBoundary | None:
             return None
         if row.decision_id and row.decision.withdrawn_at is None:
             return row.decision
+        if row.start_source_page is None or row.end_source_page is None:
+            # The rule of ``detections.decide``: a dismissal with no
+            # address could never land (``resolve`` matches by the
+            # start address), and one written anyway stood for good and
+            # was logged after every compute.
+            logger.warning(
+                "scan %s: opinion boundary %s has no address in the "
+                "standing map; the dismissal is refused",
+                scan.pk,
+                row.pk,
+            )
+            raise UnaddressableBoundary(
+                f"boundary {row.pk} of scan {scan.pk} has no address"
+            )
         dismissal = OpinionBoundary.objects.create(
             scan=scan,
             origin=OpinionBoundary.Origin.HUMAN,
@@ -608,7 +602,8 @@ def add(
         addition (withdrawn here, its dismissal carried forward).
     :returns: The new row.
     :raises UnaddressableBoundary: When an anchor's page has no address.
-    :raises MisorderedBoundary: When the end page is before the start.
+    :raises MisorderedBoundary: When the end is before the start in
+        reading order.
     """
     fields = _anchor(scan, start, "start", run)
     fields.update(_anchor(scan, end, "end", run))
@@ -617,6 +612,25 @@ def add(
             f"scan {scan.pk}: the end page {fields['end_page_index']} is "
             f"before the start page {fields['start_page_index']}"
         )
+    if fields["end_page_index"] == fields["start_page_index"]:
+        # On one page the order is the reading order: the column from
+        # the page's TEXT_COLUMN rows, then y. An end above the start in
+        # the same column closes nothing; in the right column it may
+        # sit higher than a start in the left one.
+        page = fields["start_page_index"]
+        divide = _column_boundaries(scan, {page}).get(page)
+
+        def _key(x, y):
+            column = 0 if divide is None or x < divide else 1
+            return column, y
+
+        if _key(fields["end_x"], fields["end_y"]) < _key(
+            fields["start_x"], fields["start_y"]
+        ):
+            raise MisorderedBoundary(
+                f"scan {scan.pk}: the end anchor is before the start "
+                f"anchor on page {page}"
+            )
     with transaction.atomic():
         dismissal = None
         if replaces is not None and replaces.is_computed:
@@ -719,8 +733,7 @@ def standing(scan: Scan) -> list[OpinionBoundary]:
     :returns: The rows, ordered.
     """
     rows = list(
-        OpinionBoundary.objects.filter(scan=scan)
-        .filter(
+        OpinionBoundary.objects.filter(scan=scan).filter(
             Q(origin=OpinionBoundary.Origin.COMPUTED)
             | Q(
                 origin=OpinionBoundary.Origin.HUMAN,
@@ -728,7 +741,6 @@ def standing(scan: Scan) -> list[OpinionBoundary]:
                 withdrawn_at__isnull=True,
             )
         )
-        .select_related("decision")
     )
     # A computed boundary a move replaced is left out: the curator's
     # addition stands in its place, and its Dismiss is the undo of the
@@ -873,8 +885,34 @@ def outside_rects(
     return result
 
 
+def has_live(scan: Scan) -> bool:
+    """Return whether the volume has a boundary a reader would draw.
+
+    A computed row under no dismissal, or a curator's addition not
+    withdrawn. The one answer for the action bar's "Next: Generate"
+    (``views_process._review_flags``), so its two renders agree (#151).
+
+    :param scan: The scan.
+    :returns: Whether one exists.
+    """
+    return (
+        OpinionBoundary.objects.filter(scan=scan)
+        .filter(
+            Q(origin=OpinionBoundary.Origin.COMPUTED, decision__isnull=True)
+            | Q(
+                origin=OpinionBoundary.Origin.HUMAN,
+                kind=OpinionBoundary.Kind.ADD,
+                withdrawn_at__isnull=True,
+            )
+        )
+        .exists()
+    )
+
+
 def viewer_payload(
-    scan: Scan, page_numbers: dict[int, tuple] | None = None
+    scan: Scan,
+    page_numbers: dict[int, tuple] | None = None,
+    live_only: bool = False,
 ) -> list[dict]:
     """Return the standing boundaries in the shape the viewer reads.
 
@@ -891,9 +929,13 @@ def viewer_payload(
     :param page_numbers: ``{page_index: (number, end or None)}`` in the
         rows' space, when the caller holds it;
         ``services._page_number_lookup`` otherwise.
+    :param live_only: Leave the dismissed rows out. Step 3 wants the
+        opinions it cuts, not the cards the sidebar shows.
     :returns: The dicts, in reading order.
     """
     rows = standing(scan)
+    if live_only:
+        rows = [r for r in rows if not r.is_dismissed]
     if not rows:
         return []
     if page_numbers is None:

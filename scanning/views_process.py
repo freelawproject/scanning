@@ -587,9 +587,17 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # the view built above, which is already in the space the rows are
     # drawn in (the final space when the redactions are measured against
     # the standing run, #269).
-    opinions = boundaries.viewer_payload(
-        scan, {idx: (num, None) for idx, num in idx_to_logical.items()}
-    )
+    from scanning.services import printed_page_span
+
+    page_spans = {}
+    for idx, num in idx_to_logical.items():
+        span = printed_page_span(
+            str(num), "range" if "-" in str(num) else "single"
+        )
+        if span:
+            page_spans[idx] = span
+    opinions = boundaries.viewer_payload(scan, page_spans)
+    opinion_count = sum(1 for op in opinions if not op["dismissed"])
 
     # Build a set of page indices that contain IMAGE detections
     image_page_indices = set(
@@ -786,6 +794,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "ocr_text_available": bool(final_space)
             or dots_run_is_glued(dots_run),
             "opinions": opinions,
+            "opinion_count": opinion_count,
             "opinions_json": json.dumps(opinions),
             "has_redaction_rects": has_redaction_rects,
             "opinion_scans": opinion_scans,
@@ -1940,6 +1949,11 @@ def _review_flags(scan: Scan, repairs_waiting: bool | None = None) -> dict:
         "final_space": final_space,
         "final_volume": final_volume,
         "repairs_waiting": repairs_waiting,
+        # "Next: Generate" (#240 PR C): one read for both renders of
+        # the bar, or a volume whose only boundary is a curator's
+        # showed the link on a full load and hid it after the fragment
+        # refresh.
+        "has_opinions": boundaries.has_live(scan),
         **page_edits.pending_edit_flags(scan, run),
     }
 
@@ -2065,10 +2079,6 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "issues": scan.issues.all(),
         "missing_pages": scan.missing_pages,
         "has_detections": Detection.objects.filter(scan=scan).exists(),
-        # The bar reads truthiness alone ("Next: Generate").
-        "opinions": OpinionBoundary.objects.computed()
-        .filter(scan=scan)
-        .exists(),
         "dots_run": dots_mocr.run_summary(scan),
         "yolo_run": yolo_run,
         "detect_message": detection_message(yolo_run),

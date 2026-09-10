@@ -185,7 +185,12 @@ def compute_coverage_gaps(
     :returns: List of ``(start, end, count)`` tuples, one per gap run.
     :rtype: list[tuple[int, int, int]]
     """
-    if not opinions or not start_page or not end_page:
+    if not start_page or not end_page:
+        return []
+    # A dismissed boundary (#240 PR C) is a card with an undo, not an
+    # opinion; its pages are not covered.
+    opinions = [op for op in opinions if not op.get("dismissed")]
+    if not opinions:
         return []
 
     covered: set[int] = set()

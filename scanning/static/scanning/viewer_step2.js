@@ -2426,6 +2426,18 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function _loadOpinionsData(cb) {
         if (_opinionsData) { cb(); return; }
+        // The page carries the same payload the endpoint answers
+        // (#opinions-data, read by viewer_sidebar.js too), and the
+        // endpoint may read S3 for the printed numbers of a measured
+        // volume. Read the tag; the fetch stays for a page without it.
+        var tag = document.getElementById('opinions-data');
+        if (tag) {
+            try {
+                _opinionsData = JSON.parse(tag.textContent);
+                cb();
+                return;
+            } catch (e) { /* fall through to the fetch */ }
+        }
         fetch('/scans/' + documentId + '/opinions-json/')
             .then(function(r) { return r.json(); })
             .then(function(data) { _opinionsData = data; cb(); });

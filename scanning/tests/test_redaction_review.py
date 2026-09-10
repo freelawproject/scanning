@@ -549,6 +549,32 @@ class TestTheStepTwoBar(ScanningTestCase):
         self.assertNotIn("Next: Generate", self._bar(waiting))
         self.assertIn("Next: Generate", self._bar(approved))
 
+    def test_a_curator_drawn_boundary_alone_shows_the_link(self):
+        """Both renders of the bar read ``has_opinions`` (#240 PR C), so
+        a volume whose only boundary is a curator's shows the link in
+        the fragment as on the full load, and a dismissed computed
+        boundary alone shows none."""
+        from scanning import boundaries
+        from scanning.factories import UserFactory
+        from scanning.models import OpinionBoundary
+
+        scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE, page_count=3)
+        self.assertNotIn("Next: Generate", self._bar(scan))
+
+        OpinionBoundaryFactory(
+            scan=scan,
+            origin=OpinionBoundary.Origin.HUMAN,
+            kind=OpinionBoundary.Kind.ADD,
+            ordinal=None,
+        )
+        self.assertIn("Next: Generate", self._bar(scan))
+
+        dismissed = OpinionBoundaryFactory(
+            scan=ScanFactory(status=Status.REDACTION_REVIEW_DONE, page_count=3)
+        )
+        boundaries.dismiss(dismissed.scan, dismissed, UserFactory())
+        self.assertNotIn("Next: Generate", self._bar(dismissed.scan))
+
     def test_a_legacy_volume_keeps_its_link(self):
         """It can hold neither #263 status, so a gate on the approval
         alone would strand it in step 2."""

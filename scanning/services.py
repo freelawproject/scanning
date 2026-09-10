@@ -1017,7 +1017,7 @@ def _build_combined_redactions(scan_pk: int) -> Path:
             pages,
             scan.redaction_rects,
             scan.margin_rects,
-            boundaries.viewer_payload(scan),
+            boundaries.viewer_payload(scan, live_only=True),
             reporter=scan.reporter.short_name or "",
             volume=str(scan.volume) or "",
         )
@@ -2630,7 +2630,7 @@ def run_generate_files(scan_pk: int) -> None:
         # The boundaries are rows since #240 PR C; the file names land
         # on the dicts in reading order, as ``build_redactions`` names
         # them.
-        existing_opinions = boundaries.viewer_payload(scan)
+        existing_opinions = boundaries.viewer_payload(scan, live_only=True)
 
         if existing_opinions:
             for i, op in enumerate(existing_opinions):

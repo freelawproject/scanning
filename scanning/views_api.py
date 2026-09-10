@@ -187,7 +187,13 @@ def dismiss_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     row = _boundary_or_404(scan, data)
     if isinstance(row, JsonResponse):
         return row
-    dismissal = boundaries.dismiss(scan, row, request.user)
+    try:
+        dismissal = boundaries.dismiss(scan, row, request.user)
+    except boundaries.UnaddressableBoundary:
+        return JsonResponse(
+            {"status": "error", "message": BOUNDARY_UNADDRESSABLE_MESSAGE},
+            status=409,
+        )
     return JsonResponse(
         {
             "status": "ok",

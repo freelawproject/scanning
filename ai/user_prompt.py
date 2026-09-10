@@ -408,7 +408,11 @@ def build_user_prompt(page: Any) -> str | None:
 
     pdf_path = Path(page.scan.output_dir) / page.pdf_path
     detections = page.detections or []
-    opinions = (page.scan.opinions_json or []) if page.scan else []
+    # ``Scan.opinions_json`` is gone (#240 PR C: the boundaries are
+    # rows), and this builder has had no caller since #280. An empty
+    # list keeps the module importable and the prompt shape unchanged
+    # until the app is deleted.
+    opinions: list = []
 
     with pdfplumber.open(pdf_path) as pdf:
         pdf_page = pdf.pages[0]
