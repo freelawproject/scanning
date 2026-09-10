@@ -55,6 +55,7 @@ from scanning.models import (
     BUSY_STATUSES,
     DEAD_JOB_STATUSES,
     REVIEW_STATUSES,
+    ApplyRun,
     CheckName,
     Detection,
     ExternalJob,
@@ -484,8 +485,9 @@ def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
     Thin wrapper over :func:`blackletter.scanner.snap_text_columns_to_ink`,
     which does the measuring. What is app-specific is the persistence: the
     corrected boxes are written back to the ``Detection`` rows, so the
-    viewer overlay and ``detections.json`` show what the geometry actually
-    used, and no later step has to re-measure the ink to agree with it.
+    viewer overlay and the detection entries show what the geometry
+    actually used, and no later step has to re-measure the ink to agree
+    with it.
 
     Only the x-bounds move, so header and footer geometry is untouched.
 
@@ -581,7 +583,7 @@ def printed_page_span(value, kind) -> tuple[int, int | None] | None:
 def _page_number_lookup(scan: "Scan", printed: dict | None = None) -> dict:
     """Build ``{page_index: (page_number, page_number_end)}`` for a scan.
 
-    The numbers ``detections.json`` carries beside each box, so they
+    The numbers :func:`detection_entries` puts beside each box, so they
     must be in the space the boxes are in. Since #269 the boxes of a
     volume whose redactions are measured against its standing apply run
     are final pages, so the lookup comes from the run's printed-page map
@@ -614,7 +616,7 @@ def _page_number_lookup(scan: "Scan", printed: dict | None = None) -> dict:
             except apply.ApplyError:
                 logger.exception(
                     "scan %s: the printed pages of %s did not load; "
-                    "detections.json carries the original's numbers this once",
+                    "the detection entries carry the original's numbers this once",
                     scan.pk,
                     run.label,
                 )
@@ -689,32 +691,32 @@ def _pull_processing_files_from_s3(scan_pk: int) -> None:
         )
 
 
-def _sync_detections_to_disk(
-    scan_pk: int, upload: bool = True, page_numbers: dict | None = None
-) -> list | None:
-    """Write current DB detections to detections.json on disk.
+def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
+    """The live detections of a scan, in the shape blackletter reads.
 
-    :param scan_pk: Primary key of the scan whose detections to sync.
-    :param upload: If ``True`` (default), also push detections.json to S3.
-        Pass ``False`` when a subsequent ``_push_processing_files_to_s3``
-        call will cover the upload, to avoid redundant round-trips.
+    One dict per row, with the printed page number beside each box.
+    This is what ``detections.json`` used to hold; since #240 the rows
+    are the only store, and every reader (the pairing, the redaction
+    geometry, step 3) takes this list in memory. Nothing writes it to
+    disk or to S3.
+
+    :param scan_pk: Primary key of the scan.
     :param page_numbers: The ``{page_index: (start, end)}`` lookup, when
         the caller holds it (the redaction compute loads the run's
         printed pages once, #269). Resolved by
         :func:`_page_number_lookup` otherwise.
-    :return: The detection data written, or None if no output_dir.
+    :return: The detection dicts, empty when the scan has none.
     """
-    scan = Scan.objects.get(pk=scan_pk)
-    output_dir = Path(scan.output_dir)
-    if not output_dir.is_dir():
-        return
-
     if page_numbers is None:
-        page_numbers = _page_number_lookup(scan)
+        # The one reader of the scan row; the geometry passes ``{}``
+        # and reads none.
+        page_numbers = _page_number_lookup(Scan.objects.get(pk=scan_pk))
 
-    all_saved = Detection.objects.filter(
-        scan_id=scan_pk, active=True
-    ).order_by("page_index", "y0")
+    all_saved = (
+        Detection.objects.live()
+        .filter(scan_id=scan_pk)
+        .order_by("page_index", "y0")
+    )
     det_data = []
     for d in all_saved:
         entry = {
@@ -730,8 +732,8 @@ def _sync_detections_to_disk(
         if d.found_by and d.model_name != Detection.ModelName.MANUAL:
             # Load-bearing, not decoration: the confidence gates are per
             # model family since blackletter #73, and
-            # ``rows_are_bl_warm`` reads this provenance off the file.
-            # ``blackletter.api.pair`` reads it from here, so a file
+            # ``rows_are_bl_warm`` reads this provenance off the list.
+            # ``blackletter.api.pair`` reads it from here, so a list
             # without it pairs a bl-warm volume on the legacy gates.
             # A hand-added detection carries none, and must not: it
             # would read as a second model family and send the whole
@@ -745,16 +747,6 @@ def _sync_detections_to_disk(
             if pn[1] is not None:
                 entry["page_number_end"] = pn[1]
         det_data.append(entry)
-    (output_dir / "detections.json").write_text(json.dumps(det_data))
-    if upload:
-        try:
-            from scanning import s3_sync
-
-            s3_sync.upload_file_to_s3(scan, "detections.json")
-        except Exception:
-            logger.exception(
-                "Failed to push detections.json to S3 for scan %s", scan_pk
-            )
     return det_data
 
 
@@ -764,7 +756,7 @@ def _build_document_from_detections(
     """Build a blackletter Document from detection data and a PDF.
 
     :param scan: The Scan instance for reporter/volume metadata.
-    :param det_data: List of detection dicts (from detections.json).
+    :param det_data: List of detection dicts (:func:`detection_entries`).
     :param pdf_path: Path to the PDF to read page dimensions from.
     :return: The constructed Document.
     """
@@ -832,15 +824,13 @@ def _compute_and_save_redaction_rects(
 
     :param scan_pk: Primary key of the scan to compute rects for.
     :param pdf_path: Path to the PDF used for page dimensions.
-    :param page_numbers: The page-number lookup for ``detections.json``,
-        when the caller holds it; see :func:`_sync_detections_to_disk`.
+    :param page_numbers: The page-number lookup beside each box, when
+        the caller holds it; see :func:`detection_entries`.
     :return: The computed rects list.
     """
     scan = Scan.objects.get(pk=scan_pk)
 
-    det_data = _sync_detections_to_disk(
-        scan_pk, upload=False, page_numbers=page_numbers
-    )
+    det_data = detection_entries(scan_pk, page_numbers=page_numbers)
     if not det_data:
         return []
 
@@ -869,64 +859,8 @@ def _compute_and_save_redaction_rects(
     return rects
 
 
-def _load_detections(output_dir: str | Path) -> list:
-    """Read ``detections.json`` from a scan's output dir.
-
-    :param output_dir: The scan's output directory.
-    :return: The detection list, or an empty list when absent/unreadable.
-    """
-    det_path = Path(output_dir) / "detections.json"
-    if not det_path.exists():
-        return []
-    try:
-        return json.loads(det_path.read_text())
-    except (OSError, ValueError):
-        logger.exception("Unreadable detections.json in %s", output_dir)
-        return []
-
-
-def _detections_for_geometry(scan_pk: int, output_dir: str | Path) -> list:
-    """Detection dicts for the geometry helpers, DB first.
-
-    ``detections.json`` is written by whichever process ran the pipeline, so
-    another one may not have it yet: ``/tmp`` is per-container in dev and
-    per-pod in production. Reading the DB avoids depending on that, and the
-    DB is the source of truth anyway once a reviewer starts editing
-    detections. The file is only a fallback, for a scan whose rows have not
-    been imported.
-
-    :param scan_pk: Primary key of the scan.
-    :param output_dir: The scan's output directory, for the fallback.
-    :return: Detection dicts shaped as ``detections.json`` stores them.
-    """
-    rows = Detection.objects.filter(scan_id=scan_pk, active=True).order_by(
-        "page_index", "y0"
-    )
-    dets = [
-        {
-            "page_index": d.page_index,
-            "label": d.label,
-            "label_id": d.label_id,
-            "confidence": d.confidence,
-            "bbox": [d.x0, d.y0, d.x1, d.y1],
-            "img_width": d.img_width,
-            "img_height": d.img_height,
-            # The model family, which picks the confidence gates. See
-            # :func:`_sync_detections_to_disk`, which writes the same
-            # field to the file this function falls back to.
-            **(
-                {"found_by": d.found_by}
-                if d.found_by and d.model_name != Detection.ModelName.MANUAL
-                else {}
-            ),
-        }
-        for d in rows
-    ]
-    return dets or _load_detections(output_dir)
-
-
 def _pages_for_geometry(
-    scan: "Scan", pdf_path: str, output_dir: str | Path, snap: bool = True
+    scan: "Scan", pdf_path: str, snap: bool = True
 ) -> list:
     """The detected pages blackletter's geometry should be measured against.
 
@@ -936,7 +870,6 @@ def _pages_for_geometry(
 
     :param scan: The scan being processed.
     :param pdf_path: The PDF the detections were measured against.
-    :param output_dir: The scan's output directory, for the JSON fallback.
     :param snap: Correct the ``TEXT_COLUMN`` boxes against the page ink.
         Boxes reach the DB uncorrected: nothing on the upload path snaps
         them (that would be a full-volume render review 1 does not need),
@@ -947,7 +880,8 @@ def _pages_for_geometry(
         read (see :func:`_build_combined_redactions`).
     :return: ``Page`` objects, empty when the scan has no detections yet.
     """
-    det_data = _detections_for_geometry(scan.pk, output_dir)
+    # No page numbers: the geometry reads the boxes, not the labels.
+    det_data = detection_entries(scan.pk, page_numbers={})
     if not det_data:
         return []
     document = _build_document_from_detections(scan, det_data, pdf_path)
@@ -979,7 +913,7 @@ def _compute_and_save_margin_rects(
     scan = Scan.objects.get(pk=scan_pk)
     if scan.margin_rects and not force:
         return scan.margin_rects
-    pages = _pages_for_geometry(scan, pdf_path, Path(output_dir))
+    pages = _pages_for_geometry(scan, pdf_path)
     if not pages:
         # Without detections the bounds would come from the page's marks
         # alone, so bleed-through at a page edge suppresses that page's top
@@ -1019,7 +953,7 @@ def _build_combined_redactions(scan_pk: int) -> Path:
     # ``snap=False``: this step reads only each page's dimensions and scale,
     # never its column boxes, so correcting them would render the whole
     # volume at 100 dpi to change nothing.
-    pages = _pages_for_geometry(scan, pdf_path, output_dir, snap=False)
+    pages = _pages_for_geometry(scan, pdf_path, snap=False)
 
     try:
         combined = bl_build_redactions(
@@ -1598,7 +1532,12 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _import_detections(scan_pk: int, detections: list) -> int:
+def _import_detections(
+    scan_pk: int,
+    detections: list,
+    run: "ApplyRun | None" = None,
+    detect_run: int | None = None,
+) -> int:
     """Replace a scan's model detections with the ones just merged.
 
     The rows a curator made by hand (``model_name`` ``MANUAL``) are
@@ -1607,15 +1546,32 @@ def _import_detections(scan_pk: int, detections: list) -> int:
     re-run of a deterministic model is no reason to throw it away.
     What the re-run does replace is every box the model itself drew.
 
+    Each new row carries its **address** (#240): the source page the
+    glued document names beside the box (``detections.source_of_entry``),
+    the run whose page space ``page_index`` is in, and the detection run
+    that found it. Then every standing ``DetectionDecision`` of the scan
+    is resolved onto the new rows by that address
+    (``detections.resolve``), which is how a curator's approvals and
+    deletions survive the import that used to lose them, and every kept
+    hand-drawn row is moved to its page in the new space
+    (``detections.relocate_manual_rows``), or a box drawn before a
+    deletion would paint one page out after it.
+
     ``found_by`` is copied onto each row, because the confidence gates
     are per model family (``label_confidence(label, bl_warm)``), and
     that field is where every reader looks for the family.
 
     :param scan_pk: Primary key of the scan.
     :param detections: The merged document's ``detections`` list, in
-        volume page coordinates.
+        the page coordinates of ``run`` (or of the original).
+    :param run: The apply run whose final space the list is in; None
+        for the original's space.
+    :param detect_run: The ``ExternalJob.run`` of the detection run.
     :return: How many rows were created.
     """
+    from scanning import detections as decisions
+
+    scan = Scan.objects.get(pk=scan_pk)
     kept = Detection.objects.filter(
         scan_id=scan_pk, model_name=Detection.ModelName.MANUAL
     ).count()
@@ -1632,6 +1588,7 @@ def _import_detections(scan_pk: int, detections: list) -> int:
     rows = []
     for entry in detections:
         bbox = entry.get("bbox") or [0, 0, 1, 1]
+        edit_id, source_page = decisions.source_of_entry(entry)
         rows.append(
             Detection(
                 scan_id=scan_pk,
@@ -1649,14 +1606,29 @@ def _import_detections(scan_pk: int, detections: list) -> int:
                 model_count=entry.get("model_count", 1),
                 found_by=entry.get("found_by") or [],
                 active=True,
+                source_edit_id=edit_id,
+                source_page=source_page,
+                source_fingerprint=scan.source_fingerprint or "",
+                apply_run=run,
+                detect_run=detect_run,
             )
         )
     Detection.objects.bulk_create(rows, batch_size=1000)
+    landed, stale = decisions.resolve(scan)
+    moved = 0
+    if run is not None and kept:
+        # The kept hand-drawn rows follow the new page space, by their
+        # address; the model rows arrived in it.
+        moved, _unplaced = decisions.relocate_manual_rows(scan, run)
     logger.info(
-        "Imported %d detection(s) for scan %s (%d hand-made row(s) kept)",
+        "Imported %d detection(s) for scan %s (%d hand-made row(s) kept, "
+        "%d moved; %d decision(s) landed, %d stale)",
         len(rows),
         scan_pk,
         kept,
+        moved,
+        landed,
+        len(stale),
     )
     return len(rows)
 
@@ -1862,7 +1834,9 @@ def run_compute_redactions(scan_pk: int) -> None:
 
         if importing:
             with _log_stage("Import detections"):
-                _import_detections(scan_pk, detections)
+                _import_detections(
+                    scan_pk, detections, run=run, detect_run=rows[0].run
+                )
 
             # Only after an import: the correction converges, so it is
             # a no-op once it is stored, and it renders every page.
@@ -1870,13 +1844,11 @@ def run_compute_redactions(scan_pk: int) -> None:
             with _log_stage("Column correction"):
                 _snap_text_columns_to_ink(scan_pk, pdf_path)
 
-        det_data = _sync_detections_to_disk(
-            scan_pk, upload=False, page_numbers=page_numbers
-        )
+        det_data = detection_entries(scan_pk, page_numbers=page_numbers)
         _update_progress(scan_pk, "Pairing the opinions...")
         with _log_stage("Opinion pairing"):
             opinions = bl_pair(
-                str(Path(output_dir) / "detections.json"),
+                det_data,
                 pdf_path,
                 reporter=scan.reporter.short_name or "",
                 volume=str(scan.volume) or "",
@@ -1893,9 +1865,8 @@ def run_compute_redactions(scan_pk: int) -> None:
         margins = _compute_and_save_margin_rects(
             scan_pk, pdf_path, output_dir, force=True
         )
-
-        Scan.objects.filter(pk=scan_pk).update(s3_uploaded=False)
-        _push_processing_files_to_s3(scan_pk)
+        # Nothing to push: every output of this pass is a row (#240),
+        # and the files under ``output_dir`` are the copies it pulled.
     except Exception as exc:
         logger.exception(
             "compute_redactions: scan %s failed after %.1fs",
@@ -2531,8 +2502,8 @@ def run_generate_files(scan_pk: int) -> None:
         _update_progress(scan_pk, "Correcting column boxes...")
         _snap_text_columns_to_ink(scan_pk, str(base_pdf))
 
-        # Write current DB detections -> detections.json (includes page numbers)
-        det_data = _sync_detections_to_disk(scan_pk)
+        # The live detections, with the page numbers beside each box.
+        det_data = detection_entries(scan_pk)
         Scan.objects.filter(pk=scan_pk).update(
             progress_message=f"Generating files ({len(det_data or [])} detections)..."
         )

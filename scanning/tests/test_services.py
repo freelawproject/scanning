@@ -23,6 +23,7 @@ from scanning.factories import (
 from scanning.models import (
     CheckName,
     Detection,
+    DetectionDecision,
     Issue,
     PageEdit,
     QueueStatus,
@@ -226,30 +227,28 @@ class TestModelProvenanceSurvives(TestCase):
         fields.update(kwargs)
         return Detection.objects.create(**fields)
 
-    def test_detections_json_carries_found_by(self):
-        from scanning.services import _sync_detections_to_disk
+    def test_the_entries_carry_found_by(self):
+        from scanning.services import detection_entries
 
         self._detection()
 
-        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+        det_data = detection_entries(self.scan.pk)
 
         self.assertEqual(
             det_data[0]["found_by"],
             [{"model": "bl_warm", "confidence": 0.92}],
         )
-        on_disk = json.loads(
-            (
-                pathlib.Path(self.scan.output_dir) / "detections.json"
-            ).read_text()
+        # The rows are the only store since #240: no file is written.
+        self.assertFalse(
+            (pathlib.Path(self.scan.output_dir) / "detections.json").exists()
         )
-        self.assertEqual(on_disk[0]["found_by"], det_data[0]["found_by"])
 
     def test_a_hand_added_box_claims_no_model(self):
         """It would read as a second family and send the whole volume
         back to the legacy gates."""
         from blackletter.bl_warm import rows_are_bl_warm
 
-        from scanning.services import _sync_detections_to_disk
+        from scanning.services import detection_entries
 
         self._detection()
         self._detection(
@@ -260,7 +259,7 @@ class TestModelProvenanceSurvives(TestCase):
             found_by=[],
         )
 
-        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+        det_data = detection_entries(self.scan.pk)
 
         self.assertNotIn("found_by", det_data[1])
         self.assertTrue(rows_are_bl_warm(det_data))
@@ -271,10 +270,7 @@ class TestModelProvenanceSurvives(TestCase):
         send the volume back to the legacy gates."""
         from blackletter.bl_warm import rows_are_bl_warm
 
-        from scanning.services import (
-            _detections_for_geometry,
-            _sync_detections_to_disk,
-        )
+        from scanning.services import detection_entries
 
         self._detection()
         self._detection(
@@ -285,8 +281,8 @@ class TestModelProvenanceSurvives(TestCase):
             found_by=[{"model": "manual", "confidence": 1.0}],
         )
 
-        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
-        geometry = _detections_for_geometry(self.scan.pk, self.scan.output_dir)
+        det_data = detection_entries(self.scan.pk)
+        geometry = detection_entries(self.scan.pk, page_numbers={})
 
         self.assertNotIn("found_by", det_data[1])
         self.assertNotIn("found_by", geometry[1])
@@ -299,8 +295,6 @@ class TestModelProvenanceSurvives(TestCase):
         from django.urls import reverse
 
         self._detection()
-        det_path = pathlib.Path(self.scan.output_dir) / "detections.json"
-        det_path.write_text("[]")
         self.client.force_login(UserFactory())
 
         response = self.client.post(
@@ -323,15 +317,73 @@ class TestModelProvenanceSurvives(TestCase):
             scan=self.scan, model_name=Detection.ModelName.MANUAL
         )
         self.assertEqual(added.found_by, [])
+        self.assertEqual(added.pk, response.json()["detection_id"])
+        # Addressed by its source page (#240): no run, so the original's.
+        self.assertEqual(added.source_page, 4)
+        self.assertIsNone(added.source_edit)
+
+    def test_a_second_add_on_the_curator_s_own_box_is_a_no_op(self):
+        """The proximity match includes hand-drawn rows, or a repeat
+        click would draw a second box over the first (PR #288 review)."""
+        from django.urls import reverse
+
+        self.client.force_login(UserFactory())
+        body = {
+            "page_index": 3,
+            "label_id": 1,
+            "bbox": [100, 100, 140, 140],
+            "img_width": 1700,
+            "img_height": 2200,
+        }
+        first = self.client.post(
+            reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+            data=json.dumps(body),
+            content_type="application/json",
+        )
+
+        second = self.client.post(
+            reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({**body, "bbox": [104, 98, 144, 138]}),
+            content_type="application/json",
+        )
+
+        self.assertTrue(first.json()["added"])
+        self.assertFalse(second.json()["added"])
+        self.assertEqual(
+            second.json()["detection_id"], first.json()["detection_id"]
+        )
+        self.assertEqual(
+            Detection.objects.filter(
+                scan=self.scan, model_name=Detection.ModelName.MANUAL
+            ).count(),
+            1,
+        )
+        self.assertEqual(DetectionDecision.objects.count(), 0)
+
+    def test_a_malformed_add_names_no_exception(self):
+        from django.urls import reverse
+
+        self.client.force_login(UserFactory())
+
+        with self.assertLogs("scanning.views_api", level="WARNING"):
+            response = self.client.post(
+                reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+                data=json.dumps({"page_index": 0, "label_id": 1, "bbox": [1]}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("Traceback", response.json()["error"])
+        self.assertNotIn("ValueError", response.json()["error"])
 
     def test_the_document_reads_the_bl_warm_gates(self):
         from scanning.services import (
             _build_document_from_detections,
-            _sync_detections_to_disk,
+            detection_entries,
         )
 
         self._detection()
-        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+        det_data = detection_entries(self.scan.pk)
 
         document = _build_document_from_detections(
             self.scan, det_data, PDF_PATH
@@ -342,11 +394,11 @@ class TestModelProvenanceSurvives(TestCase):
     def test_a_legacy_volume_keeps_the_legacy_gates(self):
         from scanning.services import (
             _build_document_from_detections,
-            _sync_detections_to_disk,
+            detection_entries,
         )
 
         self._detection(model_name=Detection.ModelName.LARGE, found_by=[])
-        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+        det_data = detection_entries(self.scan.pk)
 
         document = _build_document_from_detections(
             self.scan, det_data, PDF_PATH
@@ -355,11 +407,11 @@ class TestModelProvenanceSurvives(TestCase):
         self.assertFalse(document.bl_warm)
 
     def test_the_geometry_lookup_carries_it_too(self):
-        from scanning.services import _detections_for_geometry
+        from scanning.services import detection_entries
 
         self._detection()
 
-        dets = _detections_for_geometry(self.scan.pk, self.scan.output_dir)
+        dets = detection_entries(self.scan.pk, page_numbers={})
 
         self.assertEqual(
             dets[0]["found_by"],
@@ -368,42 +420,35 @@ class TestModelProvenanceSurvives(TestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestSyncDetectionsToDisk(TestCase):
-    """Test _sync_detections_to_disk."""
+class TestDetectionEntries(TestCase):
+    """``detection_entries`` is the in-memory list that replaced
+    ``detections.json`` (#240)."""
 
     def setUp(self):
         _require_fixture(self)
 
-    def test_writes_detections_json(self):
-        from scanning.services import _sync_detections_to_disk
+    def test_lists_the_live_rows_and_writes_no_file(self):
+        from scanning.services import detection_entries
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(tmpdir)
-            output = pathlib.Path(scan.output_dir)
             _run_detect_on_fixture(tmpdir)
             _import_detections(scan.pk, tmpdir)
-
-            # Delete the file from output_dir and re-sync from DB
-            det_path = output / "detections.json"
-            # Copy detections.json from tmpdir to output_dir first
-            src = pathlib.Path(tmpdir) / "detections.json"
-            if src.exists():
-                shutil.copy2(src, det_path)
+            det_path = pathlib.Path(scan.output_dir) / "detections.json"
             det_path.unlink(missing_ok=True)
+
+            det_data = detection_entries(scan.pk)
+
+            self.assertEqual(
+                len(det_data), Detection.objects.filter(scan=scan).count()
+            )
             self.assertFalse(det_path.exists())
 
-            det_data = _sync_detections_to_disk(scan.pk)
-            self.assertTrue(det_path.exists())
-            on_disk = json.loads(det_path.read_text())
-            self.assertEqual(len(on_disk), len(det_data))
-
-    def test_returns_none_without_detections(self):
-        from scanning.services import _sync_detections_to_disk
+    def test_returns_an_empty_list_without_detections(self):
+        from scanning.services import detection_entries
 
         scan = ScanFactory()
-        # output_dir is computed but directory doesn't exist on disk
-        result = _sync_detections_to_disk(scan.pk)
-        self.assertIsNone(result)
+        self.assertEqual(detection_entries(scan.pk), [])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -546,7 +591,7 @@ class TestComputeAndSaveMarginRects(TestCase):
 
     def test_reads_detections_from_the_db_not_the_file(self):
         """The DB is the source of truth, and is always reachable."""
-        from scanning.services import _detections_for_geometry
+        from scanning.services import detection_entries
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(
@@ -558,7 +603,7 @@ class TestComputeAndSaveMarginRects(TestCase):
             self.assertFalse(
                 (pathlib.Path(scan.output_dir) / "detections.json").exists()
             )
-            dets = _detections_for_geometry(scan.pk, scan.output_dir)
+            dets = detection_entries(scan.pk, page_numbers={})
             self.assertEqual([d["label"] for d in dets], ["TEXT_COLUMN"])
             self.assertEqual(dets[0]["bbox"], [100, 200, 1600, 2000])
 
@@ -595,7 +640,7 @@ class TestBuildDocumentFromDetections(TestCase):
     def test_builds_document_with_pages(self):
         from scanning.services import (
             _build_document_from_detections,
-            _sync_detections_to_disk,
+            detection_entries,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -605,7 +650,7 @@ class TestBuildDocumentFromDetections(TestCase):
             )
             _run_detect_on_fixture(tmpdir)
             _import_detections(scan.pk, tmpdir)
-            det_data = _sync_detections_to_disk(scan.pk)
+            det_data = detection_entries(scan.pk)
 
             document = _build_document_from_detections(
                 scan, det_data, PDF_PATH
@@ -1763,9 +1808,7 @@ class TestPagesForGeometry(TestCase):
     def test_widens_an_uncorrected_box_without_persisting_it(self):
         from scanning.services import _pages_for_geometry
 
-        pages = _pages_for_geometry(
-            self.scan, str(self.pdf), self.scan.output_dir
-        )
+        pages = _pages_for_geometry(self.scan, str(self.pdf))
         box = pages[0].detections[0].bbox
         self.assertAlmostEqual(box.x1, COLUMN_LEFT.x0, delta=2.0)
         self.assertAlmostEqual(box.x2, COLUMN_LEFT.x1, delta=2.0)
@@ -1777,9 +1820,7 @@ class TestPagesForGeometry(TestCase):
         """The steps that never read a column box must not pay to fix one."""
         from scanning.services import _pages_for_geometry
 
-        pages = _pages_for_geometry(
-            self.scan, str(self.pdf), self.scan.output_dir, snap=False
-        )
+        pages = _pages_for_geometry(self.scan, str(self.pdf), snap=False)
         self.assertEqual(pages[0].detections[0].bbox.x1, COLUMN_LEFT.x0 + 6)
 
 

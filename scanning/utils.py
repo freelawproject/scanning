@@ -40,23 +40,6 @@ def get_volume(reporter_slug: str, vol: int) -> Volume:
     )
 
 
-def find_json_file(output_base: Path, filename: str) -> Path | None:
-    """Search output_base and its parents for a JSON file.
-
-    :param output_base: The directory to start searching from.
-    :param filename: The JSON filename to look for.
-    :return: The Path if found, or None.
-    """
-    for candidate in [
-        output_base / filename,
-        output_base.parent / filename,
-        output_base.parent.parent / filename,
-    ]:
-        if candidate.exists():
-            return candidate
-    return None
-
-
 def find_ocr_pdf(output_dir: str | Path) -> Path | None:
     """Find the OCR PDF in output_dir (excludes bitonal, redacted, original).
 

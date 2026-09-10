@@ -28,6 +28,7 @@ from scanning.factories import (
 from scanning.models import (
     ApplyRun,
     Detection,
+    DetectionDecision,
     JobEngine,
     JobStage,
     JobStatus,
@@ -2459,253 +2460,364 @@ class TestRunFullPipelinePullsFromS3(ScanningTestCase):
         mock_pull.assert_called_once_with(scan.pk)
 
 
-class TestUpdateDetection(ScanningTestCase):
-    """Tests for the update_detection endpoint."""
+class DetectionEndpointMixin:
+    """One scan with one model detection, for the four box endpoints."""
 
-    def _make_scan_with_detection(self):
-        """Create a scan, its output_dir, and one Detection record.
+    def _make_scan_with_detection(self, **fields):
+        """Create a scan and one model ``Detection`` row.
 
+        :param fields: Overrides for the row.
         :return: Tuple of (scan, detection).
         :rtype: tuple
         """
-        scan = ScanFactory()
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        det = Detection.objects.create(
-            scan=scan,
-            page_index=0,
-            label="CASE_CAPTION",
-            label_id=1,
-            confidence=0.9,
-            x0=100.0,
-            y0=100.0,
-            x1=200.0,
-            y1=200.0,
-            img_width=1200,
-            img_height=1600,
-            model_name=Detection.ModelName.SMALL,
-            model_count=1,
-            found_by=[{"model": "yolo", "confidence": 0.9}],
+        scan = ScanFactory(source_fingerprint="100:1")
+        values = {
+            "scan": scan,
+            "page_index": 0,
+            "label": "CASE_CAPTION",
+            "label_id": 1,
+            "confidence": 0.9,
+            "x0": 100.0,
+            "y0": 100.0,
+            "x1": 200.0,
+            "y1": 200.0,
+            "img_width": 1200,
+            "img_height": 1600,
+            "model_name": Detection.ModelName.BL_WARM,
+            "model_count": 1,
+            "found_by": [{"model": "bl_warm", "confidence": 0.9}],
+            "source_page": 1,
+            "source_fingerprint": "100:1",
+        }
+        values.update(fields)
+        return scan, Detection.objects.create(**values)
+
+    def _post(self, name, scan, body):
+        """POST ``body`` as JSON to the named endpoint of ``scan``.
+
+        :param name: The URL name.
+        :param scan: The scan.
+        :param body: The payload.
+        :return: The response.
+        """
+        return self.client.post(
+            reverse(name, kwargs={"pk": scan.pk}),
+            data=json.dumps(body),
+            content_type="application/json",
         )
-        return scan, det
 
-    def test_updates_db_and_disk(self):
-        """POST with valid detection_id updates DB coords and writes detections.json."""
-        from unittest.mock import patch
 
+class TestUpdateDetection(DetectionEndpointMixin, ScanningTestCase):
+    """Tests for the update_detection endpoint (#240)."""
+
+    def test_a_moved_model_box_becomes_a_deactivation_and_a_hand_drawn_row(
+        self,
+    ):
+        """The model row is not written: it would be lost at the next
+        import. Two human rows survive it, and the response names the
+        row that holds the box now."""
         user = self.make_staff_user()
         self.client.force_login(user)
         scan, det = self._make_scan_with_detection()
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("update_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps(
-                    {
-                        "detection_id": det.pk,
-                        "new_bbox": [150.0, 150.0, 250.0, 250.0],
-                    }
-                ),
-                content_type="application/json",
-            )
+        response = self._post(
+            "update_detection",
+            scan,
+            {"detection_id": det.pk, "new_bbox": [150.0, 150.0, 250.0, 250.0]},
+        )
 
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["updated"], 1)
-
         det.refresh_from_db()
-        self.assertEqual(det.x0, 150.0)
-        self.assertEqual(det.y0, 150.0)
-        self.assertEqual(det.x1, 250.0)
-        self.assertEqual(det.y1, 250.0)
+        self.assertEqual(
+            [det.x0, det.y0, det.x1, det.y1], [100, 100, 200, 200]
+        )
+        self.assertFalse(det.active)
+        self.assertEqual(det.decision.kind, DetectionDecision.Kind.DEACTIVATE)
+        self.assertEqual(det.decision.author, user)
+        holder = Detection.objects.get(pk=body["detection_id"])
+        self.assertEqual(holder.model_name, Detection.ModelName.MANUAL)
+        self.assertEqual(
+            [holder.x0, holder.y0, holder.x1, holder.y1], [150, 150, 250, 250]
+        )
+        self.assertEqual(holder.replaces, det.decision)
+        self.assertEqual(holder.source_page, 1)
+        self.assertEqual(holder.label, det.label)
+        self.assertFalse(
+            pathlib.Path(scan.output_dir).joinpath("detections.json").exists()
+        )
 
-        det_path = pathlib.Path(scan.output_dir) / "detections.json"
-        self.assertTrue(det_path.exists())
-        saved = json.loads(det_path.read_text())
-        self.assertEqual(len(saved), 1)
-        self.assertEqual(saved[0]["bbox"], [150.0, 150.0, 250.0, 250.0])
+    def test_a_hand_drawn_row_is_written_in_place(self):
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, det = self._make_scan_with_detection(
+            model_name=Detection.ModelName.MANUAL, confidence=1.0, found_by=[]
+        )
+
+        response = self._post(
+            "update_detection",
+            scan,
+            {"detection_id": det.pk, "new_bbox": [1.0, 2.0, 3.0, 4.0]},
+        )
+
+        body = json.loads(response.content)
+        self.assertEqual(body["detection_id"], det.pk)
+        det.refresh_from_db()
+        self.assertEqual([det.x0, det.y0, det.x1, det.y1], [1, 2, 3, 4])
+        self.assertTrue(det.active)
+        self.assertEqual(DetectionDecision.objects.count(), 0)
 
     def test_unknown_detection_id_returns_404(self):
         """POST with a non-existent detection_id returns 404."""
-        from unittest.mock import patch
-
         user = self.make_staff_user()
         self.client.force_login(user)
         scan, _det = self._make_scan_with_detection()
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("update_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps(
-                    {
-                        "detection_id": 999999,
-                        "new_bbox": [0.0, 0.0, 10.0, 10.0],
-                    }
-                ),
-                content_type="application/json",
-            )
+        response = self._post(
+            "update_detection",
+            scan,
+            {"detection_id": 999999, "new_bbox": [0.0, 0.0, 10.0, 10.0]},
+        )
 
         self.assertEqual(response.status_code, 404)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "error")
 
 
-class TestDeleteDetection(ScanningTestCase):
-    """Tests for the delete_detection endpoint."""
+class TestDeleteDetection(DetectionEndpointMixin, ScanningTestCase):
+    """Tests for the delete_detection endpoint (#240)."""
 
-    def _make_scan_with_detection(self):
-        """Create a scan, its output_dir, and one active Detection record.
-
-        :return: Tuple of (scan, detection).
-        :rtype: tuple
-        """
-        scan = ScanFactory()
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        det = Detection.objects.create(
-            scan=scan,
-            page_index=0,
-            label="CASE_CAPTION",
-            label_id=1,
-            confidence=0.9,
-            x0=100.0,
-            y0=100.0,
-            x1=200.0,
-            y1=200.0,
-            img_width=1200,
-            img_height=1600,
-            model_name=Detection.ModelName.SMALL,
-            model_count=1,
-            found_by=[{"model": "small", "confidence": 0.9}],
-        )
-        return scan, det
-
-    def test_deactivates_db_and_removes_from_disk(self):
-        """POST with valid detection_id sets active=False and removes it from detections.json."""
-        from unittest.mock import patch
-
+    def test_a_model_row_gets_a_deactivation(self):
+        """``active`` is the derived read; the decision is the record."""
         user = self.make_staff_user()
         self.client.force_login(user)
         scan, det = self._make_scan_with_detection()
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("delete_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps({"detection_id": det.pk}),
-                content_type="application/json",
-            )
+        response = self._post(
+            "delete_detection", scan, {"detection_id": det.pk}
+        )
 
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["deleted"], 1)
-
         det.refresh_from_db()
         self.assertFalse(det.active)
+        decision = det.decision
+        self.assertEqual(decision.kind, DetectionDecision.Kind.DEACTIVATE)
+        self.assertEqual(decision.source_page, 1)
+        self.assertEqual(decision.source_fingerprint, "100:1")
+        self.assertEqual(decision.target_bbox, [100, 100, 200, 200])
+        self.assertEqual(decision.target_confidence, 0.9)
+        self.assertEqual(decision.author, user)
 
-        det_path = pathlib.Path(scan.output_dir) / "detections.json"
-        self.assertTrue(det_path.exists())
-        saved = json.loads(det_path.read_text())
-        self.assertEqual(len(saved), 0)
+    def test_a_hand_drawn_row_is_withdrawn_and_gives_back_the_box_it_replaced(
+        self,
+    ):
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, det = self._make_scan_with_detection()
+        moved = self._post(
+            "update_detection",
+            scan,
+            {"detection_id": det.pk, "new_bbox": [150.0, 150.0, 250.0, 250.0]},
+        )
+        holder_pk = json.loads(moved.content)["detection_id"]
+
+        response = self._post(
+            "delete_detection", scan, {"detection_id": holder_pk}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        holder = Detection.objects.get(pk=holder_pk)
+        self.assertFalse(holder.active)
+        self.assertIsNotNone(holder.withdrawn_at)
+        self.assertEqual(holder.withdrawn_by, user)
+        det.refresh_from_db()
+        self.assertTrue(det.active)
+        self.assertIsNone(det.decision)
+        self.assertIsNotNone(holder.replaces.withdrawn_at)
+
+    def test_a_second_deletion_is_a_no_op(self):
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection()
+        self._post("delete_detection", scan, {"detection_id": det.pk})
+
+        response = self._post(
+            "delete_detection", scan, {"detection_id": det.pk}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            DetectionDecision.objects.filter(scan=scan).count(), 1
+        )
 
     def test_unknown_id_returns_404(self):
         """POST with a non-existent detection_id returns 404."""
-        from unittest.mock import patch
-
-        user = self.make_staff_user()
-        self.client.force_login(user)
+        self.client.force_login(self.make_staff_user())
         scan, _det = self._make_scan_with_detection()
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("delete_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps({"detection_id": 999999}),
-                content_type="application/json",
-            )
+        response = self._post(
+            "delete_detection", scan, {"detection_id": 999999}
+        )
 
         self.assertEqual(response.status_code, 404)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "error")
 
 
-class TestApproveDetection(ScanningTestCase):
-    """Tests for the approve_detection endpoint."""
+class TestApproveDetection(DetectionEndpointMixin, ScanningTestCase):
+    """Tests for the approve_detection endpoint (#240)."""
 
-    def _make_scan_with_detection(self):
-        """Create a scan, its output_dir, and one Detection record.
-
-        :return: Tuple of (scan, detection).
-        :rtype: tuple
-        """
-        scan = ScanFactory()
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        det = Detection.objects.create(
-            scan=scan,
-            page_index=0,
-            label="KEY_ICON",
-            label_id=2,
-            confidence=0.7,
-            x0=50.0,
-            y0=50.0,
-            x1=100.0,
-            y1=100.0,
-            img_width=1200,
-            img_height=1600,
-            model_name=Detection.ModelName.SMALL,
-            model_count=1,
-            found_by=[{"model": "small", "confidence": 0.7}],
-        )
-        return scan, det
-
-    def test_sets_confidence_and_syncs_disk(self):
-        """POST with valid detection_id sets confidence=1.0 and updates detections.json."""
-        from unittest.mock import patch
-
+    def test_a_model_row_gets_an_approval(self):
         user = self.make_staff_user()
         self.client.force_login(user)
-        scan, det = self._make_scan_with_detection()
+        scan, det = self._make_scan_with_detection(
+            label="KEY_ICON", label_id=2, confidence=0.7
+        )
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("approve_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps({"detection_id": det.pk}),
-                content_type="application/json",
-            )
+        response = self._post(
+            "approve_detection", scan, {"detection_id": det.pk}
+        )
 
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["updated"], 1)
-
         det.refresh_from_db()
         self.assertEqual(det.confidence, 1.0)
+        self.assertEqual(det.decision.kind, DetectionDecision.Kind.APPROVE)
+        self.assertEqual(det.decision.target_confidence, 0.7)
 
-        det_path = pathlib.Path(scan.output_dir) / "detections.json"
-        self.assertTrue(det_path.exists())
-        saved = json.loads(det_path.read_text())
-        self.assertEqual(len(saved), 1)
-        self.assertEqual(saved[0]["confidence"], 1.0)
+    def test_a_deletion_after_an_approval_leaves_one_decision_standing(self):
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection(confidence=0.7)
+        self._post("approve_detection", scan, {"detection_id": det.pk})
+
+        self._post("delete_detection", scan, {"detection_id": det.pk})
+
+        det.refresh_from_db()
+        self.assertFalse(det.active)
+        self.assertEqual(det.decision.kind, DetectionDecision.Kind.DEACTIVATE)
+        standing = DetectionDecision.objects.filter(
+            scan=scan, withdrawn_at__isnull=True
+        )
+        self.assertEqual(standing.count(), 1)
+        self.assertEqual(
+            DetectionDecision.objects.filter(scan=scan).count(), 2
+        )
+
+    def test_a_row_with_no_address_answers_409_on_every_endpoint(self):
+        """A pre-#240 row outside the standing map: the decision cannot
+        land, so it is refused, not written (PR #288 review). The four
+        arms are copies, so one loop pins them all."""
+        from unittest.mock import patch
+
+        from scanning import detections
+        from scanning.tests.test_yolo_apply import glued_run
+
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection(
+            page_index=9, source_page=None
+        )
+        run = glued_run(scan)
+        posts = [
+            ("approve_detection", {"detection_id": det.pk}),
+            ("delete_detection", {"detection_id": det.pk}),
+            (
+                "update_detection",
+                {"detection_id": det.pk, "new_bbox": [1.0, 1.0, 2.0, 2.0]},
+            ),
+            (
+                "add_single_detection",
+                {
+                    "page_index": 9,
+                    "label_id": det.label_id,
+                    "bbox": [100.0, 100.0, 200.0, 200.0],
+                    "img_width": 1200,
+                    "img_height": 1600,
+                },
+            ),
+            (
+                "add_single_detection",
+                {
+                    "page_index": 9,
+                    "label_id": 7,
+                    "bbox": [500.0, 500.0, 600.0, 600.0],
+                    "img_width": 1200,
+                    "img_height": 1600,
+                },
+            ),
+        ]
+        for name, body in posts:
+            with self.subTest(name=name, body=body):
+                with patch.object(
+                    detections, "measured_run", return_value=run
+                ):
+                    with self.assertLogs(
+                        "scanning.detections", level="WARNING"
+                    ):
+                        response = self._post(name, scan, body)
+                self.assertEqual(response.status_code, 409)
+                self.assertIn(
+                    "cannot be addressed",
+                    json.loads(response.content)["message"],
+                )
+        self.assertEqual(DetectionDecision.objects.count(), 0)
+        self.assertEqual(Detection.objects.filter(scan=scan).count(), 1)
+        det.refresh_from_db()
+        self.assertEqual(det.confidence, 0.9)
+        self.assertTrue(det.active)
+
+    def test_a_hand_drawn_row_needs_no_decision(self):
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection(
+            model_name=Detection.ModelName.MANUAL, confidence=1.0, found_by=[]
+        )
+
+        response = self._post(
+            "approve_detection", scan, {"detection_id": det.pk}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(DetectionDecision.objects.count(), 0)
 
     def test_unknown_id_returns_404(self):
         """POST with a non-existent detection_id returns 404."""
-        from unittest.mock import patch
-
-        user = self.make_staff_user()
-        self.client.force_login(user)
+        self.client.force_login(self.make_staff_user())
         scan, _det = self._make_scan_with_detection()
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("approve_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps({"detection_id": 999999}),
-                content_type="application/json",
-            )
+        response = self._post(
+            "approve_detection", scan, {"detection_id": 999999}
+        )
 
         self.assertEqual(response.status_code, 404)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "error")
+
+
+class TestServeDetectionsCarriesTheDecision(
+    DetectionEndpointMixin, ScanningTestCase
+):
+    """The viewer's list carries the standing decision (#240)."""
+
+    def test_lists_live_rows_with_their_decision(self):
+        self.client.force_login(self.make_user())
+        scan, det = self._make_scan_with_detection()
+        self._post("approve_detection", scan, {"detection_id": det.pk})
+        _scan, gone = self._make_scan_with_detection(scan=scan, page_index=1)
+        self._post("delete_detection", scan, {"detection_id": gone.pk})
+
+        response = self.client.get(
+            reverse("serve_detections", kwargs={"pk": scan.pk})
+        )
+
+        rows = json.loads(response.content)
+        self.assertEqual([r["id"] for r in rows], [det.pk])
+        self.assertEqual(rows[0]["decision"], "approve")
+        self.assertFalse(rows[0]["manual"])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
