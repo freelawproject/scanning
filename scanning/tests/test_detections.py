@@ -199,6 +199,26 @@ class TestDecide(TestCase):
         # The approval's confidence went back with it.
         self.assertEqual(row.confidence, 0.8)
 
+    def test_a_row_the_map_does_not_hold_is_refused(self):
+        """A decision with no address could never land, so it is not
+        written (PR #288 review)."""
+        run = glued_run(self.scan)
+        row = model_row(self.scan, page_index=7, source_page=None)
+
+        with self.assertLogs("scanning.detections", level="WARNING"):
+            with self.assertRaises(detections.UnaddressableDetection):
+                detections.decide(
+                    self.scan,
+                    row,
+                    DetectionDecision.Kind.DEACTIVATE,
+                    self.user,
+                    run=run,
+                )
+
+        self.assertEqual(DetectionDecision.objects.count(), 0)
+        row.refresh_from_db()
+        self.assertTrue(row.active)
+
     def test_a_row_without_an_address_is_placed_by_position(self):
         row = model_row(self.scan, page_index=1, source_page=None)
 
@@ -292,6 +312,27 @@ class TestResolve(TestCase):
         decision = detections.decide(self.scan, row, kind, None)
         row.delete()
         return decision
+
+    def test_no_decision_reads_no_row(self):
+        """The common case: one query for the decisions, none for the
+        tens of thousands of model rows (PR #288 review)."""
+        model_row(self.scan)
+
+        with self.assertNumQueries(2):
+            landed, stale = detections.resolve(self.scan)
+
+        self.assertEqual((landed, stale), (0, []))
+
+    def test_reads_only_the_rows_a_decision_names(self):
+        self._decide()
+        model_row(self.scan)
+        model_row(self.scan, page_index=1, source_page=2)
+        model_row(self.scan, label="CASE_CAPTION", label_id=3)
+
+        with self.assertNumQueries(4):
+            landed, _ = detections.resolve(self.scan)
+
+        self.assertEqual(landed, 1)
 
     def test_lands_on_the_same_box(self):
         decision = self._decide()
@@ -411,3 +452,179 @@ class TestResolve(TestCase):
         on_edit.refresh_from_db()
         self.assertTrue(on_original.active)
         self.assertFalse(on_edit.active)
+
+
+class TestRelocateManualRows(TestCase):
+    """After an import under a new run, a hand-drawn row moves to its
+    page in the new space by its address (PR #288 review)."""
+
+    def setUp(self):
+        self.scan = ScanFactory(page_count=3, source_fingerprint="10:3")
+
+    def _manual(self, **fields):
+        return model_row(
+            self.scan,
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[],
+            confidence=1.0,
+            **fields,
+        )
+
+    def _run_without_page_2(self):
+        page_map = {
+            **identity_map(3),
+            "final_page_count": 2,
+            "deleted_pages": [2],
+            "pages": [
+                {
+                    "final_page": 1,
+                    "source": {"kind": "original", "pdf_page": 1},
+                },
+                {
+                    "final_page": 2,
+                    "source": {"kind": "original", "pdf_page": 3},
+                },
+            ],
+        }
+        return glued_run(self.scan, number=2, page_map=page_map)
+
+    def test_a_box_after_a_deletion_moves_up_one_page(self):
+        row = self._manual(page_index=2, source_page=3)
+        run = self._run_without_page_2()
+
+        moved, unplaced = detections.relocate_manual_rows(self.scan, run)
+
+        self.assertEqual((moved, unplaced), (1, []))
+        row.refresh_from_db()
+        self.assertEqual(row.page_index, 1)
+        self.assertEqual(row.apply_run, run)
+        self.assertEqual(row.source_page, 3)
+
+    def test_a_box_on_the_deleted_page_is_left_and_logged(self):
+        row = self._manual(page_index=1, source_page=2)
+        run = self._run_without_page_2()
+
+        with self.assertLogs("scanning.detections", level="WARNING") as logs:
+            moved, unplaced = detections.relocate_manual_rows(self.scan, run)
+
+        self.assertEqual(moved, 0)
+        self.assertEqual(unplaced, [row])
+        self.assertIn(f"#{row.pk}", logs.output[0])
+        row.refresh_from_db()
+        self.assertEqual(row.page_index, 1)
+        self.assertTrue(row.active)
+
+    def test_a_box_with_no_address_is_left(self):
+        self._manual(page_index=2, source_page=None)
+        run = self._run_without_page_2()
+
+        with self.assertLogs("scanning.detections", level="WARNING"):
+            moved, unplaced = detections.relocate_manual_rows(self.scan, run)
+
+        self.assertEqual((moved, len(unplaced)), (0, 1))
+
+    def test_a_box_of_another_original_is_left(self):
+        self._manual(page_index=2, source_page=3, source_fingerprint="99:3")
+        run = self._run_without_page_2()
+
+        with self.assertLogs("scanning.detections", level="WARNING"):
+            moved, unplaced = detections.relocate_manual_rows(self.scan, run)
+
+        self.assertEqual((moved, len(unplaced)), (0, 1))
+
+    def test_a_withdrawn_box_is_not_touched(self):
+        row = self._manual(page_index=2, source_page=3, active=False)
+        Detection.objects.filter(pk=row.pk).update(
+            withdrawn_at=row.date_created
+        )
+        run = self._run_without_page_2()
+
+        moved, unplaced = detections.relocate_manual_rows(self.scan, run)
+
+        self.assertEqual((moved, unplaced), (0, []))
+        row.refresh_from_db()
+        self.assertEqual(row.page_index, 2)
+
+    def test_a_box_on_an_edit_page_follows_the_slot(self):
+        edit = PageEdit.objects.create(
+            scan=self.scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            anchor_pdf_page=1,
+            source_fingerprint="10:3",
+        )
+        row = self._manual(page_index=1, source_edit=edit, source_page=1)
+        page_map = {
+            **identity_map(3),
+            "final_page_count": 4,
+            "deleted_pages": [],
+            "pages": [
+                {
+                    "final_page": 1,
+                    "source": {"kind": "original", "pdf_page": 1},
+                },
+                {
+                    "final_page": 2,
+                    "source": {"kind": "original", "pdf_page": 2},
+                },
+                {
+                    "final_page": 3,
+                    "source": {
+                        "kind": "edit",
+                        "edit_id": edit.pk,
+                        "edit_kind": "insert_page",
+                        "page": 0,
+                    },
+                },
+                {
+                    "final_page": 4,
+                    "source": {"kind": "original", "pdf_page": 3},
+                },
+            ],
+        }
+        run = glued_run(self.scan, number=2, page_map=page_map)
+
+        moved, unplaced = detections.relocate_manual_rows(self.scan, run)
+
+        self.assertEqual((moved, unplaced), (1, []))
+        row.refresh_from_db()
+        self.assertEqual(row.page_index, 2)
+
+    def test_a_box_on_a_replaced_page_does_not_carry(self):
+        """The content is new, so ``originals_to_final`` leaves the page
+        out, and the box is logged."""
+        edit = PageEdit.objects.create(
+            scan=self.scan,
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=2,
+            source_fingerprint="10:3",
+        )
+        self._manual(page_index=1, source_page=2)
+        page_map = {
+            **identity_map(3),
+            "pages": [
+                {
+                    "final_page": 1,
+                    "source": {"kind": "original", "pdf_page": 1},
+                },
+                {
+                    "final_page": 2,
+                    "source": {
+                        "kind": "edit",
+                        "edit_id": edit.pk,
+                        "edit_kind": "replace_page",
+                        "page": 0,
+                        "pdf_page": 2,
+                    },
+                },
+                {
+                    "final_page": 3,
+                    "source": {"kind": "original", "pdf_page": 3},
+                },
+            ],
+        }
+        run = glued_run(self.scan, number=2, page_map=page_map)
+
+        with self.assertLogs("scanning.detections", level="WARNING"):
+            moved, unplaced = detections.relocate_manual_rows(self.scan, run)
+
+        self.assertEqual((moved, len(unplaced)), (0, 1))

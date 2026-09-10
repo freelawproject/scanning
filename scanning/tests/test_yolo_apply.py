@@ -551,6 +551,48 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
             {d.source_fingerprint for d in imported}, {scan.source_fingerprint}
         )
 
+    def test_a_hand_drawn_box_follows_the_new_page_space(self):
+        """Drawn on final page 2 under ``a1`` (original page 2); ``a2``
+        deletes page 1, and the box is on final page 1 (PR #288 review).
+        A box on the deleted page is left where it was and logged."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        services.run_compute_redactions(scan.pk)
+        kept = detections.add_manual(
+            scan, 1, "KEY_ICON", 1, [1.0, 2.0, 3.0, 4.0], 1700, 2200
+        )
+        gone = detections.add_manual(
+            scan, 0, "KEY_ICON", 1, [1.0, 2.0, 3.0, 4.0], 1700, 2200
+        )
+        apply.supersede_runs(scan, "test")
+        new = glued_run(
+            scan,
+            number=2,
+            page_map={
+                **identity_map(2),
+                "final_page_count": 1,
+                "deleted_pages": [1],
+                "pages": [
+                    {
+                        "final_page": 1,
+                        "source": {"kind": "original", "pdf_page": 2},
+                    }
+                ],
+            },
+        )
+        stubs["load_detections_document"].reset_mock()
+
+        with self.assertLogs("scanning.detections", level="WARNING"):
+            services.run_compute_redactions(scan.pk)
+
+        kept.refresh_from_db()
+        gone.refresh_from_db()
+        self.assertEqual(kept.page_index, 0)
+        self.assertEqual(kept.apply_run, new)
+        self.assertEqual(kept.source_page, 2)
+        self.assertEqual(gone.page_index, 0)
+        self.assertTrue(gone.active)
+
     def test_a_decision_survives_the_re_import(self):
         """The curator deleted one box and approved another under ``a1``;
         ``a2`` imports the run again, and both decisions land on the new

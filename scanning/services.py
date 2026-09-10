@@ -1589,7 +1589,10 @@ def _import_detections(
     that found it. Then every standing ``DetectionDecision`` of the scan
     is resolved onto the new rows by that address
     (``detections.resolve``), which is how a curator's approvals and
-    deletions survive the import that used to lose them.
+    deletions survive the import that used to lose them, and every kept
+    hand-drawn row is moved to its page in the new space
+    (``detections.relocate_manual_rows``), or a box drawn before a
+    deletion would paint one page out after it.
 
     ``found_by`` is copied onto each row, because the confidence gates
     are per model family (``label_confidence(label, bl_warm)``), and
@@ -1649,12 +1652,18 @@ def _import_detections(
         )
     Detection.objects.bulk_create(rows, batch_size=1000)
     landed, stale = decisions.resolve(scan)
+    moved = 0
+    if run is not None and kept:
+        # The kept hand-drawn rows follow the new page space, by their
+        # address; the model rows arrived in it.
+        moved, _unplaced = decisions.relocate_manual_rows(scan, run)
     logger.info(
         "Imported %d detection(s) for scan %s (%d hand-made row(s) kept, "
-        "%d decision(s) landed, %d stale)",
+        "%d moved; %d decision(s) landed, %d stale)",
         len(rows),
         scan_pk,
         kept,
+        moved,
         landed,
         len(stale),
     )

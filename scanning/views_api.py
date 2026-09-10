@@ -801,9 +801,12 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     if row.model_name == Detection.ModelName.MANUAL:
         detections.withdraw_manual(row, request.user)
     else:
-        detections.decide(
-            scan, row, DetectionDecision.Kind.DEACTIVATE, request.user
-        )
+        try:
+            detections.decide(
+                scan, row, DetectionDecision.Kind.DEACTIVATE, request.user
+            )
+        except detections.UnaddressableDetection:
+            return _unaddressable()
     _drop_orphaned_redaction_rects(scan, row.page_index)
     return JsonResponse({"status": "ok", "deleted": 1})
 
@@ -881,9 +884,33 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
         )
         holder = row
     else:
-        holder = detections.move_model_row(scan, row, new_bbox, request.user)
+        try:
+            holder = detections.move_model_row(
+                scan, row, new_bbox, request.user
+            )
+        except detections.UnaddressableDetection:
+            return _unaddressable()
     return JsonResponse(
         {"status": "ok", "updated": 1, "detection_id": holder.pk}
+    )
+
+
+#: The 409 of a decision about a box no address can be written for
+#: (``detections.UnaddressableDetection``).
+DETECTION_UNADDRESSABLE_MESSAGE = (
+    "This box cannot be addressed in the current volume, so the change "
+    "cannot be kept. Reload the page; if it stays, ask a staff member."
+)
+
+
+def _unaddressable() -> JsonResponse:
+    """Return the 409 for a refused decision.
+
+    :returns: The response.
+    """
+    return JsonResponse(
+        {"status": "error", "message": DETECTION_UNADDRESSABLE_MESSAGE},
+        status=409,
     )
 
 
@@ -958,13 +985,16 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
     )
     if near is not None:
         if near.model_name != Detection.ModelName.MANUAL:
-            detections.decide(
-                scan,
-                near,
-                DetectionDecision.Kind.APPROVE,
-                request.user,
-                run=run,
-            )
+            try:
+                detections.decide(
+                    scan,
+                    near,
+                    DetectionDecision.Kind.APPROVE,
+                    request.user,
+                    run=run,
+                )
+            except detections.UnaddressableDetection:
+                return _unaddressable()
         return JsonResponse(
             {"status": "ok", "added": False, "detection_id": near.pk}
         )
@@ -1009,9 +1039,12 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
             {"status": "error", "message": "Detection not found"}, status=404
         )
     if row.model_name != Detection.ModelName.MANUAL:
-        detections.decide(
-            scan, row, DetectionDecision.Kind.APPROVE, request.user
-        )
+        try:
+            detections.decide(
+                scan, row, DetectionDecision.Kind.APPROVE, request.user
+            )
+        except detections.UnaddressableDetection:
+            return _unaddressable()
     return JsonResponse({"status": "ok", "updated": 1})
 
 

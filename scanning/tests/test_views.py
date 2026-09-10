@@ -2709,6 +2709,34 @@ class TestApproveDetection(DetectionEndpointMixin, ScanningTestCase):
             DetectionDecision.objects.filter(scan=scan).count(), 2
         )
 
+    def test_a_row_with_no_address_answers_409(self):
+        """A pre-#240 row outside the standing map: the decision cannot
+        land, so it is refused, not written (PR #288 review)."""
+        from unittest.mock import patch
+
+        from scanning import detections
+        from scanning.tests.test_yolo_apply import glued_run
+
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection(
+            page_index=9, source_page=None
+        )
+        run = glued_run(scan)
+
+        with patch.object(detections, "measured_run", return_value=run):
+            with self.assertLogs("scanning.detections", level="WARNING"):
+                response = self._post(
+                    "approve_detection", scan, {"detection_id": det.pk}
+                )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn(
+            "cannot be addressed", json.loads(response.content)["message"]
+        )
+        self.assertEqual(DetectionDecision.objects.count(), 0)
+        det.refresh_from_db()
+        self.assertEqual(det.confidence, 0.9)
+
     def test_a_hand_drawn_row_needs_no_decision(self):
         self.client.force_login(self.make_staff_user())
         scan, det = self._make_scan_with_detection(

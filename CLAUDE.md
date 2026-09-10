@@ -2257,6 +2257,26 @@ decisions, the resolution), `services._import_detections` and
   row is taken once. An unresolved decision is **left standing and
   logged** as a WARNING naming its pk; PR D raises it as an issue.
   Nothing withdraws a decision but a person.
+- **The kept hand-drawn rows follow the new page space**
+  (`detections.relocate_manual_rows`, called by `_import_detections`
+  when it imports under a run): an original page goes through
+  `originals_to_final` (a replaced page has new content, so a box on it
+  does not carry), an edit page through the `(edit_id, page)` slots of
+  the map. The row's `page_index` and `apply_run` are written; nothing
+  else on it is. A row the map does not hold, a row of another
+  original, or a pre-#240 row with no address is left where it was and
+  logged as a WARNING; PR D raises it as the stale finding. Without
+  this a box drawn before a deletion painted one page out after it.
+- **A decision about a row no address can be written for is refused**
+  (`detections.UnaddressableDetection`, a 409 with
+  `DETECTION_UNADDRESSABLE_MESSAGE` from the four endpoints): a pre-#240
+  row outside the standing map, or a map without that page. A decision
+  with no address could never land, and one written anyway stood for
+  good and was logged after every import.
+- **`resolve` reads no model row when no decision stands**, and only
+  the rows at the pages and labels the decisions name otherwise: a
+  volume holds tens of thousands of rows, most volumes hold no
+  decision, and the read ran on the daemon pod after every import.
 - **A move of a model box is a deactivation plus a hand-drawn row**
   (`detections.move_model_row`): the model row is not written, the
   hand-drawn row names the deactivation in `replaces`, and withdrawing

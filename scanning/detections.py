@@ -42,6 +42,16 @@ logger = logging.getLogger(__name__)
 IOU_THRESHOLD = 0.5
 
 
+class UnaddressableDetection(ValueError):
+    """A decision was asked about a row no address can be written for.
+
+    Two routes lead here: a row imported before #240, whose position
+    lies outside the standing run's map, and a map without that page.
+    A decision with no address could never land, so it is refused
+    where it is asked, not written and logged after every import.
+    """
+
+
 def iou(a: list[float], b: list[float]) -> float:
     """Return the intersection over union of two ``[x0, y0, x1, y1]`` boxes.
 
@@ -280,11 +290,23 @@ def decide(
             withdraw(DetectionDecision.objects.filter(pk=current.pk), user)
             row.refresh_from_db(fields=["confidence", "active", "decision"])
         edit_id, page = _address_of_row(scan, row, run)
+        if not page:
+            logger.warning(
+                "scan %s: detection %s (page_index %s) has no address in the "
+                "standing map; the %s is refused",
+                scan.pk,
+                row.pk,
+                row.page_index,
+                kind,
+            )
+            raise UnaddressableDetection(
+                f"detection {row.pk} of scan {scan.pk} has no address"
+            )
         decision = DetectionDecision.objects.create(
             scan=scan,
             kind=kind,
             source_edit_id=edit_id,
-            source_page=page or 0,
+            source_page=page,
             source_fingerprint=scan.source_fingerprint or "",
             label=row.label,
             label_id=row.label_id,
@@ -434,8 +456,18 @@ def resolve(scan: Scan) -> tuple[int, list[DetectionDecision]]:
     scan.refresh_from_db(fields=["source_fingerprint"])
     landed = 0
     stale: list[DetectionDecision] = []
+    decisions = list(standing_decisions(scan).order_by("pk"))
+    if not decisions:
+        # The common case, and a volume holds tens of thousands of
+        # model rows: read none of them.
+        return 0, []
     rows = list(
-        Detection.objects.model_rows().filter(scan=scan, decision__isnull=True)
+        Detection.objects.model_rows().filter(
+            scan=scan,
+            decision__isnull=True,
+            source_page__in={d.source_page for d in decisions},
+            label_id__in={d.label_id for d in decisions},
+        )
     )
     by_address: dict[tuple, list[Detection]] = {}
     for row in rows:
@@ -443,7 +475,7 @@ def resolve(scan: Scan) -> tuple[int, list[DetectionDecision]]:
             (row.source_edit_id, row.source_page, row.label_id), []
         ).append(row)
     taken: set[int] = set()
-    for decision in standing_decisions(scan).order_by("pk"):
+    for decision in decisions:
         if is_stale(decision, scan):
             stale.append(decision)
             continue
@@ -475,3 +507,82 @@ def resolve(scan: Scan) -> tuple[int, list[DetectionDecision]]:
             ),
         )
     return landed, stale
+
+
+# ---------------------------------------------------------------------------
+# The hand-drawn rows follow the new page space
+# ---------------------------------------------------------------------------
+
+
+def relocate_manual_rows(
+    scan: Scan, run: ApplyRun
+) -> tuple[int, list[Detection]]:
+    """Put every standing hand-drawn row at its page in ``run``'s space.
+
+    The import writes the model rows in the new run's space and keeps
+    the hand-drawn rows as they are, so after a reopen that deletes a
+    page a box drawn under ``a1`` would paint one page out under
+    ``a2``. The row's address says where it belongs: an original page
+    goes through ``originals_to_final`` (a replaced page has new
+    content, so a box on it does not carry), an edit page through the
+    ``(edit_id, page)`` slots of the map. A row the map does not hold,
+    a row of another original, or a row with no address (imported
+    before #240) is left as it is and logged; #240 PR D raises it as
+    a stale finding.
+
+    :param scan: The scan.
+    :param run: The run whose space the model rows were just imported in.
+    :returns: How many rows were written, and the rows left unplaced.
+    """
+    from scanning import apply
+
+    page_map = run.page_map or {}
+    kept = apply.originals_to_final(page_map)
+    slots = {
+        (entry["source"]["edit_id"], entry["source"]["page"]): entry[
+            "final_page"
+        ]
+        for entry in page_map.get("pages") or []
+        if entry["source"]["kind"] == "edit"
+    }
+    moved = 0
+    unplaced: list[Detection] = []
+    rows = Detection.objects.filter(
+        scan=scan,
+        model_name=Detection.ModelName.MANUAL,
+        withdrawn_at__isnull=True,
+    )
+    for row in rows:
+        stale = (
+            row.source_fingerprint
+            and scan.source_fingerprint
+            and row.source_fingerprint != scan.source_fingerprint
+        )
+        if row.source_page is None or stale:
+            unplaced.append(row)
+            continue
+        if row.source_edit_id is None:
+            final = kept.get(row.source_page)
+        else:
+            final = slots.get((row.source_edit_id, row.source_page - 1))
+        if final is None:
+            unplaced.append(row)
+            continue
+        if row.page_index != final - 1 or row.apply_run_id != run.pk:
+            Detection.objects.filter(pk=row.pk).update(
+                page_index=final - 1, apply_run=run
+            )
+            moved += 1
+    if unplaced:
+        logger.warning(
+            "scan %s: %d hand-drawn detection(s) have no page in %s and keep "
+            "their old position: %s",
+            scan.pk,
+            len(unplaced),
+            run.label,
+            ", ".join(
+                f"#{r.pk} {r.label} src p.{r.source_page}"
+                for r in unplaced[:20]
+            ),
+        )
+    return moved, unplaced
