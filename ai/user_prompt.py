@@ -151,9 +151,10 @@ def _opinion_roadmap(
 
     :param detections: This page's detection list (already filtered
         to ``page_index``).
-    :param opinions: ``scan.opinions_json`` — the full curated opinion
-        list for the scan, each entry with ``caption_page`` /
-        ``key_page`` / etc.
+    :param opinions: The opinion dicts of the scan (the shape
+        ``boundaries.viewer_payload`` emits since #240), each entry with
+        ``caption_page`` / ``key_page`` / etc. Empty since #280 left
+        this builder with no caller.
     :param page_index: 0-based PDF page index for this page.
     :param pdf_page: The pdfplumber ``Page`` for caption / column-top
         text crops.
@@ -387,7 +388,7 @@ def build_user_prompt(page: Any) -> str | None:
         the LLM to emit just the pagenumber).
       * ``page.detections`` drives caption/key pairing and the
         footnote hint.
-      * ``page.scan.opinions_json`` supplies the cross-page facts the
+      * The scan's opinion boundaries supply the cross-page facts the
         page can't know on its own: pass-through count, and the
         continuation-slot filter for phantom CASE_CAPTIONs that are
         actually tails of a long caption spilling in from a prior
@@ -397,8 +398,7 @@ def build_user_prompt(page: Any) -> str | None:
 
     :param page: The page object to build a prompt for. It must
         have ``detections``, ``is_blank``, ``page_index``,
-        ``pdf_path``, and a ``scan`` with ``output_dir`` +
-        ``opinions_json``.
+        ``pdf_path``, and a ``scan`` with ``output_dir``.
     :return: The prompt text, or ``None`` if there's nothing useful
         to say about the page (no detections, no opinions touching
         it, and it isn't blank).

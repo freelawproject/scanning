@@ -643,7 +643,14 @@ def add(
             # opinion). The one dismissal then stands through any number
             # of moves, and dismissing the last addition still gives the
             # computed boundary back.
-            replaces = OpinionBoundary.objects.get(pk=replaces.pk)
+            # Lock the row, as ``dismiss`` does: two moves of one
+            # addition at once would both read it standing, and both
+            # would write an addition that names the same dismissal.
+            replaces = OpinionBoundary.objects.select_for_update(
+                of=("self",)
+            ).get(pk=replaces.pk)
+            if replaces.withdrawn_at is not None:
+                raise ValueError("the addition to replace is withdrawn")
             if replaces.kind != OpinionBoundary.Kind.ADD:
                 raise ValueError(
                     "only a boundary or an addition can be replaced"
@@ -724,8 +731,9 @@ def standing(scan: Scan) -> list[OpinionBoundary]:
     The computed rows, dismissed or not (``is_dismissed`` says which,
     so the sidebar can show a dismissed one muted with an undo), plus
     the curator's additions that are not withdrawn, less the computed
-    rows a move replaced. One query for the rows, one for the moves,
-    and one for the column boxes of their start pages. Every
+    rows a move replaced. One query for the rows, one for the moves
+    when a dismissal stands (an empty ``__in`` makes none), and one for
+    the column boxes of their start pages. Every
     consumer -- the viewer JSON, the sidebar, the paused step 3 -- goes
     through here.
 

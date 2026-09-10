@@ -3442,6 +3442,48 @@ class TestSidebarDuplicateMarkers(ScanningTestCase):
         )
 
 
+class TestSidebarOpinionPageNumbers(ScanningTestCase):
+    """The opinion cards read the printed spans off the OCR rows (#240
+    PR C), not the page map: blackletter's map puts the physical page in
+    ``logical_number`` for a range page (#233) and the range in
+    ``range_label``, so a lookup built from it showed the physical page
+    where the old ``bl_pair`` output showed the range's end."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user,
+            status=Status.PENDING_REVIEW,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "913-925", "type": "range"},
+                {"pdf_page": 2, "detected": "926", "type": "single"},
+            ],
+            page_map=[
+                {
+                    "type": "pdf_page",
+                    "pdf_index": 0,
+                    "logical_number": 1,
+                    "range_label": "913-925",
+                },
+                {"type": "pdf_page", "pdf_index": 1, "logical_number": 926},
+            ],
+        )
+        OpinionBoundaryFactory(
+            scan=self.scan, start_page_index=0, end_page_index=1
+        )
+
+    def test_a_range_start_page_gives_its_end(self):
+        response = self.client.get(
+            reverse("scan_process", kwargs={"pk": self.scan.pk}) + "?step=2"
+        )
+        self.assertEqual(response.status_code, 200)
+        html = response.content.decode()
+        self.assertIn("Pages 925&ndash;926", html)
+        self.assertNotIn("Pages 1&ndash;926", html)
+
+
 class TestLazyPullsFetchOneFile(ScanningTestCase):
     """A stale /tmp/ must cost one object, not the whole prefix.
 

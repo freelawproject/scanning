@@ -583,19 +583,21 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     has_detections = Detection.objects.filter(scan=scan).exists()
 
     # The boundaries are rows since #240 PR C, read in the legacy dict
-    # shape plus their ids. The printed numbers come from the page map
-    # the view built above, which is already in the space the rows are
-    # drawn in (the final space when the redactions are measured against
-    # the standing run, #269).
+    # shape plus their ids. The printed numbers come from the OCR rows
+    # the view holds already (``ocr_by_page``, keyed by the 1-based
+    # page), which are in the space the rows are drawn in (the final
+    # space when the redactions are measured against the standing run,
+    # #269) and carry a range as ``detected`` plus ``type``. Not from
+    # the page map: blackletter's map puts the physical page in
+    # ``logical_number`` for a range page and the range in
+    # ``range_label``, so a lookup built from it lost the range's end.
     from scanning.services import printed_page_span
 
-    page_spans = {}
-    for idx, num in idx_to_logical.items():
-        span = printed_page_span(
-            str(num), "range" if "-" in str(num) else "single"
-        )
-        if span:
-            page_spans[idx] = span
+    page_spans = {
+        page - 1: span
+        for page, row in ocr_by_page.items()
+        if (span := printed_page_span(row.get("detected"), row.get("type")))
+    }
     opinions = boundaries.viewer_payload(scan, page_spans)
     opinion_count = sum(1 for op in opinions if not op["dismissed"])
 

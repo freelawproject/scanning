@@ -2426,11 +2426,15 @@ must not be broken:
   could never land, since `resolve` matches by the start address, and
   one written anyway was logged as stale after every compute. `add`
   refuses an end before the start in reading order: by page, and on one
-  page by the column of the page's `TEXT_COLUMN` rows, then y.
+  page by the column of the page's `TEXT_COLUMN` rows, then y. `add`
+  locks the addition it replaces, as `dismiss` locks its row, or two
+  moves at once would both write an addition for one opinion.
 - **The page reads its own payload.** `scan_process_view` writes the
-  list into `#opinions-data` with the printed spans of the page map it
-  built (a range page gives its end to the opinion that starts there),
-  and both viewer scripts read that tag; `serve_opinions` stays for a
+  list into `#opinions-data` with the printed spans of the OCR rows it
+  holds (`ocr_by_page`, in either space: a range page gives its end to
+  the opinion that starts there; **not** the page map, whose
+  `logical_number` is the physical page for a range page in the
+  original's space), and both viewer scripts read that tag; `serve_opinions` stays for a
   developer with a browser, and it may read the run's printed pages
   from S3.
 - **Migration 0027 copies no data**, the plan's decision: the lists
