@@ -1801,9 +1801,10 @@ class TestRecalculateIssues(TestCase):
             scan.issues.filter(check_name="suspicious_reading").exists()
         )
 
-    def test_keeps_suppressed_detection_issues(self):
-        """Recheck rebuilds page-number issues but leaves detection
-        suppressions, which are curator decisions, in place."""
+    def test_keeps_the_review_2_findings(self):
+        """Recheck rebuilds page-number issues but leaves the findings
+        of review 2 (#240 PR D), which are derived from other rows and
+        have one writer of their own, in place."""
         from scanning import services
         from scanning.models import CheckName, Issue
 
@@ -1818,9 +1819,10 @@ class TestRecalculateIssues(TestCase):
         )
         Issue.objects.create(
             scan=scan,
-            check_name=CheckName.SUPPRESS_DETECTION,
-            severity="info",
-            message="detection 42 suppressed",
+            check_name=CheckName.UNMATCHED_KEY_ICON,
+            target=Issue.Target.DETECTION,
+            severity="warning",
+            message="a key icon no opinion names",
         )
         stale = Issue.objects.create(
             scan=scan,
@@ -1834,7 +1836,7 @@ class TestRecalculateIssues(TestCase):
 
         self.assertTrue(
             scan.issues.filter(
-                check_name=CheckName.SUPPRESS_DETECTION
+                check_name=CheckName.UNMATCHED_KEY_ICON
             ).exists()
         )
         self.assertFalse(Issue.objects.filter(pk=stale.pk).exists())
@@ -2282,20 +2284,23 @@ class TestRunComputeIssues(TestCase):
             ).exists()
         )
 
-    def test_suppressed_detection_issues_are_kept(self):
+    def test_review_2_findings_are_kept(self):
+        """The apply of the page numbers says nothing about the
+        redactions (#240 PR D)."""
         scan = self._make_scan()
         Issue.objects.create(
             scan=scan,
-            check_name=CheckName.SUPPRESS_DETECTION,
-            severity=Issue.Severity.INFO,
-            message="curator decision",
+            check_name=CheckName.UNCOVERED_HEADNOTE,
+            target=Issue.Target.REDACTION,
+            severity=Issue.Severity.WARNING,
+            message="a headnote no redaction covers",
         )
 
         self._run(scan, self._document(["1", "2"]))
 
         self.assertTrue(
             scan.issues.filter(
-                check_name=CheckName.SUPPRESS_DETECTION
+                check_name=CheckName.UNCOVERED_HEADNOTE
             ).exists()
         )
 

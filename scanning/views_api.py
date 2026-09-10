@@ -22,13 +22,14 @@ from django.http import (
     StreamingHttpResponse,
 )
 from django.shortcuts import get_object_or_404, redirect
+from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils.cache import get_conditional_response
 from django.utils.http import http_date
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
-    CheckName,
+    REVIEW2_CHECKS,
     Detection,
     DetectionDecision,
     Issue,
@@ -46,6 +47,22 @@ from scanning.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _rebuild_findings(scan: Scan) -> None:
+    """Write the review-2 findings again after a curator's write (#240 PR D).
+
+    Every finding is derived from the detection, boundary and redaction
+    rows, and the recompute is off until #211, so the endpoint that
+    changed a row is what keeps the cards true. A few queries over
+    label-filtered rows.
+
+    :param scan: The scan.
+    :return: None.
+    """
+    from scanning import findings
+
+    findings.rebuild(scan)
 
 
 def _parse_json_body(request: HttpRequest) -> dict | JsonResponse:
@@ -180,6 +197,7 @@ def dismiss_boundary(request: HttpRequest, pk: int) -> JsonResponse:
             {"status": "error", "message": BOUNDARY_UNADDRESSABLE_MESSAGE},
             status=409,
         )
+    _rebuild_findings(scan)
     return JsonResponse(
         {
             "status": "ok",
@@ -213,6 +231,7 @@ def restore_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     if isinstance(row, JsonResponse):
         return row
     restored = boundaries.restore(scan, row, request.user)
+    _rebuild_findings(scan)
     return JsonResponse(
         {"status": "ok", "boundary_id": row.pk, "restored": restored}
     )
@@ -331,6 +350,7 @@ def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
             },
             status=400,
         )
+    _rebuild_findings(scan)
     return JsonResponse(
         {
             "status": "ok",
@@ -448,6 +468,7 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
         row = redactions.add(scan, page_index, bbox, fill, request.user)
     except redactions.UnaddressableRedaction:
         return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
+    _rebuild_findings(scan)
     return JsonResponse({"status": "ok", "id": row.pk})
 
 
@@ -487,6 +508,7 @@ def move_redaction(
         holder = redactions.move(scan, row, bbox, request.user)
     except redactions.UnaddressableRedaction:
         return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
+    _rebuild_findings(scan)
     return JsonResponse({"status": "ok", "id": holder.pk})
 
 
@@ -510,6 +532,7 @@ def dismiss_redaction(
     if row is None or row.bbox is None:
         return _redaction_error("Redaction not found", 404)
     redactions.dismiss(scan, row, request.user)
+    _rebuild_findings(scan)
     return JsonResponse({"status": "ok"})
 
 
@@ -532,6 +555,7 @@ def restore_redaction(
     if row is None:
         return _redaction_error("Redaction not found", 404)
     restored = redactions.restore(scan, row, request.user)
+    _rebuild_findings(scan)
     return JsonResponse({"status": "ok", "restored": restored})
 
 
@@ -927,68 +951,170 @@ def serve_ocr_results(request: HttpRequest, pk: int) -> JsonResponse:
     return JsonResponse([], safe=False)
 
 
+#: The 409 of a dismissal asked for a finding that takes none (#240 PR D).
+FINDING_UNDISMISSABLE_MESSAGE = (
+    "This finding cannot be dismissed. It says that one of your own "
+    "decisions is not applied: withdraw that decision instead, or make "
+    "it again on the page as it is now."
+)
+
+#: The 409 of a dismissal whose target has no source page (#240 PR D):
+#: a detection row from before the address existed, or a run of pages
+#: that ends outside the apply run's map.
+FINDING_UNADDRESSABLE_MESSAGE = (
+    "This finding cannot be addressed in the current volume, so the "
+    "dismissal cannot be kept. It goes away when the rows are imported "
+    "again; if it stays, ask a staff member."
+)
+
+#: The 404 of a finding the rebuild has replaced under the viewer.
+FINDING_GONE_MESSAGE = (
+    "This finding is not there any more; the list was rebuilt. Reload "
+    "the page."
+)
+
+
+def _finding_or_404(scan: Scan, data: dict):
+    """Return the review-2 finding ``data`` names, or the 404 response.
+
+    :param scan: The scan.
+    :param data: The parsed body, with ``issue_id``.
+    :returns: The row, or a ``JsonResponse``.
+    """
+    row = Issue.objects.filter(
+        pk=data.get("issue_id"), scan=scan, check_name__in=REVIEW2_CHECKS
+    ).first()
+    if row is None:
+        return JsonResponse(
+            {"status": "error", "message": FINDING_GONE_MESSAGE}, status=404
+        )
+    return row
+
+
 @login_required
 @require_POST
-def flag_issue(request: HttpRequest, pk: int) -> JsonResponse:
-    """Create a user-flagged issue on a scan.
+def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
+    """Dismiss a finding of review 2 (#240 PR D).
 
-    :param request: The HTTP request (JSON body with message,
-        page_number, and metadata).
+    One ``ReviewDismissal`` row at the finding's address, and the
+    finding's FK set at once, so the card is muted with no rebuild. Any
+    logged-in user may press it (the #151 rule). A stale finding is
+    refused: the way out of one is to withdraw the decision it names.
+
+    :param request: The HTTP request (JSON body with ``issue_id``).
     :param pk: Scan primary key.
-    :return: JSON response with the new issue ID.
+    :return: ``{status, dismissal_id}``; 404 when the row is gone, 409
+        when the finding takes no dismissal.
     """
+    from scanning import findings
+
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    message = data.get("message", "").strip()
-    page = data.get("page_number")
-    metadata = data.get("metadata", {})
-    if not message:
+    row = _finding_or_404(scan, data)
+    if isinstance(row, JsonResponse):
+        return row
+    try:
+        dismissal = findings.dismiss(scan, row, request.user)
+    except findings.UndismissableFinding:
         return JsonResponse(
-            {"status": "error", "message": "Message required"}, status=400
+            {"status": "error", "message": FINDING_UNDISMISSABLE_MESSAGE},
+            status=409,
         )
-    type_to_check = {
-        "suppress_detection": CheckName.SUPPRESS_DETECTION,
-        "add_detection": CheckName.ADD_DETECTION,
-        "approve_detection": CheckName.APPROVE_DETECTION,
-    }
-    check_name = type_to_check.get(
-        metadata.get("type", ""), CheckName.PROCESS_FLAG
-    )
-    issue = Issue.objects.create(
-        scan=scan,
-        page_number=page,
-        check_name=check_name,
-        severity="warning",
-        message=message,
-        metadata=metadata or {},
-    )
-    return JsonResponse({"status": "ok", "id": issue.pk})
+    except findings.UnaddressableFinding:
+        return JsonResponse(
+            {"status": "error", "message": FINDING_UNADDRESSABLE_MESSAGE},
+            status=409,
+        )
+    return JsonResponse({"status": "ok", "dismissal_id": dismissal.pk})
 
 
 @login_required
 @require_POST
-def remove_flag(request: HttpRequest, pk: int, flag_id: int) -> JsonResponse:
-    """Remove a user-flagged issue from a scan.
+def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
+    """Take back the dismissal of a finding: the card comes back.
+
+    :param request: The HTTP request (JSON body with ``issue_id``).
+    :param pk: Scan primary key.
+    :return: ``{status, restored}``.
+    """
+    from scanning import findings
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = _finding_or_404(scan, data)
+    if isinstance(row, JsonResponse):
+        return row
+    restored = findings.restore(scan, row, request.user)
+    return JsonResponse({"status": "ok", "restored": restored})
+
+
+@login_required
+@require_POST
+def withdraw_stale_edit(request: HttpRequest, pk: int) -> JsonResponse:
+    """Withdraw the curator row a stale finding names, and rebuild.
+
+    The one way out of a ``stale_*`` finding: the decision the compute
+    could not land or place is taken back, as its own endpoint would
+    take it back, and the findings are written again.
+
+    :param request: The HTTP request (JSON body with ``issue_id``).
+    :param pk: Scan primary key.
+    :return: ``{status, withdrawn}``; 409 when the finding names no row.
+    """
+    from scanning import findings
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = _finding_or_404(scan, data)
+    if isinstance(row, JsonResponse):
+        return row
+    try:
+        withdrawn = findings.withdraw_stale(scan, row, request.user)
+    except findings.NotAStaleFinding:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "This finding names no decision to withdraw.",
+            },
+            status=409,
+        )
+    return JsonResponse({"status": "ok", "withdrawn": withdrawn})
+
+
+@login_required
+def review_findings(request: HttpRequest, pk: int) -> JsonResponse:
+    """Render the step-2 findings section as an HTML fragment.
+
+    The page and this fragment render one template from one context
+    (``findings.viewer_groups``), the ``process_actions`` shape (#151):
+    a card that disagreed with itself after a refresh would offer a
+    button the endpoint refuses. The viewer swaps the section after
+    every write.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :param flag_id: Primary key of the Issue to remove.
-    :return: JSON response confirming removal.
+    :return: ``{html, open, stale}``.
     """
+    from scanning import findings
+
     scan = get_object_or_404(Scan, pk=pk)
-    Issue.objects.filter(
-        pk=flag_id,
-        scan=scan,
-        check_name__in=[
-            CheckName.PROCESS_FLAG,
-            CheckName.SUPPRESS_DETECTION,
-            CheckName.ADD_DETECTION,
-            CheckName.APPROVE_DETECTION,
-        ],
-    ).delete()
-    return JsonResponse({"status": "ok"})
+    context = findings.viewer_groups(scan)
+    html = render_to_string(
+        "scanning/_review_findings.html", context, request=request
+    )
+    return JsonResponse(
+        {
+            "html": html,
+            "open": context["review2_open"],
+            "stale": context["review2_stale"],
+        }
+    )
 
 
 @login_required
@@ -1027,6 +1153,7 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
             )
         except detections.UnaddressableDetection:
             return _unaddressable()
+    _rebuild_findings(scan)
     return JsonResponse({"status": "ok", "deleted": 1})
 
 
@@ -1072,6 +1199,7 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
             )
         except detections.UnaddressableDetection:
             return _unaddressable()
+    _rebuild_findings(scan)
     return JsonResponse(
         {"status": "ok", "updated": 1, "detection_id": holder.pk}
     )
@@ -1174,6 +1302,7 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 )
             except detections.UnaddressableDetection:
                 return _unaddressable()
+        _rebuild_findings(scan)
         return JsonResponse(
             {"status": "ok", "added": False, "detection_id": near.pk}
         )
@@ -1191,6 +1320,7 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
         )
     except detections.UnaddressableDetection:
         return _unaddressable()
+    _rebuild_findings(scan)
     return JsonResponse(
         {"status": "ok", "added": True, "detection_id": row.pk}
     )
@@ -1228,6 +1358,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
             )
         except detections.UnaddressableDetection:
             return _unaddressable()
+    _rebuild_findings(scan)
     return JsonResponse({"status": "ok", "updated": 1})
 
 

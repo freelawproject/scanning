@@ -52,6 +52,7 @@ from scanning import boundaries
 from scanning.models import (
     BUSY_STATUSES,
     DEAD_JOB_STATUSES,
+    REVIEW2_CHECKS,
     REVIEW_STATUSES,
     ApplyRun,
     CheckName,
@@ -922,40 +923,6 @@ def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
         return compute_margin_rects(str(pdf_path), pages=document.pages)
 
 
-def _uncovered_headnote_pages(scan_pk: int, rects_px: list) -> set[int]:
-    """Return the pages with a confident HEADNOTE box no headnote rect covers.
-
-    Measured here, in the render's pixels, where both the detections and
-    blackletter's rects still are (#240 PR B): the rows are in points
-    and a request has no page scale to compare them with. The compute
-    stamps the answer on the boundaries (``boundaries.stamp_uncovered``),
-    which the step-2 sidebar draws; PR D raises it as a finding.
-
-    :param scan_pk: Primary key of the scan.
-    :param rects_px: blackletter's rects, in pixels.
-    :return: The 0-based pages, in the rows' space.
-    """
-    hn_rects_by_page = {
-        entry["page_index"]: [
-            r for r in entry["rects"] if r.get("type") == "headnote"
-        ]
-        for entry in rects_px
-    }
-    uncovered = set()
-    for d in Detection.objects.live().filter(
-        scan_id=scan_pk, label="HEADNOTE", confidence__gte=0.8
-    ):
-        cx = (d.x0 + d.x1) / 2
-        cy = (d.y0 + d.y1) / 2
-        covered = any(
-            r["x0"] <= cx <= r["x1"] and r["y0"] <= cy <= r["y1"]
-            for r in hn_rects_by_page.get(d.page_index, [])
-        )
-        if not covered:
-            uncovered.add(d.page_index)
-    return uncovered
-
-
 def _build_combined_redactions(scan_pk: int) -> Path:
     """Write ``redactions.json`` from the rows, for blackletter's ``generate``.
 
@@ -1457,10 +1424,11 @@ def recalculate_issues(scan: "Scan") -> None:
     )
     scan.refresh_from_db(fields=["status"])
 
-    # Suppression flags are curator decisions stored as Issue rows, not
-    # derived from the page numbers, so a recheck keeps them (same
-    # exclusion the daemon rebuild uses).
-    scan.issues.exclude(check_name=CheckName.SUPPRESS_DETECTION).delete()
+    # The findings of review 2 (#240 PR D) are derived from the
+    # detection, boundary and redaction rows, not from the page numbers,
+    # so a recheck of review 1 leaves them alone: ``findings.rebuild``
+    # is their only writer.
+    scan.issues.exclude(check_name__in=REVIEW2_CHECKS).delete()
     Issue.objects.bulk_create(
         [Issue(scan=scan, **i) for i in result["issues"]]
     )
@@ -1729,7 +1697,14 @@ def run_compute_redactions(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to compute redactions for.
     :return: None.
     """
-    from scanning import apply, redactions, review_states, s3_sync, yolo
+    from scanning import (
+        apply,
+        findings,
+        redactions,
+        review_states,
+        s3_sync,
+        yolo,
+    )
     from scanning import detections as decisions
 
     django.db.connections.close_all()
@@ -1884,13 +1859,6 @@ def run_compute_redactions(scan_pk: int) -> None:
         _update_progress(scan_pk, "Measuring the page margins...")
         margins = _measure_margin_rects(pdf_path, document)
 
-        # The finding the sidebar draws rides on the boundaries until PR
-        # D gives it a table of its own; measured in pixels, before the
-        # rows are converted.
-        boundaries.stamp_uncovered(
-            scan, _uncovered_headnote_pages(scan_pk, rects)
-        )
-
         # The rows are the store (#240 PR B): the computed rows are
         # written again, the standing dismissals land on them, and the
         # human rows follow the page space the geometry was measured in.
@@ -1919,6 +1887,18 @@ def run_compute_redactions(scan_pk: int) -> None:
             written,
             landed,
             len(stale),
+        )
+        # The findings of review 2 are rows too (#240 PR D), derived
+        # from the rows just written. The run is passed, not read: the
+        # ledger stamp that ``detections.measured_run`` reads is written
+        # after the park, below.
+        _update_progress(scan_pk, "Writing the findings...")
+        with _log_stage("Review-2 findings"):
+            open_findings = findings.rebuild(scan, run=run if merged else None)
+        logger.info(
+            "compute_redactions: scan %s: %d review-2 finding(s) open",
+            scan_pk,
+            open_findings,
         )
         # Nothing to push: every output of this pass is a row (#240),
         # and the files under ``output_dir`` are the copies it pulled.

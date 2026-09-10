@@ -35,15 +35,16 @@ from scanning.views_api import (
     compute_redactions_api,
     delete_detection,
     dismiss_boundary,
+    dismiss_finding,
     dismiss_redaction,
     export_pdf,
-    flag_issue,
     generate_files,
     move_redaction,
     pair_opinions_api,
-    remove_flag,
     restore_boundary,
+    restore_finding,
     restore_redaction,
+    review_findings,
     serve_detections,
     serve_ocr_results,
     serve_opinions,
@@ -51,6 +52,7 @@ from scanning.views_api import (
     serve_redacted_pdf,
     serve_redactions,
     update_detection,
+    withdraw_stale_edit,
 )
 from scanning.views_process import (
     add_page_insert,
@@ -287,6 +289,27 @@ urlpatterns = [
         add_boundary,
         name="add_boundary",
     ),
+    # The findings of review 2 and the curator's dismissals (#240 PR D).
+    path(
+        "scans/<int:pk>/findings/",
+        review_findings,
+        name="review_findings",
+    ),
+    path(
+        "scans/<int:pk>/findings/dismiss/",
+        dismiss_finding,
+        name="dismiss_finding",
+    ),
+    path(
+        "scans/<int:pk>/findings/restore/",
+        restore_finding,
+        name="restore_finding",
+    ),
+    path(
+        "scans/<int:pk>/findings/withdraw/",
+        withdraw_stale_edit,
+        name="withdraw_stale_edit",
+    ),
     path(
         "scans/<int:pk>/redactions/",
         serve_redactions,
@@ -345,12 +368,6 @@ urlpatterns = [
         "scans/<int:pk>/ocr-results/",
         serve_ocr_results,
         name="serve_ocr_results",
-    ),
-    path("scans/<int:pk>/flag/", flag_issue, name="flag_issue"),
-    path(
-        "scans/<int:pk>/flag/<int:flag_id>/delete/",
-        remove_flag,
-        name="remove_flag",
     ),
     path(
         "scans/<int:pk>/add-single-detection/",

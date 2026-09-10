@@ -725,36 +725,6 @@ def reading_key(
     return row.start_page_index, column, row.start_y, row.start_x
 
 
-def stamp_uncovered(scan: Scan, uncovered: set[int]) -> int:
-    """Write the uncovered headnote pages on every standing boundary.
-
-    The redaction compute measures which pages hold a confident HEADNOTE
-    box no headnote rect covers (``services._uncovered_headnote_pages``),
-    in the render's pixels, and hands the set here; each boundary keeps
-    the pages of its own span (#240 PR B). ``viewer_payload`` turns the
-    list into the ``uncovered_headnote_pages`` the sidebar draws. A
-    request cannot measure it, since the redaction rows are in points.
-    PR D makes it a finding.
-
-    :param scan: The scan.
-    :param uncovered: The 0-based pages, in the rows' space.
-    :returns: How many rows were written.
-    """
-    written = 0
-    for row in standing(scan):
-        pages = [
-            i
-            for i in range(row.start_page_index, row.end_page_index + 1)
-            if i in uncovered
-        ]
-        if row.uncovered_page_indexes != pages:
-            OpinionBoundary.objects.filter(pk=row.pk).update(
-                uncovered_page_indexes=pages
-            )
-            written += 1
-    return written
-
-
 def standing(scan: Scan) -> list[OpinionBoundary]:
     """Return the boundaries a reader may draw, in reading order.
 
@@ -1016,15 +986,6 @@ def viewer_payload(
                 "first_page_number": first,
                 "last_page_number": last,
                 "outside_rects": masks.get(row.pk, []),
-                # Stamped by the redaction compute (#240 PR B): the page
-                # to show (``num``) and the one to navigate to (``idx``).
-                "uncovered_headnote_pages": [
-                    {
-                        "num": (page_numbers.get(i) or (i + 1,))[0],
-                        "idx": i,
-                    }
-                    for i in row.uncovered_page_indexes or []
-                ],
             }
         )
     return payload

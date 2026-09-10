@@ -363,16 +363,16 @@ function approveDetection(btn) {
                 showToast((data && data.message) || "Failed to approve detection");
                 return;
             }
-            var row = btn.closest("[data-unmatched-page]");
-            row.style.opacity = "0.3";
-            row.style.pointerEvents = "none";
-            btn.textContent = "\u2713";
             // Not an automatic re-pair (#196): the pairing endpoint
             // now queues the whole redaction computation, which
             // renders every page and takes the volume out of review,
             // and re-pairing on request is off for now. Say what the
-            // edit did and did not change.
-            showToast("Approved. The redactions are not recomputed from this yet.", "success");
+            // edit did and did not change: the approval raises the
+            // confidence the next pairing reads, and the card stays
+            // (its chip reads 1.0 and loses the check mark) until that
+            // pairing runs. The section is fetched again (#240 PR D).
+            showToast("Approved: the box reads 1.0 now. The card stays until the opinions are paired again.", "success");
+            refreshFindings();
         })
         .catch(function () {
             console.error("Failed to approve detection");
@@ -404,15 +404,104 @@ function deleteUnmatchedDetection(btn) {
                 showToast((data && data.message) || "Failed to delete detection");
                 return;
             }
-            var row = btn.closest("[data-unmatched-page]");
-            row.style.opacity = "0.3";
-            row.style.pointerEvents = "none";
-            btn.textContent = "\u2717";
+            refreshFindings();
         })
         .catch(function () {
             console.error("Failed to delete detection");
             showToast("Failed to delete detection");
         });
+}
+
+// --- The findings of review 2 (#240 PR D) ---
+//
+// One section, rendered by the server from the Issue rows, and fetched
+// again after every write: the endpoints rebuild the findings, so the
+// cards are true the moment the answer comes back. The action bar is
+// refreshed with it, because the approve button carries the open count.
+
+function refreshFindings() {
+    var cfg = window.SCAN_CONFIG;
+    var section = document.getElementById("review-findings");
+    if (!section) return Promise.resolve();
+    return fetch("/scans/" + cfg.docId + "/findings/", {
+        headers: { "X-Requested-With": "XMLHttpRequest" },
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (data && typeof data.html === "string") section.innerHTML = data.html;
+            labelFindingCards();
+            if (typeof window.refreshProcessActionBar === "function") {
+                window.refreshProcessActionBar();
+            }
+        })
+        .catch(function () { /* keep the stale section; a reload still works */ });
+}
+window.refreshFindings = refreshFindings;
+
+// The server renders a card's page as its position (p.<n>), because the
+// fragment has no printed-page map. The viewer has one, in the page map
+// it draws the pages from, so it writes the printed number over the
+// position, on load and after every swap. Both renders then agree.
+function labelFindingCards() {
+    var viewer = document.getElementById("pdf-viewer");
+    if (!viewer || !viewer.dataset.pageMap) return;
+    var logical = {};
+    try {
+        JSON.parse(viewer.dataset.pageMap).forEach(function (entry) {
+            if (entry && entry.pdf_index !== undefined && entry.logical_number !== undefined) {
+                logical[entry.pdf_index] = entry.logical_number;
+            }
+        });
+    } catch (e) { return; }
+    document.querySelectorAll("#review-findings [data-finding-page]").forEach(function (el) {
+        var idx = parseInt(el.dataset.findingPage, 10);
+        if (isNaN(idx)) return;
+        var label = logical[idx];
+        el.textContent = "p." + (label !== undefined && label !== null ? label : idx + 1);
+    });
+}
+window.labelFindingCards = labelFindingCards;
+document.addEventListener("DOMContentLoaded", labelFindingCards);
+
+function _postFinding(path, issueId) {
+    var cfg = window.SCAN_CONFIG;
+    return fetch("/scans/" + cfg.docId + "/findings/" + path + "/", {
+        method: "POST",
+        headers: {
+            "X-CSRFToken": cfg.csrfToken,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ issue_id: issueId }),
+    }).then(function (r) { return r.json(); });
+}
+
+function _findingAction(btn, path, issueId, failure) {
+    btn.disabled = true;
+    _postFinding(path, issueId)
+        .then(function (data) {
+            if (!data || data.status !== "ok") {
+                btn.disabled = false;
+                showToast((data && data.message) || failure, "error");
+                return;
+            }
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            showToast(failure, "error");
+        });
+}
+
+function dismissFinding(btn, issueId) {
+    _findingAction(btn, "dismiss", issueId, "Could not dismiss the finding.");
+}
+
+function restoreFinding(btn, issueId) {
+    _findingAction(btn, "restore", issueId, "Could not take the dismissal back.");
+}
+
+function withdrawStaleEdit(btn, issueId) {
+    _findingAction(btn, "withdraw", issueId, "Could not withdraw the decision.");
 }
 
 function deleteDuplicates(btn) {

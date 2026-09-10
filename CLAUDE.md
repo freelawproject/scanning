@@ -14,6 +14,9 @@ DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py test scan
 # Survey the layout-JSON repair over the corpus, changing nothing (#242)
 docker exec scanning-daemon python manage.py reglue_dots_mocr --dry-run
 
+# Write the review-2 findings of the volumes already in review 2, once after a deploy (#240 PR D)
+docker exec scanning-daemon python manage.py rebuild_review2_findings
+
 # Generate migrations
 DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py makemigrations scanning
 
@@ -152,6 +155,12 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - The compute pairs once (`_snapped_document`); `bl_pair` is not imported. A recompute keeps every row; only a first import under a run replaces the model rows
 - Nothing a curator does starts a compute (`REPAIR_ON_REQUEST_ENABLED = False`). `REDACTION_REVIEW_DONE` is recomputed by nothing but the re-queue
 - `approve_redaction_review` is the only writer of REDACTION_REVIEW_DONE, and its log line is the only record of who decided. It gates step 3; a legacy volume keeps its link
+- The findings of review 2 are `Issue` rows (`REVIEW2_CHECKS`, `Issue.target`), and `findings.rebuild` is their one writer (#240 PR D). It derives every finding from the detection, boundary and redaction rows, with no S3 read and no render, and runs at the end of the compute (which passes the run it measured in, because its ledger stamp is written after the park) and in every review-2 write endpoint (`_rebuild_findings`), since the recompute is off. `recalculate_issues` excludes `REVIEW2_CHECKS`
+- Stale is read off the rows, never threaded from `resolve`: a standing decision no `decision` FK points at, or a human row whose `apply_run` is not the measured run, is a `stale_*` card. No measured finding is written without a computed boundary
+- `ReviewDismissal` names its target by address plus a copy of the box; `findings.resolve` lands it by `IOU_THRESHOLD` and the finding is written with `Issue.dismissal` set (muted, with Undo). A stale card is withdrawn (`withdraw_stale`), never dismissed (`UndismissableFinding`, 409). Nothing deletes a dismissal
+- A review-2 `page_number` is the 1-based position in the space the rows are drawn in, so step 1 and `process_actions` list `scan.issues.exclude(check_name__in=REVIEW2_CHECKS)`, and `dismiss_issue` refuses a review-2 row. The page and the `review_findings` fragment render `_review_findings.html` from `findings.viewer_groups`
+- The review-2 approval warns and obeys: `_review_flags` carries `review2_open` and `review2_stale`, the bar asks for a confirm, the view blocks nothing
+- No migration writes a finding: `rebuild_review2_findings` writes them once after the deploy. `flag_issue`, `remove_flag` and the three user-action checks are gone
 
 ## Worker images
 
