@@ -106,6 +106,16 @@ class NotAStaleFinding(ValueError):
     """A withdrawal was asked through a finding that names no row."""
 
 
+class UnaddressableFinding(ValueError):
+    """A dismissal was asked for a finding whose target has no address.
+
+    A pre-#240 detection row keeps ``source_page`` blank until the next
+    import, and a run of pages may end outside the apply run's map. A
+    dismissal keyed by no page could never land, so it is refused, the
+    rule of ``detections.UnaddressableDetection``.
+    """
+
+
 # ---------------------------------------------------------------------------
 # The rebuild
 # ---------------------------------------------------------------------------
@@ -510,17 +520,22 @@ def address_of(finding: dict[str, Any]) -> dict[str, Any]:
     :param finding: A finding dict, or an ``Issue`` row's fields.
     :returns: The columns of the address.
     :raises UndismissableFinding: for a stale finding.
+    :raises UnaddressableFinding: when the target names no source page.
     """
     check = finding["check_name"]
     if check in STALE_REVIEW2_CHECKS or check not in REVIEW2_CHECKS:
         raise UndismissableFinding(check)
     meta = finding["metadata"]
+    if meta.get("source_page") is None:
+        raise UnaddressableFinding(check)
     address = {
         "check_name": check,
         "source_edit_id": meta.get("source_edit"),
         "source_page": meta.get("source_page"),
     }
     if check == CheckName.UNCOVERED_PAGES:
+        if meta.get("end_source_page") is None:
+            raise UnaddressableFinding(check)
         address["end_source_edit_id"] = meta.get("end_source_edit")
         address["end_source_page"] = meta.get("end_source_page")
     else:
@@ -630,6 +645,7 @@ def dismiss(scan: Scan, issue: Issue, user) -> ReviewDismissal:
     :param user: The curator. May be None.
     :returns: The standing dismissal.
     :raises UndismissableFinding: for a stale finding, or a review-1 row.
+    :raises UnaddressableFinding: when the target names no source page.
     """
     if issue.dismissal_id is not None:
         standing = ReviewDismissal.objects.filter(

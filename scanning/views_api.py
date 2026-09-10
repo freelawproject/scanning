@@ -956,6 +956,15 @@ FINDING_UNDISMISSABLE_MESSAGE = (
     "it again on the page as it is now."
 )
 
+#: The 409 of a dismissal whose target has no source page (#240 PR D):
+#: a detection row from before the address existed, or a run of pages
+#: that ends outside the apply run's map.
+FINDING_UNADDRESSABLE_MESSAGE = (
+    "This finding cannot be addressed in the current volume, so the "
+    "dismissal cannot be kept. It goes away when the rows are imported "
+    "again; if it stays, ask a staff member."
+)
+
 #: The 404 of a finding the rebuild has replaced under the viewer.
 FINDING_GONE_MESSAGE = (
     "This finding is not there any more; the list was rebuilt. Reload "
@@ -1011,6 +1020,11 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
     except findings.UndismissableFinding:
         return JsonResponse(
             {"status": "error", "message": FINDING_UNDISMISSABLE_MESSAGE},
+            status=409,
+        )
+    except findings.UnaddressableFinding:
+        return JsonResponse(
+            {"status": "error", "message": FINDING_UNADDRESSABLE_MESSAGE},
             status=409,
         )
     return JsonResponse({"status": "ok", "dismissal_id": dismissal.pk})

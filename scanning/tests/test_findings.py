@@ -561,6 +561,19 @@ class TestDismissals(ScanningTestCase):
         self.assertEqual(row.withdrawn_by, self.user)
         self.assertFalse(findings.restore(self.scan, self.finding, self.user))
 
+    def test_a_finding_with_no_source_page_takes_no_dismissal(self):
+        """A pre-#240 row keeps ``source_page`` blank until the next
+        import; a dismissal keyed by no page could never land, and one
+        written anyway would hit the NOT NULL column."""
+        Detection.objects.filter(pk=self.loose.pk).update(source_page=None)
+        findings.rebuild(self.scan)
+        finding = self.scan.issues.get(check_name=CheckName.UNMATCHED_KEY_ICON)
+
+        with self.assertRaises(findings.UnaddressableFinding):
+            findings.dismiss(self.scan, finding, self.user)
+
+        self.assertEqual(ReviewDismissal.objects.count(), 0)
+
     def test_a_stale_finding_takes_no_dismissal(self):
         DetectionDecision.objects.create(
             scan=self.scan,
@@ -727,6 +740,18 @@ class TestFindingEndpoints(ScanningTestCase):
             "withdraw_stale_edit", {"issue_id": unmatched.pk}
         )
         self.assertEqual(response.status_code, 409)
+
+    def test_a_finding_with_no_address_is_refused_with_409(self):
+        Detection.objects.filter(
+            pk=self.finding.metadata["detection_id"]
+        ).update(source_page=None)
+        findings.rebuild(self.scan)
+        finding = self.scan.issues.get(check_name=CheckName.UNMATCHED_KEY_ICON)
+
+        response = self._post("dismiss_finding", {"issue_id": finding.pk})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["status"], "error")
 
     def test_the_fragment_renders_the_cards(self):
         response = self.client.get(
