@@ -926,13 +926,24 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
         if len(bbox) != 4:
             raise ValueError("bbox needs four numbers")
         label_name = Label(label_id).name
-    except (KeyError, TypeError, ValueError) as exc:
-        return JsonResponse({"error": f"Bad detection: {exc}"}, status=400)
+    except (KeyError, TypeError, ValueError):
+        # The detail goes to the log, not to the browser (CodeQL).
+        logger.warning(
+            "add_single_detection: scan %s: malformed body", pk, exc_info=True
+        )
+        return JsonResponse(
+            {
+                "error": "Bad detection: page_index, label_id and a bbox "
+                "of four numbers are required"
+            },
+            status=400,
+        )
 
     run = detections.measured_run(scan)
+    # Any live row, hand-drawn ones included: a second click on the
+    # curator's own box must be a no-op, not a second box over it.
     near = (
         Detection.objects.live()
-        .model_rows()
         .filter(
             scan=scan,
             page_index=page_index,
@@ -946,9 +957,14 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
         .first()
     )
     if near is not None:
-        detections.decide(
-            scan, near, DetectionDecision.Kind.APPROVE, request.user, run=run
-        )
+        if near.model_name != Detection.ModelName.MANUAL:
+            detections.decide(
+                scan,
+                near,
+                DetectionDecision.Kind.APPROVE,
+                request.user,
+                run=run,
+            )
         return JsonResponse(
             {"status": "ok", "added": False, "detection_id": near.pk}
         )

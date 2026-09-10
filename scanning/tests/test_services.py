@@ -23,6 +23,7 @@ from scanning.factories import (
 from scanning.models import (
     CheckName,
     Detection,
+    DetectionDecision,
     Issue,
     PageEdit,
     QueueStatus,
@@ -323,6 +324,60 @@ class TestModelProvenanceSurvives(TestCase):
         # Addressed by its source page (#240): no run, so the original's.
         self.assertEqual(added.source_page, 4)
         self.assertIsNone(added.source_edit)
+
+    def test_a_second_add_on_the_curator_s_own_box_is_a_no_op(self):
+        """The proximity match includes hand-drawn rows, or a repeat
+        click would draw a second box over the first (PR #288 review)."""
+        from django.urls import reverse
+
+        self.client.force_login(UserFactory())
+        body = {
+            "page_index": 3,
+            "label_id": 1,
+            "bbox": [100, 100, 140, 140],
+            "img_width": 1700,
+            "img_height": 2200,
+        }
+        first = self.client.post(
+            reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+            data=json.dumps(body),
+            content_type="application/json",
+        )
+
+        second = self.client.post(
+            reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({**body, "bbox": [104, 98, 144, 138]}),
+            content_type="application/json",
+        )
+
+        self.assertTrue(first.json()["added"])
+        self.assertFalse(second.json()["added"])
+        self.assertEqual(
+            second.json()["detection_id"], first.json()["detection_id"]
+        )
+        self.assertEqual(
+            Detection.objects.filter(
+                scan=self.scan, model_name=Detection.ModelName.MANUAL
+            ).count(),
+            1,
+        )
+        self.assertEqual(DetectionDecision.objects.count(), 0)
+
+    def test_a_malformed_add_names_no_exception(self):
+        from django.urls import reverse
+
+        self.client.force_login(UserFactory())
+
+        with self.assertLogs("scanning.views_api", level="WARNING"):
+            response = self.client.post(
+                reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+                data=json.dumps({"page_index": 0, "label_id": 1, "bbox": [1]}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("Traceback", response.json()["error"])
+        self.assertNotIn("ValueError", response.json()["error"])
 
     def test_the_document_reads_the_bl_warm_gates(self):
         from scanning.services import (

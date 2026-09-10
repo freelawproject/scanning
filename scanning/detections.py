@@ -261,6 +261,14 @@ def decide(
     if run is None and row.source_page is None:
         run = measured_run(scan)
     with transaction.atomic():
+        # Lock the row before reading its decision: two clicks at once
+        # (a double click, two reviewers on one volume) would otherwise
+        # both see no standing decision and both write one.
+        row = (
+            Detection.objects.select_for_update(of=("self",))
+            .select_related("decision")
+            .get(pk=row.pk)
+        )
         current = (
             row.decision
             if row.decision_id and row.decision.withdrawn_at is None
@@ -270,7 +278,7 @@ def decide(
             return current
         if current is not None:
             withdraw(DetectionDecision.objects.filter(pk=current.pk), user)
-            row.refresh_from_db(fields=["confidence", "active"])
+            row.refresh_from_db(fields=["confidence", "active", "decision"])
         edit_id, page = _address_of_row(scan, row, run)
         decision = DetectionDecision.objects.create(
             scan=scan,
