@@ -22,12 +22,14 @@ from django.http import (
     StreamingHttpResponse,
 )
 from django.shortcuts import get_object_or_404, redirect
+from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils.cache import get_conditional_response
 from django.utils.http import http_date
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
+    REVIEW2_CHECKS,
     Detection,
     DetectionDecision,
     Issue,
@@ -979,8 +981,6 @@ def _finding_or_404(scan: Scan, data: dict):
     :param data: The parsed body, with ``issue_id``.
     :returns: The row, or a ``JsonResponse``.
     """
-    from scanning.models import REVIEW2_CHECKS
-
     row = Issue.objects.filter(
         pk=data.get("issue_id"), scan=scan, check_name__in=REVIEW2_CHECKS
     ).first()
@@ -1101,8 +1101,6 @@ def review_findings(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: ``{html, open, stale}``.
     """
-    from django.template.loader import render_to_string
-
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)

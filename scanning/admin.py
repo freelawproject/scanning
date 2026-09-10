@@ -644,7 +644,6 @@ class ReviewDismissalAdmin(admin.ModelAdmin):
         "check_name",
         "label",
         "source_page",
-        "end_source_page",
         "author",
         "withdrawn_at",
         "date_created",
@@ -653,7 +652,6 @@ class ReviewDismissalAdmin(admin.ModelAdmin):
     raw_id_fields = [
         "scan",
         "source_edit",
-        "end_source_edit",
         "author",
         "withdrawn_by",
     ]

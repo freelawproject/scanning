@@ -237,7 +237,25 @@ class TestRebuild(ScanningTestCase):
         self.assertEqual(row.metadata["first_index"], 2)
         self.assertEqual(row.metadata["last_index"], 3)
         self.assertEqual(row.metadata["source_page"], 3)
-        self.assertEqual(row.metadata["end_source_page"], 4)
+
+    def test_a_run_that_ends_past_the_volume_can_be_dismissed(self):
+        """A volume short of its last pages has a gap whose end has no
+        address; the dismissal is keyed by the first page alone."""
+        scan = make_scan(page_count=3, end_page=6)
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 1)
+        make_boundary(scan, caption, key)
+        findings.rebuild(scan)
+        row = scan.issues.get(check_name=CheckName.UNCOVERED_PAGES)
+        self.assertEqual(row.metadata["last_index"], 5)
+
+        dismissal = findings.dismiss(scan, row, self.make_user())
+
+        self.assertEqual(dismissal.source_page, 3)
+        findings.rebuild(scan)
+        self.assertTrue(
+            scan.issues.get(check_name=CheckName.UNCOVERED_PAGES).is_dismissed
+        )
 
     def test_a_headnote_no_black_box_covers_is_a_finding(self):
         """The box centre (150, 150 px at 200 dpi = 54 pt) is tested
@@ -278,6 +296,20 @@ class TestRebuild(ScanningTestCase):
             covered.pk, [r.metadata["detection_id"] for r in rows]
         )
         self.assertEqual(rows.first().target, Issue.Target.REDACTION)
+
+    def test_a_computed_box_of_another_type_is_not_cover(self):
+        """The rule the step-2 view applied: a headnote rect covers a
+        headnote; a key-number box that overlaps it does not."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+        make_detection(scan, "HEADNOTE", 0, confidence=0.95)
+        make_redaction(scan, 0, rect_type="KEY_ICON")
+
+        findings.rebuild(scan)
+
+        self.assertIn(CheckName.UNCOVERED_HEADNOTE, checks_of(scan))
 
     def test_a_curator_drawn_black_box_covers_a_headnote(self):
         scan = make_scan()
@@ -761,6 +793,8 @@ class TestFindingEndpoints(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(data["open"], 1)
+        # The same position label as the page, for the viewer to relabel.
+        self.assertIn('data-finding-page="1">p.2<', data["html"])
         self.assertEqual(data["stale"], 0)
         self.assertIn(f'data-issue-id="{self.finding.pk}"', data["html"])
         self.assertIn("dismissFinding(", data["html"])
@@ -853,10 +887,12 @@ class TestTheView(ScanningTestCase):
         )
         key_card = groups[0]["rows"][0]
         self.assertEqual(key_card.nav_pdf_index, 2)
-        self.assertEqual(key_card.logical_page, 103)
         self.assertEqual(response.context["review2_open"], 2)
         html = response.content.decode()
         self.assertIn('id="review-findings"', html)
+        # The label is the position; the viewer writes the printed
+        # number over it from the page map, so both renders agree.
+        self.assertIn('data-finding-page="2">p.3<', html)
         self.assertNotIn("Unmatched Key Icons", html)
 
     def test_the_approve_button_asks_for_a_confirm_with_open_findings(self):

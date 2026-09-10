@@ -1127,6 +1127,10 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
     }
 )
 
+#: The review-2 checks a curator may dismiss: every one but the stale
+#: checks, whose way out is to withdraw the decision they name.
+DISMISSABLE_REVIEW2_CHECKS = REVIEW2_CHECKS - STALE_REVIEW2_CHECKS
+
 
 class Issue(AbstractDateTimeModel):
     """A validation or processing issue found in a scan.
@@ -1218,11 +1222,21 @@ class ReviewDismissal(AbstractDateTimeModel):
     (``findings.rebuild``), so a dismissal cannot point at one. It names
     its target by **address** instead: the check, the source page of
     the target (``source_edit``, ``source_page``; the rule of
-    ``DetectionDecision``), the last page for a run of pages, the label
-    and a copy of the box for a detection. After each rebuild
+    ``DetectionDecision``), the label and a copy of the box for a
+    detection. A run of pages is keyed by its first page alone: two
+    runs cannot start on one page, and the last page of a volume short
+    of its pages has no address. After each rebuild
     ``findings.resolve`` lands every standing dismissal on the finding
     with that address (IoU at least ``detections.IOU_THRESHOLD`` for a
     box) and sets ``Issue.dismissal``, which mutes the card.
+
+    No unique key over the standing rows, on purpose: the address of a
+    box includes the box, and a key over the page and the label alone
+    would refuse the second dismissal on a page with two unmatched key
+    icons. So a box that moved past the IoU threshold leaves an old
+    dismissal standing beside the new one, and the old one mutes a
+    later finding only if a new box appears within the threshold of
+    the old spot. Accepted as an edge.
 
     Never deleted by automation. A curator takes one back with
     ``withdrawn_at``. A stale finding (``STALE_REVIEW2_CHECKS``) has no
@@ -1238,7 +1252,14 @@ class ReviewDismissal(AbstractDateTimeModel):
         on_delete=models.CASCADE,
         related_name="review_dismissals",
     )
-    check_name = models.CharField(max_length=100, choices=CheckName.choices)
+    check_name = models.CharField(
+        max_length=100,
+        choices=[
+            (check.value, check.label)
+            for check in CheckName
+            if check in DISMISSABLE_REVIEW2_CHECKS
+        ],
+    )
     source_edit = models.ForeignKey(
         "PageEdit",
         on_delete=models.CASCADE,
@@ -1249,19 +1270,6 @@ class ReviewDismissal(AbstractDateTimeModel):
     )
     source_page = models.PositiveIntegerField(
         help_text="1-based page of the source document.",
-    )
-    end_source_edit = models.ForeignKey(
-        "PageEdit",
-        on_delete=models.CASCADE,
-        null=True,
-        blank=True,
-        related_name="+",
-        help_text="A run of pages: the source of its last page.",
-    )
-    end_source_page = models.PositiveIntegerField(
-        null=True,
-        blank=True,
-        help_text="A run of pages: the 1-based last page of its source.",
     )
     source_fingerprint = models.CharField(
         max_length=64,

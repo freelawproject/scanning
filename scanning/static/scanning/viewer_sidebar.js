@@ -367,10 +367,11 @@ function approveDetection(btn) {
             // now queues the whole redaction computation, which
             // renders every page and takes the volume out of review,
             // and re-pairing on request is off for now. Say what the
-            // edit did and did not change. The findings were rebuilt
-            // by the endpoint (#240 PR D), so the section is fetched
-            // again in place of dimming the card.
-            showToast("Approved. The redactions are not recomputed from this yet.", "success");
+            // edit did and did not change: the approval raises the
+            // confidence the next pairing reads, and the card stays
+            // (its chip reads 1.0 and loses the check mark) until that
+            // pairing runs. The section is fetched again (#240 PR D).
+            showToast("Approved: the box reads 1.0 now. The card stays until the opinions are paired again.", "success");
             refreshFindings();
         })
         .catch(function () {
@@ -428,6 +429,7 @@ function refreshFindings() {
         .then(function (r) { return r.json(); })
         .then(function (data) {
             if (data && typeof data.html === "string") section.innerHTML = data.html;
+            labelFindingCards();
             if (typeof window.refreshProcessActionBar === "function") {
                 window.refreshProcessActionBar();
             }
@@ -435,6 +437,31 @@ function refreshFindings() {
         .catch(function () { /* keep the stale section; a reload still works */ });
 }
 window.refreshFindings = refreshFindings;
+
+// The server renders a card's page as its position (p.<n>), because the
+// fragment has no printed-page map. The viewer has one, in the page map
+// it draws the pages from, so it writes the printed number over the
+// position, on load and after every swap. Both renders then agree.
+function labelFindingCards() {
+    var viewer = document.getElementById("pdf-viewer");
+    if (!viewer || !viewer.dataset.pageMap) return;
+    var logical = {};
+    try {
+        JSON.parse(viewer.dataset.pageMap).forEach(function (entry) {
+            if (entry && entry.pdf_index !== undefined && entry.logical_number !== undefined) {
+                logical[entry.pdf_index] = entry.logical_number;
+            }
+        });
+    } catch (e) { return; }
+    document.querySelectorAll("#review-findings [data-finding-page]").forEach(function (el) {
+        var idx = parseInt(el.dataset.findingPage, 10);
+        if (isNaN(idx)) return;
+        var label = logical[idx];
+        el.textContent = "p." + (label !== undefined && label !== null ? label : idx + 1);
+    });
+}
+window.labelFindingCards = labelFindingCards;
+document.addEventListener("DOMContentLoaded", labelFindingCards);
 
 function _postFinding(path, issueId) {
     var cfg = window.SCAN_CONFIG;

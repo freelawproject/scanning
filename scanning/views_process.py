@@ -401,7 +401,20 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # pages the run stored, and no review-1 issue or edit, since those
     # address the original. Step 1 always draws the original's space,
     # where every ``PageEdit`` address lives.
-    flags = _review_flags(scan, repairs_waiting=bool(waiting_repairs))
+    # The findings of review 2 are rows since #240 PR D
+    # (``findings.rebuild`` writes them after the compute and after
+    # every curator write), read here for the step-2 section, and their
+    # counts are handed to the flags so the bar and the section agree.
+    review_findings = findings.viewer_groups(scan) if step >= 2 else {}
+    flags = _review_flags(
+        scan,
+        repairs_waiting=bool(waiting_repairs),
+        review2=(
+            (review_findings["review2_open"], review_findings["review2_stale"])
+            if review_findings
+            else None
+        ),
+    )
     final_space = step >= 2 and flags["final_space"]
     printed_warning = None
     if final_space:
@@ -572,11 +585,6 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             if idx in image_page_indices
         ]
 
-    # ``uncovered_headnote_pages`` rides on each opinion since #240 PR B:
-    # the compute stamps it, in the render's pixels where the detections
-    # and the rects both were. The rows are in points now, so a request
-    # cannot measure it here any more.
-
     opinion_scans = []
     if step == 3:
         for s in OpinionScan.objects.filter(scan=scan).order_by(
@@ -594,15 +602,9 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             )
             opinion_scans.append(s)
 
-    # The findings of review 2 are rows since #240 PR D
-    # (``findings.rebuild`` writes them after the compute and after
-    # every curator write), read here for the step-2 section. The
-    # printed-pages warning is a request-time condition, not a
+    # The printed-pages warning is a request-time condition, not a
     # finding, so it stays a warning line.
     detect_warnings = []
-    review_findings = (
-        findings.viewer_groups(scan, idx_to_logical) if step >= 2 else {}
-    )
 
     if printed_warning:
         detect_warnings.insert(0, printed_warning)
@@ -1696,7 +1698,11 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     return resp
 
 
-def _review_flags(scan: Scan, repairs_waiting: bool | None = None) -> dict:
+def _review_flags(
+    scan: Scan,
+    repairs_waiting: bool | None = None,
+    review2: tuple[int, int] | None = None,
+) -> dict:
     """Return the review flags the step-1 and step-2 button bars read.
 
     Both :func:`scan_process_view` and the :func:`process_actions`
@@ -1732,6 +1738,9 @@ def _review_flags(scan: Scan, repairs_waiting: bool | None = None) -> dict:
     :param scan: The scan the bars are rendered for.
     :param repairs_waiting: Whether a scanner still has to act on this
         scan. ``None`` asks :func:`repairs.has_waiting`.
+    :param review2: The open and the stale review-2 findings, when the
+        caller holds them (``findings.viewer_groups``). ``None`` asks
+        :func:`findings.open_count`, past the review-1 approval.
     :returns: ``page_review_ready``, ``page_review_done``,
         ``redaction_review_ready``, ``redaction_review_done``,
         ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting`` and
@@ -1762,9 +1771,9 @@ def _review_flags(scan: Scan, repairs_waiting: bool | None = None) -> dict:
         }
     if repairs_waiting is None:
         repairs_waiting = repairs.has_waiting(scan)
-    review2_open, review2_stale = (
-        findings.open_count(scan) if approved else (0, 0)
-    )
+    if review2 is None:
+        review2 = findings.open_count(scan) if approved else (0, 0)
+    review2_open, review2_stale = review2
     return {
         "page_review_ready": (
             scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW

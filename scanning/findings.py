@@ -48,6 +48,7 @@ import logging
 from typing import Any
 
 from django.db import transaction
+from django.db.models import Count, Q
 from django.utils import timezone
 
 from scanning import boundaries, detections, redactions
@@ -146,6 +147,16 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
         found.extend(_uncovered_headnote_findings(scan))
     resolve(scan, found)
     with transaction.atomic():
+        # One row lock on the scan serializes the rebuilds. Under READ
+        # COMMITTED a second DELETE that starts before the first
+        # transaction commits does not see its new rows, and both sets
+        # survive: two tabs, a double click, or a curator write during
+        # a compute doubled every card.
+        list(
+            Scan.objects.select_for_update()
+            .filter(pk=scan.pk)
+            .values_list("pk", flat=True)
+        )
         Issue.objects.filter(scan=scan, check_name__in=REVIEW2_CHECKS).delete()
         Issue.objects.bulk_create(
             [
@@ -423,7 +434,10 @@ def _uncovered_pages_findings(
     The arithmetic is ``utils.compute_coverage_gaps``'s: an index plus
     ``Scan.start_page`` is the printed number, as the warning line said
     before this was a row. The printed pages of the final space live in
-    S3, and a rebuild from an endpoint must not read them.
+    S3, and a rebuild from an endpoint must not read them. The address
+    is the first page alone: a volume short of its last pages has a gap
+    that ends past the map, and the end page adds nothing, since two
+    runs cannot start on one page.
     """
     opinions = [
         {
@@ -442,7 +456,6 @@ def _uncovered_pages_findings(
         first_edit, first_source = detections.source_for_index(
             scan, first, run
         )
-        last_edit, last_source = detections.source_for_index(scan, last, run)
         yield {
             "check_name": CheckName.UNCOVERED_PAGES,
             "target": Issue.Target.PAGES,
@@ -459,24 +472,26 @@ def _uncovered_pages_findings(
                 "count": count,
                 "source_edit": first_edit,
                 "source_page": first_source,
-                "end_source_edit": last_edit,
-                "end_source_page": last_source,
             },
         }
 
 
 def _uncovered_headnote_findings(scan: Scan):
-    """Yield one finding per confident headnote box no black box covers.
+    """Yield one finding per confident headnote box no headnote box covers.
 
     The detections are in the render's pixels and the redactions in
     points (PR B); the box centre is converted with
     ``boundaries.to_points``, which is within a point of the compute's
-    own scale. A curator's ``add`` counts as cover: they drew it to
-    cover the headnote.
+    own scale. Cover is a computed ``headnote`` rect, the rule the
+    step-2 view applied before this was a row, or any black box a
+    curator drew: they drew it to cover the headnote. A computed box of
+    another type (a key number) is not cover, whatever it overlaps.
     """
     boxes: dict[int, list[tuple[float, float, float, float]]] = {}
-    for row in Redaction.objects.visible().filter(
-        scan=scan, fill=Redaction.Fill.BLACK
+    for row in (
+        Redaction.objects.visible()
+        .filter(scan=scan, fill=Redaction.Fill.BLACK)
+        .filter(Q(rect_type="headnote") | Q(origin=Redaction.Origin.HUMAN))
     ):
         boxes.setdefault(row.page_index, []).append(
             (row.x0, row.y0, row.x1, row.y1)
@@ -533,12 +548,7 @@ def address_of(finding: dict[str, Any]) -> dict[str, Any]:
         "source_edit_id": meta.get("source_edit"),
         "source_page": meta.get("source_page"),
     }
-    if check == CheckName.UNCOVERED_PAGES:
-        if meta.get("end_source_page") is None:
-            raise UnaddressableFinding(check)
-        address["end_source_edit_id"] = meta.get("end_source_edit")
-        address["end_source_page"] = meta.get("end_source_page")
-    else:
+    if check != CheckName.UNCOVERED_PAGES:
         bbox = meta.get("bbox") or [None] * 4
         address.update(
             label=meta.get("label") or "",
@@ -562,9 +572,7 @@ def _same_address(dismissal: ReviewDismissal, finding: dict) -> bool:
     if dismissal.source_page != meta.get("source_page"):
         return False
     if finding["check_name"] == CheckName.UNCOVERED_PAGES:
-        return dismissal.end_source_edit_id == meta.get(
-            "end_source_edit"
-        ) and dismissal.end_source_page == meta.get("end_source_page")
+        return True
     return dismissal.label == (meta.get("label") or "")
 
 
@@ -755,8 +763,6 @@ def open_count(scan: Scan) -> tuple[int, int]:
     :param scan: The scan.
     :returns: ``(open, stale)``.
     """
-    from django.db.models import Count, Q
-
     counts = Issue.objects.filter(
         scan=scan, check_name__in=REVIEW2_CHECKS, dismissal__isnull=True
     ).aggregate(
@@ -766,26 +772,24 @@ def open_count(scan: Scan) -> tuple[int, int]:
     return counts["open"] or 0, counts["stale"] or 0
 
 
-def viewer_groups(
-    scan: Scan, idx_to_logical: dict[int, Any] | None = None
-) -> dict:
+def viewer_groups(scan: Scan) -> dict:
     """Return the step-2 findings section's context.
 
     The rows of the scan, annotated for the template: ``nav_pdf_index``
     (the position in the drawn space, ``page_number - 1``),
-    ``logical_page`` (from ``idx_to_logical`` when the caller holds
-    it), ``is_stale``, and grouped by ``target`` in ``TARGET_GROUPS``
-    order. The page and the fragment render one template from this
-    one context.
+    ``is_stale``, and grouped by ``target`` in ``TARGET_GROUPS`` order.
+    The page and the fragment render one template from this one
+    context, so it carries no printed page label: the fragment cannot
+    read the printed pages of the final space without S3, and a label
+    that differed between the two renders was the fault this rule
+    exists to prevent. The viewer labels each card from the page map it
+    holds (``labelFindingCards`` in ``viewer_sidebar.js``).
 
     :param scan: The scan.
-    :param idx_to_logical: ``{page_index: printed label}`` in the drawn
-        space, when the caller has it.
     :returns: ``finding_groups``, ``findings_computed`` (a computed
         boundary exists, so the measured checks were run),
         ``review2_open``, ``review2_stale``, ``review2_total``.
     """
-    idx_to_logical = idx_to_logical or {}
     rows = list(
         Issue.objects.filter(
             scan=scan, check_name__in=REVIEW2_CHECKS
@@ -794,11 +798,6 @@ def viewer_groups(
     by_target: dict[str, list[Issue]] = {}
     for row in rows:
         row.nav_pdf_index = row.page_number - 1 if row.page_number else None
-        row.logical_page = (
-            idx_to_logical.get(row.nav_pdf_index, row.page_number)
-            if row.page_number
-            else None
-        )
         row.is_stale = row.check_name in STALE_REVIEW2_CHECKS
         by_target.setdefault(row.target, []).append(row)
     groups = [
