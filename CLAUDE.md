@@ -2354,7 +2354,17 @@ must not be broken:
 - **A move of an anchor is a dismissal plus an addition** that names it
   in `replaces` (`add(..., replaces=row)`, one transaction), and
   dismissing the addition withdraws both, so the computed boundary
-  comes back. The endpoints compose a merge (one add, two dismissals)
+  comes back. **A second move replaces the addition**, not the computed
+  row: `add` withdraws the earlier addition alone and carries its
+  dismissal onto the new one, because `dismiss` on the addition would
+  free the computed boundary and leave two boundaries for one opinion.
+  The viewer therefore always sends `replaces`, whatever wrote the row.
+  **A computed boundary a move replaced has no card**: `standing`
+  leaves out a dismissed row whose dismissal has a standing
+  replacement, since the curator's card is the undo of the move (its
+  Dismiss gives the computed boundary back) and a muted card with its
+  own Undo restored the computed boundary beside the replacement. The
+  endpoints compose a merge (one add, two dismissals)
   and a split (one dismissal, two adds) as well; the viewer of this PR
   offers dismiss and move only, the minimal set decided on 2026-09-09,
   and the rest is #287's viewer work. If the full set comes, `replaces`

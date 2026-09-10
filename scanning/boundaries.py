@@ -603,7 +603,9 @@ def add(
     :param end: The key icon row, or ``(page_index, x, y)`` in points.
     :param user: The curator. May be None.
     :param run: ``detections.measured_run(scan)``.
-    :param replaces: The computed row this boundary is made in place of.
+    :param replaces: The row this boundary is made in place of: a
+        computed boundary (dismissed here), or a standing curator
+        addition (withdrawn here, its dismissal carried forward).
     :returns: The new row.
     :raises UnaddressableBoundary: When an anchor's page has no address.
     :raises MisorderedBoundary: When the end page is before the start.
@@ -617,10 +619,23 @@ def add(
         )
     with transaction.atomic():
         dismissal = None
-        if replaces is not None:
-            if not replaces.is_computed:
-                raise ValueError("only a computed boundary can be replaced")
+        if replaces is not None and replaces.is_computed:
             dismissal = dismiss(scan, replaces, user)
+        elif replaces is not None:
+            # A second move: withdraw the earlier addition alone, and
+            # carry its dismissal forward. ``dismiss`` would withdraw the
+            # dismissal too, and the computed boundary would stand
+            # again beside the new addition (two boundaries for one
+            # opinion). The one dismissal then stands through any number
+            # of moves, and dismissing the last addition still gives the
+            # computed boundary back.
+            replaces = OpinionBoundary.objects.get(pk=replaces.pk)
+            if replaces.kind != OpinionBoundary.Kind.ADD:
+                raise ValueError(
+                    "only a boundary or an addition can be replaced"
+                )
+            withdraw(OpinionBoundary.objects.filter(pk=replaces.pk), user)
+            dismissal = replaces.replaces
         return OpinionBoundary.objects.create(
             scan=scan,
             origin=OpinionBoundary.Origin.HUMAN,
@@ -694,8 +709,9 @@ def standing(scan: Scan) -> list[OpinionBoundary]:
 
     The computed rows, dismissed or not (``is_dismissed`` says which,
     so the sidebar can show a dismissed one muted with an undo), plus
-    the curator's additions that are not withdrawn. One query for the
-    rows and one for the column boxes of their start pages. Every
+    the curator's additions that are not withdrawn, less the computed
+    rows a move replaced. One query for the rows, one for the moves,
+    and one for the column boxes of their start pages. Every
     consumer -- the viewer JSON, the sidebar, the paused step 3 -- goes
     through here.
 
@@ -714,6 +730,17 @@ def standing(scan: Scan) -> list[OpinionBoundary]:
         )
         .select_related("decision")
     )
+    # A computed boundary a move replaced is left out: the curator's
+    # addition stands in its place, and its Dismiss is the undo of the
+    # move. A muted card with its own Undo would be a second path to
+    # the same act, and one that leaves the replacement standing. A
+    # move is a dismissal with a standing row in ``replacements``.
+    moved = set(
+        OpinionBoundary.objects.standing_additions()
+        .filter(replaces_id__in={r.decision_id for r in rows if r.decision_id})
+        .values_list("replaces_id", flat=True)
+    )
+    rows = [r for r in rows if r.decision_id not in moved]
     columns = _column_boundaries(scan, {r.start_page_index for r in rows})
     rows.sort(key=lambda r: reading_key(r, columns))
     return rows

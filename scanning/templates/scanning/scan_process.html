@@ -344,7 +344,7 @@ body.boundary-pick .opinion-nav.picking {
                     onclick="event.stopPropagation(); pickBoundaryAnchor(this, 'start')">&#8676;</button>
             <button class="px-1 py-0.5 rounded bg-gray-500 text-white text-[10px] hover:bg-gray-600 boundary-anchor-btn" title="Set the end of this opinion: then click a key icon box in the viewer"
                     onclick="event.stopPropagation(); pickBoundaryAnchor(this, 'end')">&#8677;</button>
-            <button class="px-1 py-0.5 rounded bg-red-600 text-white text-[10px] hover:bg-red-700" title="{% if op.origin == 'human' %}Take this boundary back{% else %}Dismiss this opinion boundary{% endif %}"
+            <button class="px-1 py-0.5 rounded bg-red-600 text-white text-[10px] hover:bg-red-700" title="{% if op.origin == 'human' %}Take this boundary back; the computed one it replaced comes back{% else %}Dismiss this opinion boundary{% endif %}"
                     onclick="event.stopPropagation(); dismissBoundary(this)">&#10005;</button>
             {% endif %}
           </span>

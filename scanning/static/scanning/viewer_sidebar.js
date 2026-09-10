@@ -564,22 +564,13 @@ window.boundaryPickTarget = function (det) {
             ? { detection_id: op.caption_detection_id }
             : { page_index: op.caption_page, x: op.start.x, y: op.start.y };
     }
-    var body = { start: start, end: end };
-    // A computed boundary is replaced (dismissed and drawn again); a
-    // curator's own boundary is withdrawn first and drawn again, since
-    // the endpoint replaces computed rows only.
-    if (op.origin === "computed") body.replaces = op.id;
+    // The row is replaced whatever wrote it: the endpoint dismisses a
+    // computed boundary, and withdraws a curator's addition while it
+    // carries its dismissal, so a second move leaves one boundary.
+    var body = { start: start, end: end, replaces: op.id };
     cancelBoundaryPick();
-    var first = op.origin === "human"
-        ? _postBoundary("dismiss", { boundary_id: op.id })
-        : Promise.resolve({ status: "ok" });
-    first
+    _postBoundary("add", body)
         .then(function (data) {
-            if (data.status !== "ok") { _boundaryFailed(data); return null; }
-            return _postBoundary("add", body);
-        })
-        .then(function (data) {
-            if (!data) return;
             if (data.status !== "ok") { _boundaryFailed(data); return; }
             window.location.reload();
         })

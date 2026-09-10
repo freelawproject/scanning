@@ -12,6 +12,7 @@ from typing import Any
 import fitz
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.db.models import Q
 from django.http import (
     FileResponse,
     Http404,
@@ -268,9 +269,11 @@ def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
 
     Each anchor is a detection the curator picked (the caption for the
     start, the key icon for the end) or a point in PDF points.
-    ``replaces`` names a computed boundary the new one stands in place
-    of (a moved anchor): the view dismisses it and writes the addition
-    in one transaction, and withdrawing the addition gives it back.
+    ``replaces`` names the boundary the new one stands in place of (a
+    moved anchor): a computed one is dismissed and the addition written
+    in one transaction, and dismissing the addition gives it back; a
+    curator's own addition is withdrawn and its dismissal carried, so a
+    second move still leaves one boundary.
 
     :param request: The HTTP request (JSON body with ``start``, ``end``
         and optionally ``replaces``).
@@ -294,8 +297,15 @@ def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     replaces = None
     if data.get("replaces") is not None:
         replaces = (
-            OpinionBoundary.objects.computed()
-            .filter(pk=data["replaces"], scan=scan)
+            OpinionBoundary.objects.filter(pk=data["replaces"], scan=scan)
+            .filter(
+                Q(origin=OpinionBoundary.Origin.COMPUTED)
+                | Q(
+                    origin=OpinionBoundary.Origin.HUMAN,
+                    kind=OpinionBoundary.Kind.ADD,
+                    withdrawn_at__isnull=True,
+                )
+            )
             .first()
         )
         if replaces is None:

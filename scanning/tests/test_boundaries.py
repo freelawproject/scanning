@@ -115,6 +115,17 @@ def document_of(rows) -> tuple[BLDoc, dict[int, int]]:
     return document, row_ids
 
 
+def _withdrawn_dismissal(scan, user):
+    """Return a human row that is not an addition: a dismissal.
+
+    :param scan: The scan.
+    :param user: The curator.
+    :returns: The dismissal of a fresh computed row.
+    """
+    row = OpinionBoundaryFactory(scan=scan)
+    return boundaries.dismiss(scan, row, user)
+
+
 def one_opinion(scan, start=0, end=1):
     """Store a caption on ``start`` and a key on ``end`` and pair them.
 
@@ -490,6 +501,72 @@ class TestAdd(TestCase):
         # A second withdrawal is a no-op.
         self.assertIsNone(boundaries.dismiss(self.scan, row, self.user))
 
+    def test_a_second_move_leaves_one_boundary(self):
+        """Replacing a curator's addition withdraws it alone and carries
+        its dismissal, so the computed boundary does not come back
+        beside the new addition."""
+        key_two = key_row(self.scan, 2)
+        key_one = key_row(self.scan, 1, y0=600.0)
+        first = boundaries.add(
+            self.scan,
+            self.caption,
+            key_two,
+            self.user,
+            None,
+            replaces=self.row,
+        )
+
+        second = boundaries.add(
+            self.scan, self.caption, key_one, self.user, None, replaces=first
+        )
+
+        first.refresh_from_db()
+        self.row.refresh_from_db()
+        self.assertIsNotNone(first.withdrawn_at)
+        self.assertEqual(second.replaces, first.replaces)
+        self.assertTrue(self.row.is_dismissed)
+        live = [(r.origin, r.kind) for r in boundaries.standing(self.scan)]
+        self.assertEqual(live, [("human", "add")])
+
+        # Dismissing the last addition gives the computed boundary back.
+        boundaries.dismiss(self.scan, second, self.user)
+        self.row.refresh_from_db()
+        self.assertFalse(self.row.is_dismissed)
+        self.assertEqual(
+            [r.pk for r in boundaries.standing(self.scan)], [self.row.pk]
+        )
+
+    def test_a_move_of_a_plain_addition_carries_no_dismissal(self):
+        plain = boundaries.add(
+            self.scan, (0, 1.0, 1.0), (2, 1.0, 1.0), self.user, None
+        )
+
+        moved = boundaries.add(
+            self.scan,
+            (0, 1.0, 1.0),
+            (1, 1.0, 1.0),
+            self.user,
+            None,
+            replaces=plain,
+        )
+
+        plain.refresh_from_db()
+        self.assertIsNotNone(plain.withdrawn_at)
+        self.assertIsNone(moved.replaces)
+
+    def test_a_dismissal_cannot_be_replaced(self):
+        """Only a boundary or an addition stands in for a moved one."""
+        dismissal = _withdrawn_dismissal(self.scan, self.user)
+        with self.assertRaises(ValueError):
+            boundaries.add(
+                self.scan,
+                (0, 1.0, 1.0),
+                (1, 1.0, 1.0),
+                self.user,
+                None,
+                replaces=dismissal,
+            )
+
     def test_a_page_outside_the_map_is_refused(self):
         with self.assertRaises(boundaries.UnaddressableBoundary):
             boundaries.add(
@@ -647,6 +724,24 @@ class TestStanding(TestCase):
         rows = boundaries.standing(scan)
 
         self.assertEqual([r.pk for r in rows], [right_high.pk, left_low.pk])
+
+    def test_a_computed_row_a_move_replaced_is_left_out(self):
+        user = UserFactory()
+        scan = ScanFactory(page_count=3)
+        caption, key, row = one_opinion(scan)
+        other_key = key_row(scan, 2)
+        moved = boundaries.add(
+            scan, caption, other_key, user, None, replaces=row
+        )
+
+        self.assertEqual([r.pk for r in boundaries.standing(scan)], [moved.pk])
+
+        # A plain dismissal, with no replacement, keeps its muted card.
+        boundaries.dismiss(scan, moved, user)
+        boundaries.dismiss(scan, row, user)
+        rows = boundaries.standing(scan)
+        self.assertEqual([r.pk for r in rows], [row.pk])
+        self.assertTrue(rows[0].is_dismissed)
 
     def test_dismissed_rows_are_kept_and_flagged_withdrawn_additions_are_not(
         self,
@@ -848,6 +943,36 @@ class TestEndpoints(TestCase):
         self.assertEqual(row.author, self.user)
         self.row.refresh_from_db()
         self.assertTrue(self.row.is_dismissed)
+
+    def test_add_replacing_a_curator_addition(self):
+        other_key = key_row(self.scan, 2)
+        first = boundaries.add(
+            self.scan,
+            self.caption,
+            other_key,
+            self.user,
+            None,
+            replaces=self.row,
+        )
+
+        response = self._post(
+            "add",
+            {
+                "start": {"detection_id": self.caption.pk},
+                "end": {"detection_id": self.key.pk},
+                "replaces": first.pk,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["dismissal_id"], first.replaces_id)
+        first.refresh_from_db()
+        self.assertIsNotNone(first.withdrawn_at)
+        payload = self.client.get(
+            f"/scans/{self.scan.pk}/opinions-json/"
+        ).json()
+        self.assertEqual([op["id"] for op in payload], [data["boundary_id"]])
 
     def test_add_from_points(self):
         response = self._post(
