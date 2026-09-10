@@ -285,9 +285,7 @@ class TestTheApplyOpensReviewTwo(ComputeMixin, TestCase):
         measured."""
         scan, _ = merged_scan()
         stubs = self.patch_geometry()
-        stubs["_compute_and_save_redaction_rects"].side_effect = RuntimeError(
-            "no"
-        )
+        stubs["_measure_redaction_rects"].side_effect = RuntimeError("no")
         self.claim(scan)
 
         services.run_compute_redactions(scan.pk)
@@ -305,9 +303,7 @@ class TestTheApplyOpensReviewTwo(ComputeMixin, TestCase):
         stubs = self.patch_geometry()
         self.claim(scan)
         services.run_compute_redactions(scan.pk)
-        stubs["_compute_and_save_redaction_rects"].side_effect = RuntimeError(
-            "no"
-        )
+        stubs["_measure_redaction_rects"].side_effect = RuntimeError("no")
         self.claim(scan)
 
         services.run_compute_redactions(scan.pk)

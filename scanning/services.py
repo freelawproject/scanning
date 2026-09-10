@@ -710,10 +710,12 @@ def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
         # and reads none.
         page_numbers = _page_number_lookup(Scan.objects.get(pk=scan_pk))
 
+    # ``pk`` last, so two boxes at one height list in one order on every
+    # database: a reader that indexes the list must not depend on a tie.
     all_saved = (
         Detection.objects.live()
         .filter(scan_id=scan_pk)
-        .order_by("page_index", "y0")
+        .order_by("page_index", "y0", "x0", "pk")
     )
     det_data = []
     for d in all_saved:
@@ -868,37 +870,24 @@ def _snapped_document(
     return document, row_ids, det_data
 
 
-def _compute_and_save_redaction_rects(
-    scan_pk: int,
-    pdf_path: str,
-    page_numbers: dict | None = None,
-    document: "BLDoc | None" = None,
-    pairs: list | None = None,
-) -> list:
-    """Compute redaction rects and save to the Scan model.
+def _measure_redaction_rects(document: "BLDoc", pairs: list | None) -> list:
+    """Measure the redaction rects on the snapped document. Nothing is written.
 
-    :param scan_pk: Primary key of the scan to compute rects for.
-    :param pdf_path: Path to the PDF used for page dimensions.
-    :param page_numbers: The page-number lookup beside each box, when
-        the caller holds it; see :func:`detection_entries`.
-    :param document: The snapped document, when the caller built it
-        (the redaction compute does, once, #240 PR C).
-    :param pairs: The ``(caption, key)`` pairs of that document, when
-        the caller paired it; paired here otherwise.
-    :return: The computed rects list.
+    The compute builds the document once (``_snapped_document``), pairs
+    it once (``boundaries.write_computed``) and hands both here, so the
+    rects are measured from the same pairs the boundary rows were
+    written from (#240 PR C). A caller with no pairs gets them paired
+    here. ``redactions.write_computed`` converts the answer to points and
+    writes the rows (#240 PR B).
+
+    :param document: The snapped document.
+    :param pairs: The ``(caption, key)`` pairs of that document, or None
+        to pair here.
+    :return: blackletter's rects, in pixels of the render, one entry per
+        page; empty for a document with no pages.
     """
-    scan = Scan.objects.get(pk=scan_pk)
-
-    if document is None:
-        document, _ids, det_data = _snapped_document(
-            scan, pdf_path, page_numbers
-        )
-        if not det_data:
-            return []
-        pairs = None
     if not document.pages:
         return []
-
     with _log_stage("Redaction rects"):
         opinions = _pair_opinions(document) if pairs is None else pairs
         # ``ocr_applied`` is set on the Document, so blackletter measures
@@ -908,142 +897,113 @@ def _compute_and_save_redaction_rects(
         # headnote boundaries inside it, then grown onto adjoining ink. The
         # app ran those three passes itself until blackletter #68 moved them
         # where every consumer gets them.
-        rects = compute_redaction_rects(document, opinions, skip_doctr=True)
-
-    Scan.objects.filter(pk=scan_pk).update(
-        redaction_rects=rects,
-    )
-    return rects
+        return compute_redaction_rects(document, opinions, skip_doctr=True)
 
 
-def _pages_for_geometry(
-    scan: "Scan", pdf_path: str, snap: bool = True
-) -> list:
-    """The detected pages blackletter's geometry should be measured against.
-
-    Wraps the detection lookup and the column correction that every
-    geometry consumer needs, so the rects and the margin strips of one scan
-    cannot be computed from differently-corrected boxes.
-
-    :param scan: The scan being processed.
-    :param pdf_path: The PDF the detections were measured against.
-    :param snap: Correct the ``TEXT_COLUMN`` boxes against the page ink.
-        Boxes reach the DB uncorrected: nothing on the upload path snaps
-        them (that would be a full-volume render review 1 does not need),
-        and a hand-added column detection is stored exactly as drawn. The
-        correction converges, so this is a no-op once ``run_generate_files``
-        has persisted it, but it is not free before then: it renders every
-        page at 100 dpi, so pass ``False`` where the column boxes are not
-        read (see :func:`_build_combined_redactions`).
-    :return: ``Page`` objects, empty when the scan has no detections yet.
-    """
-    # No page numbers: the geometry reads the boxes, not the labels.
-    det_data = detection_entries(scan.pk, page_numbers={})
-    if not det_data:
-        return []
-    document = _build_document_from_detections(scan, det_data, pdf_path)
-    if snap:
-        snap_document_columns(document)
-    return document.pages
-
-
-def _compute_and_save_margin_rects(
-    scan_pk: int, pdf_path: str, output_dir: str, force: bool = False
-) -> list:
-    """Compute margin rects and save them to the Scan model.
+def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
+    """Measure the margin strips against the pages of ``document``.
 
     The strips are pulled back off any real detection they would cover, so
     key icons, captions and other content near a page edge survive. That
     happens inside :func:`blackletter.margins.compute_margin_rects`, which
-    also uses the detections to tighten the content box.
+    also uses the detections to tighten the content box. Nothing is
+    written.
+
+    :param pdf_path: Path to the PDF to compute margins for.
+    :param document: The snapped document the rects were measured from.
+    :return: blackletter's strips, in points; empty for a document with
+        no pages, because without detections the bounds would come from
+        the page's marks alone, and bleed-through at a page edge would
+        suppress that page's top strip: a worse answer than none.
+    """
+    if not document.pages:
+        return []
+    with _log_stage("Margin rects"):
+        return compute_margin_rects(str(pdf_path), pages=document.pages)
+
+
+def _uncovered_headnote_pages(scan_pk: int, rects_px: list) -> set[int]:
+    """Return the pages with a confident HEADNOTE box no headnote rect covers.
+
+    Measured here, in the render's pixels, where both the detections and
+    blackletter's rects still are (#240 PR B): the rows are in points
+    and a request has no page scale to compare them with. The compute
+    stamps the answer on the boundaries (``boundaries.stamp_uncovered``),
+    which the step-2 sidebar draws; PR D raises it as a finding.
 
     :param scan_pk: Primary key of the scan.
-    :param pdf_path: Path to the PDF to compute margins for.
-    :param output_dir: Directory (used for detection lookup only).
-    :param force: Measure again even when the scan already holds
-        strips. The stored strips are computed *from* the detections,
-        so a fresh detection run must replace them; every other caller
-        wants the cached answer, since measuring renders the whole
-        volume at 100 dpi.
-    :return: The computed margin rects list.
+    :param rects_px: blackletter's rects, in pixels.
+    :return: The 0-based pages, in the rows' space.
     """
-    scan = Scan.objects.get(pk=scan_pk)
-    if scan.margin_rects and not force:
-        return scan.margin_rects
-    pages = _pages_for_geometry(scan, pdf_path)
-    if not pages:
-        # Without detections the bounds would come from the page's marks
-        # alone, so bleed-through at a page edge suppresses that page's top
-        # strip: a worse answer than none, and one that must not be cached or
-        # it never gets recomputed once the detections land. Refuse before
-        # measuring rather than after. The viewer asks for these on a sync
-        # request and does not cache the reply, so computing them here would
-        # render the whole volume at 100 dpi on every poll.
-        logger.warning(
-            "No margin rects for scan %s: no detections yet", scan_pk
+    hn_rects_by_page = {
+        entry["page_index"]: [
+            r for r in entry["rects"] if r.get("type") == "headnote"
+        ]
+        for entry in rects_px
+    }
+    uncovered = set()
+    for d in Detection.objects.live().filter(
+        scan_id=scan_pk, label="HEADNOTE", confidence__gte=0.8
+    ):
+        cx = (d.x0 + d.x1) / 2
+        cy = (d.y0 + d.y1) / 2
+        covered = any(
+            r["x0"] <= cx <= r["x1"] and r["y0"] <= cy <= r["y1"]
+            for r in hn_rects_by_page.get(d.page_index, [])
         )
-        return []
-    margin_rects = compute_margin_rects(str(pdf_path), pages=pages)
-    Scan.objects.filter(pk=scan_pk).update(
-        margin_rects=margin_rects,
-    )
-    return margin_rects
+        if not covered:
+            uncovered.add(d.page_index)
+    return uncovered
 
 
 def _build_combined_redactions(scan_pk: int) -> Path:
-    """Combine margin_rects, redaction_rects, and opinions into redactions.json.
+    """Write ``redactions.json`` from the rows, for blackletter's ``generate``.
 
-    All coordinates in the output are in PDF points. This file is passed
-    to blackletter's ``generate`` API as the single source of redaction data.
-
-    The merging, the pixel-to-point conversion and the opinion filenames all
-    come from :func:`blackletter.api.build_redactions`, so the payload
-    ``generate`` reads is built by the same library that consumes it.
+    All coordinates in the output are in PDF points. The opinion
+    filenames come from :func:`blackletter.api.build_redactions`, which
+    used to convert the pixel rects too; since #240 the rects are
+    ``Redaction`` rows in points (``redactions.visible_by_page``), so the
+    pages of the payload are written from them and the conversion is
+    gone with the blob. blackletter gets no pages: it read them only to
+    scale pixel rects, and both rect lists are empty.
 
     :param scan_pk: Primary key of the scan.
     :return: Path to the generated redactions.json.
     """
+    from scanning import redactions
+
     scan = Scan.objects.get(pk=scan_pk)
     output_dir = Path(scan.output_dir)
-    pdf_path = processing_pdf_path(scan)
 
-    # ``snap=False``: this step reads only each page's dimensions and scale,
-    # never its column boxes, so correcting them would render the whole
-    # volume at 100 dpi to change nothing.
-    pages = _pages_for_geometry(scan, pdf_path, snap=False)
-
-    try:
-        combined = bl_build_redactions(
-            pages,
-            scan.redaction_rects,
-            scan.margin_rects,
-            boundaries.viewer_payload(scan, live_only=True),
-            reporter=scan.reporter.short_name or "",
-            volume=str(scan.volume) or "",
-        )
-    except KeyError as exc:
-        # The rects are a saved snapshot and the pages come from the live
-        # detections, so a page with rects but no detections left cannot be
-        # scaled. Deleting the last detection prunes that page's rects (see
-        # ``views_api._drop_orphaned_redaction_rects``), so reaching this
-        # means something else desynchronised them. Refusing is right --
-        # guessing the scale would put a blackout in the wrong place -- but
-        # name recovery a reviewer can actually carry out.
-        raise RuntimeError(
-            f"scan {scan_pk}: saved redaction rects reference a page with no "
-            f"detections left, so their pixel coordinates cannot be converted "
-            f"to points. Re-add a detection on that page, or delete the "
-            f"leftover rect from the redaction overlay, then generate again. "
-            f"({exc})"
-        ) from exc
+    combined = bl_build_redactions(
+        [],
+        [],
+        [],
+        boundaries.viewer_payload(scan, live_only=True),
+        reporter=scan.reporter.short_name or "",
+        volume=str(scan.volume) or "",
+    )
+    combined["pages"] = {
+        str(entry["page_index"]): [
+            {
+                "x0": r["x0"],
+                "y0": r["y0"],
+                "x1": r["x1"],
+                "y1": r["y1"],
+                "fill": r["fill"],
+                "type": r["rect_type"],
+            }
+            for r in entry["rects"]
+        ]
+        for entry in redactions.visible_by_page(scan)
+    }
 
     out_path = output_dir / "redactions.json"
     out_path.write_text(json.dumps(combined))
-    pages = combined["pages"]
-    n_rects = sum(len(v) for v in pages.values())
+    n_rects = sum(len(v) for v in combined["pages"].values())
     logger.info(
         "Combined redactions: %s pages, %s rects, %s opinions",
-        len(pages),
+        len(combined["pages"]),
         n_rects,
         len(combined["opinions"]),
     )
@@ -1769,7 +1729,8 @@ def run_compute_redactions(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to compute redactions for.
     :return: None.
     """
-    from scanning import apply, review_states, s3_sync, yolo
+    from scanning import apply, redactions, review_states, s3_sync, yolo
+    from scanning import detections as decisions
 
     django.db.connections.close_all()
     scan = Scan.objects.get(pk=scan_pk)
@@ -1887,7 +1848,6 @@ def run_compute_redactions(scan_pk: int) -> None:
             scan.refresh_from_db()
             ensure_output_dir(scan)
             pdf_path = geometry_pdf_path(scan, None)
-        output_dir = scan.output_dir
 
         if importing:
             with _log_stage("Import detections"):
@@ -1919,17 +1879,46 @@ def run_compute_redactions(scan_pk: int) -> None:
             )
 
         _update_progress(scan_pk, "Computing the redactions...")
-        rects = _compute_and_save_redaction_rects(
-            scan_pk,
-            pdf_path,
-            page_numbers=page_numbers,
-            document=document,
-            pairs=opinions,
-        )
+        rects = _measure_redaction_rects(document, opinions)
 
         _update_progress(scan_pk, "Measuring the page margins...")
-        margins = _compute_and_save_margin_rects(
-            scan_pk, pdf_path, output_dir, force=True
+        margins = _measure_margin_rects(pdf_path, document)
+
+        # The finding the sidebar draws rides on the boundaries until PR
+        # D gives it a table of its own; measured in pixels, before the
+        # rows are converted.
+        boundaries.stamp_uncovered(
+            scan, _uncovered_headnote_pages(scan_pk, rects)
+        )
+
+        # The rows are the store (#240 PR B): the computed rows are
+        # written again, the standing dismissals land on them, and the
+        # human rows follow the page space the geometry was measured in.
+        _update_progress(scan_pk, "Writing the redactions...")
+        with _log_stage("Redaction rows"):
+            written = redactions.write_computed(
+                scan,
+                run,
+                rows[0].run if merged else None,
+                rects,
+                margins,
+                document.pages,
+            )
+            landed, stale = redactions.resolve(scan)
+            if run is not None:
+                decisions.relocate_rows(
+                    redactions.human_rows(scan),
+                    scan,
+                    run,
+                    "human redaction(s)",
+                )
+        logger.info(
+            "compute_redactions: scan %s: %d redaction row(s) written, "
+            "%d dismissal(s) landed, %d stale",
+            scan_pk,
+            written,
+            landed,
+            len(stale),
         )
         # Nothing to push: every output of this pass is a row (#240),
         # and the files under ``output_dir`` are the copies it pulled.
@@ -2574,26 +2563,8 @@ def run_generate_files(scan_pk: int) -> None:
             progress_message=f"Generating files ({len(det_data or [])} detections)..."
         )
 
-        # Margin rects are otherwise only computed on demand, by the viewer
-        # asking for them or by a reprocess. A scan taken straight from
-        # review to Generate without the margins overlay ever being switched
-        # on therefore shipped with no whiteouts at all: the platen bands,
-        # fold shadows and corner bleed stayed in the deliverable. Computing
-        # them here makes the output independent of what the reviewer
-        # happened to look at; it no-ops when they already exist.
-        _compute_and_save_margin_rects(scan_pk, str(base_pdf), str(output))
-
-        # Redaction rects, same story: off the upload path, computed here
-        # unless something already produced them. That "something" is either
-        # the step 2 overlay asking for them or a reprocess, and in the step 2
-        # case a reviewer may since have moved or deleted individual rects
-        # through ``save_redaction_rect``. Recomputing would discard those
-        # edits, so the stored set wins whenever there is one.
-        scan.refresh_from_db()
-        if not scan.redaction_rects:
-            _update_progress(scan_pk, "Computing redaction rects...")
-            _compute_and_save_redaction_rects(scan_pk, str(base_pdf))
-
+        # The redaction rows are what the compute wrote and the curator
+        # edited (#240, PR B); nothing is measured here.
         # Build combined redactions.json (margins + redaction rects + opinions)
         Scan.objects.filter(pk=scan_pk).update(
             progress_message="Building combined redactions...",

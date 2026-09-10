@@ -4,15 +4,24 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('scanning', '0016_retire_pageinsert_and_pagedeletion'),
+        ("scanning", "0016_retire_pageinsert_and_pagedeletion"),
     ]
 
     operations = [
         migrations.AlterField(
-            model_name='externaljob',
-            name='engine',
-            field=models.CharField(choices=[('blackletter', 'blackletter (YOLO detection)'), ('bitonal', 'Bitonal conversion'), ('dots_mocr', 'dots.mocr'), ('mistral_ocr', 'Mistral OCR'), ('surya', 'Surya'), ('lighton_ocr', 'LightOnOCR')], max_length=32),
+            model_name="externaljob",
+            name="engine",
+            field=models.CharField(
+                choices=[
+                    ("blackletter", "blackletter (YOLO detection)"),
+                    ("bitonal", "Bitonal conversion"),
+                    ("dots_mocr", "dots.mocr"),
+                    ("mistral_ocr", "Mistral OCR"),
+                    ("surya", "Surya"),
+                    ("lighton_ocr", "LightOnOCR"),
+                ],
+                max_length=32,
+            ),
         ),
     ]

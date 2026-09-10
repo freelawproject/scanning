@@ -1087,11 +1087,12 @@ class TestEndpoints(TestCase):
             "add",
             {
                 "start": {"page_index": 0, "x": 1, "y": 1},
-                "end": {"page_index": 40, "x": 1, "y": 1},
+                "end": {"page_index": 1, "x": 1, "y": 1},
             },
         )
-        # No run: the original's space, where every index has an
-        # address. Give the scan a run and a map without the page.
+        # No run: the original's space, where every page of the original
+        # has an address (a page past its count has none, PR B). Give
+        # the scan a run and a map without the page.
         self.assertEqual(response.status_code, 200)
         from unittest.mock import patch
 

@@ -20,6 +20,7 @@ from scanning.models import (
     PageRepairRequest,
     PendingUpload,
     QueuedAction,
+    Redaction,
     Reporter,
     Scan,
     Status,
@@ -196,8 +197,6 @@ class ScanAdmin(admin.ModelAdmin):
         "ocr_results",
         "page_map",
         "missing_pages",
-        "margin_rects",
-        "redaction_rects",
         "process_output",
     ]
     date_hierarchy = "date_created"
@@ -946,3 +945,42 @@ class ExternalJobAdmin(admin.ModelAdmin):
     def shard_label(self, obj):
         """Render the job's position in its target's fan-out."""
         return f"{obj.shard_index + 1}/{obj.shard_count}"
+
+
+@admin.register(Redaction)
+class RedactionAdmin(admin.ModelAdmin):
+    """One box to paint, or one curator decision about one (issue #240).
+
+    Read-only: the compute writes the computed rows and the review page
+    writes the human ones. Nothing here deletes.
+    """
+
+    list_display = [
+        "scan",
+        "origin",
+        "kind",
+        "rect_type",
+        "fill",
+        "page_index",
+        "source_page",
+        "author",
+        "withdrawn_at",
+        "date_created",
+    ]
+    list_filter = ["origin", "kind", "fill", "withdrawn_at"]
+    raw_id_fields = [
+        "scan",
+        "source_edit",
+        "apply_run",
+        "decision",
+        "replaces",
+        "author",
+        "withdrawn_by",
+    ]
+    readonly_fields = [f.name for f in Redaction._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

@@ -675,16 +675,6 @@ class Scan(AbstractDateTimeModel):
         blank=True,
         help_text="List of missing logical page numbers.",
     )
-    margin_rects = models.JSONField(
-        default=list,
-        blank=True,
-        help_text="Per-page margin rects in PDF points.",
-    )
-    redaction_rects = models.JSONField(
-        default=list,
-        blank=True,
-        help_text="Per-page redaction rects in image pixels.",
-    )
     source_fingerprint = models.CharField(
         max_length=64,
         blank=True,
@@ -1649,6 +1639,18 @@ class OpinionBoundary(AbstractDateTimeModel):
             "0-based, in reading order. Null on a human row."
         ),
     )
+    uncovered_page_indexes = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "The pages of this opinion, in the space of ``apply_run``, "
+            "with a confident HEADNOTE box no headnote rect covers. "
+            "Stamped by the redaction compute (#240 PR B), which measures "
+            "it in the render's pixels where the detections and the "
+            "rects both are; a request cannot, since the redaction rows "
+            "are in points. PR D makes it a finding."
+        ),
+    )
     decision = models.ForeignKey(
         "self",
         on_delete=models.SET_NULL,
@@ -1751,6 +1753,272 @@ class OpinionBoundary(AbstractDateTimeModel):
             f"{what} p.{self.start_page_index + 1}-{self.end_page_index + 1}"
             f"{state}"
         )
+
+
+class RedactionQuerySet(AutoNowQuerySet):
+    """The reads every consumer of the redactions shares (issue #240)."""
+
+    def computed(self):
+        """Return the rows the compute wrote.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(origin=Redaction.Origin.COMPUTED)
+
+    def human(self):
+        """Return the standing human rows: additions and dismissals.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(
+            origin=Redaction.Origin.HUMAN, withdrawn_at__isnull=True
+        )
+
+    def visible(self):
+        """Return the boxes a reader paints.
+
+        A computed row under no standing dismissal, and a human ``add``
+        that is not withdrawn. A ``dismiss`` row has no box of its own.
+
+        :returns: The filtered queryset.
+        """
+        from django.db.models import Q
+
+        return self.filter(
+            Q(origin=Redaction.Origin.COMPUTED, decision__isnull=True)
+            | Q(
+                origin=Redaction.Origin.HUMAN,
+                kind=Redaction.Kind.ADD,
+                withdrawn_at__isnull=True,
+            )
+        )
+
+
+class Redaction(AbstractDateTimeModel):
+    """One box to paint over the volume, or one decision about such a box
+    (issue #240, PR B). Replaces ``Scan.redaction_rects`` and
+    ``Scan.margin_rects``.
+
+    **Coordinates are PDF points** on the page. blackletter measures the
+    redaction rects in pixels of its 200 dpi render, and the compute
+    converts them once with the page scale it holds; the margin strips
+    are in points already. So a reader needs the page alone, and the
+    viewer scales a box by the pdf.js viewport as it scales the strips.
+
+    **Two families of rows, one rule for each**, the rule the detections
+    follow (PR A):
+
+    - A **computed** row is disposable. Each compute deletes the scan's
+      computed rows and writes them again: a better computation may find
+      one box where it found two, and a kept old row would sit beside
+      the new one as a duplicate. A margin strip is a computed row with
+      ``rect_type`` ``margin`` and a white fill.
+    - A **human** row is never deleted by automation. It is an ``add``
+      (a box the curator drew, or drew in place of a computed one) or a
+      ``dismiss`` (a computed box the curator took out). A curator takes
+      a human row back with ``withdrawn_at``.
+
+    **A dismiss names its target by address, not by FK**, because the
+    computed row it was made on is deleted at the next compute: the
+    source page, the ``rect_type``, and a copy of the computed box
+    (``target_*``). After each compute ``redactions.resolve`` lands every
+    standing dismiss on the new computed row at that address whose box
+    overlaps the copy (IoU at least ``detections.IOU_THRESHOLD``), and
+    sets ``decision`` on it, which hides it. A dismiss that lands on
+    nothing is logged; PR D raises it as an issue.
+
+    **A move of a computed box is a dismiss plus an add** that names the
+    dismiss in ``replaces``, so the drawn box stands whatever a later
+    compute finds, and withdrawing it gives the computed box back.
+
+    **The address is the source page** (``source_edit``, ``source_page``)
+    the apply's page map names, as on ``Detection``; ``page_index`` is
+    the row's position in the space of ``apply_run``, and the compute
+    moves the human rows through the new map after each run
+    (``detections.relocate_rows``).
+    """
+
+    class Origin(models.TextChoices):
+        COMPUTED = "computed", "Computed"
+        HUMAN = "human", "Human"
+
+    class Kind(models.TextChoices):
+        ADD = "add", "Add a box"
+        DISMISS = "dismiss", "Dismiss a computed box"
+
+    class Fill(models.TextChoices):
+        BLACK = "black", "Black"
+        WHITE = "white", "White"
+
+    #: The ``rect_type`` of a margin strip and of a drawn box. Every
+    #: other value is blackletter's (``headnote``, ``KEY_ICON``, ...).
+    MARGIN_TYPE = "margin"
+    MANUAL_TYPE = "manual"
+
+    objects = RedactionQuerySet.as_manager()
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="redactions",
+    )
+    origin = models.CharField(max_length=10, choices=Origin.choices)
+    kind = models.CharField(
+        max_length=10,
+        choices=Kind.choices,
+        blank=True,
+        default="",
+        help_text="Human rows only; blank on a computed row.",
+    )
+    rect_type = models.CharField(
+        max_length=50,
+        help_text=(
+            "blackletter's type of the box (headnote, a label name, ...), "
+            "'margin' for a strip, 'manual' for a drawn box."
+        ),
+    )
+    fill = models.CharField(max_length=5, choices=Fill.choices)
+    x0 = models.FloatField(null=True, blank=True)
+    y0 = models.FloatField(null=True, blank=True)
+    x1 = models.FloatField(null=True, blank=True)
+    y1 = models.FloatField(null=True, blank=True)
+    target_x0 = models.FloatField(null=True, blank=True)
+    target_y0 = models.FloatField(null=True, blank=True)
+    target_x1 = models.FloatField(null=True, blank=True)
+    target_y1 = models.FloatField(null=True, blank=True)
+    replaces = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replacements",
+        help_text=(
+            "Adds only: the dismiss this box was drawn in place of, when "
+            "a curator moved a computed box."
+        ),
+    )
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="redactions",
+        help_text="The page edit whose shard holds the page; null = the original.",
+    )
+    source_page = models.PositiveIntegerField(
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="The scan's source fingerprint when the row was written.",
+    )
+    page_index = models.PositiveIntegerField(
+        db_index=True,
+        help_text="0-based position in the space of ``apply_run``.",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="redactions",
+        help_text="The apply run whose final page space ``page_index`` is in.",
+    )
+    detect_run = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Computed rows: the detection run the geometry came from.",
+    )
+    decision = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="decided",
+        help_text=(
+            "Computed rows: the standing dismiss resolved onto this box, "
+            "which hides it."
+        ),
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="redactions",
+    )
+    withdrawn_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Human rows: when the curator took the row back.",
+    )
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_redactions",
+    )
+
+    class Meta:
+        ordering = ["scan", "page_index", "y0", "x0"]
+        indexes = [
+            models.Index(
+                fields=["scan", "page_index"],
+                name="idx_redaction_scan_page",
+            ),
+            models.Index(
+                fields=["scan", "source_edit", "source_page"],
+                name="idx_redaction_scan_source",
+            ),
+            models.Index(
+                fields=["scan", "origin", "withdrawn_at"],
+                name="idx_redaction_scan_open",
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(origin="computed", kind="")
+                    | models.Q(origin="human", kind__in=["add", "dismiss"])
+                ),
+                name="redaction_kind_matches_origin",
+            ),
+            # One standing box in place of one dismissed computed box: a
+            # second move in flight must write on it, not beside it.
+            models.UniqueConstraint(
+                fields=["replaces"],
+                condition=models.Q(kind="add", withdrawn_at__isnull=True),
+                name="uniq_standing_replacement_per_dismiss",
+            ),
+        ]
+
+    @property
+    def bbox(self) -> list[float] | None:
+        """The box, ``[x0, y0, x1, y1]`` in points, or None on a dismiss.
+
+        :returns: The box.
+        """
+        if self.x0 is None:
+            return None
+        return [self.x0, self.y0, self.x1, self.y1]
+
+    @property
+    def target_bbox(self) -> list[float] | None:
+        """The copied computed box of a dismiss, or None.
+
+        :returns: The box.
+        """
+        if self.target_x0 is None:
+            return None
+        return [self.target_x0, self.target_y0, self.target_x1, self.target_y1]
+
+    def __str__(self):
+        what = self.kind or self.rect_type
+        state = " [withdrawn]" if self.withdrawn_at else ""
+        return f"{self.origin} {what} p.{self.page_index}{state}"
 
 
 def page_edit_image_path(instance: "PageEdit", filename: str) -> str:

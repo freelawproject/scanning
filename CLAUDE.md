@@ -1635,7 +1635,8 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
   bl-warm collapses on 1-bit pages, so detection fans out over the
   original shards (#167/#194), while the rects are stamped on the
   bitonal copy and must be measured against its ink (PR #167). Both
-  files carry the page geometry of the original.
+  files carry the page geometry of the original. Since #240 PR B the
+  rects are `Redaction` rows in points, not `Scan.redaction_rects`.
 - **`found_by` is load-bearing, in three places.** The confidence gates
   are per model family since blackletter #73
   (`label_confidence(label, document.bl_warm)`), so the provenance has
@@ -1887,7 +1888,8 @@ the apply-outputs routes, and migration 0024. What must not be broken:
   `final_volume_ready` is that as a yes or no. Every reader of the
   final space asks it: the compute before it queues and when it runs,
   the step-2 view, the PDF route, the original-URL route, the crop
-  route and the margin-rect miss path.
+  route; the margin strips are `Redaction` rows since #240 PR B, and
+  nothing measures them in a request any more.
 - **"Computed" means computed against the standing run.** The
   detect-run ledger (`provider_meta["apply"]`) carries `apply_run`
   (the `ApplyRun` pk) beside `applied_at`, and one helper
@@ -1920,8 +1922,8 @@ the apply-outputs routes, and migration 0024. What must not be broken:
   review-1 issue is flagged and no deleted or replaced page is marked:
   they address the original. `page_edits_locked` is forced: a page
   number there is not an address `assign_page` takes. `Detection`,
-  `redaction_rects`, `opinions_json` and `uncovered_hn_pages` are read
-  as before, because the compute put them in the final space. Step 1
+  the `Redaction` rows (PR B) and the boundaries (PR C) are read as
+  before, because the compute put them in the final space. Step 1
   always draws the original's space.
 - **The local tree mirrors the prefix under `Scan.output_dir`.**
   `apply.local_copy(scan, key)` puts `{prefix}jobs/apply/a2/bitonal.pdf`
@@ -1989,10 +1991,11 @@ the apply-outputs routes, and migration 0024. What must not be broken:
   re-queued (DONE is in neither `yolo.APPLY_STATUSES` nor
   `REDACTION_COMPUTE_STATUSES`): it shows the review-1 copy with the
   "being measured" note, and the way back is the admin re-queue.
-- Out of scope, named: the carry of box edits across runs (#241; a
-  `SUPPRESS_DETECTION` issue's `metadata.page_index` and a hand-edited
-  `redaction_rects` entry keep the space of the run they were made
-  under); `upload_approved_files` does not carry `jobs/apply/` (#206).
+- Out of scope, named: the carry of box edits across runs (#241, done
+  by #240 PR A and PR B: a decision names its source page and follows
+  the run's map; a `SUPPRESS_DETECTION` issue's `metadata.page_index`
+  still keeps the space of the run it was made under, until PR D);
+  `upload_approved_files` does not carry `jobs/apply/` (#206).
 
 ## Draw the read text on the scan (issue #262)
 
@@ -2290,8 +2293,9 @@ decisions, the resolution), `services._import_detections` and
   An endpoint turns a viewer's `page_index` into an address through
   `detections.measured_run` (the #269 rule, `redactions_current`) and
   the run's `page_map` (`source_for_index`); the original's space is
-  the identity. `page_index` stays the row's position in the space it
-  was imported in, and `apply_run` says which space; `detect_run` is the
+  the identity, bounded by `Scan.page_count` when it is known (PR B).
+  `page_index` stays the row's position in the space it was imported
+  in, and `apply_run` says which space; `detect_run` is the
   `ExternalJob.run` that found it. A row imported before this PR has no
   address and is placed by position when a decision is made on it.
 - **The import resolves the standing decisions** (`detections.resolve`,
@@ -2342,11 +2346,11 @@ decisions, the resolution), `services._import_detections` and
 - **`detections.json` is retired.** `services.detection_entries` is the
   in-memory list it used to hold (the live rows, the printed number
   beside each box), and every reader takes the list: `bl_pair` accepts
-  one, `_compute_and_save_redaction_rects` and `_pages_for_geometry`
-  read the rows, `run_generate_files` (paused) too. Nothing writes the
+  one, `_measure_redaction_rects` (PR B)
+  reads the rows, `run_generate_files` (paused) too. Nothing writes the
   file or pushes it, and the compute pushes nothing at all: every output
-  of the pass is a row, and `redaction_rects` / `margin_rects` stay on
-  `Scan` until PR B (`opinions_json` went with PR C, below). The
+  of the pass is a row; `redaction_rects` and `margin_rects` went with
+  PR B and `opinions_json` with PR C, both below. The
   `--files detections.json` example of `reupload_scan_files` names a
   file that no longer exists.
 - **No data migration.** Migration 0026 adds the columns and the table.
@@ -2416,7 +2420,8 @@ must not be broken:
   and the rest is #287's viewer work. If the full set comes, `replaces`
   must move to the dismissal as `replaced_by`, since a merge has two
   dismissals for one add.
-- **The compute pairs once.** `_compute_and_save_redaction_rects` used
+- **The compute pairs once.** The rect measurement (now
+  `_measure_redaction_rects`, PR B) used
   to pair for the rects and `bl_pair` paired again for `opinions_json`.
   Now `services._snapped_document` builds the corrected document once
   and returns `{id(bl_detection): Detection pk}` (from the `"id"`
@@ -2491,6 +2496,96 @@ must not be broken:
   A `REDACTION_REVIEW_DONE` scan and a legacy scan get nothing (#263,
   #271). PR B needs the same blank; whichever lands second blanks
   again, which costs one more compute per scan in review.
+
+## Redactions as rows (issue #240, PR B)
+
+The second PR of the #240 plan. One `Redaction` table, in PDF points,
+replaced `Scan.redaction_rects` (pixels) and `Scan.margin_rects`
+(points). The pieces: `models.Redaction`, `scanning/redactions.py`
+(the compute's write, the resolution, the readers, the decisions), the
+measurers `services._measure_redaction_rects` / `_measure_margin_rects`,
+the five endpoints of `views_api.py`, and migration 0027. What must not
+be broken:
+
+- **Points, for every row.** blackletter measures the redaction rects in
+  pixels of its 200 dpi render; `redactions.write_computed` converts
+  each with the `scale_x`/`scale_y` of the blackletter page it was
+  measured on, the arithmetic `build_redactions` did at step 3. The
+  margin strips are in points already. So a reader needs the page alone:
+  the viewer scales every box by the pdf.js viewport, `_imgDimsForPage`
+  is gone, and a box can be drawn on a page with no detection.
+- **Computed rows are rebuilt; human rows are withdrawn.** Each compute
+  deletes the scan's computed rows and writes what blackletter measured,
+  in one transaction. A margin strip is a computed row with
+  `rect_type = "margin"` and a white fill. An `add` (a drawn box) and a
+  `dismiss` (a computed box taken out) are human rows; a curator takes
+  one back with `withdrawn_at`. A move of a computed box is a dismiss
+  plus an add that names it in `replaces`; a move of a drawn box is
+  written in place.
+- **Delete is not undo.** `dismiss` of a moved box withdraws the add
+  alone and leaves its dismiss standing, so the computed box stays out;
+  `withdraw` cascades to nothing. `undo_move` is the one path that
+  gives the computed box back (the add and its dismiss withdrawn
+  together), and `restore` of a dismissed computed box withdraws the
+  moved copy with the dismiss, so the two never paint together. Nothing
+  in the viewer calls `undo_move` or `restore` yet: #287 is the
+  buttons. The viewer holds the add's id after a move, not the computed
+  row's, so the undo button needs `undo_move` and cannot be served by
+  `restore`. Whoever reads `withdraw` alone must not put the cascade
+  back.
+- **One standing replacement per dismiss.** A second move of the same
+  computed box, in flight before the first answer reached the viewer,
+  writes on the add the first one drew, under the computed row's lock
+  that `dismiss` holds for the whole `move` transaction;
+  `uniq_standing_replacement_per_dismiss` (partial, over the standing
+  adds) is the backstop at the database.
+- **A dismiss names its target by address**: the source page, the
+  `rect_type`, and a copy of the computed box (`target_*`).
+  `redactions.resolve` runs after every write and lands each standing
+  dismiss on the new computed row at that address with IoU >= 0.5,
+  setting `decision`, which hides it. It reads no computed row when no
+  dismiss stands. An unresolved dismiss is left and logged; PR D raises
+  it as an issue.
+- **Every row carries the source address, `page_index` and `apply_run`**,
+  as a `Detection` does. After a compute under a run the human rows go
+  through `detections.relocate_rows` (the PR A helper, shared now), so a
+  box drawn before a deletion paints on the right page after it.
+- **The compute is the only writer of computed rows.** The two
+  `_compute_and_save_*` functions became measurers that write nothing;
+  one blackletter document feeds the pairing, the rects and the strips.
+  `serve_margin_rects` used to measure inside a GET, with a full-volume
+  render; that is gone, and a volume the compute has not reached
+  answers an empty list. `_drop_orphaned_redaction_rects` is gone with
+  the pixel conversion that needed it.
+- **The uncovered headnote pages ride on the boundaries.** The step-2
+  view computed them per request against the pixel rects. With rows in
+  points a request has no page scale, so the compute computes them
+  (`_uncovered_headnote_pages`, in pixels, before the conversion) and
+  stamps `OpinionBoundary.uncovered_page_indexes` on every standing
+  boundary (`boundaries.stamp_uncovered`); `viewer_payload` turns it
+  into the `uncovered_headnote_pages` the template reads as before. PR D
+  makes it a finding.
+- **Five endpoints, by primary key**: `GET redactions/` (one list, rects
+  and strips, grouped by `page_index`), `redactions/add/`,
+  `redactions/<id>/move/` (answers the id that holds the box now),
+  `redactions/<id>/dismiss/`, `redactions/<id>/restore/`. Every refusal
+  is `{status: "error", message}` and the viewer reads it. A page the
+  map lacks is a 409 (`REDACTION_UNADDRESSABLE_MESSAGE`), from `add`
+  and from the compute's own write (`UnaddressableRedaction`).
+- **Step 3 (paused) builds `redactions.json` from the rows**:
+  `bl_build_redactions([], [], [], opinions)` for the opinion filenames
+  (blackletter read the pages only to scale pixel rects, and both rect
+  lists are empty), then the pages from `redactions.visible_by_page`.
+  The `KeyError` branch and `_pages_for_geometry` went with the
+  conversion. `run_generate_files` measures nothing.
+- **No data migration.** Migration 0027 drops the two columns with their
+  content and blanks the detect ledger's `apply_run` for every scan in
+  `PAGE_COMPLETENESS_REVIEW_DONE` or `READY_FOR_REDACTION_REVIEW`, so the
+  collect tick queues the compute and the rows appear. A
+  `REDACTION_REVIEW_DONE` volume gets no rows until an admin re-queue; a
+  legacy volume gets none. The viewer's legacy `redactions = {}` map,
+  `rebuildRedactionDivs` and the dead `/redaction/<id>/delete/` route
+  are deleted.
 
 ## Detection Workflow
 

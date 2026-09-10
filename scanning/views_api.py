@@ -34,6 +34,7 @@ from scanning.models import (
     Issue,
     OpinionBoundary,
     OpinionScan,
+    Redaction,
     Scan,
     Stage,
     Status,
@@ -59,21 +60,6 @@ def _parse_json_body(request: HttpRequest) -> dict | JsonResponse:
         return json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-
-
-def _rounded_rect(adjusted: dict) -> dict:
-    """Round ``x0``/``y0``/``x1``/``y1`` to one decimal place.
-
-    :param adjusted: Dict with ``x0``, ``y0``, ``x1``, ``y1`` keys.
-    :returns: Dict with the same keys, values rounded to 1 decimal.
-    :rtype: dict
-    """
-    return {
-        "x0": round(adjusted["x0"], 1),
-        "y0": round(adjusted["y0"], 1),
-        "x1": round(adjusted["x1"], 1),
-        "y1": round(adjusted["y1"], 1),
-    }
 
 
 @login_required
@@ -355,190 +341,198 @@ def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
 
 
 @login_required
-def serve_margin_rects(request: HttpRequest, pk: int) -> JsonResponse:
-    """Return margin rectangles for a scan, computing them if absent.
+def serve_redactions(request: HttpRequest, pk: int) -> JsonResponse:
+    """Return the boxes to paint, grouped by page, in PDF points.
+
+    The redaction rects and the margin strips in one list (#240, PR B),
+    read off the ``Redaction`` rows the compute wrote and the curator
+    edited. Nothing is computed here: a volume the compute has not
+    reached answers an empty list.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response with per-page margin rect data.
+    :return: ``[{page_index, rects: [{id, x0, y0, x1, y1, fill,
+        rect_type, origin}]}]``.
     """
-    scan = get_object_or_404(Scan, pk=pk)
-    if scan.margin_rects:
-        return JsonResponse(scan.margin_rects, safe=False)
-    output_base = Path(scan.output_dir)
-    # Shared with the pipeline rather than reimplemented: computing these
-    # here with its own detection lookup is how a viewer request that
-    # arrived before this machine had detections.json cached margins with
-    # no top strips, permanently. The PDF is the one the geometry reads
-    # (#269): the corrected volume's copy when the rows are measured
-    # against the standing apply run, the review-1 copy otherwise.
-    from scanning import apply, review_states, yolo
-    from scanning.services import (
-        _compute_and_save_margin_rects,
-        geometry_pdf_path,
-    )
+    from scanning import redactions
 
-    run = review_states.final_run(scan)
-    if run is not None and yolo.redactions_current(
-        yolo.live_detect_jobs(scan), run
-    ):
-        try:
-            base_pdf = geometry_pdf_path(scan, run)
-        except apply.ApplyError:
-            logger.exception(
-                "serve_margin_rects: the corrected volume of scan %s did "
-                "not load",
-                scan.pk,
-            )
-            return JsonResponse([], safe=False)
-        output_base.mkdir(parents=True, exist_ok=True)
-    else:
-        base_pdf = (
-            find_processing_pdf(output_base) if output_base.is_dir() else None
+    scan = get_object_or_404(Scan, pk=pk)
+    return JsonResponse(redactions.visible_by_page(scan), safe=False)
+
+
+#: The 400 of a malformed box body: one fixed sentence per endpoint,
+#: never the exception's own text (CodeQL).
+BAD_BOX_MESSAGE = (
+    "Bad box: x0, y0, x1 and y1 are required, and the box needs a "
+    "positive width and height."
+)
+BAD_NEW_BOX_MESSAGE = (
+    "Bad box: page_index, x0, y0, x1 and y1 are required, the box needs "
+    "a positive width and height, and fill is black or white."
+)
+
+#: The 409 of a box on a page no address can be written for.
+REDACTION_UNADDRESSABLE_MESSAGE = (
+    "This page cannot be addressed in the current volume, so the box "
+    "cannot be kept. Reload the page; if it stays, ask a staff member."
+)
+
+
+def _redaction_error(message: str, status: int) -> JsonResponse:
+    """Return a refusal the viewer reads (``status == "error"``).
+
+    :param message: What to show the curator.
+    :param status: The HTTP status.
+    :returns: The response.
+    """
+    return JsonResponse({"status": "error", "message": message}, status=status)
+
+
+def _bbox_of(data: dict) -> list[float]:
+    """Read ``x0, y0, x1, y1`` off a JSON body, in points.
+
+    :param data: The body.
+    :returns: The four numbers.
+    :raises ValueError: If one is missing or not a number, or the box
+        is empty.
+    """
+    try:
+        bbox = [float(data[k]) for k in ("x0", "y0", "x1", "y1")]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("x0, y0, x1 and y1 are required") from exc
+    if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+        raise ValueError("a box needs a positive width and height")
+    return bbox
+
+
+def _redaction_of(scan: Scan, redaction_id: int) -> Redaction | None:
+    """Return the scan's redaction row, or None.
+
+    :param scan: The scan.
+    :param redaction_id: The row's pk.
+    :returns: The row.
+    """
+    return Redaction.objects.filter(pk=redaction_id, scan=scan).first()
+
+
+@login_required
+@require_POST
+def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
+    """Draw a box: a human ``add`` row, addressed by its source page.
+
+    :param request: JSON body with ``page_index``, ``x0``, ``y0``,
+        ``x1``, ``y1`` (points) and ``fill`` (``black`` or ``white``).
+    :param pk: Scan primary key.
+    :return: ``{status, id}``; 400 on a bad body, 409 when the page has
+        no address.
+    """
+    from scanning import redactions
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    try:
+        page_index = int(data["page_index"])
+        bbox = _bbox_of(data)
+        fill = str(data.get("fill") or Redaction.Fill.BLACK)
+        if fill not in Redaction.Fill.values:
+            raise ValueError("fill is black or white")
+    except (KeyError, TypeError, ValueError):
+        # The detail goes to the log, not to the browser (CodeQL).
+        logger.warning(
+            "add_redaction: scan %s: malformed body", pk, exc_info=True
         )
-    if not base_pdf:
-        return JsonResponse([], safe=False)
-
-    rects = _compute_and_save_margin_rects(pk, str(base_pdf), str(output_base))
-    return JsonResponse(rects, safe=False)
+        return _redaction_error(BAD_NEW_BOX_MESSAGE, 400)
+    try:
+        row = redactions.add(scan, page_index, bbox, fill, request.user)
+    except redactions.UnaddressableRedaction:
+        return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
+    return JsonResponse({"status": "ok", "id": row.pk})
 
 
 @login_required
-def serve_redaction_rects(request: HttpRequest, pk: int) -> JsonResponse:
-    """Return redaction rectangles for a scan as JSON.
+@require_POST
+def move_redaction(
+    request: HttpRequest, pk: int, redaction_id: int
+) -> JsonResponse:
+    """Move or resize a box, and answer the row that holds it now.
+
+    A human box is written in place; a computed one is dismissed and a
+    human box is drawn where the curator put it (#240), so the viewer
+    must address the answered id from then on.
+
+    :param request: JSON body with ``x0``, ``y0``, ``x1``, ``y1``.
+    :param pk: Scan primary key.
+    :param redaction_id: The row.
+    :return: ``{status, id}``.
+    """
+    from scanning import redactions
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = _redaction_of(scan, redaction_id)
+    if row is None or row.bbox is None:
+        return _redaction_error("Redaction not found", 404)
+    try:
+        bbox = _bbox_of(data)
+    except ValueError:
+        logger.warning(
+            "move_redaction: scan %s: malformed body", pk, exc_info=True
+        )
+        return _redaction_error(BAD_BOX_MESSAGE, 400)
+    try:
+        holder = redactions.move(scan, row, bbox, request.user)
+    except redactions.UnaddressableRedaction:
+        return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
+    return JsonResponse({"status": "ok", "id": holder.pk})
+
+
+@login_required
+@require_POST
+def dismiss_redaction(
+    request: HttpRequest, pk: int, redaction_id: int
+) -> JsonResponse:
+    """Take a box out: a dismiss of a computed row, a withdrawal of a
+    human one. Nothing is deleted; a second call is a no-op.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response with per-page redaction rect data.
+    :param redaction_id: The row.
+    :return: ``{status}``.
     """
+    from scanning import redactions
+
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.redaction_rects:
-        return JsonResponse(scan.redaction_rects, safe=False)
-    return JsonResponse([], safe=False)
+    row = _redaction_of(scan, redaction_id)
+    if row is None or row.bbox is None:
+        return _redaction_error("Redaction not found", 404)
+    redactions.dismiss(scan, row, request.user)
+    return JsonResponse({"status": "ok"})
 
 
 @login_required
 @require_POST
-def save_redaction_rect(request: HttpRequest, pk: int) -> JsonResponse:
-    """Create, update, or delete a redaction rectangle on disk.
+def restore_redaction(
+    request: HttpRequest, pk: int, redaction_id: int
+) -> JsonResponse:
+    """Give a dismissed computed box back: the undo of a dismiss.
 
-    :param request: The HTTP request (JSON body with page_index,
-        action, original, adjusted, type, and fill).
+    :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response confirming the operation.
+    :param redaction_id: The computed row.
+    :return: ``{status, restored}``.
     """
+    from scanning import redactions
+
     scan = get_object_or_404(Scan, pk=pk)
-    data = _parse_json_body(request)
-    if isinstance(data, JsonResponse):
-        return data
-    page_idx = data["page_index"]
-    action = data.get("action", "update")
-    original = data.get("original", {})
-    adjusted = data.get("adjusted", {})
-    rect_type = data.get("type", "")
-    fill = data.get("fill", "black")
-    if not scan.redaction_rects:
-        return JsonResponse({"error": "No redaction rects"}, status=404)
-    rects = scan.redaction_rects
-    if action == "delete":
-        for page_data in rects:
-            if page_data["page_index"] != page_idx:
-                continue
-            page_data["rects"] = [
-                r
-                for r in page_data["rects"]
-                if not (
-                    abs(r["x0"] - original["x0"]) < 2
-                    and abs(r["y0"] - original["y0"]) < 2
-                    and r.get("type", "") == rect_type
-                )
-            ]
-            break
-        Scan.objects.filter(pk=pk).update(redaction_rects=rects)
-        return JsonResponse({"status": "ok", "action": "deleted"})
-    found = False
-    for page_data in rects:
-        if page_data["page_index"] != page_idx:
-            continue
-        for r in page_data["rects"]:
-            if (
-                abs(r["x0"] - original.get("x0", -999)) < 2
-                and abs(r["y0"] - original.get("y0", -999)) < 2
-                and r.get("type") == rect_type
-            ):
-                r.update(_rounded_rect(adjusted))
-                found = True
-                break
-        if found:
-            break
-    if not found:
-        for page_data in rects:
-            if page_data["page_index"] == page_idx:
-                page_data["rects"].append(
-                    {
-                        **_rounded_rect(adjusted),
-                        "fill": fill,
-                        "type": rect_type,
-                    }
-                )
-                found = True
-                break
-    Scan.objects.filter(pk=pk).update(redaction_rects=rects)
-    return JsonResponse({"status": "ok", "found": found})
-
-
-@login_required
-@require_POST
-def save_margin_rect(request: HttpRequest, pk: int) -> JsonResponse:
-    """Update or delete a margin rectangle on disk.
-
-    :param request: The HTTP request (JSON body with page_index,
-        action, original, and adjusted).
-    :param pk: Scan primary key.
-    :return: JSON response confirming the operation.
-    """
-    scan = get_object_or_404(Scan, pk=pk)
-    data = _parse_json_body(request)
-    if isinstance(data, JsonResponse):
-        return data
-    page_idx = data["page_index"]
-    original = data.get("original", {})
-    action = data.get("action", "update")
-    adjusted = data.get("adjusted", {})
-    if not scan.margin_rects:
-        return JsonResponse({"error": "No margin rects"}, status=404)
-    rects = scan.margin_rects
-    if action == "delete":
-        for page_data in rects:
-            if page_data["page_index"] != page_idx:
-                continue
-            page_data["rects"] = [
-                r
-                for r in page_data["rects"]
-                if not (
-                    abs(r["x0"] - original.get("x0", -999)) < 2
-                    and abs(r["y0"] - original.get("y0", -999)) < 2
-                )
-            ]
-            break
-        Scan.objects.filter(pk=pk).update(margin_rects=rects)
-        return JsonResponse({"status": "ok", "action": "deleted"})
-    found = False
-    for page_data in rects:
-        if page_data["page_index"] != page_idx:
-            continue
-        for r in page_data["rects"]:
-            if (
-                abs(r["x0"] - original.get("x0", -999)) < 2
-                and abs(r["y0"] - original.get("y0", -999)) < 2
-            ):
-                r.update(_rounded_rect(adjusted))
-                found = True
-                break
-        if found:
-            break
-    Scan.objects.filter(pk=pk).update(margin_rects=rects)
-    return JsonResponse({"status": "ok", "found": found})
+    row = _redaction_of(scan, redaction_id)
+    if row is None:
+        return _redaction_error("Redaction not found", 404)
+    restored = redactions.restore(scan, row, request.user)
+    return JsonResponse({"status": "ok", "restored": restored})
 
 
 #: Whether a curator may ask for the redaction computation from review
@@ -1033,45 +1027,7 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
             )
         except detections.UnaddressableDetection:
             return _unaddressable()
-    _drop_orphaned_redaction_rects(scan, row.page_index)
     return JsonResponse({"status": "ok", "deleted": 1})
-
-
-def _drop_orphaned_redaction_rects(scan: Scan, page_index: int | None) -> None:
-    """Forget a page's saved rects once its last detection is gone.
-
-    ``redaction_rects`` is a snapshot in image pixels, and the scale that
-    converts it to points comes from the page's own detections. Deleting the
-    last one on a page leaves rects that cannot be placed, which stops
-    Generate Files outright, and nothing in the review UI recomputes them.
-
-    Dropping them loses nothing: a page with no detections left has nothing
-    on it to redact, and the reviewer saying so is what deleting the last
-    detection means. Rects on every other page, including any the reviewer
-    adjusted by hand, are untouched.
-
-    :param scan: The scan whose rects to prune.
-    :param page_index: Page the deleted detection was on, if known.
-    """
-    if page_index is None or not scan.redaction_rects:
-        return
-    if Detection.objects.filter(
-        scan=scan, page_index=page_index, active=True
-    ).exists():
-        return
-    remaining = [
-        entry
-        for entry in scan.redaction_rects
-        if entry.get("page_index") != page_index
-    ]
-    if len(remaining) != len(scan.redaction_rects):
-        logger.info(
-            "Dropped saved redaction rects for scan %s page %s: "
-            "no active detections left on it",
-            scan.pk,
-            page_index,
-        )
-        Scan.objects.filter(pk=scan.pk).update(redaction_rects=remaining)
 
 
 @login_required

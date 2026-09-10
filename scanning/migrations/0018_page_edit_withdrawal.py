@@ -6,45 +6,82 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('scanning', '0017_alter_externaljob_engine'),
+        ("scanning", "0017_alter_externaljob_engine"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
     operations = [
         migrations.RemoveConstraint(
-            model_name='pageedit',
-            name='uniq_open_page_edit_per_page',
+            model_name="pageedit",
+            name="uniq_open_page_edit_per_page",
         ),
         migrations.RemoveConstraint(
-            model_name='pageedit',
-            name='uniq_open_dismissal_per_check',
+            model_name="pageedit",
+            name="uniq_open_dismissal_per_check",
         ),
         migrations.RemoveConstraint(
-            model_name='pageedit',
-            name='uniq_open_insert_per_gap',
+            model_name="pageedit",
+            name="uniq_open_insert_per_gap",
         ),
         migrations.AddField(
-            model_name='pageedit',
-            name='withdrawn_at',
-            field=models.DateTimeField(blank=True, db_index=True, help_text='When the decision was taken back: the curator undid it, or replaced it with a later one (#232). A stamped row is history too, and it is never rewritten either.', null=True),
+            model_name="pageedit",
+            name="withdrawn_at",
+            field=models.DateTimeField(
+                blank=True,
+                db_index=True,
+                help_text="When the decision was taken back: the curator undid it, or replaced it with a later one (#232). A stamped row is history too, and it is never rewritten either.",
+                null=True,
+            ),
         ),
         migrations.AddField(
-            model_name='pageedit',
-            name='withdrawn_by',
-            field=models.ForeignKey(blank=True, help_text='Who took the decision back. Null while it stands.', null=True, on_delete=django.db.models.deletion.PROTECT, related_name='withdrawn_page_edits', to=settings.AUTH_USER_MODEL),
+            model_name="pageedit",
+            name="withdrawn_by",
+            field=models.ForeignKey(
+                blank=True,
+                help_text="Who took the decision back. Null while it stands.",
+                null=True,
+                on_delete=django.db.models.deletion.PROTECT,
+                related_name="withdrawn_page_edits",
+                to=settings.AUTH_USER_MODEL,
+            ),
         ),
         migrations.AddConstraint(
-            model_name='pageedit',
-            constraint=models.UniqueConstraint(condition=models.Q(('applied_at__isnull', True), ('withdrawn_at__isnull', True), ('pdf_page__isnull', False), models.Q(('kind', 'dismiss_issue'), _negated=True)), fields=('scan', 'kind', 'pdf_page'), name='uniq_open_page_edit_per_page'),
+            model_name="pageedit",
+            constraint=models.UniqueConstraint(
+                condition=models.Q(
+                    ("applied_at__isnull", True),
+                    ("withdrawn_at__isnull", True),
+                    ("pdf_page__isnull", False),
+                    models.Q(("kind", "dismiss_issue"), _negated=True),
+                ),
+                fields=("scan", "kind", "pdf_page"),
+                name="uniq_open_page_edit_per_page",
+            ),
         ),
         migrations.AddConstraint(
-            model_name='pageedit',
-            constraint=models.UniqueConstraint(condition=models.Q(('applied_at__isnull', True), ('withdrawn_at__isnull', True), ('kind', 'dismiss_issue')), fields=('scan', 'kind', 'pdf_page', 'logical_page', 'value'), name='uniq_open_dismissal_per_check', nulls_distinct=False),
+            model_name="pageedit",
+            constraint=models.UniqueConstraint(
+                condition=models.Q(
+                    ("applied_at__isnull", True),
+                    ("withdrawn_at__isnull", True),
+                    ("kind", "dismiss_issue"),
+                ),
+                fields=("scan", "kind", "pdf_page", "logical_page", "value"),
+                name="uniq_open_dismissal_per_check",
+                nulls_distinct=False,
+            ),
         ),
         migrations.AddConstraint(
-            model_name='pageedit',
-            constraint=models.UniqueConstraint(condition=models.Q(('applied_at__isnull', True), ('withdrawn_at__isnull', True), ('kind', 'insert_page')), fields=('scan', 'anchor_pdf_page', 'ordinal'), name='uniq_open_insert_per_gap'),
+            model_name="pageedit",
+            constraint=models.UniqueConstraint(
+                condition=models.Q(
+                    ("applied_at__isnull", True),
+                    ("withdrawn_at__isnull", True),
+                    ("kind", "insert_page"),
+                ),
+                fields=("scan", "anchor_pdf_page", "ordinal"),
+                name="uniq_open_insert_per_gap",
+            ),
         ),
     ]

@@ -85,9 +85,7 @@ def create_page_edits(apps, schema_editor):
     for insert in PageInsert.objects.select_related("scan").order_by(
         "scan_id", "logical_page_number"
     ):
-        anchor = _anchor_for(
-            insert.scan.page_map, insert.logical_page_number
-        )
+        anchor = _anchor_for(insert.scan.page_map, insert.logical_page_number)
         if anchor is None:
             # Nothing to place it against: the volume has no page map,
             # or none of its pages print a smaller number. Say so; the

@@ -40,6 +40,7 @@ from scanning.models import (
     PendingUpload,
     QueuedAction,
     QueueStatus,
+    Redaction,
     Scan,
     Source,
     Stage,
@@ -3539,74 +3540,212 @@ class TestLazyPullsFetchOneFile(ScanningTestCase):
         everything.assert_not_called()
 
 
-class TestDeleteDetectionPrunesStaleRects(ScanningTestCase):
-    """Deleting a page's last detection must not strand its saved rects.
-
-    ``redaction_rects`` is a snapshot in image pixels, and the scale that
-    places it comes from that page's detections. Leaving rects behind for a
-    page that has none makes Generate Files fail on every retry, with no
-    reachable way for a reviewer to clear it.
-    """
+class TestRedactionEndpoints(ScanningTestCase):
+    """The five redaction endpoints, by primary key (#240 PR B)."""
 
     def setUp(self):
         self.user = self.make_user()
         self.client.force_login(self.user)
-        self.scan = ScanFactory(reporter=ReporterFactory(short_name="tp"))
-        self.scan.redaction_rects = [
-            {"page_index": 0, "rects": [{"x0": 1, "y0": 2, "x1": 3, "y1": 4}]},
-            {"page_index": 1, "rects": [{"x0": 5, "y0": 6, "x1": 7, "y1": 8}]},
-        ]
-        self.scan.save(update_fields=["redaction_rects"])
+        self.scan = ScanFactory(page_count=2, source_fingerprint="10:2")
 
-    def _detection(self, page_index):
-        return Detection.objects.create(
-            scan=self.scan,
-            page_index=page_index,
-            label="HEADNOTE",
-            label_id=3,
-            confidence=0.9,
-            x0=10,
-            y0=20,
-            x1=30,
-            y1=40,
-            img_width=1700,
-            img_height=2200,
-        )
+    def _computed(self, **fields):
+        values = {
+            "scan": self.scan,
+            "origin": Redaction.Origin.COMPUTED,
+            "rect_type": "headnote",
+            "fill": "black",
+            "x0": 50.0,
+            "y0": 100.0,
+            "x1": 150.0,
+            "y1": 200.0,
+            "source_page": 1,
+            "source_fingerprint": "10:2",
+            "page_index": 0,
+        }
+        values.update(fields)
+        return Redaction.objects.create(**values)
 
-    def _delete(self, detection):
+    def _post(self, name, body=None, **kwargs):
         return self.client.post(
-            reverse("delete_detection", kwargs={"pk": self.scan.pk}),
-            data=json.dumps({"detection_id": detection.pk}),
+            reverse(name, kwargs={"pk": self.scan.pk, **kwargs}),
+            data=json.dumps(body or {}),
             content_type="application/json",
         )
 
-    def test_the_last_detection_on_a_page_takes_its_rects_with_it(self):
-        only_one = self._detection(0)
-        self._detection(1)
+    def test_serve_lists_the_visible_boxes_in_points(self):
+        row = self._computed()
+        self._computed(
+            rect_type="margin", fill="white", page_index=1, source_page=2
+        )
 
-        response = self._delete(only_one)
+        response = self.client.get(
+            reverse("serve_redactions", kwargs={"pk": self.scan.pk})
+        )
+
+        data = json.loads(response.content)
+        self.assertEqual([e["page_index"] for e in data], [0, 1])
+        self.assertEqual(data[0]["rects"][0]["id"], row.pk)
+        self.assertEqual(data[0]["rects"][0]["x0"], 50.0)
+        self.assertEqual(data[1]["rects"][0]["rect_type"], "margin")
+
+    def test_add_writes_a_human_row_and_answers_its_id(self):
+        response = self._post(
+            "add_redaction",
+            {
+                "page_index": 1,
+                "x0": 1.0,
+                "y0": 2.0,
+                "x1": 3.0,
+                "y1": 4.0,
+                "fill": "white",
+            },
+        )
 
         self.assertEqual(response.status_code, 200)
-        self.scan.refresh_from_db()
-        self.assertEqual(
-            [e["page_index"] for e in self.scan.redaction_rects],
-            [1],
-            "page 0's rects should have gone with its last detection",
+        body = json.loads(response.content)
+        row = Redaction.objects.get(pk=body["id"])
+        self.assertEqual(row.origin, Redaction.Origin.HUMAN)
+        self.assertEqual(row.fill, "white")
+        self.assertEqual((row.page_index, row.source_page), (1, 2))
+        self.assertEqual(row.author, self.user)
+
+    def test_add_refuses_a_bad_body(self):
+        with self.assertLogs("scanning.views_api", level="WARNING"):
+            response = self._post(
+                "add_redaction",
+                {"page_index": 0, "x0": 5, "y0": 0, "x1": 1, "y1": 1},
+            )
+        self.assertEqual(response.status_code, 400)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "error")
+        self.assertNotIn("ValueError", body["message"])
+        with self.assertLogs("scanning.views_api", level="WARNING"):
+            response = self._post("add_redaction", {"page_index": "x"})
+        self.assertNotIn(
+            "invalid literal", json.loads(response.content)["message"]
+        )
+        with self.assertLogs("scanning.views_api", level="WARNING"):
+            response = self._post(
+                "add_redaction",
+                {
+                    "page_index": 0,
+                    "x0": 0,
+                    "y0": 0,
+                    "x1": 1,
+                    "y1": 1,
+                    "fill": "red",
+                },
+            )
+        self.assertEqual(response.status_code, 400)
+
+    def test_move_of_a_computed_box_answers_the_row_that_holds_it(self):
+        row = self._computed()
+
+        response = self._post(
+            "move_redaction",
+            {"x0": 60, "y0": 110, "x1": 160, "y1": 210},
+            redaction_id=row.pk,
         )
 
-    def test_rects_survive_while_the_page_still_has_a_detection(self):
-        one_of_two = self._detection(0)
-        self._detection(0)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "ok")
+        self.assertNotEqual(body["id"], row.pk)
+        holder = Redaction.objects.get(pk=body["id"])
+        self.assertEqual(holder.bbox, [60.0, 110.0, 160.0, 210.0])
+        row.refresh_from_db()
+        self.assertEqual(holder.replaces, row.decision)
 
-        self._delete(one_of_two)
+    def test_dismiss_and_restore(self):
+        row = self._computed()
 
-        self.scan.refresh_from_db()
+        response = self._post("dismiss_redaction", redaction_id=row.pk)
+
+        self.assertEqual(json.loads(response.content)["status"], "ok")
+        row.refresh_from_db()
+        self.assertIsNotNone(row.decision)
         self.assertEqual(
-            [e["page_index"] for e in self.scan.redaction_rects], [0, 1]
+            json.loads(
+                self.client.get(
+                    reverse("serve_redactions", kwargs={"pk": self.scan.pk})
+                ).content
+            ),
+            [],
         )
 
+        response = self._post("restore_redaction", redaction_id=row.pk)
 
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+        self.assertTrue(json.loads(response.content)["restored"])
+        row.refresh_from_db()
+        self.assertIsNone(row.decision)
+
+    def test_a_dismiss_row_is_not_a_box(self):
+        row = self._computed()
+        self._post("dismiss_redaction", redaction_id=row.pk)
+        row.refresh_from_db()
+
+        for name in ("move_redaction", "dismiss_redaction"):
+            with self.subTest(name=name):
+                response = self._post(
+                    name,
+                    {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                    redaction_id=row.decision_id,
+                )
+                self.assertEqual(response.status_code, 404)
+
+    def test_unknown_id_is_404(self):
+        for name in (
+            "move_redaction",
+            "dismiss_redaction",
+            "restore_redaction",
+        ):
+            with self.subTest(name=name):
+                response = self._post(
+                    name,
+                    {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                    redaction_id=999999,
+                )
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(
+                    json.loads(response.content)["status"], "error"
+                )
+
+    def test_a_page_outside_the_map_answers_409(self):
+        from unittest.mock import patch
+
+        from scanning import detections
+        from scanning.tests.test_yolo_apply import glued_run
+
+        run = glued_run(self.scan)
+        row = self._computed(page_index=9, source_page=10)
+        posts = [
+            (
+                "add_redaction",
+                {"page_index": 9, "x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                {},
+            ),
+            (
+                "move_redaction",
+                {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                {"redaction_id": row.pk},
+            ),
+        ]
+        for name, body, kwargs in posts:
+            with self.subTest(name=name):
+                with patch.object(
+                    detections, "measured_run", return_value=run
+                ):
+                    with self.assertLogs(
+                        "scanning.redactions", level="WARNING"
+                    ):
+                        response = self._post(name, body, **kwargs)
+                self.assertEqual(response.status_code, 409)
+                self.assertIn(
+                    "cannot be addressed",
+                    json.loads(response.content)["message"],
+                )
+        self.assertEqual(Redaction.objects.human().count(), 0)
+
+
 class TestGluedOutputs(ScanningTestCase):
     """The glued outputs of the GPU stages, by scan id (issue #243).
 
