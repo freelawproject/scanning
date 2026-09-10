@@ -217,10 +217,21 @@ reach step 2.
     The corrected volume is not built yet. This is the volume as uploaded, before the page edits.{% if apply_run %} {{ apply_run.message }}{% endif %}
   </span>
   {% endif %}
+  {% comment %}
+    The open findings of review 2 (#240 PR D). The button obeys: the
+    curator judges a finding as they judge a page-completeness
+    suspicion (#151), so an open count asks for a confirm and blocks
+    nothing. A finding that says one of the curator's own decisions is
+    not applied ("not applied") is named apart, because approving over
+    it approves the model's answer in its place.
+  {% endcomment %}
   {% if redaction_review_ready %}
+  {% if review2_open %}
+  <span class="inline-flex items-center rounded px-2 py-1 text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200" title="Open findings of the redaction review, listed in the sidebar">{{ review2_open }} finding{{ review2_open|pluralize }} open{% if review2_stale %}, {{ review2_stale }} decision{{ review2_stale|pluralize }} not applied{% endif %}</span>
+  {% endif %}
   <form method="post" action="{% url 'approve_redaction_review' scan.pk %}" class="inline">
     {% csrf_token %}
-    <button type="submit" class="btn-primary text-sm" title="Confirm the redactions of this volume are correct: every headnote and key number is covered, and no opinion text is.">I reviewed the redactions and they are correct</button>
+    <button type="submit" class="btn-primary text-sm" title="Confirm the redactions of this volume are correct: every headnote and key number is covered, and no opinion text is."{% if review2_open %} onclick="return confirm('This volume still lists {{ review2_open }} open finding{{ review2_open|pluralize }}.{% if review2_stale %} {{ review2_stale }} of your decision{{ review2_stale|pluralize }} {{ review2_stale|pluralize:'is,are' }} not applied, so the volume shows the model\'s answer there.{% endif %} Approve the redactions anyway?');"{% endif %}>I reviewed the redactions and they are correct</button>
   </form>
   {% elif redaction_review_done %}
   <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed the redactions of this volume">&#10003; Redaction review done</span>

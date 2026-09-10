@@ -1,0 +1,65 @@
+{% comment %}
+  The findings of review 2 (issue #240, PR D), one card per Issue row of
+  REVIEW2_CHECKS, grouped by what the finding is about (Issue.target).
+  Rendered by scan_process_view for the page and by views_api.review_findings
+  for the in-place refresh, from the one context findings.viewer_groups
+  builds, the rule of the action bar (#151): a card that disagreed with
+  itself after a refresh would offer a button the endpoint refuses.
+
+  A detection-target card keeps the data-unmatched-* attributes the
+  unmatched cards carried, so _getDetectionData in viewer_sidebar.js and
+  the Approve / Delete handlers read it unchanged. A dismissed card is
+  muted with an Undo; a stale card has Withdraw and no Dismiss, because
+  it says that one of the curator's own decisions is not applied, and
+  the way out is to take that decision back.
+{% endcomment %}
+<h2 class="text-sm font-bold mb-2 flex items-center gap-2">
+  Findings
+  <span class="text-xs font-normal text-gray-600 dark:text-gray-300">({{ review2_open }} open{% if review2_stale %}, {{ review2_stale }} not applied{% endif %})</span>
+</h2>
+{% if not finding_groups %}
+<div class="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded px-2 py-2 text-xs text-green-700 dark:text-green-300 font-medium mb-2">
+  {% if findings_computed %}All clear &mdash; no findings{% else %}No findings yet. They appear when the redactions are computed.{% endif %}
+</div>
+{% endif %}
+{% for group in finding_groups %}
+<h3 class="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mt-2 mb-1">{{ group.label }} ({{ group.rows|length }})</h3>
+{% for issue in group.rows %}
+<div class="finding-card rounded border px-2 py-1.5 mb-1 text-xs cursor-pointer
+     {% if issue.is_dismissed %}border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 opacity-60{% elif issue.is_stale %}border-red-300 bg-red-50 hover:bg-red-100 dark:border-red-700 dark:bg-red-900/20 dark:hover:bg-red-900/40{% else %}border-yellow-300 bg-yellow-50 hover:bg-yellow-100 dark:border-yellow-700 dark:bg-yellow-900/20 dark:hover:bg-yellow-900/40{% endif %}"
+     data-issue-id="{{ issue.pk }}"
+     data-check="{{ issue.check_name }}"
+     {% if issue.metadata.detection_id %}
+     data-unmatched-page="{{ issue.metadata.page_index }}" data-unmatched-label="{{ issue.metadata.label }}"
+     data-logical-page="{{ issue.logical_page }}" data-page-index="{{ issue.metadata.page_index }}"
+     data-bbox="{{ issue.metadata.bbox.0 }},{{ issue.metadata.bbox.1 }},{{ issue.metadata.bbox.2 }},{{ issue.metadata.bbox.3 }}"
+     data-img-w="{{ issue.metadata.img_width }}" data-img-h="{{ issue.metadata.img_height }}" data-label-id="{{ issue.metadata.label_id }}"
+     data-detection-id="{{ issue.metadata.detection_id }}"
+     onclick="highlightDetection(this)"
+     {% elif issue.nav_pdf_index is not None %}
+     data-pdf-index="{{ issue.nav_pdf_index }}" onclick="goToPage(this)"
+     {% endif %}>
+  <div class="flex items-center gap-1.5">
+    <span class="font-bold uppercase text-[10px]">{% if issue.is_stale %}Not applied{% elif issue.is_dismissed %}Dismissed{% else %}{{ issue.get_severity_display }}{% endif %}</span>
+    {% if issue.logical_page %}<span class="text-gray-500 dark:text-gray-400">p.{{ issue.logical_page }}</span>{% endif %}
+    {% if issue.metadata.conf %}<span class="text-gray-500 dark:text-gray-400">{{ issue.metadata.conf }}</span>{% endif %}
+  </div>
+  <p class="mt-0.5 text-gray-700 dark:text-gray-300">{{ issue.message }}</p>
+  <div class="flex gap-1 mt-1">
+    {% if issue.is_dismissed %}
+    <button class="text-[10px] px-2 py-0.5 rounded bg-gray-600 text-white" title="Take the dismissal back" onclick="event.stopPropagation(); restoreFinding(this, {{ issue.pk }})">Undo</button>
+    {% elif issue.is_stale %}
+    <button class="text-[10px] px-2 py-0.5 rounded bg-red-600 text-white" title="Take back the decision this finding names. The model's answer stands; make the decision again on the page as it is now." onclick="event.stopPropagation(); withdrawStaleEdit(this, {{ issue.pk }})">Withdraw</button>
+    {% else %}
+    {% if issue.check_name == 'unmatched_key_icon' or issue.check_name == 'unmatched_caption' %}
+    <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Approve the detection (confidence 1.0)"
+            onclick="event.stopPropagation(); approveDetection(this)">&#10003;</button>
+    <button class="px-1 py-0.5 rounded bg-red-600 text-white text-[10px] hover:bg-red-700" title="Delete the detection"
+            onclick="event.stopPropagation(); deleteUnmatchedDetection(this)">&#10005;</button>
+    {% endif %}
+    <button class="text-[10px] px-2 py-0.5 rounded bg-gray-600 text-white" title="Judge this finding not worth acting on. It stays muted, with an undo." onclick="event.stopPropagation(); dismissFinding(this, {{ issue.pk }})">Dismiss</button>
+    {% endif %}
+  </div>
+</div>
+{% endfor %}
+{% endfor %}

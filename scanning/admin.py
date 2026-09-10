@@ -22,6 +22,7 @@ from scanning.models import (
     QueuedAction,
     Redaction,
     Reporter,
+    ReviewDismissal,
     Scan,
     Status,
     Volume,
@@ -616,10 +617,53 @@ class VolumeAdmin(admin.ModelAdmin):
 
 @admin.register(Issue)
 class IssueAdmin(admin.ModelAdmin):
-    list_display = ["scan", "page_number", "check_name", "severity", "message"]
-    list_filter = ["severity", "check_name"]
+    list_display = [
+        "scan",
+        "page_number",
+        "check_name",
+        "target",
+        "severity",
+        "dismissal",
+        "message",
+    ]
+    list_filter = ["severity", "check_name", "target"]
     search_fields = ["message", "check_name"]
-    raw_id_fields = ["scan"]
+    raw_id_fields = ["scan", "dismissal"]
+
+
+@admin.register(ReviewDismissal)
+class ReviewDismissalAdmin(admin.ModelAdmin):
+    """One curator dismissal of one review-2 finding (issue #240, PR D).
+
+    Read-only: a row records what a person decided, and the way to
+    change a decision is the review page. Nothing here deletes.
+    """
+
+    list_display = [
+        "scan",
+        "check_name",
+        "label",
+        "source_page",
+        "end_source_page",
+        "author",
+        "withdrawn_at",
+        "date_created",
+    ]
+    list_filter = ["check_name", "withdrawn_at"]
+    raw_id_fields = [
+        "scan",
+        "source_edit",
+        "end_source_edit",
+        "author",
+        "withdrawn_by",
+    ]
+    readonly_fields = [f.name for f in ReviewDismissal._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(Detection)

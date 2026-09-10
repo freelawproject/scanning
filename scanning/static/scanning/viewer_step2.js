@@ -856,6 +856,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                     showToast('Saved. The redactions are not recomputed from this yet.', 'success');
                     refreshOverlays();
+                    if (window.refreshFindings) window.refreshFindings();
                 });
             }
         };
@@ -1689,6 +1690,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         }
                     });
                 }
+                if (window.refreshFindings) window.refreshFindings();
             }).catch(function() { showToast('Failed to delete the box'); });
         });
         div.appendChild(delBtn);
@@ -1849,6 +1851,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 rectData.origin = 'human';
                 div.dataset.id = data.id;
             }
+            if (window.refreshFindings) window.refreshFindings();
         }).catch(function() { showToast('Failed to save the box'); });
     }
 
@@ -1897,6 +1900,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     det.id = data.detection_id;
                     det.manual = true;
                 }
+                if (window.refreshFindings) window.refreshFindings();
             }
         }).catch(function() {
             console.error('Failed to save detection bbox');
@@ -1939,9 +1943,9 @@ document.addEventListener('DOMContentLoaded', function () {
                 if (data.status === 'ok') {
                     div.remove();
                     _selectedDetBox = null;
-                    var sidebarItems = document.querySelectorAll('[data-unmatched-page="' + det.page_index + '"][data-unmatched-label="' + det.label + '"]');
-                    sidebarItems.forEach(function(el) { el.remove(); });
                     refreshOverlays();
+                    // The findings were rebuilt by the endpoint (#240 PR D).
+                    if (window.refreshFindings) window.refreshFindings();
                 }
             }).catch(function() {
                 console.error('Failed to delete detection');

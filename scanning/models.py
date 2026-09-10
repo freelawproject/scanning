@@ -1042,9 +1042,34 @@ class CheckName(models.TextChoices):
 
     # User actions (from scanning views)
     PROCESS_FLAG = "process_flag", "User-flagged issue"
-    SUPPRESS_DETECTION = "suppress_detection", "Suppress a detection"
-    ADD_DETECTION = "add_detection", "Add a detection"
-    APPROVE_DETECTION = "approve_detection", "Approve a detection"
+
+    # The findings of review 2 (issue #240, PR D). Each names what it
+    # is about; ``Issue.target`` says the same in one word.
+    UNMATCHED_KEY_ICON = (
+        "unmatched_key_icon",
+        "Key icon not matched to an opinion",
+    )
+    UNMATCHED_CAPTION = (
+        "unmatched_caption",
+        "Caption not matched to an opinion",
+    )
+    UNCOVERED_PAGES = "uncovered_pages", "Pages not covered by an opinion"
+    UNCOVERED_HEADNOTE = (
+        "uncovered_headnote",
+        "Headnote not covered by a redaction",
+    )
+    STALE_DETECTION_EDIT = (
+        "stale_detection_edit",
+        "Detection decision not applied",
+    )
+    STALE_REDACTION_EDIT = (
+        "stale_redaction_edit",
+        "Redaction decision not applied",
+    )
+    STALE_BOUNDARY_EDIT = (
+        "stale_boundary_edit",
+        "Opinion boundary decision not applied",
+    )
 
 
 #: Checks whose ``Issue.page_number`` is a physical PDF page, 1-based.
@@ -1074,14 +1099,59 @@ PHYSICAL_PAGE_CHECKS = frozenset(
 #: decision did not land, and a curator must always hear that.
 CHECKS_A_DELETION_ANSWERS = PHYSICAL_PAGE_CHECKS - {CheckName.STALE_PAGE_EDIT}
 
+#: The decisions of a curator that the review-2 rebuild found no row
+#: for (issue #240, PR D). A fact about a row a person wrote, not a
+#: suspicion: the way out is to withdraw that row, so these cards have
+#: no dismissal.
+STALE_REVIEW2_CHECKS = frozenset(
+    {
+        CheckName.STALE_DETECTION_EDIT,
+        CheckName.STALE_REDACTION_EDIT,
+        CheckName.STALE_BOUNDARY_EDIT,
+    }
+)
+
+#: The findings of review 2 (issue #240, PR D). ``findings.rebuild``
+#: deletes and writes these rows, and nothing else does; every other
+#: check is review 1's, and ``recalculate_issues`` leaves these alone.
+#: An ``Issue.page_number`` of one of these is the 1-based page in the
+#: space the redaction rows are drawn in (the standing apply run's, or
+#: the original's), a third space beside the two of review 1, so the
+#: step-1 view never lists them.
+REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
+    {
+        CheckName.UNMATCHED_KEY_ICON,
+        CheckName.UNMATCHED_CAPTION,
+        CheckName.UNCOVERED_PAGES,
+        CheckName.UNCOVERED_HEADNOTE,
+    }
+)
+
 
 class Issue(AbstractDateTimeModel):
-    """A validation or processing issue found in a scan."""
+    """A validation or processing issue found in a scan.
+
+    Two families of rows share the table. A review-1 row (the page
+    number checks, ``PROCESS_FLAG``) is written by ``recalculate_issues``
+    and dismissed through a ``DISMISS_ISSUE`` ``PageEdit``. A review-2
+    row (``REVIEW2_CHECKS``, issue #240 PR D) is written by
+    ``findings.rebuild`` from the detection, boundary and redaction rows,
+    says what it is about in ``target``, and is dismissed by a
+    ``ReviewDismissal`` the rebuild resolves onto it (``dismissal``).
+    """
 
     class Severity(models.TextChoices):
         ERROR = "error", "Error"
         WARNING = "warning", "Warning"
         INFO = "info", "Info"
+
+    class Target(models.TextChoices):
+        """What a review-2 finding is about (issue #240)."""
+
+        REDACTION = "redaction", "A redaction"
+        BOUNDARY = "boundary", "An opinion boundary"
+        DETECTION = "detection", "A detection"
+        PAGES = "pages", "A run of pages"
 
     scan = models.ForeignKey(
         Scan,
@@ -1102,7 +1172,26 @@ class Issue(AbstractDateTimeModel):
     metadata = models.JSONField(
         blank=True,
         default=dict,
-        help_text="Structured data (e.g. suppression info).",
+        help_text=(
+            "Structured data. A review-2 finding keeps the address of "
+            "its target here (issue #240): the detection's box and page, "
+            "the run of pages, or the human row that did not land."
+        ),
+    )
+    target = models.CharField(
+        max_length=12,
+        choices=Target.choices,
+        blank=True,
+        default="",
+        help_text="What a review-2 finding is about; blank on review 1.",
+    )
+    dismissal = models.ForeignKey(
+        "ReviewDismissal",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="issues",
+        help_text="The standing dismissal that covers this finding.",
     )
 
     class Meta:
@@ -1111,6 +1200,122 @@ class Issue(AbstractDateTimeModel):
     def __str__(self):
         page = f"p.{self.page_number}" if self.page_number else "doc"
         return f"[{self.severity}] {page}: {self.message}"
+
+    @property
+    def is_dismissed(self) -> bool:
+        """Whether a standing dismissal covers this finding.
+
+        The FK is cleared when the dismissal is withdrawn, so the FK
+        alone answers.
+        """
+        return self.dismissal_id is not None
+
+
+class ReviewDismissal(AbstractDateTimeModel):
+    """One curator dismissal of one review-2 finding (issue #240, PR D).
+
+    The finding rows are deleted and written again at every rebuild
+    (``findings.rebuild``), so a dismissal cannot point at one. It names
+    its target by **address** instead: the check, the source page of
+    the target (``source_edit``, ``source_page``; the rule of
+    ``DetectionDecision``), the last page for a run of pages, the label
+    and a copy of the box for a detection. After each rebuild
+    ``findings.resolve`` lands every standing dismissal on the finding
+    with that address (IoU at least ``detections.IOU_THRESHOLD`` for a
+    box) and sets ``Issue.dismissal``, which mutes the card.
+
+    Never deleted by automation. A curator takes one back with
+    ``withdrawn_at``. A stale finding (``STALE_REVIEW2_CHECKS``) has no
+    dismissal: it is a fact about a row a person wrote, and the way out
+    is to withdraw that row.
+
+    Not a ``PageEdit``: a ``DISMISS_ISSUE`` row is a review-1 decision
+    keyed by a printed page number, and the apply reads those rows.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="review_dismissals",
+    )
+    check_name = models.CharField(max_length=100, choices=CheckName.choices)
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="review_dismissals",
+        help_text="The page edit whose shard holds the page; null = the original.",
+    )
+    source_page = models.PositiveIntegerField(
+        help_text="1-based page of the source document.",
+    )
+    end_source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="A run of pages: the source of its last page.",
+    )
+    end_source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="A run of pages: the 1-based last page of its source.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the finding was "
+            "dismissed. Blank matches anything."
+        ),
+    )
+    label = models.CharField(max_length=50, blank=True, default="")
+    target_x0 = models.FloatField(null=True, blank=True)
+    target_y0 = models.FloatField(null=True, blank=True)
+    target_x1 = models.FloatField(null=True, blank=True)
+    target_y1 = models.FloatField(null=True, blank=True)
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="review_dismissals",
+    )
+    withdrawn_at = models.DateTimeField(null=True, blank=True)
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_review_dismissals",
+    )
+
+    class Meta:
+        ordering = ["scan", "check_name", "source_page"]
+        indexes = [
+            models.Index(
+                fields=["scan", "check_name", "withdrawn_at"],
+                name="review_dismissal_scan_check",
+            ),
+        ]
+
+    def __str__(self):
+        state = " [withdrawn]" if self.withdrawn_at else ""
+        return (
+            f"dismissal of {self.check_name} src p.{self.source_page}{state}"
+        )
+
+    @property
+    def target_bbox(self) -> list[float] | None:
+        """The copied box, or None when the target is not a box."""
+        if self.target_x0 is None:
+            return None
+        return [self.target_x0, self.target_y0, self.target_x1, self.target_y1]
 
 
 class DetectionQuerySet(AutoNowQuerySet):
@@ -1637,18 +1842,6 @@ class OpinionBoundary(AbstractDateTimeModel):
         help_text=(
             "Computed rows: the position the pairing gave the opinion, "
             "0-based, in reading order. Null on a human row."
-        ),
-    )
-    uncovered_page_indexes = models.JSONField(
-        default=list,
-        blank=True,
-        help_text=(
-            "The pages of this opinion, in the space of ``apply_run``, "
-            "with a confident HEADNOTE box no headnote rect covers. "
-            "Stamped by the redaction compute (#240 PR B), which measures "
-            "it in the render's pixels where the detections and the "
-            "rects both are; a request cannot, since the redaction rows "
-            "are in points. PR D makes it a finding."
         ),
     )
     decision = models.ForeignKey(

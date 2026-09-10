@@ -28,6 +28,7 @@ from django.views.decorators.http import require_POST
 from scanning import (
     boundaries,
     dots_mocr,
+    findings,
     jobs,
     page_edits,
     repairs,
@@ -39,6 +40,7 @@ from scanning.models import (
     PAGE_EDIT_ROTATIONS,
     PAGE_REVIEW_APPROVED_STATUSES,
     PHYSICAL_PAGE_CHECKS,
+    REVIEW2_CHECKS,
     REVIEW_STATUSES,
     CheckName,
     Detection,
@@ -57,7 +59,6 @@ from scanning.models import (
 )
 from scanning.utils import (
     PIPELINE_PAUSED_MESSAGE,
-    compute_coverage_gaps,
     find_processing_pdf,
     local_original_pdf,
 )
@@ -103,6 +104,10 @@ LEGACY_OCR_RECOMPUTE_MESSAGE = (
     "OCR again to recompute the page numbers."
 )
 RECOMPUTE_DONE_MESSAGE = "The page number issues are recomputed."
+#: The 409 of ``dismiss_issue`` on a review-2 finding (#240 PR D).
+REVIEW2_FINDING_NOT_HERE_MESSAGE = (
+    "This is a finding of the redaction review. Dismiss it from step 2."
+)
 REVALIDATE_UNAVAILABLE_MESSAGE = (
     "This scan cannot be re-run from here. Sharding, the bitonal "
     "conversion and dots.mocr are deterministic, so a re-run adds "
@@ -299,63 +304,6 @@ def detection_message(summary: dict | None) -> str:
     )
 
 
-def _unmatched_detection_dict(
-    det: Detection, idx_to_logical: dict[int, int]
-) -> dict:
-    """Build the template dict for an unmatched detection.
-
-    :param det: The Detection instance.
-    :param idx_to_logical: Mapping from pdf_index to logical page number.
-    :returns: Dict of detection metadata for the template.
-    :rtype: dict
-    """
-    return {
-        "id": det.pk,
-        "pdf_page": det.page_index + 1,
-        "page_index": det.page_index,
-        "label_id": det.label_id,
-        "logical_page": idx_to_logical.get(det.page_index, det.page_index + 1),
-        "conf": round(det.confidence, 2),
-        "bbox": [det.x0, det.y0, det.x1, det.y1],
-        "img_width": det.img_width,
-        "img_height": det.img_height,
-    }
-
-
-def _caption_is_continuation(
-    det: Detection, paired_keys_sorted: list[tuple[int, int, int]]
-) -> bool:
-    """Check if a caption detection falls in a key-icon span.
-
-    If the caption is between two paired key icons, it's a
-    continuation of the opinion in that span, not a missed opinion.
-
-    :param det: A Detection instance with page_index, y0.
-    :param paired_keys_sorted: Sorted list of (page, x, y) tuples
-        for paired key icons.
-    :returns: True if the caption falls in an existing span.
-    :rtype: bool
-    """
-    for i, (kp, kx, ky) in enumerate(paired_keys_sorted):
-        # A caption is only a continuation when it falls between two
-        # *actual* paired keys. The open-ended span past the last key
-        # is a new opinion whose closing key isn't on this scan
-        # (likely continues into the next volume), so leave it as
-        # unmatched.
-        if i + 1 >= len(paired_keys_sorted):
-            break
-        next_kp, _, next_ky = paired_keys_sorted[i + 1]
-        after_key = det.page_index > kp or (
-            det.page_index == kp and det.y0 > ky
-        )
-        before_next = det.page_index < next_kp or (
-            det.page_index == next_kp and det.y0 < next_ky
-        )
-        if after_key and before_next:
-            return True
-    return False
-
-
 @login_required
 def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     """Unified scan processing page with 3-step workflow.
@@ -415,7 +363,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         ):
             # Stay on step 1 if there are unresolved issues
             has_issues = scan.issues.exclude(
-                check_name=CheckName.SUPPRESS_DETECTION
+                check_name__in=REVIEW2_CHECKS
             ).exists()
             has_missing = bool(scan.missing_pages)
             if has_issues or has_missing:
@@ -425,7 +373,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         else:
             step = 1
 
-    issues = list(scan.issues.all())
+    # The review-1 rows only: a review-2 finding (#240 PR D) names a
+    # page by its position in the space the redaction rows are drawn
+    # in, which is not step 1's, and the step-2 section reads those
+    # rows itself (``findings.viewer_groups``, below).
+    issues = list(scan.issues.exclude(check_name__in=REVIEW2_CHECKS))
 
     # Neither GPU stage writes a scan status by design (#190, #195), so
     # their rows are the only place their progress lives.
@@ -642,102 +594,15 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             )
             opinion_scans.append(s)
 
-    # Detection warnings for step 2
+    # The findings of review 2 are rows since #240 PR D
+    # (``findings.rebuild`` writes them after the compute and after
+    # every curator write), read here for the step-2 section. The
+    # printed-pages warning is a request-time condition, not a
+    # finding, so it stays a warning line.
     detect_warnings = []
-    unmatched_keys = []
-    unmatched_captions = []
-    if step >= 2 and opinions:
-        # Build suppressed set from issues
-        suppressed = set()
-        for iss in scan.issues.filter(check_name=CheckName.SUPPRESS_DETECTION):
-            if iss.metadata:
-                m = iss.metadata
-                bb = m.get("bbox", [0, 0, 0, 0])
-                suppressed.add(
-                    (
-                        m.get("page_index", 0),
-                        m.get("label_id", 0),
-                        round(bb[0]),
-                        round(bb[1]),
-                    )
-                )
-
-        # The rows name the caption and the key they were paired from
-        # (#240 PR C), so a paired detection is one an open boundary
-        # points at; a dismissed boundary frees its two, and a boundary
-        # drawn from a point names none.
-        paired_caption_ids = set()
-        paired_key_ids = set()
-        paired_key_keys = set()
-        for op in opinions:
-            if op.get("dismissed"):
-                continue
-            if op.get("caption_detection_id"):
-                paired_caption_ids.add(op["caption_detection_id"])
-            if op.get("key_detection_id"):
-                paired_key_ids.add(op["key_detection_id"])
-
-        for d in Detection.objects.filter(
-            scan=scan, active=True, label="KEY_ICON"
-        ).order_by("page_index"):
-            if d.pk not in paired_key_ids:
-                if (
-                    d.page_index,
-                    d.label_id,
-                    round(d.x0),
-                    round(d.y0),
-                ) not in suppressed:
-                    unmatched_keys.append(
-                        _unmatched_detection_dict(d, idx_to_logical)
-                    )
-
-        # Build sorted list of paired key icon positions so we can
-        # determine which key-icon span an unmatched caption falls in.
-        # If a span already has a paired caption, extra captions in
-        # that span are continuations — not missed opinions. The test
-        # compares pixels, so the positions come off the key rows the
-        # boundaries name; a boundary drawn from a point names none and
-        # adds no span.
-        for d in Detection.objects.filter(pk__in=paired_key_ids):
-            paired_key_keys.add((d.page_index, round(d.x0), round(d.y0)))
-        paired_keys_sorted = sorted(paired_key_keys)
-
-        for d in Detection.objects.filter(
-            scan=scan, active=True, label="CASE_CAPTION"
-        ).order_by("page_index", "y0"):
-            if d.pk in paired_caption_ids:
-                continue
-            if (
-                d.page_index,
-                d.label_id,
-                round(d.x0),
-                round(d.y0),
-            ) in suppressed:
-                continue
-            if _caption_is_continuation(d, paired_keys_sorted):
-                continue
-            unmatched_captions.append(
-                _unmatched_detection_dict(d, idx_to_logical)
-            )
-
-        if unmatched_keys:
-            detect_warnings.append(
-                f"{len(unmatched_keys)} KEY_ICON(s) not matched to any opinion"
-            )
-        if unmatched_captions:
-            detect_warnings.append(
-                f"{len(unmatched_captions)} CASE_CAPTION(s) not matched to any opinion"
-            )
-
-        # Coverage gaps
-        for start, end, count in compute_coverage_gaps(
-            opinions, scan.start_page, scan.end_page
-        ):
-            detect_warnings.append(
-                f"Pages {start}-{end}"
-                f" ({count} pages) not covered"
-                " by any opinion"
-            )
+    review_findings = (
+        findings.viewer_groups(scan, idx_to_logical) if step >= 2 else {}
+    )
 
     if printed_warning:
         detect_warnings.insert(0, printed_warning)
@@ -772,8 +637,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "opinions_json": json.dumps(opinions),
             "opinion_scans": opinion_scans,
             "detect_warnings": detect_warnings,
-            "unmatched_keys": unmatched_keys,
-            "unmatched_captions": unmatched_captions,
+            **review_findings,
             "deleted_pages_json": json.dumps(deleted_pages),
             # The rule of the step-1 bar (#151): the viewer must not
             # offer a control the endpoint refuses. Step 2 runs while
@@ -1898,6 +1762,9 @@ def _review_flags(scan: Scan, repairs_waiting: bool | None = None) -> dict:
         }
     if repairs_waiting is None:
         repairs_waiting = repairs.has_waiting(scan)
+    review2_open, review2_stale = (
+        findings.open_count(scan) if approved else (0, 0)
+    )
     return {
         "page_review_ready": (
             scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
@@ -1927,6 +1794,11 @@ def _review_flags(scan: Scan, repairs_waiting: bool | None = None) -> dict:
         # showed the link on a full load and hid it after the fragment
         # refresh.
         "has_opinions": boundaries.has_live(scan),
+        # The open findings of review 2 (#240 PR D), for the badge and
+        # the confirm of the approve button. Read past the review-1
+        # approval only: before it there is no compute and no finding.
+        "review2_open": review2_open,
+        "review2_stale": review2_stale,
         **page_edits.pending_edit_flags(scan, run),
     }
 
@@ -2049,7 +1921,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "scan": scan,
         "step": step,
         "is_processing": scan.status in BUSY_STATUSES,
-        "issues": scan.issues.all(),
+        "issues": scan.issues.exclude(check_name__in=REVIEW2_CHECKS),
         "missing_pages": scan.missing_pages,
         "has_detections": Detection.objects.filter(scan=scan).exists(),
         "dots_run": dots_mocr.run_summary(scan),
@@ -3230,6 +3102,13 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
     issue = Issue.objects.filter(pk=data.get("issue_id"), scan=scan).first()
     if issue is None:
         return JsonResponse({"error": "Unknown issue."}, status=404)
+    if issue.check_name in REVIEW2_CHECKS:
+        # A review-2 finding has a dismissal of its own (#240 PR D): a
+        # ``ReviewDismissal`` keyed by the target's address, not a page
+        # edit keyed by a printed number.
+        return JsonResponse(
+            {"error": REVIEW2_FINDING_NOT_HERE_MESSAGE}, status=409
+        )
 
     physical = issue.check_name in PHYSICAL_PAGE_CHECKS
     page_edits.supersede(

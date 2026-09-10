@@ -17,7 +17,15 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.utils import timezone
 
-from scanning import apply, boundaries, detections, redactions, services, yolo
+from scanning import (
+    apply,
+    boundaries,
+    detections,
+    findings,
+    redactions,
+    services,
+    yolo,
+)
 from scanning.factories import ScanFactory
 from scanning.models import (
     ApplyRun,
@@ -356,9 +364,11 @@ class ComputeMixin:
         )
         stubs["_snapped_document"] = snapped.start()
         self.addCleanup(snapped.stop)
-        stamp = patch.object(boundaries, "stamp_uncovered", return_value=0)
-        stubs["stamp_uncovered"] = stamp.start()
-        self.addCleanup(pair.stop)
+        # The findings of review 2 are rebuilt at the end (#240 PR D);
+        # the module has its own tests.
+        rebuilt = patch.object(findings, "rebuild", return_value=0)
+        stubs["rebuild_findings"] = rebuilt.start()
+        self.addCleanup(rebuilt.stop)
         # The compute reads the run's two documents (#269): the glued
         # detections in the final page space, and the printed pages.
         load = patch.object(
@@ -575,30 +585,20 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         self.assertEqual(drawn.apply_run, new)
         self.assertEqual(drawn.source_page, 2)
 
-    def test_the_uncovered_headnotes_are_stamped_on_the_boundaries(self):
-        """A confident HEADNOTE box no headnote rect covers is measured
-        in pixels, before the rows are converted, and handed to the
-        boundaries (#240 PR B)."""
+    def test_the_findings_are_rebuilt_in_the_measured_space(self):
+        """The compute hands the run it measured in to the findings
+        (#240 PR D): its own ledger stamp is written after the park,
+        so the rebuild cannot read the space off the ledger."""
         scan, _ = merged_scan()
         stubs = self.patch_geometry()
-        stubs["load_detections_document"].return_value = {
-            **DOCUMENT,
-            "detections": [
-                {
-                    **DOCUMENT["detections"][0],
-                    "label": "HEADNOTE",
-                    "label_id": 5,
-                    "confidence": 0.95,
-                    "bbox": [100.0, 100.0, 200.0, 200.0],
-                }
-            ],
-        }
         self._measured(stubs, [{"page_index": 0, "rects": []}])
 
         services.run_compute_redactions(scan.pk)
 
-        stubs["stamp_uncovered"].assert_called_once()
-        self.assertEqual(stubs["stamp_uncovered"].call_args.args[1], {0})
+        stubs["rebuild_findings"].assert_called_once()
+        args, kwargs = stubs["rebuild_findings"].call_args
+        self.assertEqual(args[0].pk, scan.pk)
+        self.assertEqual(kwargs["run"], apply.current_run(scan))
 
     def test_a_hand_made_detection_survives_the_import(self):
         """A curator's box costs curator time, and it addresses the
