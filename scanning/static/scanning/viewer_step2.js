@@ -1291,11 +1291,21 @@ document.addEventListener('DOMContentLoaded', function () {
             body: JSON.stringify(detData),
         }).then(function (r) { return r.json(); })
         .then(function (data) {
-            if (data.detection_id !== undefined) detData.id = data.detection_id;
-            // Add to allDetections so it shows in overlay
             if (!allDetections) allDetections = [];
-            detData.manual = data.added !== false;
-            allDetections.push(detData);
+            if (data.added === false) {
+                // The server approved a box that is in the list already:
+                // change that entry, and draw no second box over it.
+                for (var ai = 0; ai < allDetections.length; ai++) {
+                    if (allDetections[ai].id === data.detection_id) {
+                        allDetections[ai].confidence = 1.0;
+                        break;
+                    }
+                }
+            } else {
+                if (data.detection_id !== undefined) detData.id = data.detection_id;
+                detData.manual = true;
+                allDetections.push(detData);
+            }
             _cancelDetDraw();
             detectionsVisible[pdfIndex] = true;
             pageDiv.querySelector('.detect-btn').classList.add('active');

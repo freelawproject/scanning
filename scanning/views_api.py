@@ -966,7 +966,6 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
             status=400,
         )
 
-    run = detections.measured_run(scan)
     # Any live row, hand-drawn ones included: a second click on the
     # curator's own box must be a no-op, not a second box over it.
     near = (
@@ -985,19 +984,18 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
     )
     if near is not None:
         if near.model_name != Detection.ModelName.MANUAL:
+            # No run passed: ``decide`` resolves one only for a row with
+            # no address, so the common case costs no ledger read.
             try:
                 detections.decide(
-                    scan,
-                    near,
-                    DetectionDecision.Kind.APPROVE,
-                    request.user,
-                    run=run,
+                    scan, near, DetectionDecision.Kind.APPROVE, request.user
                 )
             except detections.UnaddressableDetection:
                 return _unaddressable()
         return JsonResponse(
             {"status": "ok", "added": False, "detection_id": near.pk}
         )
+    run = detections.measured_run(scan)
     row = detections.add_manual(
         scan,
         page_index,

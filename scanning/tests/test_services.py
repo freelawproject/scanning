@@ -270,10 +270,7 @@ class TestModelProvenanceSurvives(TestCase):
         send the volume back to the legacy gates."""
         from blackletter.bl_warm import rows_are_bl_warm
 
-        from scanning.services import (
-            _detections_for_geometry,
-            detection_entries,
-        )
+        from scanning.services import detection_entries
 
         self._detection()
         self._detection(
@@ -285,7 +282,7 @@ class TestModelProvenanceSurvives(TestCase):
         )
 
         det_data = detection_entries(self.scan.pk)
-        geometry = _detections_for_geometry(self.scan.pk)
+        geometry = detection_entries(self.scan.pk, page_numbers={})
 
         self.assertNotIn("found_by", det_data[1])
         self.assertNotIn("found_by", geometry[1])
@@ -410,11 +407,11 @@ class TestModelProvenanceSurvives(TestCase):
         self.assertFalse(document.bl_warm)
 
     def test_the_geometry_lookup_carries_it_too(self):
-        from scanning.services import _detections_for_geometry
+        from scanning.services import detection_entries
 
         self._detection()
 
-        dets = _detections_for_geometry(self.scan.pk)
+        dets = detection_entries(self.scan.pk, page_numbers={})
 
         self.assertEqual(
             dets[0]["found_by"],
@@ -594,7 +591,7 @@ class TestComputeAndSaveMarginRects(TestCase):
 
     def test_reads_detections_from_the_db_not_the_file(self):
         """The DB is the source of truth, and is always reachable."""
-        from scanning.services import _detections_for_geometry
+        from scanning.services import detection_entries
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(
@@ -606,7 +603,7 @@ class TestComputeAndSaveMarginRects(TestCase):
             self.assertFalse(
                 (pathlib.Path(scan.output_dir) / "detections.json").exists()
             )
-            dets = _detections_for_geometry(scan.pk)
+            dets = detection_entries(scan.pk, page_numbers={})
             self.assertEqual([d["label"] for d in dets], ["TEXT_COLUMN"])
             self.assertEqual(dets[0]["bbox"], [100, 200, 1600, 2000])
 
@@ -1811,9 +1808,7 @@ class TestPagesForGeometry(TestCase):
     def test_widens_an_uncorrected_box_without_persisting_it(self):
         from scanning.services import _pages_for_geometry
 
-        pages = _pages_for_geometry(
-            self.scan, str(self.pdf), self.scan.output_dir
-        )
+        pages = _pages_for_geometry(self.scan, str(self.pdf))
         box = pages[0].detections[0].bbox
         self.assertAlmostEqual(box.x1, COLUMN_LEFT.x0, delta=2.0)
         self.assertAlmostEqual(box.x2, COLUMN_LEFT.x1, delta=2.0)
@@ -1825,9 +1820,7 @@ class TestPagesForGeometry(TestCase):
         """The steps that never read a column box must not pay to fix one."""
         from scanning.services import _pages_for_geometry
 
-        pages = _pages_for_geometry(
-            self.scan, str(self.pdf), self.scan.output_dir, snap=False
-        )
+        pages = _pages_for_geometry(self.scan, str(self.pdf), snap=False)
         self.assertEqual(pages[0].detections[0].bbox.x1, COLUMN_LEFT.x0 + 6)
 
 

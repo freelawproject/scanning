@@ -1639,14 +1639,16 @@ two review-2 endpoints in `views_api.py`. What must not be broken:
 - **`found_by` is load-bearing, in three places.** The confidence gates
   are per model family since blackletter #73
   (`label_confidence(label, document.bl_warm)`), so the provenance has
-  to survive the merge, the `Detection` row and `detections.json` —
-  `blackletter.api.pair` reads `rows_are_bl_warm` off that *file*. On
+  to survive the merge, the `Detection` row and the entry list
+  `services.detection_entries` builds from the rows —
+  `blackletter.api.pair` reads `rows_are_bl_warm` off that *list*
+  (`detections.json` carried it until #240). On
   one volume of 1364 pages the wrong family keeps 13 editorial notes
   bl-warm drops and loses 8 header boxes it keeps. A hand-added box
   carries no `found_by` on purpose: one would read as a second family
   and send the whole volume back to the legacy gates. `add_single_detection`
-  used to write a `manual` claim there, so the two collectors
-  (`_sync_detections_to_disk`, `_detections_for_geometry`) copy the
+  used to write a `manual` claim there, so the one collector
+  (`detection_entries`) copies the
   field off non-`MANUAL` rows only — the row kind is the guard, because
   the rows written before the fix are still in the database and a
   re-import keeps them.
@@ -1945,15 +1947,14 @@ the apply-outputs routes, and migration 0024. What must not be broken:
   merged run with no final run parks by the rule with "not built yet"
   and spends no attempt, the backstop for an admin supersede between
   the queue and the claim.
-- **`detections.json` carries the numbers of the space its boxes are
-  in.** `services._page_number_lookup(scan, printed=None)` resolves by
-  the rows: a measured scan reads the run's printed pages, every other
-  reads `Scan.ocr_results`. Six callers write that file
-  (`_compute_and_save_redaction_rects`, the compute, the paused step 3 and three
-  `views_api` endpoints); the compute loads the document once and
-  hands the lookup to **both** writers, since the second write is the
-  one `_push_processing_files_to_s3` ships. `printed_page_span` is the
-  one parser of a stored number.
+- **The detection entries carry the numbers of the space their boxes
+  are in.** `services._page_number_lookup(scan, printed=None)` resolves
+  by the rows: a measured scan reads the run's printed pages, every
+  other reads `Scan.ocr_results`. `services.detection_entries` puts the
+  number beside each box (it wrote `detections.json` until #240; the
+  list is in memory now, and nothing ships it); the compute loads the
+  printed pages once and hands the lookup to both of its reads.
+  `printed_page_span` is the one parser of a stored number.
 - **The crop of an edit page is 404.** `serve_original_crop?space=final`
   maps a final index through `run.page_map`: an `original` source
   crops the original at its page; an inserted, replaced or rotated page
@@ -2291,7 +2292,7 @@ decisions, the resolution), `services._import_detections` and
 - **`detections.json` is retired.** `services.detection_entries` is the
   in-memory list it used to hold (the live rows, the printed number
   beside each box), and every reader takes the list: `bl_pair` accepts
-  one, `_compute_and_save_redaction_rects` and `_detections_for_geometry`
+  one, `_compute_and_save_redaction_rects` and `_pages_for_geometry`
   read the rows, `run_generate_files` (paused) too. Nothing writes the
   file or pushes it, and the compute pushes nothing at all: every output
   of the pass is a row, and `redaction_rects` / `margin_rects` /
@@ -2309,12 +2310,12 @@ decisions, the resolution), `services._import_detections` and
 
 YOLO models detect elements on each page (captions, key icons, headnotes, etc.) and store them as `Detection` records with a confidence score. Users review detections in the process viewer (step 2) and can:
 
-- **Approve (boost):** Set an existing detection's confidence to 1.0, confirming the model was correct. This is called "boosting" because it raises a low-confidence detection to full confidence without changing which model found it.
-- **Add:** Create a new detection manually (confidence 1.0, model_name "manual") when the model missed something. If a detection with the same label and approximate position already exists, it gets boosted instead of duplicated.
-- **Delete:** Deactivate a detection (sets `active=False`). The record stays in the DB but is excluded from pairing and redaction.
-- **Suppress:** Flag a detection via an Issue record so it's excluded from pairing warnings without deleting it.
+- **Approve (boost):** an `approve` `DetectionDecision` on the model row (#240), which reads as confidence 1.0 without changing which model found it. It survives the next import.
+- **Add:** a hand-drawn `Detection` (confidence 1.0, model_name "manual"), addressed by its source page, when the model missed something. A box drawn within 15 px of a live box with the same label approves that box instead, or is a no-op on the curator's own box.
+- **Delete:** a `deactivate` decision on a model row (`active` reads False), or a withdrawal of a hand-drawn row. The record stays in the DB and is excluded from pairing and redaction.
+- **Suppress:** Flag a detection via an Issue record so it's excluded from pairing warnings without deleting it. (PR D of #240 replaces it with a dismissal of the finding.)
 
-Detections are stored both in the DB (`Detection` model) and on disk (`detections.json`). Both are kept in sync by `_sync_detections_to_disk()`. The JSON file is used by blackletter for opinion pairing and file generation.
+The rows are the only store since #240. `services.detection_entries` builds the list blackletter reads for the pairing and the geometry, in memory; `detections.json` is gone.
 
 ## PDF Sharding
 

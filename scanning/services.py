@@ -858,45 +858,8 @@ def _compute_and_save_redaction_rects(
     return rects
 
 
-def _detections_for_geometry(scan_pk: int) -> list:
-    """Detection dicts for the geometry helpers, off the live rows.
-
-    The rows are the one store since #240: ``detections.json`` was a
-    copy of them that one pod wrote and another might not have, and
-    nothing reads it any more.
-
-    :param scan_pk: Primary key of the scan.
-    :return: Detection dicts shaped as :func:`detection_entries` shapes
-        them, without the page numbers, which the geometry does not read.
-    """
-    rows = (
-        Detection.objects.live()
-        .filter(scan_id=scan_pk)
-        .order_by("page_index", "y0")
-    )
-    return [
-        {
-            "page_index": d.page_index,
-            "label": d.label,
-            "label_id": d.label_id,
-            "confidence": d.confidence,
-            "bbox": [d.x0, d.y0, d.x1, d.y1],
-            "img_width": d.img_width,
-            "img_height": d.img_height,
-            # The model family, which picks the confidence gates. See
-            # :func:`detection_entries`, which writes the same field.
-            **(
-                {"found_by": d.found_by}
-                if d.found_by and d.model_name != Detection.ModelName.MANUAL
-                else {}
-            ),
-        }
-        for d in rows
-    ]
-
-
 def _pages_for_geometry(
-    scan: "Scan", pdf_path: str, output_dir: str | Path, snap: bool = True
+    scan: "Scan", pdf_path: str, snap: bool = True
 ) -> list:
     """The detected pages blackletter's geometry should be measured against.
 
@@ -906,8 +869,6 @@ def _pages_for_geometry(
 
     :param scan: The scan being processed.
     :param pdf_path: The PDF the detections were measured against.
-    :param output_dir: The scan's output directory. Unused since #240,
-        kept so the callers need no change.
     :param snap: Correct the ``TEXT_COLUMN`` boxes against the page ink.
         Boxes reach the DB uncorrected: nothing on the upload path snaps
         them (that would be a full-volume render review 1 does not need),
@@ -918,7 +879,8 @@ def _pages_for_geometry(
         read (see :func:`_build_combined_redactions`).
     :return: ``Page`` objects, empty when the scan has no detections yet.
     """
-    det_data = _detections_for_geometry(scan.pk)
+    # No page numbers: the geometry reads the boxes, not the labels.
+    det_data = detection_entries(scan.pk, page_numbers={})
     if not det_data:
         return []
     document = _build_document_from_detections(scan, det_data, pdf_path)
@@ -950,7 +912,7 @@ def _compute_and_save_margin_rects(
     scan = Scan.objects.get(pk=scan_pk)
     if scan.margin_rects and not force:
         return scan.margin_rects
-    pages = _pages_for_geometry(scan, pdf_path, Path(output_dir))
+    pages = _pages_for_geometry(scan, pdf_path)
     if not pages:
         # Without detections the bounds would come from the page's marks
         # alone, so bleed-through at a page edge suppresses that page's top
@@ -990,7 +952,7 @@ def _build_combined_redactions(scan_pk: int) -> Path:
     # ``snap=False``: this step reads only each page's dimensions and scale,
     # never its column boxes, so correcting them would render the whole
     # volume at 100 dpi to change nothing.
-    pages = _pages_for_geometry(scan, pdf_path, output_dir, snap=False)
+    pages = _pages_for_geometry(scan, pdf_path, snap=False)
 
     try:
         combined = bl_build_redactions(
