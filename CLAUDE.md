@@ -2210,6 +2210,52 @@ attempt's first claim, when the row is handed to the provider.
   it shallow: at most the concurrency cap is in flight, so a healthy
   endpoint's queue wait sits far under the ceiling.
 
+## An apply row goes first in the queue (issue #291)
+
+The external job queue drained in creation order, per engine
+(`jobs._pending_slice`, one query per wave). An apply row (#224) holds
+one edit of a volume a curator already approved in review 1, and it is
+by construction one of the newest rows, so it waited behind every PENDING
+volume shard of every volume nobody had opened. A volunteer answered a
+repair request (#249), a curator approved the review, and the corrected
+volume then waited for the whole backlog. The rank is one key before the
+id: `annotate(is_apply=Q(apply_run__isnull=False))`, then
+`order_by("-is_apply", "id")`.
+
+- **The rank reads the row, not `Scan.status`.** The `apply_run` column
+  already says "past review 1": only the apply creates a row that
+  carries it. The reason not to rank the status is that it moves under a
+  row that is already waiting. It is **not** the cost of a join: the
+  slice reaches `scan` through `select_related` already. The two other
+  queries of that shape (`yolo.enqueue_missing_runs` and
+  `apply._candidate_scan_ids`) read statuses because they choose a
+  *scan*; a wave chooses a row.
+- **The id stays the second key.** Inside one class the creation order
+  is what keeps the drain fair, and it is the order every log line and
+  every timing of the stage was measured in.
+- **The rank almost never makes a volume row fail.** A PENDING row
+  nobody claimed carries no deadline (#218), so a de-ranked shard waits
+  and does not fail. The exception is a row a RunPod endpoint declined:
+  `jobs._defer` hands it back to PENDING with its ceiling intact, and
+  the stranded sweep fails it `QUEUE_TIMEOUT` at that ceiling. The
+  apply set is small, so the added wait is minutes against a six-hour
+  ceiling — an accepted trade, not an oversight. That set is bounded
+  twice over: `apply.MAX_SCANS_IN_FLIGHT` (5) caps the scans out at
+  once, and a run makes **one row per edit** — the pages of one edit,
+  which `apply.edit_page_count` counts (an image is one page, an
+  inserted PDF holds what a scanner sent, and a missing leaf is often
+  two), which in practice is far smaller than a volume shard.
+- **The rank picks who takes a free place, and preempts nothing.**
+  `_room_for` counts the in-flight rows against the engine's cap before
+  the slice, so a running conversion is never stopped and the caps are
+  unchanged.
+- **The scan queue's rank is a different rule and is not touched.**
+  `process_next_scan.CLAIM_PRIORITY` ranks by *action* and puts the
+  apply last, with `CLAIM_LIFT_SECONDS` (15 min) to keep it from
+  starving; there the wait is a person's upload against a backfill.
+  Here every row is already paid work of a volume in the flow, and the
+  apply row is the one a reviewer is waiting for.
+
 ## Detection provenance and the curator's decisions (issue #240, PR A)
 
 The first of the four PRs of the #240 plan (the comment of 2026-09-09
