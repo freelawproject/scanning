@@ -549,15 +549,7 @@ def relocate_manual_rows(
     """
     from scanning import apply
 
-    page_map = run.page_map or {}
-    originals = apply.originals_to_final(page_map)
-    slots = {
-        (entry["source"]["edit_id"], entry["source"]["page"]): entry[
-            "final_page"
-        ]
-        for entry in page_map.get("pages") or []
-        if entry["source"]["kind"] == "edit"
-    }
+    place = apply.index_placer(run.page_map or {})
     moved = 0
     unplaced: list[Detection] = []
     rows = Detection.objects.filter(
@@ -574,16 +566,13 @@ def relocate_manual_rows(
         if row.source_page is None or stale:
             unplaced.append(row)
             continue
-        if row.source_edit_id is None:
-            final = originals.get(row.source_page)
-        else:
-            final = slots.get((row.source_edit_id, row.source_page - 1))
+        final = place(row.source_edit_id, row.source_page)
         if final is None:
             unplaced.append(row)
             continue
-        if row.page_index != final - 1 or row.apply_run_id != run.pk:
+        if row.page_index != final or row.apply_run_id != run.pk:
             Detection.objects.filter(pk=row.pk).update(
-                page_index=final - 1, apply_run=run
+                page_index=final, apply_run=run
             )
             moved += 1
     if unplaced:

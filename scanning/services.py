@@ -21,9 +21,6 @@ import fitz
 from blackletter.api import (
     build_redactions as bl_build_redactions,
 )
-from blackletter.api import (
-    pair as bl_pair,
-)
 from blackletter.bl_warm import rows_are_bl_warm
 from blackletter.margins import compute_margin_rects
 from blackletter.models import (
@@ -51,6 +48,7 @@ from blackletter.validate import (
 from django.conf import settings
 from django.db.models import Case, F, Value, When
 
+from scanning import boundaries
 from scanning.models import (
     BUSY_STATUSES,
     DEAD_JOB_STATUSES,
@@ -720,6 +718,10 @@ def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
     det_data = []
     for d in all_saved:
         entry = {
+            # The row pk, so the compute can name the caption and the
+            # key rows of each opinion exactly (#240 PR C). blackletter
+            # reads the keys it knows and ignores this one.
+            "id": d.pk,
             "page_index": d.page_index,
             "label": d.label,
             "label_id": d.label_id,
@@ -760,6 +762,28 @@ def _build_document_from_detections(
     :param pdf_path: Path to the PDF to read page dimensions from.
     :return: The constructed Document.
     """
+    document, _ids = _build_document_with_ids(scan, det_data, pdf_path)
+    return document
+
+
+def _build_document_with_ids(
+    scan: "Scan", det_data: list, pdf_path: str
+) -> tuple["BLDoc", dict[int, int]]:
+    """Build the Document, and remember which row each detection came from.
+
+    The pairing (#240 PR C) returns blackletter's own detection objects,
+    which carry no row pk, so the compute maps each object back to its
+    ``Detection`` row by ``id()`` and writes the caption and the key FKs
+    exactly, with no match by rounded coordinates. Only an entry that
+    carries ``"id"`` (:func:`detection_entries` puts it there) is in the
+    map.
+
+    :param scan: The Scan instance for reporter/volume metadata.
+    :param det_data: List of detection dicts (:func:`detection_entries`).
+    :param pdf_path: Path to the PDF to read page dimensions from.
+    :return: The Document and ``{id(bl_detection): Detection pk}``.
+    """
+    row_ids: dict[int, int] = {}
     with fitz.open(str(pdf_path)) as src_pdf:
         pages_data = {}
         for entry in det_data:
@@ -787,14 +811,15 @@ def _build_document_from_detections(
             )
             for d in pd["detections"]:
                 b = d.get("bbox", [0, 0, 1, 1])
-                page.detections.append(
-                    BLDetection(
-                        bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
-                        label=Label(d["label_id"]),
-                        confidence=d["confidence"],
-                        page_index=pi,
-                    )
+                detection = BLDetection(
+                    bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
+                    label=Label(d["label_id"]),
+                    confidence=d["confidence"],
+                    page_index=pi,
                 )
+                page.detections.append(detection)
+                if d.get("id") is not None:
+                    row_ids[id(detection)] = d["id"]
             pages.append(page)
 
     scan_obj = scan if isinstance(scan, Scan) else Scan.objects.get(pk=scan)
@@ -814,11 +839,41 @@ def _build_document_from_detections(
         # ``found_by``, and blackletter reads it (blackletter #73).
         bl_warm=rows_are_bl_warm(det_data),
     )
-    return document
+    return document, row_ids
+
+
+def _snapped_document(
+    scan: "Scan", pdf_path: str, page_numbers: dict | None = None
+) -> tuple["BLDoc", dict[int, int], list]:
+    """Build the corrected document the compute pairs and measures on.
+
+    Every blackletter entry point corrects the column boxes before
+    reading them, and the margin strips of this same scan are computed
+    from corrected ones. Skipping it here is how a hand-added
+    TEXT_COLUMN (which reaches the DB exactly as the reviewer drew it)
+    would give the headnote rects a different column to the margins on
+    the same page.
+
+    :param scan: The scan.
+    :param pdf_path: The PDF the detections were measured against.
+    :param page_numbers: See :func:`detection_entries`.
+    :return: The document, the ``{id(bl_detection): pk}`` map, and the
+        entries it was built from (empty when the scan has none).
+    """
+    det_data = detection_entries(scan.pk, page_numbers=page_numbers)
+    if not det_data:
+        return BLDoc(pdf_path=str(pdf_path), pages=[]), {}, []
+    document, row_ids = _build_document_with_ids(scan, det_data, pdf_path)
+    snap_document_columns(document)
+    return document, row_ids, det_data
 
 
 def _compute_and_save_redaction_rects(
-    scan_pk: int, pdf_path: str, page_numbers: dict | None = None
+    scan_pk: int,
+    pdf_path: str,
+    page_numbers: dict | None = None,
+    document: "BLDoc | None" = None,
+    pairs: list | None = None,
 ) -> list:
     """Compute redaction rects and save to the Scan model.
 
@@ -826,24 +881,26 @@ def _compute_and_save_redaction_rects(
     :param pdf_path: Path to the PDF used for page dimensions.
     :param page_numbers: The page-number lookup beside each box, when
         the caller holds it; see :func:`detection_entries`.
+    :param document: The snapped document, when the caller built it
+        (the redaction compute does, once, #240 PR C).
+    :param pairs: The ``(caption, key)`` pairs of that document, when
+        the caller paired it; paired here otherwise.
     :return: The computed rects list.
     """
     scan = Scan.objects.get(pk=scan_pk)
 
-    det_data = detection_entries(scan_pk, page_numbers=page_numbers)
-    if not det_data:
+    if document is None:
+        document, _ids, det_data = _snapped_document(
+            scan, pdf_path, page_numbers
+        )
+        if not det_data:
+            return []
+        pairs = None
+    if not document.pages:
         return []
 
     with _log_stage("Redaction rects"):
-        document = _build_document_from_detections(scan, det_data, pdf_path)
-        # Every blackletter entry point corrects the column boxes before
-        # reading them, and the margin strips of this same scan are computed
-        # from corrected ones. Skipping it here is how a hand-added
-        # TEXT_COLUMN (which reaches the DB exactly as the reviewer drew it)
-        # would give the headnote rects a different column to the margins on
-        # the same page.
-        snap_document_columns(document)
-        opinions = _pair_opinions(document)
+        opinions = _pair_opinions(document) if pairs is None else pairs
         # ``ocr_applied`` is set on the Document, so blackletter measures
         # this geometry from the page ink itself (see
         # ``scanner._measure_from_ink``), and finishes each headnote rect
@@ -960,7 +1017,7 @@ def _build_combined_redactions(scan_pk: int) -> Path:
             pages,
             scan.redaction_rects,
             scan.margin_rects,
-            scan.opinions_json,
+            boundaries.viewer_payload(scan, live_only=True),
             reporter=scan.reporter.short_name or "",
             volume=str(scan.volume) or "",
         )
@@ -1844,21 +1901,30 @@ def run_compute_redactions(scan_pk: int) -> None:
             with _log_stage("Column correction"):
                 _snap_text_columns_to_ink(scan_pk, pdf_path)
 
-        det_data = detection_entries(scan_pk, page_numbers=page_numbers)
+        # One corrected document for the pairing and the geometry, and
+        # one pairing (#240 PR C): the boundaries are rows written from
+        # blackletter's own pairs, with the caption and the key rows
+        # named exactly, and the rects are measured from the same pairs.
+        document, row_ids, det_data = _snapped_document(
+            scan, pdf_path, page_numbers
+        )
         _update_progress(scan_pk, "Pairing the opinions...")
         with _log_stage("Opinion pairing"):
-            opinions = bl_pair(
-                det_data,
-                pdf_path,
-                reporter=scan.reporter.short_name or "",
-                volume=str(scan.volume) or "",
-                first_page=scan.start_page or 1,
+            opinions = boundaries.write_computed(
+                scan,
+                document,
+                row_ids,
+                run,
+                rows[0].run if merged else None,
             )
-        Scan.objects.filter(pk=scan_pk).update(opinions_json=opinions)
 
         _update_progress(scan_pk, "Computing the redactions...")
         rects = _compute_and_save_redaction_rects(
-            scan_pk, pdf_path, page_numbers=page_numbers
+            scan_pk,
+            pdf_path,
+            page_numbers=page_numbers,
+            document=document,
+            pairs=opinions,
         )
 
         _update_progress(scan_pk, "Measuring the page margins...")
@@ -2561,21 +2627,22 @@ def run_generate_files(scan_pk: int) -> None:
         )
 
         scan.refresh_from_db()
-        existing_opinions = scan.opinions_json
+        # The boundaries are rows since #240 PR C; the file names land
+        # on the dicts in reading order, as ``build_redactions`` names
+        # them.
+        existing_opinions = boundaries.viewer_payload(scan, live_only=True)
 
-        if existing_opinions and "caption_page" in existing_opinions[0]:
+        if existing_opinions:
             for i, op in enumerate(existing_opinions):
                 if i < len(redacted_files):
                     op["filename"] = redacted_files[i].name
         else:
-            existing_opinions = []
             for f in redacted_files:
                 existing_opinions.append(
                     {"filename": f.name, "first_page": 0, "last_page": 0}
                 )
 
         scan.redacted_pdf_path = str(full_redacted) if full_redacted else ""
-        scan.opinions_json = existing_opinions
         scan.progress_message = "Saving opinion records..."
         scan.save()
 
@@ -2594,6 +2661,7 @@ def run_generate_files(scan_pk: int) -> None:
                 caption_page_index=op.get("caption_page"),
                 key_page_index=op.get("key_page"),
                 has_image=op.get("has_image", False),
+                boundary_id=op.get("id"),
                 status=OpinionStatus.OK,
                 uploaded_by=scan.uploaded_by,
             )

@@ -18,7 +18,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from scanning import apply, review_states, services, yolo
-from scanning.factories import ScanFactory
+from scanning.factories import OpinionBoundaryFactory, ScanFactory
 from scanning.models import (
     ApplyRun,
     Detection,
@@ -541,26 +541,45 @@ class TestTheStepTwoBar(ScanningTestCase):
         self.assertNotIn("approve-redactions", bar)
 
     def test_the_approval_is_the_gate_of_step_three(self):
-        opinions = [{"id": 1}]
-        waiting = ScanFactory(
-            status=Status.READY_FOR_REDACTION_REVIEW,
-            opinions_json=opinions,
-        )
-        approved = ScanFactory(
-            status=Status.REDACTION_REVIEW_DONE, opinions_json=opinions
-        )
+        waiting = ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
+        approved = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
+        OpinionBoundaryFactory(scan=waiting)
+        OpinionBoundaryFactory(scan=approved)
 
         self.assertNotIn("Next: Generate", self._bar(waiting))
         self.assertIn("Next: Generate", self._bar(approved))
 
+    def test_a_curator_drawn_boundary_alone_shows_the_link(self):
+        """Both renders of the bar read ``has_opinions`` (#240 PR C), so
+        a volume whose only boundary is a curator's shows the link in
+        the fragment as on the full load, and a dismissed computed
+        boundary alone shows none."""
+        from scanning import boundaries
+        from scanning.factories import UserFactory
+        from scanning.models import OpinionBoundary
+
+        scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE, page_count=3)
+        self.assertNotIn("Next: Generate", self._bar(scan))
+
+        OpinionBoundaryFactory(
+            scan=scan,
+            origin=OpinionBoundary.Origin.HUMAN,
+            kind=OpinionBoundary.Kind.ADD,
+            ordinal=None,
+        )
+        self.assertIn("Next: Generate", self._bar(scan))
+
+        dismissed = OpinionBoundaryFactory(
+            scan=ScanFactory(status=Status.REDACTION_REVIEW_DONE, page_count=3)
+        )
+        boundaries.dismiss(dismissed.scan, dismissed, UserFactory())
+        self.assertNotIn("Next: Generate", self._bar(dismissed.scan))
+
     def test_a_legacy_volume_keeps_its_link(self):
         """It can hold neither #263 status, so a gate on the approval
         alone would strand it in step 2."""
-        scan = ScanFactory(
-            status=Status.PENDING_REVIEW,
-            opinions_json=[{"id": 1}],
-            page_count=2,
-        )
+        scan = ScanFactory(status=Status.PENDING_REVIEW, page_count=2)
+        OpinionBoundaryFactory(scan=scan)
 
         self.assertIn("Next: Generate", self._bar(scan))
 
@@ -568,11 +587,8 @@ class TestTheStepTwoBar(ScanningTestCase):
         """The gate reads the status, not ``has_legacy_ocr``: a
         backfill dots.mocr run turns that false while the volume is
         still in the legacy step 2."""
-        scan = ScanFactory(
-            status=Status.PENDING_REVIEW,
-            opinions_json=[{"id": 1}],
-            page_count=2,
-        )
+        scan = ScanFactory(status=Status.PENDING_REVIEW, page_count=2)
+        OpinionBoundaryFactory(scan=scan)
 
         with patch.object(services, "has_legacy_ocr", return_value=False):
             bar = self._bar(scan)

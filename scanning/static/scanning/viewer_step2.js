@@ -1067,6 +1067,16 @@ document.addEventListener('DOMContentLoaded', function () {
                     e.stopPropagation();
                     _selectDetectionBox(detBox, det);
                 });
+                // The anchor pick mode of the sidebar (#240 PR C): a
+                // single click on a caption or a key icon box sets the
+                // anchor. The mode yields first, or the click would
+                // fall through to the page.
+                detBox.addEventListener('click', function(e) {
+                    if (window.boundaryPickTarget && window.boundaryPickTarget(det)) {
+                        e.stopPropagation();
+                        e.preventDefault();
+                    }
+                });
             })(d, box);
 
             wrapper.appendChild(box);
@@ -1429,6 +1439,9 @@ document.addEventListener('DOMContentLoaded', function () {
         _boundsPageOwners = {};
         _boundsOutsideByPage = {};
         _opinionsData.forEach(function(op, idx) {
+            // A dismissed boundary keeps its card (with its undo) and
+            // draws nothing (#240 PR C).
+            if (op.dismissed) return;
             var startIdx = op.caption_page;
             var endIdx = (op.key_page !== undefined) ? op.key_page : op.caption_page;
             for (var p = startIdx; p <= endIdx; p++) {
@@ -2413,6 +2426,18 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function _loadOpinionsData(cb) {
         if (_opinionsData) { cb(); return; }
+        // The page carries the same payload the endpoint answers
+        // (#opinions-data, read by viewer_sidebar.js too), and the
+        // endpoint may read S3 for the printed numbers of a measured
+        // volume. Read the tag; the fetch stays for a page without it.
+        var tag = document.getElementById('opinions-data');
+        if (tag) {
+            try {
+                _opinionsData = JSON.parse(tag.textContent);
+                cb();
+                return;
+            } catch (e) { /* fall through to the fetch */ }
+        }
         fetch('/scans/' + documentId + '/opinions-json/')
             .then(function(r) { return r.json(); })
             .then(function(data) { _opinionsData = data; cb(); });

@@ -665,11 +665,6 @@ class Scan(AbstractDateTimeModel):
         blank=True,
         help_text="Per-page OCR detection results.",
     )
-    opinions_json = models.JSONField(
-        default=list,
-        blank=True,
-        help_text="Opinion boundary data.",
-    )
     page_map = models.JSONField(
         default=list,
         blank=True,
@@ -989,6 +984,19 @@ class OpinionScan(AbstractDateTimeModel):
     caption_page_index = models.PositiveIntegerField(null=True, blank=True)
     key_page_index = models.PositiveIntegerField(null=True, blank=True)
     has_image = models.BooleanField(default=False)
+    boundary = models.ForeignKey(
+        "OpinionBoundary",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_scans",
+        help_text=(
+            "The review-2 boundary this file was cut from (issue #240, "
+            "PR C). Step 3 sets it when it creates the row; a computed "
+            "boundary is rebuilt at each compute, so the link stands "
+            "only while the boundary row does (#165)."
+        ),
+    )
 
     class Meta:
         indexes = [
@@ -1442,6 +1450,307 @@ class DetectionDecision(AbstractDateTimeModel):
     def __str__(self):
         state = " [withdrawn]" if self.withdrawn_at else ""
         return f"{self.kind} {self.label} src p.{self.source_page}{state}"
+
+
+class OpinionBoundaryQuerySet(AutoNowQuerySet):
+    """The reads every consumer of the opinion boundaries shares (#240)."""
+
+    def computed(self):
+        """Return the rows the pairing wrote.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(origin=OpinionBoundary.Origin.COMPUTED)
+
+    def human(self):
+        """Return the rows a curator wrote, withdrawn or not.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(origin=OpinionBoundary.Origin.HUMAN)
+
+    def standing_dismissals(self):
+        """Return the curator's dismissals that are not withdrawn.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(
+            origin=OpinionBoundary.Origin.HUMAN,
+            kind=OpinionBoundary.Kind.DISMISS,
+            withdrawn_at__isnull=True,
+        )
+
+    def standing_additions(self):
+        """Return the boundaries a curator added and did not take back.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(
+            origin=OpinionBoundary.Origin.HUMAN,
+            kind=OpinionBoundary.Kind.ADD,
+            withdrawn_at__isnull=True,
+        )
+
+
+class OpinionBoundary(AbstractDateTimeModel):
+    """One opinion of a volume, or one curator decision about one (#240, PR C).
+
+    A boundary is two **anchors**: the start is the top-left corner of
+    the case caption, the end the bottom-right corner of the key icon
+    that closes the opinion. Each anchor is a point in PDF points on a
+    **source page** (``*_source_edit``, ``*_source_page``: the original
+    as uploaded, or the one-page shard of a page edit -- the address the
+    apply's page map names, the rule of ``Detection``), and its
+    position in the space the compute measured in (``*_page_index``,
+    0-based, in the space of ``apply_run``). The address survives a new
+    apply run; the index is what the viewer draws.
+
+    **Two families of rows, the rule of the detections.** A *computed*
+    row (``origin`` ``COMPUTED``) is written by the pairing
+    (``boundaries.write_computed``), and every compute deletes the
+    scan's computed rows and writes them again. A *human* row (``origin``
+    ``HUMAN``) is one curator decision, and automation never deletes
+    it: an ``ADD`` is a boundary the curator drew, a ``DISMISS`` is a
+    decision about a computed boundary. A curator takes a human row
+    back with ``withdrawn_at`` (#232).
+
+    **A dismissal names its target by its anchors**, in the anchor
+    columns, because the computed row it was made on is gone at the
+    next compute. ``boundaries.resolve`` then lands it on the new
+    computed row with the same start address whose start anchor is
+    within ``boundaries.ANCHOR_TOLERANCE_PT``, and sets ``decision`` on
+    that row. A move of an anchor is a ``DISMISS`` plus an ``ADD`` that
+    names it in ``replaces``, so withdrawing the addition gives the
+    computed boundary back.
+
+    ``start_detection`` and ``end_detection`` are the caption and key
+    rows the pairing used, or the boxes the curator picked. They are
+    ``SET_NULL``: the model rows are deleted at every import, and the
+    anchors carry the position on their own.
+    """
+
+    objects = OpinionBoundaryQuerySet.as_manager()
+
+    class Origin(models.TextChoices):
+        COMPUTED = "computed", "Computed by the pairing"
+        HUMAN = "human", "Made by a curator"
+
+    class Kind(models.TextChoices):
+        ADD = "add", "A boundary the curator added"
+        DISMISS = "dismiss", "A computed boundary the curator dismissed"
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="opinion_boundaries",
+    )
+    origin = models.CharField(max_length=10, choices=Origin.choices)
+    kind = models.CharField(
+        max_length=10,
+        choices=Kind.choices,
+        blank=True,
+        default="",
+        help_text="Human rows only; blank on a computed row.",
+    )
+
+    start_source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="boundary_starts",
+        help_text=(
+            "The page edit whose shard holds the start page; null = "
+            "the original as uploaded."
+        ),
+    )
+    start_source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "1-based page of the start's source document. Null when the "
+            "map held no address for the page at write time."
+        ),
+    )
+    start_page_index = models.PositiveIntegerField(
+        help_text="0-based page of the start, in the space of ``apply_run``."
+    )
+    start_x = models.FloatField(help_text="PDF points: the caption's left.")
+    start_y = models.FloatField(help_text="PDF points: the caption's top.")
+
+    end_source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="boundary_ends",
+        help_text="As ``start_source_edit``, for the end page.",
+    )
+    end_source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="As ``start_source_page``, for the end page.",
+    )
+    end_page_index = models.PositiveIntegerField(
+        help_text="0-based page of the end, in the space of ``apply_run``."
+    )
+    end_x = models.FloatField(help_text="PDF points: the key icon's right.")
+    end_y = models.FloatField(help_text="PDF points: the key icon's bottom.")
+
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the row was written. "
+            "Blank matches anything (the #214 rule)."
+        ),
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_boundaries",
+        help_text=(
+            "The apply run whose final page space the two indexes are "
+            "in (#269). Null for the original's space."
+        ),
+    )
+    detect_run = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Computed rows: the detection run (``ExternalJob.run``) the "
+            "pairing read."
+        ),
+    )
+    start_detection = models.ForeignKey(
+        Detection,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_starts",
+        help_text="The caption row the start anchor was taken from.",
+    )
+    end_detection = models.ForeignKey(
+        Detection,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_ends",
+        help_text="The key icon row the end anchor was taken from.",
+    )
+    ordinal = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Computed rows: the position the pairing gave the opinion, "
+            "0-based, in reading order. Null on a human row."
+        ),
+    )
+    decision = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="decided_boundaries",
+        help_text=(
+            "Computed rows: the standing dismissal resolved onto this "
+            "row. Null while the boundary stands."
+        ),
+    )
+    replaces = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replacements",
+        help_text=(
+            "Additions only: the dismissal this boundary was made in "
+            "place of, when a curator moved an anchor."
+        ),
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_boundaries",
+        help_text="Human rows: the curator.",
+    )
+    withdrawn_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Human rows only: when the curator took the row back. "
+            "Never rewritten."
+        ),
+    )
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_opinion_boundaries",
+        help_text="Who took the row back. Null while it stands.",
+    )
+
+    class Meta:
+        ordering = ["scan", "start_page_index", "start_y", "start_x"]
+        indexes = [
+            models.Index(
+                fields=["scan", "origin", "withdrawn_at"],
+                name="idx_opb_scan_open",
+            ),
+            models.Index(
+                fields=["scan", "start_source_edit", "start_source_page"],
+                name="idx_opb_scan_start_source",
+            ),
+            models.Index(
+                fields=["scan", "start_page_index"],
+                name="idx_opb_scan_start_index",
+            ),
+        ]
+        constraints = [
+            # A computed row has no kind; a human row has one of the two.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(origin="computed", kind="")
+                    | models.Q(origin="human", kind__in=["add", "dismiss"])
+                ),
+                name="opinion_boundary_kind_matches_origin",
+            ),
+        ]
+
+    @property
+    def is_computed(self) -> bool:
+        return self.origin == self.Origin.COMPUTED
+
+    @property
+    def is_dismissed(self) -> bool:
+        """Whether a standing dismissal hides this computed row.
+
+        The FK is cleared when the dismissal is withdrawn, so the FK
+        alone answers.
+        """
+        return self.decision_id is not None
+
+    @property
+    def start_address(self) -> tuple[int | None, int | None]:
+        return self.start_source_edit_id, self.start_source_page
+
+    @property
+    def end_address(self) -> tuple[int | None, int | None]:
+        return self.end_source_edit_id, self.end_source_page
+
+    def __str__(self):
+        what = self.kind or "opinion"
+        state = " [withdrawn]" if self.withdrawn_at else ""
+        return (
+            f"{what} p.{self.start_page_index + 1}-{self.end_page_index + 1}"
+            f"{state}"
+        )
 
 
 def page_edit_image_path(instance: "PageEdit", filename: str) -> str:

@@ -225,7 +225,7 @@ reach step 2.
   {% elif redaction_review_done %}
   <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed the redactions of this volume">&#10003; Redaction review done</span>
   {% endif %}
-  {% if opinions and redaction_review_done or opinions and legacy_review %}
+  {% if has_opinions and redaction_review_done or has_opinions and legacy_review %}
   <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
   {% endif %}
 

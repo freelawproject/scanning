@@ -25,6 +25,7 @@ from scanning.views import (
     update_scan_status,
 )
 from scanning.views_api import (
+    add_boundary,
     add_single_detection,
     apply_rect_to_opinion,
     approve_detection,
@@ -32,11 +33,13 @@ from scanning.views_api import (
     bake_redactions,
     compute_redactions_api,
     delete_detection,
+    dismiss_boundary,
     export_pdf,
     flag_issue,
     generate_files,
     pair_opinions_api,
     remove_flag,
+    restore_boundary,
     save_margin_rect,
     save_redaction_rect,
     serve_detections,
@@ -266,6 +269,22 @@ urlpatterns = [
     ),
     path(
         "scans/<int:pk>/opinions-json/", serve_opinions, name="serve_opinions"
+    ),
+    # The curator's decisions about the opinion boundaries (#240 PR C).
+    path(
+        "scans/<int:pk>/boundaries/dismiss/",
+        dismiss_boundary,
+        name="dismiss_boundary",
+    ),
+    path(
+        "scans/<int:pk>/boundaries/restore/",
+        restore_boundary,
+        name="restore_boundary",
+    ),
+    path(
+        "scans/<int:pk>/boundaries/add/",
+        add_boundary,
+        name="add_boundary",
     ),
     path(
         "scans/<int:pk>/margin-rects/",

@@ -454,6 +454,134 @@ function deleteDuplicates(btn) {
     });
 }
 
+// --- Opinion boundaries (#240 PR C) ---
+//
+// Every card names a boundary row. Dismiss and Undo post the row id and
+// reload, as pairOpinions does: the cards are rendered by the server,
+// and a reload is the one path that cannot disagree with it. The two
+// anchor buttons enter a pick mode; the viewer (viewer_step2.js) calls
+// window.boundaryPickTarget() on a click on a detection box, and
+// finishBoundaryPick posts the move.
+
+function _postBoundary(path, body) {
+    var cfg = window.SCAN_CONFIG;
+    return fetch("/scans/" + cfg.docId + "/boundaries/" + path + "/", {
+        method: "POST",
+        headers: {
+            "X-CSRFToken": cfg.csrfToken,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+    }).then(function (r) {
+        return r.json().then(function (data) {
+            data._httpOk = r.ok;
+            return data;
+        });
+    });
+}
+
+function _boundaryFailed(data) {
+    // The endpoint's refusal (a 409 with a message) or a transport
+    // fault: say what came back, and leave the card as it was.
+    var msg = (data && data.message) || "The change was not saved.";
+    if (window.showToast) showToast(msg, "error");
+    else alert(msg);
+}
+
+function dismissBoundary(btn) {
+    var card = btn.closest(".opinion-nav");
+    if (!card) return;
+    btn.disabled = true;
+    _postBoundary("dismiss", { boundary_id: parseInt(card.dataset.boundaryId) })
+        .then(function (data) {
+            if (data.status !== "ok") { btn.disabled = false; _boundaryFailed(data); return; }
+            window.location.reload();
+        })
+        .catch(function (err) { btn.disabled = false; _boundaryFailed({ message: String(err) }); });
+}
+
+function restoreBoundary(btn) {
+    var card = btn.closest(".opinion-nav");
+    if (!card) return;
+    btn.disabled = true;
+    _postBoundary("restore", { boundary_id: parseInt(card.dataset.boundaryId) })
+        .then(function (data) {
+            if (data.status !== "ok") { btn.disabled = false; _boundaryFailed(data); return; }
+            window.location.reload();
+        })
+        .catch(function (err) { btn.disabled = false; _boundaryFailed({ message: String(err) }); });
+}
+
+var _boundaryPick = null;
+
+function pickBoundaryAnchor(btn, which) {
+    var card = btn.closest(".opinion-nav");
+    if (!card) return;
+    var idx = parseInt(card.dataset.index || "0");
+    var op = _opinions[idx];
+    if (!op) return;
+    cancelBoundaryPick();
+    _boundaryPick = { boundaryId: op.id, which: which, op: op, card: card };
+    document.body.classList.add("boundary-pick");
+    card.classList.add("picking");
+    var banner = document.createElement("div");
+    banner.id = "boundary-pick-banner";
+    banner.className = "rounded bg-purple-700 text-white text-xs px-3 py-2 shadow";
+    banner.textContent = which === "start"
+        ? "Click a case caption box to set the start of opinion #" + (idx + 1) + " (Esc to cancel)"
+        : "Click a key icon box to set the end of opinion #" + (idx + 1) + " (Esc to cancel)";
+    document.body.appendChild(banner);
+}
+
+function cancelBoundaryPick() {
+    if (!_boundaryPick) return;
+    _boundaryPick.card.classList.remove("picking");
+    _boundaryPick = null;
+    document.body.classList.remove("boundary-pick");
+    var banner = document.getElementById("boundary-pick-banner");
+    if (banner) banner.remove();
+}
+
+// Called by the viewer with the detection under the click. Returns true
+// when the click was consumed by the pick mode.
+window.boundaryPickTarget = function (det) {
+    if (!_boundaryPick || !det) return false;
+    var wanted = _boundaryPick.which === "start" ? "CASE_CAPTION" : "KEY_ICON";
+    if (det.label !== wanted) {
+        if (window.showToast) showToast("Pick a " + wanted.replace("_", " ").toLowerCase() + " box.", "warning");
+        return true;
+    }
+    var op = _boundaryPick.op;
+    var start, end;
+    if (_boundaryPick.which === "start") {
+        start = { detection_id: det.id };
+        end = op.key_detection_id
+            ? { detection_id: op.key_detection_id }
+            : { page_index: op.key_page, x: op.end.x, y: op.end.y };
+    } else {
+        end = { detection_id: det.id };
+        start = op.caption_detection_id
+            ? { detection_id: op.caption_detection_id }
+            : { page_index: op.caption_page, x: op.start.x, y: op.start.y };
+    }
+    // The row is replaced whatever wrote it: the endpoint dismisses a
+    // computed boundary, and withdraws a curator's addition while it
+    // carries its dismissal, so a second move leaves one boundary.
+    var body = { start: start, end: end, replaces: op.id };
+    cancelBoundaryPick();
+    _postBoundary("add", body)
+        .then(function (data) {
+            if (data.status !== "ok") { _boundaryFailed(data); return; }
+            window.location.reload();
+        })
+        .catch(function (err) { _boundaryFailed({ message: String(err) }); });
+    return true;
+};
+
+document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") cancelBoundaryPick();
+});
+
 function pairOpinions() {
     var cfg = window.SCAN_CONFIG;
     if (cfg.step < 2) return;

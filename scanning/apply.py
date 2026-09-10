@@ -294,6 +294,42 @@ def originals_to_final(page_map: dict) -> dict[int, int]:
     }
 
 
+def index_placer(page_map: dict):
+    """Return a function from a source address to a 0-based final index.
+
+    The one arithmetic for a row that carries its address and must find
+    its page in a run's space: an original page goes through
+    :func:`originals_to_final` (a replaced page has new content, so a
+    row on it does not carry), an edit page through the ``(edit_id,
+    page)`` slots of the map. ``detections.relocate_manual_rows`` and
+    ``boundaries.placer`` both read it (#240).
+
+    :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
+    :returns: A callable ``(edit_id, source_page)`` -> index, with
+        ``source_page`` 1-based and ``edit_id`` None for the original;
+        None for an address the map does not hold.
+    """
+    originals = originals_to_final(page_map)
+    slots = {
+        (entry["source"]["edit_id"], entry["source"]["page"]): entry[
+            "final_page"
+        ]
+        for entry in page_map.get("pages") or []
+        if entry["source"]["kind"] == "edit"
+    }
+
+    def place(edit_id, source_page):
+        if not source_page:
+            return None
+        if edit_id is None:
+            final = originals.get(source_page)
+        else:
+            final = slots.get((edit_id, source_page - 1))
+        return None if final is None else final - 1
+
+    return place
+
+
 def slots_to_final(page_map: dict) -> dict[int, int]:
     """Return ``{original pdf_page: final page}`` for every held slot.
 

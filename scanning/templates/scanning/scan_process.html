@@ -14,6 +14,24 @@
 .opinion-nav.selected span {
     color: #bfdbfe !important;
 }
+.opinion-nav.selected button {
+    color: white !important;
+}
+/* The anchor pick mode (#240 PR C): the viewer waits for a click on a
+   caption or a key icon box. */
+body.boundary-pick .detection-box {
+    cursor: crosshair;
+}
+body.boundary-pick .opinion-nav.picking {
+    outline: 2px dashed #7c3aed;
+}
+#boundary-pick-banner {
+    position: fixed;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 60;
+}
 @keyframes unmatched-pulse {
     0%, 100% { border-color: #f59e0b; background: rgba(245, 158, 11, 0.15); }
     50% { border-color: #ef4444; background: rgba(239, 68, 68, 0.2); }
@@ -292,17 +310,45 @@
       {% endfor %}
       {% endif %}
       {% if opinions %}
-      <h2 class="text-sm font-bold mb-2">Opinions ({{ opinions|length }})</h2>
+      <h2 class="text-sm font-bold mb-2">Opinions ({{ opinion_count }})</h2>
+      {% comment %}
+        One card per boundary row (#240 PR C). A dismissed computed
+        boundary stays in the list, muted, with its undo; a boundary the
+        curator added is marked. The Dismiss button and the two anchor
+        pickers post to the boundary endpoints and reload.
+      {% endcomment %}
       {% for op in opinions %}
-      <div class="rounded border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 px-2 py-1.5 mb-1 cursor-pointer text-xs opinion-nav"
+      <div class="rounded border px-2 py-1.5 mb-1 cursor-pointer text-xs opinion-nav{% if op.dismissed %} opinion-dismissed border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 opacity-60{% else %} border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20{% endif %}"
            data-index="{{ forloop.counter0 }}"
+           data-boundary-id="{{ op.id }}"
+           data-origin="{{ op.origin }}"
+           data-dismissed="{{ op.dismissed|yesno:'true,false' }}"
            data-caption-page="{{ op.caption_page|add:1 }}"
            data-key-page="{% if op.end_page %}{{ op.end_page|add:1 }}{% else %}{{ op.key_page|add:1 }}{% endif %}"
            onclick="selectOpinion(this, {{ op.caption_page|add:1 }})">
-        <span class="font-bold">{{ forloop.counter }}</span>
-        {% if op.has_image %}<span title="Contains image(s)">🖼️</span>{% endif %}
-        {% if op.uncovered_headnote_pages %}<span title="Uncovered headnote(s)">⚠️</span>{% endif %}
-        <span class="text-gray-600 dark:text-gray-300">Pages {% if op.first_page_number %}{{ op.first_page_number }}&ndash;{{ op.last_page_number }}{% else %}{{ op.caption_page|add:1 }}&ndash;{{ op.key_page|add:1 }}{% endif %} ({{ op.page_count }} pg)</span>
+        <div class="flex items-center justify-between gap-1">
+          <span>
+            <span class="font-bold">{{ forloop.counter }}</span>
+            {% if op.origin == "human" %}<span class="text-[10px] px-1 rounded bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-200" title="Drawn by a curator">curator</span>{% endif %}
+            {% if op.dismissed %}<span class="text-[10px] px-1 rounded bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200" title="Dismissed by a curator">dismissed</span>{% endif %}
+            {% if op.has_image %}<span title="Contains image(s)">🖼️</span>{% endif %}
+            {% if op.uncovered_headnote_pages %}<span title="Uncovered headnote(s)">⚠️</span>{% endif %}
+            <span class="text-gray-600 dark:text-gray-300">Pages {% if op.first_page_number %}{{ op.first_page_number }}&ndash;{{ op.last_page_number }}{% else %}{{ op.caption_page|add:1 }}&ndash;{{ op.key_page|add:1 }}{% endif %} ({{ op.page_count }} pg)</span>
+          </span>
+          <span class="flex gap-1 ml-1 shrink-0">
+            {% if op.dismissed %}
+            <button class="px-1 py-0.5 rounded bg-blue-600 text-white text-[10px] hover:bg-blue-700" title="Give this opinion back"
+                    onclick="event.stopPropagation(); restoreBoundary(this)">Undo</button>
+            {% else %}
+            <button class="px-1 py-0.5 rounded bg-gray-500 text-white text-[10px] hover:bg-gray-600 boundary-anchor-btn" title="Set the start of this opinion: then click a case caption box in the viewer"
+                    onclick="event.stopPropagation(); pickBoundaryAnchor(this, 'start')">&#8676;</button>
+            <button class="px-1 py-0.5 rounded bg-gray-500 text-white text-[10px] hover:bg-gray-600 boundary-anchor-btn" title="Set the end of this opinion: then click a key icon box in the viewer"
+                    onclick="event.stopPropagation(); pickBoundaryAnchor(this, 'end')">&#8677;</button>
+            <button class="px-1 py-0.5 rounded bg-red-600 text-white text-[10px] hover:bg-red-700" title="{% if op.origin == 'human' %}Take this boundary back; the computed one it replaced comes back{% else %}Dismiss this opinion boundary{% endif %}"
+                    onclick="event.stopPropagation(); dismissBoundary(this)">&#10005;</button>
+            {% endif %}
+          </span>
+        </div>
       </div>
       {% if op.image_pages %}
       <div class="ml-4 mb-1 flex flex-wrap gap-0.5">
