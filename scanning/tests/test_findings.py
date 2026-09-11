@@ -19,6 +19,7 @@ from django.utils import timezone
 from scanning import findings
 from scanning.factories import OpinionBoundaryFactory, ScanFactory
 from scanning.models import (
+    BUSY_STATUSES,
     REVIEW2_CHECKS,
     ApplyRun,
     CheckName,
@@ -922,8 +923,25 @@ class TestTheRebuildButton(ScanningTestCase):
 
         self.assertEqual(self._rebuild().status_code, 302)
 
+    def test_a_busy_volume_is_refused(self):
+        """The compute writes the findings itself and stamps the run it
+        measured in afterwards (#305). A rebuild in that window reads
+        the stamp of the space before it, so the endpoint refuses every
+        busy status, as the sidebar offers no button there.
+        """
+        before = checks_of(self.scan)
+        for status in sorted(BUSY_STATUSES):
+            with self.subTest(status=status):
+                Scan.objects.filter(pk=self.scan.pk).update(status=status)
+
+                response = self._rebuild()
+
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.json()["status"], "error")
+                self.assertEqual(checks_of(self.scan), before)
+
     def test_an_approved_review_still_rebuilds(self):
-        """No status gate (#305). The rebuild is derived from the rows
+        """No review gate (#305). The rebuild is derived from the rows
         and is idempotent, so a closed review gets what it had.
         """
         before = checks_of(self.scan)

@@ -687,6 +687,7 @@ class TestComputeRedactionsApiView(TestCase):
         )
 
         self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["status"], "error")
         self.scan.refresh_from_db()
         self.assertEqual(self.scan.status, Status.REDACTION_REVIEW_DONE)
 
@@ -695,7 +696,9 @@ class TestComputeRedactionsApiView(TestCase):
             f"/scans/{self.scan.pk}/compute-redactions/"
         )
         self.assertEqual(response.status_code, 400)
-        self.assertIn("error", response.json())
+        # The refusal shape of every other endpoint of step 2 (#305).
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("message", response.json())
 
     def test_a_volume_with_detections_is_queued(self):
         self._detection()

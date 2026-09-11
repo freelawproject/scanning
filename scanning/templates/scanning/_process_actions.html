@@ -217,8 +217,17 @@ reach step 2.
     The confirm names the cost in time, not in money. The measurement
     renders every page on the daemon -- 83 seconds for 1364 pages --
     and takes the volume out of the review while it runs, but it pays
-    no RunPod money. The curator's own boxes and decisions are kept: a
-    recompute against the standing apply run imports no model row.
+    no RunPod money. Every row the curator wrote is kept: a recompute
+    against the standing apply run imports no model row.
+
+    One thing the confirm does not promise, because the compute cannot
+    keep it: a dismissed text box can come back. The fit of #279
+    narrows every text box to the read text, a dismiss lands by an IoU
+    of at least 0.5 against a copy of the box it named, and a box that
+    loses half its width falls under that. The volumes already in
+    review 2 carry the wide boxes, since the backfill left a dismissed
+    one alone on purpose. The curator sees a "not applied" card and
+    dismisses it again. The guard that ends this is #307.
 
     It is not offered after the approval. ``REDACTION_COMPUTE_STATUSES``
     refuses ``REDACTION_REVIEW_DONE`` -- a closed review is not
@@ -226,7 +235,7 @@ reach step 2.
     never send a curator to an action that refuses.
   {% endcomment %}
   {% if redaction_review_ready or legacy_review %}
-  <button type="button" class="btn-outline text-sm" id="recompute-btn" title="Pair the opinions again and measure every redaction from the detection boxes as they are now. It runs on the server and takes this volume out of the review for a minute or more. Your boxes and your decisions are kept." onclick="return recomputeRedactions();">Recompute redactions</button>
+  <button type="button" class="btn-outline text-sm" id="recompute-btn" title="Pair the opinions again and measure every redaction from the detection boxes as they are now. It runs on the server and takes this volume out of the review for a minute or more. Your boxes and your decisions are kept, but a text box you dismissed can come back when the new reading makes it much narrower." onclick="return recomputeRedactions();">Recompute redactions</button>
   {% endif %}
   {% comment %}
     The open findings of review 2 (#240 PR D). The button obeys: the

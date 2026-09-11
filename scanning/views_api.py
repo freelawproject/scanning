@@ -29,6 +29,7 @@ from django.utils.http import http_date
 from django.views.decorators.http import require_POST
 
 from scanning.models import (
+    BUSY_STATUSES,
     REVIEW2_CHECKS,
     Detection,
     DetectionDecision,
@@ -53,9 +54,8 @@ def _rebuild_findings(scan: Scan) -> None:
     """Write the review-2 findings again after a curator's write (#240 PR D).
 
     Every finding is derived from the detection, boundary and redaction
-    rows, and the recompute is off until #211, so the endpoint that
-    changed a row is what keeps the cards true. A few queries over
-    label-filtered rows.
+    rows, so the endpoint that changed a row is what keeps the cards
+    true. A few queries over label-filtered rows.
 
     :param scan: The scan.
     :return: None.
@@ -559,6 +559,20 @@ def restore_redaction(
     return JsonResponse({"status": "ok", "restored": restored})
 
 
+#: The refusal of the redaction recompute when the volume carries no
+#: box to measure (#305).
+NO_DETECTIONS_MESSAGE = (
+    "This volume has no detections yet, so there is nothing to measure."
+)
+
+#: The refusal of the findings rebuild while the volume is busy (#305).
+#: The compute writes the findings itself and stamps the run it
+#: measured in afterwards, so a rebuild in that window would write the
+#: cards against the space before it.
+FINDINGS_BUSY_MESSAGE = (
+    "This volume is busy. Its findings are written when the work ends."
+)
+
 #: The gate of step 3 in the view (#263/#269): a volume of the new
 #: pipeline reaches the file generation through the review-2 approval.
 GENERATE_REQUIRES_REDACTION_REVIEW_MESSAGE = (
@@ -596,6 +610,10 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
+    A refusal answers ``{status, message}``, the shape of every other
+    refusal of these views. It answered ``{error}`` while no button
+    reached it (#196); the curator reads the message now.
+
     :return: JSON response saying the work is queued, 400 when the
         volume has no detection to measure, or 409 when the status
         takes no compute (``services.REDACTION_COMPUTE_STATUSES``: a
@@ -603,13 +621,17 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
     """
     scan = get_object_or_404(Scan, pk=pk)
     if not Detection.objects.filter(scan=scan, active=True).exists():
-        return JsonResponse({"error": "No detections found"}, status=400)
+        return JsonResponse(
+            {"status": "error", "message": NO_DETECTIONS_MESSAGE}, status=400
+        )
 
     from scanning.services import queue_redaction_compute
 
     queued, message = queue_redaction_compute(scan)
     if not queued:
-        return JsonResponse({"error": message}, status=409)
+        return JsonResponse(
+            {"status": "error", "message": message}, status=409
+        )
     logger.info(
         "scan %s: %s queued a redaction recompute", scan.pk, request.user
     )
@@ -1114,17 +1136,29 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
     needs :func:`compute_redactions_api` instead.
 
     Every logged-in user may press it: review 2 is a curator's step,
-    not a staff one (#151). No status gate: the rebuild is derived from
-    the rows and is idempotent, so a volume whose rows cannot change
-    gets the findings it already had.
+    not a staff one (#151). No review gate either: the rebuild is
+    derived from the rows and is idempotent, so a volume whose rows
+    cannot change gets the findings it already had.
+
+    **A busy volume is refused.** The compute writes the findings
+    itself, against the run it measured in, and stamps that run on the
+    ledger afterwards; a rebuild in that window reads the stamp of the
+    space before it and writes the cards against the wrong one. The
+    sidebar shows the progress panel there and offers no button, and a
+    gate lives in the view, not only in the template.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: ``{status, html, open, stale}``.
+    :return: ``{status, html, open, stale}``; 409 while the volume is
+        busy.
     """
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
+    if scan.status in BUSY_STATUSES:
+        return JsonResponse(
+            {"status": "error", "message": FINDINGS_BUSY_MESSAGE}, status=409
+        )
     findings.rebuild(scan)
     logger.info(
         "scan %s: %s rebuilt the review-2 findings", scan.pk, request.user

@@ -723,11 +723,16 @@ function recomputeRedactions() {
     if (cfg.step < 2) return false;
     var btn = document.getElementById("recompute-btn");
     if (!btn) return false;
+    // The confirm says what the measurement keeps and what it can
+    // change (#305). Every row stays, and a dismiss lands again on the
+    // box it named; but a text box the new reading makes much narrower
+    // can lose its dismiss and come back, as a "not applied" card.
     if (!window.confirm(
         "The redactions are measured again from the boxes as they are now. " +
         "This volume leaves the review while the server works, and the page " +
         "reloads when the server is done. Your boxes and your decisions are " +
-        "kept. Continue?"
+        "kept. A text box you dismissed can come back when the new reading " +
+        "makes it much narrower. Continue?"
     )) return false;
     btn.textContent = "Queueing...";
     btn.disabled = true;
@@ -739,10 +744,12 @@ function recomputeRedactions() {
             return r.json();
         })
         .then(function (data) {
-            if (data.error) {
+            // The refusal shape of every other endpoint of step 2:
+            // {status: "error", message} (#305).
+            if (!data || data.status !== "queued") {
                 btn.textContent = "Recompute redactions";
                 btn.disabled = false;
-                showToast(data.error, "error");
+                showToast((data && data.message) || "Could not queue the recompute.", "error");
                 return;
             }
             window.location.reload();

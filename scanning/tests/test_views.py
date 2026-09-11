@@ -3063,7 +3063,7 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
             reverse("compute_redactions_api", kwargs={"pk": self.scan.pk})
         )
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["error"], "No detections found")
+        self.assertEqual(response.json()["status"], "error")
 
     def test_the_recompute_queues_the_work(self):
         """The button of review 2 queues the measurement (#305).
