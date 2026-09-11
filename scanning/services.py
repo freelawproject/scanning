@@ -1703,6 +1703,7 @@ def run_compute_redactions(scan_pk: int) -> None:
         redactions,
         review_states,
         s3_sync,
+        text_fit,
         yolo,
     )
     from scanning import detections as decisions
@@ -1855,6 +1856,17 @@ def run_compute_redactions(scan_pk: int) -> None:
 
         _update_progress(scan_pk, "Computing the redactions...")
         rects = _measure_redaction_rects(document, opinions)
+
+        # A text box is then fitted to the text the reader found under
+        # it (#279). blackletter builds it from the column bounds of
+        # the page, and this app gives the page none, so the fallback
+        # 50/50 split makes every box overrun its column; blackletter
+        # cannot narrow it afterwards, and the dots.mocr cells can.
+        _update_progress(scan_pk, "Fitting the text redactions...")
+        with _log_stage("Text redaction fit"):
+            text_fit.fit_rects(
+                rects, text_fit.load_cells(scan, run), document.pages
+            )
 
         _update_progress(scan_pk, "Measuring the page margins...")
         margins = _measure_margin_rects(pdf_path, document)

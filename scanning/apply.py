@@ -2471,6 +2471,35 @@ def load_detections_document(scan: Scan, run: ApplyRun) -> dict:
     return yolo.load_document_at(scan, run.detections_key)
 
 
+def load_ocr_document(scan: Scan, run: ApplyRun) -> dict:
+    """Read the run's glued OCR document (the final page space).
+
+    The pages of :func:`_glue_ocr`, keyed by ``page_index`` of the
+    corrected volume, each with the dots.mocr cells of the source page
+    it came from. The volume's own document (``dots_mocr.glued_volume_key``)
+    is the same shape in the original's space, so one reader serves
+    both spaces (``text_fit.page_cells``).
+
+    :param scan: The scan.
+    :param run: The standing, complete run.
+    :returns: The document :func:`_glue_ocr` wrote.
+    :rtype: dict
+    :raises ApplyError: If the document cannot be read.
+    """
+    try:
+        document = s3_sync.download_json_object(run.ocr_key)
+    except Exception as exc:
+        raise ApplyError(
+            f"scan {scan.pk}: the OCR volume of {run.label} at "
+            f"{run.ocr_key} could not be read: {exc}"
+        ) from exc
+    if not isinstance(document, dict) or "pages" not in document:
+        raise ApplyError(
+            f"scan {scan.pk}: the object at {run.ocr_key} is not an OCR volume"
+        )
+    return document
+
+
 def load_printed_pages(scan: Scan, run: ApplyRun) -> dict:
     """Read the run's printed-page map (the final page space).
 
