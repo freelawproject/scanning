@@ -1,0 +1,58 @@
+{% comment %}
+  The guide of the review 2 viewer (issue #299). Two controls had no text
+  anywhere: the Dismiss button behind a double click on a detection box,
+  which writes a decision and deletes nothing, and the key "r", which was
+  the only control of the overlay cycle.
+
+  The four rows of the overlay table are the one definition of the cycle
+  (#299). toggleOverlays in viewer_step2.js reads data-label off the row
+  of the active mode and writes data-mode on the button, and checker.css
+  holds the colour of each mode. A second copy in the script was what the
+  dead toggle-overlays-btn label map already was.
+
+  The detections part is hidden until the boxes are on, because it
+  describes what a reviewer can do to a box that is on the page.
+{% endcomment %}
+<div id="viewer-help-panel" class="viewer-help-panel" hidden>
+  <h3>Overlays <span class="viewer-help-key">r</span></h3>
+  <ul id="viewer-help-modes" class="viewer-help-modes">
+    <li data-overlay-mode="off" data-label="Overlays Off (r)">
+      <span class="viewer-help-swatch"></span>
+      <b>Overlays Off</b> &mdash; draws nothing, so you see the page alone.
+    </li>
+    <li data-overlay-mode="bounds" data-label="Bounds (r)">
+      <span class="viewer-help-swatch"></span>
+      <b>Bounds</b> &mdash; draws the opinion boundaries, one colour for each opinion.
+    </li>
+    <li data-overlay-mode="transparent" data-label="Overlays (r)">
+      <span class="viewer-help-swatch"></span>
+      <b>Overlays</b> &mdash; draws the redaction boxes and the margin strips. You can see through them.
+    </li>
+    <li data-overlay-mode="solid" data-label="Solid (r)">
+      <span class="viewer-help-swatch"></span>
+      <b>Solid</b> &mdash; draws the same boxes, filled black or white, as the output has them.
+    </li>
+  </ul>
+
+  <div id="viewer-help-detections" hidden>
+    <h3>Detections</h3>
+    <ul class="viewer-help-list">
+      <li><b>Detections</b> on a page label shows or hides the boxes on every page.</li>
+      <li>Double click a box to select it. The handles and the <b>Dismiss</b> button come.</li>
+      <li>Drag the body of the box to move it. Drag a handle to change the size.</li>
+      <li>A box of the model that you move becomes your own box. The old box gets a dismissal.</li>
+      <li><b>Dismiss</b> takes the box out of the volume. Nothing is deleted, and a new import keeps your choice.</li>
+      <li>Click away from the box to deselect it.</li>
+      <li>When an opinion card waits for an anchor, one click on a case caption box or a key icon box sets the anchor.</li>
+      <li><b>Draw</b> makes a new box. <b>Redact</b> and <b>Whiteout</b> draw a redaction.</li>
+    </ul>
+  </div>
+
+  <h3>Keys</h3>
+  <ul class="viewer-help-list">
+    <li><span class="viewer-help-key">r</span> one step of the overlay cycle.</li>
+    <li><span class="viewer-help-key">&larr;</span> <span class="viewer-help-key">&rarr;</span> the opinion before or after this one.</li>
+    <li><span class="viewer-help-key">&uarr;</span> <span class="viewer-help-key">&darr;</span> one page up or down.</li>
+    <li><span class="viewer-help-key">Esc</span> clears the selection.</li>
+  </ul>
+</div>

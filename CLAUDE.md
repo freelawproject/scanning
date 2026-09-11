@@ -166,6 +166,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - No migration writes a finding: `rebuild_review2_findings` writes them once after the deploy. `flag_issue`, `remove_flag` and the three user-action checks are gone
 - A text redaction box is fitted to the dots.mocr cells under it (`text_fit.fit_span`, #279): the horizontal limits only, never wider, only a `TEXT_RECT_TYPES` box, and only on a page whose cells were read. The vertical limits stay on the ink. `text_fit.load_cells` is the one rule for which OCR document the fit reads, the twin of `geometry_pdf_path`
 - The fit leaves a computed row a standing dismiss points at alone (`refit_text_redactions`, #279), so every decision keeps its IoU on the box it named. Nothing sets `Page.col_*` or `midpoint`, so blackletter measures every box from the fallback 50/50 split
+- The four overlay modes have one table, the rows of `_viewer_help.html`: the `r` cycle, the mode button's label and the guide all read it, and `checker.css` keys the colour by `data-mode`. Never write a second copy (#299)
 
 ## Worker images
 

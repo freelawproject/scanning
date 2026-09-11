@@ -63,7 +63,7 @@
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Approve the detection (confidence 1.0). The card stays until the opinions are paired again."
             onclick="event.stopPropagation(); approveDetection(this)">&#10003;</button>
     {% endif %}
-    <button class="px-1 py-0.5 rounded bg-red-600 text-white text-[10px] hover:bg-red-700" title="Delete the detection"
+    <button class="px-1 py-0.5 rounded bg-red-600 text-white text-[10px] hover:bg-red-700" title="Take the detection out of the volume. Nothing is deleted, and a new import keeps your choice."
             onclick="event.stopPropagation(); deleteUnmatchedDetection(this)">&#10005;</button>
     {% endif %}
     <button class="text-[10px] px-2 py-0.5 rounded bg-gray-600 text-white" title="Judge this finding not worth acting on. It stays muted, with an undo." onclick="event.stopPropagation(); dismissFinding(this, {{ issue.pk }})">Dismiss</button>

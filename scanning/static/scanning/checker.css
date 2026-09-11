@@ -1065,3 +1065,97 @@ a.doc-name:hover { text-decoration: underline; }
         border-color: #34d399;
     }
 }
+
+/* The guide of the review 2 viewer (#299).
+   The mode button carries the colour of the active overlay mode, keyed by
+   data-mode. The map lived in viewer_step2.js and wrote to an element no
+   template held, so the cycle had no cue at all. */
+.zoom-toolbar .overlay-mode-btn {
+    font-size: 11px;
+    padding: 3px 8px;
+    color: #ffffff;
+    border-color: rgba(255, 255, 255, 0.25);
+}
+.zoom-toolbar .overlay-mode-btn[data-mode="off"] { background: #6b7280; }
+.zoom-toolbar .overlay-mode-btn[data-mode="bounds"] { background: #2563eb; }
+.zoom-toolbar .overlay-mode-btn[data-mode="transparent"] { background: #dc2626; }
+.zoom-toolbar .overlay-mode-btn[data-mode="solid"] { background: #059669; }
+.zoom-toolbar .overlay-mode-btn:hover { filter: brightness(1.15); }
+.zoom-toolbar .viewer-help-btn {
+    font-weight: 700;
+    padding: 3px 9px;
+}
+.zoom-toolbar .viewer-help-btn.active {
+    background: #f59e0b;
+    border-color: #f59e0b;
+    color: #1f2937;
+}
+
+/* The panel sits under the toolbar and sticks with it, so a reviewer can
+   read it while the pages move. It is in the flow, so it never covers a
+   page it explains. */
+.viewer-help-panel {
+    position: sticky;
+    top: 40px;
+    left: 0;
+    z-index: 29;
+    width: max-content;
+    max-width: 460px;
+    margin-bottom: 12px;
+    padding: 8px 12px;
+    background: rgba(40, 42, 45, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    color: #e5e7eb;
+    font-size: 12px;
+    line-height: 1.5;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+.viewer-help-panel h3 {
+    margin: 8px 0 4px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #9ca3af;
+}
+.viewer-help-panel h3:first-child { margin-top: 0; }
+.viewer-help-panel ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+.viewer-help-panel li {
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+.viewer-help-panel .viewer-help-list li { padding-left: 12px; text-indent: -8px; }
+.viewer-help-modes li.active {
+    background: rgba(245, 158, 11, 0.18);
+    box-shadow: inset 2px 0 0 #f59e0b;
+}
+.viewer-help-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-right: 6px;
+    border-radius: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    vertical-align: baseline;
+}
+.viewer-help-modes [data-overlay-mode="off"] .viewer-help-swatch { background: #6b7280; }
+.viewer-help-modes [data-overlay-mode="bounds"] .viewer-help-swatch { background: #2563eb; }
+.viewer-help-modes [data-overlay-mode="transparent"] .viewer-help-swatch { background: #dc2626; }
+.viewer-help-modes [data-overlay-mode="solid"] .viewer-help-swatch { background: #059669; }
+.viewer-help-key {
+    display: inline-block;
+    min-width: 16px;
+    padding: 0 4px;
+    border: 1px solid #6b7280;
+    border-radius: 3px;
+    background: #3f4347;
+    color: #f3f4f6;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    text-align: center;
+}

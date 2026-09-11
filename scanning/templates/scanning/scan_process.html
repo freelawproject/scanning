@@ -364,7 +364,22 @@ body.boundary-pick .opinion-nav.picking {
         <button type="button" class="zoom-btn ocr-text-btn" id="ocr-text-toggle"
                 title="Show the text the OCR read on each page">Text</button>
         {% endif %}
+        {% comment %}
+          The overlay cue and the guide (#299). The key "r" was the only
+          control of the cycle, and the page showed no cue of the mode:
+          the label map in toggleOverlays wrote to an element no template
+          held. The button carries the mode now, and the "?" opens
+          _viewer_help.html, which holds the one table of the four modes.
+        {% endcomment %}
+        {% if step == 2 %}
+        <button type="button" class="zoom-btn overlay-mode-btn" id="toggle-overlays-btn"
+                data-mode="off" title="Show the redactions, the bounds or nothing (r)">Overlays Off (r)</button>
+        <button type="button" class="zoom-btn viewer-help-btn" id="viewer-help-btn"
+                aria-expanded="false" aria-controls="viewer-help-panel"
+                title="What the overlays and the detection boxes do">?</button>
+        {% endif %}
       </div>
+      {% if step == 2 %}{% include "scanning/_viewer_help.html" %}{% endif %}
       <div id="pdf-viewer"
            data-pdf-url="{% if step == 3 %}{% elif final_space %}{% url 'serve_final_pdf' scan.pk %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
            data-document-id="{{ scan.pk }}"

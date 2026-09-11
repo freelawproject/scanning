@@ -400,15 +400,19 @@ function deleteUnmatchedDetection(btn) {
         .then(function (data) {
             if (!data || data.status === "error") {
                 btn.disabled = false;
-                btn.textContent = "Delete";
-                showToast((data && data.message) || "Failed to delete detection");
+                // The button is a glyph, not a word (#299): the old text
+                // here wrote "Delete" over the cross after a refusal.
+                btn.textContent = "\u2715";
+                showToast(
+                    (data && data.message) || "Could not dismiss the detection"
+                );
                 return;
             }
             refreshFindings();
         })
         .catch(function () {
-            console.error("Failed to delete detection");
-            showToast("Failed to delete detection");
+            console.error("Failed to dismiss detection");
+            showToast("Could not dismiss the detection");
         });
 }
 
