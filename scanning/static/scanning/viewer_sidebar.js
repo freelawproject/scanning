@@ -423,24 +423,61 @@ function deleteUnmatchedDetection(btn) {
 // cards are true the moment the answer comes back. The action bar is
 // refreshed with it, because the approve button carries the open count.
 
+function _applyFindings(data) {
+    var section = document.getElementById("review-findings");
+    if (!section) return;
+    if (data && typeof data.html === "string") section.innerHTML = data.html;
+    labelFindingCards();
+    if (typeof window.refreshProcessActionBar === "function") {
+        window.refreshProcessActionBar();
+    }
+}
+
 function refreshFindings() {
     var cfg = window.SCAN_CONFIG;
-    var section = document.getElementById("review-findings");
-    if (!section) return Promise.resolve();
+    if (!document.getElementById("review-findings")) return Promise.resolve();
     return fetch("/scans/" + cfg.docId + "/findings/", {
         headers: { "X-Requested-With": "XMLHttpRequest" },
     })
         .then(function (r) { return r.json(); })
-        .then(function (data) {
-            if (data && typeof data.html === "string") section.innerHTML = data.html;
-            labelFindingCards();
-            if (typeof window.refreshProcessActionBar === "function") {
-                window.refreshProcessActionBar();
-            }
-        })
+        .then(_applyFindings)
         .catch(function () { /* keep the stale section; a reload still works */ });
 }
 window.refreshFindings = refreshFindings;
+
+// The cheap recompute (#305). The endpoint writes the cards again from
+// the detection, boundary and redaction rows and answers the section it
+// wrote, so one request does the rebuild and the swap. It moves no box:
+// the measurement that pairs the opinions again is the action bar's
+// "Recompute redactions" button.
+function rebuildFindings(btn) {
+    var cfg = window.SCAN_CONFIG;
+    if (btn) btn.disabled = true;
+    fetch("/scans/" + cfg.docId + "/findings/rebuild/", {
+        method: "POST",
+        headers: {
+            "X-CSRFToken": cfg.csrfToken,
+            "Content-Type": "application/json",
+        },
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status !== "ok") {
+                if (btn) btn.disabled = false;
+                showToast((data && data.message) || "Could not rebuild the findings.", "error");
+                return;
+            }
+            // The button is inside the section, so the swap replaces it
+            // with a fresh, enabled one. Nothing to enable here.
+            _applyFindings(data);
+            showToast("The findings were written again from the rows.", "success");
+        })
+        .catch(function () {
+            if (btn) btn.disabled = false;
+            showToast("Could not rebuild the findings.", "error");
+        });
+}
+window.rebuildFindings = rebuildFindings;
 
 // The server renders a card's page as its position (p.<n>), because the
 // fragment has no printed-page map. The viewer has one, in the page map
@@ -550,11 +587,11 @@ function deleteDuplicates(btn) {
 // --- Opinion boundaries (#240 PR C) ---
 //
 // Every card names a boundary row. Dismiss and Undo post the row id and
-// reload, as pairOpinions does: the cards are rendered by the server,
-// and a reload is the one path that cannot disagree with it. The two
-// anchor buttons enter a pick mode; the viewer (viewer_step2.js) calls
-// window.boundaryPickTarget() on a click on a detection box, and
-// finishBoundaryPick posts the move.
+// reload, as recomputeRedactions does: the cards are rendered by the
+// server, and a reload is the one path that cannot disagree with it.
+// The two anchor buttons enter a pick mode; the viewer
+// (viewer_step2.js) calls window.boundaryPickTarget() on a click on a
+// detection box, and finishBoundaryPick posts the move.
 
 function _postBoundary(path, body) {
     var cfg = window.SCAN_CONFIG;
@@ -675,20 +712,26 @@ document.addEventListener("keydown", function (e) {
     if (e.key === "Escape") cancelBoundaryPick();
 });
 
-function pairOpinions() {
+// The expensive recompute (#305). The endpoint queues the work and
+// answers at once (#196): the pairing, the redaction boxes and the
+// margin strips are measured together on the daemon, because they all
+// read the same detections and the measurement renders every page. The
+// reload below shows the progress bar, which reloads again when the
+// daemon parks the scan.
+function recomputeRedactions() {
     var cfg = window.SCAN_CONFIG;
-    if (cfg.step < 2) return;
-    var btn = document.getElementById("pair-btn");
-    if (!btn) return;
-    // The endpoint queues the work and answers at once (#196): the
-    // pairing, the redaction rects and the margin strips are measured
-    // together on the daemon, because they all read the same
-    // detections and the measurement renders every page. The reload
-    // below shows the progress bar, which reloads again when the
-    // daemon parks the scan.
+    if (cfg.step < 2) return false;
+    var btn = document.getElementById("recompute-btn");
+    if (!btn) return false;
+    if (!window.confirm(
+        "The redactions are measured again from the boxes as they are now. " +
+        "This volume leaves the review while the server works, and the page " +
+        "reloads when the server is done. Your boxes and your decisions are " +
+        "kept. Continue?"
+    )) return false;
     btn.textContent = "Queueing...";
     btn.disabled = true;
-    fetch("/scans/" + cfg.docId + "/pair-opinions/", {
+    fetch("/scans/" + cfg.docId + "/compute-redactions/", {
         method: "POST",
         headers: { "X-CSRFToken": cfg.csrfToken },
     })
@@ -696,20 +739,22 @@ function pairOpinions() {
             return r.json();
         })
         .then(function (data) {
-            btn.textContent = "Re-pair Opinions";
-            btn.disabled = false;
             if (data.error) {
-                alert("Error: " + data.error);
+                btn.textContent = "Recompute redactions";
+                btn.disabled = false;
+                showToast(data.error, "error");
                 return;
             }
             window.location.reload();
         })
         .catch(function (err) {
-            btn.textContent = "Re-pair Opinions";
+            btn.textContent = "Recompute redactions";
             btn.disabled = false;
-            alert("Error: " + err);
+            showToast("Could not queue the recompute: " + err, "error");
         });
+    return false;
 }
+window.recomputeRedactions = recomputeRedactions;
 
 // --- Helper to read detection data from data-* attributes ---
 

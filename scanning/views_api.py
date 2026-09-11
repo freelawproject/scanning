@@ -559,20 +559,6 @@ def restore_redaction(
     return JsonResponse({"status": "ok", "restored": restored})
 
 
-#: Whether a curator may ask for the redaction computation from review
-#: 2. Off for now (#196): the computation renders every page of the
-#: volume and takes the scan out of review for a minute or more, and
-#: the one run the daemon starts after a detection run is the only one
-#: wanted until the stage has been watched on a few volumes (#211).
-#: Turning it back on is this flag plus the "Re-pair Opinions" button
-#: in ``_process_actions.html``; the queueing code below is kept.
-REPAIR_ON_REQUEST_ENABLED = False
-
-REPAIR_DISABLED_MESSAGE = (
-    "Re-pairing on request is off for now. The redactions are computed "
-    "once, when the detection run finishes."
-)
-
 #: The gate of step 3 in the view (#263/#269): a volume of the new
 #: pipeline reaches the file generation through the review-2 approval.
 GENERATE_REQUIRES_REDACTION_REVIEW_MESSAGE = (
@@ -583,56 +569,39 @@ GENERATE_REQUIRES_REDACTION_REVIEW_MESSAGE = (
 
 @login_required
 @require_POST
-def pair_opinions_api(request: HttpRequest, pk: int) -> JsonResponse:
-    """Ask the daemon to pair the opinions again, with the geometry.
-
-    A curator presses this after they add or delete a detection, and
-    what they want is every consequence of that edit: the pairing, the
-    redaction rects and the margin strips, which are all measured from
-    the same detections. One queued action computes all three (#196),
-    so none of them can be left describing the boxes of an hour ago.
-
-    It runs on the daemon rather than here, because the measurement
-    renders every page of the volume: 83 seconds for 1364 pages. The
-    viewer reloads, sees the scan busy, and its progress poll reloads
-    again when the daemon parks it.
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: JSON response saying the work is queued, or 409 while
-        re-pairing on request is off (``REPAIR_ON_REQUEST_ENABLED``).
-    """
-    scan = get_object_or_404(Scan, pk=pk)
-    if not REPAIR_ON_REQUEST_ENABLED:
-        return JsonResponse({"error": REPAIR_DISABLED_MESSAGE}, status=409)
-    if not Detection.objects.filter(scan=scan, active=True).exists():
-        return JsonResponse({"error": "No detections found"}, status=400)
-
-    from scanning.services import queue_redaction_compute
-
-    queued, message = queue_redaction_compute(scan)
-    if not queued:
-        return JsonResponse({"error": message}, status=409)
-    return JsonResponse({"status": "queued", "message": message}, status=202)
-
-
-@login_required
-@require_POST
 def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
-    """Ask the daemon to compute this scan's redaction geometry.
+    """Ask the daemon to measure this scan's redactions again.
 
-    The same queued action as :func:`pair_opinions_api`, and for the
-    same reason: the measurement renders every page of the volume, so
-    it cannot run inside a request (#196).
+    The "Recompute redactions" button of review 2 (#305). A curator
+    presses it after they draw or dismiss a detection, and what they
+    want is every consequence of that edit: the pairing, the redaction
+    boxes and the margin strips, which are all measured from the same
+    detections. One queued action computes all three (#196), so none of
+    them can be left describing the boxes of an hour ago.
+
+    **It runs on the daemon, not here.** The measurement renders every
+    page of the volume: 83 seconds for 1364 pages. The viewer reloads,
+    sees the scan busy, and its progress poll reloads again when the
+    daemon parks it. Its twin, :func:`rebuild_findings`, reads rows
+    alone and does run here.
+
+    The curator's own rows are kept. A recompute against the standing
+    apply run measures again and imports no model row, so it cannot
+    throw away the edit the curator pressed this for
+    (``run_compute_redactions``).
+
+    There was a second name for this one action, ``pair_opinions_api``
+    at ``scans/<pk>/pair-opinions/``, with the same body (#305). One
+    button does not need two routes.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response saying the work is queued, or 409 while
-        re-pairing on request is off (``REPAIR_ON_REQUEST_ENABLED``).
+    :return: JSON response saying the work is queued, 400 when the
+        volume has no detection to measure, or 409 when the status
+        takes no compute (``services.REDACTION_COMPUTE_STATUSES``: a
+        closed review 2 is one, and the way back is the re-queue).
     """
     scan = get_object_or_404(Scan, pk=pk)
-    if not REPAIR_ON_REQUEST_ENABLED:
-        return JsonResponse({"error": REPAIR_DISABLED_MESSAGE}, status=409)
     if not Detection.objects.filter(scan=scan, active=True).exists():
         return JsonResponse({"error": "No detections found"}, status=400)
 
@@ -641,6 +610,9 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
     queued, message = queue_redaction_compute(scan)
     if not queued:
         return JsonResponse({"error": message}, status=409)
+    logger.info(
+        "scan %s: %s queued a redaction recompute", scan.pk, request.user
+    )
     return JsonResponse({"status": "queued", "message": message}, status=202)
 
 
@@ -1087,34 +1059,77 @@ def withdraw_stale_edit(request: HttpRequest, pk: int) -> JsonResponse:
     return JsonResponse({"status": "ok", "withdrawn": withdrawn})
 
 
+def _findings_payload(scan: Scan, request: HttpRequest) -> dict:
+    """Render the step-2 findings section and its two counts.
+
+    One context for one template, whichever view answers
+    (``findings.viewer_groups``): the section the page renders and the
+    section a refresh swaps in must agree, or a card would offer a
+    button the endpoint refuses.
+
+    :param scan: The scan.
+    :param request: The HTTP request, for the template context.
+    :return: ``{html, open, stale}``.
+    """
+    from scanning import findings
+
+    context = findings.viewer_groups(scan)
+    return {
+        "html": render_to_string(
+            "scanning/_review_findings.html", context, request=request
+        ),
+        "open": context["review2_open"],
+        "stale": context["review2_stale"],
+    }
+
+
 @login_required
 def review_findings(request: HttpRequest, pk: int) -> JsonResponse:
     """Render the step-2 findings section as an HTML fragment.
 
-    The page and this fragment render one template from one context
-    (``findings.viewer_groups``), the ``process_actions`` shape (#151):
-    a card that disagreed with itself after a refresh would offer a
-    button the endpoint refuses. The viewer swaps the section after
-    every write.
+    The viewer swaps the section after every write.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: ``{html, open, stale}``.
     """
+    scan = get_object_or_404(Scan, pk=pk)
+    return JsonResponse(_findings_payload(scan, request))
+
+
+@login_required
+@require_POST
+def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
+    """Write the review-2 findings again, here, and answer the section.
+
+    The "Recompute" button of the findings panel (#305), and the twin
+    of review 1's ``recalculate``. ``findings.rebuild`` derives every
+    finding from the ``Detection``, ``OpinionBoundary``, ``Redaction``
+    and decision rows, plus ``ApplyRun.page_map``, which is a column.
+    No S3 read and no page render, so it runs in the request on a web
+    pod that never pulled the volume's files (the #153 rule).
+
+    It changes no box. A finding that only a measurement can answer --
+    a caption the curator drew that no opinion boundary names yet --
+    needs :func:`compute_redactions_api` instead.
+
+    Every logged-in user may press it: review 2 is a curator's step,
+    not a staff one (#151). No status gate: the rebuild is derived from
+    the rows and is idempotent, so a volume whose rows cannot change
+    gets the findings it already had.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: ``{status, html, open, stale}``.
+    """
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
-    context = findings.viewer_groups(scan)
-    html = render_to_string(
-        "scanning/_review_findings.html", context, request=request
+    findings.rebuild(scan)
+    logger.info(
+        "scan %s: %s rebuilt the review-2 findings", scan.pk, request.user
     )
-    return JsonResponse(
-        {
-            "html": html,
-            "open": context["review2_open"],
-            "stale": context["review2_stale"],
-        }
-    )
+    return JsonResponse({"status": "ok", **_findings_payload(scan, request)})
 
 
 @login_required

@@ -19,9 +19,10 @@ Four rules run through the module:
   :func:`rebuild` reads ``Detection``, ``OpinionBoundary``,
   ``Redaction`` and the decision rows, deletes the scan's review-2
   rows and writes them again. No S3 read and no page render, so it
-  runs after every curator write as well as at the end of the compute:
-  the recompute button is off until #211, and a card that only the
-  compute rewrote would stand whatever the curator did.
+  runs after every curator write as well as at the end of the compute,
+  and the "Recompute" button of the findings panel calls it in the
+  request, on any pod (``views_api.rebuild_findings``, #305). A card
+  that only the compute rewrote would stand whatever the curator did.
 - **Stale is read off the rows, not threaded from the compute.** The
   resolution of each module sets a FK on the row it landed on
   (``Detection.decision``, ``Redaction.decision``,

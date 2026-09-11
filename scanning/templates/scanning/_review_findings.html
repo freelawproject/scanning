@@ -23,6 +23,17 @@
 <h2 class="text-sm font-bold mb-2 flex items-center gap-2">
   Findings
   <span class="text-xs font-normal text-gray-600 dark:text-gray-300">({{ review2_open }} open{% if review2_stale %}, {{ review2_stale }} not applied{% endif %})</span>
+  {% comment %}
+    The cheap recompute (#305). It rebuilds this list from the
+    detection, boundary and redaction rows, in the request, and changes
+    no box. The expensive one -- the measurement that pairs the
+    opinions again -- is the "Recompute redactions" button of the
+    action bar. The button is inside the fragment, so every swap brings
+    it back, and its handler is inline like the card buttons.
+  {% endcomment %}
+  <button type="button" class="ml-auto text-[10px] px-2 py-0.5 rounded bg-gray-600 text-white font-normal"
+          title="Read the detection, boundary and redaction rows again and write this list again. It changes no box. A box you drew needs Recompute redactions."
+          onclick="rebuildFindings(this)">Recompute</button>
 </h2>
 {% if not finding_groups %}
 <div class="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded px-2 py-2 text-xs text-green-700 dark:text-green-300 font-medium mb-2">

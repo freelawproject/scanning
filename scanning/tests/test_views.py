@@ -12,7 +12,7 @@ from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import models
 from django.test import RequestFactory, TestCase, override_settings
-from django.urls import reverse
+from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
 from PIL import Image
 
@@ -3052,24 +3052,6 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
             y1=1,
         )
 
-    def test_re_pairing_on_request_is_off_for_now(self):
-        """Both review-2 endpoints refuse and queue nothing (#196): the
-        daemon's one run after detection is the only computation wanted
-        until the stage has been watched on a few volumes."""
-        from scanning.views_api import REPAIR_DISABLED_MESSAGE
-
-        self._caption()
-        before = self.scan.status
-        for name in ("pair_opinions_api", "compute_redactions_api"):
-            response = self.client.post(
-                reverse(name, kwargs={"pk": self.scan.pk})
-            )
-            self.assertEqual(response.status_code, 409, name)
-            self.assertEqual(response.json()["error"], REPAIR_DISABLED_MESSAGE)
-        self.scan.refresh_from_db()
-        self.assertEqual(self.scan.status, before)
-
-    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
     def test_compute_redactions_needs_no_pdf_in_the_request(self):
         """It queues the work, so a missing local PDF is not its problem.
 
@@ -3083,13 +3065,16 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"], "No detections found")
 
-    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
-    def test_pair_opinions_queues_the_work(self):
-        """Pairing is queued with the geometry it feeds (#196), once the
-        switch is back on."""
+    def test_the_recompute_queues_the_work(self):
+        """The button of review 2 queues the measurement (#305).
+
+        One queued action pairs the opinions, measures the redaction
+        boxes and measures the margin strips, because all three read
+        the same detections (#196).
+        """
         self._caption()
         response = self.client.post(
-            reverse("pair_opinions_api", kwargs={"pk": self.scan.pk})
+            reverse("compute_redactions_api", kwargs={"pk": self.scan.pk})
         )
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["status"], "queued")
@@ -3098,6 +3083,15 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
         self.assertEqual(
             self.scan.queued_action, QueuedAction.COMPUTE_REDACTIONS
         )
+
+    def test_the_old_pairing_route_is_gone(self):
+        """One button does not need two routes (#305).
+
+        ``pair_opinions_api`` was a copy of ``compute_redactions_api``,
+        body for body.
+        """
+        with self.assertRaises(NoReverseMatch):
+            reverse("pair_opinions_api", kwargs={"pk": self.scan.pk})
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

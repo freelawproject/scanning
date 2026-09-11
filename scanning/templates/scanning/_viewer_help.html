@@ -12,6 +12,11 @@
 
   The detections part is hidden until the boxes are on, because it
   describes what a reviewer can do to a box that is on the page.
+
+  The findings part names the two recompute buttons and what each one
+  costs (#305). They look alike and they are not: one writes the cards
+  again from the rows, in the request; the other measures the whole
+  volume again on the daemon.
 {% endcomment %}
 <div id="viewer-help-panel" class="viewer-help-panel" hidden>
   <h3>Overlays <span class="viewer-help-key">r</span></h3>
@@ -51,6 +56,13 @@
       <li><b>Draw</b> makes a new box. <b>Redact</b> and <b>Whiteout</b> draw a redaction.</li>
     </ul>
   </div>
+
+  <h3>Findings</h3>
+  <ul class="viewer-help-list">
+    <li><b>Recompute</b> in the findings panel writes the list again from the boxes and the decisions as they are now. It is instant, and it moves no box.</li>
+    <li><b>Recompute redactions</b> in the bar above pairs the opinions again and measures every redaction from the detection boxes. Press it after you draw or dismiss a case caption or a key icon.</li>
+    <li>The second one runs on the server and takes this volume out of the review for a minute or more. Your boxes and your decisions are kept.</li>
+  </ul>
 
   <h3>Keys</h3>
   <ul class="viewer-help-list">

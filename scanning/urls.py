@@ -40,7 +40,7 @@ from scanning.views_api import (
     export_pdf,
     generate_files,
     move_redaction,
-    pair_opinions_api,
+    rebuild_findings,
     restore_boundary,
     restore_finding,
     restore_redaction,
@@ -296,6 +296,11 @@ urlpatterns = [
         name="review_findings",
     ),
     path(
+        "scans/<int:pk>/findings/rebuild/",
+        rebuild_findings,
+        name="rebuild_findings",
+    ),
+    path(
         "scans/<int:pk>/findings/dismiss/",
         dismiss_finding,
         name="dismiss_finding",
@@ -334,11 +339,6 @@ urlpatterns = [
         "scans/<int:pk>/redactions/<int:redaction_id>/restore/",
         restore_redaction,
         name="restore_redaction",
-    ),
-    path(
-        "scans/<int:pk>/pair-opinions/",
-        pair_opinions_api,
-        name="pair_opinions_api",
     ),
     path(
         "scans/<int:pk>/compute-redactions/",

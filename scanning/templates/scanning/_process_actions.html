@@ -163,16 +163,6 @@ reach step 2.
 
 {% elif step == 2 %}
 {% comment %}
-  No "Re-pair Opinions" button for now (#196). The computation behind
-  it renders every page of the volume on the daemon and takes the scan
-  out of review for a minute or more, so until the stage has been
-  watched on a few volumes (#211) the daemon's one run after detection
-  is the only one wanted. The endpoints refuse too
-  (views_api.REPAIR_ON_REQUEST_ENABLED); turning it back on is that flag
-  plus this button:
-  <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()">Re-pair Opinions</button>
-{% endcomment %}
-{% comment %}
   The review-2 controls (issue #263) read `redaction_review_ready` /
   `redaction_review_done`, the two new statuses, from the same
   `_review_flags` the step-1 bar reads. Approving is the gate for
@@ -216,6 +206,27 @@ reach step 2.
   <span class="text-sm text-gray-600 mr-2">
     The corrected volume is not built yet. This is the volume as uploaded, before the page edits.{% if apply_run %} {{ apply_run.message }}{% endif %}
   </span>
+  {% endif %}
+  {% comment %}
+    The recompute of review 2 (#305). A curator who draws or dismisses
+    a detection changes what the pairing would say, and nothing but
+    this measurement pairs the opinions again: the cheap "Recompute"
+    button of the findings panel writes the cards again from the rows
+    and moves no box.
+
+    The confirm names the cost in time, not in money. The measurement
+    renders every page on the daemon -- 83 seconds for 1364 pages --
+    and takes the volume out of the review while it runs, but it pays
+    no RunPod money. The curator's own boxes and decisions are kept: a
+    recompute against the standing apply run imports no model row.
+
+    It is not offered after the approval. ``REDACTION_COMPUTE_STATUSES``
+    refuses ``REDACTION_REVIEW_DONE`` -- a closed review is not
+    recomputed under the person who closed it -- and a button must
+    never send a curator to an action that refuses.
+  {% endcomment %}
+  {% if redaction_review_ready or legacy_review %}
+  <button type="button" class="btn-outline text-sm" id="recompute-btn" title="Pair the opinions again and measure every redaction from the detection boxes as they are now. It runs on the server and takes this volume out of the review for a minute or more. Your boxes and your decisions are kept." onclick="return recomputeRedactions();">Recompute redactions</button>
   {% endif %}
   {% comment %}
     The open findings of review 2 (#240 PR D). The button obeys: the

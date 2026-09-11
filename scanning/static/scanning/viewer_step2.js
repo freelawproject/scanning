@@ -1262,17 +1262,23 @@ document.addEventListener('DOMContentLoaded', function () {
             pageDiv.querySelector('.detect-btn').classList.add('active');
             drawDetectionOverlay(pageDiv, pdfIndex);
 
+            // The endpoint rebuilt the findings, so the cards are true
+            // the moment this answer comes back (#305). Every other
+            // write of step 2 already swapped the section; this one did
+            // not, and a box drawn over a bleedthrough box left its
+            // card standing until the next page load.
+            if (window.refreshFindings) window.refreshFindings();
+
             // A caption or a key icon changes the opinion pairing, and
-            // with it the redaction rects and the margin strips. That
-            // whole computation now runs on the daemon and takes the
-            // volume out of review while it does (#196), so it is not
+            // with it the redaction boxes and the margin strips. That
+            // whole computation runs on the daemon and takes the volume
+            // out of the review while it does (#196), so it is not
             // started here: an auto re-pair on every added box would
-            // interrupt the reviewer in the middle of their edits. And
-            // re-pairing on request is off for now, so say what the
-            // edit did and did not change.
+            // interrupt the reviewer in the middle of their edits. Name
+            // the button that does start it (#305).
             var _pLabels = ['CASE_CAPTION', 'KEY_ICON'];
             if (_pLabels.indexOf(labelName) >= 0) {
-                showToast('Saved. The redactions are not recomputed from this yet.', 'success');
+                showToast('Saved. Press "Recompute redactions" to pair the opinions again.', 'success');
             }
         });
     }
