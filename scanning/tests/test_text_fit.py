@@ -15,7 +15,7 @@ from django.test import TestCase
 
 from scanning import text_fit
 from scanning.factories import ScanFactory, UserFactory
-from scanning.models import Redaction, Status
+from scanning.models import ApplyRun, Redaction, Status
 
 #: The page of every fixture: 1700 x 2200 pixels of a 200 dpi render,
 #: which is 612 x 792 points.
@@ -187,6 +187,13 @@ class TestPageCells(TestCase):
         self.assertEqual(text_fit.page_cells(None), {})
         self.assertEqual(text_fit.page_cells({"pages": None}), {})
 
+    def test_records_a_re_rendered_page(self):
+        plain = ocr_document(two_column_page(0))
+        flagged = ocr_document(two_column_page(0))
+        flagged["pages"][0]["render_fallback"] = True
+        self.assertFalse(text_fit.page_cells(plain)[0].fallback)
+        self.assertTrue(text_fit.page_cells(flagged)[0].fallback)
+
 
 class TestFitRects(TestCase):
     """The compute's caller, over blackletter's pixel rects."""
@@ -315,6 +322,16 @@ class TestFitRects(TestCase):
         self.assertEqual(count, 0)
         self.assertEqual(rects[0]["rects"][0]["x0"], LEFT_COLUMN[0])
 
+    def test_fits_a_re_rendered_page_all_the_same(self):
+        """The compute reads the page's own ``pdf_width``, so a page
+        the worker rendered at 72 dpi is two fractions of one page like
+        every other. Only ``fit_rows`` must skip it."""
+        document = ocr_document(two_column_page(0))
+        document["pages"][0]["render_fallback"] = True
+        cells = text_fit.page_cells(document)
+        rects = [rect(LEFT_COLUMN[0], 400, LEFT_COLUMN[1], 800)]
+        self.assertEqual(text_fit.fit_rects(rects, cells, bl_pages(0)), 1)
+
     def test_no_cells_at_all_is_a_no_op(self):
         rects = [rect(LEFT_COLUMN[0], 400, LEFT_COLUMN[1], 800)]
         self.assertEqual(text_fit.fit_rects(rects, {}, bl_pages(0)), 0)
@@ -417,6 +434,46 @@ class TestFitRows(TestCase):
         text_fit.fit_rows(self.scan, self.cells)
         row.refresh_from_db()
         self.assertEqual(row.x0, before)
+
+    def test_leaves_a_re_rendered_page_alone(self):
+        """The page width comes from the render here, and the pinned
+        upstream renders a page over 4500 px at 72 dpi, so the divisor
+        would be wrong by 2.78 times."""
+        document = ocr_document(two_column_page(0))
+        document["pages"][0]["render_fallback"] = True
+        row = computed(self.scan)
+        before = row.x0
+        counts = text_fit.fit_rows(self.scan, text_fit.page_cells(document))
+        row.refresh_from_db()
+        self.assertEqual(counts.fitted, 0)
+        self.assertEqual(row.x0, before)
+
+    def test_leaves_a_row_of_another_apply_run_alone(self):
+        """A row of a run the rows are not measured against describes
+        pages the volume no longer shows."""
+        run = ApplyRun.objects.create(
+            scan=self.scan, number=1, page_map={"pages": []}
+        )
+        row = computed(self.scan, apply_run=run)
+        before = row.x0
+        counts = text_fit.fit_rows(self.scan, self.cells)
+        row.refresh_from_db()
+        self.assertEqual(counts.read, 0)
+        self.assertEqual(row.x0, before)
+
+    def test_fits_the_rows_of_the_measured_run(self):
+        run = ApplyRun.objects.create(
+            scan=self.scan, number=1, page_map={"pages": []}
+        )
+        row = computed(self.scan, apply_run=run)
+        original = computed(self.scan)
+        before = original.x0
+        counts = text_fit.fit_rows(self.scan, self.cells, run)
+        row.refresh_from_db()
+        original.refresh_from_db()
+        self.assertEqual((counts.read, counts.fitted), (1, 1))
+        self.assertGreater(row.x0, before)
+        self.assertEqual(original.x0, before)
 
 
 class TestCommand(TestCase):

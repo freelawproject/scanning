@@ -53,12 +53,13 @@ logger = logging.getLogger(__name__)
 
 #: The redaction types a fit may move: the two that are blocks of body
 #: text. Every other type stays as it is, and each for its own reason.
-#: ``DIVIDER`` is a printed rule, not text. ``HEADNOTE_BRACKET`` and
-#: ``STATE_ABBREVIATION`` are single glyphs blackletter keeps
-#: untightened on purpose. ``PAGE_HEADER`` sits in the head band, where
-#: one cell holds the whole running head, so a fit there would measure
-#: the box against itself. ``margin`` is a strip of the page edge and
-#: ``manual`` is a box a curator drew.
+#: ``DIVIDER`` is a printed rule, not text. ``HEADNOTE_BRACKET``,
+#: ``STATE_ABBREVIATION``, ``KEY_ICON`` and ``CASE_SEQUENCE`` are
+#: glyphs, and blackletter keeps the first two untightened on purpose.
+#: ``PAGE_HEADER`` sits in the head band, where one cell holds the
+#: whole running head, so a fit there would measure the box against
+#: itself. ``margin`` is a strip of the page edge and ``manual`` is a
+#: box a curator drew.
 TEXT_RECT_TYPES = frozenset({"headnote", "EDITORIAL"})
 
 #: Slack left around the cells, in PDF points. blackletter's own
@@ -86,11 +87,19 @@ class PageCells:
     :param width: The render width in pixels (``origin_width``).
     :param height: The render height in pixels (``origin_height``).
     :param boxes: The cell boxes, ``(x0, y0, x1, y1)`` in those pixels.
+    :param fallback: Whether the worker flagged the page
+        ``render_fallback``: the pinned upstream re-renders a page over
+        4500 px at 72 dpi instead of :data:`dots_mocr.DPI`, so the
+        render is not the resolution this page was asked for.
+        :func:`fit_rects` does not care, because it compares two
+        fractions of the same page; :func:`fit_rows` must skip the
+        page, because it derives the page width from the render.
     """
 
     width: float
     height: float
     boxes: tuple[tuple[float, float, float, float], ...]
+    fallback: bool = False
 
 
 def page_cells(document: dict | None) -> dict[int, PageCells]:
@@ -129,7 +138,10 @@ def page_cells(document: dict | None) -> dict[int, PageCells]:
                 boxes.append(box)
         if boxes:
             pages[index] = PageCells(
-                float(width or 0), float(height or 0), tuple(boxes)
+                float(width or 0),
+                float(height or 0),
+                tuple(boxes),
+                bool(page.get("render_fallback")),
             )
     return pages
 
@@ -349,13 +361,26 @@ def fit_rects(rects: list[dict], cells: dict[int, PageCells], pages) -> int:
     return counts.fitted
 
 
-def fit_rows(scan, cells: dict[int, PageCells]) -> FitCounts:
+def fit_rows(scan, cells: dict[int, PageCells], run=None) -> FitCounts:
     """Fit the standing computed text rows of a scan, in place.
 
     The backfill's caller (``refit_text_redactions``). The rows are in
     PDF points, and the page width in points is the cell render's own
     width at :data:`dots_mocr.DPI`, so the command needs no PDF and no
     render.
+
+    **Only the rows of the measured space.** ``run`` is
+    ``detections.measured_run``, and a row of another run describes
+    pages the volume no longer shows: the cells of this space would put
+    its box somewhere else. That is the rule a ``stale_*`` card already
+    states, applied here as a filter.
+
+    **A page the worker re-rendered is skipped.** The pinned upstream
+    silently renders a page over 4500 px at 72 dpi
+    (``PageCells.fallback``), so the page width this derives from the
+    render would be wrong by 2.78 times, and the box would be fitted to
+    the wrong place. The compute does not care: it reads the page's own
+    ``pdf_width``.
 
     **A row a standing dismiss points at is left alone.** A dismiss
     names its target by a copy of the box and ``redactions.resolve``
@@ -365,6 +390,8 @@ def fit_rows(scan, cells: dict[int, PageCells]) -> FitCounts:
 
     :param scan: The scan.
     :param cells: The cells of each page, :func:`page_cells`.
+    :param run: The apply run the rows are measured against, or None
+        for the original's space.
     :returns: What the pass did.
     :rtype: FitCounts
     """
@@ -379,12 +406,17 @@ def fit_rows(scan, cells: dict[int, PageCells]) -> FitCounts:
             decision__isnull=True,
             rect_type__in=TEXT_RECT_TYPES,
             page_index__in=cells.keys(),
+            **(
+                {"apply_run": run}
+                if run is not None
+                else {"apply_run__isnull": True}
+            ),
         )
     )
     changed = []
     for row in rows:
         page_cell = cells[row.page_index]
-        if row.bbox is None:
+        if row.bbox is None or page_cell.fallback:
             continue
         counts.read += 1
         width = page_cell.width * POINTS_PER_INCH / dots_mocr.DPI

@@ -135,7 +135,7 @@ class Command(BaseCommand):
         # after it has counted, and a fault on one volume leaves that
         # volume whole.
         with transaction.atomic():
-            counts = text_fit.fit_rows(scan, cells)
+            counts = text_fit.fit_rows(scan, cells, run)
             if counts.fitted:
                 # The rows moved, so the decisions must land again and
                 # the findings are derived from what stands now.
