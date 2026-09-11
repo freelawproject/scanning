@@ -1357,7 +1357,13 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // ── Unified overlay toggle ──
     // overlayMode cycles: 'off' → 'bounds' → 'transparent' → 'solid' → 'off'
-    var overlayMode = 'off';
+    //
+    // The page draws the redaction boxes and the margin strips at render
+    // time (redactionsVisible and marginsVisible start true), so the mode
+    // starts on 'transparent'. It said 'off' while the boxes were on the
+    // page, and the cue of #299 would have shown that contradiction to
+    // every reviewer.
+    var overlayMode = 'transparent';
     var _boundsColors = [
         '#3b82f6', '#f97316', '#10b981', '#a855f7',
         '#ec4899', '#eab308', '#06b6d4', '#ef4444',
@@ -1714,17 +1720,19 @@ document.addEventListener('DOMContentLoaded', function () {
         div.style.outline = '2px solid #f59e0b';
         div.style.zIndex = '20';
 
-        // Add delete button
+        // The button says what the endpoint does (#299): a dismiss of a
+        // computed box, a withdrawal of a drawn one. Nothing is deleted.
         var delBtn = document.createElement('button');
         delBtn.className = 'redaction-edit-btn redaction-del-btn';
-        delBtn.textContent = 'Delete';
+        delBtn.textContent = 'Dismiss';
+        delBtn.title = 'Take this box out of the volume. Nothing is ' +
+            'deleted, and a new import keeps your choice.';
         delBtn.style.cssText = 'position:absolute;top:-28px;right:0;background:#ef4444;color:white;border:none;padding:4px 10px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;z-index:21;white-space:nowrap;line-height:1;';
         delBtn.addEventListener('click', function(e) {
             e.stopPropagation();
-            if (!confirm('Delete this ' + (rectData.rect_type || 'redaction') + '?')) return;
+            if (!confirm('Dismiss this ' + (rectData.rect_type || 'redaction') + '?')) return;
 
-            // A dismiss of a computed box, a withdrawal of a drawn one
-            // (#240). The row is addressed by its id, and the answer is
+            // The row is addressed by its id (#240), and the answer is
             // read: a refusal must not remove a box the server kept.
             var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
             fetch('/scans/' + documentId + '/redactions/' + rectData.id + '/dismiss/', {
@@ -1733,7 +1741,7 @@ document.addEventListener('DOMContentLoaded', function () {
             }).then(function(r) { return r.json(); })
             .then(function(data) {
                 if (!data || data.status !== 'ok') {
-                    showToast((data && data.message) || 'Failed to delete the box');
+                    showToast((data && data.message) || 'Could not dismiss the box');
                     return;
                 }
                 div.remove();
@@ -1746,7 +1754,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     });
                 }
                 if (window.refreshFindings) window.refreshFindings();
-            }).catch(function() { showToast('Failed to delete the box'); });
+            }).catch(function() { showToast('Could not dismiss the box'); });
         });
         div.appendChild(delBtn);
 

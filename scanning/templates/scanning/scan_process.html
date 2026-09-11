@@ -373,13 +373,13 @@ body.boundary-pick .opinion-nav.picking {
         {% endcomment %}
         {% if step == 2 %}
         <button type="button" class="zoom-btn overlay-mode-btn" id="toggle-overlays-btn"
-                data-mode="off" title="Show the redactions, the bounds or nothing (r)">Overlays Off (r)</button>
+                data-mode="transparent" title="Show the redactions, the bounds or nothing (r)">Overlays (r)</button>
         <button type="button" class="zoom-btn viewer-help-btn" id="viewer-help-btn"
                 aria-expanded="false" aria-controls="viewer-help-panel"
                 title="What the overlays and the detection boxes do">?</button>
+        {% include "scanning/_viewer_help.html" %}
         {% endif %}
       </div>
-      {% if step == 2 %}{% include "scanning/_viewer_help.html" %}{% endif %}
       <div id="pdf-viewer"
            data-pdf-url="{% if step == 3 %}{% elif final_space %}{% url 'serve_final_pdf' scan.pk %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
            data-document-id="{{ scan.pk }}"

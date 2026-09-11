@@ -80,9 +80,11 @@ class TestViewerHelp(ScanningTestCase):
 
         self.assertIn("hidden", content[start : start + 60])
 
-    def test_the_button_starts_in_the_off_mode(self):
+    def test_the_button_starts_in_the_transparent_mode(self):
+        # The page draws the boxes at render time, so the cue must say
+        # "Overlays", not "Overlays Off" (#299).
         content = self.get(2).content.decode()
 
         start = content.index('id="toggle-overlays-btn"')
 
-        self.assertIn('data-mode="off"', content[start : start + 200])
+        self.assertIn('data-mode="transparent"', content[start : start + 200])
