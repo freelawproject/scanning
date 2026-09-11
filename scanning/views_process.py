@@ -41,6 +41,7 @@ from scanning import (
     s3_sync,
     stats,
     surya,
+    tagger,
     yolo,
 )
 from scanning.models import (
@@ -1499,6 +1500,11 @@ GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
         mistral_ocr.glued_result_key,
     ),
     "surya": (JobStage.EXTRACT, JobEngine.SURYA, surya.glued_result_key),
+    "caselaw-tagger": (
+        JobStage.TAG,
+        JobEngine.CASELAW_TAGGER,
+        tagger.glued_result_key,
+    ),
 }
 
 #: What a start button says when the committed manifest describes no

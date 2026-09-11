@@ -2033,6 +2033,8 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                     "ensure_detect_jobs",
                     "ensure_extract_jobs",
                     "ensure_shard_jobs",
+                    "ensure_run_jobs",
+                    "ensure_tag_jobs",
                 ):
                     callers.add((str(path), name))
 
@@ -2093,6 +2095,18 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 ("scanning/mistral_ocr.py", "ensure_shard_jobs"),
                 ("scanning/surya.py", "ensure_shard_jobs"),
                 ("scanning/jobs.py", "ensure_shard_jobs"),
+                # The shard creator is a thin caller of the row creator
+                # since the tagger, whose rows address one input
+                # document per volume rather than a shard set.
+                ("scanning/jobs.py", "ensure_run_jobs"),
+                ("scanning/tagger.py", "ensure_run_jobs"),
+                # The tagger: one volume per row, after review 2, and
+                # only from the command -- a staff decision, like the
+                # detection re-run. No tick pass yet, on purpose.
+                (
+                    "scanning/management/commands/enqueue_caselaw_tagger.py",
+                    "ensure_tag_jobs",
+                ),
             },
             "Something new creates external-job rows. Row creation "
             "starts paid GPU work, so update this set only on purpose.",
