@@ -903,6 +903,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function toggleDetections(pageDiv, pdfIndex) {
         _globalDetections = !_globalDetections;
+        _showDetectionHelp(_globalDetections);
 
         if (_globalDetections) {
             loadDetections(function () {
@@ -997,7 +998,7 @@ document.addEventListener('DOMContentLoaded', function () {
             label.textContent = d.label + (d.manual ? ' (manual)' : ' ' + d.confidence);
             box.appendChild(label);
 
-            // Double-click to select (shows Delete button)
+            // Double-click to select (shows the handles and Dismiss)
             (function(det, detBox) {
                 detBox.addEventListener('dblclick', function(e) {
                     e.stopPropagation();
@@ -1356,7 +1357,13 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // ── Unified overlay toggle ──
     // overlayMode cycles: 'off' → 'bounds' → 'transparent' → 'solid' → 'off'
-    var overlayMode = 'off';
+    //
+    // The page draws the redaction boxes and the margin strips at render
+    // time (redactionsVisible and marginsVisible start true), so the mode
+    // starts on 'transparent'. It said 'off' while the boxes were on the
+    // page, and the cue of #299 would have shown that contradiction to
+    // every reviewer.
+    var overlayMode = 'transparent';
     var _boundsColors = [
         '#3b82f6', '#f97316', '#10b981', '#a855f7',
         '#ec4899', '#eab308', '#06b6d4', '#ef4444',
@@ -1523,14 +1530,68 @@ document.addEventListener('DOMContentLoaded', function () {
             clearOverlaysByClass('margin-overlay-box');
             clearOverlaysByClass('opinion-bounds-overlay');
         }
-        var btn = document.getElementById('toggle-overlays-btn');
-        if (btn) {
-            var labels = {'off': 'Overlays Off (r)', 'bounds': 'Bounds (r)', 'transparent': 'Overlays (r)', 'solid': 'Solid (r)'};
-            var colors = {'off': '#6b7280', 'bounds': '#2563eb', 'transparent': '#dc2626', 'solid': '#059669'};
-            btn.textContent = labels[overlayMode];
-            btn.style.background = colors[overlayMode];
-        }
+        _showOverlayMode();
     };
+
+    // Put the mode on the button and on the guide (#299).
+    //
+    // The label and the colour came from two maps here, and they wrote to
+    // an element no template held: the cycle had no cue at all, and the
+    // key "r" was the only control. The rows of _viewer_help.html are the
+    // one table now. The row carries the label, and checker.css carries
+    // the colour of the mode, keyed by data-mode.
+    function _showOverlayMode() {
+        var row = document.querySelector(
+            '#viewer-help-modes [data-overlay-mode="' + overlayMode + '"]');
+        document.querySelectorAll('#viewer-help-modes li').forEach(function(li) {
+            li.classList.toggle('active', li === row);
+        });
+        var btn = document.getElementById('toggle-overlays-btn');
+        if (!btn) return;
+        btn.dataset.mode = overlayMode;
+        if (row) btn.textContent = row.dataset.label;
+    }
+
+    // The guide of the viewer (#299). The "?" opens it and closes it, and
+    // the mode button moves the same cycle the key "r" moves.
+    var _helpPanel = document.getElementById('viewer-help-panel');
+    var _helpBtn = document.getElementById('viewer-help-btn');
+    var _overlayBtn = document.getElementById('toggle-overlays-btn');
+
+    function _setHelpOpen(open) {
+        if (!_helpPanel) return;
+        _helpPanel.hidden = !open;
+        if (!_helpBtn) return;
+        _helpBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        _helpBtn.classList.toggle('active', open);
+    }
+
+    // The actions on a detection box apply only while the boxes are on, so
+    // that part of the guide waits for them (#299). The panel opens itself
+    // the first time in a session: a reviewer meets the guide once, and
+    // the "?" gives it back at any time.
+    function _showDetectionHelp(on) {
+        var part = document.getElementById('viewer-help-detections');
+        if (!part) return;
+        part.hidden = !on;
+        if (!on) return;
+        var key = 'viewer-help-seen-' + documentId;
+        try {
+            if (sessionStorage.getItem(key)) return;
+            sessionStorage.setItem(key, '1');
+        } catch (e) {
+            return;
+        }
+        _setHelpOpen(true);
+    }
+
+    if (_overlayBtn) {
+        _overlayBtn.addEventListener('click', function() { window.toggleOverlays(); });
+    }
+    if (_helpBtn && _helpPanel) {
+        _helpBtn.addEventListener('click', function() { _setHelpOpen(_helpPanel.hidden); });
+    }
+    _showOverlayMode();
 
     // ── Margin overlay ──
     // The strips are rows of the same list as the rects (#240), drawn by
@@ -1659,17 +1720,19 @@ document.addEventListener('DOMContentLoaded', function () {
         div.style.outline = '2px solid #f59e0b';
         div.style.zIndex = '20';
 
-        // Add delete button
+        // The button says what the endpoint does (#299): a dismiss of a
+        // computed box, a withdrawal of a drawn one. Nothing is deleted.
         var delBtn = document.createElement('button');
         delBtn.className = 'redaction-edit-btn redaction-del-btn';
-        delBtn.textContent = 'Delete';
+        delBtn.textContent = 'Dismiss';
+        delBtn.title = 'Take this box out of the volume. Nothing is ' +
+            'deleted, and a new import keeps your choice.';
         delBtn.style.cssText = 'position:absolute;top:-28px;right:0;background:#ef4444;color:white;border:none;padding:4px 10px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;z-index:21;white-space:nowrap;line-height:1;';
         delBtn.addEventListener('click', function(e) {
             e.stopPropagation();
-            if (!confirm('Delete this ' + (rectData.rect_type || 'redaction') + '?')) return;
+            if (!confirm('Dismiss this ' + (rectData.rect_type || 'redaction') + '?')) return;
 
-            // A dismiss of a computed box, a withdrawal of a drawn one
-            // (#240). The row is addressed by its id, and the answer is
+            // The row is addressed by its id (#240), and the answer is
             // read: a refusal must not remove a box the server kept.
             var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
             fetch('/scans/' + documentId + '/redactions/' + rectData.id + '/dismiss/', {
@@ -1678,7 +1741,7 @@ document.addEventListener('DOMContentLoaded', function () {
             }).then(function(r) { return r.json(); })
             .then(function(data) {
                 if (!data || data.status !== 'ok') {
-                    showToast((data && data.message) || 'Failed to delete the box');
+                    showToast((data && data.message) || 'Could not dismiss the box');
                     return;
                 }
                 div.remove();
@@ -1691,7 +1754,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     });
                 }
                 if (window.refreshFindings) window.refreshFindings();
-            }).catch(function() { showToast('Failed to delete the box'); });
+            }).catch(function() { showToast('Could not dismiss the box'); });
         });
         div.appendChild(delBtn);
 
@@ -1926,8 +1989,12 @@ document.addEventListener('DOMContentLoaded', function () {
         toolbar.className = 'det-resize-handle';
         toolbar.style.cssText = 'position:absolute;top:-30px;left:0;display:flex;gap:4px;z-index:23;white-space:nowrap;';
 
+        // "Delete" was a lie (#299): the endpoint writes a decision on a
+        // model row, or withdraws a hand-drawn row. Nothing is deleted.
         var deleteBtn = document.createElement('button');
-        deleteBtn.textContent = 'Delete';
+        deleteBtn.textContent = 'Dismiss';
+        deleteBtn.title = 'Take this box out of the volume. Nothing is ' +
+            'deleted, and a new import keeps your choice.';
         deleteBtn.style.cssText = 'background:#ef4444;color:white;border:none;padding:4px 10px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;white-space:nowrap;flex-shrink:0;line-height:1;';
         deleteBtn.addEventListener('click', function(e) {
             e.stopPropagation();
@@ -1937,7 +2004,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 body: JSON.stringify({detection_id: det.id}),
             }).then(function(r) { return r.json(); }).then(function(data) {
                 if (!data || data.status !== 'ok') {
-                    showToast((data && data.message) || 'Failed to delete detection');
+                    showToast((data && data.message) || 'Could not dismiss the detection');
                     return;
                 }
                 if (data.status === 'ok') {
@@ -1948,8 +2015,8 @@ document.addEventListener('DOMContentLoaded', function () {
                     if (window.refreshFindings) window.refreshFindings();
                 }
             }).catch(function() {
-                console.error('Failed to delete detection');
-                showToast('Failed to delete detection');
+                console.error('Failed to dismiss detection');
+                showToast('Could not dismiss the detection');
             });
         });
         toolbar.appendChild(deleteBtn);
