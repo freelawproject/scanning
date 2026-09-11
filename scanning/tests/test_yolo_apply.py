@@ -24,6 +24,7 @@ from scanning import (
     findings,
     redactions,
     services,
+    text_fit,
     yolo,
 )
 from scanning.factories import ScanFactory
@@ -383,6 +384,11 @@ class ComputeMixin:
         )
         stubs["load_printed_pages"] = printed.start()
         self.addCleanup(printed.stop)
+        # The text redaction fit reads the run's OCR volume (#279);
+        # ``test_text_fit`` owns the rule, so the read is stubbed here.
+        cells = patch.object(text_fit, "load_cells", return_value={})
+        stubs["load_cells"] = cells.start()
+        self.addCleanup(cells.stop)
         release = patch("scanning.s3_sync.release_local_processing")
         release.start()
         self.addCleanup(release.stop)
@@ -517,6 +523,64 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         self.assertEqual(margin.fill, "white")
         self.assertEqual(margin.bbox, [0.0, 0.0, 20.0, 50.0])
         self.assertEqual((margin.source_page, margin.page_index), (2, 1))
+
+    def test_a_text_box_is_fitted_to_the_read_text_before_it_is_stored(self):
+        """#279: the box blackletter measured from the fallback column
+        split is cut back to the cells under it, and the row stores the
+        fitted box."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        self._measured(
+            stubs,
+            [
+                {
+                    "page_index": 0,
+                    "rects": [
+                        {
+                            "x0": 100,
+                            "y0": 200,
+                            "x1": 300,
+                            "y1": 400,
+                            "fill": "black",
+                            "type": "headnote",
+                        }
+                    ],
+                }
+            ],
+        )
+        # The fake page is 1000 pixels wide and 500 points wide, so the
+        # 2-point pad is 4 pixels. The cells put the text at 150..250.
+        page = SimpleNamespace(
+            index=0,
+            scale_x=0.5,
+            scale_y=0.5,
+            img_width=1000,
+            img_height=1000,
+            pdf_width=500.0,
+            pdf_height=500.0,
+        )
+        stubs["_snapped_document"].return_value = (
+            SimpleNamespace(pages=[page]),
+            {},
+            [{"page_index": 0}],
+        )
+        stubs["load_cells"].return_value = text_fit.page_cells(
+            {
+                "pages": [
+                    {
+                        "page_index": 0,
+                        "origin_width": 1000,
+                        "origin_height": 1000,
+                        "cells": [{"bbox": [150, 210, 250, 390]}],
+                    }
+                ]
+            }
+        )
+
+        services.run_compute_redactions(scan.pk)
+
+        row = Redaction.objects.get(scan=scan)
+        self.assertEqual(row.bbox, [73.0, 100.0, 127.0, 200.0])
 
     def test_a_recompute_rewrites_the_computed_rows_and_keeps_the_human_ones(
         self,
