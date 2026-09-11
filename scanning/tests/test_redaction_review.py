@@ -579,6 +579,19 @@ class TestTheStepTwoBar(ScanningTestCase):
 
         self.assertIn("Next: Generate", self._bar(scan))
 
+    def test_the_recompute_button_follows_the_statuses(self):
+        """A button never sends a curator to an action that refuses
+        (#305). ``REDACTION_COMPUTE_STATUSES`` takes the volume in
+        review 2 and the legacy volume, and refuses the closed review.
+        """
+        ready = ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
+        legacy = ScanFactory(status=Status.PENDING_REVIEW, page_count=2)
+        approved = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
+
+        self.assertIn("recomputeRedactions(", self._bar(ready))
+        self.assertIn("recomputeRedactions(", self._bar(legacy))
+        self.assertNotIn("recomputeRedactions(", self._bar(approved))
+
     def test_a_backfilled_legacy_volume_keeps_its_link(self):
         """The gate reads the status, not ``has_legacy_ocr``: a
         backfill dots.mocr run turns that false while the volume is

@@ -1993,10 +1993,10 @@ def queue_redaction_compute(scan: "Scan") -> tuple[bool, str]:
 
     The request path never does this work itself. It renders every page
     of the volume, which is 83 seconds for 1364 pages and beyond what
-    an ingress gives a request. So the two review-2 buttons write a
-    status here and return, and the viewer's progress poll reloads the
-    page when the daemon is done -- the same route every other long
-    stage takes.
+    an ingress gives a request. So the "Recompute redactions" button of
+    review 2 (#305) writes a status here and returns, and the viewer's
+    progress poll reloads the page when the daemon is done -- the same
+    route every other long stage takes.
 
     The compare-and-swap is what keeps a second press from stacking:
     the scan leaves the eligible statuses on the first one.

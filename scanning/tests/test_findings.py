@@ -10,6 +10,7 @@ the approve button.
 
 import json
 from io import StringIO
+from unittest.mock import patch
 
 from django.core.management import call_command
 from django.urls import reverse
@@ -18,6 +19,7 @@ from django.utils import timezone
 from scanning import findings
 from scanning.factories import OpinionBoundaryFactory, ScanFactory
 from scanning.models import (
+    BUSY_STATUSES,
     REVIEW2_CHECKS,
     ApplyRun,
     CheckName,
@@ -28,6 +30,7 @@ from scanning.models import (
     PageEdit,
     Redaction,
     ReviewDismissal,
+    Scan,
     Status,
 )
 from scanning.tests.test_views import ScanningTestCase
@@ -824,6 +827,15 @@ class TestFindingEndpoints(ScanningTestCase):
             ).exists()
         )
 
+    def test_the_fragment_carries_the_recompute_button(self):
+        """The cheap recompute is inside the section it rewrites (#305),
+        so every swap brings the button back with its handler."""
+        response = self.client.get(
+            reverse("review_findings", kwargs={"pk": self.scan.pk})
+        )
+
+        self.assertIn("rebuildFindings(", response.json()["html"])
+
     def test_review_1_dismiss_refuses_a_review_2_finding(self):
         response = self._post("dismiss_issue", {"issue_id": self.finding.pk})
 
@@ -832,6 +844,115 @@ class TestFindingEndpoints(ScanningTestCase):
         self.assertFalse(
             PageEdit.objects.filter(kind=PageEdit.Kind.DISMISS_ISSUE).exists()
         )
+
+
+class TestTheRebuildButton(ScanningTestCase):
+    """The cheap recompute of review 2 (#305).
+
+    ``findings.rebuild`` reads rows and nothing else, so the button
+    runs in the request, on a web pod that never pulled the volume's
+    files. It is the twin of review 1's ``recalculate`` (#153).
+    """
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = make_scan()
+        caption = make_detection(self.scan, "CASE_CAPTION", 0)
+        key = make_detection(self.scan, "KEY_ICON", 3)
+        make_boundary(self.scan, caption, key)
+        self.loose = make_detection(self.scan, "KEY_ICON", 1)
+        findings.rebuild(self.scan)
+
+    def _rebuild(self):
+        return self.client.post(
+            reverse("rebuild_findings", kwargs={"pk": self.scan.pk})
+        )
+
+    def test_it_writes_the_findings_again_and_answers_the_section(self):
+        """A row written behind the endpoint's back -- by a command, or
+        by another tab -- reaches the cards on the next press."""
+        self.scan.issues.filter(check_name__in=REVIEW2_CHECKS).delete()
+
+        response = self._rebuild()
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(checks_of(self.scan), [CheckName.UNMATCHED_KEY_ICON])
+        self.assertEqual(data["open"], 1)
+        self.assertEqual(data["stale"], 0)
+        self.assertIn("finding-card", data["html"])
+
+    def test_it_follows_a_row_that_answers_a_card(self):
+        """The loose key icon goes, and so does its card."""
+        self.loose.delete()
+
+        self._rebuild()
+
+        self.assertNotIn(CheckName.UNMATCHED_KEY_ICON, checks_of(self.scan))
+
+    def test_it_reads_no_file(self):
+        """The proof that it runs on any web pod: the volume has no PDF
+        anywhere, and the answer is still the section."""
+        with (
+            patch("fitz.open") as opened,
+            patch("scanning.s3_sync.download_original_pdf") as pulled,
+        ):
+            response = self._rebuild()
+
+        self.assertEqual(response.status_code, 200)
+        opened.assert_not_called()
+        pulled.assert_not_called()
+
+    def test_any_logged_in_user_may_press_it(self):
+        """Review 2 is a curator's step, not a staff one (#151)."""
+        self.assertFalse(self.user.is_staff)
+
+        self.assertEqual(self._rebuild().status_code, 200)
+
+    def test_it_takes_a_post_alone(self):
+        response = self.client.get(
+            reverse("rebuild_findings", kwargs={"pk": self.scan.pk})
+        )
+
+        self.assertEqual(response.status_code, 405)
+
+    def test_login_is_required(self):
+        self.client.logout()
+
+        self.assertEqual(self._rebuild().status_code, 302)
+
+    def test_a_busy_volume_is_refused(self):
+        """The compute writes the findings itself and stamps the run it
+        measured in afterwards (#305). A rebuild in that window reads
+        the stamp of the space before it, so the endpoint refuses every
+        busy status, as the sidebar offers no button there.
+        """
+        before = checks_of(self.scan)
+        for status in sorted(BUSY_STATUSES):
+            with self.subTest(status=status):
+                Scan.objects.filter(pk=self.scan.pk).update(status=status)
+
+                response = self._rebuild()
+
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.json()["status"], "error")
+                self.assertEqual(checks_of(self.scan), before)
+
+    def test_an_approved_review_still_rebuilds(self):
+        """No review gate (#305). The rebuild is derived from the rows
+        and is idempotent, so a closed review gets what it had.
+        """
+        before = checks_of(self.scan)
+        Scan.objects.filter(pk=self.scan.pk).update(
+            status=Status.REDACTION_REVIEW_DONE
+        )
+
+        self.assertEqual(self._rebuild().status_code, 200)
+        self.assertEqual(checks_of(self.scan), before)
+        self.scan.refresh_from_db()
+        self.assertEqual(self.scan.status, Status.REDACTION_REVIEW_DONE)
 
 
 class TestTheView(ScanningTestCase):

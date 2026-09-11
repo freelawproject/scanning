@@ -80,6 +80,17 @@ class TestViewerHelp(ScanningTestCase):
 
         self.assertIn("hidden", content[start : start + 60])
 
+    def test_the_panel_names_both_recompute_buttons(self):
+        """The two buttons look alike and cost differently (#305), so
+        the guide must say which one measures the volume again."""
+        content = self.get(2).content.decode()
+
+        start = content.index("<h3>Findings</h3>")
+        section = content[start : content.index("<h3>Keys</h3>", start)]
+
+        self.assertIn("<b>Recompute</b>", section)
+        self.assertIn("<b>Recompute redactions</b>", section)
+
     def test_the_button_starts_in_the_transparent_mode(self):
         # The page draws the boxes at render time, so the cue must say
         # "Overlays", not "Overlays Off" (#299).

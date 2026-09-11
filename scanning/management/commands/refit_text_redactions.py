@@ -3,9 +3,10 @@
 The compute fits every text box to the dots.mocr cells under it
 (``text_fit``), but only from this deploy on. The volumes already in
 review 2 carry boxes blackletter measured from the fallback column
-split, so each one overruns its text column. Nothing recomputes them:
-``REPAIR_ON_REQUEST_ENABLED`` is off, and the admin re-queue runs the
-whole pipeline again. This command fits them instead.
+split, so each one overruns its text column. This command fits them
+instead. A curator may recompute one volume from step 2 (#305), but
+that is one volume at a time, and it takes each one out of the review
+while it runs.
 
 It reads the database and one JSON object per volume. It renders
 nothing, it pulls no PDF and it spends no GPU time. It writes no scan
