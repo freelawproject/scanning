@@ -129,11 +129,11 @@ def page_cells(document: dict | None) -> dict[int, PageCells]:
         height = page.get("origin_height")
         if not isinstance(index, int) or isinstance(index, bool):
             continue
-        if not _positive(width) or not _positive(height):
+        if not is_positive(width) or not is_positive(height):
             continue
         boxes = []
         for cell in page.get("cells") or []:
-            box = _cell_box(cell)
+            box = cell_box(cell)
             if box is not None:
                 boxes.append(box)
         if boxes:
@@ -146,20 +146,51 @@ def page_cells(document: dict | None) -> dict[int, PageCells]:
     return pages
 
 
+def load_document(scan, run) -> dict | None:
+    """Read the glued OCR document of the space ``run`` names, or None.
+
+    **The one rule for which OCR document a reader of the cells
+    reads**, the twin of ``services.geometry_pdf_path``. With a standing
+    apply run it is the run's glued OCR volume (``ApplyRun.ocr_key``),
+    whose pages are the corrected volume's; without one it is the
+    volume's own glued document (``dots_mocr.glued_volume_key``), whose
+    pages are the original's. ``views_process.ocr_text_url`` chooses
+    between the two the same way (#262), and both key their pages by
+    ``page_index``.
+
+    A read that fails costs nothing but the pass that wanted it, so the
+    fault is logged and None comes back. Two readers share this: the
+    fit below, whose boxes then keep the width blackletter measured,
+    and the survey of #303 (``text_findings``), which then reports one
+    volume fewer.
+
+    :param scan: The scan.
+    :param run: The standing apply run, or None for the original's
+        space.
+    :returns: The document, or None when nothing was read.
+    :rtype: dict | None
+    """
+    from scanning import apply, s3_sync
+
+    try:
+        if run is not None:
+            if not run.ocr_key:
+                return None
+            return apply.load_ocr_document(scan, run)
+        key = dots_mocr.glued_volume_key(scan)
+        if not key:
+            return None
+        return s3_sync.download_json_object(key)
+    except Exception:
+        logger.exception("scan %s: the OCR volume did not load", scan.pk)
+        return None
+
+
 def load_cells(scan, run) -> dict[int, PageCells]:
     """Read the cells of the space ``run`` names, and never raise.
 
-    **The one rule for which OCR document the fit reads**, the twin of
-    ``services.geometry_pdf_path``. With a standing apply run it is the
-    run's glued OCR volume (``ApplyRun.ocr_key``), whose pages are the
-    corrected volume's; without one it is the volume's own glued
-    document (``dots_mocr.glued_volume_key``), whose pages are the
-    original's. ``views_process.ocr_text_url`` chooses between the two
-    the same way (#262), and both key their pages by ``page_index``.
-
     A read that fails costs nothing but the fit: the boxes stay as
-    blackletter measured them, which is correct and only wide. So the
-    fault is logged and an empty map comes back.
+    blackletter measured them, which is correct and only wide.
 
     :param scan: The scan.
     :param run: The standing apply run, or None for the original's
@@ -167,26 +198,7 @@ def load_cells(scan, run) -> dict[int, PageCells]:
     :returns: ``{page_index: PageCells}``, empty when nothing was read.
     :rtype: dict[int, PageCells]
     """
-    from scanning import apply, s3_sync
-
-    try:
-        if run is not None:
-            if not run.ocr_key:
-                return {}
-            document = apply.load_ocr_document(scan, run)
-        else:
-            key = dots_mocr.glued_volume_key(scan)
-            if not key:
-                return {}
-            document = s3_sync.download_json_object(key)
-    except Exception:
-        logger.exception(
-            "scan %s: the OCR volume did not load; the text redaction "
-            "boxes keep the width blackletter measured",
-            scan.pk,
-        )
-        return {}
-    return page_cells(document)
+    return page_cells(load_document(scan, run))
 
 
 class Fit(NamedTuple):
@@ -444,7 +456,7 @@ def fit_rows(scan, cells: dict[int, PageCells], run=None) -> FitCounts:
     return counts
 
 
-def _cell_box(cell) -> tuple[float, float, float, float] | None:
+def cell_box(cell) -> tuple[float, float, float, float] | None:
     """Return one cell's box, when it has a usable one.
 
     :param cell: One ``cells[]`` entry of a page.
@@ -474,7 +486,7 @@ def _number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _positive(value) -> bool:
+def is_positive(value) -> bool:
     """Return whether ``value`` is a number above zero.
 
     :param value: The value.
