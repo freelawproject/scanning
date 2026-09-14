@@ -52,6 +52,9 @@ var _opinions = [];
     };
 
     function _clearDim() {
+        // The viewer holds the selection the masks are drawn from, and
+        // draws them again at every render, so it owns the clear (#311).
+        if (window.clearOpinionDim) window.clearOpinionDim();
         document
             .querySelectorAll(".opinion-dim-overlay, .opinion-dim")
             .forEach(function (d) {

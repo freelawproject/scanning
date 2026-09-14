@@ -674,6 +674,13 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                 }
             }
+            // The masks of the selected opinion hold the scale of the
+            // render they were drawn for, so this page draws its own
+            // (#311). Step 3 shows them too, so this is outside the
+            // viewOnly gate.
+            if (!_viewingOpinion) {
+                _drawDimForPage(pageDiv);
+            }
             if (!viewOnly && _globalDetections && allDetections) {
                 detectionsVisible[pdfIndex] = true;
                 drawDetectionOverlay(pageDiv, pdfIndex);
@@ -1536,6 +1543,9 @@ document.addEventListener('DOMContentLoaded', function () {
             clearOverlaysByClass('margin-overlay-box');
             clearOverlaysByClass('opinion-bounds-overlay');
         }
+        // The masks of the selected opinion follow the mode: off removes
+        // them, solid paints them white (#311).
+        drawOpinionDim();
         _showOverlayMode();
     };
 
@@ -2153,6 +2163,84 @@ document.addEventListener('DOMContentLoaded', function () {
     // Cache opinions data for within-page highlighting
     var _opinionsData = null;
 
+    // The masks of the selected opinion: the page span it owns, and its
+    // outside_rects grouped by pdf index. The draw reads them at every
+    // render, so a page re-rasterized at another zoom gets its masks at
+    // its own scale. Positioned once, they kept the older scale and sat
+    // over the wrong text (#311).
+    var _dimSpan = null;
+    var _dimRectsByPage = null;
+
+    /** Drop the selection and remove every mask it drew. */
+    function clearOpinionDim() {
+        _dimSpan = null;
+        _dimRectsByPage = null;
+        clearOverlaysByClass('opinion-dim-overlay');
+    }
+    // viewer_sidebar.js clears the masks on Escape and on an arrow scroll.
+    window.clearOpinionDim = clearOpinionDim;
+
+    /**
+     * Draw the masks of the selected opinion on one page.
+     *
+     * A page outside the opinion is covered whole; a page the opinion
+     * shares with a neighbour gets one mask per outside rect. The
+     * overlay mode is read here: off draws nothing, solid paints the
+     * mask white, transparent dims it.
+     *
+     * @param {HTMLElement} pageDiv - The .page-container element.
+     */
+    function _drawDimForPage(pageDiv) {
+        var wrapper = pageDiv.querySelector('.canvas-wrapper');
+        if (!wrapper) return;
+        wrapper.querySelectorAll('.opinion-dim-overlay').forEach(function(el) { el.remove(); });
+        if (!_dimSpan || overlayMode === 'off') return;
+
+        var solid = (overlayMode === 'solid');
+        var num = parseInt(pageDiv.dataset.pdfIndex);
+        if (num < _dimSpan.start || num > _dimSpan.end) {
+            var pageBg = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.3)';
+            var cover = document.createElement('div');
+            cover.className = 'opinion-dim-overlay';
+            cover.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:' + pageBg + ';z-index:15;pointer-events:none;';
+            wrapper.appendChild(cover);
+            return;
+        }
+
+        var rects = _dimRectsByPage ? _dimRectsByPage[num] : null;
+        if (!rects || !rects.length) return;
+        var canvas = pageDiv.querySelector('.pdf-canvas');
+        if (!canvas || !canvas.width) return;
+
+        // The rects are in PDF points; the canvas holds the page at the
+        // scale of its last render.
+        var dsx = canvas.offsetWidth / (canvas.width / pageScale(pageDiv, SCALE));
+        var dsy = canvas.offsetHeight / (canvas.height / pageScale(pageDiv, SCALE));
+        var rectBg = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.25)';
+        rects.forEach(function(r) {
+            var dim = document.createElement('div');
+            dim.className = 'opinion-dim-overlay';
+            dim.style.position = 'absolute';
+            dim.style.left = (r.x0 * dsx) + 'px';
+            dim.style.top = (r.y0 * dsy) + 'px';
+            dim.style.width = ((r.x1 - r.x0) * dsx) + 'px';
+            dim.style.height = ((r.y1 - r.y0) * dsy) + 'px';
+            dim.style.background = rectBg;
+            dim.style.zIndex = '15';
+            dim.style.pointerEvents = 'none';
+            wrapper.appendChild(dim);
+        });
+    }
+
+    /** Draw the masks of the selected opinion on every page. */
+    function drawOpinionDim() {
+        if (!_dimSpan) {
+            clearOverlaysByClass('opinion-dim-overlay');
+            return;
+        }
+        document.querySelectorAll('.lazy-page').forEach(_drawDimForPage);
+    }
+
     function _loadOpinionsData(cb) {
         if (_opinionsData) { cb(); return; }
         // The page carries the same payload the endpoint answers
@@ -2173,64 +2261,22 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     window.highlightOpinion = function(captionPage, keyPage, opIndex) {
-        clearOverlaysByClass('opinion-dim-overlay');
+        clearOpinionDim();
 
         document.querySelectorAll('.opinion-card').forEach(function(c) { c.classList.remove('selected'); });
         if (event && event.currentTarget) event.currentTarget.classList.add('selected');
 
         _loadOpinionsData(function() {
-            // off: no dimming, just scroll
-            // transparent: semi-transparent dim on other pages/regions
-            // solid: opaque whiteout on other pages/regions
-            if (overlayMode !== 'off') {
-                var solid = (overlayMode === 'solid');
-                var thisOp = (typeof opIndex === 'number' && opIndex < _opinionsData.length)
-                    ? _opinionsData[opIndex] : null;
-                if (!thisOp) return;
-
-                var outsideRects = thisOp.outside_rects || [];
-
-                // Dim pages outside the opinion
-                var pageBg = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.3)';
-                var allPages = document.querySelectorAll('.lazy-page');
-                allPages.forEach(function(pageDiv) {
-                    var num = parseInt(pageDiv.dataset.pdfIndex);
-                    var wrapper = pageDiv.querySelector('.canvas-wrapper');
-                    if (!wrapper) return;
-
-                    if (num < captionPage || num > keyPage) {
-                        var dim = document.createElement('div');
-                        dim.className = 'opinion-dim-overlay';
-                        dim.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:' + pageBg + ';z-index:15;pointer-events:none;';
-                        wrapper.appendChild(dim);
-                    }
-                });
-
-                // Draw outside_rects as dim overlays (PDF coordinates)
-                var rectBg = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.25)';
-                outsideRects.forEach(function(r) {
-                    var pageEl = _pageDivForIndex(r.page_index);
-                    if (!pageEl) return;
-                    var wrapper = pageEl.querySelector('.canvas-wrapper');
-                    var canvas = pageEl.querySelector('.pdf-canvas');
-                    if (!wrapper || !canvas) return;
-
-                    var dsx = canvas.offsetWidth / (canvas.width / pageScale(pageEl, SCALE));
-                    var dsy = canvas.offsetHeight / (canvas.height / pageScale(pageEl, SCALE));
-
-                    var dim = document.createElement('div');
-                    dim.className = 'opinion-dim-overlay';
-                    dim.style.position = 'absolute';
-                    dim.style.left = (r.x0 * dsx) + 'px';
-                    dim.style.top = (r.y0 * dsy) + 'px';
-                    dim.style.width = ((r.x1 - r.x0) * dsx) + 'px';
-                    dim.style.height = ((r.y1 - r.y0) * dsy) + 'px';
-                    dim.style.background = rectBg;
-                    dim.style.zIndex = '15';
-                    dim.style.pointerEvents = 'none';
-                    wrapper.appendChild(dim);
-                });
-            }
+            var thisOp = (typeof opIndex === 'number' && opIndex < _opinionsData.length)
+                ? _opinionsData[opIndex] : null;
+            if (!thisOp) return;
+            _dimSpan = {start: captionPage, end: keyPage};
+            _dimRectsByPage = {};
+            (thisOp.outside_rects || []).forEach(function(r) {
+                if (!_dimRectsByPage[r.page_index]) _dimRectsByPage[r.page_index] = [];
+                _dimRectsByPage[r.page_index].push(r);
+            });
+            drawOpinionDim();
         });
 
         _highlightedOpinion = {start: captionPage, end: keyPage};
@@ -2246,7 +2292,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     container.addEventListener('dblclick', function() {
         if (_highlightedOpinion) {
-            clearOverlaysByClass('opinion-dim-overlay');
+            clearOpinionDim();
             _highlightedOpinion = null;
             _currentOpIndex = -1;
             document.querySelectorAll('.opinion-card').forEach(function(c) { c.classList.remove('selected'); });
