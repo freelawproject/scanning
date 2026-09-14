@@ -52,11 +52,10 @@ var _opinions = [];
     };
 
     function _clearDim() {
-        document
-            .querySelectorAll(".opinion-dim-overlay, .opinion-dim")
-            .forEach(function (d) {
-                d.remove();
-            });
+        // The viewer holds the selection the masks are drawn from, and
+        // draws them again at every render, so it owns the clear. Step 1
+        // loads this file without the viewer, and has no masks (#311).
+        if (window.clearOpinionDim) window.clearOpinionDim();
     }
 
     // --- Step 3: view mode ---
