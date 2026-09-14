@@ -1546,8 +1546,8 @@ document.addEventListener('DOMContentLoaded', function () {
             clearOverlaysByClass('margin-overlay-box');
             clearOverlaysByClass('opinion-bounds-overlay');
         }
-        // The masks of the selected opinion follow the mode: off removes
-        // them, solid paints them white (#311).
+        // The masks of the selected opinion live in the bounds mode
+        // alone, so every other step of the cycle removes them (#311).
         drawOpinionDim();
         _showOverlayMode();
     };
@@ -2186,9 +2186,11 @@ document.addEventListener('DOMContentLoaded', function () {
      * Draw the masks of the selected opinion on one page.
      *
      * A page outside the opinion is covered whole; a page the opinion
-     * shares with a neighbour gets one mask per outside rect. The
-     * overlay mode is read here: off draws nothing, solid paints the
-     * mask white, transparent dims it.
+     * shares with a neighbour gets one mask per outside rect. Both are
+     * dim, and both draw in the bounds mode alone: that mode is the one
+     * the opinion boundaries are the subject of. The redaction modes
+     * show the page as the output has it, so an opinion mask has no
+     * place there, and an opaque white page even less (#311).
      *
      * @param {HTMLElement} pageDiv - The .page-container element.
      */
@@ -2196,15 +2198,13 @@ document.addEventListener('DOMContentLoaded', function () {
         var wrapper = pageDiv.querySelector('.canvas-wrapper');
         if (!wrapper) return;
         wrapper.querySelectorAll('.opinion-dim-overlay').forEach(function(el) { el.remove(); });
-        if (!_dimSpan || overlayMode === 'off') return;
+        if (!_dimSpan || overlayMode !== 'bounds') return;
 
-        var solid = (overlayMode === 'solid');
         var num = parseInt(pageDiv.dataset.pdfIndex);
         if (num < _dimSpan.start || num > _dimSpan.end) {
-            var pageBg = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.3)';
             var cover = document.createElement('div');
             cover.className = 'opinion-dim-overlay';
-            cover.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:' + pageBg + ';z-index:15;pointer-events:none;';
+            cover.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.3);z-index:15;pointer-events:none;';
             wrapper.appendChild(cover);
             return;
         }
@@ -2220,7 +2220,6 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!scale) return;
         var dsx = scale[0];
         var dsy = scale[1];
-        var rectBg = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.25)';
         rects.forEach(function(r) {
             var dim = document.createElement('div');
             dim.className = 'opinion-dim-overlay';
@@ -2229,7 +2228,7 @@ document.addEventListener('DOMContentLoaded', function () {
             dim.style.top = (r.y0 * dsy) + 'px';
             dim.style.width = ((r.x1 - r.x0) * dsx) + 'px';
             dim.style.height = ((r.y1 - r.y0) * dsy) + 'px';
-            dim.style.background = rectBg;
+            dim.style.background = 'rgba(0,0,0,0.25)';
             dim.style.zIndex = '15';
             dim.style.pointerEvents = 'none';
             wrapper.appendChild(dim);
