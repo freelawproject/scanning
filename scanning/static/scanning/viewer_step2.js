@@ -676,8 +676,8 @@ document.addEventListener('DOMContentLoaded', function () {
             }
             // The masks of the selected opinion hold the scale of the
             // render they were drawn for, so this page draws its own
-            // (#311). Step 3 shows them too, so this is outside the
-            // viewOnly gate.
+            // (#311). The masks are of the volume, so a page of one
+            // opinion's PDF gets none.
             if (!_viewingOpinion) {
                 _drawDimForPage(pageDiv);
             }
@@ -1294,6 +1294,9 @@ document.addEventListener('DOMContentLoaded', function () {
 
     window.loadFullRedacted = function () {
         document.querySelectorAll('.opinion-card').forEach(function (c) { c.classList.remove('selected'); });
+        // The cards lose the selection here, so the masks lose it too.
+        // The reload after a save (`?t=`) keeps both (#311).
+        clearOpinionDim();
         document.querySelectorAll('.toggle-redacted').forEach(function (b) { b.classList.add('active'); });
         document.querySelectorAll('.toggle-unredacted').forEach(function (b) { b.classList.remove('active'); });
         _viewingOpinion = false;
@@ -2157,17 +2160,16 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // ── Scroll to page and highlight opinion range ──
-    var _highlightedOpinion = null;
     var _currentViewPage = null;
 
     // Cache opinions data for within-page highlighting
     var _opinionsData = null;
 
-    // The masks of the selected opinion: the page span it owns, and its
-    // outside_rects grouped by pdf index. The draw reads them at every
-    // render, so a page re-rasterized at another zoom gets its masks at
-    // its own scale. Positioned once, they kept the older scale and sat
-    // over the wrong text (#311).
+    // The selected opinion: the page span it owns, and its outside_rects
+    // grouped by pdf index. `_dimSpan` is the one copy of the selection,
+    // and the draw reads both at every render, so a page re-rasterized
+    // at another zoom gets its masks at its own scale. Positioned once,
+    // they kept the older scale and sat over the wrong text (#311).
     var _dimSpan = null;
     var _dimRectsByPage = null;
 
@@ -2212,10 +2214,12 @@ document.addEventListener('DOMContentLoaded', function () {
         var canvas = pageDiv.querySelector('.pdf-canvas');
         if (!canvas || !canvas.width) return;
 
-        // The rects are in PDF points; the canvas holds the page at the
-        // scale of its last render.
-        var dsx = canvas.offsetWidth / (canvas.width / pageScale(pageDiv, SCALE));
-        var dsy = canvas.offsetHeight / (canvas.height / pageScale(pageDiv, SCALE));
+        // The rects are in PDF points, the same space the redaction boxes
+        // are in, so they take the same scale rule.
+        var scale = _pointScale(num, canvas);
+        if (!scale) return;
+        var dsx = scale[0];
+        var dsy = scale[1];
         var rectBg = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.25)';
         rects.forEach(function(r) {
             var dim = document.createElement('div');
@@ -2266,20 +2270,23 @@ document.addEventListener('DOMContentLoaded', function () {
         document.querySelectorAll('.opinion-card').forEach(function(c) { c.classList.remove('selected'); });
         if (event && event.currentTarget) event.currentTarget.classList.add('selected');
 
+        // The span is the selection, and the arguments carry it. Only the
+        // rects wait for the payload, and the covers of the pages outside
+        // the opinion do not need them.
+        _dimSpan = {start: captionPage, end: keyPage};
         _loadOpinionsData(function() {
             var thisOp = (typeof opIndex === 'number' && opIndex < _opinionsData.length)
                 ? _opinionsData[opIndex] : null;
-            if (!thisOp) return;
-            _dimSpan = {start: captionPage, end: keyPage};
-            _dimRectsByPage = {};
-            (thisOp.outside_rects || []).forEach(function(r) {
-                if (!_dimRectsByPage[r.page_index]) _dimRectsByPage[r.page_index] = [];
-                _dimRectsByPage[r.page_index].push(r);
-            });
+            if (thisOp) {
+                _dimRectsByPage = {};
+                (thisOp.outside_rects || []).forEach(function(r) {
+                    if (!_dimRectsByPage[r.page_index]) _dimRectsByPage[r.page_index] = [];
+                    _dimRectsByPage[r.page_index].push(r);
+                });
+            }
             drawOpinionDim();
         });
 
-        _highlightedOpinion = {start: captionPage, end: keyPage};
         _currentViewPage = captionPage;
         // Redaction/margin overlays are already drawn per page at render time
         // and don't change when selecting an opinion. Redrawing the whole
@@ -2291,9 +2298,8 @@ document.addEventListener('DOMContentLoaded', function () {
     // Click on viewer background to clear opinion highlight
 
     container.addEventListener('dblclick', function() {
-        if (_highlightedOpinion) {
+        if (_dimSpan) {
             clearOpinionDim();
-            _highlightedOpinion = null;
             _currentOpIndex = -1;
             document.querySelectorAll('.opinion-card').forEach(function(c) { c.classList.remove('selected'); });
         }
