@@ -1886,6 +1886,51 @@ class TestEnqueueMissingRuns(ScanningTestCase):
         self.assertEqual(len(volume), 3)
 
 
+class TestBarSaysWhenTheReadIsMissing(ScanningTestCase):
+    """A parked volume with no OCR run shows a line where the run's
+    state would be, never nothing (#327)."""
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.make_user())
+
+    def _bar(self, scan):
+        response = self.client.get(
+            reverse("process_actions", kwargs={"pk": scan.pk}) + "?step=1"
+        )
+        return response.json()["html"]
+
+    def test_a_parked_volume_says_the_read_is_coming_when_the_stage_is_on(
+        self,
+    ):
+        from scanning.views_process import OCR_NOT_STARTED_MESSAGE
+
+        scan = ScanFactory(page_count=30, status=Status.AWAITING_VALIDATION)
+        with (
+            override_settings(**DOTS),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+        ):
+            self.assertIn(OCR_NOT_STARTED_MESSAGE, self._bar(scan))
+
+    def test_a_parked_volume_says_so_when_the_stage_is_off(self):
+        from scanning.views_process import OCR_UNAVAILABLE_MESSAGE
+
+        scan = ScanFactory(page_count=30, status=Status.AWAITING_VALIDATION)
+        with override_settings(**{**DOTS, "RUNPOD_DOTSMOCR_ENDPOINT_ID": ""}):
+            self.assertIn(OCR_UNAVAILABLE_MESSAGE, self._bar(scan))
+
+    def test_a_run_takes_the_spot(self):
+        scan = ScanFactory(page_count=30, status=Status.AWAITING_VALIDATION)
+        dots_mocr.ensure_analyze_jobs(scan, make_manifest())
+        html = self._bar(scan)
+        self.assertIn("OCR running", html)
+        self.assertNotIn("OCR missing", html)
+
+    def test_a_legacy_volume_gets_no_line(self):
+        scan = ScanFactory(page_count=30, status=Status.PENDING_REVIEW)
+        self.assertNotIn("OCR missing", self._bar(scan))
+
+
 class TestKnownEnqueuePaths(ScanningTestCase):
     """Every path that creates paid GPU work, pinned.
 

@@ -218,6 +218,20 @@ NO_DETECTIONS_MESSAGE = (
     "finishes. If nothing shows after a few minutes, ask a staff "
     "member."
 )
+# What the step-1 bar says about a parked new-pipeline volume with no
+# OCR run at all (#327), in the spot the run's state takes once it
+# exists. Two texts, because the daemon's sweep starts the run when
+# the stage is configured and never when it is not, so the bar must
+# not promise a run that is not coming.
+OCR_NOT_STARTED_MESSAGE = (
+    "OCR missing: this volume has no OCR run yet. The server starts one "
+    "by itself within a few seconds."
+)
+OCR_UNAVAILABLE_MESSAGE = (
+    "OCR missing: OCR is not configured on this server, so the page "
+    "review cannot start. Ask a staff member."
+)
+
 
 #: The step-2 warning when the run's printed pages could not be read
 #: (#269). The page renders with positional labels instead.
@@ -267,6 +281,30 @@ def dots_run_is_glued(summary: dict | None) -> bool:
     if not summary:
         return False
     return summary["statuses"].get(JobStatus.CONSUMED) == summary["total"]
+
+
+def ocr_missing(scan, summary: dict | None) -> str | None:
+    """Return the step-1 bar's line about a missing OCR run, if any (#327).
+
+    ``summary`` is ``dots_mocr.run_summary(scan)``: ``None`` when the
+    stage has never run for this scan. Only a volume the sweep would
+    look at (``yolo.SWEEP_STATUSES``) gets a line: a legacy volume holds
+    PENDING_REVIEW, a queued one is the pipeline's, and an errored one
+    has its own banner. Which line depends on whether this environment
+    can start the read (``services.analyze_stage_open``).
+
+    :param scan: The scan the bar is for.
+    :param summary: The run summary, or ``None``.
+    :returns: The message, or ``None`` when nothing is missing.
+    :rtype: str | None
+    """
+    from scanning import services
+
+    if summary is not None or scan.status not in yolo.SWEEP_STATUSES:
+        return None
+    if services.analyze_stage_open():
+        return OCR_NOT_STARTED_MESSAGE
+    return OCR_UNAVAILABLE_MESSAGE
 
 
 def detection_message(summary: dict | None) -> str:
@@ -622,6 +660,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "has_detections": has_detections,
             "is_processing": is_processing,
             "dots_run": dots_run,
+            "ocr_missing": ocr_missing(scan, dots_run),
             "yolo_run": yolo_run,
             "detect_message": detection_message(yolo_run),
             **flags,
@@ -1923,6 +1962,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
     if step < 1 or step > 3:
         step = 1
 
+    dots_run = dots_mocr.run_summary(scan)
     yolo_run = yolo.run_summary(scan)
     context = {
         "scan": scan,
@@ -1931,7 +1971,8 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "issues": scan.issues.exclude(check_name__in=REVIEW2_CHECKS),
         "missing_pages": scan.missing_pages,
         "has_detections": Detection.objects.filter(scan=scan).exists(),
-        "dots_run": dots_mocr.run_summary(scan),
+        "dots_run": dots_run,
+        "ocr_missing": ocr_missing(scan, dots_run),
         "yolo_run": yolo_run,
         "detect_message": detection_message(yolo_run),
         **_review_flags(scan),
