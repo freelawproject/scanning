@@ -434,23 +434,35 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         self.assertTrue(state.get("applied_at"))
         self.assertNotIn("queued_at", state)
 
-    def test_the_columns_are_separated_before_the_document(self):
-        """The gutter goes into the boxes before any geometry reads
-        them (#308), and one read of the cells serves it and the text
-        fit (#279)."""
+    def test_the_columns_are_separated_before_the_geometry(self):
+        """The gutter goes into the boxes before anything measures them
+        (#308). The ink snap is one of those readers, and it grows a
+        box onto its ink and caps it at the gutter centre, where two
+        boxes can meet again, so the gutter goes back in after it. One
+        read of the cells serves both passes and the text fit (#279)."""
         scan, _ = merged_scan()
         stubs = self.patch_geometry()
+        order = []
+        stubs["_snap_text_columns_to_ink"].side_effect = (
+            lambda *args, **kwargs: order.append("ink snap") or 0
+        )
+        stubs["_snapped_document"].side_effect = lambda *args, **kwargs: (
+            order.append("document") or (SimpleNamespace(pages=[]), {}, [])
+        )
         with patch.object(
-            columns, "separate_rows", return_value=0
+            columns,
+            "separate_rows",
+            side_effect=lambda *args: order.append("gutter") or 0,
         ) as separate:
             services.run_compute_redactions(scan.pk)
 
-        separate.assert_called_once()
+        self.assertEqual(order, ["gutter", "ink snap", "gutter", "document"])
         stubs["load_cells"].assert_called_once()
         cells = stubs["load_cells"].return_value
-        self.assertIs(separate.call_args.args[1], cells)
+        for call in separate.call_args_list:
+            self.assertIs(call.args[1], cells)
         # The document takes the same cells, and puts the gutter back
-        # after blackletter's ink snap.
+        # after blackletter's own in-memory snap.
         self.assertIs(stubs["_snapped_document"].call_args.args[3], cells)
 
     def test_the_opinions_and_the_geometry_are_written(self):

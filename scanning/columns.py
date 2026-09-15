@@ -29,8 +29,8 @@ nothing else measures a column edge:
     cells the two boxes cover, drop a cell wider than
     :data:`WIDE_CELL_RATIO` of the page, project the rest on x, and take
     the widest blank band near the middle. An edge moves inwards only.
-    A page with no band keeps its edges and gets a one-pixel gap on
-    each side of the gutter centre, which does not move.
+    A page with no band keeps its edges and gets a pixel and a half of
+    gap on each side of the gutter centre, which does not move.
 
 The vertical test is what removes the running head: one cell holds the
 whole head and it spans the gutter. It finds a band on 1290 of the 1291
@@ -79,9 +79,14 @@ MIN_KEEP_RATIO = 0.50
 #: How far the fallback pulls each inner edge back, in pixels of the
 #: render the boxes are in. Any gap at all is enough for
 #: ``_gutter_limits`` to find a neighbour, and moving both edges by the
-#: same amount keeps the gutter centre exactly where it was. One pixel
-#: is the smallest move :data:`MIN_MOVE_PX` lets through.
-NUDGE_PX = 1.0
+#: same amount keeps the gutter centre exactly where it was.
+#:
+#: Above :data:`MIN_MOVE_PX`, and that is the whole reason for the
+#: half: the rule works in fractions of the page, so a move of exactly
+#: one pixel comes back from the round trip as 0.999999... on most edge
+#: values, the write is skipped as sub-pixel noise, and the pair stays
+#: in contact with the fault it exists to remove.
+NUDGE_PX = 1.5
 
 #: The smallest move worth a write, in pixels. The same threshold
 #: ``services._snap_text_columns_to_ink`` uses: under a pixel is under
@@ -125,17 +130,19 @@ def gutter_span(
         spans.append((left, right))
     if len(spans) < 2:
         return None
+    # The widest band *near the middle*, not the widest band: a cell
+    # alone in a margin leaves a wider one beside it, and taking that
+    # one would lose the gutter to the fallback.
     spans.sort()
     band, reach = None, spans[0][1]
     for left, right in spans[1:]:
-        if left > reach and (band is None or left - reach > band[1] - band[0]):
-            band = (reach, left)
+        if (
+            left > reach
+            and BAND_LIMITS[0] < (reach + left) / 2 < BAND_LIMITS[1]
+        ):
+            if band is None or left - reach > band[1] - band[0]:
+                band = (reach, left)
         reach = max(reach, right)
-    if band is None:
-        return None
-    middle = (band[0] + band[1]) / 2
-    if middle <= BAND_LIMITS[0] or middle >= BAND_LIMITS[1]:
-        return None
     return band
 
 

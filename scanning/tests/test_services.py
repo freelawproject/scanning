@@ -579,7 +579,7 @@ class TestMeasureRedactionRects(TestCase):
             self.assertAlmostEqual(boxes[1].x1, COLUMN_RIGHT.x0, delta=0.1)
             for row in rows:
                 row.refresh_from_db()
-            self.assertEqual(rows[0].x1, edge, "persisted the separation")
+            self.assertEqual(rows[0].x1, edge, "the rows are not written here")
 
     @staticmethod
     def _column(scan, x0, x1):

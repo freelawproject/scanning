@@ -122,6 +122,17 @@ class TestGutterSpan(TestCase):
 
         self.assertIsNone(span(cells_of(*body_cells(), footnote)))
 
+    def test_a_wider_band_in_the_margin_does_not_win(self):
+        """The widest band near the middle, not the widest band: one
+        cell alone in a margin leaves a wider gap beside it."""
+        aside = cell(1600, 300, 1650, 340)
+
+        got = span(cells_of(*body_cells(), aside))
+
+        self.assertIsNotNone(got)
+        self.assertAlmostEqual(got[0], LEFT_TEXT_END, places=3)
+        self.assertAlmostEqual(got[1], RIGHT_TEXT_START, places=3)
+
     def test_a_band_off_the_middle_is_refused(self):
         edge_pair = [cell(100, 183, 300, 801), cell(350, 183, 1600, 888)]
 
@@ -252,6 +263,27 @@ class TestSeparateRows(TestCase):
         right.refresh_from_db()
         self.assertLess(left.x1, right.x0, "the pair has a gutter")
         self.assertAlmostEqual((left.x1 + right.x0) / 2, LEFT_BOX[2], places=1)
+
+    def test_the_fallback_gap_survives_the_write_threshold(self):
+        """The rule works in fractions of the page, so a move of
+        exactly one pixel comes back from the round trip as
+        0.999999... on most edge values, and the write would be skipped
+        as sub-pixel noise. The pair would then stay in contact, which
+        is the fault (#308)."""
+        for edge in (106.5, 400.1, 824.3, 851.7, 903.0):
+            with self.subTest(edge=edge):
+                Detection.objects.filter(scan=self.scan).delete()
+                left = self.column((50.0, 176.6, edge, 1983.5))
+                right = self.column((edge, 176.6, 1650.0, 1983.5))
+
+                columns.separate_rows(self.scan, {})
+
+                left.refresh_from_db()
+                right.refresh_from_db()
+                self.assertLess(left.x1, right.x0, "the pair has a gutter")
+                self.assertAlmostEqual(
+                    (left.x1 + right.x0) / 2, edge, places=1
+                )
 
     def test_a_page_of_one_column_is_left_alone(self):
         only = self.column(LEFT_BOX)
