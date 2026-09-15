@@ -2026,9 +2026,7 @@ class TestRecalculateIssues(TestCase):
             CheckName.NO_PAGE_NUMBER,
         ):
             with self.subTest(check=check):
-                self.assertFalse(
-                    scan.issues.filter(check_name=check).exists()
-                )
+                self.assertFalse(scan.issues.filter(check_name=check).exists())
 
     def test_rebuild_page_map_without_local_pdf(self):
         """rebuild_page_map (manual page edits) also runs off stored data

@@ -364,7 +364,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 // number and no score (#269).
                 var detail = ocr.score ? ocr.zone + ' ' + ocr.score.toFixed(2) : ocr.zone;
                 ocrLabel = '<span class="ocr-tag' + editable + '" data-pdf-page="' + pdfPage + '" ' +
-                    'title="' + (pageEditsLocked ? lockedTitle : 'Click to correct page number') + '">' + tag + ocr.detected +
+                    'title="' + (pageEditsLocked ? lockedTitle : 'Click to correct page number') + '">' + tag + escapeHtml(ocr.detected) +
                     ' <small>(' + detail + ')</small></span>';
             } else {
                 ocrLabel = '<span class="ocr-tag miss' + editable + '" data-pdf-page="' + pdfPage + '" ' +
@@ -400,13 +400,16 @@ document.addEventListener('DOMContentLoaded', function () {
                         var current = ocr && ocr.detected ? ocr.detected : '';
                         var num = prompt(
                             'Page number for PDF page ' + pp +
-                            ' (leave blank if this page has no number):',
+                            PAGE_NUMBER_PROMPT,
                             current
                         );
                         if (num === null) return; // cancelled
                         var trimmed = num.trim();
-                        if (trimmed && (!/^\d+$/.test(trimmed) || parseInt(trimmed, 10) < 1)) {
-                            alert('Page number must be a positive whole number, or blank for none.');
+                        // The one gate, in shared.js: this copy took a
+                        // whole number, so it refused the range the
+                        // server has stored since #233 (#319).
+                        if (trimmed && !isPageNumberEntry(trimmed)) {
+                            alert(PAGE_NUMBER_ERROR);
                             return;
                         }
                         fetch('/scans/' + documentId + '/assign-page/', {
@@ -426,9 +429,11 @@ document.addEventListener('DOMContentLoaded', function () {
                                 return;
                             }
                             ocr.detected = res.data.detected;
+                            ocr.type = res.data.type;
                             if (res.data.detected) {
+                                var tag = ocr.type === 'range' ? 'Range ' : '#';
                                 btn.className = 'ocr-tag editable-page';
-                                btn.innerHTML = '#' + res.data.detected + ' <small>(manual)</small>';
+                                btn.innerHTML = tag + escapeHtml(res.data.detected) + ' <small>(manual)</small>';
                             } else {
                                 btn.className = 'ocr-tag miss editable-page';
                                 btn.innerHTML = '[no page # found]';

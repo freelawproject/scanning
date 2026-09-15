@@ -4278,3 +4278,41 @@ class TestTemplateScriptBlocks(TestCase):
                     faults.append(f"{path}:{number}")
 
         self.assertEqual(faults, [])
+
+
+class TestOnePageNumberGate(TestCase):
+    """Both viewers ask one function what a page number is (#319).
+
+    The two scripts held a gate each and they disagreed: step 2 took a
+    whole number, so it refused the range the server has stored since
+    #233. The server refuses what the shared gate refuses, and the
+    wording of the refusal is written once, in the view.
+    """
+
+    def _script(self, name):
+        from scanning import views_process
+
+        return (
+            pathlib.Path(views_process.__file__).parent
+            / "static"
+            / "scanning"
+            / name
+        ).read_text()
+
+    def test_the_gate_lives_in_shared_js(self):
+        self.assertIn("function isPageNumberEntry(", self._script("shared.js"))
+
+    def test_neither_viewer_keeps_a_copy(self):
+        for name in ("viewer_step1.js", "viewer_step2.js"):
+            with self.subTest(name=name):
+                text = self._script(name)
+                self.assertIn("isPageNumberEntry(", text)
+                self.assertNotIn("function isPageNumberEntry", text)
+                self.assertNotIn("PAGE_ENTRY_RE =", text)
+
+    def test_the_browser_and_the_server_refuse_in_the_same_words(self):
+        from scanning import views_process
+
+        fragment = "trailing letter like 2094a"
+        self.assertIn(fragment, views_process.PAGE_NUMBER_ERROR)
+        self.assertIn(fragment, self._script("shared.js"))
