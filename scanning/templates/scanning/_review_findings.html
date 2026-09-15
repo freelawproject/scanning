@@ -6,9 +6,12 @@
   builds, the rule of the action bar (#151): a card that disagreed with
   itself after a refresh would offer a button the endpoint refuses.
 
-  A detection-target card keeps the data-unmatched-* attributes the
-  unmatched cards carried, so _getDetectionData in viewer_sidebar.js and
-  the Approve / Delete handlers read it unchanged. A dismissed card is
+  A card whose finding names a box keeps the data-unmatched-* attributes
+  the unmatched cards carried, so _getDetectionData in viewer_sidebar.js
+  and the Approve / Delete handlers read it unchanged. A missed headnote
+  bracket (#328) names a box that is no row, so it carries no
+  data-detection-id and offers neither button; the highlight needs
+  neither. A dismissed card is
   muted with an Undo; a stale card has Withdraw and no Dismiss, because
   it says that one of the curator's own decisions is not applied, and
   the way out is to take that decision back.
@@ -47,12 +50,12 @@
      {% if issue.is_dismissed %}border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 opacity-60{% elif issue.is_stale %}border-red-300 bg-red-50 hover:bg-red-100 dark:border-red-700 dark:bg-red-900/20 dark:hover:bg-red-900/40{% else %}border-yellow-300 bg-yellow-50 hover:bg-yellow-100 dark:border-yellow-700 dark:bg-yellow-900/20 dark:hover:bg-yellow-900/40{% endif %}"
      data-issue-id="{{ issue.pk }}"
      data-check="{{ issue.check_name }}"
-     {% if issue.metadata.detection_id %}
+     {% if issue.metadata.bbox %}
      data-unmatched-page="{{ issue.metadata.page_index }}" data-unmatched-label="{{ issue.metadata.label }}"
      data-page-index="{{ issue.metadata.page_index }}"
      data-bbox="{{ issue.metadata.bbox.0 }},{{ issue.metadata.bbox.1 }},{{ issue.metadata.bbox.2 }},{{ issue.metadata.bbox.3 }}"
      data-img-w="{{ issue.metadata.img_width }}" data-img-h="{{ issue.metadata.img_height }}" data-label-id="{{ issue.metadata.label_id }}"
-     data-detection-id="{{ issue.metadata.detection_id }}"
+     {% if issue.metadata.detection_id %}data-detection-id="{{ issue.metadata.detection_id }}"{% endif %}
      onclick="highlightDetection(this)"
      {% elif issue.nav_pdf_index is not None %}
      data-pdf-index="{{ issue.nav_pdf_index }}" onclick="goToPage(this)"

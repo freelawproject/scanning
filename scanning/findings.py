@@ -1,11 +1,13 @@
 """The findings of review 2: one rebuild from the rows, and the dismissals.
 
 A finding of review 2 is an ``Issue`` row whose ``check_name`` is in
-``models.REVIEW2_CHECKS`` (issue #240, PR D). Seven checks, in three
+``models.REVIEW2_CHECKS`` (issue #240, PR D). Eight checks, in three
 groups:
 
 - **about detections**: a key icon or a caption no opinion boundary
-  names (``unmatched_key_icon``, ``unmatched_caption``);
+  names (``unmatched_key_icon``, ``unmatched_caption``), and a headnote
+  bracket the reader saw and the model did not
+  (``missing_headnote_bracket``, ``brackets.missing``, #328);
 - **about redactions and pages**: a confident headnote box no black
   redaction covers (``uncovered_headnote``), a run of pages no opinion
   covers (``uncovered_pages``);
@@ -52,7 +54,7 @@ from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 
-from scanning import boundaries, detections, redactions
+from scanning import boundaries, brackets, detections, redactions
 from scanning.models import (
     REVIEW2_CHECKS,
     STALE_REVIEW2_CHECKS,
@@ -146,6 +148,7 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
         found.extend(_unmatched_findings(scan, rows))
         found.extend(_uncovered_pages_findings(scan, rows, run))
         found.extend(_uncovered_headnote_findings(scan))
+        found.extend(brackets.missing(scan, rows, run))
     resolve(scan, found)
     with transaction.atomic():
         # One row lock on the scan serializes the rebuilds. Under READ

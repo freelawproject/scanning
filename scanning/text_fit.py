@@ -146,20 +146,55 @@ def page_cells(document: dict | None) -> dict[int, PageCells]:
     return pages
 
 
+def load_document(scan, run) -> dict | None:
+    """Read the glued OCR document of the space ``run`` names.
+
+    **The one rule for which OCR document the geometry reads**, the
+    twin of ``services.geometry_pdf_path``. With a standing apply run
+    it is the run's glued OCR volume (``ApplyRun.ocr_key``), whose
+    pages are the corrected volume's; without one it is the volume's
+    own glued document (``dots_mocr.glued_volume_key``), whose pages
+    are the original's. ``views_process.ocr_text_url`` chooses between
+    the two the same way (#262), and both key their pages by
+    ``page_index``.
+
+    Two readers share it, so the volume is downloaded once: the text
+    fit (:func:`page_cells`, #279) and the bracket readings
+    (``brackets.read_document``, #328).
+
+    It never raises. A read that fails costs nothing but the fit and
+    the readings: the boxes stay as blackletter measured them, which is
+    correct and only wide, and no bracket card is written. So the fault
+    is logged and None comes back.
+
+    :param scan: The scan.
+    :param run: The standing apply run, or None for the original's
+        space.
+    :returns: The document, or None when nothing was read.
+    :rtype: dict | None
+    """
+    from scanning import apply, s3_sync
+
+    try:
+        if run is not None:
+            if not run.ocr_key:
+                return None
+            return apply.load_ocr_document(scan, run)
+        key = dots_mocr.glued_volume_key(scan)
+        if not key:
+            return None
+        return s3_sync.download_json_object(key)
+    except Exception:
+        logger.exception(
+            "scan %s: the OCR volume did not load; the text redaction "
+            "boxes keep the width blackletter measured",
+            scan.pk,
+        )
+        return None
+
+
 def load_cells(scan, run) -> dict[int, PageCells]:
     """Read the cells of the space ``run`` names, and never raise.
-
-    **The one rule for which OCR document the fit reads**, the twin of
-    ``services.geometry_pdf_path``. With a standing apply run it is the
-    run's glued OCR volume (``ApplyRun.ocr_key``), whose pages are the
-    corrected volume's; without one it is the volume's own glued
-    document (``dots_mocr.glued_volume_key``), whose pages are the
-    original's. ``views_process.ocr_text_url`` chooses between the two
-    the same way (#262), and both key their pages by ``page_index``.
-
-    A read that fails costs nothing but the fit: the boxes stay as
-    blackletter measured them, which is correct and only wide. So the
-    fault is logged and an empty map comes back.
 
     :param scan: The scan.
     :param run: The standing apply run, or None for the original's
@@ -167,26 +202,7 @@ def load_cells(scan, run) -> dict[int, PageCells]:
     :returns: ``{page_index: PageCells}``, empty when nothing was read.
     :rtype: dict[int, PageCells]
     """
-    from scanning import apply, s3_sync
-
-    try:
-        if run is not None:
-            if not run.ocr_key:
-                return {}
-            document = apply.load_ocr_document(scan, run)
-        else:
-            key = dots_mocr.glued_volume_key(scan)
-            if not key:
-                return {}
-            document = s3_sync.download_json_object(key)
-    except Exception:
-        logger.exception(
-            "scan %s: the OCR volume did not load; the text redaction "
-            "boxes keep the width blackletter measured",
-            scan.pk,
-        )
-        return {}
-    return page_cells(document)
+    return page_cells(load_document(scan, run))
 
 
 class Fit(NamedTuple):
