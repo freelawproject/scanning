@@ -887,7 +887,7 @@ def _snapped_document(
     :return: The document, the ``{id(bl_detection): pk}`` map, and the
         entries it was built from (empty when the scan has none).
     """
-    from scanning import columns
+    from scanning import columns, margin_fit
 
     det_data = detection_entries(scan.pk, page_numbers=page_numbers)
     if not det_data:
@@ -895,6 +895,10 @@ def _snapped_document(
     document, row_ids = _build_document_with_ids(scan, det_data, pdf_path)
     snap_document_columns(document)
     columns.separate_document(document, cells or {})
+    # ...and the margin strips get the same reader's answer for where
+    # the page's text is (#323). The strips are measured from the
+    # page's ink, which holds the blots this box does not.
+    margin_fit.fit_pages(document, cells or {})
     return document, row_ids, det_data
 
 
