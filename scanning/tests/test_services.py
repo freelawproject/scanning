@@ -2028,6 +2028,94 @@ class TestRecalculateIssues(TestCase):
             with self.subTest(check=check):
                 self.assertFalse(scan.issues.filter(check_name=check).exists())
 
+    def _make_suffixed_scan(self, **entry):
+        """Four pages around a trailing letter the model read at page
+        2, unless ``entry`` says who read it."""
+        return self._make_scan(
+            start_page=2094,
+            end_page=2095,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "2094", "type": "single"},
+                {
+                    "pdf_page": 2,
+                    "detected": "209B",
+                    "type": "suffixed",
+                    **entry,
+                },
+                {"pdf_page": 3, "detected": "2094b", "type": "suffixed"},
+                {"pdf_page": 4, "detected": "2095", "type": "single"},
+            ],
+        )
+
+    def test_a_trailing_letter_the_model_read_is_a_question(self):
+        """The sequence asks nothing about the page, so the card does
+        (#319). It is addressed by the physical page."""
+        from scanning import services
+
+        scan = self._make_suffixed_scan(zone="dots-header")
+
+        services.recalculate_issues(scan)
+
+        cards = scan.issues.filter(check_name=CheckName.SUSPICIOUS_READING)
+        self.assertEqual(
+            sorted(cards.values_list("page_number", flat=True)), [2, 3]
+        )
+        card = cards.get(page_number=2)
+        self.assertEqual(card.severity, Issue.Severity.WARNING)
+        self.assertEqual(
+            card.message,
+            "PDF page 2 reads as '209B', a page number with a trailing "
+            "letter. Verify this is expected.",
+        )
+
+    def test_a_curators_trailing_letter_raises_nothing(self):
+        """A person read that page (#319)."""
+        from scanning import services
+
+        scan = self._make_suffixed_scan(zone="manual", ocr="manual")
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(
+            list(
+                scan.issues.filter(
+                    check_name=CheckName.SUSPICIOUS_READING
+                ).values_list("page_number", flat=True)
+            ),
+            [3],
+        )
+
+    def test_a_dismissed_trailing_letter_stays_dismissed(self):
+        """The card is a ``suspicious_reading``, so the dismissal a
+        curator already has answers it on every recompute (#214)."""
+        from scanning import page_edits, services
+
+        scan = self._make_suffixed_scan(zone="dots-header")
+        services.recalculate_issues(scan)
+        card = scan.issues.get(
+            check_name=CheckName.SUSPICIOUS_READING, page_number=2
+        )
+        page_edits.supersede(
+            scan,
+            PageEdit.Kind.DISMISS_ISSUE,
+            {
+                "pdf_page": card.page_number,
+                "logical_page": "",
+                "value": card.check_name,
+            },
+            {"source_fingerprint": scan.source_fingerprint},
+            UserFactory(),
+        )
+
+        services.recalculate_issues(scan)
+
+        self.assertFalse(
+            scan.issues.filter(
+                check_name=CheckName.SUSPICIOUS_READING, page_number=2
+            ).exists()
+        )
+
     def test_rebuild_page_map_without_local_pdf(self):
         """rebuild_page_map (manual page edits) also runs off stored data
         and applies the scan's page range."""
