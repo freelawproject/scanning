@@ -2365,7 +2365,9 @@ def _can_analyze(scan_pk: int, manifest: dict | None) -> bool:
     created where it cannot be submitted sits PENDING until its queue
     deadline expires hours later, and its failure is noise about a
     volume that did nothing wrong. An environment that fails a check
-    parks as before, and the staff button stays as the manual way in.
+    parks as before, and the daemon's sweep
+    (``dots_mocr.enqueue_missing_runs``, #327) starts the read once the
+    stage is configured.
 
     - a committed shard set, or there is nothing for a job to read;
     - ``dots_mocr.enabled()``, the operator switch plus the account

@@ -1,11 +1,12 @@
 """Submit one wave of pending external jobs per provider (a daemon tick).
 
-Before the waves, one pass creates work: ``yolo.enqueue_missing_runs``
-starts a detection run for every fingerprinted shard set that has none
-yet (issue #250), so a new upload, a backlog from before the sweep and
-a volume uploaded while the stage was off all get their run, and the
-rows go out in the wave of the same tick. Its rule is one run per
-shard set, ever: a dead run is not re-run by a tick.
+Before the waves, two passes create work: ``yolo.enqueue_missing_runs``
+(issue #250) and ``dots_mocr.enqueue_missing_runs`` (issue #327) each
+start a run for every fingerprinted shard set that has none of theirs
+yet, so a new upload, a backlog from before the sweep and a volume
+uploaded while the stage was off all get their run, and the rows go out
+in the wave of the same tick. The rule is one run per shard set, ever:
+a dead run is not re-run by a tick.
 
 Each provider counts its own in-flight rows against its own cap, so one
 saturated endpoint cannot starve another: doctor's ceiling is its replica
@@ -81,12 +82,13 @@ class Command(BaseCommand):
         """
         from django.db import OperationalError, connections
 
-        from scanning import jobs, yolo
+        from scanning import dots_mocr, jobs, yolo
 
         for attempt in range(MAX_DB_RETRIES):
             connections.close_all()
             try:
                 started = yolo.enqueue_missing_runs()
+                ocr_started = dots_mocr.enqueue_missing_runs()
                 summary = jobs.submit_pending(limit=options["limit"])
                 break
             except OperationalError as exc:
@@ -107,6 +109,7 @@ class Command(BaseCommand):
         if any(
             (
                 started,
+                ocr_started,
                 summary.submitted,
                 summary.failed,
                 summary.retried,
@@ -116,7 +119,8 @@ class Command(BaseCommand):
             )
         ):
             self.stdout.write(
-                f"Started {started} detection run(s); "
+                f"Started {started} detection run(s) and {ocr_started} OCR "
+                f"run(s); "
                 f"submitted {summary.submitted}, retried {summary.retried}, "
                 f"deferred {summary.deferred}, failed {summary.failed}, "
                 f"unanswered {summary.unanswered}, skipped {summary.skipped}"

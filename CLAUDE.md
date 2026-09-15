@@ -66,7 +66,7 @@ This file holds what the code and the git history cannot tell a reader: the comm
 State is `Scan.status`. The stages, and where each runs:
 
 1. `run_full_pipeline` (daemon, `process_next_scan`): shards the original (#164), sets `page_count`, creates the CONVERT rows (doctor bitonal, #176) and the ANALYZE rows (dots.mocr on RunPod, #190/#207), then parks the scan in AWAITING or AWAITING_VALIDATION.
-2. Daemon ticks (`submit_external_jobs`, `collect_external_jobs`, serial scheduler, #156). The submit tick starts one detection run per shard set (`yolo.enqueue_missing_runs`, #250). The collect tick merges the bitonal shards, glues the dots.mocr run, applies the page numbers (`run_compute_issues`, #204), triggers the apply (#224), merges the detection run and queues the redaction compute (#196), and promotes the review states (#263).
+2. Daemon ticks (`submit_external_jobs`, `collect_external_jobs`, serial scheduler, #156). The submit tick starts one detection run and one OCR run per shard set (`yolo.enqueue_missing_runs`, #250; `dots_mocr.enqueue_missing_runs`, #327). The collect tick merges the bitonal shards, glues the dots.mocr run, applies the page numbers (`run_compute_issues`, #204), triggers the apply (#224), merges the detection run and queues the redaction compute (#196), and promotes the review states (#263).
 3. Review 1: READY_FOR_PAGE_COMPLETENESS_REVIEW, then PAGE_COMPLETENESS_REVIEW_DONE (`approve_page_completeness`, #151/#154).
 4. The apply (#224): queued work (`APPLY_PAGE_EDITS`) that builds the corrected volume from the `PageEdit` rows under `jobs/apply/a{n}/`.
 5. The redaction compute (#196): queued work (`COMPUTE_REDACTIONS`) that renders every page; parks in READY_FOR_REDACTION_REVIEW, then REDACTION_REVIEW_DONE (`approve_redaction_review`, #263).
@@ -100,7 +100,7 @@ State is `Scan.status`. The stages, and where each runs:
 - The bitonal merge deletes its results; dots.mocr and detection keep theirs and pass `reuse_results=True`. Never delete an analyze or detect result. The row identity carries `size_bytes`
 - Run reuse compares page ranges, not shard keys. `_still_describes` compares `input_manifest` exactly, so a run-scoped counter goes in `provider_meta`, never in `input_manifest`
 - A stable hole (`jobs.hole_is_stable`) is carried; `reread_failed_pages` re-pays only the shards with unstable holes. `repaired_pages` is a page list, and a repaired page is not a filtered one (#242)
-- The job creators are pinned by an AST test (`TestKnownEnqueuePaths`): the pipeline, `start_dots_mocr`, `yolo.ensure_detect_jobs` (through the sweep and `enqueue_yolo_detect`), `apply.py`, `reread_failed_pages`. Row creation is what costs GPU money
+- The job creators are pinned by an AST test (`TestKnownEnqueuePaths`): the pipeline, `start_dots_mocr`, the two sweeps (`dots_mocr.enqueue_missing_runs`, `yolo.enqueue_missing_runs`), `enqueue_yolo_detect`, `apply.py`, `reread_failed_pages`. Row creation is what costs GPU money
 - No provider abstraction, on purpose: branch on `job.provider`. Mistral (#191, switched off) is where the branches get promoted
 - Do not add a pass that revives FAILED rows: the admin re-queue changes the status in a second write, and a reviver races it
 - A failure names the volume page range (`jobs._failure_location`). Page numbers are logged 1-based; `from_page`/`to_page` are fitz indexes
