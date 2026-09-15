@@ -365,12 +365,13 @@ function approveDetection(btn) {
             // Not an automatic re-pair (#196): the pairing endpoint
             // now queues the whole redaction computation, which
             // renders every page and takes the volume out of review,
-            // and re-pairing on request is off for now. Say what the
-            // edit did and did not change: the approval raises the
-            // confidence the next pairing reads, and the card stays
-            // (its chip reads 1.0 and loses the check mark) until that
-            // pairing runs. The section is fetched again (#240 PR D).
-            showToast("Approved: the box reads 1.0 now. The card stays until the opinions are paired again.", "success");
+            // and re-pairing on request is off for now. The view says
+            // what the edit did and did not change (#322): the
+            // approval raises the confidence the next pairing reads,
+            // and the card stays (its chip reads 1.0 and loses the
+            // check mark) until that pairing runs. The section is
+            // fetched again (#240 PR D).
+            showSaved(data);
             refreshFindings();
         })
         .catch(function () {
@@ -407,6 +408,7 @@ function deleteUnmatchedDetection(btn) {
                 );
                 return;
             }
+            showSaved(data);
             refreshFindings();
         })
         .catch(function () {
@@ -469,7 +471,7 @@ function rebuildFindings(btn) {
             // The button is inside the section, so the swap replaces it
             // with a fresh, enabled one. Nothing to enable here.
             _applyFindings(data);
-            showToast("The findings were written again from the rows.", "success");
+            showSaved(data);
         })
         .catch(function () {
             if (btn) btn.disabled = false;
@@ -524,6 +526,7 @@ function _findingAction(btn, path, issueId, failure) {
                 showToast((data && data.message) || failure, "error");
                 return;
             }
+            showSaved(data);
             refreshFindings();
         })
         .catch(function () {
@@ -624,6 +627,7 @@ function dismissBoundary(btn) {
     _postBoundary("dismiss", { boundary_id: parseInt(card.dataset.boundaryId) })
         .then(function (data) {
             if (data.status !== "ok") { btn.disabled = false; _boundaryFailed(data); return; }
+            showSavedAfterReload(data);
             window.location.reload();
         })
         .catch(function (err) { btn.disabled = false; _boundaryFailed({ message: String(err) }); });
@@ -636,6 +640,7 @@ function restoreBoundary(btn) {
     _postBoundary("restore", { boundary_id: parseInt(card.dataset.boundaryId) })
         .then(function (data) {
             if (data.status !== "ok") { btn.disabled = false; _boundaryFailed(data); return; }
+            showSavedAfterReload(data);
             window.location.reload();
         })
         .catch(function (err) { btn.disabled = false; _boundaryFailed({ message: String(err) }); });
@@ -701,6 +706,7 @@ window.boundaryPickTarget = function (det) {
     _postBoundary("add", body)
         .then(function (data) {
             if (data.status !== "ok") { _boundaryFailed(data); return; }
+            showSavedAfterReload(data);
             window.location.reload();
         })
         .catch(function (err) { _boundaryFailed({ message: String(err) }); });
@@ -751,6 +757,7 @@ function recomputeRedactions() {
                 showToast((data && data.message) || "Could not queue the recompute.", "error");
                 return;
             }
+            showSavedAfterReload(data);
             window.location.reload();
         })
         .catch(function (err) {

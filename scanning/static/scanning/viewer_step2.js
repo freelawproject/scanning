@@ -861,7 +861,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         showToast((data && data.message) || 'Failed to save the box');
                         return;
                     }
-                    showToast('Saved. The redactions are not recomputed from this yet.', 'success');
+                    showSaved(data);
                     refreshOverlays();
                     if (window.refreshFindings) window.refreshFindings();
                 });
@@ -1265,6 +1265,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 allDetections.push(detData);
             }
             _cancelDetDraw();
+            showSaved(data);
             detectionsVisible[pdfIndex] = true;
             pageDiv.querySelector('.detect-btn').classList.add('active');
             drawDetectionOverlay(pageDiv, pdfIndex);
@@ -1281,12 +1282,8 @@ document.addEventListener('DOMContentLoaded', function () {
             // whole computation runs on the daemon and takes the volume
             // out of the review while it does (#196), so it is not
             // started here: an auto re-pair on every added box would
-            // interrupt the reviewer in the middle of their edits. Name
-            // the button that does start it (#305).
-            var _pLabels = ['CASE_CAPTION', 'KEY_ICON'];
-            if (_pLabels.indexOf(labelName) >= 0) {
-                showToast('Saved. Press "Recompute redactions" to pair the opinions again.', 'success');
-            }
+            // interrupt the reviewer in the middle of their edits. The
+            // view names the button that does start it (#305/#322).
         });
     }
 
@@ -1772,6 +1769,7 @@ document.addEventListener('DOMContentLoaded', function () {
                         }
                     });
                 }
+                showSaved(data);
                 if (window.refreshFindings) window.refreshFindings();
             }).catch(function() { showToast('Could not dismiss the box'); });
         });
@@ -1933,6 +1931,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 rectData.origin = 'human';
                 div.dataset.id = data.id;
             }
+            showSaved(data);
             if (window.refreshFindings) window.refreshFindings();
         }).catch(function() { showToast('Failed to save the box'); });
     }
@@ -1982,6 +1981,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     det.id = data.detection_id;
                     det.manual = true;
                 }
+                showSaved(data);
                 if (window.refreshFindings) window.refreshFindings();
             }
         }).catch(function() {
@@ -2030,6 +2030,7 @@ document.addEventListener('DOMContentLoaded', function () {
                     div.remove();
                     _selectedDetBox = null;
                     refreshOverlays();
+                    showSaved(data);
                     // The findings were rebuilt by the endpoint (#240 PR D).
                     if (window.refreshFindings) window.refreshFindings();
                 }
