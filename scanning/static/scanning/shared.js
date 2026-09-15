@@ -503,14 +503,20 @@ function showToast(message, type) {
 
     container.appendChild(toast);
 
+    // The removal is held, because the restart below must cancel it: a
+    // repeat that lands in the 400 ms of the fade would else come back
+    // to full opacity and be taken off the page anyway (#322).
+    var removal = null;
+
     function dismiss() {
         toast.style.opacity = '0';
-        setTimeout(function () { toast.remove(); }, 400);
+        removal = setTimeout(function () { toast.remove(); }, 400);
     }
 
     var timer = setTimeout(dismiss, 5000);
     toast._restart = function () {
         clearTimeout(timer);
+        clearTimeout(removal);
         toast.style.opacity = '1';
         timer = setTimeout(dismiss, 5000);
     };

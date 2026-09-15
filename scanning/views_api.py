@@ -96,6 +96,11 @@ ADDED_ANCHOR_DETECTION_MESSAGE = (
     "opinions again."
 )
 STANDING_DETECTION_MESSAGE = "The box is there already."
+#: The approval of a row the curator drew: the view writes nothing,
+#: because the box is theirs and reads 1.0 from birth.
+OWN_DETECTION_MESSAGE = (
+    "This box is your own, so it needs no approval: it reads 1.0 already."
+)
 APPROVED_DETECTION_MESSAGE = (
     "The detection was approved: the box reads 1.0 now. The card stays "
     "until the opinions are paired again."
@@ -1571,7 +1576,8 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
 
     A model row gets an ``approve`` decision (#240), which the next
     import lands on the same box again. A hand-drawn row is the
-    curator's already and needs none.
+    curator's already and needs none, and the message says so (#322):
+    this view writes nothing for one.
 
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk)).
@@ -1590,7 +1596,8 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
-    if row.model_name != Detection.ModelName.MANUAL:
+    manual = row.model_name == Detection.ModelName.MANUAL
+    if not manual:
         try:
             detections.decide(
                 scan, row, DetectionDecision.Kind.APPROVE, request.user
@@ -1602,7 +1609,9 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
         {
             "status": "ok",
             "updated": 1,
-            "message": APPROVED_DETECTION_MESSAGE,
+            "message": (
+                OWN_DETECTION_MESSAGE if manual else APPROVED_DETECTION_MESSAGE
+            ),
         }
     )
 

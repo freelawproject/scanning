@@ -23,6 +23,7 @@ from django.urls import reverse
 from scanning import findings, views_api
 from scanning.models import (
     Detection,
+    DetectionDecision,
     OpinionBoundary,
     Redaction,
     ReviewDismissal,
@@ -172,6 +173,24 @@ class TestTheTextLivesInTheView(ScanningTestCase):
             "function flushSavedToast(",
         ):
             self.assertIn(name, text)
+
+
+class TestThePairingLabels(ScanningTestCase):
+    """The two labels the added-box message reads.
+
+    The view keeps them as strings, because the message is the only
+    reader and the label names are the worker's classes, the viewer's
+    colour table and blackletter's enum already. This pin is what a
+    rename in the enum breaks, so the two sides cannot drift apart.
+    """
+
+    def test_they_are_the_names_of_the_two_anchor_labels(self):
+        from blackletter.models import Label
+
+        self.assertEqual(
+            views_api.PAIRING_LABELS,
+            (Label.CASE_CAPTION.name, Label.KEY_ICON.name),
+        )
 
 
 class TestRedactionMessages(ScanningTestCase):
@@ -336,6 +355,22 @@ class TestDetectionMessages(DetectionEndpointMixin, ScanningTestCase):
         self.assertEqual(
             response.json()["message"], views_api.APPROVED_DETECTION_MESSAGE
         )
+
+    def test_a_hand_drawn_row_is_told_it_needs_no_approval(self):
+        """The view writes nothing for a row the curator drew, so the
+        line must not claim an approval: the box reads 1.0 from birth."""
+        scan, det = self._make_scan_with_detection(
+            model_name=Detection.ModelName.MANUAL, found_by=[], confidence=1.0
+        )
+
+        response = self._post(
+            "approve_detection", scan, {"detection_id": det.pk}
+        )
+
+        self.assertEqual(
+            response.json()["message"], views_api.OWN_DETECTION_MESSAGE
+        )
+        self.assertFalse(DetectionDecision.objects.exists())
 
     def test_a_new_anchor_box_names_the_recompute_and_a_plain_one_does_not(
         self,
