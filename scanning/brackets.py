@@ -33,6 +33,25 @@ which holds the OCR document, and stores one ``BracketReading`` row per
 reading. :func:`missing` runs in ``findings.rebuild``, reads rows only
 and no S3, and judges. So a curator who draws the missing box makes the
 card go at the next rebuild, with no recompute.
+
+**Three limits, named rather than guarded.**
+
+1. *The last headnote of an opinion is invisible.* The highest number
+   is what the boxes name, so nothing above it makes a hole. Closing it
+   needs the count of headnotes, and that count is not readable: the
+   ``HEADNOTE`` boxes equal it in only 6 of the 8 opinions of scan
+   1828, because a headnote that breaks over a column gives a second
+   box.
+2. *A star-pagination mark whose number is exactly the highest plus one
+   gives a card.* The mark passes both tests: its number is a hole, and
+   it is not above the sequence. Measured over scans 1828 and 2845, no
+   mark is in that position, and no fourth witness separates the two:
+   the mark and the bracket both open a paragraph, and **no** reading
+   of either volume holds the token alone -- 0 of 956, so the length of
+   the cell says nothing.
+3. *A card names the page of the reading, not of the missed bracket.*
+   When a mark fills a real hole, the curator is sent to the mark. The
+   number on the card is still the right one to look for.
 """
 
 from __future__ import annotations
@@ -174,7 +193,12 @@ def write_rows(scan: Scan, document: dict | None, run: ApplyRun | None) -> int:
     """Delete the scan's readings of ``run`` and write them again.
 
     A disposable row, the rule of a model ``Detection``: the compute
-    owns them, and a second compute of the same run replaces the set.
+    owns them, and a second compute replaces the set. **Every reading
+    of the scan goes, not only the run's.** The compute writes the set
+    of the space it measures and :func:`missing` reads that space
+    alone, so a superseded run's readings are 900 rows a volume that
+    nothing will ever read again.
+
     A document that did not load leaves the rows alone, because an
     empty set would withdraw every card of a volume whose S3 read
     failed.
@@ -215,7 +239,7 @@ def write_rows(scan: Scan, document: dict | None, run: ApplyRun | None) -> int:
                 )
             )
     with transaction.atomic():
-        BracketReading.objects.filter(scan=scan, apply_run=run).delete()
+        BracketReading.objects.filter(scan=scan).delete()
         BracketReading.objects.bulk_create(rows)
     logger.info(
         "scan %s: %d bracket reading(s) written for run %s",

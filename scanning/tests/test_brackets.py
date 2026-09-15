@@ -16,6 +16,7 @@ from django.urls import reverse
 
 from scanning import brackets, findings
 from scanning.models import (
+    ApplyRun,
     BracketReading,
     CheckName,
     Detection,
@@ -182,6 +183,22 @@ class TestWriteRows(ScanningTestCase):
             BracketReading.objects.filter(scan=self.scan).count(), 1
         )
 
+    def test_a_new_run_sweeps_the_readings_of_the_old_one(self):
+        # ``missing`` reads the measured run alone, so the readings of
+        # a superseded run are rows nothing will read again.
+        brackets.write_rows(self.scan, document(page(0, "[7] A")), None)
+        run = ApplyRun.objects.create(
+            scan=self.scan,
+            number=1,
+            page_map={
+                "pages": [{"source": {"kind": "original", "pdf_page": 1}}]
+            },
+        )
+        brackets.write_rows(self.scan, document(page(0, "[7] A")), run)
+        rows = BracketReading.objects.filter(scan=self.scan)
+        self.assertEqual(rows.count(), 1)
+        self.assertEqual(rows.get().apply_run_id, run.pk)
+
 
 class TestTheRule(ScanningTestCase):
     """What ``missing`` yields, and what it rejects."""
@@ -264,6 +281,55 @@ class TestTheRule(ScanningTestCase):
 
     def test_no_reading_gives_no_finding(self):
         self.assertEqual(self.found(), [])
+
+    def test_a_page_two_opinions_share_splits_by_the_column(self):
+        # The second opinion starts in the right column of page 1, so a
+        # reading in the left column belongs to the first opinion and
+        # one in the right column to the second. Ordering by y alone
+        # would give both to the first.
+        self.scan.detections.filter(label="TEXT_COLUMN").delete()
+        for x0, x1 in ((100.0, 800.0), (900.0, 1600.0)):
+            make_detection(
+                self.scan,
+                "TEXT_COLUMN",
+                page_index=1,
+                x0=x0,
+                y0=100.0,
+                x1=x1,
+                y1=2000.0,
+            )
+        second = make_boundary(
+            self.scan,
+            make_detection(self.scan, "CASE_CAPTION", page_index=1),
+            make_detection(self.scan, "KEY_ICON", page_index=1),
+            start_page_index=1,
+            start_x=900.0 * 72 / 200,
+            start_y=200.0 * 72 / 200,
+            end_page_index=1,
+        )
+        brackets.write_rows(
+            self.scan,
+            document(
+                page(
+                    1,
+                    ("[3] Left", [200.0, 1500.0, 800.0, 1800.0]),
+                    ("[1] Right", [950.0, 300.0, 1550.0, 600.0]),
+                )
+            ),
+            None,
+        )
+        rows = {r.raw: r for r in BracketReading.objects.all()}
+        ordered, columns = brackets._ordered_opinions(
+            self.scan, [self.opinion, second], {1}
+        )
+        self.assertEqual(
+            brackets.opinion_of(rows["[3]"], ordered, columns).pk,
+            self.opinion.pk,
+        )
+        self.assertEqual(
+            brackets.opinion_of(rows["[1]"], ordered, columns).pk,
+            second.pk,
+        )
 
 
 class TestTheCard(ScanningTestCase):

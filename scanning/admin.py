@@ -9,6 +9,7 @@ from django.utils.text import capfirst
 from scanning import apply, jobs
 from scanning.models import (
     ApplyRun,
+    BracketReading,
     Detection,
     DetectionDecision,
     ExternalJob,
@@ -278,6 +279,7 @@ class ScanAdmin(admin.ModelAdmin):
             Issue,
             PageEdit,
             OpinionBoundary,
+            BracketReading,
             PendingUpload,
             ExternalJob,
         ):
@@ -686,6 +688,36 @@ class DetectionAdmin(admin.ModelAdmin):
         "decision",
         "replaces",
     ]
+
+
+@admin.register(BracketReading)
+class BracketReadingAdmin(admin.ModelAdmin):
+    """One headnote bracket the OCR read (issue #328).
+
+    Read-only: the compute writes every row and replaces the set at
+    each compute, so a hand edit would last until the next one. It is
+    here to answer "what did the reader see on that page?" when a
+    missed-bracket card looks wrong.
+    """
+
+    list_display = [
+        "scan",
+        "page_index",
+        "source_page",
+        "raw",
+        "numbers",
+        "apply_run",
+        "date_created",
+    ]
+    search_fields = ["raw"]
+    raw_id_fields = ["scan", "source_edit", "apply_run"]
+    readonly_fields = [f.name for f in BracketReading._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(DetectionDecision)
