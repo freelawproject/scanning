@@ -129,13 +129,15 @@ class TestReglueDotsMocr(TestCase):
         self.assertEqual(dots_mocr._apply_state(rows), {})
 
     def test_a_volume_with_no_filtered_page_is_skipped(self):
-        scan = self._glued_scan(filtered=())
+        # The corpus pass judges on the rows, so a volume with nothing
+        # to repair costs no download.
+        self._glued_scan(filtered=())
 
-        out, err = self._call(str(scan.pk))
+        out, _ = self._call()
 
         self.upload.assert_not_called()
+        self.download.assert_not_called()
         self.assertIn("0 scan(s) glued again, 1 skipped", out)
-        self.assertIn("no shard of the live run reports a filtered", err)
 
     def test_a_dry_run_reports_the_arm_and_writes_nothing(self):
         scan = self._glued_scan(filtered=(0, 1))
@@ -180,6 +182,36 @@ class TestReglueDotsMocr(TestCase):
         self.assertIn("no answer stored", out)
         self.assertIn("1 with no stored answer", out)
 
+    def test_a_dry_run_names_a_page_with_a_box_in_the_wrong_order(self):
+        # Issue #297: no row reports such a box, so this report is the
+        # only way to learn which volumes hold one -- and the numbers
+        # the operator hands back to the writing pass.
+        scan = self._glued_scan(filtered=())
+        page = make_page(1)
+        page["cells"] = [
+            {"bbox": [1504, 1705, 1538, 10], "category": "Picture"}
+        ]
+        self._rewrite(scan, 0, [make_page(0), page])
+
+        out, _ = self._call("--dry-run")
+
+        self.assertIn(f"scan {scan.pk} volume page 2", out)
+        self.assertIn("would put 1 box(es) in order or drop them", out)
+        self.assertIn("swap_y@0", out)
+        self.assertIn(
+            "1 page(s) hold 1 unusable box(es) (#297), about one in 4", out
+        )
+        self.assertIn("swap_y 1", out)
+        # Still a survey.
+        self.upload.assert_not_called()
+
+    def test_a_dry_run_counts_no_unusable_box_when_there_is_none(self):
+        self._glued_scan(filtered=())
+
+        out, _ = self._call("--dry-run")
+
+        self.assertIn("0 page(s) hold 0 unusable box(es) (#297)", out)
+
     def test_a_dry_run_counts_what_the_threshold_rung_recovered(self):
         # Item 3 of #242: the share of filtered answers the retry rung
         # of #238 saves is what says whether it is worth 90s of GPU.
@@ -223,17 +255,18 @@ class TestReglueDotsMocr(TestCase):
             out,
         )
 
-    def test_the_writing_pass_still_skips_on_the_rows(self):
-        # Only the survey reads every volume: the writing pass must not
-        # download and re-upload a document for a volume with nothing
-        # to repair.
+    def test_a_named_volume_is_glued_whatever_the_rows_report(self):
+        # A box in the wrong order (#297) reaches no row: the four page
+        # lists have no place for one. So the rows cannot say which
+        # volume holds one, the dry run names them, and the operator
+        # hands those numbers back. A named volume is glued on the
+        # operator's word.
         scan = self._glued_scan(filtered=())
 
-        out, err = self._call(str(scan.pk))
+        out, _ = self._call(str(scan.pk))
 
-        self.upload.assert_not_called()
-        self.download.assert_not_called()
-        self.assertIn("no shard of the live run reports a filtered", err)
+        self.assertEqual(self.upload.call_count, 1)
+        self.assertIn("1 scan(s) glued again", out)
 
     def _rung_recovered(self, page_no: int) -> dict:
         """Build a page the threshold rung of #238 saved from a filter.

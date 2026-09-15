@@ -294,6 +294,117 @@ class TestRescale(SimpleTestCase):
         self.assertEqual(cells[0]["bbox"], [323, 143, 364, 177])
 
 
+class TestLegalize(SimpleTestCase):
+    """The legality of a box, in the render's pixel space (issue #297).
+
+    The production fault is the second test: a ``Picture`` cell whose
+    bottom was above its top, which upstream's markdown handed to
+    Pillow's crop.
+    """
+
+    def _cell(self, bbox, category="Text"):
+        return {"bbox": list(bbox), "category": category, "text": "x"}
+
+    def test_legal_cells_come_back_as_they_are(self):
+        cells = [self._cell([10, 20, 50, 60])]
+
+        out = layout_json.legalize(cells, 1700, 2200)
+
+        self.assertEqual(out.edits, [])
+        self.assertIs(out.cells, cells, "the list itself, not a copy")
+
+    def test_a_box_upside_down_is_put_in_order(self):
+        # Scan 2593: a thin object in the right margin, called a
+        # picture, with the two y values the wrong way round.
+        cells = [self._cell([1504, 1705, 1538, 10], category="Picture")]
+
+        out = layout_json.legalize(cells, 1700, 2200)
+
+        self.assertEqual(out.edits, ["swap_y@0"])
+        self.assertEqual(out.cells[0]["bbox"], [1504, 10, 1538, 1705])
+        self.assertEqual(out.cells[0]["category"], "Picture")
+        # A copy: the stored result must keep the answer as it was.
+        self.assertEqual(cells[0]["bbox"], [1504, 1705, 1538, 10])
+
+    def test_a_box_back_to_front_is_put_in_order(self):
+        out = layout_json.legalize([self._cell([50, 20, 10, 60])], 1700, 2200)
+
+        self.assertEqual(out.edits, ["swap_x@0"])
+        self.assertEqual(out.cells[0]["bbox"], [10, 20, 50, 60])
+
+    def test_both_axes_are_answered_on_one_cell(self):
+        out = layout_json.legalize([self._cell([50, 60, 10, 20])], 1700, 2200)
+
+        self.assertEqual(out.edits, ["swap_x@0", "swap_y@0"])
+        self.assertEqual(out.cells[0]["bbox"], [10, 20, 50, 60])
+
+    def test_a_box_with_no_area_is_dropped(self):
+        # The order cannot save a box whose two ends are one point:
+        # there is no region for a reader to look at.
+        out = layout_json.legalize([self._cell([10, 20, 10, 60])], 1700, 2200)
+
+        self.assertEqual(out.edits, ["flat_box@0"])
+        self.assertEqual(out.cells, [])
+
+    def test_a_box_off_the_page_is_dropped(self):
+        out = layout_json.legalize(
+            [self._cell([1800, 10, 1900, 60])], 1700, 2200
+        )
+
+        self.assertEqual(out.edits, ["off_page@0"])
+        self.assertEqual(out.cells, [])
+
+    def test_a_box_over_the_edge_of_the_page_is_kept(self):
+        # A region the render cuts is still a region: the model saw
+        # ink there, and the reader clamps as it likes.
+        out = layout_json.legalize(
+            [self._cell([1650, 10, 1750, 60])], 1700, 2200
+        )
+
+        self.assertEqual(out.edits, [])
+        self.assertEqual(out.cells[0]["bbox"], [1650, 10, 1750, 60])
+
+    def test_the_page_test_needs_both_dimensions(self):
+        # The glue reads the dimensions off the stored page, and an old
+        # result may carry neither. Then the order is all that is left.
+        out = layout_json.legalize([self._cell([1800, 60, 1900, 10])])
+
+        self.assertEqual(out.edits, ["swap_y@0"])
+        self.assertEqual(out.cells[0]["bbox"], [1800, 10, 1900, 60])
+
+    def test_a_cell_with_no_box_of_four_numbers_is_dropped(self):
+        for bbox in ([10, 20, 50], [10, 20, 50, "60"], "10,20,50,60"):
+            with self.subTest(bbox=bbox):
+                out = layout_json.legalize(
+                    [{"bbox": bbox, "category": "Text"}], 1700, 2200
+                )
+
+                self.assertEqual(out.edits, ["no_bbox@0"])
+                self.assertEqual(out.cells, [])
+
+    def test_one_bad_cell_costs_only_itself(self):
+        cells = [
+            self._cell([10, 20, 50, 60]),
+            self._cell([10, 20, 10, 60]),
+            self._cell([100, 260, 900, 200]),
+        ]
+
+        out = layout_json.legalize(cells, 1700, 2200)
+
+        self.assertEqual(out.edits, ["flat_box@1", "swap_y@2"])
+        self.assertEqual(len(out.cells), 2)
+        self.assertEqual(out.cells[0]["bbox"], [10, 20, 50, 60])
+        self.assertEqual(out.cells[1]["bbox"], [100, 200, 900, 260])
+
+    def test_the_edit_names_read_like_a_repair_edit(self):
+        # ``reglue_dots_mocr`` counts both by the name before the "@".
+        out = layout_json.legalize([self._cell([50, 20, 10, 60])], 1700, 2200)
+
+        arm, _, index = out.edits[0].partition("@")
+        self.assertEqual(arm, "swap_x")
+        self.assertEqual(index, "0")
+
+
 class TestExcerpt(SimpleTestCase):
     def test_the_fault_is_marked_and_newlines_are_flattened(self):
         text = "abc\ndef" * 20

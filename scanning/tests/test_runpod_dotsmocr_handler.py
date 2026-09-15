@@ -768,6 +768,178 @@ class TestLayoutJsonRepair(SimpleTestCase):
         self.assertEqual(infer.call_count, 1)
 
 
+class TestIllegalBoxes(SimpleTestCase):
+    """A box the model wrote in the wrong order (issue #297).
+
+    The production fault: a ``Picture`` cell whose bottom was above its
+    top. Upstream's markdown crops the page image for a picture, and
+    Pillow refuses such a box, so the page failed on both rungs and the
+    answer went with them.
+    """
+
+    MD = "![](data:image/png;base64,AAAA)\n\nthe body"
+
+    #: A cell nothing is wrong with, for the second page of a run whose
+    #: first page must fail: a one-page job that fails every page
+    #: raises, and the failure is what these tests read.
+    LEGAL = [{"bbox": [100, 200, 900, 800], "category": "Text", "text": "hi"}]
+
+    def _run(
+        self,
+        cells,
+        pages=1,
+        include_pictures=False,
+        md=None,
+        rungs=1,
+    ):
+        """Run ``parse`` in layout mode with ``cells`` as the answer.
+
+        Page 0 is answered with ``cells`` on each of its ``rungs``, and
+        every later page with :data:`LEGAL` once.
+
+        :param cells: What upstream's post-process answers for page 0.
+        :param pages: Pages in the PDF.
+        :param include_pictures: The input of the same name.
+        :param md: A side effect for upstream's markdown builder, or
+            None for one that records the image it was given.
+        :param rungs: How many rungs page 0 may spend.
+        :returns: ``(result, the images the markdown was given)``.
+        """
+        stubs = _renderer_stubs()
+        layout = stubs["dots_mocr.utils.layout_utils"]
+        layout.post_process_output.side_effect = [(list(cells), False)] * (
+            rungs
+        ) + [(list(self.LEGAL), False)] * (pages - 1)
+        images: list = []
+
+        def _md(image, cells_in, text_key="text"):
+            images.append((image, cells_in))
+            return self.MD
+
+        transformer = stubs["dots_mocr.utils.format_transformer"]
+        transformer.layoutjson2md.side_effect = md or _md
+        self.stubs = stubs
+        with (
+            mock.patch.dict(sys.modules, stubs),
+            mock.patch.object(handler, "download_pdf"),
+            mock.patch.object(handler, "validate_pdf", return_value=pages),
+            mock.patch.object(
+                handler,
+                "_vllm_inference",
+                side_effect=[("the answer", "stop", 11)] * (rungs + pages),
+            ),
+        ):
+            result = handler._action_parse(
+                {"id": "job-1"},
+                {
+                    "pdf_url": "https://x/y.pdf",
+                    "prompt_mode": "prompt_layout_all_en",
+                    "num_threads": 1,
+                    "include_pictures": include_pictures,
+                },
+                Path("/nonexistent"),
+            )
+        return result, images
+
+    def test_a_picture_box_upside_down_reaches_the_markdown_in_order(self):
+        upside_down = [
+            {
+                "bbox": [1504, 1705, 1538, 10],
+                "category": "Picture",
+                "text": "",
+            },
+            {"bbox": [100, 200, 900, 800], "category": "Text", "text": "hi"},
+        ]
+
+        result, images = self._run(upside_down)
+
+        page = result["pages"][0]
+        self.assertEqual(result["failed_pages"], [])
+        self.assertEqual(page["legalized"], ["swap_y@0"])
+        self.assertEqual(page["legalized_by"], "worker")
+        self.assertEqual(page["cells"][0]["bbox"], [1504, 10, 1538, 1705])
+        # The ordered cells are what upstream crops from, which is the
+        # whole point: the page failed here before.
+        self.assertEqual(images[0][1][0]["bbox"], [1504, 10, 1538, 1705])
+        self.assertEqual(page["md"], "![]()\n\nthe body")
+        self.assertEqual(page["attempts"], 1)
+
+    def test_a_legal_answer_carries_no_mark(self):
+        result, _ = self._run(
+            [{"bbox": [100, 200, 900, 800], "category": "Text", "text": "hi"}]
+        )
+
+        page = result["pages"][0]
+        self.assertNotIn("legalized", page)
+        self.assertNotIn("legalized_by", page)
+
+    def test_the_markdown_takes_no_page_image_without_pictures(self):
+        # The data URIs are stripped straight after, so the crop and
+        # the encode upstream pays for every picture are waste. A 1x1
+        # image gives the crop nothing to copy.
+        result, images = self._run(
+            [{"bbox": [10, 20, 50, 60], "category": "Picture", "text": ""}]
+        )
+
+        image = images[0][0]
+        self.assertEqual(image.size, (1, 1))
+        self.assertEqual(result["pages"][0]["md"], "![]()\n\nthe body")
+
+    def test_the_markdown_takes_the_page_image_for_pictures(self):
+        result, images = self._run(
+            [{"bbox": [10, 20, 50, 60], "category": "Picture", "text": ""}],
+            include_pictures=True,
+        )
+
+        render = self.stubs[
+            "dots_mocr.utils.doc_utils"
+        ].fitz_doc_to_image.return_value
+        self.assertIs(images[0][0], render)
+        # Nothing is stripped, so the caller gets the picture it asked
+        # for.
+        self.assertEqual(result["pages"][0]["md"], self.MD)
+
+    def test_a_page_with_no_usable_box_fails_and_keeps_the_answer(self):
+        # Every cell dropped means the answer is not a layout of this
+        # page. Both rungs are spent, and the answer survives so a
+        # later pass can read it with no GPU time.
+        result, _ = self._run(
+            [{"bbox": [10, 20, 10, 60], "category": "Text", "text": "hi"}],
+            rungs=2,
+            pages=2,
+        )
+
+        page = result["pages"][0]
+        self.assertEqual(result["failed_pages"], [0])
+        self.assertIn("no cell of the answer had a usable box", page["error"])
+        self.assertIn("flat_box@0", page["error"])
+        self.assertEqual(page["attempts"], 2)
+        self.assertEqual(len(page["errors"]), 2)
+        self.assertEqual(page["raw"], "the answer")
+
+    def test_a_markdown_failure_keeps_the_answer(self):
+        # What production threw: Pillow refusing the crop of a box
+        # whose bottom is above its top. The rule above stops it, and
+        # this is the net under the rule -- any other refusal after the
+        # model answered keeps the answer.
+        refused = ValueError("Coordinate 'lower' is less than 'upper'")
+        result, _ = self._run(
+            [{"bbox": [10, 20, 50, 60], "category": "Picture", "text": ""}],
+            md=[refused, refused, self.MD],
+            rungs=2,
+            pages=2,
+        )
+
+        page = result["pages"][0]
+        self.assertEqual(result["failed_pages"], [0])
+        self.assertEqual(
+            page["error"], "Coordinate 'lower' is less than 'upper'"
+        )
+        self.assertEqual(page["attempts"], 2)
+        self.assertEqual(page["raw"], "the answer")
+        self.assertEqual(result["pages"][1]["md"], "![]()\n\nthe body")
+
+
 class TestThresholdRender(SimpleTestCase):
     """The retry render: a grey cut that removes the verso show-through."""
 
