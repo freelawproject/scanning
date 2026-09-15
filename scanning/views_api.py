@@ -65,6 +65,76 @@ def _rebuild_findings(scan: Scan) -> None:
     findings.rebuild(scan)
 
 
+# The success lines of the review-2 writes (#322). Every write answers
+# one of these as ``message``, and the viewer shows it as a success
+# toast: a curator who moves a box had no sign that the server kept it,
+# because the box stays where the mouse left it either way. The text
+# lives here, in the view that knows what it wrote, never in the
+# viewer scripts.
+SAVED_REDACTION_MESSAGE = (
+    "The box was saved. The redactions are not measured again from it yet."
+)
+#: A move or a resize, of a redaction box and of a detection box.
+MOVED_BOX_MESSAGE = "The box was moved."
+#: The same move, when the curator's box replaced a computed one.
+MOVED_OVER_COMPUTED_MESSAGE = (
+    "The box was moved. Your box replaces the computed one."
+)
+#: The same move, when the curator's box replaced a model row.
+MOVED_OVER_MODEL_MESSAGE = (
+    "The box was moved. Your box replaces the model box."
+)
+DISMISSED_REDACTION_MESSAGE = "The box was dismissed. Nothing was deleted."
+WITHDRAWN_REDACTION_MESSAGE = "The box was withdrawn. Nothing was deleted."
+RESTORED_REDACTION_MESSAGE = "The box came back."
+STANDING_REDACTION_MESSAGE = "The box was standing already."
+ADDED_DETECTION_MESSAGE = "The detection was added."
+#: A caption or a key icon changes the pairing, which only the
+#: measurement can do (#305).
+ADDED_ANCHOR_DETECTION_MESSAGE = (
+    'The detection was added. Press "Recompute redactions" to pair the '
+    "opinions again."
+)
+STANDING_DETECTION_MESSAGE = "The box is there already."
+#: The approval of a row the curator drew: the view writes nothing,
+#: because the box is theirs and reads 1.0 from birth.
+OWN_DETECTION_MESSAGE = (
+    "This box is your own, so it needs no approval: it reads 1.0 already."
+)
+APPROVED_DETECTION_MESSAGE = (
+    "The detection was approved: the box reads 1.0 now. The card stays "
+    "until the opinions are paired again."
+)
+DISMISSED_DETECTION_MESSAGE = (
+    "The detection was dismissed. Nothing was deleted."
+)
+WITHDRAWN_DETECTION_MESSAGE = (
+    "The detection was withdrawn. Nothing was deleted."
+)
+ADDED_BOUNDARY_MESSAGE = "The opinion boundary was added."
+MOVED_BOUNDARY_MESSAGE = "The opinion boundary was moved."
+DISMISSED_BOUNDARY_MESSAGE = (
+    "The opinion boundary was dismissed. Nothing was deleted."
+)
+WITHDRAWN_BOUNDARY_MESSAGE = (
+    "The opinion boundary was withdrawn. Nothing was deleted."
+)
+RESTORED_BOUNDARY_MESSAGE = "The opinion boundary came back."
+STANDING_BOUNDARY_MESSAGE = "The opinion boundary was standing already."
+DISMISSED_FINDING_MESSAGE = (
+    "The finding was dismissed. Press Undo on the card to take it back."
+)
+RESTORED_FINDING_MESSAGE = "The dismissal was taken back."
+STANDING_FINDING_MESSAGE = "The finding was standing already."
+WITHDRAWN_DECISION_MESSAGE = "The decision was withdrawn."
+STANDING_DECISION_MESSAGE = "The decision was withdrawn already."
+REBUILT_FINDINGS_MESSAGE = "The findings were written again from the rows."
+
+#: The two labels the opinion pairing reads: a box of one of them
+#: changes the boundaries, and only the measurement pairs them again.
+PAIRING_LABELS = ("CASE_CAPTION", "KEY_ICON")
+
+
 def _parse_json_body(request: HttpRequest) -> dict | JsonResponse:
     """Parse a JSON request body or return an error response.
 
@@ -179,7 +249,8 @@ def dismiss_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     :param request: The HTTP request (JSON body with ``boundary_id``).
     :param pk: Scan primary key.
     :return: ``dismissal_id`` for a computed row, null for a withdrawn
-        addition; 404 when the row is not the scan's.
+        addition, plus the ``message`` the viewer shows (#322); 404 when
+        the row is not the scan's.
     """
     from scanning import boundaries
 
@@ -204,6 +275,11 @@ def dismiss_boundary(request: HttpRequest, pk: int) -> JsonResponse:
             "boundary_id": row.pk,
             "dismissal_id": dismissal.pk if dismissal else None,
             "withdrawn": dismissal is None,
+            "message": (
+                WITHDRAWN_BOUNDARY_MESSAGE
+                if dismissal is None
+                else DISMISSED_BOUNDARY_MESSAGE
+            ),
         }
     )
 
@@ -219,7 +295,8 @@ def restore_boundary(request: HttpRequest, pk: int) -> JsonResponse:
 
     :param request: The HTTP request (JSON body with ``boundary_id``).
     :param pk: Scan primary key.
-    :return: ``restored`` says whether a dismissal stood.
+    :return: ``restored`` says whether a dismissal stood, plus the
+        ``message`` the viewer shows (#322).
     """
     from scanning import boundaries
 
@@ -233,7 +310,16 @@ def restore_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     restored = boundaries.restore(scan, row, request.user)
     _rebuild_findings(scan)
     return JsonResponse(
-        {"status": "ok", "boundary_id": row.pk, "restored": restored}
+        {
+            "status": "ok",
+            "boundary_id": row.pk,
+            "restored": restored,
+            "message": (
+                RESTORED_BOUNDARY_MESSAGE
+                if restored
+                else STANDING_BOUNDARY_MESSAGE
+            ),
+        }
     )
 
 
@@ -356,6 +442,11 @@ def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
             "status": "ok",
             "boundary_id": row.pk,
             "dismissal_id": row.replaces_id,
+            "message": (
+                MOVED_BOUNDARY_MESSAGE
+                if row.replaces_id
+                else ADDED_BOUNDARY_MESSAGE
+            ),
         }
     )
 
@@ -443,8 +534,8 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
     :param request: JSON body with ``page_index``, ``x0``, ``y0``,
         ``x1``, ``y1`` (points) and ``fill`` (``black`` or ``white``).
     :param pk: Scan primary key.
-    :return: ``{status, id}``; 400 on a bad body, 409 when the page has
-        no address.
+    :return: ``{status, id, message}``; 400 on a bad body, 409 when the
+        page has no address.
     """
     from scanning import redactions
 
@@ -469,7 +560,9 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
     except redactions.UnaddressableRedaction:
         return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
     _rebuild_findings(scan)
-    return JsonResponse({"status": "ok", "id": row.pk})
+    return JsonResponse(
+        {"status": "ok", "id": row.pk, "message": SAVED_REDACTION_MESSAGE}
+    )
 
 
 @login_required
@@ -486,7 +579,7 @@ def move_redaction(
     :param request: JSON body with ``x0``, ``y0``, ``x1``, ``y1``.
     :param pk: Scan primary key.
     :param redaction_id: The row.
-    :return: ``{status, id}``.
+    :return: ``{status, id, message}``.
     """
     from scanning import redactions
 
@@ -509,7 +602,17 @@ def move_redaction(
     except redactions.UnaddressableRedaction:
         return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
     _rebuild_findings(scan)
-    return JsonResponse({"status": "ok", "id": holder.pk})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "id": holder.pk,
+            "message": (
+                MOVED_BOX_MESSAGE
+                if holder.pk == row.pk
+                else MOVED_OVER_COMPUTED_MESSAGE
+            ),
+        }
+    )
 
 
 @login_required
@@ -523,7 +626,7 @@ def dismiss_redaction(
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :param redaction_id: The row.
-    :return: ``{status}``.
+    :return: ``{status, message}``.
     """
     from scanning import redactions
 
@@ -531,9 +634,19 @@ def dismiss_redaction(
     row = _redaction_of(scan, redaction_id)
     if row is None or row.bbox is None:
         return _redaction_error("Redaction not found", 404)
+    human = row.origin == Redaction.Origin.HUMAN
     redactions.dismiss(scan, row, request.user)
     _rebuild_findings(scan)
-    return JsonResponse({"status": "ok"})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "message": (
+                WITHDRAWN_REDACTION_MESSAGE
+                if human
+                else DISMISSED_REDACTION_MESSAGE
+            ),
+        }
+    )
 
 
 @login_required
@@ -546,7 +659,7 @@ def restore_redaction(
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :param redaction_id: The computed row.
-    :return: ``{status, restored}``.
+    :return: ``{status, restored, message}``.
     """
     from scanning import redactions
 
@@ -556,7 +669,17 @@ def restore_redaction(
         return _redaction_error("Redaction not found", 404)
     restored = redactions.restore(scan, row, request.user)
     _rebuild_findings(scan)
-    return JsonResponse({"status": "ok", "restored": restored})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "restored": restored,
+            "message": (
+                RESTORED_REDACTION_MESSAGE
+                if restored
+                else STANDING_REDACTION_MESSAGE
+            ),
+        }
+    )
 
 
 #: The refusal of the redaction recompute when the volume carries no
@@ -997,8 +1120,8 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
 
     :param request: The HTTP request (JSON body with ``issue_id``).
     :param pk: Scan primary key.
-    :return: ``{status, dismissal_id}``; 404 when the row is gone, 409
-        when the finding takes no dismissal.
+    :return: ``{status, dismissal_id, message}``; 404 when the row is
+        gone, 409 when the finding takes no dismissal.
     """
     from scanning import findings
 
@@ -1021,7 +1144,13 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
             {"status": "error", "message": FINDING_UNADDRESSABLE_MESSAGE},
             status=409,
         )
-    return JsonResponse({"status": "ok", "dismissal_id": dismissal.pk})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "dismissal_id": dismissal.pk,
+            "message": DISMISSED_FINDING_MESSAGE,
+        }
+    )
 
 
 @login_required
@@ -1031,7 +1160,7 @@ def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
 
     :param request: The HTTP request (JSON body with ``issue_id``).
     :param pk: Scan primary key.
-    :return: ``{status, restored}``.
+    :return: ``{status, restored, message}``.
     """
     from scanning import findings
 
@@ -1043,7 +1172,17 @@ def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     if isinstance(row, JsonResponse):
         return row
     restored = findings.restore(scan, row, request.user)
-    return JsonResponse({"status": "ok", "restored": restored})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "restored": restored,
+            "message": (
+                RESTORED_FINDING_MESSAGE
+                if restored
+                else STANDING_FINDING_MESSAGE
+            ),
+        }
+    )
 
 
 @login_required
@@ -1057,7 +1196,8 @@ def withdraw_stale_edit(request: HttpRequest, pk: int) -> JsonResponse:
 
     :param request: The HTTP request (JSON body with ``issue_id``).
     :param pk: Scan primary key.
-    :return: ``{status, withdrawn}``; 409 when the finding names no row.
+    :return: ``{status, withdrawn, message}``; 409 when the finding
+        names no row.
     """
     from scanning import findings
 
@@ -1078,7 +1218,17 @@ def withdraw_stale_edit(request: HttpRequest, pk: int) -> JsonResponse:
             },
             status=409,
         )
-    return JsonResponse({"status": "ok", "withdrawn": withdrawn})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "withdrawn": withdrawn,
+            "message": (
+                WITHDRAWN_DECISION_MESSAGE
+                if withdrawn
+                else STANDING_DECISION_MESSAGE
+            ),
+        }
+    )
 
 
 def _findings_payload(scan: Scan, request: HttpRequest) -> dict:
@@ -1149,8 +1299,8 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: ``{status, html, open, stale}``; 409 while the volume is
-        busy.
+    :return: ``{status, html, open, stale, message}``; 409 while the
+        volume is busy.
     """
     from scanning import findings
 
@@ -1163,7 +1313,13 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
     logger.info(
         "scan %s: %s rebuilt the review-2 findings", scan.pk, request.user
     )
-    return JsonResponse({"status": "ok", **_findings_payload(scan, request)})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "message": REBUILT_FINDINGS_MESSAGE,
+            **_findings_payload(scan, request),
+        }
+    )
 
 
 @login_required
@@ -1180,7 +1336,8 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk)).
     :param pk: Scan primary key.
-    :return: JSON response with ``deleted`` count, or 404 if not found.
+    :return: JSON response with ``deleted`` count and the ``message``
+        the viewer shows (#322), or 404 if not found.
     """
     from scanning import detections
 
@@ -1193,7 +1350,8 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
-    if row.model_name == Detection.ModelName.MANUAL:
+    manual = row.model_name == Detection.ModelName.MANUAL
+    if manual:
         detections.withdraw_manual(row, request.user)
     else:
         try:
@@ -1203,7 +1361,17 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
         except detections.UnaddressableDetection:
             return _unaddressable()
     _rebuild_findings(scan)
-    return JsonResponse({"status": "ok", "deleted": 1})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "deleted": 1,
+            "message": (
+                WITHDRAWN_DETECTION_MESSAGE
+                if manual
+                else DISMISSED_DETECTION_MESSAGE
+            ),
+        }
+    )
 
 
 @login_required
@@ -1221,8 +1389,8 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk) and ``new_bbox`` (list[float], ``[x0,y0,x1,y1]``)).
     :param pk: Scan primary key.
-    :return: JSON response with ``updated`` count and ``detection_id``,
-        or 404 if not found.
+    :return: JSON response with ``updated`` count, ``detection_id`` and
+        the ``message`` the viewer shows (#322), or 404 if not found.
     """
     from scanning import detections
 
@@ -1250,7 +1418,16 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
             return _unaddressable()
     _rebuild_findings(scan)
     return JsonResponse(
-        {"status": "ok", "updated": 1, "detection_id": holder.pk}
+        {
+            "status": "ok",
+            "updated": 1,
+            "detection_id": holder.pk,
+            "message": (
+                MOVED_BOX_MESSAGE
+                if holder.pk == row.pk
+                else MOVED_OVER_MODEL_MESSAGE
+            ),
+        }
     )
 
 
@@ -1295,7 +1472,8 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with ``added=True`` and the new row's
         ``detection_id`` if new, ``added=False`` and the approved row's
-        id if an existing detection was approved.
+        id if an existing detection was approved. Both carry the
+        ``message`` the viewer shows (#322).
     """
     from blackletter.models import Label
 
@@ -1342,7 +1520,9 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
         .first()
     )
     if near is not None:
+        message = STANDING_DETECTION_MESSAGE
         if near.model_name != Detection.ModelName.MANUAL:
+            message = APPROVED_DETECTION_MESSAGE
             # No run passed: ``decide`` resolves one only for a row with
             # no address, so the common case costs no ledger read.
             try:
@@ -1353,7 +1533,12 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 return _unaddressable()
         _rebuild_findings(scan)
         return JsonResponse(
-            {"status": "ok", "added": False, "detection_id": near.pk}
+            {
+                "status": "ok",
+                "added": False,
+                "detection_id": near.pk,
+                "message": message,
+            }
         )
     run = detections.measured_run(scan)
     try:
@@ -1371,7 +1556,16 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
         return _unaddressable()
     _rebuild_findings(scan)
     return JsonResponse(
-        {"status": "ok", "added": True, "detection_id": row.pk}
+        {
+            "status": "ok",
+            "added": True,
+            "detection_id": row.pk,
+            "message": (
+                ADDED_ANCHOR_DETECTION_MESSAGE
+                if label_name in PAIRING_LABELS
+                else ADDED_DETECTION_MESSAGE
+            ),
+        }
     )
 
 
@@ -1382,12 +1576,14 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
 
     A model row gets an ``approve`` decision (#240), which the next
     import lands on the same box again. A hand-drawn row is the
-    curator's already and needs none.
+    curator's already and needs none, and the message says so (#322):
+    this view writes nothing for one.
 
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk)).
     :param pk: Scan primary key.
-    :return: JSON response with ``updated`` count, or 404 if not found.
+    :return: JSON response with ``updated`` count and the ``message``
+        the viewer shows (#322), or 404 if not found.
     """
     from scanning import detections
 
@@ -1400,7 +1596,8 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
-    if row.model_name != Detection.ModelName.MANUAL:
+    manual = row.model_name == Detection.ModelName.MANUAL
+    if not manual:
         try:
             detections.decide(
                 scan, row, DetectionDecision.Kind.APPROVE, request.user
@@ -1408,7 +1605,15 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
         except detections.UnaddressableDetection:
             return _unaddressable()
     _rebuild_findings(scan)
-    return JsonResponse({"status": "ok", "updated": 1})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "updated": 1,
+            "message": (
+                OWN_DETECTION_MESSAGE if manual else APPROVED_DETECTION_MESSAGE
+            ),
+        }
+    )
 
 
 @login_required

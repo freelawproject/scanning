@@ -718,7 +718,12 @@ class TestFindingEndpoints(ScanningTestCase):
 
         response = self._post("restore_finding", {"issue_id": self.finding.pk})
 
-        self.assertEqual(response.json(), {"status": "ok", "restored": True})
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertTrue(body["restored"])
+        # Every write of review 2 answers the line the viewer shows
+        # (#322).
+        self.assertTrue(body["message"])
         self.finding.refresh_from_db()
         self.assertIsNone(self.finding.dismissal_id)
 
@@ -762,7 +767,10 @@ class TestFindingEndpoints(ScanningTestCase):
         self.assertEqual(response.json()["status"], "error")
 
         response = self._post("withdraw_stale_edit", {"issue_id": stale.pk})
-        self.assertEqual(response.json(), {"status": "ok", "withdrawn": True})
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertTrue(body["withdrawn"])
+        self.assertTrue(body["message"])
         decision.refresh_from_db()
         self.assertIsNotNone(decision.withdrawn_at)
 
