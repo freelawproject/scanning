@@ -524,6 +524,86 @@ class TestMeasureRedactionRects(TestCase):
             det.refresh_from_db()
             self.assertEqual(det.x0, COLUMN_LEFT.x0 + 6, "persisted the snap")
 
+    def test_the_snapped_document_separates_the_columns(self):
+        """Two boxes that share an edge leave ``clamp_to_gutters`` with
+        no neighbour to measure, and a headnote box then grows across
+        the gutter (#308). The cells give the gutter back, after the
+        ink snap and in memory: ``columns.separate_rows`` owns the
+        rows."""
+        from scanning import services, text_fit
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir, reporter=ReporterFactory(short_name="a3d")
+            )
+            pdf = pathlib.Path(scan.output_dir) / "bitonal.pdf"
+            write_two_column_page(pdf, tmp_dir=pathlib.Path(tmpdir))
+            edge = COLUMN_LEFT.x1
+            rows = [
+                self._column(scan, COLUMN_LEFT.x0, edge),
+                self._column(scan, edge, COLUMN_RIGHT.x1),
+            ]
+            cells = text_fit.page_cells(
+                {
+                    "pages": [
+                        {
+                            "page_index": 0,
+                            "origin_width": PAGE_W,
+                            "origin_height": PAGE_H,
+                            "cells": [
+                                {
+                                    "bbox": [
+                                        band.x0,
+                                        band.y0 + 10,
+                                        band.x1,
+                                        band.y1 - 10,
+                                    ],
+                                    "category": "Text",
+                                }
+                                for band in (COLUMN_LEFT, COLUMN_RIGHT)
+                            ],
+                        }
+                    ]
+                }
+            )
+
+            document, _ids, _entries = services._snapped_document(
+                scan, str(pdf), None, cells
+            )
+
+            boxes = sorted(
+                (d.bbox for d in document.pages[0].detections),
+                key=lambda b: b.x1,
+            )
+            self.assertAlmostEqual(boxes[0].x2, COLUMN_LEFT.x1, delta=0.1)
+            self.assertAlmostEqual(boxes[1].x1, COLUMN_RIGHT.x0, delta=0.1)
+            for row in rows:
+                row.refresh_from_db()
+            self.assertEqual(rows[0].x1, edge, "persisted the separation")
+
+    @staticmethod
+    def _column(scan, x0, x1):
+        """Write one full-height ``TEXT_COLUMN`` row of the fixture page.
+
+        :param scan: The scan.
+        :param x0: The left edge, in pixels, which are points here.
+        :param x1: The right edge, the same way.
+        :returns: The row.
+        """
+        return Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="TEXT_COLUMN",
+            label_id=16,
+            confidence=0.95,
+            x0=x0,
+            y0=COLUMN_LEFT.y0,
+            x1=x1,
+            y1=COLUMN_LEFT.y1,
+            img_width=PAGE_W,
+            img_height=PAGE_H,
+        )
+
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestMeasureMarginRects(TestCase):

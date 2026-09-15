@@ -20,6 +20,7 @@ from django.utils import timezone
 from scanning import (
     apply,
     boundaries,
+    columns,
     detections,
     findings,
     redactions,
@@ -432,6 +433,25 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         state = yolo.apply_state(yolo.live_detect_jobs(scan))
         self.assertTrue(state.get("applied_at"))
         self.assertNotIn("queued_at", state)
+
+    def test_the_columns_are_separated_before_the_document(self):
+        """The gutter goes into the boxes before any geometry reads
+        them (#308), and one read of the cells serves it and the text
+        fit (#279)."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        with patch.object(
+            columns, "separate_rows", return_value=0
+        ) as separate:
+            services.run_compute_redactions(scan.pk)
+
+        separate.assert_called_once()
+        stubs["load_cells"].assert_called_once()
+        cells = stubs["load_cells"].return_value
+        self.assertIs(separate.call_args.args[1], cells)
+        # The document takes the same cells, and puts the gutter back
+        # after blackletter's ink snap.
+        self.assertIs(stubs["_snapped_document"].call_args.args[3], cells)
 
     def test_the_opinions_and_the_geometry_are_written(self):
         scan, _ = merged_scan()

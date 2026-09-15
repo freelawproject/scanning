@@ -846,7 +846,10 @@ def _build_document_with_ids(
 
 
 def _snapped_document(
-    scan: "Scan", pdf_path: str, page_numbers: dict | None = None
+    scan: "Scan",
+    pdf_path: str,
+    page_numbers: dict | None = None,
+    cells: dict | None = None,
 ) -> tuple["BLDoc", dict[int, int], list]:
     """Build the corrected document the compute pairs and measures on.
 
@@ -857,17 +860,29 @@ def _snapped_document(
     would give the headnote rects a different column to the margins on
     the same page.
 
+    The gutter is put back after the ink snap and not before (#308):
+    the snap grows each column box onto its ink and caps it at the
+    gutter centre, so two boxes that started apart can meet there, and
+    a pair that shares an edge leaves ``clamp_to_gutters`` with no
+    neighbour to measure.
+
     :param scan: The scan.
     :param pdf_path: The PDF the detections were measured against.
     :param page_numbers: See :func:`detection_entries`.
+    :param cells: The dots.mocr cells of each page
+        (``text_fit.load_cells``), when the caller holds them. Without
+        them a touching pair still gets the fallback gap.
     :return: The document, the ``{id(bl_detection): pk}`` map, and the
         entries it was built from (empty when the scan has none).
     """
+    from scanning import columns
+
     det_data = detection_entries(scan.pk, page_numbers=page_numbers)
     if not det_data:
         return BLDoc(pdf_path=str(pdf_path), pages=[]), {}, []
     document, row_ids = _build_document_with_ids(scan, det_data, pdf_path)
     snap_document_columns(document)
+    columns.separate_document(document, cells or {})
     return document, row_ids, det_data
 
 
@@ -1699,6 +1714,7 @@ def run_compute_redactions(scan_pk: int) -> None:
     """
     from scanning import (
         apply,
+        columns,
         findings,
         redactions,
         review_states,
@@ -1841,8 +1857,20 @@ def run_compute_redactions(scan_pk: int) -> None:
         # one pairing (#240 PR C): the boundaries are rows written from
         # blackletter's own pairs, with the caption and the key rows
         # named exactly, and the rects are measured from the same pairs.
+        # One read of the cells, for the two passes that measure
+        # against them: the column gutter here and the text fit below
+        # (#279, #308).
+        cells = text_fit.load_cells(scan, run)
+
+        # The two column boxes of a page share an edge, because the
+        # model cuts one text block in half. A headnote box then grows
+        # across the gutter onto the facing column's text (#308).
+        _update_progress(scan_pk, "Measuring the column gutter...")
+        with _log_stage("Column gutter"):
+            columns.separate_rows(scan, cells)
+
         document, row_ids, det_data = _snapped_document(
-            scan, pdf_path, page_numbers
+            scan, pdf_path, page_numbers, cells
         )
         _update_progress(scan_pk, "Pairing the opinions...")
         with _log_stage("Opinion pairing"):
@@ -1864,9 +1892,7 @@ def run_compute_redactions(scan_pk: int) -> None:
         # cannot narrow it afterwards, and the dots.mocr cells can.
         _update_progress(scan_pk, "Fitting the text redactions...")
         with _log_stage("Text redaction fit"):
-            text_fit.fit_rects(
-                rects, text_fit.load_cells(scan, run), document.pages
-            )
+            text_fit.fit_rects(rects, cells, document.pages)
 
         _update_progress(scan_pk, "Measuring the page margins...")
         margins = _measure_margin_rects(pdf_path, document)
