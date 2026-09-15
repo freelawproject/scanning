@@ -62,7 +62,11 @@ from one.
 The stray ``L`` decides the order the token patterns are tried in: the
 plain number first, the suffixed number second. The other order reads
 ``2094L``, which is the icon glued to page 2094, as a page named
-``2094L``.
+``2094L``. The same icon is misread as a lower-case ``l`` and as an
+``I``, which is why the reader trusts six letters (``SUFFIX_LETTERS``)
+and not the alphabet: a letter it does not trust leaves the page with
+no reading and a ``no_page_number`` card, which a curator answers,
+while a wrong suffixed reading makes no card at all.
 
 A page the worker failed or filtered has no cells and gets
 ``detected=None``; the sequence analysis reports it as
@@ -117,6 +121,15 @@ _RANGE_TOKEN_RE = re.compile(r"^(\d{1,4})[–\-](\d{1,4})$")
 #: ``3d`` at a corner, and the reading would name the page 2. A
 #: curator may still type ``9a``, because a person read the page.
 MIN_SUFFIXED_DIGITS = 2
+
+#: The letters the *reader* trusts at the end of a number. The book
+#: labels the pages it adds in order from ``a``, and six is more than
+#: a volume prints. Every other letter there is noise, and two of them
+#: are noise the reader knows: the parallel-page icon is misread as an
+#: ``l`` or an ``I`` (#228 strips the upper-case ``L`` alone), so
+#: ``2094l`` would read as a page named ``2094l``. A curator may still
+#: type any letter, because a person read the page.
+SUFFIX_LETTERS = frozenset("abcdefABCDEF")
 
 #: How many pages one printed range may cover. A compressed opinion
 #: covers tens of pages; a docket number (``19-1234``) covers more
@@ -220,8 +233,11 @@ def _suffixed_value(match: re.Match | None) -> str | None:
     """Return the suffixed number a match names, when a page prints it.
 
     The guard of :func:`_range_value`, for the other shape whose
-    pattern is wider than the printed thing (#319). See
-    :data:`MIN_SUFFIXED_DIGITS`.
+    pattern is wider than the printed thing (#319): the number carries
+    at least :data:`MIN_SUFFIXED_DIGITS` digits, and the letter is one
+    of :data:`SUFFIX_LETTERS`. A letter outside that set leaves the
+    page with no reading, which is what it had before #319: a
+    ``no_page_number`` card the curator answers.
 
     :param match: A match of the suffixed pattern, or None.
     :returns: The number as ``"2094a"``, or None.
@@ -231,6 +247,8 @@ def _suffixed_value(match: re.Match | None) -> str | None:
         return None
     value = match.group(1)
     if len(value) - 1 < MIN_SUFFIXED_DIGITS:
+        return None
+    if value[-1] not in SUFFIX_LETTERS:
         return None
     return value
 

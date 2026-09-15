@@ -190,6 +190,21 @@ class TestExtractPageNumber(SimpleTestCase):
                 self.assertEqual(entry["detected"], "2094")
                 self.assertEqual(entry["type"], "single")
 
+    def test_only_the_first_six_letters_are_read(self):
+        """The book labels the pages it adds in order from ``a``.
+
+        Every other letter there is noise, and the icon of #228 is
+        read as an ``l`` or an ``I``. The page keeps its
+        ``no_page_number`` card, which a curator answers; a wrong
+        suffixed reading would make no card at all (#319).
+        """
+        for text in ("2094a", "2094f", "2094A", "2094F"):
+            with self.subTest(text=text):
+                self.assertEqual(self.extract([cell(text)])["detected"], text)
+        for text in ("2094l", "2094I", "2094O", "2094g", "2094z"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.extract([cell(text)])["detected"])
+
     def test_a_series_ordinal_is_no_page_number(self):
         """``2d`` matches the shape exactly, so the reader asks for two
         digits (#319). A curator may still type ``9a``."""

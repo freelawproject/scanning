@@ -3374,6 +3374,15 @@ class TestAssignPage(ScanningTestCase):
             json.loads(self._post(2, "9a").content)["detected"], "9a"
         )
 
+    def test_takes_a_letter_the_reader_does_not_trust(self):
+        """The reader reads six letters, because the rest are noise it
+        cannot tell from a page (#319). A person can."""
+        for typed in ("2094l", "2094z"):
+            with self.subTest(typed=typed):
+                answer = json.loads(self._post(2, typed).content)
+                self.assertEqual(answer["detected"], typed)
+                self.assertEqual(answer["type"], "suffixed")
+
     def test_rejects_two_trailing_letters(self):
         for typed in ("2094ab", "a2094", "20a94", "2094a-2096", "0a"):
             with self.subTest(typed=typed):
