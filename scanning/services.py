@@ -561,12 +561,24 @@ def printed_page_span(value, kind) -> tuple[int, int | None] | None:
     original's space) and ``apply.page_number_lookup`` over a run's
     printed-page map (the final space, #269).
 
+    A page with a trailing letter (``"2094a"``, #319) names no span:
+    the book adds it between two numbered pages, so it carries no
+    number the sequence counts. A box on it gets no printed number,
+    and an opinion that starts there is named by its position
+    (``boundaries._page_bounds``), which is what a page with no number
+    gets today.
+
     :param value: The stored number, as ``detected`` or ``printed``.
-    :param kind: The stored type, ``"range"`` or anything else.
+    :param kind: The stored type, ``"range"``, ``"suffixed"``, or
+        anything else.
     :returns: The span, or ``None``.
     :rtype: tuple[int, int | None] | None
     """
+    from scanning import page_numbers
+
     if not value:
+        return None
+    if kind == page_numbers.SUFFIXED:
         return None
     if kind == "range":
         m = _PAGE_RANGE_RE.match(str(value))

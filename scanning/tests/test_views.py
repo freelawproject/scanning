@@ -3347,6 +3347,49 @@ class TestAssignPage(ScanningTestCase):
                     json.loads(response.content)["detected"], "913-925"
                 )
 
+    def test_sets_a_number_with_a_trailing_letter(self):
+        """The page the book adds between two numbered pages (#319)."""
+        response = self._post(2, "2094a")
+
+        self.assertEqual(response.status_code, 200)
+        answer = json.loads(response.content)
+        self.assertEqual(answer["detected"], "2094a")
+        self.assertEqual(answer["type"], "suffixed")
+        self.scan.refresh_from_db()
+        r = self.scan.ocr_results[1]
+        self.assertEqual(r["detected"], "2094a")
+        self.assertEqual(r["type"], "suffixed")
+        self.assertEqual(r["zone"], "manual")
+
+    def test_keeps_the_case_of_a_trailing_letter(self):
+        """The book prints one of the two glyphs."""
+        self.assertEqual(
+            json.loads(self._post(2, "2094A").content)["detected"], "2094A"
+        )
+
+    def test_takes_a_trailing_letter_the_reader_refuses(self):
+        """The two-digit guard is against a token of a running head, so
+        it does not reach a person with the page in front of them."""
+        self.assertEqual(
+            json.loads(self._post(2, "9a").content)["detected"], "9a"
+        )
+
+    def test_rejects_two_trailing_letters(self):
+        for typed in ("2094ab", "a2094", "20a94", "2094a-2096", "0a"):
+            with self.subTest(typed=typed):
+                self.assertEqual(self._post(2, typed).status_code, 400)
+
+    def test_answers_the_shape_of_the_stored_number(self):
+        """The viewer draws the tag from this, not from the string."""
+        for typed, shape in (
+            ("7", "single"),
+            ("913-925", "range"),
+            ("2094a", "suffixed"),
+        ):
+            with self.subTest(typed=typed):
+                answer = json.loads(self._post(2, typed).content)
+                self.assertEqual(answer["type"], shape)
+
     def test_rejects_a_backward_range(self):
         """A range names a first page and a last page, in that order."""
         self.assertEqual(self._post(2, "925-913").status_code, 400)

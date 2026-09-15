@@ -434,6 +434,10 @@ class TestGlues(GlueTestCase):
         )
         self.assertEqual(by_final[6]["printed"], "5a")
         self.assertEqual(by_final[7]["printed"], "6")
+        # The shape comes from the one deriver, so a leaf filed under
+        # 5a is a page with a trailing letter and says so (#319).
+        self.assertEqual(by_final[3]["type"], "single")
+        self.assertEqual(by_final[5]["type"], "suffixed")
 
     def test_the_detections_glue_drops_changed_pages_and_adds_new_ones(self):
         self.volume_detect_run()

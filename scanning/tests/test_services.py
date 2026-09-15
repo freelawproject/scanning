@@ -1992,6 +1992,44 @@ class TestRecalculateIssues(TestCase):
         self.assertIn("913-925", card.message)
         self.assertNotIn("Verify", card.message)
 
+    def test_a_trailing_letter_breaks_no_sequence(self):
+        """The book adds 2094a and 2094b between 2094 and 2095, so the
+        volume holds four pages and two numbers (#319).
+
+        This pins ``blackletter.validate``: it skips a reading it
+        cannot parse and keeps the page before and the page after as
+        neighbours, which is the whole rule for this shape.
+        """
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=2094,
+            end_page=2095,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "2094", "type": "single"},
+                {"pdf_page": 2, "detected": "2094a", "type": "suffixed"},
+                {"pdf_page": 3, "detected": "2094b", "type": "suffixed"},
+                {"pdf_page": 4, "detected": "2095", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [])
+        for check in (
+            CheckName.MISSING_PAGE,
+            CheckName.DUPLICATE_PAGE,
+            CheckName.BACKWARD_PAGE,
+            CheckName.LARGE_GAP,
+            CheckName.NO_PAGE_NUMBER,
+        ):
+            with self.subTest(check=check):
+                self.assertFalse(
+                    scan.issues.filter(check_name=check).exists()
+                )
+
     def test_rebuild_page_map_without_local_pdf(self):
         """rebuild_page_map (manual page edits) also runs off stored data
         and applies the scan's page range."""
@@ -2307,6 +2345,22 @@ class TestRunComputeIssues(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.ocr_results[0]["detected"], "678-686")
         self.assertEqual(scan.ocr_results[0]["type"], "range")
+
+    def test_a_curators_trailing_letter_survives_the_apply(self):
+        # The page the book adds between two numbered pages (#319).
+        scan = self._make_scan()
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.SET_NUMBER,
+            pdf_page=1,
+            value="2094a",
+        )
+
+        self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[0]["detected"], "2094a")
+        self.assertEqual(scan.ocr_results[0]["type"], "suffixed")
 
     def test_a_cleared_number_survives_the_apply(self):
         scan = self._make_scan()

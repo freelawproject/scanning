@@ -235,6 +235,9 @@ class TestPageNumberLookupResolves(TestCase):
         self.assertIsNone(services.printed_page_span("", "single"))
         self.assertIsNone(services.printed_page_span("x", "single"))
         self.assertIsNone(services.printed_page_span("12", "range"))
+        # A page the book adds between two numbered ones names no
+        # span, so a box on it carries no printed number (#319).
+        self.assertIsNone(services.printed_page_span("2094a", "suffixed"))
 
 
 class TestServeFinalPdf(ScanningTestCase):
