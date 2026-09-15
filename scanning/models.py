@@ -2392,7 +2392,8 @@ class PageEdit(AbstractDateTimeModel):
         blank=True,
         default="",
         help_text=(
-            "What was decided: the printed number ('1075') or range "
+            "What was decided: the printed number ('1075'), the "
+            "number with a trailing letter ('2094a') or the range "
             "('678-686') for a number, blank when the curator cleared "
             "it; the rotation in degrees; the dismissed check's name."
         ),

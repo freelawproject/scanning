@@ -304,6 +304,45 @@ function renderPreviewBanner(previewKind, onLoadOriginal) {
     banner.hidden = false;
 }
 
+// What a curator may type as a page number, in the one place both
+// viewers read (issue #319). The three shapes a book prints: one
+// number; one number with one trailing letter, on the page the book
+// adds between two numbered pages ("2094a"); and the range one
+// physical page carries when the book prints several pages on it
+// (#233). The server takes the same three and stores a range with a
+// hyphen, whatever dash was typed, so the dashes here are the ones a
+// reporter prints and a person pastes.
+var PAGE_ENTRY_RE = /^(\d{1,4})(?:([A-Za-z])|\s*[-–—]\s*(\d{1,4}))?$/;
+
+// The prompt, and the refusal. The server carries the same words in
+// ``views_process.PAGE_NUMBER_ERROR``.
+var PAGE_NUMBER_PROMPT =
+    ' (a number with a trailing letter like 2094a, or a range like ' +
+    '913-925 if this page carries several book pages; leave blank if ' +
+    'it has no number):';
+var PAGE_NUMBER_ERROR =
+    'Page number must be a positive whole number, a number with one ' +
+    'trailing letter like 2094a, or a range like 678-686.';
+
+/**
+ * Judge a page number a curator typed, before the request is sent.
+ *
+ * The one gate of the two viewers: both post to ``assign_page``, and
+ * the server refuses what this refuses.
+ *
+ * @param {string} text - The trimmed entry. Never the empty string,
+ *     which is the curator clearing the number.
+ * @returns {boolean} Whether the entry is one of the three shapes.
+ */
+function isPageNumberEntry(text) {
+    var parts = PAGE_ENTRY_RE.exec(text);
+    if (!parts) return false;
+    var first = parseInt(parts[1], 10);
+    if (first < 1) return false;
+    if (parts[3] === undefined) return true;
+    return first < parseInt(parts[3], 10);
+}
+
 /**
  * Escape text for safe interpolation into an innerHTML string.
  *

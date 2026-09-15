@@ -2063,9 +2063,7 @@ def printed_pages(scan: Scan, run: ApplyRun, document: dict) -> dict:
 
     def curator(page: dict, value: str) -> None:
         page["printed"] = value or None
-        page["type"] = (
-            None if not value else ("range" if "-" in value else "single")
-        )
+        page["type"] = page_numbers.number_type(value)
         page["by"] = "curator"
 
     slots = slots_to_final(page_map)

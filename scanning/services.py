@@ -561,12 +561,24 @@ def printed_page_span(value, kind) -> tuple[int, int | None] | None:
     original's space) and ``apply.page_number_lookup`` over a run's
     printed-page map (the final space, #269).
 
+    A page with a trailing letter (``"2094a"``, #319) names no span:
+    the book adds it between two numbered pages, so it carries no
+    number the sequence counts. A box on it gets no printed number,
+    and an opinion that starts there is named by its position
+    (``boundaries._page_bounds``), which is what a page with no number
+    gets today.
+
     :param value: The stored number, as ``detected`` or ``printed``.
-    :param kind: The stored type, ``"range"`` or anything else.
+    :param kind: The stored type, ``"range"``, ``"suffixed"``, or
+        anything else.
     :returns: The span, or ``None``.
     :rtype: tuple[int, int | None] | None
     """
+    from scanning import page_numbers
+
     if not value:
+        return None
+    if kind == page_numbers.SUFFIXED:
         return None
     if kind == "range":
         m = _PAGE_RANGE_RE.match(str(value))
@@ -1121,6 +1133,54 @@ def _note_curator_ranges(issues: list[dict], ocr_results: list[dict]) -> None:
         )
 
 
+def _ask_about_model_suffixes(
+    issues: list[dict], ocr_results: list[dict]
+) -> None:
+    """Ask the curator about a trailing letter the model read (#319).
+
+    A page with a trailing letter (``2094a``) claims no number, so the
+    sequence analysis writes no card for it: it makes no gap, no
+    duplicate and no missing page. That silence is right for a page a
+    person typed. It is wrong for a reading of the model, because the
+    shape is one letter away from a misread digit (``209B``), and a
+    page the reader used to hand back as ``no_page_number`` would
+    otherwise pass with no question asked. The reader trusts six
+    letters (``page_numbers.SUFFIX_LETTERS``); this card is for the
+    readings that pass that gate.
+
+    The mirror image of :func:`_note_curator_ranges`: that one lowers a
+    machine card to a note for a curator's own range, this one raises a
+    card for a machine reading a curator did not make. It is a
+    ``suspicious_reading`` card, which is addressed by the physical
+    page (``models.PHYSICAL_PAGE_CHECKS``), is dismissible, and is one
+    a deletion answers (``CHECKS_A_DELETION_ANSWERS``).
+
+    :param issues: The rebuilt issue dicts, edited in place.
+    :param ocr_results: The per-page entries the issues were built
+        from, curator numbers already overlaid.
+    :returns: None.
+    """
+    from scanning import page_numbers
+
+    for entry in ocr_results:
+        if entry.get("type") != page_numbers.SUFFIXED:
+            continue
+        if _is_manual_read(entry):
+            continue
+        issues.append(
+            {
+                "page_number": entry["pdf_page"],
+                "check_name": CheckName.SUSPICIOUS_READING,
+                "severity": Issue.Severity.WARNING,
+                "message": (
+                    f"PDF page {entry['pdf_page']} reads as "
+                    f"'{entry['detected']}', a page number with a "
+                    f"trailing letter. Verify this is expected."
+                ),
+            }
+        )
+
+
 def _project_trailing_gap(
     result: dict, analysis: dict, exp_end: int | None
 ) -> None:
@@ -1332,6 +1392,10 @@ def recalculate_issues(scan: "Scan") -> None:
     # Before the cards scanning appends below, and before the
     # dismissal filter, so a dismissal matches the card as it reads.
     _note_curator_ranges(result["issues"], ocr_results)
+
+    # A trailing letter the model read is a question, because the
+    # sequence analysis asks none about it (#319).
+    _ask_about_model_suffixes(result["issues"], ocr_results)
 
     # A range missing at the end of the volume gets a placeholder, so a
     # reviewer can upload the pages or ask a scanner for them (#256).

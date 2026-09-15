@@ -501,6 +501,8 @@ def overlay_page_numbers(
         placed on a page of this original.
     :rtype: tuple[list[dict], list[PageEdit]]
     """
+    from scanning import page_numbers
+
     by_page = {entry["pdf_page"]: entry for entry in results}
     stale: list[PageEdit] = []
     for edit in standing_edits(scan, PageEdit.Kind.SET_NUMBER):
@@ -520,7 +522,7 @@ def overlay_page_numbers(
             continue
         if edit.value:
             entry["detected"] = edit.value
-            entry["type"] = "range" if "-" in edit.value else "single"
+            entry["type"] = page_numbers.number_type(edit.value)
             entry["score"] = 1.0
         else:
             entry["detected"] = None
