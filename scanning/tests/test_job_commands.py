@@ -29,13 +29,18 @@ class TestSubmitCommand(TestCase):
 
         submit.assert_called_once_with(limit=None)
 
-    def test_the_detection_sweep_runs_before_the_wave(self):
-        """So the rows the sweep creates go out on the same tick (#250)."""
+    def test_the_sweeps_run_before_the_wave(self):
+        """So the rows the sweeps create go out on the same tick (#250,
+        #327)."""
         order = []
         with (
             patch(
                 "scanning.yolo.enqueue_missing_runs",
                 side_effect=lambda: order.append("sweep") or 2,
+            ),
+            patch(
+                "scanning.dots_mocr.enqueue_missing_runs",
+                side_effect=lambda: order.append("ocr") or 1,
             ),
             patch(
                 "scanning.jobs.submit_pending",
@@ -47,7 +52,7 @@ class TestSubmitCommand(TestCase):
         ):
             call_command("submit_external_jobs")
 
-        self.assertEqual(order, ["sweep", "wave"])
+        self.assertEqual(order, ["sweep", "ocr", "wave"])
 
     def test_the_limit_is_passed_through(self):
         with patch(
