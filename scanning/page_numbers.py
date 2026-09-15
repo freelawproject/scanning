@@ -50,6 +50,20 @@ line, exactly as a single number is, and it enters ``ocr_results``
 with ``type="range"``: the sequence analysis then breaks at that page
 and counts every page the range covers as present.
 
+A page the book adds between two numbered pages prints a number with a
+trailing letter (``2094a``, issue #319). It is read at the corner too,
+and it enters ``ocr_results`` with ``type="suffixed"``. It claims no
+number: the sequence analysis skips it and keeps the page before it
+and the page after it as neighbours, so 2094, 2094a, 2094b and 2095
+are four pages and two numbers. :func:`_value` returns None for it, so
+:func:`_resolve_by_neighbours` neither repairs such a page nor repairs
+from one.
+
+The stray ``L`` decides the order the token patterns are tried in: the
+plain number first, the suffixed number second. The other order reads
+``2094L``, which is the icon glued to page 2094, as a page named
+``2094L``.
+
 A page the worker failed or filtered has no cells and gets
 ``detected=None``; the sequence analysis reports it as
 ``no_page_number`` and interpolates across it, and review 1's manual
@@ -77,14 +91,33 @@ CORNER_BAND = 0.25
 HEADER_CATEGORY = "Page-header"
 FOOTER_CATEGORY = "Page-footer"
 
+#: The three shapes a printed page number takes, as ``type`` in
+#: ``Scan.ocr_results`` and in the apply's printed-page map.
+SINGLE = "single"
+RANGE = "range"
+SUFFIXED = "suffixed"
+
 #: A printed page number: 1 to 4 digits, possibly glued to the stray
 #: ``L`` the parallel-page icon is misread as.
 _NUMBER_RE = re.compile(r"^L?(\d{1,4})L?$")
+#: A printed page number with a trailing letter (``2094a``, #319): the
+#: page the book adds between two numbered pages. One ASCII letter,
+#: upper case or lower case, and the case is kept -- the book prints
+#: one of the two glyphs and no reader compares them. Tried after
+#: :data:`_NUMBER_RE`, which owns the stray ``L``.
+_SUFFIXED_RE = re.compile(r"^(\d{1,4}[A-Za-z])$")
 #: A first-last range like ``677-685``, hyphen or en dash. The line
 #: form allows the spaces the printer sets around the dash; the token
 #: form is the range as one word of a longer line.
 _RANGE_RE = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
 _RANGE_TOKEN_RE = re.compile(r"^(\d{1,4})[–\-](\d{1,4})$")
+#: How many digits a suffixed number the *reader* trusts carries. The
+#: shape alone is two characters wide, which is what the ordinal of a
+#: reporter series is: a head line that wraps can leave ``2d`` or
+#: ``3d`` at a corner, and the reading would name the page 2. A
+#: curator may still type ``9a``, because a person read the page.
+MIN_SUFFIXED_DIGITS = 2
+
 #: How many pages one printed range may cover. A compressed opinion
 #: covers tens of pages; a docket number (``19-1234``) covers more
 #: than any book page can, which is how the guard tells them apart.
@@ -134,6 +167,74 @@ def _range_value(match: re.Match | None) -> str | None:
     return f"{first}-{last}"
 
 
+def number_type(value: str | None) -> str | None:
+    """Name the shape of one stored printed page number.
+
+    The one deriver of ``type`` beside ``detected``, for every writer
+    of a curator's own number: ``page_edits.overlay_page_numbers``,
+    ``apply.printed_pages`` and ``views_process.assign_page``, which
+    answers it to the viewer. The reader has the shape already, from
+    the pattern that matched.
+
+    :param value: The stored number, as the curator typed it.
+    :returns: ``"range"``, ``"suffixed"``, ``"single"``, or None for a
+        blank value, which is the curator clearing the number.
+    :rtype: str | None
+    """
+    if not value:
+        return None
+    if "-" in value:
+        return RANGE
+    if _SUFFIXED_RE.match(value):
+        return SUFFIXED
+    return SINGLE
+
+
+def _token_reading(token: str) -> tuple[str, str] | None:
+    """Read the page number one token of a line offers.
+
+    The three shapes, in the one order they may be tried in: the plain
+    number owns the stray ``L`` (#228), so it goes before the suffixed
+    number (#319), which would otherwise read ``2094L`` as a page named
+    ``2094L``. The range is last, because its dash makes it the one
+    shape the other two cannot match.
+
+    :param token: One whitespace-delimited word of a cleaned line.
+    :returns: ``(detected, type)``, or None when the token is no page
+        number.
+    :rtype: tuple[str, str] | None
+    """
+    number = _NUMBER_RE.match(token)
+    if number:
+        return (number.group(1), SINGLE)
+    suffixed = _suffixed_value(_SUFFIXED_RE.match(token))
+    if suffixed:
+        return (suffixed, SUFFIXED)
+    spanned = _range_value(_RANGE_TOKEN_RE.match(token))
+    if spanned:
+        return (spanned, RANGE)
+    return None
+
+
+def _suffixed_value(match: re.Match | None) -> str | None:
+    """Return the suffixed number a match names, when a page prints it.
+
+    The guard of :func:`_range_value`, for the other shape whose
+    pattern is wider than the printed thing (#319). See
+    :data:`MIN_SUFFIXED_DIGITS`.
+
+    :param match: A match of the suffixed pattern, or None.
+    :returns: The number as ``"2094a"``, or None.
+    :rtype: str | None
+    """
+    if match is None:
+        return None
+    value = match.group(1)
+    if len(value) - 1 < MIN_SUFFIXED_DIGITS:
+        return None
+    return value
+
+
 def _line_readings(line: str) -> list[tuple[str, str, str]]:
     """Read the page numbers one line of a cell offers.
 
@@ -144,13 +245,15 @@ def _line_readings(line: str) -> list[tuple[str, str, str]]:
     A range is read at the corner too, not only as the whole line
     (#233): the head band of a compressed page prints
     ``913–925 ATLANTIC REPORTER, 2d SERIES``, and the whole-line rule
-    left that page with no number at all.
+    left that page with no number at all. A number with a trailing
+    letter is read at the corner in the same way (#319).
 
     :param line: One cleaned line of a cell's text.
     :returns: ``(detected, type, side)`` per reading, where ``side`` is
         the end of the line the token was read at -- ``"left"`` or
         ``"right"`` -- or ``"both"`` when the reading is the whole
-        line, which a bare number and a range (spaced or not) are.
+        line, which a bare number, a suffixed number and a range
+        (spaced or not) are.
     :rtype: list[tuple[str, str, str]]
     """
     tokens = line.split()
@@ -158,24 +261,16 @@ def _line_readings(line: str) -> list[tuple[str, str, str]]:
         return []
     whole_line_range = _range_value(_RANGE_RE.match(line))
     if whole_line_range:
-        return [(whole_line_range, "range", "both")]
-    leading = _NUMBER_RE.match(tokens[0])
+        return [(whole_line_range, RANGE, "both")]
+    leading = _token_reading(tokens[0])
     if len(tokens) == 1:
-        # A lone token that is a range was the whole line above, so
-        # only a bare number is left to read here.
-        return [(leading.group(1), "single", "both")] if leading else []
-    leading_range = _range_value(_RANGE_TOKEN_RE.match(tokens[0]))
-    trailing = _NUMBER_RE.match(tokens[-1])
-    trailing_range = _range_value(_RANGE_TOKEN_RE.match(tokens[-1]))
+        return [(*leading, "both")] if leading else []
+    trailing = _token_reading(tokens[-1])
     readings = []
     if leading:
-        readings.append((leading.group(1), "single", "left"))
-    elif leading_range:
-        readings.append((leading_range, "range", "left"))
+        readings.append((*leading, "left"))
     if trailing:
-        readings.append((trailing.group(1), "single", "right"))
-    elif trailing_range:
-        readings.append((trailing_range, "range", "right"))
+        readings.append((*trailing, "right"))
     return readings
 
 
@@ -238,7 +333,7 @@ def _score(
     :param band_ok: The cell's bbox sat in the head or foot band.
     :param corner_ok: The token sat within CORNER_BAND of its edge.
     :param whole_line: The reading was the whole line -- a bare
-        number, or a range.
+        number, a suffixed number, or a range.
     :returns: 1.0 down to 0.5.
     :rtype: float
     """
@@ -382,7 +477,7 @@ def _value(candidate: dict | None) -> int | None:
     :returns: The number, or None for a range or no reading.
     :rtype: int | None
     """
-    if candidate is None or candidate["type"] != "single":
+    if candidate is None or candidate["type"] != SINGLE:
         return None
     return int(candidate["detected"])
 
@@ -419,7 +514,7 @@ def _resolve_by_neighbours(
     resolved = list(chosen)
     for index, options in enumerate(candidates):
         current = chosen[index]
-        if current is None or current["type"] != "single":
+        if current is None or current["type"] != SINGLE:
             continue
         if len({o["detected"] for o in options}) < 2:
             continue
