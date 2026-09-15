@@ -12,11 +12,11 @@ dependencies = [
 
     # Inference. The `detect` extra adds ultralytics and
     # huggingface_hub; base blackletter brings numpy, opencv-python,
-    # pillow, pymupdf and ocrmypdf. 0.3.0 is the floor: it is the
-    # release that carries the bl_warm adapter, the bl_warm entry in
-    # the Hugging Face weight table, and its confidence gates
-    # (blackletter #73).
-    "blackletter[detect]>=0.3.0",
+    # pillow, pymupdf and ocrmypdf. 0.3.1 is the floor: 0.3.0 carries
+    # the bl_warm adapter, the bl_warm entry in the Hugging Face weight
+    # table, and its confidence gates (blackletter #73); 0.3.1 keeps
+    # the app and the worker on one release (blackletter #75).
+    "blackletter[detect]>=0.3.1",
 
     # RunPod plumbing
     "requests>=2.33,<3",

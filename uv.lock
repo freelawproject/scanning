@@ -141,7 +141,7 @@ wheels = [
 
 [[package]]
 name = "blackletter"
-version = "0.3.0"
+version = "0.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -150,9 +150,9 @@ dependencies = [
     { name = "pillow" },
     { name = "pymupdf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1f/ba/c5b427dec64f8612822dfa92c58bdbe873da6a88a78f1fa2256d24cfe02b/blackletter-0.3.0.tar.gz", hash = "sha256:345a3dc5b5e28c7e70315e9b060eb9121531fca0c713bc3d37396341b4182f8d", size = 177097, upload-time = "2026-08-27T03:43:07.446Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/60/1b/653c98dbaab8e1cc71eb2afa64bb2ad3f95ee9cff7b479942dbf678a6e9d/blackletter-0.3.1.tar.gz", hash = "sha256:c4174c6f6d2c52dc662a5360124606a0fbb728894e02ab7b896c4a9aee83909b", size = 179225, upload-time = "2026-09-15T03:44:50.62Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/64/4b/acffa8440fd0e0cdd6d1a81982a46c7dff366f88d77f7d042b5b0db86533/blackletter-0.3.0-py3-none-any.whl", hash = "sha256:634c849c0ea99a97dbf587c33277c799947b8dcaf7e66b7e130709132330c785", size = 134935, upload-time = "2026-08-27T03:43:06.096Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/74/57a1dbb344f8e1e9fedfa7d09210e896a9b5f90b05a31dafcc90a0712f20/blackletter-0.3.1-py3-none-any.whl", hash = "sha256:3d297a06571b5b8ee526dade69096666724ca58adbc6fce0689dfc4440d40554", size = 135261, upload-time = "2026-09-15T03:44:48.967Z" },
 ]
 
 [package.optional-dependencies]
@@ -2360,8 +2360,8 @@ local-ml = [
 
 [package.metadata]
 requires-dist = [
-    { name = "blackletter", specifier = ">=0.3.0" },
-    { name = "blackletter", extras = ["detect", "analyze"], marker = "extra == 'local-ml'", specifier = ">=0.3.0" },
+    { name = "blackletter", specifier = ">=0.3.1" },
+    { name = "blackletter", extras = ["detect", "analyze"], marker = "extra == 'local-ml'", specifier = ">=0.3.1" },
     { name = "boto3" },
     { name = "daphne" },
     { name = "django", specifier = ">=6.0,<6.1" },
