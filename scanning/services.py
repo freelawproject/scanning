@@ -1778,6 +1778,7 @@ def run_compute_redactions(scan_pk: int) -> None:
     """
     from scanning import (
         apply,
+        brackets,
         columns,
         findings,
         redactions,
@@ -1919,8 +1920,15 @@ def run_compute_redactions(scan_pk: int) -> None:
         # cells serves it and the text fit further down (#279).
         _update_progress(scan_pk, "Measuring the column gutter...")
         with _log_stage("Column gutter"):
-            cells = text_fit.load_cells(scan, run)
+            ocr_document = text_fit.load_document(scan, run)
+            cells = text_fit.page_cells(ocr_document)
             columns.separate_rows(scan, cells)
+
+        # The brackets the reader saw, stored as rows so that the
+        # findings can be rebuilt from the rows alone (#328). It reads
+        # the document already in memory and renders nothing.
+        with _log_stage("Bracket readings"):
+            brackets.write_rows(scan, ocr_document, run)
 
         if importing:
             # Only after an import: the correction converges, so it is

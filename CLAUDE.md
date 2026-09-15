@@ -17,6 +17,9 @@ docker exec scanning-daemon python manage.py reglue_dots_mocr --dry-run
 # Write the review-2 findings of the volumes already in review 2, once after a deploy (#240 PR D)
 docker exec scanning-daemon python manage.py rebuild_review2_findings
 
+# Write the headnote bracket readings of the volumes already computed (#328)
+docker exec scanning-daemon python manage.py stamp_bracket_readings --dry-run
+
 # Fit the standing text redaction boxes to the read text, once after a deploy (#279)
 docker exec scanning-daemon python manage.py refit_text_redactions --dry-run
 
@@ -166,11 +169,13 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - A review-2 `page_number` is the 1-based position in the space the rows are drawn in, so step 1 and `process_actions` list `scan.issues.exclude(check_name__in=REVIEW2_CHECKS)`, and `dismiss_issue` refuses a review-2 row. The page and the `review_findings` fragment render `_review_findings.html` from `findings.viewer_groups`
 - The review-2 approval warns and obeys: `_review_flags` carries `review2_open` and `review2_stale`, the bar asks for a confirm, the view blocks nothing
 - No migration writes a finding: `rebuild_review2_findings` writes them once after the deploy. `flag_issue`, `remove_flag` and the three user-action checks are gone
-- A text redaction box is fitted to the dots.mocr cells under it (`text_fit.fit_span`, #279): the horizontal limits only, never wider, only a `TEXT_RECT_TYPES` box, and only on a page whose cells were read. The vertical limits stay on the ink. `text_fit.load_cells` is the one rule for which OCR document the fit reads, the twin of `geometry_pdf_path`
+- A text redaction box is fitted to the dots.mocr cells under it (`text_fit.fit_span`, #279): the horizontal limits only, never wider, only a `TEXT_RECT_TYPES` box, and only on a page whose cells were read. The vertical limits stay on the ink. `text_fit.load_document` is the one rule for which OCR document the geometry reads, the twin of `geometry_pdf_path`, and the compute reads it once for the fit and the bracket readings
 - The fit leaves a computed row a standing dismiss points at alone (`refit_text_redactions`, #279), so every decision keeps its IoU on the box it named. Nothing sets `Page.col_*` or `midpoint`, so blackletter measures every box from the fallback 50/50 split
 - The two `TEXT_COLUMN` boxes of a page are separated before any geometry reads them (`columns.separate_rows`, then `separate_document` after the ink snap, #308): the inner edges come from the dots.mocr cells, inwards only, and a page with no band gets a gap of a pixel and a half on each side that keeps the gutter centre. Touching boxes leave blackletter's `clamp_to_gutters` with no neighbour, and a headnote box then grows across the gutter onto the facing column's text
 - The four overlay modes have one table, the rows of `_viewer_help.html`: the `r` cycle, the mode button's label and the guide all read it, and `checker.css` keys the colour by `data-mode`. Never write a second copy (#299)
 - Every review-2 write answers `{status: "ok", message}` and the viewer shows it as a success toast (`showSaved`, or `showSavedAfterReload` over a reload). The text lives in the view, never in the script, and the write views are the set `test_success_messages.WRITE_VIEWS` pins (#322)
+- A bracket the reader saw and the model did not is a finding (`brackets.missing`, #328): one `BracketReading` row per dots.mocr cell that **starts** with a bracket, written by the compute and disposable like a model `Detection` row. A candidate whose number its opinion already names is the star-pagination mark, never a finding
+- The opinion of a reading comes from `boundaries.standing`, in the order `reading_key` defines, never from the caption rows. The count of `HEADNOTE` boxes is not the count of headnotes, so no finding is built on it
 - Every page overlay is drawn from its rows at every render and never positioned once: `renderPage` calls the redaction, bounds and dim draws, because a re-render changes the scale. A selected opinion is a cache plus a draw (`_drawDimForPage`), never a one-time paint. Its masks dim, and draw in the `bounds` mode alone: a redaction mode shows the page as the output has it (#311)
 
 ## Worker images

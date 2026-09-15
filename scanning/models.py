@@ -1058,6 +1058,10 @@ class CheckName(models.TextChoices):
         "uncovered_headnote",
         "Headnote not covered by a redaction",
     )
+    MISSING_HEADNOTE_BRACKET = (
+        "missing_headnote_bracket",
+        "Headnote bracket the model did not find",
+    )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
         "Detection decision not applied",
@@ -1124,6 +1128,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.UNMATCHED_CAPTION,
         CheckName.UNCOVERED_PAGES,
         CheckName.UNCOVERED_HEADNOTE,
+        CheckName.MISSING_HEADNOTE_BRACKET,
     }
 )
 
@@ -2257,6 +2262,112 @@ def page_edit_image_path(instance: "PageEdit", filename: str) -> str:
         f"{s3_sync.s3_processing_prefix(instance.scan)}"
         f"{s3_sync.PAGE_EDITS_SUBDIR}{uuid.uuid4().hex}.{ext}"
     )
+
+
+class BracketReading(AbstractDateTimeModel):
+    """One headnote bracket the OCR read, at the start of one cell (#328).
+
+    A headnote bracket must be redacted, and nothing told a curator
+    that the model had missed one. dots.mocr is the second witness: it
+    writes the bracket as text. This row is that reading, stored so
+    that ``findings.rebuild`` can compare it with the ``Detection``
+    rows without an S3 read.
+
+    **A disposable row, the rule of a model `Detection`.** Every
+    compute deletes the scan's readings of the run it measured and
+    writes them again (``brackets.write_rows``). A curator never writes
+    one, nothing supersedes one, and nothing withdraws one.
+
+    **The box is the cell, not the glyph.** dots.mocr measures a layout
+    cell, and a bracket is always the first characters of its cell
+    (measured: every one of 61 on scan 1828, and 913 of 988 tokens on
+    scan 2845). A cell box is also stable between computes, which is
+    what a dismissal keyed by IoU needs.
+
+    **The address is the source page** (``source_edit``,
+    ``source_page``), the rule of ``Detection``: a new apply run moves
+    ``page_index`` and leaves the address where it was.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="bracket_readings",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="bracket_readings",
+        help_text=(
+            "The apply run whose page space ``page_index`` is in. Null "
+            "means the original's space."
+        ),
+    )
+
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="bracket_readings",
+        help_text=(
+            "The page edit whose one-page shard this cell is on. Null "
+            "means the original as uploaded."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the reading was "
+            "written. Blank matches anything."
+        ),
+    )
+
+    page_index = models.PositiveIntegerField(db_index=True)
+    x0 = models.FloatField()
+    y0 = models.FloatField()
+    x1 = models.FloatField()
+    y1 = models.FloatField()
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+
+    numbers = models.JSONField(
+        default=list,
+        help_text=(
+            "The headnote numbers the bracket names, expanded: "
+            "``[16-19]`` is stored as ``[16, 17, 18, 19]``."
+        ),
+    )
+    raw = models.CharField(
+        max_length=32,
+        help_text="The token as dots.mocr wrote it, for the card.",
+    )
+
+    class Meta:
+        ordering = ["page_index", "y0", "x0"]
+        indexes = [
+            models.Index(
+                fields=["scan", "apply_run", "page_index"],
+                name="idx_bracket_scan_run_page",
+            ),
+        ]
+
+    @property
+    def bbox(self) -> list[float]:
+        """The cell box, in the pixels of the detection render."""
+        return [self.x0, self.y0, self.x1, self.y1]
+
+    def __str__(self):
+        return f"{self.raw} p.{self.page_index + 1}"
 
 
 class PageEdit(AbstractDateTimeModel):
