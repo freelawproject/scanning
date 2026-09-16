@@ -46,7 +46,7 @@ This file holds what the code and the git history cannot tell a reader: the comm
 - `scanning/` is both the Django project (settings, urls, asgi, wsgi) and the single app (models, views, forms, admin)
 - Settings are split into modules: `settings/django.py`, `settings/project/`, `settings/third_party/`
 - Templates: `scanning/assets/templates/` for the base layout, cotton components and error pages; `scanning/templates/scanning/` for app templates
-- Worker images: `scanning/runpod/` (YOLO, `bl_warm`), `scanning/runpod-dotsmocr/`, `scanning/runpod-caselaw-tagger/`
+- Worker images: `scanning/runpod/` (YOLO, `bl_warm`), `scanning/runpod-dotsmocr/`, `scanning/runpod-surya/`, `scanning/runpod-caselaw-tagger/`
 
 ## Testing
 
@@ -185,6 +185,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - YOLO: only `bl_warm.pt` is baked, and the handler passes no `imgsz` (the checkpoint carries 1024). No CUDA base layer
 - dots.mocr: `DPI = 200` and `PROMPT_MODE` are module constants; `HANDLER_MAX_COMPLETION_TOKENS = 6144`; the retry ladder changes only the render (deterministic); the layout repair (`layout_json.py`, no Django import, copied into the image) runs before the ladder; `raw` is never written over
 - Tagger: GPU-only (`HANDLER_ALLOW_CPU=1` for a laptop only), transformers 5, model baked and opened at build time
+- Surya (#320): the handler owns no decode parameter and refuses one in the input (`REFUSED_INPUTS`); it calls surya's `RecognitionPredictor([image], full_page=True)` and the package's greedy pass, loop retry and block-mode fallback are the ladder. The `SURYA_*` env is set before the package is imported (its settings are read once). The base is `vllm/vllm-openai:v0.20.1` or later, the first to register `Qwen3_5ForConditionalGeneration`
 - One build workflow per image, and each PATCHes its own template id
 
 ## Files, disk and pages
