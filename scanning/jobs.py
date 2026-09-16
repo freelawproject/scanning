@@ -1310,6 +1310,116 @@ def check_result_envelope(
     return envelope["payload"]
 
 
+def volume_result_key(scan, stage: str, engine: str, run: int) -> str:
+    """Return the S3 key one run's glued volume document lives at.
+
+    Under ``jobs/`` on purpose: that prefix is already excluded from the
+    generic processing sync in both directions, and the admin delete
+    already sweeps it. Scoped to the run, like the per-attempt result
+    keys, so a re-run leaves the previous document addressable instead
+    of stomping it.
+
+    One rule for the three stages that glue a volume document
+    (``dots_mocr``, ``yolo``, ``mistral_ocr``). Each keeps a named
+    wrapper, because a reader that lists the outputs holds a callable
+    per output (``views_process.GLUED_OUTPUTS``).
+
+    :param scan: The scan the run belongs to.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param run: The run number.
+    :returns: Key of the form ``{processing_prefix}jobs/{stage}/
+        {engine}/r{run}-volume.json``.
+    :rtype: str
+    """
+    return (
+        f"{s3_sync.s3_processing_prefix(scan)}{s3_sync.JOB_RESULTS_SUBDIR}"
+        f"{stage}/{engine}/r{run}-volume.json"
+    )
+
+
+def ready_volume_runs(
+    stage: str,
+    engine: str,
+    provider: str,
+    live_rows: Callable[[object], list[ExternalJob]],
+    attempts: Callable[[list[ExternalJob]], int],
+    max_attempts: int,
+):
+    """Yield the scans whose live volume run is finished and unglued.
+
+    The prologue every glue pass shares (#202, #196, #245). A run is
+    finished when no row of it waits to be submitted or is in flight,
+    and none is dead: a dead row means the run can never cover the
+    volume, ``run_summary`` already shows it on the process page, and
+    the way forward is a fresh run.
+
+    The rows are the idempotence marker, because no glue pass writes a
+    scan status: a glued run is all ``CONSUMED``, so it drops out of
+    the candidate query. The candidate query therefore asks for one
+    ``COMPLETED`` row, and the exact test follows on the live run.
+
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param provider: A :class:`~scanning.models.JobProvider` value.
+    :param live_rows: The stage's own live-run reader, called per scan.
+    :param attempts: How many times this run's glue has failed, read
+        off the rows by the stage's own ledger.
+    :param max_attempts: How many failures stop the pass.
+    :returns: ``(scan, rows)`` per candidate, the rows in shard order.
+    :rtype: Iterator[tuple[Scan, list[ExternalJob]]]
+    """
+    from scanning.models import Scan
+
+    scan_ids = (
+        Scan.objects.filter(
+            jobs__stage=stage,
+            jobs__engine=engine,
+            jobs__provider=provider,
+            jobs__status=JobStatus.COMPLETED,
+            jobs__apply_run__isnull=True,
+        )
+        .values_list("pk", flat=True)
+        .distinct()
+    )
+    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
+    for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
+        "reporter"
+    ):
+        rows = live_rows(scan)
+        if not rows:
+            continue
+        if any(row.status in unfinished for row in rows):
+            continue
+        if any(row.status in DEAD_JOB_STATUSES for row in rows):
+            continue
+        if not any(row.status == JobStatus.COMPLETED for row in rows):
+            # The candidate row belongs to an older run; the live one
+            # has nothing to glue.
+            continue
+        if attempts(rows) >= max_attempts:
+            continue
+        yield scan, rows
+
+
+def consume_run(rows: list[ExternalJob]) -> int:
+    """Mark a glued run's finished rows as consumed.
+
+    The compare-and-swap of a glue pass: only a ``COMPLETED`` row is
+    taken, so a row another writer moved is left alone. The result
+    objects are **kept**; every stage that calls this passes
+    ``reuse_results`` and a later run carries them.
+
+    :param rows: The glued run's rows.
+    :returns: How many rows were flipped.
+    :rtype: int
+    """
+    return ExternalJob.objects.filter(
+        pk__in=[row.pk for row in rows],
+        status=JobStatus.COMPLETED,
+    ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+
+
 def live_run(
     scan, stage: str, engine: str, apply_run=None
 ) -> list[ExternalJob]:

@@ -877,6 +877,80 @@ def shard_manifest(
     }
 
 
+def stored_shard_manifest(scan: Scan, run: ApplyRun) -> dict:
+    """Describe a built run's one-page shards from the bucket alone.
+
+    The manifest :func:`shard_manifest` wrote at build time, rebuilt
+    from what is stored: the run's page map names the edits that hold a
+    final page, the map counts their pages, and the bucket reports each
+    shard's size. It opens no PDF, cuts no shard and reads no uploaded
+    file, so a web pod or a collect tick may call it.
+
+    It exists for a stage that joins a built run late: the Mistral read
+    (#191) starts by hand, and issue #336 will start it after the
+    second review, so its rows are created long after ``_build`` ran
+    (``mistral_ocr.ensure_apply_jobs``). Those rows must carry the
+    identity the build would have given them, or the carry
+    (``jobs._still_describes``) reads them as another shard set and
+    re-pays for the pages. Three things therefore hold, and each is
+    what one entry compares on: the edits come in primary-key order, as
+    ``ApplyPlan.edits`` reads them and ``ApplyRun.edit_ids`` stores
+    them; a page count comes from the map, not from a file; a size
+    comes from the bucket, the one way :func:`_stored_size` reads it.
+
+    :param scan: The scan.
+    :param run: A built run.
+    :returns: The manifest, with an empty ``shards`` list for an
+        identity run.
+    :rtype: dict
+    :raises ApplyError: If the bucket reports no shard for an edit the
+        map names.
+    """
+    pages: dict[int, int] = {}
+    for entry in (run.page_map or {}).get("pages") or []:
+        source = entry.get("source") or {}
+        if source.get("kind") == "edit":
+            edit_id = source["edit_id"]
+            pages[edit_id] = pages.get(edit_id, 0) + 1
+    if not pages:
+        return {
+            "version": 1,
+            "source": {"name": "page edits", "size_bytes": 0, "page_count": 0},
+            "shards": [],
+        }
+    edits = {
+        edit.pk: edit
+        for edit in PageEdit.objects.filter(pk__in=list(pages)).order_by("pk")
+    }
+    entries = []
+    for index, edit_id in enumerate(sorted(edits)):
+        edit = edits[edit_id]
+        key = page_shard_key(scan, edit)
+        page_count = pages[edit_id]
+        entries.append(
+            {
+                "name": f"e{edit.pk}.pdf",
+                "index": index,
+                "key": key,
+                "edit_id": edit.pk,
+                "from_page": 0,
+                "to_page": page_count - 1,
+                "page_count": page_count,
+                "size_bytes": _stored_size(key, edit),
+                "source_page_count": page_count,
+            }
+        )
+    return {
+        "version": 1,
+        "source": {
+            "name": "page edits",
+            "size_bytes": sum(e["size_bytes"] for e in entries),
+            "page_count": sum(e["page_count"] for e in entries),
+        },
+        "shards": entries,
+    }
+
+
 def _ensure_rows(
     scan: Scan, run: ApplyRun, plan: ApplyPlan, shards: dict[int, dict]
 ) -> list[ExternalJob]:

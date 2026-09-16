@@ -46,8 +46,6 @@ from django.utils import timezone
 
 from scanning import jobs, layout_json, runpod_client, s3_sync
 from scanning.models import (
-    DEAD_JOB_STATUSES,
-    IN_FLIGHT_JOB_STATUSES,
     ExternalJob,
     JobEngine,
     JobProvider,
@@ -272,11 +270,8 @@ def run_summary(scan) -> dict | None:
 def glued_result_key(scan, run: int) -> str:
     """Return the S3 key one run's glued volume document lives at.
 
-    Under ``jobs/`` on purpose: that prefix is already excluded from the
-    generic processing sync in both directions, and the admin delete
-    already sweeps it. Scoped to the run, like the per-attempt result
-    keys, so a re-run leaves the previous glue addressable instead of
-    stomping it.
+    This stage's name for :func:`jobs.volume_result_key`, which holds
+    the rule and the reasons.
 
     :param scan: The scan the run belongs to.
     :param run: The run number.
@@ -284,9 +279,8 @@ def glued_result_key(scan, run: int) -> str:
         dots_mocr/r{run}-volume.json``.
     :rtype: str
     """
-    return (
-        f"{s3_sync.s3_processing_prefix(scan)}{s3_sync.JOB_RESULTS_SUBDIR}"
-        f"{JobStage.ANALYZE}/{JobEngine.DOTS_MOCR}/r{run}-volume.json"
+    return jobs.volume_result_key(
+        scan, JobStage.ANALYZE, JobEngine.DOTS_MOCR, run
     )
 
 
@@ -855,36 +849,15 @@ def finish_ready_runs() -> int:
     if not s3_sync.s3_active():
         return 0
 
-    scan_ids = (
-        Scan.objects.filter(
-            jobs__stage=JobStage.ANALYZE,
-            jobs__engine=JobEngine.DOTS_MOCR,
-            jobs__provider=JobProvider.RUNPOD,
-            jobs__status=JobStatus.COMPLETED,
-            jobs__apply_run__isnull=True,
-        )
-        .values_list("pk", flat=True)
-        .distinct()
-    )
-    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     glued = 0
-    for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
-        "reporter"
+    for scan, rows in jobs.ready_volume_runs(
+        JobStage.ANALYZE,
+        JobEngine.DOTS_MOCR,
+        JobProvider.RUNPOD,
+        live_analyze_jobs,
+        _glue_attempts,
+        GLUE_MAX_ATTEMPTS,
     ):
-        rows = live_analyze_jobs(scan)
-        if not rows:
-            continue
-        if any(row.status in unfinished for row in rows):
-            continue
-        if any(row.status in DEAD_JOB_STATUSES for row in rows):
-            continue
-        if not any(row.status == JobStatus.COMPLETED for row in rows):
-            # The candidate row belongs to an older run; the live one
-            # has nothing to apply.
-            continue
-        if _glue_attempts(rows) >= GLUE_MAX_ATTEMPTS:
-            continue
-
         try:
             merge_dotsmocr_results(scan, rows)
         except Exception as exc:
@@ -893,10 +866,7 @@ def finish_ready_runs() -> int:
 
         # No delete of the shard results here, deliberately: the future
         # smart glue over page inserts and deletes re-reads them.
-        ExternalJob.objects.filter(
-            pk__in=[row.pk for row in rows],
-            status=JobStatus.COMPLETED,
-        ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+        jobs.consume_run(rows)
         glued += 1
 
     return glued

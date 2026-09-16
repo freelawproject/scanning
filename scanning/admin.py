@@ -871,6 +871,8 @@ class ApplyRunAdmin(admin.ModelAdmin):
         "ocr_key",
         "printed_pages_key",
         "detections_key",
+        "extract_key",
+        "extract_run",
         "built_at",
         "superseded_at",
         "attempts",

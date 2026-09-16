@@ -53,8 +53,6 @@ from django.utils import timezone
 
 from scanning import jobs, runpod_client, s3_sync
 from scanning.models import (
-    DEAD_JOB_STATUSES,
-    IN_FLIGHT_JOB_STATUSES,
     ExternalJob,
     JobEngine,
     JobProvider,
@@ -419,11 +417,8 @@ def run_summary(scan) -> dict | None:
 def merged_result_key(scan, run: int) -> str:
     """Return the S3 key one run's merged volume document lives at.
 
-    Under ``jobs/`` on purpose: that prefix is already excluded from the
-    generic processing sync in both directions, and the admin delete
-    already sweeps it. Scoped to the run, like the per-attempt result
-    keys, so a re-run leaves the previous document addressable instead
-    of stomping it.
+    This stage's name for :func:`jobs.volume_result_key`, which holds
+    the rule and the reasons.
 
     :param scan: The scan the run belongs to.
     :param run: The run number.
@@ -431,9 +426,8 @@ def merged_result_key(scan, run: int) -> str:
         blackletter/r{run}-volume.json``.
     :rtype: str
     """
-    return (
-        f"{s3_sync.s3_processing_prefix(scan)}{s3_sync.JOB_RESULTS_SUBDIR}"
-        f"{JobStage.DETECT}/{JobEngine.BLACKLETTER}/r{run}-volume.json"
+    return jobs.volume_result_key(
+        scan, JobStage.DETECT, JobEngine.BLACKLETTER, run
     )
 
 
@@ -783,46 +777,22 @@ def finish_ready_runs() -> int:
     if not s3_sync.s3_active():
         return 0
 
-    scan_ids = (
-        Scan.objects.filter(
-            jobs__stage=JobStage.DETECT,
-            jobs__engine=JobEngine.BLACKLETTER,
-            jobs__provider=JobProvider.RUNPOD,
-            jobs__status=JobStatus.COMPLETED,
-            jobs__apply_run__isnull=True,
-        )
-        .values_list("pk", flat=True)
-        .distinct()
-    )
-    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     merged = 0
-    for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
-        "reporter"
+    for scan, rows in jobs.ready_volume_runs(
+        JobStage.DETECT,
+        JobEngine.BLACKLETTER,
+        JobProvider.RUNPOD,
+        live_detect_jobs,
+        _merge_attempts,
+        MERGE_MAX_ATTEMPTS,
     ):
-        rows = live_detect_jobs(scan)
-        if not rows:
-            continue
-        if any(row.status in unfinished for row in rows):
-            continue
-        if any(row.status in DEAD_JOB_STATUSES for row in rows):
-            continue
-        if not any(row.status == JobStatus.COMPLETED for row in rows):
-            # The candidate row belongs to an older run; the live one
-            # has nothing to merge.
-            continue
-        if _merge_attempts(rows) >= MERGE_MAX_ATTEMPTS:
-            continue
-
         try:
             merge_detect_results(scan, rows)
         except Exception as exc:
             _record_merge_failure(scan, rows, exc)
             continue
 
-        ExternalJob.objects.filter(
-            pk__in=[row.pk for row in rows],
-            status=JobStatus.COMPLETED,
-        ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+        jobs.consume_run(rows)
         merged += 1
 
     return merged

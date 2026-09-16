@@ -31,6 +31,7 @@ from scanning.models import (
     Detection,
     DetectionDecision,
     JobEngine,
+    JobProvider,
     JobStage,
     JobStatus,
     OpinionScan,
@@ -3888,7 +3889,7 @@ class TestGluedOutputs(ScanningTestCase):
         response = self._index("paddle")
 
         self.assertEqual(response.status_code, 404)
-        self.assertIn("dots-mocr, yolo", response.json()["error"])
+        self.assertIn("dots-mocr, mistral, yolo", response.json()["error"])
 
     def test_index_of_a_scan_nothing_read_is_empty_not_an_error(self):
         response = self._index()
@@ -3991,6 +3992,54 @@ class TestGluedOutputs(ScanningTestCase):
         self.assertEqual(failed["error_code"], "QUEUE_TIMEOUT")
         self.assertNotIn(
             "url", failed, "no result: the key is absent, not blank"
+        )
+
+    def test_index_of_a_mistral_run_carries_the_failed_pages_alone(self):
+        """The other three lists of ``jobs.page_lists`` are dots.mocr
+        faults, and an empty list would read as "none" where the truth
+        is "not a question here" (#245)."""
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            provider=JobProvider.MISTRAL,
+            status=JobStatus.CONSUMED,
+            result_key="jobs/extract/mistral_ocr/r1-s0-a1.json",
+            provider_meta={"output": {"failed_pages": [3]}},
+        )
+
+        body = self._index("mistral").json()
+
+        shard = body["runs"][0]["shards"][0]
+        self.assertEqual(shard["failed_pages"], [3])
+        self.assertNotIn("filtered_pages", shard)
+        self.assertEqual(body["engine"], JobEngine.MISTRAL_OCR)
+        self.assertEqual(body["stage"], JobStage.EXTRACT)
+
+    def test_mistral_volume_redirects_to_the_glued_key(self):
+        from scanning import mistral_ocr
+
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            provider=JobProvider.MISTRAL,
+            status=JobStatus.CONSUMED,
+            result_key="jobs/extract/mistral_ocr/r1-s0-a1.json",
+        )
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch(
+                "scanning.s3_sync.presign_get", return_value="https://s3/x"
+            ) as presign,
+        ):
+            response = self._volume(output="mistral")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            presign.call_args[0][0],
+            mistral_ocr.glued_result_key(self.scan, 1),
         )
 
     def test_index_of_a_detection_run_carries_no_page_lists(self):
