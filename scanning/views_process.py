@@ -2135,19 +2135,6 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
     return back
 
 
-#: Whether the staff button may start the Mistral read (#191).
-#:
-#: ``False``, and the button in ``_mistral_actions.html`` is commented
-#: out beside it -- the shape ``views_api.REPAIR_ON_REQUEST_ENABLED``
-#: uses (#196). The read runs over the **redacted** volume, and
-#: nothing builds one yet, so a press today would send unredacted
-#: pages to a third party. ``mistral_ocr.REDACTED_SOURCE_READY`` is
-#: the lock under this one, and it refuses row creation whatever this
-#: flag says. Turning the stage on is both flags, the redacted shard
-#: set they describe, and the button.
-MISTRAL_START_ON_REQUEST_ENABLED = False
-
-
 @login_required
 @require_POST
 def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
@@ -2156,10 +2143,11 @@ def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
     Staff only, and the only way into this stage until a daemon trigger
     lands. Every press can start real paid work on Mistral's batch API.
 
-    **Switched off** behind :data:`MISTRAL_START_ON_REQUEST_ENABLED`,
-    because the read runs over the redacted volume and nothing builds
-    one yet. The view is kept whole, with its tests, so turning the
-    stage on is the two flags and the button rather than a rewrite.
+    The read is over the original shards, so the button waits on no
+    review state and on no redacted volume: the set exists from the
+    moment the pipeline cut it. ``MISTRAL_API_KEY`` is the switch an
+    environment holds, and an environment that must not spend leaves
+    the key unset.
 
     **This request makes no call to Mistral.** It writes one
     ``ExternalJob`` row per shard and returns; the daemon's next
@@ -2186,15 +2174,6 @@ def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
         messages.error(
             request,
             "Only staff can start Mistral OCR: each run costs money.",
-        )
-        return back
-
-    if not MISTRAL_START_ON_REQUEST_ENABLED:
-        messages.warning(
-            request,
-            "Mistral OCR is not available yet. It reads the redacted "
-            "volume, and nothing builds one until the file generation "
-            "returns (#206).",
         )
         return back
 
