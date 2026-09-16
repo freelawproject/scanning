@@ -515,7 +515,7 @@ class TestFinishReadyRuns(MistralRunMixin, ScanningTestCase):
             self.assertEqual(mistral_ocr.finish_ready_runs(), 0)
 
         head = mistral_ocr.live_extract_jobs(scan)[0]
-        state = head.provider_meta["glue"]["glue"]
+        state = head.provider_meta["glue"]
         self.assertEqual(state["attempts"], mistral_ocr.GLUE_MAX_ATTEMPTS)
         self.assertIn("envelope", state["last_error"])
 

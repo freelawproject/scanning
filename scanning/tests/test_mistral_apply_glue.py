@@ -364,7 +364,12 @@ class TestApplyGlue(MistralApplyTestCase):
         run.refresh_from_db()
         self.assertEqual(run.extract_key, "")
         head = mistral_ocr.live_extract_jobs(self.scan)[0]
-        self.assertEqual(head.provider_meta["glue"][run.label]["attempts"], 1)
+        self.assertEqual(
+            head.provider_meta[f"glue:{run.label}"]["attempts"],
+            1,
+            "one ledger per corrected volume, beside the volume glue's",
+        )
+        self.assertNotIn("glue", head.provider_meta)
 
     def test_an_edit_with_no_row_keeps_its_slot_with_an_error(self):
         """A page the read never covered must not shift the pages after

@@ -968,10 +968,7 @@ def glued_volume_key(scan) -> str | None:
     :returns: The key, or None when no run is glued.
     :rtype: str | None
     """
-    rows = live_extract_jobs(scan)
-    if rows and all(row.status == JobStatus.CONSUMED for row in rows):
-        return glued_result_key(scan, rows[0].run)
-    return None
+    return jobs.glued_volume_key(scan, JobStage.EXTRACT, JobEngine.MISTRAL_OCR)
 
 
 def _check_envelope(scan, job: ExternalJob, envelope) -> dict:
@@ -1165,59 +1162,31 @@ def merge_extract_results(scan, extract_jobs: list[ExternalJob]) -> str:
 
     pages: list[dict] = []
     shards: list[dict] = []
-    next_page = 0
-    for index, job in enumerate(extract_jobs):
-        if job.shard_index != index:
+    for read in jobs.read_run_shards(
+        scan, extract_jobs, action=ACTION, error_cls=MistralGlueError
+    ):
+        shard_pages = parse_payload(read.payload)
+        if sorted(shard_pages) != list(range(read.page_count)):
             raise MistralGlueError(
-                f"scan {scan.pk} shard sequence breaks at position "
-                f"{index}: job {job.pk} covers shard {job.shard_index}"
+                f"scan {scan.pk} shard {read.index} answered page(s) "
+                f"{sorted(shard_pages)}, the shard has {read.page_count}"
             )
-        if not job.result_key:
-            raise MistralGlueError(
-                f"scan {scan.pk} shard {index} has no result key"
-            )
-        manifest = job.input_manifest or {}
-        from_page = manifest.get("from_page")
-        page_count = manifest.get("page_count")
-        if from_page != next_page or not isinstance(page_count, int):
-            raise MistralGlueError(
-                f"scan {scan.pk} shard {index} covers pages from "
-                f"{from_page}, expected {next_page}"
-            )
-        payload = _check_envelope(
-            scan, job, s3_sync.download_json_object(job.result_key)
-        )
-        shard_pages = parse_payload(payload)
-        if sorted(shard_pages) != list(range(page_count)):
-            raise MistralGlueError(
-                f"scan {scan.pk} shard {index} answered page(s) "
-                f"{sorted(shard_pages)}, the shard has {page_count}"
-            )
-        for page_no in range(page_count):
-            page_index = from_page + page_no
+        for page_no in range(read.page_count):
+            page_index = read.from_page + page_no
             pages.append(
                 {
                     "page_index": page_index,
                     "pdf_page": page_index + 1,
-                    "shard_index": index,
+                    "shard_index": read.index,
                     **shard_pages[page_no],
                 }
             )
-        entry = {
-            "name": manifest.get("name"),
-            "index": index,
-            "from_page": from_page,
-            "to_page": manifest.get("to_page"),
-            "page_count": page_count,
-            "attempt": job.attempt,
-            "result_key": job.result_key,
-            "model": payload.get("model"),
-        }
-        tuning = {key: manifest[key] for key in TUNING_KEYS if key in manifest}
-        if tuning:
-            entry["tuning"] = tuning
-        shards.append(entry)
-        next_page += page_count
+        shards.append(
+            {
+                **jobs.shard_entry(read.job, read.index, TUNING_KEYS),
+                "model": read.payload.get("model"),
+            }
+        )
 
     if expected_total is not None and len(pages) != expected_total:
         raise MistralGlueError(
@@ -1264,73 +1233,53 @@ def merge_extract_results(scan, extract_jobs: list[ExternalJob]) -> str:
     return key
 
 
-def _glue_state(extract_jobs: list[ExternalJob], name: str) -> dict:
-    """Return one glue's bookkeeping for a run.
+def _ledger_key(run=None) -> str:
+    """Return the ``provider_meta`` key one glue's ledger lives under.
 
-    Kept on the first row's ``provider_meta`` rather than a field: the
-    counter describes the run, any row of it can carry that, and
-    ``input_manifest`` is off limits (``jobs._still_describes`` compares
-    it exactly, so an added key would read as a stale run). A new run
-    starts with clean rows, which is what gives a re-read fresh tries.
+    Two glues keep a ledger on the volume run's rows: the volume
+    document's, and one per corrected volume, because a scan may have
+    had more than one apply run and each is glued on its own terms.
 
-    :param extract_jobs: The live run's rows, ordered by shard index.
-    :param name: ``"glue"`` for the volume document, or the apply run's
-        label for the corrected volume's.
-    :returns: ``attempts``, ``last_error``, ``last_attempt_at``; empty
-        when the glue has never failed.
-    :rtype: dict
+    :param run: The apply run, or None for the volume document.
+    :returns: ``"glue"``, or ``"glue:a{n}"``.
+    :rtype: str
     """
-    meta = extract_jobs[0].provider_meta or {}
-    return dict((meta.get("glue") or {}).get(name) or {})
+    return "glue" if run is None else f"glue:{run.label}"
 
 
 def _record_glue_failure(
-    scan, extract_jobs: list[ExternalJob], name: str, exc
+    scan, extract_jobs: list[ExternalJob], key: str, exc
 ) -> None:
     """Count one glue failure, and give up loudly on the last one.
 
     The result objects stay in S3, so a retry costs one small download
     and no API payment. The crossing into "out of tries" is the one
     ERROR-level event; the way back after a fix is a person clearing
-    ``provider_meta["glue"]`` on the named row.
+    the named key on the named row.
 
     :param scan: The scan whose glue failed.
     :param extract_jobs: The live run's rows, ordered by shard index.
-    :param name: ``"glue"``, or the apply run's label.
+    :param key: See :func:`_ledger_key`.
     :param exc: What the glue raised.
     :return: None.
     """
-    head = extract_jobs[0]
-    meta = dict(head.provider_meta or {})
-    glue = dict(meta.get("glue") or {})
-    state = dict(glue.get(name) or {})
-    attempts = int(state.get("attempts") or 0) + 1
-    state.update(
-        {
-            "attempts": attempts,
-            "last_error": str(exc)[:500],
-            "last_attempt_at": timezone.now().isoformat(),
-        }
-    )
-    glue[name] = state
-    meta["glue"] = glue
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
+    attempts, head = jobs.bump_run_ledger(extract_jobs, key, exc)
     if attempts >= GLUE_MAX_ATTEMPTS:
         logger.exception(
             "Gluing the Mistral results (%s) for scan %s failed; giving up "
             "after %d attempt(s). The shard results stay in S3; clear "
-            "provider_meta['glue'] on job %s to retry.",
-            name,
+            "provider_meta['%s'] on job %s to retry.",
+            key,
             scan.pk,
             attempts,
+            key,
             head.pk,
         )
     else:
         logger.warning(
             "Gluing the Mistral results (%s) for scan %s failed (attempt "
             "%d of %d): %s",
-            name,
+            key,
             scan.pk,
             attempts,
             GLUE_MAX_ATTEMPTS,
@@ -1345,7 +1294,7 @@ def _volume_glue_attempts(extract_jobs: list[ExternalJob]) -> int:
     :returns: The stored attempt count, 0 when none.
     :rtype: int
     """
-    return int(_glue_state(extract_jobs, "glue").get("attempts") or 0)
+    return jobs.ledger_attempts(extract_jobs, _ledger_key())
 
 
 def finish_ready_runs() -> int:
@@ -1380,7 +1329,7 @@ def finish_ready_runs() -> int:
         try:
             merge_extract_results(scan, rows)
         except Exception as exc:
-            _record_glue_failure(scan, rows, "glue", exc)
+            _record_glue_failure(scan, rows, _ledger_key(), exc)
             continue
         jobs.consume_run(rows)
         glued += 1
@@ -1497,41 +1446,19 @@ def glue_apply_run(scan, run, rows: list[ExternalJob], volume_run: int) -> str:
     if apply.is_identity_map(page_map):
         return volume_key
 
-    by_pdf_page = {page["pdf_page"]: page for page in volume["pages"]}
     read = apply._rows_by_edit(rows, JobStage.EXTRACT)
-    edit_pages: dict[int, dict[int, dict]] = {}
-    for edit_id, row in read.items():
-        payload = apply._result_payload(scan, row, ACTION)
-        edit_pages[edit_id] = parse_payload(payload)
-
-    pages = []
-    for entry in page_map["pages"]:
-        source = entry["source"]
-        if source["kind"] == "original":
-            page = by_pdf_page.get(source["pdf_page"])
-            if page is None:
-                raise MistralGlueError(
-                    f"the Mistral volume document of scan {scan.pk} has no "
-                    f"page {source['pdf_page']}"
-                )
-            page = dict(page)
-        else:
-            page = edit_pages.get(source["edit_id"], {}).get(source["page"])
-            page = (
-                dict(page)
-                if page is not None
-                else {
-                    "md": "",
-                    "blocks": [],
-                    "error": "not read: no result for this page",
-                }
-            )
-        page.pop("shard_index", None)
-        page.pop("page_no", None)
-        page["page_index"] = entry["final_page"] - 1
-        page["pdf_page"] = entry["final_page"]
-        page["source"] = source
-        pages.append(page)
+    edit_pages = {
+        edit_id: parse_payload(apply._result_payload(scan, row, ACTION))
+        for edit_id, row in read.items()
+    }
+    pages = apply.walk_final_pages(
+        page_map,
+        volume["pages"],
+        edit_pages,
+        missing={"md": "", "blocks": []},
+        error_cls=MistralGlueError,
+        what=f"the Mistral volume document of scan {scan.pk}",
+    )
 
     document = {
         "schema_version": GLUE_SCHEMA_VERSION,
@@ -1699,15 +1626,13 @@ def finish_ready_applies() -> int:
         ):
             continue
         run, _volume_run = candidates[scan.pk]
-        name = run.label
-        if int(_glue_state(volume_rows, name).get("attempts") or 0) >= (
-            GLUE_MAX_ATTEMPTS
-        ):
+        key = _ledger_key(run)
+        if jobs.ledger_attempts(volume_rows, key) >= GLUE_MAX_ATTEMPTS:
             continue
         try:
             if _glue_one_apply(scan, run, volume_rows):
                 glued += 1
         except Exception as exc:
-            _record_glue_failure(scan, volume_rows, name, exc)
+            _record_glue_failure(scan, volume_rows, key, exc)
 
     return glued

@@ -1954,6 +1954,77 @@ def _result_payload(scan: Scan, row: ExternalJob, action: str) -> dict:
     return jobs.check_result_envelope(scan, row, envelope, action, ApplyError)
 
 
+def walk_final_pages(
+    page_map: dict,
+    volume_pages: list[dict],
+    edit_pages: dict[int, dict[int, dict]],
+    *,
+    missing: dict,
+    error_cls: type,
+    what: str,
+    drop: tuple = (),
+) -> list[dict]:
+    """Return one page dict per final page, renumbered and stamped.
+
+    The walk every per-page glue of a corrected volume shares: the OCR
+    volume (#224) and the Mistral document (#245), and the next engine
+    that reads pages (#317). What it holds is the rule those glues must
+    not each re-derive:
+
+    - the map is the page order, so a page a curator deleted is not
+      walked and the pages after it move up;
+    - a kept page comes from the volume document by its 1-based page in
+      the original, an edited page from that edit's own result by its
+      page inside the one-page shard;
+    - a page nobody read keeps its slot and says so, because a hole
+      that shifted the pages after it would put every later page's text
+      on the wrong page;
+    - the final page is the only numbering in the document
+      (``page_index`` is ``final_page`` minus one), and the shard
+      numbering never reaches it;
+    - every page names its ``source``, which is what lets a reader go
+      back to the original page or to the edit.
+
+    :param page_map: The run's stored map.
+    :param volume_pages: The volume document's pages, in the original's
+        page space.
+    :param edit_pages: ``{edit pk: {page inside the shard: page}}``.
+    :param missing: The page dict for a page nobody read; ``error`` is
+        added to a copy of it.
+    :param error_cls: What to raise when the volume document is short
+        of a page the map names.
+    :param what: The document's name, for that message.
+    :param drop: Page keys to leave out, for a field the volume
+        document keeps out of itself (dots.mocr's ``raw``).
+    :returns: The final pages, in order.
+    :rtype: list[dict]
+    :raises error_cls: If the volume document has no page the map names.
+    """
+    by_pdf_page = {page["pdf_page"]: page for page in volume_pages}
+    pages = []
+    for entry in page_map["pages"]:
+        source = entry["source"]
+        if source["kind"] == "original":
+            page = by_pdf_page.get(source["pdf_page"])
+            if page is None:
+                raise error_cls(f"{what} has no page {source['pdf_page']}")
+        else:
+            page = edit_pages.get(source["edit_id"], {}).get(source["page"])
+            if page is None:
+                page = {
+                    **missing,
+                    "error": "not read: no result for this page",
+                }
+        page = {k: v for k, v in page.items() if k not in drop}
+        page.pop("shard_index", None)
+        page.pop("page_no", None)
+        page["page_index"] = entry["final_page"] - 1
+        page["pdf_page"] = entry["final_page"]
+        page["source"] = source
+        pages.append(page)
+    return pages
+
+
 def _glue_ocr(
     scan: Scan, run: ApplyRun, rows: list[ExternalJob]
 ) -> tuple[str, str]:
@@ -1979,14 +2050,12 @@ def _glue_ocr(
     volume_key = dots_mocr.glued_result_key(scan, volume_rows[0].run)
     volume = s3_sync.download_json_object(volume_key)
     page_map = run.page_map
-    entries = page_map["pages"]
     prefix = run_prefix(scan, run)
 
     if is_identity_map(page_map):
         ocr_key = volume_key
         document = volume
     else:
-        by_pdf_page = {page["pdf_page"]: page for page in volume["pages"]}
         read = _rows_by_edit(rows, JobStage.ANALYZE)
         edit_pages: dict[int, dict[int, dict]] = {}
         for edit_id, row in read.items():
@@ -1995,31 +2064,18 @@ def _glue_ocr(
                 page["page_no"]: page for page in payload.get("pages") or []
             }
             _repair_edit_pages(scan, edit_id, edit_pages[edit_id])
-        pages = []
-        for entry in entries:
-            src = entry["source"]
-            if src["kind"] == "original":
-                page = by_pdf_page.get(src["pdf_page"])
-                if page is None:
-                    raise ApplyError(
-                        f"the volume OCR document has no page {src['pdf_page']}"
-                    )
-                page = dict(page)
-            else:
-                page = edit_pages.get(src["edit_id"], {}).get(src["page"])
-                if page is None:
-                    page = {
-                        "cells": [],
-                        "md": "",
-                        "error": "not read: no result for this page",
-                    }
-                page = {k: v for k, v in page.items() if k != "raw"}
-            page.pop("shard_index", None)
-            page.pop("page_no", None)
-            page["page_index"] = entry["final_page"] - 1
-            page["pdf_page"] = entry["final_page"]
-            page["source"] = src
-            pages.append(page)
+        pages = walk_final_pages(
+            page_map,
+            volume["pages"],
+            edit_pages,
+            missing={"cells": [], "md": ""},
+            error_cls=ApplyError,
+            what="the volume OCR document",
+            # ``raw`` stays in the shard object, which is kept for
+            # good: copying it would double a document the geometry
+            # downloads on every render.
+            drop=("raw",),
+        )
         document = {
             "schema_version": dots_mocr.GLUE_SCHEMA_VERSION,
             "engine": str(JobEngine.DOTS_MOCR),
