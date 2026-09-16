@@ -1,10 +1,15 @@
 """Pins for the viewer's copy of blackletter's label taxonomy (#343).
 
-``viewer_step2.js`` carries three label tables written by hand: the
+``viewer_step2.js`` carries four label tables written by hand: the
 name-to-id table the drawer posts with, the menu of the Add Detection
-popup, and the overlay colours. Nothing derived them from
+popup, the overlay colours, and the filter that decides which labels
+are drawn at all. Nothing derived them from
 ``blackletter.models.Label``, so bl-warm's ``heading`` and
 ``blockquote`` classes reached the rows and stopped at the browser.
+
+Each table hides a row in its own way. A name the menu offers with no
+id is posted as ``label_id: -1`` and refused; a label the filter does
+not name is held back from the page with no message at all.
 
 The same silence cost the corpus its boxes once already: before
 blackletter 0.4.1 the adapter had no ``Label`` for either name and
@@ -74,13 +79,27 @@ def viewer_menu_labels() -> list[str]:
     return re.findall(r"'([A-Z_]+)'", _literal("labelOpts", "[", "]"))
 
 
-def viewer_colour_labels() -> list[str]:
-    """Return the label names ``LABEL_COLORS`` gives a colour.
+def viewer_colours() -> dict[str, str]:
+    """Return the ``LABEL_COLORS`` table.
+
+    :returns: ``{label name: hex colour}`` as the overlay holds it.
+    :rtype: dict[str, str]
+    """
+    return dict(
+        re.findall(
+            r"([A-Z_]+):\s*'(#[0-9a-fA-F]{6})'",
+            _literal("LABEL_COLORS", "{", "}"),
+        )
+    )
+
+
+def viewer_used_labels() -> list[str]:
+    """Return the labels ``USED_LABELS`` lets the overlay draw.
 
     :returns: The names, in table order.
     :rtype: list[str]
     """
-    return re.findall(r"([A-Z_]+):\s*'#", _literal("LABEL_COLORS", "{", "}"))
+    return re.findall(r"([A-Z_]+):\s*true", _literal("USED_LABELS", "{", "}"))
 
 
 class TestViewerLabelIds(ScanningTestCase):
@@ -111,31 +130,45 @@ class TestViewerLabelIds(ScanningTestCase):
         self.assertIn("HEADING", menu)
         self.assertIn("BLOCKQUOTE", menu)
 
-    def test_every_drawable_label_has_a_colour_of_its_own(self):
-        """A label with no colour draws grey, and two labels that share
-        one are indistinguishable on the page."""
-        colours = dict(
-            re.findall(
-                r"([A-Z_]+):\s*'(#[0-9a-f]{6})'",
-                _literal("LABEL_COLORS", "{", "}"),
-            )
-        )
-        for name in viewer_colour_labels():
+    def test_every_name_the_menu_offers_is_drawn(self):
+        """The filter one layer up. A label the drawer can add but the
+        overlay does not name is held back from the page with no
+        message, which is the failure of #343 a layer up."""
+        drawn = viewer_used_labels()
+
+        for name in viewer_menu_labels():
+            with self.subTest(label=name):
+                self.assertIn(name, drawn)
+
+    def test_every_drawn_label_is_a_real_label(self):
+        """A name the enum does not carry draws nothing and says
+        nothing: no row can ever hold it."""
+        for name in viewer_used_labels():
+            with self.subTest(label=name):
+                self.assertIn(name, Label.__members__)
+
+    def test_every_colour_names_a_label(self):
+        """``EDGES`` is the one key that names no detection label."""
+        for name in viewer_colours():
             with self.subTest(label=name):
                 self.assertTrue(
                     name in NOT_A_LABEL or name in Label.__members__
                 )
-        self.assertIn("HEADING", colours)
-        self.assertIn("BLOCKQUOTE", colours)
-        self.assertNotEqual(colours["HEADING"], colours["BLOCKQUOTE"])
-        self.assertNotIn(
-            colours["HEADING"],
-            [v for k, v in colours.items() if k != "HEADING"],
-        )
-        self.assertNotIn(
-            colours["BLOCKQUOTE"],
-            [v for k, v in colours.items() if k != "BLOCKQUOTE"],
-        )
+
+    def test_the_two_new_labels_have_a_colour_no_other_label_holds(self):
+        """Not a rule for the whole table: ``HEADNOTE`` and
+        ``HEADNOTE_BRACKET`` share one on purpose, being a headnote and
+        its bracket. These two belong to no such family, so a shared
+        colour would only make them unreadable."""
+        colours = viewer_colours()
+
+        for name in ("HEADING", "BLOCKQUOTE"):
+            with self.subTest(label=name):
+                self.assertIn(name, colours)
+                others = [
+                    value for key, value in colours.items() if key != name
+                ]
+                self.assertNotIn(colours[name], others)
 
 
 class TestDrawTheOpinionBodyLabels(DetectionEndpointMixin, ScanningTestCase):
