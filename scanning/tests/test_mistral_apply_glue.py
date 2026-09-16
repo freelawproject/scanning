@@ -320,6 +320,34 @@ class TestApplyGlue(MistralApplyTestCase):
         with self.assertNumQueries(3):
             self.assertEqual(mistral_ocr.finish_ready_applies(), 0)
 
+    def test_a_run_missing_a_row_for_one_edit_is_not_glued(self):
+        """Every edited page needs a row before the document is
+        written: a hole here would be stamped as done."""
+        run, (_turn, _swap, leaf) = self.read_run()
+        ExternalJob.objects.filter(
+            apply_run=run,
+            stage=JobStage.EXTRACT,
+            input_manifest__edit_id=leaf.pk,
+        ).delete()
+        rows = mistral_ocr.apply_jobs(self.scan, run)
+
+        self.assertFalse(mistral_ocr.apply_glue_due(run, rows, 1))
+        self.assertFalse(mistral_ocr.apply_glue_due(run, rows, 1, force=True))
+
+    def test_a_run_with_only_a_deletion_needs_no_row(self):
+        """Not an identity run, and still nothing to read."""
+        self.edit(PageEdit.Kind.DELETE_PAGE, pdf_page=2)
+        run = apply.build_run(self.scan)
+        self.volume_extract_run()
+
+        self.assertEqual(mistral_ocr.finish_ready_applies(), 1)
+
+        run.refresh_from_db()
+        self.assertEqual(run.jobs.filter(stage=JobStage.EXTRACT).count(), 0)
+        pages = self.objects[run.extract_key]["pages"]
+        self.assertEqual(len(pages), self.PAGES - 1)
+        self.assertEqual([p for p in pages if "error" in p], [])
+
     def test_the_document_is_written_once(self):
         run, _ = self.read_run()
 
@@ -371,24 +399,32 @@ class TestApplyGlue(MistralApplyTestCase):
         )
         self.assertNotIn("glue", head.provider_meta)
 
-    def test_an_edit_with_no_row_keeps_its_slot_with_an_error(self):
-        """A page the read never covered must not shift the pages after
-        it: it keeps its slot and says so."""
+    def test_a_page_the_read_could_not_answer_keeps_its_slot(self):
+        """A hole must not shift the pages after it: it keeps its slot
+        and says so, in the corrected volume's own numbering."""
         run, (_turn, _swap, leaf) = self.read_run()
-        ExternalJob.objects.filter(
-            apply_run=run,
-            stage=JobStage.EXTRACT,
-            input_manifest__edit_id=leaf.pk,
-        ).delete()
+        row = next(
+            r
+            for r in mistral_ocr.apply_jobs(self.scan, run)
+            if r.input_manifest["edit_id"] == leaf.pk
+        )
+        # The second page of the inserted leaf came back with no answer.
+        payload = make_payload(2, failed=(1,))
+        payload["output"] = [make_line(0, text=f"edit {leaf.pk} page 0")]
+        self.objects[row.result_key] = envelope(
+            self.scan, row, mistral_ocr.ACTION, payload
+        )
 
         mistral_ocr.finish_ready_applies()
 
         run.refresh_from_db()
-        pages = self.objects[run.extract_key]["pages"]
-        holes = [page for page in pages if "error" in page]
-        self.assertEqual(len(holes), 2)
-        self.assertEqual(len(pages), 7)
-        self.assertEqual(self.objects[run.extract_key]["failed_pages"], [4, 5])
+        document = self.objects[run.extract_key]
+        self.assertEqual(len(document["pages"]), 7)
+        self.assertEqual(document["failed_pages"], [5])
+        hole = document["pages"][5]
+        self.assertEqual(hole["source"]["edit_id"], leaf.pk)
+        self.assertEqual(hole["source"]["page"], 1)
+        self.assertEqual(hole["pdf_page"], 6)
 
 
 class TestNoReviewStateWaits(MistralApplyTestCase):

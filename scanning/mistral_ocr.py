@@ -1384,20 +1384,35 @@ def apply_jobs(scan, run) -> list[ExternalJob]:
     )
 
 
-def apply_glue_due(run, rows: list[ExternalJob], volume_run: int) -> bool:
+def apply_glue_due(
+    run, rows: list[ExternalJob], volume_run: int, *, force: bool = False
+) -> bool:
     """Return whether the corrected volume's Mistral document can be
     written now.
 
     The one rule, called by the pass that writes it and by the command
-    that writes it again. Four things must hold: the run is built; the
-    volume run is glued (the caller's own test, passed in as its run
-    number); no row of this run's own read is unstarted or dead, the
-    way ``apply.glues_due`` judges a stage; and the document that
-    stands is not this volume run's already.
+    that writes it again. Four things must hold:
+
+    - the run is built;
+    - the volume run is glued (the caller's own test, passed in as its
+      run number);
+    - **every edited page the run's map names has a row**, and no row
+      is unstarted or dead, the way ``apply.glues_due`` judges a stage.
+      Without the first half a document would be written with every
+      edited page marked unread -- and worse, its key would then say
+      the run is done, so nothing would ever read those pages. A run
+      with no edited page (a deletion alone, or an identity run) passes
+      it with no row at all;
+    - the document that stands is not this volume run's already, unless
+      the caller asks for it anyway (``force``: a person running
+      ``reglue_mistral_ocr`` writes the document again on purpose, and
+      only that last test is theirs to skip).
 
     :param run: The standing ``ApplyRun``.
     :param rows: The run's Mistral rows (:func:`apply_jobs`).
     :param volume_run: The glued volume run's number.
+    :param force: Write a document that stands for this volume run
+        again.
     :returns: Whether to write the document.
     :rtype: bool
     """
@@ -1407,6 +1422,11 @@ def apply_glue_due(run, rows: list[ExternalJob], volume_run: int) -> bool:
         return False
     if any(row.status in apply.BLOCKING_JOB_STATUSES for row in rows):
         return False
+    named = set(apply.edit_page_counts(run.page_map))
+    if named - {(row.input_manifest or {}).get("edit_id") for row in rows}:
+        return False
+    if force:
+        return True
     return not (run.extract_key and run.extract_run == volume_run)
 
 

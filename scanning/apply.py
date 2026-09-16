@@ -877,6 +877,29 @@ def shard_manifest(
     }
 
 
+def edit_page_counts(page_map: dict | None) -> dict[int, int]:
+    """Return the edits a run's map names, and how many pages each holds.
+
+    The one reader of the map for that question, because two things
+    lean on it and must agree: the shard manifest a late stage rebuilds
+    (:func:`stored_shard_manifest`), and the test of whether a run's
+    edited pages have been read at all. An empty answer means the run
+    needs no per-edit job: a run with only deletions is not an identity
+    run, and it still has no edited page to read.
+
+    :param page_map: The run's stored map.
+    :returns: ``{edit pk: pages it holds in the final volume}``.
+    :rtype: dict[int, int]
+    """
+    counts: dict[int, int] = {}
+    for entry in (page_map or {}).get("pages") or []:
+        source = entry.get("source") or {}
+        if source.get("kind") == "edit":
+            edit_id = source["edit_id"]
+            counts[edit_id] = counts.get(edit_id, 0) + 1
+    return counts
+
+
 def stored_shard_manifest(scan: Scan, run: ApplyRun) -> dict:
     """Describe a built run's one-page shards from the bucket alone.
 
@@ -906,12 +929,7 @@ def stored_shard_manifest(scan: Scan, run: ApplyRun) -> dict:
     :raises ApplyError: If the bucket reports no shard for an edit the
         map names.
     """
-    pages: dict[int, int] = {}
-    for entry in (run.page_map or {}).get("pages") or []:
-        source = entry.get("source") or {}
-        if source.get("kind") == "edit":
-            edit_id = source["edit_id"]
-            pages[edit_id] = pages.get(edit_id, 0) + 1
+    pages = edit_page_counts(run.page_map)
     if not pages:
         return {
             "version": 1,
@@ -1606,19 +1624,29 @@ def _note_dead_rows() -> int:
     there was repeated after every later glue and never written on a
     run whose glue had also failed.
 
+    **Only a row of a stage that blocks a glue counts**
+    (:data:`GLUE_STAGES`, the same set :func:`_stage_blocked` judges).
+    A stage outside it holds nothing: a dead Mistral row (#245) leaves
+    ``is_complete`` true and review 2 open, so a note saying the run
+    had stopped would be wrong -- and it would spend the one stamp, so
+    the CONVERT, ANALYZE or DETECT row that really does stop the run
+    would never be logged at all.
+
     :returns: How many runs were noted.
     :rtype: int
     """
     noted = 0
+    blocking = list(GLUE_STAGES.values())
     runs = ApplyRun.objects.filter(
         superseded_at__isnull=True,
         built_at__isnull=False,
         dead_row_noted_at__isnull=True,
         jobs__status__in=DEAD_JOB_STATUSES,
+        jobs__stage__in=blocking,
     ).distinct()
     for run in runs:
         dead = (
-            run.jobs.filter(status__in=DEAD_JOB_STATUSES)
+            run.jobs.filter(status__in=DEAD_JOB_STATUSES, stage__in=blocking)
             .order_by("pk")
             .first()
         )

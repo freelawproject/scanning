@@ -71,14 +71,17 @@ class TestReglueMistralOcr(MistralApplyTestCase):
         self.assertNotIn(key, self.objects)
         self.assertIn("Would glue 1 volume(s)", output)
 
-    def test_no_row_is_created(self):
+    def test_no_row_is_created_and_the_document_is_left_alone(self):
+        """A run whose rows are gone keeps the document it has: writing
+        it again from no result would mark every edited page unread."""
         run = self.build_glued()
         before = ExternalJob.objects.count()
+        written = run.extract_key
         ExternalJob.objects.filter(
             apply_run=run, stage=JobStage.EXTRACT
         ).delete()
 
-        self.run_command()
+        output = self.run_command()
 
         self.assertLess(ExternalJob.objects.count(), before)
         self.assertEqual(
@@ -86,6 +89,17 @@ class TestReglueMistralOcr(MistralApplyTestCase):
                 apply_run=run, stage=JobStage.EXTRACT
             ).count(),
             0,
+        )
+        run.refresh_from_db()
+        self.assertEqual(run.extract_key, written)
+        self.assertIn("not read yet", output)
+        self.assertEqual(
+            [
+                page
+                for page in self.objects[written]["pages"]
+                if "error" in page
+            ],
+            [],
         )
 
     def test_an_open_run_is_skipped(self):
@@ -114,3 +128,52 @@ class TestReglueMistralOcr(MistralApplyTestCase):
         mistral_ocr.finish_ready_applies()
         run.refresh_from_db()
         return run
+
+
+@override_settings(**MISTRAL)
+class TestReglueBeforeTheRowsExist(TestReglueMistralOcr):
+    """The command must not stamp a document with holes (#245 review)."""
+
+    def test_the_command_leaves_a_run_whose_pages_are_unread(self):
+        """The normal case after a deploy: a person runs the command
+        before the tick has created the one-page rows. A document
+        written here would mark every edited page unread and stamp a
+        key that says the run is done, after which nothing would ever
+        read those pages."""
+        run, _edits = self.built_run()
+        self.volume_extract_run()
+
+        out = StringIO()
+        call_command("reglue_mistral_ocr", stdout=out, stderr=out)
+
+        run.refresh_from_db()
+        self.assertEqual(run.extract_key, "")
+        self.assertIsNone(run.extract_run)
+        self.assertIn("not read yet", out.getvalue())
+
+    def test_the_tick_still_reads_the_pages_afterwards(self):
+        """The run is left alone, not lost: the next tick creates its
+        rows and glues it once they answer."""
+        run, _edits = self.built_run()
+        self.volume_extract_run()
+        self.run_command()
+
+        mistral_ocr.finish_ready_applies()
+        run.refresh_from_db()
+        rows = mistral_ocr.apply_jobs(self.scan, run)
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(run.extract_key, "")
+
+        self.complete_extract_rows(run)
+        self.assertEqual(mistral_ocr.finish_ready_applies(), 1)
+
+        run.refresh_from_db()
+        self.assertEqual(
+            [
+                page
+                for page in self.objects[run.extract_key]["pages"]
+                if "error" in page
+            ],
+            [],
+        )

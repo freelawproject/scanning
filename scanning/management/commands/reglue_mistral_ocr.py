@@ -136,9 +136,17 @@ class Command(BaseCommand):
         """Write one corrected volume's document again.
 
         The rows of the apply run are read, never created: creating a
-        row is paid work, and this command starts none. A run whose
-        edited pages were never read therefore keeps the document it
-        has, and the tick creates the rows on its own terms.
+        row is paid work, and this command starts none. So a run whose
+        edited pages have not been read is left exactly as it is, and
+        the tick creates its rows on its own terms. Writing it here
+        would mark every edited page unread **and** stamp a key that
+        says the run is done, after which nothing would ever read those
+        pages -- the one way this command could lose a volume's text.
+
+        The test is ``mistral_ocr.apply_glue_due``, the same one the
+        tick makes, with only "a document for this volume run already
+        stands" waived: writing that document again is what a person
+        runs this command for.
 
         :param scan: The scan.
         :param run: The standing, built apply run.
@@ -147,12 +155,13 @@ class Command(BaseCommand):
         :rtype: bool
         """
         rows = mistral_ocr.apply_jobs(scan, run)
-        if rows and any(
-            row.status not in (JobStatus.COMPLETED, JobStatus.CONSUMED)
-            for row in rows
-        ):
-            return False
         volume_run = volume_rows[0].run
+        if not mistral_ocr.apply_glue_due(run, rows, volume_run, force=True):
+            self.stdout.write(
+                f"scan {scan.pk} apply {run.label}: the edited pages are "
+                f"not read yet; left as it is"
+            )
+            return False
         key = mistral_ocr.glue_apply_run(scan, run, rows, volume_run)
         ApplyRun.objects.filter(pk=run.pk).update(
             extract_key=key, extract_run=volume_run
