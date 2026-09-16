@@ -1,0 +1,50 @@
+[project]
+name = "surya-gpu-worker"
+version = "0.0.1"
+description = "RunPod Serverless handler for Surya OCR 2 full-page reads (vLLM-backed)."
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    # The client library. Its RecognitionPredictor owns the prompt, the
+    # image fit, the HTML parse, the loop detection and the block-mode
+    # fallback; this worker calls it and adds nothing to the decode.
+    # The floor is the first release that reads surya-ocr-2 through an
+    # external vLLM server (SURYA_INFERENCE_URL); bump deliberately and
+    # re-run the handler tests.
+    "surya-ocr>=0.22.1",
+
+    # surya imports torch at module scope (its settings probe the
+    # device) even on the vLLM-client path, where no model runs in this
+    # process. The CPU wheels from the index below satisfy the import
+    # at a fraction of the CUDA wheels' size; the GPU stack that serves
+    # the model lives in the base image's own environment, not here.
+    "torch>=2.7",
+    "torchvision>=0.20",
+
+    # Page rendering. surya's own page reader is pypdfium2; the worker
+    # renders with PyMuPDF like the other workers do, so every OCR
+    # engine reads the same 200-dpi pixels.
+    "pillow>=10",
+    "pymupdf>=1.25",
+
+    # RunPod plumbing
+    "requests>=2.33,<3",
+    "runpod>=1.9,<2",
+    "sentry-sdk>=2,<3",
+]
+
+# This project is an application (handler.py), not a library. Tell uv
+# not to try to build it as an installable package.
+[tool.uv]
+package = false
+
+# Route torch to the CPU index. ``explicit = true`` means this index is
+# only searched for the packages routed to it here, so a plain PyPI
+# package never falls through to it.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
