@@ -11,11 +11,11 @@ polls the batch, and on ``SUCCESS`` downloads the output and stores it,
 **whole**, at the row's ``result_key``.
 
 **The read is over the original shards, and the redaction is a
-transform on the text it returns.** A legal review cleared the
-unredacted page for the API, so the source is the shard set
-``sharding.ensure_shards`` already cut -- the one dots.mocr and YOLO
-read -- and this stage waits on no redacted volume and cuts no second
-set. That is also what makes a late change cheap. A page is addressed
+transform on the text it returns.** A legal review removed the
+requirement that the page be redacted before the read (2026-09-15),
+so the source is the shard set ``sharding.ensure_shards`` already cut
+-- the one dots.mocr and YOLO read -- and this stage waits on no
+redacted volume and cuts no second set. That is also what makes a late change cheap. A page is addressed
 by ``source_fingerprint`` plus a page range, nothing downstream moves
 it, and so a missed redaction, a moved boundary and a re-cut opinion
 split all cost a re-glue rather than a re-paid read. The boxes come
@@ -138,6 +138,14 @@ MAX_SUBMITS_PER_TICK = 1
 #: create may have made a job nothing we hold names, and every attempt
 #: uploads the shard's pages again.
 MAX_ATTEMPTS = 2
+
+#: How long one row waits between two polls of its batch. The sweep
+#: visits every in-flight row on every collect tick, and a batch waits
+#: at Mistral for hours, so without this a full cap would ask Mistral
+#: about sixteen batches four times a minute for a day. The deadline is
+#: judged on every tick whatever this says (``jobs.check_deadline``),
+#: so a skipped poll delays no write-off.
+POLL_INTERVAL = timedelta(minutes=2)
 
 #: Mistral's own budget for one batch job (its ``timeout_hours``, and
 #: the SDK default). A job past it ends ``TIMEOUT_EXCEEDED``.
@@ -595,6 +603,9 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     a claimed row with no id will never get one. It is retried at once
     rather than waited on for a day.
 
+    A row polled inside :data:`POLL_INTERVAL` is left alone, and its
+    deadline is judged all the same.
+
     :param job: An in-flight row.
     :param now: Comparison time.
     :param summary: Counts to update.
@@ -612,6 +623,11 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
         )
         return
 
+    if not _poll_due(job, now):
+        summary.pending += 1
+        jobs.check_deadline(job, now, summary)
+        return
+
     outcome = mistral_client.poll_batch(
         job.external_id, label=f"scan {job.scan_id} shard {job.shard_index}"
     )
@@ -625,18 +641,77 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     )
 
 
+def _poll_due(job: ExternalJob, now) -> bool:
+    """Return whether this row's batch may be polled again.
+
+    :param job: An in-flight row.
+    :param now: Comparison time.
+    :returns: Whether :data:`POLL_INTERVAL` has passed. A row never
+        polled is always due.
+    :rtype: bool
+    """
+    last = job.last_polled_at
+    return last is None or (now - last) >= POLL_INTERVAL
+
+
 def _harvest_outcome(job: ExternalJob, outcome, now) -> str:
     """Apply a finished batch: nothing wrote our result object but us.
+
+    **Three answers, because a failed download is three things.**
+    ``jobs.apply_poll_outcome`` returns inside its completion branch,
+    before the deadline check, so a finished batch this function never
+    settles is a row nothing else will ever end.
+
+    - **A transient fault** -- a 5xx, a rate limit, a lost answer.
+      The output is still at Mistral, so the row stays in flight and
+      the next tick downloads it again.
+    - **The output file is gone** (404), or Mistral refuses the
+      download for good. Waiting cannot fix either, so the shard is
+      retried: it costs an attempt, and the attempt ladder ends it.
+    - **Neither, but the row is past its deadline.** A PUT to S3 that
+      keeps failing holds the row exactly as a missing file would, so
+      the deadline is the escape from both.
 
     :param job: The row Mistral reports finished.
     :param outcome: The poll result.
     :param now: Completion timestamp.
-    :returns: The outcome label to count. A failed harvest counts as a
-        check error, like an S3 blip: the output is still at Mistral
-        and the next tick downloads it again.
+    :returns: The outcome label to count.
     :rtype: str
     """
-    return "completed" if harvest(job, outcome, now) else "errors"
+    try:
+        stored = harvest(job, outcome, now)
+    except mistral_client.MistralTransientError as exc:
+        logger.warning(
+            "job %s (scan %s shard %s): could not download the batch "
+            "output; trying again next tick: %s",
+            job.pk,
+            job.scan_id,
+            job.shard_index,
+            exc,
+        )
+        stored = False
+    except mistral_client.MistralError as exc:
+        logger.warning(
+            "job %s (scan %s shard %s): the batch output cannot be "
+            "downloaded (%s); retrying the shard: %s",
+            job.pk,
+            job.scan_id,
+            job.shard_index,
+            exc.error_code,
+            exc,
+        )
+        return jobs._retry_or_fail(job, exc.error_code, str(exc), now)
+    if stored:
+        return "completed"
+    if job.is_overdue(now):
+        return jobs._retry_or_fail(
+            job,
+            "DEADLINE_EXCEEDED",
+            f"the batch finished, but its output was still unstored at "
+            f"{job.deadline}",
+            now,
+        )
+    return "errors"
 
 
 def _record_progress(job: ExternalJob, outcome, now) -> bool:
@@ -679,37 +754,30 @@ def harvest(
     The document is written in the result-envelope shape every other
     stage uses, so the glue reuses ``jobs.check_result_envelope``.
     The row is completed only after the PUT landed; a failed PUT leaves
-    the row in flight, and the next tick downloads the output again.
+    the row in flight, and the next tick downloads the output again,
+    until the deadline ends it (:func:`_harvest_outcome`).
     Then the page files, the manifest and the two output files are
     deleted at Mistral: the object in S3 is the copy that matters.
 
     :param job: The in-flight row Mistral reports ``SUCCESS`` for.
     :param outcome: The poll answer.
     :param now: Completion timestamp.
-    :returns: Whether the row was completed.
+    :returns: Whether the row was completed. ``False`` means the S3
+        PUT did not land, or another writer took the row.
     :rtype: bool
+    :raises MistralError: If a file cannot be downloaded.
+        :func:`_harvest_outcome` decides what each failure costs.
     """
-    try:
-        output = (
-            mistral_client.download_lines(outcome.output_file)
-            if outcome.output_file
-            else []
-        )
-        errors = (
-            mistral_client.download_lines(outcome.error_file)
-            if outcome.error_file
-            else []
-        )
-    except mistral_client.MistralError as exc:
-        logger.warning(
-            "job %s (scan %s shard %s): could not download the batch "
-            "output; trying again next tick: %s",
-            job.pk,
-            job.scan_id,
-            job.shard_index,
-            exc,
-        )
-        return False
+    output = (
+        mistral_client.download_lines(outcome.output_file)
+        if outcome.output_file
+        else []
+    )
+    errors = (
+        mistral_client.download_lines(outcome.error_file)
+        if outcome.error_file
+        else []
+    )
 
     page_count = int((job.input_manifest or {}).get("page_count") or 0)
     answered: set[int] = set()

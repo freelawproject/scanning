@@ -2401,7 +2401,9 @@ def apply_poll_outcome(
       open for good.
     - **The overdue check decrements ``pending`` before it retries**,
       because the two branches above it already counted the row as
-      still waiting.
+      still waiting. It lives in :func:`check_deadline`, which a
+      provider that skipped its poll calls directly: a row that is
+      not polled this tick is still judged this tick.
 
     A lost compare-and-swap ends the tick for the row on every path:
     another writer took it, so it is theirs to judge and ours to leave
@@ -2447,18 +2449,41 @@ def apply_poll_outcome(
             return
         summary.pending += 1
 
-    if job.is_overdue(now):
-        summary.pending -= 1
-        count_sweep_outcome(
-            summary,
-            _retry_or_fail(
-                job,
-                "DEADLINE_EXCEEDED",
-                f"still {outcome.provider_status or job.status} at "
-                f"{job.deadline}",
-                now,
-            ),
-        )
+    check_deadline(job, now, summary, outcome.provider_status)
+
+
+def check_deadline(
+    job: ExternalJob, now, summary: SweepSummary, provider_status=None
+) -> None:
+    """Write off one in-flight row that is past its deadline.
+
+    The tail of :func:`apply_poll_outcome`, and the one rule for
+    "this row has waited long enough". A provider whose sweep skips
+    the poll on this tick calls it on its own, so a poll interval
+    never delays a write-off.
+
+    The caller counted the row as pending before it got here, so the
+    write-off takes that count back.
+
+    :param job: An in-flight row.
+    :param now: Comparison time.
+    :param summary: Counts to update.
+    :param provider_status: What the provider last called the job,
+        for the message.
+    :return: None.
+    """
+    if not job.is_overdue(now):
+        return
+    summary.pending -= 1
+    count_sweep_outcome(
+        summary,
+        _retry_or_fail(
+            job,
+            "DEADLINE_EXCEEDED",
+            f"still {provider_status or job.status} at {job.deadline}",
+            now,
+        ),
+    )
 
 
 def _sweep_doctor_job(job: ExternalJob, now, summary: SweepSummary) -> None:

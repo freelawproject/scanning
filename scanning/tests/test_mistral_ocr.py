@@ -771,6 +771,97 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(self.job.status, JobStatus.SUBMITTED)
         put.assert_not_called()
 
+    def test_a_missing_output_file_retries_the_shard(self):
+        # The cascade returns inside its completion branch, before the
+        # deadline check, so a 404 answered "next tick" would be a row
+        # nothing ever ends. It costs an attempt instead.
+        outcome = mistral_client.BatchOutcome(
+            status=JobStatus.COMPLETED,
+            provider_status="SUCCESS",
+            output_file="out-1",
+            job={},
+        )
+        with (
+            patch(
+                "scanning.mistral_client.download_lines",
+                side_effect=mistral_client.MistralMissing(
+                    "gone", "NOT_FOUND", 404
+                ),
+            ),
+            patch("scanning.mistral_client.poll_batch", return_value=outcome),
+            patch("scanning.mistral_client.cancel_batch"),
+            patch("scanning.mistral_client.delete_file") as delete,
+            patch("scanning.s3_sync.upload_json_object") as put,
+            self.assertLogs("scanning.mistral_ocr", "WARNING"),
+        ):
+            summary = jobs.sweep_jobs()
+        self.job.refresh_from_db()
+        self.assertEqual(summary.retried, 1)
+        self.assertEqual(self.job.status, JobStatus.PENDING)
+        self.assertEqual(self.job.attempt, 2)
+        self.assertEqual(self.job.external_id, "")
+        self.assertEqual(self.job.error_code, "NOT_FOUND")
+        put.assert_not_called()
+        # The retry deletes what the dead attempt uploaded.
+        self.assertEqual(
+            [call.args[0] for call in delete.call_args_list],
+            ["f0", "f1", "m1"],
+        )
+
+    def test_a_put_that_keeps_failing_ends_at_the_deadline(self):
+        # A finished batch whose result never lands holds the row the
+        # same way a missing file would. The harvest judges the
+        # deadline itself, because the cascade never reaches it.
+        now = timezone.now()
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            deadline=now - timedelta(minutes=1)
+        )
+        summary, _ = self._sweep(
+            mistral_client.BatchOutcome(
+                status=JobStatus.COMPLETED,
+                provider_status="SUCCESS",
+                output_file="out-1",
+                job={},
+            ),
+            now=now,
+            put=False,
+        )
+        self.assertEqual(summary.retried, 1)
+        self.assertEqual(self.job.status, JobStatus.PENDING)
+        self.assertEqual(self.job.attempt, 2)
+        self.assertEqual(self.job.error_code, "DEADLINE_EXCEEDED")
+
+    def test_a_row_polled_inside_the_interval_is_left_alone(self):
+        # A batch waits for hours, so the sweep asks about it rarely.
+        now = timezone.now()
+        ExternalJob.objects.filter(pk=self.job.pk).update(last_polled_at=now)
+        summary, mocks = self._sweep(
+            mistral_client.BatchOutcome(
+                status=JobStatus.IN_PROGRESS, provider_status="RUNNING"
+            ),
+            now=now + mistral_ocr.POLL_INTERVAL - timedelta(seconds=1),
+        )
+        mocks["poll"].assert_not_called()
+        self.assertEqual(summary.pending, 1)
+        self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+
+    def test_a_skipped_poll_still_judges_the_deadline(self):
+        # The interval delays a question to Mistral, never a write-off.
+        now = timezone.now()
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            last_polled_at=now, deadline=now - timedelta(minutes=1)
+        )
+        summary, mocks = self._sweep(
+            mistral_client.BatchOutcome(
+                status=JobStatus.IN_PROGRESS, provider_status="RUNNING"
+            ),
+            now=now,
+        )
+        mocks["poll"].assert_not_called()
+        self.assertEqual(summary.pending, 0)
+        self.assertEqual(summary.retried, 1)
+        self.assertEqual(self.job.status, JobStatus.PENDING)
+
     def test_a_timeout_retries_cancels_and_deletes(self):
         summary, mocks = self._sweep(
             mistral_client.BatchOutcome(
