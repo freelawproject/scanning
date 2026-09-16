@@ -49,6 +49,15 @@ class TestComputeCoverageGaps(TestCase):
         # pdf index 11 (page 12) is covered by neither opinion.
         self.assertEqual(compute_coverage_gaps(opinions, 1, 23), [(12, 12, 1)])
 
+    def test_a_dismissed_boundary_covers_nothing(self):
+        """A dismissed row (#240 PR C) is a card with an undo, not an
+        opinion, so its pages are gaps."""
+        opinions = [
+            _op(0, 1),
+            {"caption_page": 2, "key_page": 3, "dismissed": True},
+        ]
+        self.assertEqual(compute_coverage_gaps(opinions, 1, 4), [(3, 4, 2)])
+
     def test_page_count_does_not_extend_coverage(self):
         # A single opinion with an inflated page_count covers only
         # caption_page..key_page; trailing pages remain uncovered.

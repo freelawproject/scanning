@@ -58,8 +58,8 @@ class Prompt(AbstractDateTimeModel):
     """A system or user prompt text used by the LLM extraction pipeline.
 
     Rows are immutable in normal usage: a tweaked prompt is a new row,
-    not an edit. ``scanning.Page.user_prompt`` repoints to the new row,
-    leaving the prior Prompt as queryable history.
+    not an edit. The rows have no reader: ``scanning.Page`` held the
+    one foreign key into this model and issue #280 deleted it.
     """
 
     name = models.CharField(max_length=255, blank=True)

@@ -6,18 +6,24 @@ from django.urls import NoReverseMatch, reverse
 from django.utils.html import format_html
 from django.utils.text import capfirst
 
-from scanning import jobs
+from scanning import apply, jobs
 from scanning.models import (
+    ApplyRun,
+    BracketReading,
     Detection,
+    DetectionDecision,
     ExternalJob,
     Issue,
     JobStage,
+    OpinionBoundary,
     OpinionScan,
-    Page,
     PageEdit,
+    PageRepairRequest,
     PendingUpload,
     QueuedAction,
+    Redaction,
     Reporter,
+    ReviewDismissal,
     Scan,
     Status,
     Volume,
@@ -184,7 +190,6 @@ class ScanAdmin(admin.ModelAdmin):
         "date_created",
         "date_modified",
         "processed_at",
-        "pages_link",
     ]
     # Per-page payload fields hold megabytes on a processed scan.
     # Rendering them as editable textareas makes the change view crawl,
@@ -192,11 +197,8 @@ class ScanAdmin(admin.ModelAdmin):
     # pipeline).
     exclude = [
         "ocr_results",
-        "opinions_json",
         "page_map",
         "missing_pages",
-        "margin_rects",
-        "redaction_rects",
         "process_output",
     ]
     date_hierarchy = "date_created"
@@ -236,7 +238,7 @@ class ScanAdmin(admin.ModelAdmin):
 
         The default admin collector instantiates every related object to
         render the confirmation tree. A processed scan cascades to tens
-        of thousands of ``Detection`` rows (plus ``Page``, ``Issue``,
+        of thousands of ``Detection`` rows (plus ``Issue``, ``PageEdit``,
         etc.), so the collector exhausts memory and takes the server
         down before the user even confirms.
 
@@ -273,10 +275,11 @@ class ScanAdmin(admin.ModelAdmin):
         # the delete outright via the PROTECT above.
         for model in (
             Scan,
-            Page,
             Detection,
             Issue,
             PageEdit,
+            OpinionBoundary,
+            BracketReading,
             PendingUpload,
             ExternalJob,
         ):
@@ -290,25 +293,6 @@ class ScanAdmin(admin.ModelAdmin):
         ]
         perms_needed: set[str] = set()
         return deletable_objects, model_count, perms_needed, protected
-
-    @admin.display(description="Pages")
-    def pages_link(self, obj):
-        """Render a link to the filtered Page admin for this scan.
-
-        :param obj: The Scan instance.
-        :return: HTML link or em dash if there are no pages.
-        :rtype: SafeString | str
-        """
-        count = obj.pages.count() if obj.pk else 0
-        if not count:
-            return "—"
-        url = reverse("admin:scanning_page_changelist")
-        return format_html(
-            '<a href="{}?scan__id__exact={}">View {} page(s)</a>',
-            url,
-            obj.pk,
-            count,
-        )
 
     def save_model(self, request, obj, form, change):
         """Save a Scan and refresh affected Volume(s) queue_status.
@@ -431,6 +415,10 @@ class ScanAdmin(admin.ModelAdmin):
             jobs.abandon_open(
                 scan, "Re-queued from the admin", stage=JobStage.CONVERT
             )
+            # The pipeline runs again from the original, so a build of
+            # the final volume in flight describes nothing any more
+            # (#224). Its shards stay, and the next build reuses them.
+            apply.supersede_runs(scan, "Re-queued from the admin")
 
         # Re-point every recovered scan at the (interim) full pipeline.
         # The other queued actions were disconnected by issue #173, so a
@@ -631,10 +619,51 @@ class VolumeAdmin(admin.ModelAdmin):
 
 @admin.register(Issue)
 class IssueAdmin(admin.ModelAdmin):
-    list_display = ["scan", "page_number", "check_name", "severity", "message"]
-    list_filter = ["severity", "check_name"]
+    list_display = [
+        "scan",
+        "page_number",
+        "check_name",
+        "target",
+        "severity",
+        "dismissal",
+        "message",
+    ]
+    list_filter = ["severity", "check_name", "target"]
     search_fields = ["message", "check_name"]
-    raw_id_fields = ["scan"]
+    raw_id_fields = ["scan", "dismissal"]
+
+
+@admin.register(ReviewDismissal)
+class ReviewDismissalAdmin(admin.ModelAdmin):
+    """One curator dismissal of one review-2 finding (issue #240, PR D).
+
+    Read-only: a row records what a person decided, and the way to
+    change a decision is the review page. Nothing here deletes.
+    """
+
+    list_display = [
+        "scan",
+        "check_name",
+        "label",
+        "source_page",
+        "author",
+        "withdrawn_at",
+        "date_created",
+    ]
+    list_filter = ["check_name", "withdrawn_at"]
+    raw_id_fields = [
+        "scan",
+        "source_edit",
+        "author",
+        "withdrawn_by",
+    ]
+    readonly_fields = [f.name for f in ReviewDismissal._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(Detection)
@@ -642,14 +671,126 @@ class DetectionAdmin(admin.ModelAdmin):
     list_display = [
         "scan",
         "page_index",
+        "source_page",
         "label",
         "confidence",
         "model_name",
         "active",
+        "decision",
+        "withdrawn_at",
     ]
     list_filter = ["label", "active", "model_name"]
     search_fields = ["label"]
-    raw_id_fields = ["scan"]
+    raw_id_fields = [
+        "scan",
+        "source_edit",
+        "apply_run",
+        "decision",
+        "replaces",
+    ]
+
+
+@admin.register(BracketReading)
+class BracketReadingAdmin(admin.ModelAdmin):
+    """One headnote bracket the OCR read (issue #328).
+
+    Read-only: the compute writes every row and replaces the set at
+    each compute, so a hand edit would last until the next one. It is
+    here to answer "what did the reader see on that page?" when a
+    missed-bracket card looks wrong.
+    """
+
+    list_display = [
+        "scan",
+        "page_index",
+        "source_page",
+        "raw",
+        "numbers",
+        "apply_run",
+        "date_created",
+    ]
+    search_fields = ["raw"]
+    raw_id_fields = ["scan", "source_edit", "apply_run"]
+    readonly_fields = [f.name for f in BracketReading._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(DetectionDecision)
+class DetectionDecisionAdmin(admin.ModelAdmin):
+    """One curator decision about one model detection (issue #240).
+
+    Read-only: a row records what a person decided, and the way to
+    change a decision is the review page. Nothing here deletes.
+    """
+
+    list_display = [
+        "scan",
+        "kind",
+        "label",
+        "source_page",
+        "source_edit",
+        "author",
+        "withdrawn_at",
+        "date_created",
+    ]
+    list_filter = ["kind", "withdrawn_at", "label"]
+    raw_id_fields = ["scan", "source_edit", "author", "withdrawn_by"]
+    readonly_fields = [f.name for f in DetectionDecision._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(OpinionBoundary)
+class OpinionBoundaryAdmin(admin.ModelAdmin):
+    """One opinion, or one curator decision about one (issue #240, PR C).
+
+    Read-only: a computed row is rebuilt at each compute and a human
+    row records what a person decided, and the way to change either is
+    the review page. Nothing here deletes.
+    """
+
+    list_display = [
+        "scan",
+        "origin",
+        "kind",
+        "start_page_index",
+        "end_page_index",
+        "start_source_page",
+        "end_source_page",
+        "apply_run",
+        "author",
+        "withdrawn_at",
+        "date_created",
+    ]
+    list_filter = ["origin", "kind", "withdrawn_at"]
+    raw_id_fields = [
+        "scan",
+        "start_source_edit",
+        "end_source_edit",
+        "apply_run",
+        "start_detection",
+        "end_detection",
+        "decision",
+        "replaces",
+        "author",
+        "withdrawn_by",
+    ]
+    readonly_fields = [f.name for f in OpinionBoundary._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(PageEdit)
@@ -695,6 +836,123 @@ class PageEditAdmin(admin.ModelAdmin):
     ]
 
 
+@admin.register(ApplyRun)
+class ApplyRunAdmin(admin.ModelAdmin):
+    """One build of the final volume from the page edits (issue #224).
+
+    Read-only: the row is the daemon's ledger. The one thing an
+    operator does here is give up on a run -- a dead job row, or
+    attempts spent -- with the supersede action, after which the
+    trigger builds the next number and carries every paid result.
+    """
+
+    list_display = [
+        "scan",
+        "number",
+        "built_at",
+        "bitonal_key",
+        "ocr_key",
+        "detections_key",
+        "attempts",
+        "superseded_at",
+        "date_modified",
+    ]
+    list_filter = ["superseded_at", "built_at"]
+    search_fields = ["scan__id", "last_error"]
+    raw_id_fields = ["scan"]
+    readonly_fields = [
+        "scan",
+        "number",
+        "source_fingerprint",
+        "page_map",
+        "edit_ids",
+        "final_pdf_key",
+        "bitonal_key",
+        "ocr_key",
+        "printed_pages_key",
+        "detections_key",
+        "built_at",
+        "superseded_at",
+        "attempts",
+        "last_error",
+        "last_attempt_at",
+        "date_created",
+        "date_modified",
+    ]
+    list_select_related = ["scan__reporter"]
+    actions = ["supersede_runs"]
+
+    def has_delete_permission(self, request, obj=None):
+        """Refuse the delete: a run is a ledger, and its rows cascade.
+
+        ``ExternalJob.apply_run`` is CASCADE, so a plain delete would
+        take a PENDING or in-flight row with it and leave its RunPod
+        job running with no handle to cancel it. The supersede action
+        cancels first; the scan deletion cancels every row of the scan
+        before its own cascade. Nothing else needs a run gone.
+
+        :param request: The admin request.
+        :param obj: The run, on a change page.
+        :returns: False.
+        """
+        return False
+
+    @admin.action(description="Supersede: give up on this run and rebuild")
+    def supersede_runs(self, request, queryset):
+        """Close the selected runs, so the trigger builds the next number.
+
+        :param request: The admin request.
+        :param queryset: The selected runs.
+        :return: None.
+        """
+        count = 0
+        for run in queryset.filter(superseded_at__isnull=True):
+            count += apply.supersede_runs(
+                run.scan,
+                f"Superseded from the admin by user {request.user.pk}",
+            )
+        self.message_user(request, f"Superseded {count} apply run(s).")
+
+
+@admin.register(PageRepairRequest)
+class PageRepairRequestAdmin(admin.ModelAdmin):
+    """One page a reviewer asked a scanner to scan (issue #249).
+
+    Read-only: a row records what a person asked for, and an admin
+    who edits one rewrites history. The way to close a request is the
+    Dismiss button of the review page, or the upload that fulfils it.
+    """
+
+    list_display = [
+        "scan",
+        "action",
+        "pdf_page",
+        "anchor_pdf_page",
+        "logical_page",
+        "requested_by",
+        "dismissed_at",
+        "dismissed_by",
+        "date_created",
+    ]
+    list_filter = ["action", "dismissed_at"]
+    search_fields = ["scan__id", "note"]
+    raw_id_fields = ["scan", "requested_by", "dismissed_by"]
+    readonly_fields = [
+        "scan",
+        "action",
+        "requested_by",
+        "pdf_page",
+        "anchor_pdf_page",
+        "logical_page",
+        "note",
+        "source_fingerprint",
+        "dismissed_at",
+        "dismissed_by",
+        "date_created",
+        "date_modified",
+    ]
+
+
 @admin.register(PendingUpload)
 class PendingUploadAdmin(admin.ModelAdmin):
     list_display = [
@@ -708,60 +966,6 @@ class PendingUploadAdmin(admin.ModelAdmin):
     search_fields = ["id", "s3_key", "scan__id"]
     raw_id_fields = ["scan", "created_by"]
     readonly_fields = ["id", "date_created", "date_modified"]
-
-
-@admin.register(Page)
-class PageAdmin(admin.ModelAdmin):
-    list_display = [
-        "scan",
-        "page_index",
-        "book_page",
-        "pdf_link",
-        "is_blank",
-        "status",
-        "extracted_by",
-        "needs_review",
-        "has_prompt",
-        "has_xml",
-        "date_modified",
-    ]
-    list_filter = ["status", "needs_review", "extracted_by", "is_blank"]
-    search_fields = ["scan__id", "book_page", "scan__reporter__short_name"]
-    raw_id_fields = ["scan", "user_prompt"]
-    readonly_fields = [
-        "date_created",
-        "date_modified",
-        "pdf_link",
-    ]
-    ordering = ["scan", "page_index"]
-    list_select_related = ["scan", "user_prompt"]
-
-    @admin.display(description="PDF")
-    def pdf_link(self, obj):
-        """Render ``pdf_path`` as a clickable link to the served file.
-
-        The view resolves the local file first and lazily pulls from S3
-        if it isn't on disk, so this works regardless of which mode the
-        portal is running in.
-        """
-        if not obj.pdf_path or not obj.pk:
-            return "—"
-        url = reverse("serve_page_pdf", kwargs={"pk": obj.pk})
-        return format_html(
-            '<a href="{}" target="_blank" rel="noopener">{}</a>',
-            url,
-            obj.pdf_path,
-        )
-
-    @admin.display(boolean=True, description="Prompt")
-    def has_prompt(self, obj):
-        """Whether this page has a user_prompt FK set."""
-        return obj.user_prompt_id is not None
-
-    @admin.display(boolean=True, description="XML")
-    def has_xml(self, obj):
-        """Whether the page has extracted XML content."""
-        return bool(obj.xml_content)
 
 
 @admin.register(ExternalJob)
@@ -815,3 +1019,42 @@ class ExternalJobAdmin(admin.ModelAdmin):
     def shard_label(self, obj):
         """Render the job's position in its target's fan-out."""
         return f"{obj.shard_index + 1}/{obj.shard_count}"
+
+
+@admin.register(Redaction)
+class RedactionAdmin(admin.ModelAdmin):
+    """One box to paint, or one curator decision about one (issue #240).
+
+    Read-only: the compute writes the computed rows and the review page
+    writes the human ones. Nothing here deletes.
+    """
+
+    list_display = [
+        "scan",
+        "origin",
+        "kind",
+        "rect_type",
+        "fill",
+        "page_index",
+        "source_page",
+        "author",
+        "withdrawn_at",
+        "date_created",
+    ]
+    list_filter = ["origin", "kind", "fill", "withdrawn_at"]
+    raw_id_fields = [
+        "scan",
+        "source_edit",
+        "apply_run",
+        "decision",
+        "replaces",
+        "author",
+        "withdrawn_by",
+    ]
+    readonly_fields = [f.name for f in Redaction._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

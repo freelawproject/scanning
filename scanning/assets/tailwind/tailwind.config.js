@@ -13,6 +13,8 @@ module.exports = {
     'badge-awaiting_validation',
     'badge-ready_for_page_completeness_review',
     'badge-page_completeness_review_done',
+    'badge-ready_for_redaction_review',
+    'badge-redaction_review_done',
     'badge-pending_review',
     'badge-approved',
     'badge-extracted',

@@ -9,24 +9,23 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('scanning', '0015_page_edits_from_inserts_and_deletions'),
+        ("scanning", "0015_page_edits_from_inserts_and_deletions"),
     ]
 
     operations = [
         migrations.AlterUniqueTogether(
-            name='pageinsert',
+            name="pageinsert",
             unique_together=None,
         ),
         migrations.RemoveField(
-            model_name='pageinsert',
-            name='scan',
+            model_name="pageinsert",
+            name="scan",
         ),
         migrations.DeleteModel(
-            name='PageDeletion',
+            name="PageDeletion",
         ),
         migrations.DeleteModel(
-            name='PageInsert',
+            name="PageInsert",
         ),
     ]

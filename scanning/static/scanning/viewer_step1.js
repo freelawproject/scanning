@@ -18,25 +18,10 @@ document.addEventListener('DOMContentLoaded', function () {
     const SCALE = 1.5;
     const PLACEHOLDER_HEIGHT = 1056; // 792 * 1.5 (letter height at scale)
 
-    // What a curator may type as a page number: one printed number, or
-    // the range one physical page carries when the book prints several
-    // pages on it (issue #233). The server takes the same two shapes
-    // and stores a range with a hyphen, whatever dash was typed, so the
-    // dashes here are the ones a reporter prints and a person pastes.
-    const PAGE_ENTRY_RE = /^(\d{1,4})(?:\s*[-–—]\s*(\d{1,4}))?$/;
-
     // The label the page render gives a range, so a saved entry reads
-    // the same before and after a reload.
+    // the same before and after a reload. What a curator may type is
+    // `isPageNumberEntry` in shared.js, which step 2 reads too (#319).
     const RANGE_TAG = 'Range ';
-
-    function isPageNumberEntry(text) {
-        var parts = PAGE_ENTRY_RE.exec(text);
-        if (!parts) return false;
-        var first = parseInt(parts[1], 10);
-        if (first < 1) return false;
-        if (parts[2] === undefined) return true;
-        return first < parseInt(parts[2], 10);
-    }
 
     let pdfDoc = null;
     let defaultPageWidth = 918; // 612 * 1.5
@@ -55,7 +40,10 @@ document.addEventListener('DOMContentLoaded', function () {
         container.innerHTML = '';
         createAllPlaceholders();
         setupLazyLoading();
+        goToRequestedPage();
     }
+
+    if (window.ocrTextInit) ocrTextInit();
 
     // Swap the viewer to the original scan (issue #185). Stops the
     // preview polling first: the user chose the original, so a bitonal
@@ -211,6 +199,9 @@ document.addEventListener('DOMContentLoaded', function () {
         }
         pageDiv.style.width = '';
         pageDiv.style.height = '';
+        // The overlay boxes hold the scale of the render they were
+        // drawn for (#262).
+        if (window.ocrTextClear) ocrTextClear(pageDiv);
     }
 
     function rerenderForCurrentZoom() {
@@ -288,6 +279,10 @@ document.addEventListener('DOMContentLoaded', function () {
             pageDiv.dataset.pdfWidth = origViewport.width;
             pageDiv.dataset.pdfHeight = origViewport.height;
             applyZoomToPage(pageDiv);
+            // The text overlay (#262). Here and not in the observer:
+            // a page is rendered only near the viewport, so this is
+            // the viewport rule, and the zoom re-render follows it.
+            if (window.ocrTextPaint) ocrTextPaint(pageDiv, pdfIndex);
         });
     }
 
@@ -303,29 +298,64 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 
+    // The page edits are locked once review 1 is approved (#224), the
+    // rule step 2 already follows: offer no control the endpoint
+    // refuses. The repair requests are not page edits and stay.
+    var pageEditsLocked = typeof SCAN_CONFIG !== 'undefined'
+        && SCAN_CONFIG.pageEditsLocked === true;
+    var lockedTitle = 'The page review of this volume is approved, so its ' +
+        'pages are fixed. A staff member can reopen the review.';
+
     // --- Missing / Inserted pages (rendered immediately, they're lightweight) ---
+    // One placeholder stands for one gap. A range missing at the end of
+    // the volume is one gap too (#256), so that placeholder carries the
+    // range as its label and says the plural: the upload takes a PDF of
+    // the whole range, and the button asks a scanner for all of it.
     function renderMissingPage(entry) {
         var pageDiv = document.createElement('div');
         pageDiv.className = 'page-container missing-page';
         pageDiv.id = 'page-' + entry.logical_number;
         pageDiv.style.width = defaultPageWidth + 'px';
         var missingLabel = escapeHtml(entry.logical_number);
+        var range = entry.missing_range;
+        // The stored label carries the hyphen every reader of a range
+        // parses (#233); the heading shows the dash a book prints.
+        var heading = range
+            ? 'Pages ' + escapeHtml(range[0] + '\u2013' + range[1])
+            : 'Page ' + missingLabel;
         pageDiv.innerHTML =
-            '<div class="page-label">Page ' + missingLabel + ' &mdash; MISSING</div>' +
+            '<div class="page-label">' + heading + ' &mdash; MISSING</div>' +
             '<div class="missing-placeholder">' +
-            '  <p>This page was not found in the document.</p>' +
-            '  <p>Upload an image or a PDF to fill this gap:</p>' +
-            '  <form class="insert-form" enctype="multipart/form-data">' +
-            '    <input type="hidden" name="page_number" value="' + missingLabel + '">' +
-            '    <label class="upload-btn">' +
-            '      Choose a file' +
-            '      <input type="file" name="image" accept="image/*,application/pdf" style="display:none">' +
-            '    </label>' +
-            '  </form>' +
+            '  <p>' + (range
+                ? 'These pages were not found in the document.'
+                : 'This page was not found in the document.') + '</p>' +
+            (pageEditsLocked
+                ? '  <p title="' + lockedTitle + '">The page review is approved, so no page can be added here.</p>'
+                : '  <p>' + (range
+                    ? 'Upload a PDF of the missing pages, or an image of one:'
+                    : 'Upload an image or a PDF to fill this gap:') + '</p>' +
+                  '  <form class="insert-form" enctype="multipart/form-data">' +
+                  '    <input type="hidden" name="page_number" value="' + missingLabel + '">' +
+                  '    <label class="upload-btn">' +
+                  '      Choose a file' +
+                  '      <input type="file" name="image" accept="image/*,application/pdf" style="display:none">' +
+                  '    </label>' +
+                  '  </form>') +
+            '  <button class="repair-btn" data-action="insert" ' +
+            'data-anchor-pdf-page="' + entry.anchor_pdf_page + '" ' +
+            'data-logical-page="' + missingLabel + '" ' +
+            (range ? 'data-repair-what="scan the missing pages" ' : '') +
+            'title="Ask a scanner with the book to scan ' +
+            (range ? 'these pages">Ask for these pages' : 'this page">Ask for this page') +
+            '</button>' +
             '</div>';
         container.appendChild(pageDiv);
+        pageDiv.dataset.anchorPdfPage = entry.anchor_pdf_page;
+        if (range) { pageDiv.dataset.missingRange = '1'; }
+        drawRepairNote(pageDiv, findRepair('insert', entry.anchor_pdf_page));
 
         var fileInput = pageDiv.querySelector('input[type="file"]');
+        if (!fileInput) { return; }
         fileInput.addEventListener('change', function () {
             if (fileInput.files.length > 0) {
                 // The anchor is the physical position the server
@@ -395,7 +425,7 @@ document.addEventListener('DOMContentLoaded', function () {
         var label = unplaced
             ? 'Page ' + printed + ' &mdash; UPLOADED, BUT THIS VOLUME HAS NO PLACE FOR IT'
             : 'Page ' + printed + ' &mdash; INSERTED';
-        var button = editId
+        var button = editId && !pageEditsLocked
             ? ' <button class="remove-insert-btn" style="cursor:pointer;' +
               'background:#dc2626;color:white;border:none;border-radius:3px;' +
               'padding:1px 6px;font-size:10px;margin-left:4px">Remove</button>'
@@ -426,7 +456,10 @@ document.addEventListener('DOMContentLoaded', function () {
             })
             .then(function (r) { return r.json(); })
             .then(function (data) {
-                if (data.status !== 'ok') { return; }
+                if (data.status !== 'ok') {
+                    showToast(data.error || 'Could not remove this page.');
+                    return;
+                }
                 if (typeof window.refreshProcessActionBar === 'function') {
                     window.refreshProcessActionBar();
                 }
@@ -448,16 +481,22 @@ document.addEventListener('DOMContentLoaded', function () {
         var ocr = ocrByPage[String(pdfPage)];
         var ocrLabel = '';
         if (ocr) {
+            var editable = pageEditsLocked ? '' : ' editable-page';
             if (ocr.detected) {
                 var tag = ocr.type === 'range' ? RANGE_TAG : '#';
-                ocrLabel = '<span class="ocr-tag editable-page" data-pdf-page="' + pdfPage + '" ' +
-                    'title="Click to correct page number">' + tag + ocr.detected +
+                ocrLabel = '<span class="ocr-tag' + editable + '" data-pdf-page="' + pdfPage + '" ' +
+                    'title="' + (pageEditsLocked ? lockedTitle : 'Click to correct page number') + '">' + tag + escapeHtml(ocr.detected) +
                     ' <small>(' + ocr.zone + ' ' + (ocr.score ? ocr.score.toFixed(2) : '') + ')</small></span>';
             } else {
-                ocrLabel = '<span class="ocr-tag miss editable-page" data-pdf-page="' + pdfPage + '" ' +
-                    'title="Click to assign a page number">[no page # found — click to assign]</span>';
+                ocrLabel = '<span class="ocr-tag miss' + editable + '" data-pdf-page="' + pdfPage + '" ' +
+                    'title="' + (pageEditsLocked ? lockedTitle : 'Click to assign a page number') + '">' +
+                    (pageEditsLocked ? '[no page # found]' : '[no page # found — click to assign]') + '</span>';
             }
         }
+        var editTools = pageEditsLocked ? '' :
+            '    <button class="replace-btn" data-pdf-page="' + pdfPage + '" ' +
+            'title="Upload an image or a PDF that stands in for this page">Replace</button>' +
+            '    <button class="delete-btn" title="Delete this page">Delete</button>';
 
         div.innerHTML =
             '<div class="page-label">' +
@@ -466,9 +505,9 @@ document.addEventListener('DOMContentLoaded', function () {
             // Redact/whiteout buttons are only functional in step 2 (process_viewer.js)
             // '    <button class="redact-btn" data-fill="black" title="Draw a black redaction">Redact</button>' +
             // '    <button class="whiteout-btn" data-fill="white" title="Draw a white redaction">Whiteout</button>' +
-            '    <button class="replace-btn" data-pdf-page="' + pdfPage + '" ' +
-            'title="Upload an image or a PDF that stands in for this page">Replace</button>' +
-            '    <button class="delete-btn" title="Delete this page">Delete</button>' +
+            editTools +
+            '    <button class="repair-btn" data-action="replace" data-pdf-page="' + pdfPage + '" ' +
+            'title="Ask a scanner with the book to scan this page again">Ask for a rescan</button>' +
             '    <input type="file" class="replace-input" accept="image/*,application/pdf" hidden>' +
             '  </span>' +
             '</div>' +
@@ -497,17 +536,13 @@ document.addEventListener('DOMContentLoaded', function () {
                 var current = ocr && ocr.detected ? ocr.detected : '';
                 var num = prompt(
                     'Page number for PDF page ' + pdfPage +
-                    ' (a range like 913-925 if this page carries several ' +
-                    'book pages; leave blank if it has no number):',
+                    PAGE_NUMBER_PROMPT,
                     current
                 );
                 if (num === null) return; // cancelled
                 var trimmed = num.trim();
                 if (trimmed && !isPageNumberEntry(trimmed)) {
-                    alert(
-                        'Page number must be a positive whole number, a ' +
-                        'range like 913-925, or blank for none.'
-                    );
+                    alert(PAGE_NUMBER_ERROR);
                     return;
                 }
                 fetch('/scans/' + documentId + '/assign-page/', {
@@ -531,9 +566,8 @@ document.addEventListener('DOMContentLoaded', function () {
                     }
                     ocr.detected = res.data.detected;
                     if (res.data.detected) {
-                        // The server normalizes a range to one hyphen.
-                        ocr.type = res.data.detected.indexOf('-') === -1
-                            ? 'single' : 'range';
+                        // The server names the shape it stored (#319).
+                        ocr.type = res.data.type;
                         var tag = ocr.type === 'range' ? RANGE_TAG : '#';
                         editBtn.className = 'ocr-tag editable-page';
                         editBtn.innerHTML = tag + escapeHtml(res.data.detected) + ' <small>(manual)</small>';
@@ -565,9 +599,11 @@ document.addEventListener('DOMContentLoaded', function () {
         }
 
         var deleteBtn = div.querySelector('.delete-btn');
-        deleteBtn.addEventListener('click', function () {
-            deletePageAndResolve(pdfPage, div);
-        });
+        if (deleteBtn) {
+            deleteBtn.addEventListener('click', function () {
+                deletePageAndResolve(pdfPage, div);
+            });
+        }
 
         // A page a curator already replaced carries its note before the
         // deletion mark is drawn: markPageAsDeleted saves the label it
@@ -576,6 +612,7 @@ document.addEventListener('DOMContentLoaded', function () {
         if (replaced) {
             markPageAsReplaced(div, pdfPage, replaced);
         }
+        drawRepairNote(div, findRepair('replace', pdfPage));
 
         // If page is already marked for deletion, show the deleted state
         if (typeof deletedPages !== 'undefined' && deletedPages.indexOf(pdfPage) !== -1) {
@@ -673,11 +710,13 @@ document.addEventListener('DOMContentLoaded', function () {
         if (old) { old.remove(); }
         var note = document.createElement('span');
         note.className = 'replaced-note';
+        // No Undo on a locked volume (#224): the endpoint refuses it.
         note.innerHTML =
             'This page has been replaced. ' +
             '<a href="' + escapeHtml(replaced.url) + '" target="_blank" rel="noopener">View</a>' +
+            (pageEditsLocked ? '' :
             ' <button class="undo-replace-btn" data-pdf-page="' + pdfPage + '" ' +
-            'title="Take this replacement back">Undo</button>';
+            'title="Take this replacement back">Undo</button>');
         label.appendChild(note);
         refreshSavedLabel(label);
     }
@@ -741,6 +780,242 @@ document.addEventListener('DOMContentLoaded', function () {
             holder.appendChild(badge);
         } else if (!on && badge) {
             badge.remove();
+        }
+    }
+
+    // --- Ask a scanner for a page (issue #249) ---
+    // A reviewer with no book cannot replace a blurry page or fill a
+    // gap. The request is a row a scanner finds on the Repairs page and
+    // on this page. It is fulfilled by the upload at the same address
+    // (the server derives that), and dismissed by any user, never
+    // deleted. The rows live in repairRequests, and every drawing reads
+    // that one list: the note on the page, the sidebar badge, the
+    // sidebar section and the header badge.
+    var repairRequests = (SCAN_CONFIG.repairRequests || []).slice();
+
+    function findRepair(action, address) {
+        for (var i = 0; i < repairRequests.length; i++) {
+            var r = repairRequests[i];
+            if (r.action !== action) { continue; }
+            var at = action === 'insert' ? r.anchor_pdf_page : r.pdf_page;
+            if (String(at) === String(address)) { return r; }
+        }
+        return null;
+    }
+
+    function replaceRepair(row) {
+        repairRequests = repairRequests.filter(function (r) { return r.id !== row.id; });
+        repairRequests.push(row);
+    }
+
+    function dropRepair(id) {
+        repairRequests = repairRequests.filter(function (r) { return r.id !== id; });
+    }
+
+    // The buttons and the Dismiss are bound on the container, like the
+    // Replace button: markPageAsDeleted writes over the whole label.
+    container.addEventListener('click', function (e) {
+        var askBtn = e.target.closest('.repair-btn');
+        if (askBtn) {
+            e.preventDefault();
+            askForRepair(askBtn, askBtn.closest('.page-container'));
+            return;
+        }
+        var dismissBtn = e.target.closest('.dismiss-repair-btn');
+        if (dismissBtn) {
+            e.stopPropagation();
+            dismissRepair(parseInt(dismissBtn.dataset.requestId, 10),
+                          dismissBtn.closest('.page-container'));
+        }
+    });
+
+    function askForRepair(btn, pageDiv) {
+        var action = btn.dataset.action;
+        var what = btn.dataset.repairWhat ||
+            (action === 'insert' ? 'scan this missing page' : 'scan this page again');
+        var note = prompt('Ask a scanner to ' + what + '.\nWhat did you see? (optional)', '');
+        if (note === null) { return; }
+        var body = { action: action, note: note.trim() };
+        if (action === 'insert') {
+            body.anchor_pdf_page = parseInt(btn.dataset.anchorPdfPage, 10);
+            body.logical_page = btn.dataset.logicalPage || '';
+        } else {
+            // The server reads the printed number off its own copy of
+            // the OCR results; a label sent from here would be ignored.
+            body.pdf_page = parseInt(btn.dataset.pdfPage, 10);
+        }
+        fetch('/scans/' + documentId + '/repair/request/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+            body: JSON.stringify(body),
+        })
+        .then(function (r) {
+            return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+        })
+        .then(function (res) {
+            if (!res.ok || res.data.status !== 'ok') {
+                showToast((res.data && res.data.error) || 'Could not save the request.');
+                return;
+            }
+            replaceRepair(res.data.request);
+            drawRepairNote(pageDiv, res.data.request);
+            renderRepairsSection();
+            if (res.data.already_fulfilled) {
+                // The open row is answered, and the key matched it. Say
+                // the way out; a "saved" toast here would lose the ask.
+                showToast(res.data.message);
+                return;
+            }
+            showToast(res.data.created
+                ? 'Saved. A scanner sees this on the Repairs page.'
+                : 'This page was already requested.', 'success');
+        })
+        .catch(function () {
+            showToast('Could not save the request. Try again.');
+        });
+    }
+
+    function dismissRepair(requestId, pageDiv) {
+        if (!confirm('Dismiss this request? The row is kept, and the page is not scanned again.')) { return; }
+        fetch('/scans/' + documentId + '/repair/dismiss/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+            body: JSON.stringify({ request_id: requestId }),
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (data.status !== 'ok') {
+                showToast(data.error || 'Could not dismiss the request.');
+                return;
+            }
+            dropRepair(requestId);
+            drawRepairNote(pageDiv, null);
+            renderRepairsSection();
+            showToast('Dismissed.', 'success');
+        })
+        .catch(function () {
+            showToast('Could not dismiss the request. Try again.');
+        });
+    }
+
+    // The note on the page. On a PDF page it goes on the label, like
+    // the replaced note; on a missing placeholder it goes above the
+    // upload form. A null row removes the note.
+    function drawRepairNote(pageDiv, row) {
+        if (!pageDiv) { return; }
+        var label = pageDiv.querySelector('.page-label');
+        var host = pageDiv.classList.contains('missing-page')
+            ? pageDiv.querySelector('.missing-placeholder') : label;
+        if (!host) { return; }
+        var old = host.querySelector('.repair-note');
+        if (old) { old.remove(); }
+        var askBtn = pageDiv.querySelector('.repair-btn');
+        if (askBtn) { askBtn.hidden = !!row; }
+        if (row) {
+            var note = document.createElement('span');
+            note.className = 'repair-note' + (row.fulfilled ? ' fulfilled' : '');
+            var pages = pageDiv.dataset.missingRange ? 'these pages' : 'this page';
+            var text = row.fulfilled
+                ? 'A scanner was asked for ' + pages + ', and a new scan is saved. '
+                : (row.action === 'insert' ? 'A scanner was asked for ' + pages + '. '
+                                           : 'A scanner was asked to scan this page again. ');
+            // A fulfilled request keeps its Dismiss: the row is still
+            // open and holds the address, so a reviewer who finds the
+            // new scan bad too dismisses it and asks again.
+            var dismissTitle = row.fulfilled
+                ? 'Close this answered request. Then you can ask again.'
+                : 'The page is fine, or the request no longer applies';
+            note.innerHTML =
+                escapeHtml(text) +
+                '<span class="repair-note-text">' +
+                (row.note ? escapeHtml(row.note) + ' ' : '') +
+                '(' + escapeHtml(row.requested_by) + ', ' + escapeHtml(row.date_created) + ')' +
+                (row.stale ? ', made on an earlier upload of this scan' : '') +
+                '</span>' +
+                (row.fulfilled ? ' Still bad? Dismiss this request and ask again.' : '') +
+                ' <button class="dismiss-repair-btn" data-request-id="' + row.id + '" ' +
+                'title="' + dismissTitle + '">Dismiss</button>';
+            if (host === label) { label.appendChild(note); }
+            else { host.insertBefore(note, host.firstChild); }
+        }
+        if (host === label) { refreshSavedLabel(label); }
+        if (row && row.action === 'replace') { markSidebarNeed(row.pdf_page, !row.fulfilled); }
+        if (!row && pageDiv.dataset.pdfIndex !== undefined) {
+            markSidebarNeed(parseInt(pageDiv.dataset.pdfIndex, 10) + 1, false);
+        }
+    }
+
+    function markSidebarNeed(pdfPage, on) {
+        var sidebarRow = document.querySelector(
+            '#pages-list [data-pdf-index="' + (pdfPage - 1) + '"]'
+        );
+        if (!sidebarRow) { return; }
+        var badge = sidebarRow.querySelector('.page-need-badge');
+        if (on && !badge) {
+            badge = document.createElement('span');
+            badge.className =
+                'page-need-badge text-[9px] font-bold text-orange-600 ' +
+                'dark:text-orange-400 ml-1';
+            badge.title = 'A reviewer asked a scanner to scan this page again';
+            badge.textContent = 'NEED';
+            var holder = sidebarRow.querySelector('span') || sidebarRow;
+            holder.appendChild(badge);
+        } else if (!on && badge) {
+            badge.remove();
+        }
+    }
+
+    // The sidebar section and the header badge, redrawn whole from the
+    // list, so they cannot disagree with the notes on the pages. The
+    // action bar is refreshed with them (#266): a waiting request
+    // takes the approve button away, and the last dismissal gives it
+    // back, so a bar left as it was would offer a button the view
+    // refuses, or hide the one it accepts.
+    function renderRepairsSection() {
+        var waiting = repairRequests.filter(function (r) { return !r.fulfilled; });
+        var section = document.getElementById('repairs-section');
+        var list = document.getElementById('repairs-list');
+        var badge = document.getElementById('repairs-badge');
+        document.querySelectorAll('.repairs-count').forEach(function (el) {
+            el.textContent = waiting.length;
+        });
+        if (badge) { badge.hidden = waiting.length === 0; }
+        if (!section || !list) { return; }
+        section.hidden = waiting.length === 0;
+        list.innerHTML = waiting.map(function (r) {
+            var where = r.action === 'insert'
+                ? 'after PDF p.' + r.anchor_pdf_page : 'PDF p.' + r.pdf_page;
+            return '<div class="repair-card rounded border border-orange-300 bg-orange-50 ' +
+                'hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/20 ' +
+                'dark:hover:bg-orange-900/40 px-2 py-1.5 mb-1 cursor-pointer text-xs" ' +
+                'data-request-id="' + r.id + '" data-pdf-index="' + r.nav_pdf_index + '" ' +
+                'onclick="goToPage(this)">' +
+                '<div class="flex items-center gap-1.5">' +
+                '<span class="font-bold uppercase text-[10px]">' + escapeHtml(r.action_label) + '</span>' +
+                '<span class="text-gray-500 dark:text-gray-400">' + escapeHtml(where) +
+                (r.logical_page ? ' (#' + escapeHtml(r.logical_page) + ')' : '') + '</span>' +
+                (r.stale ? '<span class="text-[9px] font-bold text-gray-500">EARLIER UPLOAD</span>' : '') +
+                '</div>' +
+                (r.note ? '<p class="mt-0.5 text-gray-700 dark:text-gray-300">' + escapeHtml(r.note) + '</p>' : '') +
+                '<p class="mt-0.5 text-[10px] text-gray-500 dark:text-gray-400">' +
+                escapeHtml(r.requested_by) + ', ' + escapeHtml(r.date_created) + '</p>' +
+                '</div>';
+        }).join('');
+        if (typeof window.refreshProcessActionBar === 'function') {
+            window.refreshProcessActionBar();
+        }
+    }
+
+    // The Repairs page links to one page of step 1 (?goto=<pdf_index>).
+    // The placeholders exist as soon as the document is shown, so the
+    // scroll works before the page itself is rendered.
+    function goToRequestedPage() {
+        var params = new URLSearchParams(window.location.search);
+        var index = params.get('goto');
+        if (index === null || !/^\d+$/.test(index)) { return; }
+        var el = container.querySelector('.lazy-page[data-pdf-index="' + index + '"]');
+        if (el && typeof goToPage === 'function') {
+            setTimeout(function () { goToPage(el); }, 150);
         }
     }
 
@@ -1167,6 +1442,10 @@ document.addEventListener('DOMContentLoaded', function () {
             return;
         }
 
+        // Each answer is read (#224): a locked volume refuses with 409
+        // and writes no row, and a page must be marked only when the
+        // server marked it. The old blind ``then`` told the curator a
+        // duplicate was handled that the corrected volume kept.
         var promises = toDelete.map(function (pdfPage) {
             return fetch('/scans/' + documentId + '/delete-page/', {
                 method: 'POST',
@@ -1175,22 +1454,35 @@ document.addEventListener('DOMContentLoaded', function () {
                     'X-CSRFToken': csrfToken,
                 },
                 body: JSON.stringify({ pdf_page: pdfPage }),
-            }).then(function (r) { return r.json(); });
+            }).then(function (r) {
+                return r.json().then(function (data) {
+                    return { pdfPage: pdfPage, ok: r.ok && data.status === 'ok', error: data.error };
+                });
+            }).catch(function () {
+                return { pdfPage: pdfPage, ok: false, error: 'Could not reach the server.' };
+            });
         });
 
-        Promise.all(promises).then(function () {
-            toDelete.forEach(function (pdfPage) {
+        Promise.all(promises).then(function (results) {
+            var refused = results.filter(function (res) { return !res.ok; });
+            results.filter(function (res) { return res.ok; }).forEach(function (res) {
                 var containers = document.querySelectorAll('.page-container');
                 containers.forEach(function (c) {
                     var label = c.querySelector('.page-label');
-                    if (label && label.textContent.indexOf('PDF p.' + pdfPage) !== -1) {
+                    if (label && label.textContent.indexOf('PDF p.' + res.pdfPage) !== -1) {
                         c.style.opacity = '0.3';
                         c.style.pointerEvents = 'none';
-                        label.innerHTML = '<span>PDF p.' + pdfPage + ' &mdash; MARKED FOR DELETION</span>';
+                        label.innerHTML = '<span>PDF p.' + res.pdfPage + ' &mdash; MARKED FOR DELETION</span>';
                     }
                 });
             });
-
+            if (refused.length) {
+                showToast(refused[0].error || 'Could not mark ' + refused.length + ' page(s) for deletion.');
+                return;
+            }
+            if (typeof window.onPageEditSaved === 'function') {
+                window.onPageEditSaved();
+            }
             btn.textContent = 'Deleted';
             btn.disabled = true;
             btn.closest('.issue-card').style.opacity = '0.5';

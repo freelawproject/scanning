@@ -12,19 +12,21 @@ from scanning.views import (
     opinion_detail,
     opinion_list,
     opinion_upload,
-    page_detail,
     password_change,
     presign_scan_upload,
     profile,
     queue_detail_view,
     queue_upload,
     queue_view,
+    repair_queue,
     scan_detail,
     scan_list,
-    scan_pages_list,
+    stats_view,
     update_scan_status,
 )
 from scanning.views_api import (
+    add_boundary,
+    add_redaction,
     add_single_detection,
     apply_rect_to_opinion,
     approve_detection,
@@ -32,40 +34,52 @@ from scanning.views_api import (
     bake_redactions,
     compute_redactions_api,
     delete_detection,
+    dismiss_boundary,
+    dismiss_finding,
+    dismiss_redaction,
     export_pdf,
-    flag_issue,
     generate_files,
-    pair_opinions_api,
-    remove_flag,
-    save_margin_rect,
-    save_redaction_rect,
+    move_redaction,
+    rebuild_findings,
+    restore_boundary,
+    restore_finding,
+    restore_redaction,
+    review_findings,
     serve_detections,
-    serve_margin_rects,
     serve_ocr_results,
     serve_opinions,
     serve_opinionscan_pdf,
-    serve_page_pdf,
     serve_redacted_pdf,
-    serve_redaction_rects,
+    serve_redactions,
     update_detection,
+    withdraw_stale_edit,
 )
 from scanning.views_process import (
     add_page_insert,
+    apply_output_index,
     approve_page_completeness,
+    approve_redaction_review,
     assign_page,
     delete_page,
     dismiss_issue,
+    dismiss_page_repair,
     glued_output_index,
     page_edit_file,
     process_actions,
     progress_api,
     recalculate,
     remove_page_insert,
+    reopen_page_review,
     replace_page,
     reprocess,
+    request_page_repair,
     rotate_page,
+    scan_ocr_text_url,
     scan_original_url,
     scan_process_view,
+    serve_apply_output,
+    serve_apply_shard,
+    serve_final_pdf,
     serve_glued_shard,
     serve_glued_volume,
     serve_original_crop,
@@ -75,7 +89,6 @@ from scanning.views_process import (
     start_dots_mocr,
     start_mistral_ocr,
     start_validate,
-    start_yolo_detect,
     undo_delete_page,
     undo_replace_page,
 )
@@ -86,14 +99,14 @@ urlpatterns = [
     path("logout/", logout_view, name="logout"),
     path("", scan_list, name="scan_list"),
     path("scans/<int:pk>/", scan_detail, name="scan_detail"),
-    path("scans/<int:pk>/pages/", scan_pages_list, name="scan_pages_list"),
-    path("pages/<int:pk>/", page_detail, name="page_detail"),
     path("opinions/", opinion_list, name="opinion_list"),
     path("opinions/upload/", opinion_upload, name="opinion_upload"),
     path("opinions/<int:pk>/", opinion_detail, name="opinion_detail"),
     path("profile/", profile, name="profile"),
     path("profile/password/", password_change, name="password_change"),
     path("queue/", queue_view, name="queue"),
+    path("repairs/", repair_queue, name="repair_queue"),
+    path("stats/", stats_view, name="stats"),
     path(
         "queue/<str:reporter_slug>/<int:vol>/",
         queue_detail_view,
@@ -129,10 +142,21 @@ urlpatterns = [
     path("scans/<int:pk>/actions/", process_actions, name="process_actions"),
     path("scans/<int:pk>/progress/", progress_api, name="progress_api"),
     path("scans/<int:pk>/pdf/", serve_scan_pdf, name="serve_scan_pdf"),
+    # The bitonal copy of the corrected volume (#269): what step 2 shows
+    # once the redactions are measured against the standing apply run.
+    path("scans/<int:pk>/pdf/final/", serve_final_pdf, name="serve_final_pdf"),
     path(
         "scans/<int:pk>/original-url/",
         scan_original_url,
         name="scan_original_url",
+    ),
+    # The URL of the document the text overlay reads (#262). JSON, not
+    # a redirect: the viewer reads it with ``fetch``, as pdf.js reads
+    # the URL of ``scan_original_url``.
+    path(
+        "scans/<int:pk>/ocr-text-url/",
+        scan_ocr_text_url,
+        name="scan_ocr_text_url",
     ),
     path(
         "scans/<int:pk>/original/",
@@ -143,6 +167,24 @@ urlpatterns = [
         "scans/<int:pk>/original-crop/",
         serve_original_crop,
         name="serve_original_crop",
+    ),
+    # The outputs of the page edit apply (#224), by run (#269). Before
+    # the generic ``glued/<output>/`` route, so ``apply`` is not read as
+    # a slug of that table.
+    path(
+        "scans/<int:pk>/glued/apply/",
+        apply_output_index,
+        name="apply_output_index",
+    ),
+    path(
+        "scans/<int:pk>/glued/apply/a<int:number>/shards/<int:row_pk>/",
+        serve_apply_shard,
+        name="serve_apply_shard",
+    ),
+    path(
+        "scans/<int:pk>/glued/apply/a<int:number>/<str:output>/",
+        serve_apply_output,
+        name="serve_apply_output",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.
@@ -171,11 +213,6 @@ urlpatterns = [
         name="start_dots_mocr",
     ),
     path(
-        "scans/<int:pk>/start-yolo/",
-        start_yolo_detect,
-        name="start_yolo_detect",
-    ),
-    path(
         "scans/<int:pk>/start-mistral/",
         start_mistral_ocr,
         name="start_mistral_ocr",
@@ -185,6 +222,16 @@ urlpatterns = [
         "scans/<int:pk>/approve-pages/",
         approve_page_completeness,
         name="approve_page_completeness",
+    ),
+    path(
+        "scans/<int:pk>/approve-redactions/",
+        approve_redaction_review,
+        name="approve_redaction_review",
+    ),
+    path(
+        "scans/<int:pk>/reopen-pages/",
+        reopen_page_review,
+        name="reopen_page_review",
     ),
     path("scans/<int:pk>/reprocess/", reprocess, name="reprocess"),
     path("scans/<int:pk>/assign-page/", assign_page, name="assign_page"),
@@ -213,6 +260,18 @@ urlpatterns = [
     ),
     path("scans/<int:pk>/rotate-page/", rotate_page, name="rotate_page"),
     path("scans/<int:pk>/dismiss-issue/", dismiss_issue, name="dismiss_issue"),
+    # The repair requests of a reviewer with no book (#249): ask, and
+    # dismiss.
+    path(
+        "scans/<int:pk>/repair/request/",
+        request_page_repair,
+        name="request_page_repair",
+    ),
+    path(
+        "scans/<int:pk>/repair/dismiss/",
+        dismiss_page_repair,
+        name="dismiss_page_repair",
+    ),
     # views_api.py
     path(
         "scans/<int:pk>/detections/", serve_detections, name="serve_detections"
@@ -220,30 +279,72 @@ urlpatterns = [
     path(
         "scans/<int:pk>/opinions-json/", serve_opinions, name="serve_opinions"
     ),
+    # The curator's decisions about the opinion boundaries (#240 PR C).
     path(
-        "scans/<int:pk>/margin-rects/",
-        serve_margin_rects,
-        name="serve_margin_rects",
+        "scans/<int:pk>/boundaries/dismiss/",
+        dismiss_boundary,
+        name="dismiss_boundary",
     ),
     path(
-        "scans/<int:pk>/redaction-rects/",
-        serve_redaction_rects,
-        name="serve_redaction_rects",
+        "scans/<int:pk>/boundaries/restore/",
+        restore_boundary,
+        name="restore_boundary",
     ),
     path(
-        "scans/<int:pk>/save-redaction-rect/",
-        save_redaction_rect,
-        name="save_redaction_rect",
+        "scans/<int:pk>/boundaries/add/",
+        add_boundary,
+        name="add_boundary",
+    ),
+    # The findings of review 2 and the curator's dismissals (#240 PR D).
+    path(
+        "scans/<int:pk>/findings/",
+        review_findings,
+        name="review_findings",
     ),
     path(
-        "scans/<int:pk>/save-margin-rect/",
-        save_margin_rect,
-        name="save_margin_rect",
+        "scans/<int:pk>/findings/rebuild/",
+        rebuild_findings,
+        name="rebuild_findings",
     ),
     path(
-        "scans/<int:pk>/pair-opinions/",
-        pair_opinions_api,
-        name="pair_opinions_api",
+        "scans/<int:pk>/findings/dismiss/",
+        dismiss_finding,
+        name="dismiss_finding",
+    ),
+    path(
+        "scans/<int:pk>/findings/restore/",
+        restore_finding,
+        name="restore_finding",
+    ),
+    path(
+        "scans/<int:pk>/findings/withdraw/",
+        withdraw_stale_edit,
+        name="withdraw_stale_edit",
+    ),
+    path(
+        "scans/<int:pk>/redactions/",
+        serve_redactions,
+        name="serve_redactions",
+    ),
+    path(
+        "scans/<int:pk>/redactions/add/",
+        add_redaction,
+        name="add_redaction",
+    ),
+    path(
+        "scans/<int:pk>/redactions/<int:redaction_id>/move/",
+        move_redaction,
+        name="move_redaction",
+    ),
+    path(
+        "scans/<int:pk>/redactions/<int:redaction_id>/dismiss/",
+        dismiss_redaction,
+        name="dismiss_redaction",
+    ),
+    path(
+        "scans/<int:pk>/redactions/<int:redaction_id>/restore/",
+        restore_redaction,
+        name="restore_redaction",
     ),
     path(
         "scans/<int:pk>/compute-redactions/",
@@ -265,11 +366,6 @@ urlpatterns = [
         name="serve_opinionscan_pdf",
     ),
     path(
-        "pages/<int:pk>/pdf/",
-        serve_page_pdf,
-        name="serve_page_pdf",
-    ),
-    path(
         "scans/<int:pk>/opinion-edit/<int:opinion_pk>/apply-rect/",
         apply_rect_to_opinion,
         name="apply_rect_to_opinion",
@@ -278,12 +374,6 @@ urlpatterns = [
         "scans/<int:pk>/ocr-results/",
         serve_ocr_results,
         name="serve_ocr_results",
-    ),
-    path("scans/<int:pk>/flag/", flag_issue, name="flag_issue"),
-    path(
-        "scans/<int:pk>/flag/<int:flag_id>/delete/",
-        remove_flag,
-        name="remove_flag",
     ),
     path(
         "scans/<int:pk>/add-single-detection/",

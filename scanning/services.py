@@ -21,9 +21,6 @@ import fitz
 from blackletter.api import (
     build_redactions as bl_build_redactions,
 )
-from blackletter.api import (
-    pair as bl_pair,
-)
 from blackletter.bl_warm import rows_are_bl_warm
 from blackletter.margins import compute_margin_rects
 from blackletter.models import (
@@ -37,7 +34,7 @@ from blackletter.models import (
 from blackletter.models import (
     Document as BLDoc,
 )
-from blackletter.process import compute_redaction_rects, page_body_covered
+from blackletter.process import compute_redaction_rects
 from blackletter.scanner import (
     _pair_opinions,
     snap_document_columns,
@@ -51,9 +48,13 @@ from blackletter.validate import (
 from django.conf import settings
 from django.db.models import Case, F, Value, When
 
+from scanning import boundaries
 from scanning.models import (
     BUSY_STATUSES,
     DEAD_JOB_STATUSES,
+    REVIEW2_CHECKS,
+    REVIEW_STATUSES,
+    ApplyRun,
     CheckName,
     Detection,
     ExternalJob,
@@ -483,8 +484,9 @@ def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
     Thin wrapper over :func:`blackletter.scanner.snap_text_columns_to_ink`,
     which does the measuring. What is app-specific is the persistence: the
     corrected boxes are written back to the ``Detection`` rows, so the
-    viewer overlay and ``detections.json`` show what the geometry actually
-    used, and no later step has to re-measure the ink to agree with it.
+    viewer overlay and the detection entries show what the geometry
+    actually used, and no later step has to re-measure the ink to agree
+    with it.
 
     Only the x-bounds move, so header and footer geometry is untouched.
 
@@ -549,31 +551,93 @@ def _snap_text_columns_to_ink(scan_pk: int, pdf_path: str) -> int:
 _PAGE_RANGE_RE = re.compile(r"^(\d{1,4})\s*[–\-]\s*(\d{1,4})$")
 
 
-def _page_number_lookup(scan: "Scan") -> dict:
-    """Build {page_index: (page_number, page_number_end)} from ocr_results.
+def printed_page_span(value, kind) -> tuple[int, int | None] | None:
+    """Parse one stored printed number into ``(start, end)``.
 
-    For range pages like "677-685", returns (677, 685).
-    For single pages like "677", returns (677, None).
+    A range page like ``"677-685"`` gives ``(677, 685)``; a single page
+    like ``"677"`` gives ``(677, None)``; a blank or unparsable value
+    gives ``None``. One parser for the two readers of a stored number:
+    :func:`_page_number_lookup` over ``Scan.ocr_results`` (the
+    original's space) and ``apply.page_number_lookup`` over a run's
+    printed-page map (the final space, #269).
 
-    :param scan: The Scan instance whose ocr_results to parse.
-    :return: Mapping of page index to (start, end) page number tuple.
+    A page with a trailing letter (``"2094a"``, #319) names no span:
+    the book adds it between two numbered pages, so it carries no
+    number the sequence counts. A box on it gets no printed number,
+    and an opinion that starts there is named by its position
+    (``boundaries._page_bounds``), which is what a page with no number
+    gets today.
+
+    :param value: The stored number, as ``detected`` or ``printed``.
+    :param kind: The stored type, ``"range"``, ``"suffixed"``, or
+        anything else.
+    :returns: The span, or ``None``.
+    :rtype: tuple[int, int | None] | None
     """
-    ocr_results = scan.ocr_results
+    from scanning import page_numbers
+
+    if not value:
+        return None
+    if kind == page_numbers.SUFFIXED:
+        return None
+    if kind == "range":
+        m = _PAGE_RANGE_RE.match(str(value))
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+        return None
+    try:
+        return (int(value), None)
+    except (ValueError, TypeError):
+        return None
+
+
+def _page_number_lookup(scan: "Scan", printed: dict | None = None) -> dict:
+    """Build ``{page_index: (page_number, page_number_end)}`` for a scan.
+
+    The numbers :func:`detection_entries` puts beside each box, so they
+    must be in the space the boxes are in. Since #269 the boxes of a
+    volume whose redactions are measured against its standing apply run
+    are final pages, so the lookup comes from the run's printed-page map
+    then; every other volume -- a legacy one, a compute in progress, a
+    run not yet measured -- reads ``Scan.ocr_results``, the original's
+    space. Six callers write that file, so the rule resolves here and
+    not in each of them.
+
+    The resolver reads S3 once per call. Three of the callers are the
+    box-edit endpoints of review 2, whose write to the database is
+    already committed when they reach this, so a failed read must not
+    fail the request: it is logged, and the lookup falls back to
+    ``Scan.ocr_results`` for that one write, which the next write
+    corrects.
+
+    :param scan: The scan.
+    :param printed: The run's printed-page map when the caller already
+        loaded it (the compute does, once); resolved here otherwise.
+    :return: Mapping of 0-based page index to a page span.
+    """
+    from scanning import apply, review_states, yolo
+
+    if printed is None:
+        run = review_states.final_run(scan)
+        if run is not None and yolo.redactions_current(
+            yolo.live_detect_jobs(scan), run
+        ):
+            try:
+                printed = apply.load_printed_pages(scan, run)
+            except apply.ApplyError:
+                logger.exception(
+                    "scan %s: the printed pages of %s did not load; "
+                    "the detection entries carry the original's numbers this once",
+                    scan.pk,
+                    run.label,
+                )
+    if printed is not None:
+        return apply.page_number_lookup(printed)
     lookup = {}
-    for r in ocr_results:
-        pdf_idx = r["pdf_page"] - 1
-        detected = r.get("detected")
-        if not detected:
-            continue
-        if r.get("type") == "range":
-            m = _PAGE_RANGE_RE.match(str(detected))
-            if m:
-                lookup[pdf_idx] = (int(m.group(1)), int(m.group(2)))
-            continue
-        try:
-            lookup[pdf_idx] = (int(detected), None)
-        except (ValueError, TypeError):
-            pass
+    for r in scan.ocr_results:
+        span = printed_page_span(r.get("detected"), r.get("type"))
+        if span is not None:
+            lookup[r["pdf_page"] - 1] = span
     return lookup
 
 
@@ -638,29 +702,41 @@ def _pull_processing_files_from_s3(scan_pk: int) -> None:
         )
 
 
-def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
-    """Write current DB detections to detections.json on disk.
+def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
+    """The live detections of a scan, in the shape blackletter reads.
 
-    :param scan_pk: Primary key of the scan whose detections to sync.
-    :param upload: If ``True`` (default), also push detections.json to S3.
-        Pass ``False`` when a subsequent ``_push_processing_files_to_s3``
-        call will cover the upload, to avoid redundant round-trips.
-    :return: The detection data written, or None if no output_dir.
+    One dict per row, with the printed page number beside each box.
+    This is what ``detections.json`` used to hold; since #240 the rows
+    are the only store, and every reader (the pairing, the redaction
+    geometry, step 3) takes this list in memory. Nothing writes it to
+    disk or to S3.
+
+    :param scan_pk: Primary key of the scan.
+    :param page_numbers: The ``{page_index: (start, end)}`` lookup, when
+        the caller holds it (the redaction compute loads the run's
+        printed pages once, #269). Resolved by
+        :func:`_page_number_lookup` otherwise.
+    :return: The detection dicts, empty when the scan has none.
     """
-    scan = Scan.objects.get(pk=scan_pk)
-    output_dir = Path(scan.output_dir)
-    if not output_dir.is_dir():
-        return
+    if page_numbers is None:
+        # The one reader of the scan row; the geometry passes ``{}``
+        # and reads none.
+        page_numbers = _page_number_lookup(Scan.objects.get(pk=scan_pk))
 
-    # Build page_number lookup from ocr_results
-    page_numbers = _page_number_lookup(scan)
-
-    all_saved = Detection.objects.filter(
-        scan_id=scan_pk, active=True
-    ).order_by("page_index", "y0")
+    # ``pk`` last, so two boxes at one height list in one order on every
+    # database: a reader that indexes the list must not depend on a tie.
+    all_saved = (
+        Detection.objects.live()
+        .filter(scan_id=scan_pk)
+        .order_by("page_index", "y0", "x0", "pk")
+    )
     det_data = []
     for d in all_saved:
         entry = {
+            # The row pk, so the compute can name the caption and the
+            # key rows of each opinion exactly (#240 PR C). blackletter
+            # reads the keys it knows and ignores this one.
+            "id": d.pk,
             "page_index": d.page_index,
             "label": d.label,
             "label_id": d.label_id,
@@ -673,8 +749,8 @@ def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
         if d.found_by and d.model_name != Detection.ModelName.MANUAL:
             # Load-bearing, not decoration: the confidence gates are per
             # model family since blackletter #73, and
-            # ``rows_are_bl_warm`` reads this provenance off the file.
-            # ``blackletter.api.pair`` reads it from here, so a file
+            # ``rows_are_bl_warm`` reads this provenance off the list.
+            # ``blackletter.api.pair`` reads it from here, so a list
             # without it pairs a bl-warm volume on the legacy gates.
             # A hand-added detection carries none, and must not: it
             # would read as a second model family and send the whole
@@ -688,16 +764,6 @@ def _sync_detections_to_disk(scan_pk: int, upload: bool = True) -> list | None:
             if pn[1] is not None:
                 entry["page_number_end"] = pn[1]
         det_data.append(entry)
-    (output_dir / "detections.json").write_text(json.dumps(det_data))
-    if upload:
-        try:
-            from scanning import s3_sync
-
-            s3_sync.upload_file_to_s3(scan, "detections.json")
-        except Exception:
-            logger.exception(
-                "Failed to push detections.json to S3 for scan %s", scan_pk
-            )
     return det_data
 
 
@@ -707,10 +773,32 @@ def _build_document_from_detections(
     """Build a blackletter Document from detection data and a PDF.
 
     :param scan: The Scan instance for reporter/volume metadata.
-    :param det_data: List of detection dicts (from detections.json).
+    :param det_data: List of detection dicts (:func:`detection_entries`).
     :param pdf_path: Path to the PDF to read page dimensions from.
     :return: The constructed Document.
     """
+    document, _ids = _build_document_with_ids(scan, det_data, pdf_path)
+    return document
+
+
+def _build_document_with_ids(
+    scan: "Scan", det_data: list, pdf_path: str
+) -> tuple["BLDoc", dict[int, int]]:
+    """Build the Document, and remember which row each detection came from.
+
+    The pairing (#240 PR C) returns blackletter's own detection objects,
+    which carry no row pk, so the compute maps each object back to its
+    ``Detection`` row by ``id()`` and writes the caption and the key FKs
+    exactly, with no match by rounded coordinates. Only an entry that
+    carries ``"id"`` (:func:`detection_entries` puts it there) is in the
+    map.
+
+    :param scan: The Scan instance for reporter/volume metadata.
+    :param det_data: List of detection dicts (:func:`detection_entries`).
+    :param pdf_path: Path to the PDF to read page dimensions from.
+    :return: The Document and ``{id(bl_detection): Detection pk}``.
+    """
+    row_ids: dict[int, int] = {}
     with fitz.open(str(pdf_path)) as src_pdf:
         pages_data = {}
         for entry in det_data:
@@ -738,14 +826,15 @@ def _build_document_from_detections(
             )
             for d in pd["detections"]:
                 b = d.get("bbox", [0, 0, 1, 1])
-                page.detections.append(
-                    BLDetection(
-                        bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
-                        label=Label(d["label_id"]),
-                        confidence=d["confidence"],
-                        page_index=pi,
-                    )
+                detection = BLDetection(
+                    bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
+                    label=Label(d["label_id"]),
+                    confidence=d["confidence"],
+                    page_index=pi,
                 )
+                page.detections.append(detection)
+                if d.get("id") is not None:
+                    row_ids[id(detection)] = d["id"]
             pages.append(page)
 
     scan_obj = scan if isinstance(scan, Scan) else Scan.objects.get(pk=scan)
@@ -765,32 +854,74 @@ def _build_document_from_detections(
         # ``found_by``, and blackletter reads it (blackletter #73).
         bl_warm=rows_are_bl_warm(det_data),
     )
-    return document
+    return document, row_ids
 
 
-def _compute_and_save_redaction_rects(scan_pk: int, pdf_path: str) -> list:
-    """Compute redaction rects and save to the Scan model.
+def _snapped_document(
+    scan: "Scan",
+    pdf_path: str,
+    page_numbers: dict | None = None,
+    cells: dict | None = None,
+) -> tuple["BLDoc", dict[int, int], list]:
+    """Build the corrected document the compute pairs and measures on.
 
-    :param scan_pk: Primary key of the scan to compute rects for.
-    :param pdf_path: Path to the PDF used for page dimensions.
-    :return: The computed rects list.
+    Every blackletter entry point corrects the column boxes before
+    reading them, and the margin strips of this same scan are computed
+    from corrected ones. Skipping it here is how a hand-added
+    TEXT_COLUMN (which reaches the DB exactly as the reviewer drew it)
+    would give the headnote rects a different column to the margins on
+    the same page.
+
+    The gutter is put back after the ink snap and not before (#308):
+    the snap grows each column box onto its ink and caps it at the
+    gutter centre, so two boxes that started apart can meet there, and
+    a pair that shares an edge leaves ``clamp_to_gutters`` with no
+    neighbour to measure.
+
+    :param scan: The scan.
+    :param pdf_path: The PDF the detections were measured against.
+    :param page_numbers: See :func:`detection_entries`.
+    :param cells: The dots.mocr cells of each page
+        (``text_fit.load_cells``), when the caller holds them. Without
+        them a touching pair still gets the fallback gap.
+    :return: The document, the ``{id(bl_detection): pk}`` map, and the
+        entries it was built from (empty when the scan has none).
     """
-    scan = Scan.objects.get(pk=scan_pk)
+    from scanning import columns, margin_fit
 
-    det_data = _sync_detections_to_disk(scan_pk, upload=False)
+    det_data = detection_entries(scan.pk, page_numbers=page_numbers)
     if not det_data:
-        return []
+        return BLDoc(pdf_path=str(pdf_path), pages=[]), {}, []
+    document, row_ids = _build_document_with_ids(scan, det_data, pdf_path)
+    snap_document_columns(document)
+    columns.separate_document(document, cells or {})
+    # ...and the margin strips get the same reader's answer for where
+    # the page's text is (#323). The strips are measured from the
+    # page's ink, which holds the blots this box does not.
+    margin_fit.fit_pages(document, cells or {})
+    return document, row_ids, det_data
 
+
+def _measure_redaction_rects(document: "BLDoc", pairs: list | None) -> list:
+    """Measure the redaction rects on the snapped document. Nothing is written.
+
+    The compute builds the document once (``_snapped_document``), pairs
+    it once (``boundaries.write_computed``) and hands both here, so the
+    rects are measured from the same pairs the boundary rows were
+    written from (#240 PR C). A caller with no pairs gets them paired
+    here. ``redactions.write_computed`` converts the answer to points and
+    writes the rows (#240 PR B).
+
+    :param document: The snapped document.
+    :param pairs: The ``(caption, key)`` pairs of that document, or None
+        to pair here.
+    :return: blackletter's rects, in pixels of the render, one entry per
+        page; empty for a document with no pages.
+    """
+    if not document.pages:
+        return []
     with _log_stage("Redaction rects"):
-        document = _build_document_from_detections(scan, det_data, pdf_path)
-        # Every blackletter entry point corrects the column boxes before
-        # reading them, and the margin strips of this same scan are computed
-        # from corrected ones. Skipping it here is how a hand-added
-        # TEXT_COLUMN (which reaches the DB exactly as the reviewer drew it)
-        # would give the headnote rects a different column to the margins on
-        # the same page.
-        snap_document_columns(document)
-        opinions = _pair_opinions(document)
+        opinions = _pair_opinions(document) if pairs is None else pairs
         # ``ocr_applied`` is set on the Document, so blackletter measures
         # this geometry from the page ink itself (see
         # ``scanner._measure_from_ink``), and finishes each headnote rect
@@ -798,227 +929,79 @@ def _compute_and_save_redaction_rects(scan_pk: int, pdf_path: str) -> list:
         # headnote boundaries inside it, then grown onto adjoining ink. The
         # app ran those three passes itself until blackletter #68 moved them
         # where every consumer gets them.
-        rects = compute_redaction_rects(document, opinions, skip_doctr=True)
-
-    Scan.objects.filter(pk=scan_pk).update(
-        redaction_rects=rects,
-    )
-    return rects
+        return compute_redaction_rects(document, opinions, skip_doctr=True)
 
 
-def _load_detections(output_dir: str | Path) -> list:
-    """Read ``detections.json`` from a scan's output dir.
-
-    :param output_dir: The scan's output directory.
-    :return: The detection list, or an empty list when absent/unreadable.
-    """
-    det_path = Path(output_dir) / "detections.json"
-    if not det_path.exists():
-        return []
-    try:
-        return json.loads(det_path.read_text())
-    except (OSError, ValueError):
-        logger.exception("Unreadable detections.json in %s", output_dir)
-        return []
-
-
-def _detections_for_geometry(scan_pk: int, output_dir: str | Path) -> list:
-    """Detection dicts for the geometry helpers, DB first.
-
-    ``detections.json`` is written by whichever process ran the pipeline, so
-    another one may not have it yet: ``/tmp`` is per-container in dev and
-    per-pod in production. Reading the DB avoids depending on that, and the
-    DB is the source of truth anyway once a reviewer starts editing
-    detections. The file is only a fallback, for a scan whose rows have not
-    been imported.
-
-    :param scan_pk: Primary key of the scan.
-    :param output_dir: The scan's output directory, for the fallback.
-    :return: Detection dicts shaped as ``detections.json`` stores them.
-    """
-    rows = Detection.objects.filter(scan_id=scan_pk, active=True).order_by(
-        "page_index", "y0"
-    )
-    dets = [
-        {
-            "page_index": d.page_index,
-            "label": d.label,
-            "label_id": d.label_id,
-            "confidence": d.confidence,
-            "bbox": [d.x0, d.y0, d.x1, d.y1],
-            "img_width": d.img_width,
-            "img_height": d.img_height,
-            # The model family, which picks the confidence gates. See
-            # :func:`_sync_detections_to_disk`, which writes the same
-            # field to the file this function falls back to.
-            **(
-                {"found_by": d.found_by}
-                if d.found_by and d.model_name != Detection.ModelName.MANUAL
-                else {}
-            ),
-        }
-        for d in rows
-    ]
-    return dets or _load_detections(output_dir)
-
-
-def _pages_for_geometry(
-    scan: "Scan", pdf_path: str, output_dir: str | Path, snap: bool = True
-) -> list:
-    """The detected pages blackletter's geometry should be measured against.
-
-    Wraps the detection lookup and the column correction that every
-    geometry consumer needs, so the rects and the margin strips of one scan
-    cannot be computed from differently-corrected boxes.
-
-    :param scan: The scan being processed.
-    :param pdf_path: The PDF the detections were measured against.
-    :param output_dir: The scan's output directory, for the JSON fallback.
-    :param snap: Correct the ``TEXT_COLUMN`` boxes against the page ink.
-        Boxes reach the DB uncorrected: nothing on the upload path snaps
-        them (that would be a full-volume render review 1 does not need),
-        and a hand-added column detection is stored exactly as drawn. The
-        correction converges, so this is a no-op once ``run_generate_files``
-        has persisted it, but it is not free before then: it renders every
-        page at 100 dpi, so pass ``False`` where the column boxes are not
-        read (see :func:`_build_combined_redactions`).
-    :return: ``Page`` objects, empty when the scan has no detections yet.
-    """
-    det_data = _detections_for_geometry(scan.pk, output_dir)
-    if not det_data:
-        return []
-    document = _build_document_from_detections(scan, det_data, pdf_path)
-    if snap:
-        snap_document_columns(document)
-    return document.pages
-
-
-def _compute_and_save_margin_rects(
-    scan_pk: int, pdf_path: str, output_dir: str, force: bool = False
-) -> list:
-    """Compute margin rects and save them to the Scan model.
+def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
+    """Measure the margin strips against the pages of ``document``.
 
     The strips are pulled back off any real detection they would cover, so
     key icons, captions and other content near a page edge survive. That
     happens inside :func:`blackletter.margins.compute_margin_rects`, which
-    also uses the detections to tighten the content box.
+    also uses the detections to tighten the content box. Nothing is
+    written.
 
-    :param scan_pk: Primary key of the scan.
     :param pdf_path: Path to the PDF to compute margins for.
-    :param output_dir: Directory (used for detection lookup only).
-    :param force: Measure again even when the scan already holds
-        strips. The stored strips are computed *from* the detections,
-        so a fresh detection run must replace them; every other caller
-        wants the cached answer, since measuring renders the whole
-        volume at 100 dpi.
-    :return: The computed margin rects list.
+    :param document: The snapped document the rects were measured from.
+    :return: blackletter's strips, in points; empty for a document with
+        no pages, because without detections the bounds would come from
+        the page's marks alone, and bleed-through at a page edge would
+        suppress that page's top strip: a worse answer than none.
     """
-    scan = Scan.objects.get(pk=scan_pk)
-    if scan.margin_rects and not force:
-        return scan.margin_rects
-    pages = _pages_for_geometry(scan, pdf_path, Path(output_dir))
-    if not pages:
-        # Without detections the bounds would come from the page's marks
-        # alone, so bleed-through at a page edge suppresses that page's top
-        # strip: a worse answer than none, and one that must not be cached or
-        # it never gets recomputed once the detections land. Refuse before
-        # measuring rather than after. The viewer asks for these on a sync
-        # request and does not cache the reply, so computing them here would
-        # render the whole volume at 100 dpi on every poll.
-        logger.warning(
-            "No margin rects for scan %s: no detections yet", scan_pk
-        )
+    if not document.pages:
         return []
-    margin_rects = compute_margin_rects(str(pdf_path), pages=pages)
-    Scan.objects.filter(pk=scan_pk).update(
-        margin_rects=margin_rects,
-    )
-    return margin_rects
-
-
-def _add_llm_page_text_layer(scan_pk: int, llm_dir: Path) -> int:
-    """Optionally make the per-page LLM PDFs searchable.
-
-    ``ai.user_prompt`` crops three text snippets off each page (the caption's
-    first line, a column-top continuation, the footnote band) and layers them
-    on top of the structural roadmap it builds from the detections. Those
-    crops need a text layer, and since scanning #145 nothing in the pipeline
-    produces one, so they come back empty and the roadmap ships without them.
-
-    Rather than reinstate the pass for the whole pipeline, this adds it here
-    only, over pages that have already been redacted and masked, and only
-    when ``LLM_PAGE_TEXT_LAYER`` is set. It is off by default because the
-    model reads the page image anyway and the pass costs an OCR run over
-    every page of the volume.
-
-    :param scan_pk: Primary key of the scan, for progress reporting.
-    :param llm_dir: The ``llm/`` directory of per-page PDFs.
-    :return: Number of files given a text layer.
-    """
-    if not settings.LLM_PAGE_TEXT_LAYER or not llm_dir.is_dir():
-        return 0
-    from blackletter.api import add_text_layer
-
-    _update_progress(scan_pk, "Adding a text layer to the LLM pages...")
-    added = add_text_layer(llm_dir)
-    logger.info("Text layer added to %s LLM pages", len(added))
-    return len(added)
+    with _log_stage("Margin rects"):
+        return compute_margin_rects(str(pdf_path), pages=document.pages)
 
 
 def _build_combined_redactions(scan_pk: int) -> Path:
-    """Combine margin_rects, redaction_rects, and opinions into redactions.json.
+    """Write ``redactions.json`` from the rows, for blackletter's ``generate``.
 
-    All coordinates in the output are in PDF points. This file is passed
-    to blackletter's ``generate`` API as the single source of redaction data.
-
-    The merging, the pixel-to-point conversion and the opinion filenames all
-    come from :func:`blackletter.api.build_redactions`, so the payload
-    ``generate`` reads is built by the same library that consumes it.
+    All coordinates in the output are in PDF points. The opinion
+    filenames come from :func:`blackletter.api.build_redactions`, which
+    used to convert the pixel rects too; since #240 the rects are
+    ``Redaction`` rows in points (``redactions.visible_by_page``), so the
+    pages of the payload are written from them and the conversion is
+    gone with the blob. blackletter gets no pages: it read them only to
+    scale pixel rects, and both rect lists are empty.
 
     :param scan_pk: Primary key of the scan.
     :return: Path to the generated redactions.json.
     """
+    from scanning import redactions
+
     scan = Scan.objects.get(pk=scan_pk)
     output_dir = Path(scan.output_dir)
-    pdf_path = processing_pdf_path(scan)
 
-    # ``snap=False``: this step reads only each page's dimensions and scale,
-    # never its column boxes, so correcting them would render the whole
-    # volume at 100 dpi to change nothing.
-    pages = _pages_for_geometry(scan, pdf_path, output_dir, snap=False)
-
-    try:
-        combined = bl_build_redactions(
-            pages,
-            scan.redaction_rects,
-            scan.margin_rects,
-            scan.opinions_json,
-            reporter=scan.reporter.short_name or "",
-            volume=str(scan.volume) or "",
-        )
-    except KeyError as exc:
-        # The rects are a saved snapshot and the pages come from the live
-        # detections, so a page with rects but no detections left cannot be
-        # scaled. Deleting the last detection prunes that page's rects (see
-        # ``views_api._drop_orphaned_redaction_rects``), so reaching this
-        # means something else desynchronised them. Refusing is right --
-        # guessing the scale would put a blackout in the wrong place -- but
-        # name recovery a reviewer can actually carry out.
-        raise RuntimeError(
-            f"scan {scan_pk}: saved redaction rects reference a page with no "
-            f"detections left, so their pixel coordinates cannot be converted "
-            f"to points. Re-add a detection on that page, or delete the "
-            f"leftover rect from the redaction overlay, then generate again. "
-            f"({exc})"
-        ) from exc
+    combined = bl_build_redactions(
+        [],
+        [],
+        [],
+        boundaries.viewer_payload(scan, live_only=True),
+        reporter=scan.reporter.short_name or "",
+        volume=str(scan.volume) or "",
+    )
+    combined["pages"] = {
+        str(entry["page_index"]): [
+            {
+                "x0": r["x0"],
+                "y0": r["y0"],
+                "x1": r["x1"],
+                "y1": r["y1"],
+                "fill": r["fill"],
+                "type": r["rect_type"],
+            }
+            for r in entry["rects"]
+        ]
+        for entry in redactions.visible_by_page(scan)
+    }
 
     out_path = output_dir / "redactions.json"
     out_path.write_text(json.dumps(combined))
-    pages = combined["pages"]
-    n_rects = sum(len(v) for v in pages.values())
+    n_rects = sum(len(v) for v in combined["pages"].values())
     logger.info(
         "Combined redactions: %s pages, %s rects, %s opinions",
-        len(pages),
+        len(combined["pages"]),
         n_rects,
         len(combined["opinions"]),
     )
@@ -1154,6 +1137,140 @@ def _note_curator_ranges(issues: list[dict], ocr_results: list[dict]) -> None:
         )
 
 
+def _ask_about_model_suffixes(
+    issues: list[dict], ocr_results: list[dict]
+) -> None:
+    """Ask the curator about a trailing letter the model read (#319).
+
+    A page with a trailing letter (``2094a``) claims no number, so the
+    sequence analysis writes no card for it: it makes no gap, no
+    duplicate and no missing page. That silence is right for a page a
+    person typed. It is wrong for a reading of the model, because the
+    shape is one letter away from a misread digit (``209B``), and a
+    page the reader used to hand back as ``no_page_number`` would
+    otherwise pass with no question asked. The reader trusts six
+    letters (``page_numbers.SUFFIX_LETTERS``); this card is for the
+    readings that pass that gate.
+
+    The mirror image of :func:`_note_curator_ranges`: that one lowers a
+    machine card to a note for a curator's own range, this one raises a
+    card for a machine reading a curator did not make. It is a
+    ``suspicious_reading`` card, which is addressed by the physical
+    page (``models.PHYSICAL_PAGE_CHECKS``), is dismissible, and is one
+    a deletion answers (``CHECKS_A_DELETION_ANSWERS``).
+
+    :param issues: The rebuilt issue dicts, edited in place.
+    :param ocr_results: The per-page entries the issues were built
+        from, curator numbers already overlaid.
+    :returns: None.
+    """
+    from scanning import page_numbers
+
+    for entry in ocr_results:
+        if entry.get("type") != page_numbers.SUFFIXED:
+            continue
+        if _is_manual_read(entry):
+            continue
+        issues.append(
+            {
+                "page_number": entry["pdf_page"],
+                "check_name": CheckName.SUSPICIOUS_READING,
+                "severity": Issue.Severity.WARNING,
+                "message": (
+                    f"PDF page {entry['pdf_page']} reads as "
+                    f"'{entry['detected']}', a page number with a "
+                    f"trailing letter. Verify this is expected."
+                ),
+            }
+        )
+
+
+def _project_trailing_gap(
+    result: dict, analysis: dict, exp_end: int | None
+) -> None:
+    """Draw one placeholder for a page range missing at the end (#256).
+
+    ``build_issues`` collapses a run of more than 6 missing pages into
+    one ``large_gap`` card and drops every page of the run from
+    ``actually_missing``, which is the only source of a ``missing``
+    entry in ``page_map``. So a volume that stops 41 pages before its
+    recorded last page carries a card and nothing a reviewer can act
+    on: no upload form, and no button to ask a scanner for the leaves
+    (#249).
+
+    The collapse is right **inside** a volume, where the pages are
+    almost always in the book with a number nobody read. It is wrong at
+    the end, where the expected last page says the pages should be
+    there and the volume stops before them. So this appends one
+    placeholder for the trailing run, and only for that one.
+
+    **One placeholder per gap, because the gap is the address.** An
+    insert and an INSERT repair request are both addressed by
+    ``anchor_pdf_page``, the physical page the leaf follows
+    (#214/#249), and one open row may exist per address. So a
+    placeholder per missing number would put 41 buttons on one row.
+    The label is the range instead, with the hyphen every reader of a
+    range parses (#233).
+
+    The threshold is deliberately not repeated here: the run qualifies
+    when its first page did **not** survive into
+    ``result["missing_pages"]``, which is the proof that the collapse
+    took it. A retune upstream can therefore not give one page two
+    placeholders.
+
+    :param result: What ``build_issues`` returned, edited in place.
+    :param analysis: What ``build_analysis`` returned. Its
+        ``missing_pages`` still holds the collapsed pages.
+    :param exp_end: The scan's recorded last printed page. Without one
+        there is no trailing gap to find (issue #209).
+    :returns: None.
+    """
+    missing = analysis.get("missing_pages") or []
+    all_nums = analysis.get("all_nums") or []
+    # The run must reach the recorded last page, or it is not the end
+    # of the volume. Every number the volume shows is out of
+    # ``missing``, so a run that ends there also starts above the last
+    # number read.
+    if not exp_end or not missing or not all_nums or missing[-1] != exp_end:
+        return
+    first = exp_end
+    for page in reversed(missing[:-1]):
+        if page != first - 1:
+            break
+        first = page
+    if first in set(result["missing_pages"]):
+        # Not collapsed: blackletter drew one placeholder per page.
+        return
+
+    result["page_map"].append(
+        {
+            "type": "missing",
+            "logical_number": f"{first}-{exp_end}",
+            "missing_range": [first, exp_end],
+        }
+    )
+
+    # The card of that run, reworded: it reads "likely an OCR misread
+    # rather than genuinely missing pages", which says nothing about
+    # what a reviewer does next. The key does not move, so a dismissal
+    # still matches the card. A card that is not there changes nothing:
+    # the placeholder stands on the run alone.
+    for issue in result["issues"]:
+        if (
+            issue["check_name"] == CheckName.LARGE_GAP
+            and issue["page_number"] == first
+        ):
+            issue["message"] = (
+                f"Pages {first}\u2013{exp_end} "
+                f"({exp_end - first + 1} pages) are not in this volume. "
+                f"The last page number read is {max(all_nums)}. If the "
+                f"book has these pages, ask a scanner for them at the "
+                f"placeholder at the end of the volume. If the pages "
+                f"are there with a number nobody read, correct a page "
+                f"number and recompute."
+            )
+
+
 def rebuild_page_map(scan: "Scan") -> None:
     """Rebuild ``page_map`` and ``missing_pages`` from current ocr_results.
 
@@ -1179,6 +1296,9 @@ def rebuild_page_map(scan: "Scan") -> None:
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
+    # Both builders of ``page_map`` must agree, or a page-number edit
+    # would drop the placeholder from under the reviewer (#256).
+    _project_trailing_gap(result, analysis, exp_end)
     scan.ocr_results = ocr_results
     scan.page_map = result["page_map"]
     scan.missing_pages = result["missing_pages"]
@@ -1277,6 +1397,14 @@ def recalculate_issues(scan: "Scan") -> None:
     # dismissal filter, so a dismissal matches the card as it reads.
     _note_curator_ranges(result["issues"], ocr_results)
 
+    # A trailing letter the model read is a question, because the
+    # sequence analysis asks none about it (#319).
+    _ask_about_model_suffixes(result["issues"], ocr_results)
+
+    # A range missing at the end of the volume gets a placeholder, so a
+    # reviewer can upload the pages or ask a scanner for them (#256).
+    _project_trailing_gap(result, analysis, exp_end)
+
     # Every open edit this volume cannot take, not only the page
     # numbers: a delete or an insert made against another original is
     # refused by the readers that act on it, so the curator has to hear
@@ -1286,7 +1414,7 @@ def recalculate_issues(scan: "Scan") -> None:
             stale_edits
             + [
                 edit
-                for edit in page_edits.stale_open_edits(scan)
+                for edit in page_edits.stale_edits(scan)
                 if edit.kind != PageEdit.Kind.SET_NUMBER
             ]
         )
@@ -1305,6 +1433,12 @@ def recalculate_issues(scan: "Scan") -> None:
                 ),
             }
         )
+
+    # A page the curator marked for deletion answers its own cards
+    # (#255): the cards are built from ocr_results, which still holds
+    # the page, so the "No page number detected" card of a page on its
+    # way out came back on every press of the recompute button.
+    result["issues"] = page_edits.drop_deleted_pages(scan, result["issues"])
 
     # A dismissal is a curator decision, so it is a PageEdit row, not
     # the absence of an Issue row: the rebuild below gives every issue
@@ -1361,21 +1495,23 @@ def recalculate_issues(scan: "Scan") -> None:
             "progress_message",
         ]
     )
-    # A recheck must not move a scan between review states (#154): a
-    # scan in a page-completeness review state keeps it. The write to
-    # PENDING_REVIEW stays for the legacy rows that already carry it.
-    Scan.objects.filter(pk=scan.pk).exclude(
-        status__in=(
-            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
-            Status.PAGE_COMPLETENESS_REVIEW_DONE,
-        )
-    ).update(status=Status.PENDING_REVIEW)
+    # A recheck must not move a scan between review states (#154/#263):
+    # a scan in a review state keeps it. The recompute button of step 1
+    # is reachable from a volume already in review 2, so the two #263
+    # states are here for the same reason as the two #154 ones -- a
+    # rebuild of the page-number issues says nothing about the
+    # redactions. The write to PENDING_REVIEW stays for the legacy rows
+    # that already carry it.
+    Scan.objects.filter(pk=scan.pk).exclude(status__in=REVIEW_STATUSES).update(
+        status=Status.PENDING_REVIEW
+    )
     scan.refresh_from_db(fields=["status"])
 
-    # Suppression flags are curator decisions stored as Issue rows, not
-    # derived from the page numbers, so a recheck keeps them (same
-    # exclusion the daemon rebuild uses).
-    scan.issues.exclude(check_name=CheckName.SUPPRESS_DETECTION).delete()
+    # The findings of review 2 (#240 PR D) are derived from the
+    # detection, boundary and redaction rows, not from the page numbers,
+    # so a recheck of review 1 leaves them alone: ``findings.rebuild``
+    # is their only writer.
+    scan.issues.exclude(check_name__in=REVIEW2_CHECKS).delete()
     Issue.objects.bulk_create(
         [Issue(scan=scan, **i) for i in result["issues"]]
     )
@@ -1464,7 +1600,12 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _import_detections(scan_pk: int, detections: list) -> int:
+def _import_detections(
+    scan_pk: int,
+    detections: list,
+    run: "ApplyRun | None" = None,
+    detect_run: int | None = None,
+) -> int:
     """Replace a scan's model detections with the ones just merged.
 
     The rows a curator made by hand (``model_name`` ``MANUAL``) are
@@ -1473,15 +1614,32 @@ def _import_detections(scan_pk: int, detections: list) -> int:
     re-run of a deterministic model is no reason to throw it away.
     What the re-run does replace is every box the model itself drew.
 
+    Each new row carries its **address** (#240): the source page the
+    glued document names beside the box (``detections.source_of_entry``),
+    the run whose page space ``page_index`` is in, and the detection run
+    that found it. Then every standing ``DetectionDecision`` of the scan
+    is resolved onto the new rows by that address
+    (``detections.resolve``), which is how a curator's approvals and
+    deletions survive the import that used to lose them, and every kept
+    hand-drawn row is moved to its page in the new space
+    (``detections.relocate_manual_rows``), or a box drawn before a
+    deletion would paint one page out after it.
+
     ``found_by`` is copied onto each row, because the confidence gates
     are per model family (``label_confidence(label, bl_warm)``), and
     that field is where every reader looks for the family.
 
     :param scan_pk: Primary key of the scan.
     :param detections: The merged document's ``detections`` list, in
-        volume page coordinates.
+        the page coordinates of ``run`` (or of the original).
+    :param run: The apply run whose final space the list is in; None
+        for the original's space.
+    :param detect_run: The ``ExternalJob.run`` of the detection run.
     :return: How many rows were created.
     """
+    from scanning import detections as decisions
+
+    scan = Scan.objects.get(pk=scan_pk)
     kept = Detection.objects.filter(
         scan_id=scan_pk, model_name=Detection.ModelName.MANUAL
     ).count()
@@ -1498,6 +1656,7 @@ def _import_detections(scan_pk: int, detections: list) -> int:
     rows = []
     for entry in detections:
         bbox = entry.get("bbox") or [0, 0, 1, 1]
+        edit_id, source_page = decisions.source_of_entry(entry)
         rows.append(
             Detection(
                 scan_id=scan_pk,
@@ -1515,16 +1674,63 @@ def _import_detections(scan_pk: int, detections: list) -> int:
                 model_count=entry.get("model_count", 1),
                 found_by=entry.get("found_by") or [],
                 active=True,
+                source_edit_id=edit_id,
+                source_page=source_page,
+                source_fingerprint=scan.source_fingerprint or "",
+                apply_run=run,
+                detect_run=detect_run,
             )
         )
     Detection.objects.bulk_create(rows, batch_size=1000)
+    landed, stale = decisions.resolve(scan)
+    moved = 0
+    if run is not None and kept:
+        # The kept hand-drawn rows follow the new page space, by their
+        # address; the model rows arrived in it.
+        moved, _unplaced = decisions.relocate_manual_rows(scan, run)
     logger.info(
-        "Imported %d detection(s) for scan %s (%d hand-made row(s) kept)",
+        "Imported %d detection(s) for scan %s (%d hand-made row(s) kept, "
+        "%d moved; %d decision(s) landed, %d stale)",
         len(rows),
         scan_pk,
         kept,
+        moved,
+        landed,
+        len(stale),
     )
     return len(rows)
+
+
+_UNSET_RUN = object()
+
+
+def geometry_pdf_path(scan: "Scan", run=_UNSET_RUN) -> str:
+    """Return the PDF the redaction geometry of ``scan`` is measured on.
+
+    The one rule for "which PDF the geometry reads" (#269). With a
+    complete standing apply run it is the run's bitonal copy
+    (``ApplyRun.bitonal_key``), pulled to its local mirror by
+    ``apply.local_copy``; the final page space, where the imported
+    detections live. Without one it is :func:`processing_pdf_path`, the
+    review-1 copy of the original's space: a legacy volume, or a scan
+    the apply has not reached. An identity run's key is the volume
+    ``bitonal.pdf`` itself, so the two answers name the same file; for
+    a 1-bit original it is the original, which ``processing_pdf_path``
+    also falls back to.
+
+    :param scan: The scan.
+    :param run: The standing run when the caller has it (``None`` for
+        none); ``review_states.final_run`` is asked otherwise.
+    :returns: A local path.
+    :rtype: str
+    """
+    from scanning import apply, review_states
+
+    if run is _UNSET_RUN:
+        run = review_states.final_run(scan)
+    if run is None:
+        return processing_pdf_path(scan)
+    return str(apply.local_copy(scan, run.bitonal_key))
 
 
 def run_compute_redactions(scan_pk: int) -> None:
@@ -1540,22 +1746,33 @@ def run_compute_redactions(scan_pk: int) -> None:
     copy. The collect tick runs every 15 seconds on a serial scheduler
     (#156), so this belongs where the other long stages already run.
 
-    **The model read the original; the geometry reads the bitonal
-    copy.** bl-warm collapses on 1-bit pages, so detection fans out
-    over the original shards (#167/#194), while the rects are stamped
-    on the bitonal copy and must be measured against its ink. Both
-    files have the page geometry of the original, so the two spaces
-    agree.
+    **The model read the original; the geometry reads the corrected
+    bitonal copy.** bl-warm collapses on 1-bit pages, so detection fans
+    out over the original shards (#167/#194), while the rects are
+    stamped on the bitonal copy and must be measured against its ink.
+    Since #269 both are in the page space of the standing apply run
+    (#224): the detections come from the run's glued document
+    (``ApplyRun.detections_key``), which the apply moved through its
+    page map, and the copy is the run's ``bitonal_key``. A volume with
+    no page edit has an identity run, whose keys alias the review-1
+    artifacts, so nothing changes for it.
 
-    **The detections are imported once per run.** A run the apply has
-    already stamped is a *recompute*, which a curator asks for after
-    they add or delete a box: it keeps every row in the database and
-    measures again from those. Importing again there would throw the
-    curator's edits away, which is the whole reason they pressed the
-    button.
+    **The detections are imported once per run**, and the run is the
+    apply run. Rows measured against the standing run are a
+    *recompute*, which a curator asks for after they add or delete a
+    box: it keeps every row in the database and measures again from
+    those. Importing again there would throw the curator's edits away,
+    which is the whole reason they pressed the button. Rows measured
+    against a run this one supersedes (a reopen and a second approval)
+    describe pages the volume no longer shows, so they are imported
+    again; the carry of a curator's edits across runs is #241.
 
-    The scan goes back to the review it came from whatever happens,
-    and this function raises nothing. An ``ERROR`` status on
+    The scan goes back to a review whatever happens, and this function
+    raises nothing. On success that review is review 2
+    (``READY_FOR_REDACTION_REVIEW``, #263), because this pass is
+    usually the last of its three conditions; on every failure it is
+    the review-1 approval, because a curator must not be sent to judge
+    geometry that was not measured. An ``ERROR`` status on
     an approved volume would need an admin re-queue, and that re-queue
     runs the whole pipeline again. A failure is counted on the run
     instead (``yolo.record_apply_failure``), which bounds the retries.
@@ -1563,7 +1780,18 @@ def run_compute_redactions(scan_pk: int) -> None:
     :param scan_pk: Primary key of the scan to compute redactions for.
     :return: None.
     """
-    from scanning import s3_sync, yolo
+    from scanning import (
+        apply,
+        brackets,
+        columns,
+        findings,
+        redactions,
+        review_states,
+        s3_sync,
+        text_fit,
+        yolo,
+    )
+    from scanning import detections as decisions
 
     django.db.connections.close_all()
     scan = Scan.objects.get(pk=scan_pk)
@@ -1572,15 +1800,37 @@ def run_compute_redactions(scan_pk: int) -> None:
         row.status == JobStatus.CONSUMED for row in rows
     )
     has_rows = Detection.objects.filter(scan_id=scan_pk, active=True).exists()
-    # Where to hand the scan back. A volume with detections but no
-    # detection *run* is a legacy one, and its step 2 lives in
-    # PENDING_REVIEW, since the #154 states describe a review it never
-    # had. Every other volume came from review 1, dead run or not.
-    park = (
-        Status.PENDING_REVIEW
-        if has_rows and not rows
-        else Status.PAGE_COMPLETENESS_REVIEW_DONE
-    )
+    # A volume with detections but no detection *run* is a legacy one,
+    # and its step 2 lives in PENDING_REVIEW, since the #154 and #263
+    # states describe a review it never had. Every other volume came
+    # from review 1, dead run or not.
+    legacy = has_rows and not rows
+
+    def park() -> str:
+        """Return where the scan belongs, read at the moment of the park.
+
+        Derived at each exit rather than chosen once, so that one rule
+        answers for every one of them (#263). A first apply that fails
+        writes no ``applied_at``, so the rule gives review 1 back --
+        nobody may be sent to judge geometry that was never measured. A
+        *recompute* that fails under the same apply run keeps the stamp
+        of the run that worked, so the rule gives review 2 back, and the
+        failure message stands where the curator can read it. A park
+        chosen up front sent that second case to review 1, and
+        ``promote_ready_scans`` wrote its own message over the failure
+        one tick later. A compute that fails under a *new* apply run has
+        no stamp for it (#269), so the rule gives review 1 back: the old
+        geometry describes pages the volume no longer shows.
+
+        :returns: The status to park the scan in.
+        :rtype: str
+        """
+        if legacy:
+            return Status.PENDING_REVIEW
+        if review_states.redaction_review_ready(scan, rows):
+            return Status.READY_FOR_REDACTION_REVIEW
+        return Status.PAGE_COMPLETENESS_REVIEW_DONE
+
     if not merged and not has_rows:
         # Nothing to measure: no merged run, and no detections from an
         # earlier one. Park the scan back rather than fail it -- the
@@ -1592,71 +1842,185 @@ def run_compute_redactions(scan_pk: int) -> None:
         )
         _park_after_redactions(
             scan_pk,
-            "No detections to work from. Run detection first.",
-            park,
+            "No detections to work from. The detection run has not "
+            "reached this volume yet.",
+            park(),
         )
         return
 
-    # A merged run that was never applied brings its detections in. Any
-    # other case measures what the database already holds: a recompute
-    # after a curator's edit, or a legacy volume whose rows the old
-    # pipeline wrote.
-    importing = merged and not yolo.apply_state(rows).get("applied_at")
     if merged:
         yolo.record_apply_start(rows)
+    # After the claim is dropped, never before: a lost claim must not
+    # keep ``queued_at``. A merged run reads the corrected volume of the
+    # standing apply run (#269). The queue gate checked that it exists;
+    # this is the backstop for an admin supersede between the queue and
+    # the claim, and it spends no attempt, like a closed gate does in
+    # the apply. The rule parks the scan in review 1, and the next
+    # complete run queues it again.
+    run = review_states.final_run(scan) if merged else None
+    if merged and run is None:
+        logger.warning(
+            "compute_redactions: scan %s has no complete apply run; the "
+            "corrected volume is not built",
+            scan_pk,
+        )
+        _park_after_redactions(
+            scan_pk,
+            "The corrected volume is not built yet. The redactions are "
+            "computed when it is.",
+            park(),
+        )
+        return
+
+    # A merged run whose rows are not measured against the standing
+    # apply run brings its detections in. Any other case measures what
+    # the database already holds: a recompute after a curator's edit, or
+    # a legacy volume whose rows the old pipeline wrote.
+    importing = merged and not yolo.redactions_current(rows, run)
     started = time.monotonic()
     try:
         detections = []
+        page_numbers = None
+        if merged:
+            _update_progress(scan_pk, "Reading the corrected volume...")
+            page_numbers = _page_number_lookup(
+                scan, apply.load_printed_pages(scan, run)
+            )
         if importing:
             _update_progress(
                 scan_pk, "Reading the detections of this volume..."
             )
-            document = yolo.load_merged_document(scan, rows[0].run)
+            document = apply.load_detections_document(scan, run)
             detections = document.get("detections") or []
             if not detections:
                 raise RuntimeError(
-                    f"scan {scan_pk}: the merged detection run holds no "
-                    f"detections"
+                    f"scan {scan_pk}: the detection run holds no "
+                    f"detections in the corrected volume"
                 )
 
-        _pull_processing_files_from_s3(scan_pk)
-        scan.refresh_from_db()
-        ensure_output_dir(scan)
-        output_dir = scan.output_dir
-        pdf_path = processing_pdf_path(scan)
+        if merged:
+            # One key, not the prefix: the whole-prefix pull lands the
+            # multi-GB original, which nothing here reads.
+            scan.refresh_from_db()
+            ensure_output_dir(scan)
+            pdf_path = geometry_pdf_path(scan, run)
+        else:
+            _pull_processing_files_from_s3(scan_pk)
+            scan.refresh_from_db()
+            ensure_output_dir(scan)
+            pdf_path = geometry_pdf_path(scan, None)
 
         if importing:
             with _log_stage("Import detections"):
-                _import_detections(scan_pk, detections)
+                _import_detections(
+                    scan_pk, detections, run=run, detect_run=rows[0].run
+                )
 
+        # The two column boxes of a page share an edge, because the
+        # model cuts one text block in half, and a headnote box then
+        # grows across the gutter onto the facing column's text (#308).
+        # This runs before the ink snap below, which reads the pair and
+        # has no gutter to stop its own walk at either. One read of the
+        # cells serves it and the text fit further down (#279).
+        _update_progress(scan_pk, "Measuring the column gutter...")
+        with _log_stage("Column gutter"):
+            ocr_document = text_fit.load_document(scan, run)
+            cells = text_fit.page_cells(ocr_document)
+            columns.separate_rows(scan, cells)
+
+        # The brackets the reader saw, stored as rows so that the
+        # findings can be rebuilt from the rows alone (#328). It reads
+        # the document already in memory and renders nothing.
+        with _log_stage("Bracket readings"):
+            brackets.write_rows(scan, ocr_document, run)
+
+        if importing:
             # Only after an import: the correction converges, so it is
             # a no-op once it is stored, and it renders every page.
             _update_progress(scan_pk, "Measuring the text columns...")
             with _log_stage("Column correction"):
                 _snap_text_columns_to_ink(scan_pk, pdf_path)
+            # That pass grows each box onto its ink and caps it at the
+            # gutter centre, where two boxes can meet again, so the
+            # gutter goes back in after it (#308).
+            with _log_stage("Column gutter"):
+                columns.separate_rows(scan, cells)
 
-        det_data = _sync_detections_to_disk(scan_pk, upload=False)
+        # One corrected document for the pairing and the geometry, and
+        # one pairing (#240 PR C): the boundaries are rows written from
+        # blackletter's own pairs, with the caption and the key rows
+        # named exactly, and the rects are measured from the same pairs.
+        document, row_ids, det_data = _snapped_document(
+            scan, pdf_path, page_numbers, cells
+        )
         _update_progress(scan_pk, "Pairing the opinions...")
         with _log_stage("Opinion pairing"):
-            opinions = bl_pair(
-                str(Path(output_dir) / "detections.json"),
-                pdf_path,
-                reporter=scan.reporter.short_name or "",
-                volume=str(scan.volume) or "",
-                first_page=scan.start_page or 1,
+            opinions = boundaries.write_computed(
+                scan,
+                document,
+                row_ids,
+                run,
+                rows[0].run if merged else None,
             )
-        Scan.objects.filter(pk=scan_pk).update(opinions_json=opinions)
 
         _update_progress(scan_pk, "Computing the redactions...")
-        rects = _compute_and_save_redaction_rects(scan_pk, pdf_path)
+        rects = _measure_redaction_rects(document, opinions)
+
+        # A text box is then fitted to the text the reader found under
+        # it (#279). blackletter builds it from the column bounds of
+        # the page, and this app gives the page none, so the fallback
+        # 50/50 split makes every box overrun its column; blackletter
+        # cannot narrow it afterwards, and the dots.mocr cells can.
+        _update_progress(scan_pk, "Fitting the text redactions...")
+        with _log_stage("Text redaction fit"):
+            text_fit.fit_rects(rects, cells, document.pages)
 
         _update_progress(scan_pk, "Measuring the page margins...")
-        margins = _compute_and_save_margin_rects(
-            scan_pk, pdf_path, output_dir, force=True
-        )
+        margins = _measure_margin_rects(pdf_path, document)
 
-        Scan.objects.filter(pk=scan_pk).update(s3_uploaded=False)
-        _push_processing_files_to_s3(scan_pk)
+        # The rows are the store (#240 PR B): the computed rows are
+        # written again, the standing dismissals land on them, and the
+        # human rows follow the page space the geometry was measured in.
+        _update_progress(scan_pk, "Writing the redactions...")
+        with _log_stage("Redaction rows"):
+            written = redactions.write_computed(
+                scan,
+                run,
+                rows[0].run if merged else None,
+                rects,
+                margins,
+                document.pages,
+            )
+            landed, stale = redactions.resolve(scan)
+            if run is not None:
+                decisions.relocate_rows(
+                    redactions.human_rows(scan),
+                    scan,
+                    run,
+                    "human redaction(s)",
+                )
+        logger.info(
+            "compute_redactions: scan %s: %d redaction row(s) written, "
+            "%d dismissal(s) landed, %d stale",
+            scan_pk,
+            written,
+            landed,
+            len(stale),
+        )
+        # The findings of review 2 are rows too (#240 PR D), derived
+        # from the rows just written. The run is passed, not read: the
+        # ledger stamp that ``detections.measured_run`` reads is written
+        # after the park, below.
+        _update_progress(scan_pk, "Writing the findings...")
+        with _log_stage("Review-2 findings"):
+            open_findings = findings.rebuild(scan, run=run if merged else None)
+        logger.info(
+            "compute_redactions: scan %s: %d review-2 finding(s) open",
+            scan_pk,
+            open_findings,
+        )
+        # Nothing to push: every output of this pass is a row (#240),
+        # and the files under ``output_dir`` are the copies it pulled.
     except Exception as exc:
         logger.exception(
             "compute_redactions: scan %s failed after %.1fs",
@@ -1684,13 +2048,23 @@ def run_compute_redactions(scan_pk: int) -> None:
                 "The redaction computation failed. The detections are "
                 "safe; ask a staff member to look at it."
             )
-        _park_after_redactions(scan_pk, message, park)
+        _park_after_redactions(scan_pk, message, park())
         return
 
     if merged:
-        yolo.record_apply_success(rows)
+        # Before the park, never after: the review-2 edge in ``park``
+        # reads this very stamp to decide that the redactions are
+        # computed (#263), so the other order would park a finished
+        # volume one tick short of its own review. The apply is usually
+        # the last of the three conditions, and it takes the scan over
+        # the edge itself rather than leaving it to
+        # ``review_states.promote_ready_scans``: the viewer reloads the
+        # page the moment the scan parks, and a park in the approved
+        # status would show the curator a step 2 whose approve button
+        # appears a tick later, from nothing they did.
+        yolo.record_apply_success(rows, run)
     _park_after_redactions(
-        scan_pk, "Detection review is ready: check the redactions.", park
+        scan_pk, "Detection review is ready: check the redactions.", park()
     )
     logger.info(
         "compute_redactions: scan %s: %d detection(s), %d opinion(s), "
@@ -1706,12 +2080,17 @@ def run_compute_redactions(scan_pk: int) -> None:
         s3_sync.release_local_processing(scan)
 
 
-#: The statuses a redaction computation may be queued from. The
-#: approved volume of the new flow, and the legacy ``PENDING_REVIEW``
-#: rows, which reached review 2 before the #154 statuses existed. A
-#: busy scan is refused: it holds a claim already.
+#: The statuses a redaction computation may be queued from: the
+#: approved volume of the new flow, the volume already in review 2
+#: (#263) -- a recompute starts from the review the curator is looking
+#: at -- and the legacy ``PENDING_REVIEW`` rows, which reached review 2
+#: before the #154 statuses existed. A busy scan is refused: it holds a
+#: claim already. ``REDACTION_REVIEW_DONE`` is deliberately absent: a
+#: closed review is not recomputed under the person who closed it, and
+#: the way back is the admin re-queue.
 REDACTION_COMPUTE_STATUSES = (
     Status.PAGE_COMPLETENESS_REVIEW_DONE,
+    Status.READY_FOR_REDACTION_REVIEW,
     Status.PENDING_REVIEW,
 )
 
@@ -1721,10 +2100,10 @@ def queue_redaction_compute(scan: "Scan") -> tuple[bool, str]:
 
     The request path never does this work itself. It renders every page
     of the volume, which is 83 seconds for 1364 pages and beyond what
-    an ingress gives a request. So the two review-2 buttons write a
-    status here and return, and the viewer's progress poll reloads the
-    page when the daemon is done -- the same route every other long
-    stage takes.
+    an ingress gives a request. So the "Recompute redactions" button of
+    review 2 (#305) writes a status here and returns, and the viewer's
+    progress poll reloads the page when the daemon is done -- the same
+    route every other long stage takes.
 
     The compare-and-swap is what keeps a second press from stacking:
     the scan leaves the eligible statuses on the first one.
@@ -1767,9 +2146,10 @@ def _park_after_redactions(
     :param scan_pk: Primary key of the scan.
     :param message: What to show under the progress bar.
     :param status: Where to park it. Defaults to review 1's finished
-        state; a legacy volume goes back to ``PENDING_REVIEW``, which
-        is where its own step 2 lives, because the #154 states describe
-        a review it never had.
+        state; a successful run passes ``READY_FOR_REDACTION_REVIEW``
+        (#263), and a legacy volume goes back to ``PENDING_REVIEW``,
+        which is where its own step 2 lives, because the #154 and #263
+        states describe a review it never had.
     :return: None.
     """
     Scan.objects.filter(
@@ -1778,6 +2158,56 @@ def _park_after_redactions(
         status=status or Status.PAGE_COMPLETENESS_REVIEW_DONE,
         progress_message=message,
     )
+
+
+def run_apply_page_edits(scan_pk: int) -> None:
+    """Build the corrected volume from the page edits, or glue it.
+
+    The worker behind ``QueuedAction.APPLY_PAGE_EDITS`` (issue #224),
+    which ``apply.queue_ready_scans`` writes on the collect tick.
+    Queued work, like the redaction compute (#196): the build pulls the
+    original and the glue pulls the volume bitonal copy, minutes on a
+    large volume, and the tick's scheduler is serial.
+
+    The scan goes back to ``PAGE_COMPLETENESS_REVIEW_DONE`` whatever
+    happens, and this raises nothing: a failure is counted on the
+    ``ApplyRun`` row, which bounds the retries. The park is guarded on
+    PROCESSING alone. A lost claim -- the daemon's own shutdown
+    re-queued the scan, or an admin moved it -- supersedes the run, so
+    the rows it created are cancelled and the next claim builds the
+    next number from the same shards.
+
+    The local tree goes at the end, as it does on every other terminal
+    path (#215). The build pulls the original and the glue pulls the
+    volume bitonal copy, and the first ticks after a deploy apply the
+    whole approved corpus. Without this the daemon pod would hold every
+    one of those volumes until ``cleanup_processing_tmp`` reached its
+    cutoff.
+
+    :param scan_pk: Primary key of the scan to apply.
+    :return: None.
+    """
+    from scanning import apply, s3_sync
+
+    django.db.connections.close_all()
+    scan = Scan.objects.get(pk=scan_pk)
+    try:
+        message = apply.run_due_phases(scan)
+    except Exception as exc:  # pragma: no cover - run_due_phases catches
+        logger.exception("apply: scan %s: unexpected failure", scan_pk)
+        message = f"Building the corrected volume failed: {exc}"
+    parked = Scan.objects.filter(pk=scan_pk, status=Status.PROCESSING).update(
+        status=Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        progress_message=message[:255],
+        progress_current=0,
+        progress_total=0,
+    )
+    if not parked:
+        apply.supersede_runs(
+            scan, "the daemon lost its claim during the apply"
+        )
+    if s3_sync.s3_active():
+        s3_sync.release_local_processing(scan)
 
 
 def run_full_pipeline(scan_pk: int) -> None:
@@ -1975,6 +2405,35 @@ def _can_convert(scan_pk: int, manifest: dict | None) -> bool:
     return True
 
 
+def convert_stage_open() -> bool:
+    """Return whether doctor can be handed a shard in this environment.
+
+    The two checks of :func:`_can_convert` that need no shard set:
+    doctor configured, and S3 active for the presigned GET. The page
+    edit apply (#224) asks this before it queues a build, so a closed
+    stage costs no attempt and no upload.
+
+    :returns: Whether the conversion stage is open.
+    :rtype: bool
+    """
+    from scanning import doctor_client, s3_sync
+
+    return doctor_client.enabled() and s3_sync.s3_active()
+
+
+def analyze_stage_open() -> bool:
+    """Return whether dots.mocr can be handed a shard in this environment.
+
+    The mirror of :func:`convert_stage_open` for :func:`_can_analyze`.
+
+    :returns: Whether the OCR stage is open.
+    :rtype: bool
+    """
+    from scanning import dots_mocr, s3_sync
+
+    return dots_mocr.enabled() and s3_sync.s3_active()
+
+
 def _can_analyze(scan_pk: int, manifest: dict | None) -> bool:
     """Return whether this environment can hand shards to dots.mocr.
 
@@ -2161,7 +2620,10 @@ def _stamp_original_images(scan: "Scan", base_pdf_path: str) -> str:
 def run_generate_files(scan_pk: int) -> None:
     """Generate redacted/split opinion files from existing detections.
 
-    Designed to run in the daemon process.
+    Designed to run in the daemon process. Nothing queues it since #173;
+    #206 brings it back over the redacted volume, and it is left as it
+    was until then (#269 moved review 2 and the redaction compute to
+    the corrected volume, not this).
 
     :param scan_pk: Primary key of the scan to generate files for.
     """
@@ -2194,32 +2656,14 @@ def run_generate_files(scan_pk: int) -> None:
         _update_progress(scan_pk, "Correcting column boxes...")
         _snap_text_columns_to_ink(scan_pk, str(base_pdf))
 
-        # Write current DB detections -> detections.json (includes page numbers)
-        det_data = _sync_detections_to_disk(scan_pk)
+        # The live detections, with the page numbers beside each box.
+        det_data = detection_entries(scan_pk)
         Scan.objects.filter(pk=scan_pk).update(
             progress_message=f"Generating files ({len(det_data or [])} detections)..."
         )
 
-        # Margin rects are otherwise only computed on demand, by the viewer
-        # asking for them or by a reprocess. A scan taken straight from
-        # review to Generate without the margins overlay ever being switched
-        # on therefore shipped with no whiteouts at all: the platen bands,
-        # fold shadows and corner bleed stayed in the deliverable. Computing
-        # them here makes the output independent of what the reviewer
-        # happened to look at; it no-ops when they already exist.
-        _compute_and_save_margin_rects(scan_pk, str(base_pdf), str(output))
-
-        # Redaction rects, same story: off the upload path, computed here
-        # unless something already produced them. That "something" is either
-        # the step 2 overlay asking for them or a reprocess, and in the step 2
-        # case a reviewer may since have moved or deleted individual rects
-        # through ``save_redaction_rect``. Recomputing would discard those
-        # edits, so the stored set wins whenever there is one.
-        scan.refresh_from_db()
-        if not scan.redaction_rects:
-            _update_progress(scan_pk, "Computing redaction rects...")
-            _compute_and_save_redaction_rects(scan_pk, str(base_pdf))
-
+        # The redaction rows are what the compute wrote and the curator
+        # edited (#240, PR B); nothing is measured here.
         # Build combined redactions.json (margins + redaction rects + opinions)
         Scan.objects.filter(pk=scan_pk).update(
             progress_message="Building combined redactions...",
@@ -2242,8 +2686,6 @@ def run_generate_files(scan_pk: int) -> None:
             llm=True,
         )
 
-        _add_llm_page_text_layer(scan_pk, output / "llm")
-
         opinion_count = result.get("opinion_count", 0)
         full_redacted = result.get("full_redacted", "")
         redacted_dir = Path(result.get("redacted_dir", output / "redacted"))
@@ -2255,21 +2697,22 @@ def run_generate_files(scan_pk: int) -> None:
         )
 
         scan.refresh_from_db()
-        existing_opinions = scan.opinions_json
+        # The boundaries are rows since #240 PR C; the file names land
+        # on the dicts in reading order, as ``build_redactions`` names
+        # them.
+        existing_opinions = boundaries.viewer_payload(scan, live_only=True)
 
-        if existing_opinions and "caption_page" in existing_opinions[0]:
+        if existing_opinions:
             for i, op in enumerate(existing_opinions):
                 if i < len(redacted_files):
                     op["filename"] = redacted_files[i].name
         else:
-            existing_opinions = []
             for f in redacted_files:
                 existing_opinions.append(
                     {"filename": f.name, "first_page": 0, "last_page": 0}
                 )
 
         scan.redacted_pdf_path = str(full_redacted) if full_redacted else ""
-        scan.opinions_json = existing_opinions
         scan.progress_message = "Saving opinion records..."
         scan.save()
 
@@ -2288,6 +2731,7 @@ def run_generate_files(scan_pk: int) -> None:
                 caption_page_index=op.get("caption_page"),
                 key_page_index=op.get("key_page"),
                 has_image=op.get("has_image", False),
+                boundary_id=op.get("id"),
                 status=OpinionStatus.OK,
                 uploaded_by=scan.uploaded_by,
             )
@@ -2318,7 +2762,6 @@ def run_generate_files(scan_pk: int) -> None:
                     opinion.original_pdf.name = _field_name(up)
                 opinion.save()
 
-        _sync_pages_for_scan(scan_pk)
         _update_progress(scan_pk, "Finalizing files...")
         _push_processing_files_to_s3(scan_pk)
 
@@ -2336,275 +2779,6 @@ def run_generate_files(scan_pk: int) -> None:
 
     except Exception as exc:
         _handle_pipeline_exception(scan_pk, exc, context="generate_files")
-
-
-def _page_has_headnote(redactions_pages: dict, page_index: int) -> bool:
-    """Return True if any rect on this page has ``type=headnote``.
-
-    Cheap probe used by the sandwich rule to detect whether a
-    multi-page headnote block is currently flowing.
-
-    :param redactions_pages: ``redactions["pages"]`` — a dict keyed by
-        stringified page_index, each value a list of rect dicts.
-    :param page_index: 0-based PDF page index.
-    :return: True iff at least one rect on that page is a headnote
-        redaction.
-    """
-    return any(
-        r.get("type") == "headnote"
-        for r in redactions_pages.get(str(page_index), [])
-    )
-
-
-def _page_body_covered(
-    redactions_pages: dict,
-    page_index: int,
-    pdf_path: Path,
-) -> bool:
-    """Return True when rects cover essentially all of a page's body.
-
-    Boundary-case confirmation for the sandwich rule: when only one
-    neighbor of a page has headnotes (the page is the leading or trailing
-    edge of a multi-page block), we check that the redaction geometry
-    actually wipes the whole body before calling the page blank.
-
-    The measurement is :func:`blackletter.process.page_body_covered`; what
-    is app-specific is looking the page's rects up in ``redactions.json``
-    and reading the page size off the generated PDF.
-
-    Returns False on any exception so an unreadable PDF cannot mis-flag
-    a page as blank.
-
-    :param redactions_pages: ``redactions["pages"]`` -- dict keyed by
-        stringified page_index, each value a list of rect dicts with
-        ``x0``/``y0``/``x1``/``y1`` in PDF points.
-    :param page_index: 0-based PDF page index.
-    :param pdf_path: Filesystem path to the per-page PDF, used only to
-        read the page size.
-    :return: True if essentially all of the body is covered.
-    """
-    rects = redactions_pages.get(str(page_index), [])
-    if not rects:
-        return False
-    try:
-        with fitz.open(str(pdf_path)) as doc:
-            page_rect = doc[0].rect
-        return page_body_covered(rects, page_rect.width, page_rect.height)
-    except Exception:
-        return False
-
-
-def _blank_page_xml(book_page: str, page_index: int) -> str:
-    """Return the canned ``<page><pagenumber/></page>`` XML.
-
-    Stamped directly onto ``Page.xml_content`` for fully-redacted /
-    blank pages so we skip the LLM call entirely. Uses ``book_page``
-    (the printed page number from OCR) when available, otherwise
-    falls back to the 1-based PDF position.
-
-    :param book_page: The printed page number on this page, or empty
-        string if OCR hasn't populated it.
-    :param page_index: 0-based PDF page index, used as the fallback.
-    :return: A two-line XML stub with the page number filled in both
-        the ``page`` attribute and the element text.
-    """
-    pn = book_page or str(page_index + 1)
-    return f'<page>\n    <pagenumber page="{pn}">{pn}</pagenumber>\n</page>'
-
-
-def _is_blank_via_sandwich(
-    page_index: int,
-    opinions: list[dict],
-    redactions_pages: dict,
-    page_detections: list[dict],
-    pdf_path: "Path | None" = None,
-) -> bool:
-    """Decide whether a page's body is entirely covered by headnotes.
-
-    Page must be interior of a 3+ page opinion AND its neighbors must
-    have ``headnote`` redactions, with no ``FOOTNOTES`` detected on
-    this page (the footnote band is readable content, so not blank).
-
-    Two firing conditions:
-
-      * **Strict sandwich** — both prev and next pages have headnote
-        rects. The page sits inside a multi-page headnote block;
-        fires directly.
-      * **Boundary sandwich** — only one neighbor has headnotes
-        (this page is the leading or trailing edge of the block).
-        Confirm by measuring how much of the body the page's rects
-        cover, since a body made entirely of redaction rects has
-        nothing left to extract.
-
-    :param page_index: 0-based PDF page index.
-    :param opinions: ``scan.opinions_json`` — the curated opinion
-        list, each entry with ``caption_page`` / ``key_page`` /
-        ``page_count``.
-    :param redactions_pages: ``redactions["pages"]`` — per-page rect
-        list keyed by stringified page_index.
-    :param page_detections: All YOLO detections on this page (used
-        only to check for ``FOOTNOTES``).
-    :param pdf_path: Path to the per-page PDF, read for its page size
-        by the boundary coverage check. If omitted, the boundary case
-        can't fire and only strict sandwich pages are flagged.
-    :return: True iff the page's body is effectively blank under the
-        rule above.
-    """
-    if any(d.get("label") == "FOOTNOTES" for d in page_detections):
-        return False
-    if not _page_has_headnote(redactions_pages, page_index):
-        return False
-    for op in opinions:
-        cap = op.get("caption_page")
-        key = op.get("key_page")
-        if cap is None or key is None:
-            continue
-        if not (cap < page_index < key and op.get("page_count", 0) > 2):
-            continue
-        prev_hn = _page_has_headnote(redactions_pages, page_index - 1)
-        next_hn = _page_has_headnote(redactions_pages, page_index + 1)
-        if prev_hn and next_hn:
-            return True
-        # Boundary case: only one side has headnotes. Confirm from the
-        # rect geometry — if the whole body is redacted away, it really
-        # is a blank page even though sandwich doesn't fire.
-        if (prev_hn or next_hn) and pdf_path is not None:
-            if _page_body_covered(redactions_pages, page_index, pdf_path):
-                return True
-    return False
-
-
-def _sync_pages_for_scan(scan_pk: int) -> int:
-    """Create / refresh ``Page`` rows for each ``llm/page_NNNN.pdf``.
-
-    Called at the end of ``run_generate_files`` once blackletter has
-    produced the per-page PDFs. Loads ``detections.json`` once, slices
-    the per-page detection list onto each ``Page`` row, computes
-    ``is_blank``, and stamps the canned blank-
-    page XML for pages where the body is entirely redacted so we skip
-    the LLM call.
-
-    The per-page user prompt is then built via
-    ``ai.user_prompt.build_user_prompt(page)`` and persisted as an
-    ``ai.Prompt`` row that ``Page.user_prompt`` points at.
-
-    Idempotent. ``Page`` is keyed on ``(scan, page_index)``. On re-run:
-
-    - If the regenerated prompt matches the page's current
-      ``Prompt.text``, the FK is left alone (no new Prompt row).
-    - If it differs, a new ``Prompt`` row is created and the FK is
-      repointed; the old Prompt stays as queryable history.
-    - If a previously-not-blank page is now blank, the auto-blank
-      stub overwrites any empty ``xml_content``. If the page was
-      already extracted by Gemini, the existing result is preserved.
-    - If a previously-blank page is no longer blank, the auto-blank
-      stub is cleared so the LLM can pick it up on the next run.
-
-    :param scan_pk: Primary key of the scan to sync.
-    :return: Number of ``Page`` rows touched.
-    """
-    from ai.models import Prompt, PromptTypes
-    from ai.user_prompt import build_user_prompt
-    from scanning.models import ExtractedBy, ExtractionStatus, Page
-
-    scan = Scan.objects.get(pk=scan_pk)
-    output_dir = Path(scan.output_dir)
-    llm_dir = output_dir / "llm"
-    if not llm_dir.is_dir():
-        return 0
-
-    det_path = output_dir / "detections.json"
-    redact_path = output_dir / "redactions.json"
-    all_detections: list[dict] = (
-        json.loads(det_path.read_text()) if det_path.is_file() else []
-    )
-    redactions: dict = (
-        json.loads(redact_path.read_text()) if redact_path.is_file() else {}
-    )
-    redactions_pages: dict = redactions.get("pages", {}) or {}
-    opinions: list[dict] = redactions.get("opinions", []) or []
-    page_numbers = _page_number_lookup(scan)
-
-    # Pre-index detections by page_index so we slice per-page in O(1).
-    detections_by_page: dict[int, list[dict]] = {}
-    for d in all_detections:
-        pi = d.get("page_index")
-        if pi is not None:
-            detections_by_page.setdefault(pi, []).append(d)
-
-    # Tally how many opinions start / end on each page_index, directly
-    # from ``scan.opinions_json`` (caption_page / key_page are already
-    # 0-based PDF indices — no reporter-page detour).
-    starts_by_idx: dict[int, int] = {}
-    ends_by_idx: dict[int, int] = {}
-    for op in scan.opinions_json or []:
-        cap = op.get("caption_page")
-        key = op.get("key_page")
-        if isinstance(cap, int):
-            starts_by_idx[cap] = starts_by_idx.get(cap, 0) + 1
-        if isinstance(key, int):
-            ends_by_idx[key] = ends_by_idx.get(key, 0) + 1
-
-    n = 0
-    for pdf in sorted(llm_dir.glob("page_*.pdf")):
-        try:
-            # "page_0001.pdf" -> 0  (filenames are 1-based; we store 0-based)
-            page_index = int(pdf.stem.split("_", 1)[1]) - 1
-        except (IndexError, ValueError):
-            continue
-
-        pn = page_numbers.get(page_index)
-        book_page = ""
-        if pn:
-            book_page = str(pn[0]) if pn[1] is None else f"{pn[0]}-{pn[1]}"
-
-        page_detections = detections_by_page.get(page_index, [])
-        is_blank = _is_blank_via_sandwich(
-            page_index, opinions, redactions_pages, page_detections, pdf
-        )
-
-        page, _created = Page.objects.update_or_create(
-            scan=scan,
-            page_index=page_index,
-            defaults={
-                "pdf_path": f"llm/{pdf.name}",
-                "book_page": book_page,
-                "expected_opinion_starts": starts_by_idx.get(page_index, 0),
-                "expected_opinion_ends": ends_by_idx.get(page_index, 0),
-                "detections": page_detections,
-                "is_blank": is_blank,
-            },
-        )
-
-        # Auto-stamp the canned blank-page XML so we don't burn an API
-        # call on a page with nothing to extract. Preserves any earlier
-        # Gemini result if a previously-not-blank page is now blank.
-        if is_blank and not page.xml_content:
-            page.xml_content = _blank_page_xml(book_page, page_index)
-            page.extracted_by = ExtractedBy.BLANK_AUTO
-            page.status = ExtractionStatus.EXTRACTED
-            page.save(update_fields=["xml_content", "extracted_by", "status"])
-        elif not is_blank and page.extracted_by == ExtractedBy.BLANK_AUTO:
-            # Was auto-blank, no longer is — clear so the LLM can run.
-            page.xml_content = ""
-            page.extracted_by = ""
-            page.status = ExtractionStatus.PENDING
-            page.save(update_fields=["xml_content", "extracted_by", "status"])
-
-        prompt_text = build_user_prompt(page) or ""
-        if prompt_text:
-            current = page.user_prompt
-            if current is None or current.text != prompt_text:
-                new_prompt = Prompt.objects.create(
-                    name=f"scan {scan.pk} p{page_index:04d}",
-                    prompt_type=PromptTypes.USER,
-                    text=prompt_text,
-                )
-                page.user_prompt = new_prompt
-                page.save(update_fields=["user_prompt"])
-        n += 1
-
-    return n
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    OpinionBoundary,
     OpinionScan,
     OpinionStatus,
     PageEdit,
@@ -179,6 +180,41 @@ class PageEditFactory(factory.django.DjangoModelFactory):
     author = factory.SubFactory(UserFactory)
     pdf_page = 1
     value = "1"
+
+
+class OpinionBoundaryFactory(factory.django.DjangoModelFactory):
+    """Factory for creating OpinionBoundary instances (issue #240, PR C).
+
+    Defaults to one computed opinion over the first two pages of the
+    original, addressed in the original's space. For a curator's row
+    pass ``origin=OpinionBoundary.Origin.HUMAN`` and a ``kind``.
+
+    Default declarations:
+
+    - ``scan``: auto-created via ``ScanFactory``.
+    - ``origin``: ``OpinionBoundary.Origin.COMPUTED``.
+    - ``start_source_page``: 1; ``start_page_index``: 0.
+    - ``start_x``, ``start_y``: 72.0, 100.0.
+    - ``end_source_page``: 2; ``end_page_index``: 1.
+    - ``end_x``, ``end_y``: 540.0, 700.0.
+    - ``ordinal``: sequential from 0.
+    """
+
+    class Meta:
+        model = OpinionBoundary
+        skip_postgeneration_save = True
+
+    scan = factory.SubFactory(ScanFactory)
+    origin = OpinionBoundary.Origin.COMPUTED
+    start_source_page = 1
+    start_page_index = 0
+    start_x = 72.0
+    start_y = 100.0
+    end_source_page = 2
+    end_page_index = 1
+    end_x = 540.0
+    end_y = 700.0
+    ordinal = factory.Sequence(lambda n: n)
 
 
 class OpinionScanFactory(factory.django.DjangoModelFactory):

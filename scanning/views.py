@@ -12,23 +12,21 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count, Q
+from django.db.models import Count
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
-from scanning import s3_sync
+from scanning import repairs, s3_sync, stats
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
 )
 from scanning.models import (
-    ExtractionStatus,
     OpinionScan,
     OpinionStatus,
-    Page,
     PendingUpload,
     Priority,
     QueueStatus,
@@ -71,11 +69,18 @@ def logout_view(request: HttpRequest) -> HttpResponse:
 def scan_list(request: HttpRequest) -> HttpResponse:
     """List scans with opinion count annotation.
 
+    Each row of the page carries ``waiting_repairs``, the number of
+    pages a scanner must still scan (#266). A volume with one cannot
+    pass the page completeness review, so the badge keeps a reviewer
+    out of it.
+
     :param request: The current HTTP request.
     :return: The rendered scan list page.
     """
     scans = (
-        Scan.objects.select_related("reporter")
+        # ``uploaded_by`` is joined because every row prints the
+        # username: without it the page cost one query per scan.
+        Scan.objects.select_related("reporter", "uploaded_by")
         .annotate(opinion_count=Count("opinions"))
         .order_by("-date_created")
     )
@@ -104,6 +109,15 @@ def scan_list(request: HttpRequest) -> HttpResponse:
     paginator = Paginator(scans, 25)
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
+
+    # The repair badge (#266): a volume whose pages a scanner must
+    # scan cannot pass the page completeness review, so a reviewer
+    # must see that before they open it. The count is stamped after
+    # the pagination, so one grouped query answers the 25 rows of
+    # this page and the size of the corpus never reaches it.
+    waiting = repairs.waiting_counts([scan.pk for scan in page_obj])
+    for scan in page_obj:
+        scan.waiting_repairs = waiting.get(scan.pk, 0)
 
     retry_cap_count = Scan.objects.filter(
         status=Status.ERROR_MAX_RETRIES,
@@ -357,6 +371,65 @@ def queue_view(request: HttpRequest) -> HttpResponse:
             "priorities": Priority.choices,
         },
     )
+
+
+@login_required
+def repair_queue(request: HttpRequest) -> HttpResponse:
+    """The queue of pages a scanner must scan again or scan anew (#249).
+
+    Every user sees it. The rows are grouped by scan, so a scanner
+    with the book fixes every page of a volume in one trip. Each row
+    links to the page in step 1. The ``state`` filter reads
+    ``repairs.QUEUE_STATES``; the default shows the requests that
+    wait, which is the work.
+
+    :param request: The current HTTP request.
+    :return: The rendered repair queue page.
+    """
+    state = request.GET.get("state", "waiting")
+    if state not in repairs.QUEUE_STATES:
+        state = "waiting"
+    reporter_filter = request.GET.get("reporter", "")
+
+    rows = repairs.queue(state)
+    if reporter_filter:
+        rows = rows.filter(scan__reporter__short_name=reporter_filter)
+
+    # Paginate the scans, then fetch the rows of the scans on the page.
+    # A row is never deleted, so a page that loaded every row first
+    # would grow with the history of the corpus.
+    paginator = Paginator(repairs.queue_scan_ids(rows), 50)
+    page_obj = paginator.get_page(request.GET.get("page"))
+    groups = repairs.group_by_scan(rows, list(page_obj.object_list))
+
+    return render(
+        request,
+        "scanning/repair_queue.html",
+        {
+            "page_obj": page_obj,
+            "groups": groups,
+            "state": state,
+            "states": repairs.QUEUE_STATES,
+            "reporters": Reporter.objects.all(),
+            "selected_reporter": reporter_filter,
+            # The waiting total is ``waiting_repairs_count``, from the
+            # context processor that feeds the header badge: one query.
+        },
+    )
+
+
+@login_required
+def stats_view(request: HttpRequest) -> HttpResponse:
+    """How much work is done, and where the rest of it waits (#260).
+
+    Every user sees it, as they see ``/repairs/``: the counts are not
+    sensitive, and a scanner reads the same report as a member of the
+    staff. The queries live in ``scanning.stats``.
+
+    :param request: The current HTTP request.
+    :return: The rendered stats page.
+    """
+    return render(request, "scanning/stats.html", stats.collect())
 
 
 @login_required
@@ -872,87 +945,4 @@ def update_scan_status(request, reporter_slug, vol):
         "queue_detail",
         reporter_slug=reporter_slug,
         vol=vol,
-    )
-
-
-@login_required
-def scan_pages_list(request: HttpRequest, pk: int) -> HttpResponse:
-    """List every ``Page`` of a scan with extraction state.
-
-    Phase 1: read-only. Filters by status / needs_review let the human
-    surface the ~1-2 pages that need attention per volume without
-    scrolling the whole list. Each PDF link opens the per-page file via
-    ``serve_page_pdf``; each ``page_index`` cell links into the
-    per-page detail view.
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: Rendered pages-list page.
-    """
-    scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
-    pages = scan.pages.select_related("user_prompt").order_by("page_index")
-
-    status_filter = request.GET.get("status") or ""
-    review_filter = request.GET.get("needs_review") == "1"
-    if status_filter:
-        pages = pages.filter(status=status_filter)
-    if review_filter:
-        pages = pages.filter(needs_review=True)
-
-    counts = scan.pages.aggregate(
-        total=Count("id"),
-        extracted=Count("id", filter=~Q(xml_content="")),
-        with_prompt=Count("id", filter=Q(user_prompt__isnull=False)),
-        needs_review=Count("id", filter=Q(needs_review=True)),
-    )
-
-    return render(
-        request,
-        "scanning/pages_list.html",
-        {
-            "scan": scan,
-            "pages": pages,
-            "counts": counts,
-            "status_filter": status_filter,
-            "review_filter": review_filter,
-            "statuses": ExtractionStatus.choices,
-        },
-    )
-
-
-@login_required
-def page_detail(request: HttpRequest, pk: int) -> HttpResponse:
-    """Per-page review pane.
-
-    Phase 1: read-only — shows PDF link, current user prompt,
-    extraction metadata, and prev/next navigation within the scan.
-    Phase 2 will add edit / retry / OCR-fallback buttons.
-
-    :param request: The HTTP request.
-    :param pk: Page primary key.
-    :return: Rendered page-detail page.
-    """
-    page = get_object_or_404(
-        Page.objects.select_related("scan", "scan__reporter", "user_prompt"),
-        pk=pk,
-    )
-    prev_page = (
-        Page.objects.filter(scan=page.scan, page_index__lt=page.page_index)
-        .order_by("-page_index")
-        .first()
-    )
-    next_page = (
-        Page.objects.filter(scan=page.scan, page_index__gt=page.page_index)
-        .order_by("page_index")
-        .first()
-    )
-    return render(
-        request,
-        "scanning/page_detail.html",
-        {
-            "page": page,
-            "scan": page.scan,
-            "prev_page": prev_page,
-            "next_page": next_page,
-        },
     )

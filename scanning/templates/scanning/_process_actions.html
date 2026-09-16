@@ -13,16 +13,19 @@ ExternalJob rows (issues #190, #195 and #191) -- rather than from
 and is included by the step-1 bar beside the dots.mocr control: both
 read the original shards.
 
-The detection control is not "Next: Detect". It runs the stage and
-stores its output in S3, and nothing reads that output until #196. It
-is here so the rebuilt worker image can be tried on a few volumes
-before it runs over the corpus (#211).
+There is no detection button (#250). The daemon starts the run by
+itself once per shard set, right after the upload, and this bar only
+shows its state. "Next: Detect" starts nothing either: it walks to
+step 2 when detections exist and otherwise explains, with the same
+text as its title (`detect_message`).
 
 The review-1 controls (issue #151) read `page_review_ready` /
-`page_review_done`, the two #154 statuses. Approving is the gate: it is
+`page_review_done`. Approving is the gate: it is
 what reveals "Next: Detect". Open page edits do not hide it (#232):
 the apply runs after the approval, so a bar that waited for the apply
-waited for a button it was hiding.
+waited for a button it was hiding. `page_review_done` covers the whole
+of review 2 as well (#263): a curator who walks back here from the
+redaction review must find the bar they left.
 
 "Validate" and "Re-validate" are offered to a legacy scan only
 (`has_legacy_ocr`). A new-pipeline volume needs no re-run: sharding,
@@ -48,12 +51,14 @@ reach step 2.
     {% endif %}
   </span>
   {% endif %}
-  {% if user.is_staff and not dots_run.open %}
-  <form method="post" action="{% url 'start_dots_mocr' scan.pk %}" class="inline">
-    {% csrf_token %}
-    <button type="submit" class="btn-outline text-sm" title="Read every page of the original with dots.mocr on RunPod (incurs costs $$$)" onclick="return confirm('This runs dots.mocr OCR on RunPod over every page of this volume. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}{% if dots_run %}Re-run OCR{% else %}Run OCR{% endif %}</button>
-  </form>
-  {% endif %}
+  {% comment %}
+  The "Run OCR" / "Re-run OCR" button is gone (#224). The pipeline
+  starts the read at upload (#207), and a re-read over an edited volume
+  is the apply's job: it re-reads the edited pages alone, as one-page
+  shards, and keeps every paid page. A whole-volume re-run from the
+  viewer paid RunPod for every page again. The endpoint
+  (``start_dots_mocr``) stays for a staff POST.
+  {% endcomment %}
   {% include "scanning/_mistral_actions.html" %}
   {% if yolo_run %}
   <span class="text-sm text-gray-600 mr-2" title="Detection run {{ yolo_run.run }}: {{ yolo_run.label }}">
@@ -68,16 +73,6 @@ reach step 2.
     &middot; <a href="{% url 'glued_output_index' scan.pk 'yolo' %}" class="underline" title="The runs, the shards and the result files of the detection">files</a>
     {% endif %}
   </span>
-  {% endif %}
-  {# Only an approved volume: the run ends in an apply that rewrites the
-     detections and the redaction geometry (#196), and the queue pass
-     takes a scan from PAGE_COMPLETENESS_REVIEW_DONE alone -- so a
-     button offered earlier would pay for a run nothing applies. #}
-  {% if user.is_staff and page_review_done and not yolo_run.open %}
-  <form method="post" action="{% url 'start_yolo_detect' scan.pk %}" class="inline">
-    {% csrf_token %}
-    <button type="submit" class="btn-outline text-sm" title="Detect captions, key icons and headnotes on every page of the original with YOLO on RunPod, then compute the redactions of review 2 (incurs costs $$$)" onclick="return confirm('This runs YOLO detection on RunPod over every page of this volume. This will incur costs $$$. Continue?');">{% include "scanning/_runpod_icon.html" %}{% if yolo_run %}Re-run detection{% else %}Run detection{% endif %}</button>
-  </form>
   {% endif %}
   {% comment %}
     There is no "Rebuild & Validate" branch here any more (#232). It
@@ -103,13 +98,38 @@ reach step 2.
     {% csrf_token %}
     <button type="submit" class="btn-outline text-sm" title="Read the stored page numbers again and rebuild the list of issues. This does not run OCR.">Recompute page number issues</button>
   </form>
-  {% if page_review_ready %}
+  {% if page_review_ready and repairs_waiting %}
+  {% comment %}
+    A scanner was asked for a page, so the volume is not page complete
+    and there is no approve button (#266). Say why, and name the two
+    ways out: the new scan arrives, or somebody dismisses the request.
+    A bar that only hid the button would be the dead end #232 removed.
+    `approve_page_completeness` refuses the POST as well, because a
+    gate in a template cannot answer a direct POST.
+  {% endcomment %}
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-200" title="Wait for the new scan, or dismiss the request on the page if it no longer applies.">Waiting for a scanner &mdash; see Repairs requested</span>
+  {% elif page_review_ready %}
   <form method="post" action="{% url 'approve_page_completeness' scan.pk %}" class="inline">
     {% csrf_token %}
-    <button type="submit" class="btn-primary text-sm" title="Confirm this volume is page complete: no missing, duplicated, mislabeled or blurry pages.{% if has_pending_changes %} Your saved page changes are applied for you when the pass that builds the corrected volume is ready (#206).{% endif %}"{% if issues or missing_pages %} onclick="return confirm('This scan still lists issues or missing pages. Approve it as page complete anyway?');"{% elif has_pending_changes %} onclick="return confirm('Your page changes are saved. We apply them to the volume later, when that pass is ready. Approve this scan as page complete?');"{% endif %}>I reviewed this scan and it is complete</button>
+    <button type="submit" class="btn-primary text-sm" title="Confirm this volume is page complete: no missing, duplicated, mislabeled or blurry pages.{% if has_pending_changes %} The corrected volume is then built from your saved page changes{% if has_pending_inserts %}, and each inserted or replaced page is converted and read on its own (incurs costs $$$){% endif %}.{% endif %}"{% if issues or missing_pages %} onclick="return confirm('This scan still lists issues or missing pages. Approve it as page complete anyway?');"{% elif has_pending_inserts %} onclick="return confirm('The corrected volume is built from your page changes after this approval. Each inserted or replaced page is converted and read on its own, which incurs costs $$$. Approve this scan as page complete?');"{% elif has_pending_changes %} onclick="return confirm('The corrected volume is built from your page changes after this approval. Approve this scan as page complete?');"{% endif %}>I reviewed this scan and it is complete</button>
   </form>
   {% elif page_review_done %}
-  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed this volume is page complete">&#10003; Page review done</span>
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed this volume is page complete. Its pages are locked{% if page_review_reopenable %}; a staff member can reopen the review{% else %}; the way back is the admin re-queue{% endif %}.">&#10003; Page review done</span>
+  {% if apply_run %}
+  <span class="text-sm text-gray-600 mr-2" title="Apply run {{ apply_run.label }}: {{ apply_run.summary }}">{{ apply_run.message }}</span>
+  {% endif %}
+  {% comment %}
+    Staff only (#224): the reopen throws away a paid build, and the
+    curators' own step is the approval, not its reversal. Only while
+    the scan is still in DONE: the view's compare-and-swap reads that
+    status, and a volume in review 2 (#263) is not reopened here.
+  {% endcomment %}
+  {% if user.is_staff and page_review_reopenable %}
+  <form method="post" action="{% url 'reopen_page_review' scan.pk %}" class="inline">
+    {% csrf_token %}
+    <button type="submit" class="btn-outline text-sm" title="Open the page review again so its pages can be edited. The corrected volume in progress is discarded and rebuilt after the next approval." onclick="return confirm('Reopen the page review? The corrected volume in progress is discarded, and it is rebuilt after the next approval. Pages already converted and read are reused.');">Reopen page review</button>
+  </form>
+  {% endif %}
   {% endif %}
   {% if has_legacy_ocr %}
   <form method="post" action="{% url 'start_validate' scan.pk %}" class="inline">
@@ -132,28 +152,115 @@ reach step 2.
     {% if has_detections %}
     <button type="submit" class="btn-primary text-sm" title="Detections already exist. Skip directly to review (no RunPod, no cost).">Next: Detect &rarr;</button>
     {% else %}
-    {# No paid confirm here (#196): this button starts nothing.
-       start_detect walks to step 2 when detections exist and otherwise
-       says who starts the run; the staff button above is the one that
-       pays. A confirm that named RunPod and a cost here promised a run
-       the view then did not start. #}
-    <button type="submit" class="btn-outline text-sm" title="This volume has no detections yet. A staff member starts the detection run, and the redactions appear here when it finishes.">Next: Detect &rarr;</button>
+    {% comment %}
+      No paid confirm here (#196): this button starts nothing.
+      start_detect walks to step 2 when detections exist and otherwise
+      says where the run stands; the daemon is what pays (#250). A
+      confirm that named RunPod and a cost here promised a run the
+      view then did not start.
+    {% endcomment %}
+    <button type="submit" class="btn-outline text-sm" title="{{ detect_message }}">Next: Detect &rarr;</button>
     {% endif %}
   </form>
   {% endif %}
   {% endif %}
 
 {% elif step == 2 %}
-{# No "Re-pair Opinions" button for now (#196). The computation behind
-   it renders every page of the volume on the daemon and takes the scan
-   out of review for a minute or more, so until the stage has been
-   watched on a few volumes (#211) the daemon's one run after detection
-   is the only one wanted. The endpoints refuse too
-   (views_api.REPAIR_ON_REQUEST_ENABLED); turning it back on is that flag
-   plus this button:
-   <button class="btn-primary text-sm" id="pair-btn" onclick="pairOpinions()">Re-pair Opinions</button>
-#}
-  {% if opinions %}
+{% comment %}
+  The review-2 controls (issue #263) read `redaction_review_ready` /
+  `redaction_review_done`, the two new statuses, from the same
+  `_review_flags` the step-1 bar reads. Approving is the gate for
+  "Next: Generate", the mirror of how the review-1 approval reveals
+  "Next: Detect".
+
+  No confirm dialog and no cost warning: this button starts nothing and
+  pays nothing. Open detections do not hide it either -- the curator
+  judges the geometry, as they judge a page-completeness suspicion
+  (#151).
+
+  A legacy volume keeps its link. Its step 2 lives in PENDING_REVIEW,
+  so it can hold neither #263 status, and a gate on the approval alone
+  would strand it here. That clause reads `legacy_review`, the status,
+  and not `has_legacy_ocr`: a backfill dots.mocr run over an old volume
+  turns the second one false while the volume is still in the legacy
+  step 2, and the link would go with it.
+{% endcomment %}
+{% comment %}
+  Which volume the reviewer sees (#269). Step 2 shows the corrected
+  volume of the standing apply run once the redactions are measured
+  against it (`final_space`); until then it shows the volume as
+  uploaded, and this note says so, because a reviewer who cannot see
+  which pages are in front of them cannot judge the redactions. The
+  staff "files" link opens the run's outputs, the #243 shape.
+{% endcomment %}
+  {% if final_volume %}
+  <span class="text-sm text-gray-600 mr-2" title="Apply run {{ final_volume.label }}: {{ final_volume.final_page_count }} page(s), {{ final_volume.deleted }} deleted, {{ final_volume.inserted }} inserted, {{ final_volume.replaced }} replaced, {{ final_volume.rotated }} rotated">
+    {% if final_volume.measured and final_volume.identity %}
+    Showing the volume as uploaded: the page review made no page edits.
+    {% elif final_volume.measured %}
+    Showing the corrected volume {{ final_volume.label }}: {{ final_volume.final_page_count }} pages ({{ final_volume.deleted }} deleted, {{ final_volume.inserted }} inserted, {{ final_volume.replaced }} replaced, {{ final_volume.rotated }} rotated).
+    {% else %}
+    The corrected volume {{ final_volume.label }} is built. Its redactions are being measured; this is the volume as uploaded until then.
+    {% endif %}
+    {% if user.is_staff %}
+    &middot; <a href="{% url 'apply_output_index' scan.pk %}" class="underline" title="The apply runs, their outputs and their one-page shards">files</a>
+    {% endif %}
+  </span>
+  {% elif not legacy_review %}
+  <span class="text-sm text-gray-600 mr-2">
+    The corrected volume is not built yet. This is the volume as uploaded, before the page edits.{% if apply_run %} {{ apply_run.message }}{% endif %}
+  </span>
+  {% endif %}
+  {% comment %}
+    The recompute of review 2 (#305). A curator who draws or dismisses
+    a detection changes what the pairing would say, and nothing but
+    this measurement pairs the opinions again: the cheap "Recompute"
+    button of the findings panel writes the cards again from the rows
+    and moves no box.
+
+    The confirm names the cost in time, not in money. The measurement
+    renders every page on the daemon -- 83 seconds for 1364 pages --
+    and takes the volume out of the review while it runs, but it pays
+    no RunPod money. Every row the curator wrote is kept: a recompute
+    against the standing apply run imports no model row.
+
+    One thing the confirm does not promise, because the compute cannot
+    keep it: a dismissed text box can come back. The fit of #279
+    narrows every text box to the read text, a dismiss lands by an IoU
+    of at least 0.5 against a copy of the box it named, and a box that
+    loses half its width falls under that. The volumes already in
+    review 2 carry the wide boxes, since the backfill left a dismissed
+    one alone on purpose. The curator sees a "not applied" card and
+    dismisses it again. The guard that ends this is #307.
+
+    It is not offered after the approval. ``REDACTION_COMPUTE_STATUSES``
+    refuses ``REDACTION_REVIEW_DONE`` -- a closed review is not
+    recomputed under the person who closed it -- and a button must
+    never send a curator to an action that refuses.
+  {% endcomment %}
+  {% if redaction_review_ready or legacy_review %}
+  <button type="button" class="btn-outline text-sm" id="recompute-btn" title="Pair the opinions again and measure every redaction from the detection boxes as they are now. It runs on the server and takes this volume out of the review for a minute or more. Your boxes and your decisions are kept, but a text box you dismissed can come back when the new reading makes it much narrower." onclick="return recomputeRedactions();">Recompute redactions</button>
+  {% endif %}
+  {% comment %}
+    The open findings of review 2 (#240 PR D). The button obeys: the
+    curator judges a finding as they judge a page-completeness
+    suspicion (#151), so an open count asks for a confirm and blocks
+    nothing. A finding that says one of the curator's own decisions is
+    not applied ("not applied") is named apart, because approving over
+    it approves the model's answer in its place.
+  {% endcomment %}
+  {% if redaction_review_ready %}
+  {% if review2_open %}
+  <span class="inline-flex items-center rounded px-2 py-1 text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200" title="Open findings of the redaction review, listed in the sidebar">{{ review2_open }} finding{{ review2_open|pluralize }} open{% if review2_stale %}, {{ review2_stale }} decision{{ review2_stale|pluralize }} not applied{% endif %}</span>
+  {% endif %}
+  <form method="post" action="{% url 'approve_redaction_review' scan.pk %}" class="inline">
+    {% csrf_token %}
+    <button type="submit" class="btn-primary text-sm" title="Confirm the redactions of this volume are correct: every headnote and key number is covered, and no opinion text is."{% if review2_open %} onclick="return confirm('This volume still lists {{ review2_open }} open finding{{ review2_open|pluralize }}.{% if review2_stale %} {{ review2_stale }} of your decision{{ review2_stale|pluralize }} {{ review2_stale|pluralize:'is,are' }} not applied, so the volume shows the model\'s answer there.{% endif %} Approve the redactions anyway?');"{% endif %}>I reviewed the redactions and they are correct</button>
+  </form>
+  {% elif redaction_review_done %}
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed the redactions of this volume">&#10003; Redaction review done</span>
+  {% endif %}
+  {% if has_opinions and redaction_review_done or has_opinions and legacy_review %}
   <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
   {% endif %}
 

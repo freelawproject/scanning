@@ -19,23 +19,23 @@ import environ
 
 env = environ.FileAwareEnv()
 
-# Master switch for **dispatching** detection shards to RunPod.
+# Master switch for the detection stage: the sweep that creates the
+# rows and the wave that dispatches them, together.
 #
-# Read the verb carefully: this gates whether the daemon submits rows
-# that already exist. It does not enqueue anything, and turning it on
-# starts no work on its own.
-#
-# Nothing auto-enqueues this stage, and that is structural rather than a
-# promise: ``yolo.ensure_detect_jobs`` is the only thing that creates
-# DETECT rows, and ``views_process.start_yolo_detect`` -- the staff-only
-# button -- is its only caller. A test holds that line
-# (``TestKnownEnqueuePaths``), so a future caller has to delete it
+# Since #250 the daemon starts detection by itself: on every submit
+# tick ``yolo.enqueue_missing_runs`` creates one row per shard for
+# every fingerprinted shard set that has no detection run yet, alive
+# or dead, and ``jobs.submit_pending`` sends them on the same tick.
+# Both read this switch, so turning it off stops the spend at once
+# and turning it on starts the backlog draining on the next tick.
+# ``yolo.ensure_detect_jobs`` is the only thing that creates DETECT
+# rows, and the sweep is its only caller; a test holds that line
+# (``TestKnownEnqueuePaths``), so a future caller has to change it
 # deliberately rather than add one by accident.
 #
-# On by default, therefore, so a deploy needs no secret-store change to
-# make the button work. The cost stays deliberate because a person still
-# has to press it. Automatic dispatch over the corpus is a follow-up,
-# after this stage has been exercised on real volumes (#211).
+# On by default, so a deploy needs no secret-store change to run the
+# stage. The cost is bounded by the rule of the sweep: one run per
+# shard set, ever.
 YOLO_ENABLED = env.bool("YOLO_ENABLED", default=True)
 
 # The engine's own RunPod serverless endpoint id (from the RunPod
@@ -58,8 +58,17 @@ RUNPOD_YOLO_ENDPOINT_ID = env.str("RUNPOD_YOLO_ENDPOINT_ID", default="")
 # bills each worker's cold start, so shards running in parallel on cold
 # workers pay boot several times over, and three shards in series on one
 # warm worker may cost less than three at once. The real cost control is
-# the endpoint's own ``max_workers``. Low while the stage is new.
-YOLO_MAX_CONCURRENCY = env.int("YOLO_MAX_CONCURRENCY", default=2)
+# the endpoint's own ``max_workers``, which must be at least this value
+# or the extra rows wait in the provider's queue with the ceiling clock
+# running on them (#250 raised this from 2 to 3).
+#
+# The detection sweep (``yolo.enqueue_missing_runs``) reads it too, as
+# the number of volumes it looks at per submit tick. The two count
+# different things -- shards in flight, volumes per tick -- but one
+# value serves both, and a second knob would be one nobody tunes: a
+# smaller batch only means the backlog takes more ticks to become
+# rows, and nothing waits on that.
+YOLO_MAX_CONCURRENCY = env.int("YOLO_MAX_CONCURRENCY", default=3)
 
 # Attempts per shard before its job is failed. Serverless workers are
 # preempted, scheduled without a GPU, or land with a dead inference

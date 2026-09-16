@@ -23,9 +23,11 @@ from scanning.factories import (
 from scanning.models import (
     CheckName,
     Detection,
+    DetectionDecision,
     Issue,
     PageEdit,
     QueueStatus,
+    Redaction,
     Scan,
     Stage,
     Status,
@@ -226,30 +228,28 @@ class TestModelProvenanceSurvives(TestCase):
         fields.update(kwargs)
         return Detection.objects.create(**fields)
 
-    def test_detections_json_carries_found_by(self):
-        from scanning.services import _sync_detections_to_disk
+    def test_the_entries_carry_found_by(self):
+        from scanning.services import detection_entries
 
         self._detection()
 
-        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+        det_data = detection_entries(self.scan.pk)
 
         self.assertEqual(
             det_data[0]["found_by"],
             [{"model": "bl_warm", "confidence": 0.92}],
         )
-        on_disk = json.loads(
-            (
-                pathlib.Path(self.scan.output_dir) / "detections.json"
-            ).read_text()
+        # The rows are the only store since #240: no file is written.
+        self.assertFalse(
+            (pathlib.Path(self.scan.output_dir) / "detections.json").exists()
         )
-        self.assertEqual(on_disk[0]["found_by"], det_data[0]["found_by"])
 
     def test_a_hand_added_box_claims_no_model(self):
         """It would read as a second family and send the whole volume
         back to the legacy gates."""
         from blackletter.bl_warm import rows_are_bl_warm
 
-        from scanning.services import _sync_detections_to_disk
+        from scanning.services import detection_entries
 
         self._detection()
         self._detection(
@@ -260,7 +260,7 @@ class TestModelProvenanceSurvives(TestCase):
             found_by=[],
         )
 
-        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+        det_data = detection_entries(self.scan.pk)
 
         self.assertNotIn("found_by", det_data[1])
         self.assertTrue(rows_are_bl_warm(det_data))
@@ -271,10 +271,7 @@ class TestModelProvenanceSurvives(TestCase):
         send the volume back to the legacy gates."""
         from blackletter.bl_warm import rows_are_bl_warm
 
-        from scanning.services import (
-            _detections_for_geometry,
-            _sync_detections_to_disk,
-        )
+        from scanning.services import detection_entries
 
         self._detection()
         self._detection(
@@ -285,8 +282,8 @@ class TestModelProvenanceSurvives(TestCase):
             found_by=[{"model": "manual", "confidence": 1.0}],
         )
 
-        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
-        geometry = _detections_for_geometry(self.scan.pk, self.scan.output_dir)
+        det_data = detection_entries(self.scan.pk)
+        geometry = detection_entries(self.scan.pk, page_numbers={})
 
         self.assertNotIn("found_by", det_data[1])
         self.assertNotIn("found_by", geometry[1])
@@ -299,15 +296,13 @@ class TestModelProvenanceSurvives(TestCase):
         from django.urls import reverse
 
         self._detection()
-        det_path = pathlib.Path(self.scan.output_dir) / "detections.json"
-        det_path.write_text("[]")
         self.client.force_login(UserFactory())
 
         response = self.client.post(
             reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
             data=json.dumps(
                 {
-                    "page_index": 3,
+                    "page_index": 0,
                     "label_id": 1,
                     "bbox": [100, 100, 140, 140],
                     "img_width": 1700,
@@ -323,15 +318,73 @@ class TestModelProvenanceSurvives(TestCase):
             scan=self.scan, model_name=Detection.ModelName.MANUAL
         )
         self.assertEqual(added.found_by, [])
+        self.assertEqual(added.pk, response.json()["detection_id"])
+        # Addressed by its source page (#240): no run, so the original's.
+        self.assertEqual(added.source_page, 1)
+        self.assertIsNone(added.source_edit)
+
+    def test_a_second_add_on_the_curator_s_own_box_is_a_no_op(self):
+        """The proximity match includes hand-drawn rows, or a repeat
+        click would draw a second box over the first (PR #288 review)."""
+        from django.urls import reverse
+
+        self.client.force_login(UserFactory())
+        body = {
+            "page_index": 0,
+            "label_id": 1,
+            "bbox": [100, 100, 140, 140],
+            "img_width": 1700,
+            "img_height": 2200,
+        }
+        first = self.client.post(
+            reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+            data=json.dumps(body),
+            content_type="application/json",
+        )
+
+        second = self.client.post(
+            reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({**body, "bbox": [104, 98, 144, 138]}),
+            content_type="application/json",
+        )
+
+        self.assertTrue(first.json()["added"])
+        self.assertFalse(second.json()["added"])
+        self.assertEqual(
+            second.json()["detection_id"], first.json()["detection_id"]
+        )
+        self.assertEqual(
+            Detection.objects.filter(
+                scan=self.scan, model_name=Detection.ModelName.MANUAL
+            ).count(),
+            1,
+        )
+        self.assertEqual(DetectionDecision.objects.count(), 0)
+
+    def test_a_malformed_add_names_no_exception(self):
+        from django.urls import reverse
+
+        self.client.force_login(UserFactory())
+
+        with self.assertLogs("scanning.views_api", level="WARNING"):
+            response = self.client.post(
+                reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+                data=json.dumps({"page_index": 0, "label_id": 1, "bbox": [1]}),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("Traceback", response.json()["error"])
+        self.assertNotIn("ValueError", response.json()["error"])
 
     def test_the_document_reads_the_bl_warm_gates(self):
         from scanning.services import (
             _build_document_from_detections,
-            _sync_detections_to_disk,
+            detection_entries,
         )
 
         self._detection()
-        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+        det_data = detection_entries(self.scan.pk)
 
         document = _build_document_from_detections(
             self.scan, det_data, PDF_PATH
@@ -342,11 +395,11 @@ class TestModelProvenanceSurvives(TestCase):
     def test_a_legacy_volume_keeps_the_legacy_gates(self):
         from scanning.services import (
             _build_document_from_detections,
-            _sync_detections_to_disk,
+            detection_entries,
         )
 
         self._detection(model_name=Detection.ModelName.LARGE, found_by=[])
-        det_data = _sync_detections_to_disk(self.scan.pk, upload=False)
+        det_data = detection_entries(self.scan.pk)
 
         document = _build_document_from_detections(
             self.scan, det_data, PDF_PATH
@@ -355,11 +408,11 @@ class TestModelProvenanceSurvives(TestCase):
         self.assertFalse(document.bl_warm)
 
     def test_the_geometry_lookup_carries_it_too(self):
-        from scanning.services import _detections_for_geometry
+        from scanning.services import detection_entries
 
         self._detection()
 
-        dets = _detections_for_geometry(self.scan.pk, self.scan.output_dir)
+        dets = detection_entries(self.scan.pk, page_numbers={})
 
         self.assertEqual(
             dets[0]["found_by"],
@@ -368,76 +421,44 @@ class TestModelProvenanceSurvives(TestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestSyncDetectionsToDisk(TestCase):
-    """Test _sync_detections_to_disk."""
+class TestDetectionEntries(TestCase):
+    """``detection_entries`` is the in-memory list that replaced
+    ``detections.json`` (#240)."""
 
     def setUp(self):
         _require_fixture(self)
 
-    def test_writes_detections_json(self):
-        from scanning.services import _sync_detections_to_disk
+    def test_lists_the_live_rows_and_writes_no_file(self):
+        from scanning.services import detection_entries
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(tmpdir)
-            output = pathlib.Path(scan.output_dir)
             _run_detect_on_fixture(tmpdir)
             _import_detections(scan.pk, tmpdir)
-
-            # Delete the file from output_dir and re-sync from DB
-            det_path = output / "detections.json"
-            # Copy detections.json from tmpdir to output_dir first
-            src = pathlib.Path(tmpdir) / "detections.json"
-            if src.exists():
-                shutil.copy2(src, det_path)
+            det_path = pathlib.Path(scan.output_dir) / "detections.json"
             det_path.unlink(missing_ok=True)
+
+            det_data = detection_entries(scan.pk)
+
+            self.assertEqual(
+                len(det_data), Detection.objects.filter(scan=scan).count()
+            )
             self.assertFalse(det_path.exists())
 
-            det_data = _sync_detections_to_disk(scan.pk)
-            self.assertTrue(det_path.exists())
-            on_disk = json.loads(det_path.read_text())
-            self.assertEqual(len(on_disk), len(det_data))
-
-    def test_returns_none_without_detections(self):
-        from scanning.services import _sync_detections_to_disk
+    def test_returns_an_empty_list_without_detections(self):
+        from scanning.services import detection_entries
 
         scan = ScanFactory()
-        # output_dir is computed but directory doesn't exist on disk
-        result = _sync_detections_to_disk(scan.pk)
-        self.assertIsNone(result)
+        self.assertEqual(detection_entries(scan.pk), [])
 
 
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestComputeAndSaveRedactionRects(TestCase):
-    """Test _compute_and_save_redaction_rects."""
+class TestMeasureRedactionRects(TestCase):
+    """``_measure_redaction_rects`` measures and writes nothing (#240 PR B)."""
 
     def setUp(self):
         _require_fixture(self)
 
-    def test_writes_redaction_rects_json(self):
-        from scanning.services import _compute_and_save_redaction_rects
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            _run_detect_on_fixture(tmpdir)
-            _import_detections(scan.pk, tmpdir)
-
-            rects = _compute_and_save_redaction_rects(scan.pk, str(PDF_PATH))
-            self.assertGreater(len(rects), 0)
-
-            scan.refresh_from_db()
-            self.assertTrue(scan.redaction_rects)
-
-    def test_corrects_the_column_boxes_before_measuring(self):
-        """The rects and the margins must read the same column boxes.
-
-        Margin strips are computed from ink-corrected columns. A reviewer
-        who hand-draws a missed ``TEXT_COLUMN`` puts it in the DB exactly as
-        drawn, so without this the headnote rects on that page would snap to
-        the raw box while the margins used the corrected one.
-        """
+    def test_returns_the_rects_in_pixels(self):
         from scanning import services
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -447,19 +468,146 @@ class TestComputeAndSaveRedactionRects(TestCase):
             )
             _run_detect_on_fixture(tmpdir)
             _import_detections(scan.pk, tmpdir)
+            document, _ids, _entries = services._snapped_document(
+                scan, str(PDF_PATH)
+            )
 
-            with patch.object(services, "snap_document_columns") as snap:
-                services._compute_and_save_redaction_rects(
-                    scan.pk, str(PDF_PATH)
-                )
-            snap.assert_called_once()
-            document = snap.call_args.args[0]
-            self.assertTrue(document.pages, "snapped an empty document")
+            rects = services._measure_redaction_rects(document, None)
+
+            self.assertGreater(len(rects), 0)
+            self.assertEqual(Redaction.objects.filter(scan=scan).count(), 0)
+
+    def test_nothing_without_pages(self):
+        from types import SimpleNamespace
+
+        from scanning import services
+
+        self.assertEqual(
+            services._measure_redaction_rects(SimpleNamespace(pages=[]), None),
+            [],
+        )
+
+    def test_the_snapped_document_corrects_the_columns_in_memory(self):
+        """The correction is applied to the document and never written
+        back: ``_snap_text_columns_to_ink`` owns persistence, and a
+        reviewer's hand-drawn column must reach the geometry corrected
+        while its row stays as drawn."""
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir, reporter=ReporterFactory(short_name="a3d")
+            )
+            pdf = pathlib.Path(scan.output_dir) / "bitonal.pdf"
+            write_two_column_page(pdf, tmp_dir=pathlib.Path(tmpdir))
+            det = Detection.objects.create(
+                scan=scan,
+                page_index=0,
+                label="TEXT_COLUMN",
+                label_id=16,
+                confidence=0.95,
+                x0=COLUMN_LEFT.x0 + 6,
+                y0=COLUMN_LEFT.y0,
+                x1=COLUMN_LEFT.x1 - 6,
+                y1=COLUMN_LEFT.y1,
+                img_width=PAGE_W,
+                img_height=PAGE_H,
+            )
+
+            document, _ids, _entries = services._snapped_document(
+                scan, str(pdf)
+            )
+
+            box = document.pages[0].detections[0].bbox
+            self.assertAlmostEqual(box.x1, COLUMN_LEFT.x0, delta=2.0)
+            self.assertAlmostEqual(box.x2, COLUMN_LEFT.x1, delta=2.0)
+            det.refresh_from_db()
+            self.assertEqual(det.x0, COLUMN_LEFT.x0 + 6, "persisted the snap")
+
+    def test_the_snapped_document_separates_the_columns(self):
+        """Two boxes that share an edge leave ``clamp_to_gutters`` with
+        no neighbour to measure, and a headnote box then grows across
+        the gutter (#308). The cells give the gutter back, after the
+        ink snap and in memory: ``columns.separate_rows`` owns the
+        rows."""
+        from scanning import services, text_fit
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir, reporter=ReporterFactory(short_name="a3d")
+            )
+            pdf = pathlib.Path(scan.output_dir) / "bitonal.pdf"
+            write_two_column_page(pdf, tmp_dir=pathlib.Path(tmpdir))
+            edge = COLUMN_LEFT.x1
+            rows = [
+                self._column(scan, COLUMN_LEFT.x0, edge),
+                self._column(scan, edge, COLUMN_RIGHT.x1),
+            ]
+            cells = text_fit.page_cells(
+                {
+                    "pages": [
+                        {
+                            "page_index": 0,
+                            "origin_width": PAGE_W,
+                            "origin_height": PAGE_H,
+                            "cells": [
+                                {
+                                    "bbox": [
+                                        band.x0,
+                                        band.y0 + 10,
+                                        band.x1,
+                                        band.y1 - 10,
+                                    ],
+                                    "category": "Text",
+                                }
+                                for band in (COLUMN_LEFT, COLUMN_RIGHT)
+                            ],
+                        }
+                    ]
+                }
+            )
+
+            document, _ids, _entries = services._snapped_document(
+                scan, str(pdf), None, cells
+            )
+
+            boxes = sorted(
+                (d.bbox for d in document.pages[0].detections),
+                key=lambda b: b.x1,
+            )
+            self.assertAlmostEqual(boxes[0].x2, COLUMN_LEFT.x1, delta=0.1)
+            self.assertAlmostEqual(boxes[1].x1, COLUMN_RIGHT.x0, delta=0.1)
+            for row in rows:
+                row.refresh_from_db()
+            self.assertEqual(rows[0].x1, edge, "the rows are not written here")
+
+    @staticmethod
+    def _column(scan, x0, x1):
+        """Write one full-height ``TEXT_COLUMN`` row of the fixture page.
+
+        :param scan: The scan.
+        :param x0: The left edge, in pixels, which are points here.
+        :param x1: The right edge, the same way.
+        :returns: The row.
+        """
+        return Detection.objects.create(
+            scan=scan,
+            page_index=0,
+            label="TEXT_COLUMN",
+            label_id=16,
+            confidence=0.95,
+            x0=x0,
+            y0=COLUMN_LEFT.y0,
+            x1=x1,
+            y1=COLUMN_LEFT.y1,
+            img_width=PAGE_W,
+            img_height=PAGE_H,
+        )
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestComputeAndSaveMarginRects(TestCase):
-    """Test _compute_and_save_margin_rects."""
+class TestMeasureMarginRects(TestCase):
+    """``_measure_margin_rects`` measures against the document's pages."""
 
     def setUp(self):
         _require_fixture(self)
@@ -481,8 +629,18 @@ class TestComputeAndSaveMarginRects(TestCase):
             img_height=2200,
         )
 
-    def test_writes_margin_rects_to_model(self):
-        from scanning.services import _compute_and_save_margin_rects
+    def _document(self, scan):
+        from scanning.services import (
+            _build_document_from_detections,
+            detection_entries,
+        )
+
+        return _build_document_from_detections(
+            scan, detection_entries(scan.pk, page_numbers={}), str(PDF_PATH)
+        )
+
+    def test_measures_the_strips_in_points(self):
+        from scanning.services import _measure_margin_rects
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(
@@ -490,63 +648,35 @@ class TestComputeAndSaveMarginRects(TestCase):
                 reporter=ReporterFactory(short_name="a3d"),
             )
             self._with_column(scan)
-            rects = _compute_and_save_margin_rects(
-                scan.pk, str(PDF_PATH), tmpdir
+
+            margins = _measure_margin_rects(
+                str(PDF_PATH), self._document(scan)
             )
-            self.assertIsNotNone(rects)
 
-            scan.refresh_from_db()
-            self.assertTrue(scan.margin_rects)
+            self.assertTrue(margins)
+            self.assertEqual(margins[0]["page_index"], 0)
+            self.assertEqual(Redaction.objects.filter(scan=scan).count(), 0)
 
-    def test_returns_cached_on_second_call(self):
-        from scanning.services import _compute_and_save_margin_rects
+    def test_does_not_measure_anything_without_detections(self):
+        """Without detections the bounds would come from the page's marks
+        alone, so bleed-through at a page edge suppresses that page's top
+        strip: a worse answer than none."""
+        from types import SimpleNamespace
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
+        from scanning import services
+
+        with patch.object(services, "compute_margin_rects") as measure:
+            self.assertEqual(
+                services._measure_margin_rects(
+                    str(PDF_PATH), SimpleNamespace(pages=[])
+                ),
+                [],
             )
-            self._with_column(scan)
-            first = _compute_and_save_margin_rects(
-                scan.pk, str(PDF_PATH), tmpdir
-            )
-            second = _compute_and_save_margin_rects(
-                scan.pk, str(PDF_PATH), tmpdir
-            )
-            self.assertEqual(first, second)
-
-    def test_does_not_cache_a_result_computed_without_detections(self):
-        """Margins measured from marks alone lose a page's top strip.
-
-        detections.json belongs to whichever process ran the pipeline, and
-        ``/tmp`` is per-container in dev and per-pod in production, so a
-        viewer request can arrive before this machine has it. Caching that
-        answer means it is never recomputed once the detections land.
-        """
-        from scanning.services import _compute_and_save_margin_rects
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            rects = _compute_and_save_margin_rects(
-                scan.pk, str(PDF_PATH), tmpdir
-            )
-            self.assertIsNotNone(rects)
-
-            scan.refresh_from_db()
-            self.assertFalse(scan.margin_rects, "cached a detection-less run")
-
-            # ...and once the detections exist, the next call caches.
-            self._with_column(scan)
-            _compute_and_save_margin_rects(scan.pk, str(PDF_PATH), tmpdir)
-            scan.refresh_from_db()
-            self.assertTrue(scan.margin_rects)
+        measure.assert_not_called()
 
     def test_reads_detections_from_the_db_not_the_file(self):
         """The DB is the source of truth, and is always reachable."""
-        from scanning.services import _detections_for_geometry
+        from scanning.services import detection_entries
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(
@@ -558,31 +688,9 @@ class TestComputeAndSaveMarginRects(TestCase):
             self.assertFalse(
                 (pathlib.Path(scan.output_dir) / "detections.json").exists()
             )
-            dets = _detections_for_geometry(scan.pk, scan.output_dir)
+            dets = detection_entries(scan.pk, page_numbers={})
             self.assertEqual([d["label"] for d in dets], ["TEXT_COLUMN"])
             self.assertEqual(dets[0]["bbox"], [100, 200, 1600, 2000])
-
-    def test_does_not_measure_anything_without_detections(self):
-        """Refuse before rendering, not after.
-
-        The viewer asks for these on a sync request and does not cache the
-        reply, so measuring a result that is then thrown away un-cached
-        renders the whole volume at 100 dpi on every poll, in the executor
-        every other sync view shares.
-        """
-        from scanning import services
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            with patch.object(services, "compute_margin_rects") as measure:
-                rects = services._compute_and_save_margin_rects(
-                    scan.pk, str(PDF_PATH), tmpdir
-                )
-            measure.assert_not_called()
-            self.assertEqual(rects, [])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -595,7 +703,7 @@ class TestBuildDocumentFromDetections(TestCase):
     def test_builds_document_with_pages(self):
         from scanning.services import (
             _build_document_from_detections,
-            _sync_detections_to_disk,
+            detection_entries,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -605,7 +713,7 @@ class TestBuildDocumentFromDetections(TestCase):
             )
             _run_detect_on_fixture(tmpdir)
             _import_detections(scan.pk, tmpdir)
-            det_data = _sync_detections_to_disk(scan.pk)
+            det_data = detection_entries(scan.pk)
 
             document = _build_document_from_detections(
                 scan, det_data, PDF_PATH
@@ -616,13 +724,13 @@ class TestBuildDocumentFromDetections(TestCase):
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestComputeRedactionsApiView(TestCase):
-    """The endpoint queues the measurement (issue #196).
+    """The endpoint queues the measurement (issues #196, #305).
 
     It used to measure inside the request. The measurement renders
     every page of the volume -- 83 seconds for 1364 pages -- so it runs
-    on the daemon now, and this view writes one status. And for now it
-    is switched off (``REPAIR_ON_REQUEST_ENABLED``): the queueing tests
-    turn the switch on, and one test checks the refusal.
+    on the daemon now, and this view writes one status. A curator
+    presses it from step 2 (#305); the status rules of
+    ``REDACTION_COMPUTE_STATUSES`` are what refuse.
     """
 
     def setUp(self):
@@ -646,29 +754,32 @@ class TestComputeRedactionsApiView(TestCase):
             y1=4,
         )
 
-    def test_the_switch_is_off_for_now(self):
+    def test_an_approved_review_is_refused(self):
+        """A closed review 2 is not recomputed under the person who
+        closed it (#305). The way back is the admin re-queue."""
         self._detection()
+        Scan.objects.filter(pk=self.scan.pk).update(
+            status=Status.REDACTION_REVIEW_DONE
+        )
 
         response = self.client.post(
             f"/scans/{self.scan.pk}/compute-redactions/"
         )
 
         self.assertEqual(response.status_code, 409)
-        self.assertIn("off for now", response.json()["error"])
+        self.assertEqual(response.json()["status"], "error")
         self.scan.refresh_from_db()
-        self.assertEqual(
-            self.scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE
-        )
+        self.assertEqual(self.scan.status, Status.REDACTION_REVIEW_DONE)
 
-    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
     def test_a_volume_with_no_detections_is_refused(self):
         response = self.client.post(
             f"/scans/{self.scan.pk}/compute-redactions/"
         )
         self.assertEqual(response.status_code, 400)
-        self.assertIn("error", response.json())
+        # The refusal shape of every other endpoint of step 2 (#305).
+        self.assertEqual(response.json()["status"], "error")
+        self.assertIn("message", response.json())
 
-    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
     def test_a_volume_with_detections_is_queued(self):
         self._detection()
 
@@ -696,23 +807,25 @@ class TestServeOpinions(TestCase):
     """Test that serve_opinions reads from DB, not disk."""
 
     def test_returns_opinions_from_db(self):
+        from scanning.factories import OpinionBoundaryFactory
+
         user = UserFactory()
         self.client.force_login(user)
-        opinions_data = [{"caption_page": 0, "key_page": 0}]
-        scan = ScanFactory(
-            uploaded_by=user,
-            opinions_json=opinions_data,
+        scan = ScanFactory(uploaded_by=user, page_count=2)
+        row = OpinionBoundaryFactory(
+            scan=scan, start_page_index=0, end_page_index=0
         )
         response = self.client.get(f"/scans/{scan.pk}/opinions-json/")
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertEqual(len(data), 1)
         self.assertEqual(data[0]["caption_page"], 0)
+        self.assertEqual(data[0]["id"], row.pk)
 
     def test_returns_empty_list_without_opinions(self):
         user = UserFactory()
         self.client.force_login(user)
-        scan = ScanFactory(uploaded_by=user, opinions_json="")
+        scan = ScanFactory(uploaded_by=user)
         response = self.client.get(f"/scans/{scan.pk}/opinions-json/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [])
@@ -1125,17 +1238,17 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
         output = pathlib.Path(scan.output_dir)
         bitonal = output / "bitonal.pdf"
         _write_bitonal_copy(bitonal)
-        scan.opinions_json = [
-            {
-                "caption_page": 0,
-                "key_page": 0,
-                "end_page": 0,
-                "page_count": 1,
-                "first_page_number": 1,
-                "last_page_number": 1,
-            }
-        ]
-        scan.save(update_fields=["opinions_json"])
+        from scanning import boundaries
+        from scanning.factories import OpinionBoundaryFactory
+
+        boundary = OpinionBoundaryFactory(
+            scan=scan, start_page_index=0, end_page_index=0
+        )
+        # A dismissed boundary is no opinion to cut (#240 PR C).
+        dismissed = OpinionBoundaryFactory(
+            scan=scan, start_page_index=0, end_page_index=0, start_y=300.0
+        )
+        boundaries.dismiss(scan, dismissed, None)
 
         with (
             # close_all() resets connections for daemon-process forking;
@@ -1162,66 +1275,13 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.stage, Stage.APPROVED)
         self.assertEqual(scan.status, Status.PENDING_REVIEW)
+        # The file row names the boundary it was cut from (#240 PR C).
+        self.assertEqual(scan.opinions.get().boundary_id, boundary.pk)
 
-    def test_computes_margins_when_absent(self):
-        """Whiteouts must not depend on the viewer having asked for them.
-
-        Margin rects are computed on demand elsewhere, so a scan taken
-        straight from review to Generate used to ship with no whiteouts at
-        all -- platen bands, fold shadows and corner bleed left in the
-        deliverable.
-        """
-        from scanning import services
-
-        scan = _make_scan_with_output(
-            reporter=ReporterFactory(short_name="a3d"),
-        )
-        output = pathlib.Path(scan.output_dir)
-        shutil.copy2(PDF_PATH, output / "bitonal.pdf")
-        self.assertFalse(scan.margin_rects)
-        # A scan reaching Generate has been detected, and the margin bounds
-        # are only cached once detections back them up.
-        Detection.objects.create(
-            scan=scan,
-            page_index=0,
-            label="TEXT_COLUMN",
-            label_id=16,
-            confidence=0.95,
-            x0=100,
-            y0=200,
-            x1=1600,
-            y1=2000,
-            img_width=1700,
-            img_height=2200,
-        )
-
-        with (
-            patch("django.db.connections.close_all"),
-            patch("blackletter.api.generate") as generate,
-            patch.object(services, "_push_processing_files_to_s3"),
-            patch.object(services, "_pull_processing_files_from_s3"),
-        ):
-            generate.return_value = {
-                "opinion_count": 0,
-                "full_redacted": "",
-                "redacted_dir": str(output / "redacted"),
-            }
-            services.run_generate_files(scan.pk)
-
-        scan.refresh_from_db()
-        self.assertTrue(scan.margin_rects, "no margin rects computed")
-        self.assertTrue(
-            any(e["rects"] for e in scan.margin_rects),
-            "margin rects are all empty",
-        )
-
-    def test_computes_redaction_rects_when_absent(self):
-        """Generate is self-sufficient now that the upload path skips rects.
-
-        ``run_full_pipeline`` no longer computes them, and the step 2
-        overlay only asks for them if a reviewer opens it, so Generate
-        cannot assume they exist.
-        """
+    def test_writes_redactions_json_from_the_rows(self):
+        """The rows are the store (#240 PR B): a computed box and a drawn
+        one both reach ``redactions.json`` in points, and nothing is
+        measured here."""
         from scanning import services
 
         scan = _make_scan_with_output(
@@ -1229,79 +1289,31 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
         )
         output = pathlib.Path(scan.output_dir)
         _write_bitonal_copy(output / "bitonal.pdf")
-        self.assertFalse(scan.redaction_rects)
-
-        with (
-            patch("django.db.connections.close_all"),
-            patch("blackletter.api.generate") as generate,
-            patch.object(services, "_push_processing_files_to_s3"),
-            patch.object(services, "_pull_processing_files_from_s3"),
-            patch.object(
-                services, "_snap_text_columns_to_ink", return_value=0
-            ) as snap,
-            patch.object(
-                services, "_compute_and_save_redaction_rects", return_value=[]
-            ) as rects,
-        ):
-            generate.return_value = {
-                "opinion_count": 0,
-                "full_redacted": "",
-                "redacted_dir": str(output / "redacted"),
-            }
-            services.run_generate_files(scan.pk)
-
-        rects.assert_called_once()
-        self.assertEqual(rects.call_args.args[1], str(output / "bitonal.pdf"))
-        # The columns are corrected first: the rects and the margin strips
-        # are both measured against them.
-        snap.assert_called_once()
-        self.assertEqual(snap.call_args.args[1], str(output / "bitonal.pdf"))
-
-    def test_keeps_redaction_rects_a_reviewer_edited(self):
-        """Stored rects win, because a reviewer may have moved them.
-
-        ``save_redaction_rect`` writes straight into ``redaction_rects``,
-        so recomputing here would throw away every drag, delete and
-        hand-added box from step 3.
-        """
-        from scanning import services
-
-        scan = _make_scan_with_output(
-            reporter=ReporterFactory(short_name="a3d"),
+        common = {
+            "scan": scan,
+            "source_page": 1,
+            "page_index": 0,
+        }
+        Redaction.objects.create(
+            origin=Redaction.Origin.COMPUTED,
+            rect_type="headnote",
+            fill="black",
+            x0=10.0,
+            y0=20.0,
+            x1=30.0,
+            y1=40.0,
+            **common,
         )
-        output = pathlib.Path(scan.output_dir)
-        _write_bitonal_copy(output / "bitonal.pdf")
-        edited = [
-            {
-                "page_index": 0,
-                "rects": [
-                    {
-                        "x0": 10,
-                        "y0": 20,
-                        "x1": 30,
-                        "y1": 40,
-                        "fill": "black",
-                        "type": "headnote",
-                    }
-                ],
-            }
-        ]
-        scan.redaction_rects = edited
-        scan.save(update_fields=["redaction_rects"])
-        # The rects are stored in image pixels, so the page they name has to
-        # still have a detection to scale them by.
-        Detection.objects.create(
-            scan=scan,
-            page_index=0,
-            label="TEXT_COLUMN",
-            label_id=16,
-            confidence=0.95,
-            x0=100,
-            y0=200,
-            x1=1600,
-            y1=2000,
-            img_width=1700,
-            img_height=2200,
+        Redaction.objects.create(
+            origin=Redaction.Origin.HUMAN,
+            kind=Redaction.Kind.ADD,
+            rect_type="manual",
+            fill="white",
+            x0=1.0,
+            y0=2.0,
+            x1=3.0,
+            y1=4.0,
+            **common,
         )
 
         with (
@@ -1312,9 +1324,7 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
             patch.object(
                 services, "_snap_text_columns_to_ink", return_value=0
             ),
-            patch.object(
-                services, "_compute_and_save_redaction_rects"
-            ) as rects,
+            patch.object(services, "_measure_redaction_rects") as measure,
         ):
             generate.return_value = {
                 "opinion_count": 0,
@@ -1323,26 +1333,15 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
             }
             services.run_generate_files(scan.pk)
 
-        rects.assert_not_called()
-        scan.refresh_from_db()
-        self.assertEqual(scan.redaction_rects, edited)
-
-    def test_raises_without_any_processing_pdf(self):
-        """An empty output dir is still an error, just a clearer one."""
-        from scanning import services
-
-        scan = _make_scan_with_output(
-            reporter=ReporterFactory(short_name="a3d"),
+        measure.assert_not_called()
+        payload = json.loads(
+            pathlib.Path(generate.call_args.kwargs["redactions"]).read_text()
         )
-        with (
-            patch("django.db.connections.close_all"),
-            patch.object(services, "_pull_processing_files_from_s3"),
-            patch.object(services, "_handle_pipeline_exception") as handler,
-        ):
-            services.run_generate_files(scan.pk)
-
-        handler.assert_called_once()
-        self.assertIn("bitonal.pdf", str(handler.call_args.args[1]))
+        rects = payload["pages"]["0"]
+        self.assertEqual(
+            sorted((r["type"], r["x0"]) for r in rects),
+            [("headnote", 10.0), ("manual", 1.0)],
+        )
 
 
 class TestRedactionGeometryFromInk(SimpleTestCase):
@@ -1499,112 +1498,13 @@ class TestSnapTextColumnsToInk(TestCase):
         )
 
 
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestBuildCombinedRedactionsStaleRects(TestCase):
-    """Saved rects and live detections can disagree about which pages exist.
-
-    ``redaction_rects`` is a snapshot on the Scan; the pages come from the
-    detections as they stand now. Deactivating the last detection on a page
-    that a multi-page headnote block still has rects for leaves a page whose
-    pixel coordinates cannot be scaled to points.
-    """
-
-    def setUp(self):
-        _require_fixture(self)
-
-    def test_says_what_to_do_about_it(self):
-        from scanning import services
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            shutil.copy2(PDF_PATH, pathlib.Path(tmpdir) / "bitonal.pdf")
-            # Rects for page 0, and no detection anywhere to scale them by.
-            scan.redaction_rects = [
-                {
-                    "page_index": 0,
-                    "rects": [
-                        {
-                            "x0": 100,
-                            "y0": 200,
-                            "x1": 800,
-                            "y1": 400,
-                            "fill": "black",
-                            "type": "headnote",
-                        }
-                    ],
-                }
-            ]
-            scan.save(update_fields=["redaction_rects"])
-
-            with self.assertRaises(RuntimeError) as caught:
-                services._build_combined_redactions(scan.pk)
-            self.assertIn(
-                "Re-add a detection on that page", str(caught.exception)
-            )
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestLlmPageTextLayer(TestCase):
-    """The post-redaction text layer is opt-in and never implicit.
-
-    Dropping the Tesseract pre-pass is the point of scanning #145, so
-    Generate Files must not quietly reintroduce an OCR run over every page.
-    """
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.llm = pathlib.Path(self._tmp.name) / "llm"
-        self.llm.mkdir()
-        (self.llm / "page_0001.pdf").write_bytes(b"%PDF-1.4\n")
-        self.scan = ScanFactory(reporter=ReporterFactory(short_name="a3d"))
-
-    def test_off_by_default(self):
-        from scanning.services import _add_llm_page_text_layer
-
-        with patch("blackletter.api.add_text_layer") as ocr:
-            added = _add_llm_page_text_layer(self.scan.pk, self.llm)
-        ocr.assert_not_called()
-        self.assertEqual(added, 0)
-
-    @override_settings(LLM_PAGE_TEXT_LAYER=True)
-    def test_runs_over_the_llm_pages_when_switched_on(self):
-        from scanning.services import _add_llm_page_text_layer
-
-        with patch("blackletter.api.add_text_layer") as ocr:
-            ocr.return_value = [self.llm / "page_0001.pdf"]
-            added = _add_llm_page_text_layer(self.scan.pk, self.llm)
-        ocr.assert_called_once_with(self.llm)
-        self.assertEqual(added, 1)
-
-    @override_settings(LLM_PAGE_TEXT_LAYER=True)
-    def test_skips_a_scan_with_no_llm_directory(self):
-        from scanning.services import _add_llm_page_text_layer
-
-        with patch("blackletter.api.add_text_layer") as ocr:
-            added = _add_llm_page_text_layer(
-                self.scan.pk, self.llm / "missing"
-            )
-        ocr.assert_not_called()
-        self.assertEqual(added, 0)
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestBuildCombinedRedactionsPayload(TestCase):
-    """The payload ``generate`` reads mixes two coordinate spaces.
-
-    Redaction rects are stored in image pixels and margin rects in PDF
-    points, and both come out of this step in points. Getting that backwards
-    puts every blackout in the wrong place, and nothing downstream notices.
-    """
+    """The payload ``generate`` reads comes from the rows, in points (#240)."""
 
     def setUp(self):
         _require_fixture(self)
 
-    def test_pixel_rects_are_scaled_and_point_rects_are_not(self):
+    def test_rows_reach_the_pages_as_they_are(self):
         from scanning import services
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1612,46 +1512,49 @@ class TestBuildCombinedRedactionsPayload(TestCase):
                 tmpdir,
                 reporter=ReporterFactory(short_name="a3d"),
             )
-            output = pathlib.Path(scan.output_dir)
-            with fitz.open(str(output / "bitonal.pdf")) as doc:
-                page_w = doc[0].rect.width
-            # An image twice the page's width in points, so the scale is 1:2
-            # and a mistake cannot hide behind a factor of one.
-            Detection.objects.create(
-                scan=scan,
-                page_index=0,
-                label="TEXT_COLUMN",
-                label_id=16,
-                confidence=0.95,
-                x0=100,
-                y0=200,
-                x1=800,
-                y1=400,
-                img_width=int(page_w * 2),
-                img_height=2200,
+            common = {"scan": scan, "source_page": 1, "page_index": 0}
+            Redaction.objects.create(
+                origin=Redaction.Origin.COMPUTED,
+                rect_type="headnote",
+                fill="black",
+                x0=50.0,
+                y0=100.0,
+                x1=400.0,
+                y1=200.0,
+                **common,
             )
-            scan.redaction_rects = [
-                {
-                    "page_index": 0,
-                    "rects": [
-                        {
-                            "x0": 100,
-                            "y0": 200,
-                            "x1": 800,
-                            "y1": 400,
-                            "fill": "black",
-                            "type": "headnote",
-                        }
-                    ],
-                }
-            ]
-            scan.margin_rects = [
-                {
-                    "page_index": 0,
-                    "rects": [{"x0": 0.0, "y0": 0.0, "x1": 20.0, "y1": 50.0}],
-                }
-            ]
-            scan.save(update_fields=["redaction_rects", "margin_rects"])
+            Redaction.objects.create(
+                origin=Redaction.Origin.COMPUTED,
+                rect_type="margin",
+                fill="white",
+                x0=0.0,
+                y0=0.0,
+                x1=20.0,
+                y1=50.0,
+                **common,
+            )
+            hidden = Redaction.objects.create(
+                origin=Redaction.Origin.COMPUTED,
+                rect_type="KEY_ICON",
+                fill="black",
+                x0=5.0,
+                y0=5.0,
+                x1=6.0,
+                y1=6.0,
+                **common,
+            )
+            dismiss = Redaction.objects.create(
+                origin=Redaction.Origin.HUMAN,
+                kind=Redaction.Kind.DISMISS,
+                rect_type="KEY_ICON",
+                fill="black",
+                target_x0=5.0,
+                target_y0=5.0,
+                target_x1=6.0,
+                target_y1=6.0,
+                **common,
+            )
+            Redaction.objects.filter(pk=hidden.pk).update(decision=dismiss)
 
             payload = json.loads(
                 services._build_combined_redactions(scan.pk).read_text()
@@ -1659,68 +1562,12 @@ class TestBuildCombinedRedactionsPayload(TestCase):
             page_rects = payload["pages"]["0"]
 
             headnote = next(r for r in page_rects if r["type"] == "headnote")
-            self.assertAlmostEqual(headnote["x0"], 50.0, delta=0.2)
-            self.assertAlmostEqual(headnote["x1"], 400.0, delta=0.2)
-
+            self.assertEqual(headnote["x0"], 50.0)
+            self.assertEqual(headnote["x1"], 400.0)
             margin = next(r for r in page_rects if r["type"] == "margin")
-            self.assertEqual(
-                margin["x1"], 20.0, "margin rects are already points"
-            )
+            self.assertEqual(margin["x1"], 20.0)
             self.assertEqual(margin["fill"], "white")
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestServeMarginRectsView(TestCase):
-    """The endpoint the margin work exists for.
-
-    It must go through the service helper rather than measuring on its own:
-    computing here with a separate detection lookup is how the viewer once
-    cached margins with no top strips, permanently.
-    """
-
-    def setUp(self):
-        _require_fixture(self)
-        self.user = UserFactory()
-        self.client.force_login(self.user)
-
-    def test_computes_through_the_service_helper(self):
-        from scanning import services
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                uploaded_by=self.user,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            output = pathlib.Path(scan.output_dir)
-            with patch.object(
-                services, "_compute_and_save_margin_rects", return_value=[]
-            ) as compute:
-                response = self.client.get(f"/scans/{scan.pk}/margin-rects/")
-            self.assertEqual(response.status_code, 200)
-            compute.assert_called_once_with(
-                scan.pk, str(output / "bitonal.pdf"), str(output)
-            )
-
-    def test_a_detection_less_scan_is_not_cached(self):
-        """It must stay recomputable once the detections land."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                uploaded_by=self.user,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            response = self.client.get(f"/scans/{scan.pk}/margin-rects/")
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.json(), [])
-            scan.refresh_from_db()
-            self.assertFalse(scan.margin_rects)
-
-    def test_returns_empty_without_a_processing_pdf(self):
-        scan = ScanFactory(uploaded_by=self.user)
-        response = self.client.get(f"/scans/{scan.pk}/margin-rects/")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), [])
+            self.assertNotIn("KEY_ICON", [r["type"] for r in page_rects])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -1760,73 +1607,21 @@ class TestMarginRectsUseTheDetections(TestCase):
                 img_width=1700,
                 img_height=2200,
             )
+            document = services._build_document_from_detections(
+                scan,
+                services.detection_entries(scan.pk, page_numbers={}),
+                str(PDF_PATH),
+            )
             with patch.object(
                 services, "compute_margin_rects", return_value=[]
             ) as measure:
-                services._compute_and_save_margin_rects(
-                    scan.pk, str(PDF_PATH), tmpdir
-                )
+                services._measure_margin_rects(str(PDF_PATH), document)
             pages = measure.call_args.kwargs["pages"]
             self.assertTrue(pages, "measured with no detected pages")
             self.assertIn(
                 Label.TEXT_COLUMN,
                 [d.label for d in pages[0].detections],
             )
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestPagesForGeometry(TestCase):
-    """The correction is applied in memory and never written back here.
-
-    ``_snap_text_columns_to_ink`` owns persistence. This helper exists for
-    boxes that reached the DB uncorrected, which is what a reviewer's
-    hand-drawn column is, and it must leave the row alone.
-    """
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.tmp = pathlib.Path(self._tmp.name)
-        self.scan = ScanFactory(reporter=ReporterFactory(short_name="a3d"))
-        output = pathlib.Path(self.scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        self.pdf = output / "bitonal.pdf"
-        write_two_column_page(self.pdf, tmp_dir=self.tmp)
-        self.det = Detection.objects.create(
-            scan=self.scan,
-            page_index=0,
-            label="TEXT_COLUMN",
-            label_id=16,
-            confidence=0.95,
-            x0=COLUMN_LEFT.x0 + 6,
-            y0=COLUMN_LEFT.y0,
-            x1=COLUMN_LEFT.x1 - 6,
-            y1=COLUMN_LEFT.y1,
-            img_width=PAGE_W,
-            img_height=PAGE_H,
-        )
-
-    def test_widens_an_uncorrected_box_without_persisting_it(self):
-        from scanning.services import _pages_for_geometry
-
-        pages = _pages_for_geometry(
-            self.scan, str(self.pdf), self.scan.output_dir
-        )
-        box = pages[0].detections[0].bbox
-        self.assertAlmostEqual(box.x1, COLUMN_LEFT.x0, delta=2.0)
-        self.assertAlmostEqual(box.x2, COLUMN_LEFT.x1, delta=2.0)
-
-        self.det.refresh_from_db()
-        self.assertEqual(self.det.x0, COLUMN_LEFT.x0 + 6, "persisted the snap")
-
-    def test_snap_false_leaves_the_box_as_stored(self):
-        """The steps that never read a column box must not pay to fix one."""
-        from scanning.services import _pages_for_geometry
-
-        pages = _pages_for_geometry(
-            self.scan, str(self.pdf), self.scan.output_dir, snap=False
-        )
-        self.assertEqual(pages[0].detections[0].bbox.x1, COLUMN_LEFT.x0 + 6)
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -2089,9 +1884,10 @@ class TestRecalculateIssues(TestCase):
             scan.issues.filter(check_name="suspicious_reading").exists()
         )
 
-    def test_keeps_suppressed_detection_issues(self):
-        """Recheck rebuilds page-number issues but leaves detection
-        suppressions, which are curator decisions, in place."""
+    def test_keeps_the_review_2_findings(self):
+        """Recheck rebuilds page-number issues but leaves the findings
+        of review 2 (#240 PR D), which are derived from other rows and
+        have one writer of their own, in place."""
         from scanning import services
         from scanning.models import CheckName, Issue
 
@@ -2106,9 +1902,10 @@ class TestRecalculateIssues(TestCase):
         )
         Issue.objects.create(
             scan=scan,
-            check_name=CheckName.SUPPRESS_DETECTION,
-            severity="info",
-            message="detection 42 suppressed",
+            check_name=CheckName.UNMATCHED_KEY_ICON,
+            target=Issue.Target.DETECTION,
+            severity="warning",
+            message="a key icon no opinion names",
         )
         stale = Issue.objects.create(
             scan=scan,
@@ -2122,7 +1919,7 @@ class TestRecalculateIssues(TestCase):
 
         self.assertTrue(
             scan.issues.filter(
-                check_name=CheckName.SUPPRESS_DETECTION
+                check_name=CheckName.UNMATCHED_KEY_ICON
             ).exists()
         )
         self.assertFalse(Issue.objects.filter(pk=stale.pk).exists())
@@ -2195,6 +1992,130 @@ class TestRecalculateIssues(TestCase):
         self.assertIn("913-925", card.message)
         self.assertNotIn("Verify", card.message)
 
+    def test_a_trailing_letter_breaks_no_sequence(self):
+        """The book adds 2094a and 2094b between 2094 and 2095, so the
+        volume holds four pages and two numbers (#319).
+
+        This pins ``blackletter.validate``: it skips a reading it
+        cannot parse and keeps the page before and the page after as
+        neighbours, which is the whole rule for this shape.
+        """
+        from scanning import services
+
+        scan = self._make_scan(
+            start_page=2094,
+            end_page=2095,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "2094", "type": "single"},
+                {"pdf_page": 2, "detected": "2094a", "type": "suffixed"},
+                {"pdf_page": 3, "detected": "2094b", "type": "suffixed"},
+                {"pdf_page": 4, "detected": "2095", "type": "single"},
+            ],
+        )
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [])
+        for check in (
+            CheckName.MISSING_PAGE,
+            CheckName.DUPLICATE_PAGE,
+            CheckName.BACKWARD_PAGE,
+            CheckName.LARGE_GAP,
+            CheckName.NO_PAGE_NUMBER,
+        ):
+            with self.subTest(check=check):
+                self.assertFalse(scan.issues.filter(check_name=check).exists())
+
+    def _make_suffixed_scan(self, **entry):
+        """Four pages around a trailing letter the model read at page
+        2, unless ``entry`` says who read it."""
+        return self._make_scan(
+            start_page=2094,
+            end_page=2095,
+            page_count=4,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "2094", "type": "single"},
+                {
+                    "pdf_page": 2,
+                    "detected": "209B",
+                    "type": "suffixed",
+                    **entry,
+                },
+                {"pdf_page": 3, "detected": "2094b", "type": "suffixed"},
+                {"pdf_page": 4, "detected": "2095", "type": "single"},
+            ],
+        )
+
+    def test_a_trailing_letter_the_model_read_is_a_question(self):
+        """The sequence asks nothing about the page, so the card does
+        (#319). It is addressed by the physical page."""
+        from scanning import services
+
+        scan = self._make_suffixed_scan(zone="dots-header")
+
+        services.recalculate_issues(scan)
+
+        cards = scan.issues.filter(check_name=CheckName.SUSPICIOUS_READING)
+        self.assertEqual(
+            sorted(cards.values_list("page_number", flat=True)), [2, 3]
+        )
+        card = cards.get(page_number=2)
+        self.assertEqual(card.severity, Issue.Severity.WARNING)
+        self.assertEqual(
+            card.message,
+            "PDF page 2 reads as '209B', a page number with a trailing "
+            "letter. Verify this is expected.",
+        )
+
+    def test_a_curators_trailing_letter_raises_nothing(self):
+        """A person read that page (#319)."""
+        from scanning import services
+
+        scan = self._make_suffixed_scan(zone="manual", ocr="manual")
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(
+            list(
+                scan.issues.filter(
+                    check_name=CheckName.SUSPICIOUS_READING
+                ).values_list("page_number", flat=True)
+            ),
+            [3],
+        )
+
+    def test_a_dismissed_trailing_letter_stays_dismissed(self):
+        """The card is a ``suspicious_reading``, so the dismissal a
+        curator already has answers it on every recompute (#214)."""
+        from scanning import page_edits, services
+
+        scan = self._make_suffixed_scan(zone="dots-header")
+        services.recalculate_issues(scan)
+        card = scan.issues.get(
+            check_name=CheckName.SUSPICIOUS_READING, page_number=2
+        )
+        page_edits.supersede(
+            scan,
+            PageEdit.Kind.DISMISS_ISSUE,
+            {
+                "pdf_page": card.page_number,
+                "logical_page": "",
+                "value": card.check_name,
+            },
+            {"source_fingerprint": scan.source_fingerprint},
+            UserFactory(),
+        )
+
+        services.recalculate_issues(scan)
+
+        self.assertFalse(
+            scan.issues.filter(
+                check_name=CheckName.SUSPICIOUS_READING, page_number=2
+            ).exists()
+        )
+
     def test_rebuild_page_map_without_local_pdf(self):
         """rebuild_page_map (manual page edits) also runs off stored data
         and applies the scan's page range."""
@@ -2215,6 +2136,171 @@ class TestRecalculateIssues(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.missing_pages, [3, 4])
         self.assertFalse(scan.issues.exists())
+
+
+class TestTrailingGapPlaceholder(TestCase):
+    """A range missing at the end of the volume (issue #256).
+
+    ``build_issues`` collapses a run of more than 6 missing pages into
+    one ``large_gap`` card and drops its pages, so the reviewer got a
+    warning and no placeholder: nothing to upload to, and no gap to ask
+    a scanner for. One placeholder now stands for the whole run, and
+    only when the run reaches the scan's recorded last page.
+    """
+
+    def _make_scan(self, **kwargs):
+        """Create a scan whose original PDF is absent locally, as in prod.
+
+        :param kwargs: Fields for the factory.
+        :returns: The scan.
+        """
+        scan = ScanFactory(status=Status.PENDING_REVIEW, **kwargs)
+        pathlib.Path(scan.original_pdf.path).unlink()
+        return scan
+
+    def _read(self, pages, **kwargs):
+        """Create a scan that read one number per page.
+
+        :param pages: The printed numbers, in PDF page order.
+        :param kwargs: Fields for the factory.
+        :returns: The scan.
+        """
+        return self._make_scan(
+            page_count=len(pages),
+            ocr_results=[
+                {"pdf_page": i + 1, "detected": str(n), "type": "single"}
+                for i, n in enumerate(pages)
+            ],
+            **kwargs,
+        )
+
+    def _placeholders(self, scan):
+        """Return the missing entries of the scan's page map.
+
+        :param scan: The scan to read.
+        :returns: The ``missing`` entries, in order.
+        :rtype: list[dict]
+        """
+        scan.refresh_from_db()
+        return [e for e in scan.page_map if e.get("type") == "missing"]
+
+    def test_a_range_missing_at_the_end_gets_one_placeholder(self):
+        """Ten pages the volume stops before are one gap, so one
+        placeholder, labelled with the range."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(
+            self._placeholders(scan),
+            [
+                {
+                    "type": "missing",
+                    "logical_number": "11-20",
+                    "missing_range": [11, 20],
+                }
+            ],
+        )
+
+    def test_the_card_of_the_run_says_what_to_do(self):
+        """The card read "likely an OCR misread" and named no action."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+
+        services.recalculate_issues(scan)
+
+        card = scan.issues.get(check_name=CheckName.LARGE_GAP)
+        self.assertEqual(card.page_number, 11)
+        self.assertEqual(card.severity, Issue.Severity.WARNING)
+        self.assertIn("Pages 11\u201320 (10 pages)", card.message)
+        self.assertIn("The last page number read is 10", card.message)
+        self.assertIn("ask a scanner", card.message)
+
+    def test_the_placeholder_follows_the_last_page_of_the_volume(self):
+        """The gap's address is the physical page it follows, which the
+        viewer's projection stamps (#214)."""
+        from scanning import page_edits, services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        entry = page_edits.project_inserts(scan, scan.page_map)[-1]
+        self.assertEqual(entry["type"], "missing")
+        self.assertEqual(entry["anchor_pdf_page"], 10)
+
+    def test_a_short_run_keeps_the_placeholder_of_each_page(self):
+        """Three missing pages are not collapsed, so blackletter draws
+        one placeholder each and this pass adds none."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=13)
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(
+            [e["logical_number"] for e in self._placeholders(scan)],
+            [11, 12, 13],
+        )
+
+    def test_a_gap_inside_the_volume_gets_no_placeholder(self):
+        """Those pages are almost always in the book with a number
+        nobody read, so the card stands alone."""
+        from scanning import services
+
+        scan = self._read(
+            list(range(1, 6)) + list(range(20, 26)), start_page=1, end_page=25
+        )
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(self._placeholders(scan), [])
+        self.assertTrue(
+            scan.issues.filter(check_name=CheckName.LARGE_GAP).exists()
+        )
+
+    def test_a_scan_with_no_recorded_last_page_gets_no_placeholder(self):
+        """Without an end page there is no trailing gap to find (#209)."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=None, end_page=None)
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(self._placeholders(scan), [])
+
+    def test_a_printed_range_over_the_end_gets_no_placeholder(self):
+        """A compressed page carries the pages it prints (#233), so they
+        are not missing at all."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+        scan.ocr_results = scan.ocr_results + [
+            {"pdf_page": 11, "detected": "11-20", "type": "range"}
+        ]
+        scan.page_count = 11
+        scan.save(update_fields=["ocr_results", "page_count"])
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(self._placeholders(scan), [])
+
+    def test_a_page_number_edit_keeps_the_placeholder(self):
+        """``rebuild_page_map`` is the other builder of the page map, and
+        the two must agree."""
+        from scanning import services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+
+        services.rebuild_page_map(scan)
+
+        self.assertEqual(
+            self._placeholders(scan)[0]["missing_range"], [11, 20]
+        )
 
 
 class TestRunComputeIssues(TestCase):
@@ -2346,6 +2432,22 @@ class TestRunComputeIssues(TestCase):
         self.assertEqual(scan.ocr_results[0]["detected"], "678-686")
         self.assertEqual(scan.ocr_results[0]["type"], "range")
 
+    def test_a_curators_trailing_letter_survives_the_apply(self):
+        # The page the book adds between two numbered pages (#319).
+        scan = self._make_scan()
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.SET_NUMBER,
+            pdf_page=1,
+            value="2094a",
+        )
+
+        self._run(scan, self._document(["1", "2"]))
+
+        scan.refresh_from_db()
+        self.assertEqual(scan.ocr_results[0]["detected"], "2094a")
+        self.assertEqual(scan.ocr_results[0]["type"], "suffixed")
+
     def test_a_cleared_number_survives_the_apply(self):
         scan = self._make_scan()
         PageEditFactory(
@@ -2405,20 +2507,23 @@ class TestRunComputeIssues(TestCase):
             ).exists()
         )
 
-    def test_suppressed_detection_issues_are_kept(self):
+    def test_review_2_findings_are_kept(self):
+        """The apply of the page numbers says nothing about the
+        redactions (#240 PR D)."""
         scan = self._make_scan()
         Issue.objects.create(
             scan=scan,
-            check_name=CheckName.SUPPRESS_DETECTION,
-            severity=Issue.Severity.INFO,
-            message="curator decision",
+            check_name=CheckName.UNCOVERED_HEADNOTE,
+            target=Issue.Target.REDACTION,
+            severity=Issue.Severity.WARNING,
+            message="a headnote no redaction covers",
         )
 
         self._run(scan, self._document(["1", "2"]))
 
         self.assertTrue(
             scan.issues.filter(
-                check_name=CheckName.SUPPRESS_DETECTION
+                check_name=CheckName.UNCOVERED_HEADNOTE
             ).exists()
         )
 

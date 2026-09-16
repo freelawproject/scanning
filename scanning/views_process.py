@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import fitz
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.db import IntegrityError, transaction
@@ -24,11 +25,25 @@ from django.template.loader import render_to_string
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
-from scanning import dots_mocr, jobs, mistral_ocr, page_edits, s3_sync, yolo
+from scanning import (
+    boundaries,
+    dots_mocr,
+    findings,
+    jobs,
+    mistral_ocr,
+    page_edits,
+    page_numbers,
+    repairs,
+    s3_sync,
+    yolo,
+)
 from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
+    PAGE_REVIEW_APPROVED_STATUSES,
     PHYSICAL_PAGE_CHECKS,
+    REVIEW2_CHECKS,
+    REVIEW_STATUSES,
     CheckName,
     Detection,
     ExternalJob,
@@ -36,15 +51,16 @@ from scanning.models import (
     JobEngine,
     JobStage,
     JobStatus,
+    OpinionBoundary,
     OpinionScan,
     PageEdit,
+    PageRepairRequest,
     Scan,
     Stage,
     Status,
 )
 from scanning.utils import (
     PIPELINE_PAUSED_MESSAGE,
-    compute_coverage_gaps,
     find_processing_pdf,
     local_original_pdf,
 )
@@ -62,11 +78,38 @@ PAGE_REVIEW_ALREADY_DONE_MESSAGE = (
 PAGE_REVIEW_NOT_READY_MESSAGE = (
     "This scan is not ready for the page completeness review."
 )
+#: Flashed when the approval is refused because a scanner was asked
+#: for a page (#266). It names the two ways out: the new scan arrives,
+#: or somebody dismisses the request. A refusal with no way out would
+#: strand the review.
+REPAIRS_WAITING_MESSAGE = (
+    "This scan waits for a scanner. Somebody asked for a page that is "
+    "missing or bad, so the volume is not page complete yet. Wait for "
+    "the new scan, or dismiss the request on the page if it no longer "
+    "applies."
+)
+#: Flashed by the review-2 approval of issue #263, and constants for
+#: the same reason as the three above.
+REDACTION_REVIEW_APPROVED_MESSAGE = (
+    "Thank you. The redactions of this scan are marked as reviewed."
+)
+REDACTION_REVIEW_ALREADY_DONE_MESSAGE = (
+    "The redactions of this scan are already marked as reviewed."
+)
+REDACTION_REVIEW_NOT_READY_MESSAGE = (
+    "This scan is not ready for the redaction review. The redactions "
+    "are computed after the page completeness approval, and this page "
+    "shows them when they are there."
+)
 LEGACY_OCR_RECOMPUTE_MESSAGE = (
     "The old OCR engine that read this scan no longer runs here. Run "
     "OCR again to recompute the page numbers."
 )
 RECOMPUTE_DONE_MESSAGE = "The page number issues are recomputed."
+#: The 409 of ``dismiss_issue`` on a review-2 finding (#240 PR D).
+REVIEW2_FINDING_NOT_HERE_MESSAGE = (
+    "This is a finding of the redaction review. Dismiss it from step 2."
+)
 REVALIDATE_UNAVAILABLE_MESSAGE = (
     "This scan cannot be re-run from here. Sharding, the bitonal "
     "conversion and dots.mocr are deterministic, so a re-run adds "
@@ -76,18 +119,54 @@ REVALIDATE_UNAVAILABLE_MESSAGE = (
 PAGE_REVIEW_APPROVAL_REQUIRED_MESSAGE = (
     "Approve the page completeness review first. Then continue to detection."
 )
-PENDING_EDITS_SAVED_MESSAGE = (
-    "Your page changes are saved. We do not build the corrected "
-    "volume from them yet. Each inserted or replaced page must go "
-    "through the conversion and the OCR on its own, and that pass is "
-    "not built (#206). Approve this volume when the pages are "
-    "complete. We apply your changes for you when the pass is ready."
+#: Answered to a request over a page a scanner already rescanned after
+#: an earlier request (#249). The unique key matches the open row, and
+#: the row reads fulfilled, so nothing new is created: say so, and say
+#: the way out. Silence here is the fault the date rule removed, one
+#: step later.
+REPAIR_ALREADY_FULFILLED_MESSAGE = (
+    "This page was already requested, and a new scan of it is saved. If "
+    "the new scan is bad too, dismiss the old request on the page and ask "
+    "again, or upload a better scan with Replace."
 )
-
-#: The largest page file a curator may upload (#232). One page is one
-#: image or a short PDF. A bigger file is a whole volume sent by
-#: mistake, and the web pod would read it into memory to check it.
-PAGE_UPLOAD_MAX_BYTES = 50 * 1024 * 1024
+PENDING_EDITS_SAVED_MESSAGE = (
+    "Your page changes are saved, and not built into the volume yet. "
+    "Approve this volume when the pages are complete. The corrected "
+    "volume is then built from your changes, and each inserted, "
+    "replaced or rotated page goes through the conversion and the OCR "
+    "on its own."
+)
+#: The review-1 edits are locked once the review is approved (#224):
+#: the apply builds the final volume from the rows as they stand at
+#: the approval, so a row written after it would address a source the
+#: pipeline has left behind. A late correction reopens the review.
+EDITS_LOCKED_MESSAGE = (
+    "The page review of this volume is approved, so its pages cannot "
+    "be edited. Ask a staff member to reopen the page review first."
+)
+PAGE_REVIEW_REOPENED_MESSAGE = (
+    "The page review is open again. Make the corrections, then approve "
+    "the volume once more; the corrected volume is rebuilt from them."
+)
+PAGE_REVIEW_NOT_REOPENABLE_MESSAGE = (
+    "Only an approved page review can be reopened, and this volume's "
+    "is not approved."
+)
+#: The statuses under which a page edit endpoint refuses a write: an
+#: approved review (DONE), a scan the daemon holds -- the apply may be
+#: building from the rows at that moment -- and every post-review
+#: state. A scan before or outside the review keeps its rows editable:
+#: nothing reads them until the review runs.
+LOCKED_STATUSES = frozenset(
+    {
+        Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        Status.READY_FOR_REDACTION_REVIEW,
+        Status.REDACTION_REVIEW_DONE,
+        Status.APPROVED,
+        Status.EXTRACTED,
+        *BUSY_STATUSES,
+    }
+)
 
 #: What a page file may start with, and the extension that says what
 #: it is. The content type is the browser's word, and the stored
@@ -109,8 +188,11 @@ _IMAGE_MAGIC = (
 )
 _MAGIC_LENGTH = max(len(_PDF_MAGIC), *(len(m) for m, _ in _IMAGE_MAGIC))
 
+#: The refusal of a page file over the cap. ``{mb}`` is the cap in MB,
+#: from ``settings.PAGE_UPLOAD_MAX_BYTES``; see
+#: :func:`upload_too_large_message`.
 UPLOAD_TOO_LARGE_MESSAGE = (
-    "This file is larger than 50 MB. Upload one page, not a volume."
+    "This file is larger than {mb} MB. Upload the scanned pages, not a volume."
 )
 UPLOAD_WRONG_TYPE_MESSAGE = (
     "Upload an image of the page (PNG, JPEG, GIF, TIFF or BMP), or a "
@@ -127,71 +209,99 @@ REPLACEMENT_IS_ONE_PAGE_MESSAGE = (
     "A replacement stands for one page, and this PDF holds {pages}. "
     "Upload the one page that replaces it."
 )
-# What a curator sees when they ask for step 2 on a volume nobody has
-# run detection over. Since #195/#196 that is no longer a paused
-# pipeline: the stage works, and a staff member starts it, because each
-# run costs GPU time.
+# What a curator sees when they ask for step 2 on a volume with no
+# detections and no detection run. Since #250 the daemon starts the
+# run by itself once per shard set, so a volume with no run at all is
+# a legacy volume with no shard set, an environment with the stage
+# off, or a sweep that has not ticked yet.
 NO_DETECTIONS_MESSAGE = (
-    "This volume has no detections yet. A staff member starts the "
-    "detection run, and the redactions appear here when it finishes."
+    "This volume has no detections yet. Detection starts by itself "
+    "after the upload, and the redactions appear here when it "
+    "finishes. If nothing shows after a few minutes, ask a staff "
+    "member."
+)
+
+#: The step-2 warning when the run's printed pages could not be read
+#: (#269). The page renders with positional labels instead.
+PRINTED_PAGES_UNAVAILABLE_MESSAGE = (
+    "The printed page numbers of the corrected volume did not load. "
+    "Reload the page to try again."
+)
+#: The 409 of ``serve_final_pdf`` and the ``space=final`` routes when
+#: the corrected volume is not built or not measured yet (#269).
+FINAL_VOLUME_NOT_READY_MESSAGE = (
+    "The corrected volume of this scan is not ready yet. Reload the "
+    "page in a minute."
+)
+#: The 404 of ``scan_ocr_text_url`` for a volume nobody has read yet
+#: (#262): no dots.mocr run of this scan is glued.
+NO_READ_TEXT_MESSAGE = (
+    "The OCR has not read this volume yet, so there is no text to show."
+)
+#: The 404 of ``scan_ocr_text_url`` when the document was written and
+#: is not in the bucket any more (#262).
+OCR_TEXT_OBJECT_GONE_MESSAGE = (
+    "The OCR text of this volume is not in the bucket. Ask a staff "
+    "member to glue the run again."
+)
+#: The 409 of ``serve_final_pdf`` when the run's bitonal copy is the
+#: original itself: a 1-bit upload skips the conversion, and the
+#: preview route never streams the original (#185).
+FINAL_VOLUME_IS_ORIGINAL_MESSAGE = (
+    "This scan is already black-and-white, so its corrected volume is "
+    "the original. Load the original scan to see it."
 )
 
 
-def _unmatched_detection_dict(
-    det: Detection, idx_to_logical: dict[int, int]
-) -> dict:
-    """Build the template dict for an unmatched detection.
+def dots_run_is_glued(summary: dict | None) -> bool:
+    """Say whether a scan's live dots.mocr run is glued (#262).
 
-    :param det: The Detection instance.
-    :param idx_to_logical: Mapping from pdf_index to logical page number.
-    :returns: Dict of detection metadata for the template.
-    :rtype: dict
-    """
-    return {
-        "id": det.pk,
-        "pdf_page": det.page_index + 1,
-        "page_index": det.page_index,
-        "label_id": det.label_id,
-        "logical_page": idx_to_logical.get(det.page_index, det.page_index + 1),
-        "conf": round(det.confidence, 2),
-        "bbox": [det.x0, det.y0, det.x1, det.y1],
-        "img_width": det.img_width,
-        "img_height": det.img_height,
-    }
+    Off the summary the process view reads already
+    (``dots_mocr.run_summary``), so the text overlay's button costs no
+    query. The glue writes the document and flips every row to
+    ``CONSUMED`` in one pass, so "every row consumed" is the same test
+    :func:`dots_mocr.glued_volume_key` makes against the rows.
 
-
-def _caption_is_continuation(
-    det: Detection, paired_keys_sorted: list[tuple[int, int, int]]
-) -> bool:
-    """Check if a caption detection falls in a key-icon span.
-
-    If the caption is between two paired key icons, it's a
-    continuation of the opinion in that span, not a missed opinion.
-
-    :param det: A Detection instance with page_index, y0.
-    :param paired_keys_sorted: Sorted list of (page, x, y) tuples
-        for paired key icons.
-    :returns: True if the caption falls in an existing span.
+    :param summary: The run summary, or None when the stage never ran.
+    :returns: Whether a glued volume document exists for the live run.
     :rtype: bool
     """
-    for i, (kp, kx, ky) in enumerate(paired_keys_sorted):
-        # A caption is only a continuation when it falls between two
-        # *actual* paired keys. The open-ended span past the last key
-        # is a new opinion whose closing key isn't on this scan
-        # (likely continues into the next volume), so leave it as
-        # unmatched.
-        if i + 1 >= len(paired_keys_sorted):
-            break
-        next_kp, _, next_ky = paired_keys_sorted[i + 1]
-        after_key = det.page_index > kp or (
-            det.page_index == kp and det.y0 > ky
+    if not summary:
+        return False
+    return summary["statuses"].get(JobStatus.CONSUMED) == summary["total"]
+
+
+def detection_message(summary: dict | None) -> str:
+    """Say where a volume's detection stands, for a curator (#250).
+
+    One text for the "Next: Detect" title and the flash the view sends
+    when it cannot walk to step 2, so the bar and the view agree.
+    ``summary`` is ``yolo.run_summary(scan)``: ``None`` when the stage
+    has never run, else the counts of the live run.
+
+    :param summary: The run summary, or ``None``.
+    :returns: The message.
+    :rtype: str
+    """
+    if not summary:
+        return NO_DETECTIONS_MESSAGE
+    if summary["failed"]:
+        code = summary["error_code"] or "no error code"
+        return (
+            f"Detection failed on {summary['failed']} of "
+            f"{summary['total']} part(s) ({code}). Ask a staff member "
+            "to look into it."
         )
-        before_next = det.page_index < next_kp or (
-            det.page_index == next_kp and det.y0 < next_ky
+    if summary["open"]:
+        return (
+            f"Detection is running: {summary['done']} of "
+            f"{summary['total']} part(s) done. The redactions appear "
+            "here when it finishes."
         )
-        if after_key and before_next:
-            return True
-    return False
+    return (
+        "Detection finished. The redactions are computed within a "
+        "minute of the page completeness approval."
+    )
 
 
 @login_required
@@ -212,7 +322,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     )
 
     # No eager S3 pull here: this page renders entirely from the DB
-    # (page_map, ocr_results, opinions_json, detections, redaction_rects),
+    # (page_map, ocr_results, the boundaries, detections, the redactions),
     # so it never reads the processing files off disk. Pulling them here
     # blocked the response on I/O it doesn't need -- worst right after a
     # fresh upload, when the only object in the prefix is the multi-GB
@@ -229,18 +339,31 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             step = 1
         elif scan.stage == Stage.APPROVED:
             step = 3
-        elif scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE:
+        elif scan.status in (
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+            Status.READY_FOR_REDACTION_REVIEW,
+            Status.REDACTION_REVIEW_DONE,
+        ):
             # Review 1 is done (#154), so land on the detection review
             # when detections exist. The detection stage (#195) writes
             # no scan status, so its output is the only signal.
+            #
+            # The two #263 states land there as well, review 2 done
+            # included: step 3 is paused (#173/#206), and step 2 is
+            # where that state is shown and where its "Next: Generate"
+            # link waits. Send nobody to a step whose only button
+            # refuses.
             if Detection.objects.filter(scan=scan).exists():
                 step = 2
             else:
                 step = 1
-        elif scan.stage == Stage.PROCESS or scan.opinions_json:
+        elif (
+            scan.stage == Stage.PROCESS
+            or OpinionBoundary.objects.computed().filter(scan=scan).exists()
+        ):
             # Stay on step 1 if there are unresolved issues
             has_issues = scan.issues.exclude(
-                check_name=CheckName.SUPPRESS_DETECTION
+                check_name__in=REVIEW2_CHECKS
             ).exists()
             has_missing = bool(scan.missing_pages)
             if has_issues or has_missing:
@@ -250,7 +373,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         else:
             step = 1
 
-    issues = list(scan.issues.all())
+    # The review-1 rows only: a review-2 finding (#240 PR D) names a
+    # page by its position in the space the redaction rows are drawn
+    # in, which is not step 1's, and the step-2 section reads those
+    # rows itself (``findings.viewer_groups``, below).
+    issues = list(scan.issues.exclude(check_name__in=REVIEW2_CHECKS))
 
     # No external stage writes a scan status by design (#190, #195,
     # #191), so their rows are the only place their progress lives.
@@ -258,94 +385,192 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     yolo_run = yolo.run_summary(scan)
     mistral_run = mistral_ocr.run_summary(scan)
 
-    # Each uploaded image is shown at the gap its row names, and every
-    # remaining placeholder is stamped with the physical page it
-    # follows, so an upload can send that address back (#214).
-    page_map = page_edits.project_inserts(scan, scan.page_map)
-    missing_pages = scan.missing_pages
-
-    # The pages a curator replaced (#232). The viewer draws a note on
-    # each one, with a link that opens the file the curator uploaded.
-    replaced_pages = page_edits.replacements_by_page(scan)
-
-    # Map pdf_index → logical page number for navigation
-    idx_to_logical = {}
-    logical_to_indices: dict[int, list[int]] = {}
-    for entry in page_map:
-        if entry.get("type") == "pdf_page":
-            idx_to_logical[entry["pdf_index"]] = entry["logical_number"]
-            logical_to_indices.setdefault(entry["logical_number"], []).append(
-                entry["pdf_index"]
-            )
-
-    # PDF page indices the page_map flags as duplicates (a detected page
-    # number that already appeared on an earlier page). The PDF viewer marks
-    # these with a DUPLICATE badge; the sidebar page list mirrors the same set
-    # so the two views stay consistent. Unlike a consecutive-only check this
-    # also catches duplicates whose copies are far apart (e.g. the same
-    # printed "page 1" appearing on several pages).
-    duplicate_indices = {
-        entry["pdf_index"]
-        for entry in page_map
-        if entry.get("type") == "pdf_page" and entry.get("duplicate")
+    # The pages a reviewer asked a scanner to scan again, or the gaps
+    # they asked a scanner to fill (#249). The waiting ones raise the
+    # sidebar badge and the section; every open one reaches the viewer,
+    # so a fulfilled request shows as fulfilled on its page.
+    repair_requests = repairs.viewer_payload(scan)
+    waiting_repairs = [r for r in repair_requests if not r["fulfilled"]]
+    pages_needing_repair = {
+        r["pdf_page"] for r in waiting_repairs if r["pdf_page"] is not None
     }
 
-    # The viewer highlights flagged pages by pdf_index (a page's physical
-    # position), which is unique. An issue's ``page_number`` means a physical
-    # PDF page for some checks and a logical/printed page number for others;
-    # logical numbers can repeat when unnumbered front matter borrows numbers
-    # from the real pages (issue #90), so they must be resolved through the
-    # page_map rather than matched directly. The set is shared with the
-    # dismissal, which keeps its address in the same two spaces (#214).
-    flagged_indices: set[int] = set()
-    for i in issues:
-        # Resolve each issue to PDF page indices (unique physical positions),
-        # used both for the red-border highlight and for click-to-navigate.
-        # ``nav_pdf_index`` is the first resolved index, or None when the issue
-        # has no page (or points at a missing page absent from the page_map).
-        i.nav_pdf_index = None
-        if i.page_number is None:
-            continue
-        if i.check_name in PHYSICAL_PAGE_CHECKS:
-            indices = [i.page_number - 1]
-        else:
-            indices = logical_to_indices.get(i.page_number, [])
-        flagged_indices.update(indices)
-        if indices:
-            i.nav_pdf_index = indices[0]
+    # One read of the review flags for the bar and the page (#151), and
+    # with them the space the page is drawn in (#269). Step 2 shows the
+    # corrected volume of the standing apply run once the boxes are
+    # measured against it (``final_space``): the final PDF, the printed
+    # pages the run stored, and no review-1 issue or edit, since those
+    # address the original. Step 1 always draws the original's space,
+    # where every ``PageEdit`` address lives.
+    # The findings of review 2 are rows since #240 PR D
+    # (``findings.rebuild`` writes them after the compute and after
+    # every curator write), read here for the step-2 section, and their
+    # counts are handed to the flags so the bar and the section agree.
+    review_findings = findings.viewer_groups(scan) if step >= 2 else {}
+    flags = _review_flags(
+        scan,
+        repairs_waiting=bool(waiting_repairs),
+        review2=(
+            (review_findings["review2_open"], review_findings["review2_stale"])
+            if review_findings
+            else None
+        ),
+    )
+    final_space = step >= 2 and flags["final_space"]
+    printed_warning = None
+    if final_space:
+        page_map, ocr_by_page, printed_warning = _final_space_pages(
+            scan, flags["final_run"]
+        )
+        ocr_results = [ocr_by_page[page] for page in sorted(ocr_by_page)]
+        missing_pages = scan.missing_pages
+        replaced_pages = {}
+        deleted_pages: list[int] = []
+        duplicate_indices: set[int] = set()
+        flagged_indices: set[int] = set()
+        idx_to_logical = {}
+        for entry in page_map:
+            idx_to_logical[entry["pdf_index"]] = entry["logical_number"]
+        for i in issues:
+            i.nav_pdf_index = None
+    else:
+        # Each uploaded image is shown at the gap its row names, and every
+        # remaining placeholder is stamped with the physical page it
+        # follows, so an upload can send that address back (#214).
+        page_map = page_edits.project_inserts(scan, scan.page_map)
+        missing_pages = scan.missing_pages
 
-    ocr_results = scan.ocr_results
-    ocr_by_page = {}
-    for r in ocr_results:
-        ocr_by_page[r["pdf_page"]] = r
+        # The pages a curator replaced (#232). The viewer draws a note on
+        # each one, with a link that opens the file the curator uploaded.
+        replaced_pages = page_edits.replacements_by_page(scan)
 
-    # Annotate sequence issues for the sidebar page list. Duplicates are taken
-    # from ``duplicate_indices`` (the same page_map data the viewer uses);
-    # ``seq_issue`` only covers ordering anomalies (backward / gap).
-    prev_num = None
-    for r in ocr_results:
-        r["seq_issue"] = ""
-        r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
-        r["is_replaced"] = r["pdf_page"] in replaced_pages
-        if not r.get("detected") or r.get("type") == "range":
-            prev_num = None
-            continue
-        try:
-            num = int(r["detected"])
-        except (ValueError, TypeError):
-            prev_num = None
-            continue
-        if prev_num is not None:
-            diff = num - prev_num
-            if diff < 0:
-                r["seq_issue"] = "backward"
-            elif diff > 2:
-                r["seq_issue"] = "gap"
-        prev_num = num
+        # Map pdf_index → logical page number for navigation
+        idx_to_logical = {}
+        logical_to_indices: dict[int, list[int]] = {}
+        for entry in page_map:
+            if entry.get("type") == "pdf_page":
+                idx_to_logical[entry["pdf_index"]] = entry["logical_number"]
+                logical_to_indices.setdefault(
+                    entry["logical_number"], []
+                ).append(entry["pdf_index"])
+
+        # PDF page indices the page_map flags as duplicates (a detected page
+        # number that already appeared on an earlier page). The PDF viewer marks
+        # these with a DUPLICATE badge; the sidebar page list mirrors the same set
+        # so the two views stay consistent. Unlike a consecutive-only check this
+        # also catches duplicates whose copies are far apart (e.g. the same
+        # printed "page 1" appearing on several pages).
+        duplicate_indices = {
+            entry["pdf_index"]
+            for entry in page_map
+            if entry.get("type") == "pdf_page" and entry.get("duplicate")
+        }
+
+        # The viewer highlights flagged pages by pdf_index (a page's physical
+        # position), which is unique. An issue's ``page_number`` means a physical
+        # PDF page for some checks and a logical/printed page number for others;
+        # logical numbers can repeat when unnumbered front matter borrows numbers
+        # from the real pages (issue #90), so they must be resolved through the
+        # page_map rather than matched directly. The set is shared with the
+        # dismissal, which keeps its address in the same two spaces (#214).
+        flagged_indices: set[int] = set()
+        for i in issues:
+            # Resolve each issue to PDF page indices (unique physical positions),
+            # used both for the red-border highlight and for click-to-navigate.
+            # ``nav_pdf_index`` is the first resolved index, or None when the issue
+            # has no page (or points at a missing page absent from the page_map).
+            i.nav_pdf_index = None
+            if i.page_number is None:
+                continue
+            if i.check_name in PHYSICAL_PAGE_CHECKS:
+                indices = [i.page_number - 1]
+            else:
+                indices = logical_to_indices.get(i.page_number, [])
+            flagged_indices.update(indices)
+            if indices:
+                i.nav_pdf_index = indices[0]
+
+        # The card of a range missing at the end names the placeholder
+        # ("ask a scanner for them at the placeholder at the end of the
+        # volume", #256), so the card must reach it. Its own address is a
+        # printed number the volume does not show, which resolves to no
+        # page above, and the placeholder carries the range as its label,
+        # so neither of ``goToPage``'s lookups finds it. The physical
+        # address does: the page the gap follows, with the placeholder
+        # drawn right below it -- the route a repair request already takes
+        # (``PageRepairRequest.nav_pdf_index``).
+        #
+        # After the loop, and outside ``flagged_indices`` on purpose: the
+        # last page of the volume is not itself at fault, so it keeps no
+        # red border. The projected entry keeps both keys after a curator
+        # uploads into the gap, because ``_inserted_entry`` copies it.
+        trailing = next((e for e in page_map if e.get("missing_range")), None)
+        if trailing:
+            for i in issues:
+                if (
+                    i.check_name == CheckName.LARGE_GAP
+                    and i.page_number == trailing["missing_range"][0]
+                ):
+                    i.nav_pdf_index = max(
+                        trailing.get("anchor_pdf_page", 0) - 1, 0
+                    )
+
+        ocr_results = scan.ocr_results
+        ocr_by_page = {}
+        for r in ocr_results:
+            ocr_by_page[r["pdf_page"]] = r
+
+        # Annotate sequence issues for the sidebar page list. Duplicates are taken
+        # from ``duplicate_indices`` (the same page_map data the viewer uses);
+        # ``seq_issue`` only covers ordering anomalies (backward / gap).
+        prev_num = None
+        for r in ocr_results:
+            r["seq_issue"] = ""
+            r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
+            r["is_replaced"] = r["pdf_page"] in replaced_pages
+            r["needs_repair"] = r["pdf_page"] in pages_needing_repair
+            if r.get("type") == page_numbers.SUFFIXED:
+                # The book adds this page between two numbered ones, so
+                # it breaks no sequence: the page before it and the page
+                # after it stay neighbours (#319).
+                continue
+            if not r.get("detected") or r.get("type") == "range":
+                prev_num = None
+                continue
+            try:
+                num = int(r["detected"])
+            except (ValueError, TypeError):
+                prev_num = None
+                continue
+            if prev_num is not None:
+                diff = num - prev_num
+                if diff < 0:
+                    r["seq_issue"] = "backward"
+                elif diff > 2:
+                    r["seq_issue"] = "gap"
+            prev_num = num
+        deleted_pages = sorted(page_edits.deleted_pages(scan))
 
     has_detections = Detection.objects.filter(scan=scan).exists()
 
-    opinions = scan.opinions_json
+    # The boundaries are rows since #240 PR C, read in the legacy dict
+    # shape plus their ids. The printed numbers come from the OCR rows
+    # the view holds already (``ocr_by_page``, keyed by the 1-based
+    # page), which are in the space the rows are drawn in (the final
+    # space when the redactions are measured against the standing run,
+    # #269) and carry a range as ``detected`` plus ``type``. Not from
+    # the page map: blackletter's map puts the physical page in
+    # ``logical_number`` for a range page and the range in
+    # ``range_label``, so a lookup built from it lost the range's end.
+    from scanning.services import printed_page_span
+
+    page_spans = {
+        page - 1: span
+        for page, row in ocr_by_page.items()
+        if (span := printed_page_span(row.get("detected"), row.get("type")))
+    }
+    opinions = boundaries.viewer_payload(scan, page_spans)
+    opinion_count = sum(1 for op in opinions if not op["dismissed"])
 
     # Build a set of page indices that contain IMAGE detections
     image_page_indices = set(
@@ -366,39 +591,6 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             if idx in image_page_indices
         ]
 
-    has_redaction_rects = bool(scan.redaction_rects)
-
-    # Find HEADNOTE detections not covered by headnote redaction rects
-    uncovered_hn_pages = set()
-    if has_redaction_rects:
-        rects_data = scan.redaction_rects
-        hn_rects_by_page = {}
-        for entry in rects_data:
-            hn_rects_by_page[entry["page_index"]] = [
-                r for r in entry["rects"] if r.get("type") == "headnote"
-            ]
-        for d in Detection.objects.filter(
-            scan=scan, label="HEADNOTE", active=True
-        ).filter(confidence__gte=0.8):
-            page_rects = hn_rects_by_page.get(d.page_index, [])
-            cx = (d.x0 + d.x1) / 2
-            cy = (d.y0 + d.y1) / 2
-            covered = any(
-                r["x0"] <= cx <= r["x1"] and r["y0"] <= cy <= r["y1"]
-                for r in page_rects
-            )
-            if not covered:
-                uncovered_hn_pages.add(d.page_index)
-
-    for op in opinions:
-        cp = op.get("caption_page", 0)
-        ep = op.get("page_end", op.get("key_page", cp))
-        op["uncovered_headnote_pages"] = [
-            {"num": idx_to_logical.get(idx, idx + 1), "idx": idx}
-            for idx in range(cp, ep + 1)
-            if idx in uncovered_hn_pages
-        ]
-
     opinion_scans = []
     if step == 3:
         for s in OpinionScan.objects.filter(scan=scan).order_by(
@@ -416,94 +608,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             )
             opinion_scans.append(s)
 
-    # Detection warnings for step 2
+    # The printed-pages warning is a request-time condition, not a
+    # finding, so it stays a warning line.
     detect_warnings = []
-    unmatched_keys = []
-    unmatched_captions = []
-    if step >= 2 and opinions:
-        # Build suppressed set from issues
-        suppressed = set()
-        for iss in scan.issues.filter(check_name=CheckName.SUPPRESS_DETECTION):
-            if iss.metadata:
-                m = iss.metadata
-                bb = m.get("bbox", [0, 0, 0, 0])
-                suppressed.add(
-                    (
-                        m.get("page_index", 0),
-                        m.get("label_id", 0),
-                        round(bb[0]),
-                        round(bb[1]),
-                    )
-                )
 
-        paired_caption_keys = set()
-        paired_key_keys = set()
-        for op in opinions:
-            cb = op.get("caption_bbox", [0, 0, 0, 0])
-            kb = op.get("key_bbox", [0, 0, 0, 0])
-            paired_caption_keys.add(
-                (op.get("caption_page", 0), round(cb[0]), round(cb[1]))
-            )
-            paired_key_keys.add(
-                (op.get("key_page", 0), round(kb[0]), round(kb[1]))
-            )
-
-        for d in Detection.objects.filter(
-            scan=scan, active=True, label="KEY_ICON"
-        ).order_by("page_index"):
-            if (d.page_index, round(d.x0), round(d.y0)) not in paired_key_keys:
-                if (
-                    d.page_index,
-                    d.label_id,
-                    round(d.x0),
-                    round(d.y0),
-                ) not in suppressed:
-                    unmatched_keys.append(
-                        _unmatched_detection_dict(d, idx_to_logical)
-                    )
-
-        # Build sorted list of paired key icon positions so we can
-        # determine which key-icon span an unmatched caption falls in.
-        # If a span already has a paired caption, extra captions in
-        # that span are continuations — not missed opinions.
-        paired_keys_sorted = sorted(paired_key_keys)
-
-        for d in Detection.objects.filter(
-            scan=scan, active=True, label="CASE_CAPTION"
-        ).order_by("page_index", "y0"):
-            if (d.page_index, round(d.x0), round(d.y0)) in paired_caption_keys:
-                continue
-            if (
-                d.page_index,
-                d.label_id,
-                round(d.x0),
-                round(d.y0),
-            ) in suppressed:
-                continue
-            if _caption_is_continuation(d, paired_keys_sorted):
-                continue
-            unmatched_captions.append(
-                _unmatched_detection_dict(d, idx_to_logical)
-            )
-
-        if unmatched_keys:
-            detect_warnings.append(
-                f"{len(unmatched_keys)} KEY_ICON(s) not matched to any opinion"
-            )
-        if unmatched_captions:
-            detect_warnings.append(
-                f"{len(unmatched_captions)} CASE_CAPTION(s) not matched to any opinion"
-            )
-
-        # Coverage gaps
-        for start, end, count in compute_coverage_gaps(
-            opinions, scan.start_page, scan.end_page
-        ):
-            detect_warnings.append(
-                f"Pages {start}-{end}"
-                f" ({count} pages) not covered"
-                " by any opinion"
-            )
+    if printed_warning:
+        detect_warnings.insert(0, printed_warning)
 
     return render(
         request,
@@ -522,17 +632,33 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "dots_run": dots_run,
             "yolo_run": yolo_run,
             "mistral_run": mistral_run,
-            **_review_flags(scan),
+            "detect_message": detection_message(yolo_run),
+            **flags,
+            "final_space": final_space,
+            # The text overlay's button (#262). The final space always
+            # has its OCR document (``ApplyRun.is_complete`` counts
+            # it), and every other page reads the volume document, so
+            # a legacy PaddleOCR volume gets no button.
+            "ocr_text_available": bool(final_space)
+            or dots_run_is_glued(dots_run),
             "opinions": opinions,
+            "opinion_count": opinion_count,
             "opinions_json": json.dumps(opinions),
-            "has_redaction_rects": has_redaction_rects,
             "opinion_scans": opinion_scans,
             "detect_warnings": detect_warnings,
-            "unmatched_keys": unmatched_keys,
-            "unmatched_captions": unmatched_captions,
-            "deleted_pages_json": json.dumps(
-                sorted(page_edits.deleted_pages(scan))
-            ),
+            **review_findings,
+            "deleted_pages_json": json.dumps(deleted_pages),
+            # The rule of the step-1 bar (#151): the viewer must not
+            # offer a control the endpoint refuses. Step 2 runs while
+            # a new-pipeline volume is in DONE, which locks every page
+            # edit (#224), and a legacy PENDING_REVIEW volume is not
+            # locked and keeps its page-number control. The final space
+            # is locked whatever the status (#269): a page number there
+            # is a page of the corrected volume, not an address
+            # ``assign_page`` takes.
+            "page_edits_locked": final_space or scan.status in LOCKED_STATUSES,
+            "repair_requests": repair_requests,
+            "waiting_repairs": waiting_repairs,
             "replaced_pages_json": json.dumps(
                 {
                     str(page): {
@@ -714,13 +840,11 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
             status=202,
         )
 
-    if scan.status in (
-        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
-        Status.PAGE_COMPLETENESS_REVIEW_DONE,
-    ):
-        # These statuses guarantee a stored preview (#154): #149 sets
-        # the first one only after the bitonal merge. Landing here means
-        # the S3 pull above just failed, and a reload retries it.
+    if scan.status in REVIEW_STATUSES:
+        # Every review state guarantees a stored preview (#154/#263):
+        # #149 sets the first one only after the bitonal merge, and the
+        # two review-2 states come after it. Landing here means the S3
+        # pull above just failed, and a reload retries it.
         message = (
             "The preview did not load. Reload the page to try again, "
             "or load the original scan instead."
@@ -774,6 +898,22 @@ def scan_original_url(request: HttpRequest, pk: int) -> JsonResponse:
             {"error": "This scan has no original PDF."}, status=404
         )
 
+    if request.GET.get("space") == "final":
+        # The corrected volume at full quality (#269): the run's final
+        # PDF, which aliases the original when no page was edited. Only
+        # S3 holds it, and no run exists without S3.
+        from scanning import review_states
+
+        run = review_states.final_run(scan)
+        if run is None or not s3_sync.s3_active():
+            return JsonResponse(
+                {"error": FINAL_VOLUME_NOT_READY_MESSAGE}, status=409
+            )
+        url = s3_sync.presign_get(
+            run.final_pdf_key, settings.ORIGINAL_VIEW_PRESIGN_TTL
+        )
+        return JsonResponse({"url": url, "embedded_whole": False})
+
     url = s3_sync.presign_original_get(scan)
     if url:
         return JsonResponse({"url": url, "embedded_whole": False})
@@ -783,6 +923,68 @@ def scan_original_url(request: HttpRequest, pk: int) -> JsonResponse:
             "embedded_whole": True,
         }
     )
+
+
+@login_required
+def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
+    """Return a URL the browser can read the OCR document from (#262).
+
+    The twin of :func:`scan_original_url`, for the text overlay of the
+    viewer. The browser reads the document straight from the bucket, so
+    the web pod mints one presigned GET and reads no byte of it: a
+    glued volume of 1300 pages holds every cell and the text of every
+    page, and a download plus a parse per press of the button would
+    cost the pod that memory on the pod that also takes the uploads.
+
+    The answer is JSON and not a redirect, although #243 and #269 both
+    have a redirect route for these documents. A browser judges the
+    CORS rules of a redirected request differently from a direct one,
+    and the viewer reads this URL with ``fetch``; pdf.js reads the URL
+    of :func:`scan_original_url` the same way, and that is the path
+    the bucket rule is known to serve.
+
+    Which document depends on the space the viewer draws (#269), and
+    there is no fallback between the two: the text of the original over
+    the pages of the corrected volume would sit one page out from the
+    first deletion onwards.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON with ``url``, ``space`` and ``size``; a 409 when the
+        final space has no document, a 404 when nothing was read, when
+        the object is gone, or when S3 is off.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    space = "original"
+    if request.GET.get("space") == "final":
+        from scanning import review_states
+
+        run = review_states.final_run(scan)
+        if run is None or not run.ocr_key:
+            return JsonResponse(
+                {"error": FINAL_VOLUME_NOT_READY_MESSAGE}, status=409
+            )
+        space, key = "final", run.ocr_key
+    else:
+        key = dots_mocr.glued_volume_key(scan)
+        if not key:
+            return JsonResponse({"error": NO_READ_TEXT_MESSAGE}, status=404)
+
+    if not s3_sync.s3_active():
+        return JsonResponse({"error": NO_S3_GLUED_OUTPUT_MESSAGE}, status=404)
+    # One head_object. It says the object is really there -- a run
+    # glued before a sweep is not -- and its size lets the button say
+    # how much it reads before it reads it.
+    size = s3_sync.object_size(key)
+    if size is None:
+        return JsonResponse(
+            {"error": OCR_TEXT_OBJECT_GONE_MESSAGE}, status=404
+        )
+    # No ``content_disposition``: that header makes a browser save a
+    # named file, which is what the routes of #243 want and the
+    # opposite of what a ``fetch`` wants.
+    url = s3_sync.presign_get(key, GLUED_OUTPUT_PRESIGN_TTL)
+    return JsonResponse({"url": url, "space": space, "size": size})
 
 
 @login_required
@@ -815,6 +1017,70 @@ def serve_scan_original(request: HttpRequest, pk: int) -> FileResponse:
         open(original, "rb"), content_type="application/pdf"
     )
     response["X-Scan-Preview"] = "original"
+    return response
+
+
+@login_required
+def serve_final_pdf(request: HttpRequest, pk: int) -> HttpResponse:
+    """Serve the bitonal copy of the corrected volume (#269).
+
+    The step-2 counterpart of :func:`serve_scan_pdf`: the run's
+    ``bitonal_key``, pulled to its local mirror on a miss
+    (``apply.local_copy``). The template chooses this route when the
+    boxes are measured against the standing run (``final_space``), so
+    the answer here is only "is there a corrected volume": a 409 with
+    ``original_available`` otherwise, which the viewer answers with the
+    "load the original" button, as it does for the review-1 route.
+
+    A run over a 1-bit original has the original as its bitonal copy,
+    and #185 keeps the multi-GB original out of this stream: that case
+    is a 409 too, and the original load resolves through
+    ``scan_original_url?space=final`` to the same file.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: File response streaming the copy, or a 409 JSON response.
+    """
+    from scanning import apply, review_states
+
+    scan = get_object_or_404(Scan, pk=pk)
+    original_available = bool(scan.original_pdf and scan.original_pdf.name)
+
+    def refuse(message: str) -> JsonResponse:
+        return JsonResponse(
+            {
+                "status": "unavailable",
+                "scan_status": scan.status,
+                "message": message,
+                "original_available": original_available,
+            },
+            status=409,
+        )
+
+    run = review_states.final_run(scan)
+    if run is None:
+        return refuse(FINAL_VOLUME_NOT_READY_MESSAGE)
+    if run.bitonal_key == s3_sync.s3_original_key(scan):
+        return refuse(FINAL_VOLUME_IS_ORIGINAL_MESSAGE)
+    logger.info(
+        "serve_final_pdf: scan=%s run=%s key=%s",
+        scan.pk,
+        run.label,
+        run.bitonal_key,
+    )
+    try:
+        path = apply.local_copy(scan, run.bitonal_key)
+    except apply.ApplyError:
+        logger.exception(
+            "serve_final_pdf: the corrected volume of scan %s did not load",
+            scan.pk,
+        )
+        return refuse(
+            "The corrected volume did not load. Reload the page to try "
+            "again, or load the original scan instead."
+        )
+    response = FileResponse(path.open("rb"), content_type="application/pdf")
+    response["X-Scan-Preview"] = "bitonal"
     return response
 
 
@@ -877,7 +1143,12 @@ def _glued_run_rows(
     """
     return list(
         ExternalJob.objects.filter(
-            scan=scan, stage=stage, engine=engine, opinion=None, run=run
+            scan=scan,
+            stage=stage,
+            engine=engine,
+            opinion=None,
+            run=run,
+            apply_run__isnull=True,
         ).order_by("shard_index")
     )
 
@@ -1008,8 +1279,15 @@ def glued_output_index(
         return _unknown_output(output)
     stage, engine, _key_fn = spec
     scan = get_object_or_404(Scan, pk=pk)
+    # The volume runs only: the one-page shards of a page edit apply
+    # (#224) share the stage and the engine, and their run numbers, but
+    # no glued volume document is written for them.
     rows = ExternalJob.objects.filter(
-        scan=scan, stage=stage, engine=engine, opinion=None
+        scan=scan,
+        stage=stage,
+        engine=engine,
+        opinion=None,
+        apply_run__isnull=True,
     ).order_by("-run", "shard_index")
     runs = []
     for run, group in itertools.groupby(rows, key=lambda row: row.run):
@@ -1142,6 +1420,225 @@ def serve_glued_shard(
     )
 
 
+#: Slug -> (``ApplyRun`` key field, extension) of the apply's outputs
+#: (#224), for the routes below (#269). ``page-map`` has no key field:
+#: its object is written beside the run's outputs at a fixed name.
+APPLY_OUTPUTS: dict[str, tuple[str | None, str]] = {
+    "final-pdf": ("final_pdf_key", "pdf"),
+    "bitonal": ("bitonal_key", "pdf"),
+    "ocr-volume": ("ocr_key", "json"),
+    "printed-pages": ("printed_pages_key", "json"),
+    "detections-volume": ("detections_key", "json"),
+    "page-map": (None, "json"),
+}
+
+
+def _apply_output_key(scan: Scan, run, output: str) -> str | None:
+    """Return the S3 key of one apply output, or None when not written.
+
+    :param scan: The scan.
+    :param run: The ``ApplyRun``.
+    :param output: A key of :data:`APPLY_OUTPUTS`.
+    :returns: The key, or None for a blank field.
+    """
+    from scanning import apply
+
+    field, _ext = APPLY_OUTPUTS[output]
+    if field is None:
+        return (
+            f"{apply.run_prefix(scan, run)}page_map.json"
+            if run.is_built
+            else None
+        )
+    return getattr(run, field) or None
+
+
+def _apply_run_entry(scan: Scan, run, rows: list, measured: bool) -> dict:
+    """Describe one apply run for the outputs index.
+
+    :param scan: The scan.
+    :param run: The ``ApplyRun``.
+    :param rows: The run's own ``ExternalJob`` rows.
+    :param measured: Whether the redaction rows are measured against it.
+    :returns: One entry of the ``runs`` list.
+    """
+    from scanning import apply
+
+    files = {}
+    for output in APPLY_OUTPUTS:
+        if _apply_output_key(scan, run, output):
+            files[output] = reverse(
+                "serve_apply_output",
+                kwargs={"pk": scan.pk, "number": run.number, "output": output},
+            )
+    shards = []
+    for row in sorted(rows, key=lambda r: (r.stage, r.pk)):
+        manifest = row.input_manifest or {}
+        entry = {
+            "pk": row.pk,
+            "stage": row.stage,
+            "engine": row.engine,
+            "edit_id": manifest.get("edit_id"),
+            "attempt": row.attempt,
+            "status": row.status,
+            "error_code": row.error_code,
+            "page_count": manifest.get("page_count"),
+        }
+        has_summary = isinstance((row.provider_meta or {}).get("output"), dict)
+        if row.engine == JobEngine.DOTS_MOCR and has_summary:
+            entry.update(jobs.page_lists(row))
+        if row.result_key:
+            entry["url"] = reverse(
+                "serve_apply_shard",
+                kwargs={"pk": scan.pk, "number": run.number, "row_pk": row.pk},
+            )
+        shards.append(entry)
+    return {
+        "label": run.label,
+        "number": run.number,
+        "standing": run.superseded_at is None,
+        "built_at": run.built_at.isoformat() if run.built_at else None,
+        "complete": run.is_complete,
+        "measured": measured,
+        "source_fingerprint": run.source_fingerprint,
+        # The attempt count and the row states, not ``last_error``: it
+        # holds the text of an exception, and a response must not carry
+        # one (CodeQL). The admin shows it.
+        "attempts": run.attempts,
+        **apply.describe_map(run.page_map),
+        "files": files,
+        "shards": shards,
+    }
+
+
+@login_required
+def apply_output_index(request: HttpRequest, pk: int) -> JsonResponse:
+    """List every apply run of a scan with its outputs and shards (#269).
+
+    The #243 shape for the corrected volume (#224): the runs newest
+    first, each with its counts, the URL of each written output, and
+    its one-page shard rows. Every fact is on the rows, so no S3 call.
+    ``measured`` says whether the redaction rows of the scan are
+    measured against that run (``yolo.redactions_current``), which is
+    what step 2 shows.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: JSON with ``scan``, ``standing`` and ``runs``.
+    """
+    from scanning.models import ApplyRun
+
+    scan = get_object_or_404(Scan, pk=pk)
+    runs = list(ApplyRun.objects.filter(scan=scan).order_by("-number"))
+    rows_by_run: dict[int, list] = {}
+    for row in ExternalJob.objects.filter(scan=scan, apply_run__isnull=False):
+        rows_by_run.setdefault(row.apply_run_id, []).append(row)
+    detect_rows = yolo.live_detect_jobs(scan)
+    entries = [
+        _apply_run_entry(
+            scan,
+            run,
+            rows_by_run.get(run.pk, []),
+            bool(detect_rows) and yolo.redactions_current(detect_rows, run),
+        )
+        for run in runs
+    ]
+    standing = next((e["label"] for e in entries if e["standing"]), None)
+    return JsonResponse(
+        {"scan": scan.pk, "standing": standing, "runs": entries}
+    )
+
+
+@login_required
+def serve_apply_output(
+    request: HttpRequest, pk: int, number: int, output: str
+) -> HttpResponse:
+    """Send the browser to one output of an apply run (#269).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param number: The run number (the ``n`` of ``a{n}``).
+    :param output: A key of :data:`APPLY_OUTPUTS`.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    from scanning.models import ApplyRun
+
+    if output not in APPLY_OUTPUTS:
+        return _json_404(
+            f"Unknown apply output {output!r}. "
+            f"Known: {', '.join(sorted(APPLY_OUTPUTS))}."
+        )
+    scan = get_object_or_404(Scan, pk=pk)
+    run = ApplyRun.objects.filter(scan=scan, number=number).first()
+    if run is None:
+        return _json_404(
+            f"Scan {scan.pk} has no apply run a{number}.", run=number
+        )
+    key = _apply_output_key(scan, run, output)
+    if not key:
+        return _json_404(
+            f"Apply run {run.label} has not written its {output} yet.",
+            run=number,
+            label=run.label,
+        )
+    _field, ext = APPLY_OUTPUTS[output]
+    return _redirect_to_object(
+        scan,
+        f"apply/{output}",
+        number,
+        key,
+        filename=f"scan-{scan.pk}-apply-{run.label}-{output}.{ext}",
+        missing_message=(
+            f"The {output} of apply run {run.label} is not in the bucket."
+        ),
+        label=run.label,
+    )
+
+
+@login_required
+def serve_apply_shard(
+    request: HttpRequest, pk: int, number: int, row_pk: int
+) -> HttpResponse:
+    """Send the browser to one apply row's result object (#269).
+
+    The one-page shard results of a page edit apply (#224) are kept,
+    and the #243 shard route cannot reach them: it resolves rows by a
+    volume slug and a run number, and filters the apply rows out.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param number: The run number.
+    :param row_pk: The ``ExternalJob`` pk.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    row = ExternalJob.objects.filter(
+        scan=scan, pk=row_pk, apply_run__number=number
+    ).first()
+    if row is None:
+        return _json_404(
+            f"Apply run a{number} of scan {scan.pk} has no row {row_pk}.",
+            run=number,
+        )
+    if not row.result_key:
+        return _json_404(
+            f"Row {row_pk} has no result yet ({row.status}).", run=number
+        )
+    return _redirect_to_object(
+        scan,
+        "apply/shard",
+        number,
+        row.result_key,
+        filename=(
+            f"scan-{scan.pk}-apply-a{number}-{row.stage}-{row.engine}-"
+            f"e{(row.input_manifest or {}).get('edit_id')}"
+            f"{Path(row.result_key).suffix or '.json'}"
+        ),
+        missing_message=f"Row {row_pk} names a result that is not in the bucket.",
+        label=row.status,
+    )
+
+
 @login_required
 def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     """Render a cropped region from the original (non-bitonal) PDF as PNG.
@@ -1170,6 +1667,25 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
         page,
         dpi,
     )
+    if request.GET.get("space") == "final":
+        # Step 2 sends a page of the corrected volume (#269). The run's
+        # page map says which page of the original it is; a page a
+        # curator added, replaced or rotated has no crop in the original
+        # (a rotated page's boxes are in the rotated space), so the
+        # viewer keeps the bitonal render for it.
+        from scanning import review_states
+
+        run = review_states.final_run(scan)
+        if run is None:
+            return HttpResponse(status=404)
+        entries = run.page_map.get("pages") or []
+        if page < 0 or page >= len(entries):
+            return HttpResponse(status=404)
+        source = entries[page].get("source") or {}
+        if source.get("kind") != "original":
+            return HttpResponse(status=404)
+        page = int(source["pdf_page"]) - 1
+
     # Prod: the original lives only in S3 (direct-to-S3 upload, and the
     # classic prod path streams straight to S3 too). The process view no
     # longer eagerly lands it locally, and download_preview_pdf excludes
@@ -1192,32 +1708,169 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     return resp
 
 
-def _review_flags(scan: Scan) -> dict:
-    """Return the review-1 flags the step-1 button bar reads (#151).
+def _review_flags(
+    scan: Scan,
+    repairs_waiting: bool | None = None,
+    review2: tuple[int, int] | None = None,
+) -> dict:
+    """Return the review flags the step-1 and step-2 button bars read.
 
     Both :func:`scan_process_view` and the :func:`process_actions`
-    fragment render that bar, so the flags come from one place. A bar
-    that disagreed with itself would offer an approve button the view
-    refuses, or hide the one it accepts.
+    fragment render those bars, so the flags come from one place (#151).
+    A bar that disagreed with itself would offer an approve button the
+    view refuses, or hide the one it accepts. The two review-2 flags
+    (#263) ride along for that same reason, and their approve button is
+    the gate of step 3.
 
-    :param scan: The scan the bar is rendered for.
+    ``page_review_done`` says "review 1 is approved", which stays true
+    for the whole of review 2: a curator who walks back to step 1 from
+    there -- through the step tabs, the repair queue link, or the
+    recompute button -- must find the bar they left, with its mark and
+    its "Next: Detect" button. ``start_detect`` accepts all three
+    statuses, so a narrower flag would hide a button the view honours.
+
+    ``legacy_review`` is the status, not
+    :func:`services.has_legacy_ocr`: the two ask different questions.
+    ``has_legacy_ocr`` asks who read the page numbers, and it turns
+    false the moment a backfill run gives an old volume an ``ANALYZE``
+    row; ``legacy_review`` asks which review flow the volume is in, and
+    ``PENDING_REVIEW`` is where a legacy step 2 lives (the park of
+    ``run_compute_redactions`` and the step chooser both say so).
+
+    ``repairs_waiting`` is the gate of the review-1 approval (#266): a
+    volume whose pages a scanner must still scan is not page complete,
+    so the bar shows a note in place of the approve button and
+    ``approve_page_completeness`` refuses the POST. The caller may pass
+    the answer it already holds -- ``scan_process_view`` reads the
+    requests for the sidebar anyway -- and the flag is queried only for
+    a caller that does not (the ``process_actions`` fragment).
+
+    :param scan: The scan the bars are rendered for.
+    :param repairs_waiting: Whether a scanner still has to act on this
+        scan. ``None`` asks :func:`repairs.has_waiting`.
+    :param review2: The open and the stale review-2 findings, when the
+        caller holds them (``findings.viewer_groups``). ``None`` asks
+        :func:`findings.open_count`, past the review-1 approval.
     :returns: ``page_review_ready``, ``page_review_done``,
-        ``has_legacy_ocr`` and the two pending-edit flags, for the
-        template context.
+        ``redaction_review_ready``, ``redaction_review_done``,
+        ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting`` and
+        the two pending-edit flags, for the template context.
     :rtype: dict
     """
-    from scanning import services
+    from scanning import apply, review_states, services
 
+    done = scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
+    approved = scan.status in PAGE_REVIEW_APPROVED_STATUSES
+    # One read of the standing apply run for the readers below.
+    run = apply.current_run(scan)
+    # The corrected volume (#269): the run when it is complete for this
+    # original, and whether the boxes are measured against it. The
+    # viewer follows the rows, not the run alone: a complete run over
+    # rows measured on the original would put the final PDF under boxes
+    # of another space, the one thing step 2 must never show.
+    final = review_states.final_run(scan, run)
+    final_space = final is not None and yolo.redactions_current(
+        yolo.live_detect_jobs(scan), final
+    )
+    final_volume = None
+    if final is not None:
+        final_volume = {
+            "label": final.label,
+            "measured": final_space,
+            **apply.describe_map(final.page_map),
+        }
+    if repairs_waiting is None:
+        repairs_waiting = repairs.has_waiting(scan)
+    if review2 is None:
+        review2 = findings.open_count(scan) if approved else (0, 0)
+    review2_open, review2_stale = review2
     return {
         "page_review_ready": (
             scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
         ),
-        "page_review_done": (
-            scan.status == Status.PAGE_COMPLETENESS_REVIEW_DONE
+        "page_review_done": approved,
+        "redaction_review_ready": (
+            scan.status == Status.READY_FOR_REDACTION_REVIEW
         ),
+        "redaction_review_done": (scan.status == Status.REDACTION_REVIEW_DONE),
+        "legacy_review": scan.status == Status.PENDING_REVIEW,
+        # The reopen is a compare-and-swap on DONE (#224), so the
+        # button shows only there: a volume in review 2 keeps its
+        # badge and loses the button.
+        "page_review_reopenable": done,
         "has_legacy_ocr": services.has_legacy_ocr(scan),
-        **page_edits.pending_edit_flags(scan),
+        # The apply writes no scan status while its rows run (#224), so
+        # the run row is the only place its progress lives. Read for
+        # every status past the review-1 approval, because the step-2
+        # note says where the corrected volume stands (#269).
+        "apply_run": apply.run_state(scan, run) if approved else None,
+        "final_run": final,
+        "final_space": final_space,
+        "final_volume": final_volume,
+        "repairs_waiting": repairs_waiting,
+        # "Next: Generate" (#240 PR C): one read for both renders of
+        # the bar, or a volume whose only boundary is a curator's
+        # showed the link on a full load and hid it after the fragment
+        # refresh.
+        "has_opinions": boundaries.has_live(scan),
+        # The open findings of review 2 (#240 PR D), for the badge and
+        # the confirm of the approve button. Read past the review-1
+        # approval only: before it there is no compute and no finding.
+        "review2_open": review2_open,
+        "review2_stale": review2_stale,
+        **page_edits.pending_edit_flags(scan, run),
     }
+
+
+def _final_space_pages(scan: Scan, run) -> tuple[list, dict, str | None]:
+    """Return the step-2 page map and labels of the corrected volume.
+
+    From the run's printed-page map (``apply.viewer_pages``, #269). When
+    that read fails the page still renders: the map comes from the
+    stored ``page_map`` with no labels (``apply.positional_pages``),
+    and one warning says so.
+
+    :param scan: The scan.
+    :param run: The standing, complete apply run.
+    :returns: ``(page_map, ocr_by_page, warning)``; ``warning`` is
+        ``None`` when the printed pages loaded.
+    :rtype: tuple[list, dict, str | None]
+    """
+    from scanning import apply
+
+    try:
+        printed = apply.load_printed_pages(scan, run)
+    except Exception:
+        logger.exception(
+            "scan_process_view: the printed pages of scan %s (%s) did not load",
+            scan.pk,
+            run.label,
+        )
+        page_map, ocr_by_page = apply.positional_pages(run)
+        return page_map, ocr_by_page, PRINTED_PAGES_UNAVAILABLE_MESSAGE
+    page_map, ocr_by_page = apply.viewer_pages(printed)
+    return page_map, ocr_by_page, None
+
+
+def _refuse_locked_edits(scan: Scan) -> JsonResponse | None:
+    """Refuse a page edit on a volume whose review is not open.
+
+    The first thing every page edit endpoint does (#224), the dismissal
+    of an issue excepted: it is built into nothing. Once the page
+    review is approved the apply builds the final volume from the rows
+    as they stand, so a row written after that addresses a source the
+    pipeline has left behind: it would be applied by no run, or by the
+    wrong one. A late correction reopens the review first
+    (:func:`reopen_page_review`), which supersedes the run in flight.
+
+    :param scan: The scan the edit is about.
+    :returns: A 409 answer naming the reason, or None when the edit
+        may proceed.
+    :rtype: JsonResponse | None
+    """
+    if scan.status not in LOCKED_STATUSES:
+        return None
+    return JsonResponse({"error": EDITS_LOCKED_MESSAGE}, status=409)
 
 
 def _block_if_pending_changes(
@@ -1227,7 +1880,7 @@ def _block_if_pending_changes(
 
     The detect action ignores the structural page edits -- a delete, an
     insert, a replacement, a rotation -- so running it would silently
-    strand the curator's work. They must be applied first (#206), and
+    strand the curator's work. They must be applied first (#224), and
     the apply runs after the review-1 approval.
 
     Only ``start_detect`` calls this, which is step 2, and it checks
@@ -1249,8 +1902,8 @@ def _block_if_pending_changes(
         messages.warning(
             request,
             "Your page changes are not built into the volume yet, so "
-            "this step would ignore them. The pass that builds them "
-            "(#206) is not ready.",
+            "this step would ignore them. The corrected volume is "
+            "built after the approval; wait for that to finish.",
         )
         return redirect(
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
@@ -1282,17 +1935,18 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
     if step < 1 or step > 3:
         step = 1
 
+    yolo_run = yolo.run_summary(scan)
     context = {
         "scan": scan,
         "step": step,
         "is_processing": scan.status in BUSY_STATUSES,
-        "issues": scan.issues.all(),
+        "issues": scan.issues.exclude(check_name__in=REVIEW2_CHECKS),
         "missing_pages": scan.missing_pages,
         "has_detections": Detection.objects.filter(scan=scan).exists(),
-        "opinions": scan.opinions_json,
         "dots_run": dots_mocr.run_summary(scan),
-        "yolo_run": yolo.run_summary(scan),
+        "yolo_run": yolo_run,
         "mistral_run": mistral_ocr.run_summary(scan),
+        "detect_message": detection_message(yolo_run),
         **_review_flags(scan),
     }
     html = render_to_string(
@@ -1349,10 +2003,10 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     """Skip to review 2 when detections exist; otherwise explain.
 
     The only thing left of this action is its shortcut: a scan that has
-    detections goes straight to step 2. It starts nothing itself --
-    since #195 the detection run has its own staff button, because each
-    run costs GPU time -- so a volume with no detections is told who
-    starts one.
+    detections goes straight to step 2. It starts nothing itself -- the
+    daemon starts the detection run once per shard set (#250) -- so a
+    volume with no detections is told where its run stands
+    (:func:`detection_message`).
 
     Approval is the gate (#151), in the view and not only in the bar:
     a scan still in READY_FOR_PAGE_COMPLETENESS_REVIEW is sent back to
@@ -1384,7 +2038,7 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
         )
 
-    messages.info(request, NO_DETECTIONS_MESSAGE)
+    messages.info(request, detection_message(yolo.run_summary(scan)))
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -1477,121 +2131,6 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
             request,
             f"This volume was already read: run {created[0].run} covers "
             f"all {len(created)} part(s). Nothing new was queued.",
-        )
-    return back
-
-
-@login_required
-@require_POST
-def start_yolo_detect(request: HttpRequest, pk: int) -> HttpResponse:
-    """Start YOLO detection over a scan's original shards (#195).
-
-    Staff only, and the **only** way into this stage. The pipeline
-    deliberately does not enqueue it: the rebuilt worker image (#194)
-    has to be exercised on a few volumes before it runs over the
-    corpus (#211). Every press can start real graphics processing unit
-    (GPU) work on RunPod that costs money.
-
-    Review 2 follows review 1, so the volume must be approved first
-    (``PAGE_COMPLETENESS_REVIEW_DONE``). The gate is here and not only
-    in the template: the run ends in an apply that imports detections
-    and rewrites the redaction geometry (#196), and a volume whose page
-    set a curator is still editing would be detected twice.
-
-    Detection reads the **original** shards, not the converted ones.
-    bl-warm was trained on greyscale renders, and its large region
-    classes collapse on 1-bit pages (#167).
-
-    **This request makes no call to RunPod.** It writes one
-    ``ExternalJob`` row per shard and returns; the daemon's next
-    ``submit_external_jobs`` tick sends them, and ``collect_external_jobs``
-    polls and retries them. That keeps a request thread off a slow HTTP
-    call, and it is what makes the run survive a redeployed web pod.
-
-    It also never cuts shards. ``sharding.committed_manifest`` verifies
-    the stored set against the original with one ``head_object``, so this
-    view neither downloads a multi-gigabyte PDF nor reads ``shards/``
-    directly. A stale or missing set is refused, because re-cutting is
-    the pipeline's job.
-
-    The daemon reads the output. Once every row is ``COMPLETED``, the
-    collect tick merges the run into one volume document and queues the
-    redaction computation, which imports the detections, pairs the
-    opinions and measures the geometry review 2 shows (#196).
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: Redirect to the scan processing page.
-    """
-    from scanning import sharding
-
-    scan = get_object_or_404(Scan, pk=pk)
-    back = redirect("scan_process", pk=scan.pk)
-
-    if not request.user.is_staff:
-        messages.error(
-            request,
-            "Only staff can start detection: each run costs GPU time.",
-        )
-        return back
-
-    if scan.status != Status.PAGE_COMPLETENESS_REVIEW_DONE:
-        messages.warning(
-            request,
-            "Detection runs after the page completeness review is "
-            "approved. This volume is not approved yet.",
-        )
-        return back
-
-    if not yolo.enabled():
-        messages.warning(
-            request,
-            "YOLO detection is not switched on in this environment. Set "
-            "YOLO_ENABLED and RUNPOD_YOLO_ENDPOINT_ID first.",
-        )
-        return back
-
-    # An open run means the daemon is still working on the last press.
-    # A finished run is reused rather than refused, which is what keeps
-    # ``ensure_detect_jobs`` from paying twice for shards already read.
-    summary = yolo.run_summary(scan)
-    if summary and summary["open"]:
-        messages.info(
-            request,
-            f"Detection run {summary['run']} is already going: "
-            f"{summary['done']} of {summary['total']} part(s) done.",
-        )
-        return back
-
-    manifest, reason = sharding.committed_manifest(scan)
-    if manifest is None:
-        messages.warning(request, reason)
-        return back
-
-    created = yolo.ensure_detect_jobs(scan, manifest)
-    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
-    logger.info(
-        "start_yolo_detect: scan=%s user=%s run=%s shards=%d queued=%d",
-        scan.pk,
-        request.user.pk,
-        created[0].run if created else "?",
-        len(created),
-        queued,
-    )
-    if queued:
-        messages.success(
-            request,
-            f"Queued detection for {queued} part(s) of this volume. The "
-            "daemon sends them to RunPod within a few seconds.",
-        )
-    else:
-        # ``ensure_detect_jobs`` reused a run that is already done, so
-        # nothing was queued and nothing will be sent. Saying otherwise
-        # would have staff waiting on a dispatch that is not coming.
-        messages.info(
-            request,
-            f"This volume was already detected: run {created[0].run} "
-            f"covers all {len(created)} part(s). Nothing new was queued.",
         )
     return back
 
@@ -1767,11 +2306,30 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
     cancelled, errored, or still waiting on its inputs must not be
     approved by a stale page a curator left open.
 
+    **A waiting repair request refuses the approval** (#266). A page a
+    scanner must still scan is a page the volume does not have, so the
+    volume is not page complete, and the step-1 bar shows a note in
+    place of the button. The gate is here as well as in the bar,
+    because a template gate alone cannot refuse a direct POST -- the
+    rule ``start_detect`` follows for the review it gates. Open
+    *issues* still do not block: a suspicion is the curator's to
+    judge, and a missing page is not (#151).
+
+    The gate is a read, then the compare-and-swap. A request made
+    between the two does not block that approval, and the plan accepts
+    it: both acts are decisions of a person, seconds apart, and the way
+    back from a wrong approval is the admin re-queue whichever wins.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to step 1 of the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if repairs.has_waiting(scan):
+        messages.warning(request, REPAIRS_WAITING_MESSAGE)
+        return redirect(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+        )
     approved = Scan.objects.filter(
         pk=scan.pk, status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
     ).update(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
@@ -1800,6 +2358,109 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
 
 @login_required
 @require_POST
+def reopen_page_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Open the page review again, after an approval.
+
+    The way back for a late correction (#224). The approval locks the
+    page edit endpoints, because the apply builds the final volume from
+    the rows as they stand at the approval. A curator who then finds a
+    page review 1 missed asks a staff member to press this. It
+    supersedes the apply run in flight -- its open job rows are
+    cancelled, its outputs stay in S3 -- and moves the scan back to
+    READY with one compare-and-swap. The next approval writes DONE
+    again, and the trigger builds ``a{n+1}`` from every standing row,
+    reusing every paid result the edits did not change.
+
+    Staff only: the reopen throws away a paid build, and the curators'
+    own step is the approval, not its reversal.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to step 1 of the scan processing page.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    if not request.user.is_staff:
+        messages.warning(request, "Only a staff member can reopen a review.")
+        return redirect(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+        )
+    from scanning import apply
+
+    reopened = Scan.objects.filter(
+        pk=scan.pk, status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+    ).update(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
+    if reopened:
+        # After the status write, not before: an apply worker that
+        # claims the scan between the two would build a run this
+        # reopen then supersedes, and the status is what stops it.
+        apply.supersede_runs(
+            scan, f"Page review reopened by user {request.user.pk}"
+        )
+        logger.info(
+            "reopen_page_review: scan=%s reopened by user=%s",
+            scan.pk,
+            request.user.pk,
+        )
+        messages.success(request, PAGE_REVIEW_REOPENED_MESSAGE)
+    else:
+        messages.warning(request, PAGE_REVIEW_NOT_REOPENABLE_MESSAGE)
+    return redirect(
+        reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+    )
+
+
+@login_required
+@require_POST
+def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Record that a person reviewed the redactions of this scan.
+
+    The approve button of review 2 (#263), and the only writer of
+    ``REDACTION_REVIEW_DONE``. Every logged-in user may press it, which
+    is the rule of the review-1 approve button (#151): both are the
+    same kind of human decision, and the log line below is the only
+    record of who made this one.
+
+    The write is one compare-and-swap on ``READY_FOR_REDACTION_REVIEW``,
+    never a full instance save. The collect tick and the redaction
+    apply both write that status over the same row
+    (``review_states``), and a scan that was re-queued, errored, or
+    whose geometry is being measured again must not be approved from a
+    stale page a curator left open.
+
+    Open detections or unpaired opinions do not block it. The curator
+    is the judge of the geometry, exactly as they are the judge of a
+    page-completeness suspicion (#151).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to step 2 of the scan processing page.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    approved = Scan.objects.filter(
+        pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
+    ).update(status=Status.REDACTION_REVIEW_DONE)
+    if approved:
+        logger.info(
+            "approve_redaction_review: scan=%s approved by user=%s",
+            scan.pk,
+            request.user.pk,
+        )
+        messages.success(request, REDACTION_REVIEW_APPROVED_MESSAGE)
+    else:
+        # The write lost, so the fetch above is stale. Re-read the row
+        # so the message describes it as it is.
+        scan.refresh_from_db()
+        if scan.status == Status.REDACTION_REVIEW_DONE:
+            messages.info(request, REDACTION_REVIEW_ALREADY_DONE_MESSAGE)
+        else:
+            messages.warning(request, REDACTION_REVIEW_NOT_READY_MESSAGE)
+    return redirect(
+        reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
+    )
+
+
+@login_required
+@require_POST
 def reprocess(request: HttpRequest, pk: int) -> HttpResponse:
     """Refuse to apply pending page edits while the pipeline is paused.
 
@@ -1818,13 +2479,23 @@ def reprocess(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=scan.pk)
 
 
+#: What the curator may type, in the one wording the server and both
+#: viewers use. ``shared.js`` carries the copy the browser shows
+#: before the request leaves the page (#319).
+PAGE_NUMBER_ERROR = (
+    "Page number must be a positive whole number, a number with one "
+    "trailing letter like 2094a, or a range like 678-686."
+)
+
+
 def _page_number_value(raw) -> str | None:
     """Return a curator's page number entry, normalized, or None.
 
-    Accepts a positive whole number, and a printed range like
-    ``678-686`` for the one PDF page that carries several book pages --
-    the shape ``CheckName.PAGE_RANGE`` exists for, and the shape
-    ``Page.book_page`` has always documented. A blank entry is the
+    Accepts the three shapes a book prints: a positive whole number; a
+    number with one trailing letter (``2094a``, issue #319) on the page
+    the book adds between two numbered pages; and a range like
+    ``678-686`` for the one PDF page that carries several book pages,
+    the shape ``CheckName.PAGE_RANGE`` exists for. A blank entry is the
     curator clearing the number, which is a decision, so it returns the
     empty string rather than None.
 
@@ -1834,6 +2505,12 @@ def _page_number_value(raw) -> str | None:
     hyphen, which is the shape every reader of a range parses
     (``services._page_number_lookup``,
     ``blackletter.validate.RANGE_RE``).
+
+    The case of a trailing letter is kept: the book prints one of the
+    two glyphs and no reader compares them. The reader asks for two
+    digits before the letter (``page_numbers.MIN_SUFFIXED_DIGITS``) and
+    this does not: that guard is against a token of a running head, and
+    here a person has the page in front of them.
 
     :param raw: The ``page_number`` field of the request body.
     :returns: The value for ``PageEdit.value``, or None when the entry
@@ -1845,6 +2522,10 @@ def _page_number_value(raw) -> str | None:
     text = str(raw).strip().replace("–", "-").replace("—", "-")
     if not text:
         return ""
+    if page_numbers.number_type(text) == page_numbers.SUFFIXED:
+        if int(text[:-1]) < 1:
+            return None
+        return f"{int(text[:-1])}{text[-1]}"
     parts = [part.strip() for part in text.split("-")]
     if len(parts) > 2 or not all(p.isdigit() and int(p) >= 1 for p in parts):
         return None
@@ -1880,6 +2561,9 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with the stored value and duplicate flag.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -1895,12 +2579,7 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
     page_value = _page_number_value(data["page_number"])
     if page_value is None:
         return JsonResponse(
-            {
-                "error": (
-                    "Page number must be a positive whole number, or a "
-                    "range like 678-686."
-                )
-            },
+            {"error": PAGE_NUMBER_ERROR},
             status=400,
         )
 
@@ -1909,14 +2588,11 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
     if entry is None:
         return JsonResponse({"error": "Unknown PDF page."}, status=404)
 
-    PageEdit.objects.update_or_create(
-        scan=scan,
-        kind=PageEdit.Kind.SET_NUMBER,
-        pdf_page=pdf_page,
-        applied_at=None,
-        withdrawn_at=None,
-        defaults={
-            "author": request.user,
+    page_edits.supersede(
+        scan,
+        PageEdit.Kind.SET_NUMBER,
+        {"pdf_page": pdf_page},
+        {
             "value": page_value,
             # The reading this number overrules. It is rebuilt from
             # the run on every recompute, so this row is the only
@@ -1924,6 +2600,7 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
             "previous_value": str(entry.get("detected") or ""),
             "source_fingerprint": scan.source_fingerprint,
         },
+        request.user,
     )
 
     # Clear the page's no-page-number flag; the rebuild does not touch Issue
@@ -1949,6 +2626,9 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
         {
             "status": "ok",
             "detected": page_value or None,
+            # The shape, so the viewer draws the right tag without
+            # deriving it from the string a second time (#319).
+            "type": page_numbers.number_type(page_value),
             "duplicate": duplicate,
         }
     )
@@ -1999,17 +2679,39 @@ def _uploaded_page_file(upload) -> str | None:
     return kind
 
 
+def upload_too_large_message() -> str:
+    """Return the refusal of a page file over the cap, with the cap in MB.
+
+    :returns: :data:`UPLOAD_TOO_LARGE_MESSAGE` with the current
+        ``settings.PAGE_UPLOAD_MAX_BYTES``.
+    :rtype: str
+    """
+    return UPLOAD_TOO_LARGE_MESSAGE.format(
+        mb=settings.PAGE_UPLOAD_MAX_BYTES // (1024 * 1024)
+    )
+
+
 def _pdf_page_count(upload) -> int | None:
     """Return how many pages an uploaded PDF holds, or None.
+
+    Django writes an upload over ``FILE_UPLOAD_MAX_MEMORY_SIZE`` to a
+    temporary file, and fitz opens that file by its path. So a file at
+    the cap is not read into the web pod's memory a second time: the
+    cap is 512 MiB by default, and one worker that held one file
+    would take more than the pod asks for.
 
     :param upload: The ``UploadedFile``, rewound by
         :func:`_uploaded_page_file`.
     :returns: The page count, or None when the file will not open.
     :rtype: int | None
     """
-    data = upload.read()
-    upload.seek(0)
+    temporary_file_path = getattr(upload, "temporary_file_path", None)
     try:
+        if temporary_file_path is not None:
+            with fitz.open(temporary_file_path(), filetype="pdf") as doc:
+                return doc.page_count
+        data = upload.read()
+        upload.seek(0)
         with fitz.open(stream=data, filetype="pdf") as doc:
             return doc.page_count
     except Exception:
@@ -2031,8 +2733,8 @@ def _accept_page_upload(upload, one_page: bool) -> tuple[str | None, str]:
     """
     if upload is None:
         return None, "Missing file"
-    if upload.size and upload.size > PAGE_UPLOAD_MAX_BYTES:
-        return None, UPLOAD_TOO_LARGE_MESSAGE
+    if upload.size and upload.size > settings.PAGE_UPLOAD_MAX_BYTES:
+        return None, upload_too_large_message()
     kind = _uploaded_page_file(upload)
     if kind is None:
         return None, UPLOAD_WRONG_TYPE_MESSAGE
@@ -2173,6 +2875,9 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     :return: JSON response confirming the deletion record.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -2180,19 +2885,16 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
     if pdf_page is None:
         return JsonResponse({"error": "Unknown PDF page."}, status=404)
-    # Both stamps are in the lookup, not just the apply's (#232): a
-    # withdrawn row is history, and matching it would hand the caller
-    # a row that marks nothing.
-    PageEdit.objects.get_or_create(
-        scan=scan,
-        kind=PageEdit.Kind.DELETE_PAGE,
-        pdf_page=pdf_page,
-        applied_at=None,
-        withdrawn_at=None,
-        defaults={
-            "author": request.user,
-            "source_fingerprint": scan.source_fingerprint,
-        },
+    # A standing deletion is left as it is: a second click has nothing
+    # to refresh. An applied one is superseded, so the new decision is
+    # a row of its own (#224).
+    page_edits.supersede(
+        scan,
+        PageEdit.Kind.DELETE_PAGE,
+        {"pdf_page": pdf_page},
+        {"source_fingerprint": scan.source_fingerprint},
+        request.user,
+        refresh_open=False,
     )
     return JsonResponse({"status": "ok"})
 
@@ -2211,12 +2913,15 @@ def undo_delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     :return: JSON response confirming the undo.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
     page_edits.withdraw(
-        page_edits.open_edits(scan, PageEdit.Kind.DELETE_PAGE).filter(
+        page_edits.standing_edits(scan, PageEdit.Kind.DELETE_PAGE).filter(
             pdf_page=data.get("pdf_page")
         ),
         request.user,
@@ -2254,6 +2959,9 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with the insert URL and page number.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     image_file = request.FILES.get("image")
     kind, refusal = _accept_page_upload(image_file, one_page=False)
     if kind is None:
@@ -2325,19 +3033,22 @@ def remove_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response confirming the removal.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
     edit = (
-        page_edits.open_edits(scan, PageEdit.Kind.INSERT_PAGE)
+        page_edits.standing_edits(scan, PageEdit.Kind.INSERT_PAGE)
         .filter(pk=data.get("edit_id"))
         .first()
     )
     if edit is None:
         return JsonResponse({"error": "Unknown page insert."}, status=404)
     page_edits.withdraw(
-        page_edits.open_edits(scan, PageEdit.Kind.INSERT_PAGE).filter(
+        page_edits.standing_edits(scan, PageEdit.Kind.INSERT_PAGE).filter(
             pk=edit.pk
         ),
         request.user,
@@ -2373,6 +3084,9 @@ def replace_page(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with the edit id and the file URL.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     image_file = request.FILES.get("image")
     kind, refusal = _accept_page_upload(image_file, one_page=True)
     if kind is None:
@@ -2384,7 +3098,7 @@ def replace_page(request: HttpRequest, pk: int) -> JsonResponse:
     def withdraw_earlier():
         """Close the replacement this one supersedes, if any."""
         page_edits.withdraw(
-            page_edits.open_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
+            page_edits.standing_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
                 pdf_page=pdf_page
             ),
             request.user,
@@ -2434,12 +3148,15 @@ def undo_replace_page(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response confirming the undo.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
     page_edits.withdraw(
-        page_edits.open_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
+        page_edits.standing_edits(scan, PageEdit.Kind.REPLACE_PAGE).filter(
             pdf_page=data.get("pdf_page")
         ),
         request.user,
@@ -2483,8 +3200,8 @@ def rotate_page(request: HttpRequest, pk: int) -> JsonResponse:
     raise but never resolve. The value is clockwise degrees, and only a
     quarter turn is a legal one.
 
-    The endpoint lands with the model; the button belongs with #206 and
-    #151.
+    The endpoint lands with the model; the button belongs with #151.
+    The apply (#224) re-renders a rotated page as a one-page shard.
 
     :param request: The HTTP request (JSON body with ``pdf_page`` and
         ``degrees``).
@@ -2492,6 +3209,9 @@ def rotate_page(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response confirming the rotation.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -2510,17 +3230,12 @@ def rotate_page(request: HttpRequest, pk: int) -> JsonResponse:
             },
             status=400,
         )
-    PageEdit.objects.update_or_create(
-        scan=scan,
-        kind=PageEdit.Kind.ROTATE_PAGE,
-        pdf_page=pdf_page,
-        applied_at=None,
-        withdrawn_at=None,
-        defaults={
-            "author": request.user,
-            "value": degrees,
-            "source_fingerprint": scan.source_fingerprint,
-        },
+    page_edits.supersede(
+        scan,
+        PageEdit.Kind.ROTATE_PAGE,
+        {"pdf_page": pdf_page},
+        {"value": degrees, "source_fingerprint": scan.source_fingerprint},
+        request.user,
     )
     return JsonResponse({"status": "ok"})
 
@@ -2552,6 +3267,9 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response confirming dismissal.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    # Not locked with the page edits (#224): a dismissal is built into
+    # nothing, and the recompute button stays reachable after the
+    # approval, so a curator must be able to answer the cards it raises.
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -2559,24 +3277,171 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
     issue = Issue.objects.filter(pk=data.get("issue_id"), scan=scan).first()
     if issue is None:
         return JsonResponse({"error": "Unknown issue."}, status=404)
+    if issue.check_name in REVIEW2_CHECKS:
+        # A review-2 finding has a dismissal of its own (#240 PR D): a
+        # ``ReviewDismissal`` keyed by the target's address, not a page
+        # edit keyed by a printed number.
+        return JsonResponse(
+            {"error": REVIEW2_FINDING_NOT_HERE_MESSAGE}, status=409
+        )
 
     physical = issue.check_name in PHYSICAL_PAGE_CHECKS
-    PageEdit.objects.update_or_create(
+    page_edits.supersede(
+        scan,
+        PageEdit.Kind.DISMISS_ISSUE,
+        {
+            "pdf_page": issue.page_number if physical else None,
+            "logical_page": (
+                ""
+                if physical or issue.page_number is None
+                else str(issue.page_number)
+            ),
+            "value": issue.check_name,
+        },
+        {"source_fingerprint": scan.source_fingerprint},
+        request.user,
+    )
+    issue.delete()
+    return JsonResponse({"status": "ok"})
+
+
+def _printed_number_of(scan: Scan, pdf_page: int) -> str:
+    """Return the printed number the page shows, as a label.
+
+    Read off the cached ``ocr_results``, which carries the curator's
+    own numbers too (#214). A label only: the scanner reads it on the
+    Repairs page to find the leaf in the book. It goes through
+    ``_page_label`` like every other label, and a reading the narrowing
+    refuses is dropped: the narrowing is the first of the two layers,
+    and the blob is not a trusted source.
+
+    :param scan: The scan.
+    :param pdf_page: The 1-based page.
+    :returns: The printed number, or the empty string.
+    :rtype: str
+    """
+    for entry in scan.ocr_results or []:
+        if entry.get("pdf_page") == pdf_page:
+            return _page_label(str(entry.get("detected") or "")) or ""
+    return ""
+
+
+@login_required
+@require_POST
+def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
+    """Record that a page needs a scanner, and what the scanner must do.
+
+    The button of a reviewer who has no book (#249). A REPLACE names
+    the page to scan again; an INSERT names the gap a missing leaf
+    goes in, by the page it follows, the address an insert uses
+    (#214). One open row per address: a second request for the same
+    page answers the first row, with ``created`` false, so two
+    reviewers who find one page do not stack two requests.
+
+    **A fulfilled row is still an open row**, and the key matches it
+    too. The derivation refuses an edit older than the request, but
+    SQL cannot index a derived flag, so the key cannot. So when the
+    matched row is fulfilled the answer says so
+    (``already_fulfilled``, ``REPAIR_ALREADY_FULFILLED_MESSAGE``): the
+    reviewer dismisses the answered request and asks again, or uses
+    Replace. A toast that said "already requested" here would lose the
+    ask, which is the silence this feature exists to remove.
+
+    The note is free text a person typed. It is cut at
+    ``repairs.NOTE_MAX_CHARS`` here and escaped where it is drawn: in
+    the viewer through ``escapeHtml``, in the templates by the
+    auto-escape. Both layers, on purpose.
+
+    :param request: The HTTP request (JSON body with ``action``,
+        ``pdf_page`` or ``anchor_pdf_page``, ``logical_page``,
+        ``note``).
+    :param pk: Scan primary key.
+    :return: JSON response with the request, and whether it is new.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    action = data.get("action")
+    if action not in PageRepairRequest.Action.values:
+        return JsonResponse({"error": "Unknown action."}, status=400)
+    note = str(data.get("note") or "").strip()[: repairs.NOTE_MAX_CHARS]
+
+    address = {}
+    if action == PageRepairRequest.Action.REPLACE:
+        # The label is a hint for the scanner, not the reviewer's
+        # typing, so the server reads it off ``ocr_results`` itself and
+        # drops a reading the narrowing refuses. A label sent by the
+        # viewer is ignored: refusing it would make the button fail on
+        # exactly the page whose reading is junk.
+        pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
+        if pdf_page is None:
+            return JsonResponse({"error": "Unknown PDF page."}, status=404)
+        address["pdf_page"] = pdf_page
+        label = _printed_number_of(scan, pdf_page)
+    else:
+        # An older viewer places the gap by the label alone
+        # (``_anchor_of``), so here the label is an address and a
+        # refused one is an error.
+        label = _page_label(str(data.get("logical_page") or ""))
+        if label is None:
+            return JsonResponse({"error": "Invalid page number."}, status=400)
+        anchor = _anchor_of(scan, data.get("anchor_pdf_page"), label)
+        if anchor is None:
+            return JsonResponse({"error": "Unknown gap."}, status=404)
+        address["anchor_pdf_page"] = anchor
+
+    row, created = PageRepairRequest.objects.get_or_create(
         scan=scan,
-        kind=PageEdit.Kind.DISMISS_ISSUE,
-        pdf_page=issue.page_number if physical else None,
-        logical_page=(
-            ""
-            if physical or issue.page_number is None
-            else str(issue.page_number)
-        ),
-        value=issue.check_name,
-        applied_at=None,
-        withdrawn_at=None,
+        action=action,
+        dismissed_at=None,
+        **address,
         defaults={
-            "author": request.user,
+            "requested_by": request.user,
+            "logical_page": label,
+            "note": note,
             "source_fingerprint": scan.source_fingerprint,
         },
     )
-    issue.delete()
+    row = repairs.open_requests(scan).get(pk=row.pk)
+    answer = {
+        "status": "ok",
+        "created": created,
+        "already_fulfilled": bool(not created and row.fulfilled),
+        "request": repairs.as_dict(row, scan),
+    }
+    if answer["already_fulfilled"]:
+        answer["message"] = REPAIR_ALREADY_FULFILLED_MESSAGE
+    return JsonResponse(answer)
+
+
+@login_required
+@require_POST
+def dismiss_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
+    """Close a repair request without deleting it.
+
+    Any logged-in user may dismiss, the rule of every review-1 button.
+    The row is stamped with who and when. A second dismissal of the
+    same row is a no-op, not an error, like ``undo_delete_page``: a
+    second tab must not fail on a request that is already closed.
+
+    :param request: The HTTP request (JSON body with ``request_id``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the dismissal.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    try:
+        request_id = int(data.get("request_id"))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "Unknown request."}, status=404)
+    rows = scan.repair_requests.filter(pk=request_id)
+    if not rows.exists():
+        return JsonResponse({"error": "Unknown request."}, status=404)
+    repairs.dismiss(rows, request.user)
     return JsonResponse({"status": "ok"})

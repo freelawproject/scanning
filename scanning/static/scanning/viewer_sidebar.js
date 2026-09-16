@@ -52,11 +52,10 @@ var _opinions = [];
     };
 
     function _clearDim() {
-        document
-            .querySelectorAll(".opinion-dim-overlay, .opinion-dim")
-            .forEach(function (d) {
-                d.remove();
-            });
+        // The viewer holds the selection the masks are drawn from, and
+        // draws them again at every render, so it owns the clear. Step 1
+        // loads this file without the viewer, and has no masks (#311).
+        if (window.clearOpinionDim) window.clearOpinionDim();
     }
 
     // --- Step 3: view mode ---
@@ -356,16 +355,24 @@ function approveDetection(btn) {
             return r.json();
         })
         .then(function (data) {
-            var row = btn.closest("[data-unmatched-page]");
-            row.style.opacity = "0.3";
-            row.style.pointerEvents = "none";
-            btn.textContent = "\u2713";
+            // A refusal (409, 404) must not read as work done (#240).
+            if (!data || data.status === "error") {
+                btn.disabled = false;
+                btn.textContent = "Approve";
+                showToast((data && data.message) || "Failed to approve detection");
+                return;
+            }
             // Not an automatic re-pair (#196): the pairing endpoint
             // now queues the whole redaction computation, which
             // renders every page and takes the volume out of review,
-            // and re-pairing on request is off for now. Say what the
-            // edit did and did not change.
-            showToast("Approved. The redactions are not recomputed from this yet.", "success");
+            // and re-pairing on request is off for now. The view says
+            // what the edit did and did not change (#322): the
+            // approval raises the confidence the next pairing reads,
+            // and the card stays (its chip reads 1.0 and loses the
+            // check mark) until that pairing runs. The section is
+            // fetched again (#240 PR D).
+            showSaved(data);
+            refreshFindings();
         })
         .catch(function () {
             console.error("Failed to approve detection");
@@ -391,15 +398,153 @@ function deleteUnmatchedDetection(btn) {
             return r.json();
         })
         .then(function (data) {
-            var row = btn.closest("[data-unmatched-page]");
-            row.style.opacity = "0.3";
-            row.style.pointerEvents = "none";
-            btn.textContent = "\u2717";
+            if (!data || data.status === "error") {
+                btn.disabled = false;
+                // The button is a glyph, not a word (#299): the old text
+                // here wrote "Delete" over the cross after a refusal.
+                btn.textContent = "\u2715";
+                showToast(
+                    (data && data.message) || "Could not dismiss the detection"
+                );
+                return;
+            }
+            showSaved(data);
+            refreshFindings();
         })
         .catch(function () {
-            console.error("Failed to delete detection");
-            showToast("Failed to delete detection");
+            console.error("Failed to dismiss detection");
+            showToast("Could not dismiss the detection");
         });
+}
+
+// --- The findings of review 2 (#240 PR D) ---
+//
+// One section, rendered by the server from the Issue rows, and fetched
+// again after every write: the endpoints rebuild the findings, so the
+// cards are true the moment the answer comes back. The action bar is
+// refreshed with it, because the approve button carries the open count.
+
+function _applyFindings(data) {
+    var section = document.getElementById("review-findings");
+    if (!section) return;
+    if (data && typeof data.html === "string") section.innerHTML = data.html;
+    labelFindingCards();
+    if (typeof window.refreshProcessActionBar === "function") {
+        window.refreshProcessActionBar();
+    }
+}
+
+function refreshFindings() {
+    var cfg = window.SCAN_CONFIG;
+    if (!document.getElementById("review-findings")) return Promise.resolve();
+    return fetch("/scans/" + cfg.docId + "/findings/", {
+        headers: { "X-Requested-With": "XMLHttpRequest" },
+    })
+        .then(function (r) { return r.json(); })
+        .then(_applyFindings)
+        .catch(function () { /* keep the stale section; a reload still works */ });
+}
+window.refreshFindings = refreshFindings;
+
+// The cheap recompute (#305). The endpoint writes the cards again from
+// the detection, boundary and redaction rows and answers the section it
+// wrote, so one request does the rebuild and the swap. It moves no box:
+// the measurement that pairs the opinions again is the action bar's
+// "Recompute redactions" button.
+function rebuildFindings(btn) {
+    var cfg = window.SCAN_CONFIG;
+    if (btn) btn.disabled = true;
+    fetch("/scans/" + cfg.docId + "/findings/rebuild/", {
+        method: "POST",
+        headers: {
+            "X-CSRFToken": cfg.csrfToken,
+            "Content-Type": "application/json",
+        },
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status !== "ok") {
+                if (btn) btn.disabled = false;
+                showToast((data && data.message) || "Could not rebuild the findings.", "error");
+                return;
+            }
+            // The button is inside the section, so the swap replaces it
+            // with a fresh, enabled one. Nothing to enable here.
+            _applyFindings(data);
+            showSaved(data);
+        })
+        .catch(function () {
+            if (btn) btn.disabled = false;
+            showToast("Could not rebuild the findings.", "error");
+        });
+}
+window.rebuildFindings = rebuildFindings;
+
+// The server renders a card's page as its position (p.<n>), because the
+// fragment has no printed-page map. The viewer has one, in the page map
+// it draws the pages from, so it writes the printed number over the
+// position, on load and after every swap. Both renders then agree.
+function labelFindingCards() {
+    var viewer = document.getElementById("pdf-viewer");
+    if (!viewer || !viewer.dataset.pageMap) return;
+    var logical = {};
+    try {
+        JSON.parse(viewer.dataset.pageMap).forEach(function (entry) {
+            if (entry && entry.pdf_index !== undefined && entry.logical_number !== undefined) {
+                logical[entry.pdf_index] = entry.logical_number;
+            }
+        });
+    } catch (e) { return; }
+    document.querySelectorAll("#review-findings [data-finding-page]").forEach(function (el) {
+        var idx = parseInt(el.dataset.findingPage, 10);
+        if (isNaN(idx)) return;
+        var label = logical[idx];
+        el.textContent = "p." + (label !== undefined && label !== null ? label : idx + 1);
+    });
+}
+window.labelFindingCards = labelFindingCards;
+document.addEventListener("DOMContentLoaded", labelFindingCards);
+
+function _postFinding(path, issueId) {
+    var cfg = window.SCAN_CONFIG;
+    return fetch("/scans/" + cfg.docId + "/findings/" + path + "/", {
+        method: "POST",
+        headers: {
+            "X-CSRFToken": cfg.csrfToken,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ issue_id: issueId }),
+    }).then(function (r) { return r.json(); });
+}
+
+function _findingAction(btn, path, issueId, failure) {
+    btn.disabled = true;
+    _postFinding(path, issueId)
+        .then(function (data) {
+            if (!data || data.status !== "ok") {
+                btn.disabled = false;
+                showToast((data && data.message) || failure, "error");
+                return;
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            showToast(failure, "error");
+        });
+}
+
+function dismissFinding(btn, issueId) {
+    _findingAction(btn, "dismiss", issueId, "Could not dismiss the finding.");
+}
+
+function restoreFinding(btn, issueId) {
+    _findingAction(btn, "restore", issueId, "Could not take the dismissal back.");
+}
+
+function withdrawStaleEdit(btn, issueId) {
+    _findingAction(btn, "withdraw", issueId, "Could not withdraw the decision.");
 }
 
 function deleteDuplicates(btn) {
@@ -441,20 +586,162 @@ function deleteDuplicates(btn) {
     });
 }
 
-function pairOpinions() {
+// --- Opinion boundaries (#240 PR C) ---
+//
+// Every card names a boundary row. Dismiss and Undo post the row id and
+// reload, as recomputeRedactions does: the cards are rendered by the
+// server, and a reload is the one path that cannot disagree with it.
+// The two anchor buttons enter a pick mode; the viewer
+// (viewer_step2.js) calls window.boundaryPickTarget() on a click on a
+// detection box, and finishBoundaryPick posts the move.
+
+function _postBoundary(path, body) {
     var cfg = window.SCAN_CONFIG;
-    if (cfg.step < 2) return;
-    var btn = document.getElementById("pair-btn");
-    if (!btn) return;
-    // The endpoint queues the work and answers at once (#196): the
-    // pairing, the redaction rects and the margin strips are measured
-    // together on the daemon, because they all read the same
-    // detections and the measurement renders every page. The reload
-    // below shows the progress bar, which reloads again when the
-    // daemon parks the scan.
+    return fetch("/scans/" + cfg.docId + "/boundaries/" + path + "/", {
+        method: "POST",
+        headers: {
+            "X-CSRFToken": cfg.csrfToken,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+    }).then(function (r) {
+        return r.json().then(function (data) {
+            data._httpOk = r.ok;
+            return data;
+        });
+    });
+}
+
+function _boundaryFailed(data) {
+    // The endpoint's refusal (a 409 with a message) or a transport
+    // fault: say what came back, and leave the card as it was.
+    var msg = (data && data.message) || "The change was not saved.";
+    if (window.showToast) showToast(msg, "error");
+    else alert(msg);
+}
+
+function dismissBoundary(btn) {
+    var card = btn.closest(".opinion-nav");
+    if (!card) return;
+    btn.disabled = true;
+    _postBoundary("dismiss", { boundary_id: parseInt(card.dataset.boundaryId) })
+        .then(function (data) {
+            if (data.status !== "ok") { btn.disabled = false; _boundaryFailed(data); return; }
+            showSavedAfterReload(data);
+            window.location.reload();
+        })
+        .catch(function (err) { btn.disabled = false; _boundaryFailed({ message: String(err) }); });
+}
+
+function restoreBoundary(btn) {
+    var card = btn.closest(".opinion-nav");
+    if (!card) return;
+    btn.disabled = true;
+    _postBoundary("restore", { boundary_id: parseInt(card.dataset.boundaryId) })
+        .then(function (data) {
+            if (data.status !== "ok") { btn.disabled = false; _boundaryFailed(data); return; }
+            showSavedAfterReload(data);
+            window.location.reload();
+        })
+        .catch(function (err) { btn.disabled = false; _boundaryFailed({ message: String(err) }); });
+}
+
+var _boundaryPick = null;
+
+function pickBoundaryAnchor(btn, which) {
+    var card = btn.closest(".opinion-nav");
+    if (!card) return;
+    var idx = parseInt(card.dataset.index || "0");
+    var op = _opinions[idx];
+    if (!op) return;
+    cancelBoundaryPick();
+    _boundaryPick = { boundaryId: op.id, which: which, op: op, card: card };
+    document.body.classList.add("boundary-pick");
+    card.classList.add("picking");
+    var banner = document.createElement("div");
+    banner.id = "boundary-pick-banner";
+    banner.className = "rounded bg-purple-700 text-white text-xs px-3 py-2 shadow";
+    banner.textContent = which === "start"
+        ? "Click a case caption box to set the start of opinion #" + (idx + 1) + " (Esc to cancel)"
+        : "Click a key icon box to set the end of opinion #" + (idx + 1) + " (Esc to cancel)";
+    document.body.appendChild(banner);
+}
+
+function cancelBoundaryPick() {
+    if (!_boundaryPick) return;
+    _boundaryPick.card.classList.remove("picking");
+    _boundaryPick = null;
+    document.body.classList.remove("boundary-pick");
+    var banner = document.getElementById("boundary-pick-banner");
+    if (banner) banner.remove();
+}
+
+// Called by the viewer with the detection under the click. Returns true
+// when the click was consumed by the pick mode.
+window.boundaryPickTarget = function (det) {
+    if (!_boundaryPick || !det) return false;
+    var wanted = _boundaryPick.which === "start" ? "CASE_CAPTION" : "KEY_ICON";
+    if (det.label !== wanted) {
+        if (window.showToast) showToast("Pick a " + wanted.replace("_", " ").toLowerCase() + " box.", "warning");
+        return true;
+    }
+    var op = _boundaryPick.op;
+    var start, end;
+    if (_boundaryPick.which === "start") {
+        start = { detection_id: det.id };
+        end = op.key_detection_id
+            ? { detection_id: op.key_detection_id }
+            : { page_index: op.key_page, x: op.end.x, y: op.end.y };
+    } else {
+        end = { detection_id: det.id };
+        start = op.caption_detection_id
+            ? { detection_id: op.caption_detection_id }
+            : { page_index: op.caption_page, x: op.start.x, y: op.start.y };
+    }
+    // The row is replaced whatever wrote it: the endpoint dismisses a
+    // computed boundary, and withdraws a curator's addition while it
+    // carries its dismissal, so a second move leaves one boundary.
+    var body = { start: start, end: end, replaces: op.id };
+    cancelBoundaryPick();
+    _postBoundary("add", body)
+        .then(function (data) {
+            if (data.status !== "ok") { _boundaryFailed(data); return; }
+            showSavedAfterReload(data);
+            window.location.reload();
+        })
+        .catch(function (err) { _boundaryFailed({ message: String(err) }); });
+    return true;
+};
+
+document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") cancelBoundaryPick();
+});
+
+// The expensive recompute (#305). The endpoint queues the work and
+// answers at once (#196): the pairing, the redaction boxes and the
+// margin strips are measured together on the daemon, because they all
+// read the same detections and the measurement renders every page. The
+// reload below shows the progress bar, which reloads again when the
+// daemon parks the scan.
+function recomputeRedactions() {
+    var cfg = window.SCAN_CONFIG;
+    if (cfg.step < 2) return false;
+    var btn = document.getElementById("recompute-btn");
+    if (!btn) return false;
+    // The confirm says what the measurement keeps and what it can
+    // change (#305). Every row stays, and a dismiss lands again on the
+    // box it named; but a text box the new reading makes much narrower
+    // can lose its dismiss and come back, as a "not applied" card.
+    if (!window.confirm(
+        "The redactions are measured again from the boxes as they are now. " +
+        "This volume leaves the review while the server works, and the page " +
+        "reloads when the server is done. Your boxes and your decisions are " +
+        "kept. A text box you dismissed can come back when the new reading " +
+        "makes it much narrower. Continue?"
+    )) return false;
     btn.textContent = "Queueing...";
     btn.disabled = true;
-    fetch("/scans/" + cfg.docId + "/pair-opinions/", {
+    fetch("/scans/" + cfg.docId + "/compute-redactions/", {
         method: "POST",
         headers: { "X-CSRFToken": cfg.csrfToken },
     })
@@ -462,20 +749,25 @@ function pairOpinions() {
             return r.json();
         })
         .then(function (data) {
-            btn.textContent = "Re-pair Opinions";
-            btn.disabled = false;
-            if (data.error) {
-                alert("Error: " + data.error);
+            // The refusal shape of every other endpoint of step 2:
+            // {status: "error", message} (#305).
+            if (!data || data.status !== "queued") {
+                btn.textContent = "Recompute redactions";
+                btn.disabled = false;
+                showToast((data && data.message) || "Could not queue the recompute.", "error");
                 return;
             }
+            showSavedAfterReload(data);
             window.location.reload();
         })
         .catch(function (err) {
-            btn.textContent = "Re-pair Opinions";
+            btn.textContent = "Recompute redactions";
             btn.disabled = false;
-            alert("Error: " + err);
+            showToast("Could not queue the recompute: " + err, "error");
         });
+    return false;
 }
+window.recomputeRedactions = recomputeRedactions;
 
 // --- Helper to read detection data from data-* attributes ---
 

@@ -1,0 +1,109 @@
+"""The findings of review 2 are ``Issue`` rows (issue #240, PR D).
+
+``Issue.target`` says what a finding is about, ``ReviewDismissal`` is
+the curator's dismissal of one, and ``Issue.dismissal`` is the
+resolution. The three user-action checks (``suppress_detection``,
+``add_detection``, ``approve_detection``) go with their rows: they
+described decisions about legacy-model detections, and the curator's
+decisions are ``DetectionDecision`` rows since PR A. The loss of the
+``suppress_detection`` rows is accepted (the #240 plan, section 4): a
+row kept would show as a step-1 card. The uncovered headnote pages
+leave the boundaries (PR B's stopgap) for a finding.
+
+No finding is written here: every finding is derived from the rows, and
+``manage.py rebuild_review2_findings`` writes them after the deploy.
+"""
+
+import logging
+
+import django.db.models.deletion
+from django.conf import settings
+from django.db import migrations, models
+
+#: The checks retired by PR D, whose rows are deleted with them.
+_RETIRED_CHECKS = ("suppress_detection", "add_detection", "approve_detection")
+
+
+def delete_retired_check_rows(apps, schema_editor):
+    """Delete the rows of the three retired user-action checks.
+
+    :param apps: The historical app registry.
+    :param schema_editor: Unused.
+    :return: None.
+    """
+    Issue = apps.get_model("scanning", "Issue")
+    deleted, _by_model = Issue.objects.filter(
+        check_name__in=_RETIRED_CHECKS
+    ).delete()
+    logging.getLogger(__name__).info(
+        "review-2 findings: %d row(s) of the retired checks deleted",
+        deleted,
+    )
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('scanning', '0028_redaction_rows'),
+        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
+    ]
+
+    operations = [
+        migrations.RunPython(
+            delete_retired_check_rows, migrations.RunPython.noop
+        ),
+        migrations.RemoveField(
+            model_name='opinionboundary',
+            name='uncovered_page_indexes',
+        ),
+        migrations.AddField(
+            model_name='issue',
+            name='target',
+            field=models.CharField(blank=True, choices=[('redaction', 'A redaction'), ('boundary', 'An opinion boundary'), ('detection', 'A detection'), ('pages', 'A run of pages')], default='', help_text='What a review-2 finding is about; blank on review 1.', max_length=12),
+        ),
+        migrations.AlterField(
+            model_name='issue',
+            name='check_name',
+            field=models.CharField(choices=[('no_page_number', 'No page number detected'), ('missing_page', 'Missing page in sequence'), ('duplicate_page', 'Duplicate page number'), ('backward_page', 'Page number goes backward'), ('large_gap', 'Large gap in page numbers'), ('suspicious_reading', 'Suspicious OCR reading'), ('page_range', 'Page range detected'), ('mislabeled_document', 'Mislabeled document type'), ('auto_corrected', 'Auto-corrected page number'), ('blank_page', 'Blank page detected'), ('orientation', 'Page orientation issue'), ('stale_page_edit', 'Page edit not applied'), ('process_flag', 'User-flagged issue'), ('unmatched_key_icon', 'Key icon not matched to an opinion'), ('unmatched_caption', 'Caption not matched to an opinion'), ('uncovered_pages', 'Pages not covered by an opinion'), ('uncovered_headnote', 'Headnote not covered by a redaction'), ('stale_detection_edit', 'Detection decision not applied'), ('stale_redaction_edit', 'Redaction decision not applied'), ('stale_boundary_edit', 'Opinion boundary decision not applied')], max_length=100),
+        ),
+        migrations.AlterField(
+            model_name='issue',
+            name='metadata',
+            field=models.JSONField(blank=True, default=dict, help_text="Structured data. A review-2 finding keeps the address of its target here (issue #240): the detection's box and page, the run of pages, or the human row that did not land."),
+        ),
+        migrations.CreateModel(
+            name='ReviewDismissal',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('date_created', models.DateTimeField(auto_now_add=True, db_index=True, help_text='The moment when the item was created.')),
+                ('date_modified', models.DateTimeField(auto_now=True, db_index=True, help_text='The last moment when the item was modified.')),
+                ('check_name', models.CharField(choices=[('unmatched_key_icon', 'Key icon not matched to an opinion'), ('unmatched_caption', 'Caption not matched to an opinion'), ('uncovered_pages', 'Pages not covered by an opinion'), ('uncovered_headnote', 'Headnote not covered by a redaction')], max_length=100)),
+                ('source_page', models.PositiveIntegerField(help_text='1-based page of the source document.')),
+                ('source_fingerprint', models.CharField(blank=True, default='', help_text="The scan's source fingerprint when the finding was dismissed. Blank matches anything.", max_length=64)),
+                ('label', models.CharField(blank=True, default='', max_length=50)),
+                ('target_x0', models.FloatField(blank=True, null=True)),
+                ('target_y0', models.FloatField(blank=True, null=True)),
+                ('target_x1', models.FloatField(blank=True, null=True)),
+                ('target_y1', models.FloatField(blank=True, null=True)),
+                ('img_width', models.PositiveIntegerField(default=0)),
+                ('img_height', models.PositiveIntegerField(default=0)),
+                ('withdrawn_at', models.DateTimeField(blank=True, null=True)),
+                ('author', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='review_dismissals', to=settings.AUTH_USER_MODEL)),
+                ('scan', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='review_dismissals', to='scanning.scan')),
+                ('source_edit', models.ForeignKey(blank=True, help_text='The page edit whose shard holds the page; null = the original.', null=True, on_delete=django.db.models.deletion.CASCADE, related_name='review_dismissals', to='scanning.pageedit')),
+                ('withdrawn_by', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='withdrawn_review_dismissals', to=settings.AUTH_USER_MODEL)),
+            ],
+            options={
+                'ordering': ['scan', 'check_name', 'source_page'],
+            },
+        ),
+        migrations.AddField(
+            model_name='issue',
+            name='dismissal',
+            field=models.ForeignKey(blank=True, help_text='The standing dismissal that covers this finding.', null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='issues', to='scanning.reviewdismissal'),
+        ),
+        migrations.AddIndex(
+            model_name='reviewdismissal',
+            index=models.Index(fields=['scan', 'check_name', 'withdrawn_at'], name='review_dismissal_scan_check'),
+        ),
+    ]

@@ -126,6 +126,25 @@ class Status(models.TextChoices):
         "page_completeness_review_done",
         "Page review done",
     )
+    # The two redaction review states (#263), the same shape as the
+    # two above. ``review_states.redaction_review_ready`` is the whole
+    # rule behind READY -- review 1 approved, the page complete volume
+    # built (#224), and the redactions computed from the detection run
+    # -- and it has two callers: the redaction apply parks in READY
+    # (``services._park_after_redactions``), and
+    # ``review_states.promote_ready_scans`` catches on the collect tick
+    # what the apply could not see yet. ``approve_redaction_review``
+    # (#263, views_process) is the only writer of
+    # REDACTION_REVIEW_DONE, and that approval is the gate of step 3.
+    # Parked human states again: no polling, no sweep.
+    READY_FOR_REDACTION_REVIEW = (
+        "ready_for_redaction_review",
+        "Ready for redaction review",
+    )
+    REDACTION_REVIEW_DONE = (
+        "redaction_review_done",
+        "Redaction review done",
+    )
     PENDING_REVIEW = "pending_review", "Pending Review"
     APPROVED = "approved", "Approved"
     EXTRACTED = "extracted", "Extracted"
@@ -147,6 +166,37 @@ class Status(models.TextChoices):
 #: guards: only PROCESSING may be swept as stale.
 BUSY_STATUSES = frozenset({Status.QUEUED, Status.PROCESSING, Status.AWAITING})
 
+#: The parked human states of the two reviews (#154, #263). None of
+#: them is busy: nothing polls them and the stale sweep never touches
+#: them. A recompute that rebuilds data underneath a review must
+#: preserve whichever one the scan holds, which is what this set is
+#: read for (``services.recalculate_issues``). The legacy
+#: ``PENDING_REVIEW`` is not here: it is the status such a recompute
+#: writes for the rows that never entered this flow.
+REVIEW_STATUSES = frozenset(
+    {
+        Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+        Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        Status.READY_FOR_REDACTION_REVIEW,
+        Status.REDACTION_REVIEW_DONE,
+    }
+)
+
+#: The statuses that say "a person approved the page completeness".
+#: `PAGE_COMPLETENESS_REVIEW_DONE` is where that approval lands, and
+#: the two #263 states are further along the same road, so the approval
+#: holds in all three. Read by the step-1 bar (`_review_flags`), whose
+#: mark and whose "Next: Detect" button describe review 1 alone: a
+#: curator who walks back to step 1 from review 2 must see the same
+#: bar they left, and `start_detect` accepts all three.
+PAGE_REVIEW_APPROVED_STATUSES = frozenset(
+    {
+        Status.PAGE_COMPLETENESS_REVIEW_DONE,
+        Status.READY_FOR_REDACTION_REVIEW,
+        Status.REDACTION_REVIEW_DONE,
+    }
+)
+
 
 class Stage(models.TextChoices):
     VALIDATE = "validate", "Validate"
@@ -165,6 +215,11 @@ class QueuedAction(models.TextChoices):
     # pass on the collect tick, because it renders every page of the
     # volume three times (~83s for 1364 pages).
     COMPUTE_REDACTIONS = "compute_redactions", "Compute Redactions"
+    # Issue #224: build the final volume from the original plus the
+    # PageEdit rows, and glue the paid results into its space. Queued
+    # work in two phases (build, glue), because both pull and write
+    # whole volumes.
+    APPLY_PAGE_EDITS = "apply_page_edits", "Apply Page Edits"
 
 
 class UploadAction(models.TextChoices):
@@ -610,11 +665,6 @@ class Scan(AbstractDateTimeModel):
         blank=True,
         help_text="Per-page OCR detection results.",
     )
-    opinions_json = models.JSONField(
-        default=list,
-        blank=True,
-        help_text="Opinion boundary data.",
-    )
     page_map = models.JSONField(
         default=list,
         blank=True,
@@ -624,16 +674,6 @@ class Scan(AbstractDateTimeModel):
         default=list,
         blank=True,
         help_text="List of missing logical page numbers.",
-    )
-    margin_rects = models.JSONField(
-        default=list,
-        blank=True,
-        help_text="Per-page margin rects in PDF points.",
-    )
-    redaction_rects = models.JSONField(
-        default=list,
-        blank=True,
-        help_text="Per-page redaction rects in image pixels.",
     )
     source_fingerprint = models.CharField(
         max_length=64,
@@ -934,6 +974,19 @@ class OpinionScan(AbstractDateTimeModel):
     caption_page_index = models.PositiveIntegerField(null=True, blank=True)
     key_page_index = models.PositiveIntegerField(null=True, blank=True)
     has_image = models.BooleanField(default=False)
+    boundary = models.ForeignKey(
+        "OpinionBoundary",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_scans",
+        help_text=(
+            "The review-2 boundary this file was cut from (issue #240, "
+            "PR C). Step 3 sets it when it creates the row; a computed "
+            "boundary is rebuilt at each compute, so the link stands "
+            "only while the boundary row does (#165)."
+        ),
+    )
 
     class Meta:
         indexes = [
@@ -989,9 +1042,38 @@ class CheckName(models.TextChoices):
 
     # User actions (from scanning views)
     PROCESS_FLAG = "process_flag", "User-flagged issue"
-    SUPPRESS_DETECTION = "suppress_detection", "Suppress a detection"
-    ADD_DETECTION = "add_detection", "Add a detection"
-    APPROVE_DETECTION = "approve_detection", "Approve a detection"
+
+    # The findings of review 2 (issue #240, PR D). Each names what it
+    # is about; ``Issue.target`` says the same in one word.
+    UNMATCHED_KEY_ICON = (
+        "unmatched_key_icon",
+        "Key icon not matched to an opinion",
+    )
+    UNMATCHED_CAPTION = (
+        "unmatched_caption",
+        "Caption not matched to an opinion",
+    )
+    UNCOVERED_PAGES = "uncovered_pages", "Pages not covered by an opinion"
+    UNCOVERED_HEADNOTE = (
+        "uncovered_headnote",
+        "Headnote not covered by a redaction",
+    )
+    MISSING_HEADNOTE_BRACKET = (
+        "missing_headnote_bracket",
+        "Headnote bracket the model did not find",
+    )
+    STALE_DETECTION_EDIT = (
+        "stale_detection_edit",
+        "Detection decision not applied",
+    )
+    STALE_REDACTION_EDIT = (
+        "stale_redaction_edit",
+        "Redaction decision not applied",
+    )
+    STALE_BOUNDARY_EDIT = (
+        "stale_boundary_edit",
+        "Opinion boundary decision not applied",
+    )
 
 
 #: Checks whose ``Issue.page_number`` is a physical PDF page, 1-based.
@@ -1011,14 +1093,74 @@ PHYSICAL_PAGE_CHECKS = frozenset(
     }
 )
 
+#: The checks a page deletion answers (#255). A card about a page the
+#: curator marked for deletion is noise: the page goes away, and the
+#: finding goes with it. Only the physical space, because a deletion
+#: names a physical page while every other check names a printed
+#: number, whose cards (a duplicate, a gap) count numbers over the
+#: whole volume and need the sequence analysis to run again without
+#: those pages. ``STALE_PAGE_EDIT`` is excepted: it says that a
+#: decision did not land, and a curator must always hear that.
+CHECKS_A_DELETION_ANSWERS = PHYSICAL_PAGE_CHECKS - {CheckName.STALE_PAGE_EDIT}
+
+#: The decisions of a curator that the review-2 rebuild found no row
+#: for (issue #240, PR D). A fact about a row a person wrote, not a
+#: suspicion: the way out is to withdraw that row, so these cards have
+#: no dismissal.
+STALE_REVIEW2_CHECKS = frozenset(
+    {
+        CheckName.STALE_DETECTION_EDIT,
+        CheckName.STALE_REDACTION_EDIT,
+        CheckName.STALE_BOUNDARY_EDIT,
+    }
+)
+
+#: The findings of review 2 (issue #240, PR D). ``findings.rebuild``
+#: deletes and writes these rows, and nothing else does; every other
+#: check is review 1's, and ``recalculate_issues`` leaves these alone.
+#: An ``Issue.page_number`` of one of these is the 1-based page in the
+#: space the redaction rows are drawn in (the standing apply run's, or
+#: the original's), a third space beside the two of review 1, so the
+#: step-1 view never lists them.
+REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
+    {
+        CheckName.UNMATCHED_KEY_ICON,
+        CheckName.UNMATCHED_CAPTION,
+        CheckName.UNCOVERED_PAGES,
+        CheckName.UNCOVERED_HEADNOTE,
+        CheckName.MISSING_HEADNOTE_BRACKET,
+    }
+)
+
+#: The review-2 checks a curator may dismiss: every one but the stale
+#: checks, whose way out is to withdraw the decision they name.
+DISMISSABLE_REVIEW2_CHECKS = REVIEW2_CHECKS - STALE_REVIEW2_CHECKS
+
 
 class Issue(AbstractDateTimeModel):
-    """A validation or processing issue found in a scan."""
+    """A validation or processing issue found in a scan.
+
+    Two families of rows share the table. A review-1 row (the page
+    number checks, ``PROCESS_FLAG``) is written by ``recalculate_issues``
+    and dismissed through a ``DISMISS_ISSUE`` ``PageEdit``. A review-2
+    row (``REVIEW2_CHECKS``, issue #240 PR D) is written by
+    ``findings.rebuild`` from the detection, boundary and redaction rows,
+    says what it is about in ``target``, and is dismissed by a
+    ``ReviewDismissal`` the rebuild resolves onto it (``dismissal``).
+    """
 
     class Severity(models.TextChoices):
         ERROR = "error", "Error"
         WARNING = "warning", "Warning"
         INFO = "info", "Info"
+
+    class Target(models.TextChoices):
+        """What a review-2 finding is about (issue #240)."""
+
+        REDACTION = "redaction", "A redaction"
+        BOUNDARY = "boundary", "An opinion boundary"
+        DETECTION = "detection", "A detection"
+        PAGES = "pages", "A run of pages"
 
     scan = models.ForeignKey(
         Scan,
@@ -1039,7 +1181,26 @@ class Issue(AbstractDateTimeModel):
     metadata = models.JSONField(
         blank=True,
         default=dict,
-        help_text="Structured data (e.g. suppression info).",
+        help_text=(
+            "Structured data. A review-2 finding keeps the address of "
+            "its target here (issue #240): the detection's box and page, "
+            "the run of pages, or the human row that did not land."
+        ),
+    )
+    target = models.CharField(
+        max_length=12,
+        choices=Target.choices,
+        blank=True,
+        default="",
+        help_text="What a review-2 finding is about; blank on review 1.",
+    )
+    dismissal = models.ForeignKey(
+        "ReviewDismissal",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="issues",
+        help_text="The standing dismissal that covers this finding.",
     )
 
     class Meta:
@@ -1049,13 +1210,180 @@ class Issue(AbstractDateTimeModel):
         page = f"p.{self.page_number}" if self.page_number else "doc"
         return f"[{self.severity}] {page}: {self.message}"
 
+    @property
+    def is_dismissed(self) -> bool:
+        """Whether a standing dismissal covers this finding.
+
+        The FK is cleared when the dismissal is withdrawn, so the FK
+        alone answers.
+        """
+        return self.dismissal_id is not None
+
+
+class ReviewDismissal(AbstractDateTimeModel):
+    """One curator dismissal of one review-2 finding (issue #240, PR D).
+
+    The finding rows are deleted and written again at every rebuild
+    (``findings.rebuild``), so a dismissal cannot point at one. It names
+    its target by **address** instead: the check, the source page of
+    the target (``source_edit``, ``source_page``; the rule of
+    ``DetectionDecision``), the label and a copy of the box for a
+    detection. A run of pages is keyed by its first page alone: two
+    runs cannot start on one page, and the last page of a volume short
+    of its pages has no address. After each rebuild
+    ``findings.resolve`` lands every standing dismissal on the finding
+    with that address (IoU at least ``detections.IOU_THRESHOLD`` for a
+    box) and sets ``Issue.dismissal``, which mutes the card.
+
+    No unique key over the standing rows, on purpose: the address of a
+    box includes the box, and a key over the page and the label alone
+    would refuse the second dismissal on a page with two unmatched key
+    icons. So a box that moved past the IoU threshold leaves an old
+    dismissal standing beside the new one, and the old one mutes a
+    later finding only if a new box appears within the threshold of
+    the old spot. Accepted as an edge.
+
+    Never deleted by automation. A curator takes one back with
+    ``withdrawn_at``. A stale finding (``STALE_REVIEW2_CHECKS``) has no
+    dismissal: it is a fact about a row a person wrote, and the way out
+    is to withdraw that row.
+
+    Not a ``PageEdit``: a ``DISMISS_ISSUE`` row is a review-1 decision
+    keyed by a printed page number, and the apply reads those rows.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="review_dismissals",
+    )
+    check_name = models.CharField(
+        max_length=100,
+        choices=[
+            (check.value, check.label)
+            for check in CheckName
+            if check in DISMISSABLE_REVIEW2_CHECKS
+        ],
+    )
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="review_dismissals",
+        help_text="The page edit whose shard holds the page; null = the original.",
+    )
+    source_page = models.PositiveIntegerField(
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the finding was "
+            "dismissed. Blank matches anything."
+        ),
+    )
+    label = models.CharField(max_length=50, blank=True, default="")
+    target_x0 = models.FloatField(null=True, blank=True)
+    target_y0 = models.FloatField(null=True, blank=True)
+    target_x1 = models.FloatField(null=True, blank=True)
+    target_y1 = models.FloatField(null=True, blank=True)
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="review_dismissals",
+    )
+    withdrawn_at = models.DateTimeField(null=True, blank=True)
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_review_dismissals",
+    )
+
+    class Meta:
+        ordering = ["scan", "check_name", "source_page"]
+        indexes = [
+            models.Index(
+                fields=["scan", "check_name", "withdrawn_at"],
+                name="review_dismissal_scan_check",
+            ),
+        ]
+
+    def __str__(self):
+        state = " [withdrawn]" if self.withdrawn_at else ""
+        return (
+            f"dismissal of {self.check_name} src p.{self.source_page}{state}"
+        )
+
+    @property
+    def target_bbox(self) -> list[float] | None:
+        """The copied box, or None when the target is not a box."""
+        if self.target_x0 is None:
+            return None
+        return [self.target_x0, self.target_y0, self.target_x1, self.target_y1]
+
+
+class DetectionQuerySet(AutoNowQuerySet):
+    """The reads every consumer of the detections shares (issue #240)."""
+
+    def live(self):
+        """Return the rows a reader may act on.
+
+        A model row that no ``deactivate`` decision hides, and a
+        hand-drawn row that is not withdrawn. ``active`` is the derived
+        flag both write, so one filter answers for both.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(active=True)
+
+    def model_rows(self):
+        """Return the rows the model wrote, live or not.
+
+        :returns: The filtered queryset.
+        """
+        return self.exclude(model_name=Detection.ModelName.MANUAL)
+
 
 class Detection(AbstractDateTimeModel):
-    """YOLO detection stored in DB.
+    """One bounding box on one page (YOLO, or a curator's hand).
 
-    Each row is one bounding box from one model.
-    Coordinates are in image pixels.
+    Coordinates are in image pixels of the 200 dpi render the model
+    read, and ``img_width``/``img_height`` say how big that render was.
+
+    **Two families of rows, and one rule for each (issue #240).** A
+    model row is disposable: every import (``services._import_detections``)
+    deletes the scan's model rows and writes the merged run again, so
+    nothing supersedes one and nothing keeps an old one. A hand-drawn
+    row (``model_name`` ``MANUAL``) is a human addition, and automation
+    never deletes it; a curator takes it back with ``withdrawn_at``.
+
+    **A curator's decision about a model row is a `DetectionDecision`**,
+    not a write on the row: the row will be deleted at the next import,
+    so the decision names its target by address (the source page, the
+    label, a copy of the box), and the import resolves it onto the new
+    row with the same box. ``decision`` is that resolution, and
+    ``confidence = 1.0`` / ``active = False`` are the derived reads
+    blackletter and the viewer want. Nothing writes those two by hand
+    any more.
+
+    **The address is the source page** (``source_edit``, ``source_page``),
+    the document and page the apply's page map names: the original as
+    uploaded, or the one-page shard of a page edit. ``page_index`` is
+    the row's position in the space it was imported in, and
+    ``apply_run`` says which space that is (#269); a legacy row has
+    neither.
     """
+
+    objects = DetectionQuerySet.as_manager()
 
     scan = models.ForeignKey(
         Scan,
@@ -1106,12 +1434,100 @@ class Detection(AbstractDateTimeModel):
     )
     active = models.BooleanField(default=True)
 
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="detections",
+        help_text=(
+            "The page edit whose one-page shard this box is on. Null "
+            "means the original as uploaded (issue #240)."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "1-based page of the source document: of the original, or "
+            "of the edit's shard. Null on a row imported before #240."
+        ),
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint at import. Blank on a legacy "
+            "row, which matches anything."
+        ),
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="detections",
+        help_text=(
+            "The apply run whose final page space ``page_index`` is in "
+            "(#269). Null on a legacy row and on a hand-drawn row of "
+            "a volume with no run: the original's space."
+        ),
+    )
+    detect_run = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="The detection run (``ExternalJob.run``) that found it.",
+    )
+    decision = models.ForeignKey(
+        "DetectionDecision",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="detections",
+        help_text=(
+            "The standing curator decision resolved onto this model row: "
+            "the reason its confidence is 1.0 or it is inactive."
+        ),
+    )
+    replaces = models.ForeignKey(
+        "DetectionDecision",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replacements",
+        help_text=(
+            "Hand-drawn rows only: the deactivation this box was drawn "
+            "in place of, when a curator moved a model box."
+        ),
+    )
+    withdrawn_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Hand-drawn rows only: when the curator took the box back. "
+            "The row stays; ``active`` reads False."
+        ),
+    )
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_detections",
+        help_text="Who took the box back. Null while it stands.",
+    )
+
     class Meta:
         ordering = ["page_index", "y0", "x0"]
         indexes = [
             models.Index(
                 fields=["scan", "page_index"],
                 name="idx_det_scan_page",
+            ),
+            models.Index(
+                fields=["scan", "source_edit", "source_page"],
+                name="idx_det_scan_source",
             ),
             models.Index(
                 fields=["scan", "label"],
@@ -1129,6 +1545,686 @@ class Detection(AbstractDateTimeModel):
             f"{self.label} p.{self.page_index}"
             f" conf={self.confidence:.2f}{state}"
         )
+
+
+class DetectionDecision(AbstractDateTimeModel):
+    """One curator decision about one model detection (issue #240).
+
+    The model rows are deleted and written again at every import, so a
+    decision cannot point at one. It names its target by **address**
+    instead: the source page (``source_edit``, ``source_page``), the
+    label, and a copy of the box as the model drew it when the curator
+    decided (``target_*``). After each import
+    ``detections.resolve`` looks for the new model row on that page
+    with that label whose box overlaps the copy (IoU at least
+    ``detections.IOU_THRESHOLD``), sets ``Detection.decision`` on it,
+    and writes the derived read: ``confidence = 1.0`` for an approval,
+    ``active = False`` for a deactivation. A decision that finds no row
+    is stale, and is logged; #240 PR D raises it as an issue.
+
+    Never deleted by automation. A curator takes one back with
+    ``withdrawn_at``, which also gives the row back its own values. A
+    later decision on the same row withdraws the earlier one, so one
+    decision stands per target.
+
+    A curator who *moves* a model box makes two rows: a deactivation
+    here, and a hand-drawn ``Detection`` that names it in ``replaces``.
+    """
+
+    class Kind(models.TextChoices):
+        APPROVE = "approve", "Approve (confidence 1.0)"
+        DEACTIVATE = "deactivate", "Deactivate"
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="detection_decisions",
+    )
+    kind = models.CharField(max_length=12, choices=Kind.choices)
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="detection_decisions",
+        help_text="The page edit whose shard holds the page; null = the original.",
+    )
+    source_page = models.PositiveIntegerField(
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the decision was made. "
+            "Blank matches anything."
+        ),
+    )
+    label = models.CharField(max_length=50)
+    label_id = models.SmallIntegerField()
+    target_x0 = models.FloatField()
+    target_y0 = models.FloatField()
+    target_x1 = models.FloatField()
+    target_y1 = models.FloatField()
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+    target_confidence = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The model's own confidence when the decision was made, so "
+            "a withdrawn approval gives it back."
+        ),
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="detection_decisions",
+    )
+    withdrawn_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="When the curator took the decision back. Never rewritten.",
+    )
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_detection_decisions",
+    )
+
+    class Meta:
+        ordering = ["scan", "source_page", "target_y0", "target_x0"]
+        indexes = [
+            models.Index(
+                fields=["scan", "withdrawn_at"],
+                name="idx_det_decision_scan_open",
+            ),
+        ]
+
+    @property
+    def target_bbox(self) -> list[float]:
+        """The copied box, in the ``[x0, y0, x1, y1]`` shape every reader uses.
+
+        :returns: The box.
+        """
+        return [self.target_x0, self.target_y0, self.target_x1, self.target_y1]
+
+    def __str__(self):
+        state = " [withdrawn]" if self.withdrawn_at else ""
+        return f"{self.kind} {self.label} src p.{self.source_page}{state}"
+
+
+class OpinionBoundaryQuerySet(AutoNowQuerySet):
+    """The reads every consumer of the opinion boundaries shares (#240)."""
+
+    def computed(self):
+        """Return the rows the pairing wrote.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(origin=OpinionBoundary.Origin.COMPUTED)
+
+    def human(self):
+        """Return the rows a curator wrote, withdrawn or not.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(origin=OpinionBoundary.Origin.HUMAN)
+
+    def standing_dismissals(self):
+        """Return the curator's dismissals that are not withdrawn.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(
+            origin=OpinionBoundary.Origin.HUMAN,
+            kind=OpinionBoundary.Kind.DISMISS,
+            withdrawn_at__isnull=True,
+        )
+
+    def standing_additions(self):
+        """Return the boundaries a curator added and did not take back.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(
+            origin=OpinionBoundary.Origin.HUMAN,
+            kind=OpinionBoundary.Kind.ADD,
+            withdrawn_at__isnull=True,
+        )
+
+
+class OpinionBoundary(AbstractDateTimeModel):
+    """One opinion of a volume, or one curator decision about one (#240, PR C).
+
+    A boundary is two **anchors**: the start is the top-left corner of
+    the case caption, the end the bottom-right corner of the key icon
+    that closes the opinion. Each anchor is a point in PDF points on a
+    **source page** (``*_source_edit``, ``*_source_page``: the original
+    as uploaded, or the one-page shard of a page edit -- the address the
+    apply's page map names, the rule of ``Detection``), and its
+    position in the space the compute measured in (``*_page_index``,
+    0-based, in the space of ``apply_run``). The address survives a new
+    apply run; the index is what the viewer draws.
+
+    **Two families of rows, the rule of the detections.** A *computed*
+    row (``origin`` ``COMPUTED``) is written by the pairing
+    (``boundaries.write_computed``), and every compute deletes the
+    scan's computed rows and writes them again. A *human* row (``origin``
+    ``HUMAN``) is one curator decision, and automation never deletes
+    it: an ``ADD`` is a boundary the curator drew, a ``DISMISS`` is a
+    decision about a computed boundary. A curator takes a human row
+    back with ``withdrawn_at`` (#232).
+
+    **A dismissal names its target by its anchors**, in the anchor
+    columns, because the computed row it was made on is gone at the
+    next compute. ``boundaries.resolve`` then lands it on the new
+    computed row with the same start address whose start anchor is
+    within ``boundaries.ANCHOR_TOLERANCE_PT``, and sets ``decision`` on
+    that row. A move of an anchor is a ``DISMISS`` plus an ``ADD`` that
+    names it in ``replaces``, so withdrawing the addition gives the
+    computed boundary back.
+
+    ``start_detection`` and ``end_detection`` are the caption and key
+    rows the pairing used, or the boxes the curator picked. They are
+    ``SET_NULL``: the model rows are deleted at every import, and the
+    anchors carry the position on their own.
+    """
+
+    objects = OpinionBoundaryQuerySet.as_manager()
+
+    class Origin(models.TextChoices):
+        COMPUTED = "computed", "Computed by the pairing"
+        HUMAN = "human", "Made by a curator"
+
+    class Kind(models.TextChoices):
+        ADD = "add", "A boundary the curator added"
+        DISMISS = "dismiss", "A computed boundary the curator dismissed"
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="opinion_boundaries",
+    )
+    origin = models.CharField(max_length=10, choices=Origin.choices)
+    kind = models.CharField(
+        max_length=10,
+        choices=Kind.choices,
+        blank=True,
+        default="",
+        help_text="Human rows only; blank on a computed row.",
+    )
+
+    start_source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="boundary_starts",
+        help_text=(
+            "The page edit whose shard holds the start page; null = "
+            "the original as uploaded."
+        ),
+    )
+    start_source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "1-based page of the start's source document. Null when the "
+            "map held no address for the page at write time."
+        ),
+    )
+    start_page_index = models.PositiveIntegerField(
+        help_text="0-based page of the start, in the space of ``apply_run``."
+    )
+    start_x = models.FloatField(help_text="PDF points: the caption's left.")
+    start_y = models.FloatField(help_text="PDF points: the caption's top.")
+
+    end_source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="boundary_ends",
+        help_text="As ``start_source_edit``, for the end page.",
+    )
+    end_source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="As ``start_source_page``, for the end page.",
+    )
+    end_page_index = models.PositiveIntegerField(
+        help_text="0-based page of the end, in the space of ``apply_run``."
+    )
+    end_x = models.FloatField(help_text="PDF points: the key icon's right.")
+    end_y = models.FloatField(help_text="PDF points: the key icon's bottom.")
+
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the row was written. "
+            "Blank matches anything (the #214 rule)."
+        ),
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_boundaries",
+        help_text=(
+            "The apply run whose final page space the two indexes are "
+            "in (#269). Null for the original's space."
+        ),
+    )
+    detect_run = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Computed rows: the detection run (``ExternalJob.run``) the "
+            "pairing read."
+        ),
+    )
+    start_detection = models.ForeignKey(
+        Detection,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_starts",
+        help_text="The caption row the start anchor was taken from.",
+    )
+    end_detection = models.ForeignKey(
+        Detection,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_ends",
+        help_text="The key icon row the end anchor was taken from.",
+    )
+    ordinal = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Computed rows: the position the pairing gave the opinion, "
+            "0-based, in reading order. Null on a human row."
+        ),
+    )
+    decision = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="decided_boundaries",
+        help_text=(
+            "Computed rows: the standing dismissal resolved onto this "
+            "row. Null while the boundary stands."
+        ),
+    )
+    replaces = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replacements",
+        help_text=(
+            "Additions only: the dismissal this boundary was made in "
+            "place of, when a curator moved an anchor."
+        ),
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_boundaries",
+        help_text="Human rows: the curator.",
+    )
+    withdrawn_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Human rows only: when the curator took the row back. "
+            "Never rewritten."
+        ),
+    )
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_opinion_boundaries",
+        help_text="Who took the row back. Null while it stands.",
+    )
+
+    class Meta:
+        ordering = ["scan", "start_page_index", "start_y", "start_x"]
+        indexes = [
+            models.Index(
+                fields=["scan", "origin", "withdrawn_at"],
+                name="idx_opb_scan_open",
+            ),
+            models.Index(
+                fields=["scan", "start_source_edit", "start_source_page"],
+                name="idx_opb_scan_start_source",
+            ),
+            models.Index(
+                fields=["scan", "start_page_index"],
+                name="idx_opb_scan_start_index",
+            ),
+        ]
+        constraints = [
+            # A computed row has no kind; a human row has one of the two.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(origin="computed", kind="")
+                    | models.Q(origin="human", kind__in=["add", "dismiss"])
+                ),
+                name="opinion_boundary_kind_matches_origin",
+            ),
+        ]
+
+    @property
+    def is_computed(self) -> bool:
+        return self.origin == self.Origin.COMPUTED
+
+    @property
+    def is_dismissed(self) -> bool:
+        """Whether a standing dismissal hides this computed row.
+
+        The FK is cleared when the dismissal is withdrawn, so the FK
+        alone answers.
+        """
+        return self.decision_id is not None
+
+    @property
+    def start_address(self) -> tuple[int | None, int | None]:
+        return self.start_source_edit_id, self.start_source_page
+
+    @property
+    def end_address(self) -> tuple[int | None, int | None]:
+        return self.end_source_edit_id, self.end_source_page
+
+    def __str__(self):
+        what = self.kind or "opinion"
+        state = " [withdrawn]" if self.withdrawn_at else ""
+        return (
+            f"{what} p.{self.start_page_index + 1}-{self.end_page_index + 1}"
+            f"{state}"
+        )
+
+
+class RedactionQuerySet(AutoNowQuerySet):
+    """The reads every consumer of the redactions shares (issue #240)."""
+
+    def computed(self):
+        """Return the rows the compute wrote.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(origin=Redaction.Origin.COMPUTED)
+
+    def human(self):
+        """Return the standing human rows: additions and dismissals.
+
+        :returns: The filtered queryset.
+        """
+        return self.filter(
+            origin=Redaction.Origin.HUMAN, withdrawn_at__isnull=True
+        )
+
+    def visible(self):
+        """Return the boxes a reader paints.
+
+        A computed row under no standing dismissal, and a human ``add``
+        that is not withdrawn. A ``dismiss`` row has no box of its own.
+
+        :returns: The filtered queryset.
+        """
+        from django.db.models import Q
+
+        return self.filter(
+            Q(origin=Redaction.Origin.COMPUTED, decision__isnull=True)
+            | Q(
+                origin=Redaction.Origin.HUMAN,
+                kind=Redaction.Kind.ADD,
+                withdrawn_at__isnull=True,
+            )
+        )
+
+
+class Redaction(AbstractDateTimeModel):
+    """One box to paint over the volume, or one decision about such a box
+    (issue #240, PR B). Replaces ``Scan.redaction_rects`` and
+    ``Scan.margin_rects``.
+
+    **Coordinates are PDF points** on the page. blackletter measures the
+    redaction rects in pixels of its 200 dpi render, and the compute
+    converts them once with the page scale it holds; the margin strips
+    are in points already. So a reader needs the page alone, and the
+    viewer scales a box by the pdf.js viewport as it scales the strips.
+
+    **Two families of rows, one rule for each**, the rule the detections
+    follow (PR A):
+
+    - A **computed** row is disposable. Each compute deletes the scan's
+      computed rows and writes them again: a better computation may find
+      one box where it found two, and a kept old row would sit beside
+      the new one as a duplicate. A margin strip is a computed row with
+      ``rect_type`` ``margin`` and a white fill.
+    - A **human** row is never deleted by automation. It is an ``add``
+      (a box the curator drew, or drew in place of a computed one) or a
+      ``dismiss`` (a computed box the curator took out). A curator takes
+      a human row back with ``withdrawn_at``.
+
+    **A dismiss names its target by address, not by FK**, because the
+    computed row it was made on is deleted at the next compute: the
+    source page, the ``rect_type``, and a copy of the computed box
+    (``target_*``). After each compute ``redactions.resolve`` lands every
+    standing dismiss on the new computed row at that address whose box
+    overlaps the copy (IoU at least ``detections.IOU_THRESHOLD``), and
+    sets ``decision`` on it, which hides it. A dismiss that lands on
+    nothing is logged; PR D raises it as an issue.
+
+    **A move of a computed box is a dismiss plus an add** that names the
+    dismiss in ``replaces``, so the drawn box stands whatever a later
+    compute finds, and withdrawing it gives the computed box back.
+
+    **The address is the source page** (``source_edit``, ``source_page``)
+    the apply's page map names, as on ``Detection``; ``page_index`` is
+    the row's position in the space of ``apply_run``, and the compute
+    moves the human rows through the new map after each run
+    (``detections.relocate_rows``).
+    """
+
+    class Origin(models.TextChoices):
+        COMPUTED = "computed", "Computed"
+        HUMAN = "human", "Human"
+
+    class Kind(models.TextChoices):
+        ADD = "add", "Add a box"
+        DISMISS = "dismiss", "Dismiss a computed box"
+
+    class Fill(models.TextChoices):
+        BLACK = "black", "Black"
+        WHITE = "white", "White"
+
+    #: The ``rect_type`` of a margin strip and of a drawn box. Every
+    #: other value is blackletter's (``headnote``, ``KEY_ICON``, ...).
+    MARGIN_TYPE = "margin"
+    MANUAL_TYPE = "manual"
+
+    objects = RedactionQuerySet.as_manager()
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="redactions",
+    )
+    origin = models.CharField(max_length=10, choices=Origin.choices)
+    kind = models.CharField(
+        max_length=10,
+        choices=Kind.choices,
+        blank=True,
+        default="",
+        help_text="Human rows only; blank on a computed row.",
+    )
+    rect_type = models.CharField(
+        max_length=50,
+        help_text=(
+            "blackletter's type of the box (headnote, a label name, ...), "
+            "'margin' for a strip, 'manual' for a drawn box."
+        ),
+    )
+    fill = models.CharField(max_length=5, choices=Fill.choices)
+    x0 = models.FloatField(null=True, blank=True)
+    y0 = models.FloatField(null=True, blank=True)
+    x1 = models.FloatField(null=True, blank=True)
+    y1 = models.FloatField(null=True, blank=True)
+    target_x0 = models.FloatField(null=True, blank=True)
+    target_y0 = models.FloatField(null=True, blank=True)
+    target_x1 = models.FloatField(null=True, blank=True)
+    target_y1 = models.FloatField(null=True, blank=True)
+    replaces = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replacements",
+        help_text=(
+            "Adds only: the dismiss this box was drawn in place of, when "
+            "a curator moved a computed box."
+        ),
+    )
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="redactions",
+        help_text="The page edit whose shard holds the page; null = the original.",
+    )
+    source_page = models.PositiveIntegerField(
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="The scan's source fingerprint when the row was written.",
+    )
+    page_index = models.PositiveIntegerField(
+        db_index=True,
+        help_text="0-based position in the space of ``apply_run``.",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="redactions",
+        help_text="The apply run whose final page space ``page_index`` is in.",
+    )
+    detect_run = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Computed rows: the detection run the geometry came from.",
+    )
+    decision = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="decided",
+        help_text=(
+            "Computed rows: the standing dismiss resolved onto this box, "
+            "which hides it."
+        ),
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="redactions",
+    )
+    withdrawn_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Human rows: when the curator took the row back.",
+    )
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="withdrawn_redactions",
+    )
+
+    class Meta:
+        ordering = ["scan", "page_index", "y0", "x0"]
+        indexes = [
+            models.Index(
+                fields=["scan", "page_index"],
+                name="idx_redaction_scan_page",
+            ),
+            models.Index(
+                fields=["scan", "source_edit", "source_page"],
+                name="idx_redaction_scan_source",
+            ),
+            models.Index(
+                fields=["scan", "origin", "withdrawn_at"],
+                name="idx_redaction_scan_open",
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(origin="computed", kind="")
+                    | models.Q(origin="human", kind__in=["add", "dismiss"])
+                ),
+                name="redaction_kind_matches_origin",
+            ),
+            # One standing box in place of one dismissed computed box: a
+            # second move in flight must write on it, not beside it.
+            models.UniqueConstraint(
+                fields=["replaces"],
+                condition=models.Q(kind="add", withdrawn_at__isnull=True),
+                name="uniq_standing_replacement_per_dismiss",
+            ),
+        ]
+
+    @property
+    def bbox(self) -> list[float] | None:
+        """The box, ``[x0, y0, x1, y1]`` in points, or None on a dismiss.
+
+        :returns: The box.
+        """
+        if self.x0 is None:
+            return None
+        return [self.x0, self.y0, self.x1, self.y1]
+
+    @property
+    def target_bbox(self) -> list[float] | None:
+        """The copied computed box of a dismiss, or None.
+
+        :returns: The box.
+        """
+        if self.target_x0 is None:
+            return None
+        return [self.target_x0, self.target_y0, self.target_x1, self.target_y1]
+
+    def __str__(self):
+        what = self.kind or self.rect_type
+        state = " [withdrawn]" if self.withdrawn_at else ""
+        return f"{self.origin} {what} p.{self.page_index}{state}"
 
 
 def page_edit_image_path(instance: "PageEdit", filename: str) -> str:
@@ -1168,6 +2264,112 @@ def page_edit_image_path(instance: "PageEdit", filename: str) -> str:
     )
 
 
+class BracketReading(AbstractDateTimeModel):
+    """One headnote bracket the OCR read, at the start of one cell (#328).
+
+    A headnote bracket must be redacted, and nothing told a curator
+    that the model had missed one. dots.mocr is the second witness: it
+    writes the bracket as text. This row is that reading, stored so
+    that ``findings.rebuild`` can compare it with the ``Detection``
+    rows without an S3 read.
+
+    **A disposable row, the rule of a model `Detection`.** Every
+    compute deletes the scan's readings of the run it measured and
+    writes them again (``brackets.write_rows``). A curator never writes
+    one, nothing supersedes one, and nothing withdraws one.
+
+    **The box is the cell, not the glyph.** dots.mocr measures a layout
+    cell, and a bracket is always the first characters of its cell
+    (measured: every one of 61 on scan 1828, and 913 of 988 tokens on
+    scan 2845). A cell box is also stable between computes, which is
+    what a dismissal keyed by IoU needs.
+
+    **The address is the source page** (``source_edit``,
+    ``source_page``), the rule of ``Detection``: a new apply run moves
+    ``page_index`` and leaves the address where it was.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="bracket_readings",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="bracket_readings",
+        help_text=(
+            "The apply run whose page space ``page_index`` is in. Null "
+            "means the original's space."
+        ),
+    )
+
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="bracket_readings",
+        help_text=(
+            "The page edit whose one-page shard this cell is on. Null "
+            "means the original as uploaded."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the reading was "
+            "written. Blank matches anything."
+        ),
+    )
+
+    page_index = models.PositiveIntegerField(db_index=True)
+    x0 = models.FloatField()
+    y0 = models.FloatField()
+    x1 = models.FloatField()
+    y1 = models.FloatField()
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+
+    numbers = models.JSONField(
+        default=list,
+        help_text=(
+            "The headnote numbers the bracket names, expanded: "
+            "``[16-19]`` is stored as ``[16, 17, 18, 19]``."
+        ),
+    )
+    raw = models.CharField(
+        max_length=32,
+        help_text="The token as dots.mocr wrote it, for the card.",
+    )
+
+    class Meta:
+        ordering = ["page_index", "y0", "x0"]
+        indexes = [
+            models.Index(
+                fields=["scan", "apply_run", "page_index"],
+                name="idx_bracket_scan_run_page",
+            ),
+        ]
+
+    @property
+    def bbox(self) -> list[float]:
+        """The cell box, in the pixels of the detection render."""
+        return [self.x0, self.y0, self.x1, self.y1]
+
+    def __str__(self):
+        return f"{self.raw} p.{self.page_index + 1}"
+
+
 class PageEdit(AbstractDateTimeModel):
     """One decision a person made about one page of a scan (issue #214).
 
@@ -1199,15 +2401,21 @@ class PageEdit(AbstractDateTimeModel):
       only. A printed number cannot be an address: front matter has
       none, and two pages can both print 1074 -- which is one of the
       defects review 1 exists to find.
-    - **A decision is closed, never rewritten and never deleted.** The
-      apply (#206) stamps ``applied_at``; a curator who takes the
-      decision back stamps ``withdrawn_at`` and ``withdrawn_by``
-      (#232). Either stamp makes the row history. So every unique
-      constraint is partial over the rows that carry neither: a
-      curator who edits the same page again writes a new row, against
-      the fingerprint of the original as it is then. A second file
-      uploaded for one page withdraws the first row rather than
-      writing over it -- the audit must show every file a person
+    - **A decision stands until it is withdrawn, and it is never
+      rewritten or deleted.** A curator who takes the decision back
+      stamps ``withdrawn_at`` and ``withdrawn_by`` (#232), and that is
+      the one stamp that closes a row. The apply (#224) stamps
+      ``applied_at`` and ``applied_run`` when it builds the decision
+      into a final volume, but the row keeps standing: a reopened
+      review must show an applied deletion as deleted, and the next
+      apply run must build it again, or the second final PDF would
+      restore the page in silence. So every unique constraint is
+      partial over the standing rows -- one decision per address --
+      and a curator who edits the same page again supersedes the row
+      there (``page_edits.supersede``): an open row is updated in
+      place, an applied row is withdrawn and a new one is written. A
+      second file uploaded for one page withdraws the first row rather
+      than writing over it -- the audit must show every file a person
       uploaded, and the object of an overwritten row would stay in the
       bucket with nothing naming it.
     - **``source_fingerprint`` is the scan's**
@@ -1295,7 +2503,8 @@ class PageEdit(AbstractDateTimeModel):
         blank=True,
         default="",
         help_text=(
-            "What was decided: the printed number ('1075') or range "
+            "What was decided: the printed number ('1075'), the "
+            "number with a trailing letter ('2094a') or the range "
             "('678-686') for a number, blank when the curator cleared "
             "it; the rotation in degrees; the dismissed check's name."
         ),
@@ -1346,8 +2555,20 @@ class PageEdit(AbstractDateTimeModel):
         null=True,
         blank=True,
         help_text=(
-            "When the apply (#206) built this decision into a new "
-            "original. A stamped row is history: it is never rewritten."
+            "When the apply (#224) built this decision into a final "
+            "volume. A ledger stamp, not a close: the row keeps "
+            "standing until it is withdrawn, and it is never rewritten."
+        ),
+    )
+    applied_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="applied_edits",
+        help_text=(
+            "The apply run whose final volume carries this decision. "
+            "Null while no build has read the row."
         ),
     )
     withdrawn_at = models.DateTimeField(
@@ -1421,20 +2642,20 @@ class PageEdit(AbstractDateTimeModel):
                 ),
                 name="page_edit_rotation_is_a_quarter_turn",
             ),
-            # The unique keys are partial over the open rows. A row
-            # leaves that set in one of two ways, and both are
-            # history: the apply built it in, or the curator took it
-            # back (#232). After either, the same page may be edited
-            # again.
+            # The unique keys are partial over the standing rows: one
+            # decision per address. A row leaves that set in one way
+            # only, the curator taking it back (#232). The apply stamp
+            # is not a close (#224): an applied row stands, and the
+            # curator who edits that page again supersedes it, so the
+            # audit keeps both rows and the address keeps one decision.
             models.UniqueConstraint(
                 fields=["scan", "kind", "pdf_page"],
                 condition=(
-                    models.Q(applied_at__isnull=True)
-                    & models.Q(withdrawn_at__isnull=True)
+                    models.Q(withdrawn_at__isnull=True)
                     & models.Q(pdf_page__isnull=False)
                     & ~models.Q(kind="dismiss_issue")
                 ),
-                name="uniq_open_page_edit_per_page",
+                name="uniq_standing_page_edit_per_page",
             ),
             # A page raises several checks, so a dismissal is unique
             # per check, not per page. Both address columns are in the
@@ -1453,21 +2674,19 @@ class PageEdit(AbstractDateTimeModel):
                     "value",
                 ],
                 condition=(
-                    models.Q(applied_at__isnull=True)
-                    & models.Q(withdrawn_at__isnull=True)
+                    models.Q(withdrawn_at__isnull=True)
                     & models.Q(kind="dismiss_issue")
                 ),
                 nulls_distinct=False,
-                name="uniq_open_dismissal_per_check",
+                name="uniq_standing_dismissal_per_check",
             ),
             models.UniqueConstraint(
                 fields=["scan", "anchor_pdf_page", "ordinal"],
                 condition=(
-                    models.Q(applied_at__isnull=True)
-                    & models.Q(withdrawn_at__isnull=True)
+                    models.Q(withdrawn_at__isnull=True)
                     & models.Q(kind="insert_page")
                 ),
-                name="uniq_open_insert_per_gap",
+                name="uniq_standing_insert_per_gap",
             ),
         ]
 
@@ -1479,161 +2698,426 @@ class PageEdit(AbstractDateTimeModel):
         )
         value = f" = {self.value!r}" if self.value else ""
         state = ""
-        if self.applied_at is not None:
-            state = " [applied]"
-        elif self.withdrawn_at is not None:
+        if self.withdrawn_at is not None:
             state = " [withdrawn]"
+        elif self.applied_at is not None:
+            state = " [applied]"
         return f"{self.get_kind_display()} {where}{value}{state}"
 
 
-class ExtractionStatus(models.TextChoices):
-    """Lifecycle of a Page through the LLM extraction pipeline."""
+class ApplyRun(AbstractDateTimeModel):
+    """One build of the final volume from the original plus the page
+    edits (issue #224), ``a{number}`` in the S3 keys.
 
-    PENDING = "pending", "Pending"
-    SUBMITTED = "submitted", "Submitted to batch"
-    EXTRACTED = "extracted", "Extracted"
-    FAILED = "failed", "Failed"
-    PROMPT_BLOCKED = "prompt_blocked", "Blocked at prompt level"
-    RESPONSE_BLOCKED = "response_blocked", "Blocked at response level"
-    RECITATION_BLOCKED = (
-        "recitation_blocked",
-        "Blocked by recitation filter",
-    )
+    Review 1 ends when a curator approves the page completeness. The
+    ``PageEdit`` rows plus the original then describe the complete
+    volume, and this row records one attempt to build it and to glue
+    the paid per-shard results into its page space. **The apply
+    assembles; it does not recompute.** A page nobody touched keeps its
+    conversion, its OCR read and its detections; only a page a curator
+    added or changed enters a queue, as a one-page shard whose
+    ``ExternalJob`` rows point back here through ``apply_run``.
 
+    Why a row of its own, rather than a mark on a job row like the
+    glue and apply ledgers of the volume stages:
 
-class ExtractedBy(models.TextChoices):
-    """Which pipeline produced the page's XML content."""
+    - A run may have **no job rows** at all -- a volume with only
+      deletes, or with no structural edit -- so there is no shard-0
+      row to carry a ledger.
+    - One run spans **three stages** whose glues finish at different
+      times, and a mark on one stage's head row cannot say which of
+      the three is written.
+    - The trigger asks every 15 seconds, for every approved scan, "is
+      there a run for this edit set, is it built, which glues are
+      written, how many attempts are spent". That is one query here,
+      and five S3 HEADs otherwise.
 
-    LLM = "LLM", "LLM"
-    OCR_FALLBACK = "ocr-fallback", "Local OCR fallback"
-    HUMAN = "human", "Human review"
-    BLANK_AUTO = "blank-auto", "Blank page (auto)"
+    The offset map is stored here **once**, at build time, and every
+    glue reads it. Nothing derives it again. The original stays the
+    source of record: ``source_fingerprint`` is copied from the scan
+    so a glue can refuse a document from another original, and the
+    apply never writes ``Scan.source_fingerprint``.
 
-
-class Page(AbstractDateTimeModel):
-    """One PDF page of a ``Scan`` produced by ``run_generate_files``.
-
-    Holds the per-page artifact path plus all extraction state. The
-    user prompt that drives extraction lives in ``ai.Prompt``; this
-    model FKs to whichever Prompt row is currently bound to the page.
-    Tweaking the prompt creates a new Prompt and repoints this FK.
-
-    XML extraction details (``xml_content``, ``status``, etc.) are
-    populated by the Phase 2 batch flow.
+    A run with no structural edit aliases the review-1 artifacts: its
+    ``final_pdf_key`` is the original's key and its ``bitonal_key``
+    the volume ``bitonal.pdf``, with no copy. The printed-page map is
+    written for every run, because it is a product.
     """
 
     scan = models.ForeignKey(
         Scan,
         on_delete=models.CASCADE,
-        related_name="pages",
+        related_name="apply_runs",
     )
-    page_index = models.PositiveIntegerField(
-        help_text=(
-            "0-based, matching ``Detection.page_index``. The PDF "
-            "filename is ``llm/page_{page_index + 1:04d}.pdf``."
-        ),
+    number = models.PositiveSmallIntegerField(
+        help_text="The n in a{n}: 1 for the first build of this scan.",
     )
-    book_page = models.CharField(
-        max_length=32,
+    source_fingerprint = models.CharField(
+        max_length=64,
         blank=True,
         default="",
         help_text=(
-            "Visible page number printed on this page of the book. "
-            "Usually one integer like '687'; rarely a range like "
-            "'678-686' when a single PDF page collapses several book "
-            "pages."
+            "The scan's source fingerprint when the run was built. "
+            "Every glue checks its inputs against it."
         ),
     )
-
-    pdf_path = models.CharField(
-        max_length=512,
+    page_map = models.JSONField(
+        default=dict,
         blank=True,
-        default="",
         help_text=(
-            "Relative to ``scan.output_dir``, e.g. ``llm/page_0001.pdf``."
+            "The offset map, written once at build time: one entry per "
+            "final page naming its source (an original page, with its "
+            "rotation, or a page of an edit's file), plus the deleted "
+            "pages and the original's page count."
         ),
     )
-    user_prompt = models.ForeignKey(
-        "ai.Prompt",
-        on_delete=models.PROTECT,
-        null=True,
-        blank=True,
-        related_name="pages",
-        help_text=(
-            "Current user prompt for this page. A tweaked prompt is a "
-            "new Prompt row; this FK is repointed and the prior Prompt "
-            "stays as history."
-        ),
-    )
-    xml_content = models.TextField(
-        blank=True,
-        default="",
-        help_text=("Extracted XML for this page."),
-    )
-    status = models.CharField(
-        max_length=32,
-        choices=ExtractionStatus.choices,
-        default=ExtractionStatus.PENDING,
-    )
-    extracted_by = models.CharField(
-        max_length=32,
-        choices=ExtractedBy.choices,
-        blank=True,
-        default="",
-    )
-    needs_review = models.BooleanField(
-        default=False,
-        help_text=(
-            "Set when the OCR fallback ran or the model output looked "
-            "suspicious. Triage view filters by this."
-        ),
-    )
-
-    # Per-attempt LLM state lives on ``ai.LLMTask`` (GenericFK back to
-    # this Page). Page only carries the page-level rollup: which row
-    # is the canonical extraction (xml_content above), how the work
-    # was sourced (``extracted_by``), and overall lifecycle state
-    # (``status``). Cost, tokens, retry-level errors, and provider
-    # specifics are LLMTask/LLMRequest concerns.
-
-    expected_opinion_starts = models.PositiveIntegerField(default=0)
-    expected_opinion_ends = models.PositiveIntegerField(default=0)
-
-    detections = models.JSONField(
+    edit_ids = models.JSONField(
         default=list,
         blank=True,
         help_text=(
-            "All YOLO detections on this page, filtered from "
-            "``detections.json`` at sync time."
+            "The standing structural PageEdit rows the build read, in "
+            "primary-key order. The trigger compares it with the "
+            "current set to decide whether a new run is due."
         ),
     )
-    is_blank = models.BooleanField(
-        default=False,
-        help_text=("Body is entirely covered by headnote redactions."),
+    final_pdf_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the final PDF, or of the original when no "
+            "structural edit exists. Blank until the build commits."
+        ),
+    )
+    bitonal_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text="S3 key of the final bitonal copy. Blank until glued.",
+    )
+    ocr_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text="S3 key of the final OCR volume JSON. Blank until glued.",
+    )
+    printed_pages_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the frozen printed-page map, in the final page "
+            "space. Blank until the OCR glue writes it."
+        ),
+    )
+    detections_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the final detections volume JSON. Blank until "
+            "glued, which waits for a volume detection run."
+        ),
+    )
+    built_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the final PDF, the map and the job rows were committed.",
+    )
+    superseded_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When a later run replaced this one: the review was "
+            "reopened, or an admin gave up on a dead row. Its outputs "
+            "stay in S3."
+        ),
+    )
+    attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Failed attempts at the current phase.",
+    )
+    last_error = models.TextField(
+        blank=True,
+        default="",
+        help_text="What the last failed attempt raised.",
+    )
+    last_attempt_at = models.DateTimeField(null=True, blank=True)
+    dead_row_noted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the trigger first saw a dead job row on this run and "
+            "logged it. Its own stamp: last_error is written by the "
+            "failed attempts and cleared by a successful glue, so a note "
+            "kept there was repeated after every glue and lost behind a "
+            "failed one."
+        ),
     )
 
     class Meta:
-        ordering = ("scan", "page_index")
+        ordering = ["scan", "number"]
         constraints = [
             models.UniqueConstraint(
-                fields=["scan", "page_index"],
-                name="unique_page_scan_index",
-            ),
-        ]
-        indexes = [
-            models.Index(
-                fields=["scan", "page_index"],
-                name="idx_page_scan_idx",
-            ),
-            models.Index(fields=["status"], name="idx_page_status"),
-            models.Index(
-                fields=["scan", "needs_review"],
-                name="idx_page_review",
+                fields=["scan", "number"],
+                name="uniq_apply_run_number_per_scan",
             ),
         ]
 
     def __str__(self):
-        return f"scan {self.scan_id} p{self.page_index:04d}"
+        return f"Apply run a{self.number} of scan {self.scan_id}"
+
+    @property
+    def label(self) -> str:
+        """Return the run's name in the S3 keys and the logs.
+
+        :returns: ``a{number}``.
+        :rtype: str
+        """
+        return f"a{self.number}"
+
+    @property
+    def is_built(self) -> bool:
+        """Return whether phase 1 committed."""
+        return self.built_at is not None
+
+    @property
+    def is_glued(self) -> bool:
+        """Return whether the review-1 glues are written.
+
+        The bitonal copy, the OCR volume and the printed pages. The
+        detections glue waits for a volume detection run, so it is not
+        part of this; :attr:`is_complete` is the whole set.
+        """
+        return bool(
+            self.bitonal_key and self.ocr_key and self.printed_pages_key
+        )
+
+    @property
+    def is_complete(self) -> bool:
+        """Return whether every glue is written, the detections included.
+
+        The precondition of ``READY_FOR_REDACTION_REVIEW``
+        (``review_states.final_volume_ready``, #263): review 2 judges
+        the redactions of the corrected volume, so every output of the
+        corrected volume must exist before the review opens.
+        """
+        return self.is_glued and bool(self.detections_key)
+
+
+class PageRepairRequest(AbstractDateTimeModel):
+    """One request for a page a person with the book must scan (#249).
+
+    A reviewer finds a blurry page or a missing leaf. The reviewer has
+    no book, so the finding is work for a scanner. This row keeps the
+    finding until the scanner does the work. The finding used to go to
+    a chat message, and the system kept nothing.
+
+    A request is **not** a ``PageEdit``. A ``PageEdit`` is a decision
+    about the document, and the apply (#206) builds it into the volume.
+    A request is work for a person. It carries a free-text ``note``,
+    and it has an end state a decision does not have: **fulfilled**.
+    A reader of ``page_edits.open_edits`` never sees a request, so the
+    apply cannot mistake one for a decision.
+
+    What must not be broken:
+
+    - **The address is a physical page of the original as uploaded**,
+      1-based, the space ``PageEdit`` uses. ``pdf_page`` names the page
+      to scan again (REPLACE). ``anchor_pdf_page`` names the page the
+      missing leaf follows (INSERT), and 0 means "before page 1". The
+      printed number is a label in ``logical_page`` and locates
+      nothing.
+    - **A request is dismissed, never deleted.** ``dismissed_at`` and
+      ``dismissed_by`` close it. The row stays as the audit of what a
+      reviewer asked for and who judged it unnecessary.
+    - **Fulfilled is derived, not stamped.** A request is fulfilled
+      when a standing ``INSERT_PAGE`` or ``REPLACE_PAGE`` edit exists
+      at its address (``repairs._fulfilling_edits``), and made after
+      the request. No writer stamps
+      it, so the upload cannot race a stamp, and an undo of the upload
+      (#232) reopens the request with no second writer.
+    - **One open request per address.** The unique key is partial over
+      the rows with no dismissal. A second request for the same page
+      answers the first row. A dismissed row frees the address.
+    - **``source_fingerprint`` is the scan's** at the time of the
+      request. The original never changes (the apply writes another
+      file), so it moves only when somebody re-uploads the volume. A
+      request made against an earlier upload is shown with a mark,
+      never dropped: it is for a person, and the person judges it.
+    """
+
+    class Action(models.TextChoices):
+        """What the scanner must do."""
+
+        INSERT = "insert", "Scan a missing page"
+        REPLACE = "replace", "Scan this page again"
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="repair_requests",
+    )
+    action = models.CharField(
+        max_length=16,
+        choices=Action.choices,
+        db_index=True,
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="repair_requests",
+        help_text="Who found the page.",
+    )
+    pdf_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "REPLACE only: the 1-based page of the original PDF to scan again."
+        ),
+    )
+    anchor_pdf_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "INSERT only: the 1-based original page the missing leaf "
+            "follows. 0 puts it before page 1."
+        ),
+    )
+    logical_page = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text=(
+            "The printed page number, a label for the scanner. It "
+            "never locates the page."
+        ),
+    )
+    note = models.TextField(
+        blank=True,
+        default="",
+        help_text="What the reviewer saw. Free text, cut at 500 characters.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the request was made. "
+            "Blank matches anything."
+        ),
+    )
+    dismissed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=(
+            "When a person judged the request unnecessary. A stamped "
+            "row is history, and it is never rewritten."
+        ),
+    )
+    dismissed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="dismissed_repair_requests",
+        help_text="Who dismissed the request. Null while it stands.",
+    )
+
+    class Meta:
+        # The address order needs the column the action uses;
+        # ``repairs.annotate_fulfilled`` orders by that.
+        ordering = ["scan", "pk"]
+        indexes = [
+            models.Index(
+                fields=["scan", "dismissed_at"],
+                name="idx_repair_request_scan_open",
+            ),
+            models.Index(
+                fields=["dismissed_at", "date_created"],
+                name="idx_repair_request_queue",
+            ),
+        ]
+        constraints = [
+            # One address column per action, as on PageEdit: a null is
+            # never a second meaning of a column.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        action="insert",
+                        pdf_page__isnull=True,
+                        anchor_pdf_page__isnull=False,
+                    )
+                    | models.Q(
+                        action="replace",
+                        pdf_page__isnull=False,
+                        anchor_pdf_page__isnull=True,
+                    )
+                ),
+                name="repair_request_address_matches_action",
+            ),
+            # Partial over the open rows: a dismissed request frees the
+            # address, so a later reviewer can ask again.
+            # ``nulls_distinct=False`` because one of the two address
+            # columns is always null.
+            models.UniqueConstraint(
+                fields=["scan", "action", "pdf_page", "anchor_pdf_page"],
+                condition=models.Q(dismissed_at__isnull=True),
+                nulls_distinct=False,
+                name="uniq_open_repair_request_per_address",
+            ),
+        ]
+
+    @property
+    def address(self) -> int:
+        """Return the page or the anchor this request names.
+
+        :returns: ``pdf_page`` for a REPLACE, ``anchor_pdf_page`` for
+            an INSERT.
+        :rtype: int
+        """
+        if self.action == self.Action.INSERT:
+            return self.anchor_pdf_page
+        return self.pdf_page
+
+    @property
+    def is_stale(self) -> bool:
+        """Return whether this request names an earlier upload of the scan.
+
+        A person judges a stale request; nothing applies it, so it is
+        marked and never dropped. Reads ``self.scan``, so a caller that
+        lists many rows joins the scan first.
+
+        :returns: Whether the fingerprints differ. A blank on either
+            side matches anything, the rule of ``page_edits.is_stale``.
+        :rtype: bool
+        """
+        mine, theirs = self.source_fingerprint, self.scan.source_fingerprint
+        return bool(mine and theirs and mine != theirs)
+
+    @property
+    def nav_pdf_index(self) -> int:
+        """Return the 0-based page the viewer scrolls to.
+
+        A missing leaf has no page of its own, so the viewer shows the
+        page before the gap. A gap before page 1 shows page 1.
+
+        :returns: A 0-based PDF page index.
+        :rtype: int
+        """
+        if self.action == self.Action.INSERT:
+            return max(self.anchor_pdf_page - 1, 0)
+        return self.pdf_page - 1
+
+    def __str__(self):
+        where = (
+            f"after p.{self.anchor_pdf_page}"
+            if self.action == self.Action.INSERT
+            else f"p.{self.pdf_page}"
+        )
+        state = " [dismissed]" if self.dismissed_at is not None else ""
+        return f"{self.get_action_display()} {where}{state}"
 
 
 class PendingUpload(AbstractDateTimeModel):
@@ -1938,6 +3422,20 @@ class ExternalJob(AbstractDateTimeModel):
             "pay for hundreds of jobs a volume."
         ),
     )
+    apply_run = models.ForeignKey(
+        ApplyRun,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="jobs",
+        help_text=(
+            "The apply run this row works for (issue #224): a one-page "
+            "shard of a page a curator added or changed. Null for the "
+            "volume runs. Every reader of 'the live volume run' filters "
+            "these rows out, and the apply reads its rows through this "
+            "key and never by run number."
+        ),
+    )
     stage = models.CharField(
         max_length=20,
         choices=JobStage.choices,
@@ -2042,6 +3540,21 @@ class ExternalJob(AbstractDateTimeModel):
             '"page_index": 7, "bbox": [84, 132, 1620, 230]}]}\n\n'
             "and any job may carry per-job tuning overrides, such as "
             '{"dpi": 400}.'
+        ),
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The shard set this row was cut for: '{size_bytes}:"
+            "{page_count}' of the original, the value "
+            "sharding.ensure_shards stamps on Scan.source_fingerprint. "
+            "Stamped by jobs.ensure_shard_jobs on every row of every "
+            "stage, so 'has this set been detected' is one query "
+            "(#250). Not part of the shard identity in input_manifest. "
+            "Blank on a row written before the column, which matches "
+            "anything."
         ),
     )
 

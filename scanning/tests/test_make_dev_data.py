@@ -39,9 +39,10 @@ class TestMakeDevData(TestCase):
         self.assertTrue(pathlib.Path(scan.pdf_path).is_file())
 
     def test_seeds_one_example_of_each_review_state(self):
-        """The seed shows both #154 states plus the legacy review one,
-        so the badges and the step selection are visible in dev."""
-        call_command("make_dev_data", count=3)
+        """The seed shows the two #154 states, the two #263 ones and
+        the legacy review status, so the badges and the step selection
+        are visible in dev."""
+        call_command("make_dev_data", count=5)
 
         statuses = list(
             Scan.objects.order_by("pk").values_list("status", flat=True)
@@ -51,6 +52,8 @@ class TestMakeDevData(TestCase):
             [
                 Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
                 Status.PAGE_COMPLETENESS_REVIEW_DONE,
+                Status.READY_FOR_REDACTION_REVIEW,
+                Status.REDACTION_REVIEW_DONE,
                 Status.PENDING_REVIEW,
             ],
         )

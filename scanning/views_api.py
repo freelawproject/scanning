@@ -12,6 +12,7 @@ from typing import Any
 import fitz
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.db.models import Q
 from django.http import (
     FileResponse,
     Http404,
@@ -21,29 +22,117 @@ from django.http import (
     StreamingHttpResponse,
 )
 from django.shortcuts import get_object_or_404, redirect
+from django.template.loader import render_to_string
+from django.urls import reverse
 from django.utils.cache import get_conditional_response
 from django.utils.http import http_date
-from django.views.decorators.clickjacking import xframe_options_sameorigin
 from django.views.decorators.http import require_POST
 
-from scanning import page_edits
 from scanning.models import (
-    CheckName,
+    BUSY_STATUSES,
+    REVIEW2_CHECKS,
     Detection,
+    DetectionDecision,
     Issue,
+    OpinionBoundary,
     OpinionScan,
+    Redaction,
     Scan,
     Stage,
     Status,
 )
 from scanning.utils import (
     PIPELINE_PAUSED_MESSAGE,
-    find_json_file,
     find_processing_pdf,
     local_original_pdf,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _rebuild_findings(scan: Scan) -> None:
+    """Write the review-2 findings again after a curator's write (#240 PR D).
+
+    Every finding is derived from the detection, boundary and redaction
+    rows, so the endpoint that changed a row is what keeps the cards
+    true. A few queries over label-filtered rows.
+
+    :param scan: The scan.
+    :return: None.
+    """
+    from scanning import findings
+
+    findings.rebuild(scan)
+
+
+# The success lines of the review-2 writes (#322). Every write answers
+# one of these as ``message``, and the viewer shows it as a success
+# toast: a curator who moves a box had no sign that the server kept it,
+# because the box stays where the mouse left it either way. The text
+# lives here, in the view that knows what it wrote, never in the
+# viewer scripts.
+SAVED_REDACTION_MESSAGE = (
+    "The box was saved. The redactions are not measured again from it yet."
+)
+#: A move or a resize, of a redaction box and of a detection box.
+MOVED_BOX_MESSAGE = "The box was moved."
+#: The same move, when the curator's box replaced a computed one.
+MOVED_OVER_COMPUTED_MESSAGE = (
+    "The box was moved. Your box replaces the computed one."
+)
+#: The same move, when the curator's box replaced a model row.
+MOVED_OVER_MODEL_MESSAGE = (
+    "The box was moved. Your box replaces the model box."
+)
+DISMISSED_REDACTION_MESSAGE = "The box was dismissed. Nothing was deleted."
+WITHDRAWN_REDACTION_MESSAGE = "The box was withdrawn. Nothing was deleted."
+RESTORED_REDACTION_MESSAGE = "The box came back."
+STANDING_REDACTION_MESSAGE = "The box was standing already."
+ADDED_DETECTION_MESSAGE = "The detection was added."
+#: A caption or a key icon changes the pairing, which only the
+#: measurement can do (#305).
+ADDED_ANCHOR_DETECTION_MESSAGE = (
+    'The detection was added. Press "Recompute redactions" to pair the '
+    "opinions again."
+)
+STANDING_DETECTION_MESSAGE = "The box is there already."
+#: The approval of a row the curator drew: the view writes nothing,
+#: because the box is theirs and reads 1.0 from birth.
+OWN_DETECTION_MESSAGE = (
+    "This box is your own, so it needs no approval: it reads 1.0 already."
+)
+APPROVED_DETECTION_MESSAGE = (
+    "The detection was approved: the box reads 1.0 now. The card stays "
+    "until the opinions are paired again."
+)
+DISMISSED_DETECTION_MESSAGE = (
+    "The detection was dismissed. Nothing was deleted."
+)
+WITHDRAWN_DETECTION_MESSAGE = (
+    "The detection was withdrawn. Nothing was deleted."
+)
+ADDED_BOUNDARY_MESSAGE = "The opinion boundary was added."
+MOVED_BOUNDARY_MESSAGE = "The opinion boundary was moved."
+DISMISSED_BOUNDARY_MESSAGE = (
+    "The opinion boundary was dismissed. Nothing was deleted."
+)
+WITHDRAWN_BOUNDARY_MESSAGE = (
+    "The opinion boundary was withdrawn. Nothing was deleted."
+)
+RESTORED_BOUNDARY_MESSAGE = "The opinion boundary came back."
+STANDING_BOUNDARY_MESSAGE = "The opinion boundary was standing already."
+DISMISSED_FINDING_MESSAGE = (
+    "The finding was dismissed. Press Undo on the card to take it back."
+)
+RESTORED_FINDING_MESSAGE = "The dismissal was taken back."
+STANDING_FINDING_MESSAGE = "The finding was standing already."
+WITHDRAWN_DECISION_MESSAGE = "The decision was withdrawn."
+STANDING_DECISION_MESSAGE = "The decision was withdrawn already."
+REBUILT_FINDINGS_MESSAGE = "The findings were written again from the rows."
+
+#: The two labels the opinion pairing reads: a box of one of them
+#: changes the boundaries, and only the measurement pairs them again.
+PAIRING_LABELS = ("CASE_CAPTION", "KEY_ICON")
 
 
 def _parse_json_body(request: HttpRequest) -> dict | JsonResponse:
@@ -60,21 +149,6 @@ def _parse_json_body(request: HttpRequest) -> dict | JsonResponse:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
 
-def _rounded_rect(adjusted: dict) -> dict:
-    """Round ``x0``/``y0``/``x1``/``y1`` to one decimal place.
-
-    :param adjusted: Dict with ``x0``, ``y0``, ``x1``, ``y1`` keys.
-    :returns: Dict with the same keys, values rounded to 1 decimal.
-    :rtype: dict
-    """
-    return {
-        "x0": round(adjusted["x0"], 1),
-        "y0": round(adjusted["y0"], 1),
-        "x1": round(adjusted["x1"], 1),
-        "y1": round(adjusted["y1"], 1),
-    }
-
-
 @login_required
 def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     """Return active detections for a scan as JSON.
@@ -84,8 +158,11 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with a list of detection dicts.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    dets = Detection.objects.filter(scan=scan, active=True).order_by(
-        "page_index", "y0"
+    dets = (
+        Detection.objects.live()
+        .filter(scan=scan)
+        .select_related("decision")
+        .order_by("page_index", "y0")
     )
     data = [
         {
@@ -103,6 +180,9 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
             # reviewer draws the box, so until it came from here a
             # hand-added box lost both on the next page load (PR #167).
             "manual": d.model_name == Detection.ModelName.MANUAL,
+            # The standing curator decision on a model row (#240):
+            # "approve" here is why the confidence reads 1.0.
+            "decision": d.decision.kind if d.decision_id else None,
         }
         for d in dets
     ]
@@ -111,258 +191,573 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
 
 @login_required
 def serve_opinions(request: HttpRequest, pk: int) -> JsonResponse:
-    """Return paired opinion data for a scan as JSON.
+    """Return the opinion boundaries of a scan as JSON.
+
+    The rows, in the dict shape ``blackletter.api.pair`` produced plus
+    their ids (#240 PR C, ``boundaries.viewer_payload``). A dismissed
+    computed boundary is in the list with ``dismissed`` true, so the
+    sidebar can offer its undo; the overlays skip it.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: JSON response with a list of opinion dicts.
     """
+    from scanning import boundaries
+
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.opinions_json:
-        return JsonResponse(scan.opinions_json, safe=False)
-    return JsonResponse([], safe=False)
+    return JsonResponse(boundaries.viewer_payload(scan), safe=False)
+
+
+#: The 409 of a boundary anchor on a page no address can be written for
+#: (``boundaries.UnaddressableBoundary``).
+BOUNDARY_UNADDRESSABLE_MESSAGE = (
+    "This page cannot be addressed in the current volume, so the "
+    "boundary cannot be kept. Reload the page; if it stays, ask a staff "
+    "member."
+)
+
+
+def _boundary_or_404(scan: Scan, data: dict):
+    """Return the boundary ``data`` names, or the 404 response.
+
+    :param scan: The scan.
+    :param data: The parsed body, with ``boundary_id``.
+    :returns: The row, or a ``JsonResponse``.
+    """
+    row = OpinionBoundary.objects.filter(
+        pk=data.get("boundary_id"), scan=scan
+    ).first()
+    if row is None:
+        return JsonResponse(
+            {"status": "error", "message": "Opinion boundary not found"},
+            status=404,
+        )
+    return row
 
 
 @login_required
-def serve_margin_rects(request: HttpRequest, pk: int) -> JsonResponse:
-    """Return margin rectangles for a scan, computing them if absent.
+@require_POST
+def dismiss_boundary(request: HttpRequest, pk: int) -> JsonResponse:
+    """Take an opinion boundary out of the volume.
 
-    :param request: The HTTP request.
+    A computed row gets a ``dismiss`` row that copies its anchors (#240
+    PR C): the row is rebuilt at the next compute, and the dismissal is
+    what carries the curator's choice onto the new row. A boundary the
+    curator added is withdrawn, and gives back the computed one it
+    replaced, if any. Nothing is deleted.
+
+    :param request: The HTTP request (JSON body with ``boundary_id``).
     :param pk: Scan primary key.
-    :return: JSON response with per-page margin rect data.
+    :return: ``dismissal_id`` for a computed row, null for a withdrawn
+        addition, plus the ``message`` the viewer shows (#322); 404 when
+        the row is not the scan's.
     """
+    from scanning import boundaries
+
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.margin_rects:
-        return JsonResponse(scan.margin_rects, safe=False)
-    output_base = Path(scan.output_dir)
-    base_pdf = (
-        find_processing_pdf(output_base) if output_base.is_dir() else None
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = _boundary_or_404(scan, data)
+    if isinstance(row, JsonResponse):
+        return row
+    try:
+        dismissal = boundaries.dismiss(scan, row, request.user)
+    except boundaries.UnaddressableBoundary:
+        return JsonResponse(
+            {"status": "error", "message": BOUNDARY_UNADDRESSABLE_MESSAGE},
+            status=409,
+        )
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "boundary_id": row.pk,
+            "dismissal_id": dismissal.pk if dismissal else None,
+            "withdrawn": dismissal is None,
+            "message": (
+                WITHDRAWN_BOUNDARY_MESSAGE
+                if dismissal is None
+                else DISMISSED_BOUNDARY_MESSAGE
+            ),
+        }
     )
-    if not base_pdf:
-        return JsonResponse([], safe=False)
-    # Shared with the pipeline rather than reimplemented: computing these
-    # here with its own detection lookup is how a viewer request that
-    # arrived before this machine had detections.json cached margins with
-    # no top strips, permanently.
-    from scanning.services import _compute_and_save_margin_rects
-
-    rects = _compute_and_save_margin_rects(pk, str(base_pdf), str(output_base))
-    return JsonResponse(rects, safe=False)
 
 
 @login_required
-def serve_redaction_rects(request: HttpRequest, pk: int) -> JsonResponse:
-    """Return redaction rectangles for a scan as JSON.
+@require_POST
+def restore_boundary(request: HttpRequest, pk: int) -> JsonResponse:
+    """Give a dismissed computed boundary back.
+
+    Withdraws the standing dismissal; the boundary is drawn again with
+    no compute. A withdrawn addition is not restored: the curator adds
+    again.
+
+    :param request: The HTTP request (JSON body with ``boundary_id``).
+    :param pk: Scan primary key.
+    :return: ``restored`` says whether a dismissal stood, plus the
+        ``message`` the viewer shows (#322).
+    """
+    from scanning import boundaries
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = _boundary_or_404(scan, data)
+    if isinstance(row, JsonResponse):
+        return row
+    restored = boundaries.restore(scan, row, request.user)
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "boundary_id": row.pk,
+            "restored": restored,
+            "message": (
+                RESTORED_BOUNDARY_MESSAGE
+                if restored
+                else STANDING_BOUNDARY_MESSAGE
+            ),
+        }
+    )
+
+
+def _anchor_spec(scan: Scan, spec) -> "Detection | tuple | JsonResponse":
+    """Turn one anchor of the ``add`` body into what ``boundaries.add`` takes.
+
+    :param scan: The scan.
+    :param spec: ``{"detection_id": n}`` or ``{"page_index", "x", "y"}``
+        with the point in PDF points.
+    :returns: The detection row, the point, or a 400/404 response.
+    """
+    if not isinstance(spec, dict):
+        return JsonResponse(
+            {"status": "error", "message": "An anchor must be an object"},
+            status=400,
+        )
+    if spec.get("detection_id") is not None:
+        row = Detection.objects.filter(
+            pk=spec["detection_id"], scan=scan
+        ).first()
+        if row is None:
+            return JsonResponse(
+                {"status": "error", "message": "Detection not found"},
+                status=404,
+            )
+        return row
+    try:
+        return (int(spec["page_index"]), float(spec["x"]), float(spec["y"]))
+    except (KeyError, TypeError, ValueError):
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "An anchor needs a detection_id, or a "
+                "page_index with x and y",
+            },
+            status=400,
+        )
+
+
+@login_required
+@require_POST
+def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
+    """Write an opinion boundary the curator drew.
+
+    Each anchor is a detection the curator picked (the caption for the
+    start, the key icon for the end) or a point in PDF points.
+    ``replaces`` names the boundary the new one stands in place of (a
+    moved anchor): a computed one is dismissed and the addition written
+    in one transaction, and dismissing the addition gives it back; a
+    curator's own addition is withdrawn and its dismissal carried, so a
+    second move still leaves one boundary.
+
+    :param request: The HTTP request (JSON body with ``start``, ``end``
+        and optionally ``replaces``).
+    :param pk: Scan primary key.
+    :return: The new ``boundary_id`` and the ``dismissal_id`` it
+        replaces; 409 when a page has no address; 400 when the end page
+        is before the start.
+    """
+    from scanning import boundaries, detections
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    start = _anchor_spec(scan, data.get("start"))
+    if isinstance(start, JsonResponse):
+        return start
+    end = _anchor_spec(scan, data.get("end"))
+    if isinstance(end, JsonResponse):
+        return end
+    replaces = None
+    if data.get("replaces") is not None:
+        replaces = (
+            OpinionBoundary.objects.filter(pk=data["replaces"], scan=scan)
+            .filter(
+                Q(origin=OpinionBoundary.Origin.COMPUTED)
+                | Q(
+                    origin=OpinionBoundary.Origin.HUMAN,
+                    kind=OpinionBoundary.Kind.ADD,
+                    withdrawn_at__isnull=True,
+                )
+            )
+            .first()
+        )
+        if replaces is None:
+            return JsonResponse(
+                {
+                    "status": "error",
+                    "message": "The boundary to replace was not found",
+                },
+                status=404,
+            )
+    try:
+        row = boundaries.add(
+            scan,
+            start,
+            end,
+            request.user,
+            detections.measured_run(scan),
+            replaces=replaces,
+        )
+    except boundaries.UnaddressableBoundary:
+        return JsonResponse(
+            {"status": "error", "message": BOUNDARY_UNADDRESSABLE_MESSAGE},
+            status=409,
+        )
+    except boundaries.MisorderedBoundary:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "The end of an opinion cannot be on a page "
+                "before its start.",
+            },
+            status=400,
+        )
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "boundary_id": row.pk,
+            "dismissal_id": row.replaces_id,
+            "message": (
+                MOVED_BOUNDARY_MESSAGE
+                if row.replaces_id
+                else ADDED_BOUNDARY_MESSAGE
+            ),
+        }
+    )
+
+
+@login_required
+def serve_redactions(request: HttpRequest, pk: int) -> JsonResponse:
+    """Return the boxes to paint, grouped by page, in PDF points.
+
+    The redaction rects and the margin strips in one list (#240, PR B),
+    read off the ``Redaction`` rows the compute wrote and the curator
+    edited. Nothing is computed here: a volume the compute has not
+    reached answers an empty list.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response with per-page redaction rect data.
+    :return: ``[{page_index, rects: [{id, x0, y0, x1, y1, fill,
+        rect_type, origin}]}]``.
     """
+    from scanning import redactions
+
     scan = get_object_or_404(Scan, pk=pk)
-    if scan.redaction_rects:
-        return JsonResponse(scan.redaction_rects, safe=False)
-    return JsonResponse([], safe=False)
+    return JsonResponse(redactions.visible_by_page(scan), safe=False)
+
+
+#: The 400 of a malformed box body: one fixed sentence per endpoint,
+#: never the exception's own text (CodeQL).
+BAD_BOX_MESSAGE = (
+    "Bad box: x0, y0, x1 and y1 are required, and the box needs a "
+    "positive width and height."
+)
+BAD_NEW_BOX_MESSAGE = (
+    "Bad box: page_index, x0, y0, x1 and y1 are required, the box needs "
+    "a positive width and height, and fill is black or white."
+)
+
+#: The 409 of a box on a page no address can be written for.
+REDACTION_UNADDRESSABLE_MESSAGE = (
+    "This page cannot be addressed in the current volume, so the box "
+    "cannot be kept. Reload the page; if it stays, ask a staff member."
+)
+
+
+def _redaction_error(message: str, status: int) -> JsonResponse:
+    """Return a refusal the viewer reads (``status == "error"``).
+
+    :param message: What to show the curator.
+    :param status: The HTTP status.
+    :returns: The response.
+    """
+    return JsonResponse({"status": "error", "message": message}, status=status)
+
+
+def _bbox_of(data: dict) -> list[float]:
+    """Read ``x0, y0, x1, y1`` off a JSON body, in points.
+
+    :param data: The body.
+    :returns: The four numbers.
+    :raises ValueError: If one is missing or not a number, or the box
+        is empty.
+    """
+    try:
+        bbox = [float(data[k]) for k in ("x0", "y0", "x1", "y1")]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("x0, y0, x1 and y1 are required") from exc
+    if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+        raise ValueError("a box needs a positive width and height")
+    return bbox
+
+
+def _redaction_of(scan: Scan, redaction_id: int) -> Redaction | None:
+    """Return the scan's redaction row, or None.
+
+    :param scan: The scan.
+    :param redaction_id: The row's pk.
+    :returns: The row.
+    """
+    return Redaction.objects.filter(pk=redaction_id, scan=scan).first()
 
 
 @login_required
 @require_POST
-def save_redaction_rect(request: HttpRequest, pk: int) -> JsonResponse:
-    """Create, update, or delete a redaction rectangle on disk.
+def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
+    """Draw a box: a human ``add`` row, addressed by its source page.
 
-    :param request: The HTTP request (JSON body with page_index,
-        action, original, adjusted, type, and fill).
+    :param request: JSON body with ``page_index``, ``x0``, ``y0``,
+        ``x1``, ``y1`` (points) and ``fill`` (``black`` or ``white``).
     :param pk: Scan primary key.
-    :return: JSON response confirming the operation.
+    :return: ``{status, id, message}``; 400 on a bad body, 409 when the
+        page has no address.
     """
+    from scanning import redactions
+
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    page_idx = data["page_index"]
-    action = data.get("action", "update")
-    original = data.get("original", {})
-    adjusted = data.get("adjusted", {})
-    rect_type = data.get("type", "")
-    fill = data.get("fill", "black")
-    if not scan.redaction_rects:
-        return JsonResponse({"error": "No redaction rects"}, status=404)
-    rects = scan.redaction_rects
-    if action == "delete":
-        for page_data in rects:
-            if page_data["page_index"] != page_idx:
-                continue
-            page_data["rects"] = [
-                r
-                for r in page_data["rects"]
-                if not (
-                    abs(r["x0"] - original["x0"]) < 2
-                    and abs(r["y0"] - original["y0"]) < 2
-                    and r.get("type", "") == rect_type
-                )
-            ]
-            break
-        Scan.objects.filter(pk=pk).update(redaction_rects=rects)
-        return JsonResponse({"status": "ok", "action": "deleted"})
-    found = False
-    for page_data in rects:
-        if page_data["page_index"] != page_idx:
-            continue
-        for r in page_data["rects"]:
-            if (
-                abs(r["x0"] - original.get("x0", -999)) < 2
-                and abs(r["y0"] - original.get("y0", -999)) < 2
-                and r.get("type") == rect_type
-            ):
-                r.update(_rounded_rect(adjusted))
-                found = True
-                break
-        if found:
-            break
-    if not found:
-        for page_data in rects:
-            if page_data["page_index"] == page_idx:
-                page_data["rects"].append(
-                    {
-                        **_rounded_rect(adjusted),
-                        "fill": fill,
-                        "type": rect_type,
-                    }
-                )
-                found = True
-                break
-    Scan.objects.filter(pk=pk).update(redaction_rects=rects)
-    return JsonResponse({"status": "ok", "found": found})
+    try:
+        page_index = int(data["page_index"])
+        bbox = _bbox_of(data)
+        fill = str(data.get("fill") or Redaction.Fill.BLACK)
+        if fill not in Redaction.Fill.values:
+            raise ValueError("fill is black or white")
+    except (KeyError, TypeError, ValueError):
+        # The detail goes to the log, not to the browser (CodeQL).
+        logger.warning(
+            "add_redaction: scan %s: malformed body", pk, exc_info=True
+        )
+        return _redaction_error(BAD_NEW_BOX_MESSAGE, 400)
+    try:
+        row = redactions.add(scan, page_index, bbox, fill, request.user)
+    except redactions.UnaddressableRedaction:
+        return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {"status": "ok", "id": row.pk, "message": SAVED_REDACTION_MESSAGE}
+    )
 
 
 @login_required
 @require_POST
-def save_margin_rect(request: HttpRequest, pk: int) -> JsonResponse:
-    """Update or delete a margin rectangle on disk.
+def move_redaction(
+    request: HttpRequest, pk: int, redaction_id: int
+) -> JsonResponse:
+    """Move or resize a box, and answer the row that holds it now.
 
-    :param request: The HTTP request (JSON body with page_index,
-        action, original, and adjusted).
+    A human box is written in place; a computed one is dismissed and a
+    human box is drawn where the curator put it (#240), so the viewer
+    must address the answered id from then on.
+
+    :param request: JSON body with ``x0``, ``y0``, ``x1``, ``y1``.
     :param pk: Scan primary key.
-    :return: JSON response confirming the operation.
+    :param redaction_id: The row.
+    :return: ``{status, id, message}``.
     """
+    from scanning import redactions
+
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    page_idx = data["page_index"]
-    original = data.get("original", {})
-    action = data.get("action", "update")
-    adjusted = data.get("adjusted", {})
-    if not scan.margin_rects:
-        return JsonResponse({"error": "No margin rects"}, status=404)
-    rects = scan.margin_rects
-    if action == "delete":
-        for page_data in rects:
-            if page_data["page_index"] != page_idx:
-                continue
-            page_data["rects"] = [
-                r
-                for r in page_data["rects"]
-                if not (
-                    abs(r["x0"] - original.get("x0", -999)) < 2
-                    and abs(r["y0"] - original.get("y0", -999)) < 2
-                )
-            ]
-            break
-        Scan.objects.filter(pk=pk).update(margin_rects=rects)
-        return JsonResponse({"status": "ok", "action": "deleted"})
-    found = False
-    for page_data in rects:
-        if page_data["page_index"] != page_idx:
-            continue
-        for r in page_data["rects"]:
-            if (
-                abs(r["x0"] - original.get("x0", -999)) < 2
-                and abs(r["y0"] - original.get("y0", -999)) < 2
-            ):
-                r.update(_rounded_rect(adjusted))
-                found = True
-                break
-        if found:
-            break
-    Scan.objects.filter(pk=pk).update(margin_rects=rects)
-    return JsonResponse({"status": "ok", "found": found})
+    row = _redaction_of(scan, redaction_id)
+    if row is None or row.bbox is None:
+        return _redaction_error("Redaction not found", 404)
+    try:
+        bbox = _bbox_of(data)
+    except ValueError:
+        logger.warning(
+            "move_redaction: scan %s: malformed body", pk, exc_info=True
+        )
+        return _redaction_error(BAD_BOX_MESSAGE, 400)
+    try:
+        holder = redactions.move(scan, row, bbox, request.user)
+    except redactions.UnaddressableRedaction:
+        return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "id": holder.pk,
+            "message": (
+                MOVED_BOX_MESSAGE
+                if holder.pk == row.pk
+                else MOVED_OVER_COMPUTED_MESSAGE
+            ),
+        }
+    )
 
 
-#: Whether a curator may ask for the redaction computation from review
-#: 2. Off for now (#196): the computation renders every page of the
-#: volume and takes the scan out of review for a minute or more, and
-#: the one run the daemon starts after a detection run is the only one
-#: wanted until the stage has been watched on a few volumes (#211).
-#: Turning it back on is this flag plus the "Re-pair Opinions" button
-#: in ``_process_actions.html``; the queueing code below is kept.
-REPAIR_ON_REQUEST_ENABLED = False
+@login_required
+@require_POST
+def dismiss_redaction(
+    request: HttpRequest, pk: int, redaction_id: int
+) -> JsonResponse:
+    """Take a box out: a dismiss of a computed row, a withdrawal of a
+    human one. Nothing is deleted; a second call is a no-op.
 
-REPAIR_DISABLED_MESSAGE = (
-    "Re-pairing on request is off for now. The redactions are computed "
-    "once, when the detection run finishes."
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param redaction_id: The row.
+    :return: ``{status, message}``.
+    """
+    from scanning import redactions
+
+    scan = get_object_or_404(Scan, pk=pk)
+    row = _redaction_of(scan, redaction_id)
+    if row is None or row.bbox is None:
+        return _redaction_error("Redaction not found", 404)
+    human = row.origin == Redaction.Origin.HUMAN
+    redactions.dismiss(scan, row, request.user)
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "message": (
+                WITHDRAWN_REDACTION_MESSAGE
+                if human
+                else DISMISSED_REDACTION_MESSAGE
+            ),
+        }
+    )
+
+
+@login_required
+@require_POST
+def restore_redaction(
+    request: HttpRequest, pk: int, redaction_id: int
+) -> JsonResponse:
+    """Give a dismissed computed box back: the undo of a dismiss.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param redaction_id: The computed row.
+    :return: ``{status, restored, message}``.
+    """
+    from scanning import redactions
+
+    scan = get_object_or_404(Scan, pk=pk)
+    row = _redaction_of(scan, redaction_id)
+    if row is None:
+        return _redaction_error("Redaction not found", 404)
+    restored = redactions.restore(scan, row, request.user)
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "restored": restored,
+            "message": (
+                RESTORED_REDACTION_MESSAGE
+                if restored
+                else STANDING_REDACTION_MESSAGE
+            ),
+        }
+    )
+
+
+#: The refusal of the redaction recompute when the volume carries no
+#: box to measure (#305).
+NO_DETECTIONS_MESSAGE = (
+    "This volume has no detections yet, so there is nothing to measure."
+)
+
+#: The refusal of the findings rebuild while the volume is busy (#305).
+#: The compute writes the findings itself and stamps the run it
+#: measured in afterwards, so a rebuild in that window would write the
+#: cards against the space before it.
+FINDINGS_BUSY_MESSAGE = (
+    "This volume is busy. Its findings are written when the work ends."
+)
+
+#: The gate of step 3 in the view (#263/#269): a volume of the new
+#: pipeline reaches the file generation through the review-2 approval.
+GENERATE_REQUIRES_REDACTION_REVIEW_MESSAGE = (
+    "The redaction review of this volume is not approved yet. Approve "
+    "it in step 2 before the files are generated."
 )
 
 
 @login_required
 @require_POST
-def pair_opinions_api(request: HttpRequest, pk: int) -> JsonResponse:
-    """Ask the daemon to pair the opinions again, with the geometry.
-
-    A curator presses this after they add or delete a detection, and
-    what they want is every consequence of that edit: the pairing, the
-    redaction rects and the margin strips, which are all measured from
-    the same detections. One queued action computes all three (#196),
-    so none of them can be left describing the boxes of an hour ago.
-
-    It runs on the daemon rather than here, because the measurement
-    renders every page of the volume: 83 seconds for 1364 pages. The
-    viewer reloads, sees the scan busy, and its progress poll reloads
-    again when the daemon parks it.
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: JSON response saying the work is queued, or 409 while
-        re-pairing on request is off (``REPAIR_ON_REQUEST_ENABLED``).
-    """
-    scan = get_object_or_404(Scan, pk=pk)
-    if not REPAIR_ON_REQUEST_ENABLED:
-        return JsonResponse({"error": REPAIR_DISABLED_MESSAGE}, status=409)
-    if not Detection.objects.filter(scan=scan, active=True).exists():
-        return JsonResponse({"error": "No detections found"}, status=400)
-
-    from scanning.services import queue_redaction_compute
-
-    queued, message = queue_redaction_compute(scan)
-    if not queued:
-        return JsonResponse({"error": message}, status=409)
-    return JsonResponse({"status": "queued", "message": message}, status=202)
-
-
-@login_required
-@require_POST
 def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
-    """Ask the daemon to compute this scan's redaction geometry.
+    """Ask the daemon to measure this scan's redactions again.
 
-    The same queued action as :func:`pair_opinions_api`, and for the
-    same reason: the measurement renders every page of the volume, so
-    it cannot run inside a request (#196).
+    The "Recompute redactions" button of review 2 (#305). A curator
+    presses it after they draw or dismiss a detection, and what they
+    want is every consequence of that edit: the pairing, the redaction
+    boxes and the margin strips, which are all measured from the same
+    detections. One queued action computes all three (#196), so none of
+    them can be left describing the boxes of an hour ago.
+
+    **It runs on the daemon, not here.** The measurement renders every
+    page of the volume: 83 seconds for 1364 pages. The viewer reloads,
+    sees the scan busy, and its progress poll reloads again when the
+    daemon parks it. Its twin, :func:`rebuild_findings`, reads rows
+    alone and does run here.
+
+    The curator's own rows are kept. A recompute against the standing
+    apply run measures again and imports no model row, so it cannot
+    throw away the edit the curator pressed this for
+    (``run_compute_redactions``).
+
+    There was a second name for this one action, ``pair_opinions_api``
+    at ``scans/<pk>/pair-opinions/``, with the same body (#305). One
+    button does not need two routes.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response saying the work is queued, or 409 while
-        re-pairing on request is off (``REPAIR_ON_REQUEST_ENABLED``).
+    A refusal answers ``{status, message}``, the shape of every other
+    refusal of these views. It answered ``{error}`` while no button
+    reached it (#196); the curator reads the message now.
+
+    :return: JSON response saying the work is queued, 400 when the
+        volume has no detection to measure, or 409 when the status
+        takes no compute (``services.REDACTION_COMPUTE_STATUSES``: a
+        closed review 2 is one, and the way back is the re-queue).
     """
     scan = get_object_or_404(Scan, pk=pk)
-    if not REPAIR_ON_REQUEST_ENABLED:
-        return JsonResponse({"error": REPAIR_DISABLED_MESSAGE}, status=409)
     if not Detection.objects.filter(scan=scan, active=True).exists():
-        return JsonResponse({"error": "No detections found"}, status=400)
+        return JsonResponse(
+            {"status": "error", "message": NO_DETECTIONS_MESSAGE}, status=400
+        )
 
     from scanning.services import queue_redaction_compute
 
     queued, message = queue_redaction_compute(scan)
     if not queued:
-        return JsonResponse({"error": message}, status=409)
+        return JsonResponse(
+            {"status": "error", "message": message}, status=409
+        )
+    logger.info(
+        "scan %s: %s queued a redaction recompute", scan.pk, request.user
+    )
     return JsonResponse({"status": "queued", "message": message}, status=202)
 
 
@@ -376,11 +771,26 @@ def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
     code (``services.run_generate_files``) is kept, but nothing queues
     it; this view fails with the unified pipeline-paused message.
 
+    The review-2 approval is the gate of step 3 (#263), and it is
+    checked here first (#269), before the paused flash: a template gate
+    alone cannot refuse a direct POST, the rule ``start_detect`` follows
+    for review 1. A legacy volume (``PENDING_REVIEW``) never holds the
+    approval and keeps its way in. The order holds the day #206
+    connects the generation.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if scan.status not in (
+        Status.REDACTION_REVIEW_DONE,
+        Status.PENDING_REVIEW,
+    ):
+        messages.warning(request, GENERATE_REQUIRES_REDACTION_REVIEW_MESSAGE)
+        return redirect(
+            f"{reverse('scan_process', kwargs={'pk': scan.pk})}?step=2"
+        )
     messages.warning(request, PIPELINE_PAUSED_MESSAGE)
     return redirect("scan_process", pk=scan.pk)
 
@@ -508,45 +918,6 @@ def serve_opinionscan_pdf(
     response["ETag"] = etag
     response["Last-Modified"] = http_date(last_modified)
     return response
-
-
-@login_required
-@xframe_options_sameorigin
-def serve_page_pdf(request: HttpRequest, pk: int) -> FileResponse:
-    """Serve the per-page PDF for a ``Page`` row.
-
-    Resolves ``page.pdf_path`` (relative to ``scan.output_dir``) to a
-    local file, falling back to an S3 pull when the file is missing
-    locally — same pattern as ``serve_opinionscan_pdf``.
-
-    :param request: The HTTP request.
-    :param pk: Page primary key.
-    :return: File response streaming the PDF.
-    :raises Http404: When the page or its file can't be found.
-    """
-    from scanning.models import Page
-
-    page = get_object_or_404(Page.objects.select_related("scan"), pk=pk)
-    if not page.pdf_path or not page.scan:
-        raise Http404
-
-    candidate = Path(page.scan.output_dir) / page.pdf_path
-    if candidate.is_file():
-        return FileResponse(
-            candidate.open("rb"), content_type="application/pdf"
-        )
-    try:
-        from scanning import s3_sync
-
-        # Just this page's file, not the scan's whole prefix.
-        s3_sync.download_processing_file(page.scan, page.pdf_path)
-    except Exception:
-        logger.exception("Lazy S3 pull failed for page %s", page.pk)
-    if candidate.is_file():
-        return FileResponse(
-            candidate.open("rb"), content_type="application/pdf"
-        )
-    raise Http404
 
 
 def _apply_rect_to_pdf(
@@ -697,290 +1068,552 @@ def serve_ocr_results(request: HttpRequest, pk: int) -> JsonResponse:
     return JsonResponse([], safe=False)
 
 
+#: The 409 of a dismissal asked for a finding that takes none (#240 PR D).
+FINDING_UNDISMISSABLE_MESSAGE = (
+    "This finding cannot be dismissed. It says that one of your own "
+    "decisions is not applied: withdraw that decision instead, or make "
+    "it again on the page as it is now."
+)
+
+#: The 409 of a dismissal whose target has no source page (#240 PR D):
+#: a detection row from before the address existed, or a run of pages
+#: that ends outside the apply run's map.
+FINDING_UNADDRESSABLE_MESSAGE = (
+    "This finding cannot be addressed in the current volume, so the "
+    "dismissal cannot be kept. It goes away when the rows are imported "
+    "again; if it stays, ask a staff member."
+)
+
+#: The 404 of a finding the rebuild has replaced under the viewer.
+FINDING_GONE_MESSAGE = (
+    "This finding is not there any more; the list was rebuilt. Reload "
+    "the page."
+)
+
+
+def _finding_or_404(scan: Scan, data: dict):
+    """Return the review-2 finding ``data`` names, or the 404 response.
+
+    :param scan: The scan.
+    :param data: The parsed body, with ``issue_id``.
+    :returns: The row, or a ``JsonResponse``.
+    """
+    row = Issue.objects.filter(
+        pk=data.get("issue_id"), scan=scan, check_name__in=REVIEW2_CHECKS
+    ).first()
+    if row is None:
+        return JsonResponse(
+            {"status": "error", "message": FINDING_GONE_MESSAGE}, status=404
+        )
+    return row
+
+
 @login_required
 @require_POST
-def flag_issue(request: HttpRequest, pk: int) -> JsonResponse:
-    """Create a user-flagged issue on a scan.
+def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
+    """Dismiss a finding of review 2 (#240 PR D).
 
-    :param request: The HTTP request (JSON body with message,
-        page_number, and metadata).
+    One ``ReviewDismissal`` row at the finding's address, and the
+    finding's FK set at once, so the card is muted with no rebuild. Any
+    logged-in user may press it (the #151 rule). A stale finding is
+    refused: the way out of one is to withdraw the decision it names.
+
+    :param request: The HTTP request (JSON body with ``issue_id``).
     :param pk: Scan primary key.
-    :return: JSON response with the new issue ID.
+    :return: ``{status, dismissal_id, message}``; 404 when the row is
+        gone, 409 when the finding takes no dismissal.
     """
+    from scanning import findings
+
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    message = data.get("message", "").strip()
-    page = data.get("page_number")
-    metadata = data.get("metadata", {})
-    if not message:
+    row = _finding_or_404(scan, data)
+    if isinstance(row, JsonResponse):
+        return row
+    try:
+        dismissal = findings.dismiss(scan, row, request.user)
+    except findings.UndismissableFinding:
         return JsonResponse(
-            {"status": "error", "message": "Message required"}, status=400
+            {"status": "error", "message": FINDING_UNDISMISSABLE_MESSAGE},
+            status=409,
         )
-    type_to_check = {
-        "suppress_detection": CheckName.SUPPRESS_DETECTION,
-        "add_detection": CheckName.ADD_DETECTION,
-        "approve_detection": CheckName.APPROVE_DETECTION,
-    }
-    check_name = type_to_check.get(
-        metadata.get("type", ""), CheckName.PROCESS_FLAG
+    except findings.UnaddressableFinding:
+        return JsonResponse(
+            {"status": "error", "message": FINDING_UNADDRESSABLE_MESSAGE},
+            status=409,
+        )
+    return JsonResponse(
+        {
+            "status": "ok",
+            "dismissal_id": dismissal.pk,
+            "message": DISMISSED_FINDING_MESSAGE,
+        }
     )
-    issue = Issue.objects.create(
-        scan=scan,
-        page_number=page,
-        check_name=check_name,
-        severity="warning",
-        message=message,
-        metadata=metadata or {},
-    )
-    return JsonResponse({"status": "ok", "id": issue.pk})
 
 
 @login_required
 @require_POST
-def remove_flag(request: HttpRequest, pk: int, flag_id: int) -> JsonResponse:
-    """Remove a user-flagged issue from a scan.
+def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
+    """Take back the dismissal of a finding: the card comes back.
+
+    :param request: The HTTP request (JSON body with ``issue_id``).
+    :param pk: Scan primary key.
+    :return: ``{status, restored, message}``.
+    """
+    from scanning import findings
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = _finding_or_404(scan, data)
+    if isinstance(row, JsonResponse):
+        return row
+    restored = findings.restore(scan, row, request.user)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "restored": restored,
+            "message": (
+                RESTORED_FINDING_MESSAGE
+                if restored
+                else STANDING_FINDING_MESSAGE
+            ),
+        }
+    )
+
+
+@login_required
+@require_POST
+def withdraw_stale_edit(request: HttpRequest, pk: int) -> JsonResponse:
+    """Withdraw the curator row a stale finding names, and rebuild.
+
+    The one way out of a ``stale_*`` finding: the decision the compute
+    could not land or place is taken back, as its own endpoint would
+    take it back, and the findings are written again.
+
+    :param request: The HTTP request (JSON body with ``issue_id``).
+    :param pk: Scan primary key.
+    :return: ``{status, withdrawn, message}``; 409 when the finding
+        names no row.
+    """
+    from scanning import findings
+
+    scan = get_object_or_404(Scan, pk=pk)
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = _finding_or_404(scan, data)
+    if isinstance(row, JsonResponse):
+        return row
+    try:
+        withdrawn = findings.withdraw_stale(scan, row, request.user)
+    except findings.NotAStaleFinding:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": "This finding names no decision to withdraw.",
+            },
+            status=409,
+        )
+    return JsonResponse(
+        {
+            "status": "ok",
+            "withdrawn": withdrawn,
+            "message": (
+                WITHDRAWN_DECISION_MESSAGE
+                if withdrawn
+                else STANDING_DECISION_MESSAGE
+            ),
+        }
+    )
+
+
+def _findings_payload(scan: Scan, request: HttpRequest) -> dict:
+    """Render the step-2 findings section and its two counts.
+
+    One context for one template, whichever view answers
+    (``findings.viewer_groups``): the section the page renders and the
+    section a refresh swaps in must agree, or a card would offer a
+    button the endpoint refuses.
+
+    :param scan: The scan.
+    :param request: The HTTP request, for the template context.
+    :return: ``{html, open, stale}``.
+    """
+    from scanning import findings
+
+    context = findings.viewer_groups(scan)
+    return {
+        "html": render_to_string(
+            "scanning/_review_findings.html", context, request=request
+        ),
+        "open": context["review2_open"],
+        "stale": context["review2_stale"],
+    }
+
+
+@login_required
+def review_findings(request: HttpRequest, pk: int) -> JsonResponse:
+    """Render the step-2 findings section as an HTML fragment.
+
+    The viewer swaps the section after every write.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :param flag_id: Primary key of the Issue to remove.
-    :return: JSON response confirming removal.
+    :return: ``{html, open, stale}``.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    Issue.objects.filter(
-        pk=flag_id,
-        scan=scan,
-        check_name__in=[
-            CheckName.PROCESS_FLAG,
-            CheckName.SUPPRESS_DETECTION,
-            CheckName.ADD_DETECTION,
-            CheckName.APPROVE_DETECTION,
-        ],
-    ).delete()
-    return JsonResponse({"status": "ok"})
+    return JsonResponse(_findings_payload(scan, request))
+
+
+@login_required
+@require_POST
+def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
+    """Write the review-2 findings again, here, and answer the section.
+
+    The "Recompute" button of the findings panel (#305), and the twin
+    of review 1's ``recalculate``. ``findings.rebuild`` derives every
+    finding from the ``Detection``, ``OpinionBoundary``, ``Redaction``
+    and decision rows, plus ``ApplyRun.page_map``, which is a column.
+    No S3 read and no page render, so it runs in the request on a web
+    pod that never pulled the volume's files (the #153 rule).
+
+    It changes no box. A finding that only a measurement can answer --
+    a caption the curator drew that no opinion boundary names yet --
+    needs :func:`compute_redactions_api` instead.
+
+    Every logged-in user may press it: review 2 is a curator's step,
+    not a staff one (#151). No review gate either: the rebuild is
+    derived from the rows and is idempotent, so a volume whose rows
+    cannot change gets the findings it already had.
+
+    **A busy volume is refused.** The compute writes the findings
+    itself, against the run it measured in, and stamps that run on the
+    ledger afterwards; a rebuild in that window reads the stamp of the
+    space before it and writes the cards against the wrong one. The
+    sidebar shows the progress panel there and offers no button, and a
+    gate lives in the view, not only in the template.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: ``{status, html, open, stale, message}``; 409 while the
+        volume is busy.
+    """
+    from scanning import findings
+
+    scan = get_object_or_404(Scan, pk=pk)
+    if scan.status in BUSY_STATUSES:
+        return JsonResponse(
+            {"status": "error", "message": FINDINGS_BUSY_MESSAGE}, status=409
+        )
+    findings.rebuild(scan)
+    logger.info(
+        "scan %s: %s rebuilt the review-2 findings", scan.pk, request.user
+    )
+    return JsonResponse(
+        {
+            "status": "ok",
+            "message": REBUILT_FINDINGS_MESSAGE,
+            **_findings_payload(scan, request),
+        }
+    )
 
 
 @login_required
 @require_POST
 def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Deactivate a detection in the database and sync the JSON file.
+    """Take a detection out of the volume.
+
+    A model row gets a ``deactivate`` decision (#240): the row is
+    deleted and written again at the next import, and the decision is
+    what carries the curator's choice onto the new row. A hand-drawn
+    row is withdrawn, and gives back the model box it replaced, if any.
+    Nothing is deleted.
 
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk)).
     :param pk: Scan primary key.
-    :return: JSON response with ``deleted`` count, or 404 if not found.
+    :return: JSON response with ``deleted`` count and the ``message``
+        the viewer shows (#322), or 404 if not found.
     """
-    from scanning.services import _sync_detections_to_disk
+    from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    detection_id = data["detection_id"]
-    page_index = (
-        Detection.objects.filter(pk=detection_id, scan=scan)
-        .values_list("page_index", flat=True)
-        .first()
-    )
-    count = Detection.objects.filter(pk=detection_id, scan=scan).update(
-        active=False
-    )
-    if count == 0:
+    row = Detection.objects.filter(pk=data["detection_id"], scan=scan).first()
+    if row is None:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
-    _drop_orphaned_redaction_rects(scan, page_index)
-    output_dir = Path(scan.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _sync_detections_to_disk(scan.pk)
-    return JsonResponse({"status": "ok", "deleted": count})
-
-
-def _drop_orphaned_redaction_rects(scan: Scan, page_index: int | None) -> None:
-    """Forget a page's saved rects once its last detection is gone.
-
-    ``redaction_rects`` is a snapshot in image pixels, and the scale that
-    converts it to points comes from the page's own detections. Deleting the
-    last one on a page leaves rects that cannot be placed, which stops
-    Generate Files outright, and nothing in the review UI recomputes them.
-
-    Dropping them loses nothing: a page with no detections left has nothing
-    on it to redact, and the reviewer saying so is what deleting the last
-    detection means. Rects on every other page, including any the reviewer
-    adjusted by hand, are untouched.
-
-    :param scan: The scan whose rects to prune.
-    :param page_index: Page the deleted detection was on, if known.
-    """
-    if page_index is None or not scan.redaction_rects:
-        return
-    if Detection.objects.filter(
-        scan=scan, page_index=page_index, active=True
-    ).exists():
-        return
-    remaining = [
-        entry
-        for entry in scan.redaction_rects
-        if entry.get("page_index") != page_index
-    ]
-    if len(remaining) != len(scan.redaction_rects):
-        logger.info(
-            "Dropped saved redaction rects for scan %s page %s: "
-            "no active detections left on it",
-            scan.pk,
-            page_index,
-        )
-        Scan.objects.filter(pk=scan.pk).update(redaction_rects=remaining)
+    manual = row.model_name == Detection.ModelName.MANUAL
+    if manual:
+        detections.withdraw_manual(row, request.user)
+    else:
+        try:
+            detections.decide(
+                scan, row, DetectionDecision.Kind.DEACTIVATE, request.user
+            )
+        except detections.UnaddressableDetection:
+            return _unaddressable()
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "deleted": 1,
+            "message": (
+                WITHDRAWN_DETECTION_MESSAGE
+                if manual
+                else DISMISSED_DETECTION_MESSAGE
+            ),
+        }
+    )
 
 
 @login_required
 @require_POST
 def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Update the bounding box of an existing detection.
+    """Move or resize a detection box.
 
-    Looks up the detection by its DB primary key, updates the bbox
-    columns, then rebuilds ``detections.json`` from the DB via
-    ``_sync_detections_to_disk`` so the file and S3 stay in sync.
+    A hand-drawn row is the curator's own and is written in place. A
+    model row is not written (#240): it is deactivated by a decision
+    and a hand-drawn row is created where the curator put the box, so
+    the move survives the next import. The response names the row that
+    now holds the box, and the viewer must address that one from then
+    on.
 
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk) and ``new_bbox`` (list[float], ``[x0,y0,x1,y1]``)).
     :param pk: Scan primary key.
-    :return: JSON response with ``updated`` count, or 404 if not found.
+    :return: JSON response with ``updated`` count, ``detection_id`` and
+        the ``message`` the viewer shows (#322), or 404 if not found.
     """
-    from scanning.services import _sync_detections_to_disk
+    from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    detection_id = data["detection_id"]
     new_bbox = data["new_bbox"]
-    count = Detection.objects.filter(pk=detection_id, scan=scan).update(
-        x0=new_bbox[0],
-        y0=new_bbox[1],
-        x1=new_bbox[2],
-        y1=new_bbox[3],
-    )
-    if count == 0:
+    row = Detection.objects.filter(pk=data["detection_id"], scan=scan).first()
+    if row is None:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
-    output_dir = Path(scan.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _sync_detections_to_disk(scan.pk)
-    return JsonResponse({"status": "ok", "updated": count})
+    if row.model_name == Detection.ModelName.MANUAL:
+        Detection.objects.filter(pk=row.pk).update(
+            x0=new_bbox[0], y0=new_bbox[1], x1=new_bbox[2], y1=new_bbox[3]
+        )
+        holder = row
+    else:
+        try:
+            holder = detections.move_model_row(
+                scan, row, new_bbox, request.user
+            )
+        except detections.UnaddressableDetection:
+            return _unaddressable()
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "updated": 1,
+            "detection_id": holder.pk,
+            "message": (
+                MOVED_BOX_MESSAGE
+                if holder.pk == row.pk
+                else MOVED_OVER_MODEL_MESSAGE
+            ),
+        }
+    )
+
+
+#: The 409 of a decision about a box no address can be written for
+#: (``detections.UnaddressableDetection``).
+DETECTION_UNADDRESSABLE_MESSAGE = (
+    "This box cannot be addressed in the current volume, so the change "
+    "cannot be kept. Reload the page; if it stays, ask a staff member."
+)
+
+
+def _unaddressable() -> JsonResponse:
+    """Return the 409 for a refused decision.
+
+    :returns: The response.
+    """
+    return JsonResponse(
+        {"status": "error", "message": DETECTION_UNADDRESSABLE_MESSAGE},
+        status=409,
+    )
+
+
+#: How far, in image pixels, a drawn box may sit from a model box and
+#: still mean "that one": the add endpoint then approves the model box
+#: rather than draw a second one over it.
+BOOST_TOLERANCE_PX = 15
 
 
 @login_required
 @require_POST
 def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Add a new detection or boost an existing one.
+    """Add a detection by hand, or approve the model box it lands on.
 
-    If a detection with the same label and approximate position already
-    exists, its confidence is "boosted" to 1.0 (confirmed by the user).
-    Otherwise a new detection is created with confidence 1.0 and
-    model_name "manual".
-
-    Updates both the Detection DB record and detections.json on disk.
+    A box drawn within ``BOOST_TOLERANCE_PX`` of a live model box with
+    the same label is that box, and the model box gets an ``approve``
+    decision (#240). Otherwise a hand-drawn row is written, addressed
+    by its source page. The rows are the only store; nothing here reads
+    or writes a file.
 
     :param request: The HTTP request (JSON body with page_index,
         label_id, bbox, img_width, and img_height).
     :param pk: Scan primary key.
-    :return: JSON response with ``added=True`` if new, ``added=False``
-        if an existing detection was boosted.
+    :return: JSON response with ``added=True`` and the new row's
+        ``detection_id`` if new, ``added=False`` and the approved row's
+        id if an existing detection was approved. Both carry the
+        ``message`` the viewer shows (#322).
     """
+    from blackletter.models import Label
+
+    from scanning import detections
+
     scan = get_object_or_404(Scan, pk=pk)
     det = _parse_json_body(request)
     if isinstance(det, JsonResponse):
         return det
-    output_base = Path(scan.output_dir)
-    det_path = find_json_file(output_base, "detections.json")
-    if not det_path:
-        return JsonResponse({"error": "No detections.json"}, status=404)
-    existing = json.loads(det_path.read_text())
-    boosted = False
-    for e in existing:
-        if e["page_index"] != det["page_index"]:
-            continue
-        if e["label_id"] != det["label_id"]:
-            continue
-        if (
-            abs(e["bbox"][0] - det["bbox"][0]) < 15
-            and abs(e["bbox"][1] - det["bbox"][1]) < 15
-        ):
-            e["confidence"] = 1.0
-            boosted = True
-            Detection.objects.filter(
-                scan=scan,
-                page_index=det["page_index"],
-                label_id=det["label_id"],
-                x0__gte=det["bbox"][0] - 15,
-                x0__lte=det["bbox"][0] + 15,
-                y0__gte=det["bbox"][1] - 15,
-                y0__lte=det["bbox"][1] + 15,
-            ).update(confidence=1.0)
-            break
-    if not boosted:
-        det["confidence"] = 1.0
-        existing.append(det)
-        from blackletter.models import Label
+    try:
+        page_index = int(det["page_index"])
+        label_id = int(det["label_id"])
+        bbox = [float(v) for v in det["bbox"]]
+        if len(bbox) != 4:
+            raise ValueError("bbox needs four numbers")
+        label_name = Label(label_id).name
+    except (KeyError, TypeError, ValueError):
+        # The detail goes to the log, not to the browser (CodeQL).
+        logger.warning(
+            "add_single_detection: scan %s: malformed body", pk, exc_info=True
+        )
+        return JsonResponse(
+            {
+                "error": "Bad detection: page_index, label_id and a bbox "
+                "of four numbers are required"
+            },
+            status=400,
+        )
 
-        try:
-            label_name = Label(det["label_id"]).name
-            Detection.objects.create(
-                scan=scan,
-                page_index=det["page_index"],
-                label=label_name,
-                label_id=det["label_id"],
-                confidence=1.0,
-                x0=det["bbox"][0],
-                y0=det["bbox"][1],
-                x1=det["bbox"][2],
-                y1=det["bbox"][3],
-                img_width=det.get("img_width", 0),
-                img_height=det.get("img_height", 0),
-                model_name=Detection.ModelName.MANUAL,
-                model_count=1,
-                # No provenance, on purpose (#196): the confidence gates
-                # are per model family, and a second family in the file
-                # sends the whole volume back to the legacy gates.
-                found_by=[],
-            )
-        except Exception:
-            logger.exception("Failed to create manual detection")
-    det_path.write_text(json.dumps(existing))
-    return JsonResponse({"status": "ok", "added": not boosted})
+    # Any live row, hand-drawn ones included: a second click on the
+    # curator's own box must be a no-op, not a second box over it.
+    near = (
+        Detection.objects.live()
+        .filter(
+            scan=scan,
+            page_index=page_index,
+            label_id=label_id,
+            x0__gte=bbox[0] - BOOST_TOLERANCE_PX,
+            x0__lte=bbox[0] + BOOST_TOLERANCE_PX,
+            y0__gte=bbox[1] - BOOST_TOLERANCE_PX,
+            y0__lte=bbox[1] + BOOST_TOLERANCE_PX,
+        )
+        .order_by("pk")
+        .first()
+    )
+    if near is not None:
+        message = STANDING_DETECTION_MESSAGE
+        if near.model_name != Detection.ModelName.MANUAL:
+            message = APPROVED_DETECTION_MESSAGE
+            # No run passed: ``decide`` resolves one only for a row with
+            # no address, so the common case costs no ledger read.
+            try:
+                detections.decide(
+                    scan, near, DetectionDecision.Kind.APPROVE, request.user
+                )
+            except detections.UnaddressableDetection:
+                return _unaddressable()
+        _rebuild_findings(scan)
+        return JsonResponse(
+            {
+                "status": "ok",
+                "added": False,
+                "detection_id": near.pk,
+                "message": message,
+            }
+        )
+    run = detections.measured_run(scan)
+    try:
+        row = detections.add_manual(
+            scan,
+            page_index,
+            label_name,
+            label_id,
+            bbox,
+            int(det.get("img_width") or 0),
+            int(det.get("img_height") or 0),
+            run=run,
+        )
+    except detections.UnaddressableDetection:
+        return _unaddressable()
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "added": True,
+            "detection_id": row.pk,
+            "message": (
+                ADDED_ANCHOR_DETECTION_MESSAGE
+                if label_name in PAIRING_LABELS
+                else ADDED_DETECTION_MESSAGE
+            ),
+        }
+    )
 
 
 @login_required
 @require_POST
 def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Set a detection's confidence to 1.0 in the DB and sync the JSON file.
+    """Approve a detection: its confidence reads 1.0 from now on.
+
+    A model row gets an ``approve`` decision (#240), which the next
+    import lands on the same box again. A hand-drawn row is the
+    curator's already and needs none, and the message says so (#322):
+    this view writes nothing for one.
 
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk)).
     :param pk: Scan primary key.
-    :return: JSON response with ``updated`` count, or 404 if not found.
+    :return: JSON response with ``updated`` count and the ``message``
+        the viewer shows (#322), or 404 if not found.
     """
-    from scanning.services import _sync_detections_to_disk
+    from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    detection_id = data["detection_id"]
-    count = Detection.objects.filter(pk=detection_id, scan=scan).update(
-        confidence=1.0
-    )
-    if count == 0:
+    row = Detection.objects.filter(pk=data["detection_id"], scan=scan).first()
+    if row is None:
         return JsonResponse(
             {"status": "error", "message": "Detection not found"}, status=404
         )
-    output_dir = Path(scan.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _sync_detections_to_disk(scan.pk)
-    return JsonResponse({"status": "ok", "updated": count})
+    manual = row.model_name == Detection.ModelName.MANUAL
+    if not manual:
+        try:
+            detections.decide(
+                scan, row, DetectionDecision.Kind.APPROVE, request.user
+            )
+        except detections.UnaddressableDetection:
+            return _unaddressable()
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "updated": 1,
+            "message": (
+                OWN_DETECTION_MESSAGE if manual else APPROVED_DETECTION_MESSAGE
+            ),
+        }
+    )
 
 
 @login_required
@@ -1002,24 +1635,48 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     )
 
 
+#: The 409 of ``export_pdf``: the standing page edits cannot be built
+#: into a volume. The fault itself is logged, never sent.
+EXPORT_NOT_BUILDABLE_MESSAGE = (
+    "The corrected PDF cannot be built from the page edits as they "
+    "stand. Check the step-1 page changes, or ask a staff member."
+)
+
+
+def _unlink_quietly(path: str) -> None:
+    """Remove a temp file, and swallow a file that is already gone.
+
+    :param path: The file.
+    :return: None.
+    """
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 @login_required
 def export_pdf(
     request: HttpRequest, pk: int
 ) -> StreamingHttpResponse | HttpResponse:
-    """Export a corrected PDF with the deletions and inserts applied.
+    """Export the corrected PDF, as the apply builds it.
 
     Reads the curator's decisions off the ``PageEdit`` rows (#214), in
-    the physical space of the original: a page marked for deletion is
-    dropped, and each uploaded image is placed in the gap its row
-    names. A replacement or a rotation is *not* applied here -- those
-    kinds have no interface yet, and the volume-level apply that owns
-    them is #206.
+    the physical space of the original, and runs the walk the apply
+    runs (``apply.build_final_pdf``, #224): a page marked for deletion
+    is dropped, an uploaded page stands in for a replaced one, a
+    rotated page is turned, and each inserted file is placed in the gap
+    its row names. The export and the final PDF are one walk, so what
+    a curator downloads is what the apply builds.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: PDF file download response, or a 404 when the original PDF
-        cannot be made available locally.
+    :return: PDF file download response, a 404 when the original PDF
+        cannot be made available locally, or a 409 naming the fault when
+        the rows cannot be built into a volume.
     """
+    from scanning import apply
+
     scan = get_object_or_404(Scan, pk=pk)
     # Resolve the source PDF before the temp file exists, so a missing
     # original is a clean 404 rather than a leaked temp file.
@@ -1030,53 +1687,36 @@ def export_pdf(
     tmp.close()
     tmp_path = tmp.name
     try:
-        deleted_pages = page_edits.deleted_pages(scan)
-        gaps = page_edits.inserts_by_gap(scan)
         with fitz.open(original) as pdf_doc:
-            for pdf_page in sorted(deleted_pages, reverse=True):
-                pdf_index = pdf_page - 1
-                if 0 <= pdf_index < len(pdf_doc):
-                    pdf_doc.delete_page(pdf_index)
-            offset = 0
-            for anchor in sorted(gaps):
-                # The anchor is a page of the *original*, so the
-                # position it names moves by every page removed before
-                # it and every page inserted before it.
-                surviving = anchor - len(
-                    [p for p in deleted_pages if p <= anchor]
-                )
-                for edit in gaps[anchor]:
-                    pno = min(surviving + offset, len(pdf_doc))
-                    # The image lives in S3 since #214, so it is read as
-                    # bytes: a remote file has no path for fitz to open.
-                    with edit.image.open("rb") as fh:
-                        data = fh.read()
-                    if edit.image.name.lower().endswith(".pdf"):
-                        with fitz.open(stream=data, filetype="pdf") as ins:
-                            pdf_doc.insert_pdf(
-                                ins,
-                                from_page=0,
-                                to_page=ins.page_count - 1,
-                                start_at=pno,
-                            )
-                            offset += ins.page_count
-                        continue
-                    reference = pdf_doc.load_page(
-                        min(pno, len(pdf_doc) - 1)
-                    ).rect
-                    new_page = pdf_doc.new_page(
-                        pno=pno,
-                        width=reference.width,
-                        height=reference.height,
-                    )
-                    new_page.insert_image(new_page.rect, stream=data)
-                    offset += 1
-            pdf_doc.save(tmp_path)
+            # The plan is built over ``Scan.page_count``, so a row that
+            # disagrees with the file would address a page the walk
+            # cannot reach and raise inside ``build_final_pdf``. The
+            # old walk clamped every index; this reads the file, which
+            # is what ``apply._build`` checks too.
+            scan.page_count = pdf_doc.page_count
+        # Each uploaded file is read once, for the plan and the walk.
+        files, counts = apply.preload_edit_files(scan)
+        plan = apply.plan_run(scan, counts)
+        with fitz.open(original) as source:
+            with apply.build_final_pdf(
+                source, plan, read_file=lambda edit: files[edit.pk]
+            ) as pdf_doc:
+                pdf_doc.save(tmp_path)
+    except apply.ApplyError as exc:
+        # The rows do not build into a volume: a shard with fewer pages
+        # than the map asks for, a file that is gone. The apply counts
+        # the same fault on its run. The detail goes to the log and not
+        # to the browser (CodeQL: an exception's text is not for an
+        # external user); the answer says what to do.
+        _unlink_quietly(tmp_path)
+        logger.warning(
+            "export_pdf: scan %s: the page edits do not build: %s", pk, exc
+        )
+        return HttpResponse(
+            EXPORT_NOT_BUILDABLE_MESSAGE, status=409, content_type="text/plain"
+        )
     except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        _unlink_quietly(tmp_path)
         raise
 
     filename = f"{scan.reporter.short_name}_{scan.volume}_corrected.pdf"

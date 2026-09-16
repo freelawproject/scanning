@@ -190,8 +190,11 @@ function showViewerWait(container, message, opts) {
  * @param {Function} cb.onFail - (error, url) => void; url is the direct
  *   link to offer (null when even the URL fetch failed).
  */
-function loadOriginalPdf(docId, cb) {
-    fetch('/scans/' + docId + '/original-url/')
+function loadOriginalPdf(docId, cb, opts) {
+    // opts.final asks for the corrected volume of the standing apply
+    // run (#269), which step 2 shows; the review-1 space otherwise.
+    var query = (opts && opts.final) ? '?space=final' : '';
+    fetch('/scans/' + docId + '/original-url/' + query)
         .then(function (resp) {
             if (!resp.ok) throw new Error('HTTP ' + resp.status);
             return resp.json();
@@ -301,6 +304,45 @@ function renderPreviewBanner(previewKind, onLoadOriginal) {
     banner.hidden = false;
 }
 
+// What a curator may type as a page number, in the one place both
+// viewers read (issue #319). The three shapes a book prints: one
+// number; one number with one trailing letter, on the page the book
+// adds between two numbered pages ("2094a"); and the range one
+// physical page carries when the book prints several pages on it
+// (#233). The server takes the same three and stores a range with a
+// hyphen, whatever dash was typed, so the dashes here are the ones a
+// reporter prints and a person pastes.
+var PAGE_ENTRY_RE = /^(\d{1,4})(?:([A-Za-z])|\s*[-–—]\s*(\d{1,4}))?$/;
+
+// The prompt, and the refusal. The server carries the same words in
+// ``views_process.PAGE_NUMBER_ERROR``.
+var PAGE_NUMBER_PROMPT =
+    ' (a number with a trailing letter like 2094a, or a range like ' +
+    '913-925 if this page carries several book pages; leave blank if ' +
+    'it has no number):';
+var PAGE_NUMBER_ERROR =
+    'Page number must be a positive whole number, a number with one ' +
+    'trailing letter like 2094a, or a range like 678-686.';
+
+/**
+ * Judge a page number a curator typed, before the request is sent.
+ *
+ * The one gate of the two viewers: both post to ``assign_page``, and
+ * the server refuses what this refuses.
+ *
+ * @param {string} text - The trimmed entry. Never the empty string,
+ *     which is the curator clearing the number.
+ * @returns {boolean} Whether the entry is one of the three shapes.
+ */
+function isPageNumberEntry(text) {
+    var parts = PAGE_ENTRY_RE.exec(text);
+    if (!parts) return false;
+    var first = parseInt(parts[1], 10);
+    if (first < 1) return false;
+    if (parts[3] === undefined) return true;
+    return first < parseInt(parts[3], 10);
+}
+
 /**
  * Escape text for safe interpolation into an innerHTML string.
  *
@@ -357,6 +399,9 @@ function deletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelete) {
             if (typeof window.onPageEditSaved === 'function') {
                 window.onPageEditSaved();
             }
+        } else {
+            // A locked review answers 409 with the reason (#224).
+            showToast(data.error || 'Could not mark this page for deletion.');
         }
     });
 }
@@ -381,16 +426,24 @@ function markPageAsDeleted(pageDiv, pdfPage, labelPrefix, csrfToken, docId, onDe
         if (!label.dataset.originalHtml) {
             label.dataset.originalHtml = label.innerHTML;
         }
+        // The page edits are locked once review 1 is approved (#224),
+        // and an applied deletion still stands, so this runs on load
+        // for a locked volume too: it must not offer the one control
+        // the endpoint refuses.
+        var locked = typeof SCAN_CONFIG !== 'undefined' && SCAN_CONFIG.pageEditsLocked === true;
         label.innerHTML =
             '<span>' + labelPrefix + ' ' + pdfPage + ' &mdash; MARKED FOR DELETION</span> ' +
+            (locked ? '' :
             '<button class="undo-delete-btn" style="pointer-events:auto;cursor:pointer;' +
             'background:#dc2626;color:white;border:none;border-radius:3px;padding:1px 6px;' +
-            'font-size:10px;margin-left:4px">Undo Delete</button>';
+            'font-size:10px;margin-left:4px">Undo Delete</button>');
         var undoBtn = label.querySelector('.undo-delete-btn');
-        undoBtn.addEventListener('click', function (e) {
-            e.stopPropagation();
-            undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelete);
-        });
+        if (undoBtn) {
+            undoBtn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelete);
+            });
+        }
     }
 }
 
@@ -433,6 +486,8 @@ function undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelet
             if (typeof window.onPageEditSaved === 'function') {
                 window.onPageEditSaved();
             }
+        } else {
+            showToast(data.error || 'Could not take the deletion back.');
         }
     });
 }
@@ -440,9 +495,14 @@ function undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelet
 /**
  * Show a stacking toast notification that auto-dismisses after 5 seconds.
  *
+ * The same text in a toast that still stands restarts that toast's
+ * timer and adds no second card (#322): a drag over four resize
+ * handles saves four times, and four copies of one line would bury the
+ * page.
+ *
  * @param {string} message - Text to display.
- * @param {string} [type="error"] - "error" (red), "info" (blue), or
- *     "success" (green).
+ * @param {string} [type="error"] - "error" (red), "info" (blue),
+ *     "success" (green), or "warning" (amber).
  */
 function showToast(message, type) {
     type = type || 'error';
@@ -453,10 +513,20 @@ function showToast(message, type) {
         container.style.cssText = 'position:fixed;bottom:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:9999;pointer-events:none;';
         document.body.appendChild(container);
     }
+    var key = type + '\n' + message;
+    for (var i = 0; i < container.children.length; i++) {
+        var standing = container.children[i];
+        if (standing.dataset.toastKey === key && standing._restart) {
+            standing._restart();
+            return;
+        }
+    }
     var toast = document.createElement('div');
+    toast.dataset.toastKey = key;
     var bg = '#2563eb';
     if (type === 'error') { bg = '#dc2626'; }
     else if (type === 'success') { bg = '#059669'; }
+    else if (type === 'warning') { bg = '#d97706'; }
     toast.style.cssText = 'background:' + bg + ';color:#fff;padding:10px 16px;border-radius:6px;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,0.3);opacity:1;transition:opacity 0.4s;max-width:320px;pointer-events:auto;display:flex;align-items:center;gap:10px;';
 
     var text = document.createElement('span');
@@ -472,14 +542,83 @@ function showToast(message, type) {
 
     container.appendChild(toast);
 
+    // The removal is held, because the restart below must cancel it: a
+    // repeat that lands in the 400 ms of the fade would else come back
+    // to full opacity and be taken off the page anyway (#322).
+    var removal = null;
+
     function dismiss() {
         toast.style.opacity = '0';
-        setTimeout(function () { toast.remove(); }, 400);
+        removal = setTimeout(function () { toast.remove(); }, 400);
     }
 
     var timer = setTimeout(dismiss, 5000);
+    toast._restart = function () {
+        clearTimeout(timer);
+        clearTimeout(removal);
+        toast.style.opacity = '1';
+        timer = setTimeout(dismiss, 5000);
+    };
     closeBtn.addEventListener('mouseenter', function () { clearTimeout(timer); });
     closeBtn.addEventListener('mouseleave', function () { timer = setTimeout(dismiss, 2000); });
+}
+
+// The key the saved line waits under while the page reloads (#322).
+var SAVED_TOAST_KEY = 'scanning.savedToast';
+
+/**
+ * Show the server's success line as a toast (#322).
+ *
+ * Every write of review 2 answers ``{status: "ok", message}``, and the
+ * message is the one record of what the server kept: a moved box stays
+ * where the mouse left it, so the page looks the same after a save and
+ * after a refusal. The text comes from the view, which knows what it
+ * wrote; a call site adds none of its own.
+ *
+ * @param {Object} data - The parsed answer of the endpoint.
+ */
+function showSaved(data) {
+    if (data && data.message) { showToast(data.message, 'success'); }
+}
+
+/**
+ * Keep the server's success line over a page reload (#322).
+ *
+ * The boundary writes and the recompute reload the page, which would
+ * throw a toast away. The line waits in ``sessionStorage`` and the
+ * loaded page shows it. Session storage throws in a private window, so
+ * every access is guarded; a lost message costs the reader the line,
+ * not the page.
+ *
+ * @param {Object} data - The parsed answer of the endpoint.
+ */
+function showSavedAfterReload(data) {
+    if (!data || !data.message) { return; }
+    try {
+        window.sessionStorage.setItem(SAVED_TOAST_KEY, data.message);
+    } catch (e) {
+        showToast(data.message, 'success');
+    }
+}
+
+/**
+ * Show the line a write left before it reloaded the page (#322).
+ */
+function flushSavedToast() {
+    var message = null;
+    try {
+        message = window.sessionStorage.getItem(SAVED_TOAST_KEY);
+        window.sessionStorage.removeItem(SAVED_TOAST_KEY);
+    } catch (e) {
+        return;
+    }
+    if (message) { showToast(message, 'success'); }
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', flushSavedToast);
+} else {
+    flushSavedToast();
 }
 
 /**

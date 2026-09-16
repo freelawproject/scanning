@@ -13,8 +13,12 @@ import tempfile
 from unittest import mock
 
 import fitz
+from django.conf import settings
 from django.core.files.storage import default_storage
-from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.files.uploadedfile import (
+    SimpleUploadedFile,
+    TemporaryUploadedFile,
+)
 from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
@@ -116,15 +120,26 @@ class TestPageEditConstraints(TestCase):
         PageEditFactory(scan=other, pdf_page=7, value="700")
         self.assertEqual(PageEdit.objects.count(), 2)
 
-    def test_an_applied_decision_frees_its_address(self):
-        # The apply closes a row and produces a new original. A curator
-        # editing the same page again writes a new row, so the unique
-        # key must count only the open ones.
+    def test_an_applied_decision_keeps_its_address(self):
+        # The apply stamp is a ledger entry, not a close (#224): an
+        # applied row stands, so the address is still taken. A curator
+        # who decides again supersedes it (``page_edits.supersede``),
+        # which withdraws the applied row first.
         PageEditFactory(
             scan=self.scan,
             pdf_page=7,
             value="700",
             applied_at=timezone.now(),
+        )
+        self._refused(pdf_page=7, value="701")
+
+    def test_a_withdrawn_decision_frees_its_address(self):
+        PageEditFactory(
+            scan=self.scan,
+            pdf_page=7,
+            value="700",
+            applied_at=timezone.now(),
+            withdrawn_at=timezone.now(),
         )
         again = PageEditFactory(scan=self.scan, pdf_page=7, value="701")
         self.assertIsNone(again.applied_at)
@@ -515,6 +530,93 @@ class TestDismissIssueWritesAnEdit(TestCase):
         )
 
 
+class TestADeletionAnswersItsCards(TestCase):
+    """A card about a page marked for deletion goes away (#255)."""
+
+    def setUp(self):
+        self.user = UserFactory()
+        self.scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            start_page=1,
+            end_page=2,
+            page_count=2,
+            source_fingerprint="100:2",
+            ocr_results=[
+                {"pdf_page": 1, "detected": None, "type": None, "zone": None},
+                {
+                    "pdf_page": 2,
+                    "detected": "2",
+                    "type": "single",
+                    "zone": "dots-header",
+                },
+            ],
+        )
+
+    def _delete_page_1(self, **fields):
+        """Mark PDF page 1 for deletion.
+
+        :param fields: Values that overwrite the row's defaults.
+        :returns: The new edit.
+        :rtype: PageEdit
+        """
+        defaults = {
+            "kind": PageEdit.Kind.DELETE_PAGE,
+            "pdf_page": 1,
+            "value": "",
+            "source_fingerprint": self.scan.source_fingerprint,
+        }
+        return PageEditFactory(scan=self.scan, **{**defaults, **fields})
+
+    def _checks(self):
+        """Read the checks the rebuild wrote.
+
+        :returns: One name per issue row of the scan.
+        :rtype: list[str]
+        """
+        from scanning import services
+
+        services.recalculate_issues(self.scan)
+        return list(
+            self.scan.issues.values_list("check_name", flat=True).order_by(
+                "check_name"
+            )
+        )
+
+    def test_the_card_of_a_deleted_page_goes(self):
+        self._delete_page_1()
+
+        self.assertNotIn(CheckName.NO_PAGE_NUMBER, self._checks())
+
+    def test_the_card_of_a_live_page_stays(self):
+        # The same volume, with no deletion on it.
+        self.assertIn(CheckName.NO_PAGE_NUMBER, self._checks())
+
+    def test_a_printed_number_card_stays(self):
+        # "Page 1 is missing" names the printed number 1, not PDF page
+        # 1. To answer it the sequence analysis must run again over the
+        # volume without the deleted pages, which this pass does not do.
+        self._delete_page_1()
+
+        self.assertIn(CheckName.MISSING_PAGE, self._checks())
+
+    def test_an_undone_deletion_brings_the_card_back(self):
+        edit = self._delete_page_1()
+        self.assertNotIn(CheckName.NO_PAGE_NUMBER, self._checks())
+
+        page_edits.withdraw(PageEdit.objects.filter(pk=edit.pk), self.user)
+
+        self.assertIn(CheckName.NO_PAGE_NUMBER, self._checks())
+
+    def test_a_deletion_of_another_original_hides_nothing(self):
+        # The row names a page nobody chose, so it answers no card and
+        # it keeps the warning that says it did not land.
+        self._delete_page_1(source_fingerprint="999:9")
+
+        checks = self._checks()
+        self.assertIn(CheckName.NO_PAGE_NUMBER, checks)
+        self.assertIn(CheckName.STALE_PAGE_EDIT, checks)
+
+
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestManualReadingMigration(TestCase):
     """The #214 data migration, run against the live app registry.
@@ -711,6 +813,26 @@ class TestPageInsertEndpoints(ScanningTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.scan.page_edits.get().anchor_pdf_page, 1)
+
+    def test_a_range_missing_at_the_end_takes_one_upload(self):
+        # The placeholder of a collapsed trailing run is labelled with
+        # the range it stands for (#256), and an insert may be several
+        # pages, so one PDF of the whole range fills it.
+        self.scan.page_map = self.scan.page_map + [
+            {
+                "type": "missing",
+                "logical_number": "4-13",
+                "missing_range": [4, 13],
+            }
+        ]
+        self.scan.save(update_fields=["page_map"])
+
+        response = self._upload(anchor_pdf_page=2, page_number="4-13")
+
+        self.assertEqual(response.status_code, 200)
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.anchor_pdf_page, 2)
+        self.assertEqual(edit.logical_page, "4-13")
 
     def test_a_printed_number_may_hold_letters(self):
         # A printed page number is not always a whole number: front
@@ -1062,7 +1184,10 @@ class TestReplaceButton(ScanningTestCase):
         response = self._step_one()
 
         self.assertContains(response, "Your page changes are saved.")
-        self.assertContains(response, "#206")
+        self.assertContains(
+            response, "Approve this volume when the pages are complete"
+        )
+        self.assertNotContains(response, "#206")
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -1157,17 +1282,59 @@ class TestPageUploadsTakeAPdf(ScanningTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertFalse(self.scan.page_edits.exists())
 
+    @override_settings(PAGE_UPLOAD_MAX_BYTES=2 * 1024 * 1024)
     def test_a_file_over_the_cap_is_refused(self):
+        """The cap is the setting, and the refusal names its value in MB."""
         upload = SimpleUploadedFile(
             "page.png",
-            b"x" * (views_process.PAGE_UPLOAD_MAX_BYTES + 1),
+            b"x" * (2 * 1024 * 1024 + 1),
             content_type="image/png",
         )
 
         response = self._replace(upload)
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("50 MB", json.loads(response.content)["error"])
+        self.assertIn("2 MB", json.loads(response.content)["error"])
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_the_default_cap_takes_a_rescan_of_a_whole_gap(self):
+        """A 90-page rescan of 138 MB was refused at 50 MB (so3d vol 361).
+
+        A gap takes one insert (#256), so the file could not be split;
+        the default is a sixth of the original upload cap instead.
+        """
+        self.assertEqual(
+            settings.PAGE_UPLOAD_MAX_BYTES,
+            settings.MAX_ORIGINAL_UPLOAD_SIZE // 6,
+        )
+        self.assertEqual(settings.PAGE_UPLOAD_MAX_BYTES, 512 * 1024 * 1024)
+        self.assertGreater(settings.PAGE_UPLOAD_MAX_BYTES, 138 * 1024 * 1024)
+        self.assertIn("512 MB", views_process.upload_too_large_message())
+
+    def test_a_pdf_on_disk_is_counted_from_its_temporary_file(self):
+        """A large upload lands in a temporary file; fitz opens that path.
+
+        The bytes are not read into memory a second time, and the
+        upload is left rewound for the storage write that follows.
+        """
+        with fitz.open() as doc:
+            for _ in range(3):
+                doc.new_page()
+            pdf = doc.tobytes()
+        upload = TemporaryUploadedFile(
+            "leaf.pdf", "application/pdf", len(pdf), None
+        )
+        upload.write(pdf)
+        upload.seek(0)
+        with mock.patch.object(
+            views_process.fitz, "open", wraps=fitz.open
+        ) as opened:
+            self.assertEqual(views_process._pdf_page_count(upload), 3)
+        opened.assert_called_once_with(
+            upload.temporary_file_path(), filetype="pdf"
+        )
+        self.assertEqual(upload.tell(), 0)
+        upload.close()
 
     def test_an_image_keeps_its_own_extension(self):
         self._replace(self.make_image())
@@ -1441,13 +1608,28 @@ class TestExportPdfAppliesTheEdits(ScanningTestCase):
 
         self.assertEqual(self._export(), 5)
 
-    def test_an_applied_edit_is_not_applied_again(self):
+    def test_an_applied_edit_still_stands(self):
+        # An applied deletion is still a deletion (#224): the next
+        # build must see it, or the second final PDF would restore the
+        # page in silence. Only a withdrawal takes a decision back.
         PageEditFactory(
             scan=self.scan,
             kind=PageEdit.Kind.DELETE_PAGE,
             pdf_page=2,
             value="",
             applied_at=timezone.now(),
+        )
+
+        self.assertEqual(self._export(), 3)
+
+    def test_a_withdrawn_edit_is_not_applied(self):
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+            applied_at=timezone.now(),
+            withdrawn_at=timezone.now(),
         )
 
         self.assertEqual(self._export(), 4)

@@ -12,12 +12,13 @@ from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import models
 from django.test import RequestFactory, TestCase, override_settings
-from django.urls import reverse
+from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
 from PIL import Image
 
 from scanning.factories import (
     ExternalJobFactory,
+    OpinionBoundaryFactory,
     OpinionScanFactory,
     PageEditFactory,
     ReporterFactory,
@@ -26,16 +27,20 @@ from scanning.factories import (
     VolumeFactory,
 )
 from scanning.models import (
+    ApplyRun,
     Detection,
+    DetectionDecision,
     JobEngine,
     JobStage,
     JobStatus,
     OpinionScan,
     OpinionStatus,
     PageEdit,
+    PageRepairRequest,
     PendingUpload,
     QueuedAction,
     QueueStatus,
+    Redaction,
     Scan,
     Source,
     Stage,
@@ -183,6 +188,81 @@ class TestScanList(ScanningTestCase):
         self.assertEqual(len(response.context["page_obj"]), 25)
         response = self.client.get(reverse("scan_list"), {"page": 2})
         self.assertEqual(len(response.context["page_obj"]), 5)
+
+    def _ask_for_a_page(self, scan, user, pdf_page=1):
+        """Record one waiting repair request on the scan (#266).
+
+        :param scan: The scan the page belongs to.
+        :param user: Who found the page.
+        :param pdf_page: The page a scanner must scan again.
+        :returns: The new row.
+        """
+        return PageRepairRequest.objects.create(
+            scan=scan,
+            action=PageRepairRequest.Action.REPLACE,
+            requested_by=user,
+            pdf_page=pdf_page,
+            source_fingerprint=scan.source_fingerprint,
+        )
+
+    def test_a_waiting_repair_raises_a_badge(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(uploaded_by=user, page_count=3)
+        self._ask_for_a_page(scan, user, pdf_page=1)
+        self._ask_for_a_page(scan, user, pdf_page=2)
+
+        response = self.client.get(reverse("scan_list"))
+
+        self.assertEqual(response.context["page_obj"][0].waiting_repairs, 2)
+        # One badge in the table, one in the mobile card.
+        self.assertContains(response, "2 repairs requested", count=2)
+
+    def test_a_scan_with_no_request_carries_no_badge(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        ScanFactory(uploaded_by=user, page_count=3)
+
+        response = self.client.get(reverse("scan_list"))
+
+        self.assertEqual(response.context["page_obj"][0].waiting_repairs, 0)
+        self.assertNotContains(response, "repairs requested")
+
+    def test_a_dismissed_request_carries_no_badge(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(uploaded_by=user, page_count=3)
+        row = self._ask_for_a_page(scan, user)
+        row.dismissed_at = timezone.now()
+        row.dismissed_by = user
+        row.save(update_fields=["dismissed_at", "dismissed_by"])
+
+        response = self.client.get(reverse("scan_list"))
+
+        self.assertNotContains(response, "repairs requested")
+
+    def test_the_badge_costs_one_query_whatever_the_page_holds(self):
+        """The count is grouped, never a subquery per row (#266).
+
+        The nine are the session, the user, the page count, the rows,
+        the repair count, the two error counters, the reporters of the
+        filter, and the header count. None of them is per scan, so ten
+        volumes cost what one costs.
+        """
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(uploaded_by=user, page_count=3)
+        self._ask_for_a_page(scan, user)
+
+        with self.assertNumQueries(9):
+            self.client.get(reverse("scan_list"))
+
+        for _ in range(9):
+            other = ScanFactory(uploaded_by=user, page_count=3)
+            self._ask_for_a_page(other, user)
+
+        with self.assertNumQueries(9):
+            self.client.get(reverse("scan_list"))
 
 
 class TestScanDetail(ScanningTestCase):
@@ -2382,253 +2462,364 @@ class TestRunFullPipelinePullsFromS3(ScanningTestCase):
         mock_pull.assert_called_once_with(scan.pk)
 
 
-class TestUpdateDetection(ScanningTestCase):
-    """Tests for the update_detection endpoint."""
+class DetectionEndpointMixin:
+    """One scan with one model detection, for the four box endpoints."""
 
-    def _make_scan_with_detection(self):
-        """Create a scan, its output_dir, and one Detection record.
+    def _make_scan_with_detection(self, **fields):
+        """Create a scan and one model ``Detection`` row.
 
+        :param fields: Overrides for the row.
         :return: Tuple of (scan, detection).
         :rtype: tuple
         """
-        scan = ScanFactory()
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        det = Detection.objects.create(
-            scan=scan,
-            page_index=0,
-            label="CASE_CAPTION",
-            label_id=1,
-            confidence=0.9,
-            x0=100.0,
-            y0=100.0,
-            x1=200.0,
-            y1=200.0,
-            img_width=1200,
-            img_height=1600,
-            model_name=Detection.ModelName.SMALL,
-            model_count=1,
-            found_by=[{"model": "yolo", "confidence": 0.9}],
+        scan = ScanFactory(source_fingerprint="100:1")
+        values = {
+            "scan": scan,
+            "page_index": 0,
+            "label": "CASE_CAPTION",
+            "label_id": 1,
+            "confidence": 0.9,
+            "x0": 100.0,
+            "y0": 100.0,
+            "x1": 200.0,
+            "y1": 200.0,
+            "img_width": 1200,
+            "img_height": 1600,
+            "model_name": Detection.ModelName.BL_WARM,
+            "model_count": 1,
+            "found_by": [{"model": "bl_warm", "confidence": 0.9}],
+            "source_page": 1,
+            "source_fingerprint": "100:1",
+        }
+        values.update(fields)
+        return scan, Detection.objects.create(**values)
+
+    def _post(self, name, scan, body):
+        """POST ``body`` as JSON to the named endpoint of ``scan``.
+
+        :param name: The URL name.
+        :param scan: The scan.
+        :param body: The payload.
+        :return: The response.
+        """
+        return self.client.post(
+            reverse(name, kwargs={"pk": scan.pk}),
+            data=json.dumps(body),
+            content_type="application/json",
         )
-        return scan, det
 
-    def test_updates_db_and_disk(self):
-        """POST with valid detection_id updates DB coords and writes detections.json."""
-        from unittest.mock import patch
 
+class TestUpdateDetection(DetectionEndpointMixin, ScanningTestCase):
+    """Tests for the update_detection endpoint (#240)."""
+
+    def test_a_moved_model_box_becomes_a_deactivation_and_a_hand_drawn_row(
+        self,
+    ):
+        """The model row is not written: it would be lost at the next
+        import. Two human rows survive it, and the response names the
+        row that holds the box now."""
         user = self.make_staff_user()
         self.client.force_login(user)
         scan, det = self._make_scan_with_detection()
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("update_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps(
-                    {
-                        "detection_id": det.pk,
-                        "new_bbox": [150.0, 150.0, 250.0, 250.0],
-                    }
-                ),
-                content_type="application/json",
-            )
+        response = self._post(
+            "update_detection",
+            scan,
+            {"detection_id": det.pk, "new_bbox": [150.0, 150.0, 250.0, 250.0]},
+        )
 
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["updated"], 1)
-
         det.refresh_from_db()
-        self.assertEqual(det.x0, 150.0)
-        self.assertEqual(det.y0, 150.0)
-        self.assertEqual(det.x1, 250.0)
-        self.assertEqual(det.y1, 250.0)
+        self.assertEqual(
+            [det.x0, det.y0, det.x1, det.y1], [100, 100, 200, 200]
+        )
+        self.assertFalse(det.active)
+        self.assertEqual(det.decision.kind, DetectionDecision.Kind.DEACTIVATE)
+        self.assertEqual(det.decision.author, user)
+        holder = Detection.objects.get(pk=body["detection_id"])
+        self.assertEqual(holder.model_name, Detection.ModelName.MANUAL)
+        self.assertEqual(
+            [holder.x0, holder.y0, holder.x1, holder.y1], [150, 150, 250, 250]
+        )
+        self.assertEqual(holder.replaces, det.decision)
+        self.assertEqual(holder.source_page, 1)
+        self.assertEqual(holder.label, det.label)
+        self.assertFalse(
+            pathlib.Path(scan.output_dir).joinpath("detections.json").exists()
+        )
 
-        det_path = pathlib.Path(scan.output_dir) / "detections.json"
-        self.assertTrue(det_path.exists())
-        saved = json.loads(det_path.read_text())
-        self.assertEqual(len(saved), 1)
-        self.assertEqual(saved[0]["bbox"], [150.0, 150.0, 250.0, 250.0])
+    def test_a_hand_drawn_row_is_written_in_place(self):
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, det = self._make_scan_with_detection(
+            model_name=Detection.ModelName.MANUAL, confidence=1.0, found_by=[]
+        )
+
+        response = self._post(
+            "update_detection",
+            scan,
+            {"detection_id": det.pk, "new_bbox": [1.0, 2.0, 3.0, 4.0]},
+        )
+
+        body = json.loads(response.content)
+        self.assertEqual(body["detection_id"], det.pk)
+        det.refresh_from_db()
+        self.assertEqual([det.x0, det.y0, det.x1, det.y1], [1, 2, 3, 4])
+        self.assertTrue(det.active)
+        self.assertEqual(DetectionDecision.objects.count(), 0)
 
     def test_unknown_detection_id_returns_404(self):
         """POST with a non-existent detection_id returns 404."""
-        from unittest.mock import patch
-
         user = self.make_staff_user()
         self.client.force_login(user)
         scan, _det = self._make_scan_with_detection()
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("update_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps(
-                    {
-                        "detection_id": 999999,
-                        "new_bbox": [0.0, 0.0, 10.0, 10.0],
-                    }
-                ),
-                content_type="application/json",
-            )
+        response = self._post(
+            "update_detection",
+            scan,
+            {"detection_id": 999999, "new_bbox": [0.0, 0.0, 10.0, 10.0]},
+        )
 
         self.assertEqual(response.status_code, 404)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "error")
 
 
-class TestDeleteDetection(ScanningTestCase):
-    """Tests for the delete_detection endpoint."""
+class TestDeleteDetection(DetectionEndpointMixin, ScanningTestCase):
+    """Tests for the delete_detection endpoint (#240)."""
 
-    def _make_scan_with_detection(self):
-        """Create a scan, its output_dir, and one active Detection record.
-
-        :return: Tuple of (scan, detection).
-        :rtype: tuple
-        """
-        scan = ScanFactory()
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        det = Detection.objects.create(
-            scan=scan,
-            page_index=0,
-            label="CASE_CAPTION",
-            label_id=1,
-            confidence=0.9,
-            x0=100.0,
-            y0=100.0,
-            x1=200.0,
-            y1=200.0,
-            img_width=1200,
-            img_height=1600,
-            model_name=Detection.ModelName.SMALL,
-            model_count=1,
-            found_by=[{"model": "small", "confidence": 0.9}],
-        )
-        return scan, det
-
-    def test_deactivates_db_and_removes_from_disk(self):
-        """POST with valid detection_id sets active=False and removes it from detections.json."""
-        from unittest.mock import patch
-
+    def test_a_model_row_gets_a_deactivation(self):
+        """``active`` is the derived read; the decision is the record."""
         user = self.make_staff_user()
         self.client.force_login(user)
         scan, det = self._make_scan_with_detection()
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("delete_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps({"detection_id": det.pk}),
-                content_type="application/json",
-            )
+        response = self._post(
+            "delete_detection", scan, {"detection_id": det.pk}
+        )
 
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["deleted"], 1)
-
         det.refresh_from_db()
         self.assertFalse(det.active)
+        decision = det.decision
+        self.assertEqual(decision.kind, DetectionDecision.Kind.DEACTIVATE)
+        self.assertEqual(decision.source_page, 1)
+        self.assertEqual(decision.source_fingerprint, "100:1")
+        self.assertEqual(decision.target_bbox, [100, 100, 200, 200])
+        self.assertEqual(decision.target_confidence, 0.9)
+        self.assertEqual(decision.author, user)
 
-        det_path = pathlib.Path(scan.output_dir) / "detections.json"
-        self.assertTrue(det_path.exists())
-        saved = json.loads(det_path.read_text())
-        self.assertEqual(len(saved), 0)
+    def test_a_hand_drawn_row_is_withdrawn_and_gives_back_the_box_it_replaced(
+        self,
+    ):
+        user = self.make_staff_user()
+        self.client.force_login(user)
+        scan, det = self._make_scan_with_detection()
+        moved = self._post(
+            "update_detection",
+            scan,
+            {"detection_id": det.pk, "new_bbox": [150.0, 150.0, 250.0, 250.0]},
+        )
+        holder_pk = json.loads(moved.content)["detection_id"]
+
+        response = self._post(
+            "delete_detection", scan, {"detection_id": holder_pk}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        holder = Detection.objects.get(pk=holder_pk)
+        self.assertFalse(holder.active)
+        self.assertIsNotNone(holder.withdrawn_at)
+        self.assertEqual(holder.withdrawn_by, user)
+        det.refresh_from_db()
+        self.assertTrue(det.active)
+        self.assertIsNone(det.decision)
+        self.assertIsNotNone(holder.replaces.withdrawn_at)
+
+    def test_a_second_deletion_is_a_no_op(self):
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection()
+        self._post("delete_detection", scan, {"detection_id": det.pk})
+
+        response = self._post(
+            "delete_detection", scan, {"detection_id": det.pk}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            DetectionDecision.objects.filter(scan=scan).count(), 1
+        )
 
     def test_unknown_id_returns_404(self):
         """POST with a non-existent detection_id returns 404."""
-        from unittest.mock import patch
-
-        user = self.make_staff_user()
-        self.client.force_login(user)
+        self.client.force_login(self.make_staff_user())
         scan, _det = self._make_scan_with_detection()
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("delete_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps({"detection_id": 999999}),
-                content_type="application/json",
-            )
+        response = self._post(
+            "delete_detection", scan, {"detection_id": 999999}
+        )
 
         self.assertEqual(response.status_code, 404)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "error")
 
 
-class TestApproveDetection(ScanningTestCase):
-    """Tests for the approve_detection endpoint."""
+class TestApproveDetection(DetectionEndpointMixin, ScanningTestCase):
+    """Tests for the approve_detection endpoint (#240)."""
 
-    def _make_scan_with_detection(self):
-        """Create a scan, its output_dir, and one Detection record.
-
-        :return: Tuple of (scan, detection).
-        :rtype: tuple
-        """
-        scan = ScanFactory()
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        det = Detection.objects.create(
-            scan=scan,
-            page_index=0,
-            label="KEY_ICON",
-            label_id=2,
-            confidence=0.7,
-            x0=50.0,
-            y0=50.0,
-            x1=100.0,
-            y1=100.0,
-            img_width=1200,
-            img_height=1600,
-            model_name=Detection.ModelName.SMALL,
-            model_count=1,
-            found_by=[{"model": "small", "confidence": 0.7}],
-        )
-        return scan, det
-
-    def test_sets_confidence_and_syncs_disk(self):
-        """POST with valid detection_id sets confidence=1.0 and updates detections.json."""
-        from unittest.mock import patch
-
+    def test_a_model_row_gets_an_approval(self):
         user = self.make_staff_user()
         self.client.force_login(user)
-        scan, det = self._make_scan_with_detection()
+        scan, det = self._make_scan_with_detection(
+            label="KEY_ICON", label_id=2, confidence=0.7
+        )
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("approve_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps({"detection_id": det.pk}),
-                content_type="application/json",
-            )
+        response = self._post(
+            "approve_detection", scan, {"detection_id": det.pk}
+        )
 
         self.assertEqual(response.status_code, 200)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["updated"], 1)
-
         det.refresh_from_db()
         self.assertEqual(det.confidence, 1.0)
+        self.assertEqual(det.decision.kind, DetectionDecision.Kind.APPROVE)
+        self.assertEqual(det.decision.target_confidence, 0.7)
 
-        det_path = pathlib.Path(scan.output_dir) / "detections.json"
-        self.assertTrue(det_path.exists())
-        saved = json.loads(det_path.read_text())
-        self.assertEqual(len(saved), 1)
-        self.assertEqual(saved[0]["confidence"], 1.0)
+    def test_a_deletion_after_an_approval_leaves_one_decision_standing(self):
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection(confidence=0.7)
+        self._post("approve_detection", scan, {"detection_id": det.pk})
+
+        self._post("delete_detection", scan, {"detection_id": det.pk})
+
+        det.refresh_from_db()
+        self.assertFalse(det.active)
+        self.assertEqual(det.decision.kind, DetectionDecision.Kind.DEACTIVATE)
+        standing = DetectionDecision.objects.filter(
+            scan=scan, withdrawn_at__isnull=True
+        )
+        self.assertEqual(standing.count(), 1)
+        self.assertEqual(
+            DetectionDecision.objects.filter(scan=scan).count(), 2
+        )
+
+    def test_a_row_with_no_address_answers_409_on_every_endpoint(self):
+        """A pre-#240 row outside the standing map: the decision cannot
+        land, so it is refused, not written (PR #288 review). The four
+        arms are copies, so one loop pins them all."""
+        from unittest.mock import patch
+
+        from scanning import detections
+        from scanning.tests.test_yolo_apply import glued_run
+
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection(
+            page_index=9, source_page=None
+        )
+        run = glued_run(scan)
+        posts = [
+            ("approve_detection", {"detection_id": det.pk}),
+            ("delete_detection", {"detection_id": det.pk}),
+            (
+                "update_detection",
+                {"detection_id": det.pk, "new_bbox": [1.0, 1.0, 2.0, 2.0]},
+            ),
+            (
+                "add_single_detection",
+                {
+                    "page_index": 9,
+                    "label_id": det.label_id,
+                    "bbox": [100.0, 100.0, 200.0, 200.0],
+                    "img_width": 1200,
+                    "img_height": 1600,
+                },
+            ),
+            (
+                "add_single_detection",
+                {
+                    "page_index": 9,
+                    "label_id": 7,
+                    "bbox": [500.0, 500.0, 600.0, 600.0],
+                    "img_width": 1200,
+                    "img_height": 1600,
+                },
+            ),
+        ]
+        for name, body in posts:
+            with self.subTest(name=name, body=body):
+                with patch.object(
+                    detections, "measured_run", return_value=run
+                ):
+                    with self.assertLogs(
+                        "scanning.detections", level="WARNING"
+                    ):
+                        response = self._post(name, scan, body)
+                self.assertEqual(response.status_code, 409)
+                self.assertIn(
+                    "cannot be addressed",
+                    json.loads(response.content)["message"],
+                )
+        self.assertEqual(DetectionDecision.objects.count(), 0)
+        self.assertEqual(Detection.objects.filter(scan=scan).count(), 1)
+        det.refresh_from_db()
+        self.assertEqual(det.confidence, 0.9)
+        self.assertTrue(det.active)
+
+    def test_a_hand_drawn_row_needs_no_decision(self):
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection(
+            model_name=Detection.ModelName.MANUAL, confidence=1.0, found_by=[]
+        )
+
+        response = self._post(
+            "approve_detection", scan, {"detection_id": det.pk}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(DetectionDecision.objects.count(), 0)
 
     def test_unknown_id_returns_404(self):
         """POST with a non-existent detection_id returns 404."""
-        from unittest.mock import patch
-
-        user = self.make_staff_user()
-        self.client.force_login(user)
+        self.client.force_login(self.make_staff_user())
         scan, _det = self._make_scan_with_detection()
 
-        with patch("scanning.s3_sync.upload_file_to_s3"):
-            response = self.client.post(
-                reverse("approve_detection", kwargs={"pk": scan.pk}),
-                data=json.dumps({"detection_id": 999999}),
-                content_type="application/json",
-            )
+        response = self._post(
+            "approve_detection", scan, {"detection_id": 999999}
+        )
 
         self.assertEqual(response.status_code, 404)
         body = json.loads(response.content)
         self.assertEqual(body["status"], "error")
+
+
+class TestServeDetectionsCarriesTheDecision(
+    DetectionEndpointMixin, ScanningTestCase
+):
+    """The viewer's list carries the standing decision (#240)."""
+
+    def test_lists_live_rows_with_their_decision(self):
+        self.client.force_login(self.make_user())
+        scan, det = self._make_scan_with_detection()
+        self._post("approve_detection", scan, {"detection_id": det.pk})
+        _scan, gone = self._make_scan_with_detection(scan=scan, page_index=1)
+        self._post("delete_detection", scan, {"detection_id": gone.pk})
+
+        response = self.client.get(
+            reverse("serve_detections", kwargs={"pk": scan.pk})
+        )
+
+        rows = json.loads(response.content)
+        self.assertEqual([r["id"] for r in rows], [det.pk])
+        self.assertEqual(rows[0]["decision"], "approve")
+        self.assertFalse(rows[0]["manual"])
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -2733,9 +2924,9 @@ class TestPipelinePausedViews(ScanningTestCase):
     def test_start_detect_explains_itself_without_detections(self):
         """Not "paused" any more: detection works since #195/#196.
 
-        The action still starts nothing -- a run costs GPU time, so a
-        staff member starts it -- but it says who does, instead of
-        blaming a pipeline that is back.
+        The action still starts nothing -- the daemon starts the run
+        by itself (#250) -- and a volume with no run at all hears
+        that, instead of blaming a pipeline that is back.
         """
         from scanning.views_process import NO_DETECTIONS_MESSAGE
 
@@ -2825,7 +3016,9 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
             uploaded_by=self.user,
             status=Status.PENDING_REVIEW,
             page_count=1,
-            opinions_json=[{"dummy": True}],
+        )
+        OpinionBoundaryFactory(
+            scan=self.scan, start_page_index=0, end_page_index=0
         )
         pathlib.Path(self.scan.original_pdf.path).unlink()
         # An output dir with no bitonal/OCR PDF in it: the API views get
@@ -2859,24 +3052,6 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
             y1=1,
         )
 
-    def test_re_pairing_on_request_is_off_for_now(self):
-        """Both review-2 endpoints refuse and queue nothing (#196): the
-        daemon's one run after detection is the only computation wanted
-        until the stage has been watched on a few volumes."""
-        from scanning.views_api import REPAIR_DISABLED_MESSAGE
-
-        self._caption()
-        before = self.scan.status
-        for name in ("pair_opinions_api", "compute_redactions_api"):
-            response = self.client.post(
-                reverse(name, kwargs={"pk": self.scan.pk})
-            )
-            self.assertEqual(response.status_code, 409, name)
-            self.assertEqual(response.json()["error"], REPAIR_DISABLED_MESSAGE)
-        self.scan.refresh_from_db()
-        self.assertEqual(self.scan.status, before)
-
-    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
     def test_compute_redactions_needs_no_pdf_in_the_request(self):
         """It queues the work, so a missing local PDF is not its problem.
 
@@ -2888,15 +3063,18 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
             reverse("compute_redactions_api", kwargs={"pk": self.scan.pk})
         )
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["error"], "No detections found")
+        self.assertEqual(response.json()["status"], "error")
 
-    @patch("scanning.views_api.REPAIR_ON_REQUEST_ENABLED", True)
-    def test_pair_opinions_queues_the_work(self):
-        """Pairing is queued with the geometry it feeds (#196), once the
-        switch is back on."""
+    def test_the_recompute_queues_the_work(self):
+        """The button of review 2 queues the measurement (#305).
+
+        One queued action pairs the opinions, measures the redaction
+        boxes and measures the margin strips, because all three read
+        the same detections (#196).
+        """
         self._caption()
         response = self.client.post(
-            reverse("pair_opinions_api", kwargs={"pk": self.scan.pk})
+            reverse("compute_redactions_api", kwargs={"pk": self.scan.pk})
         )
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["status"], "queued")
@@ -2905,6 +3083,15 @@ class TestViewsWithoutLocalOriginal(ScanningTestCase):
         self.assertEqual(
             self.scan.queued_action, QueuedAction.COMPUTE_REDACTIONS
         )
+
+    def test_the_old_pairing_route_is_gone(self):
+        """One button does not need two routes (#305).
+
+        ``pair_opinions_api`` was a copy of ``compute_redactions_api``,
+        body for body.
+        """
+        with self.assertRaises(NoReverseMatch):
+            reverse("pair_opinions_api", kwargs={"pk": self.scan.pk})
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -3160,6 +3347,58 @@ class TestAssignPage(ScanningTestCase):
                     json.loads(response.content)["detected"], "913-925"
                 )
 
+    def test_sets_a_number_with_a_trailing_letter(self):
+        """The page the book adds between two numbered pages (#319)."""
+        response = self._post(2, "2094a")
+
+        self.assertEqual(response.status_code, 200)
+        answer = json.loads(response.content)
+        self.assertEqual(answer["detected"], "2094a")
+        self.assertEqual(answer["type"], "suffixed")
+        self.scan.refresh_from_db()
+        r = self.scan.ocr_results[1]
+        self.assertEqual(r["detected"], "2094a")
+        self.assertEqual(r["type"], "suffixed")
+        self.assertEqual(r["zone"], "manual")
+
+    def test_keeps_the_case_of_a_trailing_letter(self):
+        """The book prints one of the two glyphs."""
+        self.assertEqual(
+            json.loads(self._post(2, "2094A").content)["detected"], "2094A"
+        )
+
+    def test_takes_a_trailing_letter_the_reader_refuses(self):
+        """The two-digit guard is against a token of a running head, so
+        it does not reach a person with the page in front of them."""
+        self.assertEqual(
+            json.loads(self._post(2, "9a").content)["detected"], "9a"
+        )
+
+    def test_takes_a_letter_the_reader_does_not_trust(self):
+        """The reader reads six letters, because the rest are noise it
+        cannot tell from a page (#319). A person can."""
+        for typed in ("2094l", "2094z"):
+            with self.subTest(typed=typed):
+                answer = json.loads(self._post(2, typed).content)
+                self.assertEqual(answer["detected"], typed)
+                self.assertEqual(answer["type"], "suffixed")
+
+    def test_rejects_two_trailing_letters(self):
+        for typed in ("2094ab", "a2094", "20a94", "2094a-2096", "0a"):
+            with self.subTest(typed=typed):
+                self.assertEqual(self._post(2, typed).status_code, 400)
+
+    def test_answers_the_shape_of_the_stored_number(self):
+        """The viewer draws the tag from this, not from the string."""
+        for typed, shape in (
+            ("7", "single"),
+            ("913-925", "range"),
+            ("2094a", "suffixed"),
+        ):
+            with self.subTest(typed=typed):
+                answer = json.loads(self._post(2, typed).content)
+                self.assertEqual(answer["type"], shape)
+
     def test_rejects_a_backward_range(self):
         """A range names a first page and a last page, in that order."""
         self.assertEqual(self._post(2, "925-913").status_code, 400)
@@ -3250,11 +3489,53 @@ class TestSidebarDuplicateMarkers(ScanningTestCase):
         )
 
 
+class TestSidebarOpinionPageNumbers(ScanningTestCase):
+    """The opinion cards read the printed spans off the OCR rows (#240
+    PR C), not the page map: blackletter's map puts the physical page in
+    ``logical_number`` for a range page (#233) and the range in
+    ``range_label``, so a lookup built from it showed the physical page
+    where the old ``bl_pair`` output showed the range's end."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            uploaded_by=self.user,
+            status=Status.PENDING_REVIEW,
+            page_count=2,
+            ocr_results=[
+                {"pdf_page": 1, "detected": "913-925", "type": "range"},
+                {"pdf_page": 2, "detected": "926", "type": "single"},
+            ],
+            page_map=[
+                {
+                    "type": "pdf_page",
+                    "pdf_index": 0,
+                    "logical_number": 1,
+                    "range_label": "913-925",
+                },
+                {"type": "pdf_page", "pdf_index": 1, "logical_number": 926},
+            ],
+        )
+        OpinionBoundaryFactory(
+            scan=self.scan, start_page_index=0, end_page_index=1
+        )
+
+    def test_a_range_start_page_gives_its_end(self):
+        response = self.client.get(
+            reverse("scan_process", kwargs={"pk": self.scan.pk}) + "?step=2"
+        )
+        self.assertEqual(response.status_code, 200)
+        html = response.content.decode()
+        self.assertIn("Pages 925&ndash;926", html)
+        self.assertNotIn("Pages 1&ndash;926", html)
+
+
 class TestLazyPullsFetchOneFile(ScanningTestCase):
     """A stale /tmp/ must cost one object, not the whole prefix.
 
-    Both of these views used to call ``download_processing_files``, which
-    pulls every object under the scan's processing prefix: gigabytes for one
+    This view used to call ``download_processing_files``, which pulls
+    every object under the scan's processing prefix: gigabytes for one
     page on a full volume, and because the sync views share a single
     executor under ASGI, it stalled every other request while it ran.
     """
@@ -3274,34 +3555,6 @@ class TestLazyPullsFetchOneFile(ScanningTestCase):
             target.write_bytes(b"%PDF-1.4 pulled")
 
         return _fake
-
-    def test_serve_page_pdf_pulls_only_that_page(self):
-        from scanning.models import Page
-
-        scan = ScanFactory(reporter=ReporterFactory(short_name="tp"), volume=7)
-        page = Page.objects.create(
-            scan=scan, page_index=0, pdf_path="llm/page_0001.pdf"
-        )
-
-        with (
-            override_settings(
-                DEVELOPMENT=False,
-                TESTING=False,
-                PROCESSING_TMP_DIR=self.tmp_root,
-            ),
-            patch(
-                "scanning.s3_sync.download_processing_file",
-                side_effect=self._writes_the_file(lambda key: key),
-            ) as one,
-            patch("scanning.s3_sync.download_processing_files") as everything,
-        ):
-            response = self.client.get(
-                reverse("serve_page_pdf", kwargs={"pk": page.pk})
-            )
-
-        self.assertEqual(response.status_code, 200)
-        one.assert_called_once_with(scan, "llm/page_0001.pdf")
-        everything.assert_not_called()
 
     def test_serve_redacted_pdf_pulls_only_the_redacted_file(self):
         scan = ScanFactory(reporter=ReporterFactory(short_name="tp"), volume=8)
@@ -3333,74 +3586,212 @@ class TestLazyPullsFetchOneFile(ScanningTestCase):
         everything.assert_not_called()
 
 
-class TestDeleteDetectionPrunesStaleRects(ScanningTestCase):
-    """Deleting a page's last detection must not strand its saved rects.
-
-    ``redaction_rects`` is a snapshot in image pixels, and the scale that
-    places it comes from that page's detections. Leaving rects behind for a
-    page that has none makes Generate Files fail on every retry, with no
-    reachable way for a reviewer to clear it.
-    """
+class TestRedactionEndpoints(ScanningTestCase):
+    """The five redaction endpoints, by primary key (#240 PR B)."""
 
     def setUp(self):
         self.user = self.make_user()
         self.client.force_login(self.user)
-        self.scan = ScanFactory(reporter=ReporterFactory(short_name="tp"))
-        self.scan.redaction_rects = [
-            {"page_index": 0, "rects": [{"x0": 1, "y0": 2, "x1": 3, "y1": 4}]},
-            {"page_index": 1, "rects": [{"x0": 5, "y0": 6, "x1": 7, "y1": 8}]},
-        ]
-        self.scan.save(update_fields=["redaction_rects"])
+        self.scan = ScanFactory(page_count=2, source_fingerprint="10:2")
 
-    def _detection(self, page_index):
-        return Detection.objects.create(
-            scan=self.scan,
-            page_index=page_index,
-            label="HEADNOTE",
-            label_id=3,
-            confidence=0.9,
-            x0=10,
-            y0=20,
-            x1=30,
-            y1=40,
-            img_width=1700,
-            img_height=2200,
-        )
+    def _computed(self, **fields):
+        values = {
+            "scan": self.scan,
+            "origin": Redaction.Origin.COMPUTED,
+            "rect_type": "headnote",
+            "fill": "black",
+            "x0": 50.0,
+            "y0": 100.0,
+            "x1": 150.0,
+            "y1": 200.0,
+            "source_page": 1,
+            "source_fingerprint": "10:2",
+            "page_index": 0,
+        }
+        values.update(fields)
+        return Redaction.objects.create(**values)
 
-    def _delete(self, detection):
+    def _post(self, name, body=None, **kwargs):
         return self.client.post(
-            reverse("delete_detection", kwargs={"pk": self.scan.pk}),
-            data=json.dumps({"detection_id": detection.pk}),
+            reverse(name, kwargs={"pk": self.scan.pk, **kwargs}),
+            data=json.dumps(body or {}),
             content_type="application/json",
         )
 
-    def test_the_last_detection_on_a_page_takes_its_rects_with_it(self):
-        only_one = self._detection(0)
-        self._detection(1)
+    def test_serve_lists_the_visible_boxes_in_points(self):
+        row = self._computed()
+        self._computed(
+            rect_type="margin", fill="white", page_index=1, source_page=2
+        )
 
-        response = self._delete(only_one)
+        response = self.client.get(
+            reverse("serve_redactions", kwargs={"pk": self.scan.pk})
+        )
+
+        data = json.loads(response.content)
+        self.assertEqual([e["page_index"] for e in data], [0, 1])
+        self.assertEqual(data[0]["rects"][0]["id"], row.pk)
+        self.assertEqual(data[0]["rects"][0]["x0"], 50.0)
+        self.assertEqual(data[1]["rects"][0]["rect_type"], "margin")
+
+    def test_add_writes_a_human_row_and_answers_its_id(self):
+        response = self._post(
+            "add_redaction",
+            {
+                "page_index": 1,
+                "x0": 1.0,
+                "y0": 2.0,
+                "x1": 3.0,
+                "y1": 4.0,
+                "fill": "white",
+            },
+        )
 
         self.assertEqual(response.status_code, 200)
-        self.scan.refresh_from_db()
-        self.assertEqual(
-            [e["page_index"] for e in self.scan.redaction_rects],
-            [1],
-            "page 0's rects should have gone with its last detection",
+        body = json.loads(response.content)
+        row = Redaction.objects.get(pk=body["id"])
+        self.assertEqual(row.origin, Redaction.Origin.HUMAN)
+        self.assertEqual(row.fill, "white")
+        self.assertEqual((row.page_index, row.source_page), (1, 2))
+        self.assertEqual(row.author, self.user)
+
+    def test_add_refuses_a_bad_body(self):
+        with self.assertLogs("scanning.views_api", level="WARNING"):
+            response = self._post(
+                "add_redaction",
+                {"page_index": 0, "x0": 5, "y0": 0, "x1": 1, "y1": 1},
+            )
+        self.assertEqual(response.status_code, 400)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "error")
+        self.assertNotIn("ValueError", body["message"])
+        with self.assertLogs("scanning.views_api", level="WARNING"):
+            response = self._post("add_redaction", {"page_index": "x"})
+        self.assertNotIn(
+            "invalid literal", json.loads(response.content)["message"]
+        )
+        with self.assertLogs("scanning.views_api", level="WARNING"):
+            response = self._post(
+                "add_redaction",
+                {
+                    "page_index": 0,
+                    "x0": 0,
+                    "y0": 0,
+                    "x1": 1,
+                    "y1": 1,
+                    "fill": "red",
+                },
+            )
+        self.assertEqual(response.status_code, 400)
+
+    def test_move_of_a_computed_box_answers_the_row_that_holds_it(self):
+        row = self._computed()
+
+        response = self._post(
+            "move_redaction",
+            {"x0": 60, "y0": 110, "x1": 160, "y1": 210},
+            redaction_id=row.pk,
         )
 
-    def test_rects_survive_while_the_page_still_has_a_detection(self):
-        one_of_two = self._detection(0)
-        self._detection(0)
+        body = json.loads(response.content)
+        self.assertEqual(body["status"], "ok")
+        self.assertNotEqual(body["id"], row.pk)
+        holder = Redaction.objects.get(pk=body["id"])
+        self.assertEqual(holder.bbox, [60.0, 110.0, 160.0, 210.0])
+        row.refresh_from_db()
+        self.assertEqual(holder.replaces, row.decision)
 
-        self._delete(one_of_two)
+    def test_dismiss_and_restore(self):
+        row = self._computed()
 
-        self.scan.refresh_from_db()
+        response = self._post("dismiss_redaction", redaction_id=row.pk)
+
+        self.assertEqual(json.loads(response.content)["status"], "ok")
+        row.refresh_from_db()
+        self.assertIsNotNone(row.decision)
         self.assertEqual(
-            [e["page_index"] for e in self.scan.redaction_rects], [0, 1]
+            json.loads(
+                self.client.get(
+                    reverse("serve_redactions", kwargs={"pk": self.scan.pk})
+                ).content
+            ),
+            [],
         )
 
+        response = self._post("restore_redaction", redaction_id=row.pk)
 
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+        self.assertTrue(json.loads(response.content)["restored"])
+        row.refresh_from_db()
+        self.assertIsNone(row.decision)
+
+    def test_a_dismiss_row_is_not_a_box(self):
+        row = self._computed()
+        self._post("dismiss_redaction", redaction_id=row.pk)
+        row.refresh_from_db()
+
+        for name in ("move_redaction", "dismiss_redaction"):
+            with self.subTest(name=name):
+                response = self._post(
+                    name,
+                    {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                    redaction_id=row.decision_id,
+                )
+                self.assertEqual(response.status_code, 404)
+
+    def test_unknown_id_is_404(self):
+        for name in (
+            "move_redaction",
+            "dismiss_redaction",
+            "restore_redaction",
+        ):
+            with self.subTest(name=name):
+                response = self._post(
+                    name,
+                    {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                    redaction_id=999999,
+                )
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(
+                    json.loads(response.content)["status"], "error"
+                )
+
+    def test_a_page_outside_the_map_answers_409(self):
+        from unittest.mock import patch
+
+        from scanning import detections
+        from scanning.tests.test_yolo_apply import glued_run
+
+        run = glued_run(self.scan)
+        row = self._computed(page_index=9, source_page=10)
+        posts = [
+            (
+                "add_redaction",
+                {"page_index": 9, "x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                {},
+            ),
+            (
+                "move_redaction",
+                {"x0": 0, "y0": 0, "x1": 1, "y1": 1},
+                {"redaction_id": row.pk},
+            ),
+        ]
+        for name, body, kwargs in posts:
+            with self.subTest(name=name):
+                with patch.object(
+                    detections, "measured_run", return_value=run
+                ):
+                    with self.assertLogs(
+                        "scanning.redactions", level="WARNING"
+                    ):
+                        response = self._post(name, body, **kwargs)
+                self.assertEqual(response.status_code, 409)
+                self.assertIn(
+                    "cannot be addressed",
+                    json.loads(response.content)["message"],
+                )
+        self.assertEqual(Redaction.objects.human().count(), 0)
+
+
 class TestGluedOutputs(ScanningTestCase):
     """The glued outputs of the GPU stages, by scan id (issue #243).
 
@@ -3471,6 +3862,26 @@ class TestGluedOutputs(ScanningTestCase):
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("login"), response["Location"])
 
+    def test_index_lists_no_apply_rows(self):
+        """The one-page shards of a page edit apply (#224) share the
+        stage, the engine and the run sequence, but no glued volume
+        document is written for them: the index must not offer one."""
+        self._dots_row()
+        self._dots_row(shard_index=1)
+        run = ApplyRun.objects.create(scan=self.scan, number=1)
+        self._dots_row(
+            run=2,
+            shard_index=0,
+            shard_count=1,
+            apply_run=run,
+            result_key="jobs/apply/a1/analyze/dots_mocr/r2-s0-a1.json",
+        )
+
+        data = self._index().json()
+
+        self.assertEqual([entry["run"] for entry in data["runs"]], [1])
+        self.assertEqual(data["live_run"], 1)
+
     def test_index_refuses_an_unknown_output_as_json(self):
         """Every answer of these routes is JSON, the 404s included: a
         curl user must not get an HTML page from one of them."""
@@ -3502,7 +3913,11 @@ class TestGluedOutputs(ScanningTestCase):
                 "page_count": 200,
             },
             provider_meta={
-                "output": {"failed_pages": [7], "recovered_pages": [2]}
+                "output": {
+                    "failed_pages": [7],
+                    "recovered_pages": [2],
+                    "repaired_pages": [5],
+                }
             },
         )
         self._dots_row(
@@ -3553,6 +3968,11 @@ class TestGluedOutputs(ScanningTestCase):
         self.assertEqual(second["failed_pages"], [7])
         self.assertEqual(second["filtered_pages"], [])
         self.assertEqual(second["recovered_pages"], [2])
+        self.assertEqual(
+            second["repaired_pages"],
+            [5],
+            "the repaired pages of #242 reach the index too",
+        )
         self.assertEqual(
             second["url"],
             reverse(
@@ -3781,3 +4201,127 @@ class TestGluedOutputs(ScanningTestCase):
             ),
             body["html"],
         )
+
+
+class TestTemplateScriptBlocks(TestCase):
+    """No inline script may contain a closing script tag.
+
+    The HTML parser ends a script element at the first `</script`, in a
+    comment and in a string too. One such text in a comment of
+    scan_process.html cut the SCAN_CONFIG block in two and left the
+    step-1 viewer with no configuration (#249).
+    """
+
+    #: An open or a closing script tag, as the HTML parser reads it.
+    SCRIPT_TAG = re.compile(r"</?script\b", re.I)
+
+    @classmethod
+    def script_tag_faults(cls, text):
+        """Walk the script tags of one template and report the bad ones.
+
+        The walk is the parser's own rule: a closing tag ends the
+        element, whatever it stands in. So an open tag while the walk is
+        inside an element says the element ended too early, and a
+        closing tag while it is outside says the same one line later.
+        Do not look for a closing tag *inside* a matched block: a
+        non-greedy match ends at the first one, so the block it gives
+        can never hold one and the test can never fail.
+
+        :param text: The template's text.
+        :returns: The 1-based line number of each bad tag.
+        """
+        faults = []
+        inside = False
+        for match in cls.SCRIPT_TAG.finditer(text):
+            closing = match.group().startswith("</")
+            if closing != inside:
+                faults.append(text[: match.start()].count("\n") + 1)
+            inside = not closing
+        if inside:
+            faults.append(text.count("\n") + 1)
+        return faults
+
+    def test_no_template_closes_a_script_block_early(self):
+        root = pathlib.Path(__file__).resolve().parent.parent
+        faults = []
+        for path in root.rglob("*.html"):
+            if "node_modules" in str(path):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            faults += [
+                f"{path}:{line}" for line in self.script_tag_faults(text)
+            ]
+
+        self.assertEqual(faults, [])
+
+    def test_the_walk_finds_the_tag_that_broke_the_page(self):
+        """The guard must fail on the text of issue #249.
+
+        The first guard read the block a non-greedy match gave it, which
+        ends at the first closing tag. It could not fail.
+        """
+        broken = (
+            '<script>\nvar A = {  // a "</script>" in a note\n};\n</script>\n'
+        )
+
+        self.assertEqual(self.script_tag_faults(broken), [4])
+        self.assertEqual(
+            self.script_tag_faults(broken.replace("</s", "<\\/s", 1)), []
+        )
+
+    def test_no_template_opens_a_comment_it_does_not_close(self):
+        """`{# ... #}` holds one line only.
+
+        Django renders a `{#` with no `#}` on the same line as text, so
+        the note reached the interface. A note over several lines needs
+        `{% comment %}`.
+        """
+        root = pathlib.Path(__file__).resolve().parent.parent
+        faults = []
+        for path in root.rglob("*.html"):
+            if "node_modules" in str(path):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for number, line in enumerate(text.splitlines(), 1):
+                if "{#" in line and "#}" not in line:
+                    faults.append(f"{path}:{number}")
+
+        self.assertEqual(faults, [])
+
+
+class TestOnePageNumberGate(TestCase):
+    """Both viewers ask one function what a page number is (#319).
+
+    The two scripts held a gate each and they disagreed: step 2 took a
+    whole number, so it refused the range the server has stored since
+    #233. The server refuses what the shared gate refuses, and the
+    wording of the refusal is written once, in the view.
+    """
+
+    def _script(self, name):
+        from scanning import views_process
+
+        return (
+            pathlib.Path(views_process.__file__).parent
+            / "static"
+            / "scanning"
+            / name
+        ).read_text()
+
+    def test_the_gate_lives_in_shared_js(self):
+        self.assertIn("function isPageNumberEntry(", self._script("shared.js"))
+
+    def test_neither_viewer_keeps_a_copy(self):
+        for name in ("viewer_step1.js", "viewer_step2.js"):
+            with self.subTest(name=name):
+                text = self._script(name)
+                self.assertIn("isPageNumberEntry(", text)
+                self.assertNotIn("function isPageNumberEntry", text)
+                self.assertNotIn("PAGE_ENTRY_RE =", text)
+
+    def test_the_browser_and_the_server_refuse_in_the_same_words(self):
+        from scanning import views_process
+
+        fragment = "trailing letter like 2094a"
+        self.assertIn(fragment, views_process.PAGE_NUMBER_ERROR)
+        self.assertIn(fragment, self._script("shared.js"))

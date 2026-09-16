@@ -1,7 +1,7 @@
 """Sync intermediate processing files between MEDIA_ROOT, S3, and /tmp/.
 
-Files produced by the scanning pipeline (bitonal PDF, detections.json,
-stamped PDF, page images, original PDF) are small
+Files produced by the scanning pipeline (bitonal PDF, stamped PDF,
+page images, original PDF) are small
 enough that re-running the pipeline to regenerate them is expensive.
 Pushing them to S3 lets us recover after pod redeploys without a full
 re-run. Pulling them to /tmp/ when the viewer opens gives editing
@@ -215,8 +215,13 @@ def s3_job_attempt_key(job, suffix: str = ".json") -> str:
     :rtype: str
     """
     target = f"op{job.opinion_id}/" if job.opinion_id else ""
+    # The one-page shards of an apply run (#224) write under the run's
+    # own prefix, so a human reading the bucket sees them beside the
+    # final PDF they feed, and the volume stages' prefixes hold volume
+    # results only.
+    run_dir = f"apply/a{job.apply_run.number}/" if job.apply_run_id else ""
     return (
-        f"{s3_processing_prefix(job.scan)}{JOB_RESULTS_SUBDIR}"
+        f"{s3_processing_prefix(job.scan)}{JOB_RESULTS_SUBDIR}{run_dir}"
         f"{job.stage}/{job.engine}/{target}"
         f"r{job.run}-s{job.shard_index}-a{job.attempt}{suffix}"
     )
@@ -512,6 +517,39 @@ def upload_json_object(key: str, data: dict) -> bool:
     return True
 
 
+def upload_file_object(key: str, path: Path, content_type: str) -> bool:
+    """Upload one local file to an exact key, bypassing the sync.
+
+    The file-shaped twin of :func:`upload_json_object`, for the apply's
+    artifacts under ``jobs/apply/`` (issue #224): the final PDF, the
+    one-page shards and the final bitonal copy. ``upload_file_to_s3``
+    cannot serve those, since it keys off a path under the scan's
+    output directory and everything there comes back down with the
+    next generic pull.
+
+    :param key: Object key inside the private bucket.
+    :param path: The local file.
+    :param content_type: The ``ContentType`` to store, which a presigned
+        GET hands to the reader.
+    :returns: Whether the object was uploaded. False when S3 is off or
+        the PUT failed; the caller decides whether that is fatal.
+    :rtype: bool
+    """
+    if not _s3_enabled():
+        return False
+    try:
+        _s3_client().upload_file(
+            str(path),
+            settings.AWS_PRIVATE_STORAGE_BUCKET_NAME,
+            key,
+            ExtraArgs={"ContentType": content_type},
+        )
+    except (BotoCoreError, ClientError):
+        logger.warning("Could not upload %s to %s", path, key, exc_info=True)
+        return False
+    return True
+
+
 def download_json_object(key: str) -> dict:
     """Download and parse one JSON document by key.
 
@@ -647,8 +685,7 @@ def _is_approved_deliverable(relative_path: str) -> bool:
     Approved deliverables are opinion PDFs under ``redacted/``,
     extracted figure images under ``images/``, plus the full-book
     original and redacted PDFs. Everything else (bitonal,
-    detections.json, unredacted/, stamped, llm/) stays under
-    processing/.
+    unredacted/, stamped, llm/) stays under processing/.
 
     :param relative_path: Path relative to the scan's processing prefix.
     :returns: Whether to copy this file into approved/.
@@ -1179,8 +1216,8 @@ def _delete_prefix(scan: Scan, prefix: str, kind: str) -> int:
 def upload_file_to_s3(scan: Scan, relative_path: str) -> bool:
     """Upload a single file (relative to the scan's local root) to S3.
 
-    Used when a viewer edit rewrites a file on disk (e.g.
-    ``detections.json``). Overwrites unconditionally.
+    For a single file a caller wrote on disk (the pipeline input copy,
+    the ``reupload_scan_files`` command). Overwrites unconditionally.
 
     :param scan: The scan the file belongs to.
     :param relative_path: Path relative to the scan's output dir.

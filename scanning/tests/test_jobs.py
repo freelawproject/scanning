@@ -20,6 +20,7 @@ from django.utils import timezone
 from scanning import doctor_client, jobs
 from scanning.factories import ExternalJobFactory, ScanFactory
 from scanning.models import (
+    ApplyRun,
     ExternalJob,
     JobEngine,
     JobProvider,
@@ -117,6 +118,30 @@ class TestEnsureConvertJobs(ScanningTestCase):
             self.assertEqual(job.status, JobStatus.PENDING)
             self.assertEqual(job.provider, JobProvider.DOCTOR)
             self.assertEqual(job.run, 1)
+
+    def test_rows_carry_the_source_fingerprint_of_their_set(self):
+        """The set as one string, beside the per-shard identity (#250).
+
+        The detection sweep asks "has this set been detected" with it,
+        so it is stamped for every stage; and it is not in
+        ``input_manifest``, which ``_still_describes`` compares exactly.
+        """
+        scan = ScanFactory()
+        manifest = make_manifest(shard_count=2, pages_per_shard=7)
+
+        created = jobs.ensure_convert_jobs(scan, manifest)
+
+        self.assertEqual(
+            {job.source_fingerprint for job in created}, {"2048:14"}
+        )
+        self.assertNotIn("source_fingerprint", created[0].input_manifest)
+        # The same value ``ensure_shards`` stamps on the scan.
+        from scanning import sharding
+
+        self.assertEqual(
+            created[0].source_fingerprint,
+            sharding.fingerprint_value(manifest["source"]),
+        )
 
     def test_rows_carry_the_shard_identity_they_were_cut_from(self):
         """So the merge checks what ran, not a live manifest.
@@ -420,6 +445,208 @@ class TestSubmitPending(ScanningTestCase):
         other.refresh_from_db()
         self.assertEqual(other.status, JobStatus.PENDING)
         self.assertEqual(summary.submitted, 3)
+
+
+#: Every engine on at once, so one tick exercises all three waves.
+#: The caps are 1, which makes each wave claim exactly one row and the
+#: rank the only thing that decides which.
+EVERY_ENGINE = {
+    **DOCTOR,
+    "DOCTOR_MAX_CONCURRENCY": 1,
+    "RUNPOD_ENABLED": True,
+    "RUNPOD_API_KEY": "key-1",
+    "RUNPOD_PRESIGNED_TTL": 3600,
+    "RUNPOD_REQUEST_TIMEOUT": 600,
+    "DOTS_MOCR_ENABLED": True,
+    "RUNPOD_DOTSMOCR_ENDPOINT_ID": "ep-dots",
+    "DOTS_MOCR_MAX_CONCURRENCY": 1,
+    "DOTS_MOCR_MAX_ATTEMPTS": 3,
+    "DOTS_MOCR_SECONDS_PER_PAGE": 4.0,
+    "YOLO_ENABLED": True,
+    "RUNPOD_YOLO_ENDPOINT_ID": "ep-yolo",
+    "YOLO_MAX_CONCURRENCY": 1,
+    "YOLO_MAX_ATTEMPTS": 3,
+    "YOLO_SECONDS_PER_PAGE": 2.0,
+}
+
+#: One entry per engine a wave sends for: the row shape and the stage.
+ENGINE_SHAPES = (
+    (JobStage.CONVERT, JobEngine.BITONAL, JobProvider.DOCTOR),
+    (JobStage.ANALYZE, JobEngine.DOTS_MOCR, JobProvider.RUNPOD),
+    (JobStage.DETECT, JobEngine.BLACKLETTER, JobProvider.RUNPOD),
+)
+
+
+@override_settings(**EVERY_ENGINE)
+class TestApplyRowsGoFirst(ScanningTestCase):
+    """The queue rank of issue #291.
+
+    An apply row (#224) holds one edit of a volume a curator already
+    approved, and it is one of the newest rows in the table. In creation
+    order alone it therefore waited behind every volume shard of every
+    volume nobody had opened yet.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.presign = patch.multiple(
+            "scanning.s3_sync",
+            s3_active=lambda: True,
+            presign_get=lambda key, ttl: f"https://s3/{key}?get",
+            presign_put=lambda key, ct, ttl: f"https://s3/{key}?put",
+        )
+        self.presign.start()
+        self.addCleanup(self.presign.stop)
+
+    def _tick(self, **kwargs):
+        """Run one submit tick with every provider call patched.
+
+        Doctor answers with a completion and RunPod with a job id, so a
+        row that was sent leaves PENDING whichever engine took it.
+
+        :param kwargs: Passed to ``submit_pending``.
+        :return: None.
+        """
+        with (
+            patch(
+                "scanning.doctor_client.convert_bitonal",
+                return_value={"pages": 1},
+            ),
+            patch("scanning.runpod_client.submit_job", return_value="job-1"),
+        ):
+            jobs.submit_pending(**kwargs)
+
+    def _apply_row(
+        self,
+        scan,
+        stage,
+        engine,
+        provider,
+        run=None,
+        shard_index=0,
+        shard_count=1,
+    ):
+        """Create one PENDING apply row.
+
+        An apply row holds the pages of one edit, so the run's shard
+        set holds one row per edit a curator made.
+
+        :param scan: The scan it belongs to.
+        :param stage: Its stage.
+        :param engine: Its engine.
+        :param provider: Its provider.
+        :param run: The ``ApplyRun`` to hang it on; one is made if not
+            given.
+        :param shard_index: Its place in the apply's shard set.
+        :param shard_count: How many one-page shards the run holds.
+        :returns: The row.
+        :rtype: ExternalJob
+        """
+        if run is None:
+            run = ApplyRun.objects.create(
+                scan=scan, number=ApplyRun.objects.count() + 1
+            )
+        return ExternalJobFactory(
+            scan=scan,
+            apply_run=run,
+            stage=stage,
+            engine=engine,
+            provider=provider,
+            status=JobStatus.PENDING,
+            run=2,
+            shard_index=shard_index,
+            shard_count=shard_count,
+        )
+
+    def _sent(self, row):
+        """Return whether the wave sent one row.
+
+        :param row: The row to re-read.
+        :returns: Whether it left PENDING.
+        :rtype: bool
+        """
+        row.refresh_from_db()
+        return row.status != JobStatus.PENDING
+
+    def test_the_apply_row_is_claimed_before_older_volume_shards(self):
+        """The whole point: the newest row goes first."""
+        scan = ScanFactory()
+        volume = jobs.ensure_convert_jobs(scan, make_manifest(shard_count=3))
+        apply_row = self._apply_row(
+            scan, JobStage.CONVERT, JobEngine.BITONAL, JobProvider.DOCTOR
+        )
+        self.assertGreater(apply_row.pk, max(row.pk for row in volume))
+
+        self._tick()
+
+        self.assertTrue(self._sent(apply_row))
+        for row in volume:
+            self.assertFalse(self._sent(row))
+
+    def test_the_rank_holds_for_every_engine(self):
+        """Each engine reads its own queue, so each needs the rank."""
+        for stage, engine, provider in ENGINE_SHAPES:
+            with self.subTest(engine=engine):
+                scan = ScanFactory()
+                volume = ExternalJobFactory(
+                    scan=scan,
+                    stage=stage,
+                    engine=engine,
+                    provider=provider,
+                    status=JobStatus.PENDING,
+                )
+                apply_row = self._apply_row(scan, stage, engine, provider)
+
+                self._tick()
+
+                self.assertTrue(self._sent(apply_row))
+                self.assertFalse(self._sent(volume))
+
+    def test_two_apply_rows_keep_the_creation_order(self):
+        """The id stays the second key: one class drains fairly."""
+        scan = ScanFactory()
+        run = ApplyRun.objects.create(scan=scan, number=1)
+        first = self._apply_row(
+            scan,
+            JobStage.CONVERT,
+            JobEngine.BITONAL,
+            JobProvider.DOCTOR,
+            run=run,
+            shard_index=0,
+            shard_count=2,
+        )
+        second = self._apply_row(
+            scan,
+            JobStage.CONVERT,
+            JobEngine.BITONAL,
+            JobProvider.DOCTOR,
+            run=run,
+            shard_index=1,
+            shard_count=2,
+        )
+
+        self._tick()
+
+        self.assertTrue(self._sent(first))
+        self.assertFalse(self._sent(second))
+
+    def test_the_cap_still_bounds_the_wave(self):
+        """The rank picks who takes a free place; it preempts nothing."""
+        scan = ScanFactory()
+        ExternalJobFactory(
+            scan=scan,
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            status=JobStatus.SUBMITTED,
+        )
+        apply_row = self._apply_row(
+            scan, JobStage.CONVERT, JobEngine.BITONAL, JobProvider.DOCTOR
+        )
+
+        self._tick()
+
+        self.assertFalse(self._sent(apply_row))
 
 
 @override_settings(**DOCTOR)
@@ -1109,6 +1336,47 @@ class TestDurationLogging(ScanningTestCase):
         self.assertIn("completed in 10.0s", line)
         self.assertIn("confirmed by s3_head", line)
         self.assertNotIn("doctor", line)
+
+    def test_an_apply_row_is_timed_against_its_own_run(self):
+        """An apply run (#224) is a run of its own. Reading the
+        volume's rows here would time and name the wrong run, and the
+        volume's rows are CONSUMED, so the line would come out on
+        every one-page shard."""
+        scan = ScanFactory()
+        run = ApplyRun.objects.create(scan=scan, number=1)
+        for index in range(3):
+            ExternalJobFactory(
+                scan=scan,
+                stage=JobStage.CONVERT,
+                engine=JobEngine.BITONAL,
+                provider=JobProvider.DOCTOR,
+                status=JobStatus.CONSUMED,
+                run=1,
+                shard_index=index,
+                shard_count=3,
+            )
+        job = ExternalJobFactory(
+            scan=scan,
+            apply_run=run,
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            status=JobStatus.SUBMITTED,
+            run=2,
+            shard_index=0,
+            shard_count=1,
+        )
+        submitted = timezone.now() - timedelta(seconds=5)
+        ExternalJob.objects.filter(pk=job.pk).update(submitted_at=submitted)
+        job.submitted_at = submitted
+
+        with self.assertLogs("scanning.jobs", level="INFO") as logs:
+            jobs._complete(job, None, timezone.now())
+
+        line = "\n".join(logs.output)
+        self.assertIn("run 2 done", line)
+        # The apply run has one shard; the volume run has three.
+        self.assertIn("1 shard(s)", line)
 
     def test_nothing_is_logged_when_the_write_loses_the_race(self):
         job = ExternalJobFactory(status=JobStatus.SUBMITTED)

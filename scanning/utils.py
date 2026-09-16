@@ -40,23 +40,6 @@ def get_volume(reporter_slug: str, vol: int) -> Volume:
     )
 
 
-def find_json_file(output_base: Path, filename: str) -> Path | None:
-    """Search output_base and its parents for a JSON file.
-
-    :param output_base: The directory to start searching from.
-    :param filename: The JSON filename to look for.
-    :return: The Path if found, or None.
-    """
-    for candidate in [
-        output_base / filename,
-        output_base.parent / filename,
-        output_base.parent.parent / filename,
-    ]:
-        if candidate.exists():
-            return candidate
-    return None
-
-
 def find_ocr_pdf(output_dir: str | Path) -> Path | None:
     """Find the OCR PDF in output_dir (excludes bitonal, redacted, original).
 
@@ -202,7 +185,12 @@ def compute_coverage_gaps(
     :returns: List of ``(start, end, count)`` tuples, one per gap run.
     :rtype: list[tuple[int, int, int]]
     """
-    if not opinions or not start_page or not end_page:
+    if not start_page or not end_page:
+        return []
+    # A dismissed boundary (#240 PR C) is a card with an undo, not an
+    # opinion; its pages are not covered.
+    opinions = [op for op in opinions if not op.get("dismissed")]
+    if not opinions:
         return []
 
     covered: set[int] = set()

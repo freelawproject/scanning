@@ -49,7 +49,7 @@ Four properties are load-bearing and easy to break:
 - **Every write is a compare-and-swap** (:func:`_write`), so no lock is
   held across an HTTP call. The other writer is the web process, not a
   second daemon: the admin re-queue, the admin scan deletion and the
-  two start buttons all call into this module from a request, and the
+  dots.mocr start button all call into this module from a request, and the
   loser's update simply matches nothing.
 - **A resubmission bumps ``attempt``**, re-addressing the result
   object. Doctor finishes a conversion after we stop listening, and
@@ -81,9 +81,10 @@ from datetime import datetime, timedelta
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 
-from scanning import doctor_client, runpod_client, s3_sync
+from scanning import doctor_client, runpod_client, s3_sync, sharding
 from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
@@ -849,12 +850,16 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
     of the *volume* -- the worker counts from zero inside the shard it
     was given.
 
-    The pages a retry rung saved, and the pages whose answer was not
-    layout JSON (``filtered``: text but no cell, so no page number
-    either), are logged too, at INFO, so the ladder's recovery rate and
-    the size of each hole class can be read off the logs. The numbers
-    survive in ``provider_meta["output"]`` either way; ``_complete``
-    stores the whole summary.
+    The pages a retry rung saved, and the pages whose broken layout
+    JSON the repair of issue #242 gave back, are logged at INFO, so the
+    ladder's recovery rate and the repair's reach can be read off the
+    logs. A page whose answer was not layout JSON and which nothing
+    repaired (``filtered``: text but no cell, so no page number either)
+    is a **WARNING**, like a failed page: issue #242 asks for it by
+    name, because each such page is a new shape of the fault and the
+    log line is what makes the next one visible. The numbers survive in
+    ``provider_meta["output"]`` either way; ``_complete`` stores the
+    whole summary.
 
     :param job: The row just completed.
     :param output: The provider's summary.
@@ -873,13 +878,23 @@ def _log_failed_pages(job: ExternalJob, output: dict | None) -> None:
             return f"volume page(s) {volume}"
         return f"shard page(s) {pages}"
 
-    for field, verb in (
-        ("recovered_pages", "recovered %d page(s) on a retry"),
-        ("filtered_pages", "answered %d page(s) with no layout JSON"),
+    for field, verb, level in (
+        ("recovered_pages", "recovered %d page(s) on a retry", logging.INFO),
+        (
+            "repaired_pages",
+            "repaired the layout JSON of %d page(s)",
+            logging.INFO,
+        ),
+        (
+            "filtered_pages",
+            "answered %d page(s) with layout JSON nothing could repair",
+            logging.WARNING,
+        ),
     ):
         pages = output.get(field)
         if pages and isinstance(pages, list):
-            logger.info(
+            logger.log(
+                level,
                 "%s/%s shard %d/%d of scan %s " + verb + ": %s",
                 job.stage,
                 job.engine,
@@ -923,8 +938,10 @@ def _log_run_complete(job: ExternalJob) -> None:
     # Not ``OPEN_JOB_STATUSES``: COMPLETED belongs to that set on
     # purpose (the provider is done, we have applied nothing), and a run
     # of COMPLETED rows is exactly the case this logs. What must be
-    # empty is the work still to come.
-    rows = live_run(job.scan_id, job.stage, job.engine)
+    # empty is the work still to come. The row's own target, not the
+    # volume's: an apply run (#224) is a run of its own, and reading
+    # the volume's rows here would time and name the wrong one.
+    rows = live_run(job.scan_id, job.stage, job.engine, job.apply_run)
     unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     if not rows or any(row.status in unfinished for row in rows):
         return
@@ -1144,27 +1161,37 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
     before this field existed match leniently in
     :func:`_still_describes` and never in :func:`_reusable_results`.
 
+    An apply manifest (#224) names each shard's ``key`` itself, under
+    ``jobs/apply/pages/``, and carries the ``edit_id`` the shard was
+    built from: that is what keeps two edits' shards apart when both
+    hold one page of the same size.
+
     :param scan: The scan the shards belong to.
-    :param manifest: The shard manifest from :mod:`scanning.sharding`.
+    :param manifest: The shard manifest from :mod:`scanning.sharding`,
+        or the apply's (:func:`scanning.apply.shard_manifest`).
     :returns: ``(key, identity)`` per shard, ordered by shard index.
     :rtype: list[tuple[str, dict]]
     """
     prefix = s3_sync.shards_prefix(scan)
     source_page_count = manifest["source"]["page_count"]
-    return [
-        (
-            f"{prefix}{entry['name']}",
-            {
-                "name": entry["name"],
-                "from_page": entry["from_page"],
-                "to_page": entry["to_page"],
-                "page_count": entry["page_count"],
-                "size_bytes": entry["size_bytes"],
-                "source_page_count": source_page_count,
-            },
+    specs = []
+    for entry in sorted(manifest["shards"], key=lambda e: e["index"]):
+        identity = {
+            "name": entry["name"],
+            "from_page": entry["from_page"],
+            "to_page": entry["to_page"],
+            "page_count": entry["page_count"],
+            "size_bytes": entry["size_bytes"],
+            "source_page_count": entry.get(
+                "source_page_count", source_page_count
+            ),
+        }
+        if "edit_id" in entry:
+            identity["edit_id"] = entry["edit_id"]
+        specs.append(
+            (entry.get("key") or f"{prefix}{entry['name']}", identity)
         )
-        for entry in sorted(manifest["shards"], key=lambda e: e["index"])
-    ]
+    return specs
 
 
 def _identity_matches(stored: dict | None, identity: dict) -> bool:
@@ -1283,23 +1310,36 @@ def check_result_envelope(
     return envelope["payload"]
 
 
-def live_run(scan, stage: str, engine: str) -> list[ExternalJob]:
+def live_run(
+    scan, stage: str, engine: str, apply_run=None
+) -> list[ExternalJob]:
     """Return a target's current-run rows for one engine, in page order.
 
     The live run is the rows at ``max(run)``: a re-run keeps the
     previous run as history, and reading those as live would report work
     nobody wants any more.
 
+    The volume run by default. The rows of an apply run (#224) are a
+    target of their own -- one-page shards of the pages a curator
+    changed -- and they are read only through ``apply_run``; a volume
+    reader that saw them would glue a one-page shard as the volume.
+
     :param scan: The scan, or its pk.
     :param stage: A :class:`~scanning.models.JobStage` value.
     :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param apply_run: The apply run whose rows are wanted, or None for
+        the volume run.
     :returns: The live run's rows ordered by shard index, or an empty
-        list when the engine has never run for this scan.
+        list when the engine has never run for this target.
     :rtype: list[ExternalJob]
     """
     rows = list(
         ExternalJob.objects.filter(
-            scan=scan, stage=stage, engine=engine, opinion=None
+            scan=scan,
+            stage=stage,
+            engine=engine,
+            opinion=None,
+            apply_run=apply_run,
         ).order_by("-run", "shard_index")
     )
     if not rows:
@@ -1307,7 +1347,7 @@ def live_run(scan, stage: str, engine: str) -> list[ExternalJob]:
     return [job for job in rows if job.run == rows[0].run]
 
 
-def run_summary(scan, stage: str, engine: str) -> dict | None:
+def run_summary(scan, stage: str, engine: str, apply_run=None) -> dict | None:
     """Describe a scan's live run of one engine for the process page.
 
     Neither GPU stage writes a scan status while it works (issue #190),
@@ -1329,12 +1369,14 @@ def run_summary(scan, stage: str, engine: str) -> dict | None:
     :param scan: The scan (or its pk) to describe.
     :param stage: A :class:`~scanning.models.JobStage` value.
     :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param apply_run: The apply run to describe instead of the volume
+        run (#224).
     :returns: ``{"run", "total", "done", "open", "failed", "statuses",
         "label", "error_code", "error_message"}``, or ``None`` when the
-        engine has never run for this scan.
+        engine has never run for this target.
     :rtype: dict | None
     """
-    rows = live_run(scan, stage, engine)
+    rows = live_run(scan, stage, engine, apply_run)
     if not rows:
         return None
 
@@ -1397,8 +1439,14 @@ def rows_label(rows: list[ExternalJob]) -> str:
 
 #: The per-shard page lists a dots.mocr summary carries (shard-local
 #: indexes). The first two are holes to the page-number reader; the
-#: third is the pages a retry rung saved.
-PAGE_LIST_NAMES = ("failed_pages", "filtered_pages", "recovered_pages")
+#: third is the pages a retry rung saved, and the fourth the pages
+#: whose layout JSON broke on one character and was repaired (#242).
+PAGE_LIST_NAMES = (
+    "failed_pages",
+    "filtered_pages",
+    "recovered_pages",
+    "repaired_pages",
+)
 
 
 def page_lists(job: ExternalJob) -> dict[str, list]:
@@ -1589,6 +1637,7 @@ def ensure_shard_jobs(
     reuse_results: bool = False,
     force_new_run: bool = False,
     carry_stable_holes: bool = True,
+    apply_run=None,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``scan``'s shards,
     creating them if the current run does not describe today's shard set.
@@ -1634,6 +1683,11 @@ def ensure_shard_jobs(
         passes it.
     :param carry_stable_holes: See :func:`_reusable_results`. Pass
         False for a provider whose failed pages are not reproducible.
+    :param apply_run: The apply run (#224) the rows work for, or None
+        for the volume run. The rows carry it, the live-run read is
+        scoped by it, and the run number still comes from the one
+        sequence of :meth:`ExternalJob.next_run`, so the unique key
+        holds unchanged.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -1641,7 +1695,11 @@ def ensure_shard_jobs(
 
     existing = list(
         ExternalJob.objects.filter(
-            scan=scan, stage=stage, engine=engine, opinion=None
+            scan=scan,
+            stage=stage,
+            engine=engine,
+            opinion=None,
+            apply_run=apply_run,
         ).order_by("-run", "shard_index")
     )
     if existing:
@@ -1673,6 +1731,21 @@ def ensure_shard_jobs(
         if reuse_results
         else {}
     )
+    # The set the run is cut for, as one string. Not in the identity:
+    # ``_still_describes`` compares ``input_manifest`` exactly, so a new
+    # key there would read every live run as stale and re-pay it. The
+    # column is what lets the detection sweep ask "has this set been
+    # detected" in one query (#250).
+    #
+    # An apply run (#224) is not a shard set of an original: its
+    # manifest source is the sum over the one-page shards of the pages
+    # a curator changed. So it carries no fingerprint, and the sweep's
+    # question stays about the volume alone.
+    fingerprint = (
+        ""
+        if apply_run is not None
+        else sharding.fingerprint_value(manifest["source"])
+    )
     rows = []
     for index, (key, identity) in enumerate(specs):
         row = ExternalJob(
@@ -1684,11 +1757,13 @@ def ensure_shard_jobs(
             run=run,
             shard_index=index,
             shard_count=len(specs),
+            apply_run=apply_run,
             input_key=key,
             # Travels with the row, so the reuse check and any later
             # merge read what was actually processed rather than a
             # manifest that may since have changed.
             input_manifest=identity,
+            source_fingerprint=fingerprint,
             # No deadline: a row in our own queue has no clock. The
             # queue ceiling is stamped at the attempt's first claim,
             # when the row is handed to the provider (issue #218).
@@ -1716,7 +1791,7 @@ def ensure_shard_jobs(
         # (bulk_create is one statement inside one transaction), so
         # re-read and hand theirs back. This is what keeps two staff
         # presses a no-op rather than a 500 for whoever lost.
-        rows = live_run(scan, stage, engine)
+        rows = live_run(scan, stage, engine, apply_run)
         logger.info(
             "scan %s %s/%s run %d was created by another writer; "
             "reusing its %d row(s)",
@@ -1938,15 +2013,55 @@ def count_sweep_outcome(summary: SweepSummary, result: str) -> None:
 def _pending_slice(queryset, room: int) -> list[ExternalJob]:
     """Return the PENDING rows a wave will claim.
 
+    **An apply row goes first** (issue #291). A row carrying an
+    ``apply_run`` holds one edit of a volume a curator already approved
+    in review 1 (#224), and it is by construction one of the newest
+    rows, so a queue drained in creation order alone put it behind
+    every volume shard of every volume nobody has looked at yet.
+    A volunteer rescanned a page, a curator approved the review, and the
+    corrected volume then waited for the whole backlog.
+
+    Four properties make the rank safe, and each one is a reason not to
+    replace it with a cap or a queue of its own:
+
+    - An apply row carries **the pages of one edit**
+      (``apply.edit_page_count``: an image is one page, an inserted PDF
+      holds what a scanner sent, and a missing leaf is often two). In
+      practice that is far smaller than a volume shard, so it delays one
+      very little.
+    - The apply set **cannot grow without a limit**:
+      ``apply.MAX_SCANS_IN_FLIGHT`` bounds the scans out at once, and a
+      run makes one row per edit.
+    - A row that loses its place **waits, and almost never fails from
+      the wait**: a PENDING row nobody claimed carries no deadline
+      (#218), because the queue ceiling starts at the attempt's first
+      claim. One exception, named here so the next reader of
+      :func:`sweep_jobs` finds no contradiction: a row a RunPod endpoint
+      declined is back in PENDING with its ceiling intact
+      (:func:`_defer`), and the sweep fails it ``QUEUE_TIMEOUT`` at that
+      ceiling. The apply set is small, so the added wait is minutes
+      against a six-hour ceiling.
+    - The rank decides who takes a free place and **preempts nothing**;
+      :func:`_room_for` counts the in-flight rows against the cap.
+
+    The id stays the second key: inside one class the creation order is
+    what keeps the drain fair. The rank reads the row and not
+    ``Scan.status``, which moves under a row that is already waiting.
+    (It would cost no join: the slice already reaches ``scan`` through
+    ``select_related``.)
+
     :param queryset: This provider and stage's rows.
     :param room: How many rows the cap allows.
-    :returns: Rows in creation order, at most ``room`` of them.
+    :returns: The apply rows first, each class in creation order, at
+        most ``room`` of them.
     :rtype: list[ExternalJob]
     """
     return list(
         queryset.filter(status=JobStatus.PENDING)
-        .select_related("scan", "scan__reporter")
-        .order_by("id")[:room]
+        # ``s3_job_attempt_key`` reads the apply run's number (#224).
+        .select_related("scan", "scan__reporter", "apply_run")
+        .annotate(is_apply=Q(apply_run__isnull=False))
+        .order_by("-is_apply", "id")[:room]
     )
 
 
@@ -2551,6 +2666,7 @@ def abandon_open(
     stage: str | None = None,
     engine: str | None = None,
     statuses: frozenset = OPEN_JOB_STATUSES,
+    apply_run=None,
 ) -> int:
     """Cancel a scan's open jobs, optionally for one engine only.
 
@@ -2585,6 +2701,12 @@ def abandon_open(
     :param engine: Limit to one :class:`~scanning.models.JobEngine`.
     :param statuses: The statuses to treat as open. Narrow, never
         widen: ``CONSUMED`` and the dead statuses must stay terminal.
+    :param apply_run: Limit to the rows of one apply run (#224). The
+        reopen of a page review cancels the run it supersedes and
+        nothing else; without this scope it would take the volume
+        runs down with it. The default keeps the volume-run behaviour:
+        an unscoped call still reaches every row, apply rows included,
+        which is what the admin scan deletion wants.
     :returns: How many rows were cancelled.
     :rtype: int
     """
@@ -2593,6 +2715,12 @@ def abandon_open(
         rows = rows.filter(stage=stage)
     if engine is not None:
         rows = rows.filter(engine=engine)
+    if apply_run is not None:
+        rows = rows.filter(apply_run=apply_run)
+    elif stage is not None or engine is not None:
+        # A stage is restarted for the volume run: a re-queue re-runs
+        # the pipeline, which owns no part of an apply run (#224).
+        rows = rows.filter(apply_run__isnull=True)
 
     # Read the handles before the update: it is the only thing that says
     # what to cancel, and afterwards the rows no longer read as open.

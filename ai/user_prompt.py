@@ -8,8 +8,6 @@ import pdfplumber
 if TYPE_CHECKING:
     from pdfplumber.page import Page as PdfPage
 
-    from scanning.models import Page
-
 DETECTION_IMG_W = 1700
 DETECTION_IMG_H = 2200
 _FOOTNOTE_CONF_FLOOR = 0.80
@@ -153,9 +151,10 @@ def _opinion_roadmap(
 
     :param detections: This page's detection list (already filtered
         to ``page_index``).
-    :param opinions: ``scan.opinions_json`` — the full curated opinion
-        list for the scan, each entry with ``caption_page`` /
-        ``key_page`` / etc.
+    :param opinions: The opinion dicts of the scan (the shape
+        ``boundaries.viewer_payload`` emits since #240), each entry with
+        ``caption_page`` / ``key_page`` / etc. Empty since #280 left
+        this builder with no caller.
     :param page_index: 0-based PDF page index for this page.
     :param pdf_page: The pdfplumber ``Page`` for caption / column-top
         text crops.
@@ -375,17 +374,21 @@ _BLANK_PAGE_INSTRUCTION = (
 )
 
 
-def build_user_prompt(page: Page) -> str | None:
-    """Build the per-page user prompt text from a ``Page`` row.
+def build_user_prompt(page: Any) -> str | None:
+    """Build the per-page user prompt text from a page object.
 
-    Inputs come from the ``Page`` row plus its parent ``Scan``:
+    This function has no caller. ``scanning.models.Page`` was its
+    one input and issue #280 deleted the model, so the parameter is
+    now any object that carries the attributes below.
+
+    Inputs come from the page object plus its parent ``Scan``:
 
       * ``page.is_blank`` short-circuits to a fixed instruction (the
         body is entirely covered by headnote redactions, so we tell
         the LLM to emit just the pagenumber).
       * ``page.detections`` drives caption/key pairing and the
         footnote hint.
-      * ``page.scan.opinions_json`` supplies the cross-page facts the
+      * The scan's opinion boundaries supply the cross-page facts the
         page can't know on its own: pass-through count, and the
         continuation-slot filter for phantom CASE_CAPTIONs that are
         actually tails of a long caption spilling in from a prior
@@ -393,10 +396,9 @@ def build_user_prompt(page: Page) -> str | None:
       * ``page.pdf_path`` (resolved against ``page.scan.output_dir``)
         is opened only for caption / footnote text crops.
 
-    :param page: The ``scanning.models.Page`` row to build a prompt
-        for. The Page must have ``detections``, ``is_blank``,
-        ``page_index``, ``pdf_path``, and a ``scan`` with
-        ``output_dir`` + ``opinions_json``.
+    :param page: The page object to build a prompt for. It must
+        have ``detections``, ``is_blank``, ``page_index``,
+        ``pdf_path``, and a ``scan`` with ``output_dir``.
     :return: The prompt text, or ``None`` if there's nothing useful
         to say about the page (no detections, no opinions touching
         it, and it isn't blank).
@@ -406,7 +408,11 @@ def build_user_prompt(page: Page) -> str | None:
 
     pdf_path = Path(page.scan.output_dir) / page.pdf_path
     detections = page.detections or []
-    opinions = (page.scan.opinions_json or []) if page.scan else []
+    # ``Scan.opinions_json`` is gone (#240 PR C: the boundaries are
+    # rows), and this builder has had no caller since #280. An empty
+    # list keeps the module importable and the prompt shape unchanged
+    # until the app is deleted.
+    opinions: list = []
 
     with pdfplumber.open(pdf_path) as pdf:
         pdf_page = pdf.pages[0]
