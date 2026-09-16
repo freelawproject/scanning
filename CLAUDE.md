@@ -69,7 +69,7 @@ This file holds what the code and the git history cannot tell a reader: the comm
 State is `Scan.status`. The stages, and where each runs:
 
 1. `run_full_pipeline` (daemon, `process_next_scan`): shards the original (#164), sets `page_count`, creates the CONVERT rows (doctor bitonal, #176) and the ANALYZE rows (dots.mocr on RunPod, #190/#207), then parks the scan in AWAITING or AWAITING_VALIDATION.
-2. Daemon ticks (`submit_external_jobs`, `collect_external_jobs`, serial scheduler, #156). The submit tick starts one detection run per shard set (`yolo.enqueue_missing_runs`, #250). The collect tick merges the bitonal shards, glues the dots.mocr run, applies the page numbers (`run_compute_issues`, #204), triggers the apply (#224), merges the detection run and queues the redaction compute (#196), and promotes the review states (#263).
+2. Daemon ticks (`submit_external_jobs`, `collect_external_jobs`, serial scheduler, #156). The submit tick starts one detection run per shard set (`yolo.enqueue_missing_runs`, #250). The collect tick merges the bitonal shards, glues the dots.mocr run, applies the page numbers (`run_compute_issues`, #204), triggers the apply (#224), merges the detection run and queues the redaction compute (#196), glues the tagger run (`tagger.finish_ready_runs`), and promotes the review states (#263).
 3. Review 1: READY_FOR_PAGE_COMPLETENESS_REVIEW, then PAGE_COMPLETENESS_REVIEW_DONE (`approve_page_completeness`, #151/#154).
 4. The apply (#224): queued work (`APPLY_PAGE_EDITS`) that builds the corrected volume from the `PageEdit` rows under `jobs/apply/a{n}/`.
 5. The redaction compute (#196): queued work (`COMPUTE_REDACTIONS`) that renders every page; parks in READY_FOR_REDACTION_REVIEW, then REDACTION_REVIEW_DONE (`approve_redaction_review`, #263).
@@ -103,7 +103,7 @@ State is `Scan.status`. The stages, and where each runs:
 - The bitonal merge deletes its results; dots.mocr and detection keep theirs and pass `reuse_results=True`. Never delete an analyze or detect result. The row identity carries `size_bytes`
 - Run reuse compares page ranges, not shard keys. `_still_describes` compares `input_manifest` exactly, so a run-scoped counter goes in `provider_meta`, never in `input_manifest`
 - A stable hole (`jobs.hole_is_stable`) is carried; `reread_failed_pages` re-pays only the shards with unstable holes. `repaired_pages` is a page list, and a repaired page is not a filtered one (#242)
-- The job creators are pinned by an AST test (`TestKnownEnqueuePaths`): the pipeline, `start_dots_mocr`, `yolo.ensure_detect_jobs` (through the sweep and `enqueue_yolo_detect`), `apply.py`, `reread_failed_pages`. Row creation is what costs GPU money
+- The job creators are pinned by an AST test (`TestKnownEnqueuePaths`): the pipeline, `start_dots_mocr`, `yolo.ensure_detect_jobs` (through the sweep and `enqueue_yolo_detect`), `apply.py`, `reread_failed_pages`, `tagger.ensure_tag_jobs` (through `enqueue_caselaw_tagger` alone). Row creation is what costs GPU money
 - No provider abstraction, on purpose: branch on `job.provider`. Mistral (#191, switched off) is where the branches get promoted
 - Do not add a pass that revives FAILED rows: the admin re-queue changes the status in a second write, and a reviver races it
 - A failure names the volume page range (`jobs._failure_location`). Page numbers are logged 1-based; `from_page`/`to_page` are fitz indexes
@@ -179,6 +179,16 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - The opinion of a reading comes from `boundaries.standing`, in the order `reading_key` defines, never from the caption rows. The count of `HEADNOTE` boxes is not the count of headnotes, so no finding is built on it
 - Every page overlay is drawn from its rows at every render and never positioned once: `renderPage` calls the redaction, bounds and dim draws, because a re-render changes the scale. A selected opinion is a cache plus a draw (`_drawDimForPage`), never a one-time paint. Its masks dim, and draw in the `bounds` mode alone: a redaction mode shows the page as the output has it (#311)
 
+## The tagger (one RunPod job per volume)
+
+- `tagger.py` is the stage at `TAG`/`CASELAW_TAGGER`/`RUNPOD`, the shape of `dots_mocr.py` and `yolo.py`; `tagger_input.py` is the converter, pure standard library, so the serialization is reproducible in a test with a dict. Gate: `TAG_STATUSES` is `REDACTION_REVIEW_DONE`; `--any-status` is for a test volume. Nothing enqueues on a tick yet
+- One job per volume, addressed by content: the input and its map go under `jobs/tag/caselaw_tagger/input-{digest}.json`, and the row's identity carries the digest, the OCR key and run, the measured `apply_run` and `CONVERTER_VERSION` (`jobs.ensure_run_jobs`). The same inputs reuse the run; a new glue, a box decision, a boundary or a converter change starts one. Bump `CONVERTER_VERSION` whenever the same rows would give a different text. `page_count` is the pages the sent text covers, not the cases
+- Every read is in the one space `tagger.measured_run` names (`detections.measured_run`, the #269 rule): the run's `ocr_key` and `printed_pages.json` with a measured run, else the volume's glued document and `Scan.ocr_results`. A row whose `apply_run` is not that run is left out and logged, never placed by its index
+- The review-2 rows are the layout: `Detection.live()` claims cells (a `FOOTNOTES` box holds a cell out and lists it on the map, a `KEY_ICON` closes an opinion, the head-band labels are furniture, an `IMAGE` box is recorded and not sent); `Redaction.visible()` in points, through `tagger_input.points_to_frame` (200/72), removes every cell whose centre it covers, margin strips included; `boundaries.standing` less the dismissed rows gives the opinion ranges (`ranges_from_anchors`: the caption's top-left opens at the first block after it in reading order, the key icon's bottom-right closes at the last block before it; the left column reads before the right; ranges are clipped at the next start, and a block in no range is not sent and counted in `blocks_outside_boundaries`). Without a boundary the key icons cut; a caption box opens nothing by itself (373 opinions of 303 on volume 2574)
+- The converter reads no running head: printed pages, furniture and boundaries all have a source in scanning. Do not port the prototype's "Cite as" parse back. The column ordering, the inline-HTML rendering, the footnote label split and the repetition-loop filter were measured over sixteen volumes in encoder-testing; do not simplify them
+- The glue writes `r{run}-volume.json` beside the input (the spans per opinion, the map's key, the OCR key), consumes the row, keeps the result object and writes no scan status. Failures count on `provider_meta["glue"]`, loud then quiet. The `glued/caselaw-tagger/` routes serve it
+- Not here: reading the spans back into cases, wiring footnotes, cropping figures, casebody output (the assembly PR, the port of encoder-testing's `structure.py`)
+
 ## Worker images
 
 - The scaffold is in `runpod_common`, once: Sentry, the result envelope, `execute_action`. Only `BadInputError` maps to `BAD_INPUT`. Without `result_url` a worker answers inline
@@ -205,4 +215,4 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - `DEVELOPMENT=True` enables the debug toolbar, local filesystem storage and the dev S3 buckets
 - `TESTING=True` is auto-detected from `sys.argv`: LocMemCache, MD5 password hasher, no debug toolbar URLs
 - `DB_SSL_MODE=prefer` is needed outside Docker
-- `DOCTOR_ENABLED` and `DOCTOR_HOST` default to working values; `RUNPOD_YOLO_ENDPOINT_ID` blank turns detection off and leaves dots.mocr on
+- `DOCTOR_ENABLED` and `DOCTOR_HOST` default to working values; `RUNPOD_YOLO_ENDPOINT_ID` blank turns detection off and leaves dots.mocr on; `RUNPOD_TAGGER_ENDPOINT_ID` blank turns the tagger off the same way

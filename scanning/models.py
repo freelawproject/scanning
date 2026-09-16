@@ -3206,6 +3206,7 @@ class JobEngine(models.TextChoices):
     BLACKLETTER = "blackletter", "blackletter (YOLO detection)"
     BITONAL = "bitonal", "Bitonal conversion"
     DOTS_MOCR = "dots_mocr", "dots.mocr"
+    CASELAW_TAGGER = "caselaw_tagger", "caselaw-block-tagger"
     MISTRAL_OCR = "mistral_ocr", "Mistral OCR"
     SURYA = "surya", "Surya"
     LIGHTON_OCR = "lighton_ocr", "LightOnOCR"
@@ -3240,6 +3241,7 @@ class JobStage(models.TextChoices):
     CONVERT = "convert", "Convert to bitonal"
     DETECT = "detect", "Detect (YOLO)"
     ANALYZE = "analyze", "Analyze (page numbers)"
+    TAG = "tag", "Tag (case-law blocks)"
     EXTRACT = "extract", "Extract text"
     TIEBREAK = "tiebreak", "Tiebreak disputed reads"
 

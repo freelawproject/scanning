@@ -206,7 +206,7 @@ def _runpod_engines() -> dict[str, RunpodEngine]:
     :returns: The engine table.
     :rtype: dict[str, RunpodEngine]
     """
-    from scanning import dots_mocr, yolo
+    from scanning import dots_mocr, tagger, yolo
 
     return {
         JobEngine.DOTS_MOCR: RunpodEngine(
@@ -230,6 +230,21 @@ def _runpod_engines() -> dict[str, RunpodEngine]:
             is_enabled=yolo.enabled,
             build_payload=yolo.build_payload,
             label="YOLO",
+        ),
+        # One job per volume, not per shard: the input is a JSON
+        # document the daemon writes (``tagger.ensure_tag_jobs``), and
+        # ``page_count`` on its row counts cases, which is what the
+        # per-page allowance is per.
+        JobEngine.CASELAW_TAGGER: RunpodEngine(
+            engine=JobEngine.CASELAW_TAGGER,
+            stage=JobStage.TAG,
+            endpoint_setting="RUNPOD_TAGGER_ENDPOINT_ID",
+            concurrency_setting="TAGGER_MAX_CONCURRENCY",
+            attempts_setting="TAGGER_MAX_ATTEMPTS",
+            seconds_per_page_setting="TAGGER_SECONDS_PER_PAGE",
+            is_enabled=tagger.enabled,
+            build_payload=tagger.build_payload,
+            label="tagger",
         ),
     }
 
@@ -1445,8 +1460,72 @@ def ensure_shard_jobs(
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
-    specs = _shard_specs(scan, manifest)
+    # The set the run is cut for, as one string. Not in the identity:
+    # ``_still_describes`` compares ``input_manifest`` exactly, so a new
+    # key there would read every live run as stale and re-pay it. The
+    # column is what lets the detection sweep ask "has this set been
+    # detected" in one query (#250).
+    #
+    # An apply run (#224) is not a shard set of an original: its
+    # manifest source is the sum over the one-page shards of the pages
+    # a curator changed. So it carries no fingerprint, and the sweep's
+    # question stays about the volume alone.
+    fingerprint = (
+        ""
+        if apply_run is not None
+        else sharding.fingerprint_value(manifest["source"])
+    )
+    return ensure_run_jobs(
+        scan,
+        _shard_specs(scan, manifest),
+        stage=stage,
+        engine=engine,
+        provider=provider,
+        fingerprint=fingerprint,
+        reuse_results=reuse_results,
+        force_new_run=force_new_run,
+        apply_run=apply_run,
+    )
 
+
+def ensure_run_jobs(
+    scan,
+    specs: list[tuple[str, dict]],
+    *,
+    stage: str,
+    engine: str,
+    provider: str,
+    fingerprint: str,
+    reuse_results: bool = False,
+    force_new_run: bool = False,
+    apply_run=None,
+) -> list[ExternalJob]:
+    """Return the live rows for one engine over ``specs``, creating
+    them if the current run does not describe that work.
+
+    The body of :func:`ensure_shard_jobs`, with the work described by
+    the caller: one ``(input_key, identity)`` pair per row, in row
+    order. The shard stages describe a shard set with it; the tagger
+    describes one input document per volume. The idempotence, the reuse
+    of prior results, the unique key and the race with a second writer
+    are the same whatever the rows address, which is why there is one
+    creator and not one per shape.
+
+    :param scan: The scan the rows belong to.
+    :param specs: ``(input_key, identity)`` per row, ordered.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param provider: A :class:`~scanning.models.JobProvider` value.
+    :param fingerprint: The ``source_fingerprint`` every row carries;
+        blank for an apply run.
+    :param reuse_results: Carry prior results forward
+        (:func:`_reusable_results`).
+    :param force_new_run: Start a new run even when the live one still
+        describes today's work.
+    :param apply_run: The apply run the rows work for, or None.
+    :returns: The live run's rows, ordered by row index.
+    :rtype: list[ExternalJob]
+    """
     existing = list(
         ExternalJob.objects.filter(
             scan=scan,
@@ -1482,21 +1561,6 @@ def ensure_shard_jobs(
     now = timezone.now()
     reusable = (
         _reusable_results(scan, stage, engine, specs) if reuse_results else {}
-    )
-    # The set the run is cut for, as one string. Not in the identity:
-    # ``_still_describes`` compares ``input_manifest`` exactly, so a new
-    # key there would read every live run as stale and re-pay it. The
-    # column is what lets the detection sweep ask "has this set been
-    # detected" in one query (#250).
-    #
-    # An apply run (#224) is not a shard set of an original: its
-    # manifest source is the sum over the one-page shards of the pages
-    # a curator changed. So it carries no fingerprint, and the sweep's
-    # question stays about the volume alone.
-    fingerprint = (
-        ""
-        if apply_run is not None
-        else sharding.fingerprint_value(manifest["source"])
     )
     rows = []
     for index, (key, identity) in enumerate(specs):

@@ -34,6 +34,7 @@ from scanning import (
     page_numbers,
     repairs,
     s3_sync,
+    tagger,
     yolo,
 )
 from scanning.models import (
@@ -1094,6 +1095,11 @@ GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
         dots_mocr.glued_result_key,
     ),
     "yolo": (JobStage.DETECT, JobEngine.BLACKLETTER, yolo.merged_result_key),
+    "caselaw-tagger": (
+        JobStage.TAG,
+        JobEngine.CASELAW_TAGGER,
+        tagger.glued_result_key,
+    ),
 }
 
 NO_S3_GLUED_OUTPUT_MESSAGE = (
