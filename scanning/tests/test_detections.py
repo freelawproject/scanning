@@ -267,6 +267,62 @@ class TestDecide(TestCase):
         )
 
 
+class TestStandingDecision(TestCase):
+    """The decision is read after the lock, never through the join.
+
+    A rival writer can commit while the caller waits for the row lock.
+    PostgreSQL then gives the new row, but a row joined by
+    ``select_related`` stays on the old snapshot, so the row carried a
+    new ``decision_id`` with no object behind it (Sentry SCANNING-48).
+    """
+
+    def setUp(self):
+        self.scan = ScanFactory(page_count=2, source_fingerprint="10:2")
+        self.user = UserFactory()
+
+    def stale_row(self) -> tuple[Detection, DetectionDecision]:
+        """Store a decided row, and give it the join a rival writer left.
+
+        :returns: The row and its standing decision.
+        """
+        row = model_row(self.scan)
+        decision = detections.decide(
+            self.scan, row, DetectionDecision.Kind.DEACTIVATE, self.user
+        )
+        row.refresh_from_db()
+        row._state.fields_cache["decision"] = None
+        return row, decision
+
+    def test_a_stale_join_still_finds_the_decision(self):
+        row, decision = self.stale_row()
+
+        self.assertEqual(detections.standing_decision(row), decision)
+
+    def test_a_second_click_is_still_a_no_op(self):
+        row, decision = self.stale_row()
+
+        again = detections.decide(
+            self.scan, row, DetectionDecision.Kind.DEACTIVATE, self.user
+        )
+
+        self.assertEqual(again, decision)
+        self.assertEqual(DetectionDecision.objects.count(), 1)
+
+    def test_a_withdrawn_decision_does_not_stand(self):
+        row, decision = self.stale_row()
+        detections.withdraw(
+            DetectionDecision.objects.filter(pk=decision.pk), self.user
+        )
+        row.decision_id = decision.pk
+
+        self.assertIsNone(detections.standing_decision(row))
+
+    def test_an_undecided_row_reads_nothing(self):
+        row = model_row(self.scan)
+
+        self.assertIsNone(detections.standing_decision(row))
+
+
 class TestMoveAndManual(TestCase):
     def setUp(self):
         self.scan = ScanFactory(page_count=2, source_fingerprint="10:2")
