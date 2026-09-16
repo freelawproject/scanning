@@ -455,10 +455,8 @@ def dismiss(scan: Scan, row: OpinionBoundary, user) -> OpinionBoundary | None:
     :raises UnaddressableBoundary: For a computed row with no address.
     """
     with transaction.atomic():
-        row = (
-            OpinionBoundary.objects.select_for_update(of=("self",))
-            .select_related("decision")
-            .get(pk=row.pk)
+        row = OpinionBoundary.objects.select_for_update(of=("self",)).get(
+            pk=row.pk
         )
         if not row.is_computed:
             if withdraw(OpinionBoundary.objects.filter(pk=row.pk), user):
@@ -468,8 +466,9 @@ def dismiss(scan: Scan, row: OpinionBoundary, user) -> OpinionBoundary | None:
                         user,
                     )
             return None
-        if row.decision_id and row.decision.withdrawn_at is None:
-            return row.decision
+        current = detections.standing_decision(row)
+        if current is not None:
+            return current
         if row.start_source_page is None or row.end_source_page is None:
             # The rule of ``detections.decide``: a dismissal with no
             # address could never land (``resolve`` matches by the
