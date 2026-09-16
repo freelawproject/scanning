@@ -30,7 +30,9 @@ from scanning import (
     dots_mocr,
     findings,
     jobs,
+    mistral_ocr,
     page_edits,
+    page_numbers,
     repairs,
     s3_sync,
     yolo,
@@ -415,10 +417,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # rows itself (``findings.viewer_groups``, below).
     issues = list(scan.issues.exclude(check_name__in=REVIEW2_CHECKS))
 
-    # Neither GPU stage writes a scan status by design (#190, #195), so
-    # their rows are the only place their progress lives.
+    # No external stage writes a scan status by design (#190, #195,
+    # #191), so their rows are the only place their progress lives.
     dots_run = dots_mocr.run_summary(scan)
     yolo_run = yolo.run_summary(scan)
+    mistral_run = mistral_ocr.run_summary(scan)
 
     # The pages a reviewer asked a scanner to scan again, or the gaps
     # they asked a scanner to fill (#249). The waiting ones raise the
@@ -564,6 +567,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
             r["is_replaced"] = r["pdf_page"] in replaced_pages
             r["needs_repair"] = r["pdf_page"] in pages_needing_repair
+            if r.get("type") == page_numbers.SUFFIXED:
+                # The book adds this page between two numbered ones, so
+                # it breaks no sequence: the page before it and the page
+                # after it stay neighbours (#319).
+                continue
             if not r.get("detected") or r.get("type") == "range":
                 prev_num = None
                 continue
@@ -662,6 +670,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "dots_run": dots_run,
             "ocr_missing": ocr_missing(scan, dots_run),
             "yolo_run": yolo_run,
+            "mistral_run": mistral_run,
             "detect_message": detection_message(yolo_run),
             **flags,
             "final_space": final_space,
@@ -734,6 +743,9 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     yolo_run = yolo.run_summary(scan)
     if yolo_run:
         data["yolo_run"] = yolo_run
+    mistral_run = mistral_ocr.run_summary(scan)
+    if mistral_run:
+        data["mistral_run"] = mistral_run
     return JsonResponse(data)
 
 
@@ -1974,6 +1986,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "dots_run": dots_run,
         "ocr_missing": ocr_missing(scan, dots_run),
         "yolo_run": yolo_run,
+        "mistral_run": mistral_ocr.run_summary(scan),
         "detect_message": detection_message(yolo_run),
         **_review_flags(scan),
     }
@@ -2155,6 +2168,100 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
         # ``ensure_analyze_jobs`` reused a run that is already done, so
         # nothing was queued and nothing will be sent. Saying otherwise
         # would have staff waiting on a dispatch that is not coming.
+        messages.info(
+            request,
+            f"This volume was already read: run {created[0].run} covers "
+            f"all {len(created)} part(s). Nothing new was queued.",
+        )
+    return back
+
+
+@login_required
+@require_POST
+def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
+    """Start the Mistral OCR read over a scan's shards (#191).
+
+    Staff only, and the only way into this stage until a daemon trigger
+    lands. Every press can start real paid work on Mistral's batch API.
+
+    The read is over the original shards, so the button waits on no
+    review state and on no redacted volume: the set exists from the
+    moment the pipeline cut it. ``MISTRAL_API_KEY`` is the switch an
+    environment holds, and an environment that must not spend leaves
+    the key unset.
+
+    **This request makes no call to Mistral.** It writes one
+    ``ExternalJob`` row per shard and returns; the daemon's next
+    ``submit_external_jobs`` tick renders, uploads and submits them,
+    and ``collect_external_jobs`` polls, harvests and retries them.
+    The render is the daemon's work, so a web pod never opens the
+    volume.
+
+    It also never cuts shards. ``sharding.committed_manifest`` verifies
+    the stored set against the original with one ``head_object``, and a
+    stale or missing set is refused, because re-cutting is the
+    pipeline's job.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page.
+    """
+    from scanning import sharding
+
+    scan = get_object_or_404(Scan, pk=pk)
+    back = redirect("scan_process", pk=scan.pk)
+
+    if not request.user.is_staff:
+        messages.error(
+            request,
+            "Only staff can start Mistral OCR: each run costs money.",
+        )
+        return back
+
+    if not mistral_ocr.enabled():
+        messages.warning(
+            request,
+            "Mistral OCR is not switched on in this environment. Set "
+            "MISTRAL_API_KEY first.",
+        )
+        return back
+
+    # An open run means the daemon is still working on the last press.
+    # A finished run is reused rather than refused, which is what keeps
+    # ``ensure_extract_jobs`` from paying twice for shards already read.
+    summary = mistral_ocr.run_summary(scan)
+    if summary and summary["open"]:
+        messages.info(
+            request,
+            f"Mistral OCR run {summary['run']} is already going: "
+            f"{summary['done']} of {summary['total']} part(s) done.",
+        )
+        return back
+
+    manifest, reason = sharding.committed_manifest(scan)
+    if manifest is None:
+        messages.warning(request, reason)
+        return back
+
+    created = mistral_ocr.ensure_extract_jobs(scan, manifest)
+    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
+    logger.info(
+        "start_mistral_ocr: scan=%s user=%s run=%s shards=%d queued=%d",
+        scan.pk,
+        request.user.pk,
+        created[0].run if created else "?",
+        len(created),
+        queued,
+    )
+    if queued:
+        messages.success(
+            request,
+            f"Queued Mistral OCR for {queued} part(s) of this volume. The "
+            "daemon renders and sends them within a few seconds.",
+        )
+    else:
+        # ``ensure_extract_jobs`` reused a run that is already done, so
+        # nothing was queued and nothing will be sent.
         messages.info(
             request,
             f"This volume was already read: run {created[0].run} covers "
@@ -2392,13 +2499,23 @@ def reprocess(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=scan.pk)
 
 
+#: What the curator may type, in the one wording the server and both
+#: viewers use. ``shared.js`` carries the copy the browser shows
+#: before the request leaves the page (#319).
+PAGE_NUMBER_ERROR = (
+    "Page number must be a positive whole number, a number with one "
+    "trailing letter like 2094a, or a range like 678-686."
+)
+
+
 def _page_number_value(raw) -> str | None:
     """Return a curator's page number entry, normalized, or None.
 
-    Accepts a positive whole number, and a printed range like
-    ``678-686`` for the one PDF page that carries several book pages --
-    the shape ``CheckName.PAGE_RANGE`` exists for, and the shape
-    ``Page.book_page`` has always documented. A blank entry is the
+    Accepts the three shapes a book prints: a positive whole number; a
+    number with one trailing letter (``2094a``, issue #319) on the page
+    the book adds between two numbered pages; and a range like
+    ``678-686`` for the one PDF page that carries several book pages,
+    the shape ``CheckName.PAGE_RANGE`` exists for. A blank entry is the
     curator clearing the number, which is a decision, so it returns the
     empty string rather than None.
 
@@ -2408,6 +2525,12 @@ def _page_number_value(raw) -> str | None:
     hyphen, which is the shape every reader of a range parses
     (``services._page_number_lookup``,
     ``blackletter.validate.RANGE_RE``).
+
+    The case of a trailing letter is kept: the book prints one of the
+    two glyphs and no reader compares them. The reader asks for two
+    digits before the letter (``page_numbers.MIN_SUFFIXED_DIGITS``) and
+    this does not: that guard is against a token of a running head, and
+    here a person has the page in front of them.
 
     :param raw: The ``page_number`` field of the request body.
     :returns: The value for ``PageEdit.value``, or None when the entry
@@ -2419,6 +2542,10 @@ def _page_number_value(raw) -> str | None:
     text = str(raw).strip().replace("–", "-").replace("—", "-")
     if not text:
         return ""
+    if page_numbers.number_type(text) == page_numbers.SUFFIXED:
+        if int(text[:-1]) < 1:
+            return None
+        return f"{int(text[:-1])}{text[-1]}"
     parts = [part.strip() for part in text.split("-")]
     if len(parts) > 2 or not all(p.isdigit() and int(p) >= 1 for p in parts):
         return None
@@ -2472,12 +2599,7 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
     page_value = _page_number_value(data["page_number"])
     if page_value is None:
         return JsonResponse(
-            {
-                "error": (
-                    "Page number must be a positive whole number, or a "
-                    "range like 678-686."
-                )
-            },
+            {"error": PAGE_NUMBER_ERROR},
             status=400,
         )
 
@@ -2524,6 +2646,9 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
         {
             "status": "ok",
             "detected": page_value or None,
+            # The shape, so the viewer draws the right tag without
+            # deriving it from the string a second time (#319).
+            "type": page_numbers.number_type(page_value),
             "duplicate": duplicate,
         }
     )

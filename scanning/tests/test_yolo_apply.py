@@ -31,6 +31,7 @@ from scanning import (
 from scanning.factories import ScanFactory
 from scanning.models import (
     ApplyRun,
+    BracketReading,
     Detection,
     DetectionDecision,
     ExternalJob,
@@ -385,11 +386,12 @@ class ComputeMixin:
         )
         stubs["load_printed_pages"] = printed.start()
         self.addCleanup(printed.stop)
-        # The text redaction fit reads the run's OCR volume (#279);
-        # ``test_text_fit`` owns the rule, so the read is stubbed here.
-        cells = patch.object(text_fit, "load_cells", return_value={})
-        stubs["load_cells"] = cells.start()
-        self.addCleanup(cells.stop)
+        # The text redaction fit and the bracket readings share one
+        # read of the run's OCR volume (#279, #328); ``test_text_fit``
+        # and ``test_brackets`` own the rules, so the read is stubbed.
+        ocr = patch.object(text_fit, "load_document", return_value=None)
+        stubs["load_document"] = ocr.start()
+        self.addCleanup(ocr.stop)
         release = patch("scanning.s3_sync.release_local_processing")
         release.start()
         self.addCleanup(release.stop)
@@ -457,8 +459,8 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
             services.run_compute_redactions(scan.pk)
 
         self.assertEqual(order, ["gutter", "ink snap", "gutter", "document"])
-        stubs["load_cells"].assert_called_once()
-        cells = stubs["load_cells"].return_value
+        stubs["load_document"].assert_called_once()
+        cells = separate.call_args_list[0].args[1]
         for call in separate.call_args_list:
             self.assertIs(call.args[1], cells)
         # The document takes the same cells, and puts the gutter back
@@ -596,23 +598,68 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
             {},
             [{"page_index": 0}],
         )
-        stubs["load_cells"].return_value = text_fit.page_cells(
-            {
-                "pages": [
-                    {
-                        "page_index": 0,
-                        "origin_width": 1000,
-                        "origin_height": 1000,
-                        "cells": [{"bbox": [150, 210, 250, 390]}],
-                    }
-                ]
-            }
-        )
+        stubs["load_document"].return_value = {
+            "pages": [
+                {
+                    "page_index": 0,
+                    "origin_width": 1000,
+                    "origin_height": 1000,
+                    "cells": [{"bbox": [150, 210, 250, 390]}],
+                }
+            ]
+        }
 
         services.run_compute_redactions(scan.pk)
 
         row = Redaction.objects.get(scan=scan)
         self.assertEqual(row.bbox, [73.0, 100.0, 127.0, 200.0])
+
+    def test_the_compute_stores_the_bracket_readings(self):
+        """#328: the brackets the reader found become rows, from the
+        same read of the OCR volume the text fit uses."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        self._measured(stubs, [])
+        stubs["_snapped_document"].return_value = (
+            SimpleNamespace(
+                pages=[
+                    SimpleNamespace(
+                        index=0,
+                        scale_x=0.5,
+                        scale_y=0.5,
+                        img_width=1000,
+                        img_height=1000,
+                        pdf_width=500.0,
+                        pdf_height=500.0,
+                    )
+                ]
+            ),
+            {},
+            [{"page_index": 0}],
+        )
+        stubs["load_document"].return_value = {
+            "pages": [
+                {
+                    "page_index": 0,
+                    "origin_width": 1000,
+                    "origin_height": 1000,
+                    "cells": [
+                        {
+                            "bbox": [150, 210, 250, 390],
+                            "text": "[7] The court",
+                        },
+                        {"bbox": [150, 400, 250, 500], "text": "In [1106] it"},
+                    ],
+                }
+            ]
+        }
+
+        services.run_compute_redactions(scan.pk)
+
+        row = BracketReading.objects.get(scan=scan)
+        self.assertEqual(row.numbers, [7])
+        self.assertEqual(row.raw, "[7]")
+        self.assertEqual(row.page_index, 0)
 
     def test_a_recompute_rewrites_the_computed_rows_and_keeps_the_human_ones(
         self,

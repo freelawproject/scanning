@@ -281,7 +281,7 @@ wheels = [
 
 [[package]]
 name = "blackletter"
-version = "0.3.1"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -290,9 +290,9 @@ dependencies = [
     { name = "pillow" },
     { name = "pymupdf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/60/1b/653c98dbaab8e1cc71eb2afa64bb2ad3f95ee9cff7b479942dbf678a6e9d/blackletter-0.3.1.tar.gz", hash = "sha256:c4174c6f6d2c52dc662a5360124606a0fbb728894e02ab7b896c4a9aee83909b", size = 179225, upload-time = "2026-09-15T03:44:50.62Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/d6/388835ac8ef8009583879293bdde406a11790930b606426f82596a602cf9/blackletter-0.4.1.tar.gz", hash = "sha256:e272d6a6e8fb90cb847dec8e2b9a93efb51f2c5174b0c66af206815ebe5fe3bc", size = 188470, upload-time = "2026-09-16T13:40:15.101Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bf/74/57a1dbb344f8e1e9fedfa7d09210e896a9b5f90b05a31dafcc90a0712f20/blackletter-0.3.1-py3-none-any.whl", hash = "sha256:3d297a06571b5b8ee526dade69096666724ca58adbc6fce0689dfc4440d40554", size = 135261, upload-time = "2026-09-15T03:44:48.967Z" },
+    { url = "https://files.pythonhosted.org/packages/46/7e/6af4161dac23a44986bc966bf08f118190c3e188f56bc3cb6fb3cce71ba5/blackletter-0.4.1-py3-none-any.whl", hash = "sha256:57c8f7e2c072b6844d6ea533e0af4cd88b598f2cb6e549f72b7573465e7a2129", size = 138922, upload-time = "2026-09-16T13:40:13.554Z" },
 ]
 
 [package.optional-dependencies]

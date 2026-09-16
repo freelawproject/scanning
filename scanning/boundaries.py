@@ -455,10 +455,8 @@ def dismiss(scan: Scan, row: OpinionBoundary, user) -> OpinionBoundary | None:
     :raises UnaddressableBoundary: For a computed row with no address.
     """
     with transaction.atomic():
-        row = (
-            OpinionBoundary.objects.select_for_update(of=("self",))
-            .select_related("decision")
-            .get(pk=row.pk)
+        row = OpinionBoundary.objects.select_for_update(of=("self",)).get(
+            pk=row.pk
         )
         if not row.is_computed:
             if withdraw(OpinionBoundary.objects.filter(pk=row.pk), user):
@@ -468,8 +466,9 @@ def dismiss(scan: Scan, row: OpinionBoundary, user) -> OpinionBoundary | None:
                         user,
                     )
             return None
-        if row.decision_id and row.decision.withdrawn_at is None:
-            return row.decision
+        current = detections.standing_decision(row)
+        if current is not None:
+            return current
         if row.start_source_page is None or row.end_source_page is None:
             # The rule of ``detections.decide``: a dismissal with no
             # address could never land (``resolve`` matches by the
@@ -618,7 +617,7 @@ def add(
         # the same column closes nothing; in the right column it may
         # sit higher than a start in the left one.
         page = fields["start_page_index"]
-        divide = _column_boundaries(scan, {page}).get(page)
+        divide = column_boundaries(scan, {page}).get(page)
 
         def _key(x, y):
             column = 0 if divide is None or x < divide else 1
@@ -674,7 +673,7 @@ def add(
 # ---------------------------------------------------------------------------
 
 
-def _column_boundaries(scan: Scan, page_indexes: set[int]) -> dict[int, float]:
+def column_boundaries(scan: Scan, page_indexes: set[int]) -> dict[int, float]:
     """Return the x, in points, that divides the two columns of each page.
 
     From the live ``TEXT_COLUMN`` rows of the page, the rule of
@@ -717,12 +716,32 @@ def reading_key(
     alone would order them wrong (plan section 3.3).
 
     :param row: The boundary.
-    :param columns: :func:`_column_boundaries` for the start pages.
+    :param columns: :func:`column_boundaries` for the start pages.
     :returns: The key.
     """
-    divide = columns.get(row.start_page_index)
-    column = 0 if divide is None or row.start_x < divide else 1
-    return row.start_page_index, column, row.start_y, row.start_x
+    return position_key(
+        row.start_page_index, row.start_x, row.start_y, columns
+    )
+
+
+def position_key(
+    page_index: int, x: float, y: float, columns: dict[int, float]
+) -> tuple[int, int, float, float]:
+    """Return the reading-order key of one point of one page.
+
+    The half of :func:`reading_key` that does not need a boundary row,
+    so a bracket reading can be ordered against the opinion starts
+    (``brackets.opinion_of``, #328).
+
+    :param page_index: The 0-based page.
+    :param x: The x of the point, in PDF points.
+    :param y: The y of the point, in PDF points.
+    :param columns: :func:`column_boundaries` for that page.
+    :returns: The key.
+    """
+    divide = columns.get(page_index)
+    column = 0 if divide is None or x < divide else 1
+    return page_index, column, y, x
 
 
 def standing(scan: Scan) -> list[OpinionBoundary]:
@@ -761,7 +780,7 @@ def standing(scan: Scan) -> list[OpinionBoundary]:
         .values_list("replaces_id", flat=True)
     )
     rows = [r for r in rows if r.decision_id not in moved]
-    columns = _column_boundaries(scan, {r.start_page_index for r in rows})
+    columns = column_boundaries(scan, {r.start_page_index for r in rows})
     rows.sort(key=lambda r: reading_key(r, columns))
     return rows
 

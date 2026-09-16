@@ -145,6 +145,87 @@ class TestExtractPageNumber(SimpleTestCase):
                     self.extract([cell(f"{text} A REPORTER")])["detected"]
                 )
 
+    def test_a_number_with_a_trailing_letter_is_read_whole(self):
+        """The page the book adds between two numbered pages (#319)."""
+        entry = self.extract([cell("2094a")])
+
+        self.assertEqual(entry["detected"], "2094a")
+        self.assertEqual(entry["type"], "suffixed")
+        self.assertEqual(entry["score"], 1.0)
+
+    def test_a_trailing_letter_leads_the_running_head(self):
+        entry = self.extract([cell("2094a OCTOBER TERM, 2019")])
+
+        self.assertEqual(entry["detected"], "2094a")
+        self.assertEqual(entry["type"], "suffixed")
+
+    def test_a_trailing_letter_trails_the_cite_line(self):
+        entry = self.extract(
+            [
+                cell(
+                    "SMITH v. JONES Cite as 140 S.Ct. 2094b",
+                    bbox=[1200, 143, 1550, 177],
+                )
+            ]
+        )
+
+        self.assertEqual(entry["detected"], "2094b")
+        self.assertEqual(entry["type"], "suffixed")
+
+    def test_the_case_of_the_trailing_letter_is_kept(self):
+        """The book prints one of the two glyphs, and no reader
+        compares them."""
+        entry = self.extract([cell("2094A")])
+
+        self.assertEqual(entry["detected"], "2094A")
+        self.assertEqual(entry["type"], "suffixed")
+
+    def test_the_stray_icon_is_not_a_trailing_letter(self):
+        """The parallel-page icon is misread as an ``L`` glued to the
+        number (#228), so the plain number is tried first."""
+        for text in ("2094L", "L2094"):
+            with self.subTest(text=text):
+                entry = self.extract([cell(text)])
+
+                self.assertEqual(entry["detected"], "2094")
+                self.assertEqual(entry["type"], "single")
+
+    def test_only_the_first_six_letters_are_read(self):
+        """The book labels the pages it adds in order from ``a``.
+
+        Every other letter there is noise, and the icon of #228 is
+        read as an ``l`` or an ``I``. The page keeps its
+        ``no_page_number`` card, which a curator answers; a wrong
+        suffixed reading would make no card at all (#319).
+        """
+        for text in ("2094a", "2094f", "2094A", "2094F"):
+            with self.subTest(text=text):
+                self.assertEqual(self.extract([cell(text)])["detected"], text)
+        for text in ("2094l", "2094I", "2094O", "2094g", "2094z"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.extract([cell(text)])["detected"])
+
+    def test_a_series_ordinal_is_no_page_number(self):
+        """``2d`` matches the shape exactly, so the reader asks for two
+        digits (#319). A curator may still type ``9a``."""
+        for text in ("2d", "3d", "9a"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.extract([cell(text)])["detected"])
+
+    def test_two_letters_are_no_page_number(self):
+        for text in ("2094ab", "a2094", "2094a2"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.extract([cell(text)])["detected"])
+
+    def test_the_type_of_a_stored_number(self):
+        """The one deriver every writer of a curator's number calls."""
+        self.assertIsNone(page_numbers.number_type(""))
+        self.assertIsNone(page_numbers.number_type(None))
+        self.assertEqual(page_numbers.number_type("2094"), "single")
+        self.assertEqual(page_numbers.number_type("2094a"), "suffixed")
+        self.assertEqual(page_numbers.number_type("9a"), "suffixed")
+        self.assertEqual(page_numbers.number_type("678-686"), "range")
+
     def test_a_section_opening_page_reads_its_footer(self):
         entry = self.extract(
             [

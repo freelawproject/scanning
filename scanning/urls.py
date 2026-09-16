@@ -87,6 +87,7 @@ from scanning.views_process import (
     serve_scan_pdf,
     start_detect,
     start_dots_mocr,
+    start_mistral_ocr,
     start_validate,
     undo_delete_page,
     undo_replace_page,
@@ -210,6 +211,11 @@ urlpatterns = [
         "scans/<int:pk>/start-ocr/",
         start_dots_mocr,
         name="start_dots_mocr",
+    ),
+    path(
+        "scans/<int:pk>/start-mistral/",
+        start_mistral_ocr,
+        name="start_mistral_ocr",
     ),
     path("scans/<int:pk>/recalculate/", recalculate, name="recalculate"),
     path(
