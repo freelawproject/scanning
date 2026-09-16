@@ -1609,8 +1609,9 @@ def _apply_candidates() -> dict[int, int]:
     whose document already names the live volume run drops out here,
     and :func:`finish_ready_applies` then judges the rest exactly.
 
-    :returns: ``{scan pk: the glued volume run's number}``.
-    :rtype: dict[int, int]
+    :returns: ``{scan pk: (the standing run, the glued volume run's
+        number)}``.
+    :rtype: dict[int, tuple]
     """
     from django.db.models import Max
 
@@ -1646,7 +1647,7 @@ def _apply_candidates() -> dict[int, int]:
         volume_run = live[run.scan_id]
         if run.extract_key and run.extract_run == volume_run:
             continue
-        candidates[run.scan_id] = volume_run
+        candidates[run.scan_id] = (run, volume_run)
     return candidates
 
 
@@ -1680,7 +1681,7 @@ def finish_ready_applies() -> int:
     :returns: How many corrected volumes were glued.
     :rtype: int
     """
-    from scanning.models import ApplyRun, Scan
+    from scanning.models import Scan
 
     if not s3_sync.s3_active() or not enabled():
         return 0
@@ -1688,16 +1689,8 @@ def finish_ready_applies() -> int:
     candidates = _apply_candidates()
     if not candidates:
         return 0
-    runs = {
-        run.scan_id: run
-        for run in ApplyRun.objects.filter(
-            scan_id__in=list(candidates),
-            superseded_at__isnull=True,
-            built_at__isnull=False,
-        )
-    }
     glued = 0
-    for scan in Scan.objects.filter(pk__in=list(runs)).select_related(
+    for scan in Scan.objects.filter(pk__in=list(candidates)).select_related(
         "reporter"
     ):
         volume_rows = live_extract_jobs(scan)
@@ -1705,7 +1698,7 @@ def finish_ready_applies() -> int:
             row.status != JobStatus.CONSUMED for row in volume_rows
         ):
             continue
-        run = runs[scan.pk]
+        run, _volume_run = candidates[scan.pk]
         name = run.label
         if int(_glue_state(volume_rows, name).get("attempts") or 0) >= (
             GLUE_MAX_ATTEMPTS
