@@ -141,14 +141,25 @@ class TestOpinionLevelJobs(ScanningTestCase):
         self.assertEqual(job.scan_id, self.scan.pk)
         self.assertEqual(job.opinion_id, self.opinion.pk)
 
-    def test_extract_job_requires_an_opinion(self):
-        with self.assertRaises(IntegrityError):
-            with transaction.atomic():
-                ExternalJobFactory(
-                    scan=self.scan,
-                    stage=JobStage.EXTRACT,
-                    engine=JobEngine.DOTS_MOCR,
-                )
+    def test_extract_job_takes_either_shape(self):
+        """EXTRACT is read per opinion by some engines and per shard by
+        Mistral (#191), so the constraint leaves it alone and the two
+        conditional unique keys sort its rows by shape."""
+        by_shard = ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            provider=JobProvider.MISTRAL,
+        )
+        by_opinion = ExternalJobFactory(
+            scan=self.scan,
+            opinion=self.opinion,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            provider=JobProvider.MISTRAL,
+        )
+        self.assertIsNone(by_shard.opinion)
+        self.assertEqual(by_opinion.opinion, self.opinion)
 
     def test_tiebreak_job_requires_an_opinion(self):
         with self.assertRaises(IntegrityError):

@@ -30,6 +30,7 @@ from scanning import (
     dots_mocr,
     findings,
     jobs,
+    mistral_ocr,
     page_edits,
     page_numbers,
     repairs,
@@ -378,10 +379,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # rows itself (``findings.viewer_groups``, below).
     issues = list(scan.issues.exclude(check_name__in=REVIEW2_CHECKS))
 
-    # Neither GPU stage writes a scan status by design (#190, #195), so
-    # their rows are the only place their progress lives.
+    # No external stage writes a scan status by design (#190, #195,
+    # #191), so their rows are the only place their progress lives.
     dots_run = dots_mocr.run_summary(scan)
     yolo_run = yolo.run_summary(scan)
+    mistral_run = mistral_ocr.run_summary(scan)
 
     # The pages a reviewer asked a scanner to scan again, or the gaps
     # they asked a scanner to fill (#249). The waiting ones raise the
@@ -629,6 +631,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "is_processing": is_processing,
             "dots_run": dots_run,
             "yolo_run": yolo_run,
+            "mistral_run": mistral_run,
             "detect_message": detection_message(yolo_run),
             **flags,
             "final_space": final_space,
@@ -701,6 +704,9 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     yolo_run = yolo.run_summary(scan)
     if yolo_run:
         data["yolo_run"] = yolo_run
+    mistral_run = mistral_ocr.run_summary(scan)
+    if mistral_run:
+        data["mistral_run"] = mistral_run
     return JsonResponse(data)
 
 
@@ -1939,6 +1945,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "has_detections": Detection.objects.filter(scan=scan).exists(),
         "dots_run": dots_mocr.run_summary(scan),
         "yolo_run": yolo_run,
+        "mistral_run": mistral_ocr.run_summary(scan),
         "detect_message": detection_message(yolo_run),
         **_review_flags(scan),
     }
@@ -2120,6 +2127,100 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
         # ``ensure_analyze_jobs`` reused a run that is already done, so
         # nothing was queued and nothing will be sent. Saying otherwise
         # would have staff waiting on a dispatch that is not coming.
+        messages.info(
+            request,
+            f"This volume was already read: run {created[0].run} covers "
+            f"all {len(created)} part(s). Nothing new was queued.",
+        )
+    return back
+
+
+@login_required
+@require_POST
+def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
+    """Start the Mistral OCR read over a scan's shards (#191).
+
+    Staff only, and the only way into this stage until a daemon trigger
+    lands. Every press can start real paid work on Mistral's batch API.
+
+    The read is over the original shards, so the button waits on no
+    review state and on no redacted volume: the set exists from the
+    moment the pipeline cut it. ``MISTRAL_API_KEY`` is the switch an
+    environment holds, and an environment that must not spend leaves
+    the key unset.
+
+    **This request makes no call to Mistral.** It writes one
+    ``ExternalJob`` row per shard and returns; the daemon's next
+    ``submit_external_jobs`` tick renders, uploads and submits them,
+    and ``collect_external_jobs`` polls, harvests and retries them.
+    The render is the daemon's work, so a web pod never opens the
+    volume.
+
+    It also never cuts shards. ``sharding.committed_manifest`` verifies
+    the stored set against the original with one ``head_object``, and a
+    stale or missing set is refused, because re-cutting is the
+    pipeline's job.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page.
+    """
+    from scanning import sharding
+
+    scan = get_object_or_404(Scan, pk=pk)
+    back = redirect("scan_process", pk=scan.pk)
+
+    if not request.user.is_staff:
+        messages.error(
+            request,
+            "Only staff can start Mistral OCR: each run costs money.",
+        )
+        return back
+
+    if not mistral_ocr.enabled():
+        messages.warning(
+            request,
+            "Mistral OCR is not switched on in this environment. Set "
+            "MISTRAL_API_KEY first.",
+        )
+        return back
+
+    # An open run means the daemon is still working on the last press.
+    # A finished run is reused rather than refused, which is what keeps
+    # ``ensure_extract_jobs`` from paying twice for shards already read.
+    summary = mistral_ocr.run_summary(scan)
+    if summary and summary["open"]:
+        messages.info(
+            request,
+            f"Mistral OCR run {summary['run']} is already going: "
+            f"{summary['done']} of {summary['total']} part(s) done.",
+        )
+        return back
+
+    manifest, reason = sharding.committed_manifest(scan)
+    if manifest is None:
+        messages.warning(request, reason)
+        return back
+
+    created = mistral_ocr.ensure_extract_jobs(scan, manifest)
+    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
+    logger.info(
+        "start_mistral_ocr: scan=%s user=%s run=%s shards=%d queued=%d",
+        scan.pk,
+        request.user.pk,
+        created[0].run if created else "?",
+        len(created),
+        queued,
+    )
+    if queued:
+        messages.success(
+            request,
+            f"Queued Mistral OCR for {queued} part(s) of this volume. The "
+            "daemon renders and sends them within a few seconds.",
+        )
+    else:
+        # ``ensure_extract_jobs`` reused a run that is already done, so
+        # nothing was queued and nothing will be sent.
         messages.info(
             request,
             f"This volume was already read: run {created[0].run} covers "
