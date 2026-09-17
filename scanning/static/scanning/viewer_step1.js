@@ -577,6 +577,14 @@ document.addEventListener('DOMContentLoaded', function () {
                         editBtn.innerHTML = '[no page # found — click to assign]';
                     }
                     window.onPageEditSaved();
+                    // The approve button is gated on the pages with no
+                    // number (#342), so the bar must be redrawn here:
+                    // the last number a curator types gives the button
+                    // back, and a bar left as it was would hide the one
+                    // the view accepts.
+                    if (typeof window.refreshProcessActionBar === 'function') {
+                        window.refreshProcessActionBar();
+                    }
                     // The server already rebuilt page_map, but the rendered
                     // duplicate/missing badges and the issue cards are now
                     // stale. Surface the pending banner so the user can
