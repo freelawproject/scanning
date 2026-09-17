@@ -28,6 +28,7 @@ from scanning.models import (
     Opinion,
     OpinionBoundary,
     OpinionCheck,
+    OpinionFindingDismissal,
     OpinionReviewStatus,
     QueuedAction,
     Scan,
@@ -770,3 +771,67 @@ class TestSuffixedNumber(TestCase):
         for value in (None, "", "2094", "677-685", "abc"):
             with self.subTest(value=value):
                 self.assertIsNone(page_numbers.suffixed_number(value))
+
+
+class TestFindingCounts(TestCase):
+    """The warning badge of the opinions list (#334)."""
+
+    def setUp(self):
+        self.scan = ScanFactory()
+        self.opinion = OpinionFactory(scan=self.scan)
+
+    def test_an_opinion_with_no_finding_is_absent(self):
+        counts = opinions.finding_counts([self.opinion.pk])
+
+        self.assertEqual(counts, {})
+
+    def test_the_findings_of_two_pages_are_one_count(self):
+        OpinionFindingFactory(opinion=self.opinion, page_in_opinion=0)
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.COLUMN_EDGE,
+        )
+
+        counts = opinions.finding_counts([self.opinion.pk])
+
+        self.assertEqual(counts, {self.opinion.pk: (2, 0)})
+
+    def test_a_stale_finding_counts_twice(self):
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=None,
+            check_name=OpinionCheck.ORPHANED_OPINION,
+        )
+
+        counts = opinions.finding_counts([self.opinion.pk])
+
+        self.assertEqual(counts, {self.opinion.pk: (1, 1)})
+
+    def test_a_dismissed_finding_does_not_count(self):
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.ENGINES_DISAGREE,
+        )
+        OpinionFindingFactory(opinion=self.opinion, dismissal=dismissal)
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.COLUMN_EDGE,
+        )
+
+        counts = opinions.finding_counts([self.opinion.pk])
+
+        self.assertEqual(counts, {self.opinion.pk: (1, 0)})
+
+    def test_two_opinions_take_one_query(self):
+        other = OpinionFactory(scan=self.scan)
+        OpinionFindingFactory(opinion=self.opinion)
+        OpinionFindingFactory(opinion=other)
+
+        with self.assertNumQueries(1):
+            counts = opinions.finding_counts([self.opinion.pk, other.pk])
+
+        self.assertEqual(counts[self.opinion.pk], (1, 0))
+        self.assertEqual(counts[other.pk], (1, 0))
