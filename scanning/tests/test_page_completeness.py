@@ -17,7 +17,7 @@ import pathlib
 from django.contrib.messages import get_messages
 from django.urls import reverse
 
-from scanning import dots_mocr, services
+from scanning import dots_mocr, page_edits, page_numbers, services
 from scanning.factories import (
     ExternalJobFactory,
     PageEditFactory,
@@ -26,10 +26,12 @@ from scanning.factories import (
 from scanning.models import (
     CheckName,
     Detection,
+    Issue,
     JobEngine,
     JobStage,
     JobStatus,
     PageEdit,
+    PageRepairRequest,
     Scan,
     Status,
 )
@@ -43,6 +45,7 @@ from scanning.views_process import (
     PAGE_REVIEW_NOT_READY_MESSAGE,
     PENDING_EDITS_SAVED_MESSAGE,
     RECOMPUTE_DONE_MESSAGE,
+    REPAIRS_WAITING_MESSAGE,
     REVALIDATE_UNAVAILABLE_MESSAGE,
 )
 
@@ -768,3 +771,359 @@ class TestTheCardOfARangeMissingAtTheEnd(ScanningTestCase):
 
         self.assertContains(response, "missing_range")
         self.assertContains(response, "11-20")
+
+
+def unread_results(count=3, without=(2,)):
+    """Build ``ocr_results`` where some pages carry no reading.
+
+    :param count: How many pages to describe.
+    :param without: The pages the reader left with no number.
+    :returns: One entry per page, in page order.
+    :rtype: list[dict]
+    """
+    return [
+        {
+            "pdf_page": page,
+            "detected": None if page in without else str(page),
+            "type": None if page in without else "single",
+            "zone": "dots-header",
+        }
+        for page in range(1, count + 1)
+    ]
+
+
+class TestPagesWithoutNumber(ScanningTestCase):
+    """The rule of the second review-1 gate (#342).
+
+    It answers one question -- which pages of this volume carry no page
+    number -- from the data, never from the ``Issue`` rows.
+    """
+
+    def test_a_page_with_no_reading_is_named(self):
+        scan = ScanFactory(ocr_results=unread_results())
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [2])
+
+    def test_a_volume_every_page_of_which_is_read_names_nobody(self):
+        scan = ScanFactory(ocr_results=dots_results(3))
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [])
+
+    def test_a_scan_with_no_readings_names_nobody(self):
+        """The glue has not run, so the question has no answer yet.
+        Such a volume is not in READY either."""
+        self.assertEqual(page_numbers.pages_without_number(ScanFactory()), [])
+
+    def test_a_trailing_letter_is_a_reading(self):
+        """A page like 2094a claims no number in the sequence (#319),
+        but a reader read it, so it is not a hole."""
+        results = unread_results(without=())
+        results[1]["detected"] = "2094a"
+        results[1]["type"] = "suffixed"
+        scan = ScanFactory(ocr_results=results)
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [])
+
+    def test_a_range_is_a_reading(self):
+        results = unread_results(without=())
+        results[1]["detected"] = "677-685"
+        results[1]["type"] = "range"
+        scan = ScanFactory(ocr_results=results)
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [])
+
+    def test_a_number_the_curator_typed_answers_its_page(self):
+        """With no recompute: the overlay comes before the count, so
+        the approve button comes back on the next render."""
+        scan = ScanFactory(ocr_results=unread_results())
+        PageEditFactory(scan=scan, pdf_page=2, value="17")
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [])
+
+    def test_a_number_the_curator_cleared_answers_its_page(self):
+        """Emptying the field is the gesture the page editor offers
+        for a page with no number, and the row says a person did it.
+        ``assign_page`` deletes the card of the page it writes,
+        whatever it writes, so a rule that ignored the row would name
+        a page whose card nobody can reach until the next recompute."""
+        scan = ScanFactory(ocr_results=dots_results(3))
+        PageEditFactory(scan=scan, pdf_page=2, value="")
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [])
+
+    def test_a_cleared_number_of_another_original_answers_nothing(self):
+        """The #214 rule, on the page the reader left with none: the
+        overlay skips the stale row and so does the count."""
+        scan = ScanFactory(
+            ocr_results=unread_results(), source_fingerprint="abc"
+        )
+        PageEditFactory(
+            scan=scan, pdf_page=2, value="", source_fingerprint="def"
+        )
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [2])
+
+    def test_a_page_marked_for_deletion_is_not_named(self):
+        scan = ScanFactory(ocr_results=unread_results())
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.DELETE_PAGE,
+            pdf_page=2,
+            value="",
+        )
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [])
+
+    def test_a_dismissed_card_answers_its_page(self):
+        """A cover, a blank leaf and a plate carry no printed number,
+        and the dismissal is how a person says so."""
+        scan = ScanFactory(ocr_results=unread_results())
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.DISMISS_ISSUE,
+            pdf_page=2,
+            value=CheckName.NO_PAGE_NUMBER,
+        )
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [])
+
+    def test_a_dismissal_of_another_check_answers_nothing(self):
+        scan = ScanFactory(ocr_results=unread_results())
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.DISMISS_ISSUE,
+            pdf_page=2,
+            value=CheckName.BLANK_PAGE,
+        )
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [2])
+
+    def test_a_withdrawn_dismissal_names_the_page_again(self):
+        scan = ScanFactory(ocr_results=unread_results())
+        row = PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.DISMISS_ISSUE,
+            pdf_page=2,
+            value=CheckName.NO_PAGE_NUMBER,
+        )
+        page_edits.withdraw(
+            PageEdit.objects.filter(pk=row.pk), self.make_user(username="w")
+        )
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [2])
+
+    def test_a_dismissal_against_another_original_hides_no_page(self):
+        """The #214 rule: an acting reader takes the current rows."""
+        scan = ScanFactory(
+            ocr_results=unread_results(), source_fingerprint="abc"
+        )
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.DISMISS_ISSUE,
+            pdf_page=2,
+            value=CheckName.NO_PAGE_NUMBER,
+            source_fingerprint="def",
+        )
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [2])
+
+    def test_the_pages_come_back_in_page_order(self):
+        scan = ScanFactory(ocr_results=unread_results(5, without=(4, 1, 2)))
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [1, 2, 4])
+
+    def test_the_issue_rows_are_not_the_source(self):
+        """A card nobody rebuilt says nothing about the pages."""
+        scan = ScanFactory(ocr_results=dots_results(3))
+        Issue.objects.create(
+            scan=scan,
+            check_name=CheckName.NO_PAGE_NUMBER,
+            severity=Issue.Severity.INFO,
+            page_number=2,
+            message="No page number detected on PDF page 2.",
+        )
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [])
+
+
+class TestThePageNumberGate(ScanningTestCase):
+    """The approval, the bar and the fragment under the gate (#342)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            page_count=3,
+            ocr_results=unread_results(),
+        )
+
+    def _approve(self):
+        """POST the approve button and return the flashed messages.
+
+        :returns: The flashed message strings.
+        :rtype: list[str]
+        """
+        response = self.client.post(
+            reverse("approve_page_completeness", kwargs={"pk": self.scan.pk})
+        )
+        self.scan.refresh_from_db()
+        return [str(m) for m in get_messages(response.wsgi_request)]
+
+    def _ask_for_a_page(self):
+        """Ask a scanner for one page, so the other gate refuses too.
+
+        :returns: None.
+        """
+        PageRepairRequest.objects.create(
+            scan=self.scan,
+            action=PageRepairRequest.Action.REPLACE,
+            requested_by=self.user,
+            pdf_page=3,
+        )
+
+    def _step_one(self):
+        """Render step 1 of the processing page.
+
+        :returns: The response.
+        """
+        return self.client.get(
+            reverse("scan_process", kwargs={"pk": self.scan.pk}) + "?step=1"
+        )
+
+    def test_the_approval_is_refused(self):
+        flashed = self._approve()
+
+        self.assertEqual(
+            self.scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        self.assertEqual(len(flashed), 1)
+        self.assertIn("1 page with no page number: 2", flashed[0])
+
+    def test_the_message_names_the_pages(self):
+        self.scan.ocr_results = unread_results(5, without=(2, 4))
+        self.scan.save(update_fields=["ocr_results"])
+
+        flashed = self._approve()
+
+        self.assertIn("2 pages with no page number: 2, 4", flashed[0])
+
+    def test_the_message_counts_the_pages_it_does_not_name(self):
+        self.scan.ocr_results = unread_results(12, without=tuple(range(1, 12)))
+        self.scan.save(update_fields=["ocr_results"])
+
+        flashed = self._approve()
+
+        self.assertIn("1, 2, 3, 4, 5, 6, 7, 8 and 3 more", flashed[0])
+
+    def test_the_approval_passes_once_the_number_is_typed(self):
+        PageEditFactory(scan=self.scan, pdf_page=2, value="17")
+
+        flashed = self._approve()
+
+        self.assertEqual(
+            self.scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+        self.assertIn(PAGE_REVIEW_APPROVED_MESSAGE, flashed)
+
+    def test_the_approval_passes_once_the_card_is_dismissed(self):
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.DISMISS_ISSUE,
+            pdf_page=2,
+            value=CheckName.NO_PAGE_NUMBER,
+        )
+
+        flashed = self._approve()
+
+        self.assertEqual(
+            self.scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+        self.assertIn(PAGE_REVIEW_APPROVED_MESSAGE, flashed)
+
+    def test_the_two_refusals_do_not_hide_each_other(self):
+        """A reviewer who answers one must see the other at once."""
+        self._ask_for_a_page()
+
+        flashed = self._approve()
+
+        self.assertEqual(len(flashed), 2)
+        self.assertEqual(flashed[0], REPAIRS_WAITING_MESSAGE)
+        self.assertIn("no page number", flashed[1])
+        self.assertEqual(
+            self.scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+
+    def test_a_volume_past_review_one_hears_the_status(self):
+        """Its pages are locked, so "type the number" would name work
+        nobody can do. The compare-and-swap owns the answer there."""
+        self.scan.status = Status.PAGE_COMPLETENESS_REVIEW_DONE
+        self.scan.save(update_fields=["status"])
+
+        flashed = self._approve()
+
+        self.assertEqual(flashed, [PAGE_REVIEW_ALREADY_DONE_MESSAGE])
+
+    def test_a_volume_that_is_not_ready_hears_the_status(self):
+        self.scan.status = Status.ERROR
+        self.scan.save(update_fields=["status"])
+
+        flashed = self._approve()
+
+        self.assertEqual(flashed, [PAGE_REVIEW_NOT_READY_MESSAGE])
+
+    def test_the_bar_shows_the_note_and_no_button(self):
+        response = self._step_one()
+
+        self.assertEqual(response.context["pages_without_number"], [2])
+        self.assertContains(response, "1 page with no number")
+        self.assertNotContains(
+            response, "I reviewed this scan and it is complete"
+        )
+
+    def test_the_bar_shows_both_notes(self):
+        self._ask_for_a_page()
+
+        response = self._step_one()
+
+        self.assertContains(response, "Waiting for a scanner")
+        self.assertContains(response, "1 page with no number")
+
+    def test_the_note_carries_the_first_page(self):
+        """``goToPage`` reads ``data-pdf-index``, which is 0-based."""
+        self.scan.ocr_results = unread_results(5, without=(3, 5))
+        self.scan.save(update_fields=["ocr_results"])
+
+        self.assertContains(self._step_one(), 'data-pdf-index="2"')
+
+    def test_the_fragment_agrees_with_the_page(self):
+        """One flag serves both, or the bar would offer a refused
+        button on one of them."""
+        fragment = self.client.get(
+            reverse("process_actions", kwargs={"pk": self.scan.pk}) + "?step=1"
+        )
+
+        self.assertIn(
+            "1 page with no number", json.loads(fragment.content)["html"]
+        )
+
+    def test_the_bar_gives_the_button_back(self):
+        PageEditFactory(scan=self.scan, pdf_page=2, value="17")
+
+        response = self._step_one()
+
+        self.assertEqual(response.context["pages_without_number"], [])
+        self.assertContains(
+            response, "I reviewed this scan and it is complete"
+        )
+
+    def test_a_volume_past_review_one_is_not_measured(self):
+        """The rule is for new approvals, and every other status pays
+        no query for it."""
+        self.scan.status = Status.PAGE_COMPLETENESS_REVIEW_DONE
+        self.scan.save(update_fields=["status"])
+
+        response = self._step_one()
+
+        self.assertEqual(response.context["pages_without_number"], [])
+        self.assertContains(response, "Page review done")

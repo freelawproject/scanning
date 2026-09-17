@@ -88,6 +88,21 @@ REPAIRS_WAITING_MESSAGE = (
     "the new scan, or dismiss the request on the page if it no longer "
     "applies."
 )
+#: Flashed when the approval is refused because a page carries no page
+#: number (#342). The opinions are named by the printed page, so a page
+#: with no number would give one a name nobody approved. It names the
+#: two ways out, as the message above does.
+PAGE_NUMBERS_MISSING_MESSAGE = (
+    "This scan has {count} page{plural} with no page number: {pages}. "
+    "The opinions of this volume are named by their printed page, so "
+    "every page needs one. Type the number on the page, or dismiss its "
+    "\u201cNo page number detected\u201d card when the page carries no "
+    "printed number."
+)
+#: How many pages :func:`page_numbers_missing_message` names. A volume
+#: can leave hundreds, and a message nobody reads to the end helps
+#: nobody; the bar sends the reviewer to the first of them.
+MAX_NAMED_PAGES = 8
 #: Flashed by the review-2 approval of issue #263, and constants for
 #: the same reason as the three above.
 REDACTION_REVIEW_APPROVED_MESSAGE = (
@@ -1757,6 +1772,12 @@ def _review_flags(
     requests for the sidebar anyway -- and the flag is queried only for
     a caller that does not (the ``process_actions`` fragment).
 
+    ``pages_without_number`` is the second gate of that approval
+    (#342), and it is read in READY alone, which is the condition the
+    view reads: a volume past review 1 pays no query for it, whichever
+    step asks for the bar. The bar shows a note for each gate that
+    refuses, and the button when neither does.
+
     :param scan: The scan the bars are rendered for.
     :param repairs_waiting: Whether a scanner still has to act on this
         scan. ``None`` asks :func:`repairs.has_waiting`.
@@ -1765,8 +1786,9 @@ def _review_flags(
         :func:`findings.open_count`, past the review-1 approval.
     :returns: ``page_review_ready``, ``page_review_done``,
         ``redaction_review_ready``, ``redaction_review_done``,
-        ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting`` and
-        the two pending-edit flags, for the template context.
+        ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting``,
+        ``pages_without_number`` and the two pending-edit flags, for
+        the template context.
     :rtype: dict
     """
     from scanning import apply, review_states, services
@@ -1793,13 +1815,18 @@ def _review_flags(
         }
     if repairs_waiting is None:
         repairs_waiting = repairs.has_waiting(scan)
+    ready = scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+    # Only where the button is offered (#342). The rule overlays the
+    # page numbers, which is three queries, and no other status reads
+    # the answer.
+    pages_without_number = (
+        page_numbers.pages_without_number(scan) if ready else []
+    )
     if review2 is None:
         review2 = findings.open_count(scan) if approved else (0, 0)
     review2_open, review2_stale = review2
     return {
-        "page_review_ready": (
-            scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
-        ),
+        "page_review_ready": ready,
         "page_review_done": approved,
         "redaction_review_ready": (
             scan.status == Status.READY_FOR_REDACTION_REVIEW
@@ -1820,6 +1847,9 @@ def _review_flags(
         "final_space": final_space,
         "final_volume": final_volume,
         "repairs_waiting": repairs_waiting,
+        # The pages review 1 left with no number (#342). The bar names
+        # the count and sends the reviewer to the first of them.
+        "pages_without_number": pages_without_number,
         # "Next: Generate" (#240 PR C): one read for both renders of
         # the bar, or a volume whose only boundary is a curator's
         # showed the link on a full load and hid it after the fragment
@@ -2282,6 +2312,28 @@ def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=pk)
 
 
+def page_numbers_missing_message(pages: list[int]) -> str:
+    """Name the pages that have no page number, for the refusal (#342).
+
+    At most ``MAX_NAMED_PAGES`` of them, then a count: the message is
+    read in one line at the top of the page, and a volume can leave
+    hundreds. The cards name every one of them, and the note in the
+    bar sends the reviewer to the first.
+
+    :param pages: What ``page_numbers.pages_without_number`` returned.
+    :returns: The message the view flashes.
+    :rtype: str
+    """
+    named = ", ".join(str(page) for page in pages[:MAX_NAMED_PAGES])
+    if len(pages) > MAX_NAMED_PAGES:
+        named += f" and {len(pages) - MAX_NAMED_PAGES} more"
+    return PAGE_NUMBERS_MISSING_MESSAGE.format(
+        count=len(pages),
+        plural="" if len(pages) == 1 else "s",
+        pages=named,
+    )
+
+
 @login_required
 @require_POST
 def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
@@ -2306,6 +2358,22 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
     *issues* still do not block: a suspicion is the curator's to
     judge, and a missing page is not (#151).
 
+    **A page with no page number refuses it too** (#342), which is the
+    one open card that is not a suspicion. The opinions are named by
+    their printed page (#335), so a page nobody numbered would name an
+    opinion by its position in the volume, a number no person approved
+    and one that moves when the first page of the volume moves. The
+    rule is ``page_numbers.pages_without_number``, and its answers are
+    a number, a deletion or a dismissal of that page's card.
+
+    The two rules are read together and each flashes its own message.
+    A reviewer who answers one must see the other without a second
+    press of the button. Both are read in READY alone, which is the
+    condition ``_review_flags`` reads for the bar: in every other
+    status the compare-and-swap below owns the answer, and a volume
+    already approved has locked pages, so a gate would name work
+    nobody can do.
+
     The gate is a read, then the compare-and-swap. A request made
     between the two does not block that approval, and the plan accepts
     it: both acts are decisions of a person, seconds apart, and the way
@@ -2316,11 +2384,29 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
     :return: Redirect to step 1 of the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    if repairs.has_waiting(scan):
-        messages.warning(request, REPAIRS_WAITING_MESSAGE)
-        return redirect(
-            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
-        )
+    # The two gates speak for the status that offers the button, and
+    # for no other. A volume already approved has its pages locked, so
+    # "type the number" would name work nobody can do; the
+    # compare-and-swap below says what is true of such a row instead.
+    # It is the condition ``_review_flags`` reads, so the bar and the
+    # view cannot disagree.
+    if scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW:
+        refusals = []
+        if repairs.has_waiting(scan):
+            refusals.append(REPAIRS_WAITING_MESSAGE)
+        missing = page_numbers.pages_without_number(scan)
+        if missing:
+            refusals.append(page_numbers_missing_message(missing))
+        if refusals:
+            # One message for each rule, repairs first: the two
+            # refusals are different work for different people, and a
+            # reviewer who answers one must see the other without a
+            # second press.
+            for refusal in refusals:
+                messages.warning(request, refusal)
+            return redirect(
+                reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+            )
     approved = Scan.objects.filter(
         pk=scan.pk, status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
     ).update(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)

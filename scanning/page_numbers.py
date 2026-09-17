@@ -569,3 +569,82 @@ def ocr_results_from_volume(document: dict) -> list[dict]:
     chosen = [options[0] if options else None for options in candidates]
     chosen = _resolve_by_neighbours(chosen, candidates)
     return [_entry(page, candidate) for page, candidate in zip(pages, chosen)]
+
+
+def pages_without_number(scan) -> list[int]:
+    """Return the pages of this volume that carry no page number (#342).
+
+    The gate of the review-1 approval, and the one rule for "a page has
+    no number": the view refuses the approval while this list is not
+    empty, and the step-1 bar shows a note in place of the button. The
+    twin of ``repairs.has_waiting`` (#266), which refuses the same
+    approval for the other reason.
+
+    The list is derived from the data, never from the ``Issue`` rows.
+    An ``Issue`` row is a copy of a card, and the copy is older than
+    the last write on more than one path: ``views_process.assign_page``
+    deletes the ``no_page_number`` row of the page it writes, and it
+    deletes that row also when the curator **clears** the number. A
+    gate over the rows would pass a page with no number at all.
+
+    Four answers take a page off the list:
+
+    - A number, from the reader or from the curator. The overlay comes
+      first, so a number typed since the last rebuild counts at once.
+    - A number the curator **cleared**. ``assign_page`` keeps the row
+      with a blank value, so the row itself separates "a person
+      cleared this" from "the model read nothing", and that is the
+      gesture the page editor offers for a page with no number: the
+      curator empties the field. The card of that page is deleted by
+      the same endpoint, so a rule that ignored the row would name a
+      page whose card a curator cannot reach until the next recompute.
+    - A deletion. The volume loses the page (#255).
+    - A dismissal of the page's ``no_page_number`` card. A cover, a
+      blank leaf and a plate carry no printed number, and a refusal
+      with no way out would strand the review. The dismissal is one
+      click by a person who looked at the page.
+
+    A page with a trailing letter (#319) carries a reading, so it is
+    never named here, which is the rule of the issue. Its reading names
+    no span (``services.printed_page_span``), so an opinion that starts
+    on such a page is still named by its position. An inserted page is
+    not in ``ocr_results``, and its number is read after the apply.
+
+    :param scan: The scan a reviewer wants to approve.
+    :returns: The 1-based pages of the original, in page order.
+    :rtype: list[int]
+    """
+    from scanning import page_edits
+    from scanning.models import CheckName, PageEdit
+
+    if not scan.ocr_results:
+        return []
+    # A copy: ``overlay_page_numbers`` writes into the entries it is
+    # given, and this function is a read. The cache belongs to the
+    # rebuild (``services.recalculate_issues``), which writes it back.
+    results = [dict(entry) for entry in scan.ocr_results]
+    # The curator outranks the model (#214), so the overlay comes
+    # first: a number typed after the last rebuild answers its page.
+    results, _stale = page_edits.overlay_page_numbers(scan, results)
+    without = {
+        entry["pdf_page"] for entry in results if not entry.get("detected")
+    }
+    if not without:
+        return []
+    without -= page_edits.deleted_pages(scan)
+    # ``current_edits`` reads the standing rows of *this* original, so
+    # a withdrawn row and one made against another document answer
+    # nothing. One query for the two kinds.
+    answered = page_edits.current_edits(
+        scan, PageEdit.Kind.DISMISS_ISSUE, PageEdit.Kind.SET_NUMBER
+    )
+    without -= {
+        edit.pdf_page
+        for edit in answered
+        if edit.pdf_page
+        and (
+            edit.kind == PageEdit.Kind.SET_NUMBER
+            or edit.value == CheckName.NO_PAGE_NUMBER
+        )
+    }
+    return sorted(without)
