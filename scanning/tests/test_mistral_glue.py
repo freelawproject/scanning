@@ -29,11 +29,14 @@ from scanning.tests.test_views import ScanningTestCase
 
 
 def make_line(page_no: int, text: str = "878 N. C.") -> dict:
-    """Build one output line of the shape Mistral writes.
+    """Build one output line of the shape a stored batch answer has.
 
     The same shape as the fixture of ``test_mistral_ocr.TestSweep``:
     one request answered one page image, and the block list is the
-    page's own.
+    page's own. A block carries its four corners on itself and its
+    text under ``content``, as the answers of scan 2845 do (#317,
+    #350). PR #247 nested the corners under ``bbox``, a shape Mistral
+    does not write, and that fixture hid the lost boxes.
 
     :param page_no: 0-based page inside the shard.
     :param text: The block's text.
@@ -59,12 +62,10 @@ def make_line(page_no: int, text: str = "878 N. C.") -> dict:
                         "blocks": [
                             {
                                 "type": "text",
-                                "bbox": {
-                                    "top_left_x": 100,
-                                    "top_left_y": 200,
-                                    "bottom_right_x": 900,
-                                    "bottom_right_y": 300,
-                                },
+                                "top_left_x": 100,
+                                "top_left_y": 200,
+                                "bottom_right_x": 900,
+                                "bottom_right_y": 300,
                                 "content": text,
                             }
                         ],
@@ -194,17 +195,68 @@ class TestParsePayload(ScanningTestCase):
                 {
                     "id": 0,
                     "type": "text",
-                    "bbox": {
-                        "top_left_x": 100,
-                        "top_left_y": 200,
-                        "bottom_right_x": 900,
-                        "bottom_right_y": 300,
-                    },
+                    "bbox": [100.0, 200.0, 900.0, 300.0],
                     "content": "878 N. C.",
                 }
             ],
         )
         self.assertNotIn("error", page)
+
+    def _block(self, payload: dict) -> dict:
+        """The one block of the one page of a one-page payload."""
+        return payload["output"][0]["response"]["body"]["pages"][0]["blocks"][
+            0
+        ]
+
+    def _strip_corners(self, block: dict) -> dict:
+        """Take the four corners off a block and return them."""
+        return {key: block.pop(key) for key in mistral_ocr.BLOCK_BOX_KEYS}
+
+    def test_the_box_is_read_under_a_nested_bbox_too(self):
+        """PR #247's fixture nested the corners under ``bbox``; the
+        parse reads that shape as well, to the same list (#350)."""
+        payload = make_payload(1)
+        block = self._block(payload)
+        block["bbox"] = self._strip_corners(block)
+
+        pages = mistral_ocr.parse_payload(payload)
+
+        self.assertEqual(
+            pages[0]["blocks"][0]["bbox"], [100.0, 200.0, 900.0, 300.0]
+        )
+
+    def test_a_block_with_no_box_keeps_none(self):
+        payload = make_payload(1)
+        self._strip_corners(self._block(payload))
+
+        pages = mistral_ocr.parse_payload(payload)
+
+        self.assertIsNone(pages[0]["blocks"][0]["bbox"])
+        self.assertEqual(pages[0]["blocks"][0]["content"], "878 N. C.")
+
+    def test_a_box_with_a_missing_corner_is_none(self):
+        payload = make_payload(1)
+        del self._block(payload)["bottom_right_y"]
+
+        pages = mistral_ocr.parse_payload(payload)
+
+        self.assertIsNone(pages[0]["blocks"][0]["bbox"])
+
+    def test_a_box_with_a_corner_that_is_not_a_number_is_none(self):
+        payload = make_payload(1)
+        self._block(payload)["top_left_x"] = "100"
+
+        pages = mistral_ocr.parse_payload(payload)
+
+        self.assertIsNone(pages[0]["blocks"][0]["bbox"])
+
+    def test_a_box_with_no_area_is_none(self):
+        payload = make_payload(1)
+        self._block(payload)["bottom_right_x"] = 100
+
+        pages = mistral_ocr.parse_payload(payload)
+
+        self.assertIsNone(pages[0]["blocks"][0]["bbox"])
 
     def test_every_page_of_the_shard_comes_back_in_order(self):
         pages = mistral_ocr.parse_payload(make_payload(4))
@@ -354,6 +406,24 @@ class TestMergeExtractResults(MistralRunMixin, ScanningTestCase):
             },
         )
         self.assertEqual(document["failed_pages"], [])
+
+    def test_a_written_document_carries_list_boxes_and_a_version_past_one(
+        self,
+    ):
+        """A version-1 document carries ``bbox: null`` on every block,
+        because the parse read a field Mistral does not write (#350).
+        A document written now says so by its version, and its blocks
+        carry the list."""
+        scan, rows = self.build(shard_count=1, pages_per_shard=1)
+
+        key = mistral_ocr.merge_extract_results(scan, rows)
+
+        document = self.store[key]
+        self.assertGreater(document["schema_version"], 1)
+        self.assertEqual(
+            document["pages"][0]["blocks"][0]["bbox"],
+            [100.0, 200.0, 900.0, 300.0],
+        )
 
     def test_the_document_lands_at_a_run_scoped_key(self):
         scan, rows = self.build(shard_count=2, pages_per_shard=1)
