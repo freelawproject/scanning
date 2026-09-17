@@ -824,11 +824,11 @@ class TestJobAttemptKeys(TestCase):
         self.assertEqual(len({base, by_shard, by_run}), 3)
 
     def test_an_opinion_job_is_namespaced_by_its_opinion(self):
-        from scanning.factories import OpinionScanFactory
+        from scanning.factories import OpinionFactory
         from scanning.models import JobEngine, JobStage
 
         scan = _reporter_scan()
-        opinion = OpinionScanFactory(scan=scan)
+        opinion = OpinionFactory(scan=scan)
         job = self._job(
             scan=scan,
             opinion=opinion,

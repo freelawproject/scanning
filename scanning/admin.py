@@ -15,8 +15,11 @@ from scanning.models import (
     ExternalJob,
     Issue,
     JobStage,
+    Opinion,
     OpinionBoundary,
+    OpinionFinding,
     OpinionScan,
+    OpinionText,
     PageEdit,
     PageRepairRequest,
     PendingUpload,
@@ -27,6 +30,7 @@ from scanning.models import (
     Scan,
     Status,
     Volume,
+    WithdrawnOpinion,
 )
 from scanning.services import (
     refresh_volume_queue_status,
@@ -271,8 +275,8 @@ class ScanAdmin(admin.ModelAdmin):
         # this list has to be extended whenever a new model cascades from
         # Scan, or the confirmation page understates the blast radius.
         # ExternalJob in practice only contributes its volume-level rows:
-        # an opinion-level job requires an opinion, and an opinion blocks
-        # the delete outright via the PROTECT above.
+        # an opinion-level job requires an ``Opinion``, which cascades
+        # from the scan and takes its jobs with it (#335).
         for model in (
             Scan,
             Detection,
@@ -280,6 +284,8 @@ class ScanAdmin(admin.ModelAdmin):
             PageEdit,
             OpinionBoundary,
             BracketReading,
+            Opinion,
+            WithdrawnOpinion,
             PendingUpload,
             ExternalJob,
         ):
@@ -597,6 +603,65 @@ class OpinionScanAdmin(admin.ModelAdmin):
         "uploaded_by__username",
     ]
     raw_id_fields = ["uploaded_by", "reporter", "scan"]
+    readonly_fields = ["date_created", "date_modified"]
+
+
+class OpinionTextInline(admin.TabularInline):
+    """The pages of an opinion, read-only: one rebuild is their writer."""
+
+    model = OpinionText
+    extra = 0
+    fields = ["page_in_opinion", "page_index", "human_by", "human_at"]
+    readonly_fields = fields
+    show_change_link = True
+
+
+class OpinionFindingInline(admin.TabularInline):
+    """The warnings of an opinion, read-only for the same reason."""
+
+    model = OpinionFinding
+    extra = 0
+    fields = ["check_name", "page_in_opinion", "severity", "dismissal"]
+    readonly_fields = fields
+
+
+@admin.register(Opinion)
+class OpinionAdmin(admin.ModelAdmin):
+    list_display = [
+        "__str__",
+        "scan",
+        "status",
+        "first_printed_page",
+        "last_printed_page",
+        "page_count",
+        "approved_by",
+        "approved_at",
+    ]
+    list_filter = ["status"]
+    search_fields = ["scan__id", "notes"]
+    raw_id_fields = [
+        "scan",
+        "apply_run",
+        "boundary",
+        "start_source_edit",
+        "end_source_edit",
+        "approved_by",
+    ]
+    readonly_fields = ["date_created", "date_modified"]
+    inlines = [OpinionTextInline, OpinionFindingInline]
+
+
+@admin.register(WithdrawnOpinion)
+class WithdrawnOpinionAdmin(admin.ModelAdmin):
+    list_display = [
+        "__str__",
+        "scan",
+        "created_by",
+        "withdrawn_at",
+        "date_created",
+    ]
+    search_fields = ["scan__id", "note"]
+    raw_id_fields = ["scan", "apply_run", "source_edit", "created_by"]
     readonly_fields = ["date_created", "date_modified"]
 
 
