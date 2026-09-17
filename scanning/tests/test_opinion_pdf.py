@@ -1171,7 +1171,8 @@ class TestRoute(ScanningTestCase):
             'inline; filename="a3d.214.0012-0015.pdf"',
         )
 
-    def test_the_route_can_be_framed_by_our_own_page(self):
+    @override_settings(X_FRAME_OPTIONS="DENY")
+    def test_our_own_page_may_frame_the_route_and_no_other_site(self):
         """The review page frames it, and the site denies frames."""
         Opinion.objects.filter(pk=self.row.pk).update(redacted_pdf_revision=0)
         self.client.force_login(UserFactory())
@@ -1185,7 +1186,7 @@ class TestRoute(ScanningTestCase):
         ):
             response = self.client.get(self.url, {"disposition": "inline"})
 
-        self.assertNotIn("X-Frame-Options", response)
+        self.assertEqual(response["X-Frame-Options"], "SAMEORIGIN")
 
     def test_an_unknown_disposition_still_saves_the_file(self):
         Opinion.objects.filter(pk=self.row.pk).update(redacted_pdf_revision=0)

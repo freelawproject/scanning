@@ -19,6 +19,7 @@ from scanning.factories import (
     ScanFactory,
 )
 from scanning.models import (
+    ApplyRun,
     Opinion,
     OpinionCheck,
     OpinionFindingDismissal,
@@ -410,7 +411,14 @@ class TestOpinionFileIndex(ScanningTestCase):
     def setUp(self):
         self.client.force_login(self.make_user())
         self.scan = ScanFactory()
-        self.opinion = OpinionFactory(scan=self.scan, first_printed_page=11)
+        # A run that was read with dots.mocr and not with Mistral, the
+        # shape of every volume today: the stage is switched off (#191).
+        self.run = ApplyRun.objects.create(
+            scan=self.scan, number=1, ocr_key="processing/1/a1/ocr.json"
+        )
+        self.opinion = OpinionFactory(
+            scan=self.scan, first_printed_page=11, apply_run=self.run
+        )
         self.url = reverse(
             "opinion_file_index",
             kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
@@ -458,12 +466,53 @@ class TestOpinionFileIndex(ScanningTestCase):
                 )
             )
 
-    def test_an_object_that_is_not_written_carries_no_url(self):
+    def test_an_object_that_is_not_glued_carries_no_url(self):
         response = self.client.get(self.url)
 
         for entry in response.json()["files"]:
             self.assertFalse(entry["written"])
             self.assertNotIn("url", entry)
+
+    def test_an_engine_the_run_never_read_is_not_written(self):
+        """The stamp is one over four files, the glue writes what it has.
+
+        ``opinion_ocr.write`` writes one document per engine the run
+        carries, so a stamped row of a volume nobody read with Mistral
+        has no ``mistral_ocr.json`` in the bucket (#191).
+        """
+        Opinion.objects.filter(pk=self.opinion.pk).update(ocr_glue_revision=0)
+
+        response = self.client.get(self.url)
+
+        files = {entry["name"]: entry for entry in response.json()["files"]}
+        self.assertTrue(files["dots_mocr.json"]["written"])
+        self.assertTrue(files["manifest.json"]["written"])
+        self.assertFalse(files["mistral_ocr.json"]["written"])
+        self.assertNotIn("url", files["mistral_ocr.json"])
+
+    def test_an_engine_the_run_read_is_written(self):
+        ApplyRun.objects.filter(pk=self.run.pk).update(
+            extract_key="processing/1/a1/extract.json"
+        )
+        Opinion.objects.filter(pk=self.opinion.pk).update(ocr_glue_revision=0)
+
+        response = self.client.get(self.url)
+
+        files = {entry["name"]: entry for entry in response.json()["files"]}
+        self.assertTrue(files["mistral_ocr.json"]["written"])
+        self.assertIn("url", files["mistral_ocr.json"])
+
+    def test_a_row_in_the_original_space_writes_no_engine_document(self):
+        """No run, no key, so no engine document can be in the bucket."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            apply_run=None, ocr_glue_revision=0
+        )
+
+        response = self.client.get(self.url)
+
+        files = {entry["name"]: entry for entry in response.json()["files"]}
+        self.assertFalse(files["dots_mocr.json"]["written"])
+        self.assertTrue(files["manifest.json"]["written"])
 
     def test_a_written_object_carries_its_route(self):
         Opinion.objects.filter(pk=self.opinion.pk).update(
