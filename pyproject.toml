@@ -92,8 +92,11 @@ dev = [
   "pytest-django",
 ]
 # Heavy in-process inference stack (YOLO + PaddleOCR + doctr, all CPU). Install
-# wherever detection runs locally instead of on RunPod: local dev, CI, the
-# offline daemon, and the RunPod worker image. Excluded from the lean web image.
+# wherever detection runs locally instead of on RunPod: the offline daemon and
+# the RunPod worker image. Excluded from the lean web image, and from the dev
+# image the tests run in: no module of the app and no test calls
+# `blackletter.api.detect` since #360, and base blackletter imports torch and
+# ultralytics lazily.
 local-ml = [
   "blackletter[detect,analyze]>=0.4.2",
   "torch",
