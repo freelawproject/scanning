@@ -944,6 +944,76 @@ class TestThePass(OpinionOcrTestCase):
         ]
         self.assertEqual(list(manifest["engines"]), ["dots_mocr"])
 
+    def test_a_dead_read_of_the_edited_pages_holds_nothing(self):
+        """The apply rows are the last step of the read, so they decide:
+        a consumed volume run beside a failed apply row is a read
+        nothing will finish (#350 review)."""
+        self.apply_run.extract_key = ""
+        self.apply_run.save(update_fields=["extract_key"])
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine="mistral_ocr",
+            status=JobStatus.CONSUMED,
+        )
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine="mistral_ocr",
+            apply_run=self.apply_run,
+            # The rows of the edited pages take the next run number,
+            # as ``ensure_extract_apply_jobs`` gives them.
+            run=2,
+            status=JobStatus.FAILED,
+        )
+
+        self.assertEqual(
+            opinion_ocr.engines_owed(self.scan, self.apply_run), []
+        )
+        self.assertEqual(opinion_ocr.glue_due(), 1)
+
+    def test_a_live_read_of_the_edited_pages_holds_the_scan(self):
+        self.apply_run.extract_key = ""
+        self.apply_run.save(update_fields=["extract_key"])
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine="mistral_ocr",
+            status=JobStatus.CONSUMED,
+        )
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine="mistral_ocr",
+            apply_run=self.apply_run,
+            run=2,
+            status=JobStatus.SUBMITTED,
+        )
+
+        self.assertEqual(
+            opinion_ocr.engines_owed(self.scan, self.apply_run),
+            ["mistral_ocr"],
+        )
+        with self.assertLogs("scanning.opinion_ocr", level="INFO"):
+            self.assertEqual(opinion_ocr.glue_due(), 0)
+
+    def test_a_consumed_volume_run_with_no_apply_row_yet_holds_the_scan(self):
+        """The window before the tick creates the rows of the edited
+        pages: the volume rows are the fallback."""
+        self.apply_run.extract_key = ""
+        self.apply_run.save(update_fields=["extract_key"])
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine="mistral_ocr",
+            status=JobStatus.CONSUMED,
+        )
+
+        self.assertEqual(
+            opinion_ocr.engines_owed(self.scan, self.apply_run),
+            ["mistral_ocr"],
+        )
+
     def test_a_scan_sent_back_has_no_due_row(self):
         Scan.objects.filter(pk=self.scan.pk).update(
             status=Status.READY_FOR_REDACTION_REVIEW

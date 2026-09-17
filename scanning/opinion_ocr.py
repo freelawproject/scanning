@@ -19,6 +19,13 @@ any of whose units carries an exclusion; :func:`kept_units` is the one
 reader for a consumer that wants the clean text alone. The excluded
 text stays under ``jobs/``, which nothing serves without a login.
 
+**A unit nobody could measure is not clean text.** A unit with no box,
+or on a page whose size no detection and no render gives, carries the
+third verdict :data:`UNJUDGED`, counts in ``unjudged`` on the page and
+in the manifest, and stays out of :func:`kept_units`. It may be under
+a redaction, and the rule of the module is that no reader sees the
+text under one, so "not judged" never reads as "judged and clean".
+
 **One unit shape for every engine**, so the reader keeps one adapter:
 ``id``, ``type``, ``text``, ``bbox`` (the engine's render pixels, as
 glued), ``box_pt`` (the same box in PDF points, the space every
@@ -36,13 +43,15 @@ reads as "glued", the rule of ``sharding.ensure_shards``.
 **The ledger is on the row.** ``Opinion.ocr_glue_revision ==
 glue_revision`` is the one rule for "the OCR glue exists"
 (:func:`is_written`), a query and never an S3 HEAD. The pass
-(:func:`glue_due`) runs on the collect tick, takes the newest scan
-that owes a glue, and writes up to :data:`OPINIONS_PER_TICK` rows of
-it, so the volume documents are parsed once per tick. A fact about the
-scan (no corrected volume, a stale redaction set, an engine the run
-still owes, a document that does not pull) holds the scan and spends
-nothing, the rule of ``apply.gates_closed``. A fact about the row (a
-lost boundary, a page the document lacks) spends an attempt, and at
+(:func:`glue_due`) runs on the collect tick. It walks the due scans
+newest first and glues the first one whose inputs load, up to
+:data:`OPINIONS_PER_TICK` rows of it, so the volume documents are
+parsed once per tick and a held volume holds no other. A fact about
+the scan (no corrected volume, a stale redaction set, an engine the
+run still owes, a document that does not pull) holds that scan and
+spends nothing, the rule of ``apply.gates_closed``. A fact about the
+row (a lost boundary, a page the document lacks) spends an attempt,
+and at
 :data:`MAX_ATTEMPTS` the row is ``ERROR``: loud, then quiet, the rule
 of ``ApplyRun.attempts``. The way back is the next approval, which
 raises the revision (``opinions.create_rows``).
@@ -194,9 +203,24 @@ def _mistral_frame(page: dict, document: dict) -> tuple[float, float] | None:
 
 
 def _mistral_owed_rows(scan: Scan, run) -> list:
-    """The rows of a Mistral read on its way: the volume, or the pages."""
-    return mistral_ocr.live_extract_jobs(scan) or mistral_ocr.apply_jobs(
-        scan, run
+    """The rows that say a Mistral read is on its way, last step first.
+
+    The read has two steps: the volume rows, then the rows of the
+    pages a curator changed, which the tick creates once the volume is
+    glued. **The later step decides**, because the earlier one is
+    already done when it exists: a consumed volume run with a dead
+    apply row is a read nothing will finish, and asking the volume
+    first would call it owed for good. A scan with no apply row yet
+    falls back to the volume rows, which is the window before the tick
+    creates them.
+
+    :param scan: The scan.
+    :param run: The final apply run.
+    :returns: The rows of the last step that exists.
+    :rtype: list
+    """
+    return mistral_ocr.apply_jobs(scan, run) or mistral_ocr.live_extract_jobs(
+        scan
     )
 
 
