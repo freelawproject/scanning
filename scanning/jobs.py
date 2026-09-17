@@ -185,7 +185,18 @@ class ProviderSpec:
         ``result_key``.
     :ivar result_content_type: Content type the result PUT is signed
         with, and stored under.
-    :ivar claim_deadline: The deadline fields a claim writes.
+    :ivar claim_deadline: The deadline fields a claim writes. Doctor
+        takes its flat answer budget straight away, because its
+        response *is* the completion: there is no queue to tell apart,
+        and the clock that matters starts when the request goes out. A
+        RunPod row takes the queue ceiling at the attempt's **first**
+        claim, the moment it leaves our queue for the provider's. A row
+        that already carries one is written **nothing**: the only way
+        back to a claim with a ceiling intact is a defer, and a second
+        stamp there would restart the wait on every tick, so an
+        endpoint paused for good would hold a scan forever. Only the
+        crossing into ``IN_PROGRESS`` (:func:`_record_progress`)
+        replaces the ceiling with a run budget.
     :ivar run_deadline: The budget written when a job crosses into
         ``IN_PROGRESS``, or ``None`` for a provider whose queue and run
         share one ceiling.
@@ -464,46 +475,6 @@ def _max_attempts(job: ExternalJob) -> int:
     return _provider(job).max_attempts(job)
 
 
-def _presigned_ttl(job: ExternalJob) -> int:
-    """Return the lifetime of the URLs this row's worker is handed.
-
-    :param job: The row to look up.
-    :returns: Seconds.
-    :rtype: int
-    :raises UnknownProvider: If the row's provider signs no URL.
-    """
-    ttl = _provider(job).presigned_ttl
-    if ttl is None:
-        raise UnknownProvider(
-            f"job {job.pk}: provider {job.provider} is handed no URL"
-        )
-    return ttl(job)
-
-
-def _result_suffix(job: ExternalJob) -> str:
-    """Return the extension of the object written at ``result_key``.
-
-    :param job: The row to look up.
-    :returns: ``".pdf"`` for a conversion, ``".json"`` for a read.
-    :rtype: str
-    """
-    return _provider(job).result_suffix
-
-
-def _result_content_type(job: ExternalJob) -> str:
-    """Return the content type the result PUT must be signed with.
-
-    Signed into the presigned URL, so this and the header the worker
-    sends must agree exactly. A mismatch is a 403 the worker reports as
-    an expired signature.
-
-    :param job: The row to look up.
-    :returns: The content type.
-    :rtype: str
-    """
-    return _provider(job).result_content_type
-
-
 def _runpod_endpoint(job: ExternalJob) -> str:
     """Return the RunPod endpoint id serving this row's engine.
 
@@ -597,8 +568,8 @@ def queue_deadline(waiting_since):
     (issue #218).
 
     Stamped **once per attempt**, at the attempt's first claim
-    (:func:`submit_deadline_fields`) -- the moment the row is handed to
-    the provider. Nothing after that first claim moves it. A re-claim
+    (``ProviderSpec.claim_deadline``) -- the moment the row is handed
+    to the provider. Nothing after that first claim moves it. A re-claim
     after a defer does not, and a defer does not, or an endpoint that
     is paused or saturated for good would push the ceiling out on every
     tick and hold a scan forever. A retry clears it, so the next
@@ -651,36 +622,13 @@ def runpod_execution_deadline(job: ExternalJob, started_at):
     )
 
 
-def submit_deadline_fields(job: ExternalJob, submitted_at) -> dict:
-    """Return the deadline field a claim should write, if any.
-
-    Doctor takes its flat answer budget straight away, because its
-    response *is* the completion: there is no queue to distinguish, and
-    the clock that matters starts when the request goes out.
-
-    A RunPod row takes the queue ceiling here, at the attempt's
-    **first** claim -- the moment it leaves our queue for the
-    provider's. A row that already carries one is written **nothing**:
-    the only way back to a claim with a ceiling intact is a defer, and
-    re-stamping there would restart the wait on every tick, so an
-    endpoint paused for good would hold a scan forever. Only the
-    crossing into ``IN_PROGRESS`` (:func:`_record_progress`) replaces
-    the ceiling with a run budget.
-
-    :param job: The row being submitted.
-    :param submitted_at: Submission timestamp.
-    :returns: Fields to merge into the claim's write.
-    :rtype: dict
-    """
-    return _provider(job).claim_deadline(job, submitted_at)
-
-
 def _queue_ceiling_once(job: ExternalJob, submitted_at) -> dict:
     """Return the queue ceiling for a first claim, and nothing after.
 
-    The RunPod rule described in :func:`submit_deadline_fields`: a row
-    that already carries a deadline is written nothing, so a re-claim
-    after a defer cannot restart the wait.
+    The RunPod entry of ``ProviderSpec.claim_deadline``, whose
+    docstring carries the rule: a row that already holds a deadline is
+    written nothing, so a re-claim after a defer cannot restart the
+    wait.
 
     :param job: The row being submitted.
     :param submitted_at: Submission timestamp.

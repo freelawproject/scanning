@@ -393,36 +393,3 @@ def delete_file(file_id: str) -> None:
         _call(client().files.delete, file_id=file_id)
     except MistralError as exc:
         logger.warning("could not delete Mistral file %s: %s", file_id, exc)
-
-
-def ocr_page_realtime(
-    png: bytes, *, include_blocks: bool = True, table_format: str = "html"
-) -> dict:
-    """Read one page image on the synchronous ``/v1/ocr`` endpoint.
-
-    For the smoke test the ai-research runner prescribes before a
-    batch ("run realtime first, then batch"), never for the stage: the
-    realtime price is twice the batch price. The response is returned
-    whole.
-
-    :param png: The rendered page.
-    :param include_blocks: Ask for the block bboxes.
-    :param table_format: How tables come back.
-    :returns: The OCR response as a dict.
-    :rtype: dict
-    :raises MistralError: The classified failure.
-    """
-    import base64
-
-    encoded = base64.b64encode(png).decode()
-    response = _call(
-        client().ocr.process,
-        model=model(),
-        document={
-            "type": "image_url",
-            "image_url": f"data:image/png;base64,{encoded}",
-        },
-        include_blocks=include_blocks,
-        table_format=table_format,
-    )
-    return _dump(response)
