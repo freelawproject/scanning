@@ -22,6 +22,9 @@ MISTRAL_API_KEY unset, and the view refuses with a message.
   {% else %}
   Mistral OCR done: {{ mistral_run.total }} part(s)
   {% endif %}
+  {% if user.is_staff %}
+  &middot; <a href="{% url 'glued_output_index' scan.pk 'mistral' %}" class="underline" title="The runs, the shards and the result files of the Mistral read">files</a>
+  {% endif %}
 </span>
 {% endif %}
 {% if user.is_staff and not mistral_run.open %}

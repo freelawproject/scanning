@@ -1768,9 +1768,14 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 ("scanning/apply.py", "ensure_shard_jobs"),
                 ("scanning/apply.py", "ensure_analyze_jobs"),
                 ("scanning/apply.py", "ensure_detect_jobs"),
-                # Mistral OCR: the staff button alone (#191), until a
-                # daemon trigger lands.
+                # Mistral OCR: the staff button (#191), and the
+                # collect pass that reads the edited pages of a
+                # corrected volume (#245). That pass creates a row
+                # only for a scan whose volume read a person already
+                # started and the daemon already glued, so it mints no
+                # work of its own.
                 ("scanning/views_process.py", "ensure_extract_jobs"),
+                ("scanning/mistral_ocr.py", "ensure_extract_jobs"),
                 # The generic creator's four wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
                 ("scanning/yolo.py", "ensure_shard_jobs"),

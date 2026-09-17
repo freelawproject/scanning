@@ -17,7 +17,7 @@ from unittest.mock import patch
 from django.test import override_settings
 from django.utils import timezone
 
-from scanning import doctor_client, jobs
+from scanning import doctor_client, jobs, s3_sync
 from scanning.factories import ExternalJobFactory, ScanFactory
 from scanning.models import (
     ApplyRun,
@@ -822,6 +822,61 @@ class TestSweepJobs(ScanningTestCase):
         self.assertEqual(summary.failed, 1)
         self.assertEqual(stranded.status, JobStatus.FAILED)
         self.assertEqual(stranded.error_code, "QUEUE_TIMEOUT")
+
+
+class TestVolumeResultKey(ScanningTestCase):
+    """One key rule for the three stages that glue a volume (#245)."""
+
+    def test_each_stage_names_its_own_document_under_jobs(self):
+        from scanning import dots_mocr, mistral_ocr, yolo
+
+        scan = ScanFactory()
+        prefix = s3_sync.s3_processing_prefix(scan)
+
+        self.assertEqual(
+            dots_mocr.glued_result_key(scan, 2),
+            f"{prefix}jobs/analyze/dots_mocr/r2-volume.json",
+        )
+        self.assertEqual(
+            yolo.merged_result_key(scan, 2),
+            f"{prefix}jobs/detect/blackletter/r2-volume.json",
+        )
+        self.assertEqual(
+            mistral_ocr.glued_result_key(scan, 2),
+            f"{prefix}jobs/extract/mistral_ocr/r2-volume.json",
+        )
+
+    def test_the_key_is_scoped_to_the_run(self):
+        """A re-run leaves the previous document addressable."""
+        scan = ScanFactory()
+
+        first = jobs.volume_result_key(
+            scan, JobStage.ANALYZE, JobEngine.DOTS_MOCR, 1
+        )
+        second = jobs.volume_result_key(
+            scan, JobStage.ANALYZE, JobEngine.DOTS_MOCR, 2
+        )
+
+        self.assertNotEqual(first, second)
+
+
+class TestConsumeRun(ScanningTestCase):
+    """The one write a glue pass makes on the rows it read (#245)."""
+
+    def test_only_a_completed_row_is_taken(self):
+        scan = ScanFactory()
+        rows = jobs.ensure_convert_jobs(scan, make_manifest(shard_count=2))
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.COMPLETED
+        )
+
+        self.assertEqual(jobs.consume_run(rows), 1)
+
+        rows[0].refresh_from_db()
+        rows[1].refresh_from_db()
+        self.assertEqual(rows[0].status, JobStatus.CONSUMED)
+        self.assertIsNotNone(rows[0].consumed_at)
+        self.assertEqual(rows[1].status, JobStatus.PENDING)
 
 
 class TestProviderTable(ScanningTestCase):

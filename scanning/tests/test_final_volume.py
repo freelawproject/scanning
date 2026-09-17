@@ -636,6 +636,65 @@ class TestApplyOutputs(ScanningTestCase):
             ),
         )
 
+    def test_the_mistral_document_is_listed_once_it_is_glued(self):
+        """A run with no Mistral read offers no such file, and a read
+        one does (#245). No review state waits for it either way."""
+        scan, _ = applied_scan()
+        url = reverse("apply_output_index", kwargs={"pk": scan.pk})
+
+        before = self.client.get(url).json()["runs"][0]
+        self.assertNotIn("extract-volume", before["files"])
+
+        ApplyRun.objects.filter(scan=scan).update(
+            extract_key="processing/x/jobs/apply/a1/extract-volume.json",
+            extract_run=3,
+        )
+        entry = self.client.get(url).json()["runs"][0]
+
+        self.assertIn("extract-volume", entry["files"])
+        self.assertTrue(entry["complete"])
+        self.assertEqual(
+            entry["files"]["extract-volume"],
+            reverse(
+                "serve_apply_output",
+                kwargs={
+                    "pk": scan.pk,
+                    "number": 1,
+                    "output": "extract-volume",
+                },
+            ),
+        )
+
+    def test_the_mistral_document_redirects_to_a_presigned_get(self):
+        scan, _ = applied_scan()
+        ApplyRun.objects.filter(scan=scan).update(extract_key="x/extract.json")
+
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch(
+                "scanning.s3_sync.presign_get", return_value="https://x/y"
+            ) as presign,
+        ):
+            response = self.client.get(
+                reverse(
+                    "serve_apply_output",
+                    kwargs={
+                        "pk": scan.pk,
+                        "number": 1,
+                        "output": "extract-volume",
+                    },
+                )
+            )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(presign.call_args.args[0], "x/extract.json")
+        self.assertEqual(
+            presign.call_args.kwargs["content_disposition"],
+            f'attachment; filename="scan-{scan.pk}-apply-a1-'
+            f'extract-volume.json"',
+        )
+
     def test_a_scan_with_no_run_gets_an_empty_list(self):
         scan = ScanFactory(page_count=2)
 

@@ -1100,6 +1100,11 @@ GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
         dots_mocr.glued_result_key,
     ),
     "yolo": (JobStage.DETECT, JobEngine.BLACKLETTER, yolo.merged_result_key),
+    "mistral": (
+        JobStage.EXTRACT,
+        JobEngine.MISTRAL_OCR,
+        mistral_ocr.glued_result_key,
+    ),
 }
 
 NO_S3_GLUED_OUTPUT_MESSAGE = (
@@ -1240,6 +1245,12 @@ def _shard_entry(scan: Scan, output: str, row: ExternalJob) -> dict:
     has_summary = isinstance((row.provider_meta or {}).get("output"), dict)
     if row.engine == JobEngine.DOTS_MOCR and has_summary:
         entry.update(jobs.page_lists(row))
+    elif row.engine == JobEngine.MISTRAL_OCR and has_summary:
+        # ``failed_pages`` alone (#245): the other three names of
+        # ``jobs.page_lists`` are dots.mocr faults, and an empty list
+        # would read as "none" where the truth is "not a question
+        # here".
+        entry["failed_pages"] = jobs.page_lists(row)["failed_pages"]
     if row.result_key:
         entry["url"] = reverse(
             "serve_glued_shard",
@@ -1429,6 +1440,7 @@ APPLY_OUTPUTS: dict[str, tuple[str | None, str]] = {
     "ocr-volume": ("ocr_key", "json"),
     "printed-pages": ("printed_pages_key", "json"),
     "detections-volume": ("detections_key", "json"),
+    "extract-volume": ("extract_key", "json"),
     "page-map": (None, "json"),
 }
 

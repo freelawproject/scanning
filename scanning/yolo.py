@@ -53,8 +53,6 @@ from django.utils import timezone
 
 from scanning import jobs, runpod_client, s3_sync
 from scanning.models import (
-    DEAD_JOB_STATUSES,
-    IN_FLIGHT_JOB_STATUSES,
     ExternalJob,
     JobEngine,
     JobProvider,
@@ -419,11 +417,8 @@ def run_summary(scan) -> dict | None:
 def merged_result_key(scan, run: int) -> str:
     """Return the S3 key one run's merged volume document lives at.
 
-    Under ``jobs/`` on purpose: that prefix is already excluded from the
-    generic processing sync in both directions, and the admin delete
-    already sweeps it. Scoped to the run, like the per-attempt result
-    keys, so a re-run leaves the previous document addressable instead
-    of stomping it.
+    This stage's name for :func:`jobs.volume_result_key`, which holds
+    the rule and the reasons.
 
     :param scan: The scan the run belongs to.
     :param run: The run number.
@@ -431,9 +426,8 @@ def merged_result_key(scan, run: int) -> str:
         blackletter/r{run}-volume.json``.
     :rtype: str
     """
-    return (
-        f"{s3_sync.s3_processing_prefix(scan)}{s3_sync.JOB_RESULTS_SUBDIR}"
-        f"{JobStage.DETECT}/{JobEngine.BLACKLETTER}/r{run}-volume.json"
+    return jobs.volume_result_key(
+        scan, JobStage.DETECT, JobEngine.BLACKLETTER, run
     )
 
 
@@ -499,91 +493,75 @@ def merge_detect_results(scan, detect_jobs: list[ExternalJob]) -> str:
     detections: list[dict] = []
     shards: list[dict] = []
     models: list[str] = []
-    next_page = 0
+    # The pages the run covered, not the detections: this payload
+    # lists detections alone, so a page with none reads exactly like a
+    # page nobody read, and only the shards' own page counts can say
+    # the run covered the volume.
+    covered = 0
     # A temp dir, not the output dir: the generic S3 sync sweeps up
     # everything there, and these are wire artifacts that stay out of it.
     with tempfile.TemporaryDirectory(
         prefix=f"{MERGE_TMP_PREFIX}{scan.pk}-"
     ) as tmp:
         tmp_dir = Path(tmp)
-        for index, job in enumerate(detect_jobs):
-            if job.shard_index != index:
-                raise DetectMergeError(
-                    f"scan {scan.pk} shard sequence breaks at position "
-                    f"{index}: job {job.pk} covers shard {job.shard_index}"
-                )
-            if not job.result_key:
-                raise DetectMergeError(
-                    f"scan {scan.pk} shard {index} has no result key"
-                )
-            manifest = job.input_manifest or {}
-            from_page = manifest.get("from_page")
-            page_count = manifest.get("page_count")
-            if from_page != next_page or not isinstance(page_count, int):
-                raise DetectMergeError(
-                    f"scan {scan.pk} shard {index} covers pages from "
-                    f"{from_page}, expected {next_page}"
-                )
 
-            local = tmp_dir / f"{index:04d}.json"
-            s3_sync.download_object(job.result_key, local)
-            payload = _check_envelope(scan, job, json.loads(local.read_text()))
+        def _download(key: str) -> dict:
+            local = tmp_dir / Path(key).name
+            s3_sync.download_object(key, local)
+            return json.loads(local.read_text())
 
-            answered = payload.get("page_count")
-            if answered != page_count:
+        for read in jobs.read_run_shards(
+            scan,
+            detect_jobs,
+            action=ACTION,
+            error_cls=DetectMergeError,
+            download=_download,
+        ):
+            answered = read.payload.get("page_count")
+            if answered != read.page_count:
                 raise DetectMergeError(
-                    f"scan {scan.pk} shard {index} read {answered} page(s), "
-                    f"the shard has {page_count}"
+                    f"scan {scan.pk} shard {read.index} read {answered} "
+                    f"page(s), the shard has {read.page_count}"
                 )
-            shard_models = list(payload.get("models") or [])
+            shard_models = list(read.payload.get("models") or [])
             if not models:
                 models = shard_models
             elif shard_models != models:
                 raise DetectMergeError(
-                    f"scan {scan.pk} shard {index} ran {shard_models}, "
+                    f"scan {scan.pk} shard {read.index} ran {shard_models}, "
                     f"shard 0 ran {models}"
                 )
 
-            for row in payload.get("detections") or []:
+            for row in read.payload.get("detections") or []:
                 page_no = row.get("page_index")
                 if not isinstance(page_no, int) or not (
-                    0 <= page_no < page_count
+                    0 <= page_no < read.page_count
                 ):
                     raise DetectMergeError(
-                        f"scan {scan.pk} shard {index} has a detection on "
-                        f"page {page_no}, the shard has {page_count}"
+                        f"scan {scan.pk} shard {read.index} has a detection "
+                        f"on page {page_no}, the shard has {read.page_count}"
                     )
-                page_index = from_page + page_no
+                page_index = read.from_page + page_no
                 detections.append(
                     {
                         **row,
                         "page_index": page_index,
                         "pdf_page": page_index + 1,
-                        "shard_index": index,
+                        "shard_index": read.index,
                     }
                 )
 
-            entry = {
-                "name": manifest.get("name"),
-                "index": index,
-                "from_page": from_page,
-                "to_page": manifest.get("to_page"),
-                "page_count": page_count,
-                "attempt": job.attempt,
-                "result_key": job.result_key,
-                "duration_ms": payload.get("duration_ms"),
-            }
-            tuning = {
-                key: manifest[key] for key in TUNING_KEYS if key in manifest
-            }
-            if tuning:
-                entry["tuning"] = tuning
-            shards.append(entry)
-            next_page += page_count
+            shards.append(
+                {
+                    **jobs.shard_entry(read.job, read.index, TUNING_KEYS),
+                    "duration_ms": read.payload.get("duration_ms"),
+                }
+            )
+            covered += read.page_count
 
-    if expected_total is not None and next_page != expected_total:
+    if expected_total is not None and covered != expected_total:
         raise DetectMergeError(
-            f"scan {scan.pk} merged {next_page} page(s), the original has "
+            f"scan {scan.pk} merged {covered} page(s), the original has "
             f"{expected_total}"
         )
 
@@ -702,8 +680,7 @@ def _merge_attempts(detect_jobs: list[ExternalJob]) -> int:
     :returns: The stored attempt count, 0 when none.
     :rtype: int
     """
-    meta = detect_jobs[0].provider_meta or {}
-    return int((meta.get("merge") or {}).get("attempts") or 0)
+    return jobs.ledger_attempts(detect_jobs, "merge")
 
 
 def _record_merge_failure(scan, detect_jobs: list[ExternalJob], exc) -> None:
@@ -722,20 +699,7 @@ def _record_merge_failure(scan, detect_jobs: list[ExternalJob], exc) -> None:
     :param exc: What the merge raised.
     :return: None.
     """
-    head = detect_jobs[0]
-    meta = head.provider_meta or {}
-    merge = dict(meta.get("merge") or {})
-    attempts = int(merge.get("attempts") or 0) + 1
-    merge.update(
-        {
-            "attempts": attempts,
-            "last_error": str(exc)[:500],
-            "last_attempt_at": timezone.now().isoformat(),
-        }
-    )
-    meta["merge"] = merge
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
+    attempts, head = jobs.bump_run_ledger(detect_jobs, "merge", exc)
     if attempts >= MERGE_MAX_ATTEMPTS:
         logger.exception(
             "Merging the detection results for scan %s failed; giving up "
@@ -783,46 +747,22 @@ def finish_ready_runs() -> int:
     if not s3_sync.s3_active():
         return 0
 
-    scan_ids = (
-        Scan.objects.filter(
-            jobs__stage=JobStage.DETECT,
-            jobs__engine=JobEngine.BLACKLETTER,
-            jobs__provider=JobProvider.RUNPOD,
-            jobs__status=JobStatus.COMPLETED,
-            jobs__apply_run__isnull=True,
-        )
-        .values_list("pk", flat=True)
-        .distinct()
-    )
-    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     merged = 0
-    for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
-        "reporter"
+    for scan, rows in jobs.ready_volume_runs(
+        JobStage.DETECT,
+        JobEngine.BLACKLETTER,
+        JobProvider.RUNPOD,
+        live_detect_jobs,
+        _merge_attempts,
+        MERGE_MAX_ATTEMPTS,
     ):
-        rows = live_detect_jobs(scan)
-        if not rows:
-            continue
-        if any(row.status in unfinished for row in rows):
-            continue
-        if any(row.status in DEAD_JOB_STATUSES for row in rows):
-            continue
-        if not any(row.status == JobStatus.COMPLETED for row in rows):
-            # The candidate row belongs to an older run; the live one
-            # has nothing to merge.
-            continue
-        if _merge_attempts(rows) >= MERGE_MAX_ATTEMPTS:
-            continue
-
         try:
             merge_detect_results(scan, rows)
         except Exception as exc:
             _record_merge_failure(scan, rows, exc)
             continue
 
-        ExternalJob.objects.filter(
-            pk__in=[row.pk for row in rows],
-            status=JobStatus.COMPLETED,
-        ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+        jobs.consume_run(rows)
         merged += 1
 
     return merged

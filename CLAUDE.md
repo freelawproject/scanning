@@ -14,6 +14,9 @@ DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py test scan
 # Survey the layout-JSON repair over the corpus, changing nothing (#242)
 docker exec scanning-daemon python manage.py reglue_dots_mocr --dry-run
 
+# Glue the Mistral reads again after a transform change (#245)
+docker exec scanning-daemon python manage.py reglue_mistral_ocr --dry-run
+
 # Write the review-2 findings of the volumes already in review 2, once after a deploy (#240 PR D)
 docker exec scanning-daemon python manage.py rebuild_review2_findings
 
@@ -112,6 +115,13 @@ State is `Scan.status`. The stages, and where each runs:
 - A Mistral result with a hole is never carried (`carry_stable_holes=False`, #191). The stable-hole rule of #238 trusts a deterministic decoder; a batch line fails from a transient fault
 - `jobs.check_deadline` is the one rule for "this row has waited long enough", and a provider that skips a poll calls it itself. `apply_poll_outcome` returns inside its completion branch, so a finished batch is ended by `_harvest_outcome` alone: a transient fault waits, a missing output file retries, and the deadline ends a PUT that never lands (#191)
 - `EXTRACT` takes either shape (`EITHER_LEVEL_STAGES`, migration 0032): a shard row with no opinion, or an opinion row for an engine that reads opinion PDFs. Only `TIEBREAK` still requires an opinion
+- `mistral_ocr.parse_payload` is the one transform of a stored Mistral result, and both glues call it (#245). A better transform is a re-glue (`reglue_mistral_ocr`) and never a re-paid read. The block text key is internal: the parse reads `text` or `content` and writes `content`
+- The Mistral glues run on the collect tick and never in `apply.glues_due` (#245): the apply trigger takes `PAGE_COMPLETENESS_REVIEW_DONE` alone, and the read starts later than that status
+- A volume glue writes no copy of what the three stages share (#245): `jobs.volume_result_key` and `jobs.glued_volume_key` for the keys, `jobs.ready_volume_runs` and `jobs.consume_run` for the pass, `jobs.read_run_shards` and `jobs.shard_entry` for the walk and its page arithmetic, `jobs.run_ledger`/`bump_run_ledger` for the retry state (on the head row's `provider_meta`, never in `input_manifest`), `apply.walk_final_pages` for a corrected volume's page walk
+- No review state reads `ApplyRun.extract_key`: `is_complete` and `final_volume_ready` do not change, or a volume nobody read with Mistral would never open review 2 (#245)
+- The apply's EXTRACT rows are created by the collect pass, only for a scan whose live Mistral volume run is glued, and from `apply.stored_shard_manifest` so the carry matches the build's identity (#245)
+- `mistral_ocr.apply_glue_due` is the one rule for writing a corrected volume's Mistral document, and `reglue_mistral_ocr` waives only its last test (#245). Every edit `apply.edit_page_counts` names must have a row first: a document written without them marks the edited pages unread and stamps a key that says the run is done
+- `apply._note_dead_rows` counts a dead row of `GLUE_STAGES` alone (#245). A stage that blocks no glue must not spend the one `dead_row_noted_at` stamp, or the row that does stop the run is never logged
 - Do not add a pass that revives FAILED rows: the admin re-queue changes the status in a second write, and a reviver races it
 - A failure names the volume page range (`jobs._failure_location`). Page numbers are logged 1-based; `from_page`/`to_page` are fitz indexes
 

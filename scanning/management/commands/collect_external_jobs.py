@@ -1,6 +1,6 @@
 """Confirm in-flight external jobs and finish the scans they belong to.
 
-Seven passes, in order.
+Nine passes, in order.
 
 **1. ``jobs.sweep_jobs()`` asks after every job still in flight.** How
 it asks depends on the provider:
@@ -61,6 +61,22 @@ scan it just finished in that status itself, so what is left here is
 the volume whose corrected build lands after its geometry, and every
 volume that was already approved and measured when #263 shipped.
 
+**8. ``mistral_ocr.finish_ready_runs()`` glues finished Mistral runs.**
+It joins the stored per-shard results of any scan whose Mistral rows
+are all ``COMPLETED`` into one volume JSON on S3 and flips the rows to
+``CONSUMED`` (#245). Like the other two glues it writes no scan status
+and keeps the results: the glue is where every transform runs, so a
+better transform is a re-glue at no API cost.
+
+**9. ``mistral_ocr.finish_ready_applies()`` reads the edited pages.**
+For a scan whose Mistral volume run is glued and whose corrected
+volume (#224) is built, it creates the one-page rows of the pages a
+curator changed and, once those have answered, writes the corrected
+volume's own Mistral document. A volume nobody read with Mistral is
+never a candidate, so this pass starts no paid work of its own. It is
+last because nothing else waits for it: no review state reads its
+output.
+
 Examples:
 
     # Run one confirm tick and exit.
@@ -89,8 +105,10 @@ class Command(BaseCommand):
         "every glued run (page numbers and Issues), then merge every "
         "finished detection run, queue the page edit apply of every "
         "approved scan that owes one, queue every merged detection "
-        "run's redaction computation, then open the redaction review "
-        "of every scan that is ready for it."
+        "run's redaction computation, open the redaction review "
+        "of every scan that is ready for it, then glue every finished "
+        "Mistral run and every corrected volume that owes its Mistral "
+        "document."
     )
 
     def handle(self, *args, **options):
@@ -107,6 +125,7 @@ class Command(BaseCommand):
             bitonal,
             dots_mocr,
             jobs,
+            mistral_ocr,
             review_states,
             yolo,
         )
@@ -122,6 +141,8 @@ class Command(BaseCommand):
                 applied_edits = apply.queue_ready_scans()
                 queued = yolo.queue_ready_runs()
                 promoted = review_states.promote_ready_scans()
+                extracted = mistral_ocr.finish_ready_runs()
+                extracted_applies = mistral_ocr.finish_ready_applies()
                 break
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -149,6 +170,8 @@ class Command(BaseCommand):
                 applied_edits,
                 queued,
                 promoted,
+                extracted,
+                extracted_applies,
             )
         ):
             self.stdout.write(
@@ -159,5 +182,6 @@ class Command(BaseCommand):
                 f"merged {detected} detection run(s), queued "
                 f"{applied_edits} page edit apply(s) and {queued} "
                 f"redaction computation(s), opened {promoted} redaction "
-                f"review(s)"
+                f"review(s), glued {extracted} Mistral run(s) and "
+                f"{extracted_applies} corrected volume(s)"
             )
