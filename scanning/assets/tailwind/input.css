@@ -149,6 +149,19 @@
            dark:bg-emerald-900/50 dark:text-emerald-300;
   }
 
+  /* Text review states (#334). The third review, the same pair one
+     step further on: ready keeps the actionable orange, done gets the
+     green of a finished opinion. */
+  .badge-ready_for_text_review {
+    @apply badge bg-orange-100 text-orange-800
+           dark:bg-orange-900/50 dark:text-orange-300;
+  }
+
+  .badge-text_review_done {
+    @apply badge bg-green-100 text-green-800
+           dark:bg-green-900/50 dark:text-green-300;
+  }
+
   .badge-pending_review {
     @apply badge bg-yellow-100 text-yellow-800
            dark:bg-yellow-900/50 dark:text-yellow-300;

@@ -7,11 +7,13 @@ from scanning.monitoring import health_check, heartbeat, sentry_fail
 from scanning.views import (
     claim_scan,
     confirm_scan_upload,
+    legacy_opinion_detail,
+    legacy_opinion_list,
+    legacy_opinion_upload,
     login_view,
     logout_view,
-    opinion_detail,
     opinion_list,
-    opinion_upload,
+    opinion_review,
     password_change,
     presign_scan_upload,
     profile,
@@ -102,8 +104,29 @@ urlpatterns = [
     path("", scan_list, name="scan_list"),
     path("scans/<int:pk>/", scan_detail, name="scan_detail"),
     path("opinions/", opinion_list, name="opinion_list"),
-    path("opinions/upload/", opinion_upload, name="opinion_upload"),
-    path("opinions/<int:pk>/", opinion_detail, name="opinion_detail"),
+    path(
+        "opinions/<int:pk>/review/",
+        opinion_review,
+        name="opinion_review",
+    ),
+    # The legacy pipeline's opinions keep their pages under
+    # ``legacy/`` (#334). ``legacy`` is not a number, so it cannot
+    # collide with an opinion pk.
+    path(
+        "opinions/legacy/",
+        legacy_opinion_list,
+        name="legacy_opinion_list",
+    ),
+    path(
+        "opinions/legacy/upload/",
+        legacy_opinion_upload,
+        name="legacy_opinion_upload",
+    ),
+    path(
+        "opinions/legacy/<int:pk>/",
+        legacy_opinion_detail,
+        name="legacy_opinion_detail",
+    ),
     path("profile/", profile, name="profile"),
     path("profile/password/", password_change, name="password_change"),
     path("queue/", queue_view, name="queue"),
@@ -376,7 +399,7 @@ urlpatterns = [
         name="serve_redacted_pdf",
     ),
     path(
-        "opinions/<int:pk>/pdf/<str:variant>/",
+        "opinions/legacy/<int:pk>/pdf/<str:variant>/",
         serve_opinionscan_pdf,
         name="serve_opinionscan_pdf",
     ),

@@ -16,6 +16,10 @@ module.exports = {
     'badge-ready_for_redaction_review',
     'badge-redaction_review_done',
     'badge-pending_review',
+    // Opinion review statuses (rendered via badge-{{ opinion.status }},
+    // #334). 'badge-processing' and 'badge-error' are above.
+    'badge-ready_for_text_review',
+    'badge-text_review_done',
     'badge-approved',
     'badge-extracted',
     'badge-error',

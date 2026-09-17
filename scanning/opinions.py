@@ -47,7 +47,7 @@ import logging
 from dataclasses import dataclass
 
 from django.db import transaction
-from django.db.models import Case, F, Q, Value, When
+from django.db.models import Case, Count, F, Q, Value, When
 
 from scanning import apply, boundaries, review_states
 from scanning.models import (
@@ -491,3 +491,42 @@ def run(scan_pk: int) -> None:
             "The creation of the opinions failed. Approve again to retry."
         )
     _park_after_redactions(scan_pk, message, status)
+
+
+# ---------------------------------------------------------------------------
+# The list page
+# ---------------------------------------------------------------------------
+
+
+def finding_counts(opinion_ids) -> dict[int, tuple[int, int]]:
+    """Return the open findings, and the stale ones, per opinion (#334).
+
+    The warning badge of the opinions list, the twin of
+    ``findings.open_count`` for one scan and of
+    ``repairs.waiting_counts`` for one page of a list. The caller passes
+    the ids of one page alone, so one grouped query answers the whole
+    page and the size of the corpus never reaches it.
+
+    **The ordering is cleared before the grouping.** Django puts the
+    ordering columns into ``GROUP BY``, and ``OpinionFinding.Meta``
+    orders by ``page_in_opinion``, so without the clear an opinion with
+    two findings on two pages reads 1 twice instead of 2 once.
+
+    :param opinion_ids: The opinions to count, usually one page of the
+        list.
+    :returns: ``{opinion id: (open, stale)}``. An opinion with no open
+        finding is absent.
+    :rtype: dict[int, tuple[int, int]]
+    """
+    rows = (
+        OpinionFinding.objects.filter(
+            opinion_id__in=opinion_ids, dismissal__isnull=True
+        )
+        .order_by()
+        .values("opinion_id")
+        .annotate(
+            open=Count("pk"),
+            stale=Count("pk", filter=Q(check_name__in=STALE_OPINION_CHECKS)),
+        )
+    )
+    return {row["opinion_id"]: (row["open"], row["stale"]) for row in rows}

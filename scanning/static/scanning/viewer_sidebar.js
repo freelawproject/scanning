@@ -104,7 +104,14 @@ var _opinions = [];
                 .forEach(function (c, i) {
                     c.style.outline = i === index ? "2px solid #2563eb" : "";
                 });
-            var url = "/opinions/" + pk + "/pdf/" + variant + "/";
+            // The card carries the address (#334). The route moved
+            // under opinions/legacy/, and a path this script spelled
+            // by hand went stale with no test to catch it.
+            var url =
+                variant === "redacted"
+                    ? el.dataset.redactedUrl
+                    : el.dataset.unredactedUrl;
+            if (!url) return;
             if (window.loadOpinionUrl) {
                 window.loadOpinionUrl(url);
             } else if (window.loadOpinion) {
