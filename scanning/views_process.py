@@ -23,6 +23,7 @@ from django.http import (
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.urls import reverse
+from django.views.decorators.clickjacking import xframe_options_sameorigin
 from django.views.decorators.http import require_POST
 
 from scanning import (
@@ -1188,6 +1189,7 @@ def _redirect_to_object(
     *,
     filename: str,
     missing_message: str,
+    disposition: str = "attachment",
     **fields,
 ) -> HttpResponse:
     """Send the browser to one object of the bucket, or say why not.
@@ -1208,6 +1210,8 @@ def _redirect_to_object(
     :param key: Object key inside the private bucket.
     :param filename: The name the browser saves the file under.
     :param missing_message: The 404 message when the object is absent.
+    :param disposition: ``attachment``, the default, or ``inline`` for
+        a frame that shows the object instead of saving it (#334).
     :param fields: What names the object in the 404 body and the log
         line: ``run`` and ``label`` for a glued or an apply output,
         ``opinion`` and ``revision`` for an opinion's PDF (#336). Each
@@ -1228,7 +1232,7 @@ def _redirect_to_object(
     url = s3_sync.presign_get(
         key,
         GLUED_OUTPUT_PRESIGN_TTL,
-        content_disposition=f'attachment; filename="{filename}"',
+        content_disposition=f'{disposition}; filename="{filename}"',
     )
     return redirect(url)
 
@@ -1406,6 +1410,7 @@ OPINION_PDF_NOT_WRITTEN_MESSAGE = (
 
 
 @login_required
+@xframe_options_sameorigin
 def serve_opinion_pdf(
     request: HttpRequest, pk: int, opinion_pk: int
 ) -> HttpResponse:
@@ -1417,6 +1422,19 @@ def serve_opinion_pdf(
     for "the PDF exists"; before it holds, a 404 that says so, without
     an S3 HEAD. The review page of #334 reads the same key through the
     same rule.
+
+    ``?disposition=inline`` asks for the same object in a frame (#334).
+    The review page puts this route in an ``iframe``, which is a
+    navigation and needs no CORS rule, and the browser's own PDF viewer
+    shows the file. Every other caller gets the download name.
+
+    The route answers ``SAMEORIGIN`` where the site answers ``DENY``,
+    because the site's own page frames it: a browser that reads the
+    header on the redirect would otherwise refuse the frame. It is the
+    narrower value, and the right one. An exemption would let any site
+    frame the route, and although the frame ends at the bucket, which
+    is cross-origin and gives its bytes to no page, a third party's
+    page would still make this pod sign a URL.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -1437,6 +1455,11 @@ def serve_opinion_pdf(
         "opinion-pdf",
         opinion_pdf.key(opinion),
         filename=opinion_pdf.download_name(opinion),
+        disposition=(
+            "inline"
+            if request.GET.get("disposition") == "inline"
+            else "attachment"
+        ),
         missing_message=(
             f"The redacted PDF of opinion {opinion.pk} was written at "
             f"{label}, but it is not in the bucket."
@@ -1495,6 +1518,97 @@ def serve_opinion_ocr(
         opinion=opinion.pk,
         revision=revision,
         label=opinion.status,
+    )
+
+
+@login_required
+def opinion_file_index(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """List the glued objects of one opinion (#334).
+
+    The ``files`` index of an opinion, the twin of
+    :func:`glued_output_index` for a volume: the review page links it,
+    and it answers "which object exists, and where is it". Every fact
+    is on the row, so the index makes no S3 call and answers in every
+    environment. It writes no copy of a rule: the two ledgers are
+    ``opinion_pdf.is_written`` and ``opinion_ocr.is_written``, the same
+    two the two routes read. An entry carries its ``url`` only when it
+    is written, the rule of :func:`_shard_entry`, where a link that
+    cannot work is left out.
+
+    **The OCR ledger is one stamp over four files, and the glue writes
+    one file per engine the run has** (``opinion_ocr.write``). So an
+    engine document is written when the stamp is live **and** the run
+    carries that engine's key: a volume nobody read with Mistral is
+    glued from dots.mocr alone, and its ``mistral_ocr.json`` was never
+    put in the bucket. The manifest is written on every glue. A key
+    that lands on the run after the glue reads as written until the
+    next re-glue, the one error left here, and the rarer one.
+
+    The keys are of the live revision (``Opinion.glue_prefix``). A
+    re-glue raises the revision, so this index never names an object of
+    an older prefix, although that object stays in the bucket.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
+    :return: JSON with ``scan``, ``opinion``, ``label``, ``status``,
+        ``glue_revision``, ``prefix`` and ``files``.
+    """
+    from scanning import opinion_ocr
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    files = [
+        {
+            "name": opinion_pdf.REDACTED_NAME,
+            "output": "redacted-pdf",
+            "written": opinion_pdf.is_written(opinion),
+            "key": opinion_pdf.key(opinion),
+            "url": reverse(
+                "serve_opinion_pdf",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    ]
+    ocr_written = opinion_ocr.is_written(opinion)
+    run = opinion.apply_run
+    for engine in (*opinion_ocr.ENGINES, "manifest"):
+        key = opinion_ocr.engine_key(opinion, engine)
+        spec = opinion_ocr.ENGINES.get(engine)
+        has_read = spec is None or bool(
+            run is not None and spec.document_key(run)
+        )
+        files.append(
+            {
+                "name": key.rsplit("/", 1)[-1],
+                "output": f"opinion-{engine}",
+                "written": ocr_written and has_read,
+                "key": key,
+                "url": reverse(
+                    "serve_opinion_ocr",
+                    kwargs={
+                        "pk": scan.pk,
+                        "opinion_pk": opinion.pk,
+                        "engine": engine,
+                    },
+                ),
+            }
+        )
+    for entry in files:
+        if not entry["written"]:
+            entry.pop("url")
+    return JsonResponse(
+        {
+            "scan": scan.pk,
+            "opinion": opinion.pk,
+            "label": str(opinion),
+            "status": opinion.status,
+            "glue_revision": opinion.glue_revision,
+            "prefix": opinion.glue_prefix,
+            "files": files,
+        }
     )
 
 

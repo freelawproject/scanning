@@ -221,6 +221,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - `/opinions/` lists the `Opinion` rows and `/opinions/legacy/` the frozen `OpinionScan` rows (#334). The step-3 tab and the step-2 "Next" button read one pair of flags: `review3_opinions` sends both to the opinions page, `legacy_pipeline` (`stats.LEGACY_STATUSES`, not `legacy_review`) keeps both on `?step=3`, and a new volume with neither gets no link. The flag is not `opinion_count`, which already names the boundaries of step 2
 - The warning badge of the opinions list is `opinions.finding_counts` over the ids of one page, after the pagination, the rule every list badge follows. `/opinions/<pk>/review/` has no write endpoint until the text review lands, so it offers no control (#334)
 - A template writes every opinion PDF address onto its card (`data-redacted-url`), and the viewer reads it: a path a script spells by hand goes stale in silence, because no test reverses it (#334)
+- The review page of an opinion frames `serve_opinion_pdf` under `?disposition=inline`, the one route that answers `SAMEORIGIN` where the site answers `DENY`, and `opinion_file_index` is its `files` index (#334): both read the two ledgers (`opinion_pdf.is_written`, `opinion_ocr.is_written`) and never the bucket. The OCR stamp is one over four files, so an engine document is written only when the run also carries that engine's key, and an entry with no `url` is an object nothing wrote
 
 ## Worker images
 

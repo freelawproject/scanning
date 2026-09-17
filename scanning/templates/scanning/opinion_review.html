@@ -3,11 +3,12 @@
 {% comment %}
   One opinion of the third review (issue #334), stage 1.
 
-  The page shows what the rows hold and nothing that needs S3. It
-  carries no write control: the approval, the dismissal and the typing
-  of a page arrive with the text review itself, which needs OpinionText
-  and the per-opinion PDF. A button the endpoint would refuse is the one
-  thing a viewer must never offer (the rule of the step-1 bar, #151).
+  The page shows what the rows hold, and the redacted PDF of the
+  opinion in a frame when the row says the file exists. It carries no
+  write control: the approval, the dismissal and the typing of a page
+  arrive with the text review itself, which needs OpinionText. A button
+  the endpoint would refuse is the one thing a viewer must never offer
+  (the rule of the step-1 bar, #151).
 {% endcomment %}
 
 {% block title %}{{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }} - FLP Scanning Portal{% endblock %}
@@ -110,9 +111,45 @@
     </div>
     {% endfor %}
 
+    {% comment %}
+      The redacted PDF (#336) in a frame. The source is our own route,
+      which answers a 302 to a presigned GET: a navigation, so the
+      bucket needs no CORS rule, and the browser's own PDF viewer shows
+      the file. "disposition=inline" asks for that; the Download button
+      is the same route without it, and it saves the file under the
+      printed range (#165).
+    {% endcomment %}
+    <h2 class="text-sm font-bold mt-6 mb-3 flex items-center gap-2">
+      The redacted PDF
+      {% if user.is_staff %}
+      <a href="{{ files_url }}"
+         class="text-xs font-normal text-gray-500 dark:text-gray-400 underline hover:text-blue-600 dark:hover:text-blue-400"
+         title="The glued objects of this opinion: the redacted PDF and the OCR documents">files</a>
+      {% endif %}
+    </h2>
+    {% if redacted_pdf_url %}
+    <div class="flex items-center gap-3 mb-2">
+      <a href="{{ redacted_pdf_url }}" class="btn-outline text-xs px-2 py-1">
+        <i class="fa-solid fa-download"></i> Download
+      </a>
+      <span class="text-xs text-gray-500 dark:text-gray-400">
+        {{ opinion.page_count }} page{{ opinion.page_count|pluralize }}, revision r{{ opinion.glue_revision }}.
+      </span>
+    </div>
+    <iframe src="{{ redacted_pdf_url }}?disposition=inline"
+            title="The redacted PDF of the opinion"
+            class="w-full rounded border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800"
+            style="height: 800px;"></iframe>
+    {% else %}
+    <div class="border border-dashed border-gray-300 dark:border-gray-700 rounded px-4 py-10 text-center">
+      <p class="text-sm text-gray-500 dark:text-gray-400">The redacted PDF is not written yet.</p>
+      <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">The daemon writes one PDF of each opinion, one per tick. This opinion is at revision r{{ opinion.glue_revision }}.</p>
+    </div>
+    {% endif %}
+
     <div class="mt-6 border border-dashed border-gray-300 dark:border-gray-700 rounded px-4 py-10 text-center">
       <p class="text-sm text-gray-500 dark:text-gray-400">The text review is not built yet.</p>
-      <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">The redacted pages and the text of the OCR ensemble go here.</p>
+      <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">The text of the OCR ensemble goes here.</p>
     </div>
   </div>
 

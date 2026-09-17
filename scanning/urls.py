@@ -66,6 +66,7 @@ from scanning.views_process import (
     dismiss_issue,
     dismiss_page_repair,
     glued_output_index,
+    opinion_file_index,
     page_edit_file,
     process_actions,
     progress_api,
@@ -223,6 +224,13 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/redacted-pdf/",
         serve_opinion_pdf,
         name="serve_opinion_pdf",
+    ),
+    # The glued objects of one opinion (#334), the twin of the volume's
+    # own index: which object exists, and where it is.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/files/",
+        opinion_file_index,
+        name="opinion_file_index",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.

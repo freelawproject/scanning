@@ -1151,6 +1151,63 @@ class TestRoute(ScanningTestCase):
             'attachment; filename="a3d.214.0012-0015.pdf"',
         )
 
+    def test_the_inline_disposition_is_for_the_frame(self):
+        """The review page frames this route (#334), so it must show."""
+        Opinion.objects.filter(pk=self.row.pk).update(redacted_pdf_revision=0)
+        self.client.force_login(UserFactory())
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch(
+                "scanning.s3_sync.presign_get",
+                return_value="https://bucket/signed",
+            ) as presign,
+        ):
+            response = self.client.get(self.url, {"disposition": "inline"})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            presign.call_args.kwargs["content_disposition"],
+            'inline; filename="a3d.214.0012-0015.pdf"',
+        )
+
+    @override_settings(X_FRAME_OPTIONS="DENY")
+    def test_our_own_page_may_frame_the_route_and_no_other_site(self):
+        """The review page frames it, and the site denies frames."""
+        Opinion.objects.filter(pk=self.row.pk).update(redacted_pdf_revision=0)
+        self.client.force_login(UserFactory())
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch(
+                "scanning.s3_sync.presign_get",
+                return_value="https://bucket/signed",
+            ),
+        ):
+            response = self.client.get(self.url, {"disposition": "inline"})
+
+        self.assertEqual(response["X-Frame-Options"], "SAMEORIGIN")
+
+    def test_an_unknown_disposition_still_saves_the_file(self):
+        Opinion.objects.filter(pk=self.row.pk).update(redacted_pdf_revision=0)
+        self.client.force_login(UserFactory())
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch(
+                "scanning.s3_sync.presign_get",
+                return_value="https://bucket/signed",
+            ) as presign,
+        ):
+            response = self.client.get(self.url, {"disposition": "banana"})
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(
+            presign.call_args.kwargs["content_disposition"].startswith(
+                "attachment;"
+            )
+        )
+
 
 class TestLogging(TestCase):
     def test_the_blackletter_logger_has_the_console_handler(self):
