@@ -2470,13 +2470,18 @@ class Opinion(AbstractDateTimeModel):
     me" is a question about the whole span.
 
     **The glues are derived and disposable.** Every artifact of the
-    split lives under ``jobs/opinions/o{pk}/r{glue_revision}/`` and a
-    re-glue raises the revision, the rule of the apply's
-    ``jobs/apply/a{n}/``. The detections and the redactions are **not**
-    among them: they are rows since #241, and restricting them to one
-    opinion is a query over the rows. ``approved_text_key`` is not a
-    glue: it is written once when a human approves, and no re-glue may
-    overwrite it.
+    split lives under the row's :attr:`glue_prefix`,
+    ``jobs/opinions/{first}.{index}/r{revision}/``: the invariant key
+    and never the pk (#350), so a script that walks the bucket finds an
+    opinion by the printed page it looks at. A re-glue raises the
+    revision, the rule of the apply's ``jobs/apply/a{n}/``, and the
+    creation raises it on every matched row that is not approved,
+    because the prefix belongs to one row at a time and a second
+    approval must not write into the old revision. The detections and
+    the redactions are **not** among the glues: they are rows since
+    #241, and restricting them to one opinion is a query over the rows.
+    ``approved_text_key`` is not a glue: it is written once when a
+    human approves, and no re-glue may overwrite it.
     """
 
     scan = models.ForeignKey(
@@ -2601,7 +2606,23 @@ class Opinion(AbstractDateTimeModel):
         default=0,
         help_text=(
             "The revision of the per-opinion glues. Every glue key is "
-            "derived from the pk and this number; a re-glue raises it."
+            "derived from the key and this number; a re-glue raises it."
+        ),
+    )
+    ocr_glue_revision = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The glue_revision the OCR documents were written at "
+            "(#350). Null: no OCR glue. Equal to glue_revision: the "
+            "glue exists, the one rule opinion_ocr.is_written reads."
+        ),
+    )
+    ocr_glue_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "Failed OCR glue ticks on this row at the live revision "
+            "(#350). At opinion_ocr.MAX_ATTEMPTS the row goes to ERROR."
         ),
     )
     approved_text_key = models.CharField(
@@ -2637,8 +2658,15 @@ class Opinion(AbstractDateTimeModel):
 
     @property
     def glue_prefix(self) -> str:
-        """The S3 prefix of this opinion's glues, at the live revision."""
-        return f"jobs/opinions/o{self.pk}/r{self.glue_revision}/"
+        """The S3 prefix of this opinion's glues, at the live revision.
+
+        Keyed by the invariant identity, not the pk (#350). Relative to
+        the scan's processing prefix.
+        """
+        return (
+            f"jobs/opinions/{self.first_printed_page}.{self.index_in_page}/"
+            f"r{self.glue_revision}/"
+        )
 
     def __str__(self):
         return f"Opinion {self.first_printed_page}.{self.index_in_page}"

@@ -51,6 +51,7 @@ from scanning.models import (
     JobEngine,
     JobStage,
     JobStatus,
+    Opinion,
     OpinionBoundary,
     OpinionScan,
     PageEdit,
@@ -1391,6 +1392,56 @@ def serve_glued_volume(
         filename=f"scan-{scan.pk}-{output}-r{run}.json",
         missing_message=missing,
         label=label,
+    )
+
+
+@login_required
+def serve_opinion_ocr(
+    request: HttpRequest, pk: int, opinion_pk: int, engine: str
+) -> HttpResponse:
+    """Send the browser to one engine's OCR document of one opinion (#350).
+
+    A developer's route, so it redirects (#243/#262). ``manifest``
+    names the manifest. A 404 before the glue is written
+    (``opinion_ocr.is_written``), for an engine this module does not
+    know, and for an opinion of another scan.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :param engine: A name of ``opinion_ocr.ENGINES``, or ``manifest``.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    from scanning import opinion_ocr
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if engine != "manifest" and engine not in opinion_ocr.ENGINES:
+        return _json_404(
+            f"Unknown engine {engine!r}. "
+            f"Known: manifest, {', '.join(opinion_ocr.ENGINES)}."
+        )
+    revision = opinion.glue_revision
+    if not opinion_ocr.is_written(opinion):
+        return _json_404(
+            f"The OCR glue of {opinion} is not written at r{revision}.",
+            run=revision,
+            label=opinion.status,
+        )
+    return _redirect_to_object(
+        scan,
+        f"opinion-{engine}",
+        revision,
+        opinion_ocr.engine_key(opinion, engine),
+        filename=(
+            f"scan-{scan.pk}-opinion-{opinion.first_printed_page}."
+            f"{opinion.index_in_page}-r{revision}-{engine}.json"
+        ),
+        missing_message=(
+            f"The OCR glue of {opinion} is stamped at r{revision}, but "
+            f"its {engine} document is not in the bucket."
+        ),
+        label=opinion.status,
     )
 
 
