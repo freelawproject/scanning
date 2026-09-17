@@ -26,8 +26,24 @@ from django.contrib.sessions.middleware import SessionMiddleware
 from django.test import RequestFactory, TestCase
 
 from scanning.admin import ScanAdmin
-from scanning.factories import ExternalJobFactory, ScanFactory, UserFactory
-from scanning.models import JobStage, PendingUpload, Scan, Status
+from scanning.factories import (
+    ExternalJobFactory,
+    OpinionFactory,
+    OpinionFindingFactory,
+    OpinionTextFactory,
+    ScanFactory,
+    UserFactory,
+    WithdrawnOpinionFactory,
+)
+from scanning.models import (
+    JobEngine,
+    JobStage,
+    OpinionCheck,
+    OpinionFindingDismissal,
+    PendingUpload,
+    Scan,
+    Status,
+)
 
 
 def _request_with_messages():
@@ -352,3 +368,105 @@ class TestApplyRunAdmin(TestCase):
         self.assertFalse(admin_site.has_delete_permission(request))
         self.assertFalse(admin_site.has_delete_permission(request, run))
         self.assertNotIn("delete_selected", admin_site.get_actions(request))
+
+
+class TestExternalJobChangelist(TestCase):
+    """The changelist of the job rows, which nothing opened before #335.
+
+    ``list_select_related`` names a path, and Django checks it when the
+    changelist runs its query, not when the module imports. A path to a
+    column the model does not have is a 500 for the staff user and green
+    tests for everyone else.
+    """
+
+    def setUp(self):
+        self.user = UserFactory(is_staff=True, is_superuser=True)
+        self.client.force_login(self.user)
+
+    def test_the_list_opens_with_a_volume_level_row(self):
+        ExternalJobFactory(stage=JobStage.DETECT)
+
+        response = self.client.get("/admin/scanning/externaljob/")
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_the_list_opens_with_an_opinion_level_row(self):
+        """The join to the opinion stops at the FK: it has no reporter."""
+        scan = ScanFactory()
+        ExternalJobFactory(
+            scan=scan,
+            opinion=OpinionFactory(scan=scan),
+            stage=JobStage.TIEBREAK,
+            engine=JobEngine.DOTS_MOCR,
+        )
+
+        response = self.client.get("/admin/scanning/externaljob/")
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_the_opinion_list_opens(self):
+        OpinionFactory()
+
+        response = self.client.get("/admin/scanning/opinion/")
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_the_withdrawn_opinion_list_opens(self):
+        WithdrawnOpinionFactory()
+
+        response = self.client.get("/admin/scanning/withdrawnopinion/")
+
+        self.assertEqual(response.status_code, 200)
+
+
+class ScanAdminDeleteSummaryOpinionTests(TestCase):
+    """The opinion tables cascade through ``Opinion``, one level down.
+
+    The loop filters by a path to the scan for exactly this reason: a
+    volume holds about one ``OpinionText`` row per page, and counting
+    only the tables with a ``scan_id`` would hide them all.
+    """
+
+    def setUp(self):
+        self.admin = ScanAdmin(Scan, AdminSite())
+
+    def _summary(self, scan):
+        _, model_count, _, _ = self.admin.get_deleted_objects(
+            [scan], _request_with_messages()
+        )
+        return model_count
+
+    def test_summary_counts_the_opinions(self):
+        scan = ScanFactory()
+        OpinionFactory(scan=scan)
+        WithdrawnOpinionFactory(scan=scan)
+
+        model_count = self._summary(scan)
+
+        self.assertEqual(model_count.get("opinions"), 1)
+        self.assertEqual(model_count.get("withdrawn opinions"), 1)
+
+    def test_summary_counts_the_pages_and_the_warnings(self):
+        scan = ScanFactory()
+        opinion = OpinionFactory(scan=scan)
+        OpinionTextFactory(opinion=opinion, page_in_opinion=0)
+        OpinionTextFactory(opinion=opinion, page_in_opinion=1)
+        OpinionFindingFactory(opinion=opinion)
+        OpinionFindingDismissal.objects.create(
+            opinion=opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.ENGINES_DISAGREE,
+        )
+
+        model_count = self._summary(scan)
+
+        self.assertEqual(model_count.get("opinion texts"), 2)
+        self.assertEqual(model_count.get("opinion findings"), 1)
+        self.assertEqual(model_count.get("opinion finding dismissals"), 1)
+
+    def test_another_scan_opinion_is_not_counted(self):
+        OpinionTextFactory(opinion=OpinionFactory(scan=ScanFactory()))
+
+        model_count = self._summary(ScanFactory())
+
+        self.assertNotIn("opinion texts", model_count)

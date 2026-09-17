@@ -1264,6 +1264,40 @@ class TestAutoNowQuerySet(ScanningTestCase):
         self.assertGreater(scan2.date_modified, old)
 
 
+class TestScanListOpinionCount(ScanningTestCase):
+    """The ``opinion_count`` column of the scan list.
+
+    It counts the legacy ``OpinionScan`` rows. #335 gave the name
+    ``opinions`` to the new ``Opinion`` table, so a count of the wrong
+    relation shows every volume as empty and says nothing about it.
+    """
+
+    def test_counts_the_legacy_rows(self):
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(uploaded_by=user)
+        OpinionScanFactory(scan=scan, reporter=scan.reporter)
+        OpinionScanFactory(scan=scan, reporter=scan.reporter)
+
+        response = self.client.get(reverse("scan_list"))
+
+        row = response.context["page_obj"][0]
+        self.assertEqual(row.opinion_count, 2)
+
+    def test_a_new_opinion_row_does_not_count(self):
+        """#334 gives the new rows their own page, not this column."""
+        from scanning.factories import OpinionFactory
+
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(uploaded_by=user)
+        OpinionFactory(scan=scan)
+
+        response = self.client.get(reverse("scan_list"))
+
+        self.assertEqual(response.context["page_obj"][0].opinion_count, 0)
+
+
 class TestOpinionList(ScanningTestCase):
     """Test the opinion list view."""
 

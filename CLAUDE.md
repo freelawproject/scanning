@@ -198,6 +198,14 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - The opinion of a reading comes from `boundaries.standing`, in the order `reading_key` defines, never from the caption rows. The count of `HEADNOTE` boxes is not the count of headnotes, so no finding is built on it
 - Every page overlay is drawn from its rows at every render and never positioned once: `renderPage` calls the redaction, bounds and dim draws, because a re-render changes the scale. A selected opinion is a cache plus a draw (`_drawDimForPage`), never a one-time paint. Its masks dim, and draw in the `bounds` mode alone: a redaction mode shows the page as the output has it (#311)
 
+## Review 3 (#335)
+
+- An `Opinion` is keyed by `(scan, first printed page, index in that printed page)`, stamped at creation, never by the boundary anchors. A later reading change is a card, never a new key. `page_count` holds the physical count, so no check does arithmetic on the printed numbers
+- `OpinionText` is one row per **page** of an opinion, and it holds an engine reading only where the engines disagree; the whole read of every engine stays on S3. `text` is a cache; `human_text` is the truth and nothing discards it. An edit moves the offsets of `disagreements`, so it answers that page
+- The per-opinion glues live under `jobs/opinions/o{pk}/r{glue_revision}/` and a re-glue raises the revision. The detections and the redactions are not among them: they are rows since #241, and restricting them to one opinion is a query. `approved_text_key` is not a glue, and no re-glue may overwrite it
+- A warning of review 3 is an `OpinionFinding`, never an `Issue` row. It keeps the review-2 rules: one rebuild writes them, a dismissal is its own row that nothing deletes, and a `STALE_OPINION_CHECKS` row cannot be dismissed
+- `OpinionScan` is frozen (#173/#206 paused its writer). `scan.legacy_opinions` reads it, `scan.opinions` reads the new model, and `ExternalJob.opinion` is an `Opinion`
+
 ## Worker images
 
 - The scaffold is in `runpod_common`, once: Sentry, the result envelope, `execute_action`. Only `BadInputError` maps to `BAD_INPUT`. Without `result_url` a worker answers inline

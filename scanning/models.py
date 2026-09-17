@@ -256,7 +256,10 @@ class Source(models.TextChoices):
 
 
 class OpinionStatus(models.TextChoices):
-    """Review status for an individual opinion scan.
+    """Review status of a legacy ``OpinionScan`` row.
+
+    The new pipeline uses :class:`OpinionReviewStatus` on
+    :class:`Opinion` (#335). This one stays with the rows it describes.
 
     ``GAP`` indicates missing pages within an opinion's page range,
     e.g. pages were skipped or lost during scanning.
@@ -925,14 +928,22 @@ class Scan(AbstractDateTimeModel):
 
 
 class OpinionScan(AbstractDateTimeModel):
-    """An individual opinion extracted from a book scan or uploaded standalone."""
+    """An individual opinion of the legacy pipeline (frozen, #335).
+
+    The new pipeline writes :class:`Opinion` rows instead. This model
+    keeps the rows the legacy pipeline made and the pages that read
+    them; nothing writes it, because the file generation that did is
+    paused (#173, #206). The identity fault of #165 -- every regenerate
+    deleted and recreated the rows -- is what the new key exists to
+    answer, so it is not fixed here.
+    """
 
     scan = models.ForeignKey(
         Scan,
         on_delete=models.PROTECT,
         null=True,
         blank=True,
-        related_name="opinions",
+        related_name="legacy_opinions",
     )
     reporter = models.ForeignKey(
         Reporter,
@@ -2370,6 +2381,596 @@ class BracketReading(AbstractDateTimeModel):
         return f"{self.raw} p.{self.page_index + 1}"
 
 
+# ── The third review: the opinions of a volume ────────────────────────
+#
+# Issue #335. The models alone. Nothing writes them yet: the creation of
+# the rows is #336 and the review interface is #334.
+
+
+class OpinionReviewStatus(models.TextChoices):
+    """The state of one opinion in the third review (#335).
+
+    Not :class:`OpinionStatus`, which belongs to the legacy
+    ``OpinionScan`` row and stays with it. ``ERROR`` is terminal, the
+    rule of ``Scan.status``: the way back is a new run of the work that
+    creates the rows (#336).
+    """
+
+    PROCESSING = "processing", "Processing"
+    READY_FOR_TEXT_REVIEW = "ready_for_text_review", "Ready for text review"
+    TEXT_REVIEW_DONE = "text_review_done", "Text review done"
+    ERROR = "error", "Error"
+
+
+class OpinionCheck(models.TextChoices):
+    """What an :class:`OpinionFinding` is about (#334).
+
+    The first five are the warnings the review shows on a page. The last
+    three are facts about the opinion row itself.
+    """
+
+    ENGINES_DISAGREE = "engines_disagree", "The engines do not all agree"
+    NO_MAJORITY = "no_majority", "No two engines agree"
+    READING_ORDER = "reading_order", "The reading order needs a check"
+    COLUMN_EDGE = "column_edge", "A column starts or ends here"
+    PARTIAL_REDACTION = (
+        "partial_redaction",
+        "A redaction covers part of a cell",
+    )
+    PAGE_GAP = "page_gap", "A gap in the printed page numbers"
+    STALE_PAGE_NUMBER = "stale_page_number", "The printed number changed"
+    ORPHANED_OPINION = "orphaned_opinion", "No boundary matches this opinion"
+
+
+#: The checks a curator may dismiss. The two stale checks are facts
+#: about a row, not judgements, so the way out is to fix the row, the
+#: rule of ``STALE_REVIEW2_CHECKS``.
+STALE_OPINION_CHECKS = frozenset(
+    {OpinionCheck.STALE_PAGE_NUMBER, OpinionCheck.ORPHANED_OPINION}
+)
+DISMISSABLE_OPINION_CHECKS = frozenset(OpinionCheck) - STALE_OPINION_CHECKS
+
+
+class Opinion(AbstractDateTimeModel):
+    """One opinion of a volume, for the third human review (#335).
+
+    **The identity is the printed page, not the geometry.** A row is
+    keyed by ``(scan, first_printed_page, index_in_page)``, stamped when
+    the row is created. The anchors of an ``OpinionBoundary`` cannot be
+    the key: a computed boundary is written again at every compute, and
+    a detection re-run with a new model (#338) moves a caption box
+    further than ``boundaries.ANCHOR_TOLERANCE_PT``. ``opinion_order``
+    cannot be the key either, because one opinion added or dropped
+    renumbers every later one; the index inside one printed page moves
+    at most the two or three opinions of that page.
+
+    ``first_printed_page`` is a **stamp**, not a reading that is taken
+    again. If a later re-read changes the number under the opinion, that
+    is an ``OpinionCheck.STALE_PAGE_NUMBER`` card. The key never moves in
+    silence. A page with a trailing letter (#319) is parsed to its
+    number, so ``2094`` and ``2094a`` share one bucket and
+    ``index_in_page`` orders them.
+
+    This rests on every page of a volume having a number, which is the
+    rule of review 1 that #342 makes the approval hold.
+
+    **Two addresses, the rule of ``Detection``.** ``start_source_edit``
+    and ``start_source_page`` (with the ``end_*`` pair) are the durable
+    address of the first and last page: the original as uploaded, or the
+    one-page shard of a page edit. ``start_page_index`` and
+    ``end_page_index`` are the position in the space of ``apply_run``.
+    The address survives a new apply run; the indexes are what a viewer
+    draws. Both ends are stored, because "does this change fall inside
+    me" is a question about the whole span.
+
+    **The glues are derived and disposable.** Every artifact of the
+    split lives under ``jobs/opinions/o{pk}/r{glue_revision}/`` and a
+    re-glue raises the revision, the rule of the apply's
+    ``jobs/apply/a{n}/``. The detections and the redactions are **not**
+    among them: they are rows since #241, and restricting them to one
+    opinion is a query over the rows. ``approved_text_key`` is not a
+    glue: it is written once when a human approves, and no re-glue may
+    overwrite it.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="opinions",
+    )
+    first_printed_page = models.PositiveIntegerField(
+        help_text=(
+            "The printed number of the page the opinion starts on, as "
+            "stamped at creation. Half of the identity."
+        ),
+    )
+    index_in_page = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "The rank of the opinion among those that start on that "
+            "printed page, in reading order. 0 for the first. The other "
+            "half of the identity."
+        ),
+    )
+    last_printed_page = models.PositiveIntegerField(
+        help_text="The printed number of the last page. Feeds the gap check.",
+    )
+    page_count = models.PositiveIntegerField(
+        help_text=(
+            "The true count of physical pages, so no check does "
+            "arithmetic on the printed numbers. A page with a trailing "
+            "letter (#319) counts here and names no printed number."
+        ),
+    )
+
+    start_source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="opinion_starts",
+        help_text=(
+            "The page edit whose one-page shard holds the first page; "
+            "null = the original as uploaded."
+        ),
+    )
+    start_source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the first page's source document.",
+    )
+    end_source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="opinion_ends",
+        help_text="As ``start_source_edit``, for the last page.",
+    )
+    end_source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="As ``start_source_page``, for the last page.",
+    )
+    start_page_index = models.PositiveIntegerField(
+        help_text="0-based first page, in the space of ``apply_run``.",
+    )
+    end_page_index = models.PositiveIntegerField(
+        help_text="0-based last page, in the space of ``apply_run``.",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinions",
+        help_text=(
+            "The apply run whose page space the two indexes are in "
+            "(#269). Null for the original's space."
+        ),
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the row was written. "
+            "Blank matches anything (the #214 rule)."
+        ),
+    )
+    boundary = models.ForeignKey(
+        "OpinionBoundary",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinions",
+        help_text=(
+            "The boundary the opinion was cut from, for the viewer. Not "
+            "the identity: a computed boundary is rebuilt at every "
+            "compute, so this link stands only while that row does."
+        ),
+    )
+
+    status = models.CharField(
+        max_length=25,
+        choices=OpinionReviewStatus.choices,
+        default=OpinionReviewStatus.PROCESSING,
+        db_index=True,
+    )
+    error_message = models.TextField(
+        blank=True,
+        default="",
+        help_text="What failed in the work that prepares the review.",
+    )
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approved_opinions",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+
+    glue_revision = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "The revision of the per-opinion glues. Every glue key is "
+            "derived from the pk and this number; a re-glue raises it."
+        ),
+    )
+    approved_text_key = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the text written once at the approval, the "
+            "frozen output the tagger reads (#272). Not a glue."
+        ),
+    )
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["first_printed_page", "index_in_page"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["scan", "first_printed_page", "index_in_page"],
+                name="unique_opinion_per_printed_page",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(
+                    first_printed_page__lte=models.F("last_printed_page")
+                ),
+                name="opinion_printed_pages_ordered",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["scan", "status"], name="idx_opinion_review_status"
+            ),
+        ]
+
+    @property
+    def glue_prefix(self) -> str:
+        """The S3 prefix of this opinion's glues, at the live revision."""
+        return f"jobs/opinions/o{self.pk}/r{self.glue_revision}/"
+
+    def __str__(self):
+        return f"Opinion {self.first_printed_page}.{self.index_in_page}"
+
+
+class WithdrawnOpinion(AbstractDateTimeModel):
+    """A printed range a volume says holds no opinion (#334).
+
+    A reporter prints a short note where an opinion was withdrawn. The
+    note has no case caption and no key icon, so the pairing writes no
+    ``OpinionBoundary`` for it and no :class:`Opinion` covers its pages.
+    The gap check is what finds it: the printed sequence jumps, an
+    ``OpinionCheck.PAGE_GAP`` card opens, and a human answers the card
+    by the creation of this row.
+
+    A human row, so nothing deletes it. A curator takes one back with
+    ``withdrawn_at``, the rule every human row of review 2 follows.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="withdrawn_opinions",
+    )
+    first_printed_page = models.PositiveIntegerField()
+    last_printed_page = models.PositiveIntegerField()
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="withdrawn_opinions",
+        help_text="The page edit whose shard holds the notice page.",
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the notice page's source document.",
+    )
+    page_index = models.PositiveIntegerField(
+        help_text="0-based notice page, in the space of ``apply_run``.",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="withdrawn_opinions",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+    )
+    note = models.TextField(
+        blank=True,
+        default="",
+        help_text="What the book says about the withdrawal.",
+    )
+    notice_pdf_key = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text="S3 key of the PDF of the notice page.",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="withdrawn_opinions",
+    )
+    withdrawn_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["first_printed_page"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(
+                    first_printed_page__lte=models.F("last_printed_page")
+                ),
+                name="withdrawn_printed_pages_ordered",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["scan", "first_printed_page"],
+                name="idx_withdrawn_scan_page",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Withdrawn {self.first_printed_page}-{self.last_printed_page}"
+
+
+class OpinionText(AbstractDateTimeModel):
+    """The text of one page of one opinion (#334).
+
+    **One row per page, not per block.** An opinion holds about four
+    pages, so a volume holds about its own page count in rows. A row per
+    dots.mocr cell would be about two hundred a volume page. The cells
+    are still what the redaction subtraction, the reading order and the
+    viewer highlight work on; they are computed when the row is written
+    and are not stored.
+
+    **The row holds no engine reading unless the engines disagree.** The
+    whole read of every engine is already on S3 and stays there: the
+    Mistral harvest keeps every byte at its row's ``result_key`` (#191)
+    and the dots.mocr run is glued to S3. So a better comparison rule
+    later is a re-glue at no API cost, never a re-paid read.
+
+    ``text`` is a **cache**, rebuilt from the glued runs plus the human
+    rows, exactly as ``Scan.ocr_results`` is a cache. ``human_text`` is
+    the truth, and nothing discards it.
+
+    **A human edit answers the page.** An entry of ``disagreements``
+    points into ``text`` by offset, and an edit moves every offset after
+    it. So an edit marks that page's disagreements answered and nothing
+    reads the old offsets again.
+    """
+
+    opinion = models.ForeignKey(
+        Opinion,
+        on_delete=models.CASCADE,
+        related_name="pages",
+    )
+    page_in_opinion = models.PositiveSmallIntegerField(
+        help_text="0-based page of the opinion. Half of the identity.",
+    )
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="opinion_pages",
+        help_text="The durable address in the volume; null = the original.",
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    page_index = models.PositiveIntegerField(
+        help_text="0-based page of the volume, in the space of ``apply_run``.",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_pages",
+    )
+    text = models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "The resolved text of the page, in reading order. A cache, "
+            "rebuilt from the glued runs plus the human rows."
+        ),
+    )
+    disagreements = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "One entry per place the engines differ: "
+            "``{'start': int, 'end': int, 'variants': {engine: text}}``, "
+            "with the offsets against ``text``. Empty when they agree."
+        ),
+    )
+    human_text = models.TextField(
+        blank=True,
+        default="",
+        help_text="What a curator typed. Never discarded.",
+    )
+    human_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_page_edits",
+    )
+    human_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["page_in_opinion"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["opinion", "page_in_opinion"],
+                name="unique_opinion_page",
+            ),
+        ]
+
+    @property
+    def current_text(self) -> str:
+        """What a reader should show: the human text when there is one."""
+        return self.human_text or self.text
+
+    def __str__(self):
+        return f"{self.opinion} page {self.page_in_opinion}"
+
+
+class OpinionFindingDismissal(AbstractDateTimeModel):
+    """One curator dismissal of one finding of the third review (#334).
+
+    The finding rows are written again at every rebuild, so a dismissal
+    cannot point at one. It names its target by address instead: the
+    opinion, the page, and the check. A review-3 finding has no box, so
+    the address needs no copy of one and the standing rows take a real
+    unique key, which ``ReviewDismissal`` could not have.
+
+    Never deleted. A curator takes one back with ``withdrawn_at``.
+    """
+
+    opinion = models.ForeignKey(
+        Opinion,
+        on_delete=models.CASCADE,
+        related_name="finding_dismissals",
+    )
+    page_in_opinion = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Null when the finding is about the whole opinion.",
+    )
+    check_name = models.CharField(
+        max_length=50,
+        choices=[
+            (check.value, check.label)
+            for check in OpinionCheck
+            if check in DISMISSABLE_OPINION_CHECKS
+        ],
+    )
+    dismissed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_finding_dismissals",
+    )
+    withdrawn_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            # Two keys, not one: Postgres counts two NULLs as different,
+            # so a single key over a nullable ``page_in_opinion`` would
+            # let a second whole-opinion dismissal through.
+            models.UniqueConstraint(
+                fields=["opinion", "page_in_opinion", "check_name"],
+                condition=models.Q(
+                    withdrawn_at__isnull=True, page_in_opinion__isnull=False
+                ),
+                name="unique_standing_page_dismissal",
+            ),
+            models.UniqueConstraint(
+                fields=["opinion", "check_name"],
+                condition=models.Q(
+                    withdrawn_at__isnull=True, page_in_opinion__isnull=True
+                ),
+                name="unique_standing_opinion_dismissal",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.check_name} dismissed on {self.opinion}"
+
+
+class OpinionFinding(AbstractDateTimeModel):
+    """One warning of the third review (#334).
+
+    Its own model, not an ``Issue`` row. ``Issue`` already carries two
+    families and every reader excludes one of them by check name; a
+    third family would make each of those a two-set test, and the one
+    that is forgotten is a silent bug. ``Issue.page_number`` would also
+    take a third meaning, a page of an opinion rather than of the
+    volume.
+
+    It keeps the rules of review 2, which are what matter:
+
+    - One rebuild function is the only writer. It derives every finding
+      from the rows of **one** opinion, reads no S3 and renders nothing.
+    - A dismissal is its own row and nothing deletes it. The rebuild
+      lands a standing one on the new finding and sets ``dismissal``,
+      which mutes the card.
+    - A stale check (``STALE_OPINION_CHECKS``) cannot be dismissed. It
+      is a fact about a row, and the way out is to fix the row.
+
+    A ``PAGE_GAP`` names the opinion **after** the gap, because a gap
+    lies between two opinions and the one that follows it is the row a
+    curator acts on.
+    """
+
+    opinion = models.ForeignKey(
+        Opinion,
+        on_delete=models.CASCADE,
+        related_name="findings",
+    )
+    page_in_opinion = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Null when the finding is about the whole opinion.",
+    )
+    check_name = models.CharField(
+        max_length=50,
+        choices=OpinionCheck.choices,
+        db_index=True,
+    )
+    severity = models.CharField(
+        max_length=10,
+        choices=Issue.Severity.choices,
+        default=Issue.Severity.WARNING,
+    )
+    message = models.TextField(blank=True, default="")
+    dismissal = models.ForeignKey(
+        OpinionFindingDismissal,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="findings",
+        help_text="Set by the rebuild when a standing dismissal names it.",
+    )
+
+    class Meta:
+        ordering = ["page_in_opinion", "check_name"]
+        indexes = [
+            models.Index(
+                fields=["opinion", "check_name"],
+                name="idx_opinion_finding",
+            ),
+        ]
+
+    @property
+    def is_stale(self) -> bool:
+        """Whether this check is a fact about a row, not a judgement."""
+        return self.check_name in STALE_OPINION_CHECKS
+
+    def __str__(self):
+        return f"{self.check_name} on {self.opinion}"
+
+
 class PageEdit(AbstractDateTimeModel):
     """One decision a person made about one page of a scan (issue #214).
 
@@ -3426,25 +4027,22 @@ class ExternalJob(AbstractDateTimeModel):
         ),
     )
     opinion = models.ForeignKey(
-        OpinionScan,
+        "Opinion",
         on_delete=models.CASCADE,
         null=True,
         blank=True,
         related_name="jobs",
         help_text=(
-            "The opinion PDF this job read, for the post-generation "
+            "The opinion this job worked on, for the opinion-level "
             "stages. Null for the volume-level stages, which run before "
             "any opinion exists. Must belong to ``scan``.\n\n"
-            "CASCADE rather than SET_NULL: an orphaned extract row "
-            "would break the invariant that an opinion-level stage has "
-            "an opinion, and would leave the stage barrier counting a "
-            "row with no target. The consequence is that "
-            "``run_generate_files`` deletes and recreates a scan's "
-            "OpinionScan rows, so regenerating files discards every "
-            "extraction job with them. Right when the opinion changed, "
-            "wasteful when it did not, which is why preserving "
-            "unchanged opinion rows (issue #165) has to land before we "
-            "pay for hundreds of jobs a volume."
+            "CASCADE rather than SET_NULL: an orphaned row would break "
+            "the invariant that an opinion-level stage has an opinion, "
+            "and would leave the stage barrier counting a row with no "
+            "target. An ``Opinion`` is keyed by its printed page and "
+            "survives a re-glue (#335), so a CASCADE here no longer "
+            "throws away paid work at every regenerate, which is what "
+            "#165 raised against ``OpinionScan``."
         ),
     )
     apply_run = models.ForeignKey(
@@ -3746,7 +4344,7 @@ class ExternalJob(AbstractDateTimeModel):
         :param scan: The Scan, or its pk.
         :param stage: A :class:`JobStage` value.
         :param engine: A :class:`JobEngine` value.
-        :param opinion: The OpinionScan (or its pk) for an
+        :param opinion: The :class:`Opinion` (or its pk) for an
             opinion-level stage; omit for the volume-level stages.
         :returns: ``max(run) + 1`` for that target, or 1 if it has
             never run.

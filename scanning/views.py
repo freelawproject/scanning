@@ -81,7 +81,11 @@ def scan_list(request: HttpRequest) -> HttpResponse:
         # ``uploaded_by`` is joined because every row prints the
         # username: without it the page cost one query per scan.
         Scan.objects.select_related("reporter", "uploaded_by")
-        .annotate(opinion_count=Count("opinions"))
+        # The legacy rows, on purpose: ``opinions`` is the new
+        # ``Opinion`` table since #335, and this column counts what the
+        # legacy pipeline generated. #334 gives the new rows their own
+        # page.
+        .annotate(opinion_count=Count("legacy_opinions"))
         .order_by("-date_created")
     )
 
