@@ -47,7 +47,7 @@ import logging
 from dataclasses import dataclass
 
 from django.db import transaction
-from django.db.models import F
+from django.db.models import Case, F, Q, Value, When
 
 from scanning import apply, boundaries, review_states
 from scanning.models import (
@@ -359,25 +359,40 @@ def create_rows(
                 )
                 continue
             matched.add(opinion.pk)
-            Opinion.objects.filter(pk=opinion.pk).update(**fields)
+            # One statement per matched row, with three rules folded in.
+            # The way back from ERROR is this run of the work (#335).
             # The inputs of every glue may have moved under the key, so
             # the revision moves too, and with it the attempt count of
-            # each glue (#350, #336). An approved opinion keeps its
-            # glues. A redaction a curator moved after a send-back
-            # changes the ink of the PDF and no field of this row, so
-            # the revision is what says the set is new.
-            Opinion.objects.filter(pk=opinion.pk).exclude(
-                status=OpinionReviewStatus.TEXT_REVIEW_DONE
-            ).update(
-                glue_revision=F("glue_revision") + 1,
-                ocr_glue_attempts=0,
-                pdf_attempts=0,
-                pdf_attempted_at=None,
+            # each glue (#350, #336): a redaction a curator moved after
+            # a send-back changes the ink of the PDF and no field of
+            # this row, so the revision is what says the set is new. An
+            # approved opinion keeps its revision and its glues.
+            approved = Q(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+            Opinion.objects.filter(pk=opinion.pk).update(
+                **fields,
+                status=Case(
+                    When(
+                        status=OpinionReviewStatus.ERROR,
+                        then=Value(OpinionReviewStatus.PROCESSING),
+                    ),
+                    default=F("status"),
+                ),
+                glue_revision=Case(
+                    When(approved, then=F("glue_revision")),
+                    default=F("glue_revision") + 1,
+                ),
+                ocr_glue_attempts=Case(
+                    When(approved, then=F("ocr_glue_attempts")),
+                    default=Value(0),
+                ),
+                pdf_attempts=Case(
+                    When(approved, then=F("pdf_attempts")), default=Value(0)
+                ),
+                pdf_attempted_at=Case(
+                    When(approved, then=F("pdf_attempted_at")),
+                    default=Value(None),
+                ),
             )
-            # The way back from ERROR is this run of the work (#335).
-            Opinion.objects.filter(
-                pk=opinion.pk, status=OpinionReviewStatus.ERROR
-            ).update(status=OpinionReviewStatus.PROCESSING)
             summary.updated += 1
         Opinion.objects.bulk_create(new_rows, batch_size=500)
         summary.created = len(new_rows)

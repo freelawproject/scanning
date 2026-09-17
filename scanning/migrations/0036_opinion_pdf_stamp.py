@@ -32,9 +32,24 @@ class Migration(migrations.Migration):
                 default=0,
                 help_text=(
                     "Failed ticks of the PDF pass at the live revision "
-                    "(#336). Reset when the revision rises and when the PDF "
+                    "(#336) that the rows explain; a transient fault counts "
+                    "none. Reset when the revision rises and when the PDF "
                     "is written."
                 ),
+            ),
+        ),
+        migrations.AddField(
+            model_name="opinion",
+            name="pdf_attempted_at",
+            field=models.DateTimeField(
+                blank=True,
+                help_text=(
+                    "When the PDF pass last failed on this row, of either "
+                    "kind (#336). The row is not due again before "
+                    "opinion_pdf.RETRY_AFTER has passed. Cleared when the "
+                    "PDF is written."
+                ),
+                null=True,
             ),
         ),
     ]

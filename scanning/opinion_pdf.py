@@ -6,16 +6,31 @@ carries its own status. So the PDF is one pass over the rows and not a
 schedule (``build_opinion_pdfs``, last in ``run_daemon``), the tick
 finds one row that owes its PDF, writes it, and stamps the row. One PDF
 per tick (:data:`PDFS_PER_TICK`), the rule of the Mistral wave
-(``mistral_ocr.MAX_SUBMITS_PER_TICK``): the work re-encodes the pages
-of one opinion and blocks the serial scheduler for a second or two, so
-every other task waits for one opinion at most.
+(``mistral_ocr.MAX_SUBMITS_PER_TICK``), because the tick blocks the
+serial scheduler for the whole write, and every other task
+(``process_next_scan``, the two job waves) waits for it. After the
+pulls that is a second or two of re-encoding. The first tick of a
+volume pulls the corrected bitonal copy, and the first tick that needs
+a picture pulls a shard of about 200 MB, and those pulls are inside the
+same loop: minutes, once per volume, the same hazard the Mistral wave
+carries for its render.
 
 **The trigger is a fact on the row.** A row owes its PDF when
 ``redacted_pdf_revision`` is not ``glue_revision`` (:func:`is_written`,
 :func:`due`). Part 1 writes no chain, no stamp and no queue for this
 pass; it raises ``glue_revision`` when it re-derives a row no human
-approved, and that alone makes the PDF due again. Nothing here writes a
-status on the scan.
+approved, and that alone makes the PDF due again. The file at the old
+revision stays in the bucket, the rule of the apply's ``a{n}`` outputs:
+disposable, swept by the admin deletion, and a link a reviewer holds
+keeps working until then. Nothing here writes a status on the scan, and
+:data:`OPINION_PDF_STATUSES` is the one place that says which scan
+statuses the pass reads.
+
+**Finish the volume on disk first.** :func:`next_due` prefers a scan
+whose local mirror exists, then the newest scan. The inputs of a volume
+are gigabytes (the bitonal copy plus every shard that holds a picture),
+and a newer approval that preempted the volume in progress would hold
+that tree until the pass came back to it.
 
 **blackletter cuts the pages.** ``blackletter.api.generate`` paints the
 rects, applies them and repaints the fill, once per opinion, over a
@@ -38,12 +53,20 @@ leaves no row of the scan due releases the tree, and
 starts. The small source and the opinion file live in a scratch
 directory under the mirror, removed in the ``finally`` of the tick.
 
-**A fault is the fault of one opinion.** It counts on
-``pdf_attempts``; at :data:`MAX_ATTEMPTS` the row is ``ERROR`` with
-``error_message``, loud then quiet (the rule of ``ApplyRun.attempts``),
-and the next approval brings it back through part 1. A picture that
-cannot be read is not a fault: the callable answers ``None`` and the
-page keeps its bitonal pixels there.
+**A fault is the fault of one opinion, and there are two kinds.** An
+:class:`OpinionPdfError` is a fact the rows explain (a null boundary, a
+page count that disagrees, the run moved, blackletter refused the
+payload), and it will fail again: it counts on ``pdf_attempts``, and
+at :data:`MAX_ATTEMPTS` the row is ``ERROR`` with ``error_message``,
+loud then quiet (the rule of ``ApplyRun.attempts``); the next approval
+brings it back through part 1. A :class:`TransientFault` is the
+network (a pull that fails, a PUT that answers false) or an unexpected
+exception: it costs no attempt, the rule of a defer in the jobs layer.
+Both stamp ``pdf_attempted_at``, and the row is not due again before
+:data:`RETRY_AFTER`, so a failed row never holds the head of the queue
+and three counted faults span three cooldowns and not fifteen seconds.
+A picture that cannot be read is neither: the callable answers ``None``
+and the page keeps its bitonal pixels there.
 """
 
 from __future__ import annotations
@@ -53,11 +76,13 @@ import shutil
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 
 import fitz
 from django.conf import settings
 from django.db.models import F, QuerySet
+from django.utils import timezone
 
 from scanning import apply, boundaries, review_states, s3_sync, sharding
 from scanning.models import (
@@ -76,8 +101,20 @@ logger = logging.getLogger(__name__)
 #: serial scheduler for the whole write, and every other task waits.
 PDFS_PER_TICK = 1
 
-#: Failed ticks a row may spend at one revision before it is ``ERROR``.
+#: Counted faults a row may spend at one revision before it is ``ERROR``.
 MAX_ATTEMPTS = 3
+
+#: How long a failed row stays out of :func:`due` after a fault of
+#: either kind. A counted fault will fail again, so retrying it every
+#: tick spends the cap in seconds; a transient fault is the network, and
+#: the network needs minutes.
+RETRY_AFTER = timedelta(minutes=15)
+
+#: The scan statuses whose rows the pass writes. One value today: the
+#: approval of review 2 wrote the rows. Review 3 (#334) moves a scan
+#: past it, and an unwritten PDF must stay due there too, so this set is
+#: the one place to extend, the rule of ``REDACTION_COMPUTE_STATUSES``.
+OPINION_PDF_STATUSES = (Status.REDACTION_REVIEW_DONE,)
 
 #: The name of the file under ``Opinion.glue_prefix``. Internal on
 #: purpose: the printed range is the download name alone (#165).
@@ -97,7 +134,16 @@ IMAGE_LABEL = "IMAGE"
 class OpinionPdfError(Exception):
     """One opinion's PDF cannot be written from what the rows say.
 
-    The message is what the row's ``error_message`` holds at the cap.
+    A fact of the rows, so it will fail again: it counts on the row. The
+    message is what the row's ``error_message`` holds at the cap.
+    """
+
+
+class TransientFault(Exception):
+    """One opinion's PDF was not written because of a fault that passes.
+
+    A pull or a PUT that failed. It counts no attempt; the row waits
+    :data:`RETRY_AFTER` and is due again.
     """
 
 
@@ -173,35 +219,70 @@ def due() -> QuerySet:
     """Return the rows that owe a PDF, newest scan first.
 
     The one rule for "a PDF is owed": the stamp is not the revision,
-    the row is not ``ERROR``, its attempts at this revision are under
-    the cap, and its scan is in ``REDACTION_REVIEW_DONE``. The scan's
-    status is joined so a volume an admin sent back writes no PDF while
-    it is back. Newest scan first for the reason
-    ``apply.queue_ready_scans`` gives: the volume a volunteer approved
-    today goes before the backlog. Inside a scan, reading order.
+    the row is not ``ERROR``, its counted faults at this revision are
+    under the cap, its last fault is older than :data:`RETRY_AFTER`,
+    and its scan is in :data:`OPINION_PDF_STATUSES`. The scan's status
+    is joined so a volume an admin sent back writes no PDF while it is
+    back. Newest scan first for the reason ``apply.queue_ready_scans``
+    gives: the volume a volunteer approved today goes before the
+    backlog. Inside a scan, reading order. :func:`next_due` puts the
+    volume on disk ahead of that order.
+
+    The reporter is joined because :func:`key` reads it through the
+    processing prefix; the boundary because the masks read its anchors.
 
     :returns: The queryset, ordered.
     :rtype: QuerySet
     """
     return (
         Opinion.objects.filter(
-            scan__status=Status.REDACTION_REVIEW_DONE,
+            scan__status__in=OPINION_PDF_STATUSES,
             pdf_attempts__lt=MAX_ATTEMPTS,
         )
         .exclude(status=OpinionReviewStatus.ERROR)
         .exclude(redacted_pdf_revision=F("glue_revision"))
-        .select_related("scan", "scan__reporter", "boundary", "apply_run")
+        .exclude(pdf_attempted_at__gt=timezone.now() - RETRY_AFTER)
+        .select_related("scan", "scan__reporter", "boundary")
         .order_by("-scan_id", "first_printed_page", "index_in_page")
     )
+
+
+def _has_mirror(scan: Scan) -> bool:
+    """Return whether the scan's local tree exists on this daemon.
+
+    :param scan: The scan.
+    :returns: Whether ``Scan.output_dir`` is a directory.
+    :rtype: bool
+    """
+    return Path(scan.output_dir).is_dir()
 
 
 def next_due() -> Opinion | None:
     """Return the row the next tick writes, or None.
 
-    :returns: The first row of :func:`due`.
+    The first due row of the first due scan whose mirror is on disk,
+    in the order of :func:`due`; the first due row of all when no due
+    scan has one. Finishing the volume on disk bounds the disk to one
+    tree in progress, where the newest-first order alone would hold
+    the tree of every volume a newer approval preempted. The check is
+    one ``is_dir`` per candidate scan.
+
+    :returns: The row, or None.
     :rtype: Opinion | None
     """
-    return due().first()
+    rows = due()
+    first = rows.first()
+    if first is None:
+        return None
+    if _has_mirror(first.scan):
+        return first
+    for scan_id in rows.values_list("scan_id", flat=True).distinct():
+        if scan_id == first.scan_id:
+            continue
+        candidate = rows.filter(scan_id=scan_id).first()
+        if candidate is not None and _has_mirror(candidate.scan):
+            return candidate
+    return first
 
 
 def _stamp(opinion: Opinion) -> bool:
@@ -217,27 +298,51 @@ def _stamp(opinion: Opinion) -> bool:
     return bool(
         Opinion.objects.filter(
             pk=opinion.pk, glue_revision=opinion.glue_revision
-        ).update(redacted_pdf_revision=opinion.glue_revision, pdf_attempts=0)
+        ).update(
+            redacted_pdf_revision=opinion.glue_revision,
+            pdf_attempts=0,
+            pdf_attempted_at=None,
+        )
     )
 
 
-def _fail(opinion: Opinion, message: str) -> None:
-    """Count one failed tick on the row, and close it at the cap.
+def _fail(opinion: Opinion, message: str, counted: bool) -> None:
+    """Record one failed tick on the row, and close it at the cap.
 
-    The count is scoped to the revision, so a bump that landed during
-    the tick spends no attempt of the new set. At :data:`MAX_ATTEMPTS`
-    a row still in ``PROCESSING`` goes to ``ERROR`` with the message
-    (terminal; part 1 sets it back at the next approval). A row a human
-    already reviewed keeps its status: it leaves :func:`due` through
-    the count alone, and the message is stored for the admin.
+    Both kinds stamp ``pdf_attempted_at`` and store the message, so
+    the row leaves :func:`due` for :data:`RETRY_AFTER` and the admin
+    can read what happened. A counted fault (an :class:`OpinionPdfError`)
+    also spends one of :data:`MAX_ATTEMPTS`; a transient one does not.
+    The writes are scoped to the revision, so a bump that landed during
+    the tick spends nothing of the new set. At the cap a row still in
+    ``PROCESSING`` goes to ``ERROR`` (terminal; part 1 sets it back at
+    the next approval). A row a human already reviewed keeps its status:
+    it leaves :func:`due` through the count alone.
 
     :param opinion: The opinion, as read at the start of the tick.
     :param message: What failed.
+    :param counted: Whether the fault is one the rows explain.
     :return: None.
     """
+    values = {
+        "pdf_attempted_at": timezone.now(),
+        "error_message": message[:2000],
+    }
+    if counted:
+        values["pdf_attempts"] = F("pdf_attempts") + 1
     Opinion.objects.filter(
         pk=opinion.pk, glue_revision=opinion.glue_revision
-    ).update(pdf_attempts=F("pdf_attempts") + 1, error_message=message[:2000])
+    ).update(**values)
+    if not counted:
+        logger.warning(
+            "opinion %s (scan %s): the redacted PDF hit a transient fault; "
+            "it is due again in %s: %s",
+            opinion.pk,
+            opinion.scan_id,
+            RETRY_AFTER,
+            message,
+        )
+        return
     row = (
         Opinion.objects.filter(pk=opinion.pk)
         .values("pdf_attempts", "glue_revision")
@@ -309,6 +414,11 @@ def _small_source(
     :raises OpinionPdfError: If the volume has fewer pages than the
         opinion names, or the cut has another count than the row.
     """
+    if opinion.start_page_index > opinion.end_page_index:
+        raise OpinionPdfError(
+            f"The opinion starts on page {opinion.start_page_index + 1} and "
+            f"ends on page {opinion.end_page_index + 1}, which is before it."
+        )
     if opinion.end_page_index >= volume.page_count:
         raise OpinionPdfError(
             f"The corrected volume has {volume.page_count} pages and the "
@@ -403,19 +513,22 @@ def _image_rects(
     for row in rows:
         index = row.page_index - opinion.start_page_index
         page_rect = small[index].rect
+        # The fields as they are: a zero render size makes ``to_points``
+        # fall back to the render density, and a ``1`` would make the
+        # scale the page width.
         x0, y0 = boundaries.to_points(
             row.x0,
             row.y0,
-            row.img_width or 1,
-            row.img_height or 1,
+            row.img_width,
+            row.img_height,
             page_rect.width,
             page_rect.height,
         )
         x1, y1 = boundaries.to_points(
             row.x1,
             row.y1,
-            row.img_width or 1,
-            row.img_height or 1,
+            row.img_width,
+            row.img_height,
             page_rect.width,
             page_rect.height,
         )
@@ -724,6 +837,7 @@ def write_one(opinion: Opinion) -> dict:
     :returns: A summary: ``pages``, ``images``, ``seconds``.
     :rtype: dict
     :raises OpinionPdfError: For a fault the rows explain.
+    :raises TransientFault: For a pull or a PUT that failed.
     :raises Exception: For any other fault of the write.
     """
     from blackletter.api import generate
@@ -738,7 +852,10 @@ def write_one(opinion: Opinion) -> dict:
             "The corrected volume changed under this opinion. Approve the "
             "redaction review again."
         )
-    bitonal = apply.local_copy(scan, run.bitonal_key)
+    try:
+        bitonal = apply.local_copy(scan, run.bitonal_key)
+    except apply.ApplyError as exc:
+        raise TransientFault(str(exc)) from exc
     scratch = _scratch_dir(opinion)
     shutil.rmtree(scratch, ignore_errors=True)
     scratch.mkdir(parents=True, exist_ok=True)
@@ -781,7 +898,7 @@ def write_one(opinion: Opinion) -> dict:
         if not s3_sync.upload_file_object(
             target, Path(written), "application/pdf"
         ):
-            raise OpinionPdfError(f"The upload to {target} failed.")
+            raise TransientFault(f"The upload to {target} failed.")
         if not _stamp(opinion):
             logger.info(
                 "opinion %s (scan %s): the revision moved during the write; "
@@ -826,8 +943,9 @@ def run_tick() -> int:
 
     The body of the ``build_opinion_pdfs`` command. A fault of the
     write is the fault of that row (:func:`_fail`) and never raises out
-    of the tick. After each row, the scan's mirror is released when
-    nothing of it is due.
+    of the tick: an :class:`OpinionPdfError` counts, a
+    :class:`TransientFault` and any other exception do not. After each
+    row, the scan's mirror is released when nothing of it is due.
 
     :returns: How many PDFs were written.
     :rtype: int
@@ -841,20 +959,22 @@ def run_tick() -> int:
             write_one(opinion)
             written += 1
         except OpinionPdfError as exc:
-            _fail(opinion, str(exc))
+            _fail(opinion, str(exc), counted=True)
+        except TransientFault as exc:
+            _fail(opinion, str(exc), counted=False)
         except Exception as exc:
             logger.exception(
                 "opinion %s (scan %s): the redacted PDF raised",
                 opinion.pk,
                 opinion.scan_id,
             )
-            _fail(opinion, f"{type(exc).__name__}: {exc}")
+            _fail(opinion, f"{type(exc).__name__}: {exc}", counted=False)
         _release_if_done(opinion.scan)
     return written
 
 
 def release_mirrors() -> int:
-    """Release the local mirror of every scan in ``REDACTION_REVIEW_DONE``.
+    """Release the local mirror of every scan the pass may read.
 
     Run once when the daemon starts. No worker runs at that moment, the
     apply and the compute release their own trees at their end, and
@@ -880,7 +1000,7 @@ def release_mirrors() -> int:
         return 0
     removed = 0
     for scan in Scan.objects.filter(
-        pk__in=pks, status=Status.REDACTION_REVIEW_DONE
+        pk__in=pks, status__in=OPINION_PDF_STATUSES
     ):
         if s3_sync.release_local_processing(scan):
             removed += 1

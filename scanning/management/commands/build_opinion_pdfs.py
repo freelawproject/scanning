@@ -8,10 +8,12 @@ redaction rows and the pictures, uploads the file and stamps the row.
 No scan status moves. See :mod:`scanning.opinion_pdf`.
 
 One PDF per tick (``opinion_pdf.PDFS_PER_TICK``), the rule of the
-Mistral wave: the write re-encodes the pages of one opinion and blocks
-the serial scheduler for a second or two, so every other task waits for
-one opinion at most. The interval (``DAEMON_OPINION_PDF_INTERVAL``) is
-the throughput knob.
+Mistral wave: the tick blocks the serial scheduler for the whole write,
+and ``process_next_scan`` and the two job waves wait for it. After the
+pulls that is a second or two of re-encoding; the first tick of a
+volume pulls the corrected bitonal copy, and the first tick that needs
+a picture pulls a shard of about 200 MB, inside the same loop. The
+interval (``DAEMON_OPINION_PDF_INTERVAL``) is the throughput knob.
 
 Examples:
 

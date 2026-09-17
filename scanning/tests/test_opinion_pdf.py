@@ -20,6 +20,7 @@ local mirror, so nothing here needs a bucket.
 import logging
 import shutil
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -28,8 +29,9 @@ from blackletter.models import Label
 from django.conf import settings
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
-from scanning import boundaries, opinion_pdf, opinions, s3_sync
+from scanning import apply, boundaries, opinion_pdf, opinions, s3_sync
 from scanning.factories import OpinionFactory, ScanFactory, UserFactory
 from scanning.management.commands.run_daemon import Command as DaemonCommand
 from scanning.models import (
@@ -284,6 +286,31 @@ class TestLedger(TestCase):
 
         self.assertEqual(list(opinion_pdf.due()), [])
 
+    def test_the_statuses_the_pass_reads_are_one_set(self):
+        """#334 extends the set; a row of a moved scan must stay due."""
+        self.assertIn(
+            Status.REDACTION_REVIEW_DONE, opinion_pdf.OPINION_PDF_STATUSES
+        )
+        for status in opinion_pdf.OPINION_PDF_STATUSES:
+            row = OpinionFactory(scan=ScanFactory(status=status))
+            self.assertIn(row, list(opinion_pdf.due()))
+
+    def test_a_failed_row_waits_the_cooldown(self):
+        scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
+        recent = OpinionFactory(
+            scan=scan, first_printed_page=1, pdf_attempted_at=timezone.now()
+        )
+        old = OpinionFactory(
+            scan=scan,
+            first_printed_page=2,
+            pdf_attempted_at=timezone.now()
+            - opinion_pdf.RETRY_AFTER
+            - timedelta(seconds=1),
+        )
+
+        self.assertEqual(list(opinion_pdf.due()), [old])
+        self.assertNotIn(recent, list(opinion_pdf.due()))
+
     def test_newest_scan_first_then_reading_order(self):
         older = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
         newer = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
@@ -345,13 +372,19 @@ class TestPartOneBumpsTheRevision(TestCase):
         run = make_run(scan)
         first = self._write(scan, run)
         self.assertEqual(first.glue_revision, 0)
-        Opinion.objects.filter(pk=first.pk).update(pdf_attempts=2)
+        Opinion.objects.filter(pk=first.pk).update(
+            pdf_attempts=2,
+            pdf_attempted_at=timezone.now(),
+            status=OpinionReviewStatus.ERROR,
+        )
 
         second = self._write(scan, run)
 
         self.assertEqual(second.pk, first.pk)
         self.assertEqual(second.glue_revision, 1)
         self.assertEqual(second.pdf_attempts, 0)
+        self.assertIsNone(second.pdf_attempted_at)
+        self.assertEqual(second.status, OpinionReviewStatus.PROCESSING)
 
     def test_an_approved_row_keeps_its_revision(self):
         scan = ScanFactory(page_count=2)
@@ -419,6 +452,43 @@ class TestPayload(OpinionPdfCase):
         self.assertAlmostEqual(image["x0"], 72.0, places=0)
         self.assertAlmostEqual(image["y0"], 306.0, places=0)
 
+    def test_a_zero_render_size_falls_back_to_the_render_density(self):
+        """A ``1`` in place of the zero would make the scale the page width."""
+        row = self.opinion(start=1, end=3)
+        model_row(
+            self.scan,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+            page_index=2,
+            source_page=3,
+            x0=200,
+            y0=850,
+            x1=800,
+            y1=1400,
+            img_width=0,
+            img_height=0,
+        )
+        with fitz.open(str(self.volume_path)) as volume:
+            small = fitz.open()
+            small.insert_pdf(volume, from_page=1, to_page=3)
+            data = opinion_pdf.payload(row, volume, small)
+            small.close()
+        image = data["images"]["1"][0]
+        self.assertAlmostEqual(image["x0"], 72.0, places=1)
+        self.assertAlmostEqual(image["x1"], 288.0, places=1)
+        self.assertLess(image["x1"], pdf_fixtures.PAGE_W)
+
+    def test_a_reversed_range_refuses(self):
+        row = self.opinion(start=1, end=3)
+        Opinion.objects.filter(pk=row.pk).update(
+            start_page_index=3, end_page_index=1
+        )
+        row.refresh_from_db()
+        with fitz.open(str(self.volume_path)) as volume:
+            with self.assertRaises(opinion_pdf.OpinionPdfError) as ctx:
+                opinion_pdf._small_source(volume, row, self.tmp / "s.pdf")
+        self.assertIn("before it", str(ctx.exception))
+
     def test_no_picture_gives_no_images_key(self):
         row = self.opinion(start=1, end=3)
         with fitz.open(str(self.volume_path)) as volume:
@@ -485,6 +555,7 @@ class TestWrite(OpinionPdfCase):
         row.refresh_from_db()
         self.assertTrue(opinion_pdf.is_written(row))
         self.assertEqual(row.pdf_attempts, 0)
+        self.assertIsNone(row.pdf_attempted_at)
         self.assertEqual(summary["pages"], 3)
         # The scratch directory is gone; the inputs stay.
         self.assertFalse(opinion_pdf._scratch_dir(row).exists())
@@ -680,6 +751,26 @@ class TestWrite(OpinionPdfCase):
         self.assertIn("corrected volume changed", str(ctx.exception))
         self.assertEqual(self.uploaded, {})
 
+    def test_a_pull_that_fails_is_transient(self):
+        row = self.opinion(start=1, end=3)
+        with (
+            patch(
+                "scanning.apply.local_copy",
+                side_effect=apply.ApplyError("could not pull"),
+            ),
+            self.assertRaises(opinion_pdf.TransientFault),
+        ):
+            opinion_pdf.write_one(row)
+
+    def test_a_put_that_fails_is_transient(self):
+        row = self.opinion(start=1, end=3)
+        self.upload.side_effect = None
+        self.upload.return_value = False
+        with self.assertRaises(opinion_pdf.TransientFault):
+            opinion_pdf.write_one(row)
+        row.refresh_from_db()
+        self.assertFalse(opinion_pdf.is_written(row))
+
     def test_a_failed_result_is_the_opinions_fault(self):
         row = self.opinion(start=1, end=3)
         result = {
@@ -756,24 +847,31 @@ class TestTick(OpinionPdfCase):
             self.assertEqual(opinion_pdf.run_tick(), 0)
         broken.refresh_from_db()
         self.assertEqual(broken.pdf_attempts, 1)
+        self.assertIsNotNone(broken.pdf_attempted_at)
         self.assertIn("boundary of this opinion is gone", broken.error_message)
         self.assertEqual(broken.status, OpinionReviewStatus.PROCESSING)
 
-        # The broken row is still first in reading order, but the pick
-        # is by the queryset, so it is tried again first; after two more
-        # faults it leaves due and the good one is written.
-        with self.assertLogs("scanning.opinion_pdf", level="WARNING"):
-            opinion_pdf.run_tick()
-            opinion_pdf.run_tick()
-        broken.refresh_from_db()
-        self.assertEqual(broken.pdf_attempts, opinion_pdf.MAX_ATTEMPTS)
-        self.assertEqual(broken.status, OpinionReviewStatus.ERROR)
-
+        # The broken row is under its cooldown, so it no longer holds
+        # the head of the queue: the next tick writes the good one.
         self.assertEqual(opinion_pdf.run_tick(), 1)
         good.refresh_from_db()
         self.assertTrue(opinion_pdf.is_written(good))
 
-    def test_a_raise_inside_the_write_is_counted_too(self):
+        # Two more faults, each after its cooldown, close the row.
+        expired = (
+            timezone.now() - opinion_pdf.RETRY_AFTER - timedelta(seconds=1)
+        )
+        for _ in range(opinion_pdf.MAX_ATTEMPTS - 1):
+            Opinion.objects.filter(pk=broken.pk).update(
+                pdf_attempted_at=expired
+            )
+            with self.assertLogs("scanning.opinion_pdf", level="WARNING"):
+                opinion_pdf.run_tick()
+        broken.refresh_from_db()
+        self.assertEqual(broken.pdf_attempts, opinion_pdf.MAX_ATTEMPTS)
+        self.assertEqual(broken.status, OpinionReviewStatus.ERROR)
+
+    def test_a_raise_inside_the_write_is_transient(self):
         row = self.opinion(start=1, end=2)
         with (
             patch(
@@ -784,8 +882,47 @@ class TestTick(OpinionPdfCase):
         ):
             self.assertEqual(opinion_pdf.run_tick(), 0)
         row.refresh_from_db()
-        self.assertEqual(row.pdf_attempts, 1)
+        self.assertEqual(row.pdf_attempts, 0)
+        self.assertIsNotNone(row.pdf_attempted_at)
         self.assertIn("ValueError: bad payload", row.error_message)
+        self.assertEqual(list(opinion_pdf.due()), [])
+
+    def test_a_transient_fault_spends_no_attempt(self):
+        row = self.opinion(start=1, end=2)
+        self.upload.side_effect = None
+        self.upload.return_value = False
+        with self.assertLogs("scanning.opinion_pdf", level="WARNING") as logs:
+            self.assertEqual(opinion_pdf.run_tick(), 0)
+        self.assertTrue(any("transient fault" in m for m in logs.output))
+        row.refresh_from_db()
+        self.assertEqual(row.pdf_attempts, 0)
+        self.assertEqual(row.status, OpinionReviewStatus.PROCESSING)
+        self.assertIsNotNone(row.pdf_attempted_at)
+        # Past the cooldown it is due again, with its attempts intact.
+        Opinion.objects.filter(pk=row.pk).update(
+            pdf_attempted_at=timezone.now()
+            - opinion_pdf.RETRY_AFTER
+            - timedelta(seconds=1)
+        )
+        self.assertEqual(list(opinion_pdf.due()), [row])
+
+    def test_the_volume_on_disk_is_finished_first(self):
+        on_disk = self.opinion(start=1, end=2)
+        newer_scan = ScanFactory(
+            page_count=PAGES,
+            source_fingerprint="10:6",
+            status=Status.REDACTION_REVIEW_DONE,
+        )
+        newer = OpinionFactory(scan=newer_scan)
+        self.assertGreater(newer_scan.pk, self.scan.pk)
+        self.assertEqual(opinion_pdf.due().first(), newer)
+        self.assertFalse(Path(newer_scan.output_dir).is_dir())
+
+        self.assertEqual(opinion_pdf.next_due(), on_disk)
+
+        # With no mirror anywhere, the newest scan goes first.
+        shutil.rmtree(self.scan.output_dir)
+        self.assertEqual(opinion_pdf.next_due(), newer)
 
     def test_a_reviewed_row_at_the_cap_keeps_its_status(self):
         row = self.opinion(
@@ -905,7 +1042,11 @@ class TestRoute(ScanningTestCase):
         self.client.force_login(UserFactory())
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, 404)
-        self.assertIn("not written yet", response.json()["error"])
+        body = response.json()
+        self.assertIn("not written yet", body["error"])
+        self.assertEqual(body["opinion"], self.row.pk)
+        self.assertEqual(body["revision"], 0)
+        self.assertNotIn("run", body)
 
     def test_404_for_an_opinion_of_another_scan(self):
         other = OpinionFactory(redacted_pdf_revision=0)

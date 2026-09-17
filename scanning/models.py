@@ -2647,8 +2647,18 @@ class Opinion(AbstractDateTimeModel):
     pdf_attempts = models.PositiveSmallIntegerField(
         default=0,
         help_text=(
-            "Failed ticks of the PDF pass at the live revision (#336). "
-            "Reset when the revision rises and when the PDF is written."
+            "Failed ticks of the PDF pass at the live revision (#336) "
+            "that the rows explain; a transient fault counts none. Reset "
+            "when the revision rises and when the PDF is written."
+        ),
+    )
+    pdf_attempted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the PDF pass last failed on this row, of either kind "
+            "(#336). The row is not due again before opinion_pdf.RETRY_AFTER "
+            "has passed. Cleared when the PDF is written."
         ),
     )
     notes = models.TextField(blank=True, default="")
