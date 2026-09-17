@@ -81,7 +81,8 @@ class Command(BaseCommand):
                 )
                 moved += count
                 continue
-            moved += opinion_ocr.reglue(scan)
+            count = opinion_ocr.reglue(scan)
+            moved += count
             self.stdout.write(f"scan {pk}: {count} opinion(s) due again")
         self.stdout.write(
             f"{'Would move' if dry_run else 'Moved'} {moved} opinion(s)"

@@ -38,6 +38,7 @@ from scanning.factories import (
 )
 from scanning.models import (
     ApplyRun,
+    Detection,
     ExternalJob,
     JobStage,
     JobStatus,
@@ -252,11 +253,12 @@ class OpinionOcrTestCase(TestCase):
         )
         return rows
 
-    def columns(self, scan, page_index):
+    def columns(self, scan, page_index, run=None):
         """The two text columns of one page, for the outside masks."""
         for x0, x1 in ((100, 800), (900, 1600)):
             model_row(
                 scan,
+                apply_run=run or self.apply_run,
                 label="TEXT_COLUMN",
                 label_id=int(Label.TEXT_COLUMN),
                 page_index=page_index,
@@ -413,6 +415,23 @@ class TestTheFrame(OpinionOcrTestCase):
         )
         self.assertEqual(mistral["pages"][0]["frame"]["render_width"], 1700.0)
 
+    def test_a_detection_of_another_space_gives_no_size(self):
+        """A human row the relocation could not place keeps its old run
+        and its old index; it must not size a page of this run."""
+        Detection.objects.filter(scan=self.scan, page_index=4).delete()
+        model_row(
+            self.scan,
+            apply_run=None,
+            page_index=4,
+            img_width=850,
+            img_height=1100,
+        )
+
+        inputs = self.inputs()
+
+        self.assertNotIn(4, inputs.renders)
+        self.assertEqual(inputs.renders[1], (IMG_W, IMG_H))
+
     def test_a_page_with_no_detection_takes_the_dots_render(self):
         inputs = opinion_ocr.ScanInputs(run=self.apply_run)
         page = {"origin_width": 1700, "origin_height": 2200}
@@ -535,7 +554,9 @@ class TestTheVerdict(OpinionOcrTestCase):
         self.assertEqual(header["exclusion"]["reason"], "redaction")
         self.assertEqual(header["exclusion"]["redaction_id"], row.pk)
 
-    def test_a_unit_with_no_box_gets_no_verdict(self):
+    def test_a_unit_with_no_box_is_unjudged_and_not_kept(self):
+        """No box means nobody measured the unit against the redaction
+        over it, so it is not clean text (#350 review)."""
         document = dots_document()
         document["pages"][2]["cells"].append(
             {"bbox": None, "category": "Text", "text": "no box"}
@@ -547,9 +568,46 @@ class TestTheVerdict(OpinionOcrTestCase):
 
         unit = self.unit(written, 1, "no box")
         self.assertIsNone(unit["box_pt"])
-        self.assertIsNone(unit["exclusion"])
+        self.assertEqual(unit["exclusion"], {"reason": opinion_ocr.UNJUDGED})
         self.assertEqual(unit["share"], 0.0)
         self.assertEqual(self.unit(written, 1, "body A")["share"], 1.0)
+        self.assertNotIn(
+            "no box",
+            [u["text"] for u in opinion_ocr.kept_units(written["pages"][1])],
+        )
+        self.assertEqual(written["counts"]["unjudged"], 1)
+        # An unjudged unit is not an excluded one: the three judged
+        # units under the page-wide box, plus the header of page 0.
+        self.assertEqual(written["counts"]["excluded"], 4)
+
+    def test_a_page_with_no_size_leaves_every_unit_unjudged(self):
+        """No detection in the run's space and no dots.mocr render: the
+        redaction over the body cannot be measured, so nothing on the
+        page reads as clean."""
+        Detection.objects.filter(scan=self.scan, page_index=2).delete()
+        document = dots_document()
+        del document["pages"][2]["origin_width"]
+        self.objects[self.apply_run.ocr_key] = document
+        self.redact(2, to_pt(BODY_A))
+
+        written = self.write()
+
+        page = written["pages"][1]
+        self.assertIsNone(page["frame"])
+        self.assertEqual(
+            {u["exclusion"]["reason"] for u in page["units"]},
+            {opinion_ocr.UNJUDGED},
+        )
+        self.assertEqual(opinion_ocr.kept_units(page), [])
+        self.assertEqual(written["counts"]["unjudged"], 3)
+        manifest = self.uploads[
+            opinion_ocr.engine_key(self.opinion, "manifest")
+        ]
+        self.assertEqual(
+            manifest["engines"]["dots_mocr"]["counts"]["unjudged"], 3
+        )
+        # The other pages are judged as before.
+        self.assertEqual(len(opinion_ocr.kept_units(written["pages"][2])), 3)
 
 
 # ── the document ─────────────────────────────────────────────────────
@@ -666,6 +724,26 @@ class TestTheLedger(OpinionOcrTestCase):
         self.opinion.refresh_from_db()
         self.assertIsNone(self.opinion.ocr_glue_revision)
         self.assertFalse(opinion_ocr.is_written(self.opinion))
+
+    def test_a_success_clears_this_module_s_message_alone(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            error_message="PDF: the cut failed"
+        )
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.error_message, "PDF: the cut failed")
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            error_message=f"{opinion_ocr.MESSAGE_PREFIX}the boundary is gone",
+            glue_revision=F("glue_revision") + 1,
+        )
+        self.opinion.refresh_from_db()
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.error_message, "")
 
     def test_the_prefix_is_the_invariant_key(self):
         self.assertEqual(self.opinion.glue_prefix, "jobs/opinions/502.0/r0/")
@@ -798,7 +876,7 @@ class TestThePass(OpinionOcrTestCase):
         run = self.make_run(newer)
         self.measure(newer, run)
         for page in range(PAGES):
-            self.columns(newer, page)
+            self.columns(newer, page, run)
         row = self.make_opinion(
             newer, run, self.make_boundary(newer, run, 1, 3), 900
         )
@@ -809,6 +887,62 @@ class TestThePass(OpinionOcrTestCase):
         self.opinion.refresh_from_db()
         self.assertTrue(opinion_ocr.is_written(row))
         self.assertFalse(opinion_ocr.is_written(self.opinion))
+
+    def test_a_held_newer_scan_does_not_stop_an_older_one(self):
+        """A volume that waits for its Mistral batch must not hold the
+        whole corpus (#350 review)."""
+        newer = ScanFactory(
+            page_count=PAGES,
+            status=Status.REDACTION_REVIEW_DONE,
+            source_fingerprint="fp2",
+        )
+        self.addCleanup(shutil.rmtree, newer.output_dir, ignore_errors=True)
+        run = self.make_run(newer, mistral=False)
+        self.measure(newer, run)
+        for page in range(PAGES):
+            self.columns(newer, page, run)
+        row = self.make_opinion(
+            newer, run, self.make_boundary(newer, run, 1, 3), 900
+        )
+        ExternalJobFactory(
+            scan=newer,
+            stage=JobStage.EXTRACT,
+            engine="mistral_ocr",
+            status=JobStatus.SUBMITTED,
+        )
+
+        with self.assertLogs("scanning.opinion_ocr", level="INFO") as logs:
+            self.assertEqual(opinion_ocr.glue_due(), 1)
+
+        self.assertIn(
+            f"scan {newer.pk}: its opinions owe", "\n".join(logs.output)
+        )
+        row.refresh_from_db()
+        self.opinion.refresh_from_db()
+        self.assertFalse(opinion_ocr.is_written(row))
+        self.assertTrue(opinion_ocr.is_written(self.opinion))
+
+    def test_a_dead_engine_run_holds_nothing(self):
+        """A FAILED Mistral run brings no read; only a person restarts
+        it, so it must not hold the glue for good."""
+        self.apply_run.extract_key = ""
+        self.apply_run.save(update_fields=["extract_key"])
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine="mistral_ocr",
+            status=JobStatus.FAILED,
+        )
+
+        self.assertEqual(
+            opinion_ocr.engines_owed(self.scan, self.apply_run), []
+        )
+        self.assertEqual(opinion_ocr.glue_due(), 1)
+
+        manifest = self.uploads[
+            opinion_ocr.engine_key(self.opinion, "manifest")
+        ]
+        self.assertEqual(list(manifest["engines"]), ["dots_mocr"])
 
     def test_a_scan_sent_back_has_no_due_row(self):
         Scan.objects.filter(pk=self.scan.pk).update(
@@ -1046,6 +1180,7 @@ class TestReglueCommand(OpinionOcrTestCase):
         output = self.run_command(str(self.scan.pk))
 
         self.assertIn("1 opinion(s) due again", output)
+        self.assertIn("Moved 1 opinion(s)", output)
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.glue_revision, 1)
         self.assertEqual(self.opinion.ocr_glue_attempts, 0)

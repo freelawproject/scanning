@@ -78,6 +78,7 @@ from scanning import (
     yolo,
 )
 from scanning.models import (
+    DEAD_JOB_STATUSES,
     Detection,
     Opinion,
     OpinionReviewStatus,
@@ -111,6 +112,15 @@ OPINIONS_PER_TICK = 10
 
 #: Failed ticks on one row at one revision before the row is ERROR.
 MAX_ATTEMPTS = 3
+
+#: The verdict of a unit nobody could measure: no box, or a page with
+#: no size. Not clean text, and not a redaction either.
+UNJUDGED = "unjudged"
+
+#: The start of every ``Opinion.error_message`` this module writes, so
+#: a success clears its own message and nobody else's: the field is
+#: shared with every work that prepares the review.
+MESSAGE_PREFIX = "OCR glue: "
 
 #: Points per inch, for the page size a 200-dpi render implies.
 POINTS_PER_INCH = 72.0
@@ -275,19 +285,24 @@ def engines_owed(scan: Scan, run) -> list[str]:
     """Return the engines ``run`` does not have yet but will get.
 
     An engine whose key on the run is blank while a read of it is on
-    its way: a live volume run, or the rows of the run's edited pages.
-    An engine nobody asked to read is not owed.
+    its way: a live volume run, or the rows of the run's edited pages,
+    with at least one row that is not dead (``DEAD_JOB_STATUSES``). A
+    dead run brings no read, and only a person restarts it, so it does
+    not hold the glue. An engine nobody asked to read is not owed.
 
     :param scan: The scan.
     :param run: The final apply run.
     :returns: Engine names, in :data:`ENGINES` order.
     :rtype: list[str]
     """
-    return [
-        spec.name
-        for spec in ENGINES.values()
-        if not spec.document_key(run) and spec.owed_rows(scan, run)
-    ]
+    owed = []
+    for spec in ENGINES.values():
+        if spec.document_key(run):
+            continue
+        rows = spec.owed_rows(scan, run)
+        if any(row.status not in DEAD_JOB_STATUSES for row in rows):
+            owed.append(spec.name)
+    return owed
 
 
 # ---------------------------------------------------------------------------
@@ -357,9 +372,11 @@ def load_inputs(scan: Scan) -> ScanInputs:
     inputs = ScanInputs(run=run, documents=documents)
     for entry in redactions.visible_by_page(scan):
         inputs.redactions[entry["page_index"]] = entry["rects"]
+    # The run's space alone: a human row ``detections.relocate_rows``
+    # could not place keeps its old index and its old run.
     for page_index, width, height in (
         Detection.objects.live()
-        .filter(scan=scan, img_width__gt=0, img_height__gt=0)
+        .filter(scan=scan, apply_run=run, img_width__gt=0, img_height__gt=0)
         .values_list("page_index", "img_width", "img_height")
         .distinct()
     ):
@@ -472,6 +489,12 @@ def verdict(
     share is the larger of the two, so a partial verdict is read off
     the file as ``share < FULL_SHARE``.
 
+    A unit with no box, or on a page with no size, cannot be judged.
+    It carries the third verdict, :data:`UNJUDGED`, so a reader tells
+    "judged and clean" from "not judged" and :func:`kept_units` leaves
+    it out: the rule is that no reader sees the text under a
+    redaction, and a unit nobody measured may be under one.
+
     :param box_pt: The unit's box in points, or None for a unit with
         no box or on a page with no size.
     :param rects: The redaction boxes of the page, in points.
@@ -480,7 +503,7 @@ def verdict(
     :rtype: tuple[dict | None, float]
     """
     if box_pt is None:
-        return None, 0.0
+        return {"reason": UNJUDGED}, 0.0
     red_share, hit = covered_share(box_pt, rects)
     out_share, _ = covered_share(box_pt, masks)
     share = max(red_share, out_share)
@@ -557,7 +580,7 @@ def build_document(
     }
     pages: list[dict] = []
     failed: list[int] = []
-    counts = {"units": 0, "excluded": 0, "partial": 0}
+    counts = {"units": 0, "excluded": 0, "partial": 0, "unjudged": 0}
     for offset in range(opinion.page_count):
         page_index = opinion.start_page_index + offset
         page = by_index.get(page_index)
@@ -605,7 +628,9 @@ def build_document(
                 ]
             exclusion, share = verdict(box_pt, rects, page_masks)
             counts["units"] += 1
-            if exclusion is not None:
+            if exclusion is not None and exclusion["reason"] == UNJUDGED:
+                counts["unjudged"] += 1
+            elif exclusion is not None:
                 counts["excluded"] += 1
                 if share < FULL_SHARE:
                     counts["partial"] += 1
@@ -718,13 +743,15 @@ def write(opinion: Opinion, inputs: ScanInputs) -> list[str]:
         raise OpinionGlueError(
             f"the manifest could not be uploaded to {manifest_key}"
         )
-    Opinion.objects.filter(
+    stamped = Opinion.objects.filter(
         pk=opinion.pk, glue_revision=opinion.glue_revision
-    ).update(
-        ocr_glue_revision=opinion.glue_revision,
-        ocr_glue_attempts=0,
-        error_message="",
-    )
+    ).update(ocr_glue_revision=opinion.glue_revision, ocr_glue_attempts=0)
+    if stamped:
+        # This module's own message alone: another work's failure on
+        # the same row is not answered by this success.
+        Opinion.objects.filter(
+            pk=opinion.pk, error_message__startswith=MESSAGE_PREFIX
+        ).update(error_message="")
     return list(written)
 
 
@@ -736,7 +763,8 @@ def record_failure(opinion: Opinion, message: str) -> None:
     :return: None.
     """
     Opinion.objects.filter(pk=opinion.pk).update(
-        ocr_glue_attempts=F("ocr_glue_attempts") + 1, error_message=message
+        ocr_glue_attempts=F("ocr_glue_attempts") + 1,
+        error_message=f"{MESSAGE_PREFIX}{message}",
     )
     ended = (
         Opinion.objects.filter(
@@ -771,10 +799,12 @@ def record_failure(opinion: Opinion, message: str) -> None:
 def glue_due(limit: int = OPINIONS_PER_TICK) -> int:
     """Write the OCR glue of up to ``limit`` rows of one scan.
 
-    The tenth pass of the collect tick. The newest scan that owes a
-    glue goes first (the rule of ``apply.queue_ready_scans``), its
-    rows in reading order. One scan per tick, so the engine documents
-    are parsed once.
+    The tenth pass of the collect tick. The due scans are walked newest
+    first (the rule of ``apply.queue_ready_scans``), and the first one
+    whose inputs load is glued, its rows in reading order. A held scan
+    is logged and passed over, so a volume that waits for its Mistral
+    batch holds no other volume. One scan is glued per tick, so the
+    engine documents are parsed once.
 
     :param limit: The rows to write.
     :returns: How many rows were written.
@@ -782,10 +812,33 @@ def glue_due(limit: int = OPINIONS_PER_TICK) -> int:
     """
     if not s3_sync.s3_active():
         return 0
-    head = due().order_by("-scan_id").values_list("scan_id", flat=True).first()
-    if head is None:
-        return 0
-    scan = Scan.objects.get(pk=head)
+    scan_ids = list(
+        due().order_by("-scan_id").values_list("scan_id", flat=True).distinct()
+    )
+    for scan_id in scan_ids:
+        scan = Scan.objects.get(pk=scan_id)
+        try:
+            inputs = load_inputs(scan)
+        except ScanHeld as exc:
+            logger.info(
+                "scan %s: its opinions owe their OCR glue and wait: %s",
+                scan.pk,
+                exc,
+            )
+            continue
+        return _glue_scan(scan, inputs, limit)
+    return 0
+
+
+def _glue_scan(scan: Scan, inputs: ScanInputs, limit: int) -> int:
+    """Write up to ``limit`` due rows of one scan whose inputs loaded.
+
+    :param scan: The scan.
+    :param inputs: :func:`load_inputs`.
+    :param limit: The rows to write.
+    :returns: How many rows were written.
+    :rtype: int
+    """
     rows = list(
         due()
         .filter(scan=scan)
@@ -793,16 +846,6 @@ def glue_due(limit: int = OPINIONS_PER_TICK) -> int:
         .order_by("first_printed_page", "index_in_page")[:limit]
     )
     started = time.monotonic()
-    try:
-        inputs = load_inputs(scan)
-    except ScanHeld as exc:
-        logger.info(
-            "scan %s: %d opinion(s) owe their OCR glue and wait: %s",
-            scan.pk,
-            len(rows),
-            exc,
-        )
-        return 0
     written = 0
     for opinion in rows:
         try:

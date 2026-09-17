@@ -2468,17 +2468,18 @@ class Opinion(AbstractDateTimeModel):
     me" is a question about the whole span.
 
     **The glues are derived and disposable.** Every artifact of the
-    split lives under ``jobs/opinions/{first_printed_page}.{index_in_page}/
-    r{glue_revision}/``, the invariant key and never the pk (#350), so a
-    script that walks the bucket finds an opinion by the printed page
-    it looks at. A re-glue raises the revision, the rule of the apply's
-    ``jobs/apply/a{n}/``, and the creation raises it on every matched
-    row that is not approved, because the prefix belongs to one row at
-    a time and a second approval must not write into the old revision. The detections and the redactions are **not**
-    among them: they are rows since #241, and restricting them to one
-    opinion is a query over the rows. ``approved_text_key`` is not a
-    glue: it is written once when a human approves, and no re-glue may
-    overwrite it.
+    split lives under the row's :attr:`glue_prefix`,
+    ``jobs/opinions/{first}.{index}/r{revision}/``: the invariant key
+    and never the pk (#350), so a script that walks the bucket finds an
+    opinion by the printed page it looks at. A re-glue raises the
+    revision, the rule of the apply's ``jobs/apply/a{n}/``, and the
+    creation raises it on every matched row that is not approved,
+    because the prefix belongs to one row at a time and a second
+    approval must not write into the old revision. The detections and
+    the redactions are **not** among the glues: they are rows since
+    #241, and restricting them to one opinion is a query over the rows.
+    ``approved_text_key`` is not a glue: it is written once when a
+    human approves, and no re-glue may overwrite it.
     """
 
     scan = models.ForeignKey(
