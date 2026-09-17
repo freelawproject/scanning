@@ -1305,7 +1305,7 @@ class TestOpinionList(ScanningTestCase):
         user = self.make_user()
         self.client.force_login(user)
         OpinionScanFactory(uploaded_by=user)
-        response = self.client.get(reverse("opinion_list"))
+        response = self.client.get(reverse("legacy_opinion_list"))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.context["page_obj"]), 1)
 
@@ -1315,7 +1315,9 @@ class TestOpinionList(ScanningTestCase):
         scan = ScanFactory(uploaded_by=user)
         OpinionScanFactory(scan=scan, reporter=scan.reporter)
         OpinionScanFactory()  # standalone
-        response = self.client.get(reverse("opinion_list"), {"scan": scan.pk})
+        response = self.client.get(
+            reverse("legacy_opinion_list"), {"scan": scan.pk}
+        )
         self.assertEqual(len(response.context["page_obj"]), 1)
 
     def test_filter_by_reporter(self):
@@ -1330,7 +1332,7 @@ class TestOpinionList(ScanningTestCase):
         OpinionScanFactory(reporter=reporter_a)
         OpinionScanFactory(reporter=reporter_f3d)
         response = self.client.get(
-            reverse("opinion_list"), {"reporter": reporter_a.pk}
+            reverse("legacy_opinion_list"), {"reporter": reporter_a.pk}
         )
         self.assertEqual(len(response.context["page_obj"]), 1)
 
@@ -1340,7 +1342,7 @@ class TestOpinionList(ScanningTestCase):
         OpinionScanFactory(status=OpinionStatus.OK)
         OpinionScanFactory(status=OpinionStatus.GAP)
         response = self.client.get(
-            reverse("opinion_list"), {"status": OpinionStatus.GAP}
+            reverse("legacy_opinion_list"), {"status": OpinionStatus.GAP}
         )
         self.assertEqual(len(response.context["page_obj"]), 1)
 
@@ -1348,9 +1350,9 @@ class TestOpinionList(ScanningTestCase):
         user = self.make_user()
         self.client.force_login(user)
         OpinionScanFactory.create_batch(60, uploaded_by=user)
-        response = self.client.get(reverse("opinion_list"))
+        response = self.client.get(reverse("legacy_opinion_list"))
         self.assertEqual(len(response.context["page_obj"]), 50)
-        response = self.client.get(reverse("opinion_list"), {"page": 2})
+        response = self.client.get(reverse("legacy_opinion_list"), {"page": 2})
         self.assertEqual(len(response.context["page_obj"]), 10)
 
 
@@ -1362,7 +1364,7 @@ class TestOpinionDetail(ScanningTestCase):
         self.client.force_login(user)
         opinion = OpinionScanFactory(uploaded_by=user)
         response = self.client.get(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk})
+            reverse("legacy_opinion_detail", kwargs={"pk": opinion.pk})
         )
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, opinion.reporter.full_name)
@@ -1373,7 +1375,7 @@ class TestOpinionDetail(ScanningTestCase):
         scan = ScanFactory(uploaded_by=user)
         opinion = OpinionScanFactory(scan=scan, reporter=scan.reporter)
         response = self.client.get(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk})
+            reverse("legacy_opinion_detail", kwargs={"pk": opinion.pk})
         )
         self.assertContains(response, "Book")
         self.assertContains(
@@ -1385,7 +1387,7 @@ class TestOpinionDetail(ScanningTestCase):
         self.client.force_login(user)
         opinion = OpinionScanFactory(uploaded_by=user)
         response = self.client.get(
-            reverse("opinion_detail", kwargs={"pk": opinion.pk})
+            reverse("legacy_opinion_detail", kwargs={"pk": opinion.pk})
         )
         self.assertNotContains(response, "Parent Book")
 
@@ -1404,12 +1406,12 @@ class TestOpinionUpload(ScanningTestCase):
 
     def test_regular_user_forbidden(self):
         self.client.force_login(self.make_user())
-        response = self.client.get(reverse("opinion_upload"))
+        response = self.client.get(reverse("legacy_opinion_upload"))
         self.assertEqual(response.status_code, 403)
 
     def test_upload_page_renders(self):
         self.client.force_login(self.make_superuser())
-        response = self.client.get(reverse("opinion_upload"))
+        response = self.client.get(reverse("legacy_opinion_upload"))
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Upload Opinion Scan")
 
@@ -1418,7 +1420,7 @@ class TestOpinionUpload(ScanningTestCase):
         self.client.force_login(user)
         reporter = ReporterFactory()
         response = self.client.post(
-            reverse("opinion_upload"),
+            reverse("legacy_opinion_upload"),
             {
                 "reporter": reporter.pk,
                 "volume": 5,
@@ -1439,7 +1441,7 @@ class TestOpinionUpload(ScanningTestCase):
         self.client.force_login(self.make_superuser())
         reporter = ReporterFactory()
         response = self.client.post(
-            reverse("opinion_upload"),
+            reverse("legacy_opinion_upload"),
             {
                 "reporter": reporter.pk,
                 "volume": 1,
@@ -1458,7 +1460,7 @@ class TestOpinionUpload(ScanningTestCase):
             content_type="text/plain",
         )
         response = self.client.post(
-            reverse("opinion_upload"),
+            reverse("legacy_opinion_upload"),
             {
                 "reporter": reporter.pk,
                 "volume": 1,
@@ -1496,19 +1498,19 @@ class TestScanListFilters(ScanningTestCase):
 
 
 class TestOpinionListFilters(ScanningTestCase):
-    """Test that invalid filter params don't crash opinion_list."""
+    """Test that invalid filter params don't crash legacy_opinion_list."""
 
     def test_invalid_reporter_filter_returns_200(self):
         self.client.force_login(self.make_user())
         response = self.client.get(
-            reverse("opinion_list"), {"reporter": "notanumber"}
+            reverse("legacy_opinion_list"), {"reporter": "notanumber"}
         )
         self.assertEqual(response.status_code, 200)
 
     def test_invalid_scan_filter_returns_200(self):
         self.client.force_login(self.make_user())
         response = self.client.get(
-            reverse("opinion_list"), {"scan": "notanumber"}
+            reverse("legacy_opinion_list"), {"scan": "notanumber"}
         )
         self.assertEqual(response.status_code, 200)
 
@@ -1565,7 +1567,7 @@ class TestSpoofedPdfUpload(ScanningTestCase):
             content_type="application/pdf",
         )
         response = self.client.post(
-            reverse("opinion_upload"),
+            reverse("legacy_opinion_upload"),
             {
                 "reporter": reporter.pk,
                 "volume": 1,
@@ -1584,7 +1586,7 @@ class TestOpinionListEmptyState(ScanningTestCase):
 
     def test_non_superuser_no_upload_link(self):
         self.client.force_login(self.make_user())
-        response = self.client.get(reverse("opinion_list"))
+        response = self.client.get(reverse("legacy_opinion_list"))
         self.assertNotContains(response, "Upload your first opinion")
 
 

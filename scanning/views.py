@@ -168,11 +168,15 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
 
 
 @login_required
-def opinion_list(request: HttpRequest) -> HttpResponse:
-    """List opinion scans with filters for scan, reporter, and status.
+def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
+    """List the opinions of the legacy pipeline (#334).
+
+    ``OpinionScan`` is frozen (#173, #206): nothing writes it. The new
+    pipeline writes ``Opinion`` rows, which :func:`opinion_list` lists
+    at ``/opinions/``. This page keeps what the legacy pipeline made.
 
     :param request: The current HTTP request.
-    :return: The rendered opinion list page.
+    :return: The rendered legacy opinion list page.
     """
     opinions = OpinionScan.objects.select_related("reporter", "scan").order_by(
         "reporter__short_name", "volume", "page_start"
@@ -205,7 +209,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
 
     return render(
         request,
-        "scanning/opinion_list.html",
+        "scanning/legacy_opinion_list.html",
         {
             "page_obj": page_obj,
             "status_choices": OpinionStatus.choices,
@@ -221,12 +225,12 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
 
 
 @login_required
-def opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
-    """Display opinion scan detail with side-by-side PDF iframes.
+def legacy_opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
+    """Show one legacy opinion, with side-by-side PDF frames (#334).
 
     :param request: The current HTTP request.
     :param pk: The primary key of the opinion scan.
-    :return: The rendered opinion detail page.
+    :return: The rendered legacy opinion detail page.
     """
     opinion = get_object_or_404(
         OpinionScan.objects.select_related("reporter", "scan", "uploaded_by"),
@@ -235,14 +239,14 @@ def opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
 
     return render(
         request,
-        "scanning/opinion_detail.html",
+        "scanning/legacy_opinion_detail.html",
         {"opinion": opinion},
     )
 
 
 @login_required
-def opinion_upload(request: HttpRequest) -> HttpResponse:
-    """Handle standalone opinion upload form (superuser only).
+def legacy_opinion_upload(request: HttpRequest) -> HttpResponse:
+    """Upload one legacy opinion, for a superuser alone (#334).
 
     :param request: The current HTTP request.
     :return: The rendered upload form or a redirect on success.
@@ -258,13 +262,13 @@ def opinion_upload(request: HttpRequest) -> HttpResponse:
             opinion.uploaded_by = request.user
             opinion.save()
             messages.success(request, "Opinion uploaded successfully.")
-            return redirect("opinion_detail", pk=opinion.pk)
+            return redirect("legacy_opinion_detail", pk=opinion.pk)
     else:
         form = OpinionScanUploadForm()
 
     return render(
         request,
-        "scanning/opinion_upload.html",
+        "scanning/legacy_opinion_upload.html",
         {"form": form},
     )
 

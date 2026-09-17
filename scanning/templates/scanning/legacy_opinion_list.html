@@ -8,7 +8,7 @@
   <div class="flex items-center gap-3">
     <span class="text-sm text-gray-500 dark:text-gray-400">{{ page_obj.paginator.count }} opinions</span>
     {% if user.is_superuser %}
-    <a href="{% url 'opinion_upload' %}" class="btn-primary text-sm"><i class="fa-solid fa-upload"></i> Upload</a>
+    <a href="{% url 'legacy_opinion_upload' %}" class="btn-primary text-sm"><i class="fa-solid fa-upload"></i> Upload</a>
     {% endif %}
   </div>
 </div>
@@ -42,7 +42,7 @@
       </div>
     </div>
     <div class="flex items-center justify-end gap-2 mt-3">
-      <a href="{% url 'opinion_list' %}" class="btn-ghost text-sm"><i class="fa-solid fa-xmark"></i> Clear filters</a>
+      <a href="{% url 'legacy_opinion_list' %}" class="btn-ghost text-sm"><i class="fa-solid fa-xmark"></i> Clear filters</a>
       <button type="submit" class="btn-outline"><i class="fa-solid fa-magnifying-glass"></i> Filter</button>
     </div>
   </form>
@@ -63,7 +63,7 @@
       {% for opinion in page_obj %}
       <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50">
         <td class="px-4 py-3 whitespace-nowrap">
-          <a href="{% url 'opinion_detail' pk=opinion.pk %}" class="text-sm font-medium text-gray-900 dark:text-gray-100 hover:text-blue-600 dark:hover:text-blue-400">
+          <a href="{% url 'legacy_opinion_detail' pk=opinion.pk %}" class="text-sm font-medium text-gray-900 dark:text-gray-100 hover:text-blue-600 dark:hover:text-blue-400">
             {{ opinion.volume }} {{ opinion.reporter.cite_name }} {{ opinion.page_start }}
           </a>
           {% if opinion.status == 'gap' %}
@@ -79,7 +79,7 @@
 
         <td class="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{{ opinion.date_created|date:"M j, Y g:i A" }}{% if opinion.uploaded_by %} by {{ opinion.uploaded_by.username }}{% endif %}</td>
         <td class="px-4 py-3 text-sm text-right">
-          <a href="{% url 'opinion_detail' pk=opinion.pk %}" class="btn-outline text-xs px-2 py-1">View</a>
+          <a href="{% url 'legacy_opinion_detail' pk=opinion.pk %}" class="btn-outline text-xs px-2 py-1">View</a>
         </td>
       </tr>
       {% endfor %}
@@ -110,7 +110,7 @@
 <div class="card text-center py-12">
   <p class="text-gray-500 dark:text-gray-400 mb-4">No opinions found.</p>
   {% if user.is_superuser %}
-  <a href="{% url 'opinion_upload' %}" class="btn-primary">Upload your first opinion</a>
+  <a href="{% url 'legacy_opinion_upload' %}" class="btn-primary">Upload your first opinion</a>
   {% endif %}
 </div>
 {% endif %}
