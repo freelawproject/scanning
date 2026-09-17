@@ -180,7 +180,7 @@ def write_computed(
 
     One pairing per compute: the caller hands the pairs to
     ``compute_redaction_rects`` afterwards. The document is the snapped
-    one ``services._build_document_from_detections`` built from the
+    one ``services._build_document_with_ids`` built from the
     live rows, and ``row_ids`` maps each of its detection objects (by
     ``id()``) to the ``Detection`` pk it came from, which is how the
     caption and the key FKs are exact and no match by rounded

@@ -71,14 +71,6 @@ def _s3_client():
     return _cached_s3_client()
 
 
-# File relative-path prefixes considered deliverables. When a scan is
-# approved, every file under one of these subdirs gets server-side
-# copied from processing/ to approved/ (the processing/ copy is kept).
-# Everything else in processing/ (bitonal, detections, unredacted/,
-# stamped, etc.) stays only under processing/.
-APPROVED_SUBDIR_PREFIXES = ("redacted/", "images/")
-APPROVED_FILE_SUFFIXES = (".original.pdf", ".redacted.pdf")
-
 # Subdirectory under a scan's processing prefix where GPU workers PUT
 # their job results (see ``scanning/runpod_client.py``). Deliberately
 # excluded from the processing-file sync in both directions: these are
@@ -677,28 +669,6 @@ def _iter_files_to_sync(local_root: Path):
     for path in local_root.rglob("*"):
         if path.is_file():
             yield path
-
-
-def _is_approved_deliverable(relative_path: str) -> bool:
-    """Return True if ``relative_path`` (under processing/) belongs in approved/.
-
-    Approved deliverables are opinion PDFs under ``redacted/``,
-    extracted figure images under ``images/``, plus the full-book
-    original and redacted PDFs. Everything else (bitonal,
-    unredacted/, stamped, llm/) stays under processing/.
-
-    :param relative_path: Path relative to the scan's processing prefix.
-    :returns: Whether to copy this file into approved/.
-    :rtype: bool
-    """
-    if relative_path.startswith(APPROVED_SUBDIR_PREFIXES):
-        # One-level deep only: redacted/foo.pdf, not redacted/sub/foo.pdf.
-        return relative_path.count("/") == 1
-    if "/" not in relative_path and relative_path.endswith(
-        APPROVED_FILE_SUFFIXES
-    ):
-        return True
-    return False
 
 
 def _is_stage_input(rel: str) -> bool:
@@ -1411,62 +1381,3 @@ def verify_uploaded_object(scan: Scan, relative_path: str) -> bool:
         )
         return False
     return True
-
-
-def approved_prefix(scan: Scan) -> str:
-    """Return the S3 prefix where a scan's approved deliverables live.
-
-    :param scan: The scan to build the prefix for.
-    :returns: Prefix of the form ``approved/{reporter}/{vol}/{start}/``.
-    :rtype: str
-    """
-    short = scan.reporter.short_name if scan.reporter else "unknown"
-    start = scan.start_page or 1
-    return f"approved/{short}/{scan.volume}/{start}/"
-
-
-def copy_processing_to_approved(scan: Scan) -> tuple[str, int]:
-    """Server-side copy deliverables from processing/ to approved/ on S3.
-
-    Lists the scan's processing prefix, picks the files flagged by
-    ``_is_approved_deliverable``, and issues an S3 ``copy_object`` for
-    each. No local download/upload happens; the data stays in S3.
-
-    :param scan: The scan being approved.
-    :returns: ``(approved_prefix, copied_count)``. Prefix is returned
-        even when S3 is disabled so callers can still record it.
-    :rtype: tuple[str, int]
-    """
-    dest_prefix = approved_prefix(scan)
-    if not _s3_enabled():
-        return dest_prefix, 0
-
-    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
-    src_prefix = s3_processing_prefix(scan)
-    s3 = _s3_client()
-    paginator = s3.get_paginator("list_objects_v2")
-
-    count = 0
-    for page in paginator.paginate(Bucket=bucket, Prefix=src_prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            rel = key[len(src_prefix) :]
-            if not rel or not _is_approved_deliverable(rel):
-                continue
-            s3.copy_object(
-                Bucket=bucket,
-                CopySource={"Bucket": bucket, "Key": key},
-                Key=f"{dest_prefix}{rel}",
-            )
-            count += 1
-
-    logger.info(
-        "Copied %d deliverable(s) for scan %s: s3://%s/%s -> s3://%s/%s",
-        count,
-        scan.pk,
-        bucket,
-        src_prefix,
-        bucket,
-        dest_prefix,
-    )
-    return dest_prefix, count

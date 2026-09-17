@@ -429,63 +429,6 @@ class TestSyncHelpersWithCredentials(TestCase):
             },
         )
 
-    def test_is_approved_deliverable(self):
-        self.assertTrue(s3_sync._is_approved_deliverable("redacted/foo.pdf"))
-        self.assertTrue(s3_sync._is_approved_deliverable("images/1-001.png"))
-        self.assertTrue(
-            s3_sync._is_approved_deliverable("tc.1.1.2.original.pdf")
-        )
-        self.assertTrue(
-            s3_sync._is_approved_deliverable("tc.1.1.2.redacted.pdf")
-        )
-        self.assertFalse(
-            s3_sync._is_approved_deliverable("unredacted/foo.pdf")
-        )
-        self.assertFalse(s3_sync._is_approved_deliverable("bitonal.pdf"))
-        self.assertFalse(s3_sync._is_approved_deliverable("detections.json"))
-        # Guard against nested paths under one of the approved subdirs.
-        self.assertFalse(
-            s3_sync._is_approved_deliverable("redacted/sub/x.pdf")
-        )
-
-    def test_copy_processing_to_approved_copies_only_deliverables(self):
-        scan = _reporter_scan()
-        src_prefix = s3_sync.s3_processing_prefix(scan)
-        mock_s3 = MagicMock()
-        mock_paginator = MagicMock()
-        mock_paginator.paginate.return_value = [
-            {
-                "Contents": [
-                    {"Key": f"{src_prefix}bitonal.pdf"},
-                    {"Key": f"{src_prefix}detections.json"},
-                    {"Key": f"{src_prefix}tc.164.1.2.original.pdf"},
-                    {"Key": f"{src_prefix}tc.164.1.2.redacted.pdf"},
-                    {"Key": f"{src_prefix}redacted/a.pdf"},
-                    {"Key": f"{src_prefix}unredacted/a.pdf"},
-                    {"Key": f"{src_prefix}images/1-001.png"},
-                ]
-            }
-        ]
-        mock_s3.get_paginator.return_value = mock_paginator
-
-        with patch("scanning.s3_sync.boto3") as mock_boto3:
-            mock_boto3.client.return_value = mock_s3
-            prefix, count = s3_sync.copy_processing_to_approved(scan)
-
-        expected_prefix = "approved/tc/164/1/"
-        self.assertEqual(prefix, expected_prefix)
-        self.assertEqual(count, 4)
-        copied = {c.kwargs["Key"] for c in mock_s3.copy_object.call_args_list}
-        self.assertEqual(
-            copied,
-            {
-                f"{expected_prefix}tc.164.1.2.original.pdf",
-                f"{expected_prefix}tc.164.1.2.redacted.pdf",
-                f"{expected_prefix}redacted/a.pdf",
-                f"{expected_prefix}images/1-001.png",
-            },
-        )
-
     def test_download_processing_files_skips_same_size(self):
         scan = _reporter_scan()
         scan.status = Status.PENDING_REVIEW

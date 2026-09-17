@@ -12,7 +12,6 @@ from unittest.mock import patch
 import fitz
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from scanning import s3_sync
 from scanning.factories import (
     PageEditFactory,
     ReporterFactory,
@@ -380,30 +379,30 @@ class TestModelProvenanceSurvives(TestCase):
 
     def test_the_document_reads_the_bl_warm_gates(self):
         from scanning.services import (
-            _build_document_from_detections,
+            _build_document_with_ids,
             detection_entries,
         )
 
         self._detection()
         det_data = detection_entries(self.scan.pk)
 
-        document = _build_document_from_detections(
-            self.scan, det_data, PDF_PATH
+        document, _ids = _build_document_with_ids(
+            self.scan, det_data, str(PDF_PATH)
         )
 
         self.assertTrue(document.bl_warm)
 
     def test_a_legacy_volume_keeps_the_legacy_gates(self):
         from scanning.services import (
-            _build_document_from_detections,
+            _build_document_with_ids,
             detection_entries,
         )
 
         self._detection(model_name=Detection.ModelName.LARGE, found_by=[])
         det_data = detection_entries(self.scan.pk)
 
-        document = _build_document_from_detections(
-            self.scan, det_data, PDF_PATH
+        document, _ids = _build_document_with_ids(
+            self.scan, det_data, str(PDF_PATH)
         )
 
         self.assertFalse(document.bl_warm)
@@ -629,14 +628,23 @@ class TestMeasureMarginRects(TestCase):
         )
 
     def _document(self, scan):
+        """Build the document the redaction compute measures (#360).
+
+        ``_build_document_with_ids`` is what the compute calls. The
+        wrapper that dropped the ids went with the file generation.
+
+        :param scan: The scan whose rows the document holds.
+        :returns: The document.
+        """
         from scanning.services import (
-            _build_document_from_detections,
+            _build_document_with_ids,
             detection_entries,
         )
 
-        return _build_document_from_detections(
+        document, _ids = _build_document_with_ids(
             scan, detection_entries(scan.pk, page_numbers={}), str(PDF_PATH)
         )
+        return document
 
     def test_measures_the_strips_in_points(self):
         from scanning.services import _measure_margin_rects
@@ -690,34 +698,6 @@ class TestMeasureMarginRects(TestCase):
             dets = detection_entries(scan.pk, page_numbers={})
             self.assertEqual([d["label"] for d in dets], ["TEXT_COLUMN"])
             self.assertEqual(dets[0]["bbox"], [100, 200, 1600, 2000])
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestBuildDocumentFromDetections(TestCase):
-    """Test _build_document_from_detections."""
-
-    def setUp(self):
-        _require_fixture(self)
-
-    def test_builds_document_with_pages(self):
-        from scanning.services import (
-            _build_document_from_detections,
-            detection_entries,
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            _import_detections(scan.pk)
-            det_data = detection_entries(scan.pk)
-
-            document = _build_document_from_detections(
-                scan, det_data, PDF_PATH
-            )
-            self.assertGreater(len(document.pages), 0)
-            self.assertEqual(document.reporter, "a3d")
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -869,172 +849,6 @@ PDF_23_PATH = (
     / "original"
     / "332_a3d_1-23_opinions.pdf"
 )
-
-
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestUploadApprovedFiles(TestCase):
-    """Test the upload_approved_files helper."""
-
-    def setUp(self):
-        # _s3_client() is lru_cached; drop any client cached under a prior
-        # test's boto3 patch so this test's mock is the one that's used.
-        s3_sync._cached_s3_client.cache_clear()
-
-    def _make_scan_with_generated_files(self):
-        """Create a scan that has been through file generation."""
-        scan = ScanFactory(start_page=1, end_page=95, stage=Stage.APPROVED)
-        output = pathlib.Path(scan.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-
-        redacted_dir = output / "redacted"
-        redacted_dir.mkdir()
-
-        for name in ["a.1.0001-0010.pdf", "a.1.0011-0020.pdf"]:
-            (redacted_dir / name).write_bytes(b"%PDF-1.4 redacted")
-
-        short = scan.reporter.short_name
-        (output / f"{short}.{scan.volume}.1.95.original.pdf").write_bytes(
-            b"%PDF-1.4 original"
-        )
-        (output / f"{short}.{scan.volume}.1.95.redacted.pdf").write_bytes(
-            b"%PDF-1.4 redacted-full"
-        )
-        return scan
-
-    def test_pre_generation_returns_error(self):
-        """Return error when the scan hasn't reached the APPROVED stage."""
-        from scanning.services import upload_approved_files
-
-        scan = ScanFactory(start_page=1, end_page=95)
-        self.assertNotEqual(scan.stage, Stage.APPROVED)
-
-        result = upload_approved_files(scan.pk)
-        self.assertIn("Before approving", result)
-        scan.refresh_from_db()
-        self.assertFalse(scan.s3_uploaded)
-
-    def test_already_uploaded_skips(self):
-        """Return early if files were already uploaded."""
-        from scanning.services import upload_approved_files
-
-        scan = self._make_scan_with_generated_files()
-        scan.s3_uploaded = True
-        scan.s3_path = "approved/a/1/1/"
-        scan.save(update_fields=["s3_uploaded", "s3_path"])
-
-        result = upload_approved_files(scan.pk)
-        self.assertIn("already uploaded", result)
-
-    @override_settings(DEVELOPMENT=True)
-    def test_no_credentials_skips_upload(self):
-        """Without AWS creds, set s3_path but not s3_uploaded."""
-
-        from scanning.services import upload_approved_files
-
-        scan = self._make_scan_with_generated_files()
-        with patch.dict("os.environ", {}, clear=True):
-            result = upload_approved_files(scan.pk)
-
-        self.assertIn("No AWS credentials", result)
-        scan.refresh_from_db()
-        self.assertFalse(scan.s3_uploaded)
-        self.assertTrue(scan.s3_path.startswith("approved/"))
-
-    def test_s3_path_format(self):
-        """Verify the S3 prefix follows the expected pattern."""
-
-        from scanning.services import upload_approved_files
-
-        scan = self._make_scan_with_generated_files()
-        with patch.dict("os.environ", {}, clear=True):
-            upload_approved_files(scan.pk)
-        scan.refresh_from_db()
-
-        short = scan.reporter.short_name
-        expected = f"approved/{short}/{scan.volume}/{scan.start_page}/"
-        self.assertEqual(scan.s3_path, expected)
-
-    @override_settings(
-        AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
-        DEVELOPMENT=False,
-        TESTING=False,
-    )
-    def test_copy_calls_s3_copy_object(self):
-        """Approve should issue copy_object per deliverable, not upload_file."""
-        from unittest.mock import MagicMock
-
-        from scanning.services import upload_approved_files
-
-        scan = self._make_scan_with_generated_files()
-        mock_client = MagicMock()
-        # Simulate processing/ has deliverables + non-deliverables.
-        short = scan.reporter.short_name
-        src_prefix = f"processing/{scan.pk}/{short}/{scan.volume}/1/"
-        mock_paginator = MagicMock()
-        mock_paginator.paginate.return_value = [
-            {
-                "Contents": [
-                    {"Key": f"{src_prefix}redacted/a.pdf"},
-                    {"Key": f"{src_prefix}redacted/b.pdf"},
-                    {
-                        "Key": f"{src_prefix}{short}.{scan.volume}.1.95.original.pdf"
-                    },
-                    {
-                        "Key": f"{src_prefix}{short}.{scan.volume}.1.95.redacted.pdf"
-                    },
-                    {"Key": f"{src_prefix}bitonal.pdf"},  # not a deliverable
-                    {
-                        "Key": f"{src_prefix}detections.json"
-                    },  # not a deliverable
-                ]
-            }
-        ]
-        mock_client.get_paginator.return_value = mock_paginator
-
-        env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
-        with (
-            patch.dict("os.environ", env),
-            patch("boto3.client", return_value=mock_client),
-        ):
-            result = upload_approved_files(scan.pk)
-
-        self.assertIn("4 files", result)
-        # upload_file must NOT be used; copy_object handles everything.
-        self.assertEqual(mock_client.upload_file.call_count, 0)
-        self.assertEqual(mock_client.copy_object.call_count, 4)
-        scan.refresh_from_db()
-        self.assertTrue(scan.s3_uploaded)
-
-    @override_settings(
-        AWS_PRIVATE_STORAGE_BUCKET_NAME="test-bucket",
-        DEVELOPMENT=False,
-        TESTING=False,
-    )
-    def test_re_upload_after_changes(self):
-        """After reprocessing (s3_uploaded reset), copy runs again."""
-        from unittest.mock import MagicMock
-
-        from scanning.services import upload_approved_files
-
-        scan = self._make_scan_with_generated_files()
-        scan.s3_uploaded = False
-        scan.s3_path = "approved/a/1/1/"
-        scan.save(update_fields=["s3_uploaded", "s3_path"])
-        mock_client = MagicMock()
-        mock_paginator = MagicMock()
-        mock_paginator.paginate.return_value = [{"Contents": []}]
-        mock_client.get_paginator.return_value = mock_paginator
-
-        env = {"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}
-        with (
-            patch.dict("os.environ", env),
-            patch("boto3.client", return_value=mock_client),
-        ):
-            upload_approved_files(scan.pk)
-
-        self.assertEqual(mock_client.upload_file.call_count, 0)
-        scan.refresh_from_db()
-        self.assertTrue(scan.s3_uploaded)
 
 
 class TestHandlePipelineExceptionRetryCap(TestCase):
@@ -1216,132 +1030,6 @@ class TestRefreshVolumeQueueStatus(TestCase):
         self.assertEqual(volume.queue_status, QueueStatus.SCANNING)
 
 
-@override_settings(MEDIA_ROOT=MEDIA_ROOT)
-class TestGenerateFilesWithoutOcrPdf(TestCase):
-    """``run_generate_files`` works from ``bitonal.pdf`` alone.
-
-    The pipeline no longer produces an OCR'd PDF, so generation has to
-    build on the processing PDF instead of refusing to run.
-    """
-
-    def setUp(self):
-        _require_fixture(self)
-
-    def test_generates_from_bitonal(self):
-        from scanning import services
-
-        scan = _make_scan_with_output(
-            reporter=ReporterFactory(short_name="a3d"),
-        )
-        output = pathlib.Path(scan.output_dir)
-        bitonal = output / "bitonal.pdf"
-        _write_bitonal_copy(bitonal)
-        from scanning import boundaries
-        from scanning.factories import OpinionBoundaryFactory
-
-        boundary = OpinionBoundaryFactory(
-            scan=scan, start_page_index=0, end_page_index=0
-        )
-        # A dismissed boundary is no opinion to cut (#240 PR C).
-        dismissed = OpinionBoundaryFactory(
-            scan=scan, start_page_index=0, end_page_index=0, start_y=300.0
-        )
-        boundaries.dismiss(scan, dismissed, None)
-
-        with (
-            # close_all() resets connections for daemon-process forking;
-            # in tests it kills the test transaction -- patch it out.
-            patch("django.db.connections.close_all"),
-            patch("blackletter.api.generate") as generate,
-            patch.object(services, "_push_processing_files_to_s3"),
-            patch.object(services, "_pull_processing_files_from_s3"),
-        ):
-            generate.return_value = {
-                "opinion_count": 1,
-                "full_redacted": "",
-                "redacted_dir": str(output / "redacted"),
-            }
-            services.run_generate_files(scan.pk)
-
-        generate.assert_called_once()
-        gen_pdf = pathlib.Path(generate.call_args.kwargs["pdf_path"])
-        # Generation runs on a stamped *copy* of the bitonal, never on
-        # the bitonal itself.
-        self.assertEqual(gen_pdf.name, "stamped.pdf")
-        self.assertEqual(gen_pdf.read_bytes(), bitonal.read_bytes())
-
-        scan.refresh_from_db()
-        self.assertEqual(scan.stage, Stage.APPROVED)
-        self.assertEqual(scan.status, Status.PENDING_REVIEW)
-        # The file row names the boundary it was cut from (#240 PR C).
-        self.assertEqual(scan.legacy_opinions.get().boundary_id, boundary.pk)
-
-    def test_writes_redactions_json_from_the_rows(self):
-        """The rows are the store (#240 PR B): a computed box and a drawn
-        one both reach ``redactions.json`` in points, and nothing is
-        measured here."""
-        from scanning import services
-
-        scan = _make_scan_with_output(
-            reporter=ReporterFactory(short_name="a3d"),
-        )
-        output = pathlib.Path(scan.output_dir)
-        _write_bitonal_copy(output / "bitonal.pdf")
-        common = {
-            "scan": scan,
-            "source_page": 1,
-            "page_index": 0,
-        }
-        Redaction.objects.create(
-            origin=Redaction.Origin.COMPUTED,
-            rect_type="headnote",
-            fill="black",
-            x0=10.0,
-            y0=20.0,
-            x1=30.0,
-            y1=40.0,
-            **common,
-        )
-        Redaction.objects.create(
-            origin=Redaction.Origin.HUMAN,
-            kind=Redaction.Kind.ADD,
-            rect_type="manual",
-            fill="white",
-            x0=1.0,
-            y0=2.0,
-            x1=3.0,
-            y1=4.0,
-            **common,
-        )
-
-        with (
-            patch("django.db.connections.close_all"),
-            patch("blackletter.api.generate") as generate,
-            patch.object(services, "_push_processing_files_to_s3"),
-            patch.object(services, "_pull_processing_files_from_s3"),
-            patch.object(
-                services, "_snap_text_columns_to_ink", return_value=0
-            ),
-            patch.object(services, "_measure_redaction_rects") as measure,
-        ):
-            generate.return_value = {
-                "opinion_count": 0,
-                "full_redacted": "",
-                "redacted_dir": str(output / "redacted"),
-            }
-            services.run_generate_files(scan.pk)
-
-        measure.assert_not_called()
-        payload = json.loads(
-            pathlib.Path(generate.call_args.kwargs["redactions"]).read_text()
-        )
-        rects = payload["pages"]["0"]
-        self.assertEqual(
-            sorted((r["type"], r["x0"]) for r in rects),
-            [("headnote", 10.0), ("manual", 1.0)],
-        )
-
-
 class TestRedactionGeometryFromInk(SimpleTestCase):
     """The library contract this app now depends on for headnote rects.
 
@@ -1350,7 +1038,7 @@ class TestRedactionGeometryFromInk(SimpleTestCase):
     words, which collapsed every headnote rect and dropped it: a text-less
     ``bitonal.pdf`` produced *no* headnote rects while every other rect type
     came out unchanged. blackletter measures ink itself now (#68), keyed off
-    ``Document.ocr_applied``, which ``_build_document_from_detections``
+    ``Document.ocr_applied``, which ``_build_document_with_ids``
     always sets. These tests pin that contract, so a library release that
     regressed it would fail here rather than silently ship empty redactions.
     """
@@ -1496,78 +1184,6 @@ class TestSnapTextColumnsToInk(TestCase):
         )
 
 
-class TestBuildCombinedRedactionsPayload(TestCase):
-    """The payload ``generate`` reads comes from the rows, in points (#240)."""
-
-    def setUp(self):
-        _require_fixture(self)
-
-    def test_rows_reach_the_pages_as_they_are(self):
-        from scanning import services
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            scan = _make_scan_with_output(
-                tmpdir,
-                reporter=ReporterFactory(short_name="a3d"),
-            )
-            common = {"scan": scan, "source_page": 1, "page_index": 0}
-            Redaction.objects.create(
-                origin=Redaction.Origin.COMPUTED,
-                rect_type="headnote",
-                fill="black",
-                x0=50.0,
-                y0=100.0,
-                x1=400.0,
-                y1=200.0,
-                **common,
-            )
-            Redaction.objects.create(
-                origin=Redaction.Origin.COMPUTED,
-                rect_type="margin",
-                fill="white",
-                x0=0.0,
-                y0=0.0,
-                x1=20.0,
-                y1=50.0,
-                **common,
-            )
-            hidden = Redaction.objects.create(
-                origin=Redaction.Origin.COMPUTED,
-                rect_type="KEY_ICON",
-                fill="black",
-                x0=5.0,
-                y0=5.0,
-                x1=6.0,
-                y1=6.0,
-                **common,
-            )
-            dismiss = Redaction.objects.create(
-                origin=Redaction.Origin.HUMAN,
-                kind=Redaction.Kind.DISMISS,
-                rect_type="KEY_ICON",
-                fill="black",
-                target_x0=5.0,
-                target_y0=5.0,
-                target_x1=6.0,
-                target_y1=6.0,
-                **common,
-            )
-            Redaction.objects.filter(pk=hidden.pk).update(decision=dismiss)
-
-            payload = json.loads(
-                services._build_combined_redactions(scan.pk).read_text()
-            )
-            page_rects = payload["pages"]["0"]
-
-            headnote = next(r for r in page_rects if r["type"] == "headnote")
-            self.assertEqual(headnote["x0"], 50.0)
-            self.assertEqual(headnote["x1"], 400.0)
-            margin = next(r for r in page_rects if r["type"] == "margin")
-            self.assertEqual(margin["x1"], 20.0)
-            self.assertEqual(margin["fill"], "white")
-            self.assertNotIn("KEY_ICON", [r["type"] for r in page_rects])
-
-
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestMarginRectsUseTheDetections(TestCase):
     """The detected pages must reach the measurement.
@@ -1605,7 +1221,7 @@ class TestMarginRectsUseTheDetections(TestCase):
                 img_width=1700,
                 img_height=2200,
             )
-            document = services._build_document_from_detections(
+            document, _ids = services._build_document_with_ids(
                 scan,
                 services.detection_entries(scan.pk, page_numbers={}),
                 str(PDF_PATH),

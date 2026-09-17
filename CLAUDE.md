@@ -79,7 +79,7 @@ State is `Scan.status`. The stages, and where each runs:
 3. Review 1: READY_FOR_PAGE_COMPLETENESS_REVIEW, then PAGE_COMPLETENESS_REVIEW_DONE (`approve_page_completeness`, #151/#154).
 4. The apply (#224): queued work (`APPLY_PAGE_EDITS`) that builds the corrected volume from the `PageEdit` rows under `jobs/apply/a{n}/`.
 5. The redaction compute (#196): queued work (`COMPUTE_REDACTIONS`) that renders every page; parks in READY_FOR_REDACTION_REVIEW. The approval (`approve_redaction_review`, #263) queues `CREATE_OPINIONS` (#336), whose worker writes the `Opinion` rows and parks in REDACTION_REVIEW_DONE.
-6. Step 3, the file generation, is paused (#173/#206). `start_validate`, `reprocess` and `generate_files` refuse with `utils.PIPELINE_PAUSED_MESSAGE`; nothing queues `run_generate_files`.
+6. Step 3, the file generation, is paused (#173/#206). `start_validate`, `reprocess` and `generate_files` refuse with `utils.PIPELINE_PAUSED_MESSAGE`; the volume-level generation code is deleted (#360), and `opinion_pdf` writes the per-opinion PDF.
 
 - A legacy row (before #173) holds `PENDING_REVIEW` for both reviews, never enters the #154/#263 states, gets no apply and keeps the old buttons. `legacy_review` reads the status; `has_legacy_ocr` asks who read the page numbers. They are different questions
 - `RUNPOD_ENABLED` gates only whether GPU jobs dispatch. Upload paths must work without it
