@@ -13,6 +13,7 @@ Four groups:
 from unittest.mock import patch
 
 from django.test import TestCase
+from django.urls import reverse
 
 from scanning import apply, opinions, review_states
 from scanning.factories import (
@@ -32,6 +33,7 @@ from scanning.models import (
     Scan,
     Status,
 )
+from scanning.tests.test_views import ScanningTestCase
 
 
 def printed_document(*pages) -> dict:
@@ -694,6 +696,63 @@ class TestTheQueue(TestCase):
             services.run_create_opinions(7)
 
         body.assert_called_once_with(7)
+
+
+class TestTheStepTwoNote(ScanningTestCase):
+    """The reason of a failed run reaches the reviewer.
+
+    The worker parks the scan in READY_FOR_REDACTION_REVIEW with the
+    reason in ``progress_message``, and the poll reloads the page at
+    once, so the step-2 bar must print that field there.
+    """
+
+    def setUp(self):
+        self.client.force_login(self.make_user(username="reviewer"))
+
+    def _bar(self, scan):
+        response = self.client.get(
+            reverse("process_actions", kwargs={"pk": scan.pk}),
+            {"step": 2},
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()["html"]
+
+    def test_the_reason_shows_in_review_two(self):
+        scan = ScanFactory(
+            status=Status.READY_FOR_REDACTION_REVIEW,
+            progress_message="Page 2 of the corrected volume has no printed number.",
+        )
+
+        bar = self._bar(scan)
+
+        self.assertIn("review2-note", bar)
+        self.assertIn("Page 2 of the corrected volume", bar)
+
+    def test_the_note_is_escaped(self):
+        scan = ScanFactory(
+            status=Status.READY_FOR_REDACTION_REVIEW,
+            progress_message="<b>boom</b>",
+        )
+
+        bar = self._bar(scan)
+
+        self.assertIn("&lt;b&gt;boom", bar)
+        self.assertNotIn("<b>boom", bar)
+
+    def test_no_note_without_a_message(self):
+        scan = ScanFactory(
+            status=Status.READY_FOR_REDACTION_REVIEW, progress_message=""
+        )
+
+        self.assertNotIn("review2-note", self._bar(scan))
+
+    def test_no_note_after_the_approval(self):
+        scan = ScanFactory(
+            status=Status.REDACTION_REVIEW_DONE,
+            progress_message="1 opinion(s): 1 new, 0 updated.",
+        )
+
+        self.assertNotIn("review2-note", self._bar(scan))
 
 
 class TestSuffixedNumber(TestCase):

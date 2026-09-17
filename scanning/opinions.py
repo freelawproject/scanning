@@ -160,8 +160,9 @@ def printed_span(
     if start is None:
         raise PrintedNumberError(
             f"Page {row.start_page_index + 1} of the corrected volume has "
-            "no printed number, and an opinion starts there. Give it a "
-            "number in review 1."
+            "no printed number, and an opinion starts there. Review 1 is "
+            "closed for this volume: ask an admin to re-queue it, then "
+            "give that page a number before the approval."
         )
     if row.end_page_index <= row.start_page_index:
         return start[0], start[1] or start[0]
@@ -310,6 +311,12 @@ def create_rows(
     of the scan are read by key, every boundary updates or creates its
     row, the two stale checks are deleted from every row of the scan
     and written again on the rows no boundary matched.
+
+    The match is by key, so a boundary added before another on the
+    same printed page takes that page's index 0 and, with it, the row
+    and the human fields the other opinion held; the other opinion's
+    old row becomes the orphan. That is the accepted cost of the #335
+    key: the index moves at most the opinions of one printed page.
 
     :param scan: The scan.
     :param run: The final apply run the boundaries are measured in.

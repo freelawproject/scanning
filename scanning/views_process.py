@@ -1837,6 +1837,16 @@ def _review_flags(
             scan.status == Status.READY_FOR_REDACTION_REVIEW
         ),
         "redaction_review_done": (scan.status == Status.REDACTION_REVIEW_DONE),
+        # The last word of the server on a volume parked in review 2
+        # (#336). A failed opinion creation or a failed recompute parks
+        # the scan here with the reason in ``progress_message``, and the
+        # poll reloads the page at once, so without this line the
+        # approve button seems to do nothing.
+        "redaction_review_note": (
+            scan.progress_message
+            if scan.status == Status.READY_FOR_REDACTION_REVIEW
+            else ""
+        ),
         "legacy_review": scan.status == Status.PENDING_REVIEW,
         # The reopen is a compare-and-swap on DONE (#224), so the
         # button shows only there: a volume in review 2 keeps its
