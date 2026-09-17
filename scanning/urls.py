@@ -82,7 +82,6 @@ from scanning.views_process import (
     serve_final_pdf,
     serve_glued_shard,
     serve_glued_volume,
-    serve_opinion_ocr,
     serve_original_crop,
     serve_scan_original,
     serve_scan_pdf,
@@ -186,12 +185,6 @@ urlpatterns = [
         "scans/<int:pk>/glued/apply/a<int:number>/<str:output>/",
         serve_apply_output,
         name="serve_apply_output",
-    ),
-    # The OCR documents of one opinion (#350), one redirect per engine.
-    path(
-        "scans/<int:pk>/opinions/<int:opinion_pk>/ocr/<str:engine>/",
-        serve_opinion_ocr,
-        name="serve_opinion_ocr",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.

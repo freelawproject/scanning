@@ -80,18 +80,11 @@ class TestOpinionFields(TestCase):
             OpinionFactory().status, OpinionReviewStatus.PROCESSING
         )
 
-    def test_the_glue_prefix_is_the_key_and_follows_the_revision(self):
-        """The invariant identity, never the pk (#350)."""
-        row = OpinionFactory(first_printed_page=2094, index_in_page=1)
-        self.assertEqual(row.glue_prefix, "jobs/opinions/2094.1/r0/")
-        row.glue_revision = 3
-        self.assertEqual(row.glue_prefix, "jobs/opinions/2094.1/r3/")
-        self.assertNotIn(str(row.pk), row.glue_prefix.split("/")[2])
-
-    def test_the_ledger_fields_start_empty(self):
+    def test_the_glue_prefix_follows_the_revision(self):
         row = OpinionFactory()
-        self.assertIsNone(row.ocr_glue_revision)
-        self.assertEqual(row.ocr_glue_attempts, 0)
+        self.assertEqual(row.glue_prefix, f"jobs/opinions/o{row.pk}/r0/")
+        row.glue_revision = 3
+        self.assertEqual(row.glue_prefix, f"jobs/opinions/o{row.pk}/r3/")
 
     def test_the_approved_text_key_is_not_under_the_glue_prefix(self):
         """A re-glue raises the revision and must not reach the text."""

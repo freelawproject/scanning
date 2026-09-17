@@ -77,12 +77,6 @@ never a candidate, so this pass starts no paid work of its own. It is
 last because nothing else waits for it: no review state reads its
 output.
 
-**10. ``opinion_ocr.glue_due()`` writes the OCR documents of the
-opinions (#350).** Up to ``OPINIONS_PER_TICK`` rows of the newest scan
-in ``REDACTION_REVIEW_DONE`` that owe their glue. Seconds over the
-corrected volume's JSON documents, read once per tick from the local
-mirror. A scan whose run still owes an engine read waits.
-
 Examples:
 
     # Run one confirm tick and exit.
@@ -114,8 +108,7 @@ class Command(BaseCommand):
         "run's redaction computation, open the redaction review "
         "of every scan that is ready for it, then glue every finished "
         "Mistral run and every corrected volume that owes its Mistral "
-        "document, then write the OCR documents of the opinions that "
-        "owe them."
+        "document."
     )
 
     def handle(self, *args, **options):
@@ -133,7 +126,6 @@ class Command(BaseCommand):
             dots_mocr,
             jobs,
             mistral_ocr,
-            opinion_ocr,
             review_states,
             yolo,
         )
@@ -151,7 +143,6 @@ class Command(BaseCommand):
                 promoted = review_states.promote_ready_scans()
                 extracted = mistral_ocr.finish_ready_runs()
                 extracted_applies = mistral_ocr.finish_ready_applies()
-                glued_opinions = opinion_ocr.glue_due()
                 break
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -181,7 +172,6 @@ class Command(BaseCommand):
                 promoted,
                 extracted,
                 extracted_applies,
-                glued_opinions,
             )
         ):
             self.stdout.write(
@@ -193,6 +183,5 @@ class Command(BaseCommand):
                 f"{applied_edits} page edit apply(s) and {queued} "
                 f"redaction computation(s), opened {promoted} redaction "
                 f"review(s), glued {extracted} Mistral run(s) and "
-                f"{extracted_applies} corrected volume(s), wrote the OCR "
-                f"documents of {glued_opinions} opinion(s)"
+                f"{extracted_applies} corrected volume(s)"
             )

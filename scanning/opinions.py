@@ -18,14 +18,9 @@ two functions.
 
 **A second run keeps every human field.** A key that exists is updated
 in place: the addresses, the indexes, the run, the page count, the last
-printed page and the boundary link. ``status``, the approval and the
-notes are not touched, except that an ``ERROR`` row goes back to
-``PROCESSING``, because the work that failed runs again. The
-``glue_revision`` of a matched row that is not approved is raised
-(#350): the glue prefix belongs to one row at a time, and the boxes
-and the boundary under the key may have moved, so every derived
-artifact of the row is due again and the old revision is never written
-over. An approved row keeps its revision and its glues. A row no
+printed page and the boundary link. ``status``, the approval, the notes
+and the glues are not touched, except that an ``ERROR`` row goes back
+to ``PROCESSING``, because the work that failed runs again. A row no
 boundary matched keeps its data and gets one of the two
 ``STALE_OPINION_CHECKS`` cards: ``STALE_PAGE_NUMBER`` when a live
 boundary shares its start address under another number, and
@@ -46,7 +41,6 @@ import logging
 from dataclasses import dataclass
 
 from django.db import transaction
-from django.db.models import F
 
 from scanning import apply, boundaries, review_states
 from scanning.models import (
@@ -359,12 +353,6 @@ def create_rows(
                 continue
             matched.add(opinion.pk)
             Opinion.objects.filter(pk=opinion.pk).update(**fields)
-            # The inputs of every glue may have moved under the key, so
-            # the revision moves too, and with it the attempt count of
-            # each glue (#350). An approved opinion keeps its glues.
-            Opinion.objects.filter(pk=opinion.pk).exclude(
-                status=OpinionReviewStatus.TEXT_REVIEW_DONE
-            ).update(glue_revision=F("glue_revision") + 1, ocr_glue_attempts=0)
             # The way back from ERROR is this run of the work (#335).
             Opinion.objects.filter(
                 pk=opinion.pk, status=OpinionReviewStatus.ERROR
