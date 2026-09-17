@@ -254,6 +254,29 @@ def _address_of_row(
     return source_for_index(scan, row.page_index, run)
 
 
+def standing_decision(row):
+    """Return the standing decision on ``row``, read after the lock.
+
+    Never read the decision through ``select_related``. The caller
+    waits for the row lock, and a rival writer (a double click, two
+    reviewers on one volume) can commit while it waits: PostgreSQL then
+    gives the locked row again, but the joined decision stays on the
+    old snapshot. The row answers the new ``decision_id`` with no
+    object behind it, and the read raises (Sentry SCANNING-48). This
+    reads the decision in its own query, after the lock.
+
+    :param row: A locked ``Detection``, ``Redaction`` or
+        ``OpinionBoundary``.
+    :returns: The standing decision, or None.
+    """
+    if not row.decision_id:
+        return None
+    model = row._meta.get_field("decision").related_model
+    return model._default_manager.filter(
+        pk=row.decision_id, withdrawn_at__isnull=True
+    ).first()
+
+
 def decide(
     scan: Scan, row: Detection, kind: str, user, run: ApplyRun | None = None
 ) -> DetectionDecision:
@@ -279,16 +302,8 @@ def decide(
         # Lock the row before reading its decision: two clicks at once
         # (a double click, two reviewers on one volume) would otherwise
         # both see no standing decision and both write one.
-        row = (
-            Detection.objects.select_for_update(of=("self",))
-            .select_related("decision")
-            .get(pk=row.pk)
-        )
-        current = (
-            row.decision
-            if row.decision_id and row.decision.withdrawn_at is None
-            else None
-        )
+        row = Detection.objects.select_for_update(of=("self",)).get(pk=row.pk)
+        current = standing_decision(row)
         if current is not None and current.kind == kind:
             return current
         if current is not None:

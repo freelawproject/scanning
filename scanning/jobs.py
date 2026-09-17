@@ -5,7 +5,7 @@ write off lives on :class:`~scanning.models.ExternalJob` rows, never in
 a Python call stack. That is what makes an interrupted daemon
 resumable: the next tick re-reads the rows and carries on.
 
-Two providers, and they differ in *shape* rather than only in
+Three providers, and they differ in *shape* rather than only in
 transport:
 
 - ``CONVERT`` on doctor (issue #176) is **synchronous**. The response is
@@ -15,6 +15,10 @@ transport:
   **asynchronous**. Submitting returns a job id, ``GET /status``
   reports progress, and cancelling matters because a graphics
   processing unit (GPU) job bills while it runs.
+- ``EXTRACT`` on Mistral (issue #191) is a **batch**. The daemon renders
+  the pages itself, uploads them, and submits one batch job per shard;
+  the batch is polled, and its output is a file *we* download and
+  store, so nothing presigned is handed out at all.
 
 Those two RunPod stages are two *engines*, and each is a separate
 serverless endpoint with its own image, its own GPU class and its own
@@ -22,15 +26,23 @@ worker pool. What differs is small and it is tabulated once, in
 :class:`RunpodEngine`: an endpoint id, three caps and a payload
 builder. Everything else about them is shared.
 
-That difference is carried by plain branches on ``job.provider``, not by
-a provider abstraction. The deliberate trade: about 600 of the lines
-here are provider-agnostic and stay in one place, and only the submit
-call and the in-flight check fork. **Do not answer a third provider by
-copying a wave or a sweep** -- Mistral is the point to promote these
-branches to a real interface, because it changes the shape again (it
-runs at the opinion-level ``EXTRACT`` stage with no shard fan-out, it
-has rate limits rather than a worker pool, and it has no presigned PUT
-at all). Until then, branching keeps the shared lines shared.
+What differs between the *providers* is tabulated once too, in
+:class:`ProviderSpec`: the wave, the sweep, the cancel, the caps, the
+deadline rules, and whether a claim signs URLs. The table replaced
+thirteen ``if _is_runpod(job)`` branches when the third provider
+arrived, because a third fork in each of them would have been the copy
+this module's docstring had always warned against. The deliberate
+trade stands: about 600 of the lines here are provider-agnostic and
+stay in one place -- every compare-and-swap, the attempt bookkeeping,
+the run reuse, the carry -- and a provider entry holds only what its
+transport forces. **Do not answer a fourth provider by copying a wave
+or a sweep**: add an entry, and call the three shared pieces the
+entry's own functions are built from --- :func:`claim_for_wave` (the
+prologue of every wave), :func:`apply_poll_outcome` (the cascade of
+every poll) and :func:`count_sweep_outcome` (the one spelling of
+counting one). Mistral arrived by copying the poll cascade whole, and
+the ``summary.pending`` order and the "we learned nothing is not we
+learned it failed" rule then lived in two places.
 
 Four properties are load-bearing and easy to break:
 
@@ -64,7 +76,7 @@ import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
@@ -85,6 +97,15 @@ from scanning.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The result-envelope contract every stage's result object follows:
+#: the schema version and the content type. Defined by the worker
+#: scaffold (``runpod_common``) and carried by ``runpod_client``; named
+#: here so a stage whose result the *daemon* writes (Mistral) reads the
+#: contract off the lifecycle module rather than off another
+#: provider's transport.
+RESULT_SCHEMA_VERSION = runpod_client.RESULT_SCHEMA_VERSION
+RESULT_CONTENT_TYPE = runpod_client.RESULT_CONTENT_TYPE
 
 
 @dataclass
@@ -126,19 +147,191 @@ class SweepSummary:
     errors: int = 0
 
 
-# ── per-row provider knobs ──────────────────────────────────────────
-# One `if` each, deliberately. Something has to map a row to its own
-# limits whether or not a provider abstraction exists, and these are
-# that map. Add a branch per provider; do not fan them out into the
-# call sites.
-def _is_runpod(job: ExternalJob) -> bool:
-    """Return whether this row runs on RunPod.
+# ── the provider table ──────────────────────────────────────────────
+# One entry per JobProvider value, and every per-provider decision in
+# this module reads it through ``_provider(job)``. The entries are
+# built per call, like the engine table below, so a test that patches
+# a stage module's ``enabled`` reaches them.
+class UnknownProvider(RuntimeError):
+    """A row names a provider this module has no entry for.
 
-    :param job: The row to classify.
-    :returns: True for a RunPod row.
-    :rtype: bool
+    An internal fault, never an operator's: only the ``ensure_*``
+    wrappers create rows, and each names a provider from the table. The
+    sweep says so once per tick and leaves the row alone, as it does
+    for an engine with no endpoint.
     """
-    return job.provider == JobProvider.RUNPOD
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    """What one provider does differently from the others.
+
+    Everything a provider forces on the shared lifecycle, and nothing
+    else: the shared lines (the claim, every compare-and-swap, the
+    attempt bookkeeping, the run reuse, the carry) do not appear here.
+
+    :ivar provider: The :class:`~scanning.models.JobProvider` value.
+    :ivar label: What a log line calls this provider.
+    :ivar is_enabled: Whether any row of this provider may be sent.
+    :ivar submit_wave: Sends one wave of this provider's PENDING rows
+        and records the outcomes on ``SubmitSummary``.
+    :ivar sweep_job: Judges one in-flight row on the confirm tick.
+    :ivar cancel: Cancels one provider job id for a row. A no-op for a
+        provider with nothing to cancel.
+    :ivar max_attempts: The attempt ceiling of a row.
+    :ivar presigned_ttl: The lifetime of the URLs a claim signs, or
+        ``None`` for a provider that is handed no URL.
+    :ivar result_suffix: Extension of the object written at
+        ``result_key``.
+    :ivar result_content_type: Content type the result PUT is signed
+        with, and stored under.
+    :ivar claim_deadline: The deadline fields a claim writes.
+    :ivar run_deadline: The budget written when a job crosses into
+        ``IN_PROGRESS``, or ``None`` for a provider whose queue and run
+        share one ceiling.
+    :ivar describe_failure: Extra clauses for a failure's location line,
+        read off the provider's own failure details.
+    """
+
+    provider: str
+    label: str
+    is_enabled: Callable[[], bool]
+    submit_wave: Callable[[SubmitSummary, int | None], None]
+    sweep_job: Callable[[ExternalJob, datetime, SweepSummary], None]
+    cancel: Callable[[ExternalJob, str], None]
+    max_attempts: Callable[[ExternalJob], int]
+    presigned_ttl: Callable[[ExternalJob], int] | None
+    result_suffix: str
+    result_content_type: str
+    claim_deadline: Callable[[ExternalJob, datetime], dict]
+    run_deadline: Callable[[ExternalJob, datetime], datetime] | None
+    describe_failure: Callable[[dict], list[str]]
+
+
+def _providers() -> dict[str, ProviderSpec]:
+    """Return every provider this module serves, keyed by provider.
+
+    **Insertion order is wave order.** :func:`submit_pending` walks this
+    dict: the non-blocking RunPod wave goes first; doctor's wave, which
+    holds a socket for a whole conversion (25-45 s a shard) but gates
+    review 1, where a person waits, second; and Mistral's wave last,
+    because it blocks for as long as a shard's render and uploads take
+    (minutes) and gates nothing until its glue lands. See
+    :func:`submit_pending` for why.
+
+    Rebuilt on each call, and deliberately not cached: the entries read
+    functions off the stage modules at build time, so a test that
+    patches ``mistral_ocr.enabled`` reaches this table too. The import
+    is inside the function because the stage module imports this one.
+
+    :returns: The provider table.
+    :rtype: dict[str, ProviderSpec]
+    """
+    from scanning import mistral_ocr
+
+    return {
+        JobProvider.RUNPOD: ProviderSpec(
+            provider=JobProvider.RUNPOD,
+            label="RunPod",
+            is_enabled=_any_runpod_engine_enabled,
+            submit_wave=_submit_runpod_wave,
+            sweep_job=_sweep_runpod_job,
+            cancel=_cancel_runpod_job_id,
+            max_attempts=lambda job: int(
+                _engine_setting(job, "attempts_setting")
+            ),
+            presigned_ttl=lambda job: int(settings.RUNPOD_PRESIGNED_TTL),
+            result_suffix=".json",
+            result_content_type=runpod_client.RESULT_CONTENT_TYPE,
+            claim_deadline=_queue_ceiling_once,
+            run_deadline=runpod_execution_deadline,
+            describe_failure=_no_failure_details,
+        ),
+        JobProvider.DOCTOR: ProviderSpec(
+            provider=JobProvider.DOCTOR,
+            label="doctor",
+            is_enabled=doctor_client.enabled,
+            submit_wave=_submit_doctor_wave,
+            sweep_job=_sweep_doctor_job,
+            cancel=_cancel_nothing,
+            max_attempts=lambda job: int(settings.DOCTOR_MAX_ATTEMPTS),
+            presigned_ttl=lambda job: int(settings.DOCTOR_PRESIGNED_TTL),
+            result_suffix=".pdf",
+            result_content_type=doctor_client.RESULT_CONTENT_TYPE,
+            claim_deadline=_doctor_claim_deadline,
+            run_deadline=None,
+            describe_failure=_doctor_failure_details,
+        ),
+        JobProvider.MISTRAL: ProviderSpec(
+            provider=JobProvider.MISTRAL,
+            label="Mistral",
+            is_enabled=mistral_ocr.enabled,
+            submit_wave=mistral_ocr.submit_wave,
+            sweep_job=mistral_ocr.sweep_job,
+            cancel=mistral_ocr.cancel_job,
+            max_attempts=lambda job: int(mistral_ocr.MAX_ATTEMPTS),
+            # Nothing presigned: the daemon downloads the shard itself
+            # and writes the result object itself.
+            presigned_ttl=None,
+            result_suffix=".json",
+            result_content_type=RESULT_CONTENT_TYPE,
+            claim_deadline=mistral_ocr.claim_deadline,
+            run_deadline=None,
+            describe_failure=_no_failure_details,
+        ),
+    }
+
+
+def _provider(job: ExternalJob) -> ProviderSpec:
+    """Return the table entry that serves this row.
+
+    :param job: Any row.
+    :returns: Its provider's entry.
+    :rtype: ProviderSpec
+    :raises UnknownProvider: If the table has no entry for it.
+    """
+    spec = _providers().get(job.provider)
+    if spec is None:
+        raise UnknownProvider(
+            f"job {job.pk} names provider {job.provider!r}, which has no "
+            "wave, no sweep and no caps here"
+        )
+    return spec
+
+
+def _cancel_nothing(job: ExternalJob, job_id: str) -> None:
+    """Cancel nothing: doctor's request is over when it answers.
+
+    :param job: The row being written off.
+    :param job_id: Unused; doctor mints no job id.
+    :return: None.
+    """
+
+
+def _no_failure_details(details: dict) -> list[str]:
+    """Return no extra clauses for a failure location.
+
+    :param details: The provider's failure details, ignored.
+    :returns: An empty list.
+    :rtype: list[str]
+    """
+    return []
+
+
+def _doctor_failure_details(details: dict) -> list[str]:
+    """Return doctor's raster-size clause for a failure location.
+
+    A raster size is meaningful only against the resolution it was
+    rendered at, and that is doctor's conversion parameter.
+
+    :param details: Doctor's ``FAILURE_DETAIL_KEYS``.
+    :returns: The ``pixels`` clause, when doctor sent one.
+    :rtype: list[str]
+    """
+    pixels = details.get("pixels")
+    if isinstance(pixels, int):
+        return [f"{pixels} pixel(s) at {settings.DOCTOR_BITONAL_DPI} dpi"]
+    return []
 
 
 # ── per-engine RunPod knobs ─────────────────────────────────────────
@@ -268,9 +461,7 @@ def _max_attempts(job: ExternalJob) -> int:
     :returns: The attempt ceiling.
     :rtype: int
     """
-    if _is_runpod(job):
-        return int(_engine_setting(job, "attempts_setting"))
-    return int(settings.DOCTOR_MAX_ATTEMPTS)
+    return _provider(job).max_attempts(job)
 
 
 def _presigned_ttl(job: ExternalJob) -> int:
@@ -279,20 +470,24 @@ def _presigned_ttl(job: ExternalJob) -> int:
     :param job: The row to look up.
     :returns: Seconds.
     :rtype: int
+    :raises UnknownProvider: If the row's provider signs no URL.
     """
-    if _is_runpod(job):
-        return int(settings.RUNPOD_PRESIGNED_TTL)
-    return int(settings.DOCTOR_PRESIGNED_TTL)
+    ttl = _provider(job).presigned_ttl
+    if ttl is None:
+        raise UnknownProvider(
+            f"job {job.pk}: provider {job.provider} is handed no URL"
+        )
+    return ttl(job)
 
 
 def _result_suffix(job: ExternalJob) -> str:
-    """Return the extension of the object this row's worker writes.
+    """Return the extension of the object written at ``result_key``.
 
     :param job: The row to look up.
     :returns: ``".pdf"`` for a conversion, ``".json"`` for a read.
     :rtype: str
     """
-    return ".json" if _is_runpod(job) else ".pdf"
+    return _provider(job).result_suffix
 
 
 def _result_content_type(job: ExternalJob) -> str:
@@ -306,9 +501,7 @@ def _result_content_type(job: ExternalJob) -> str:
     :returns: The content type.
     :rtype: str
     """
-    if _is_runpod(job):
-        return runpod_client.RESULT_CONTENT_TYPE
-    return doctor_client.RESULT_CONTENT_TYPE
+    return _provider(job).result_content_type
 
 
 def _runpod_endpoint(job: ExternalJob) -> str:
@@ -350,12 +543,27 @@ def _cancel_job_id(job: ExternalJob, job_id: str) -> None:
     one case that most needs cancelling is a job whose id never reached
     the row: a submit that succeeded after a cancel took the row away.
 
-    :param job: The row the job was submitted for; names the endpoint.
+    :param job: The row the job was submitted for; names the provider.
     :param job_id: The provider's job id.
     :return: None.
     """
-    if not (_is_runpod(job) and job_id):
+    if not job_id:
         return
+    try:
+        spec = _provider(job)
+    except UnknownProvider as exc:
+        logger.warning("cannot cancel job %s: %s", job.pk, exc)
+        return
+    spec.cancel(job, job_id)
+
+
+def _cancel_runpod_job_id(job: ExternalJob, job_id: str) -> None:
+    """Cancel one RunPod job on ``job``'s engine endpoint.
+
+    :param job: A RunPod row; names the endpoint through its engine.
+    :param job_id: RunPod's job id.
+    :return: None.
+    """
     try:
         base_url, headers = runpod_client.endpoint_config(
             _runpod_endpoint(job)
@@ -464,10 +672,34 @@ def submit_deadline_fields(job: ExternalJob, submitted_at) -> dict:
     :returns: Fields to merge into the claim's write.
     :rtype: dict
     """
-    if _is_runpod(job):
-        if job.deadline is not None:
-            return {}
-        return {"deadline": queue_deadline(submitted_at)}
+    return _provider(job).claim_deadline(job, submitted_at)
+
+
+def _queue_ceiling_once(job: ExternalJob, submitted_at) -> dict:
+    """Return the queue ceiling for a first claim, and nothing after.
+
+    The RunPod rule described in :func:`submit_deadline_fields`: a row
+    that already carries a deadline is written nothing, so a re-claim
+    after a defer cannot restart the wait.
+
+    :param job: The row being submitted.
+    :param submitted_at: Submission timestamp.
+    :returns: ``{"deadline": ...}`` on the first claim, else ``{}``.
+    :rtype: dict
+    """
+    if job.deadline is not None:
+        return {}
+    return {"deadline": queue_deadline(submitted_at)}
+
+
+def _doctor_claim_deadline(job: ExternalJob, submitted_at) -> dict:
+    """Return doctor's flat answer budget, stamped on every claim.
+
+    :param job: The row being submitted.
+    :param submitted_at: Submission timestamp.
+    :returns: ``{"deadline": ...}``.
+    :rtype: dict
+    """
     return {"deadline": doctor_attempt_deadline(submitted_at)}
 
 
@@ -762,11 +994,10 @@ def _failure_location(job: ExternalJob, details: dict | None = None) -> str:
     page_number = details.get("page_number")
     if isinstance(page_number, int) and page_number >= 1:
         parts.append(f"failed on volume page {from_page + page_number}")
-    pixels = details.get("pixels")
-    # A raster size is meaningful only against the resolution it was
-    # rendered at, and that is doctor's conversion parameter.
-    if isinstance(pixels, int) and not _is_runpod(job):
-        parts.append(f"{pixels} pixel(s) at {settings.DOCTOR_BITONAL_DPI} dpi")
+    try:
+        parts.extend(_provider(job).describe_failure(details))
+    except UnknownProvider:
+        pass
     return f" [{'; '.join(parts)}]"
 
 
@@ -1079,6 +1310,324 @@ def check_result_envelope(
     return envelope["payload"]
 
 
+def volume_result_key(scan, stage: str, engine: str, run: int) -> str:
+    """Return the S3 key one run's glued volume document lives at.
+
+    Under ``jobs/`` on purpose: that prefix is already excluded from the
+    generic processing sync in both directions, and the admin delete
+    already sweeps it. Scoped to the run, like the per-attempt result
+    keys, so a re-run leaves the previous document addressable instead
+    of stomping it.
+
+    One rule for the three stages that glue a volume document
+    (``dots_mocr``, ``yolo``, ``mistral_ocr``). Each keeps a named
+    wrapper, because a reader that lists the outputs holds a callable
+    per output (``views_process.GLUED_OUTPUTS``).
+
+    :param scan: The scan the run belongs to.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param run: The run number.
+    :returns: Key of the form ``{processing_prefix}jobs/{stage}/
+        {engine}/r{run}-volume.json``.
+    :rtype: str
+    """
+    return (
+        f"{s3_sync.s3_processing_prefix(scan)}{s3_sync.JOB_RESULTS_SUBDIR}"
+        f"{stage}/{engine}/r{run}-volume.json"
+    )
+
+
+def ready_volume_runs(
+    stage: str,
+    engine: str,
+    provider: str,
+    live_rows: Callable[[object], list[ExternalJob]],
+    attempts: Callable[[list[ExternalJob]], int],
+    max_attempts: int,
+):
+    """Yield the scans whose live volume run is finished and unglued.
+
+    The prologue every glue pass shares (#202, #196, #245). A run is
+    finished when no row of it waits to be submitted or is in flight,
+    and none is dead: a dead row means the run can never cover the
+    volume, ``run_summary`` already shows it on the process page, and
+    the way forward is a fresh run.
+
+    The rows are the idempotence marker, because no glue pass writes a
+    scan status: a glued run is all ``CONSUMED``, so it drops out of
+    the candidate query. The candidate query therefore asks for one
+    ``COMPLETED`` row, and the exact test follows on the live run.
+
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param provider: A :class:`~scanning.models.JobProvider` value.
+    :param live_rows: The stage's own live-run reader, called per scan.
+    :param attempts: How many times this run's glue has failed, read
+        off the rows by the stage's own ledger.
+    :param max_attempts: How many failures stop the pass.
+    :returns: ``(scan, rows)`` per candidate, the rows in shard order.
+    :rtype: Iterator[tuple[Scan, list[ExternalJob]]]
+    """
+    from scanning.models import Scan
+
+    scan_ids = (
+        Scan.objects.filter(
+            jobs__stage=stage,
+            jobs__engine=engine,
+            jobs__provider=provider,
+            jobs__status=JobStatus.COMPLETED,
+            jobs__apply_run__isnull=True,
+        )
+        .values_list("pk", flat=True)
+        .distinct()
+    )
+    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
+    for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
+        "reporter"
+    ):
+        rows = live_rows(scan)
+        if not rows:
+            continue
+        if any(row.status in unfinished for row in rows):
+            continue
+        if any(row.status in DEAD_JOB_STATUSES for row in rows):
+            continue
+        if not any(row.status == JobStatus.COMPLETED for row in rows):
+            # The candidate row belongs to an older run; the live one
+            # has nothing to glue.
+            continue
+        if attempts(rows) >= max_attempts:
+            continue
+        yield scan, rows
+
+
+def consume_run(rows: list[ExternalJob]) -> int:
+    """Mark a glued run's finished rows as consumed.
+
+    The compare-and-swap of a glue pass: only a ``COMPLETED`` row is
+    taken, so a row another writer moved is left alone. The result
+    objects are **kept**; every stage that calls this passes
+    ``reuse_results`` and a later run carries them.
+
+    :param rows: The glued run's rows.
+    :returns: How many rows were flipped.
+    :rtype: int
+    """
+    return ExternalJob.objects.filter(
+        pk__in=[row.pk for row in rows],
+        status=JobStatus.COMPLETED,
+    ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+
+
+def glued_volume_key(scan, stage: str, engine: str) -> str | None:
+    """Return the key of a target's glued volume document, or nothing.
+
+    A run is glued when every one of its rows is ``CONSUMED``: the glue
+    writes the document and flips the rows in one pass. Said here
+    rather than in each stage, because the test is the same one three
+    times and a reader that only wants the key should not have to know
+    it (``apply._volume_ocr_run``, the text overlay of #262, the flag
+    that shows its button).
+
+    :param scan: The scan (or its pk) to look up.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :returns: The key :func:`volume_result_key` gives the live run, or
+        None when no run is glued.
+    :rtype: str | None
+    """
+    rows = live_run(scan, stage, engine)
+    if rows and all(row.status == JobStatus.CONSUMED for row in rows):
+        return volume_result_key(scan, stage, engine, rows[0].run)
+    return None
+
+
+def run_ledger(rows: list[ExternalJob], key: str) -> dict:
+    """Return one run-level pass's bookkeeping, off the run's first row.
+
+    Kept on the first row's ``provider_meta`` rather than on a field of
+    its own: the counter describes the run, any row of it can carry
+    that, and **``input_manifest`` is off limits** --
+    :func:`_still_describes` compares it exactly, so an added key there
+    would read as a stale run and re-pay for the shards. A new run
+    starts with clean rows, which is what gives a re-read fresh tries.
+
+    :param rows: The live run's rows, ordered by shard index.
+    :param key: The pass's own name in ``provider_meta``: ``"glue"``
+        for the dots.mocr and Mistral volume glues, ``"merge"`` for the
+        detection merge, ``"apply"`` for the page-number apply,
+        ``"glue:a{n}"`` for a corrected volume's own glue.
+    :returns: The stored state, empty when the pass has never failed.
+    :rtype: dict
+    """
+    meta = rows[0].provider_meta or {}
+    return dict(meta.get(key) or {})
+
+
+def ledger_attempts(rows: list[ExternalJob], key: str) -> int:
+    """Return how many times one run-level pass has already failed.
+
+    :param rows: The live run's rows, ordered by shard index.
+    :param key: See :func:`run_ledger`.
+    :returns: The stored attempt count, 0 when none.
+    :rtype: int
+    """
+    return int(run_ledger(rows, key).get("attempts") or 0)
+
+
+def bump_run_ledger(
+    rows: list[ExternalJob], key: str, exc: Exception
+) -> tuple[int, ExternalJob]:
+    """Count one failure of a run-level pass, and say which row carries it.
+
+    The state shape in one place, because four passes keep it: the two
+    glues, the merge and the page-number apply. Every other key of the
+    state survives, so a stamp beside the counter (the apply's
+    ``applied_at``) is not lost by a failure.
+
+    The caller logs, in its own words and with its own logger, and it
+    is the caller that decides what the last attempt means: the reason
+    to give up loudly once, rather than on every tick, belongs with the
+    pass that knows its own retry budget.
+
+    :param rows: The live run's rows, ordered by shard index.
+    :param key: See :func:`run_ledger`.
+    :param exc: What the pass raised.
+    :returns: ``(attempts so far, the row that carries the state)``.
+    :rtype: tuple[int, ExternalJob]
+    """
+    head = rows[0]
+    meta = dict(head.provider_meta or {})
+    state = dict(meta.get(key) or {})
+    attempts = int(state.get("attempts") or 0) + 1
+    state.update(
+        {
+            "attempts": attempts,
+            "last_error": str(exc)[:500],
+            "last_attempt_at": timezone.now().isoformat(),
+        }
+    )
+    meta[key] = state
+    head.provider_meta = meta
+    head.save(update_fields=["provider_meta"])
+    return attempts, head
+
+
+@dataclass
+class ShardRead:
+    """One shard of a glued run, with its payload and its page range.
+
+    :ivar index: The shard's position in the run.
+    :ivar job: The row.
+    :ivar payload: The payload of the stored result envelope.
+    :ivar from_page: The shard's first page, as a fitz index into the
+        volume.
+    :ivar page_count: How many pages the shard holds.
+    """
+
+    index: int
+    job: ExternalJob
+    payload: dict
+    from_page: int
+    page_count: int
+
+
+def read_run_shards(
+    scan,
+    rows: list[ExternalJob],
+    *,
+    action: str,
+    error_cls: type,
+    download: Callable[[str], object] | None = None,
+):
+    """Yield one run's shard payloads in strict order, arithmetic checked.
+
+    The walk every volume glue shares (#202, #196, #245). What it
+    asserts is what a glue cannot do without: the rows cover the
+    shards in order, each names a result, and each starts where the
+    last one ended. A page's volume index is then the shard's
+    ``from_page`` plus its page inside the shard, and nothing else in
+    the document is right if that arithmetic is not.
+
+    The envelope is checked as well, which is all that stands between a
+    paid result and a document glued from the wrong bytes
+    (:func:`check_result_envelope`).
+
+    What is left to each caller is what differs: the pages or the
+    detections inside a payload, the stage's own extra checks, and the
+    per-shard work a stage does on the way past (the layout repair of
+    #242, the page-list stamp).
+
+    :param scan: The scan being glued.
+    :param rows: The live run's rows, ordered by shard index.
+    :param action: The handler action the envelopes must name.
+    :param error_cls: The exception class to raise, so each stage
+        reports its own failure type.
+    :param download: How to fetch and parse one result object. The
+        default reads it straight into memory; a stage that wants the
+        bytes on disk passes its own.
+    :returns: One :class:`ShardRead` per shard, in order.
+    :rtype: Iterator[ShardRead]
+    :raises error_cls: If a result is missing or malformed, or the page
+        arithmetic does not add up.
+    """
+    fetch = download or s3_sync.download_json_object
+    next_page = 0
+    for index, job in enumerate(rows):
+        if job.shard_index != index:
+            raise error_cls(
+                f"scan {scan.pk} shard sequence breaks at position "
+                f"{index}: job {job.pk} covers shard {job.shard_index}"
+            )
+        if not job.result_key:
+            raise error_cls(f"scan {scan.pk} shard {index} has no result key")
+        manifest = job.input_manifest or {}
+        from_page = manifest.get("from_page")
+        page_count = manifest.get("page_count")
+        if from_page != next_page or not isinstance(page_count, int):
+            raise error_cls(
+                f"scan {scan.pk} shard {index} covers pages from "
+                f"{from_page}, expected {next_page}"
+            )
+        payload = check_result_envelope(
+            scan, job, fetch(job.result_key), action, error_cls
+        )
+        yield ShardRead(index, job, payload, from_page, page_count)
+        next_page += page_count
+
+
+def shard_entry(job: ExternalJob, index: int, tuning_keys: tuple = ()) -> dict:
+    """Describe one shard of a glued run for the volume document.
+
+    The provenance a later reader needs to go back to the bytes: which
+    pages, which attempt, and the object itself. A smarter glue over
+    page inserts and deletes re-reads those objects, which is why no
+    stage deletes them.
+
+    :param job: The shard's row.
+    :param index: The shard's position in the run.
+    :param tuning_keys: The manifest keys that override a stage
+        constant for one run, recorded when present.
+    :returns: One entry of the document's ``shards`` list.
+    :rtype: dict
+    """
+    manifest = job.input_manifest or {}
+    entry = {
+        "name": manifest.get("name"),
+        "index": index,
+        "from_page": manifest.get("from_page"),
+        "to_page": manifest.get("to_page"),
+        "page_count": manifest.get("page_count"),
+        "attempt": job.attempt,
+        "result_key": job.result_key,
+    }
+    tuning = {key: manifest[key] for key in tuning_keys if key in manifest}
+    if tuning:
+        entry["tuning"] = tuning
+    return entry
+
+
 def live_run(
     scan, stage: str, engine: str, apply_run=None
 ) -> list[ExternalJob]:
@@ -1293,7 +1842,11 @@ def hole_is_stable(job: ExternalJob) -> bool:
 
 
 def _reusable_results(
-    scan, stage: str, engine: str, specs: list[tuple[str, dict]]
+    scan,
+    stage: str,
+    engine: str,
+    specs: list[tuple[str, dict]],
+    carry_stable_holes: bool = True,
 ) -> dict[int, ExternalJob]:
     """Map today's shard indexes to prior rows whose results still serve.
 
@@ -1326,6 +1879,12 @@ def _reusable_results(
     :param stage: A :class:`~scanning.models.JobStage` value.
     :param engine: A :class:`~scanning.models.JobEngine` value.
     :param specs: Today's work, from :func:`_shard_specs`.
+    :param carry_stable_holes: Whether :func:`hole_is_stable` may carry
+        a result with unread pages. True for a deterministic worker
+        (dots.mocr's greedy decoder, #238), whose second read of a
+        shard is its first read again. False for a provider whose
+        failed line may be a transient fault (Mistral's batch API): two
+        unlucky runs would otherwise freeze a page as unread for good.
     :returns: ``{shard_index: prior_row}`` for every reusable shard.
     :rtype: dict[int, ExternalJob]
     """
@@ -1346,7 +1905,9 @@ def _reusable_results(
     for row in prior_rows:
         if not row.result_key:
             continue
-        if has_unread_pages(row) and not hole_is_stable(row):
+        if has_unread_pages(row) and not (
+            carry_stable_holes and hole_is_stable(row)
+        ):
             # A result with a hole is not a result to carry (#238): the
             # new run exists to read the pages the old one could not,
             # so this shard is re-paid while its clean siblings ride
@@ -1393,6 +1954,7 @@ def ensure_shard_jobs(
     provider: str,
     reuse_results: bool = False,
     force_new_run: bool = False,
+    carry_stable_holes: bool = True,
     apply_run=None,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``scan``'s shards,
@@ -1437,6 +1999,8 @@ def ensure_shard_jobs(
         with ``reuse_results`` the carry re-pays only the shards with a
         hole. A deliberate way to spend GPU money, which is why no tick
         passes it.
+    :param carry_stable_holes: See :func:`_reusable_results`. Pass
+        False for a provider whose failed pages are not reproducible.
     :param apply_run: The apply run (#224) the rows work for, or None
         for the volume run. The rows carry it, the live-run read is
         scoped by it, and the run number still comes from the one
@@ -1481,7 +2045,9 @@ def ensure_shard_jobs(
     run = ExternalJob.next_run(scan, stage, engine)
     now = timezone.now()
     reusable = (
-        _reusable_results(scan, stage, engine, specs) if reuse_results else {}
+        _reusable_results(scan, stage, engine, specs, carry_stable_holes)
+        if reuse_results
+        else {}
     )
     # The set the run is cut for, as one string. Not in the identity:
     # ``_still_describes`` compares ``input_manifest`` exactly, so a new
@@ -1592,14 +2158,20 @@ def _claim(job: ExternalJob, now) -> tuple[str, tuple[str, str] | None]:
     names the key to look for. The other order would leave a completed
     job with nothing pointing at it.
 
+    A provider that is handed no URL (Mistral: the daemon downloads the
+    shard and writes the result itself) gets the claim alone, and an
+    empty tuple where the URLs would be.
+
     :param job: A PENDING row.
     :param now: Submission timestamp.
-    :returns: ``("claimed", (input_url, output_url))``, or an outcome
-        label with no URLs -- ``"skipped"`` if another writer took the
-        row, ``"retried"`` / ``"failed"`` if signing failed.
-    :rtype: tuple[str, tuple[str, str] | None]
+    :returns: ``("claimed", (input_url, output_url))`` -- or
+        ``("claimed", ())`` for a provider that signs nothing -- or an
+        outcome label with ``None``: ``"skipped"`` if another writer
+        took the row, ``"retried"`` / ``"failed"`` if signing failed.
+    :rtype: tuple[str, tuple[str, ...] | None]
     """
-    result_key = s3_sync.s3_job_attempt_key(job, suffix=_result_suffix(job))
+    spec = _provider(job)
+    result_key = s3_sync.s3_job_attempt_key(job, suffix=spec.result_suffix)
     if not _write(
         job,
         status=JobStatus.SUBMITTED,
@@ -1607,15 +2179,17 @@ def _claim(job: ExternalJob, now) -> tuple[str, tuple[str, str] | None]:
         submitted_at=now,
         error_code="",
         error_message="",
-        **submit_deadline_fields(job, now),
+        **spec.claim_deadline(job, now),
     ):
         return "skipped", None
 
+    if spec.presigned_ttl is None:
+        return "claimed", ()
     try:
-        ttl = _presigned_ttl(job)
+        ttl = spec.presigned_ttl(job)
         return "claimed", (
             s3_sync.presign_get(job.input_key, ttl),
-            s3_sync.presign_put(result_key, _result_content_type(job), ttl),
+            s3_sync.presign_put(result_key, spec.result_content_type, ttl),
         )
     except (BotoCoreError, ClientError) as exc:
         # Nothing was sent, so this is purely local: hand the row
@@ -1625,30 +2199,78 @@ def _claim(job: ExternalJob, now) -> tuple[str, tuple[str, str] | None]:
 
 def _claim_wave(
     pending: list[ExternalJob], now, summary: SubmitSummary
-) -> list[tuple[ExternalJob, tuple[str, str]]]:
+) -> list[tuple[ExternalJob, tuple[str, ...]]]:
     """Claim every row a wave will send, and sign its URLs.
 
-    Shared by both providers: the claim, the presign and the accounting
+    Shared by every provider: the claim, the presign and the accounting
     of what fell out are identical, and only the call that follows
     differs.
 
     :param pending: PENDING rows this tick will send.
     :param now: Submission timestamp.
     :param summary: Counts to update for rows that fell out.
-    :returns: ``(job, (input_url, output_url))`` for each claimed row.
-    :rtype: list[tuple[ExternalJob, tuple[str, str]]]
+    :returns: ``(job, urls)`` for each claimed row; ``urls`` is
+        ``(input_url, output_url)``, or ``()`` for a provider that is
+        handed none.
+    :rtype: list[tuple[ExternalJob, tuple[str, ...]]]
     """
     claimed = []
     for job in pending:
         outcome, urls = _claim(job, now)
-        if urls is None:
+        if outcome != "claimed":
             setattr(summary, outcome, getattr(summary, outcome) + 1)
             continue
-        claimed.append((job, urls))
+        claimed.append((job, urls or ()))
     return claimed
 
 
-def _room_for(queryset, limit: int, label: str) -> int:
+def claim_for_wave(
+    queryset,
+    cap: int,
+    label: str,
+    summary: SubmitSummary,
+    *,
+    per_tick: int | None = None,
+    level: int = logging.INFO,
+) -> list[tuple[ExternalJob, tuple]]:
+    """Claim the rows one submit wave may send, and return them.
+
+    The prologue every wave runs: count what is in flight, take what
+    the cap leaves, claim it. Written out three times before, once per
+    provider, which put the "a wave is not a queue drain" rule and the
+    per-tick rule in three places.
+
+    :param queryset: This provider and stage's rows.
+    :param cap: How many of them may be in flight at once.
+    :param label: What to call the work in the log lines.
+    :param summary: Counts to update for the rows a claim lost.
+    :param per_tick: Ceiling on the rows this one tick claims, below
+        the in-flight cap. For a wave whose own work blocks the serial
+        scheduler (#156): Mistral renders and uploads a whole shard
+        before it returns, so it claims one. ``None`` claims whatever
+        the cap leaves.
+    :param level: Level of the "cap reached" line. INFO for a provider
+        that holds rows for minutes; a provider that holds them for
+        hours (Mistral's batches) passes DEBUG, or the line repeats on
+        every tick for the whole wait.
+    :returns: ``(row, urls)`` per claimed row, empty when there is
+        nothing to send.
+    :rtype: list[tuple[ExternalJob, tuple]]
+    """
+    room = _room_for(queryset, int(cap), label, level)
+    if not room:
+        return []
+    if per_tick is not None:
+        room = min(room, per_tick)
+    pending = _pending_slice(queryset, room)
+    if not pending:
+        return []
+    return _claim_wave(pending, timezone.now(), summary)
+
+
+def _room_for(
+    queryset, limit: int, label: str, level: int = logging.INFO
+) -> int:
     """Return how many more jobs of one kind may be started.
 
     A wave, not a queue drain: the cap bounds the jobs running at once,
@@ -1660,13 +2282,18 @@ def _room_for(queryset, limit: int, label: str) -> int:
     :param queryset: This provider and stage's rows.
     :param limit: The concurrency ceiling.
     :param label: What to call the work in the log line.
+    :param level: Level of the "cap reached" line. INFO for a provider
+        that holds rows for minutes; a provider that holds them for
+        hours (Mistral's batches) passes DEBUG, or the line repeats on
+        every tick for the whole wait.
     :returns: How many rows to claim, possibly zero.
     :rtype: int
     """
     in_flight = queryset.filter(status__in=IN_FLIGHT_JOB_STATUSES).count()
     room = limit - in_flight
     if room < 1:
-        logger.info(
+        logger.log(
+            level,
             "%d %s shard(s) already in flight at a cap of %d; submitting "
             "none this tick",
             in_flight,
@@ -1675,6 +2302,30 @@ def _room_for(queryset, limit: int, label: str) -> int:
         )
         return 0
     return room
+
+
+#: Fields of :class:`SweepSummary` an outcome label may name. A label
+#: outside this set counts nothing: ``"skipped"`` means another writer
+#: took the row, so it is that writer's outcome to record, not ours.
+SWEEP_OUTCOMES = frozenset(
+    {"completed", "retried", "failed", "pending", "errors"}
+)
+
+
+def count_sweep_outcome(summary: SweepSummary, result: str) -> None:
+    """Add one outcome label to a sweep summary.
+
+    One spelling of the idiom, for every provider. It was written out
+    at each of the four places an outcome was counted, and two of them
+    spelled it differently.
+
+    :param summary: Counts to update.
+    :param result: What :func:`_retry_or_fail`, :func:`_fail` or a
+        completion callback answered.
+    :return: None.
+    """
+    if result in SWEEP_OUTCOMES:
+        setattr(summary, result, getattr(summary, result) + 1)
 
 
 def _pending_slice(queryset, room: int) -> list[ExternalJob]:
@@ -1884,20 +2535,14 @@ def _submit_doctor_wave(summary: SubmitSummary, limit: int | None) -> None:
     """
     if not doctor_client.enabled():
         return
-    ours = ExternalJob.objects.filter(
-        provider=JobProvider.DOCTOR, stage=JobStage.CONVERT
+    claimed = claim_for_wave(
+        ExternalJob.objects.filter(
+            provider=JobProvider.DOCTOR, stage=JobStage.CONVERT
+        ),
+        int(limit or settings.DOCTOR_MAX_CONCURRENCY),
+        "bitonal",
+        summary,
     )
-    room = _room_for(
-        ours, int(limit or settings.DOCTOR_MAX_CONCURRENCY), "bitonal"
-    )
-    if not room:
-        return
-    pending = _pending_slice(ours, room)
-    if not pending:
-        return
-
-    now = timezone.now()
-    claimed = _claim_wave(pending, now, summary)
     if not claimed:
         return
 
@@ -1957,21 +2602,16 @@ def _submit_runpod_engine_wave(
         concurrency setting.
     :return: None.
     """
-    ours = ExternalJob.objects.filter(
-        provider=JobProvider.RUNPOD,
-        stage=spec.stage,
-        engine=spec.engine,
+    claimed = claim_for_wave(
+        ExternalJob.objects.filter(
+            provider=JobProvider.RUNPOD,
+            stage=spec.stage,
+            engine=spec.engine,
+        ),
+        int(limit or getattr(settings, spec.concurrency_setting)),
+        spec.label,
+        summary,
     )
-    cap = limit or getattr(settings, spec.concurrency_setting)
-    room = _room_for(ours, int(cap), spec.label)
-    if not room:
-        return
-    pending = _pending_slice(ours, room)
-    if not pending:
-        return
-
-    now = timezone.now()
-    claimed = _claim_wave(pending, now, summary)
     if not claimed:
         return
 
@@ -2005,15 +2645,17 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
     its replica count; each RunPod engine's is that engine's own
     serverless endpoint, which scales on its own.
 
-    **The non-blocking waves go first, and the blocking one goes last.**
-    A RunPod submit is a fast ``POST /run`` that returns as soon as the
-    job is queued, while a doctor submit holds the socket open for the
-    whole conversion (~25-45s per shard) -- and the daemon's scheduler
-    is serial (issue #156), so whatever runs first delays everything
-    after it. Ordered the other way, a wave of bitonal shards would keep
-    RunPod's queue empty for a minute or more at a time, wasting exactly
-    the queue depth a narrow worker pool depends on. Reversed, the GPU
-    work is already queueing at RunPod while doctor converts.
+    **The waves run in order of what waits behind them.** The daemon's
+    scheduler is serial (issue #156), so whatever runs first delays
+    everything after it. A RunPod submit is a fast ``POST /run`` that
+    returns as soon as the job is queued, so it goes first: ordered
+    otherwise, a wave of bitonal shards would keep RunPod's queue empty
+    for a minute or more at a time, wasting exactly the queue depth a
+    narrow worker pool depends on. A doctor submit holds the socket
+    open for the whole conversion (~25-45s per shard), but the
+    conversion gates review 1, where a person waits, so it goes second.
+    Mistral's wave renders and uploads one shard (minutes) and gates
+    nothing until its glue lands, so it goes last.
 
     :param limit: Concurrency override applied to **each** wave.
         Defaults to each provider's own setting.
@@ -2021,12 +2663,14 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
     :rtype: SubmitSummary
     """
     summary = SubmitSummary()
+    providers = _providers()
     if not s3_sync.s3_active():
-        # Every provider reads its input through a presigned GET, so
-        # without S3 the shards were never uploaded: every request would
-        # 404 and burn a job's whole retry budget under a misleading
-        # code. Say so once instead.
-        if doctor_client.enabled() or _any_runpod_engine_enabled():
+        # Every provider reads its input from the bucket -- through a
+        # presigned GET, or downloaded by the daemon -- so without S3
+        # the shards were never uploaded: every request would 404 and
+        # burn a job's whole retry budget under a misleading code. Say
+        # so once instead.
+        if any(spec.is_enabled() for spec in providers.values()):
             logger.error(
                 "an external stage is enabled but S3 is inactive (no "
                 "credentials, or DEVELOPMENT without them): shards never "
@@ -2035,11 +2679,12 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
             )
         return summary
 
-    # Non-blocking first. See the note above: the serial scheduler makes
-    # this ordering the difference between RunPod queueing during a
-    # conversion and waiting for one.
-    _submit_runpod_wave(summary, limit)
-    _submit_doctor_wave(summary, limit)
+    # The table's insertion order is the wave order (see
+    # ``_providers``): what a person waits behind goes first, and the
+    # wave nothing waits behind goes last.
+    for spec in providers.values():
+        if spec.is_enabled():
+            spec.submit_wave(summary, limit)
     return summary
 
 
@@ -2053,6 +2698,112 @@ def _any_runpod_engine_enabled() -> bool:
 
 
 # ── confirming ──────────────────────────────────────────────────────
+def apply_poll_outcome(
+    job: ExternalJob,
+    outcome,
+    now,
+    summary: SweepSummary,
+    *,
+    on_complete: Callable[[ExternalJob, object, datetime], str],
+    on_progress: Callable[[ExternalJob, object, datetime], bool],
+) -> None:
+    """Apply one status answer to its row, and count what it did.
+
+    The cascade every provider that polls runs, in one place. Two
+    rules live here and nowhere else:
+
+    - **"We learned nothing" is not "we learned it failed."**
+      ``outcome.status is None`` leaves the row as it was and falls
+      through to the deadline, so a status endpoint that is
+      permanently unhappy still ends the job rather than holding it
+      open for good.
+    - **The overdue check decrements ``pending`` before it retries**,
+      because the two branches above it already counted the row as
+      still waiting. It lives in :func:`check_deadline`, which a
+      provider that skipped its poll calls directly: a row that is
+      not polled this tick is still judged this tick.
+
+    A lost compare-and-swap ends the tick for the row on every path:
+    another writer took it, so it is theirs to judge and ours to leave
+    alone.
+
+    :param job: An in-flight row, already polled.
+    :param outcome: The provider's answer. Any object carrying
+        ``status``, ``provider_status``, ``retriable``, ``error_code``
+        and ``error_message``.
+    :param now: Comparison time.
+    :param summary: Counts to update.
+    :param on_complete: What finishing means for this provider --
+        :func:`_complete` for a worker that wrote its own result
+        object, a download for one that did not. Returns the outcome
+        label to count (``"completed"``, ``"errors"``, or
+        ``"skipped"`` to count nothing).
+    :param on_progress: What a still-running answer writes. Returns
+        whether the write won its compare-and-swap.
+    :return: None.
+    """
+    if outcome.status is None:
+        if not _write(job, last_polled_at=now):
+            return
+        summary.pending += 1
+    elif outcome.status == JobStatus.COMPLETED:
+        count_sweep_outcome(summary, on_complete(job, outcome, now))
+        return
+    elif outcome.status in DEAD_JOB_STATUSES:
+        if outcome.retriable:
+            result = _retry_or_fail(
+                job, outcome.error_code, outcome.error_message, now
+            )
+        else:
+            result = (
+                "failed"
+                if _fail(job, outcome.error_code, outcome.error_message)
+                else "skipped"
+            )
+        count_sweep_outcome(summary, result)
+        return
+    else:
+        if not on_progress(job, outcome, now):
+            return
+        summary.pending += 1
+
+    check_deadline(job, now, summary, outcome.provider_status)
+
+
+def check_deadline(
+    job: ExternalJob, now, summary: SweepSummary, provider_status=None
+) -> None:
+    """Write off one in-flight row that is past its deadline.
+
+    The tail of :func:`apply_poll_outcome`, and the one rule for
+    "this row has waited long enough". A provider whose sweep skips
+    the poll on this tick calls it on its own, so a poll interval
+    never delays a write-off.
+
+    The caller counted the row as pending before it got here, so the
+    write-off takes that count back.
+
+    :param job: An in-flight row.
+    :param now: Comparison time.
+    :param summary: Counts to update.
+    :param provider_status: What the provider last called the job,
+        for the message.
+    :return: None.
+    """
+    if not job.is_overdue(now):
+        return
+    summary.pending -= 1
+    count_sweep_outcome(
+        summary,
+        _retry_or_fail(
+            job,
+            "DEADLINE_EXCEEDED",
+            f"still {provider_status or job.status} at {job.deadline}",
+            now,
+        ),
+    )
+
+
 def _sweep_doctor_job(job: ExternalJob, now, summary: SweepSummary) -> None:
     """Confirm one conversion against its result object.
 
@@ -2091,14 +2842,15 @@ def _sweep_doctor_job(job: ExternalJob, now, summary: SweepSummary) -> None:
             summary.completed += 1
         return
     if job.is_overdue(now):
-        result = _retry_or_fail(
-            job,
-            "DEADLINE_EXCEEDED",
-            f"no result at {job.result_key} by {job.deadline}",
-            now,
+        count_sweep_outcome(
+            summary,
+            _retry_or_fail(
+                job,
+                "DEADLINE_EXCEEDED",
+                f"no result at {job.result_key} by {job.deadline}",
+                now,
+            ),
         )
-        if result in ("retried", "failed"):
-            setattr(summary, result, getattr(summary, result) + 1)
         return
     _write(job, last_polled_at=now)
     summary.pending += 1
@@ -2144,47 +2896,31 @@ def _sweep_runpod_job(job: ExternalJob, now, summary: SweepSummary) -> None:
         result_key=job.result_key,
     )
 
-    if outcome.status is None:
-        # We learned nothing, which is not the same as learning it
-        # failed. Fall through to the deadline check so a job whose
-        # status endpoint is permanently unhappy still ends.
-        _write(job, last_polled_at=now)
-        summary.pending += 1
-    elif outcome.status == JobStatus.COMPLETED:
-        if _complete(job, outcome.output, now, outcome.confirmed_by):
-            summary.completed += 1
-        return
-    elif outcome.status in DEAD_JOB_STATUSES:
-        if outcome.retriable:
-            result = _retry_or_fail(
-                job, outcome.error_code, outcome.error_message, now
-            )
-        else:
-            result = (
-                "failed"
-                if _fail(job, outcome.error_code, outcome.error_message)
-                else "skipped"
-            )
-        if result in ("retried", "failed"):
-            setattr(summary, result, getattr(summary, result) + 1)
-        return
-    else:
-        _record_progress(job, outcome, now)
-        summary.pending += 1
-
-    if job.is_overdue(now):
-        summary.pending -= 1
-        result = _retry_or_fail(
-            job,
-            "DEADLINE_EXCEEDED",
-            f"still {outcome.provider_status or job.status} at {job.deadline}",
-            now,
-        )
-        if result in ("retried", "failed"):
-            setattr(summary, result, getattr(summary, result) + 1)
+    apply_poll_outcome(
+        job,
+        outcome,
+        now,
+        summary,
+        on_complete=_complete_runpod_job,
+        on_progress=_record_progress,
+    )
 
 
-def _record_progress(job: ExternalJob, outcome, now) -> None:
+def _complete_runpod_job(job: ExternalJob, outcome, now) -> str:
+    """Apply a finished RunPod job: the worker wrote its own result.
+
+    :param job: The row RunPod reports finished.
+    :param outcome: The poll result.
+    :param now: Completion timestamp.
+    :returns: The outcome label to count.
+    :rtype: str
+    """
+    if _complete(job, outcome.output, now, outcome.confirmed_by):
+        return "completed"
+    return "skipped"
+
+
+def _record_progress(job: ExternalJob, outcome, now) -> bool:
     """Store a still-running job's state, and start its run budget.
 
     Crossing into ``IN_PROGRESS`` is when the deadline stops being a
@@ -2196,14 +2932,17 @@ def _record_progress(job: ExternalJob, outcome, now) -> None:
     :param job: The in-flight row.
     :param outcome: The poll result.
     :param now: Current time.
-    :return: None.
+    :returns: Whether the write won its compare-and-swap.
+    :rtype: bool
     """
     fields = {"status": outcome.status, "last_polled_at": now}
+    run_deadline = _provider(job).run_deadline
     if (
-        outcome.status == JobStatus.IN_PROGRESS
+        run_deadline is not None
+        and outcome.status == JobStatus.IN_PROGRESS
         and job.status != JobStatus.IN_PROGRESS
     ):
-        fields["deadline"] = runpod_execution_deadline(job, now)
+        fields["deadline"] = run_deadline(job, now)
         logger.info(
             "job %s (scan %s shard %s) started; run budget until %s",
             job.pk,
@@ -2211,7 +2950,7 @@ def _record_progress(job: ExternalJob, outcome, now) -> None:
             job.shard_index,
             fields["deadline"],
         )
-    _write(job, **fields)
+    return _write(job, **fields)
 
 
 def sweep_jobs(now=None) -> SweepSummary:
@@ -2232,10 +2971,15 @@ def sweep_jobs(now=None) -> SweepSummary:
         status__in=IN_FLIGHT_JOB_STATUSES
     ).select_related("scan", "scan__reporter")
     for job in in_flight:
-        if _is_runpod(job):
-            _sweep_runpod_job(job, now, summary)
-        else:
-            _sweep_doctor_job(job, now, summary)
+        try:
+            spec = _provider(job)
+        except UnknownProvider as exc:
+            # Not the job's fault and not fixable by retrying it: say so
+            # once per tick and judge every other row.
+            logger.warning("cannot sweep job %s: %s", job.pk, exc)
+            summary.errors += 1
+            continue
+        spec.sweep_job(job, now, summary)
 
     # PENDING rows that carry an expired ceiling. Since the ceiling
     # moved to the first claim (issue #218), that means an endpoint

@@ -7,15 +7,21 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    Opinion,
     OpinionBoundary,
+    OpinionCheck,
+    OpinionFinding,
+    OpinionReviewStatus,
     OpinionScan,
     OpinionStatus,
+    OpinionText,
     PageEdit,
     Reporter,
     Scan,
     Source,
     Status,
     Volume,
+    WithdrawnOpinion,
 )
 
 
@@ -245,3 +251,107 @@ class OpinionScanFactory(factory.django.DjangoModelFactory):
     status = OpinionStatus.NO_STATUS
     page_start = 1
     page_end = 10
+
+
+class OpinionFactory(factory.django.DjangoModelFactory):
+    """Factory for creating Opinion instances (issue #335).
+
+    Defaults to one opinion of the first two physical pages, printed
+    ``1`` to ``2``, addressed in the original's space and still in
+    ``PROCESSING``. For a second opinion on the same printed page pass
+    ``index_in_page=1``.
+
+    Default declarations:
+
+    - ``scan``: auto-created via ``ScanFactory``.
+    - ``first_printed_page``: sequential from 1; ``index_in_page``: 0.
+    - ``last_printed_page``: the first plus one; ``page_count``: 2.
+    - ``start_source_page``: 1, ``start_page_index``: 0.
+    - ``end_source_page``: 2, ``end_page_index``: 1.
+    - ``status``: ``OpinionReviewStatus.PROCESSING``.
+    """
+
+    class Meta:
+        model = Opinion
+        skip_postgeneration_save = True
+
+    scan = factory.SubFactory(ScanFactory)
+    first_printed_page = factory.Sequence(lambda n: n + 1)
+    index_in_page = 0
+    last_printed_page = factory.LazyAttribute(
+        lambda o: o.first_printed_page + 1
+    )
+    page_count = 2
+    start_source_page = 1
+    start_page_index = 0
+    end_source_page = 2
+    end_page_index = 1
+    status = OpinionReviewStatus.PROCESSING
+
+
+class OpinionTextFactory(factory.django.DjangoModelFactory):
+    """Factory for creating OpinionText instances (issue #335).
+
+    Defaults to the first page of its opinion, with a short text the
+    engines agreed on, so ``disagreements`` is empty.
+
+    Default declarations:
+
+    - ``opinion``: auto-created via ``OpinionFactory``.
+    - ``page_in_opinion``: 0; ``page_index``: 0; ``source_page``: 1.
+    - ``text``: ``"The opinion of the court."``.
+    """
+
+    class Meta:
+        model = OpinionText
+        skip_postgeneration_save = True
+
+    opinion = factory.SubFactory(OpinionFactory)
+    page_in_opinion = 0
+    page_index = 0
+    source_page = 1
+    text = "The opinion of the court."
+
+
+class WithdrawnOpinionFactory(factory.django.DjangoModelFactory):
+    """Factory for creating WithdrawnOpinion instances (issue #335).
+
+    Defaults to a one-page notice, addressed in the original's space.
+
+    Default declarations:
+
+    - ``scan``: auto-created via ``ScanFactory``.
+    - ``first_printed_page``: sequential from 1, and the same last page.
+    - ``source_page``: 1; ``page_index``: 0.
+    """
+
+    class Meta:
+        model = WithdrawnOpinion
+        skip_postgeneration_save = True
+
+    scan = factory.SubFactory(ScanFactory)
+    first_printed_page = factory.Sequence(lambda n: n + 1)
+    last_printed_page = factory.LazyAttribute(lambda o: o.first_printed_page)
+    source_page = 1
+    page_index = 0
+
+
+class OpinionFindingFactory(factory.django.DjangoModelFactory):
+    """Factory for creating OpinionFinding instances (issue #335).
+
+    Defaults to a dismissable warning on the first page of its opinion.
+
+    Default declarations:
+
+    - ``opinion``: auto-created via ``OpinionFactory``.
+    - ``page_in_opinion``: 0.
+    - ``check_name``: ``OpinionCheck.ENGINES_DISAGREE``.
+    """
+
+    class Meta:
+        model = OpinionFinding
+        skip_postgeneration_save = True
+
+    opinion = factory.SubFactory(OpinionFactory)
+    page_in_opinion = 0
+    check_name = OpinionCheck.ENGINES_DISAGREE

@@ -1052,7 +1052,9 @@ class TestTheView(ScanningTestCase):
 
         self.assertEqual(response.status_code, 302)
         self.scan.refresh_from_db()
-        self.assertEqual(self.scan.status, Status.REDACTION_REVIEW_DONE)
+        # The approval queues the creation of the opinions (#336); the
+        # worker writes REDACTION_REVIEW_DONE.
+        self.assertEqual(self.scan.status, Status.QUEUED)
 
 
 class TestTheCommand(ScanningTestCase):

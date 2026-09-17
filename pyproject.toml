@@ -33,7 +33,7 @@ dependencies = [
   # validation and the ink geometry — no torch/paddle. The heavy in-process
   # inference stack lives in the `local-ml` extra so the web/daemon images stay
   # lean whenever detection is offloaded to RunPod (RUNPOD_ENABLED=True).
-  # 0.4.0 is the floor. 0.2.0 brought the ink geometry (blackletter #68/#69)
+  # 0.4.2 is the floor. 0.2.0 brought the ink geometry (blackletter #68/#69)
   # this app reads instead of measuring it here; 0.3.0 adds the bl_warm
   # adapter, its weight source and its confidence gates (blackletter #73),
   # which the generalized YOLO stage needs (#193 and its parts); 0.3.1 stops
@@ -41,10 +41,14 @@ dependencies = [
   # is redacted whole and never shrinks to a sliver; 0.4.0 takes a caller's
   # `Page.text_box` into the margin content box (blackletter #78), which is
   # what `margin_fit` writes (#323) — without it the field is ignored and the
-  # strips miss the page-edge blots. The worker image (#194) keeps its own
-  # floor, 0.3.1: it runs detection and reads no margin, so it rebuilds only
-  # for a release it uses.
-  "blackletter>=0.4.0",
+  # strips miss the page-edge blots; 0.4.2 gives `generate` the keywords the
+  # per-opinion PDF pass calls it with (blackletter #81, scanning #336):
+  # `full_redacted`, `image_for`, the `files` and `failed` result keys, and
+  # log records in place of prints, which is why LOGGING carries a
+  # `blackletter` logger. The worker image (#194) keeps its own floor,
+  # 0.3.1: it runs detection and reads no margin, so it rebuilds only for a
+  # release it uses.
+  "blackletter>=0.4.2",
   # Not called anywhere: the pipeline embeds no text layer, and issue #280
   # deleted the one switch (LLM_PAGE_TEXT_LAYER) that called blackletter's
   # add_text_layer. Declared because base blackletter requires it anyway.
@@ -56,6 +60,12 @@ dependencies = [
   # no text. Dropping the package is scanning #155.
   "pdfplumber>=0.11",
   "pymupdf>=1.25",
+  # The Mistral OCR stage (#191) talks to Mistral's files, OCR and batch
+  # APIs through the official SDK. The 2.x line moved the package to the
+  # `mistralai.client` namespace, which mistral_client imports; 3.x is
+  # excluded until someone reads its changelog. Imported lazily, so an
+  # environment with no MISTRAL_API_KEY never loads it.
+  "mistralai>=2.9,<3",
   # runpod_client imports it directly to talk to the RunPod API. Declared
   # because until now it arrived only as a transitive dependency of the
   # `local-ml` extra (ultralytics/paddleocr), so a plain `uv sync` -- what
@@ -85,7 +95,7 @@ dev = [
 # wherever detection runs locally instead of on RunPod: local dev, CI, the
 # offline daemon, and the RunPod worker image. Excluded from the lean web image.
 local-ml = [
-  "blackletter[detect,analyze]>=0.4.0",
+  "blackletter[detect,analyze]>=0.4.2",
   "torch",
   "torchvision",
   "ultralytics>=8.3",

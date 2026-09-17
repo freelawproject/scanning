@@ -877,6 +877,98 @@ def shard_manifest(
     }
 
 
+def edit_page_counts(page_map: dict | None) -> dict[int, int]:
+    """Return the edits a run's map names, and how many pages each holds.
+
+    The one reader of the map for that question, because two things
+    lean on it and must agree: the shard manifest a late stage rebuilds
+    (:func:`stored_shard_manifest`), and the test of whether a run's
+    edited pages have been read at all. An empty answer means the run
+    needs no per-edit job: a run with only deletions is not an identity
+    run, and it still has no edited page to read.
+
+    :param page_map: The run's stored map.
+    :returns: ``{edit pk: pages it holds in the final volume}``.
+    :rtype: dict[int, int]
+    """
+    counts: dict[int, int] = {}
+    for entry in (page_map or {}).get("pages") or []:
+        source = entry.get("source") or {}
+        if source.get("kind") == "edit":
+            edit_id = source["edit_id"]
+            counts[edit_id] = counts.get(edit_id, 0) + 1
+    return counts
+
+
+def stored_shard_manifest(scan: Scan, run: ApplyRun) -> dict:
+    """Describe a built run's one-page shards from the bucket alone.
+
+    The manifest :func:`shard_manifest` wrote at build time, rebuilt
+    from what is stored: the run's page map names the edits that hold a
+    final page, the map counts their pages, and the bucket reports each
+    shard's size. It opens no PDF, cuts no shard and reads no uploaded
+    file, so a web pod or a collect tick may call it.
+
+    It exists for a stage that joins a built run late: the Mistral read
+    (#191) starts by hand, and issue #336 will start it after the
+    second review, so its rows are created long after ``_build`` ran
+    (``mistral_ocr.ensure_apply_jobs``). Those rows must carry the
+    identity the build would have given them, or the carry
+    (``jobs._still_describes``) reads them as another shard set and
+    re-pays for the pages. Three things therefore hold, and each is
+    what one entry compares on: the edits come in primary-key order, as
+    ``ApplyPlan.edits`` reads them and ``ApplyRun.edit_ids`` stores
+    them; a page count comes from the map, not from a file; a size
+    comes from the bucket, the one way :func:`_stored_size` reads it.
+
+    :param scan: The scan.
+    :param run: A built run.
+    :returns: The manifest, with an empty ``shards`` list for an
+        identity run.
+    :rtype: dict
+    :raises ApplyError: If the bucket reports no shard for an edit the
+        map names.
+    """
+    pages = edit_page_counts(run.page_map)
+    if not pages:
+        return {
+            "version": 1,
+            "source": {"name": "page edits", "size_bytes": 0, "page_count": 0},
+            "shards": [],
+        }
+    edits = {
+        edit.pk: edit
+        for edit in PageEdit.objects.filter(pk__in=list(pages)).order_by("pk")
+    }
+    entries = []
+    for index, edit_id in enumerate(sorted(edits)):
+        edit = edits[edit_id]
+        key = page_shard_key(scan, edit)
+        page_count = pages[edit_id]
+        entries.append(
+            {
+                "name": f"e{edit.pk}.pdf",
+                "index": index,
+                "key": key,
+                "edit_id": edit.pk,
+                "from_page": 0,
+                "to_page": page_count - 1,
+                "page_count": page_count,
+                "size_bytes": _stored_size(key, edit),
+                "source_page_count": page_count,
+            }
+        )
+    return {
+        "version": 1,
+        "source": {
+            "name": "page edits",
+            "size_bytes": sum(e["size_bytes"] for e in entries),
+            "page_count": sum(e["page_count"] for e in entries),
+        },
+        "shards": entries,
+    }
+
+
 def _ensure_rows(
     scan: Scan, run: ApplyRun, plan: ApplyPlan, shards: dict[int, dict]
 ) -> list[ExternalJob]:
@@ -1532,19 +1624,29 @@ def _note_dead_rows() -> int:
     there was repeated after every later glue and never written on a
     run whose glue had also failed.
 
+    **Only a row of a stage that blocks a glue counts**
+    (:data:`GLUE_STAGES`, the same set :func:`_stage_blocked` judges).
+    A stage outside it holds nothing: a dead Mistral row (#245) leaves
+    ``is_complete`` true and review 2 open, so a note saying the run
+    had stopped would be wrong -- and it would spend the one stamp, so
+    the CONVERT, ANALYZE or DETECT row that really does stop the run
+    would never be logged at all.
+
     :returns: How many runs were noted.
     :rtype: int
     """
     noted = 0
+    blocking = list(GLUE_STAGES.values())
     runs = ApplyRun.objects.filter(
         superseded_at__isnull=True,
         built_at__isnull=False,
         dead_row_noted_at__isnull=True,
         jobs__status__in=DEAD_JOB_STATUSES,
+        jobs__stage__in=blocking,
     ).distinct()
     for run in runs:
         dead = (
-            run.jobs.filter(status__in=DEAD_JOB_STATUSES)
+            run.jobs.filter(status__in=DEAD_JOB_STATUSES, stage__in=blocking)
             .order_by("pk")
             .first()
         )
@@ -1880,6 +1982,77 @@ def _result_payload(scan: Scan, row: ExternalJob, action: str) -> dict:
     return jobs.check_result_envelope(scan, row, envelope, action, ApplyError)
 
 
+def walk_final_pages(
+    page_map: dict,
+    volume_pages: list[dict],
+    edit_pages: dict[int, dict[int, dict]],
+    *,
+    missing: dict,
+    error_cls: type,
+    what: str,
+    drop: tuple = (),
+) -> list[dict]:
+    """Return one page dict per final page, renumbered and stamped.
+
+    The walk every per-page glue of a corrected volume shares: the OCR
+    volume (#224) and the Mistral document (#245), and the next engine
+    that reads pages (#317). What it holds is the rule those glues must
+    not each re-derive:
+
+    - the map is the page order, so a page a curator deleted is not
+      walked and the pages after it move up;
+    - a kept page comes from the volume document by its 1-based page in
+      the original, an edited page from that edit's own result by its
+      page inside the one-page shard;
+    - a page nobody read keeps its slot and says so, because a hole
+      that shifted the pages after it would put every later page's text
+      on the wrong page;
+    - the final page is the only numbering in the document
+      (``page_index`` is ``final_page`` minus one), and the shard
+      numbering never reaches it;
+    - every page names its ``source``, which is what lets a reader go
+      back to the original page or to the edit.
+
+    :param page_map: The run's stored map.
+    :param volume_pages: The volume document's pages, in the original's
+        page space.
+    :param edit_pages: ``{edit pk: {page inside the shard: page}}``.
+    :param missing: The page dict for a page nobody read; ``error`` is
+        added to a copy of it.
+    :param error_cls: What to raise when the volume document is short
+        of a page the map names.
+    :param what: The document's name, for that message.
+    :param drop: Page keys to leave out, for a field the volume
+        document keeps out of itself (dots.mocr's ``raw``).
+    :returns: The final pages, in order.
+    :rtype: list[dict]
+    :raises error_cls: If the volume document has no page the map names.
+    """
+    by_pdf_page = {page["pdf_page"]: page for page in volume_pages}
+    pages = []
+    for entry in page_map["pages"]:
+        source = entry["source"]
+        if source["kind"] == "original":
+            page = by_pdf_page.get(source["pdf_page"])
+            if page is None:
+                raise error_cls(f"{what} has no page {source['pdf_page']}")
+        else:
+            page = edit_pages.get(source["edit_id"], {}).get(source["page"])
+            if page is None:
+                page = {
+                    **missing,
+                    "error": "not read: no result for this page",
+                }
+        page = {k: v for k, v in page.items() if k not in drop}
+        page.pop("shard_index", None)
+        page.pop("page_no", None)
+        page["page_index"] = entry["final_page"] - 1
+        page["pdf_page"] = entry["final_page"]
+        page["source"] = source
+        pages.append(page)
+    return pages
+
+
 def _glue_ocr(
     scan: Scan, run: ApplyRun, rows: list[ExternalJob]
 ) -> tuple[str, str]:
@@ -1905,14 +2078,12 @@ def _glue_ocr(
     volume_key = dots_mocr.glued_result_key(scan, volume_rows[0].run)
     volume = s3_sync.download_json_object(volume_key)
     page_map = run.page_map
-    entries = page_map["pages"]
     prefix = run_prefix(scan, run)
 
     if is_identity_map(page_map):
         ocr_key = volume_key
         document = volume
     else:
-        by_pdf_page = {page["pdf_page"]: page for page in volume["pages"]}
         read = _rows_by_edit(rows, JobStage.ANALYZE)
         edit_pages: dict[int, dict[int, dict]] = {}
         for edit_id, row in read.items():
@@ -1921,31 +2092,18 @@ def _glue_ocr(
                 page["page_no"]: page for page in payload.get("pages") or []
             }
             _repair_edit_pages(scan, edit_id, edit_pages[edit_id])
-        pages = []
-        for entry in entries:
-            src = entry["source"]
-            if src["kind"] == "original":
-                page = by_pdf_page.get(src["pdf_page"])
-                if page is None:
-                    raise ApplyError(
-                        f"the volume OCR document has no page {src['pdf_page']}"
-                    )
-                page = dict(page)
-            else:
-                page = edit_pages.get(src["edit_id"], {}).get(src["page"])
-                if page is None:
-                    page = {
-                        "cells": [],
-                        "md": "",
-                        "error": "not read: no result for this page",
-                    }
-                page = {k: v for k, v in page.items() if k != "raw"}
-            page.pop("shard_index", None)
-            page.pop("page_no", None)
-            page["page_index"] = entry["final_page"] - 1
-            page["pdf_page"] = entry["final_page"]
-            page["source"] = src
-            pages.append(page)
+        pages = walk_final_pages(
+            page_map,
+            volume["pages"],
+            edit_pages,
+            missing={"cells": [], "md": ""},
+            error_cls=ApplyError,
+            what="the volume OCR document",
+            # ``raw`` stays in the shard object, which is kept for
+            # good: copying it would double a document the geometry
+            # downloads on every render.
+            drop=("raw",),
+        )
         document = {
             "schema_version": dots_mocr.GLUE_SCHEMA_VERSION,
             "engine": str(JobEngine.DOTS_MOCR),

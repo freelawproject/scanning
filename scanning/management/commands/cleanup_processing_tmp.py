@@ -164,6 +164,7 @@ class Command(BaseCommand):
         from scanning.apply import BUILD_TMP_PREFIX
         from scanning.bitonal import MERGE_TMP_PREFIX
         from scanning.dots_mocr import GLUE_TMP_PREFIX
+        from scanning.mistral_ocr import RENDER_TMP_PREFIX
         from scanning.yolo import MERGE_TMP_PREFIX as DETECT_TMP_PREFIX
 
         if getattr(settings, "TESTING", False):
@@ -185,6 +186,7 @@ class Command(BaseCommand):
                     MERGE_TMP_PREFIX,
                     GLUE_TMP_PREFIX,
                     DETECT_TMP_PREFIX,
+                    RENDER_TMP_PREFIX,
                     BUILD_TMP_PREFIX,
                 )
             ):

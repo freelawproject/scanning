@@ -379,13 +379,10 @@ def dismiss(scan: Scan, row: Redaction, user) -> Redaction | None:
         withdraw(Redaction.objects.filter(pk=row.pk), user)
         return None
     with transaction.atomic():
-        row = (
-            Redaction.objects.select_for_update(of=("self",))
-            .select_related("decision")
-            .get(pk=row.pk)
-        )
-        if row.decision_id and row.decision.withdrawn_at is None:
-            return row.decision
+        row = Redaction.objects.select_for_update(of=("self",)).get(pk=row.pk)
+        current = detections.standing_decision(row)
+        if current is not None:
+            return current
         decision = Redaction.objects.create(
             scan=scan,
             origin=Redaction.Origin.HUMAN,

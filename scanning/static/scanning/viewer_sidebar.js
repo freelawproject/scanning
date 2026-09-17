@@ -104,7 +104,14 @@ var _opinions = [];
                 .forEach(function (c, i) {
                     c.style.outline = i === index ? "2px solid #2563eb" : "";
                 });
-            var url = "/opinions/" + pk + "/pdf/" + variant + "/";
+            // The card carries the address (#334). The route moved
+            // under opinions/legacy/, and a path this script spelled
+            // by hand went stale with no test to catch it.
+            var url =
+                variant === "redacted"
+                    ? el.dataset.redactedUrl
+                    : el.dataset.unredactedUrl;
+            if (!url) return;
             if (window.loadOpinionUrl) {
                 window.loadOpinionUrl(url);
             } else if (window.loadOpinion) {
@@ -584,6 +591,64 @@ function deleteDuplicates(btn) {
         btn.disabled = true;
         btn.closest(".issue-card").style.opacity = "0.3";
     });
+}
+
+/**
+ * Mark the unnumbered front of the volume for deletion in one step.
+ *
+ * The card's message ends with the run in brackets, the way the
+ * duplicate card carries its pages. One request names them all, so
+ * the curator confirms once, and the page containers already drawn
+ * take the deleted look without a reload.
+ *
+ * @param {HTMLElement} btn - The card's button.
+ */
+function deleteFrontMatter(btn) {
+    var cfg = window.SCAN_CONFIG;
+    var match = (btn.dataset.message || "").match(/\[([0-9, ]+)\]/);
+    if (!match) return;
+    var pdfPages = match[1].split(",").map(function (s) {
+        return parseInt(s.trim());
+    });
+    var span = pdfPages.length === 1 ? "PDF page " + pdfPages[0]
+        : "PDF pages " + pdfPages[0] + "-" + pdfPages[pdfPages.length - 1];
+    if (!confirm("Mark " + span + " (" + pdfPages.length + " page" +
+        (pdfPages.length === 1 ? "" : "s") + ") for deletion?")) {
+        return;
+    }
+    fetch("/scans/" + cfg.docId + "/delete-page/", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": cfg.csrfToken,
+        },
+        body: JSON.stringify({ pdf_pages: pdfPages }),
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (data.status !== "ok") {
+                showToast(data.error || "Could not mark these pages for deletion.");
+                return;
+            }
+            pdfPages.forEach(function (p) {
+                if (Array.isArray(window.deletedPages) && window.deletedPages.indexOf(p) === -1) {
+                    window.deletedPages.push(p);
+                }
+                var pageDiv = document.getElementById("page-" + p);
+                if (pageDiv && typeof markPageAsDeleted === "function") {
+                    markPageAsDeleted(pageDiv, p, "PDF p.", cfg.csrfToken, cfg.docId);
+                }
+            });
+            btn.textContent = "Marked";
+            btn.disabled = true;
+            btn.closest(".issue-card").style.opacity = "0.3";
+            if (typeof window.refreshProcessActionBar === "function") {
+                window.refreshProcessActionBar();
+            }
+            if (typeof window.onPageEditSaved === "function") {
+                window.onPageEditSaved();
+            }
+        });
 }
 
 // --- Opinion boundaries (#240 PR C) ---

@@ -17,7 +17,7 @@ from unittest.mock import patch
 from django.test import override_settings
 from django.utils import timezone
 
-from scanning import doctor_client, jobs
+from scanning import doctor_client, jobs, s3_sync
 from scanning.factories import ExternalJobFactory, ScanFactory
 from scanning.models import (
     ApplyRun,
@@ -822,6 +822,266 @@ class TestSweepJobs(ScanningTestCase):
         self.assertEqual(summary.failed, 1)
         self.assertEqual(stranded.status, JobStatus.FAILED)
         self.assertEqual(stranded.error_code, "QUEUE_TIMEOUT")
+
+
+class TestVolumeResultKey(ScanningTestCase):
+    """One key rule for the three stages that glue a volume (#245)."""
+
+    def test_each_stage_names_its_own_document_under_jobs(self):
+        from scanning import dots_mocr, mistral_ocr, yolo
+
+        scan = ScanFactory()
+        prefix = s3_sync.s3_processing_prefix(scan)
+
+        self.assertEqual(
+            dots_mocr.glued_result_key(scan, 2),
+            f"{prefix}jobs/analyze/dots_mocr/r2-volume.json",
+        )
+        self.assertEqual(
+            yolo.merged_result_key(scan, 2),
+            f"{prefix}jobs/detect/blackletter/r2-volume.json",
+        )
+        self.assertEqual(
+            mistral_ocr.glued_result_key(scan, 2),
+            f"{prefix}jobs/extract/mistral_ocr/r2-volume.json",
+        )
+
+    def test_the_key_is_scoped_to_the_run(self):
+        """A re-run leaves the previous document addressable."""
+        scan = ScanFactory()
+
+        first = jobs.volume_result_key(
+            scan, JobStage.ANALYZE, JobEngine.DOTS_MOCR, 1
+        )
+        second = jobs.volume_result_key(
+            scan, JobStage.ANALYZE, JobEngine.DOTS_MOCR, 2
+        )
+
+        self.assertNotEqual(first, second)
+
+
+class TestConsumeRun(ScanningTestCase):
+    """The one write a glue pass makes on the rows it read (#245)."""
+
+    def test_only_a_completed_row_is_taken(self):
+        scan = ScanFactory()
+        rows = jobs.ensure_convert_jobs(scan, make_manifest(shard_count=2))
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.COMPLETED
+        )
+
+        self.assertEqual(jobs.consume_run(rows), 1)
+
+        rows[0].refresh_from_db()
+        rows[1].refresh_from_db()
+        self.assertEqual(rows[0].status, JobStatus.CONSUMED)
+        self.assertIsNotNone(rows[0].consumed_at)
+        self.assertEqual(rows[1].status, JobStatus.PENDING)
+
+
+class TestProviderTable(ScanningTestCase):
+    """Every provider a row can name has an entry, and no other."""
+
+    def test_every_provider_value_has_an_entry(self):
+        table = jobs._providers()
+        self.assertEqual(set(table), {p.value for p in JobProvider})
+        for provider, spec in table.items():
+            self.assertEqual(spec.provider, provider)
+
+    def test_the_wave_order_follows_what_waits_behind_each(self):
+        # RunPod returns as soon as a job is queued. Doctor holds a
+        # socket for a whole conversion, but the conversion gates review
+        # 1, where a person waits. Mistral blocks for minutes a shard and
+        # gates nothing until its glue lands, so it goes last.
+        self.assertEqual(
+            list(jobs._providers()),
+            [JobProvider.RUNPOD, JobProvider.DOCTOR, JobProvider.MISTRAL],
+        )
+
+    def test_a_row_with_no_entry_is_left_alone_by_the_sweep(self):
+        job = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        ExternalJob.objects.filter(pk=job.pk).update(
+            status=JobStatus.SUBMITTED, provider="abacus"
+        )
+        with self.assertLogs("scanning.jobs", level="WARNING"):
+            summary = jobs.sweep_jobs()
+        job.refresh_from_db()
+        self.assertEqual(summary.errors, 1)
+        self.assertEqual(job.status, JobStatus.SUBMITTED)
+        self.assertEqual(job.attempt, 1)
+
+    def test_doctor_s_knobs_read_through_the_table(self):
+        job = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        with override_settings(DOCTOR_MAX_ATTEMPTS=9, DOCTOR_PRESIGNED_TTL=7):
+            self.assertEqual(jobs._max_attempts(job), 9)
+            self.assertEqual(jobs._presigned_ttl(job), 7)
+        self.assertEqual(jobs._result_suffix(job), ".pdf")
+        self.assertEqual(
+            jobs._result_content_type(job), doctor_client.RESULT_CONTENT_TYPE
+        )
+
+    def test_a_provider_handed_no_url_refuses_a_ttl(self):
+        from scanning import mistral_ocr
+
+        job = mistral_ocr.ensure_extract_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        with self.assertRaises(jobs.UnknownProvider):
+            jobs._presigned_ttl(job)
+        self.assertEqual(jobs._result_suffix(job), ".json")
+
+
+class _Outcome:
+    """The fields :func:`jobs.apply_poll_outcome` reads off an answer.
+
+    Neither ``PollOutcome`` nor ``BatchOutcome``, on purpose: the
+    cascade is what every provider that polls shares, so the test
+    states the shape it needs rather than borrowing one provider's.
+    """
+
+    def __init__(self, status, **fields):
+        self.status = status
+        self.provider_status = fields.get("provider_status", "")
+        self.retriable = fields.get("retriable", False)
+        self.error_code = fields.get("error_code", "")
+        self.error_message = fields.get("error_message", "")
+
+
+class TestApplyPollOutcome(ScanningTestCase):
+    """The poll cascade every provider shares, and the two rules in it."""
+
+    def setUp(self):
+        super().setUp()
+        self.summary = jobs.SweepSummary()
+        self.now = timezone.now()
+        self.completed = []
+        self.progressed = []
+
+    def _on_complete(self, job, outcome, now):
+        self.completed.append(job.pk)
+        return "completed"
+
+    def _on_progress(self, job, outcome, now):
+        self.progressed.append(job.pk)
+        return jobs._write(job, status=outcome.status, last_polled_at=now)
+
+    def _apply(self, job, outcome):
+        jobs.apply_poll_outcome(
+            job,
+            outcome,
+            self.now,
+            self.summary,
+            on_complete=self._on_complete,
+            on_progress=self._on_progress,
+        )
+
+    def test_learning_nothing_leaves_the_row_and_counts_it_waiting(self):
+        job = ExternalJobFactory(
+            status=JobStatus.IN_PROGRESS,
+            deadline=self.now + timedelta(hours=1),
+        )
+
+        self._apply(job, _Outcome(None))
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.IN_PROGRESS)
+        self.assertEqual(job.last_polled_at, self.now)
+        self.assertEqual(self.summary.pending, 1)
+        self.assertEqual(self.summary.failed, 0)
+
+    def test_learning_nothing_past_the_deadline_still_ends_the_row(self):
+        """A status endpoint that is permanently unhappy must not hold a
+        row open for good, so the None branch falls through."""
+        job = ExternalJobFactory(
+            status=JobStatus.IN_PROGRESS,
+            attempt=1,
+            deadline=self.now - timedelta(minutes=1),
+        )
+
+        with self.assertLogs("scanning.jobs", level="WARNING"):
+            self._apply(job, _Outcome(None))
+
+        # Counted waiting, then un-counted by the overdue branch.
+        self.assertEqual(self.summary.pending, 0)
+        self.assertEqual(self.summary.retried, 1)
+
+    def test_a_lost_write_ends_the_tick_for_the_row(self):
+        """Another writer took it, so it is theirs to judge."""
+        job = ExternalJobFactory(
+            status=JobStatus.IN_PROGRESS,
+            deadline=self.now - timedelta(minutes=1),
+        )
+        ExternalJob.objects.filter(pk=job.pk).update(
+            status=JobStatus.CANCELLED
+        )
+
+        with self.assertLogs("scanning.jobs", level="INFO"):
+            self._apply(job, _Outcome(None))
+
+        self.assertEqual(self.summary.pending, 0)
+        self.assertEqual(self.summary.retried, 0)
+        self.assertEqual(self.summary.failed, 0)
+
+    def test_completion_counts_what_the_callback_answers(self):
+        job = ExternalJobFactory(status=JobStatus.IN_PROGRESS)
+
+        jobs.apply_poll_outcome(
+            job,
+            _Outcome(JobStatus.COMPLETED),
+            self.now,
+            self.summary,
+            on_complete=lambda *args: "errors",
+            on_progress=self._on_progress,
+        )
+
+        self.assertEqual(self.summary.errors, 1)
+        self.assertEqual(self.summary.completed, 0)
+
+    def test_a_dead_answer_that_is_retriable_retries(self):
+        job = ExternalJobFactory(status=JobStatus.IN_PROGRESS, attempt=1)
+
+        with self.assertLogs("scanning.jobs", level="WARNING"):
+            self._apply(
+                job,
+                _Outcome(JobStatus.FAILED, retriable=True, error_code="BLIP"),
+            )
+
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(self.summary.retried, 1)
+
+    def test_progress_counts_the_row_waiting_and_can_still_time_out(self):
+        job = ExternalJobFactory(
+            status=JobStatus.IN_QUEUE,
+            attempt=1,
+            deadline=self.now - timedelta(minutes=1),
+        )
+
+        with self.assertLogs("scanning.jobs", level="WARNING"):
+            self._apply(job, _Outcome(JobStatus.IN_PROGRESS))
+
+        self.assertEqual(self.progressed, [job.pk])
+        self.assertEqual(self.summary.pending, 0)
+        self.assertEqual(self.summary.retried, 1)
+
+    def test_an_unrecognised_label_counts_nothing(self):
+        """``"skipped"`` is another writer's outcome, not ours."""
+        jobs.count_sweep_outcome(self.summary, "skipped")
+
+        self.assertEqual(
+            (
+                self.summary.completed,
+                self.summary.retried,
+                self.summary.failed,
+                self.summary.pending,
+                self.summary.errors,
+            ),
+            (0, 0, 0, 0, 0),
+        )
 
 
 class TestConcurrentWriters(ScanningTestCase):

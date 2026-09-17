@@ -13,7 +13,7 @@ from django.utils import timezone
 
 from scanning.factories import (
     ExternalJobFactory,
-    OpinionScanFactory,
+    OpinionFactory,
     ScanFactory,
 )
 from scanning.models import (
@@ -22,7 +22,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
-    OpinionScan,
+    Opinion,
 )
 from scanning.tests.test_views import ScanningTestCase
 
@@ -39,7 +39,7 @@ class TestVolumeLevelJobs(ScanningTestCase):
     def test_volume_job_may_not_name_an_opinion(self):
         """A volume stage predates every opinion, so it cannot target one."""
         scan = ScanFactory()
-        opinion = OpinionScanFactory(scan=scan)
+        opinion = OpinionFactory(scan=scan)
 
         for stage in [JobStage.CONVERT, JobStage.DETECT, JobStage.ANALYZE]:
             with self.subTest(stage=stage):
@@ -123,11 +123,11 @@ class TestVolumeLevelJobs(ScanningTestCase):
 
 
 class TestOpinionLevelJobs(ScanningTestCase):
-    """EXTRACT and TIEBREAK, which run once per opinion PDF."""
+    """EXTRACT and TIEBREAK, when they name one opinion (#335)."""
 
     def setUp(self):
         self.scan = ScanFactory()
-        self.opinion = OpinionScanFactory(scan=self.scan, page_start=1)
+        self.opinion = OpinionFactory(scan=self.scan, first_printed_page=1)
 
     def test_opinion_job_carries_both_scan_and_opinion(self):
         """The scan is denormalized so the rollup needs no join."""
@@ -141,14 +141,25 @@ class TestOpinionLevelJobs(ScanningTestCase):
         self.assertEqual(job.scan_id, self.scan.pk)
         self.assertEqual(job.opinion_id, self.opinion.pk)
 
-    def test_extract_job_requires_an_opinion(self):
-        with self.assertRaises(IntegrityError):
-            with transaction.atomic():
-                ExternalJobFactory(
-                    scan=self.scan,
-                    stage=JobStage.EXTRACT,
-                    engine=JobEngine.DOTS_MOCR,
-                )
+    def test_extract_job_takes_either_shape(self):
+        """EXTRACT is read per opinion by some engines and per shard by
+        Mistral (#191), so the constraint leaves it alone and the two
+        conditional unique keys sort its rows by shape."""
+        by_shard = ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            provider=JobProvider.MISTRAL,
+        )
+        by_opinion = ExternalJobFactory(
+            scan=self.scan,
+            opinion=self.opinion,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            provider=JobProvider.MISTRAL,
+        )
+        self.assertIsNone(by_shard.opinion)
+        self.assertEqual(by_opinion.opinion, self.opinion)
 
     def test_tiebreak_job_requires_an_opinion(self):
         with self.assertRaises(IntegrityError):
@@ -178,8 +189,8 @@ class TestOpinionLevelJobs(ScanningTestCase):
     def test_one_engine_reads_many_opinions(self):
         """A volume's opinions each get their own row, keyed by opinion."""
         opinions = [
-            OpinionScanFactory(scan=self.scan, page_start=start)
-            for start in (1, 11, 21)
+            OpinionFactory(scan=self.scan, first_printed_page=start)
+            for start in (11, 21, 31)
         ]
         for opinion in opinions:
             ExternalJobFactory(
@@ -216,7 +227,7 @@ class TestOpinionLevelJobs(ScanningTestCase):
         Without the conditional constraints, every opinion after the
         first would look like a duplicate of scan/stage/engine/run/0.
         """
-        other = OpinionScanFactory(scan=self.scan, page_start=11)
+        other = OpinionFactory(scan=self.scan, first_printed_page=11)
         for opinion in (self.opinion, other):
             ExternalJobFactory(
                 scan=self.scan,
@@ -230,7 +241,7 @@ class TestOpinionLevelJobs(ScanningTestCase):
         self.assertEqual(self.scan.jobs.count(), 2)
 
     def test_opinion_must_belong_to_the_job_scan(self):
-        stranger = OpinionScanFactory(scan=ScanFactory())
+        stranger = OpinionFactory(scan=ScanFactory())
         job = ExternalJobFactory.build(
             scan=self.scan,
             opinion=stranger,
@@ -242,13 +253,13 @@ class TestOpinionLevelJobs(ScanningTestCase):
             job.full_clean()
         self.assertIn("opinion", ctx.exception.message_dict)
 
-    def test_regenerating_opinions_discards_their_jobs(self):
-        """What ``run_generate_files`` does today, and its cost.
+    def test_deleting_an_opinion_discards_its_jobs(self):
+        """The cost of the CASCADE, and why the key of #335 matters.
 
-        It deletes and recreates a scan's OpinionScan rows, so the
-        cascade takes the extraction jobs with them. Correct when the
-        opinion really changed, expensive when it did not, which is
-        issue #165.
+        An ``Opinion`` that goes takes its paid rows with it. That is
+        correct when the opinion really changed, and it is why the row
+        is keyed by its printed page and survives a re-glue, unlike the
+        ``OpinionScan`` rows that #165 raised.
         """
         ExternalJobFactory(
             scan=self.scan,
@@ -258,7 +269,7 @@ class TestOpinionLevelJobs(ScanningTestCase):
             status=JobStatus.CONSUMED,
         )
 
-        OpinionScan.objects.filter(scan=self.scan).delete()
+        Opinion.objects.filter(scan=self.scan).delete()
 
         self.assertEqual(ExternalJob.objects.count(), 0)
 
@@ -352,7 +363,7 @@ class TestExternalJobRuns(ScanningTestCase):
         finished without its results.
         """
         scan = ScanFactory()
-        opinion = OpinionScanFactory(scan=scan)
+        opinion = OpinionFactory(scan=scan)
         for engine, provider in [
             (JobEngine.DOTS_MOCR, JobProvider.RUNPOD),
             (JobEngine.MISTRAL_OCR, JobProvider.MISTRAL),
@@ -382,8 +393,8 @@ class TestExternalJobRuns(ScanningTestCase):
     def test_next_run_is_per_opinion(self):
         """Re-reading one opinion must not renumber the other 299."""
         scan = ScanFactory()
-        first = OpinionScanFactory(scan=scan, page_start=1)
-        second = OpinionScanFactory(scan=scan, page_start=11)
+        first = OpinionFactory(scan=scan, first_printed_page=1)
+        second = OpinionFactory(scan=scan, first_printed_page=11)
         for opinion in (first, second):
             ExternalJobFactory(
                 scan=scan,

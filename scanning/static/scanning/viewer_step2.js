@@ -170,12 +170,19 @@ document.addEventListener('DOMContentLoaded', function () {
     var detDrawDragInitRect = null;
     var detDrawRect = { left: 0, top: 0, width: 0, height: 0 };
 
+    // The browser's copy of blackletter's Label enum, and the only place
+    // the drawer turns a name into the id it posts. A name missing here
+    // is sent as -1 and the server answers 400, so the menu below can
+    // never offer one this table does not carry. TestViewerLabelIds pins
+    // both directions against Label, so a class the next checkpoint adds
+    // fails a test rather than being dropped in silence (#343).
     var LABEL_IDS = {
         KEY_ICON: 0, DIVIDER: 1, PAGE_HEADER: 2, CASE_CAPTION: 3,
         FOOTNOTES: 4, HEADNOTE_BRACKET: 5, CASE_METADATA: 6, CASE_SEQUENCE: 7,
         PAGE_NUMBER: 8, STATE_ABBREVIATION: 9, IMAGE: 10, HEADNOTE: 11,
         BACKGROUND: 12, SYLLABUS: 13, EDITORIAL: 14, JUDGES: 15,
         TEXT_COLUMN: 16, DOCKET: 17, DATE: 18, COURT: 19, CITATION: 20,
+        HEADING: 21, BLOCKQUOTE: 22,
     };
 
     // Global drag handlers for draw detection resize/move
@@ -899,6 +906,8 @@ document.addEventListener('DOMContentLoaded', function () {
         DATE: '#fbbf24',
         COURT: '#2dd4bf',
         CITATION: '#f87171',
+        HEADING: '#4338ca',
+        BLOCKQUOTE: '#92400e',
     };
 
     function loadDetections(callback) {
@@ -946,7 +955,12 @@ document.addEventListener('DOMContentLoaded', function () {
         // Remove old detection divs
         wrapper.querySelectorAll('.detection-box').forEach(function (el) { el.remove(); });
 
-        // Only show labels that affect the pipeline (pairing, redaction, headnotes, layout)
+        // The labels that affect the pipeline (pairing, redaction,
+        // headnotes, layout), plus HEADING and BLOCKQUOTE. Those two
+        // affect no redaction: they are opinion-body structure and they
+        // feed the opinion model (#335). They are drawn so a curator can
+        // see what the model read before drawing the box it missed, so
+        // do not take them out as "unused" (#343).
         var USED_LABELS = {
             CASE_CAPTION: true, KEY_ICON: true,
             STATE_ABBREVIATION: true, PAGE_HEADER: true, PAGE_NUMBER: true,
@@ -954,6 +968,7 @@ document.addEventListener('DOMContentLoaded', function () {
             CASE_SEQUENCE: true, HEADNOTE: true, CASE_METADATA: true,
             FOOTNOTES: true, IMAGE: true, TEXT_COLUMN: true,
             BACKGROUND: true, SYLLABUS: true, JUDGES: true,
+            HEADING: true, BLOCKQUOTE: true,
         };
         // A column box is the full height of its column, so it would cover the
         // detections inside it and take their clicks. Draw those first, and the
@@ -1185,7 +1200,7 @@ document.addEventListener('DOMContentLoaded', function () {
             'CASE_CAPTION', 'KEY_ICON', 'HEADNOTE', 'HEADNOTE_BRACKET', 'TEXT_COLUMN',
             'PAGE_NUMBER', 'PAGE_HEADER', 'STATE_ABBREVIATION', 'CASE_SEQUENCE',
             'DIVIDER', 'BACKGROUND', 'SYLLABUS', 'JUDGES', 'EDITORIAL',
-            'FOOTNOTES', 'CASE_METADATA', 'IMAGE',
+            'FOOTNOTES', 'CASE_METADATA', 'IMAGE', 'HEADING', 'BLOCKQUOTE',
         ];
         popup.innerHTML =
             '<div class="det-draw-popup-title">Add Detection</div>' +

@@ -15,8 +15,12 @@ from scanning.models import (
     ExternalJob,
     Issue,
     JobStage,
+    Opinion,
     OpinionBoundary,
+    OpinionFinding,
+    OpinionFindingDismissal,
     OpinionScan,
+    OpinionText,
     PageEdit,
     PageRepairRequest,
     PendingUpload,
@@ -27,6 +31,7 @@ from scanning.models import (
     Scan,
     Status,
     Volume,
+    WithdrawnOpinion,
 )
 from scanning.services import (
     refresh_volume_queue_status,
@@ -270,20 +275,26 @@ class ScanAdmin(admin.ModelAdmin):
         # the default collector is what loses its automatic discovery. So
         # this list has to be extended whenever a new model cascades from
         # Scan, or the confirmation page understates the blast radius.
-        # ExternalJob in practice only contributes its volume-level rows:
-        # an opinion-level job requires an opinion, and an opinion blocks
-        # the delete outright via the PROTECT above.
-        for model in (
-            Scan,
-            Detection,
-            Issue,
-            PageEdit,
-            OpinionBoundary,
-            BracketReading,
-            PendingUpload,
-            ExternalJob,
+        # A table that cascades through another needs the path to the
+        # scan, not ``scan_id``: the three opinion tables hang off
+        # ``Opinion`` and a volume holds about one text row per page
+        # (#335). ExternalJob is counted once, by its own scan column,
+        # which covers its opinion-level rows too.
+        for model, field in (
+            (Scan, "pk"),
+            (Detection, "scan_id"),
+            (Issue, "scan_id"),
+            (PageEdit, "scan_id"),
+            (OpinionBoundary, "scan_id"),
+            (BracketReading, "scan_id"),
+            (Opinion, "scan_id"),
+            (WithdrawnOpinion, "scan_id"),
+            (OpinionText, "opinion__scan_id"),
+            (OpinionFinding, "opinion__scan_id"),
+            (OpinionFindingDismissal, "opinion__scan_id"),
+            (PendingUpload, "scan_id"),
+            (ExternalJob, "scan_id"),
         ):
-            field = "pk" if model is Scan else "scan_id"
             count = model.objects.filter(**{f"{field}__in": scan_ids}).count()
             if count:
                 model_count[str(model._meta.verbose_name_plural)] = count
@@ -600,6 +611,72 @@ class OpinionScanAdmin(admin.ModelAdmin):
     readonly_fields = ["date_created", "date_modified"]
 
 
+class OpinionTextInline(admin.TabularInline):
+    """The pages of an opinion, read-only: one rebuild is their writer."""
+
+    model = OpinionText
+    extra = 0
+    fields = ["page_in_opinion", "page_index", "human_by", "human_at"]
+    readonly_fields = fields
+    show_change_link = True
+
+
+class OpinionFindingInline(admin.TabularInline):
+    """The warnings of an opinion, read-only for the same reason."""
+
+    model = OpinionFinding
+    extra = 0
+    fields = ["check_name", "page_in_opinion", "severity", "dismissal"]
+    readonly_fields = fields
+
+
+@admin.register(Opinion)
+class OpinionAdmin(admin.ModelAdmin):
+    list_display = [
+        "__str__",
+        "scan",
+        "status",
+        "first_printed_page",
+        "last_printed_page",
+        "page_count",
+        "approved_by",
+        "approved_at",
+    ]
+    list_filter = ["status"]
+    search_fields = ["scan__id", "notes"]
+    raw_id_fields = [
+        "scan",
+        "apply_run",
+        "boundary",
+        "start_source_edit",
+        "end_source_edit",
+        "approved_by",
+    ]
+    readonly_fields = [
+        "date_created",
+        "date_modified",
+        # The ledger of the PDF pass (#336): equal to glue_revision
+        # means the file exists; the attempts count its failed ticks.
+        "redacted_pdf_revision",
+        "pdf_attempts",
+    ]
+    inlines = [OpinionTextInline, OpinionFindingInline]
+
+
+@admin.register(WithdrawnOpinion)
+class WithdrawnOpinionAdmin(admin.ModelAdmin):
+    list_display = [
+        "__str__",
+        "scan",
+        "created_by",
+        "withdrawn_at",
+        "date_created",
+    ]
+    search_fields = ["scan__id", "note"]
+    raw_id_fields = ["scan", "apply_run", "source_edit", "created_by"]
+    readonly_fields = ["date_created", "date_modified"]
+
+
 @admin.register(Volume)
 class VolumeAdmin(admin.ModelAdmin):
     list_display = [
@@ -871,6 +948,8 @@ class ApplyRunAdmin(admin.ModelAdmin):
         "ocr_key",
         "printed_pages_key",
         "detections_key",
+        "extract_key",
+        "extract_run",
         "built_at",
         "superseded_at",
         "attempts",
@@ -1009,11 +1088,12 @@ class ExternalJobAdmin(admin.ModelAdmin):
     ordering = ["-date_created"]
     # An extract changelist is one row per opinion per engine, so these
     # joins have to be eager or the page issues hundreds of queries
-    # rendering its own list_display. Joined through to the reporter
-    # because both ``Scan.__str__`` and ``OpinionScan.__str__``
-    # dereference it, so stopping at the FK itself would still cost a
-    # query per row per column.
-    list_select_related = ["scan__reporter", "opinion__reporter"]
+    # rendering its own list_display. The scan is joined through to the
+    # reporter because ``Scan.__str__`` dereferences it; the opinion
+    # stops at the FK, because ``Opinion.__str__`` reads only its own
+    # columns (#335). Naming a column the model does not have raises
+    # ``FieldError`` when the changelist runs, not at import.
+    list_select_related = ["scan__reporter", "opinion"]
 
     @admin.display(description="Shard")
     def shard_label(self, obj):

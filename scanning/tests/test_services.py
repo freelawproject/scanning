@@ -1276,7 +1276,7 @@ class TestGenerateFilesWithoutOcrPdf(TestCase):
         self.assertEqual(scan.stage, Stage.APPROVED)
         self.assertEqual(scan.status, Status.PENDING_REVIEW)
         # The file row names the boundary it was cut from (#240 PR C).
-        self.assertEqual(scan.opinions.get().boundary_id, boundary.pk)
+        self.assertEqual(scan.legacy_opinions.get().boundary_id, boundary.pk)
 
     def test_writes_redactions_json_from_the_rows(self):
         """The rows are the store (#240 PR B): a computed box and a drawn

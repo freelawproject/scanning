@@ -9,6 +9,17 @@ DEVELOPMENT = env.bool("DEVELOPMENT", default=True)
 # seconds) and other verbose scanning-side debug output.
 SCANNING_LOG_LEVEL = env.str("SCANNING_LOG_LEVEL", default="INFO").upper()
 
+# Log level for the ``blackletter`` package. Since blackletter 0.4.2
+# ``generate`` writes log records (INFO for the start and end of a
+# call, DEBUG per opinion and per picture, ERROR with the traceback for
+# an opinion it could not write) and no longer prints. Without a
+# handler here those records reach nothing: ``dictConfig`` leaves the
+# root logger alone, and the ERROR of a lost deliverable would fall to
+# ``logging.lastResort`` on stderr, unformatted (blackletter#81).
+BLACKLETTER_LOG_LEVEL = env.str(
+    "BLACKLETTER_LOG_LEVEL", default="INFO"
+).upper()
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -48,6 +59,11 @@ LOGGING = {
         "scanning": {
             "handlers": ["console"],
             "level": SCANNING_LOG_LEVEL,
+            "propagate": True,
+        },
+        "blackletter": {
+            "handlers": ["console"],
+            "level": BLACKLETTER_LOG_LEVEL,
             "propagate": True,
         },
     },

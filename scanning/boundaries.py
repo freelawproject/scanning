@@ -455,10 +455,8 @@ def dismiss(scan: Scan, row: OpinionBoundary, user) -> OpinionBoundary | None:
     :raises UnaddressableBoundary: For a computed row with no address.
     """
     with transaction.atomic():
-        row = (
-            OpinionBoundary.objects.select_for_update(of=("self",))
-            .select_related("decision")
-            .get(pk=row.pk)
+        row = OpinionBoundary.objects.select_for_update(of=("self",)).get(
+            pk=row.pk
         )
         if not row.is_computed:
             if withdraw(OpinionBoundary.objects.filter(pk=row.pk), user):
@@ -468,8 +466,9 @@ def dismiss(scan: Scan, row: OpinionBoundary, user) -> OpinionBoundary | None:
                         user,
                     )
             return None
-        if row.decision_id and row.decision.withdrawn_at is None:
-            return row.decision
+        current = detections.standing_decision(row)
+        if current is not None:
+            return current
         if row.start_source_page is None or row.end_source_page is None:
             # The rule of ``detections.decide``: a dismissal with no
             # address could never land (``resolve`` matches by the
@@ -813,19 +812,28 @@ def _page_bounds(
 
 
 def outside_rects(
-    scan: Scan, rows: list[OpinionBoundary]
+    scan: Scan,
+    rows: list[OpinionBoundary],
+    document=None,
 ) -> dict[int, list[dict]]:
     """Return the masks over the neighbours' text on a shared page.
 
-    Derived from the anchors and the live rows, unwidened (blackletter's
-    ``_outside_opinion_rects`` with no page: the ink growth needs the
-    PDF, which step 3 has and the viewer does not). On an opinion's
-    first page everything before the caption in reading order is
-    masked, on its last page everything after the key. The page
-    geometry comes from the rows' render size at ``yolo.DPI``.
+    Derived from the anchors and the live rows. On an opinion's first
+    page everything before the caption in reading order is masked, on
+    its last page everything after the key. The page geometry comes
+    from the rows' render size at ``yolo.DPI``.
+
+    One derivation, two callers. The viewer has no PDF and gets the
+    masks unwidened (blackletter's ``_outside_opinion_rects`` with no
+    page). The PDF pass of #336 has the volume and passes it: each mask
+    then grows over the ink that continues past its side edges and is
+    clamped to the gutters, so a column box a little inside the printed
+    text leaves no first or last character of a masked line behind.
 
     :param scan: The scan.
     :param rows: The boundaries to answer for.
+    :param document: The volume the rows are drawn in, open, when the
+        caller has it; its pages turn the ink growth on.
     :returns: ``{boundary pk: [{"page_index", "x0", "y0", "x1", "y1"}]}``
         in PDF points.
     """
@@ -897,8 +905,17 @@ def outside_rects(
             is_last = page_index == row.end_page_index
             caption = _marker(page, row.start_x, row.start_y, "start")
             key = _marker(page, row.end_x, row.end_y, "end")
+            fitz_page = None
+            if document is not None and page_index < document.page_count:
+                fitz_page = document[page_index]
             for rect in _outside_opinion_rects(
-                page, page.pdf_width, caption, key, is_first, is_last
+                page,
+                page.pdf_width,
+                caption,
+                key,
+                is_first,
+                is_last,
+                fitz_page=fitz_page,
             ):
                 rects.append(
                     {

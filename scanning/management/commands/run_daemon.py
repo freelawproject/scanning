@@ -14,6 +14,14 @@ Current schedule:
   (default 15s)
 - ``cleanup_processing_tmp`` every ``PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS``
   seconds (default 900s)
+- ``build_opinion_pdfs`` every ``DAEMON_OPINION_PDF_INTERVAL`` seconds
+  (default 5s), last in the tick: one redacted opinion PDF per run
+  (#336)
+
+Before the loop, one start step: ``opinion_pdf.release_mirrors`` frees
+the local mirror of every scan in ``REDACTION_REVIEW_DONE``. The PDF
+pass keeps its inputs between ticks on purpose, and a crash leaves them
+behind; no worker runs at start, so nothing is in use.
 
 Known limitation: the loop is serial, so a long task delays the others
 by however long it runs -- a submit wave blocks scan claiming for the
@@ -114,7 +122,27 @@ class Command(BaseCommand):
                     settings.PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS
                 ),
             ),
+            # Last, on purpose: the loop walks the list in order, and
+            # this one blocks it for one opinion's write (#336).
+            ScheduledTask(
+                name="build_opinion_pdfs",
+                interval_seconds=float(settings.DAEMON_OPINION_PDF_INTERVAL),
+            ),
         ]
+
+    def _release_at_start(self) -> None:
+        """Free the mirrors the PDF pass keeps between ticks (#336).
+
+        Best effort: a failure here must not keep the daemon down.
+
+        :return: None.
+        """
+        from scanning import opinion_pdf
+
+        try:
+            opinion_pdf.release_mirrors()
+        except Exception:
+            logger.exception("Could not release the opinion PDF mirrors")
 
     def handle(self, *args, **options):
         """Tick the schedule until a termination signal is received.
@@ -131,6 +159,7 @@ class Command(BaseCommand):
             f"{t.name}={t.interval_seconds:g}s" for t in schedule
         )
         self.stdout.write(f"Daemon started. Schedule: {intervals}")
+        self._release_at_start()
 
         while not self.shutdown:
             now = time.monotonic()
