@@ -1137,6 +1137,66 @@ def _note_curator_ranges(issues: list[dict], ocr_results: list[dict]) -> None:
         )
 
 
+def _ask_about_front_matter(
+    issues: list[dict], ocr_results: list[dict], deleted: set[int]
+) -> None:
+    """Offer the unnumbered front of the volume as one deletion.
+
+    A reporter volume opens with pages that carry no printed number:
+    the title leaf, the table of cases, the judges' roster. The reader
+    hands each one back as a ``no_page_number`` card, and a curator
+    marks them for deletion one page at a time, nine confirms for nine
+    pages on 139 F.4th. This card names the whole run, from the first
+    page the volume still has to the page before the first printed
+    number, and its button marks every page of it at once.
+
+    Only the front: an unnumbered run later in the volume is a missing
+    number or a plate, and a page-by-page look, so it gets no such
+    offer. A volume with no numbered page at all gets none either: the
+    run would be the whole book, and a read that found nothing is a
+    question for the OCR, not a deletion. Pages already marked are
+    skipped over, so the card shrinks as the curator works and goes
+    when the run is gone. It is addressed by its first page
+    (``models.PHYSICAL_PAGE_CHECKS``) and is dismissible.
+
+    :param issues: The rebuilt issue dicts, edited in place.
+    :param ocr_results: The per-page entries, curator numbers overlaid,
+        in page order.
+    :param deleted: The pages already marked for deletion.
+    :returns: None.
+    """
+    run: list[int] = []
+    numbered_after = False
+    for entry in ocr_results:
+        page = entry.get("pdf_page")
+        if page in deleted:
+            continue
+        if entry.get("detected"):
+            numbered_after = True
+            break
+        run.append(page)
+    if not run or not numbered_after:
+        return
+    if len(run) == 1:
+        span, verb, them = f"PDF page {run[0]}", "carries", "it"
+    else:
+        span, verb, them = f"PDF pages {run[0]}-{run[-1]}", "carry", "them"
+    issues.append(
+        {
+            "page_number": run[0],
+            "check_name": CheckName.FRONT_MATTER,
+            "severity": "warning",
+            "message": (
+                f"{span} {verb} no printed page number and the numbering "
+                f"starts after {them}: front matter such as a title page "
+                f"or a table of contents? One step marks all "
+                f"{len(run)} for deletion. "
+                f"[{', '.join(str(p) for p in run)}]"
+            ),
+        }
+    )
+
+
 def _ask_about_model_suffixes(
     issues: list[dict], ocr_results: list[dict]
 ) -> None:
@@ -1404,6 +1464,12 @@ def recalculate_issues(scan: "Scan") -> None:
     # A range missing at the end of the volume gets a placeholder, so a
     # reviewer can upload the pages or ask a scanner for them (#256).
     _project_trailing_gap(result, analysis, exp_end)
+
+    # The unnumbered pages before the first numbered one are one card
+    # with one button, not one card per page.
+    _ask_about_front_matter(
+        result["issues"], ocr_results, page_edits.deleted_pages(scan)
+    )
 
     # Every open edit this volume cannot take, not only the page
     # numbers: a delete or an insert made against another original is
