@@ -18,6 +18,7 @@ from scanning.models import (
     Opinion,
     OpinionBoundary,
     OpinionFinding,
+    OpinionFindingDismissal,
     OpinionScan,
     OpinionText,
     PageEdit,
@@ -274,22 +275,26 @@ class ScanAdmin(admin.ModelAdmin):
         # the default collector is what loses its automatic discovery. So
         # this list has to be extended whenever a new model cascades from
         # Scan, or the confirmation page understates the blast radius.
-        # ExternalJob in practice only contributes its volume-level rows:
-        # an opinion-level job requires an ``Opinion``, which cascades
-        # from the scan and takes its jobs with it (#335).
-        for model in (
-            Scan,
-            Detection,
-            Issue,
-            PageEdit,
-            OpinionBoundary,
-            BracketReading,
-            Opinion,
-            WithdrawnOpinion,
-            PendingUpload,
-            ExternalJob,
+        # A table that cascades through another needs the path to the
+        # scan, not ``scan_id``: the three opinion tables hang off
+        # ``Opinion`` and a volume holds about one text row per page
+        # (#335). ExternalJob is counted once, by its own scan column,
+        # which covers its opinion-level rows too.
+        for model, field in (
+            (Scan, "pk"),
+            (Detection, "scan_id"),
+            (Issue, "scan_id"),
+            (PageEdit, "scan_id"),
+            (OpinionBoundary, "scan_id"),
+            (BracketReading, "scan_id"),
+            (Opinion, "scan_id"),
+            (WithdrawnOpinion, "scan_id"),
+            (OpinionText, "opinion__scan_id"),
+            (OpinionFinding, "opinion__scan_id"),
+            (OpinionFindingDismissal, "opinion__scan_id"),
+            (PendingUpload, "scan_id"),
+            (ExternalJob, "scan_id"),
         ):
-            field = "pk" if model is Scan else "scan_id"
             count = model.objects.filter(**{f"{field}__in": scan_ids}).count()
             if count:
                 model_count[str(model._meta.verbose_name_plural)] = count
@@ -1076,11 +1081,12 @@ class ExternalJobAdmin(admin.ModelAdmin):
     ordering = ["-date_created"]
     # An extract changelist is one row per opinion per engine, so these
     # joins have to be eager or the page issues hundreds of queries
-    # rendering its own list_display. Joined through to the reporter
-    # because both ``Scan.__str__`` and ``OpinionScan.__str__``
-    # dereference it, so stopping at the FK itself would still cost a
-    # query per row per column.
-    list_select_related = ["scan__reporter", "opinion__reporter"]
+    # rendering its own list_display. The scan is joined through to the
+    # reporter because ``Scan.__str__`` dereferences it; the opinion
+    # stops at the FK, because ``Opinion.__str__`` reads only its own
+    # columns (#335). Naming a column the model does not have raises
+    # ``FieldError`` when the changelist runs, not at import.
+    list_select_related = ["scan__reporter", "opinion"]
 
     @admin.display(description="Shard")
     def shard_label(self, obj):

@@ -4344,7 +4344,7 @@ class ExternalJob(AbstractDateTimeModel):
         :param scan: The Scan, or its pk.
         :param stage: A :class:`JobStage` value.
         :param engine: A :class:`JobEngine` value.
-        :param opinion: The OpinionScan (or its pk) for an
+        :param opinion: The :class:`Opinion` (or its pk) for an
             opinion-level stage; omit for the volume-level stages.
         :returns: ``max(run) + 1`` for that target, or 1 if it has
             never run.

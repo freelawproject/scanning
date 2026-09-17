@@ -8,7 +8,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('scanning', '0032_extract_stage_either_level'),
+        ('scanning', '0033_apply_run_extract_outputs'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
