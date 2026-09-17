@@ -36,6 +36,7 @@ from scanning import (
     page_numbers,
     repairs,
     s3_sync,
+    stats,
     yolo,
 )
 from scanning.models import (
@@ -1895,8 +1896,9 @@ def _review_flags(
     :returns: ``page_review_ready``, ``page_review_done``,
         ``redaction_review_ready``, ``redaction_review_done``,
         ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting``,
-        ``pages_without_number``, ``review3_opinions`` and the two
-        pending-edit flags, for the template context.
+        ``pages_without_number``, ``legacy_pipeline``,
+        ``review3_opinions`` and the two pending-edit flags, for the
+        template context.
     :rtype: dict
     """
     from scanning import apply, review_states, services
@@ -1951,6 +1953,13 @@ def _review_flags(
             else ""
         ),
         "legacy_review": scan.status == Status.PENDING_REVIEW,
+        # Which pipeline the volume belongs to (#334). Not
+        # ``legacy_review``, which is PENDING_REVIEW alone: a legacy
+        # volume also holds APPROVED and EXTRACTED, and those keep the
+        # step 3 that lists the files the legacy pipeline generated.
+        # ``stats.LEGACY_STATUSES`` is the project's one definition of
+        # a status no new scan can reach.
+        "legacy_pipeline": scan.status in stats.LEGACY_STATUSES,
         # The reopen is a compare-and-swap on DONE (#224), so the
         # button shows only there: a volume in review 2 keeps its
         # badge and loses the button.

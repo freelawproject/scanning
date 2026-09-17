@@ -32,7 +32,7 @@
 </div>
 
 {% if opinion.status == 'error' and opinion.error_message %}
-<div class="alert-error mb-6">{{ opinion.error_message }}</div>
+<div class="alert-danger mb-6">{{ opinion.error_message }}</div>
 {% endif %}
 
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">

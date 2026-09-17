@@ -285,7 +285,16 @@ reach step 2.
   {% elif redaction_review_done %}
   <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed the redactions of this volume">&#10003; Redaction review done</span>
   {% endif %}
-  {% if has_opinions and redaction_review_done or has_opinions and legacy_review %}
+  {% comment %}
+    The button follows the step-3 tab (#334). A volume whose opinions
+    are written goes to the opinions page; a legacy volume keeps the
+    Generate pane. A new-pipeline volume with no opinion row gets no
+    button, because the only action of its step 3 refuses with
+    utils.PIPELINE_PAUSED_MESSAGE.
+  {% endcomment %}
+  {% if review3_opinions %}
+  <a href="{% url 'opinion_list' %}?scan={{ scan.pk }}" class="btn-primary text-sm no-underline" style="background:#059669" title="Review the text of the opinions of this volume">Next: Opinion text &rarr;</a>
+  {% elif has_opinions and legacy_pipeline %}
   <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
   {% endif %}
 

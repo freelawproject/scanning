@@ -7,9 +7,12 @@ pages keep their tests in ``test_views.py``, under their new names.
 
 from django.urls import reverse
 
+from scanning import stats
 from scanning.factories import (
+    OpinionBoundaryFactory,
     OpinionFactory,
     OpinionFindingFactory,
+    OpinionScanFactory,
     ReporterFactory,
     ScanFactory,
 )
@@ -273,6 +276,9 @@ class TestOpinionReview(ScanningTestCase):
         response = self.client.get(self.url)
 
         self.assertContains(response, "The glue failed.")
+        # The four alert classes are alert-success, alert-info,
+        # alert-warning and alert-danger. There is no alert-error.
+        self.assertContains(response, "alert-danger")
 
 
 class TestTheStepThreeTab(ScanningTestCase):
@@ -305,13 +311,75 @@ class TestTheStepThreeTab(ScanningTestCase):
         self.assertContains(response, "Opinion text")
         self.assertContains(response, "cursor-not-allowed")
 
-    def test_a_legacy_volume_keeps_its_own_step_three(self):
+    def test_every_legacy_status_keeps_its_own_step_three(self):
+        """A legacy volume also holds APPROVED and EXTRACTED (#334)."""
+        for status in stats.LEGACY_STATUSES:
+            with self.subTest(status=status):
+                self.scan.status = status
+                self.scan.save(update_fields=["status"])
+
+                response = self.client.get(self.url)
+
+                self.assertTrue(response.context["legacy_pipeline"])
+                self.assertContains(response, 'href="?step=3"')
+                self.assertContains(response, "Generate")
+                self.assertNotContains(response, "Opinion text")
+
+    def test_the_legacy_cards_carry_their_addresses(self):
+        """The viewer reads the address off the card, never builds it."""
         self.scan.status = Status.PENDING_REVIEW
         self.scan.save(update_fields=["status"])
+        opinion_scan = OpinionScanFactory(scan=self.scan)
 
-        response = self.client.get(self.url)
+        response = self.client.get(self.url, {"step": 3})
 
-        self.assertTrue(response.context["legacy_review"])
-        self.assertContains(response, 'href="?step=3"')
-        self.assertContains(response, "Generate")
-        self.assertNotContains(response, "Opinion text")
+        for variant in ("redacted", "original"):
+            self.assertContains(
+                response,
+                reverse(
+                    "serve_opinionscan_pdf",
+                    kwargs={"pk": opinion_scan.pk, "variant": variant},
+                ),
+            )
+
+
+class TestTheNextButton(ScanningTestCase):
+    """Where the step-2 bar sends a curator next (#334)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
+        self.url = reverse("scan_process", kwargs={"pk": self.scan.pk})
+
+    def _bar(self, **params) -> str:
+        """Return the step-2 action bar of the page."""
+        response = self.client.get(self.url, {"step": 2, **params})
+        return response.content.decode()
+
+    def test_a_volume_with_opinions_is_sent_to_them(self):
+        OpinionFactory(scan=self.scan)
+
+        body = self._bar()
+
+        self.assertIn("Next: Opinion text", body)
+        self.assertIn(f"{reverse('opinion_list')}?scan={self.scan.pk}", body)
+        self.assertNotIn("Next: Generate", body)
+
+    def test_a_new_volume_with_no_opinion_gets_no_button(self):
+        OpinionBoundaryFactory(scan=self.scan)
+
+        body = self._bar()
+
+        self.assertNotIn("Next: Opinion text", body)
+        self.assertNotIn("Next: Generate", body)
+
+    def test_a_legacy_volume_keeps_the_generate_button(self):
+        self.scan.status = Status.PENDING_REVIEW
+        self.scan.save(update_fields=["status"])
+        OpinionBoundaryFactory(scan=self.scan)
+
+        body = self._bar()
+
+        self.assertIn("Next: Generate", body)
+        self.assertNotIn("Next: Opinion text", body)

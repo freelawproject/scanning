@@ -553,24 +553,35 @@ class TestTheStepTwoBar(ScanningTestCase):
         self.assertNotIn("approve-redactions", bar)
 
     def test_the_approval_is_the_gate_of_step_three(self):
+        """The approval writes the ``Opinion`` rows (#336), and those
+        rows are what the link reads (#334). A volume still in review 2
+        has none, so it gets no link."""
+        from scanning.factories import OpinionFactory
+
         waiting = ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
         approved = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
         OpinionBoundaryFactory(scan=waiting)
         OpinionBoundaryFactory(scan=approved)
+        OpinionFactory(scan=approved)
 
-        self.assertNotIn("Next: Generate", self._bar(waiting))
-        self.assertIn("Next: Generate", self._bar(approved))
+        self.assertNotIn("Next: Opinion text", self._bar(waiting))
+        self.assertIn("Next: Opinion text", self._bar(approved))
 
     def test_a_curator_drawn_boundary_alone_shows_the_link(self):
         """Both renders of the bar read ``has_opinions`` (#240 PR C), so
         a volume whose only boundary is a curator's shows the link in
         the fragment as on the full load, and a dismissed computed
-        boundary alone shows none."""
+        boundary alone shows none.
+
+        Over a legacy volume, because ``has_opinions`` gates the
+        Generate link there alone since #334: a new-pipeline volume
+        reads its ``Opinion`` rows instead.
+        """
         from scanning import boundaries
         from scanning.factories import UserFactory
         from scanning.models import OpinionBoundary
 
-        scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE, page_count=3)
+        scan = ScanFactory(status=Status.PENDING_REVIEW, page_count=3)
         self.assertNotIn("Next: Generate", self._bar(scan))
 
         OpinionBoundaryFactory(
@@ -582,7 +593,7 @@ class TestTheStepTwoBar(ScanningTestCase):
         self.assertIn("Next: Generate", self._bar(scan))
 
         dismissed = OpinionBoundaryFactory(
-            scan=ScanFactory(status=Status.REDACTION_REVIEW_DONE, page_count=3)
+            scan=ScanFactory(status=Status.PENDING_REVIEW, page_count=3)
         )
         boundaries.dismiss(dismissed.scan, dismissed, UserFactory())
         self.assertNotIn("Next: Generate", self._bar(dismissed.scan))
