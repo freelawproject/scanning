@@ -130,7 +130,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 ## Review 1
 
 - Approving is a compare-and-swap on READY, open to every logged-in user. Open issues do not block it; a waiting repair request does (#266). The approval gates "Next: Detect" in the view
-- A page with no page number blocks the approval too (`page_numbers.pages_without_number`, #342): the answers are a number, a deletion or a dismissal of that page's card; a `suffixed` page carries a reading and never blocks. The gate is in the view and in the bar, it reads the data and not the `Issue` rows, and each refusal flashes its own message
+- A page with no page number blocks the approval too (`page_numbers.pages_without_number`, #342): the answers are a number, a number the curator cleared, a deletion or a dismissal of that page's card; a `suffixed` page carries a reading and never blocks. The gate reads the data and not the `Issue` rows, it and the repair gate are read in READY alone (the condition `_review_flags` reads), and each refusal flashes its own message
 - A new-pipeline volume is never re-run from the viewer; `start_validate` refuses it for good. A re-run is the admin re-queue
 - `PageEdit` (#214): one standing row per address, partial unique keys over `withdrawn_at IS NULL`. Write through `page_edits.supersede`; undo through `page_edits.withdraw`. Nothing is deleted. `applied_at` is a ledger, not a close. Acting readers go through `current_edits`, never `standing_edits`
 - `has_pending_changes` counts the structural kinds the standing apply run has not built, not the `applied_at` stamp alone

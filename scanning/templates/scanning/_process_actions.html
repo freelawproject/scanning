@@ -113,11 +113,13 @@ reach step 2.
   {% endif %}
   {% if pages_without_number %}
   {% comment %}
-    The note carries the first page, and `goToPage` (step 1) reads
-    `data-pdf-index`, so a click moves the viewer to it. On step 2 that
-    function is absent and the note is a plain label.
+    The note carries the first page, and `goToPage` reads
+    `data-pdf-index`, so a click moves the viewer to it. That function
+    is global on every step: `viewer_sidebar.js` declares it outside
+    its IIFE, and the page loads that file whichever step it renders.
+    The repair cards call it the same way.
   {% endcomment %}
-  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-200 cursor-pointer" data-pdf-index="{{ pages_without_number.0|add:"-1" }}" onclick="if (typeof goToPage === 'function') { goToPage(this); }" title="Type the number on the page, or dismiss its &ldquo;No page number detected&rdquo; card when the page carries no printed number.">{{ pages_without_number|length }} page{{ pages_without_number|length|pluralize }} with no number &mdash; click to open the first</span>
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-200 cursor-pointer" data-pdf-index="{{ pages_without_number.0|add:"-1" }}" onclick="goToPage(this)" title="Type the number on the page, or dismiss its &ldquo;No page number detected&rdquo; card when the page carries no printed number.">{{ pages_without_number|length }} page{{ pages_without_number|length|pluralize }} with no number &mdash; click to open the first</span>
   {% endif %}
   {% if not repairs_waiting and not pages_without_number %}
   <form method="post" action="{% url 'approve_page_completeness' scan.pk %}" class="inline">

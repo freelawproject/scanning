@@ -1761,9 +1761,9 @@ def _review_flags(
     a caller that does not (the ``process_actions`` fragment).
 
     ``pages_without_number`` is the second gate of that approval
-    (#342), and it is read only in the one status that offers the
-    button: every other status pays nothing, so the step-2 fragment
-    refresh costs no query. The bar shows a note for each gate that
+    (#342), and it is read in READY alone, which is the condition the
+    view reads: a volume past review 1 pays no query for it, whichever
+    step asks for the bar. The bar shows a note for each gate that
     refuses, and the button when neither does.
 
     :param scan: The scan the bars are rendered for.
@@ -2356,7 +2356,11 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
 
     The two rules are read together and each flashes its own message.
     A reviewer who answers one must see the other without a second
-    press of the button.
+    press of the button. Both are read in READY alone, which is the
+    condition ``_review_flags`` reads for the bar: in every other
+    status the compare-and-swap below owns the answer, and a volume
+    already approved has locked pages, so a gate would name work
+    nobody can do.
 
     The gate is a read, then the compare-and-swap. A request made
     between the two does not block that approval, and the plan accepts
@@ -2368,21 +2372,29 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
     :return: Redirect to step 1 of the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    refusals = []
-    if repairs.has_waiting(scan):
-        refusals.append(REPAIRS_WAITING_MESSAGE)
-    missing = page_numbers.pages_without_number(scan)
-    if missing:
-        refusals.append(page_numbers_missing_message(missing))
-    if refusals:
-        # One message for each rule, repairs first: the two refusals
-        # are different work for different people, and a reviewer who
-        # answers one must see the other without a second press.
-        for refusal in refusals:
-            messages.warning(request, refusal)
-        return redirect(
-            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
-        )
+    # The two gates speak for the status that offers the button, and
+    # for no other. A volume already approved has its pages locked, so
+    # "type the number" would name work nobody can do; the
+    # compare-and-swap below says what is true of such a row instead.
+    # It is the condition ``_review_flags`` reads, so the bar and the
+    # view cannot disagree.
+    if scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW:
+        refusals = []
+        if repairs.has_waiting(scan):
+            refusals.append(REPAIRS_WAITING_MESSAGE)
+        missing = page_numbers.pages_without_number(scan)
+        if missing:
+            refusals.append(page_numbers_missing_message(missing))
+        if refusals:
+            # One message for each rule, repairs first: the two
+            # refusals are different work for different people, and a
+            # reviewer who answers one must see the other without a
+            # second press.
+            for refusal in refusals:
+                messages.warning(request, refusal)
+            return redirect(
+                reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+            )
     approved = Scan.objects.filter(
         pk=scan.pk, status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
     ).update(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)

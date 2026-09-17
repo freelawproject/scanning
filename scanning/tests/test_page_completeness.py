@@ -840,11 +840,26 @@ class TestPagesWithoutNumber(ScanningTestCase):
 
         self.assertEqual(page_numbers.pages_without_number(scan), [])
 
-    def test_a_number_the_curator_cleared_leaves_a_page_with_none(self):
-        """The one path that makes a hole and no card: ``assign_page``
-        deletes the card of the page it writes, whatever it writes."""
+    def test_a_number_the_curator_cleared_answers_its_page(self):
+        """Emptying the field is the gesture the page editor offers
+        for a page with no number, and the row says a person did it.
+        ``assign_page`` deletes the card of the page it writes,
+        whatever it writes, so a rule that ignored the row would name
+        a page whose card nobody can reach until the next recompute."""
         scan = ScanFactory(ocr_results=dots_results(3))
         PageEditFactory(scan=scan, pdf_page=2, value="")
+
+        self.assertEqual(page_numbers.pages_without_number(scan), [])
+
+    def test_a_cleared_number_of_another_original_answers_nothing(self):
+        """The #214 rule, on the page the reader left with none: the
+        overlay skips the stale row and so does the count."""
+        scan = ScanFactory(
+            ocr_results=unread_results(), source_fingerprint="abc"
+        )
+        PageEditFactory(
+            scan=scan, pdf_page=2, value="", source_fingerprint="def"
+        )
 
         self.assertEqual(page_numbers.pages_without_number(scan), [2])
 
@@ -1038,6 +1053,24 @@ class TestThePageNumberGate(ScanningTestCase):
         self.assertEqual(
             self.scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
         )
+
+    def test_a_volume_past_review_one_hears_the_status(self):
+        """Its pages are locked, so "type the number" would name work
+        nobody can do. The compare-and-swap owns the answer there."""
+        self.scan.status = Status.PAGE_COMPLETENESS_REVIEW_DONE
+        self.scan.save(update_fields=["status"])
+
+        flashed = self._approve()
+
+        self.assertEqual(flashed, [PAGE_REVIEW_ALREADY_DONE_MESSAGE])
+
+    def test_a_volume_that_is_not_ready_hears_the_status(self):
+        self.scan.status = Status.ERROR
+        self.scan.save(update_fields=["status"])
+
+        flashed = self._approve()
+
+        self.assertEqual(flashed, [PAGE_REVIEW_NOT_READY_MESSAGE])
 
     def test_the_bar_shows_the_note_and_no_button(self):
         response = self._step_one()

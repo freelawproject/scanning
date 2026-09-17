@@ -587,10 +587,17 @@ def pages_without_number(scan) -> list[int]:
     deletes that row also when the curator **clears** the number. A
     gate over the rows would pass a page with no number at all.
 
-    Three answers take a page off the list:
+    Four answers take a page off the list:
 
     - A number, from the reader or from the curator. The overlay comes
       first, so a number typed since the last rebuild counts at once.
+    - A number the curator **cleared**. ``assign_page`` keeps the row
+      with a blank value, so the row itself separates "a person
+      cleared this" from "the model read nothing", and that is the
+      gesture the page editor offers for a page with no number: the
+      curator empties the field. The card of that page is deleted by
+      the same endpoint, so a rule that ignored the row would name a
+      page whose card a curator cannot reach until the next recompute.
     - A deletion. The volume loses the page (#255).
     - A dismissal of the page's ``no_page_number`` card. A cover, a
       blank leaf and a plate carry no printed number, and a refusal
@@ -626,11 +633,18 @@ def pages_without_number(scan) -> list[int]:
         return []
     without -= page_edits.deleted_pages(scan)
     # ``current_edits`` reads the standing rows of *this* original, so
-    # a withdrawn dismissal and one made against another document hide
-    # no page.
+    # a withdrawn row and one made against another document answer
+    # nothing. One query for the two kinds.
+    answered = page_edits.current_edits(
+        scan, PageEdit.Kind.DISMISS_ISSUE, PageEdit.Kind.SET_NUMBER
+    )
     without -= {
         edit.pdf_page
-        for edit in page_edits.current_edits(scan, PageEdit.Kind.DISMISS_ISSUE)
-        if edit.value == CheckName.NO_PAGE_NUMBER and edit.pdf_page
+        for edit in answered
+        if edit.pdf_page
+        and (
+            edit.kind == PageEdit.Kind.SET_NUMBER
+            or edit.value == CheckName.NO_PAGE_NUMBER
+        )
     }
     return sorted(without)
