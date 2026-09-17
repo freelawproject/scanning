@@ -19,7 +19,7 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
-from scanning import opinions, repairs, s3_sync, stats
+from scanning import opinion_pdf, opinions, repairs, s3_sync, stats
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
@@ -346,13 +346,20 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
 
     The first stage of the review interface. It shows what the rows
     hold: the citation, the printed range, the status, the links to the
-    volume and the boundary, and the findings. It reads no S3 and
-    renders no page.
+    volume and the boundary, and the findings.
+
+    It also shows the redacted PDF of the opinion (#336) in a frame,
+    when the row says the file was written. ``opinion_pdf.is_written``
+    is the one rule for that, a read of the row and never of the
+    bucket, and the frame is a navigation to ``serve_opinion_pdf``, so
+    this view still makes no S3 call. A staff reader gets the
+    ``files`` link beside it (``opinion_file_index``), the rule of the
+    volume's own glued outputs (#243).
 
     The page carries **no write control**. The approval, the dismissal
     and the typing of a page come with the text review itself, which
-    needs ``OpinionText`` and the per-opinion PDF. A button that an
-    endpoint would refuse is the one thing a viewer must never offer.
+    needs ``OpinionText``. A button that an endpoint would refuse is
+    the one thing a viewer must never offer.
 
     :param request: The current HTTP request.
     :param pk: The primary key of the opinion.
@@ -387,6 +394,24 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "opinion": opinion,
             "findings": findings,
             "open_findings": open_findings,
+            # Absent when the PDF pass has not written the file at the
+            # live revision: the template shows the reason instead of a
+            # frame that would answer a 404 JSON.
+            "redacted_pdf_url": (
+                reverse(
+                    "serve_opinion_pdf",
+                    kwargs={
+                        "pk": opinion.scan_id,
+                        "opinion_pk": opinion.pk,
+                    },
+                )
+                if opinion_pdf.is_written(opinion)
+                else ""
+            ),
+            "files_url": reverse(
+                "opinion_file_index",
+                kwargs={"pk": opinion.scan_id, "opinion_pk": opinion.pk},
+            ),
             # The list the reviewer came from, so the back link keeps
             # their filters. Never fed to a redirect: it is a query
             # string on one known route, not a ``next``.
