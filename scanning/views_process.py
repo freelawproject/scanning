@@ -1895,8 +1895,8 @@ def _review_flags(
     :returns: ``page_review_ready``, ``page_review_done``,
         ``redaction_review_ready``, ``redaction_review_done``,
         ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting``,
-        ``pages_without_number`` and the two pending-edit flags, for
-        the template context.
+        ``pages_without_number``, ``review3_opinions`` and the two
+        pending-edit flags, for the template context.
     :rtype: dict
     """
     from scanning import apply, review_states, services
@@ -1978,6 +1978,14 @@ def _review_flags(
         # approval only: before it there is no compute and no finding.
         "review2_open": review2_open,
         "review2_stale": review2_stale,
+        # The opinions of review 3 (#334). The step-3 tab links the
+        # opinions page with this scan as its filter, and only when the
+        # rows exist: a tab that opened an empty list would send a
+        # curator to a page with no work on it. A legacy volume has no
+        # ``Opinion`` row and keeps its own step 3. Not
+        # ``opinion_count``, which the step-2 sidebar already uses for
+        # the boundaries of the volume.
+        "review3_opinions": Opinion.objects.filter(scan=scan).count(),
         **page_edits.pending_edit_flags(scan, run),
     }
 

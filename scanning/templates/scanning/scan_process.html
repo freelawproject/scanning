@@ -53,9 +53,27 @@ body.boundary-pick .opinion-nav.picking {
         <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step > 2 %}bg-green-600 text-white{% elif step == 2 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">2</span>
         Review</a>
       <div class="w-6 h-0.5 {% if step > 2 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
+      {% comment %}
+        Step 3 forks on the pipeline (#334). A legacy volume keeps its
+        own step 3, which lists the files the legacy pipeline generated.
+        A new-pipeline volume goes to the opinions page, filtered to
+        this scan, and only when its Opinion rows exist: a tab that
+        opened an empty list would send a curator to a page with no
+        work on it, the rule the step-1 bar follows (#151).
+      {% endcomment %}
+      {% if legacy_review %}
       <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 3 %}bg-blue-600 text-white{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=3">
         <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step == 3 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">3</span>
         Generate</a>
+      {% elif review3_opinions %}
+      <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400" href="{% url 'opinion_list' %}?scan={{ scan.pk }}" title="{{ review3_opinions }} opinion(s) of this volume">
+        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs bg-gray-300 text-gray-600">3</span>
+        Opinion text</a>
+      {% else %}
+      <span class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium bg-gray-100 text-gray-400 dark:bg-gray-800 dark:text-gray-500 cursor-not-allowed" title="The opinions are written when a curator approves the redaction review.">
+        <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs bg-gray-300 text-gray-500">3</span>
+        Opinion text</span>
+      {% endif %}
     </div>
     <div class="flex items-center gap-2">
       <span class="text-base font-bold">{% if scan.reporter %}{{ scan.reporter.short_name|upper }} vol. {{ scan.volume }}{% else %}Scan #{{ scan.pk }}{% endif %}</span>

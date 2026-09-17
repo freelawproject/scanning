@@ -17,6 +17,7 @@ from scanning.models import (
     OpinionCheck,
     OpinionFindingDismissal,
     OpinionReviewStatus,
+    Status,
 )
 from scanning.tests.test_views import ScanningTestCase
 
@@ -272,3 +273,45 @@ class TestOpinionReview(ScanningTestCase):
         response = self.client.get(self.url)
 
         self.assertContains(response, "The glue failed.")
+
+
+class TestTheStepThreeTab(ScanningTestCase):
+    """Where the step chooser of a volume sends a curator (#334)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
+        self.url = reverse("scan_process", kwargs={"pk": self.scan.pk})
+
+    def test_a_volume_with_opinions_links_the_filtered_list(self):
+        OpinionFactory(scan=self.scan)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.context["review3_opinions"], 1)
+        self.assertContains(
+            response, f"{reverse('opinion_list')}?scan={self.scan.pk}"
+        )
+        self.assertContains(response, "Opinion text")
+
+    def test_a_volume_with_no_opinion_has_a_dead_tab(self):
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.context["review3_opinions"], 0)
+        self.assertNotContains(
+            response, f"{reverse('opinion_list')}?scan={self.scan.pk}"
+        )
+        self.assertContains(response, "Opinion text")
+        self.assertContains(response, "cursor-not-allowed")
+
+    def test_a_legacy_volume_keeps_its_own_step_three(self):
+        self.scan.status = Status.PENDING_REVIEW
+        self.scan.save(update_fields=["status"])
+
+        response = self.client.get(self.url)
+
+        self.assertTrue(response.context["legacy_review"])
+        self.assertContains(response, 'href="?step=3"')
+        self.assertContains(response, "Generate")
+        self.assertNotContains(response, "Opinion text")
