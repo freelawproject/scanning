@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import os
+import re
 import sys
 import types
 from pathlib import Path
@@ -137,13 +138,47 @@ def _answer(prompt_type, raw, tokens=120, error=False, confidence=0.97):
     )
 
 
-def _read(blocks=None, answers=None, size=(1700, 2200)):
-    """One scripted read: the result returned, and the answers made."""
+def _read(blocks=None, answers=None, size=(1700, 2200), raise_after=None):
+    """One scripted read: the result returned, and the answers made.
+
+    ``raise_after`` is an exception the fake predictor raises once the
+    answers are made: a read that failed after the model had spoken.
+    """
     if blocks is None:
         blocks = [_block()]
     if answers is None:
         answers = [_answer("high_accuracy_bbox", FULL_PAGE_ANSWER)]
-    return {"result": _result(blocks, size), "answers": list(answers)}
+    return {
+        "result": _result(blocks, size),
+        "answers": list(answers),
+        "raise_after": raise_after,
+    }
+
+
+_DIV_RE = re.compile(r"<div ([^>]*)>(.*?)</div>", re.S)
+_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+
+
+def _fake_parse_full_page_html(text):
+    """surya's parser, for flat answers: one entry per top-level div,
+    in either attribute order, a div with a bad bbox skipped, as
+    ``parse_full_page_html`` does."""
+    if text == "not html at all":
+        raise ValueError("no soup")
+    out = []
+    for attrs, inner in _DIV_RE.findall(text):
+        a = dict(_ATTR_RE.findall(attrs))
+        parts = (a.get("data-bbox") or "").split()
+        if not a.get("data-label") or len(parts) != 4:
+            continue
+        out.append(
+            SimpleNamespace(
+                label=a["data-label"],
+                bbox=tuple(float(v) for v in parts),
+                html=inner,
+            )
+        )
+    return out
 
 
 def _surya_stubs(script, calls):
@@ -186,6 +221,8 @@ def _surya_stubs(script, calls):
                 raise entry
             if entry["answers"]:
                 self.manager.generate(entry["answers"])
+            if entry.get("raise_after") is not None:
+                raise entry["raise_after"]
             return [entry["result"]] * len(images)
 
     surya = types.ModuleType("surya")
@@ -193,9 +230,12 @@ def _surya_stubs(script, calls):
     inference.SuryaInferenceManager = Manager
     recognition = types.ModuleType("surya.recognition")
     recognition.RecognitionPredictor = Recognizer
+    parsers = types.ModuleType("surya.inference.parsers")
+    parsers.parse_full_page_html = _fake_parse_full_page_html
     return {
         "surya": surya,
         "surya.inference": inference,
+        "surya.inference.parsers": parsers,
         "surya.recognition": recognition,
         # ``_action_ocr`` imports fitz itself; the render is patched on
         # the handler, so the document only needs to be indexable.
@@ -476,10 +516,14 @@ class TestOcrPages(SimpleTestCase):
         self.assertNotIn("empty", page)
         self.assertNotIn("error_blocks", page)
         self.assertIn("duration_ms", page)
+        # The answer parsed to one div and the one block is it.
+        self.assertEqual(page["parsed_blocks"], 1)
+        self.assertNotIn("dropped_blocks", page)
         self.assertEqual(run.result["page_count"], 1)
         self.assertEqual(run.result["failed_pages"], [])
         self.assertEqual(run.result["empty_pages"], [])
         self.assertEqual(run.result["fallback_pages"], [])
+        self.assertEqual(run.result["dropped_block_pages"], [])
 
     def test_the_bbox_falls_back_to_the_polygon(self):
         block = _block()
@@ -544,11 +588,136 @@ class TestOcrPages(SimpleTestCase):
 
     def test_a_skipped_figure_is_not_empty(self):
         figure = _block(label="Figure", html="", skipped=True)
-        run = _OcrRun(self, [_read(blocks=[figure])])
+        raw = '<div data-bbox="59 91 529 118" data-label="Figure"><img/></div>'
+        run = _OcrRun(
+            self,
+            [
+                _read(
+                    blocks=[figure],
+                    answers=[_answer("high_accuracy_bbox", raw)],
+                )
+            ],
+        )
         page = run.result["pages"][0]
         self.assertEqual(page["attempts"], 1)
         self.assertNotIn("empty", page)
+        # surya emptied the block's html; the parsed answer gives it
+        # back, which for a figure is the image tag and no text.
+        self.assertEqual(page["blocks"][0]["html"], "<img/>")
         self.assertEqual(page["text"], "")
+        self.assertIs(page["blocks"][0]["skipped"], True)
+
+    def test_a_complex_block_keeps_its_text_from_raw(self):
+        # surya canonicalizes Complex-Block to Figure and skips it: the
+        # model's text for it survives in the answer only, so the
+        # block gets it back from there. The other block is untouched.
+        raw = (
+            '<div data-bbox="10 10 500 200" data-label="Complex-Block">'
+            "<p>Held: the <b>motion</b> is denied.</p></div>"
+            '<div data-bbox="10 210 500 300" data-label="Text"><p>Plain</p></div>'
+        )
+        blocks = [
+            _block(
+                label="Figure",
+                raw_label="Complex-Block",
+                html="",
+                skipped=True,
+            ),
+            _block(order=1, html="<p>Plain</p>"),
+        ]
+        run = _OcrRun(
+            self,
+            [
+                _read(
+                    blocks=blocks, answers=[_answer("high_accuracy_bbox", raw)]
+                )
+            ],
+        )
+        page = run.result["pages"][0]
+        first, second = page["blocks"]
+        self.assertEqual(
+            first["html"], "<p>Held: the <b>motion</b> is denied.</p>"
+        )
+        self.assertEqual(first["text"], "Held: the motion is denied.")
+        self.assertIs(first["skipped"], True)
+        self.assertEqual(second["html"], "<p>Plain</p>")
+        self.assertEqual(page["text"], "Held: the motion is denied.\nPlain")
+        self.assertEqual(page["parsed_blocks"], 2)
+        self.assertNotIn("dropped_blocks", page)
+
+    def test_a_block_surya_dropped_is_counted_and_named(self):
+        # The answer had three divs; surya kept two (a blank-crop drop
+        # in the middle keeps the survivors' numbering).
+        raw = (
+            '<div data-bbox="10 10 500 100" data-label="Text"><p>One</p></div>'
+            '<div data-bbox="10 110 500 200" data-label="Text"><p>ghost</p></div>'
+            '<div data-bbox="10 210 500 300" data-label="Page-Footer"><p>3</p></div>'
+        )
+        blocks = [
+            _block(order=0, html="<p>One</p>"),
+            _block(
+                order=2,
+                label="PageFooter",
+                raw_label="Page-Footer",
+                html="<p>3</p>",
+            ),
+        ]
+        run = _OcrRun(
+            self,
+            [
+                _read(
+                    blocks=blocks, answers=[_answer("high_accuracy_bbox", raw)]
+                )
+            ],
+            pages=1,
+        )
+        page = run.result["pages"][0]
+        self.assertEqual(page["parsed_blocks"], 3)
+        self.assertEqual(
+            page["dropped_blocks"], [{"order": 1, "raw_label": "Text"}]
+        )
+        self.assertEqual(run.result["dropped_block_pages"], [0])
+
+    def test_a_block_mode_page_is_counted_but_not_realigned(self):
+        # In block mode the blocks are numbered by the layout pass, not
+        # by the failed answer, so nothing is restored or reported as
+        # dropped; the count of what the answer held is still kept.
+        looped = (
+            '<div data-bbox="1 1 2 2" data-label="Figure"><p>x</p></div>' * 3
+        )
+        answers = [
+            _answer("high_accuracy_bbox", looped),
+            _answer("layout", "[]"),
+            _answer("block", "<p>y</p>"),
+        ]
+        figure = _block(label="Figure", html="", skipped=True)
+        run = _OcrRun(self, [_read(blocks=[figure], answers=answers)])
+        page = run.result["pages"][0]
+        self.assertEqual(page["fallback"], "block")
+        self.assertEqual(page["parsed_blocks"], 3)
+        self.assertNotIn("dropped_blocks", page)
+        self.assertEqual(page["blocks"][0]["html"], "")
+
+    def test_an_unparseable_answer_leaves_the_count_none(self):
+        answers = [_answer("high_accuracy_bbox", "not html at all")]
+        run = _OcrRun(self, [_read(answers=answers)])
+        page = run.result["pages"][0]
+        self.assertIsNone(page["parsed_blocks"])
+        self.assertEqual(page["raw"], "not html at all")
+        self.assertEqual(len(page["blocks"]), 1)
+
+    def test_a_raising_read_keeps_the_answer(self):
+        # The model answered and then the read raised: the answer is
+        # the evidence, as on a failed dots.mocr page.
+        run = _OcrRun(
+            self,
+            [_read(raise_after=RuntimeError("parse blew up")), _read()],
+            pages=2,
+        )
+        page = run.result["pages"][0]
+        self.assertEqual(page["error"], "parse blew up")
+        self.assertEqual(page["raw"], FULL_PAGE_ANSWER)
+        self.assertEqual(run.result["failed_pages"], [0])
 
     def test_twice_empty_is_written_and_marked(self):
         # Kept so the shard converges, marked so a reader checks it.
@@ -813,6 +982,11 @@ class TestSummaryFields(SimpleTestCase):
     """What the response keeps when the payload goes to S3."""
 
     def test_the_page_lists_travel_and_the_pages_do_not(self):
-        for field in ("failed_pages", "empty_pages", "fallback_pages"):
+        for field in (
+            "failed_pages",
+            "empty_pages",
+            "fallback_pages",
+            "dropped_block_pages",
+        ):
             self.assertIn(field, handler._SUMMARY_FIELDS)
         self.assertNotIn("pages", handler._SUMMARY_FIELDS)

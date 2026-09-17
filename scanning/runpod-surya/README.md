@@ -270,7 +270,8 @@ Returns:
         }
       ],
       "text": "OPINION\n...",
-      "raw": "<div data-label=\"Section-Header\" data-bbox=\"360 85 640 105\"><h2>OPINION</h2></div>...",
+      "raw": "<div data-bbox=\"360 85 640 105\" data-label=\"Section-Header\"><h2>OPINION</h2></div>...",
+      "parsed_blocks": 14,
       "requests": 1,
       "completion_tokens": 1830,
       "confidence": 0.98,
@@ -282,6 +283,7 @@ Returns:
   "failed_pages": [],
   "empty_pages": [],
   "fallback_pages": [],
+  "dropped_block_pages": [],
   "duration_ms": 311034,
   "worker_boot_ms": 96210,
   "worker_uptime_ms": 128,
@@ -300,14 +302,19 @@ Notes on the page dicts:
   `Bibliography`, `ChemicalBlock`, `Picture` (the model's `Image`),
   `Figure` (the model's `Figure` **and** `Complex-Block`), `Diagram`,
   `BlankPage`. Key on `label`, with that spelling. `html` is the
-  model's verbatim block HTML, `text` that HTML flattened (tags
-  dropped; `<br>`, `<hr>` and closed paragraphs, headings, list items,
-  table cells and rows as newlines; entities unescaped).
-  `skipped: true` marks a label surya does not OCR: `Figure`,
-  `Picture`, `Diagram` and `BlankPage`, with `html` empty. Because
-  `Complex-Block` canonicalizes to `Figure`, a complex text block loses
-  its HTML in `blocks`; the model's text for it survives in `raw` only.
-  `error: true` marks a block whose read failed in block mode.
+  block's inner HTML as surya's parser hands it over: the model's
+  markup, with the `data-bbox` and `data-label` attributes of nested
+  elements removed (`parse_full_page_html` strips them), so any
+  sub-block geometry the model wrote is in `raw` only. `text` is that
+  HTML flattened (tags dropped; `<br>`, `<hr>` and closed paragraphs,
+  headings, list items, table cells and rows as newlines; entities
+  unescaped). `skipped: true` marks a label surya does not OCR:
+  `Figure`, `Picture`, `Diagram` and `BlankPage`. surya empties the
+  HTML of such a block; the worker puts it back from the parsed
+  answer (see "What surya drops" below), so a figure carries its
+  `<img/>` and a `Complex-Block`, which canonicalizes to `Figure`,
+  keeps the text the model read in it. `error: true` marks a block
+  whose read failed in block mode.
 - `raw` is the full-page answer as the model wrote it, on every page
   that got one (`null` when there was no answer): `blocks` is surya's
   parse of it, so `raw` is what a later post-processor starts from,
@@ -338,8 +345,48 @@ Notes on the page dicts:
   after the full-page answer looped or would not parse; `error_blocks`
   counts the blocks that failed in that pass. Such pages are listed in
   `fallback_pages`.
-- A page whose read raised appears as `{"page_no": N, "error": "..."}`
-  and is listed in `failed_pages`; one bad page doesn't sink the job.
+- `parsed_blocks` and `dropped_blocks` say what surya's parse lost on
+  the way to `blocks`; see the next section. `dropped_block_pages`
+  lists the pages with a drop.
+- A page whose read raised appears as `{"page_no": N, "error": "..."}`,
+  plus `raw` when the model had answered before the failure, and is
+  listed in `failed_pages`; one bad page doesn't sink the job.
+
+### What surya drops, and how the output shows it
+
+The dots.mocr and YOLO post-processing incidents were each a step
+that threw data away with no count anyone could read. surya has four
+such steps between the model's answer and `blocks`, all in
+`surya/recognition/__init__.py` and `surya/inference/parsers.py`:
+
+| Step | What is lost | Signal |
+|---|---|---|
+| `parse_full_page_html` skips a top-level div whose `data-label` or `data-bbox` is missing or malformed | the block, silently | `dropped_blocks` |
+| `_drop_blank_text_blocks` deletes a text-labelled block whose crop is blank (over 99 percent of pixels at or above 245 on every channel, or a per-channel standard deviation under 8) | the block, on one INFO line of surya's logger | `dropped_blocks` |
+| a skipped label (`Figure`, `Picture`, `Diagram`, `BlankPage`, and `Complex-Block` which maps to `Figure`) gets `html=""` | the block's HTML, so a complex text block drops out of `text` | restored from `raw` |
+| nested `data-bbox` and `data-label` attributes are removed from every block's inner HTML | sub-block geometry | `raw` only |
+
+The worker parses `raw` once more with surya's own parser
+(`parse_full_page_html`) and records `parsed_blocks`, the count of
+top-level divs it found, so `parsed_blocks - len(blocks)` is what
+surya dropped. Each missing entry is listed in `dropped_blocks` as
+`{"order", "raw_label"}` and the page in `dropped_block_pages`. On a
+page read whole the parsed list and `blocks` align by `order` (surya
+numbers those blocks by their index in the parsed list and a drop
+keeps the survivors' numbers), so a skipped block gets its `html` and
+`text` back from its parsed entry. A page read in block mode
+(`fallback: "block"`) is numbered by the layout pass instead, and its
+`raw` is the answer that failed, so only `parsed_blocks` is recorded
+for it. A `raw` surya's parser refuses leaves `parsed_blocks` null.
+
+Measured on the smoke run (the 15-page Transformer paper): 147
+top-level divs, 147 blocks, no drop; no nested geometry in any
+answer; six skipped `Figure` and `Diagram` blocks whose inner HTML was
+`<img/>`. On a reporter volume the case to watch is `Complex-Block`
+over a dense headnote or a table of parallel citations: with these
+fields it is one number in the summary and the text is still there.
+`raw` and these fields belong to the shard object on S3; the glue is
+free to leave them out of the volume document.
 
 ### Hardening
 
@@ -376,6 +423,7 @@ here so they never come back as a success with no text in it:
     "failed_pages": [],
     "empty_pages": [],
     "fallback_pages": [3],
+    "dropped_block_pages": [],
     "duration_ms": 311034
   }
   ```

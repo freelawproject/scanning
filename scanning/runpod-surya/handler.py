@@ -671,6 +671,96 @@ def _is_empty(blocks: list[dict]) -> bool:
     return all(block["error"] for block in blocks)
 
 
+def _raw_answer(records: list[dict]) -> str | None:
+    """The full-page answer among a read's requests, as the model wrote it.
+
+    :param records: The recorder's notes for one read.
+    :returns: The answer, or None when there was none: no full-page
+        request made, or one that errored (surya hands those back as
+        ``""``).
+    :rtype: str | None
+    """
+    for record in records:
+        if record["prompt_type"] == FULL_PAGE_PROMPT:
+            return record["raw"] or None
+    return None
+
+
+def _account_for_raw(page: dict, parse_raw) -> None:
+    """Say what surya dropped between the answer and the blocks (#344).
+
+    surya's parse of the full-page answer loses things on the way to
+    ``blocks``, each of them silently or on one INFO line of its own
+    logger: a top-level div with a missing or malformed ``data-bbox``
+    is skipped; a text block over a crop that is 99 percent near-white
+    is dropped as a hallucination (``_drop_blank_text_blocks``); a
+    label surya does not OCR (``Figure``, ``Picture``, ``Diagram``,
+    ``BlankPage``, and ``Complex-Block``, which canonicalizes to
+    ``Figure``) keeps its geometry but has its HTML replaced by ``""``.
+    The dots.mocr and YOLO post-processing incidents were exactly a
+    count nobody had, so the answer is parsed once more here, with
+    surya's own parser, and compared.
+
+    Only on a page read whole: surya numbers the blocks of that path by
+    their index in the parsed list (``reading_order=idx``) and a later
+    drop keeps the survivors' numbers, so the two lists align by
+    ``order``. A page read in block mode numbers its blocks by the
+    layout pass instead, and its answer is the one that failed, so the
+    count is recorded and nothing is restored.
+
+    :param page: The page dict, updated in place: ``parsed_blocks``
+        (top-level divs surya's parser finds in ``raw``, None when it
+        raises), ``dropped_blocks`` (the parsed entries with no block,
+        as ``{"order", "raw_label"}``), and on a skipped block ``html``
+        and ``text`` restored from the parsed entry.
+    :param parse_raw: surya's ``parse_full_page_html``.
+    """
+    raw = page.get("raw")
+    if not raw:
+        return
+    try:
+        parsed = parse_raw(raw)
+    except Exception as exc:
+        logger.warning(
+            "page %d: surya's parser refused raw: %s", page["page_no"], exc
+        )
+        page["parsed_blocks"] = None
+        return
+    page["parsed_blocks"] = len(parsed)
+    if "fallback" in page:
+        return
+    by_order = {block["order"]: block for block in page["blocks"]}
+    dropped = []
+    restored = False
+    for order, item in enumerate(parsed):
+        block = by_order.get(order)
+        if block is None:
+            dropped.append(
+                {"order": order, "raw_label": _field(item, "label")}
+            )
+            continue
+        if block["skipped"] and not block["html"]:
+            html = _field(item, "html") or ""
+            block["html"] = html
+            block["text"] = _html_to_text(html)
+            restored = restored or bool(html)
+    if restored:
+        # The page text is the blocks' text in order, and a block just
+        # got some back.
+        page["text"] = "\n".join(
+            block["text"] for block in page["blocks"] if block["text"]
+        )
+    if dropped:
+        page["dropped_blocks"] = dropped
+        logger.warning(
+            "page %d: surya dropped %d of %d parsed blocks: %s",
+            page["page_no"],
+            len(dropped),
+            len(parsed),
+            ", ".join(f"{d['order']} {d['raw_label']}" for d in dropped),
+        )
+
+
 def _page_from_read(page_idx: int, image, result, records: list[dict]) -> dict:
     """Assemble one page dict from a read and the requests it made.
 
@@ -699,10 +789,8 @@ def _page_from_read(page_idx: int, image, result, records: list[dict]) -> dict:
         # The answer as the model wrote it, on every page: what a later
         # post-processor starts from, and on a page surya could not
         # parse, the only evidence of what it wrote. surya keeps no
-        # copy. None when there was no answer: no request made, or a
-        # request that errored (surya hands those back as ""). The
-        # payload goes to S3, so its size is no concern.
-        "raw": (full_page[0]["raw"] or None) if full_page else None,
+        # copy. The payload goes to S3, so its size is no concern.
+        "raw": _raw_answer(records),
         "requests": len(records),
         "completion_tokens": sum(tokens) if tokens else None,
     }
@@ -750,7 +838,8 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     :param tmp_dir: Per-job scratch directory.
     :returns: ``{"pages": list[dict], "page_count": int,
         "failed_pages": list[int], "empty_pages": list[int],
-        "fallback_pages": list[int], "duration_ms": int}``. Each page
+        "fallback_pages": list[int], "dropped_block_pages": list[int],
+        "duration_ms": int}``. Each page
         dict carries ``page_no``, ``origin_width``/``origin_height``
         (the render size, the pixel space of every ``bbox``),
         ``blocks`` (see :func:`_serialize_blocks`), ``text`` (the
@@ -763,9 +852,14 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         ``fallback: "block"`` (surya re-read the page block by block
         after the full-page answer failed), ``error_blocks`` (blocks
         that failed in block mode) and ``empty: true`` (no block after
-        every read; kept, not failed, so the shard converges). A page
-        whose read raised is ``{"page_no", "error", "attempts"}`` and is
-        listed in ``failed_pages``.
+        every read; kept, not failed, so the shard converges). On a
+        page read whole, ``parsed_blocks`` and ``dropped_blocks`` say
+        what surya's parse lost on the way to ``blocks``, and a skipped
+        block carries the HTML of its parsed entry
+        (:func:`_account_for_raw`); ``dropped_block_pages`` lists the
+        pages with a drop. A page whose read raised is ``{"page_no",
+        "error", "attempts"}`` plus ``raw`` when the model had answered,
+        and is listed in ``failed_pages``.
     :rtype: dict
     :raises RuntimeError: When every page failed or came back empty,
         or when a run of empty pages met a server that no longer
@@ -813,6 +907,7 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     # served name once, on this thread, so a wrong name fails the job
     # with its own message and not as N identical page errors.
     recognizer = _recognizer()
+    from surya.inference.parsers import parse_full_page_html
 
     # One fitz document per thread: rendering from a shared Document
     # across threads segfaults. Docs are tracked so they can be closed
@@ -833,6 +928,7 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     def _read_page(page_idx: int) -> dict:
         t0 = time.monotonic()
         attempt = 0
+        records: list[dict] = []
         try:
             image = _render_page(_doc()[page_idx], dpi)
             page: dict | None = None
@@ -847,6 +943,7 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 finally:
                     records = _LOG.close()
                 page = _page_from_read(page_idx, image, result, records)
+                _account_for_raw(page, parse_full_page_html)
                 page["attempts"] = attempt
                 if not _is_empty(page["blocks"]):
                     break
@@ -862,11 +959,18 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             # error per page, with the read it happened on, and keep
             # going. If *every* page fails the whole job raises below.
             logger.exception("page %d failed", page_idx)
-            return {
+            failed = {
                 "page_no": page_idx,
                 "error": str(exc),
                 "attempts": max(attempt, 1),
             }
+            # The answer the model gave before the read raised, when
+            # there was one: the only evidence of what went wrong, as
+            # on a failed dots.mocr page.
+            raw = _raw_answer(records)
+            if raw is not None:
+                failed["raw"] = raw
+            return failed
         if _is_empty(page["blocks"]):
             # Twice empty: written, so the shard converges instead of
             # looping, but marked, because a truly blank page is rare.
@@ -929,6 +1033,7 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     failed = [r["page_no"] for r in results if "error" in r]
     empty = [r["page_no"] for r in results if r.get("empty")]
     fallback = [r["page_no"] for r in results if "fallback" in r]
+    dropped = [r["page_no"] for r in results if r.get("dropped_blocks")]
     if len(failed) + len(empty) == pages:
         raise RuntimeError(
             f"all {pages} pages failed or came back empty; "
@@ -937,12 +1042,13 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
 
     duration_ms = int((time.monotonic() - t0) * 1000)
     logger.info(
-        "ocr OK: %d pages (%d failed, %d empty, %d read in block mode) "
-        "in %d ms (dpi=%d)",
+        "ocr OK: %d pages (%d failed, %d empty, %d read in block mode, "
+        "%d with a dropped block) in %d ms (dpi=%d)",
         pages,
         len(failed),
         len(empty),
         len(fallback),
+        len(dropped),
         duration_ms,
         dpi,
     )
@@ -952,6 +1058,7 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         "failed_pages": failed,
         "empty_pages": empty,
         "fallback_pages": fallback,
+        "dropped_block_pages": dropped,
         "duration_ms": duration_ms,
     }
 
@@ -968,6 +1075,7 @@ _SUMMARY_FIELDS = (
     "failed_pages",
     "empty_pages",
     "fallback_pages",
+    "dropped_block_pages",
     "duration_ms",
 )
 
