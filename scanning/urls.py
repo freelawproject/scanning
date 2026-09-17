@@ -12,6 +12,8 @@ from scanning.views import (
     legacy_opinion_upload,
     login_view,
     logout_view,
+    opinion_list,
+    opinion_review,
     password_change,
     presign_scan_upload,
     profile,
@@ -101,6 +103,12 @@ urlpatterns = [
     path("logout/", logout_view, name="logout"),
     path("", scan_list, name="scan_list"),
     path("scans/<int:pk>/", scan_detail, name="scan_detail"),
+    path("opinions/", opinion_list, name="opinion_list"),
+    path(
+        "opinions/<int:pk>/review/",
+        opinion_review,
+        name="opinion_review",
+    ),
     # The legacy pipeline's opinions keep their pages under
     # ``legacy/`` (#334). ``legacy`` is not a number, so it cannot
     # collide with an opinion pk.

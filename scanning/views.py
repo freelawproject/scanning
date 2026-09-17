@@ -19,12 +19,14 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
-from scanning import repairs, s3_sync, stats
+from scanning import opinions, repairs, s3_sync, stats
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
 )
 from scanning.models import (
+    Opinion,
+    OpinionReviewStatus,
     OpinionScan,
     OpinionStatus,
     PendingUpload,
@@ -168,6 +170,82 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
 
 
 @login_required
+def opinion_list(request: HttpRequest) -> HttpResponse:
+    """List the opinions of the third review (#334).
+
+    One flat row per :class:`Opinion`, the rows ``opinions.create_rows``
+    writes after the review-2 approval. The four filters are the shape
+    of the scan list, and the step-3 tab of a volume sends ``scan``.
+
+    The warning count is stamped after the pagination, so one grouped
+    query answers the 50 rows of this page and the size of the corpus
+    never reaches it. This is the badge rule of the scan list (#266).
+
+    The opinions of the legacy pipeline are on their own page
+    (:func:`legacy_opinion_list`), linked from this one.
+
+    :param request: The current HTTP request.
+    :return: The rendered opinion list page.
+    """
+    opinions_qs = Opinion.objects.select_related(
+        "scan", "scan__reporter"
+    ).order_by(
+        "scan__reporter__short_name",
+        "scan__volume",
+        "first_printed_page",
+        "index_in_page",
+    )
+
+    scan_filter = request.GET.get("scan")
+    if scan_filter and scan_filter.isdigit():
+        opinions_qs = opinions_qs.filter(scan_id=scan_filter)
+    else:
+        scan_filter = ""
+
+    reporter_filter = request.GET.get("reporter")
+    if reporter_filter and reporter_filter.isdigit():
+        opinions_qs = opinions_qs.filter(scan__reporter_id=reporter_filter)
+    else:
+        reporter_filter = ""
+
+    status_filter = request.GET.get("status")
+    if status_filter:
+        opinions_qs = opinions_qs.filter(status=status_filter)
+
+    volume_filter = request.GET.get("volume")
+    if volume_filter:
+        if volume_filter.isdigit():
+            opinions_qs = opinions_qs.filter(scan__volume=volume_filter)
+        else:
+            messages.error(request, "Volume must be a number.")
+            volume_filter = ""
+
+    paginator = Paginator(opinions_qs, 50)
+    page_obj = paginator.get_page(request.GET.get("page"))
+
+    counts = opinions.finding_counts([row.pk for row in page_obj])
+    for row in page_obj:
+        row.open_findings, row.stale_findings = counts.get(row.pk, (0, 0))
+
+    return render(
+        request,
+        "scanning/opinion_list.html",
+        {
+            "page_obj": page_obj,
+            "status_choices": OpinionReviewStatus.choices,
+            "reporter_choices": [
+                (str(r.pk), f"{r.full_name} ({r.short_name})")
+                for r in Reporter.objects.all()
+            ],
+            "current_scan": scan_filter,
+            "current_reporter": reporter_filter,
+            "current_status": status_filter or "",
+            "current_volume": volume_filter or "",
+        },
+    )
+
+
+@login_required
 def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
     """List the opinions of the legacy pipeline (#334).
 
@@ -220,6 +298,61 @@ def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
             "current_reporter": reporter_filter or "",
             "current_status": status_filter or "",
             "current_volume": volume_filter or "",
+        },
+    )
+
+
+@login_required
+def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Show one opinion of the third review (#334).
+
+    The first stage of the review interface. It shows what the rows
+    hold: the citation, the printed range, the status, the links to the
+    volume and the boundary, and the findings. It reads no S3 and
+    renders no page.
+
+    The page carries **no write control**. The approval, the dismissal
+    and the typing of a page come with the text review itself, which
+    needs ``OpinionText`` and the per-opinion PDF. A button that an
+    endpoint would refuse is the one thing a viewer must never offer.
+
+    :param request: The current HTTP request.
+    :param pk: The primary key of the opinion.
+    :return: The rendered opinion review page.
+    """
+    opinion = get_object_or_404(
+        Opinion.objects.select_related(
+            "scan", "scan__reporter", "apply_run", "boundary", "approved_by"
+        ),
+        pk=pk,
+    )
+    findings = list(
+        opinion.findings.select_related("dismissal").order_by(
+            "page_in_opinion", "check_name"
+        )
+    )
+    # The label is stamped here, not derived in the template. Page 0 is
+    # a real page and a falsy value, and ``None`` is not a name a
+    # Django template holds, so the test belongs in Python.
+    for row in findings:
+        row.page_label = (
+            "the whole opinion"
+            if row.page_in_opinion is None
+            else f"page {row.page_in_opinion + 1} of the opinion"
+        )
+    open_findings = sum(1 for row in findings if row.dismissal_id is None)
+
+    return render(
+        request,
+        "scanning/opinion_review.html",
+        {
+            "opinion": opinion,
+            "findings": findings,
+            "open_findings": open_findings,
+            # The list the reviewer came from, so the back link keeps
+            # their filters. Never fed to a redirect: it is a query
+            # string on one known route, not a ``next``.
+            "list_query": request.GET.urlencode(),
         },
     )
 

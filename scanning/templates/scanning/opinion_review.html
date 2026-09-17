@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+
+{% comment %}
+  One opinion of the third review (issue #334), stage 1.
+
+  The page shows what the rows hold and nothing that needs S3. It
+  carries no write control: the approval, the dismissal and the typing
+  of a page arrive with the text review itself, which needs OpinionText
+  and the per-opinion PDF. A button the endpoint would refuse is the one
+  thing a viewer must never offer (the rule of the step-1 bar, #151).
+{% endcomment %}
+
+{% block title %}{{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }} - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<a href="{% url 'opinion_list' %}{% if list_query %}?{{ list_query }}{% endif %}"
+   class="inline-flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 mb-4">
+  <i class="fa-solid fa-arrow-left"></i> Back to the opinions
+</a>
+
+<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4">
+  <div class="flex items-center gap-3 flex-wrap">
+    <h1 class="text-2xl font-bold">
+      {{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }}
+      {% if opinion.index_in_page %}<span class="text-base font-normal text-gray-500 dark:text-gray-400">({{ opinion.index_in_page|add:1 }} of that page)</span>{% endif %}
+    </h1>
+    <span class="badge-{{ opinion.status }}">{{ opinion.get_status_display }}</span>
+  </div>
+  <a href="{% url 'scan_process' pk=opinion.scan.pk %}?step=2" class="btn-outline text-sm">
+    <i class="fa-solid fa-book"></i> Open the volume
+  </a>
+</div>
+
+{% if opinion.status == 'error' and opinion.error_message %}
+<div class="alert-error mb-6">{{ opinion.error_message }}</div>
+{% endif %}
+
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+  {# The facts of the row #}
+  <div class="card lg:col-span-1">
+    <h2 class="text-sm font-bold mb-3">The opinion</h2>
+    <table class="min-w-full text-sm">
+      <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+        <tr>
+          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Printed pages</th>
+          <td class="py-2">{{ opinion.first_printed_page }}{% if opinion.last_printed_page != opinion.first_printed_page %} &ndash; {{ opinion.last_printed_page }}{% endif %}</td>
+        </tr>
+        <tr>
+          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Physical pages</th>
+          <td class="py-2">{{ opinion.page_count }}</td>
+        </tr>
+        <tr>
+          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Volume</th>
+          <td class="py-2">
+            <a href="{% url 'scan_process' pk=opinion.scan.pk %}" class="text-blue-600 dark:text-blue-400 hover:underline">
+              {% if opinion.scan.reporter %}{{ opinion.scan.reporter.short_name|upper }} vol. {{ opinion.scan.volume }}{% else %}Scan #{{ opinion.scan.pk }}{% endif %}
+            </a>
+          </td>
+        </tr>
+        <tr>
+          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Pages of the volume</th>
+          <td class="py-2">{{ opinion.start_page_index|add:1 }} &ndash; {{ opinion.end_page_index|add:1 }}{% if opinion.apply_run %} of {{ opinion.apply_run.label }}{% else %} of the original{% endif %}</td>
+        </tr>
+        <tr>
+          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Boundary</th>
+          <td class="py-2">{% if opinion.boundary %}#{{ opinion.boundary.pk }}{% else %}<span class="text-gray-400">none</span>{% endif %}</td>
+        </tr>
+        {% if opinion.approved_at %}
+        <tr>
+          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Approved</th>
+          <td class="py-2">{{ opinion.approved_at|date:"M j, Y g:i A" }}{% if opinion.approved_by %} by {{ opinion.approved_by.username }}{% endif %}</td>
+        </tr>
+        {% endif %}
+      </tbody>
+    </table>
+    {% if opinion.notes %}
+    <h3 class="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mt-4 mb-1">Notes</h3>
+    <p class="text-sm whitespace-pre-line">{{ opinion.notes }}</p>
+    {% endif %}
+  </div>
+
+  {# The findings #}
+  <div class="card lg:col-span-2">
+    <h2 class="text-sm font-bold mb-3 flex items-center gap-2">
+      Findings
+      <span class="text-xs font-normal text-gray-600 dark:text-gray-300">({{ open_findings }} open)</span>
+    </h2>
+    {% if not findings %}
+    <div class="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded px-3 py-2 text-xs text-green-700 dark:text-green-300 font-medium">
+      No findings.
+    </div>
+    {% endif %}
+    {% for finding in findings %}
+    {% comment %}
+      A stale card is a fact about a row, not a judgement, so it carries
+      no dismiss control anywhere in the portal. Here no card carries
+      one: this stage has no write endpoint at all.
+    {% endcomment %}
+    <div class="rounded border px-3 py-2 mb-2 text-sm
+         {% if finding.dismissal %}border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 opacity-60{% elif finding.is_stale %}border-red-300 bg-red-50 dark:border-red-700 dark:bg-red-900/20{% else %}border-yellow-300 bg-yellow-50 dark:border-yellow-700 dark:bg-yellow-900/20{% endif %}"
+         data-check="{{ finding.check_name }}">
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="font-semibold">{{ finding.get_check_name_display }}</span>
+        <span class="text-xs text-gray-500 dark:text-gray-400">{{ finding.page_label }}</span>
+        {% if finding.is_stale %}<span class="text-[10px] font-bold uppercase text-red-700 dark:text-red-300">not applied</span>{% endif %}
+        {% if finding.dismissal %}<span class="text-[10px] font-bold uppercase text-gray-500">dismissed</span>{% endif %}
+      </div>
+      {% if finding.message %}<p class="mt-1 text-xs text-gray-700 dark:text-gray-300">{{ finding.message }}</p>{% endif %}
+    </div>
+    {% endfor %}
+
+    <div class="mt-6 border border-dashed border-gray-300 dark:border-gray-700 rounded px-4 py-10 text-center">
+      <p class="text-sm text-gray-500 dark:text-gray-400">The text review is not built yet.</p>
+      <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">The redacted pages and the text of the OCR ensemble go here.</p>
+    </div>
+  </div>
+
+</div>
+{% endblock %}

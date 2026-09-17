@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+
+{% comment %}
+  The opinions of the third review (issue #334), one flat row per
+  Opinion row. The legacy pipeline's opinions have their own page,
+  linked under the title.
+
+  Each row carries open_findings and stale_findings, which the view
+  stamps after the pagination from opinions.finding_counts: one grouped
+  query for the 50 rows of this page, the badge rule of the scan list.
+{% endcomment %}
+
+{% block title %}Opinions - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-2 gap-4">
+  <h1 class="text-2xl font-bold">Opinions</h1>
+  <span class="text-sm text-gray-500 dark:text-gray-400">{{ page_obj.paginator.count }} opinions</span>
+</div>
+<p class="text-xs text-gray-500 dark:text-gray-400 mb-6">
+  The opinions of the legacy pipeline are on
+  <a href="{% url 'legacy_opinion_list' %}" class="text-blue-600 dark:text-blue-400 hover:underline">their own page</a>.
+</p>
+
+<!-- Filters -->
+<div class="card mb-6">
+  <form method="get">
+    {% if current_scan %}<input type="hidden" name="scan" value="{{ current_scan }}">{% endif %}
+    <div class="flex flex-col sm:flex-row gap-3">
+      <div class="flex-1">
+        <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
+        <select id="filter-reporter" name="reporter" class="input-text w-full">
+          <option value="">All reporters</option>
+          {% for value, label in reporter_choices %}
+          <option value="{{ value }}" {% if current_reporter == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="flex-1">
+        <label for="filter-volume" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Volume</label>
+        <input id="filter-volume" name="volume" type="text" inputmode="numeric" pattern="[0-9]*"
+               value="{{ current_volume }}" placeholder="e.g. 237" class="input-text w-full">
+      </div>
+      <div class="flex-1">
+        <label for="filter-status" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Status</label>
+        <select id="filter-status" name="status" class="input-text w-full">
+          <option value="">All</option>
+          {% for value, label in status_choices %}
+          <option value="{{ value }}" {% if current_status == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="flex items-center justify-between gap-2 mt-3">
+      <span class="text-xs text-gray-500 dark:text-gray-400">
+        {% if current_scan %}One volume only (scan #{{ current_scan }}).{% endif %}
+      </span>
+      <div class="flex items-center gap-2">
+        <a href="{% url 'opinion_list' %}" class="btn-ghost text-sm"><i class="fa-solid fa-xmark"></i> Clear filters</a>
+        <button type="submit" class="btn-outline"><i class="fa-solid fa-magnifying-glass"></i> Filter</button>
+      </div>
+    </div>
+  </form>
+</div>
+
+{% if page_obj %}
+<div class="card overflow-hidden p-0">
+  <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+    <thead class="bg-gray-50 dark:bg-gray-800">
+      <tr>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Citation</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Volume</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Printed pages</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Warnings</th>
+        <th class="px-4 py-3"></th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+      {% for opinion in page_obj %}
+      <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50">
+        <td class="px-4 py-3 whitespace-nowrap">
+          <a href="{% url 'opinion_review' pk=opinion.pk %}" class="text-sm font-medium text-gray-900 dark:text-gray-100 hover:text-blue-600 dark:hover:text-blue-400">
+            {{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }}
+          </a>
+          {% if opinion.index_in_page %}<span class="text-xs text-gray-500 dark:text-gray-400">({{ opinion.index_in_page|add:1 }})</span>{% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm whitespace-nowrap">
+          <a href="{% url 'scan_process' pk=opinion.scan.pk %}" class="text-blue-600 dark:text-blue-400 hover:underline">
+            {{ opinion.scan.reporter.short_name|upper }} vol. {{ opinion.scan.volume }}
+          </a>
+        </td>
+        <td class="px-4 py-3 text-sm whitespace-nowrap">
+          {{ opinion.first_printed_page }}{% if opinion.last_printed_page != opinion.first_printed_page %} &ndash; {{ opinion.last_printed_page }}{% endif %}
+          <span class="text-xs text-gray-500 dark:text-gray-400">({{ opinion.page_count }} pages)</span>
+        </td>
+        <td class="px-4 py-3 whitespace-nowrap">
+          <span class="badge-{{ opinion.status }}">{{ opinion.get_status_display }}</span>
+        </td>
+        <td class="px-4 py-3 text-sm whitespace-nowrap">
+          {% if opinion.open_findings %}
+          <span class="text-yellow-700 dark:text-yellow-300 font-medium">{{ opinion.open_findings }}</span>
+          {% if opinion.stale_findings %}<span class="ml-1 text-xs font-bold uppercase text-red-700 dark:text-red-300" title="A decision of a curator is not applied">{{ opinion.stale_findings }} not applied</span>{% endif %}
+          {% else %}
+          <span class="text-gray-400">&mdash;</span>
+          {% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm text-right">
+          <a href="{% url 'opinion_review' pk=opinion.pk %}" class="btn-outline text-xs px-2 py-1">Review</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- Pagination -->
+{% if page_obj.has_other_pages %}
+<nav class="flex items-center justify-center gap-2 mt-6" aria-label="Pagination">
+  {% if page_obj.has_previous %}
+  <a href="?page={{ page_obj.previous_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}"
+     class="btn-outline text-sm">&laquo; Previous</a>
+  {% endif %}
+
+  <span class="text-sm text-gray-500 dark:text-gray-400">
+    Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}
+  </span>
+
+  {% if page_obj.has_next %}
+  <a href="?page={{ page_obj.next_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}"
+     class="btn-outline text-sm">Next &raquo;</a>
+  {% endif %}
+</nav>
+{% endif %}
+
+{% else %}
+<div class="card text-center py-12">
+  <p class="text-gray-500 dark:text-gray-400">No opinions found.</p>
+  <p class="text-xs text-gray-400 dark:text-gray-500 mt-2">
+    A volume writes its opinions when a curator approves the redaction review.
+  </p>
+</div>
+{% endif %}
+{% endblock %}
