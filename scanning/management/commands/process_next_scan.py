@@ -38,8 +38,15 @@ RETRY_BACKOFF_SECONDS = 0.5
 #: The claim order, by action, then by age. The worker is serial, so a
 #: person's wait goes first: an upload (a blank action means the same),
 #: then a redaction compute, then the page edit apply (#224), a
-#: backfill nobody watches. An unlisted action ranks with the compute.
-CLAIM_PRIORITY = ("full_pipeline", "compute_redactions", "apply_page_edits")
+#: backfill nobody watches. The opinion creation (#336) follows a
+#: curator's approval, so it goes before the apply too. An unlisted
+#: action ranks with the compute.
+CLAIM_PRIORITY = (
+    "full_pipeline",
+    "compute_redactions",
+    "create_opinions",
+    "apply_page_edits",
+)
 
 #: An apply queued longer than this is claimed next. Without it, a
 #: steady stream of uploads starves the apply: the five queued applies
@@ -216,6 +223,9 @@ class Command(BaseCommand):
             # Issue #224. Same shape: it pulls and writes whole volumes,
             # parks the scan itself and raises nothing.
             QueuedAction.APPLY_PAGE_EDITS: services.run_apply_page_edits,
+            # Issue #336. Rows and one JSON read; parks the scan itself
+            # and raises nothing.
+            QueuedAction.CREATE_OPINIONS: services.run_create_opinions,
         }
 
         # Legacy actions whose pipelines were disconnected (issue #173).

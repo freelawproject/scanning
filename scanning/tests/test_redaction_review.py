@@ -6,8 +6,8 @@ Three groups, one per part of the design:
   that reads it on the collect tick;
 - the redaction apply, which parks a scan it just finished in the new
   READY status itself, so the button is on the page the viewer reloads;
-- the approve button, the only writer of ``REDACTION_REVIEW_DONE``, and
-  the step-3 gate it opens.
+- the approve button, which queues the creation of the opinions (#336),
+  and the step-3 gate that ``REDACTION_REVIEW_DONE`` opens.
 """
 
 from unittest.mock import patch
@@ -24,6 +24,7 @@ from scanning.models import (
     Detection,
     ExternalJob,
     JobStatus,
+    QueuedAction,
     Scan,
     Status,
 )
@@ -38,6 +39,7 @@ from scanning.views_process import (
     REDACTION_REVIEW_ALREADY_DONE_MESSAGE,
     REDACTION_REVIEW_APPROVED_MESSAGE,
     REDACTION_REVIEW_NOT_READY_MESSAGE,
+    REDACTION_REVIEW_QUEUED_MESSAGE,
 )
 
 
@@ -435,12 +437,16 @@ class TestApproveRedactionReview(ScanningTestCase):
         scan.refresh_from_db()
         return [str(m) for m in get_messages(response.wsgi_request)]
 
-    def test_a_ready_scan_is_approved(self):
+    def test_a_ready_scan_is_queued_for_the_opinions(self):
+        """The approval is the event that creates the opinions (#336):
+        the scan goes to the daemon, and the worker writes
+        ``REDACTION_REVIEW_DONE``."""
         scan = ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
 
         flashed = self._approve(scan)
 
-        self.assertEqual(scan.status, Status.REDACTION_REVIEW_DONE)
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertEqual(scan.queued_action, QueuedAction.CREATE_OPINIONS)
         self.assertIn(REDACTION_REVIEW_APPROVED_MESSAGE, flashed)
 
     def test_every_logged_in_user_may_approve(self):
@@ -450,7 +456,17 @@ class TestApproveRedactionReview(ScanningTestCase):
 
         self._approve(scan)
 
-        self.assertEqual(scan.status, Status.REDACTION_REVIEW_DONE)
+        self.assertEqual(scan.status, Status.QUEUED)
+
+    def test_a_press_while_the_opinions_are_created_says_so(self):
+        scan = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.CREATE_OPINIONS
+        )
+
+        flashed = self._approve(scan)
+
+        self.assertEqual(scan.status, Status.QUEUED)
+        self.assertIn(REDACTION_REVIEW_QUEUED_MESSAGE, flashed)
 
     def test_a_second_press_says_so_and_changes_nothing(self):
         scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE)

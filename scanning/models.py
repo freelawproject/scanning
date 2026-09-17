@@ -220,6 +220,10 @@ class QueuedAction(models.TextChoices):
     # work in two phases (build, glue), because both pull and write
     # whole volumes.
     APPLY_PAGE_EDITS = "apply_page_edits", "Apply Page Edits"
+    # Issue #336: write one ``Opinion`` row per standing boundary of the
+    # corrected volume. Queued by the review-2 approval; the worker
+    # writes ``REDACTION_REVIEW_DONE`` when it is done.
+    CREATE_OPINIONS = "create_opinions", "Create Opinions"
 
 
 class UploadAction(models.TextChoices):
