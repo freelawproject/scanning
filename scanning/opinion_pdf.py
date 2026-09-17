@@ -48,7 +48,7 @@ as JPEG bytes.
 **The inputs stay, the outputs go.** The bitonal copy and the shards
 are pulled to the scan's local mirror and never deleted inside a tick:
 three hundred ticks over one volume pull the copy once. The tick that
-leaves no row of the scan due releases the tree, and
+leaves no row of the scan owed releases the tree, and
 :func:`release_mirrors` releases every such tree when the daemon
 starts. The small source and the opinion file live in a scratch
 directory under the mirror, removed in the ``finally`` of the tick.
@@ -73,9 +73,13 @@ callable answers ``None`` and the page keeps its bitonal pixels there.
 
 **The known limit.** A transient fault that never passes -- a
 permission fault on one key -- retries every cooldown with no end and
-never reaches ``ERROR``. The jobs layer bounds its defers with a
-deadline (``jobs.check_deadline``); a cap here is a later change, once
-the first weeks say whether it is needed.
+never reaches ``ERROR``. Such a row is still *owed*, so it also holds
+its volume's whole local tree until ``cleanup_processing_tmp`` sweeps
+it at 24 hours, after which the pass pulls it again: the right trade
+against re-pulling the volume every cooldown, but a real cost. The
+jobs layer bounds its defers with a deadline (``jobs.check_deadline``);
+a cap here is a later change, once the first weeks say whether it is
+needed.
 """
 
 from __future__ import annotations
@@ -176,7 +180,8 @@ def key(opinion: Opinion) -> str:
     """Return the S3 key of the opinion's redacted PDF at the live revision.
 
     The one rule for the key: the scan's processing prefix, the
-    opinion's glue prefix (``jobs/opinions/o{pk}/r{n}/``), the internal
+    opinion's glue prefix (``jobs/opinions/{first}.{index}/r{n}/``, the
+    invariant identity since #350), the internal
     name. Under ``jobs/`` so the generic sync never carries it and the
     admin deletion sweeps it.
 
@@ -437,7 +442,10 @@ def _scratch_dir(opinion: Opinion) -> Path:
     :rtype: Path
     """
     return (
-        Path(opinion.scan.output_dir) / "jobs" / "opinions" / f"o{opinion.pk}"
+        Path(opinion.scan.output_dir)
+        / "jobs"
+        / "opinions"
+        / f"{opinion.first_printed_page}.{opinion.index_in_page}"
     )
 
 
@@ -906,8 +914,9 @@ def write_one(opinion: Opinion) -> dict:
     scratch.mkdir(parents=True, exist_ok=True)
     try:
         with fitz.open(str(bitonal)) as volume:
-            source_path = (
-                scratch / f"o{opinion.pk}.r{opinion.glue_revision}.pdf"
+            source_path = scratch / (
+                f"{opinion.first_printed_page}."
+                f"{opinion.index_in_page}.r{opinion.glue_revision}.pdf"
             )
             small = _small_source(volume, opinion, source_path)
             try:

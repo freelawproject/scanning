@@ -2657,8 +2657,9 @@ class Opinion(AbstractDateTimeModel):
         blank=True,
         help_text=(
             "When the PDF pass last failed on this row, of either kind "
-            "(#336). The row is not due again before opinion_pdf.RETRY_AFTER "
-            "has passed. Cleared when the PDF is written."
+            "(#336). The row is not due again before "
+            "opinion_pdf.retry_after() has passed. Cleared when the PDF "
+            "is written."
         ),
     )
     notes = models.TextField(blank=True, default="")

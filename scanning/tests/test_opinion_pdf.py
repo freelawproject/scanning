@@ -341,8 +341,8 @@ class TestLedger(TestCase):
 
         self.assertEqual(
             opinion_pdf.key(row),
-            f"{s3_sync.s3_processing_prefix(scan)}jobs/opinions/o{row.pk}/"
-            "r3/redacted.pdf",
+            f"{s3_sync.s3_processing_prefix(scan)}jobs/opinions/"
+            "12.0/r3/redacted.pdf",
         )
         self.assertEqual(
             opinion_pdf.download_name(row), "a3d.214.0012-0015.pdf"
@@ -1166,7 +1166,7 @@ class TestLogging(TestCase):
             doc.new_page()
             tmp = Path(tempfile.mkdtemp(prefix="bl-log-"))
             self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-            source = tmp / "o7.r0.pdf"
+            source = tmp / "12.0.r0.pdf"
             doc.save(str(source))
         from blackletter.api import generate
 
@@ -1186,4 +1186,4 @@ class TestLogging(TestCase):
                 output_dir=tmp / "out",
                 full_redacted=False,
             )
-        self.assertTrue(any("o7.r0.pdf" in line for line in logs.output))
+        self.assertTrue(any("12.0.r0.pdf" in line for line in logs.output))

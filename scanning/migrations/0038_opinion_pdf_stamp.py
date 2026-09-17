@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("scanning", "0035_create_opinions_action"),
+        ("scanning", "0037_opinion_ocr_glue_ledger"),
     ]
 
     operations = [
@@ -46,8 +46,8 @@ class Migration(migrations.Migration):
                 help_text=(
                     "When the PDF pass last failed on this row, of either "
                     "kind (#336). The row is not due again before "
-                    "opinion_pdf.RETRY_AFTER has passed. Cleared when the "
-                    "PDF is written."
+                    "opinion_pdf.retry_after() has passed. Cleared when "
+                    "the PDF is written."
                 ),
                 null=True,
             ),

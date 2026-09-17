@@ -1475,13 +1475,13 @@ def serve_opinion_ocr(
     if not opinion_ocr.is_written(opinion):
         return _json_404(
             f"The OCR glue of {opinion} is not written at r{revision}.",
-            run=revision,
+            opinion=opinion.pk,
+            revision=revision,
             label=opinion.status,
         )
     return _redirect_to_object(
         scan,
         f"opinion-{engine}",
-        revision,
         opinion_ocr.engine_key(opinion, engine),
         filename=(
             f"scan-{scan.pk}-opinion-{opinion.first_printed_page}."
@@ -1491,6 +1491,8 @@ def serve_opinion_ocr(
             f"The OCR glue of {opinion} is stamped at r{revision}, but "
             f"its {engine} document is not in the bucket."
         ),
+        opinion=opinion.pk,
+        revision=revision,
         label=opinion.status,
     )
 
