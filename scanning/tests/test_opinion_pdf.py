@@ -304,7 +304,7 @@ class TestLedger(TestCase):
             scan=scan,
             first_printed_page=2,
             pdf_attempted_at=timezone.now()
-            - opinion_pdf.RETRY_AFTER
+            - opinion_pdf.retry_after()
             - timedelta(seconds=1),
         )
 
@@ -814,7 +814,7 @@ class TestTick(OpinionPdfCase):
         self.assertFalse(opinion_pdf.is_written(second))
         release.assert_not_called()
 
-    def test_the_tick_that_leaves_nothing_due_releases_the_mirror(self):
+    def test_the_tick_that_leaves_nothing_owed_releases_the_mirror(self):
         self.opinion(start=1, end=2)
 
         with patch("scanning.s3_sync.release_local_processing") as release:
@@ -822,6 +822,24 @@ class TestTick(OpinionPdfCase):
 
         release.assert_called_once()
         self.assertEqual(release.call_args.args[0].pk, self.scan.pk)
+
+    def test_a_row_under_its_cooldown_keeps_the_tree(self):
+        """Else the pass pulls the whole volume again to write one PDF."""
+        row = self.opinion(start=1, end=2)
+        self.upload.side_effect = None
+        self.upload.return_value = False
+
+        with (
+            patch("scanning.s3_sync.release_local_processing") as release,
+            self.assertLogs("scanning.opinion_pdf", level="WARNING"),
+        ):
+            opinion_pdf.run_tick()
+
+        row.refresh_from_db()
+        # Not due now, but still owed, so the tree stays.
+        self.assertEqual(list(opinion_pdf.due()), [])
+        self.assertEqual(list(opinion_pdf.owed()), [row])
+        release.assert_not_called()
 
     def test_no_due_row_is_a_no_op(self):
         with patch("scanning.apply.local_copy") as pull:
@@ -859,7 +877,7 @@ class TestTick(OpinionPdfCase):
 
         # Two more faults, each after its cooldown, close the row.
         expired = (
-            timezone.now() - opinion_pdf.RETRY_AFTER - timedelta(seconds=1)
+            timezone.now() - opinion_pdf.retry_after() - timedelta(seconds=1)
         )
         for _ in range(opinion_pdf.MAX_ATTEMPTS - 1):
             Opinion.objects.filter(pk=broken.pk).update(
@@ -871,19 +889,26 @@ class TestTick(OpinionPdfCase):
         self.assertEqual(broken.pdf_attempts, opinion_pdf.MAX_ATTEMPTS)
         self.assertEqual(broken.status, OpinionReviewStatus.ERROR)
 
-    def test_a_raise_inside_the_write_is_transient(self):
+    def test_an_unknown_exception_counts(self):
+        """A bug in the write path must reach ERROR rather than repeat."""
         row = self.opinion(start=1, end=2)
-        with (
-            patch(
-                "blackletter.api.generate",
-                side_effect=ValueError("bad payload"),
-            ),
-            self.assertLogs("scanning.opinion_pdf", level="ERROR"),
-        ):
-            self.assertEqual(opinion_pdf.run_tick(), 0)
+        for _ in range(opinion_pdf.MAX_ATTEMPTS):
+            Opinion.objects.filter(pk=row.pk).update(
+                pdf_attempted_at=timezone.now()
+                - opinion_pdf.retry_after()
+                - timedelta(seconds=1)
+            )
+            with (
+                patch(
+                    "blackletter.api.generate",
+                    side_effect=ValueError("bad payload"),
+                ),
+                self.assertLogs("scanning.opinion_pdf", level="ERROR"),
+            ):
+                self.assertEqual(opinion_pdf.run_tick(), 0)
         row.refresh_from_db()
-        self.assertEqual(row.pdf_attempts, 0)
-        self.assertIsNotNone(row.pdf_attempted_at)
+        self.assertEqual(row.pdf_attempts, opinion_pdf.MAX_ATTEMPTS)
+        self.assertEqual(row.status, OpinionReviewStatus.ERROR)
         self.assertIn("ValueError: bad payload", row.error_message)
         self.assertEqual(list(opinion_pdf.due()), [])
 
@@ -901,7 +926,7 @@ class TestTick(OpinionPdfCase):
         # Past the cooldown it is due again, with its attempts intact.
         Opinion.objects.filter(pk=row.pk).update(
             pdf_attempted_at=timezone.now()
-            - opinion_pdf.RETRY_AFTER
+            - opinion_pdf.retry_after()
             - timedelta(seconds=1)
         )
         self.assertEqual(list(opinion_pdf.due()), [row])
@@ -923,6 +948,35 @@ class TestTick(OpinionPdfCase):
         # With no mirror anywhere, the newest scan goes first.
         shutil.rmtree(self.scan.output_dir)
         self.assertEqual(opinion_pdf.next_due(), newer)
+
+    def test_the_walk_costs_one_query_per_scan_and_not_per_row(self):
+        """``distinct()`` would distinct the ordering triple, not the scan."""
+        on_disk = self.opinion(start=1, end=2)
+        for page in range(3, 9):
+            OpinionFactory(
+                scan=self.scan, first_printed_page=200 + page, index_in_page=0
+            )
+        for index in range(2):
+            newer_scan = ScanFactory(
+                page_count=PAGES, status=Status.REDACTION_REVIEW_DONE
+            )
+            for page in range(6):
+                OpinionFactory(
+                    scan=newer_scan,
+                    first_printed_page=300 + page,
+                    index_in_page=0,
+                )
+            self.assertFalse(Path(newer_scan.output_dir).is_dir())
+
+        # 19 due rows over 3 scans, and four queries: the opening
+        # first(), the scan ids, and one first() for each of the two
+        # scans the walk passes (the newest is the opening row's own).
+        # With a ``distinct()`` over the ordering triple the walk would
+        # run one query per due row instead.
+        with self.assertNumQueries(4):
+            picked = opinion_pdf.next_due()
+
+        self.assertEqual(picked, on_disk)
 
     def test_a_reviewed_row_at_the_cap_keeps_its_status(self):
         row = self.opinion(
@@ -983,6 +1037,23 @@ class TestReleaseMirrors(TestCase):
         ):
             self.assertEqual(opinion_pdf.release_mirrors(), 0)
         release.assert_not_called()
+
+
+class TestCooldownSetting(TestCase):
+    def test_the_cooldown_reads_the_setting_at_every_call(self):
+        """An operator shortens it during an incident, with no deploy."""
+        with override_settings(OPINION_PDF_RETRY_AFTER_SECONDS=60):
+            self.assertEqual(opinion_pdf.retry_after(), timedelta(minutes=1))
+        with override_settings(OPINION_PDF_RETRY_AFTER_SECONDS=1):
+            scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
+            row = OpinionFactory(
+                scan=scan,
+                pdf_attempted_at=timezone.now() - timedelta(seconds=2),
+            )
+            self.assertEqual(list(opinion_pdf.due()), [row])
+        with override_settings(OPINION_PDF_RETRY_AFTER_SECONDS=3600):
+            self.assertEqual(list(opinion_pdf.due()), [])
+            self.assertEqual(list(opinion_pdf.owed()), [row])
 
 
 class TestDaemon(TestCase):

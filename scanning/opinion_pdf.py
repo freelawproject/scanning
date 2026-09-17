@@ -53,20 +53,29 @@ leaves no row of the scan due releases the tree, and
 starts. The small source and the opinion file live in a scratch
 directory under the mirror, removed in the ``finally`` of the tick.
 
-**A fault is the fault of one opinion, and there are two kinds.** An
+**A fault is the fault of one opinion, and only one kind is free.** An
 :class:`OpinionPdfError` is a fact the rows explain (a null boundary, a
 page count that disagrees, the run moved, blackletter refused the
-payload), and it will fail again: it counts on ``pdf_attempts``, and
-at :data:`MAX_ATTEMPTS` the row is ``ERROR`` with ``error_message``,
-loud then quiet (the rule of ``ApplyRun.attempts``); the next approval
-brings it back through part 1. A :class:`TransientFault` is the
-network (a pull that fails, a PUT that answers false) or an unexpected
-exception: it costs no attempt, the rule of a defer in the jobs layer.
-Both stamp ``pdf_attempted_at``, and the row is not due again before
-:data:`RETRY_AFTER`, so a failed row never holds the head of the queue
-and three counted faults span three cooldowns and not fifteen seconds.
-A picture that cannot be read is neither: the callable answers ``None``
-and the page keeps its bitonal pixels there.
+payload), and it will fail again. An unexpected exception is not
+transient either: a fault in the cut, in the payload or in PyMuPDF is
+deterministic. Both count on ``pdf_attempts``, and at
+:data:`MAX_ATTEMPTS` the row is ``ERROR`` with ``error_message``, loud
+then quiet (the rule of ``ApplyRun.attempts``); the next approval
+brings it back through part 1. A :class:`TransientFault` alone is the
+network (a pull that fails, a PUT that answers false), and it costs no
+attempt, the rule of a defer in the jobs layer.
+
+Every fault stamps ``pdf_attempted_at``, and the row is not due again
+before :func:`retry_after`, so a failed row never holds the head of
+the queue and three counted faults span three cooldowns and not
+fifteen seconds. A picture that cannot be read is no fault at all: the
+callable answers ``None`` and the page keeps its bitonal pixels there.
+
+**The known limit.** A transient fault that never passes -- a
+permission fault on one key -- retries every cooldown with no end and
+never reaches ``ERROR``. The jobs layer bounds its defers with a
+deadline (``jobs.check_deadline``); a cap here is a later change, once
+the first weeks say whether it is needed.
 """
 
 from __future__ import annotations
@@ -104,12 +113,6 @@ PDFS_PER_TICK = 1
 #: Counted faults a row may spend at one revision before it is ``ERROR``.
 MAX_ATTEMPTS = 3
 
-#: How long a failed row stays out of :func:`due` after a fault of
-#: either kind. A counted fault will fail again, so retrying it every
-#: tick spends the cap in seconds; a transient fault is the network, and
-#: the network needs minutes.
-RETRY_AFTER = timedelta(minutes=15)
-
 #: The scan statuses whose rows the pass writes. One value today: the
 #: approval of review 2 wrote the rows. Review 3 (#334) moves a scan
 #: past it, and an unwritten PDF must stay due there too, so this set is
@@ -131,6 +134,21 @@ IMAGE_JPEG_QUALITY = 85
 IMAGE_LABEL = "IMAGE"
 
 
+def retry_after() -> timedelta:
+    """Return how long a failed row stays out of :func:`due`.
+
+    A counted fault will fail again, so retrying it every tick would
+    spend the cap in seconds; a transient fault is the network, and the
+    network needs minutes. Read from the settings at every call, not
+    bound at import, so an operator can shorten it during an incident
+    without a deploy, and ``override_settings`` reaches it in a test.
+
+    :returns: The cooldown.
+    :rtype: timedelta
+    """
+    return timedelta(seconds=settings.OPINION_PDF_RETRY_AFTER_SECONDS)
+
+
 class OpinionPdfError(Exception):
     """One opinion's PDF cannot be written from what the rows say.
 
@@ -142,8 +160,10 @@ class OpinionPdfError(Exception):
 class TransientFault(Exception):
     """One opinion's PDF was not written because of a fault that passes.
 
-    A pull or a PUT that failed. It counts no attempt; the row waits
-    :data:`RETRY_AFTER` and is due again.
+    A pull or a PUT that failed, and nothing else: an unexpected
+    exception is unknown rather than transient, and counts. This one
+    counts no attempt; the row waits :func:`retry_after` and is due
+    again.
     """
 
 
@@ -215,18 +235,22 @@ def is_written(opinion: Opinion) -> bool:
     )
 
 
-def due() -> QuerySet:
-    """Return the rows that owe a PDF, newest scan first.
+def owed() -> QuerySet:
+    """Return the rows that still owe a PDF, newest scan first.
 
-    The one rule for "a PDF is owed": the stamp is not the revision,
-    the row is not ``ERROR``, its counted faults at this revision are
-    under the cap, its last fault is older than :data:`RETRY_AFTER`,
+    The ledger alone: the stamp is not the revision, the row is not
+    ``ERROR``, its counted faults at this revision are under the cap,
     and its scan is in :data:`OPINION_PDF_STATUSES`. The scan's status
     is joined so a volume an admin sent back writes no PDF while it is
     back. Newest scan first for the reason ``apply.queue_ready_scans``
     gives: the volume a volunteer approved today goes before the
-    backlog. Inside a scan, reading order. :func:`next_due` puts the
-    volume on disk ahead of that order.
+    backlog. Inside a scan, reading order.
+
+    **Not the same question as** :func:`due`, which subtracts the
+    cooldown. "Does this volume still owe a PDF" must not answer no
+    for the minutes a transient fault holds its last row, or
+    :func:`_release_if_done` would free the tree and the pass would
+    pull the whole volume again to write that one opinion.
 
     The reporter is joined because :func:`key` reads it through the
     processing prefix; the boundary because the masks read its anchors.
@@ -241,10 +265,22 @@ def due() -> QuerySet:
         )
         .exclude(status=OpinionReviewStatus.ERROR)
         .exclude(redacted_pdf_revision=F("glue_revision"))
-        .exclude(pdf_attempted_at__gt=timezone.now() - RETRY_AFTER)
         .select_related("scan", "scan__reporter", "boundary")
         .order_by("-scan_id", "first_printed_page", "index_in_page")
     )
+
+
+def due() -> QuerySet:
+    """Return the rows a tick may write now, newest scan first.
+
+    :func:`owed` less the rows under their cooldown: a row whose last
+    fault is younger than :func:`retry_after` waits. :func:`next_due`
+    puts the volume on disk ahead of the order.
+
+    :returns: The queryset, ordered.
+    :rtype: QuerySet
+    """
+    return owed().exclude(pdf_attempted_at__gt=timezone.now() - retry_after())
 
 
 def _has_mirror(scan: Scan) -> bool:
@@ -264,8 +300,16 @@ def next_due() -> Opinion | None:
     in the order of :func:`due`; the first due row of all when no due
     scan has one. Finishing the volume on disk bounds the disk to one
     tree in progress, where the newest-first order alone would hold
-    the tree of every volume a newer approval preempted. The check is
-    one ``is_dir`` per candidate scan.
+    the tree of every volume a newer approval preempted. The cost is
+    one query for the scan ids and one ``is_dir`` per candidate scan.
+
+    The ids are deduplicated here and not with ``distinct()``: Django
+    puts every ``order_by`` column into a ``SELECT DISTINCT``, so the
+    database would distinct the triple rather than the scan, and the
+    walk below would run one query per due *row* -- about 1500 of them
+    for a backlog of five volumes, inside the serial loop.
+    ``dict.fromkeys`` keeps the order of the rows, which is already
+    newest scan first.
 
     :returns: The row, or None.
     :rtype: Opinion | None
@@ -276,7 +320,7 @@ def next_due() -> Opinion | None:
         return None
     if _has_mirror(first.scan):
         return first
-    for scan_id in rows.values_list("scan_id", flat=True).distinct():
+    for scan_id in dict.fromkeys(rows.values_list("scan_id", flat=True)):
         if scan_id == first.scan_id:
             continue
         candidate = rows.filter(scan_id=scan_id).first()
@@ -309,10 +353,11 @@ def _stamp(opinion: Opinion) -> bool:
 def _fail(opinion: Opinion, message: str, counted: bool) -> None:
     """Record one failed tick on the row, and close it at the cap.
 
-    Both kinds stamp ``pdf_attempted_at`` and store the message, so
-    the row leaves :func:`due` for :data:`RETRY_AFTER` and the admin
-    can read what happened. A counted fault (an :class:`OpinionPdfError`)
-    also spends one of :data:`MAX_ATTEMPTS`; a transient one does not.
+    Every fault stamps ``pdf_attempted_at`` and stores the message, so
+    the row leaves :func:`due` for :func:`retry_after` and the admin
+    can read what happened. A counted fault (an
+    :class:`OpinionPdfError`, or an unexpected exception) also spends
+    one of :data:`MAX_ATTEMPTS`; a :class:`TransientFault` does not.
     The writes are scoped to the revision, so a bump that landed during
     the tick spends nothing of the new set. At the cap a row still in
     ``PROCESSING`` goes to ``ERROR`` (terminal; part 1 sets it back at
@@ -339,7 +384,7 @@ def _fail(opinion: Opinion, message: str, counted: bool) -> None:
             "it is due again in %s: %s",
             opinion.pk,
             opinion.scan_id,
-            RETRY_AFTER,
+            retry_after(),
             message,
         )
         return
@@ -929,11 +974,17 @@ def write_one(opinion: Opinion) -> dict:
 def _release_if_done(scan: Scan) -> bool:
     """Release the scan's local mirror when no row of it owes a PDF.
 
+    :func:`owed` and not :func:`due`: a row under its cooldown still
+    owes its PDF. Reading the cooldown here would free the tree of a
+    volume whose last opinion hit one failed PUT, and the pass would
+    pull the whole volume again minutes later to write that one
+    opinion -- every cooldown, for a fault that does not pass.
+
     :param scan: The scan.
     :returns: Whether a tree was removed.
     :rtype: bool
     """
-    if due().filter(scan=scan).exists():
+    if owed().filter(scan=scan).exists():
         return False
     return s3_sync.release_local_processing(scan)
 
@@ -943,9 +994,9 @@ def run_tick() -> int:
 
     The body of the ``build_opinion_pdfs`` command. A fault of the
     write is the fault of that row (:func:`_fail`) and never raises out
-    of the tick: an :class:`OpinionPdfError` counts, a
-    :class:`TransientFault` and any other exception do not. After each
-    row, the scan's mirror is released when nothing of it is due.
+    of the tick: a :class:`TransientFault` costs no attempt, an
+    :class:`OpinionPdfError` and any other exception count. After each
+    row, the scan's mirror is released when nothing of it is owed.
 
     :returns: How many PDFs were written.
     :rtype: int
@@ -963,12 +1014,16 @@ def run_tick() -> int:
         except TransientFault as exc:
             _fail(opinion, str(exc), counted=False)
         except Exception as exc:
+            # Unknown, not transient: a fault in the cut, in the
+            # payload or in PyMuPDF is deterministic, so it must reach
+            # ERROR and stop rather than log a traceback every
+            # cooldown with no end.
             logger.exception(
                 "opinion %s (scan %s): the redacted PDF raised",
                 opinion.pk,
                 opinion.scan_id,
             )
-            _fail(opinion, f"{type(exc).__name__}: {exc}", counted=False)
+            _fail(opinion, f"{type(exc).__name__}: {exc}", counted=True)
         _release_if_done(opinion.scan)
     return written
 
