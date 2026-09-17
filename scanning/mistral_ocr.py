@@ -907,8 +907,11 @@ def cancel_job(
 
 # ── the glue ────────────────────────────────────────────────────────
 #: Version of the volume document this module writes. A reader checks
-#: it before it trusts the page shape.
-GLUE_SCHEMA_VERSION = 1
+#: it before it trusts the page shape. Version 2 (#350) writes every
+#: block box as a four-number list; a version-1 document carries
+#: ``bbox: null`` on every block, because the parse read a field
+#: Mistral does not write, and no geometry may trust it.
+GLUE_SCHEMA_VERSION = 2
 
 #: How many times a run's glue may fail before the pass leaves it
 #: alone. The per-shard results are kept, so a retry costs one small
@@ -934,6 +937,19 @@ _BBOX_MARKER = re.compile(
 #: ``text``, so the parse takes either and writes one.
 BLOCK_TEXT_KEY = "content"
 BLOCK_TEXT_FIELDS = ("content", "text")
+
+#: The four corners of a block box, in the order the glue writes them.
+#: A stored batch answer carries them on the block itself (the
+#: ensemble experiment of #317 read them there over scan 2845); the
+#: fixture of PR #247 nests them under ``bbox``. The parse reads both
+#: and writes one list, ``[x0, y0, x1, y1]``, the shape of a dots.mocr
+#: cell, so one geometry reads both engines (#350).
+BLOCK_BOX_KEYS = (
+    "top_left_x",
+    "top_left_y",
+    "bottom_right_x",
+    "bottom_right_y",
+)
 
 
 class MistralGlueError(Exception):
@@ -1001,14 +1017,44 @@ def _block_text(block: dict) -> str:
     return ""
 
 
+def _block_box(block: dict) -> list[float] | None:
+    """Return one block's box as ``[x0, y0, x1, y1]``, or nothing.
+
+    The four corners are read from :data:`BLOCK_BOX_KEYS` on the block,
+    or from a ``bbox`` dict that holds them. The numbers are kept as
+    they came: every engine of the ai-research ensemble measures in the
+    1700x2200 render space, and a second convention here would have to
+    be undone by every reader. A corner that is missing or not a
+    number, or a box with no area, gives None, so a reader never scales
+    a box that is not one.
+
+    :param block: A block as Mistral wrote it.
+    :returns: The box, or None.
+    :rtype: list[float] | None
+    """
+    source = block
+    if not all(key in block for key in BLOCK_BOX_KEYS):
+        source = block.get("bbox")
+        if not isinstance(source, dict):
+            return None
+    corners = []
+    for key in BLOCK_BOX_KEYS:
+        value = source.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        corners.append(float(value))
+    x0, y0, x1, y1 = corners
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return corners
+
+
 def _blocks(page: dict) -> list[dict]:
     """Return one page's blocks in this module's own shape.
 
     ``{"id", "type", "bbox", "content"}`` per block, in the order
-    Mistral wrote them. The box is kept exactly as it came: every
-    engine of the ai-research ensemble measures in the 1700x2200 render
-    space, and a second convention here would have to be undone by
-    every reader.
+    Mistral wrote them. The box is the list :func:`_block_box` reads
+    off the block, in the 1700x2200 render space, or None.
 
     :param page: One page of a response body.
     :returns: The blocks, empty when the answer has none.
@@ -1021,7 +1067,7 @@ def _blocks(page: dict) -> list[dict]:
         {
             "id": index,
             "type": block.get("type") or "",
-            "bbox": block.get("bbox"),
+            "bbox": _block_box(block),
             BLOCK_TEXT_KEY: _block_text(block),
         }
         for index, block in enumerate(blocks)
@@ -1069,7 +1115,8 @@ def parse_payload(payload: dict) -> dict[int, dict]:
     **The one transform of a Mistral result.** The harvest stores the
     output lines verbatim (:func:`harvest`), and this is where they
     become pages: the body of each line, the page markdown, the blocks
-    with their boxes and their text cleaned of the coordinate markers.
+    with their boxes read into one list shape (:func:`_block_box`) and
+    their text cleaned of the coordinate markers.
     Both glues call it -- the volume glue over a shard result, the
     apply glue over a one-page result -- so a better transform is a
     re-glue at no API cost, and it is right in both documents at once.

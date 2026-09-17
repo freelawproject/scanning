@@ -45,6 +45,16 @@ class TestReglueMistralOcr(MistralApplyTestCase):
 
         self.assertIn(key, self.objects)
         self.assertIn("Glued 1 volume(s)", output)
+        # The re-glue is how a transform change reaches a read volume:
+        # the boxes the version-1 glue lost come back as lists (#350).
+        document = self.objects[key]
+        self.assertEqual(
+            document["schema_version"], mistral_ocr.GLUE_SCHEMA_VERSION
+        )
+        self.assertEqual(
+            document["pages"][0]["blocks"][0]["bbox"],
+            [100.0, 200.0, 900.0, 300.0],
+        )
 
     def test_the_corrected_volume_is_written_again(self):
         run = self.build_glued()

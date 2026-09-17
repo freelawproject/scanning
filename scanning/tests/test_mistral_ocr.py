@@ -576,7 +576,16 @@ class TestSweep(ScanningTestCase):
                                 "height": 2200,
                                 "width": 1700,
                             },
-                            "blocks": [{"type": "text", "content": "One"}],
+                            "blocks": [
+                                {
+                                    "type": "text",
+                                    "top_left_x": 100,
+                                    "top_left_y": 200,
+                                    "bottom_right_x": 900,
+                                    "bottom_right_y": 300,
+                                    "content": "One",
+                                }
+                            ],
                         }
                     ],
                     "usage_info": {"pages_processed": 1},
