@@ -253,6 +253,24 @@ def _suffixed_value(match: re.Match | None) -> str | None:
     return value
 
 
+def suffixed_number(value: str | None) -> int | None:
+    """Return the number a suffixed page shares its bucket with (#335).
+
+    ``2094a`` gives ``2094``. The sequence gives such a page no span
+    (``services.printed_page_span``), because the book adds it between
+    two numbered pages; the key of an opinion that starts there is the
+    number without the letter, so ``2094`` and ``2094a`` share one
+    bucket and ``Opinion.index_in_page`` orders them.
+
+    :param value: The stored number, as ``"2094a"``.
+    :returns: The number, or None when the value is not that shape.
+    :rtype: int | None
+    """
+    if not value or not _SUFFIXED_RE.match(str(value)):
+        return None
+    return int(str(value)[:-1])
+
+
 def _line_readings(line: str) -> list[tuple[str, str, str]]:
     """Read the page numbers one line of a cell offers.
 

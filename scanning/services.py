@@ -2210,6 +2210,24 @@ def run_apply_page_edits(scan_pk: int) -> None:
         s3_sync.release_local_processing(scan)
 
 
+def run_create_opinions(scan_pk: int) -> None:
+    """Write the ``Opinion`` rows of an approved volume (#336).
+
+    The worker behind ``QueuedAction.CREATE_OPINIONS``, which the
+    review-2 approval writes. Rows and one JSON read, so it is short;
+    the shape is the compute's: it raises nothing, parks the scan
+    itself, and never writes ``ERROR``. The body is
+    ``opinions.run``.
+
+    :param scan_pk: Primary key of the claimed scan.
+    :return: None.
+    """
+    from scanning import opinions
+
+    django.db.connections.close_all()
+    opinions.run(scan_pk)
+
+
 def run_full_pipeline(scan_pk: int) -> None:
     """Run the upload pipeline: shard the original, then hand it to doctor.
 

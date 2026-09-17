@@ -55,6 +55,7 @@ from scanning.models import (
     OpinionScan,
     PageEdit,
     PageRepairRequest,
+    QueuedAction,
     Scan,
     Stage,
     Status,
@@ -106,10 +107,14 @@ MAX_NAMED_PAGES = 8
 #: Flashed by the review-2 approval of issue #263, and constants for
 #: the same reason as the three above.
 REDACTION_REVIEW_APPROVED_MESSAGE = (
-    "Thank you. The redactions of this scan are marked as reviewed."
+    "Thank you. The opinions of this scan are created on the server, and "
+    "this page reloads when they are ready."
 )
 REDACTION_REVIEW_ALREADY_DONE_MESSAGE = (
     "The redactions of this scan are already marked as reviewed."
+)
+REDACTION_REVIEW_QUEUED_MESSAGE = (
+    "The opinions of this scan are being created. Wait for the page to reload."
 )
 REDACTION_REVIEW_NOT_READY_MESSAGE = (
     "This scan is not ready for the redaction review. The redactions "
@@ -1832,6 +1837,16 @@ def _review_flags(
             scan.status == Status.READY_FOR_REDACTION_REVIEW
         ),
         "redaction_review_done": (scan.status == Status.REDACTION_REVIEW_DONE),
+        # The last word of the server on a volume parked in review 2
+        # (#336). A failed opinion creation or a failed recompute parks
+        # the scan here with the reason in ``progress_message``, and the
+        # poll reloads the page at once, so without this line the
+        # approve button seems to do nothing.
+        "redaction_review_note": (
+            scan.progress_message
+            if scan.status == Status.READY_FOR_REDACTION_REVIEW
+            else ""
+        ),
         "legacy_review": scan.status == Status.PENDING_REVIEW,
         # The reopen is a compare-and-swap on DONE (#224), so the
         # button shows only there: a volume in review 2 keeps its
@@ -2491,18 +2506,22 @@ def reopen_page_review(request: HttpRequest, pk: int) -> HttpResponse:
 def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     """Record that a person reviewed the redactions of this scan.
 
-    The approve button of review 2 (#263), and the only writer of
-    ``REDACTION_REVIEW_DONE``. Every logged-in user may press it, which
-    is the rule of the review-1 approve button (#151): both are the
-    same kind of human decision, and the log line below is the only
-    record of who made this one.
+    The approve button of review 2 (#263), and the only place a person
+    closes it. Every logged-in user may press it, which is the rule of
+    the review-1 approve button (#151): both are the same kind of human
+    decision, and the log line below is the only record of who made
+    this one.
 
-    The write is one compare-and-swap on ``READY_FOR_REDACTION_REVIEW``,
-    never a full instance save. The collect tick and the redaction
-    apply both write that status over the same row
-    (``review_states``), and a scan that was re-queued, errored, or
-    whose geometry is being measured again must not be approved from a
-    stale page a curator left open.
+    The write is one compare-and-swap on ``READY_FOR_REDACTION_REVIEW``
+    (``opinions.queue_create_opinions``, #336): the scan goes to
+    ``QUEUED`` with ``CREATE_OPINIONS``, the daemon writes the
+    ``Opinion`` rows, and its worker parks the scan in
+    ``REDACTION_REVIEW_DONE``. A failure parks it back here with the
+    reason, so the next press is the retry. Never a full instance save:
+    the collect tick and the redaction compute both write the status
+    over the same row (``review_states``), and a scan that was
+    re-queued, errored, or whose geometry is being measured again must
+    not be approved from a stale page a curator left open.
 
     Open detections or unpaired opinions do not block it. The curator
     is the judge of the geometry, exactly as they are the judge of a
@@ -2512,11 +2531,10 @@ def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to step 2 of the scan processing page.
     """
+    from scanning import opinions
+
     scan = get_object_or_404(Scan, pk=pk)
-    approved = Scan.objects.filter(
-        pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
-    ).update(status=Status.REDACTION_REVIEW_DONE)
-    if approved:
+    if opinions.queue_create_opinions(scan):
         logger.info(
             "approve_redaction_review: scan=%s approved by user=%s",
             scan.pk,
@@ -2529,6 +2547,11 @@ def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
         scan.refresh_from_db()
         if scan.status == Status.REDACTION_REVIEW_DONE:
             messages.info(request, REDACTION_REVIEW_ALREADY_DONE_MESSAGE)
+        elif (
+            scan.status in (Status.QUEUED, Status.PROCESSING)
+            and scan.queued_action == QueuedAction.CREATE_OPINIONS
+        ):
+            messages.info(request, REDACTION_REVIEW_QUEUED_MESSAGE)
         else:
             messages.warning(request, REDACTION_REVIEW_NOT_READY_MESSAGE)
     return redirect(
