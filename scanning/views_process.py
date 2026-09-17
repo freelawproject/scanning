@@ -2970,9 +2970,17 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     page (#214). The apply (#206) decides what a delete does to the
     volume; until then the row is a saved decision and nothing else.
 
-    :param request: The HTTP request (JSON body with pdf_page).
+    Several pages at once, when the body carries ``pdf_pages``: the
+    front-matter card offers the unnumbered run before the first
+    printed number as one decision, and one request is one confirm.
+    Every page is checked before any row is written, so a request that
+    names a page the volume does not have writes nothing.
+
+    :param request: The HTTP request (JSON body with ``pdf_page``, or
+        ``pdf_pages`` for several).
     :param pk: Scan primary key.
-    :return: JSON response confirming the deletion record.
+    :return: JSON response confirming the deletion record, with the
+        pages it marked.
     """
     scan = get_object_or_404(Scan, pk=pk)
     locked = _refuse_locked_edits(scan)
@@ -2982,21 +2990,27 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-    pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
-    if pdf_page is None:
+    raw = data.get("pdf_pages")
+    if raw is None:
+        raw = [data.get("pdf_page")]
+    if not isinstance(raw, list) or not raw:
+        return JsonResponse({"error": "Unknown PDF page."}, status=404)
+    pages = [_pdf_page_of(scan, value) for value in raw]
+    if any(page is None for page in pages):
         return JsonResponse({"error": "Unknown PDF page."}, status=404)
     # A standing deletion is left as it is: a second click has nothing
     # to refresh. An applied one is superseded, so the new decision is
     # a row of its own (#224).
-    page_edits.supersede(
-        scan,
-        PageEdit.Kind.DELETE_PAGE,
-        {"pdf_page": pdf_page},
-        {"source_fingerprint": scan.source_fingerprint},
-        request.user,
-        refresh_open=False,
-    )
-    return JsonResponse({"status": "ok"})
+    for pdf_page in sorted(set(pages)):
+        page_edits.supersede(
+            scan,
+            PageEdit.Kind.DELETE_PAGE,
+            {"pdf_page": pdf_page},
+            {"source_fingerprint": scan.source_fingerprint},
+            request.user,
+            refresh_open=False,
+        )
+    return JsonResponse({"status": "ok", "pdf_pages": sorted(set(pages))})
 
 
 @login_required

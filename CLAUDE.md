@@ -153,6 +153,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - One page-number gate for the browser (`shared.isPageNumberEntry`, called by both viewers) and one for the server (`_page_number_value`, whose refusal is `PAGE_NUMBER_ERROR`), #319
 - `_project_trailing_gap` (#256) puts one range placeholder on a collapsed missing run at the end of the volume only, from both `page_map` builders
 - A deletion answers the cards of the page it names (`CHECKS_A_DELETION_ANSWERS`, #255), never a `duplicate_page` or `missing_page` card
+- The unnumbered run before the first printed number is one `front_matter` card (`_ask_about_front_matter`), addressed by its first undeleted page, never a run later in the volume or a volume with no number at all; its button sends `pdf_pages` to `delete_page`, which checks every page before it writes one row
 - Every page label is narrowed (`_page_label`) and escaped (`escapeHtml`). A note is escaped only
 - Step-1 buttons bind by delegation on the container, and `refreshSavedLabel` runs after a note changes on a live page
 

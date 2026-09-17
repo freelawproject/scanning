@@ -1043,6 +1043,7 @@ class CheckName(models.TextChoices):
 
     # Page number validation (from blackletter)
     NO_PAGE_NUMBER = "no_page_number", "No page number detected"
+    FRONT_MATTER = "front_matter", "Unnumbered pages at the front"
     MISSING_PAGE = "missing_page", "Missing page in sequence"
     DUPLICATE_PAGE = "duplicate_page", "Duplicate page number"
     BACKWARD_PAGE = "backward_page", "Page number goes backward"
@@ -1100,6 +1101,7 @@ class CheckName(models.TextChoices):
 PHYSICAL_PAGE_CHECKS = frozenset(
     {
         CheckName.NO_PAGE_NUMBER,
+        CheckName.FRONT_MATTER,
         CheckName.SUSPICIOUS_READING,
         CheckName.AUTO_CORRECTED,
         CheckName.BLANK_PAGE,
