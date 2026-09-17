@@ -47,6 +47,12 @@ from scanning.tests.pdf_fixtures import (
 
 FIXTURE_DIR = pathlib.Path(__file__).parent / "fixtures"
 PDF_PATH = FIXTURE_DIR / "a3d.332.1.1.pdf"
+#: One recorded bl-warm detection run over :data:`PDF_PATH` (#360). The
+#: tests read it instead of running the models: a run cost the suite
+#: about 19 seconds and loaded torch and ultralytics, which nothing in
+#: the application needs. ``meta`` in the file says how to record it
+#: again after a checkpoint change.
+DETECTIONS_PATH = FIXTURE_DIR / "detections.a3d.332.1.1.json"
 
 MEDIA_ROOT = tempfile.mkdtemp()
 
@@ -106,25 +112,20 @@ def _write_bitonal_copy(dest):
         fh.write(b"\n% bitonal\n")
 
 
-def _run_detect_on_fixture(tmpdir):
-    """Run YOLO detect on the fixture PDF, return detections list."""
-    from blackletter.api import detect
-
-    return detect(str(PDF_PATH), tmpdir, models=["small", "medium", "large"])
-
-
-def _import_detections(scan_pk, output_dir):
-    """Load a ``detections.json`` into Detection rows, clearing old ones.
+def _import_detections(scan_pk):
+    """Write the recorded detections of the fixture page as rows.
 
     Test-local copy of the pipeline importer that left with the legacy
-    detect stage (issue #173). The geometry tests still need DB rows
-    that mirror what ``_run_detect_on_fixture`` wrote to disk.
+    detect stage (issue #173). The geometry tests need DB rows that
+    describe a real book page. They read :data:`DETECTIONS_PATH` for
+    them, and run no model (#360).
+
+    :param scan_pk: The scan the rows belong to.
+    :returns: The recorded detections, as the file holds them.
     """
     from blackletter.models import Label
 
-    dets = json.loads(
-        (pathlib.Path(output_dir) / "detections.json").read_text()
-    )
+    dets = json.loads(DETECTIONS_PATH.read_text())["detections"]
     Detection.objects.filter(scan_id=scan_pk).delete()
     Detection.objects.bulk_create(
         Detection(
@@ -433,8 +434,7 @@ class TestDetectionEntries(TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             scan = _make_scan_with_output(tmpdir)
-            _run_detect_on_fixture(tmpdir)
-            _import_detections(scan.pk, tmpdir)
+            _import_detections(scan.pk)
             det_path = pathlib.Path(scan.output_dir) / "detections.json"
             det_path.unlink(missing_ok=True)
 
@@ -466,8 +466,7 @@ class TestMeasureRedactionRects(TestCase):
                 tmpdir,
                 reporter=ReporterFactory(short_name="a3d"),
             )
-            _run_detect_on_fixture(tmpdir)
-            _import_detections(scan.pk, tmpdir)
+            _import_detections(scan.pk)
             document, _ids, _entries = services._snapped_document(
                 scan, str(PDF_PATH)
             )
@@ -711,8 +710,7 @@ class TestBuildDocumentFromDetections(TestCase):
                 tmpdir,
                 reporter=ReporterFactory(short_name="a3d"),
             )
-            _run_detect_on_fixture(tmpdir)
-            _import_detections(scan.pk, tmpdir)
+            _import_detections(scan.pk)
             det_data = detection_entries(scan.pk)
 
             document = _build_document_from_detections(
