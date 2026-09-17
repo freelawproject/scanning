@@ -22,10 +22,11 @@ printed page and the boundary link. ``status``, the approval and the
 notes are not touched, except that an ``ERROR`` row goes back to
 ``PROCESSING``, because the work that failed runs again. The
 ``glue_revision`` of a matched row that is not approved is raised
-(#350): the glue prefix belongs to one row at a time, and the boxes
-and the boundary under the key may have moved, so every derived
-artifact of the row is due again and the old revision is never written
-over. An approved row keeps its revision and its glues. A row no
+(#350, #336): the glue prefix belongs to one row at a time, and the
+boxes and the boundary under the key may have moved, so every derived
+artifact of the row -- its OCR documents and its redacted PDF -- is due
+again and the old revision is never written over. An approved row keeps
+its revision and its glues. A row no
 boundary matched keeps its data and gets one of the two
 ``STALE_OPINION_CHECKS`` cards: ``STALE_PAGE_NUMBER`` when a live
 boundary shares its start address under another number, and
@@ -361,10 +362,18 @@ def create_rows(
             Opinion.objects.filter(pk=opinion.pk).update(**fields)
             # The inputs of every glue may have moved under the key, so
             # the revision moves too, and with it the attempt count of
-            # each glue (#350). An approved opinion keeps its glues.
+            # each glue (#350, #336). An approved opinion keeps its
+            # glues. A redaction a curator moved after a send-back
+            # changes the ink of the PDF and no field of this row, so
+            # the revision is what says the set is new.
             Opinion.objects.filter(pk=opinion.pk).exclude(
                 status=OpinionReviewStatus.TEXT_REVIEW_DONE
-            ).update(glue_revision=F("glue_revision") + 1, ocr_glue_attempts=0)
+            ).update(
+                glue_revision=F("glue_revision") + 1,
+                ocr_glue_attempts=0,
+                pdf_attempts=0,
+                pdf_attempted_at=None,
+            )
             # The way back from ERROR is this run of the work (#335).
             Opinion.objects.filter(
                 pk=opinion.pk, status=OpinionReviewStatus.ERROR

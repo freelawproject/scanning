@@ -2634,6 +2634,23 @@ class Opinion(AbstractDateTimeModel):
             "frozen output the tagger reads (#272). Not a glue."
         ),
     )
+    redacted_pdf_revision = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The glue_revision the redacted PDF was written at (#336). "
+            "Equal to glue_revision: the PDF exists at the live "
+            "revision. Null: no PDF was ever written. A stamp and not a "
+            "key; the key is derived from the pk and the revision."
+        ),
+    )
+    pdf_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "Failed ticks of the PDF pass at the live revision (#336). "
+            "Reset when the revision rises and when the PDF is written."
+        ),
+    )
     notes = models.TextField(blank=True, default="")
 
     class Meta:

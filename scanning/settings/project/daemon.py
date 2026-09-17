@@ -34,3 +34,11 @@ DAEMON_COLLECT_INTERVAL = env.int("DAEMON_COLLECT_INTERVAL", default=15)
 DAEMON_JOB_MAX_QUEUE_SECONDS = env.int(
     "DAEMON_JOB_MAX_QUEUE_SECONDS", default=6 * 60 * 60
 )
+
+# How often (in seconds) the daemon writes one redacted opinion PDF
+# (#336, part 3). One PDF per tick (``opinion_pdf.PDFS_PER_TICK``): the
+# write re-encodes the pages of one opinion and blocks the serial
+# scheduler for a second or two, so the interval, not the count per
+# tick, is the throughput knob. About 300 opinions a volume at one per
+# 5 seconds is 25 minutes, in the background.
+DAEMON_OPINION_PDF_INTERVAL = env.int("DAEMON_OPINION_PDF_INTERVAL", default=5)

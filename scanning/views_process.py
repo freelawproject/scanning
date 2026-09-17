@@ -31,6 +31,7 @@ from scanning import (
     findings,
     jobs,
     mistral_ocr,
+    opinion_pdf,
     page_edits,
     page_numbers,
     repairs,
@@ -1391,6 +1392,52 @@ def serve_glued_volume(
         key_fn(scan, run),
         filename=f"scan-{scan.pk}-{output}-r{run}.json",
         missing_message=missing,
+        label=label,
+    )
+
+
+#: The 404 of ``serve_opinion_pdf`` before the pass has written the file.
+OPINION_PDF_NOT_WRITTEN_MESSAGE = (
+    "The redacted PDF of this opinion is not written yet. The daemon "
+    "writes one per tick after the redaction review is approved."
+)
+
+
+@login_required
+def serve_opinion_pdf(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Send the browser to the redacted PDF of one opinion (#336).
+
+    A developer's route redirects (#243/#262): a 302 to a presigned GET
+    with the printed range as the download name, which is the one place
+    that name lives (#165). ``opinion_pdf.is_written`` is the one rule
+    for "the PDF exists"; before it holds, a 404 that says so, without
+    an S3 HEAD. The review page of #334 reads the same key through the
+    same rule.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The opinion's primary key; it must be of that scan.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    label = f"r{opinion.glue_revision}"
+    if not opinion_pdf.is_written(opinion):
+        return _json_404(
+            OPINION_PDF_NOT_WRITTEN_MESSAGE, opinion=opinion.pk, label=label
+        )
+    return _redirect_to_object(
+        scan,
+        "opinion-pdf",
+        opinion.glue_revision,
+        opinion_pdf.key(opinion),
+        filename=opinion_pdf.download_name(opinion),
+        missing_message=(
+            f"The redacted PDF of opinion {opinion.pk} was written at "
+            f"{label}, but it is not in the bucket."
+        ),
         label=label,
     )
 

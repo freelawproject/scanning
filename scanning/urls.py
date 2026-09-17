@@ -83,6 +83,7 @@ from scanning.views_process import (
     serve_glued_shard,
     serve_glued_volume,
     serve_opinion_ocr,
+    serve_opinion_pdf,
     serve_original_crop,
     serve_scan_original,
     serve_scan_pdf,
@@ -192,6 +193,13 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/ocr/<str:engine>/",
         serve_opinion_ocr,
         name="serve_opinion_ocr",
+    ),
+    # The redacted PDF of one opinion (#336): a redirect to a presigned
+    # GET, named by the printed range for the download alone (#165).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/redacted-pdf/",
+        serve_opinion_pdf,
+        name="serve_opinion_pdf",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.
