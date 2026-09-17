@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("scanning", "0035_create_opinions_action"),
+        ("scanning", "0036_issue_front_matter_check"),
     ]
 
     operations = [

@@ -31,6 +31,7 @@ from scanning import (
     findings,
     jobs,
     mistral_ocr,
+    opinion_pdf,
     page_edits,
     page_numbers,
     repairs,
@@ -1182,12 +1183,11 @@ def _glued_run_rows(
 def _redirect_to_object(
     scan: Scan,
     output: str,
-    run: int,
     key: str,
     *,
     filename: str,
     missing_message: str,
-    label: str,
+    **fields,
 ) -> HttpResponse:
     """Send the browser to one object of the bucket, or say why not.
 
@@ -1204,22 +1204,24 @@ def _redirect_to_object(
 
     :param scan: The scan the object belongs to.
     :param output: The slug, for the log line.
-    :param run: The run number, for the log line and the answer.
     :param key: Object key inside the private bucket.
     :param filename: The name the browser saves the file under.
     :param missing_message: The 404 message when the object is absent.
-    :param label: The run's status counts, for the 404 body.
+    :param fields: What names the object in the 404 body and the log
+        line: ``run`` and ``label`` for a glued or an apply output,
+        ``opinion`` and ``revision`` for an opinion's PDF (#336). Each
+        route means something else by its key, so none is fixed here.
     :returns: A 302 to the presigned URL, or a 404 JSON response.
     """
     if not s3_sync.s3_active():
-        return _json_404(NO_S3_GLUED_OUTPUT_MESSAGE, run=run, label=label)
+        return _json_404(NO_S3_GLUED_OUTPUT_MESSAGE, **fields)
     if not s3_sync.object_exists(key):
-        return _json_404(missing_message, run=run, label=label)
+        return _json_404(missing_message, **fields)
     logger.info(
-        "glued output: scan=%s output=%s run=%s key=%s",
+        "glued output: scan=%s output=%s %s key=%s",
         scan.pk,
         output,
-        run,
+        " ".join(f"{name}={value}" for name, value in fields.items()),
         key,
     )
     url = s3_sync.presign_get(
@@ -1387,11 +1389,59 @@ def serve_glued_volume(
     return _redirect_to_object(
         scan,
         output,
-        run,
         key_fn(scan, run),
         filename=f"scan-{scan.pk}-{output}-r{run}.json",
         missing_message=missing,
+        run=run,
         label=label,
+    )
+
+
+#: The 404 of ``serve_opinion_pdf`` before the pass has written the file.
+OPINION_PDF_NOT_WRITTEN_MESSAGE = (
+    "The redacted PDF of this opinion is not written yet. The daemon "
+    "writes one per tick after the redaction review is approved."
+)
+
+
+@login_required
+def serve_opinion_pdf(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Send the browser to the redacted PDF of one opinion (#336).
+
+    A developer's route redirects (#243/#262): a 302 to a presigned GET
+    with the printed range as the download name, which is the one place
+    that name lives (#165). ``opinion_pdf.is_written`` is the one rule
+    for "the PDF exists"; before it holds, a 404 that says so, without
+    an S3 HEAD. The review page of #334 reads the same key through the
+    same rule.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The opinion's primary key; it must be of that scan.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    label = f"r{opinion.glue_revision}"
+    if not opinion_pdf.is_written(opinion):
+        return _json_404(
+            OPINION_PDF_NOT_WRITTEN_MESSAGE,
+            opinion=opinion.pk,
+            revision=opinion.glue_revision,
+        )
+    return _redirect_to_object(
+        scan,
+        "opinion-pdf",
+        opinion_pdf.key(opinion),
+        filename=opinion_pdf.download_name(opinion),
+        missing_message=(
+            f"The redacted PDF of opinion {opinion.pk} was written at "
+            f"{label}, but it is not in the bucket."
+        ),
+        opinion=opinion.pk,
+        revision=opinion.glue_revision,
     )
 
 
@@ -1425,13 +1475,13 @@ def serve_opinion_ocr(
     if not opinion_ocr.is_written(opinion):
         return _json_404(
             f"The OCR glue of {opinion} is not written at r{revision}.",
-            run=revision,
+            opinion=opinion.pk,
+            revision=revision,
             label=opinion.status,
         )
     return _redirect_to_object(
         scan,
         f"opinion-{engine}",
-        revision,
         opinion_ocr.engine_key(opinion, engine),
         filename=(
             f"scan-{scan.pk}-opinion-{opinion.first_printed_page}."
@@ -1441,6 +1491,8 @@ def serve_opinion_ocr(
             f"The OCR glue of {opinion} is stamped at r{revision}, but "
             f"its {engine} document is not in the bucket."
         ),
+        opinion=opinion.pk,
+        revision=revision,
         label=opinion.status,
     )
 
@@ -1491,9 +1543,9 @@ def serve_glued_shard(
     return _redirect_to_object(
         scan,
         output,
-        run,
         row.result_key,
         filename=f"scan-{scan.pk}-{output}-r{run}-s{shard}.json",
+        run=run,
         missing_message=(
             f"The result of shard {shard} of run {run} is not in the "
             f"bucket ({status})."
@@ -1668,9 +1720,9 @@ def serve_apply_output(
     return _redirect_to_object(
         scan,
         f"apply/{output}",
-        number,
         key,
         filename=f"scan-{scan.pk}-apply-{run.label}-{output}.{ext}",
+        run=number,
         missing_message=(
             f"The {output} of apply run {run.label} is not in the bucket."
         ),
@@ -1710,8 +1762,8 @@ def serve_apply_shard(
     return _redirect_to_object(
         scan,
         "apply/shard",
-        number,
         row.result_key,
+        run=number,
         filename=(
             f"scan-{scan.pk}-apply-a{number}-{row.stage}-{row.engine}-"
             f"e{(row.input_manifest or {}).get('edit_id')}"

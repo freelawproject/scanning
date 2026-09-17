@@ -652,7 +652,14 @@ class OpinionAdmin(admin.ModelAdmin):
         "end_source_edit",
         "approved_by",
     ]
-    readonly_fields = ["date_created", "date_modified"]
+    readonly_fields = [
+        "date_created",
+        "date_modified",
+        # The ledger of the PDF pass (#336): equal to glue_revision
+        # means the file exists; the attempts count its failed ticks.
+        "redacted_pdf_revision",
+        "pdf_attempts",
+    ]
     inlines = [OpinionTextInline, OpinionFindingInline]
 
 
