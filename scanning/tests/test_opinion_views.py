@@ -122,6 +122,51 @@ class TestOpinionList(ScanningTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(list(response.context["page_obj"]), [self.opinion])
 
+    def test_a_digit_that_is_not_a_decimal_is_refused(self):
+        """``str.isdigit`` is true for a character ``int`` refuses.
+
+        ``"\u00b2".isdigit()`` is true, ``int("\u00b2")`` raises, and
+        Django re-raises that ``ValueError``, so the old guard gave an
+        unhandled 500 on each of the three integer filters.
+        """
+        for name in ("scan", "reporter", "volume"):
+            with self.subTest(name=name):
+                response = self.client.get(
+                    reverse("opinion_list"), {name: "\u00b2"}
+                )
+
+                self.assertEqual(response.status_code, 200)
+
+    def test_the_ordering_is_total(self):
+        """Two scans of one reporter and volume tie on the four keys
+        above the pk, so a paginated walk could show one opinion twice
+        and another not at all."""
+        twin = ScanFactory(reporter=self.reporter, volume=237)
+        OpinionFactory(
+            scan=twin,
+            first_printed_page=412,
+            last_printed_page=415,
+            page_count=4,
+        )
+
+        response = self.client.get(reverse("opinion_list"))
+
+        rows = list(response.context["page_obj"])
+        self.assertEqual([row.pk for row in rows], sorted(r.pk for r in rows))
+
+    def test_the_row_links_carry_the_filters(self):
+        response = self.client.get(
+            reverse("opinion_list"), {"scan": self.scan.pk}
+        )
+
+        self.assertContains(
+            response,
+            "{}?scan={}".format(
+                reverse("opinion_review", kwargs={"pk": self.opinion.pk}),
+                self.scan.pk,
+            ),
+        )
+
     def test_the_row_carries_its_warning_count(self):
         OpinionFindingFactory(opinion=self.opinion)
         OpinionFindingFactory(

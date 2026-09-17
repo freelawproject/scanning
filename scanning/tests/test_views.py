@@ -1320,6 +1320,34 @@ class TestOpinionList(ScanningTestCase):
         )
         self.assertEqual(len(response.context["page_obj"]), 1)
 
+    def test_the_scan_filter_survives_a_page_turn(self):
+        """Without it one page turn widened the list to the corpus."""
+        user = self.make_user()
+        self.client.force_login(user)
+        scan = ScanFactory(uploaded_by=user)
+        OpinionScanFactory(scan=scan, reporter=scan.reporter)
+
+        response = self.client.get(
+            reverse("legacy_opinion_list"), {"scan": scan.pk}
+        )
+
+        self.assertEqual(response.context["current_scan"], str(scan.pk))
+        self.assertContains(
+            response, f'name="scan" value="{scan.pk}"', html=False
+        )
+
+    def test_a_digit_that_is_not_a_decimal_is_refused(self):
+        """``"\u00b2".isdigit()`` is true and ``int`` refuses it."""
+        self.client.force_login(self.make_user())
+
+        for name in ("scan", "reporter", "volume"):
+            with self.subTest(name=name):
+                response = self.client.get(
+                    reverse("legacy_opinion_list"), {name: "\u00b2"}
+                )
+
+                self.assertEqual(response.status_code, 200)
+
     def test_filter_by_reporter(self):
         user = self.make_user()
         self.client.force_login(user)

@@ -67,6 +67,27 @@ def logout_view(request: HttpRequest) -> HttpResponse:
     )(request)
 
 
+def _whole_number(value: str | None) -> int | None:
+    """Return a query-string value as an integer, or ``None``.
+
+    The guard of every integer filter of every list page. ``str.isdigit``
+    is not that test: it answers true for ``"\u00b2"``, which ``int``
+    refuses, and Django's ``IntegerField.get_prep_value`` re-raises that
+    ``ValueError`` rather than a ``ValidationError``. A superscript in
+    ``?volume=`` was an unhandled 500.
+
+    :param value: The raw query-string value, or ``None``.
+    :returns: The number, or ``None`` when there is none to read.
+    :rtype: int | None
+    """
+    if not value:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @login_required
 def scan_list(request: HttpRequest) -> HttpResponse:
     """List scans with opinion count annotation.
@@ -97,8 +118,10 @@ def scan_list(request: HttpRequest) -> HttpResponse:
         scans = scans.filter(status=status_filter)
 
     reporter_filter = request.GET.get("reporter")
-    if reporter_filter and reporter_filter.isdigit():
+    if _whole_number(reporter_filter) is not None:
         scans = scans.filter(reporter_id=reporter_filter)
+    else:
+        reporter_filter = ""
 
     source_filter = request.GET.get("source")
     if source_filter:
@@ -106,7 +129,7 @@ def scan_list(request: HttpRequest) -> HttpResponse:
 
     volume_filter = request.GET.get("volume")
     if volume_filter:
-        if volume_filter.isdigit():
+        if _whole_number(volume_filter) is not None:
             scans = scans.filter(volume=volume_filter)
         else:
             messages.error(request, "Volume must be a number.")
@@ -194,16 +217,22 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
         "scan__volume",
         "first_printed_page",
         "index_in_page",
+        # The last key makes the ordering total. ``Scan`` has no unique
+        # key over (reporter, volume) -- a volume comes in parts -- so
+        # two scans tie on the four keys above, and Postgres may rank
+        # tied rows differently for each page of a LIMIT/OFFSET walk.
+        # An opinion would then show on two pages, or on none.
+        "pk",
     )
 
     scan_filter = request.GET.get("scan")
-    if scan_filter and scan_filter.isdigit():
+    if _whole_number(scan_filter) is not None:
         opinions_qs = opinions_qs.filter(scan_id=scan_filter)
     else:
         scan_filter = ""
 
     reporter_filter = request.GET.get("reporter")
-    if reporter_filter and reporter_filter.isdigit():
+    if _whole_number(reporter_filter) is not None:
         opinions_qs = opinions_qs.filter(scan__reporter_id=reporter_filter)
     else:
         reporter_filter = ""
@@ -214,7 +243,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
 
     volume_filter = request.GET.get("volume")
     if volume_filter:
-        if volume_filter.isdigit():
+        if _whole_number(volume_filter) is not None:
             opinions_qs = opinions_qs.filter(scan__volume=volume_filter)
         else:
             messages.error(request, "Volume must be a number.")
@@ -256,32 +285,38 @@ def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
     :param request: The current HTTP request.
     :return: The rendered legacy opinion list page.
     """
-    opinions = OpinionScan.objects.select_related("reporter", "scan").order_by(
-        "reporter__short_name", "volume", "page_start"
-    )
+    # Not ``opinions``: that name holds the module this view's twin
+    # calls for its warning badge, and a local would hide it.
+    opinions_qs = OpinionScan.objects.select_related(
+        "reporter", "scan"
+    ).order_by("reporter__short_name", "volume", "page_start", "pk")
 
     # Filtering
     scan_filter = request.GET.get("scan")
-    if scan_filter and scan_filter.isdigit():
-        opinions = opinions.filter(scan_id=scan_filter)
+    if _whole_number(scan_filter) is not None:
+        opinions_qs = opinions_qs.filter(scan_id=scan_filter)
+    else:
+        scan_filter = ""
 
     reporter_filter = request.GET.get("reporter")
-    if reporter_filter and reporter_filter.isdigit():
-        opinions = opinions.filter(reporter_id=reporter_filter)
+    if _whole_number(reporter_filter) is not None:
+        opinions_qs = opinions_qs.filter(reporter_id=reporter_filter)
+    else:
+        reporter_filter = ""
 
     status_filter = request.GET.get("status")
     if status_filter:
-        opinions = opinions.filter(status=status_filter)
+        opinions_qs = opinions_qs.filter(status=status_filter)
 
     volume_filter = request.GET.get("volume")
     if volume_filter:
-        if volume_filter.isdigit():
-            opinions = opinions.filter(volume=volume_filter)
+        if _whole_number(volume_filter) is not None:
+            opinions_qs = opinions_qs.filter(volume=volume_filter)
         else:
             messages.error(request, "Volume must be a number.")
             volume_filter = ""
 
-    paginator = Paginator(opinions, 50)
+    paginator = Paginator(opinions_qs, 50)
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
 
@@ -295,7 +330,10 @@ def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
                 (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
-            "current_reporter": reporter_filter or "",
+            # The scan filter is kept, as on the new page: without it
+            # one page turn widened the list to the whole corpus.
+            "current_scan": scan_filter,
+            "current_reporter": reporter_filter,
             "current_status": status_filter or "",
             "current_volume": volume_filter or "",
         },

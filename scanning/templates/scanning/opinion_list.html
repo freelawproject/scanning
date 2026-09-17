@@ -80,7 +80,11 @@
       {% for opinion in page_obj %}
       <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50">
         <td class="px-4 py-3 whitespace-nowrap">
-          <a href="{% url 'opinion_review' pk=opinion.pk %}" class="text-sm font-medium text-gray-900 dark:text-gray-100 hover:text-blue-600 dark:hover:text-blue-400">
+          {% comment %}
+            The filters ride on the link, so the review page's back
+            link opens the list the reviewer left, not the corpus.
+          {% endcomment %}
+          <a href="{% url 'opinion_review' pk=opinion.pk %}{% if request.GET %}?{{ request.GET.urlencode }}{% endif %}" class="text-sm font-medium text-gray-900 dark:text-gray-100 hover:text-blue-600 dark:hover:text-blue-400">
             {{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }}
           </a>
           {% if opinion.index_in_page %}<span class="text-xs text-gray-500 dark:text-gray-400">({{ opinion.index_in_page|add:1 }})</span>{% endif %}
@@ -106,7 +110,7 @@
           {% endif %}
         </td>
         <td class="px-4 py-3 text-sm text-right">
-          <a href="{% url 'opinion_review' pk=opinion.pk %}" class="btn-outline text-xs px-2 py-1">Review</a>
+          <a href="{% url 'opinion_review' pk=opinion.pk %}{% if request.GET %}?{{ request.GET.urlencode }}{% endif %}" class="btn-outline text-xs px-2 py-1">Review</a>
         </td>
       </tr>
       {% endfor %}
