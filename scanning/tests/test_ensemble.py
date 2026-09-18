@@ -15,19 +15,20 @@ Eight groups:
 - the findings (``ensemble.rebuild_findings``): the three checks, the
   dismissal, the stale cards of the creation;
 - the ledger and the pass: the stamp, the gate, the attempts;
-- the button and the command.
+- the button, the command and the two routes the review page reads.
 """
 
 import json
 from io import StringIO
 from unittest.mock import patch
 
+from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
-from scanning import ensemble, opinion_ocr
+from scanning import ensemble, opinion_ocr, opinion_pdf, views_process
 from scanning.factories import ScanFactory
 from scanning.models import (
     Issue,
@@ -1503,6 +1504,208 @@ class TestTheButton(EnsembleTestCase, ScanningTestCase):
 
     def test_the_button_refuses_a_get(self):
         self.assertEqual(self.client.get(self.url()).status_code, 405)
+
+
+class TestTheReaderRoutes(EnsembleTestCase, ScanningTestCase):
+    """The two routes the review page reads, and the staff redirect.
+
+    The answer is JSON that holds a presigned GET, not a 302: pdf.js
+    and ``fetch`` read a direct URL, and a browser judges the CORS
+    rules of a redirected request differently (#365).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.make_user())
+
+    def url(self, name, opinion=None, scan=None, **extra) -> str:
+        opinion = opinion or self.opinion
+        scan = scan or self.scan
+        return reverse(
+            name,
+            kwargs={"pk": scan.pk, "opinion_pk": opinion.pk, **extra},
+        )
+
+    def write_the_pdf(self):
+        """Stamp the PDF ledger and put the object in the bucket."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            redacted_pdf_revision=self.opinion.glue_revision
+        )
+        self.objects[opinion_pdf.key(self.opinion)] = b"%PDF-1.7"
+        self.opinion.refresh_from_db()
+
+    # -- the PDF ----------------------------------------------------------
+
+    def test_the_pdf_route_answers_a_presigned_get(self):
+        self.write_the_pdf()
+
+        with patch(
+            "scanning.s3_sync.presign_get", return_value="https://s3/pdf"
+        ) as presign:
+            response = self.client.get(self.url("opinion_pdf_url"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["url"], "https://s3/pdf")
+        self.assertEqual(response.json()["revision"], 0)
+        key, _ttl = presign.call_args.args
+        self.assertEqual(key, opinion_pdf.key(self.opinion))
+
+    def test_the_pdf_signature_outlives_the_reading(self):
+        """pdf.js asks for another range whenever the reviewer scrolls.
+
+        Ten minutes is the size of one download (#243). A range after
+        the signature dies is a 403 on a page that shows no reason, so
+        the PDF takes the lifetime of the original's own URL.
+        """
+        self.write_the_pdf()
+
+        with patch(
+            "scanning.s3_sync.presign_get", return_value="https://s3/pdf"
+        ) as presign:
+            self.client.get(self.url("opinion_pdf_url"))
+
+        _key, ttl = presign.call_args.args
+        self.assertEqual(ttl, settings.ORIGINAL_VIEW_PRESIGN_TTL)
+        self.assertGreater(ttl, views_process.GLUED_OUTPUT_PRESIGN_TTL)
+
+    def test_the_document_signature_is_one_read_long(self):
+        """One ``fetch`` at load, so the short lifetime is the right one."""
+        self.run_ensemble()
+
+        with patch(
+            "scanning.s3_sync.presign_get", return_value="https://s3/e"
+        ) as presign:
+            self.client.get(self.url("opinion_ensemble_url"))
+
+        _key, ttl = presign.call_args.args
+        self.assertEqual(ttl, views_process.GLUED_OUTPUT_PRESIGN_TTL)
+
+    def test_the_pdf_route_names_no_download(self):
+        """A ``Content-Disposition`` makes a browser save the file.
+
+        That header belongs to the routes of #243, and it is the
+        opposite of what a reader wants.
+        """
+        self.write_the_pdf()
+
+        with patch(
+            "scanning.s3_sync.presign_get", return_value="https://s3/pdf"
+        ) as presign:
+            self.client.get(self.url("opinion_pdf_url"))
+
+        self.assertEqual(presign.call_args.kwargs, {})
+
+    def test_404_before_the_pdf_is_written(self):
+        response = self.client.get(self.url("opinion_pdf_url"))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("not written yet", response.json()["error"])
+
+    def test_404_when_the_pdf_is_stamped_and_gone(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            redacted_pdf_revision=self.opinion.glue_revision
+        )
+
+        response = self.client.get(self.url("opinion_pdf_url"))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("not in the", response.json()["error"])
+
+    # -- the ensemble document --------------------------------------------
+
+    def test_the_ensemble_route_answers_a_presigned_get(self):
+        self.run_ensemble()
+
+        with patch(
+            "scanning.s3_sync.presign_get", return_value="https://s3/e"
+        ) as presign:
+            response = self.client.get(self.url("opinion_ensemble_url"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["url"], "https://s3/e")
+        key, _ttl = presign.call_args.args
+        self.assertEqual(key, ensemble.document_key(self.opinion))
+
+    def test_404_before_the_ensemble_is_written(self):
+        self.glue()
+
+        response = self.client.get(self.url("opinion_ensemble_url"))
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("not written yet", response.json()["error"])
+
+    def test_404_when_the_ocr_glue_moved_on(self):
+        """The stamp must name the live revision, the one rule."""
+        self.run_ensemble()
+        Opinion.objects.filter(pk=self.opinion.pk).update(glue_revision=1)
+
+        response = self.client.get(self.url("opinion_ensemble_url"))
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_404_for_an_opinion_of_another_scan(self):
+        other = ScanFactory()
+
+        response = self.client.get(
+            self.url("opinion_ensemble_url", scan=other)
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_the_login_is_required(self):
+        self.client.logout()
+
+        for name in ("opinion_pdf_url", "opinion_ensemble_url"):
+            response = self.client.get(self.url(name))
+
+            self.assertEqual(response.status_code, 302)
+            self.assertIn("login", response["Location"])
+
+    # -- the staff redirect ------------------------------------------------
+
+    def test_the_staff_route_serves_the_ensemble(self):
+        self.run_ensemble()
+
+        with patch(
+            "scanning.s3_sync.presign_get", return_value="https://s3/e"
+        ):
+            response = self.client.get(
+                self.url("serve_opinion_ocr", engine="ensemble")
+            )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "https://s3/e")
+
+    def test_the_staff_route_404s_before_the_ensemble_is_written(self):
+        self.glue()
+
+        response = self.client.get(
+            self.url("serve_opinion_ocr", engine="ensemble")
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("not written yet", response.json()["error"])
+
+    def test_the_file_index_lists_the_ensemble(self):
+        self.run_ensemble()
+
+        response = self.client.get(self.url("opinion_file_index"))
+
+        files = {entry["name"]: entry for entry in response.json()["files"]}
+        self.assertTrue(files["ensemble.json"]["written"])
+        self.assertEqual(
+            files["ensemble.json"]["url"],
+            self.url("serve_opinion_ocr", engine="ensemble"),
+        )
+
+    def test_the_file_index_leaves_an_unwritten_ensemble_without_a_url(self):
+        self.glue()
+
+        response = self.client.get(self.url("opinion_file_index"))
+
+        files = {entry["name"]: entry for entry in response.json()["files"]}
+        self.assertFalse(files["ensemble.json"]["written"])
+        self.assertNotIn("url", files["ensemble.json"])
 
 
 class TestTheCommand(EnsembleTestCase):

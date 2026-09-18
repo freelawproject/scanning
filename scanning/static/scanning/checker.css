@@ -1166,3 +1166,98 @@ a.doc-name:hover { text-decoration: underline; }
     padding-left: 4px;
     color: #cbd5e1;
 }
+
+/* ------------------------------------------------------------------ */
+/* The text review of one opinion (#365)                               */
+/* ------------------------------------------------------------------ */
+
+/* Each column is its own scroll box, so a jump inside one column
+   leaves the other one where the reviewer put it. */
+.opinion-pages,
+.opinion-text {
+    max-height: 78vh;
+    overflow-y: auto;
+    position: relative;
+}
+
+.opinion-page {
+    margin: 0 auto 16px;
+}
+
+/* A box takes no pointer: one hit test on the wrapper opens the box
+   under it, the rule of the OCR text overlay (#262). */
+.ensemble-box {
+    position: absolute;
+    border: 1px solid rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.05);
+    pointer-events: none;
+    box-sizing: border-box;
+}
+.ensemble-box[data-agreement="majority"],
+.ensemble-box[data-agreement="voted"] {
+    border-color: rgba(217, 119, 6, 0.75);
+    background: rgba(217, 119, 6, 0.08);
+}
+.ensemble-box[data-agreement="single"] {
+    border-color: rgba(107, 114, 128, 0.7);
+    background: rgba(107, 114, 128, 0.06);
+}
+.ensemble-box.weak {
+    border-style: dashed;
+}
+.ensemble-box.ensemble-selected {
+    border-color: #dc2626;
+    border-width: 2px;
+    background: rgba(220, 38, 38, 0.12);
+}
+
+.opinion-text-page {
+    border-bottom: 1px solid rgba(107, 114, 128, 0.3);
+    padding-bottom: 12px;
+    margin-bottom: 12px;
+}
+.opinion-text-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #6b7280;
+    margin-bottom: 6px;
+}
+.opinion-text-error {
+    font-size: 13px;
+    font-style: italic;
+    color: #b45309;
+}
+
+.ensemble-group {
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 0 0 10px;
+    padding: 2px 4px;
+    border-left: 2px solid transparent;
+    white-space: pre-wrap;
+    cursor: default;
+}
+.ensemble-group[data-agreement="majority"],
+.ensemble-group[data-agreement="voted"] {
+    border-left-color: rgba(217, 119, 6, 0.75);
+}
+.ensemble-group[data-agreement="single"] {
+    border-left-color: rgba(107, 114, 128, 0.7);
+}
+.ensemble-group.ensemble-selected {
+    background: rgba(220, 38, 38, 0.10);
+    border-left-color: #dc2626;
+}
+.ensemble-low {
+    background: rgba(217, 119, 6, 0.25);
+    border-bottom: 1px dotted #b45309;
+}
+.ensemble-note {
+    font-size: 11px;
+    color: #6b7280;
+}
+
+.finding-card-live {
+    cursor: pointer;
+}

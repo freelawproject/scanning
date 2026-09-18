@@ -19,7 +19,15 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
-from scanning import opinion_pdf, opinions, repairs, s3_sync, stats
+from scanning import (
+    ensemble,
+    opinion_ocr,
+    opinion_pdf,
+    opinions,
+    repairs,
+    s3_sync,
+    stats,
+)
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
@@ -342,24 +350,33 @@ def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
 
 @login_required
 def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
-    """Show one opinion of the third review (#334).
+    """Show one opinion of the third review (#334/#365).
 
-    The first stage of the review interface. It shows what the rows
-    hold: the citation, the printed range, the status, the links to the
-    volume and the boundary, and the findings.
+    The text review of an opinion. It shows what the rows hold -- the
+    citation, the printed range, the status, the links to the volume
+    and the boundary, and the findings -- and the text of the OCR
+    ensemble beside the pages it was read from.
 
-    It also shows the redacted PDF of the opinion (#336) in a frame,
-    when the row says the file was written. ``opinion_pdf.is_written``
-    is the one rule for that, a read of the row and never of the
-    bucket, and the frame is a navigation to ``serve_opinion_pdf``, so
-    this view still makes no S3 call. A staff reader gets the
-    ``files`` link beside it (``opinion_file_index``), the rule of the
-    volume's own glued outputs (#243).
+    The page reads the redacted PDF of the opinion (#336) beside the
+    text of the OCR ensemble (#365), page by page. The browser draws
+    both: it asks ``opinion_pdf_url`` and ``opinion_ensemble_url`` for
+    a presigned GET of each object and reads them straight from the
+    bucket, so **this view makes no S3 call**. Every address is written
+    on the container, and the script spells none (#334).
 
-    The page carries **no write control**. The approval, the dismissal
-    and the typing of a page come with the text review itself, which
-    needs ``OpinionText``. A button that an endpoint would refuse is
-    the one thing a viewer must never offer.
+    The three ledgers are read off the row and never off the bucket:
+    ``opinion_pdf.is_written``, ``opinion_ocr.is_written`` and
+    ``ensemble.is_written``. Each one decides what the page shows in
+    place of a column it cannot draw, and the OCR one decides whether
+    the button appears: a control an endpoint would refuse is the one
+    thing a viewer must never offer. A staff reader gets the ``files``
+    link (``opinion_file_index``), the rule of the volume's own glued
+    outputs (#243).
+
+    The one write control is "Read the OCR documents again", which
+    posts to ``rerun_opinion_ensemble``. The approval, the dismissal
+    and the typing of a page come with the review that closes an
+    opinion.
 
     :param request: The current HTTP request.
     :param pk: The primary key of the opinion.
@@ -386,6 +403,13 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             else f"page {row.page_in_opinion + 1} of the opinion"
         )
     open_findings = sum(1 for row in findings if row.dismissal_id is None)
+    ocr_written = opinion_ocr.is_written(opinion)
+
+    def address(name: str) -> str:
+        """Return one route of this opinion, for a ``data-`` attribute."""
+        return reverse(
+            name, kwargs={"pk": opinion.scan_id, "opinion_pk": opinion.pk}
+        )
 
     return render(
         request,
@@ -394,9 +418,25 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "opinion": opinion,
             "findings": findings,
             "open_findings": open_findings,
-            # Absent when the PDF pass has not written the file at the
-            # live revision: the template shows the reason instead of a
-            # frame that would answer a 404 JSON.
+            # The three addresses the script reads (#365). They are
+            # routes and not presigned URLs: each one is minted per
+            # request, and a URL signed at render time would die in an
+            # open tab.
+            "pdf_url_endpoint": address("opinion_pdf_url"),
+            "ensemble_url_endpoint": address("opinion_ensemble_url"),
+            "rerun_url": address("rerun_opinion_ensemble"),
+            # What the page draws, and what it says instead.
+            "ensemble_written": ensemble.is_written(opinion),
+            "ocr_written": ocr_written,
+            # The button reads the OCR documents, so it appears only
+            # where they exist and the text is not approved.
+            "can_rerun": (
+                ocr_written
+                and opinion.status != OpinionReviewStatus.TEXT_REVIEW_DONE
+            ),
+            # Absent when the PDF pass has not written the file at
+            # the live revision: the template shows the reason instead
+            # of the two links and the column of the pages.
             "redacted_pdf_url": (
                 reverse(
                     "serve_opinion_pdf",

@@ -1444,6 +1444,173 @@ OPINION_PDF_NOT_WRITTEN_MESSAGE = (
     "writes one per tick after the redaction review is approved."
 )
 
+#: The 404 of ``opinion_ensemble_url`` before the pass has written the
+#: ensemble document at the live revision (#365).
+OPINION_ENSEMBLE_NOT_WRITTEN_MESSAGE = (
+    "The text of this opinion is not written yet. The daemon writes it "
+    "after the OCR glue, and the button reads the documents again."
+)
+#: The 404 of the two reader routes when the row says the object was
+#: written and the bucket does not hold it.
+OPINION_OBJECT_GONE_MESSAGE = (
+    "The row says this object was written, but it is not in the "
+    "bucket. Ask a staff member to write it again."
+)
+
+#: The objects of an opinion that are not one engine's document:
+#: ``opinion_ocr``'s manifest and the document of the ensemble (#365).
+#: One table, read by ``serve_opinion_ocr`` and by
+#: :func:`opinion_file_index`, so a name lives in one place.
+EXTRA_OPINION_OBJECTS = ("manifest", "ensemble")
+
+
+def _opinion_object_key(opinion: Opinion, name: str) -> str:
+    """Return the key of one object of an opinion's glue prefix.
+
+    Each module owns the key of its own object: ``opinion_ocr`` the
+    engine documents and the manifest, ``ensemble`` the document of the
+    ensemble. This function chooses between them and writes no key.
+
+    :param opinion: The row.
+    :param name: An engine, ``manifest`` or ``ensemble``.
+    :returns: The key.
+    :rtype: str
+    """
+    from scanning import ensemble, opinion_ocr
+
+    if name == "ensemble":
+        return ensemble.document_key(opinion)
+    return opinion_ocr.engine_key(opinion, name)
+
+
+@login_required
+def opinion_pdf_url(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return a URL the browser can read the redacted PDF from (#365).
+
+    The twin of :func:`scan_original_url`, for one opinion. The review
+    page draws the pages with pdf.js, which reads the file with range
+    requests straight from the bucket.
+
+    **The answer is JSON and not the 302 of** :func:`serve_opinion_pdf`.
+    A browser judges the CORS rules of a redirected request differently
+    from a direct one, the reason :func:`scan_ocr_text_url` gives, and
+    the direct presigned GET is the path the bucket rule is known to
+    serve. The 302 route keeps the download and the tab, where a
+    navigation needs no CORS rule at all.
+
+    ``opinion_pdf.is_written`` is the one rule for "the PDF exists", a
+    read of the row. One ``head_object`` follows it, so a row that is
+    stamped and an object that is gone do not send pdf.js to an S3
+    error page. The signature lives as long as the original's
+    (``ORIGINAL_VIEW_PRESIGN_TTL``), because the reader scrolls for
+    hours and every range is one more request.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
+    :return: JSON with ``url`` and ``revision``, or a 404.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not opinion_pdf.is_written(opinion):
+        return _json_404(
+            OPINION_PDF_NOT_WRITTEN_MESSAGE,
+            opinion=opinion.pk,
+            revision=opinion.glue_revision,
+        )
+    return _presigned_opinion_object(
+        opinion_pdf.key(opinion),
+        opinion.glue_revision,
+        opinion.pk,
+        # pdf.js holds this URL for the life of the page and asks for
+        # another range whenever the reviewer scrolls, so the signature
+        # must outlive the reading. ``GLUED_OUTPUT_PRESIGN_TTL`` is ten
+        # minutes, the size of one download, and a range after it would
+        # be a 403 on a page that shows no reason.
+        ttl=settings.ORIGINAL_VIEW_PRESIGN_TTL,
+    )
+
+
+@login_required
+def opinion_ensemble_url(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return a URL the browser can read the ensemble document from (#365).
+
+    The twin of :func:`scan_ocr_text_url`, for one opinion. The review
+    page reads the document with ``fetch`` and draws its boxes and its
+    text; the document of one opinion is small, and the pod still reads
+    no byte of it.
+
+    ``ensemble.is_written`` is the one rule for "the ensemble exists",
+    and it names the live revision of the OCR glue. The staff route
+    ``serve_opinion_ocr`` answers the same object with a redirect.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
+    :return: JSON with ``url`` and ``revision``, or a 404.
+    """
+    from scanning import ensemble
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not ensemble.is_written(opinion):
+        return _json_404(
+            OPINION_ENSEMBLE_NOT_WRITTEN_MESSAGE,
+            opinion=opinion.pk,
+            revision=opinion.glue_revision,
+        )
+    return _presigned_opinion_object(
+        ensemble.document_key(opinion), opinion.glue_revision, opinion.pk
+    )
+
+
+def _presigned_opinion_object(
+    key: str,
+    revision: int | None,
+    opinion_pk: int,
+    *,
+    ttl: int = GLUED_OUTPUT_PRESIGN_TTL,
+) -> JsonResponse:
+    """Answer one object of an opinion as a URL the browser reads.
+
+    The body of the two routes above. No ``content_disposition``: that
+    header makes a browser save a named file, which is what the routes
+    of #243 want and the opposite of what a reader wants.
+
+    :param key: Object key inside the private bucket.
+    :param revision: The glue revision the row is stamped at.
+    :param opinion_pk: The row, for the body of a 404.
+    :param ttl: How long the signature lives. The default is one read
+        of one object; a file pdf.js keeps reading takes the long one.
+    :returns: JSON with ``url`` and ``revision``, or a 404.
+    :rtype: JsonResponse
+    """
+    if not s3_sync.s3_active():
+        return _json_404(
+            NO_S3_GLUED_OUTPUT_MESSAGE,
+            opinion=opinion_pk,
+            revision=revision,
+        )
+    # One ``head_object``, the rule of :func:`_redirect_to_object`:
+    # without it a row that is stamped and an object that is gone would
+    # send pdf.js to an S3 error page.
+    if not s3_sync.object_exists(key):
+        return _json_404(
+            OPINION_OBJECT_GONE_MESSAGE,
+            opinion=opinion_pk,
+            revision=revision,
+        )
+    return JsonResponse(
+        {
+            "url": s3_sync.presign_get(key, ttl),
+            "revision": revision,
+        }
+    )
+
 
 @login_required
 @xframe_options_sameorigin
@@ -1459,18 +1626,22 @@ def serve_opinion_pdf(
     an S3 HEAD. The review page of #334 reads the same key through the
     same rule.
 
-    ``?disposition=inline`` asks for the same object in a frame (#334).
-    The review page puts this route in an ``iframe``, which is a
-    navigation and needs no CORS rule, and the browser's own PDF viewer
-    shows the file. Every other caller gets the download name.
+    ``?disposition=inline`` asks for the same object to be shown and
+    not saved (#334). The review page opens this route in a tab of its
+    own, a navigation that needs no CORS rule, and the browser's own
+    PDF viewer shows the file. Every other caller gets the download
+    name. The page itself draws the pages from ``opinion_pdf_url``,
+    whose answer pdf.js reads directly (#365).
 
     The route answers ``SAMEORIGIN`` where the site answers ``DENY``,
-    because the site's own page frames it: a browser that reads the
-    header on the redirect would otherwise refuse the frame. It is the
-    narrower value, and the right one. An exemption would let any site
-    frame the route, and although the frame ends at the bucket, which
-    is cross-origin and gives its bytes to no page, a third party's
-    page would still make this pod sign a URL.
+    so a page of the site can frame it: a browser that reads the header
+    on the redirect would otherwise refuse the frame. The review page
+    frames it no longer (#365 draws the pages instead), and the header
+    stays at that narrower value for the next page that does. An
+    exemption would let any site frame the route, and although the
+    frame ends at the bucket, which is cross-origin and gives its bytes
+    to no page, a third party's page would still make this pod sign a
+    URL.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -1512,24 +1683,32 @@ def serve_opinion_ocr(
     """Send the browser to one engine's OCR document of one opinion (#350).
 
     A developer's route, so it redirects (#243/#262). ``manifest``
-    names the manifest. A 404 before the glue is written
-    (``opinion_ocr.is_written``), for an engine this module does not
-    know, and for an opinion of another scan.
+    names the manifest, and ``ensemble`` the document of the OCR
+    ensemble (#365), which has a ledger of its own
+    (``ensemble.is_written``): the engine documents of a revision can
+    exist while nothing read them yet. A 404 before the glue is
+    written (``opinion_ocr.is_written``), for an engine this module
+    does not know, and for an opinion of another scan.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :param opinion_pk: The ``Opinion`` primary key.
-    :param engine: A name of ``opinion_ocr.ENGINES``, or ``manifest``.
+    :param engine: A name of ``opinion_ocr.ENGINES``, ``manifest``, or
+        ``ensemble``.
     :return: A 302 to a presigned GET, or a 404 JSON response.
     """
+    from scanning import ensemble as ensemble_module
     from scanning import opinion_ocr
 
     scan = get_object_or_404(Scan, pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
-    if engine != "manifest" and engine not in opinion_ocr.ENGINES:
+    if (
+        engine not in EXTRA_OPINION_OBJECTS
+        and engine not in opinion_ocr.ENGINES
+    ):
         return _json_404(
-            f"Unknown engine {engine!r}. "
-            f"Known: manifest, {', '.join(opinion_ocr.ENGINES)}."
+            f"Unknown engine {engine!r}. Known: "
+            f"{', '.join((*EXTRA_OPINION_OBJECTS, *opinion_ocr.ENGINES))}."
         )
     revision = opinion.glue_revision
     if not opinion_ocr.is_written(opinion):
@@ -1539,10 +1718,17 @@ def serve_opinion_ocr(
             revision=revision,
             label=opinion.status,
         )
+    if engine == "ensemble" and not ensemble_module.is_written(opinion):
+        return _json_404(
+            OPINION_ENSEMBLE_NOT_WRITTEN_MESSAGE,
+            opinion=opinion.pk,
+            revision=revision,
+            label=opinion.status,
+        )
     return _redirect_to_object(
         scan,
         f"opinion-{engine}",
-        opinion_ocr.engine_key(opinion, engine),
+        _opinion_object_key(opinion, engine),
         filename=(
             f"scan-{scan.pk}-opinion-{opinion.first_printed_page}."
             f"{opinion.index_in_page}-r{revision}-{engine}.json"
@@ -1576,13 +1762,19 @@ def opinion_file_index(
     **The OCR ledger is one stamp over every file of the revision, and
     the glue writes one file per engine the run has**
     (``opinion_ocr.write``). The count follows ``opinion_ocr.ENGINES``,
-    which #368 made three plus the manifest, so no reader counts. So an
-    engine document is written when the stamp is live **and** the run
-    carries that engine's key: a volume nobody read with Mistral is
-    glued from dots.mocr alone, and its ``mistral_ocr.json`` was never
-    put in the bucket. The manifest is written on every glue. A key
-    that lands on the run after the glue reads as written until the
-    next re-glue, the one error left here, and the rarer one.
+    which #368 made three, plus :data:`EXTRA_OPINION_OBJECTS`, so no
+    reader counts. So an engine document is written when the stamp is
+    live **and** the run carries that engine's key: a volume nobody
+    read with Mistral is glued from dots.mocr alone, and its
+    ``mistral_ocr.json`` was never put in the bucket. The manifest is
+    written on every glue. A key that lands on the run after the glue
+    reads as written until the next re-glue, the one error left here,
+    and the rarer one.
+
+    **The ensemble has a ledger of its own** (``ensemble.is_written``,
+    #365). It is written after the engine documents of the same
+    revision, and a volume two engines read waits for the button, so
+    the OCR stamp does not answer for it.
 
     The keys are of the live revision (``Opinion.glue_prefix``). A
     re-glue raises the revision, so this index never names an object of
@@ -1594,7 +1786,7 @@ def opinion_file_index(
     :return: JSON with ``scan``, ``opinion``, ``label``, ``status``,
         ``glue_revision``, ``prefix`` and ``files``.
     """
-    from scanning import opinion_ocr
+    from scanning import ensemble, opinion_ocr
 
     scan = get_object_or_404(Scan, pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
@@ -1612,17 +1804,25 @@ def opinion_file_index(
     ]
     ocr_written = opinion_ocr.is_written(opinion)
     run = opinion.apply_run
-    for engine in (*opinion_ocr.ENGINES, "manifest"):
-        key = opinion_ocr.engine_key(opinion, engine)
+    for engine in (*opinion_ocr.ENGINES, *EXTRA_OPINION_OBJECTS):
+        key = _opinion_object_key(opinion, engine)
         spec = opinion_ocr.ENGINES.get(engine)
         has_read = spec is None or bool(
             run is not None and spec.document_key(run)
+        )
+        # The ensemble has a ledger of its own: it is written after the
+        # engine documents of the same revision, and a two-engine
+        # volume waits for the button (#365).
+        written = (
+            ensemble.is_written(opinion)
+            if engine == "ensemble"
+            else ocr_written and has_read
         )
         files.append(
             {
                 "name": key.rsplit("/", 1)[-1],
                 "output": f"opinion-{engine}",
-                "written": ocr_written and has_read,
+                "written": written,
                 "key": key,
                 "url": reverse(
                     "serve_opinion_ocr",

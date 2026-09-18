@@ -827,9 +827,9 @@ def rerun_opinion_ensemble(
 
     It **waives the engine gate**. The daemon pass waits for
     ``OPINION_ENSEMBLE_MIN_ENGINES`` engine documents, which a volume
-    read by two engines never holds. No page posts here yet: the
-    viewer of #365 puts the button on the review page, and until then
-    the ``rerun_opinion_ensemble`` command is the way in.
+    read by two engines never holds. The button of the review page
+    posts here, and the ``rerun_opinion_ensemble`` command runs the
+    same work over a whole volume.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
