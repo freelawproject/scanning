@@ -1720,16 +1720,23 @@ class TestKnownEnqueuePaths(ScanningTestCase):
         import pathlib
 
         root = pathlib.Path("scanning")
+        # Every **mention** of a creator, not every call: a module that
+        # hands one to a table (``views_process._shard_reads``) starts
+        # the work as surely as one that calls it, and a walk over
+        # calls alone would lose that module in silence. An attribute
+        # node covers both, because a call is a node over one.
         callers = set()
         for path in root.rglob("*.py"):
             if "tests" in path.parts or "migrations" in path.parts:
                 continue
             tree = ast.parse(path.read_text())
             for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
+                if isinstance(node, ast.Attribute):
+                    name = node.attr
+                elif isinstance(node, ast.Name):
+                    name = node.id
+                else:
                     continue
-                func = node.func
-                name = getattr(func, "attr", getattr(func, "id", ""))
                 if name in (
                     "ensure_analyze_jobs",
                     "ensure_detect_jobs",
@@ -1776,10 +1783,11 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 # work of its own.
                 ("scanning/views_process.py", "ensure_extract_jobs"),
                 ("scanning/mistral_ocr.py", "ensure_extract_jobs"),
-                # Surya: the staff button (#364) and nothing else. Its
-                # view call is the ``ensure_extract_jobs`` entry above
-                # -- one name, two engines -- so the wrapper below is
-                # what pins this engine.
+                # Surya: the staff button (#364) and nothing else. The
+                # three buttons are one view over a table, so the view
+                # module names ``ensure_analyze_jobs`` once and
+                # ``ensure_extract_jobs`` once for two engines; the
+                # wrapper below is what pins this one.
                 #
                 # The generic creator's five wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
@@ -1791,6 +1799,28 @@ class TestKnownEnqueuePaths(ScanningTestCase):
             "Something new creates external-job rows. Row creation "
             "starts paid GPU work, so update this set only on purpose.",
         )
+
+    def test_every_start_button_is_wired_to_its_own_entry(self):
+        # The three buttons are one view over ``_shard_reads`` (#364).
+        # A wrong entry would start another engine's read, and the
+        # press would still look right, so the route, the name and the
+        # label of each entry are pinned together.
+        from scanning import views_process
+
+        scan = ScanFactory()
+        self.client.force_login(self.make_user())
+        for engine, spec in views_process._shard_reads().items():
+            with self.subTest(engine=engine):
+                response = self.client.post(
+                    reverse(spec.name, kwargs={"pk": scan.pk}), follow=True
+                )
+                self.assertIn(
+                    f"Only staff can start {spec.label}",
+                    [str(m) for m in response.context["messages"]][0],
+                )
+                self.assertEqual(
+                    ExternalJob.objects.filter(scan=scan).count(), 0
+                )
 
     @override_settings(**DOTS)
     def test_convert_rows_alone_submit_no_ocr(self):
