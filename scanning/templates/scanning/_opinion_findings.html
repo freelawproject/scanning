@@ -1,0 +1,38 @@
+{% comment %}
+  The warnings of one opinion (#334/#365).
+
+  A strip above the two columns, so the reviewer reads them before the
+  text. Each card names its page and carries `data-page`, which the
+  viewer reads: a click scrolls both columns to that page.
+
+  A stale card is a fact about a row, not a judgement, so it carries no
+  dismiss control anywhere in the portal. Here no card carries one: the
+  dismissal comes with the review that closes an opinion.
+{% endcomment %}
+<div class="card mb-6">
+  <h2 class="text-sm font-bold mb-3 flex items-center gap-2">
+    Findings
+    <span class="text-xs font-normal text-gray-600 dark:text-gray-300">({{ open_findings }} open)</span>
+  </h2>
+  {% if not findings %}
+  <div class="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded px-3 py-2 text-xs text-green-700 dark:text-green-300 font-medium">
+    No findings.
+  </div>
+  {% endif %}
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+    {% for finding in findings %}
+    <div class="finding-card rounded border px-3 py-2 text-sm
+         {% if finding.dismissal %}border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 opacity-60{% elif finding.is_stale %}border-red-300 bg-red-50 dark:border-red-700 dark:bg-red-900/20{% else %}border-yellow-300 bg-yellow-50 dark:border-yellow-700 dark:bg-yellow-900/20{% endif %}"
+         data-check="{{ finding.check_name }}"
+         {% if finding.page_in_opinion is not None %}data-page="{{ finding.page_in_opinion }}"{% endif %}>
+      <div class="flex items-center gap-2 flex-wrap">
+        <span class="font-semibold">{{ finding.get_check_name_display }}</span>
+        <span class="text-xs text-gray-500 dark:text-gray-400">{{ finding.page_label }}</span>
+        {% if finding.is_stale %}<span class="text-[10px] font-bold uppercase text-red-700 dark:text-red-300">not applied</span>{% endif %}
+        {% if finding.dismissal %}<span class="text-[10px] font-bold uppercase text-gray-500">dismissed</span>{% endif %}
+      </div>
+      {% if finding.message %}<p class="mt-1 text-xs text-gray-700 dark:text-gray-300">{{ finding.message }}</p>{% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</div>

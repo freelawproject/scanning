@@ -67,7 +67,9 @@ from scanning.views_process import (
     dismiss_issue,
     dismiss_page_repair,
     glued_output_index,
+    opinion_ensemble_url,
     opinion_file_index,
+    opinion_pdf_url,
     page_edit_file,
     process_actions,
     progress_api,
@@ -233,6 +235,19 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/redacted-pdf/",
         serve_opinion_pdf,
         name="serve_opinion_pdf",
+    ),
+    # The two objects the review page reads (#365). The answer is a
+    # presigned GET in JSON, because pdf.js and ``fetch`` read a direct
+    # URL and a browser judges a redirect's CORS rules differently.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/pdf-url/",
+        opinion_pdf_url,
+        name="opinion_pdf_url",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/ensemble-url/",
+        opinion_ensemble_url,
+        name="opinion_ensemble_url",
     ),
     # The glued objects of one opinion (#334), the twin of the volume's
     # own index: which object exists, and where it is.

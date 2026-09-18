@@ -71,6 +71,7 @@ VIEWS_PATH = pathlib.Path("scanning/views_api.py")
 SCRIPTS = (
     pathlib.Path("scanning/static/scanning/viewer_step2.js"),
     pathlib.Path("scanning/static/scanning/viewer_sidebar.js"),
+    pathlib.Path("scanning/static/scanning/viewer_step3.js"),
 )
 SHARED = pathlib.Path("scanning/static/scanning/shared.js")
 
@@ -162,8 +163,19 @@ class TestTheTextLivesInTheView(ScanningTestCase):
             )
 
     def test_the_viewer_scripts_show_the_server_line(self):
+        """The helper is called with the answer, never with a string.
+
+        A viewer shows the line the write view wrote. Two helpers do
+        that: ``showSaved`` on the page, and ``showSavedAfterReload``
+        over a reload. Either one must take a value of the answer, so a
+        literal in the script is what this pin catches.
+        """
+        pattern = re.compile(r"showSaved(?:AfterReload)?\(\s*[A-Za-z_$]")
         for path in SCRIPTS:
-            self.assertIn("showSaved(data)", path.read_text())
+            self.assertIsNotNone(
+                pattern.search(path.read_text()),
+                f"{path.name} shows no line of the server",
+            )
 
     def test_the_shared_script_defines_the_three_helpers(self):
         text = SHARED.read_text()
