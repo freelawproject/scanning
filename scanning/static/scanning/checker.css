@@ -1265,7 +1265,9 @@ a.doc-name:hover { text-decoration: underline; }
 }
 
 /* The readings of the engines, under the group that differs (#365). */
-.ensemble-group.differs {
+/* Not on a selected group: the two rules have the same weight, and
+   this one comes later, so the red of the selection would go. */
+.ensemble-group.differs:not(.ensemble-selected) {
     border-left-color: rgba(217, 119, 6, 0.75);
 }
 .ensemble-compare {

@@ -560,6 +560,32 @@ def text_review_ready(opinion: Opinion) -> bool:
     return opinion_pdf.is_written(opinion) and ensemble.is_written(opinion)
 
 
+#: How many rows one tick moves in each direction. The twin of
+#: ``opinion_ocr.OPINIONS_PER_TICK`` and ``opinion_pdf.PDFS_PER_TICK``:
+#: the collect tick is serial, and the first tick after a deploy would
+#: else carry the whole corpus.
+PROMOTIONS_PER_TICK = 50
+
+
+def _live_stamps() -> Q:
+    """Return the rows whose three ledgers name the live revision.
+
+    The candidate filter of the pass, in both directions. It is the
+    shape of :func:`text_review_ready` and not a second copy of it:
+    that function decides, row by row, and this only keeps the tick
+    from reading every opinion of the corpus.
+
+    :returns: The filter.
+    :rtype: Q
+    """
+    return Q(
+        glue_revision__isnull=False,
+        redacted_pdf_revision=F("glue_revision"),
+        ocr_glue_revision=F("glue_revision"),
+        ensemble_revision=F("glue_revision"),
+    )
+
+
 def promote_ready(opinion: Opinion) -> bool:
     """Take one opinion to ``READY_FOR_TEXT_REVIEW``.
 
@@ -590,28 +616,74 @@ def promote_ready(opinion: Opinion) -> bool:
     return bool(moved)
 
 
-def promote_ready_opinions() -> int:
-    """Take every qualifying opinion to the text review.
+def demote_stale(opinion: Opinion) -> bool:
+    """Take one opinion back to ``PROCESSING``.
+
+    The other half of :func:`promote_ready`, and the reason both live
+    in one pass. ``create_rows`` and the two re-glue commands raise
+    ``glue_revision`` on every row a person has not approved, and they
+    keep the status, so a row that was ready now points at a PDF and a
+    text nobody has written yet. The list would call it ready and the
+    review page would show two empty columns.
+
+    A compare-and-swap over ``READY_FOR_TEXT_REVIEW`` and the revision
+    the caller read. An approved row is not touched: a person read that
+    text, and the way a new revision reaches it is a new approval.
+
+    :param opinion: The row.
+    :returns: Whether this call moved the row.
+    :rtype: bool
+    """
+    if text_review_ready(opinion):
+        return False
+    moved = Opinion.objects.filter(
+        pk=opinion.pk,
+        status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+        glue_revision=opinion.glue_revision,
+    ).update(status=OpinionReviewStatus.PROCESSING)
+    if moved:
+        logger.info(
+            "%s of scan %s went back to processing: its PDF or its text "
+            "is not written at r%s",
+            opinion,
+            opinion.scan_id,
+            opinion.glue_revision,
+        )
+    return bool(moved)
+
+
+def promote_ready_opinions(limit: int = PROMOTIONS_PER_TICK) -> int:
+    """Move every qualifying opinion in or out of the text review.
 
     The twin of ``review_states.promote_ready_scans`` for one opinion,
     and the one writer of ``READY_FOR_TEXT_REVIEW`` (#365). The two
     objects are written by two passes that know nothing of each other,
-    and either can be last, so the promotion is a pass of its own
-    rather than a line in both.
+    and either can be last, so the state is a pass of its own rather
+    than a line in both.
 
-    The candidates are the rows that still say ``PROCESSING`` and whose
-    three stamps name the live revision. That filter is the shape of
-    the two rules and not a second copy of them:
-    :func:`text_review_ready` decides, row by row.
+    **Both directions, because a revision goes up as well as down.**
+    A row is promoted when its two objects are written and demoted when
+    a re-glue takes them away (:func:`demote_stale`). The promotion
+    reads the scan status and the demotion does not: a volume an admin
+    sent back invites nobody new, and a row that keeps its objects
+    keeps its state until a re-glue moves the revision.
 
-    :returns: How many opinions were promoted.
+    ``opinion_pdf.OPINION_PDF_STATUSES`` is the one table of the scan
+    statuses the opinion passes read, so #334 extends it once.
+
+    :param limit: How many rows to move in each direction.
+    :returns: How many opinions were moved.
     :rtype: int
     """
-    candidates = Opinion.objects.filter(
+    from scanning.opinion_pdf import OPINION_PDF_STATUSES
+
+    ready = Opinion.objects.filter(
+        _live_stamps(),
+        scan__status__in=OPINION_PDF_STATUSES,
         status=OpinionReviewStatus.PROCESSING,
-        glue_revision__isnull=False,
-        redacted_pdf_revision=F("glue_revision"),
-        ocr_glue_revision=F("glue_revision"),
-        ensemble_revision=F("glue_revision"),
-    )
-    return sum(1 for row in candidates if promote_ready(row))
+    )[:limit]
+    moved = sum(1 for row in ready if promote_ready(row))
+    stale = Opinion.objects.filter(
+        status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+    ).exclude(_live_stamps())[:limit]
+    return moved + sum(1 for row in stale if demote_stale(row))

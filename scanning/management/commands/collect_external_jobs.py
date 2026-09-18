@@ -111,7 +111,9 @@ nothing runs by itself until the third engine reads.
 at the live revision goes from ``PROCESSING`` to
 ``READY_FOR_TEXT_REVIEW``. The two objects come from two passes that
 know nothing of each other and either can be last, so the promotion is
-a pass of its own, the twin of pass 8 for a scan.
+a pass of its own, the twin of pass 7 for a scan. It takes a row
+back to ``PROCESSING`` too, because a re-glue raises the revision and
+leaves the status where it was.
 
 Examples:
 

@@ -155,15 +155,23 @@
      */
     function changeZoom(action) {
         if (!pageSize) { return; }
+        var before = scaleFor(pageSize.width);
         if (action === 'fit') {
             zoom = null;
         } else {
-            var now = scaleFor(pageSize.width);
             var step = action === 'in' ? ZOOM_STEP : -ZOOM_STEP;
-            zoom = Math.min(MAX_SCALE, Math.max(MIN_SCALE, now + step));
+            zoom = Math.min(MAX_SCALE, Math.max(MIN_SCALE, before + step));
         }
+        var after = scaleFor(pageSize.width);
         sizePlaceholders();
         redrawRenderedPages();
+        // The column keeps its place in the opinion: every page grew
+        // or shrank by the same factor, and an offset in the old
+        // pixels points at another page in the new ones.
+        if (before) {
+            pagesColumn.scrollTop *= after / before;
+            pagesColumn.scrollLeft *= after / before;
+        }
         showZoom();
     }
 
@@ -592,10 +600,12 @@
      * Build the panel that holds one reading per engine.
      *
      * Every engine of the page has a line, in the order of the
-     * document, which is the rank of the vote: the engine the ensemble
-     * shows, then the others, then the ones that read nothing here and
-     * the ones that drew no box at all. The reading enters the DOM
-     * with ``textContent``.
+     * document, which is the order of ``opinion_ocr.ENGINES`` and
+     * therefore the same on every group of every opinion. The engine
+     * whose reading the text above shows carries the mark, wherever it
+     * falls; an engine that read nothing here, and an engine that drew
+     * no box at all, each say which of the two they are. The reading
+     * enters the DOM with ``textContent``.
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.

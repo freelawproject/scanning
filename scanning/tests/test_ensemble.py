@@ -1384,7 +1384,13 @@ class TestTheLedger(EnsembleTestCase):
             "OCR glue: the document did not load",
         )
 
-    def test_the_pass_is_the_last_of_the_collect_tick(self):
+    def test_the_pass_runs_after_the_glue_and_before_the_promotion(self):
+        """The three opinion passes end the tick, in this order.
+
+        The glue writes the documents, the ensemble reads them, and the
+        promotion opens the review of a row that now has both of its
+        objects (#365).
+        """
         calls = []
         with (
             patch(
@@ -1395,11 +1401,15 @@ class TestTheLedger(EnsembleTestCase):
                 "scanning.ensemble.run_tick",
                 side_effect=lambda: calls.append("ensemble") or 0,
             ),
+            patch(
+                "scanning.opinions.promote_ready_opinions",
+                side_effect=lambda: calls.append("promote") or 0,
+            ),
             patch("django.db.connections.close_all"),
         ):
             call_command("collect_external_jobs")
 
-        self.assertEqual(calls[-2:], ["glue", "ensemble"])
+        self.assertEqual(calls[-3:], ["glue", "ensemble", "promote"])
 
 
 # ── the button and the command ───────────────────────────────────────
