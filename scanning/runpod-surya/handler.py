@@ -671,18 +671,32 @@ def _is_empty(blocks: list[dict]) -> bool:
     return all(block["error"] for block in blocks)
 
 
-def _raw_answer(records: list[dict]) -> str | None:
-    """The full-page answer among a read's requests, as the model wrote it.
+def _full_page_record(records: list[dict]) -> dict | None:
+    """The full-page request a read's blocks came from.
+
+    The **last** one that answered, and not the first. surya makes one
+    full-page request per read while ``SURYA_FULLPAGE_REGEN`` is off,
+    which is its default and what this worker documents, and then the
+    two are the same record. An endpoint that turns the setting on
+    makes up to seven, each at a temperature surya raises itself, and
+    stops at the first answer it can parse: the last one is then the
+    answer the blocks were parsed from, and the first is an answer
+    that failed. A page read in block mode answered none of them, and
+    the last one with text is the most of what the model wrote whole.
+
+    One record, because ``raw`` and ``confidence`` must describe one
+    answer, and :func:`_account_for_raw` compares that answer against
+    the blocks.
 
     :param records: The recorder's notes for one read.
-    :returns: The answer, or None when there was none: no full-page
-        request made, or one that errored (surya hands those back as
-        ``""``).
-    :rtype: str | None
+    :returns: The record, or None when there was none: no full-page
+        request made, or none that answered (surya hands an errored
+        request back as ``""``).
+    :rtype: dict | None
     """
-    for record in records:
-        if record["prompt_type"] == FULL_PAGE_PROMPT:
-            return record["raw"] or None
+    for record in reversed(records):
+        if record["prompt_type"] == FULL_PAGE_PROMPT and record["raw"]:
+            return record
     return None
 
 
@@ -903,7 +917,7 @@ def _page_from_read(page_idx: int, image, result, records: list[dict]) -> dict:
     """
     blocks = _serialize_blocks(result)
     texts = [block["text"] for block in blocks if block["text"]]
-    full_page = [r for r in records if r["prompt_type"] == FULL_PAGE_PROMPT]
+    answer = _full_page_record(records)
     tokens = [
         r["completion_tokens"]
         for r in records
@@ -919,15 +933,14 @@ def _page_from_read(page_idx: int, image, result, records: list[dict]) -> dict:
         # post-processor starts from, and on a page surya could not
         # parse, the only evidence of what it wrote. surya keeps no
         # copy. The payload goes to S3, so its size is no concern.
-        "raw": _raw_answer(records),
+        "raw": answer["raw"] if answer else None,
         "requests": len(records),
         "completion_tokens": sum(tokens) if tokens else None,
     }
-    confidences = [
-        r["confidence"] for r in full_page if r["confidence"] is not None
-    ]
-    if confidences:
-        page["confidence"] = confidences[0]
+    if answer and answer["confidence"] is not None:
+        # surya's mean token probability of the answer above, and of
+        # no other request.
+        page["confidence"] = answer["confidence"]
     if any(r["prompt_type"] == LAYOUT_PROMPT for r in records):
         # surya ran its layout pass: the full-page answer looped or
         # would not parse, and the blocks were read one by one. This
@@ -1097,9 +1110,9 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             # The answer the model gave before the read raised, when
             # there was one: the only evidence of what went wrong, as
             # on a failed dots.mocr page.
-            raw = _raw_answer(records)
-            if raw is not None:
-                failed["raw"] = raw
+            answer = _full_page_record(records)
+            if answer is not None:
+                failed["raw"] = answer["raw"]
             return failed
         if _is_empty(page["blocks"]):
             # Twice empty: written, so the shard converges instead of

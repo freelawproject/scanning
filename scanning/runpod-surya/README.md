@@ -320,10 +320,15 @@ Notes on the page dicts:
   that got one (`null` when there was no answer): `blocks` is surya's
   parse of it, so `raw` is what a later post-processor starts from,
   and on a page surya could not parse it is the only evidence of what
-  the model wrote. surya keeps no copy of it. `requests` and
-  `completion_tokens` count the model requests the read made as surya
-  reports them, block-mode fallback included. `confidence` is surya's
-  mean token probability of the answer.
+  the model wrote. surya keeps no copy of it. It is the **last**
+  full-page answer of the read, which is the only one while
+  `SURYA_FULLPAGE_REGEN` is off; an endpoint that turns that setting
+  on makes surya ask again at a higher temperature until an answer
+  parses, and the last one is then the answer `blocks` came from.
+  `requests` and `completion_tokens` count the model requests the read
+  made as surya reports them, block-mode fallback included.
+  `confidence` is surya's mean token probability of that same answer
+  and of no other request.
 - **What the output cannot show.** surya's client retries a looping or
   errored answer up to three times *inside* one request
   (`surya/inference/backends/openai_client.py`, at a temperature surya

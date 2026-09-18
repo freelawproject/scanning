@@ -908,6 +908,39 @@ class TestOcrPages(SimpleTestCase):
         )
         self.assertIsNone(run.result["pages"][0]["raw"])
 
+    def test_the_last_full_page_answer_is_the_one_kept(self):
+        # A regeneration run (SURYA_FULLPAGE_REGEN on an endpoint):
+        # surya asks again at a higher temperature and stops at the
+        # answer it can parse, so the blocks came from the last one.
+        # ``raw`` and ``confidence`` describe that answer and no other.
+        first = '<div data-bbox="1 1 2 2" data-label="Text"><p>x</p></div>'
+        answers = [
+            _answer("high_accuracy_bbox", first, confidence=0.40),
+            _answer("high_accuracy_bbox", FULL_PAGE_ANSWER, confidence=0.93),
+        ]
+        run = _OcrRun(self, [_read(answers=answers)])
+        page = run.result["pages"][0]
+        self.assertEqual(page["raw"], FULL_PAGE_ANSWER)
+        self.assertEqual(page["confidence"], 0.93)
+        self.assertEqual(page["requests"], 2)
+
+    def test_an_errored_last_answer_keeps_the_one_that_answered(self):
+        # Every round failed and the page went to block mode. The
+        # errored round wrote nothing, so the evidence is the last
+        # round that wrote something.
+        looped = '<div data-bbox="1 1 2 2" data-label="Figure">x</div>' * 3
+        answers = [
+            _answer("high_accuracy_bbox", looped, confidence=0.31),
+            _answer("high_accuracy_bbox", "", tokens=0, error=True),
+            _answer("layout", "[]"),
+            _answer("block", "<p>y</p>"),
+        ]
+        run = _OcrRun(self, [_read(answers=answers)])
+        page = run.result["pages"][0]
+        self.assertEqual(page["raw"], looped)
+        self.assertEqual(page["confidence"], 0.31)
+        self.assertEqual(page["fallback"], "block")
+
     def test_pages_come_back_in_order(self):
         script = [_read(blocks=[_block(html=f"<p>{n}</p>")]) for n in range(3)]
         run = _OcrRun(self, script, pages=3)
