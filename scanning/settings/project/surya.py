@@ -11,8 +11,10 @@ per engine: ``RUNPOD_ENABLED``, ``RUNPOD_API_KEY``,
 ``RUNPOD_PRESIGNED_TTL`` and ``RUNPOD_REQUEST_TIMEOUT``. The render
 resolution and the thread count are not here at all -- they are module
 constants in ``scanning/surya.py``, since neither has an operational
-reason to change per deploy, and ``ExternalJob.input_manifest`` already
-carries a per-row override for a one-off experiment.
+reason to change per deploy. ``ExternalJob.input_manifest`` carries a
+per-row override for a one-off experiment, and that override starts a
+new run over the shard it names, because the manifest is the shard
+identity (see ``surya.DPI``).
 """
 
 import environ

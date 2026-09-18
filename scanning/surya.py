@@ -58,8 +58,15 @@ ACTION = "ocr"
 #: its boxes back to that image, so nothing rescales later.
 #:
 #: A module constant rather than a setting: there is no operational
-#: reason to retune this per deploy, and a one-off experiment writes
-#: ``{"dpi": 400}`` onto the row's ``input_manifest`` instead.
+#: reason to retune this per deploy. A one-off experiment writes
+#: ``{"dpi": 400}`` onto the row's ``input_manifest`` instead, and
+#: **that costs a new run**: ``input_manifest`` is the shard identity,
+#: so the edited row no longer describes today's shard set
+#: (``jobs._still_describes``) and cannot be carried
+#: (``jobs._reusable_results``). The next ``ensure_extract_jobs`` opens
+#: run n+1 and re-pays that shard. For an experiment that is the point
+#: -- a read at another resolution is a second read -- but it is never
+#: free.
 DPI = 200
 
 #: Pages one worker reads at once against its own inference server. The
@@ -70,7 +77,8 @@ NUM_THREADS = 16
 
 #: Per-row tuning keys this stage reads off ``input_manifest``, so an
 #: experiment can override them without a deploy. Everything else there
-#: describes the shard and must not be treated as a knob.
+#: describes the shard and must not be treated as a knob. An override
+#: re-pays the shard it names; see :data:`DPI`.
 #:
 #: No decode parameter belongs here, ever. The worker refuses
 #: ``temperature``, ``top_p``, ``max_tokens`` and
@@ -148,13 +156,21 @@ def ensure_extract_jobs(
     (``jobs._reusable_results``). This engine can carry, because its
     per-shard results are kept for the glue.
 
-    A result with a hole is never carried, stable or not
+    A result with an unread page is never carried, stable or not
     (``carry_stable_holes=False``). The stable-hole rule of #238 trusts
     a deterministic worker to give the same answer twice. Surya's own
     client reads a looped answer again at a temperature it raises
     itself, so a page that failed once may well read on the next
     attempt, and two unlucky runs must not freeze it as unread for
     good.
+
+    "Unread" is ``jobs.has_unread_pages``, which reads ``failed_pages``
+    and ``filtered_pages`` and nothing else. The worker also reports
+    ``empty_pages`` -- a page it read twice and got no block from --
+    and this stage does **not** treat one as a hole: a blank page is
+    rare but real, and re-paying a shard for one would never converge.
+    Such a page is carried, and what an empty page means is the glue's
+    question. The files index lists them so a reader checks (#364).
 
     :param scan: The scan to read.
     :param manifest: The committed shard manifest.

@@ -1120,9 +1120,11 @@ def serve_final_pdf(request: HttpRequest, pk: int) -> HttpResponse:
 #: hours and is the wrong size here.
 GLUED_OUTPUT_PRESIGN_TTL = 600
 
-#: Slug -> (stage, engine, glued key function): the two glued documents
-#: of issue #243. The outputs differ in nothing else, so a third engine
-#: is one more entry, not a view.
+#: Slug -> (stage, engine, glued key function): the glued documents of
+#: issue #243. The outputs differ in nothing else, so one more engine is
+#: one more entry, not a view. Surya is listed although no pass glues it
+#: yet (#364): the index reads the rows, and the volume route answers
+#: "not glued yet" for a key with no object, which is the true answer.
 GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
     "dots-mocr": (
         JobStage.ANALYZE,
@@ -1141,6 +1143,16 @@ GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
     # what the worker wrote.
     "surya": (JobStage.EXTRACT, JobEngine.SURYA, surya.glued_result_key),
 }
+
+#: What a start button says when the committed manifest describes no
+#: shard at all. ``ensure_*`` then creates no row, and the "already
+#: read" line would address ``created[0]`` and raise. A manifest like
+#: that is a fault of the cut, not of the press, so the answer names
+#: it rather than claiming a read that never happened.
+NO_SHARDS_TO_READ_MESSAGE = (
+    "This volume's shard set lists no part to read. Re-cut it with the "
+    "admin re-queue before you start a read."
+)
 
 NO_S3_GLUED_OUTPUT_MESSAGE = (
     "No glued output exists without S3: the daemon glues into the "
@@ -1764,9 +1776,11 @@ def _apply_run_entry(scan: Scan, run, rows: list, measured: bool) -> dict:
             "error_code": row.error_code,
             "page_count": manifest.get("page_count"),
         }
-        has_summary = isinstance((row.provider_meta or {}).get("output"), dict)
-        if row.engine == JobEngine.DOTS_MOCR and has_summary:
-            entry.update(jobs.page_lists(row))
+        summary = (row.provider_meta or {}).get("output")
+        if isinstance(summary, dict):
+            for name in SHARD_PAGE_LISTS.get(row.engine, ()):
+                value = summary.get(name)
+                entry[name] = list(value) if isinstance(value, list) else []
         if row.result_key:
             entry["url"] = reverse(
                 "serve_apply_shard",
@@ -2445,7 +2459,7 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
             f"Queued OCR for {queued} part(s) of this volume. The "
             "daemon sends them to RunPod within a few seconds.",
         )
-    else:
+    elif created:
         # ``ensure_analyze_jobs`` reused a run that is already done, so
         # nothing was queued and nothing will be sent. Saying otherwise
         # would have staff waiting on a dispatch that is not coming.
@@ -2454,6 +2468,8 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
             f"This volume was already read: run {created[0].run} covers "
             f"all {len(created)} part(s). Nothing new was queued.",
         )
+    else:
+        messages.warning(request, NO_SHARDS_TO_READ_MESSAGE)
     return back
 
 
@@ -2540,7 +2556,7 @@ def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
             f"Queued Mistral OCR for {queued} part(s) of this volume. The "
             "daemon renders and sends them within a few seconds.",
         )
-    else:
+    elif created:
         # ``ensure_extract_jobs`` reused a run that is already done, so
         # nothing was queued and nothing will be sent.
         messages.info(
@@ -2548,6 +2564,8 @@ def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
             f"This volume was already read: run {created[0].run} covers "
             f"all {len(created)} part(s). Nothing new was queued.",
         )
+    else:
+        messages.warning(request, NO_SHARDS_TO_READ_MESSAGE)
     return back
 
 
@@ -2634,7 +2652,7 @@ def start_surya_ocr(request: HttpRequest, pk: int) -> HttpResponse:
             f"Queued Surya OCR for {queued} part(s) of this volume. The "
             "daemon sends them to RunPod within a few seconds.",
         )
-    else:
+    elif created:
         # ``ensure_extract_jobs`` reused a run that is already done, so
         # nothing was queued and nothing will be sent.
         messages.info(
@@ -2642,6 +2660,8 @@ def start_surya_ocr(request: HttpRequest, pk: int) -> HttpResponse:
             f"This volume was already read: run {created[0].run} covers "
             f"all {len(created)} part(s). Nothing new was queued.",
         )
+    else:
+        messages.warning(request, NO_SHARDS_TO_READ_MESSAGE)
     return back
 
 

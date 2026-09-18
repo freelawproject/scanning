@@ -1776,10 +1776,11 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 # work of its own.
                 ("scanning/views_process.py", "ensure_extract_jobs"),
                 ("scanning/mistral_ocr.py", "ensure_extract_jobs"),
-                # Surya: the staff button (#364) and nothing else. The
-                # view's call above is both engines' -- one name, two
-                # modules -- so the wrapper below is what pins this
-                # engine.
+                # Surya: the staff button (#364) and nothing else. Its
+                # view call is the ``ensure_extract_jobs`` entry above
+                # -- one name, two engines -- so the wrapper below is
+                # what pins this engine.
+                #
                 # The generic creator's five wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
                 ("scanning/yolo.py", "ensure_shard_jobs"),

@@ -17,6 +17,7 @@ No HTTP and no S3: ``runpod_client`` and the S3 helpers are patched.
 
 from unittest.mock import patch
 
+from django.template.loader import render_to_string
 from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -457,6 +458,15 @@ class TestStartSuryaOcr(ScanningTestCase):
         self.assertEqual(surya_jobs(self.scan), [])
         self.assertIn("RUNPOD_SURYA_ENDPOINT_ID", self._messages(response)[0])
 
+    def test_a_manifest_with_no_shard_is_refused(self):
+        # ``ensure_extract_jobs`` then creates no row, and the "already
+        # read" line would address ``created[0]`` and raise.
+        empty = {**self.manifest, "shards": []}
+        with self._committed(manifest=empty):
+            response = self._press()
+        self.assertEqual(surya_jobs(self.scan), [])
+        self.assertIn("no part to read", self._messages(response)[-1])
+
     def test_no_committed_shard_set_is_refused(self):
         with self._committed(manifest=None, reason="no shard set"):
             response = self._press()
@@ -583,3 +593,31 @@ class TestTheFilesIndex(ScanningTestCase):
             )
         self.assertEqual(response.status_code, 404)
         self.assertIn("not glued yet", response.json()["error"])
+
+
+# ── the shared control ──────────────────────────────────────────────
+class TestTheEngineControl(ScanningTestCase):
+    """The template both OCR buttons render from (#364)."""
+
+    def test_the_confirm_text_is_escaped_for_javascript(self):
+        # The text lands inside a JavaScript string. HTML escaping is
+        # not enough: the browser decodes the entity before the
+        # JavaScript parser reads the handler, so an apostrophe would
+        # break it and the click would POST the paid work with no
+        # question.
+        html = render_to_string(
+            "scanning/_ocr_engine_actions.html",
+            {
+                "scan": ScanFactory(),
+                "user": self.make_staff_user(),
+                "run": None,
+                "label": "Surya OCR",
+                "start_url": "start_surya_ocr",
+                "files_slug": "surya",
+                "title": "t",
+                "confirm": "Read Mistral's pages?",
+            },
+        )
+        self.assertIn(r"confirm('Read Mistral\u0027s pages?')", html)
+        self.assertNotIn("Mistral's", html)
+        self.assertNotIn("Mistral&#x27;s", html)

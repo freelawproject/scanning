@@ -13,6 +13,12 @@ than a copy of it (#364). The caller passes:
   title       - the button's hover text
   confirm     - the question the browser asks before the POST
 
+`confirm` goes through `escapejs` because it lands inside a JavaScript
+string. HTML escaping is not enough there: the browser decodes `&#x27;`
+before the JavaScript parser reads the handler, so an apostrophe would
+break the handler and the click would POST the paid work with no
+question.
+
 Neither stage moves a scan status, so its state comes from the run
 summary and never from `is_processing`. That summary still renders
 after the run ends, so a historical run stays readable.
@@ -42,6 +48,6 @@ message.
 {% if user.is_staff and not run.open %}
 <form method="post" action="{% url start_url scan.pk %}" class="inline">
   {% csrf_token %}
-  <button type="submit" class="btn-outline text-sm" title="{{ title }}" onclick="return confirm('{{ confirm }}');">{% if run %}Re-run {{ label }}{% else %}Run {{ label }}{% endif %}</button>
+  <button type="submit" class="btn-outline text-sm" title="{{ title }}" onclick="return confirm('{{ confirm|escapejs }}');">{% if run %}Re-run {{ label }}{% else %}Run {{ label }}{% endif %}</button>
 </form>
 {% endif %}
