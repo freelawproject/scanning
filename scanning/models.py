@@ -2411,7 +2411,7 @@ class OpinionReviewStatus(models.TextChoices):
 class OpinionCheck(models.TextChoices):
     """What an :class:`OpinionFinding` is about (#334).
 
-    The first five are the warnings the review shows on a page. The last
+    The first six are the warnings the review shows on a page. The last
     three are facts about the opinion row itself.
     """
 
@@ -2423,6 +2423,7 @@ class OpinionCheck(models.TextChoices):
         "partial_redaction",
         "A redaction covers part of a cell",
     )
+    PAGE_NOT_READ = "page_not_read", "This page has no text"
     PAGE_GAP = "page_gap", "A gap in the printed page numbers"
     STALE_PAGE_NUMBER = "stale_page_number", "The printed number changed"
     ORPHANED_OPINION = "orphaned_opinion", "No boundary matches this opinion"
@@ -2623,6 +2624,31 @@ class Opinion(AbstractDateTimeModel):
         help_text=(
             "Failed OCR glue ticks on this row at the live revision "
             "(#350). At opinion_ocr.MAX_ATTEMPTS the row goes to ERROR."
+        ),
+    )
+    ocr_engine_count = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "How many engine documents the OCR glue wrote at "
+            "ocr_glue_revision (#365). The ensemble gate reads it, so a "
+            "two-engine volume waits for the third engine."
+        ),
+    )
+    ensemble_revision = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The ocr_glue_revision the ensemble ran at (#365). Equal to "
+            "ocr_glue_revision: the text of the rows describes the OCR "
+            "documents that exist now, the one rule "
+            "ensemble.is_written reads."
+        ),
+    )
+    ensemble_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "Failed ensemble ticks on this row at the live revision "
+            "(#365). At ensemble.MAX_ATTEMPTS the row goes to ERROR."
         ),
     )
     approved_text_key = models.CharField(

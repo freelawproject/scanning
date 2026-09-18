@@ -52,3 +52,15 @@ DAEMON_OPINION_PDF_INTERVAL = env.int("DAEMON_OPINION_PDF_INTERVAL", default=5)
 OPINION_PDF_RETRY_AFTER_SECONDS = env.int(
     "OPINION_PDF_RETRY_AFTER_SECONDS", default=15 * 60
 )
+
+# How many of an opinion's engine documents must exist before the
+# ensemble runs by itself (#365). Three engines are what the vote
+# needs: with two, every place they differ has no majority and every
+# word of it is low confidence. Surya (#320, #364, #368) is the third,
+# so a volume whose apply run carries all three keys opens the pass by
+# itself; a volume read by two waits, and the rerun_opinion_ensemble
+# command reads it. The endpoint waives the gate too; the viewer of
+# #365 puts its button on the page.
+OPINION_ENSEMBLE_MIN_ENGINES = env.int(
+    "OPINION_ENSEMBLE_MIN_ENGINES", default=3
+)

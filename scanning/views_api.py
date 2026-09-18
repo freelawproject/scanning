@@ -34,6 +34,7 @@ from scanning.models import (
     Detection,
     DetectionDecision,
     Issue,
+    Opinion,
     OpinionBoundary,
     OpinionScan,
     Redaction,
@@ -129,6 +130,56 @@ STANDING_FINDING_MESSAGE = "The finding was standing already."
 WITHDRAWN_DECISION_MESSAGE = "The decision was withdrawn."
 STANDING_DECISION_MESSAGE = "The decision was withdrawn already."
 REBUILT_FINDINGS_MESSAGE = "The findings were written again from the rows."
+
+#: The answers of the "Re run OCR ensemble" button of review 3 (#365).
+#: The text lives here, the rule of the review-2 writes above.
+ENSEMBLE_RERUN_MESSAGE = (
+    "The text was written again from {engines}: {groups} block(s) read, "
+    "{dropped} left out, {low} word(s) with no majority."
+)
+ENSEMBLE_NOT_GLUED_MESSAGE = (
+    "The OCR documents of this opinion are not written at the live "
+    "revision, so there is nothing to read yet. The daemon writes them "
+    "after the redaction review."
+)
+#: An approved opinion is never written over: a person read its text
+#: and said it is right (#365).
+ENSEMBLE_APPROVED_MESSAGE = (
+    "The text review of this opinion is done, so its text is not "
+    "written again. Reopen it first."
+)
+#: A fault that passes. The detail goes to the log and not to the
+#: answer: it carries the words of a library, and a message of ours is
+#: what a curator can act on.
+ENSEMBLE_BUCKET_MESSAGE = (
+    "The file store did not answer, so nothing was written. Press the "
+    "button again."
+)
+#: The OCR glue wrote again while the text was written, so the write
+#: kept nothing (#365).
+ENSEMBLE_MOVED_MESSAGE = (
+    "The OCR documents of this opinion were written again while this "
+    "ran, so nothing was kept. Press the button again."
+)
+#: The line of each ``ensemble.EnsembleError`` code. The answer is
+#: built from this table and never from the error: the error names the
+#: object it read, and a key of the bucket belongs in the log and on
+#: the row, not in a browser.
+ENSEMBLE_ERROR_MESSAGES = {
+    "unreadable": (
+        "One of the OCR documents of this opinion is missing, or it is "
+        "not a document this portal can read. They must be written "
+        "again before the text can be."
+    ),
+    "no_engine": (
+        "The OCR glue of this opinion wrote no engine document, so "
+        "there is nothing to read."
+    ),
+    "short_document": (
+        "An OCR document of this opinion has fewer pages than the "
+        "opinion. They must be written again before the text can be."
+    ),
+}
 
 #: The two labels the opinion pairing reads: a box of one of them
 #: changes the boundaries, and only the measurement pairs them again.
@@ -759,6 +810,114 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
         "scan %s: %s queued a redaction recompute", scan.pk, request.user
     )
     return JsonResponse({"status": "queued", "message": message}, status=202)
+
+
+@login_required
+@require_POST
+def rerun_opinion_ensemble(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Read this opinion's OCR documents again and write its text (#365).
+
+    The "Re run OCR ensemble" button of review 3. The work is a few
+    small S3 reads and a geometry over the pages of one opinion, so it
+    runs here and not on the daemon: the rule of
+    :func:`rebuild_findings`, whose twin ``compute_redactions_api``
+    renders every page and therefore queues.
+
+    It **waives the engine gate**. The daemon pass waits for
+    ``OPINION_ENSEMBLE_MIN_ENGINES`` engine documents, which a volume
+    read by two engines never holds. No page posts here yet: the
+    viewer of #365 puts the button on the review page, and until then
+    the ``rerun_opinion_ensemble`` command is the way in.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: JSON with the message, 404 for an opinion of another scan,
+        or 409 when the OCR documents are not written or the row
+        refuses to read.
+    """
+    from scanning import ensemble, opinion_ocr, s3_sync
+    from scanning.models import OpinionReviewStatus
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE:
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_APPROVED_MESSAGE},
+            status=409,
+        )
+    if not opinion_ocr.is_written(opinion):
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_NOT_GLUED_MESSAGE},
+            status=409,
+        )
+    if not s3_sync.s3_active():
+        # The reads and the write are the bucket, the rule of
+        # ``ensemble.run_tick``, which asks the same question first.
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_BUCKET_MESSAGE},
+            status=409,
+        )
+    try:
+        document = ensemble.rerun(opinion)
+    except ensemble.RevisionMoved:
+        # The OCR documents were written again while this ran, so the
+        # rows went back. Nothing was kept, and the answer says so.
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_MOVED_MESSAGE},
+            status=409,
+        )
+    except ensemble.TransientFault as exc:
+        # A fault that passes: the curator presses the button again,
+        # and no attempt was spent. The detail is logged, never sent.
+        logger.warning(
+            "%s of scan %s: the ensemble did not reach the bucket: %s",
+            opinion,
+            scan.pk,
+            exc,
+        )
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_BUCKET_MESSAGE},
+            status=409,
+        )
+    except ensemble.EnsembleError as exc:
+        # The line comes from the table above, by the code of the
+        # error: the error itself names the object it read.
+        logger.warning(
+            "%s of scan %s: the ensemble refused the row: %s",
+            opinion,
+            scan.pk,
+            exc,
+        )
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": ENSEMBLE_ERROR_MESSAGES.get(
+                    exc.code, ENSEMBLE_ERROR_MESSAGES["unreadable"]
+                ),
+            },
+            status=409,
+        )
+    logger.info(
+        "%s of scan %s: %s ran the OCR ensemble again",
+        opinion,
+        scan.pk,
+        request.user,
+    )
+    counts = document["counts"]
+    return JsonResponse(
+        {
+            "status": "ok",
+            "message": ENSEMBLE_RERUN_MESSAGE.format(
+                engines=", ".join(document["engines"]),
+                groups=counts["groups"],
+                dropped=counts["dropped"],
+                low=counts["low_confidence"],
+            ),
+        }
+    )
 
 
 @login_required

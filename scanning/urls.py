@@ -43,6 +43,7 @@ from scanning.views_api import (
     generate_files,
     move_redaction,
     rebuild_findings,
+    rerun_opinion_ensemble,
     restore_boundary,
     restore_finding,
     restore_redaction,
@@ -218,6 +219,13 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/ocr/<str:engine>/",
         serve_opinion_ocr,
         name="serve_opinion_ocr",
+    ),
+    # The OCR ensemble of one opinion (#365): the button that reads
+    # the OCR documents again and writes the text.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/ensemble/rerun/",
+        rerun_opinion_ensemble,
+        name="rerun_opinion_ensemble",
     ),
     # The redacted PDF of one opinion (#336): a redirect to a presigned
     # GET, named by the printed range for the download alone (#165).

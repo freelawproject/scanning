@@ -469,8 +469,12 @@ def page_size_pt(
     return frame[0] * scale, frame[1] * scale
 
 
-def _box(value) -> list[float] | None:
-    """Return a four-number box with area, or None."""
+def as_box(value) -> list[float] | None:
+    """Return a four-number box with area, or None.
+
+    Public, because the ensemble (#365) reads the same boxes out of
+    the documents this module writes. One copy of the box rules.
+    """
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         return None
     if not all(_number(v) for v in value):
@@ -491,8 +495,11 @@ def _positive(value) -> bool:
     return _number(value) and value > 0
 
 
-def _intersection(a: list[float], b: list[float]) -> float:
-    """Return the area two boxes share."""
+def intersection(a: list[float], b: list[float]) -> float:
+    """Return the area two boxes share.
+
+    Public, for the ensemble's own geometry (#365).
+    """
     width = min(a[2], b[2]) - max(a[0], b[0])
     height = min(a[3], b[3]) - max(a[1], b[1])
     if width <= 0 or height <= 0:
@@ -519,10 +526,10 @@ def covered_share(
         return 0.0, None
     best, hit = 0.0, None
     for rect in rects:
-        other = _box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
+        other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
         if other is None:
             continue
-        share = _intersection(box, other) / area
+        share = intersection(box, other) / area
         if share > best:
             best, hit = share, rect
     return best, hit
@@ -667,7 +674,7 @@ def build_document(
         for index, unit in enumerate(page.get(spec.units_key) or []):
             if not isinstance(unit, dict):
                 continue
-            box = _box(unit.get("bbox"))
+            box = as_box(unit.get("bbox"))
             box_pt = None
             if box and size and frame:
                 sx, sy = size[0] / frame[0], size[1] / frame[1]
@@ -796,7 +803,14 @@ def write(opinion: Opinion, inputs: ScanInputs) -> list[str]:
         )
     stamped = Opinion.objects.filter(
         pk=opinion.pk, glue_revision=opinion.glue_revision
-    ).update(ocr_glue_revision=opinion.glue_revision, ocr_glue_attempts=0)
+    ).update(
+        ocr_glue_revision=opinion.glue_revision,
+        ocr_glue_attempts=0,
+        # How many engines this revision holds (#365). The ensemble
+        # gate is a query over it, so it is written with the stamp it
+        # describes and never read back off the manifest.
+        ocr_engine_count=len(written),
+    )
     if stamped:
         # This module's own message alone: another work's failure on
         # the same row is not answered by this success.
