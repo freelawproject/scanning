@@ -271,6 +271,7 @@ Returns:
       ],
       "text": "OPINION\n...",
       "raw": "<div data-bbox=\"360 85 640 105\" data-label=\"Section-Header\"><h2>OPINION</h2></div>...",
+      "raw_divs": 14,
       "parsed_blocks": 14,
       "requests": 1,
       "completion_tokens": 1830,
@@ -345,9 +346,10 @@ Notes on the page dicts:
   after the full-page answer looped or would not parse; `error_blocks`
   counts the blocks that failed in that pass. Such pages are listed in
   `fallback_pages`.
-- `parsed_blocks` and `dropped_blocks` say what surya's parse lost on
-  the way to `blocks`; see the next section. `dropped_block_pages`
-  lists the pages with a drop.
+- `raw_divs`, `parsed_blocks`, `refused_divs` and `dropped_blocks` say
+  what the answer lost on the way to `blocks`; see the next section.
+  `dropped_block_pages` lists the pages that lost something either
+  way.
 - A page whose read raised appears as `{"page_no": N, "error": "..."}`,
   plus `raw` when the model had answered before the failure, and is
   listed in `failed_pages`; one bad page doesn't sink the job.
@@ -361,28 +363,42 @@ such steps between the model's answer and `blocks`, all in
 
 | Step | What is lost | Signal |
 |---|---|---|
-| `parse_full_page_html` skips a top-level div whose `data-label` or `data-bbox` is missing or malformed | the block, silently | `dropped_blocks` |
+| `parse_full_page_html` skips a top-level div whose `data-label` or `data-bbox` is missing or malformed | the block, silently | `raw_divs` > `parsed_blocks`, and `refused_divs` |
 | `_drop_blank_text_blocks` deletes a text-labelled block whose crop is blank (over 99 percent of pixels at or above 245 on every channel, or a per-channel standard deviation under 8) | the block, on one INFO line of surya's logger | `dropped_blocks` |
 | a skipped label (`Figure`, `Picture`, `Diagram`, `BlankPage`, and `Complex-Block` which maps to `Figure`) gets `html=""` | the block's HTML, so a complex text block drops out of `text` | restored from `raw` |
 | nested `data-bbox` and `data-label` attributes are removed from every block's inner HTML | sub-block geometry | `raw` only |
 
-The worker parses `raw` once more with surya's own parser
-(`parse_full_page_html`) and records `parsed_blocks`, the count of
-top-level divs it found, so `parsed_blocks - len(blocks)` is what
-surya dropped. Each missing entry is listed in `dropped_blocks` as
-`{"order", "raw_label"}` and the page in `dropped_block_pages`. On a
-page read whole the parsed list and `blocks` align by `order` (surya
-numbers those blocks by their index in the parsed list and a drop
-keeps the survivors' numbers), so a skipped block gets its `html` and
-`text` back from its parsed entry. A page read in block mode
-(`fallback: "block"`) is numbered by the layout pass instead, and its
-`raw` is the answer that failed, so only `parsed_blocks` is recorded
-for it. A `raw` surya's parser refuses leaves `parsed_blocks` null.
+The worker reads `raw` once more and takes two measurements, because
+one parse cannot see both losses. It counts the answer's top-level
+divs as `raw_divs`, with the library and the settings
+`parse_full_page_html` itself uses, so the two see one tree. **That
+count is the only way to see the first row**: the parser refuses those
+divs, so a second call to it returns the same short list and could
+never name what it left out. Each refused div is listed in
+`refused_divs` as `{"div", "raw_label"}`, by a walk over the two lists
+in order and never by a copy of the parser's own test; a walk that
+cannot account for exactly the difference writes no name, and the two
+counts still say how many were lost.
 
-Measured on the smoke run (the 15-page Transformer paper): 147
-top-level divs, 147 blocks, no drop; no nested geometry in any
-answer; six skipped `Figure` and `Diagram` blocks whose inner HTML was
-`<img/>`. On a reporter volume the case to watch is `Complex-Block`
+It then parses `raw` and records `parsed_blocks`, the entries the
+parser kept, so `parsed_blocks - len(blocks)` is what surya dropped
+after the parse. Each missing entry is listed in `dropped_blocks` as
+`{"order", "raw_label"}`. A page that lost something either way is
+listed in `dropped_block_pages`. On a page read whole the parsed list
+and `blocks` align by `order` (surya numbers those blocks by their
+index in the parsed list and a drop keeps the survivors' numbers), so
+a skipped block gets its `html` and `text` back from its parsed
+entry. A page read in block mode
+(`fallback: "block"`) is numbered by the layout pass instead, and its
+`raw` is the answer that failed, so it carries the two counts and
+`refused_divs` but no `dropped_blocks`. A `raw` surya's parser refuses
+leaves `parsed_blocks` null, and `raw_divs` then says how much was in
+the answer.
+
+Measured on the smoke run (the 15-page Transformer paper), which
+predates `raw_divs`: 147 parsed entries, 147 blocks, no drop after the
+parse; no nested geometry in any answer; six skipped `Figure` and
+`Diagram` blocks whose inner HTML was `<img/>`. On a reporter volume the case to watch is `Complex-Block`
 over a dense headnote or a table of parallel citations: with these
 fields it is one number in the summary and the text is still there.
 `raw` and these fields belong to the shard object on S3; the glue is

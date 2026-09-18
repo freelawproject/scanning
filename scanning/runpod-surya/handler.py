@@ -686,38 +686,131 @@ def _raw_answer(records: list[dict]) -> str | None:
     return None
 
 
+def _top_level_divs(raw: str) -> list:
+    """The top-level ``div`` elements of a full-page answer.
+
+    surya's parser walks exactly this list and keeps the divs whose
+    ``data-label`` and ``data-bbox`` it can read
+    (``inference.parsers.parse_full_page_html``). Counting the list
+    here is the only way to see the divs it refused: a second call to
+    that parser refuses them again, so its own answer can never name
+    them. Read with the parser's own library and its own settings, so
+    the two see one tree: an unclosed div nests its siblings for both.
+
+    :param raw: The model's full-page answer.
+    :returns: The elements, in the answer's order.
+    :rtype: list
+    """
+    from bs4 import BeautifulSoup
+
+    return BeautifulSoup(raw, "html.parser").find_all("div", recursive=False)
+
+
+def _div_became(div, item) -> bool:
+    """Whether ``div`` is the answer's div that ``item`` was parsed from.
+
+    :param div: A top-level div of the answer.
+    :param item: A ``ParsedFullPageBlock``.
+    :returns: True when the label and the box are the same.
+    :rtype: bool
+    """
+    if div.get("data-label") != _field(item, "label"):
+        return False
+    try:
+        box = [float(v) for v in (div.get("data-bbox") or "").split()]
+        parsed = [float(v) for v in _field(item, "bbox") or []]
+    except (TypeError, ValueError):
+        return False
+    return len(box) == 4 and box == parsed
+
+
+def _refused_divs(divs: list, parsed: list) -> list[dict] | None:
+    """The top-level divs surya's parser refused, named.
+
+    A walk over the answer's divs and the parser's entries, which are
+    in the same order: a div the next entry was parsed from is one
+    that survived, and every other one was refused. Written this way
+    and not as a copy of the parser's own test, so a change to that
+    test cannot make this list lie.
+
+    :param divs: The answer's top-level divs.
+    :param parsed: What the parser returned.
+    :returns: One ``{"div", "raw_label"}`` per refused div, in the
+        answer's order, or None when the walk does not account for
+        exactly the difference between the two counts. The counts
+        (``raw_divs``, ``parsed_blocks``) are the measurement; these
+        names are a convenience, and a walk that lost its place must
+        not put a name on the wrong div.
+    :rtype: list[dict] | None
+    """
+    refused = []
+    index = 0
+    for position, div in enumerate(divs):
+        if index < len(parsed) and _div_became(div, parsed[index]):
+            index += 1
+            continue
+        refused.append({"div": position, "raw_label": div.get("data-label")})
+    if len(refused) != len(divs) - len(parsed):
+        return None
+    return refused
+
+
 def _account_for_raw(page: dict, parse_raw) -> None:
     """Say what surya dropped between the answer and the blocks (#344).
 
     surya's parse of the full-page answer loses things on the way to
     ``blocks``, each of them silently or on one INFO line of its own
-    logger: a top-level div with a missing or malformed ``data-bbox``
-    is skipped; a text block over a crop that is 99 percent near-white
-    is dropped as a hallucination (``_drop_blank_text_blocks``); a
-    label surya does not OCR (``Figure``, ``Picture``, ``Diagram``,
-    ``BlankPage``, and ``Complex-Block``, which canonicalizes to
-    ``Figure``) keeps its geometry but has its HTML replaced by ``""``.
-    The dots.mocr and YOLO post-processing incidents were exactly a
-    count nobody had, so the answer is parsed once more here, with
-    surya's own parser, and compared.
+    logger: a top-level div whose ``data-label`` or ``data-bbox`` is
+    missing or malformed is refused by the parser; a text block over a
+    crop that is 99 percent near-white is dropped as a hallucination
+    (``_drop_blank_text_blocks``); a label surya does not OCR
+    (``Figure``, ``Picture``, ``Diagram``, ``BlankPage``, and
+    ``Complex-Block``, which canonicalizes to ``Figure``) keeps its
+    geometry but has its HTML replaced by ``""``. The dots.mocr and
+    YOLO post-processing incidents were exactly a count nobody had, so
+    the answer is read once more here and compared.
 
-    Only on a page read whole: surya numbers the blocks of that path by
-    their index in the parsed list (``reading_order=idx``) and a later
-    drop keeps the survivors' numbers, so the two lists align by
-    ``order``. A page read in block mode numbers its blocks by the
-    layout pass instead, and its answer is the one that failed, so the
-    count is recorded and nothing is restored.
+    It takes two measurements, because one parse cannot see both
+    losses. The answer's top-level divs are counted first
+    (:func:`_top_level_divs`): the parser's own answer can never name
+    the divs it refuses, so a second call to it would miss the first
+    loss entirely. The parser then gives the entries that survived,
+    which the blocks are compared against for the other two.
 
-    :param page: The page dict, updated in place: ``parsed_blocks``
-        (top-level divs surya's parser finds in ``raw``, None when it
-        raises), ``dropped_blocks`` (the parsed entries with no block,
-        as ``{"order", "raw_label"}``), and on a skipped block ``html``
-        and ``text`` restored from the parsed entry.
+    The block comparison runs on a page read whole only: surya numbers
+    the blocks of that path by their index in the parsed list
+    (``reading_order=idx``) and a later drop keeps the survivors'
+    numbers, so the two lists align by ``order``. A page read in block
+    mode numbers its blocks by the layout pass instead, and its answer
+    is the one that failed, so the two counts and the refused divs are
+    recorded and nothing is restored.
+
+    :param page: The page dict, updated in place: ``raw_divs`` (the
+        top-level divs of ``raw``, absent when they could not be
+        counted), ``parsed_blocks`` (the entries surya's parser kept,
+        None when it raises), ``refused_divs`` (the divs it would not
+        take, as ``{"div", "raw_label"}``), ``dropped_blocks`` (the
+        parsed entries with no block, as ``{"order", "raw_label"}``),
+        and on a skipped block ``html`` and ``text`` restored from the
+        parsed entry.
     :param parse_raw: surya's ``parse_full_page_html``.
     """
     raw = page.get("raw")
     if not raw:
         return
+    try:
+        divs = _top_level_divs(raw)
+    except Exception as exc:
+        # Never fail a read over the accounting: the page is sound and
+        # its ``raw`` is on S3, where the same count can be taken again.
+        logger.warning(
+            "page %d: could not count the divs of raw: %s",
+            page["page_no"],
+            exc,
+        )
+        divs = None
+    if divs is not None:
+        page["raw_divs"] = len(divs)
     try:
         parsed = parse_raw(raw)
     except Exception as exc:
@@ -727,6 +820,18 @@ def _account_for_raw(page: dict, parse_raw) -> None:
         page["parsed_blocks"] = None
         return
     page["parsed_blocks"] = len(parsed)
+    if divs is not None and len(divs) > len(parsed):
+        refused = _refused_divs(divs, parsed)
+        if refused is not None:
+            page["refused_divs"] = refused
+        logger.warning(
+            "page %d: surya's parser refused %d of %d top-level divs: %s",
+            page["page_no"],
+            len(divs) - len(parsed),
+            len(divs),
+            ", ".join(f"{d['div']} {d['raw_label']}" for d in refused or [])
+            or "not named",
+        )
     if "fallback" in page:
         return
     by_order = {block["order"]: block for block in page["blocks"]}
@@ -759,6 +864,30 @@ def _account_for_raw(page: dict, parse_raw) -> None:
             len(parsed),
             ", ".join(f"{d['order']} {d['raw_label']}" for d in dropped),
         )
+
+
+def _lost_content(page: dict) -> bool:
+    """Whether something in the answer did not reach the page's blocks.
+
+    One rule for both losses, and it reads the counts, not the names:
+    a refused div that :func:`_refused_divs` could not name is still a
+    refused div, and a page nobody lists is a page nobody looks at. A
+    caller acts on either loss the same way -- it opens the page -- so
+    they share ``dropped_block_pages``, and the page itself says which
+    one it was.
+
+    :param page: A page of the result.
+    :returns: True when a div was refused or a parsed entry has no
+        block.
+    :rtype: bool
+    """
+    if page.get("dropped_blocks"):
+        return True
+    divs = page.get("raw_divs")
+    if not isinstance(divs, int):
+        return False
+    parsed = page.get("parsed_blocks")
+    return divs > (parsed if isinstance(parsed, int) else 0)
 
 
 def _page_from_read(page_idx: int, image, result, records: list[dict]) -> dict:
@@ -853,13 +982,14 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         after the full-page answer failed), ``error_blocks`` (blocks
         that failed in block mode) and ``empty: true`` (no block after
         every read; kept, not failed, so the shard converges). On a
-        page read whole, ``parsed_blocks`` and ``dropped_blocks`` say
-        what surya's parse lost on the way to ``blocks``, and a skipped
-        block carries the HTML of its parsed entry
+        page that was answered, ``raw_divs``, ``parsed_blocks``,
+        ``refused_divs`` and, on a page read whole, ``dropped_blocks``
+        say what the answer lost on the way to ``blocks``, and a
+        skipped block carries the HTML of its parsed entry
         (:func:`_account_for_raw`); ``dropped_block_pages`` lists the
-        pages with a drop. A page whose read raised is ``{"page_no",
-        "error", "attempts"}`` plus ``raw`` when the model had answered,
-        and is listed in ``failed_pages``.
+        pages that lost something either way. A page whose read raised
+        is ``{"page_no", "error", "attempts"}`` plus ``raw`` when the
+        model had answered, and is listed in ``failed_pages``.
     :rtype: dict
     :raises RuntimeError: When every page failed or came back empty,
         or when a run of empty pages met a server that no longer
@@ -1033,7 +1163,7 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     failed = [r["page_no"] for r in results if "error" in r]
     empty = [r["page_no"] for r in results if r.get("empty")]
     fallback = [r["page_no"] for r in results if "fallback" in r]
-    dropped = [r["page_no"] for r in results if r.get("dropped_blocks")]
+    dropped = [r["page_no"] for r in results if _lost_content(r)]
     if len(failed) + len(empty) == pages:
         raise RuntimeError(
             f"all {pages} pages failed or came back empty; "
@@ -1043,7 +1173,7 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     duration_ms = int((time.monotonic() - t0) * 1000)
     logger.info(
         "ocr OK: %d pages (%d failed, %d empty, %d read in block mode, "
-        "%d with a dropped block) in %d ms (dpi=%d)",
+        "%d that lost content) in %d ms (dpi=%d)",
         pages,
         len(failed),
         len(empty),

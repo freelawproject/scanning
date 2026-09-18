@@ -20,6 +20,12 @@ dependencies = [
     "torch>=2.7",
     "torchvision>=0.20",
 
+    # The handler counts the top-level divs of a full-page answer with
+    # the same library and the same settings surya's own parser uses,
+    # so the two see one tree (handler._top_level_divs). It arrives
+    # with surya anyway; declared because this code imports it.
+    "beautifulsoup4>=4.12",
+
     # Page rendering. surya's own page reader is pypdfium2; the worker
     # renders with PyMuPDF like the other workers do, so every OCR
     # engine reads the same 200-dpi pixels.

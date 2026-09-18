@@ -25,7 +25,10 @@ aborting the job), the block serialization and both delivery shapes.
 entry is the ``PageOCRResult`` the predictor returns and the model
 answers it made along the way, which it feeds through the manager's
 ``generate`` so the handler's recorder sees them the way it would see
-surya's own requests.
+surya's own requests. ``bs4``, which the handler reads a full-page
+answer's top-level divs with, is stubbed beside it, off the one regex
+the parser fake reads: the two fakes stand in the relation the real
+pair stands in, where the parser walks the tree bs4 built.
 """
 
 from __future__ import annotations
@@ -158,12 +161,47 @@ def _read(blocks=None, answers=None, size=(1700, 2200), raise_after=None):
 _DIV_RE = re.compile(r"<div ([^>]*)>(.*?)</div>", re.S)
 _ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 
+#: An answer the parser fake refuses, wherever it appears in one.
+UNPARSEABLE = "not html at all"
+
+
+def _fixture_divs(text):
+    """The top-level divs of a flat fixture answer, as attribute dicts.
+
+    The bs4 fake and the parser fake read one regex, as the real pair
+    reads one BeautifulSoup tree, so no fixture can make them disagree
+    about how many divs an answer holds.
+    """
+    return [
+        dict(_ATTR_RE.findall(attrs)) for attrs, _ in _DIV_RE.findall(text)
+    ]
+
+
+class _FakeDiv:
+    """A bs4 ``Tag`` look-alike: the one reader the handler calls."""
+
+    def __init__(self, attrs):
+        self._attrs = attrs
+
+    def get(self, name, default=None):
+        return self._attrs.get(name, default)
+
+
+class _FakeSoup:
+    """``BeautifulSoup(text, "html.parser")``, for flat answers."""
+
+    def __init__(self, text, parser):
+        self._divs = [_FakeDiv(attrs) for attrs in _fixture_divs(text)]
+
+    def find_all(self, name, recursive=True):
+        return list(self._divs) if name == "div" else []
+
 
 def _fake_parse_full_page_html(text):
     """surya's parser, for flat answers: one entry per top-level div,
     in either attribute order, a div with a bad bbox skipped, as
     ``parse_full_page_html`` does."""
-    if text == "not html at all":
+    if UNPARSEABLE in text:
         raise ValueError("no soup")
     out = []
     for attrs, inner in _DIV_RE.findall(text):
@@ -232,7 +270,10 @@ def _surya_stubs(script, calls):
     recognition.RecognitionPredictor = Recognizer
     parsers = types.ModuleType("surya.inference.parsers")
     parsers.parse_full_page_html = _fake_parse_full_page_html
+    bs4 = types.ModuleType("bs4")
+    bs4.BeautifulSoup = _FakeSoup
     return {
+        "bs4": bs4,
         "surya": surya,
         "surya.inference": inference,
         "surya.inference.parsers": parsers,
@@ -516,8 +557,11 @@ class TestOcrPages(SimpleTestCase):
         self.assertNotIn("empty", page)
         self.assertNotIn("error_blocks", page)
         self.assertIn("duration_ms", page)
-        # The answer parsed to one div and the one block is it.
+        # The answer held one div, the parser took it, and the one
+        # block is it.
+        self.assertEqual(page["raw_divs"], 1)
         self.assertEqual(page["parsed_blocks"], 1)
+        self.assertNotIn("refused_divs", page)
         self.assertNotIn("dropped_blocks", page)
         self.assertEqual(run.result["page_count"], 1)
         self.assertEqual(run.result["failed_pages"], [])
@@ -676,6 +720,95 @@ class TestOcrPages(SimpleTestCase):
         self.assertEqual(
             page["dropped_blocks"], [{"order": 1, "raw_label": "Text"}]
         )
+        self.assertEqual(run.result["dropped_block_pages"], [0])
+
+    def test_a_div_the_parser_refused_is_counted_and_named(self):
+        # The answer held three divs and surya's parser took two: the
+        # middle one's bbox is not four numbers. A second call to that
+        # parser cannot see the loss -- it refuses the div again -- so
+        # the divs of the answer are counted on their own (#344).
+        raw = (
+            '<div data-bbox="10 10 500 100" data-label="Text"><p>One</p></div>'
+            '<div data-bbox="10 110 500" data-label="Text"><p>Two</p></div>'
+            '<div data-bbox="10 210 500 300" data-label="Text"><p>Three</p>'
+            "</div>"
+        )
+        blocks = [
+            _block(order=0, html="<p>One</p>"),
+            _block(order=1, html="<p>Three</p>"),
+        ]
+        run = _OcrRun(
+            self,
+            [
+                _read(
+                    blocks=blocks, answers=[_answer("high_accuracy_bbox", raw)]
+                )
+            ],
+        )
+        page = run.result["pages"][0]
+        self.assertEqual(page["raw_divs"], 3)
+        self.assertEqual(page["parsed_blocks"], 2)
+        self.assertEqual(
+            page["refused_divs"], [{"div": 1, "raw_label": "Text"}]
+        )
+        # The parse and the blocks agree, which is why this loss needs
+        # a count of its own: it is no ``dropped_blocks`` entry.
+        self.assertNotIn("dropped_blocks", page)
+        self.assertEqual(run.result["dropped_block_pages"], [0])
+
+    def test_a_div_with_no_label_is_refused_too(self):
+        raw = (
+            '<div data-bbox="10 10 500 100"><p>One</p></div>'
+            '<div data-bbox="10 210 500 300" data-label="Text"><p>Two</p></div>'
+        )
+        run = _OcrRun(
+            self,
+            [
+                _read(
+                    blocks=[_block(order=0, html="<p>Two</p>")],
+                    answers=[_answer("high_accuracy_bbox", raw)],
+                )
+            ],
+        )
+        page = run.result["pages"][0]
+        self.assertEqual((page["raw_divs"], page["parsed_blocks"]), (2, 1))
+        self.assertEqual(page["refused_divs"], [{"div": 0, "raw_label": None}])
+
+    def test_a_block_mode_page_counts_its_refused_divs(self):
+        # The answer that failed is still an answer: its divs are
+        # counted, although no block of the page came from it.
+        raw = (
+            '<div data-bbox="10 10 500 100" data-label="Text"><p>One</p></div>'
+            '<div data-bbox="bad" data-label="Text"><p>Two</p></div>'
+        )
+        answers = [
+            _answer("high_accuracy_bbox", raw),
+            _answer("layout", "[]"),
+            _answer("block", "<p>y</p>"),
+        ]
+        run = _OcrRun(self, [_read(answers=answers)])
+        page = run.result["pages"][0]
+        self.assertEqual(page["fallback"], "block")
+        self.assertEqual((page["raw_divs"], page["parsed_blocks"]), (2, 1))
+        self.assertEqual(
+            page["refused_divs"], [{"div": 1, "raw_label": "Text"}]
+        )
+        self.assertNotIn("dropped_blocks", page)
+        self.assertEqual(run.result["dropped_block_pages"], [0])
+
+    def test_an_answer_the_parser_refuses_still_counts_its_divs(self):
+        # ``parsed_blocks`` is null, so the div count is the only
+        # measure of what the model wrote.
+        raw = (
+            '<div data-bbox="10 10 500 100" data-label="Text"><p>One</p></div>'
+            + UNPARSEABLE
+        )
+        run = _OcrRun(
+            self, [_read(answers=[_answer("high_accuracy_bbox", raw)])]
+        )
+        page = run.result["pages"][0]
+        self.assertEqual(page["raw_divs"], 1)
+        self.assertIsNone(page["parsed_blocks"])
         self.assertEqual(run.result["dropped_block_pages"], [0])
 
     def test_a_block_mode_page_is_counted_but_not_realigned(self):
@@ -851,6 +984,90 @@ class TestOcrPages(SimpleTestCase):
         self.assertEqual(build.call_count, 1)
         self.assertEqual(first.manager.method, "vllm")
         self.assertTrue(first.manager.started)
+
+
+class TestRefusedDivs(SimpleTestCase):
+    """The walk that names the divs surya's parser would not take."""
+
+    def _div(self, label, bbox):
+        attrs = {}
+        if label is not None:
+            attrs["data-label"] = label
+        if bbox is not None:
+            attrs["data-bbox"] = bbox
+        return _FakeDiv(attrs)
+
+    def _item(self, label, bbox):
+        return SimpleNamespace(label=label, bbox=bbox)
+
+    def test_the_refused_div_is_named_by_its_place(self):
+        divs = [
+            self._div("Text", "1 2 3 4"),
+            self._div("Text", "1 2 3"),
+            self._div("PageFooter", "5 6 7 8"),
+        ]
+        parsed = [
+            self._item("Text", (1.0, 2.0, 3.0, 4.0)),
+            self._item("PageFooter", (5.0, 6.0, 7.0, 8.0)),
+        ]
+        self.assertEqual(
+            handler._refused_divs(divs, parsed),
+            [{"div": 1, "raw_label": "Text"}],
+        )
+
+    def test_two_divs_of_one_label_and_box_keep_the_count(self):
+        divs = [self._div("Text", "1 2 3 4")] * 2
+        parsed = [self._item("Text", (1.0, 2.0, 3.0, 4.0))]
+        self.assertEqual(
+            handler._refused_divs(divs, parsed),
+            [{"div": 1, "raw_label": "Text"}],
+        )
+
+    def test_a_walk_that_lost_its_place_names_nothing(self):
+        # Neither div is the parsed entry, so the walk cannot say
+        # which one was refused. The counts on the page still can.
+        divs = [self._div("Text", "1 2 3 4"), self._div("Text", "5 6 7 8")]
+        parsed = [self._item("Caption", (9.0, 9.0, 9.0, 9.0))]
+        self.assertIsNone(handler._refused_divs(divs, parsed))
+
+    def test_nothing_refused(self):
+        divs = [self._div("Text", "1 2 3 4")]
+        parsed = [self._item("Text", (1.0, 2.0, 3.0, 4.0))]
+        self.assertEqual(handler._refused_divs(divs, parsed), [])
+
+
+class TestLostContent(SimpleTestCase):
+    """The one rule for ``dropped_block_pages``."""
+
+    def test_a_dropped_block(self):
+        self.assertIs(
+            handler._lost_content({"dropped_blocks": [{"order": 0}]}), True
+        )
+
+    def test_a_refused_div_by_the_counts_alone(self):
+        # The names are absent, and the page is listed all the same.
+        self.assertIs(
+            handler._lost_content({"raw_divs": 3, "parsed_blocks": 2}), True
+        )
+
+    def test_an_answer_the_parser_refused(self):
+        self.assertIs(
+            handler._lost_content({"raw_divs": 2, "parsed_blocks": None}), True
+        )
+
+    def test_an_answer_of_no_divs_lost_nothing(self):
+        self.assertIs(
+            handler._lost_content({"raw_divs": 0, "parsed_blocks": None}),
+            False,
+        )
+
+    def test_a_page_with_no_counts(self):
+        self.assertIs(handler._lost_content({"page_no": 0}), False)
+
+    def test_every_div_survived(self):
+        self.assertIs(
+            handler._lost_content({"raw_divs": 4, "parsed_blocks": 4}), False
+        )
 
 
 class TestRequestLog(SimpleTestCase):
