@@ -408,6 +408,27 @@ class TestCreateRows(TestCase):
         one.refresh_from_db()
         self.assertEqual(one.status, OpinionReviewStatus.PROCESSING)
 
+    def test_the_attempt_counters_of_an_unapproved_row_go_back_to_zero(self):
+        """The approval is the documented way back from an ERROR of
+        every derived work, so no counter may keep the row out (#365)."""
+        make_boundary(self.scan, self.apply_run, 0, 2)
+        self._create()
+        one = Opinion.objects.get(scan=self.scan)
+        Opinion.objects.filter(pk=one.pk).update(
+            status=OpinionReviewStatus.ERROR,
+            ocr_glue_attempts=3,
+            pdf_attempts=3,
+            ensemble_attempts=3,
+        )
+
+        self._create()
+
+        one.refresh_from_db()
+        self.assertEqual(one.status, OpinionReviewStatus.PROCESSING)
+        self.assertEqual(one.ocr_glue_attempts, 0)
+        self.assertEqual(one.pdf_attempts, 0)
+        self.assertEqual(one.ensemble_attempts, 0)
+
     def test_a_ready_row_is_not_reset(self):
         make_boundary(self.scan, self.apply_run, 0, 2)
         self._create()

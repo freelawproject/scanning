@@ -37,6 +37,7 @@ from scanning.models import (
     OpinionFindingDismissal,
     OpinionReviewStatus,
     OpinionText,
+    PageEdit,
     Status,
 )
 from scanning.tests.test_opinion_ocr import (
@@ -152,9 +153,9 @@ class TestTheAlignment(TestCase):
         self.assertEqual(merged["mistral_ocr"]["ids"], [0, 1])
         self.assertEqual(groups[0]["present"], ["dots_mocr", "mistral_ocr"])
 
-    def test_a_page_scale_box_links_to_nothing(self):
+    def test_a_page_scale_box_swallows_no_paragraph(self):
         """A whole-page picture box would chain the page into one
-        group, so it is held out of the link graph."""
+        group, so it links to no smaller unit."""
         units = [
             unit("dots_mocr", 0, (0, 0, WIDTH, HEIGHT), "", kind="Picture"),
             unit("mistral_ocr", 0, (36, 108, 288, 324), "alpha"),
@@ -165,6 +166,38 @@ class TestTheAlignment(TestCase):
         self.assertEqual(len(groups), 2)
         self.assertEqual(sorted(len(g["present"]) for g in groups), [1, 1])
         self.assertTrue(any(g["page_scale"] for g in groups))
+
+    def test_two_whole_page_boxes_make_one_group(self):
+        """Two engines' reading of the same whole-page box is one
+        group: held apart, it would write the page twice."""
+        units = [
+            unit("dots_mocr", 0, (0, 0, WIDTH, HEIGHT), "alpha"),
+            unit("mistral_ocr", 0, (0, 0, WIDTH, HEIGHT), "alpha"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 1)
+        self.assertTrue(groups[0]["page_scale"])
+
+    def test_a_big_body_block_links_to_the_paragraphs_inside_it(self):
+        """One block over the body of a page is 0.68 of it, and it is
+        text. Held out of the graph it would write the body a second
+        time beside the other engine's paragraphs."""
+        units = [
+            unit("dots_mocr", 0, (50, 80, 562, 720), "alpha beta gamma"),
+            unit("mistral_ocr", 0, (50, 80, 562, 280), "alpha"),
+            unit("mistral_ocr", 1, (50, 300, 562, 500), "beta"),
+            unit("mistral_ocr", 2, (50, 520, 562, 720), "gamma"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 1)
+        self.assertFalse(groups[0]["page_scale"])
+        self.assertEqual(
+            ensemble.resolve(groups[0])["agreement"], ensemble.UNANIMOUS
+        )
 
     def test_two_engines_of_one_page_never_link_to_themselves(self):
         units = [
@@ -396,6 +429,51 @@ class TestTheVote(TestCase):
         self.assertEqual(ensemble.compare_text("appeal. . . ."), "appeal...")
         self.assertEqual(ensemble.compare_word("##"), "")
 
+    def test_a_word_only_the_other_engine_read_is_marked_and_counted(self):
+        """Two engines make every difference a tie, and the same tie on
+        a word the base does have is marked. So the word goes in,
+        marked, and the count and the mark say the same thing."""
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("alpha gamma"),
+            [ensemble._pairs("alpha beta gamma")],
+        )
+
+        self.assertEqual(
+            tokens,
+            [
+                {"text": "alpha"},
+                {"text": "beta", "low_confidence": True},
+                {"text": "gamma"},
+            ],
+        )
+        self.assertEqual(disputed, 1)
+
+    def test_a_word_only_a_minority_read_is_dropped(self):
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("alpha gamma"),
+            [
+                ensemble._pairs("alpha beta gamma"),
+                ensemble._pairs("alpha gamma"),
+            ],
+        )
+
+        self.assertEqual([t["text"] for t in tokens], ["alpha", "gamma"])
+        self.assertEqual(disputed, 0)
+
+    def test_a_word_a_majority_read_goes_in_marked_and_counted(self):
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("the quick fox"),
+            [
+                ensemble._pairs("the quick brown fox"),
+                ensemble._pairs("the quick brown fox"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["the", "quick", "brown", "fox"]
+        )
+        self.assertEqual(disputed, 1)
+
     def test_the_first_engine_of_the_table_is_the_base(self):
         answer = ensemble.resolve(
             self.read("alpha beta", "alpha xeta", "alpha zeta")
@@ -435,6 +513,18 @@ class EnsembleTestCase(OpinionOcrTestCase):
         """Glue the OCR documents, then write the text."""
         opinion = self.glue(opinion)
         return ensemble.rerun(opinion)
+
+    def edit(self):
+        """One page edit of the scan, for an address of kind ``edit``."""
+        if not hasattr(self, "_edit"):
+            self._edit = PageEdit.objects.create(
+                scan=self.scan,
+                kind=PageEdit.Kind.ROTATE_PAGE,
+                pdf_page=2,
+                value="90",
+                source_fingerprint=self.scan.source_fingerprint,
+            )
+        return self._edit
 
     def stored(self, opinion=None) -> dict:
         """The ensemble document in the bucket."""
@@ -599,6 +689,36 @@ class TestTheRows(EnsembleTestCase):
             OpinionText.objects.filter(opinion=self.opinion).count(), 3
         )
 
+    def test_the_address_of_an_edited_page_is_one_based(self):
+        """``detections.source_of_entry`` is the one rule: the apply
+        writes the page of an edit 0-based inside its shard, and a
+        rotation writes 0."""
+        page = page_of()
+        page["source"] = {"kind": "edit", "edit_id": self.edit().pk, "page": 0}
+
+        ensemble.write_rows(self.opinion, document_of(page))
+
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
+        self.assertEqual(row.source_page, 1)
+        self.assertEqual(row.source_edit_id, self.edit().pk)
+
+    def test_a_page_the_opinion_lost_keeps_a_curator_s_text(self):
+        """An opinion does grow shorter, and ``human_text`` is never
+        discarded (#335)."""
+        self.run_ensemble()
+        last = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=2)
+        last.human_text = "what the curator typed"
+        last.save(update_fields=["human_text"])
+        empty = OpinionText.objects.create(
+            opinion=self.opinion, page_in_opinion=3, page_index=4
+        )
+
+        ensemble.write_rows(self.opinion, document_of(page_of(0), page_of(1)))
+
+        last.refresh_from_db()
+        self.assertEqual(last.human_text, "what the curator typed")
+        self.assertFalse(OpinionText.objects.filter(pk=empty.pk).exists())
+
     def test_a_disagreement_names_its_place_and_every_reading(self):
         document = document_of(
             page_of(
@@ -672,6 +792,19 @@ class TestTheFindings(EnsembleTestCase):
         self.assertEqual(cards[0].check_name, OpinionCheck.ENGINES_DISAGREE)
         self.assertEqual(cards[0].page_in_opinion, 0)
         self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
+        self.assertIn("2 place(s)", cards[0].message)
+
+    def test_a_voted_group_is_an_engines_disagree_card(self):
+        """With two engines no group can hold a majority, and a card
+        that read the majority alone would never be written."""
+        cards = self.rebuild(voted=2)
+
+        self.assertEqual(cards[0].check_name, OpinionCheck.ENGINES_DISAGREE)
+        self.assertIn("2 place(s)", cards[0].message)
+
+    def test_the_card_counts_what_the_row_calls_a_disagreement(self):
+        cards = self.rebuild(majority=1, voted=1)
+
         self.assertIn("2 place(s)", cards[0].message)
 
     def test_a_word_with_no_majority_is_its_own_card(self):
@@ -825,6 +958,42 @@ class TestTheLedger(EnsembleTestCase):
         )
         self.assertEqual(ensemble.run_tick(), 0)
 
+    @override_settings(OPINION_ENSEMBLE_MIN_ENGINES=2)
+    def test_a_bucket_that_is_away_spends_no_attempt(self):
+        """The tick runs every fifteen seconds, so a fault that passes
+        would otherwise end every due row in a minute."""
+        self.glue()
+        with patch(
+            "scanning.s3_sync.download_json_object",
+            side_effect=OSError("connection reset"),
+        ):
+            self.assertEqual(ensemble.run_tick(), 0)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.ensemble_attempts, 0)
+        self.assertEqual(self.opinion.status, OpinionReviewStatus.PROCESSING)
+
+    @override_settings(OPINION_ENSEMBLE_MIN_ENGINES=2)
+    def test_an_upload_that_fails_spends_no_attempt(self):
+        self.glue()
+        with patch("scanning.s3_sync.upload_json_object", return_value=False):
+            self.assertEqual(ensemble.run_tick(), 0)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.ensemble_attempts, 0)
+
+    @override_settings(OPINION_ENSEMBLE_MIN_ENGINES=2)
+    def test_a_missing_document_spends_an_attempt(self):
+        """The row says its OCR documents are written, so an object
+        that is not in the bucket is a fact about the row."""
+        self.glue()
+        del self.objects[opinion_ocr.engine_key(self.opinion, "dots_mocr")]
+
+        self.assertEqual(ensemble.run_tick(), 0)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.ensemble_attempts, 1)
+
     def test_a_run_that_works_takes_back_this_module_s_error(self):
         self.glue()
         Opinion.objects.filter(pk=self.opinion.pk).update(
@@ -916,7 +1085,7 @@ class TestTheButton(EnsembleTestCase, ScanningTestCase):
         response = self.client.post(self.url())
 
         self.assertEqual(response.status_code, 409)
-        self.assertIn("did not load", response.json()["message"])
+        self.assertIn("is not in the bucket", response.json()["message"])
 
     def test_404_across_scans(self):
         other = ScanFactory()

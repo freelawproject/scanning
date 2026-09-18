@@ -388,6 +388,10 @@ def create_rows(
                 pdf_attempts=Case(
                     When(approved, then=F("pdf_attempts")), default=Value(0)
                 ),
+                ensemble_attempts=Case(
+                    When(approved, then=F("ensemble_attempts")),
+                    default=Value(0),
+                ),
                 pdf_attempted_at=Case(
                     When(approved, then=F("pdf_attempted_at")),
                     default=Value(None),

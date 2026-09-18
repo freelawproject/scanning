@@ -95,7 +95,7 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
-from scanning import opinion_ocr, s3_sync
+from scanning import detections, opinion_ocr, s3_sync
 from scanning.models import (
     Issue,
     Opinion,
@@ -118,8 +118,15 @@ DOCUMENT = "ensemble.json"
 #: The least share of the smaller box two units must share to link.
 OVERLAP = 0.5
 
-#: A unit of this share of the page or more does not link.
-MAX_AREA = 0.5
+#: A unit of this share of the page or more does not link to a smaller
+#: one. The prototype holds a whole-page picture box out of the graph,
+#: because it overlaps everything and would chain the page into one
+#: group. Its line is half the page, and half a page is a size real
+#: text reaches: one Mistral block over the body of a single-column
+#: page is about 0.68 of it, and such a unit held out of the graph
+#: writes the page a second time beside the other engine's paragraphs.
+#: The line is where a picture box lives and text does not.
+MAX_AREA = 0.9
 
 #: Below this worst pair IoU of the merged boxes a group is weak: the
 #: link rule is permissive, and a text difference of a weak group may
@@ -234,6 +241,22 @@ class EnsembleError(Exception):
 
     Spends an attempt on the row. The message goes to
     ``Opinion.error_message``.
+    """
+
+
+class TransientFault(Exception):
+    """A fault that passes: a read or a write of the bucket failed.
+
+    Spends nothing, the rule of ``opinion_pdf.TransientFault``. The
+    collect tick runs every fifteen seconds, so a bucket that is away
+    for a minute would otherwise spend every attempt of every due row
+    and end them all in ERROR, which only a person can undo.
+
+    A missing object is not this: the row says its OCR documents are
+    written, so an object that is not there is a fact about the row.
+    The retry costs three small reads and no page, so the row waits no
+    cooldown: that is the one place this differs from #336, whose
+    retry re-pulls a volume.
     """
 
 
@@ -436,7 +459,11 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
 
     union = _Union(len(units))
     for left, right in combinations(range(len(units)), 2):
-        if left in page_scale or right in page_scale:
+        # A page-scale unit links to another page-scale unit and to
+        # nothing else: the guard is that it must not swallow the
+        # paragraphs of the page, not that two engines' reading of the
+        # same whole-page box must stay apart and be written twice.
+        if (left in page_scale) != (right in page_scale):
             continue
         if units[left]["engine"] == units[right]["engine"]:
             continue
@@ -712,6 +739,13 @@ def vote_words(
     word no majority settled carries ``"low_confidence": True``. The
     viewer builds the nodes from that.
 
+    A word the base engine did not read is put in, marked and counted
+    when the engines that read it are a majority or a tie: the base is
+    the engine this module believes, so a word it did not read is a
+    question for a person, and with two engines every difference is a
+    tie. A word only a minority read is dropped, which is the reading
+    of the majority.
+
     :param base: The base engine's ``(key, word)`` pairs.
     :param others: The other engines' pairs.
     :returns: ``(tokens, how many positions had no majority)``.
@@ -726,6 +760,7 @@ def vote_words(
 
     # A strict majority of every reading, the base's own included, so
     # two engines never settle a word the third disputes.
+    total = len(others) + 1
     quorum = (len(others) + 3) // 2
     tokens: list[dict] = []
     disputed = 0
@@ -740,12 +775,22 @@ def vote_words(
         ]
         counted = Counter(keys for keys, _ in runs)
         for keys, count in counted.items():
-            if count < quorum:
+            # A run the base does not have: ``count`` engines read it
+            # and ``total - count`` did not. A majority of them puts it
+            # in; a tie puts it in too, because the same tie on a word
+            # the base **does** have is marked rather than dropped, and
+            # two engines make every difference a tie. A minority is
+            # dropped, the reading of the majority.
+            if count < quorum and count * 2 != total:
                 continue
             words = next(words for other, words in runs if other == keys)
             tokens += [
                 {"text": word, "low_confidence": True} for word in words
             ]
+            # A word the base did not read is marked, so it is counted
+            # too: the mark the viewer draws and the card the findings
+            # write read the same number.
+            disputed += len(words)
         if position == len(base):
             break
         readings = [base[position]] + [
@@ -1192,14 +1237,19 @@ def record_failure(opinion: Opinion, message: str) -> None:
 def _address(page: dict) -> tuple[int | None, int | None]:
     """Return the durable address of one page of the corrected volume.
 
+    ``detections.source_of_entry`` is the one rule for this shape, and
+    it is called and never copied: the apply writes the page of an
+    edit 0-based inside that edit's shard (a rotation writes 0), and
+    every stored address is 1-based. A copy of the rule here would put
+    the ``OpinionText`` row one page below the ``Detection``, the
+    boundary and the opinion at the same address.
+
     :param page: One page of the document.
-    :returns: ``(the page edit's pk or None, the page of its source)``.
+    :returns: ``(the page edit's pk or None, the 1-based page of its
+        source)``.
     :rtype: tuple[int | None, int | None]
     """
-    source = page.get("source") or {}
-    if source.get("kind") == "original":
-        return None, source.get("pdf_page")
-    return source.get("edit_id"), source.get("page")
+    return detections.source_of_entry(page)
 
 
 def write_rows(opinion: Opinion, document: dict) -> int:
@@ -1230,8 +1280,16 @@ def write_rows(opinion: Opinion, document: dict) -> int:
             },
         )
         written += 1
+    # A row of a page the opinion no longer has. An opinion does grow
+    # shorter: ``opinions.create_rows`` writes ``page_count`` again on
+    # a matched row, so a boundary a curator moves up takes a page off
+    # the end. The derived text of that page goes, and a row a curator
+    # typed stays: ``human_text`` is the truth and nothing discards it
+    # (#335).
     OpinionText.objects.filter(
-        opinion=opinion, page_in_opinion__gte=len(document["pages"])
+        opinion=opinion,
+        page_in_opinion__gte=len(document["pages"]),
+        human_text="",
     ).delete()
     return written
 
@@ -1289,15 +1347,22 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
     for page in document["pages"]:
         page_number = page["page_in_opinion"]
         counts = page["counts"]
-        if counts[MAJORITY]:
+        # Every group the engines did not all read alike: the ones a
+        # majority settled and the ones the word vote settled. It is
+        # the count of ``OpinionText.disagreements`` for this page, and
+        # a card and an entry must not disagree. With two engines no
+        # group can hold a majority, so a card that read
+        # ``counts[MAJORITY]`` alone would never be written.
+        differing = counts[MAJORITY] + counts[VOTED]
+        if differing:
             cards.append(
                 _card(
                     opinion,
                     page_number,
                     OpinionCheck.ENGINES_DISAGREE,
                     Issue.Severity.WARNING,
-                    f"The engines differ in {counts[MAJORITY]} place(s) on "
-                    "this page. The majority read wins.",
+                    f"The engines differ in {differing} place(s) on this "
+                    "page. The vote picked a read for each.",
                     standing,
                 )
             )
@@ -1354,6 +1419,37 @@ def _card(
 # ---------------------------------------------------------------------------
 
 
+def _is_missing(exc: Exception) -> bool:
+    """Return whether a failed read says the object is not there.
+
+    :param exc: What the read raised.
+    :returns: Whether the object is missing, rather than the bucket
+        away.
+    :rtype: bool
+    """
+    if isinstance(exc, KeyError):
+        return True
+    error = (getattr(exc, "response", None) or {}).get("Error") or {}
+    return str(error.get("Code", "")) in {"NoSuchKey", "404"}
+
+
+def _read(key: str) -> dict:
+    """Read one JSON object, and say which kind of fault stopped it.
+
+    :param key: The object key.
+    :returns: The document.
+    :rtype: dict
+    :raises EnsembleError: When the object is not there.
+    :raises TransientFault: When the read itself failed.
+    """
+    try:
+        return s3_sync.download_json_object(key)
+    except Exception as exc:
+        if _is_missing(exc):
+            raise EnsembleError(f"the object at {key} is not in the bucket")
+        raise TransientFault(f"the read of {key} failed: {exc}") from exc
+
+
 def load_documents(opinion: Opinion) -> dict[str, dict]:
     """Read one opinion's engine documents off S3.
 
@@ -1363,16 +1459,13 @@ def load_documents(opinion: Opinion) -> dict[str, dict]:
     :param opinion: The row.
     :returns: ``{engine: the document}``.
     :rtype: dict[str, dict]
-    :raises EnsembleError: When the manifest or a document does not
-        load, or names no engine this module knows.
+    :raises EnsembleError: When an object is missing or is not a
+        document, or when the manifest names no engine this module
+        knows.
+    :raises TransientFault: When a read failed.
     """
     manifest_key = opinion_ocr.engine_key(opinion, "manifest")
-    try:
-        manifest = s3_sync.download_json_object(manifest_key)
-    except Exception as exc:
-        raise EnsembleError(
-            f"the manifest at {manifest_key} did not load: {exc}"
-        )
+    manifest = _read(manifest_key)
     names = [
         name
         for name in opinion_ocr.ENGINES
@@ -1383,10 +1476,7 @@ def load_documents(opinion: Opinion) -> dict[str, dict]:
     documents = {}
     for name in names:
         key = opinion_ocr.engine_key(opinion, name)
-        try:
-            document = s3_sync.download_json_object(key)
-        except Exception as exc:
-            raise EnsembleError(f"the document at {key} did not load: {exc}")
+        document = _read(key)
         if not isinstance(document, dict) or "pages" not in document:
             raise EnsembleError(f"the object at {key} is not a document")
         documents[name] = document
@@ -1405,11 +1495,12 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
     :returns: The document.
     :rtype: dict
     :raises EnsembleError: On a fact about the row.
+    :raises TransientFault: When the upload failed.
     """
     document = build_document(opinion, documents)
     key = document_key(opinion)
     if not s3_sync.upload_json_object(key, document):
-        raise EnsembleError(f"the document could not be uploaded to {key}")
+        raise TransientFault(f"the upload to {key} failed")
 
     with transaction.atomic():
         write_rows(opinion, document)
@@ -1446,6 +1537,7 @@ def rerun(opinion: Opinion) -> dict:
     :returns: The document.
     :rtype: dict
     :raises EnsembleError: On a fact about the row.
+    :raises TransientFault: When a read or the upload failed.
     """
     return write(opinion, load_documents(opinion))
 
@@ -1460,7 +1552,9 @@ def run_tick(limit: int = ENSEMBLE_PER_TICK) -> int:
 
     The eleventh pass of the collect tick. The rows are walked newest
     scan first, the rule of ``opinion_ocr.glue_due``. A fault of one
-    row spends that row's attempt and the pass goes on.
+    row spends that row's attempt and the pass goes on; a
+    :class:`TransientFault` spends nothing and the row is due again on
+    the next tick.
 
     :param limit: How many rows to write.
     :returns: How many rows were written.
@@ -1476,6 +1570,14 @@ def run_tick(limit: int = ENSEMBLE_PER_TICK) -> int:
     for opinion in rows:
         try:
             document = rerun(opinion)
+        except TransientFault as exc:
+            logger.warning(
+                "%s of scan %s: the ensemble waits for the bucket: %s",
+                opinion,
+                opinion.scan_id,
+                exc,
+            )
+            continue
         except EnsembleError as exc:
             record_failure(opinion, str(exc))
             continue

@@ -811,7 +811,9 @@ def rerun_opinion_ensemble(
         )
     try:
         document = ensemble.rerun(opinion)
-    except ensemble.EnsembleError as exc:
+    except (ensemble.EnsembleError, ensemble.TransientFault) as exc:
+        # A fault that passes answers the same way: the curator presses
+        # the button again, and no attempt was spent either way.
         return JsonResponse(
             {"status": "error", "message": str(exc)}, status=409
         )

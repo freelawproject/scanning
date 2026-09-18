@@ -94,6 +94,11 @@ class Command(BaseCommand):
             for opinion in rows:
                 try:
                     document = ensemble.rerun(opinion)
+                except ensemble.TransientFault as exc:
+                    # The bucket, not the row: nothing is counted.
+                    failed += 1
+                    self.stderr.write(f"{opinion}: {exc}")
+                    continue
                 except ensemble.EnsembleError as exc:
                     ensemble.record_failure(opinion, str(exc))
                     failed += 1
