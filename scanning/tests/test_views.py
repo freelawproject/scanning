@@ -3958,7 +3958,9 @@ class TestGluedOutputs(ScanningTestCase):
         response = self._index("paddle")
 
         self.assertEqual(response.status_code, 404)
-        self.assertIn("dots-mocr, mistral, yolo", response.json()["error"])
+        self.assertIn(
+            "dots-mocr, mistral, surya, yolo", response.json()["error"]
+        )
 
     def test_index_of_a_scan_nothing_read_is_empty_not_an_error(self):
         response = self._index()

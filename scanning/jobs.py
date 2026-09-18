@@ -400,17 +400,17 @@ class RunpodEngine:
 def _runpod_engines() -> dict[str, RunpodEngine]:
     """Return every RunPod engine this deploy knows, keyed by engine.
 
-    Rebuilt on each call, and deliberately not cached: the two entries
+    Rebuilt on each call, and deliberately not cached: the entries
     read their functions off the engine modules at build time, so a test
     that patches ``dots_mocr.enabled`` reaches this table too.
 
-    The imports are inside the function because both engine modules
-    import this one.
+    The imports are inside the function because every engine module
+    imports this one.
 
     :returns: The engine table.
     :rtype: dict[str, RunpodEngine]
     """
-    from scanning import dots_mocr, yolo
+    from scanning import dots_mocr, surya, yolo
 
     return {
         JobEngine.DOTS_MOCR: RunpodEngine(
@@ -434,6 +434,17 @@ def _runpod_engines() -> dict[str, RunpodEngine]:
             is_enabled=yolo.enabled,
             build_payload=yolo.build_payload,
             label="YOLO",
+        ),
+        JobEngine.SURYA: RunpodEngine(
+            engine=JobEngine.SURYA,
+            stage=JobStage.EXTRACT,
+            endpoint_setting="RUNPOD_SURYA_ENDPOINT_ID",
+            concurrency_setting="SURYA_MAX_CONCURRENCY",
+            attempts_setting="SURYA_MAX_ATTEMPTS",
+            seconds_per_page_setting="SURYA_SECONDS_PER_PAGE",
+            is_enabled=surya.enabled,
+            build_payload=surya.build_payload,
+            label="Surya",
         ),
     }
 

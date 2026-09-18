@@ -5,13 +5,14 @@ Rendered both inline by scan_process.html and standalone by the
 process_actions view (fetched by the step-1/step-2 viewers to refresh the
 buttons in place after a page is marked for or restored from deletion).
 
-The OCR (dots.mocr), detection (YOLO) and Mistral OCR controls are
-staff-only and move no scan status, so their state comes from
-`dots_run`, `yolo_run` and `mistral_run` -- summaries of the
-ExternalJob rows (issues #190, #195 and #191) -- rather than from
-`is_processing`. The Mistral control lives in _mistral_actions.html
-and is included by the step-1 bar beside the dots.mocr control: both
-read the original shards.
+The OCR (dots.mocr), detection (YOLO), Mistral OCR and Surya OCR
+controls are staff-only and move no scan status, so their state comes
+from `dots_run`, `yolo_run`, `mistral_run` and `surya_run` --
+summaries of the ExternalJob rows (issues #190, #195, #191 and #364)
+-- rather than from `is_processing`. The Mistral control and the Surya
+control are one file, _ocr_engine_actions.html, included once each by
+the step-1 bar beside the dots.mocr state: all three read the original
+shards.
 
 There is no detection button (#250). The daemon starts the run by
 itself once per shard set, right after the upload, and this bar only
@@ -59,7 +60,8 @@ reach step 2.
   viewer paid RunPod for every page again. The endpoint
   (``start_dots_mocr``) stays for a staff POST.
   {% endcomment %}
-  {% include "scanning/_mistral_actions.html" %}
+  {% include "scanning/_ocr_engine_actions.html" with run=mistral_run label="Mistral OCR" start_url="start_mistral_ocr" files_slug="mistral" title="Read every page of this volume with Mistral OCR on Mistral's batch API (incurs costs $$$)" confirm="This sends every page of this volume to the Mistral OCR batch API. This will incur costs $$$. Continue?" %}
+  {% include "scanning/_ocr_engine_actions.html" with run=surya_run label="Surya OCR" start_url="start_surya_ocr" files_slug="surya" title="Read every page of this volume with Surya OCR on RunPod (incurs costs $$$)" confirm="This sends every page of this volume to the Surya OCR worker on RunPod. This will incur costs $$$. Continue?" %}
   {% if yolo_run %}
   <span class="text-sm text-gray-600 mr-2" title="Detection run {{ yolo_run.run }}: {{ yolo_run.label }}">
     {% if yolo_run.failed %}

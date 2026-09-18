@@ -1,0 +1,47 @@
+{% comment %}
+One OCR engine's control on the step-1 bar, staff-only for the button.
+Included once per engine by _process_actions.html: Mistral (#191) and
+Surya (#364).
+
+The two differ in five values only, so they share this file rather
+than a copy of it (#364). The caller passes:
+
+  run         - the run summary of that engine's rows, or None
+  label       - what a line calls the engine ("Mistral OCR")
+  start_url   - the name of the POST route that creates the rows
+  files_slug  - the GLUED_OUTPUTS slug of the files index
+  title       - the button's hover text
+  confirm     - the question the browser asks before the POST
+
+Neither stage moves a scan status, so its state comes from the run
+summary and never from `is_processing`. That summary still renders
+after the run ends, so a historical run stays readable.
+
+The button has no review-state gate, because both reads are over the
+original shards: what they need exists from the moment the pipeline
+cut them, and nothing later in the pipeline moves a page they name.
+Every press can start real paid work, so the button is staff-only and
+it confirms first; an environment that must not spend leaves the
+engine's key or endpoint id unset, and the view refuses with a
+message.
+{% endcomment %}
+{% if run %}
+<span class="text-sm text-gray-600 mr-2" title="{{ label }} run {{ run.run }}: {{ run.label }}">
+  {% if run.failed %}
+  {{ label }} failed on {{ run.failed }} of {{ run.total }} part(s): {{ run.error_code }}
+  {% elif run.open %}
+  {{ label }} running: {{ run.done }} of {{ run.total }} part(s) done
+  {% else %}
+  {{ label }} done: {{ run.total }} part(s)
+  {% endif %}
+  {% if user.is_staff %}
+  &middot; <a href="{% url 'glued_output_index' scan.pk files_slug %}" class="underline" title="The runs, the shards and the result files of the {{ label }} read">files</a>
+  {% endif %}
+</span>
+{% endif %}
+{% if user.is_staff and not run.open %}
+<form method="post" action="{% url start_url scan.pk %}" class="inline">
+  {% csrf_token %}
+  <button type="submit" class="btn-outline text-sm" title="{{ title }}" onclick="return confirm('{{ confirm }}');">{% if run %}Re-run {{ label }}{% else %}Run {{ label }}{% endif %}</button>
+</form>
+{% endif %}

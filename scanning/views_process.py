@@ -38,6 +38,7 @@ from scanning import (
     repairs,
     s3_sync,
     stats,
+    surya,
     yolo,
 )
 from scanning.models import (
@@ -408,6 +409,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     dots_run = dots_mocr.run_summary(scan)
     yolo_run = yolo.run_summary(scan)
     mistral_run = mistral_ocr.run_summary(scan)
+    surya_run = surya.run_summary(scan)
 
     # The pages a reviewer asked a scanner to scan again, or the gaps
     # they asked a scanner to fill (#249). The waiting ones raise the
@@ -656,6 +658,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "dots_run": dots_run,
             "yolo_run": yolo_run,
             "mistral_run": mistral_run,
+            "surya_run": surya_run,
             "detect_message": detection_message(yolo_run),
             **flags,
             "final_space": final_space,
@@ -731,6 +734,9 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     mistral_run = mistral_ocr.run_summary(scan)
     if mistral_run:
         data["mistral_run"] = mistral_run
+    surya_run = surya.run_summary(scan)
+    if surya_run:
+        data["surya_run"] = surya_run
     return JsonResponse(data)
 
 
@@ -1129,6 +1135,11 @@ GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
         JobEngine.MISTRAL_OCR,
         mistral_ocr.glued_result_key,
     ),
+    # Surya (#364) has no glue yet, so its volume route answers "not
+    # glued yet" for every run. The index is the point: it lists the
+    # runs, the shards and the result objects a reader needs to see
+    # what the worker wrote.
+    "surya": (JobStage.EXTRACT, JobEngine.SURYA, surya.glued_result_key),
 }
 
 NO_S3_GLUED_OUTPUT_MESSAGE = (
@@ -1237,6 +1248,29 @@ def _redirect_to_object(
     return redirect(url)
 
 
+#: Which page lists one engine's summary carries, keyed by engine. Each
+#: engine reports its own faults and no other's, so an empty list of a
+#: name the engine does not report would read as "none" where the truth
+#: is "not a question here". One table, because the index is the triage
+#: tool and a second copy of a name would go stale in silence.
+SHARD_PAGE_LISTS: dict[str, tuple[str, ...]] = {
+    # The two holes, the pages a retry rung saved, and the pages whose
+    # layout JSON was repaired (#242).
+    JobEngine.DOTS_MOCR: jobs.PAGE_LIST_NAMES,
+    # One list: a batch line either answered or it did not (#245).
+    JobEngine.MISTRAL_OCR: ("failed_pages",),
+    # The worker's four (#320/#364): the pages that raised, the pages
+    # that came back with no block twice, the pages surya re-read block
+    # by block, and the pages whose parse lost a block.
+    JobEngine.SURYA: (
+        "failed_pages",
+        "empty_pages",
+        "fallback_pages",
+        "dropped_block_pages",
+    ),
+}
+
+
 def _shard_entry(scan: Scan, output: str, row: ExternalJob) -> dict:
     """Describe one shard row for the glued-output index.
 
@@ -1270,15 +1304,11 @@ def _shard_entry(scan: Scan, output: str, row: ExternalJob) -> dict:
         "to_page": to_page + 1 if isinstance(to_page, int) else None,
         "page_count": manifest.get("page_count"),
     }
-    has_summary = isinstance((row.provider_meta or {}).get("output"), dict)
-    if row.engine == JobEngine.DOTS_MOCR and has_summary:
-        entry.update(jobs.page_lists(row))
-    elif row.engine == JobEngine.MISTRAL_OCR and has_summary:
-        # ``failed_pages`` alone (#245): the other three names of
-        # ``jobs.page_lists`` are dots.mocr faults, and an empty list
-        # would read as "none" where the truth is "not a question
-        # here".
-        entry["failed_pages"] = jobs.page_lists(row)["failed_pages"]
+    summary = (row.provider_meta or {}).get("output")
+    if isinstance(summary, dict):
+        for name in SHARD_PAGE_LISTS.get(row.engine, ()):
+            value = summary.get(name)
+            entry[name] = list(value) if isinstance(value, list) else []
     if row.result_key:
         entry["url"] = reverse(
             "serve_glued_shard",
@@ -2237,6 +2267,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "dots_run": dots_mocr.run_summary(scan),
         "yolo_run": yolo_run,
         "mistral_run": mistral_ocr.run_summary(scan),
+        "surya_run": surya.run_summary(scan),
         "detect_message": detection_message(yolo_run),
         **_review_flags(scan),
     }
@@ -2508,6 +2539,100 @@ def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
             request,
             f"Queued Mistral OCR for {queued} part(s) of this volume. The "
             "daemon renders and sends them within a few seconds.",
+        )
+    else:
+        # ``ensure_extract_jobs`` reused a run that is already done, so
+        # nothing was queued and nothing will be sent.
+        messages.info(
+            request,
+            f"This volume was already read: run {created[0].run} covers "
+            f"all {len(created)} part(s). Nothing new was queued.",
+        )
+    return back
+
+
+@login_required
+@require_POST
+def start_surya_ocr(request: HttpRequest, pk: int) -> HttpResponse:
+    """Start the Surya OCR read over a scan's shards (#364).
+
+    Staff only, and the only way into this stage: no tick and no
+    pipeline arm creates a Surya row. Every press can start real paid
+    work on RunPod.
+
+    The read is over the original shards, so the button waits on no
+    review state and on no redacted volume: the set exists from the
+    moment the pipeline cut it, and the pages are unredacted, which is
+    what a reader of the headnote brackets needs (#303).
+    ``RUNPOD_SURYA_ENDPOINT_ID`` is the switch an environment holds,
+    and an environment with no endpoint leaves it unset.
+
+    **This request makes no call to RunPod.** It writes one
+    ``ExternalJob`` row per shard and returns; the daemon's next
+    ``submit_external_jobs`` tick signs the URLs and submits them, and
+    ``collect_external_jobs`` polls, harvests and retries them.
+
+    It also never cuts shards. ``sharding.committed_manifest`` verifies
+    the stored set against the original with one ``head_object``, and a
+    stale or missing set is refused, because re-cutting is the
+    pipeline's job. So a web pod never pulls the original.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to the scan processing page.
+    """
+    from scanning import sharding
+
+    scan = get_object_or_404(Scan, pk=pk)
+    back = redirect("scan_process", pk=scan.pk)
+
+    if not request.user.is_staff:
+        messages.error(
+            request,
+            "Only staff can start Surya OCR: each run costs money.",
+        )
+        return back
+
+    if not surya.enabled():
+        messages.warning(
+            request,
+            "Surya OCR is not switched on in this environment. Set "
+            "RUNPOD_SURYA_ENDPOINT_ID first.",
+        )
+        return back
+
+    # An open run means the daemon is still working on the last press.
+    # A finished run is reused rather than refused, which is what keeps
+    # ``ensure_extract_jobs`` from paying twice for shards already read.
+    summary = surya.run_summary(scan)
+    if summary and summary["open"]:
+        messages.info(
+            request,
+            f"Surya OCR run {summary['run']} is already going: "
+            f"{summary['done']} of {summary['total']} part(s) done.",
+        )
+        return back
+
+    manifest, reason = sharding.committed_manifest(scan)
+    if manifest is None:
+        messages.warning(request, reason)
+        return back
+
+    created = surya.ensure_extract_jobs(scan, manifest)
+    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
+    logger.info(
+        "start_surya_ocr: scan=%s user=%s run=%s shards=%d queued=%d",
+        scan.pk,
+        request.user.pk,
+        created[0].run if created else "?",
+        len(created),
+        queued,
+    )
+    if queued:
+        messages.success(
+            request,
+            f"Queued Surya OCR for {queued} part(s) of this volume. The "
+            "daemon sends them to RunPod within a few seconds.",
         )
     else:
         # ``ensure_extract_jobs`` reused a run that is already done, so
