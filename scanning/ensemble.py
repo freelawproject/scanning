@@ -821,26 +821,49 @@ def resolve(group: dict) -> dict:
     text is the answer: the vote must not turn a curly quote into a
     difference, and a reader must see the page as its engine read it.
 
+    **An engine that read nothing does not vote.** One engine calls a
+    region a picture and reads no word of it while another reads the
+    paragraph under it. An empty read is not a reading of the text, so
+    it is not a candidate and it cannot carry the vote; the engines
+    that did read decide, and the silent ones are named in ``silent``,
+    which makes the group a place the engines differ.
+
     :param group: One group of :func:`align_page`.
-    :returns: ``{agreement, source, agreeing, text, tokens,
+    :returns: ``{agreement, source, agreeing, silent, text, tokens,
         n_low_confidence}``. ``tokens`` is empty unless the group was
         voted word by word.
     :rtype: dict
     """
     engines = group["engines"]
-    present = _ranked(engines)
+    every = _ranked(engines)
+    keys = {name: compare_text(engines[name]["text"]) for name in every}
+    present = [name for name in every if keys[name]]
+    silent = [name for name in every if not keys[name]]
+    if not present:
+        # Nobody read a word here. The group carries no text and
+        # ``build_page`` drops it as empty.
+        return {
+            "agreement": SINGLE,
+            "source": every[0],
+            "agreeing": every,
+            "silent": [],
+            "text": engines[every[0]]["text"],
+            "tokens": [],
+            "n_low_confidence": 0,
+        }
+
     base = present[0]
     if len(present) == 1:
         return {
             "agreement": SINGLE,
             "source": base,
             "agreeing": [base],
+            "silent": silent,
             "text": engines[base]["text"],
             "tokens": [],
             "n_low_confidence": 0,
         }
 
-    keys = {name: compare_text(engines[name]["text"]) for name in present}
     winner, votes = Counter(keys[name] for name in present).most_common(1)[0]
     quorum = (len(present) + 2) // 2
     if votes >= quorum:
@@ -849,6 +872,7 @@ def resolve(group: dict) -> dict:
             "agreement": UNANIMOUS if votes == len(present) else MAJORITY,
             "source": agreeing[0],
             "agreeing": agreeing,
+            "silent": silent,
             "text": engines[agreeing[0]]["text"],
             "tokens": [],
             "n_low_confidence": 0,
@@ -862,6 +886,7 @@ def resolve(group: dict) -> dict:
         "agreement": VOTED,
         "source": base,
         "agreeing": [],
+        "silent": silent,
         "text": " ".join(token["text"] for token in tokens if token["text"]),
         "tokens": tokens,
         "n_low_confidence": disputed,
@@ -921,6 +946,31 @@ def _frame(pages: dict[str, dict]) -> tuple[float, float] | None:
     return None
 
 
+def _counts() -> dict:
+    """Return an empty count of one page or of one document.
+
+    ``differing`` is one per group the engines did not read alike, and
+    it is the number the ``ENGINES_DISAGREE`` card reads: a group can
+    be voted and hold a silent engine at once, and it is one place,
+    not two.
+
+    :returns: Every count at zero.
+    :rtype: dict
+    """
+    return {
+        "groups": 0,
+        "dropped": 0,
+        UNANIMOUS: 0,
+        MAJORITY: 0,
+        VOTED: 0,
+        SINGLE: 0,
+        "silent": 0,
+        "differing": 0,
+        "low_confidence": 0,
+        "partial": 0,
+    }
+
+
 def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
     """Return the ensemble of one page of one opinion.
 
@@ -939,16 +989,7 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         "text": "",
         "groups": [],
         "dropped": [],
-        "counts": {
-            "groups": 0,
-            "dropped": 0,
-            UNANIMOUS: 0,
-            MAJORITY: 0,
-            VOTED: 0,
-            SINGLE: 0,
-            "low_confidence": 0,
-            "partial": 0,
-        },
+        "counts": _counts(),
     }
     read = {
         engine: page for engine, page in pages.items() if "error" not in page
@@ -1025,6 +1066,7 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
                 "alignment_iou": group["alignment_iou"],
                 "weak": group["weak"],
                 "page_scale": group["page_scale"],
+                "silent": read_back["silent"],
                 "n_low_confidence": read_back["n_low_confidence"],
                 "tokens": read_back["tokens"],
                 "text": read_back["text"],
@@ -1040,6 +1082,10 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         )
         entry["counts"][read_back["agreement"]] += 1
         entry["counts"]["low_confidence"] += read_back["n_low_confidence"]
+        if read_back["silent"]:
+            entry["counts"]["silent"] += 1
+        if _differs(entry["groups"][-1]):
+            entry["counts"]["differing"] += 1
 
     entry["text"] = PARAGRAPH_GAP.join(parts)
     entry["counts"]["groups"] = len(entry["groups"])
@@ -1048,6 +1094,19 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         1 for drop in entry["dropped"] if drop["partial"]
     )
     return entry
+
+
+def _differs(group: dict) -> bool:
+    """Return whether the engines did not read one group alike.
+
+    One rule for the card of the findings and for the entry of
+    ``OpinionText.disagreements``, which must count the same places.
+
+    :param group: One group of the document.
+    :returns: Whether it is a disagreement.
+    :rtype: bool
+    """
+    return bool(group["agreement"] in (MAJORITY, VOTED) or group.get("silent"))
 
 
 def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
@@ -1072,16 +1131,7 @@ def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
         }
 
     pages = []
-    counts = {
-        "groups": 0,
-        "dropped": 0,
-        UNANIMOUS: 0,
-        MAJORITY: 0,
-        VOTED: 0,
-        SINGLE: 0,
-        "low_confidence": 0,
-        "partial": 0,
-    }
+    counts = _counts()
     for page_in_opinion in range(opinion.page_count):
         of_page = {}
         for engine in engines:
@@ -1167,10 +1217,15 @@ def due(limit: int | None = None):
     """Return the rows that owe their ensemble, as a queryset.
 
     A row whose OCR glue is written at the live revision, that holds
-    at least :func:`min_engines` engine documents, that is not
-    ``ERROR``, that has attempts left, and whose ensemble stamp is not
-    the OCR glue's. The scan must be in ``REDACTION_REVIEW_DONE``: a
-    volume an admin sent back writes no text while it is back.
+    at least :func:`min_engines` engine documents, that is neither
+    ``ERROR`` nor ``TEXT_REVIEW_DONE``, that has attempts left, and
+    whose ensemble stamp is not the OCR glue's. The scan must be in
+    ``REDACTION_REVIEW_DONE``: a volume an admin sent back writes no
+    text while it is back.
+
+    An approved row is out for the reason ``opinion_ocr.reglue`` and
+    ``opinions.create_rows`` leave it alone: a person read its text
+    and said it is right, and nothing derived writes over that.
 
     :param limit: How many rows to take, newest scan first.
     :returns: The queryset.
@@ -1183,7 +1238,12 @@ def due(limit: int | None = None):
             ocr_glue_revision=F("glue_revision"),
             ocr_engine_count__gte=min_engines(),
         )
-        .exclude(status=OpinionReviewStatus.ERROR)
+        .exclude(
+            status__in=(
+                OpinionReviewStatus.ERROR,
+                OpinionReviewStatus.TEXT_REVIEW_DONE,
+            )
+        )
         .filter(
             Q(ensemble_revision__isnull=True)
             | ~Q(ensemble_revision=F("ocr_glue_revision"))
@@ -1201,9 +1261,16 @@ def record_failure(opinion: Opinion, message: str) -> None:
     :return: None.
     """
     Opinion.objects.filter(pk=opinion.pk).update(
-        ensemble_attempts=F("ensemble_attempts") + 1,
-        error_message=f"{MESSAGE_PREFIX}{message}",
+        ensemble_attempts=F("ensemble_attempts") + 1
     )
+    # The message is shared with every work that prepares the review,
+    # so this one never writes over another work's ERROR: a row the
+    # PDF pass ended must keep the reason it ended, which is the only
+    # record an operator has.
+    Opinion.objects.filter(pk=opinion.pk).exclude(
+        Q(status=OpinionReviewStatus.ERROR)
+        & ~Q(error_message__startswith=MESSAGE_PREFIX)
+    ).update(error_message=f"{MESSAGE_PREFIX}{message}")
     ended = (
         Opinion.objects.filter(
             pk=opinion.pk, ensemble_attempts__gte=MAX_ATTEMPTS
@@ -1311,7 +1378,7 @@ def _disagreements(page: dict) -> list[dict]:
             },
         }
         for group in page["groups"]
-        if group["agreement"] in (MAJORITY, VOTED)
+        if _differs(group)
     ]
 
 
@@ -1347,13 +1414,14 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
     for page in document["pages"]:
         page_number = page["page_in_opinion"]
         counts = page["counts"]
-        # Every group the engines did not all read alike: the ones a
-        # majority settled and the ones the word vote settled. It is
-        # the count of ``OpinionText.disagreements`` for this page, and
-        # a card and an entry must not disagree. With two engines no
-        # group can hold a majority, so a card that read
-        # ``counts[MAJORITY]`` alone would never be written.
-        differing = counts[MAJORITY] + counts[VOTED]
+        # Every group the engines did not read alike (``_differs``):
+        # the ones a majority settled, the ones the word vote settled,
+        # and the ones an engine read nothing of. It is the count of
+        # ``OpinionText.disagreements`` for this page, and a card and
+        # an entry must not disagree. With two engines no group can
+        # hold a majority, so a card that read ``counts[MAJORITY]``
+        # alone would never be written.
+        differing = counts["differing"]
         if differing:
             cards.append(
                 _card(

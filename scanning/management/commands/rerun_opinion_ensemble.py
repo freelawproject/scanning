@@ -19,7 +19,8 @@ a deploy, and a volume the daemon pass will not take.
 A ``TEXT_REVIEW_DONE`` row is left alone: a human approved its text,
 and nothing derived overwrites that. An ``ERROR`` row is read again and
 comes back to life on success, because the command is the operator's
-own decision and not a pass that would spin.
+own decision and not a pass that would spin; a row another work ended
+keeps that work's reason, which this one never writes over.
 
 Examples:
 

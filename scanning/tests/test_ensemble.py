@@ -94,16 +94,7 @@ def group_of(*units) -> dict:
 
 def counts(**values) -> dict:
     """The counts of one page of a document, with the rest at zero."""
-    base = {
-        "groups": 0,
-        "dropped": 0,
-        ensemble.UNANIMOUS: 0,
-        ensemble.MAJORITY: 0,
-        ensemble.VOTED: 0,
-        ensemble.SINGLE: 0,
-        "low_confidence": 0,
-        "partial": 0,
-    }
+    base = ensemble._counts()
     base.update(values)
     return base
 
@@ -474,6 +465,33 @@ class TestTheVote(TestCase):
         )
         self.assertEqual(disputed, 1)
 
+    def test_an_engine_that_read_nothing_does_not_vote(self):
+        """One engine calls a region a picture and reads no word of it
+        while the other reads the paragraph. An empty read is not a
+        reading of the text, and it must not take it away."""
+        answer = ensemble.resolve(self.read("", "the paragraph"))
+
+        self.assertEqual(answer["text"], "the paragraph")
+        self.assertEqual(answer["agreement"], ensemble.SINGLE)
+        self.assertEqual(answer["source"], "mistral_ocr")
+        self.assertEqual(answer["silent"], ["dots_mocr"])
+        self.assertEqual(answer["n_low_confidence"], 0)
+
+    def test_a_group_no_engine_read_stays_empty(self):
+        answer = ensemble.resolve(self.read("", ""))
+
+        self.assertEqual(answer["text"], "")
+        self.assertEqual(answer["silent"], [])
+
+    def test_the_engines_that_read_decide_among_themselves(self):
+        answer = ensemble.resolve(
+            self.read("", "the court held", "the court held")
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(answer["agreeing"], ["mistral_ocr", "surya"])
+        self.assertEqual(answer["silent"], ["dots_mocr"])
+
     def test_the_first_engine_of_the_table_is_the_base(self):
         answer = ensemble.resolve(
             self.read("alpha beta", "alpha xeta", "alpha zeta")
@@ -595,6 +613,25 @@ class TestTheDocument(EnsembleTestCase):
         self.assertEqual(
             sorted(voted[0]["engines"]), ["dots_mocr", "mistral_ocr"]
         )
+
+    def test_a_picture_box_of_one_engine_keeps_the_other_s_text(self):
+        """The engines align a paragraph with a box one of them read
+        nothing in. The text stays, and the page says they differ."""
+        document = mistral_document()
+        for page in document["pages"]:
+            for block in page["blocks"]:
+                if block["content"].startswith("body A"):
+                    block["content"] = ""
+                    block["type"] = "picture"
+        self.objects[self.apply_run.extract_key] = document
+
+        built = self.run_ensemble()
+
+        page = built["pages"][1]
+        self.assertIn("body A 2", page["text"])
+        group = next(g for g in page["groups"] if "body A 2" in g["text"])
+        self.assertEqual(group["silent"], ["mistral_ocr"])
+        self.assertEqual(page["counts"]["differing"], 1)
 
     def test_a_page_nobody_read_carries_its_reason(self):
         self.objects[self.apply_run.extract_key] = mistral_document()
@@ -786,7 +823,7 @@ class TestTheFindings(EnsembleTestCase):
         )
 
     def test_a_majority_group_is_an_engines_disagree_card(self):
-        cards = self.rebuild(majority=2)
+        cards = self.rebuild(majority=2, differing=2)
 
         self.assertEqual(len(cards), 1)
         self.assertEqual(cards[0].check_name, OpinionCheck.ENGINES_DISAGREE)
@@ -797,15 +834,21 @@ class TestTheFindings(EnsembleTestCase):
     def test_a_voted_group_is_an_engines_disagree_card(self):
         """With two engines no group can hold a majority, and a card
         that read the majority alone would never be written."""
-        cards = self.rebuild(voted=2)
+        cards = self.rebuild(voted=2, differing=2)
 
         self.assertEqual(cards[0].check_name, OpinionCheck.ENGINES_DISAGREE)
         self.assertIn("2 place(s)", cards[0].message)
 
     def test_the_card_counts_what_the_row_calls_a_disagreement(self):
-        cards = self.rebuild(majority=1, voted=1)
+        cards = self.rebuild(majority=1, voted=1, differing=2)
 
         self.assertIn("2 place(s)", cards[0].message)
+
+    def test_a_silent_engine_is_a_place_the_engines_differ(self):
+        cards = self.rebuild(differing=1, silent=1)
+
+        self.assertEqual(cards[0].check_name, OpinionCheck.ENGINES_DISAGREE)
+        self.assertIn("1 place(s)", cards[0].message)
 
     def test_a_word_with_no_majority_is_its_own_card(self):
         cards = self.rebuild(low_confidence=3)
@@ -829,7 +872,7 @@ class TestTheFindings(EnsembleTestCase):
             check_name=OpinionCheck.ENGINES_DISAGREE,
         )
 
-        cards = self.rebuild(majority=1)
+        cards = self.rebuild(majority=1, differing=1)
 
         self.assertEqual(cards[0].dismissal_id, dismissal.pk)
 
@@ -843,7 +886,7 @@ class TestTheFindings(EnsembleTestCase):
             withdrawn_at=timezone.now(),
         )
 
-        cards = self.rebuild(majority=1)
+        cards = self.rebuild(majority=1, differing=1)
 
         self.assertIsNone(cards[0].dismissal_id)
 
@@ -856,13 +899,13 @@ class TestTheFindings(EnsembleTestCase):
             message="no boundary",
         )
 
-        self.rebuild(majority=1)
+        self.rebuild(majority=1, differing=1)
 
         self.assertTrue(OpinionFinding.objects.filter(pk=stale.pk).exists())
 
     def test_a_second_rebuild_writes_one_card(self):
-        self.rebuild(majority=1)
-        cards = self.rebuild(majority=1)
+        self.rebuild(majority=1, differing=1)
+        cards = self.rebuild(majority=1, differing=1)
 
         self.assertEqual(len(cards), 1)
 
@@ -994,6 +1037,37 @@ class TestTheLedger(EnsembleTestCase):
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.ensemble_attempts, 1)
 
+    @override_settings(OPINION_ENSEMBLE_MIN_ENGINES=2)
+    def test_an_approved_row_is_not_due(self):
+        """A person read its text and said it is right, the rule
+        ``opinion_ocr.reglue`` and ``opinions.create_rows`` follow."""
+        self.glue()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        self.assertEqual(list(ensemble.due()), [])
+        self.assertEqual(ensemble.run_tick(), 0)
+
+    @override_settings(OPINION_ENSEMBLE_MIN_ENGINES=2)
+    def test_another_work_s_error_message_survives_a_failure(self):
+        """``error_message`` is shared, and a row the PDF pass ended
+        must keep the reason it ended."""
+        self.glue()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.ERROR,
+            error_message="The PDF source did not pull.",
+        )
+        self.opinion.refresh_from_db()
+
+        ensemble.record_failure(self.opinion, "the document failed")
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            self.opinion.error_message, "The PDF source did not pull."
+        )
+        self.assertEqual(self.opinion.ensemble_attempts, 1)
+
     def test_a_run_that_works_takes_back_this_module_s_error(self):
         self.glue()
         Opinion.objects.filter(pk=self.opinion.pk).update(
@@ -1086,6 +1160,34 @@ class TestTheButton(EnsembleTestCase, ScanningTestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertIn("is not in the bucket", response.json()["message"])
+
+    def test_409_for_an_approved_opinion(self):
+        self.glue()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        response = self.client.post(self.url())
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Reopen it first", response.json()["message"])
+        self.assertFalse(
+            OpinionText.objects.filter(opinion=self.opinion).exists()
+        )
+
+    def test_a_bucket_fault_answers_our_own_line(self):
+        """The words of a library never reach the answer."""
+        self.glue()
+
+        with patch(
+            "scanning.s3_sync.download_json_object",
+            side_effect=OSError("connection reset by 10.0.0.1"),
+        ):
+            response = self.client.post(self.url())
+
+        self.assertEqual(response.status_code, 409)
+        self.assertNotIn("10.0.0.1", response.json()["message"])
+        self.assertIn("Press the button again", response.json()["message"])
 
     def test_404_across_scans(self):
         other = ScanFactory()

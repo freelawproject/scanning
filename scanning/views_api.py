@@ -142,6 +142,19 @@ ENSEMBLE_NOT_GLUED_MESSAGE = (
     "revision, so there is nothing to read yet. The daemon writes them "
     "after the redaction review."
 )
+#: An approved opinion is never written over: a person read its text
+#: and said it is right (#365).
+ENSEMBLE_APPROVED_MESSAGE = (
+    "The text review of this opinion is done, so its text is not "
+    "written again. Reopen it first."
+)
+#: A fault that passes. The detail goes to the log and not to the
+#: answer: it carries the words of a library, and a message of ours is
+#: what a curator can act on.
+ENSEMBLE_BUCKET_MESSAGE = (
+    "The file store did not answer, so nothing was written. Press the "
+    "button again."
+)
 
 #: The two labels the opinion pairing reads: a box of one of them
 #: changes the boundaries, and only the measurement pairs them again.
@@ -801,9 +814,15 @@ def rerun_opinion_ensemble(
         refuses to read.
     """
     from scanning import ensemble, opinion_ocr
+    from scanning.models import OpinionReviewStatus
 
     scan = get_object_or_404(Scan, pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE:
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_APPROVED_MESSAGE},
+            status=409,
+        )
     if not opinion_ocr.is_written(opinion):
         return JsonResponse(
             {"status": "error", "message": ENSEMBLE_NOT_GLUED_MESSAGE},
@@ -811,9 +830,21 @@ def rerun_opinion_ensemble(
         )
     try:
         document = ensemble.rerun(opinion)
-    except (ensemble.EnsembleError, ensemble.TransientFault) as exc:
-        # A fault that passes answers the same way: the curator presses
-        # the button again, and no attempt was spent either way.
+    except ensemble.TransientFault as exc:
+        # A fault that passes: the curator presses the button again,
+        # and no attempt was spent. The detail is logged, never sent.
+        logger.warning(
+            "%s of scan %s: the ensemble did not reach the bucket: %s",
+            opinion,
+            scan.pk,
+            exc,
+        )
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_BUCKET_MESSAGE},
+            status=409,
+        )
+    except ensemble.EnsembleError as exc:
+        # Every message of this class is one this code wrote.
         return JsonResponse(
             {"status": "error", "message": str(exc)}, status=409
         )
