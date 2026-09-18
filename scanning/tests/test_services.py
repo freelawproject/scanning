@@ -119,12 +119,31 @@ def _import_detections(scan_pk):
     describe a real book page. They read :data:`DETECTIONS_PATH` for
     them, and run no model (#360).
 
+    The file holds the label id and the label name of every box, and
+    this asks the two to agree. A live detection run kept them in step
+    by itself; a stored one cannot. A blackletter release that gives
+    the labels new numbers would otherwise write a row whose box is a
+    column and whose label is a heading, and the geometry tests would
+    measure the wrong thing and still pass. A **deleted** number
+    raises in :class:`~blackletter.models.Label` already; only a
+    renumbering is silent, so the names are what this compares.
+
     :param scan_pk: The scan the rows belong to.
     :returns: The recorded detections, as the file holds them.
+    :raises AssertionError: If a recorded label and its id disagree.
     """
     from blackletter.models import Label
 
     dets = json.loads(DETECTIONS_PATH.read_text())["detections"]
+    for entry in dets:
+        name = Label(entry["label_id"]).name
+        if name != entry["label"]:
+            raise AssertionError(
+                f"{DETECTIONS_PATH.name}: label id {entry['label_id']} "
+                f"reads {name} in this blackletter and {entry['label']} "
+                "in the file. Record the file again -- its `meta` holds "
+                "the command."
+            )
     Detection.objects.filter(scan_id=scan_pk).delete()
     Detection.objects.bulk_create(
         Detection(

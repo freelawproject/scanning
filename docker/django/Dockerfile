@@ -43,7 +43,7 @@ WORKDIR /opt/scanning
 # Split so each image resolves only the deps it needs and layer caching keys  #
 # on pyproject.toml + uv.lock alone (source changes don't bust the venv).     #
 #   deps-web  lean base only         -> web image (detection offloaded)        #
-#   deps-ml   base + local-ml extra  -> daemon image + offline/local detection #
+#   deps-ml   base + local-ml extra  -> daemon image (see the stage's note)   #
 #   deps-dev  base + dev extra       -> local dev (docker-compose) and CI     #
 ##############################################################################
 FROM build-base AS deps-web
@@ -60,8 +60,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 FROM build-base AS deps-ml
 
 COPY pyproject.toml uv.lock ./
-# local-ml pulls the CPU torch/paddle/ultralytics stack for in-process
-# detection (offline daemon, or RUNPOD_ENABLED=False). No dev tooling.
+# local-ml pulls the CPU torch/paddle/ultralytics stack. No dev tooling.
+# The stack runs nothing here any more: in-process detection is gone
+# (#360), and `RUNPOD_ENABLED=False` only stops the dispatch. It stays
+# because nobody has run the daemon's own work -- the redaction compute
+# and the opinion PDF pass -- without it. Base blackletter imports
+# torch and ultralytics lazily, so a lean daemon is likely. It is not
+# proven. Prove it on a real volume, then this stage is `deps-web`.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --extra local-ml
 
@@ -78,8 +83,8 @@ FROM build-base AS deps-dev
 COPY pyproject.toml uv.lock ./
 # Dev tooling, and no `local-ml`: no test runs a model since #360, and
 # base blackletter imports torch and ultralytics lazily. This is the
-# image the CI tests run in, so the extra cost every test job a
-# multi-gigabyte download for nothing. A developer who wants
+# image the CI tests run in, where the extra used to cost every test
+# job a multi-gigabyte download for nothing. A developer who wants
 # in-process detection in this container adds `--extra local-ml` back.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --extra dev
@@ -184,9 +189,9 @@ USER www-data
 ENTRYPOINT ["/bin/sh", "/opt/scanning/docker/django/docker-entrypoint.sh"]
 
 ##############################################################################
-# prod-ml: slim runtime for the daemon (also the offline/local-detection      #
-# image). Same layout as prod-web but carries the heavy CPU ML stack so        #
-# detection/OCR can run in-process, plus the full OpenCV/torch/paddle libs.    #
+# prod-ml: slim runtime for the daemon. Same layout as prod-web, plus the     #
+# heavy CPU ML stack and the full OpenCV/torch/paddle libs. Nothing runs a    #
+# model in this image since #360; the deps-ml stage says why it stays.        #
 ##############################################################################
 FROM python:3.12-slim AS prod-ml
 
