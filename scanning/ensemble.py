@@ -87,8 +87,10 @@ approval, which raises the revision.
 OPINION_ENSEMBLE_MIN_ENGINES`` (3) is how many engine documents a row
 must hold before the pass takes it, and ``Opinion.ocr_engine_count``
 is that number, stamped by the OCR glue. A vote of two engines settles
-nothing: every place they differ has no majority. The button waives
-the gate, which is how a two-engine volume is read during development.
+nothing: every place they differ has no majority. The command
+``rerun_opinion_ensemble`` and the endpoint ``ensemble/rerun/`` waive
+the gate, and that is how a two-engine volume is read today. No page
+posts to the endpoint yet: the viewer of #365 puts the button on it.
 """
 
 from __future__ import annotations
@@ -186,6 +188,11 @@ SINGLE = "single"
 DROP_EXCLUDED = "excluded"
 DROP_EMPTY = "empty"
 
+#: The ``error`` of a page no engine measured. A page nobody read
+#: carries the engine's own reason instead, and both write the one
+#: ``PAGE_NOT_READ`` card: the page has no text at all.
+UNMEASURED = "no engine measured this page"
+
 #: The checks this module writes. One rebuild is their only writer,
 #: and ``opinions.create_rows`` keeps the two stale ones.
 ENSEMBLE_CHECKS = frozenset(
@@ -193,6 +200,7 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.ENGINES_DISAGREE,
         OpinionCheck.NO_MAJORITY,
         OpinionCheck.PARTIAL_REDACTION,
+        OpinionCheck.PAGE_NOT_READ,
     }
 )
 
@@ -270,15 +278,6 @@ class EnsembleError(Exception):
         self.code = code
 
 
-class _RevisionMoved(Exception):
-    """The OCR glue wrote again while the text was written (#365).
-
-    Raised inside the transaction of :func:`write` alone, to take back
-    the rows and the cards of a document nothing describes now. The
-    row keeps its old stamp, so the ensemble is due again.
-    """
-
-
 class TransientFault(Exception):
     """A fault that passes: a read or a write of the bucket failed.
 
@@ -292,6 +291,16 @@ class TransientFault(Exception):
     The retry costs three small reads and no page, so the row waits no
     cooldown: that is the one place this differs from #336, whose
     retry re-pulls a volume.
+    """
+
+
+class RevisionMoved(TransientFault):
+    """The OCR glue wrote again while the text was written (#365).
+
+    A fault that passes, and the caller treats it as one: the rows,
+    the cards and the stamp of :func:`write` are taken back inside its
+    transaction, the row keeps its old stamp, and the ensemble is due
+    again. Nothing was written, so no caller may report a success.
     """
 
 
@@ -614,7 +623,9 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     that **does** read is the text of what it covers, and it must link
     or the page is written twice. So the rule reads the presence of a
     reading and never its content: what the engines wrote still
-    decides nothing about what merges.
+    decides nothing about what merges. :func:`plain` is the one rule
+    for "this unit reads nothing", because a picture box of Mistral
+    carries an image placeholder and not an empty string.
 
     :param units: Every engine's units of the page, each with
         ``engine``, ``id``, ``box_pt``, ``text``, ``type``,
@@ -634,7 +645,11 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     boundary = column_boundary(units, width, height)
     speaking, quiet = [], []
     for unit in units:
-        (speaking if compare_text(unit["text"]) else quiet).append(unit)
+        # :func:`plain` and never ``compare_text``: Mistral writes a
+        # picture box as an image placeholder and a break as a tag,
+        # and both are text to a comparison. A box that reads nothing
+        # must not link, whatever it wrote in place of the reading.
+        (speaking if plain(unit["text"]) else quiet).append(unit)
 
     union = _Union(len(speaking))
     for left, right in combinations(range(len(speaking)), 2):
@@ -1202,7 +1217,10 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
     if size is None:
         # No detection and no render measured this page, so no box of
         # it is in points and nothing can be aligned. Every unit is
-        # unjudged already, the rule of ``opinion_ocr.verdict``.
+        # unjudged already, the rule of ``opinion_ocr.verdict``. The
+        # page carries a reason like a page nobody read, because a
+        # page with no text and no card is a page lost in silence.
+        entry["error"] = UNMEASURED
         entry["counts"]["dropped"] = len(entry["dropped"])
         return entry
 
@@ -1617,6 +1635,20 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
         # an entry must not disagree. With two engines no group can
         # hold a majority, so a card that read ``counts[MAJORITY]``
         # alone would never be written.
+        if page.get("error"):
+            # The page has no text at all, so it has no group to
+            # count and no other card to write.
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.PAGE_NOT_READ,
+                    Issue.Severity.ERROR,
+                    _unread_message(page),
+                    standing,
+                )
+            )
+            continue
         differing = counts["differing"]
         missing = page.get("missing") or []
         if differing or missing:
@@ -1649,14 +1681,62 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     page_number,
                     OpinionCheck.PARTIAL_REDACTION,
                     Issue.Severity.WARNING,
-                    f"A redaction covers part of {counts['partial']} "
-                    "block(s) on this page. The whole block is out of the "
-                    "text.",
+                    _partial_message(page),
                     standing,
                 )
             )
     OpinionFinding.objects.bulk_create(cards)
     return len(cards)
+
+
+#: What took a block out of the text, in words. ``opinion_ocr``
+#: writes both reasons, and a card must not call the mask of the
+#: opinion before a redaction.
+_REASON_WORDS = {
+    "redaction": "a redaction",
+    "outside": "the mask of the opinion before",
+}
+
+
+def _unread_message(page: dict) -> str:
+    """Return the line of one ``PAGE_NOT_READ`` card.
+
+    :param page: One page of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    if page.get("error") == UNMEASURED:
+        return (
+            "No engine measured this page, so no box of it is in points "
+            "and nothing could be aligned. The page has no text."
+        )
+    return "No engine read this page, so it has no text."
+
+
+def _partial_message(page: dict) -> str:
+    """Return the line of one ``PARTIAL_REDACTION`` card.
+
+    The reason is read off the drops the count came from: a group goes
+    whole, and the box that took it is a redaction or the mask of the
+    opinion before (``opinion_ocr.verdict`` writes both).
+
+    :param page: One page of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    count = page["counts"]["partial"]
+    reasons = sorted(
+        {
+            _REASON_WORDS.get(drop["reason"], drop["reason"])
+            for drop in page["dropped"]
+            if drop["partial"]
+        }
+    )
+    said = " or ".join(reasons) or "a box"
+    return (
+        f"{said[0].upper()}{said[1:]} covers part of {count} block(s) on "
+        "this page. The whole block is out of the text."
+    )
 
 
 def _disagree_message(differing: int, missing: list[str]) -> str:
@@ -1806,6 +1886,8 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
     :rtype: dict
     :raises EnsembleError: On a fact about the row.
     :raises TransientFault: When the upload failed.
+    :raises RevisionMoved: When the OCR glue wrote again during this
+        write, which keeps nothing.
     """
     document = build_document(opinion, documents)
     key = document_key(opinion)
@@ -1832,7 +1914,9 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
                 # The glue wrote the documents again while this ran, so
                 # the rows and the cards above describe documents that
                 # are gone. Take them back and leave the ensemble due.
-                raise _RevisionMoved
+                raise RevisionMoved(
+                    "the OCR glue wrote again while the text was written"
+                )
             # An ERROR this module wrote is answered by this success:
             # the row is readable again, and the operator who pressed
             # the button or ran the command is the one who decided
@@ -1846,20 +1930,21 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             Opinion.objects.filter(
                 pk=opinion.pk, error_message__startswith=MESSAGE_PREFIX
             ).update(error_message="")
-    except _RevisionMoved:
+    except RevisionMoved:
         logger.info(
             "%s of scan %s: the OCR glue moved while the text was written; "
-            "the ensemble is due again",
+            "the rows went back and the ensemble is due again",
             opinion,
             opinion.scan_id,
         )
+        raise
     return document
 
 
 def rerun(opinion: Opinion) -> dict:
     """Read the documents of one opinion and write its text again.
 
-    The body of the button and of the command. It waives the engine
+    The body of the endpoint and of the command. It waives the engine
     gate, which is the only way a two-engine volume is read today.
 
     :param opinion: The row.
@@ -1899,6 +1984,10 @@ def run_tick(limit: int = ENSEMBLE_PER_TICK) -> int:
     for opinion in rows:
         try:
             document = rerun(opinion)
+        except RevisionMoved:
+            # Nothing was written and nothing was spent. The row is due
+            # at the revision the glue has now.
+            continue
         except TransientFault as exc:
             logger.warning(
                 "%s of scan %s: the ensemble waits for the bucket: %s",

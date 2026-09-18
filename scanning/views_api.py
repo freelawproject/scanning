@@ -155,6 +155,12 @@ ENSEMBLE_BUCKET_MESSAGE = (
     "The file store did not answer, so nothing was written. Press the "
     "button again."
 )
+#: The OCR glue wrote again while the text was written, so the write
+#: kept nothing (#365).
+ENSEMBLE_MOVED_MESSAGE = (
+    "The OCR documents of this opinion were written again while this "
+    "ran, so nothing was kept. Press the button again."
+)
 #: The line of each ``ensemble.EnsembleError`` code. The answer is
 #: built from this table and never from the error: the error names the
 #: object it read, and a key of the bucket belongs in the log and on
@@ -821,9 +827,9 @@ def rerun_opinion_ensemble(
 
     It **waives the engine gate**. The daemon pass waits for
     ``OPINION_ENSEMBLE_MIN_ENGINES`` engine documents, which no volume
-    has until the third engine reads; this button is how a curator
-    reads a two-engine volume, and how everybody sees the answer of a
-    changed transform without a re-paid read.
+    has until the third engine reads. No page posts here yet: the
+    viewer of #365 puts the button on the review page, and until then
+    the ``rerun_opinion_ensemble`` command is the way in.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -856,6 +862,13 @@ def rerun_opinion_ensemble(
         )
     try:
         document = ensemble.rerun(opinion)
+    except ensemble.RevisionMoved:
+        # The OCR documents were written again while this ran, so the
+        # rows went back. Nothing was kept, and the answer says so.
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_MOVED_MESSAGE},
+            status=409,
+        )
     except ensemble.TransientFault as exc:
         # A fault that passes: the curator presses the button again,
         # and no attempt was spent. The detail is logged, never sent.

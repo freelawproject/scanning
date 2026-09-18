@@ -267,6 +267,36 @@ class TestTheAlignment(TestCase):
             "left one left two right one right two",
         )
 
+    def test_an_image_placeholder_links_nothing(self):
+        """Mistral writes a picture box as an image placeholder, so a
+        box that reads nothing is not an empty string."""
+        cells = [
+            unit("dots_mocr", 0, (50, 100, 290, 300), "left one"),
+            unit("dots_mocr", 1, (50, 320, 290, 700), "left two"),
+            unit("dots_mocr", 2, (320, 100, 560, 300), "right one"),
+            unit("dots_mocr", 3, (320, 320, 560, 700), "right two"),
+        ]
+        picture = unit(
+            "mistral_ocr", 4, (50, 100, 560, 700), "![img-0.jpeg](img-0.jpeg)"
+        )
+
+        groups = ensemble.align_page([*cells, picture], WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 4)
+        silent = [g for g in groups if "mistral_ocr" in g["engines"]]
+        self.assertEqual(len(silent), 1)
+        self.assertEqual(
+            ensemble.resolve(silent[0])["silent"], ["mistral_ocr"]
+        )
+
+    def test_a_line_break_tag_links_nothing(self):
+        cells = [unit("dots_mocr", 0, (50, 100, 290, 300), "left one")]
+        tag = unit("mistral_ocr", 1, (50, 100, 560, 700), "<br>")
+
+        groups = ensemble.align_page([*cells, tag], WIDTH, HEIGHT)
+
+        self.assertEqual(groups[0]["engines"]["mistral_ocr"]["text"], "")
+
     def test_a_unit_of_marks_alone_reads_nothing(self):
         """A lone ``###`` is a heading mark with no heading."""
         groups = ensemble.align_page(
@@ -788,6 +818,26 @@ class TestTheDocument(EnsembleTestCase):
         self.assertEqual(page["groups"], [])
         self.assertEqual(page["text"], "")
 
+    def test_a_page_nobody_measured_carries_its_reason(self):
+        """No detection and no render measured the page, so no box of
+        it is in points. The page has no text, and it says why."""
+        page = {
+            "page_in_opinion": 0,
+            "page_index": 0,
+            "pdf_page": 1,
+            "source": None,
+            "frame": None,
+            "units": [],
+        }
+
+        entry = ensemble.build_page(
+            {"dots_mocr": page, "mistral_ocr": dict(page)}, 0
+        )
+
+        self.assertEqual(entry["error"], ensemble.UNMEASURED)
+        self.assertEqual(entry["text"], "")
+        self.assertEqual(entry["groups"], [])
+
     def test_the_document_names_the_opinion_and_the_engines(self):
         document = self.run_ensemble()
 
@@ -1022,6 +1072,48 @@ class TestTheFindings(EnsembleTestCase):
         )
         self.assertIn("mistral_ocr did not read this page", card.message)
 
+    def test_a_page_with_no_text_is_one_card_of_its_own(self):
+        page = page_of(text="")
+        page["error"] = ensemble.UNMEASURED
+
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        card = OpinionFinding.objects.get(opinion=self.opinion)
+        self.assertEqual(card.check_name, OpinionCheck.PAGE_NOT_READ)
+        self.assertEqual(card.severity, Issue.Severity.ERROR)
+        self.assertIn("No engine measured", card.message)
+
+    def test_a_page_no_engine_read_says_so(self):
+        page = page_of(text="")
+        page["error"] = "not read"
+
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        card = OpinionFinding.objects.get(opinion=self.opinion)
+        self.assertEqual(card.check_name, OpinionCheck.PAGE_NOT_READ)
+        self.assertIn("No engine read this page", card.message)
+
+    def test_the_partial_card_names_what_covered_the_block(self):
+        """``opinion_ocr`` masks the opinion before this one, and that
+        is not a redaction."""
+        page = page_of(partial=1)
+        page["dropped"] = [
+            {
+                "engines": {},
+                "box_pt": None,
+                "reason": "outside",
+                "partial": True,
+            }
+        ]
+
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        card = OpinionFinding.objects.get(
+            opinion=self.opinion, check_name=OpinionCheck.PARTIAL_REDACTION
+        )
+        self.assertIn("The mask of the opinion before", card.message)
+        self.assertNotIn("redaction covers", card.message)
+
     def test_a_standing_dismissal_mutes_the_new_card(self):
         dismissal = OpinionFindingDismissal.objects.create(
             opinion=self.opinion,
@@ -1222,11 +1314,13 @@ class TestTheLedger(EnsembleTestCase):
             return 0
 
         with patch("scanning.ensemble.rebuild_findings", side_effect=move):
-            ensemble.write(opinion, documents)
+            with self.assertRaises(ensemble.RevisionMoved):
+                ensemble.write(opinion, documents)
 
         self.assertFalse(OpinionText.objects.filter(opinion=opinion).exists())
         opinion.refresh_from_db()
         self.assertIsNone(opinion.ensemble_revision)
+        self.assertEqual(opinion.ensemble_attempts, 0)
 
     def test_an_approved_row_is_not_due(self):
         """A person read its text and said it is right, the rule
@@ -1380,6 +1474,25 @@ class TestTheButton(EnsembleTestCase, ScanningTestCase):
         self.assertEqual(response.status_code, 409)
         self.assertNotIn("10.0.0.1", response.json()["message"])
         self.assertIn("Press the button again", response.json()["message"])
+
+    def test_409_when_the_glue_moved_under_the_write(self):
+        """Nothing was kept, so the answer must not say it was."""
+        self.glue()
+
+        def move(*args, **kwargs):
+            Opinion.objects.filter(pk=self.opinion.pk).update(
+                ocr_glue_revision=self.opinion.ocr_glue_revision + 1
+            )
+            return 0
+
+        with patch("scanning.ensemble.rebuild_findings", side_effect=move):
+            response = self.client.post(self.url())
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("nothing was kept", response.json()["message"])
+        self.assertFalse(
+            OpinionText.objects.filter(opinion=self.opinion).exists()
+        )
 
     def test_404_across_scans(self):
         other = ScanFactory()

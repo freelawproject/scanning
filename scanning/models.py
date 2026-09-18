@@ -2411,7 +2411,7 @@ class OpinionReviewStatus(models.TextChoices):
 class OpinionCheck(models.TextChoices):
     """What an :class:`OpinionFinding` is about (#334).
 
-    The first five are the warnings the review shows on a page. The last
+    The first six are the warnings the review shows on a page. The last
     three are facts about the opinion row itself.
     """
 
@@ -2423,6 +2423,7 @@ class OpinionCheck(models.TextChoices):
         "partial_redaction",
         "A redaction covers part of a cell",
     )
+    PAGE_NOT_READ = "page_not_read", "This page has no text"
     PAGE_GAP = "page_gap", "A gap in the printed page numbers"
     STALE_PAGE_NUMBER = "stale_page_number", "The printed number changed"
     ORPHANED_OPINION = "orphaned_opinion", "No boundary matches this opinion"
