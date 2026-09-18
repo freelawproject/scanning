@@ -51,6 +51,13 @@ reach step 2.
     &middot; <a href="{% url 'glued_output_index' scan.pk 'dots-mocr' %}" class="underline" title="The runs, the shards and the result files of the dots.mocr read">files</a>
     {% endif %}
   </span>
+  {% elif ocr_missing %}
+  {% comment %}
+    A parked new-pipeline volume with no OCR run at all (#327), in the
+    spot the run's state takes once it exists. A bar with no word about
+    OCR was how such a volume sat for good unnoticed.
+  {% endcomment %}
+  <span class="text-sm text-orange-800 dark:text-orange-200 mr-2" title="The OCR read is what the page review is built on.">{{ ocr_missing }}</span>
   {% endif %}
   {% comment %}
   The "Run OCR" / "Re-run OCR" button is gone (#224). The pipeline
