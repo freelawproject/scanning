@@ -1138,10 +1138,6 @@ GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
         JobEngine.MISTRAL_OCR,
         mistral_ocr.glued_result_key,
     ),
-    # Surya (#364) has no glue yet, so its volume route answers "not
-    # glued yet" for every run. The index is the point: it lists the
-    # runs, the shards and the result objects a reader needs to see
-    # what the worker wrote.
     "surya": (JobStage.EXTRACT, JobEngine.SURYA, surya.glued_result_key),
 }
 
