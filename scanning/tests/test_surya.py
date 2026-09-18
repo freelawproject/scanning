@@ -621,6 +621,7 @@ class TestTheEngineControl(ScanningTestCase):
             {
                 "scan": ScanFactory(),
                 "user": self.make_staff_user(),
+                "part": "button",
                 "run": None,
                 "label": "Surya OCR",
                 "start_url": "start_surya_ocr",
