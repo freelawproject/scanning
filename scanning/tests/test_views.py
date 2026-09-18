@@ -6,6 +6,7 @@ import re
 import shutil
 import tempfile
 from datetime import timedelta
+from html.parser import HTMLParser
 from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
@@ -3272,6 +3273,143 @@ class TestProcessActionsFragment(ScanningTestCase):
         self.assertIn(
             reverse("recalculate", kwargs={"pk": self.scan.pk}), body["html"]
         )
+
+    def _rows(self, step):
+        """The inner HTML of the status row and of the button row.
+
+        The bar is two rows (#333), each a ``data-row`` wrapper the
+        fragment itself renders, because the viewer replaces the bar's
+        innerHTML with the fragment and a wrapper on the page would not
+        survive that. The parser tracks the depth of every open div, so
+        a nested div inside a row lands in that row and not in a third.
+        """
+        response = self.client.get(
+            reverse("process_actions", kwargs={"pk": self.scan.pk})
+            + f"?step={step}"
+        )
+        self.assertEqual(response.status_code, 200)
+        html = json.loads(response.content)["html"]
+
+        class Rows(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.rows = {}
+                self.open = None
+                self.depth = 0
+
+            def handle_starttag(self, tag, attrs):
+                if self.open is None:
+                    if tag == "div" and dict(attrs).get("data-row"):
+                        self.open = dict(attrs)["data-row"]
+                        self.depth = 0
+                        self.rows[self.open] = ""
+                    return
+                if tag == "div":
+                    self.depth += 1
+                self.rows[self.open] += self.get_starttag_text()
+
+            def handle_endtag(self, tag):
+                if self.open is None:
+                    return
+                if tag == "div" and self.depth == 0:
+                    self.open = None
+                    return
+                if tag == "div":
+                    self.depth -= 1
+                self.rows[self.open] += f"</{tag}>"
+
+            def handle_data(self, data):
+                if self.open is not None:
+                    self.rows[self.open] += data
+
+            def handle_entityref(self, name):
+                if self.open is not None:
+                    self.rows[self.open] += f"&{name};"
+
+            def handle_charref(self, name):
+                if self.open is not None:
+                    self.rows[self.open] += f"&#{name};"
+
+        parser = Rows()
+        parser.feed(html)
+        self.assertLessEqual(set(parser.rows), {"status", "buttons"})
+        return parser.rows.get("status", ""), parser.rows.get("buttons", "")
+
+    def test_step_one_keeps_the_texts_and_the_buttons_apart(self):
+        """No button renders in the status row, and no status in the
+        button row (#333). The wrap of the header used to split the
+        flat siblings wherever the width ran out."""
+        self.client.force_login(self.make_staff_user())
+        self.scan.status = Status.PAGE_COMPLETENESS_REVIEW_DONE
+        self.scan.save(update_fields=["status"])
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.ANALYZE,
+            engine=JobEngine.DOTS_MOCR,
+            status=JobStatus.COMPLETED,
+        )
+
+        status, buttons = self._rows(1)
+
+        self.assertIn("OCR done: 1 part(s)", status)
+        self.assertIn("Page review done", status)
+        self.assertNotIn("<button", status)
+        self.assertNotIn("<form", status)
+        self.assertNotIn("btn-", status)
+        for label in (
+            "Run Mistral OCR",
+            "Recompute page number issues",
+            "Reopen page review",
+            "Next: Detect",
+        ):
+            self.assertIn(label, buttons)
+        self.assertNotIn("OCR done", buttons)
+        self.assertNotIn("Page review done", buttons)
+
+    def test_step_one_refusal_notes_are_status(self):
+        """The two notes that refuse the approval (#266, #342) are texts
+        and sit in the status row, where the button they replace would
+        have been."""
+        self.scan.status = Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        self.scan.save(update_fields=["status"])
+        self.scan.ocr_results = [
+            {"pdf_page": i, "detected": False} for i in range(1, 6)
+        ]
+        self.scan.save(update_fields=["ocr_results"])
+
+        status, buttons = self._rows(1)
+
+        self.assertIn("with no number", status)
+        self.assertNotIn("<button", status)
+        self.assertNotIn("I reviewed this scan", buttons)
+        self.assertIn("Recompute page number issues", buttons)
+
+    def test_step_two_keeps_the_texts_and_the_buttons_apart(self):
+        self.scan.status = Status.READY_FOR_REDACTION_REVIEW
+        self.scan.progress_message = "Page 2 has no printed number."
+        self.scan.save(update_fields=["status", "progress_message"])
+
+        status, buttons = self._rows(2)
+
+        self.assertIn("The corrected volume is not built yet", status)
+        self.assertIn("review2-note", status)
+        self.assertNotIn("<button", status)
+        self.assertIn("Recompute redactions", buttons)
+        self.assertIn("I reviewed the redactions", buttons)
+        self.assertNotIn("corrected volume", buttons)
+        self.assertNotIn("review2-note", buttons)
+
+    def test_a_row_with_nothing_in_it_is_empty(self):
+        """An empty row must be ``<div></div>`` so ``empty:hidden``
+        hides it, else the column pays its gap for nothing: the rows are
+        rendered ``spaceless``."""
+        self.scan.status = Status.UPLOADED
+        self.scan.page_count = 0
+        self.scan.save(update_fields=["status", "page_count"])
+
+        status, buttons = self._rows(1)
+
+        self.assertEqual(buttons, "")
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

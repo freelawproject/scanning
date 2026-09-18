@@ -40,10 +40,10 @@ body.boundary-pick .opinion-nav.picking {
 {% endblock %}
 
 {% block content %}
-{# Header: stepper + title + actions in one row #}
-<div class="flex items-center justify-between mb-3 gap-4 flex-wrap">
-  {# Left: stepper + title #}
-  <div class="flex items-center gap-4">
+{# Header: the stepper and the title on one line, the action bar under it #}
+<div class="flex flex-col mb-3 gap-2">
+  {# The stepper + title #}
+  <div class="flex items-center gap-4 flex-wrap">
     <div class="flex items-center gap-0">
       <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 1 %}bg-blue-600 text-white{% elif step > 1 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=1">
         <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step > 1 %}bg-green-600 text-white{% elif step == 1 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">1</span>
@@ -96,8 +96,13 @@ body.boundary-pick .opinion-nav.picking {
       {% if scan.s3_uploaded %}<span class="badge-s3 text-xs" title="Files uploaded to S3">S3</span>{% endif %}
     </div>
   </div>
-  {# Right: actions #}
-  <div id="action-bar" class="flex flex-wrap gap-2">
+  {% comment %}
+    The action bar (#333): a status row over a button row. The two rows
+    are the fragment's own wrappers, because refreshProcessActionBar
+    replaces this element's innerHTML with the fragment; this element
+    only stacks them.
+  {% endcomment %}
+  <div id="action-bar" class="flex flex-col gap-2">
     {% include "scanning/_process_actions.html" %}
   </div>
 </div>
