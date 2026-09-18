@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('scanning', '0038_opinion_pdf_stamp'),
+        ('scanning', '0039_apply_run_surya_keys'),
     ]
 
     operations = [

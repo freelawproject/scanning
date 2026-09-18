@@ -56,10 +56,11 @@ OPINION_PDF_RETRY_AFTER_SECONDS = env.int(
 # How many of an opinion's engine documents must exist before the
 # ensemble runs by itself (#365). Three engines are what the vote
 # needs: with two, every place they differ has no majority and every
-# word of it is low confidence. Surya (#320, #364) is the third, and
-# it is not deployed yet, so the daemon pass writes nothing until then
-# and the rerun_opinion_ensemble command is the way in. The endpoint
-# waives the gate too; the viewer of #365 puts its button on the page.
+# word of it is low confidence. Surya (#320, #364, #368) is the third,
+# so a volume whose apply run carries all three keys opens the pass by
+# itself; a volume read by two waits, and the rerun_opinion_ensemble
+# command reads it. The endpoint waives the gate too; the viewer of
+# #365 puts its button on the page.
 OPINION_ENSEMBLE_MIN_ENGINES = env.int(
     "OPINION_ENSEMBLE_MIN_ENGINES", default=3
 )

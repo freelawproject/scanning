@@ -87,10 +87,12 @@ approval, which raises the revision.
 OPINION_ENSEMBLE_MIN_ENGINES`` (3) is how many engine documents a row
 must hold before the pass takes it, and ``Opinion.ocr_engine_count``
 is that number, stamped by the OCR glue. A vote of two engines settles
-nothing: every place they differ has no majority. The command
+nothing: every place they differ has no majority. Surya (#368) is the
+third engine, so a volume whose run carries all three keys opens the
+pass by itself. A volume read by two engines waits, and the command
 ``rerun_opinion_ensemble`` and the endpoint ``ensemble/rerun/`` waive
-the gate, and that is how a two-engine volume is read today. No page
-posts to the endpoint yet: the viewer of #365 puts the button on it.
+the gate for it. No page posts to the endpoint yet: the viewer of #365
+puts the button on it.
 """
 
 from __future__ import annotations
@@ -1945,7 +1947,7 @@ def rerun(opinion: Opinion) -> dict:
     """Read the documents of one opinion and write its text again.
 
     The body of the endpoint and of the command. It waives the engine
-    gate, which is the only way a two-engine volume is read today.
+    gate, which is the only way a two-engine volume is read.
 
     :param opinion: The row.
     :returns: The document.

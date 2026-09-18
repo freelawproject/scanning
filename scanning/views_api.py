@@ -826,8 +826,8 @@ def rerun_opinion_ensemble(
     renders every page and therefore queues.
 
     It **waives the engine gate**. The daemon pass waits for
-    ``OPINION_ENSEMBLE_MIN_ENGINES`` engine documents, which no volume
-    has until the third engine reads. No page posts here yet: the
+    ``OPINION_ENSEMBLE_MIN_ENGINES`` engine documents, which a volume
+    read by two engines never holds. No page posts here yet: the
     viewer of #365 puts the button on the review page, and until then
     the ``rerun_opinion_ensemble`` command is the way in.
 

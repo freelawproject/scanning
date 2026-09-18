@@ -8,10 +8,10 @@ S3 read each, and writes the ``OpinionText`` rows, the findings and one
 ``ensemble.json``. No engine is asked to read again, and no page is
 rendered.
 
-**It waives the engine gate**, as the "Re run OCR ensemble" button
+**It waives the engine gate**, as the "Re run OCR ensemble" endpoint
 does. The daemon pass waits for ``OPINION_ENSEMBLE_MIN_ENGINES``
-engine documents, which no volume has until the third engine reads, so
-this command is how a two-engine corpus is read today.
+engine documents, which a volume read by two engines never holds, so
+this command is how such a volume is read.
 
 Two reasons to run it: a change of the transform in ``ensemble`` after
 a deploy, and a volume the daemon pass will not take.

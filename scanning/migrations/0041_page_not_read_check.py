@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('scanning', '0039_opinion_ensemble_ledger'),
+        ('scanning', '0040_opinion_ensemble_ledger'),
     ]
 
     operations = [
