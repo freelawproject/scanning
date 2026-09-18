@@ -1,6 +1,6 @@
 """Confirm in-flight external jobs and finish the scans they belong to.
 
-Eleven passes, in order.
+Twelve passes, in order.
 
 **1. ``jobs.sweep_jobs()`` asks after every job still in flight.** How
 it asks depends on the provider:
@@ -84,7 +84,14 @@ joins the stored per-shard results of any scan whose Surya rows are all
 status, the results kept, and the glue as the one transform of a
 result.
 
-**11. ``opinion_ocr.glue_due()`` writes the OCR documents of the
+**11. ``surya.finish_ready_applies()`` reads the edited pages.** The
+twin of pass 9 for Surya (#368): for a scan whose Surya volume run is
+glued and whose corrected volume (#224) is built, it creates the
+one-page rows of the pages a curator changed and, once those have
+answered, writes the corrected volume's own Surya document. A volume
+nobody read with Surya is never a candidate.
+
+**12. ``opinion_ocr.glue_due()`` writes the OCR documents of the
 opinions (#350).** Up to ``OPINIONS_PER_TICK`` rows of the newest scan
 in ``REDACTION_REVIEW_DONE`` that owe their glue. Seconds over the
 corrected volume's JSON documents, read once per tick from the local
@@ -121,8 +128,9 @@ class Command(BaseCommand):
         "run's redaction computation, open the redaction review "
         "of every scan that is ready for it, then glue every finished "
         "Mistral run and every corrected volume that owes its Mistral "
-        "document, then glue every finished Surya run, then write the "
-        "OCR documents of the opinions that owe them."
+        "document, then glue every finished Surya run and every "
+        "corrected volume that owes its Surya document, then write "
+        "the OCR documents of the opinions that owe them."
     )
 
     def handle(self, *args, **options):
@@ -160,6 +168,7 @@ class Command(BaseCommand):
                 extracted = mistral_ocr.finish_ready_runs()
                 extracted_applies = mistral_ocr.finish_ready_applies()
                 read_surya = surya.finish_ready_runs()
+                surya_applies = surya.finish_ready_applies()
                 glued_opinions = opinion_ocr.glue_due()
                 break
             except OperationalError as exc:
@@ -191,6 +200,7 @@ class Command(BaseCommand):
                 extracted,
                 extracted_applies,
                 read_surya,
+                surya_applies,
                 glued_opinions,
             )
         ):
@@ -204,6 +214,7 @@ class Command(BaseCommand):
                 f"redaction computation(s), opened {promoted} redaction "
                 f"review(s), glued {extracted} Mistral run(s) and "
                 f"{extracted_applies} corrected volume(s), glued "
-                f"{read_surya} Surya run(s), wrote the OCR "
+                f"{read_surya} Surya run(s) and {surya_applies} "
+                f"corrected volume(s), wrote the OCR "
                 f"documents of {glued_opinions} opinion(s)"
             )

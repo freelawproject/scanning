@@ -1783,11 +1783,16 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 # work of its own.
                 ("scanning/views_process.py", "ensure_extract_jobs"),
                 ("scanning/mistral_ocr.py", "ensure_extract_jobs"),
-                # Surya: the staff button (#364) and nothing else. The
-                # three buttons are one view over a table, so the view
-                # module names ``ensure_analyze_jobs`` once and
-                # ``ensure_extract_jobs`` once for two engines; the
-                # wrapper below is what pins this one.
+                # Surya: the staff button (#364), and the collect
+                # pass that reads the edited pages of a corrected
+                # volume (#368), which is the Mistral rule engine for
+                # engine -- a row only for a scan whose volume read a
+                # person already started and the daemon already glued.
+                # The three buttons are one view over a table, so the
+                # view module names ``ensure_analyze_jobs`` once and
+                # ``ensure_extract_jobs`` once for three engines; the
+                # wrappers below are what pin the two of this stage.
+                ("scanning/surya.py", "ensure_extract_jobs"),
                 #
                 # The generic creator's five wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),

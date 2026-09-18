@@ -1718,6 +1718,7 @@ APPLY_OUTPUTS: dict[str, tuple[str | None, str]] = {
     "printed-pages": ("printed_pages_key", "json"),
     "detections-volume": ("detections_key", "json"),
     "extract-volume": ("extract_key", "json"),
+    "surya-volume": ("surya_key", "json"),
     "page-map": (None, "json"),
 }
 

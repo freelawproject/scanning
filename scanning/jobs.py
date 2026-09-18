@@ -81,7 +81,7 @@ from datetime import datetime, timedelta
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import Max, Q
 from django.utils import timezone
 
 from scanning import doctor_client, runpod_client, s3_sync, sharding
@@ -1359,6 +1359,151 @@ def ready_volume_runs(
         if attempts(rows) >= max_attempts:
             continue
         yield scan, rows
+
+
+def glue_ledger_key(run=None) -> str:
+    """Return the ``provider_meta`` key one glue's ledger lives under.
+
+    A stage that reads a volume keeps two ledgers on the volume run's
+    rows: the volume document's, and one per corrected volume, because
+    a scan may have had more than one apply run and each is glued on
+    its own terms.
+
+    :param run: The ``ApplyRun``, or None for the volume document.
+    :returns: ``"glue"``, or ``"glue:a{n}"``.
+    :rtype: str
+    """
+    return "glue" if run is None else f"glue:{run.label}"
+
+
+@dataclass(frozen=True)
+class ApplyGlueTarget:
+    """Which engine's document of a corrected volume a pass writes.
+
+    :ivar stage: A :class:`~scanning.models.JobStage` value.
+    :ivar engine: A :class:`~scanning.models.JobEngine` value.
+    :ivar provider: A :class:`~scanning.models.JobProvider` value.
+    :ivar key_field: The ``ApplyRun`` field that names the document.
+    :ivar run_field: The ``ApplyRun`` field that holds the volume run
+        the document was glued from.
+    """
+
+    stage: str
+    engine: str
+    provider: str
+    key_field: str
+    run_field: str
+
+
+@dataclass
+class ApplyGlueCandidate:
+    """One corrected volume that may owe one engine's document.
+
+    :ivar scan: The scan.
+    :ivar run: Its standing, built ``ApplyRun``.
+    :ivar volume_run: The glued volume run's number.
+    :ivar volume_rows: That run's rows, in shard order.
+    :ivar ledger_key: Where this glue's retry state lives
+        (:func:`glue_ledger_key`).
+    """
+
+    scan: object
+    run: object
+    volume_run: int
+    volume_rows: list[ExternalJob]
+    ledger_key: str
+
+
+def ready_apply_runs(
+    target: ApplyGlueTarget,
+    live_rows: Callable[[object], list[ExternalJob]],
+    max_attempts: int,
+):
+    """Yield the corrected volumes that owe one engine's document.
+
+    The prologue both ``EXTRACT`` stages share (#245, #368), the twin
+    of :func:`ready_volume_runs` for an apply run. A candidate is a
+    scan whose live volume run of this engine is **glued** and whose
+    standing apply run is **built**, and whose document does not name
+    that volume run already.
+
+    The pre-check is three queries over the whole corpus rather than
+    two per scan: every volume ever read keeps a glued run for good, so
+    a per-scan check would grow with the corpus -- the fault
+    ``apply._candidate_scan_ids`` was written to avoid. Each question is
+    one query: the live volume run per scan, the runs that are not
+    glued yet, and the standing built apply runs. The exact test then
+    runs per candidate, on that scan's own rows.
+
+    **A volume nobody read with this engine is never a candidate**,
+    which is what keeps a pass over it from starting paid work of its
+    own: the candidate is a glued volume run, and only a person starts
+    one.
+
+    :param target: The engine and its two ``ApplyRun`` fields.
+    :param live_rows: The engine's own live-run reader, called per
+        scan.
+    :param max_attempts: How many failures stop a run's glue.
+    :returns: One :class:`ApplyGlueCandidate` per corrected volume.
+    :rtype: Iterator[ApplyGlueCandidate]
+    """
+    from scanning.models import ApplyRun, Scan
+
+    rows = ExternalJob.objects.filter(
+        stage=target.stage,
+        engine=target.engine,
+        provider=target.provider,
+        apply_run__isnull=True,
+    )
+    live = {
+        entry["scan_id"]: entry["run"]
+        for entry in rows.values("scan_id").annotate(run=Max("run"))
+    }
+    if not live:
+        return
+    # A run with a row of any other status is not glued: the glue
+    # writes the document and flips every row in one pass.
+    for scan_id, run in rows.exclude(status=JobStatus.CONSUMED).values_list(
+        "scan_id", "run"
+    ):
+        if live.get(scan_id) == run:
+            live.pop(scan_id, None)
+    if not live:
+        return
+    candidates = {}
+    for run in ApplyRun.objects.filter(
+        scan_id__in=list(live),
+        superseded_at__isnull=True,
+        built_at__isnull=False,
+    ):
+        volume_run = live[run.scan_id]
+        if (
+            getattr(run, target.key_field)
+            and getattr(run, target.run_field) == volume_run
+        ):
+            continue
+        candidates[run.scan_id] = run
+    if not candidates:
+        return
+    for scan in Scan.objects.filter(pk__in=list(candidates)).select_related(
+        "reporter"
+    ):
+        volume_rows = live_rows(scan)
+        if not volume_rows or any(
+            row.status != JobStatus.CONSUMED for row in volume_rows
+        ):
+            continue
+        run = candidates[scan.pk]
+        key = glue_ledger_key(run)
+        if ledger_attempts(volume_rows, key) >= max_attempts:
+            continue
+        yield ApplyGlueCandidate(
+            scan=scan,
+            run=run,
+            volume_run=volume_rows[0].run,
+            volume_rows=volume_rows,
+            ledger_key=key,
+        )
 
 
 def consume_run(rows: list[ExternalJob]) -> int:

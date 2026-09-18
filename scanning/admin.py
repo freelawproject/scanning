@@ -950,6 +950,8 @@ class ApplyRunAdmin(admin.ModelAdmin):
         "detections_key",
         "extract_key",
         "extract_run",
+        "surya_key",
+        "surya_run",
         "built_at",
         "superseded_at",
         "attempts",

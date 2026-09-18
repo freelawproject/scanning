@@ -3502,6 +3502,26 @@ class ApplyRun(AbstractDateTimeModel):
             "that is what makes the glue due again."
         ),
     )
+    surya_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the final Surya OCR volume JSON (#368). The twin "
+            "of extract_key: blank until glued, which waits for a Surya "
+            "volume run, and a volume nobody read with Surya never has "
+            "one. No review state reads it."
+        ),
+    )
+    surya_run = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The Surya volume run surya_key was glued from. A second "
+            "read of the volume gets a later run number, and that is "
+            "what makes the glue due again."
+        ),
+    )
     built_at = models.DateTimeField(
         null=True,
         blank=True,
@@ -3585,10 +3605,11 @@ class ApplyRun(AbstractDateTimeModel):
         the redactions of the corrected volume, so every output of the
         corrected volume must exist before the review opens.
 
-        ``extract_key`` is deliberately **not** part of it (#245). The
-        Mistral read is started by a person, and after the reviews
-        rather than before them, so a volume nobody read with Mistral
-        would never open review 2 if this waited for it.
+        ``extract_key`` and ``surya_key`` are deliberately **not** part
+        of it (#245, #368). A person starts those two reads, and after
+        the reviews rather than before them, so a volume nobody read
+        with Mistral or with Surya would never open review 2 if this
+        waited for them.
         """
         return self.is_glued and bool(self.detections_key)
 
