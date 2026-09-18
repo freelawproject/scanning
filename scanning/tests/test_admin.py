@@ -18,14 +18,17 @@ Covers:
 
 from unittest.mock import patch
 
+from blackletter.models import Label
 from botocore.exceptions import ClientError
 from django.contrib import messages
 from django.contrib.admin.sites import AdminSite
 from django.contrib.messages.storage.fallback import FallbackStorage
 from django.contrib.sessions.middleware import SessionMiddleware
+from django.db import connection
 from django.test import RequestFactory, TestCase
+from django.test.utils import CaptureQueriesContext
 
-from scanning.admin import ScanAdmin
+from scanning.admin import EstimatingPaginator, LabelFilter, ScanAdmin
 from scanning.factories import (
     ExternalJobFactory,
     OpinionFactory,
@@ -36,6 +39,8 @@ from scanning.factories import (
     WithdrawnOpinionFactory,
 )
 from scanning.models import (
+    Detection,
+    DetectionDecision,
     JobEngine,
     JobStage,
     OpinionCheck,
@@ -417,6 +422,169 @@ class TestExternalJobChangelist(TestCase):
         response = self.client.get("/admin/scanning/withdrawnopinion/")
 
         self.assertEqual(response.status_code, 200)
+
+
+def _detection(scan, **fields) -> Detection:
+    """Store one model detection.
+
+    :param scan: The scan.
+    :param fields: Overrides.
+    :returns: The row.
+    """
+    values = {
+        "scan": scan,
+        "page_index": 0,
+        "label": "KEY_ICON",
+        "label_id": 0,
+        "confidence": 0.8,
+        "x0": 100.0,
+        "y0": 100.0,
+        "x1": 200.0,
+        "y1": 200.0,
+        "img_width": 1700,
+        "img_height": 2200,
+        "model_name": Detection.ModelName.BL_WARM,
+        "found_by": [{"model": "bl_warm", "confidence": 0.8}],
+        "source_page": 1,
+    }
+    values.update(fields)
+    return Detection.objects.create(**values)
+
+
+class TestDetectionChangelist(TestCase):
+    """The detection table holds millions of rows (issue #359).
+
+    The changelist must read no more of it than the page it shows: one
+    count for the paginator, no ``SELECT DISTINCT label`` for the
+    filter, and no sort the indexes cannot serve.
+    """
+
+    def setUp(self):
+        self.user = UserFactory(is_staff=True, is_superuser=True)
+        self.client.force_login(self.user)
+        self.scan = ScanFactory()
+
+    def _get(self, query=""):
+        with CaptureQueriesContext(connection) as captured:
+            response = self.client.get(f"/admin/scanning/detection/{query}")
+        self.assertEqual(response.status_code, 200)
+        return response, [q["sql"] for q in captured.captured_queries]
+
+    def test_the_list_opens_and_walks_the_primary_key(self):
+        first = _detection(self.scan, page_index=3, y0=10.0)
+        second = _detection(self.scan, page_index=0, y0=900.0)
+
+        response, queries = self._get()
+
+        self.assertEqual(
+            [row.pk for row in response.context["cl"].result_list],
+            [second.pk, first.pk],
+        )
+        listing = [
+            q
+            for q in queries
+            if q.startswith('SELECT "scanning_detection"."id"')
+            and "ORDER BY" in q
+        ]
+        self.assertEqual(len(listing), 1, queries)
+        self.assertIn('ORDER BY "scanning_detection"."id" DESC', listing[0])
+        self.assertNotIn('"y0" ASC', listing[0])
+
+    def test_a_filtered_list_reads_the_table_once(self):
+        """One count, and no ``DISTINCT label`` for the filter.
+
+        A filter, because an unfiltered page may take its count from
+        the statistics instead, and ``ANALYZE`` writes those in place,
+        outside the test transaction.
+        """
+        _detection(self.scan)
+
+        _response, queries = self._get("?active__exact=1")
+
+        # The header's repair badge counts another table; only the
+        # detection table is under test.
+        counts = [
+            q
+            for q in queries
+            if "COUNT(*)" in q and 'FROM "scanning_detection"' in q
+        ]
+        self.assertEqual(len(counts), 1, counts)
+        self.assertEqual([q for q in queries if "DISTINCT" in q], [])
+
+    def test_an_unfiltered_page_counts_from_the_statistics(self):
+        for _ in range(3):
+            _detection(self.scan)
+        with connection.cursor() as cursor:
+            cursor.execute("ANALYZE scanning_detection")
+
+        with CaptureQueriesContext(connection) as captured:
+            count = EstimatingPaginator(Detection.objects.all(), 100).count
+
+        self.assertEqual(count, 3)
+        self.assertEqual(
+            [q for q in captured.captured_queries if "COUNT(*)" in q["sql"]],
+            [],
+        )
+
+    def test_a_filtered_page_counts_its_rows(self):
+        _detection(self.scan, label="HEADNOTE", label_id=11)
+        _detection(self.scan, label="KEY_ICON", label_id=0)
+
+        paginator = EstimatingPaginator(
+            Detection.objects.filter(label="HEADNOTE"), 100
+        )
+
+        self.assertEqual(paginator.count, 1)
+
+    def test_a_table_nothing_analyzed_counts_its_rows(self):
+        """A fresh table reports ``-1``, never a guess of zero."""
+        _detection(self.scan)
+
+        self.assertEqual(
+            EstimatingPaginator(Detection.objects.all(), 100).count, 1
+        )
+
+    def test_the_label_filter_offers_every_label_without_a_query(self):
+        request = RequestFactory().get("/admin/scanning/detection/")
+        spec = LabelFilter(request, {}, Detection, None)
+
+        with self.assertNumQueries(0):
+            choices = spec.lookups(request, None)
+
+        self.assertEqual(
+            [name for name, _ in choices], [label.name for label in Label]
+        )
+
+    def test_the_label_filter_narrows_the_list(self):
+        kept = _detection(self.scan, label="HEADNOTE", label_id=11)
+        _detection(self.scan, label="KEY_ICON", label_id=0)
+
+        response, _queries = self._get("?label=HEADNOTE")
+
+        self.assertEqual(
+            [row.pk for row in response.context["cl"].result_list],
+            [kept.pk],
+        )
+
+    def test_the_decision_list_opens_with_the_same_filter(self):
+        DetectionDecision.objects.create(
+            scan=self.scan,
+            kind=DetectionDecision.Kind.APPROVE,
+            source_page=1,
+            label="KEY_ICON",
+            label_id=0,
+            target_x0=1.0,
+            target_y0=1.0,
+            target_x1=2.0,
+            target_y1=2.0,
+        )
+
+        response = self.client.get(
+            "/admin/scanning/detectiondecision/?label=KEY_ICON"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.context["cl"].result_list), 1)
 
 
 class ScanAdminDeleteSummaryOpinionTests(TestCase):
