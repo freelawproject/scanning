@@ -239,6 +239,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - `release_local_processing` frees `/tmp/scanning/{pk}` after a successful push, on the exit from AWAITING when the park won, on a terminal failure, and at the end of the two queued workers. Never on a re-queue (#215). `cleanup_processing_tmp` judges by `_tree_mtime` and sweeps the `*_TMP_PREFIX` scratch dirs
 - `/stats/` (#260): `STATUS_GROUPS` covers every `Status` value once, test-pinned. A legacy status counts in `LEGACY_STATUSES` only. When #206 lands, move APPROVED into `REDACTION_REVIEW_COMPLETE_STATUSES`
 - A list page costs one query per page for its badges (`repairs.waiting_counts` over the page's ids, after the pagination)
+- The `Detection` admin reads a page of its table and no more (#359): the list walks the primary key, an unfiltered page takes its count from `pg_class` (`EstimatingPaginator`), and a filter on a free text column of a large table is a `SimpleListFilter` with static choices (`LabelFilter`), never Django's default, which runs `SELECT DISTINCT` over the table
 
 ## Tailwind CSS
 
