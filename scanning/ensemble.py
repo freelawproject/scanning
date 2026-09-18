@@ -28,9 +28,14 @@ branch ``extraction_align``, ``pipeline/core/{align,order,consensus}``):
    containment, not IoU, because a small box inside a big one is the
    same content and scores badly on IoU. A group is a connected
    component of those links, so one engine's three boxes and another's
-   one box resolve in one pass. A unit of :data:`MAX_AREA` of the page
-   or more does not link, because a whole-page picture box would chain
-   the page into one group.
+   one box resolve in one pass. **A unit that reads nothing does not
+   link**: a picture box over the body of a page would otherwise take
+   every paragraph of the other engine into one group and read them
+   across the gutter. Such a unit is attached to the group it covers
+   most, as a silent engine, so a reader still learns that one engine
+   read nothing there. The size of a unit decides nothing: a block
+   over the whole body **is** the text of that body, and held apart it
+   would write the page a second time.
 2. **Order.** Three bands: the running heads, the body, the foot. The
    body splits at a column boundary taken from the **left edges** of
    the body boxes, which survives what a hunt for the gutter does not.
@@ -118,14 +123,12 @@ DOCUMENT = "ensemble.json"
 #: The least share of the smaller box two units must share to link.
 OVERLAP = 0.5
 
-#: A unit of this share of the page or more does not link to a smaller
-#: one. The prototype holds a whole-page picture box out of the graph,
-#: because it overlaps everything and would chain the page into one
-#: group. Its line is half the page, and half a page is a size real
-#: text reaches: one Mistral block over the body of a single-column
-#: page is about 0.68 of it, and such a unit held out of the graph
-#: writes the page a second time beside the other engine's paragraphs.
-#: The line is where a picture box lives and text does not.
+#: A group of this share of the page or more is reported as
+#: ``page_scale``. It is a report and not a rule: the prototype holds
+#: a unit of half the page out of the link graph, and half a page is a
+#: size real text reaches (one Mistral block over the body of a
+#: single-column page is about 0.68 of it). What must not link is a
+#: unit that reads nothing, whatever its size.
 MAX_AREA = 0.9
 
 #: Below this worst pair IoU of the merged boxes a group is weak: the
@@ -436,8 +439,95 @@ def _round_box(box: list[float]) -> list[float]:
     return [round(value, 2) for value in box]
 
 
+def _group(
+    by_engine: dict[str, list[dict]], line_band: float, page_area: float
+) -> dict:
+    """Build one group from the units of each engine in it.
+
+    :param by_engine: ``{engine: its units of this group}``.
+    :param line_band: The height of one line band, in points.
+    :param page_area: The area of the page, in square points.
+    :returns: The group.
+    :rtype: dict
+    """
+    merged = {
+        engine: _merge(members, line_band)
+        for engine, members in by_engine.items()
+    }
+    boxes = [unit["box_pt"] for unit in merged.values()]
+    worst = round(
+        min((iou(a, b) for a, b in combinations(boxes, 2)), default=1.0), 3
+    )
+    excluded = [unit for unit in merged.values() if unit["excluded"]]
+    box = _round_box(_union_box(boxes))
+    return {
+        "engines": merged,
+        "present": _ranked(merged),
+        "box_pt": box,
+        "page_scale": area(box) >= MAX_AREA * page_area,
+        "alignment_iou": worst,
+        "weak": len(boxes) > 1 and worst < WEAK_IOU,
+        "excluded": bool(excluded),
+        "reason": excluded[0]["reason"] if excluded else "",
+        "partial": any(unit["partial"] for unit in merged.values()),
+    }
+
+
+def _attach_quiet(
+    quiet: list[dict], groups: list[dict], line_band: float, page_area: float
+) -> None:
+    """Put each unit that reads nothing beside the group it covers.
+
+    A unit with no reading never links, so it cannot chain a page. It
+    is still a fact: one engine drew a box where another read the
+    text, and ``resolve`` reports it in ``silent``. Each such unit goes
+    to the one group it covers most, so a picture box over eight
+    paragraphs is one mark and not eight. A unit that covers no group
+    becomes a group of its own, which carries no text and is dropped.
+
+    :param quiet: The units whose reading is empty.
+    :param groups: The groups of the speaking units; changed in place.
+    :param line_band: The height of one line band, in points.
+    :param page_area: The area of the page, in square points.
+    :return: None.
+    """
+    attached: dict[int, dict[str, list[dict]]] = {}
+    for unit in quiet:
+        best, share = None, 0.0
+        for index, group in enumerate(groups):
+            if unit["engine"] in group["engines"]:
+                continue
+            covered = contained(unit["box_pt"], group["box_pt"])
+            if covered > share:
+                best, share = index, covered
+        if best is None or share < OVERLAP:
+            groups.append(
+                _group({unit["engine"]: [unit]}, line_band, page_area)
+            )
+            continue
+        attached.setdefault(best, {}).setdefault(unit["engine"], []).append(
+            unit
+        )
+    for index, by_engine in attached.items():
+        for engine, members in by_engine.items():
+            # The box and the exclusion of the group stay the ones the
+            # engines that read gave it: a silent box must not grow the
+            # group, and a redaction over an empty box must not take
+            # away text another engine read under its own verdict.
+            groups[index]["engines"][engine] = _merge(members, line_band)
+        groups[index]["present"] = _ranked(groups[index]["engines"])
+
+
 def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     """Return the aligned groups of one page, unordered.
+
+    **A unit that reads nothing does not link.** The guard exists so
+    that a box covering many others cannot chain the page into one
+    group, and that is a picture box, which reads nothing. A big unit
+    that **does** read is the text of what it covers, and it must link
+    or the page is written twice. So the rule reads the presence of a
+    reading and never its content: what the engines wrote still
+    decides nothing about what merges.
 
     :param units: Every engine's units of the page, each with
         ``engine``, ``id``, ``box_pt``, ``text``, ``type``,
@@ -449,60 +539,33 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
         exclusion of its members.
     :rtype: list[dict]
     """
-    cutoff = MAX_AREA * width * height
-    page_scale = {
-        index
-        for index, unit in enumerate(units)
-        if area(unit["box_pt"]) >= cutoff
-    }
     line_band = LINE_BAND * height
+    page_area = width * height
+    speaking, quiet = [], []
+    for unit in units:
+        (speaking if compare_text(unit["text"]) else quiet).append(unit)
 
-    union = _Union(len(units))
-    for left, right in combinations(range(len(units)), 2):
-        # A page-scale unit links to another page-scale unit and to
-        # nothing else: the guard is that it must not swallow the
-        # paragraphs of the page, not that two engines' reading of the
-        # same whole-page box must stay apart and be written twice.
-        if (left in page_scale) != (right in page_scale):
+    union = _Union(len(speaking))
+    for left, right in combinations(range(len(speaking)), 2):
+        if speaking[left]["engine"] == speaking[right]["engine"]:
             continue
-        if units[left]["engine"] == units[right]["engine"]:
-            continue
-        if contained(units[left]["box_pt"], units[right]["box_pt"]) >= OVERLAP:
+        share = contained(speaking[left]["box_pt"], speaking[right]["box_pt"])
+        if share >= OVERLAP:
             union.join(left, right)
 
     buckets: dict[int, list[int]] = {}
-    for index in range(len(units)):
+    for index in range(len(speaking)):
         buckets.setdefault(union.find(index), []).append(index)
 
     groups = []
     for indices in buckets.values():
         by_engine: dict[str, list[dict]] = {}
         for index in indices:
-            by_engine.setdefault(units[index]["engine"], []).append(
-                units[index]
+            by_engine.setdefault(speaking[index]["engine"], []).append(
+                speaking[index]
             )
-        merged = {
-            engine: _merge(members, line_band)
-            for engine, members in by_engine.items()
-        }
-        boxes = [unit["box_pt"] for unit in merged.values()]
-        worst = round(
-            min((iou(a, b) for a, b in combinations(boxes, 2)), default=1.0), 3
-        )
-        excluded = [u for u in merged.values() if u["excluded"]]
-        groups.append(
-            {
-                "engines": merged,
-                "present": _ranked(merged),
-                "box_pt": _round_box(_union_box(boxes)),
-                "page_scale": any(index in page_scale for index in indices),
-                "alignment_iou": worst,
-                "weak": len(boxes) > 1 and worst < WEAK_IOU,
-                "excluded": bool(excluded),
-                "reason": excluded[0]["reason"] if excluded else "",
-                "partial": any(u["partial"] for u in merged.values()),
-            }
-        )
+        groups.append(_group(by_engine, line_band, page_area))
+    _attach_quiet(quiet, groups, line_band, page_area)
     return groups
 
 
@@ -1487,15 +1550,24 @@ def _card(
 # ---------------------------------------------------------------------------
 
 
-def _is_missing(exc: Exception) -> bool:
-    """Return whether a failed read says the object is not there.
+def _is_row_fault(exc: Exception) -> bool:
+    """Return whether a failed read is a fact about the row.
+
+    An object that is not there, and an object that is not JSON: both
+    say the row must be glued again, and both fail the same way at
+    every retry. Everything else is the bucket, and the bucket comes
+    back.
+
+    **Known limit**, the one ``opinion_pdf`` documents: a permission
+    fault reads as transient here, so a bucket policy that forbids the
+    read holds the rows out of ERROR and logs a warning every tick
+    instead. That is the safer way round, and the log says so.
 
     :param exc: What the read raised.
-    :returns: Whether the object is missing, rather than the bucket
-        away.
+    :returns: Whether the row must answer for it.
     :rtype: bool
     """
-    if isinstance(exc, KeyError):
+    if isinstance(exc, (KeyError, ValueError)):
         return True
     error = (getattr(exc, "response", None) or {}).get("Error") or {}
     return str(error.get("Code", "")) in {"NoSuchKey", "404"}
@@ -1507,14 +1579,17 @@ def _read(key: str) -> dict:
     :param key: The object key.
     :returns: The document.
     :rtype: dict
-    :raises EnsembleError: When the object is not there.
+    :raises EnsembleError: When the object is missing or is not JSON.
     :raises TransientFault: When the read itself failed.
     """
     try:
         return s3_sync.download_json_object(key)
     except Exception as exc:
-        if _is_missing(exc):
-            raise EnsembleError(f"the object at {key} is not in the bucket")
+        if _is_row_fault(exc):
+            raise EnsembleError(
+                f"the object at {key} is not in the bucket, or is not a "
+                "document this module can read"
+            )
         raise TransientFault(f"the read of {key} failed: {exc}") from exc
 
 

@@ -144,19 +144,61 @@ class TestTheAlignment(TestCase):
         self.assertEqual(merged["mistral_ocr"]["ids"], [0, 1])
         self.assertEqual(groups[0]["present"], ["dots_mocr", "mistral_ocr"])
 
-    def test_a_page_scale_box_swallows_no_paragraph(self):
-        """A whole-page picture box would chain the page into one
-        group, so it links to no smaller unit."""
+    def test_a_box_that_reads_nothing_swallows_no_paragraph(self):
+        """A picture box over the body would chain the page into one
+        group and read it across the gutter, so it never links. It is
+        still reported: one engine read nothing where the other read
+        the text."""
         units = [
-            unit("dots_mocr", 0, (0, 0, WIDTH, HEIGHT), "", kind="Picture"),
-            unit("mistral_ocr", 0, (36, 108, 288, 324), "alpha"),
+            unit("dots_mocr", 0, (40, 100, 570, 620), "", kind="Picture"),
+            unit("mistral_ocr", 0, (50, 110, 290, 300), "left one"),
+            unit("mistral_ocr", 1, (50, 320, 290, 600), "left two"),
+            unit("mistral_ocr", 2, (330, 110, 560, 300), "right one"),
+            unit("mistral_ocr", 3, (330, 320, 560, 600), "right two"),
+        ]
+
+        placed = ensemble.place(
+            ensemble.align_page(units, WIDTH, HEIGHT), WIDTH, HEIGHT
+        )
+
+        self.assertEqual(
+            [ensemble.resolve(g)["text"] for g in placed],
+            ["left one", "left two", "right one", "right two"],
+        )
+        silent = [g for g in placed if ensemble.resolve(g)["silent"]]
+        self.assertEqual(len(silent), 1)
+
+    def test_a_whole_page_block_with_text_links(self):
+        """One engine reads the page as one block and the other as
+        paragraphs. Held apart, the page would hold its text twice and
+        no card would say so."""
+        units = [
+            unit("dots_mocr", 0, (0, 0, WIDTH, HEIGHT), "alpha beta"),
+            unit("mistral_ocr", 0, (50, 110, 560, 300), "alpha"),
+            unit("mistral_ocr", 1, (50, 320, 560, 600), "beta"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(
+            ensemble.resolve(groups[0])["agreement"], ensemble.UNANIMOUS
+        )
+        self.assertTrue(groups[0]["page_scale"])
+
+    def test_a_box_that_reads_nothing_and_covers_nothing_is_dropped(self):
+        units = [
+            unit("dots_mocr", 0, (0, 0, 100, 60), "", kind="Picture"),
+            unit("mistral_ocr", 0, (300, 400, 560, 600), "alpha"),
         ]
 
         groups = ensemble.align_page(units, WIDTH, HEIGHT)
 
         self.assertEqual(len(groups), 2)
-        self.assertEqual(sorted(len(g["present"]) for g in groups), [1, 1])
-        self.assertTrue(any(g["page_scale"] for g in groups))
+        self.assertEqual(
+            sorted(ensemble.resolve(g)["text"] for g in groups),
+            ["", "alpha"],
+        )
 
     def test_two_whole_page_boxes_make_one_group(self):
         """Two engines' reading of the same whole-page box is one
@@ -1024,6 +1066,20 @@ class TestTheLedger(EnsembleTestCase):
 
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.ensemble_attempts, 0)
+
+    @override_settings(OPINION_ENSEMBLE_MIN_ENGINES=2)
+    def test_a_document_that_is_not_json_spends_an_attempt(self):
+        """It fails the same way at every retry, so it is a fact about
+        the row and not a fault that passes."""
+        self.glue()
+        with patch(
+            "scanning.s3_sync.download_json_object",
+            side_effect=ValueError("Expecting value: line 1 column 1"),
+        ):
+            self.assertEqual(ensemble.run_tick(), 0)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.ensemble_attempts, 1)
 
     @override_settings(OPINION_ENSEMBLE_MIN_ENGINES=2)
     def test_a_missing_document_spends_an_attempt(self):
