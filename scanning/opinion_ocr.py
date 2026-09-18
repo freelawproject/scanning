@@ -2,7 +2,8 @@
 
 Every engine reads the whole volume, and its read is glued into one
 document per corrected volume (``ApplyRun.ocr_key`` for dots.mocr,
-``ApplyRun.extract_key`` for Mistral). The third review (#334) and the
+``ApplyRun.extract_key`` for Mistral, ``ApplyRun.surya_key`` for
+Surya). The third review (#334) and the
 OCR ensemble (#317) work on one opinion at a time, and they must never
 see the text under a redaction or the text of the neighbour opinion on
 a shared page. This module cuts each engine's document to the pages of
@@ -67,6 +68,7 @@ for a late key.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import time
@@ -84,6 +86,7 @@ from scanning import (
     redactions,
     review_states,
     s3_sync,
+    surya,
     yolo,
 )
 from scanning.models import (
@@ -184,8 +187,14 @@ class EngineSpec:
         return getattr(run, self.key_field) or ""
 
 
-def _dots_frame(page: dict, document: dict) -> tuple[float, float] | None:
-    """The render size of a dots.mocr page, off the page itself."""
+def _page_frame(page: dict, document: dict) -> tuple[float, float] | None:
+    """The render size of one page, off the page itself.
+
+    The rule of the two engines whose worker renders each page and
+    reports that render's size: dots.mocr and Surya both write
+    ``origin_width`` and ``origin_height``, and every box of the page
+    is in that pixel space.
+    """
     width, height = page.get("origin_width"), page.get("origin_height")
     if _positive(width) and _positive(height):
         return float(width), float(height)
@@ -202,30 +211,36 @@ def _mistral_frame(page: dict, document: dict) -> tuple[float, float] | None:
     return None
 
 
-def _mistral_owed_rows(scan: Scan, run) -> list:
-    """The rows that say a Mistral read is on its way, last step first.
+def _extract_owed_rows(stage, scan: Scan, run) -> list:
+    """The rows that say one ``EXTRACT`` read is on its way, last step
+    first.
 
-    The read has two steps: the volume rows, then the rows of the
-    pages a curator changed, which the tick creates once the volume is
-    glued. **The later step decides**, because the earlier one is
-    already done when it exists: a consumed volume run with a dead
-    apply row is a read nothing will finish, and asking the volume
-    first would call it owed for good. A scan with no apply row yet
-    falls back to the volume rows, which is the window before the tick
-    creates them.
+    The rule of both engines a person starts (#245, #368), which read
+    in two steps: the volume rows, then the rows of the pages a curator
+    changed, which the tick creates once the volume is glued. **The
+    later step decides**, because the earlier one is already done when
+    it exists: a consumed volume run with a dead apply row is a read
+    nothing will finish, and asking the volume first would call it owed
+    for good. A scan with no apply row yet falls back to the volume
+    rows, which is the window before the tick creates them.
 
+    :param stage: The engine's module (``mistral_ocr`` or ``surya``).
     :param scan: The scan.
     :param run: The final apply run.
     :returns: The rows of the last step that exists.
     :rtype: list
     """
-    return mistral_ocr.apply_jobs(scan, run) or mistral_ocr.live_extract_jobs(
-        scan
-    )
+    return stage.apply_jobs(scan, run) or stage.live_extract_jobs(scan)
 
 
-#: The engines, in the order the ensemble votes. Surya (#301) is one
-#: entry more, and no other code.
+#: The engines, in the order the ensemble votes (#365). Surya is last
+#: (#368): nobody has measured it against the other two on this
+#: corpus, so it takes the rank that moves neither of them. A
+#: measurement is what moves it.
+#:
+#: A third engine is one entry here and no other code. Every reader
+#: walks this table: the glue, the files index, the file route, and
+#: ``engines_owed``.
 ENGINES: dict[str, EngineSpec] = {
     "dots_mocr": EngineSpec(
         name="dots_mocr",
@@ -233,7 +248,7 @@ ENGINES: dict[str, EngineSpec] = {
         units_key="cells",
         text_key="text",
         type_key="category",
-        frame=_dots_frame,
+        frame=_page_frame,
         owed_rows=lambda scan, run: dots_mocr.live_analyze_jobs(scan),
     ),
     "mistral_ocr": EngineSpec(
@@ -243,7 +258,19 @@ ENGINES: dict[str, EngineSpec] = {
         text_key=mistral_ocr.BLOCK_TEXT_KEY,
         type_key="type",
         frame=_mistral_frame,
-        owed_rows=_mistral_owed_rows,
+        owed_rows=functools.partial(_extract_owed_rows, mistral_ocr),
+    ),
+    "surya": EngineSpec(
+        name="surya",
+        key_field="surya_key",
+        units_key="blocks",
+        # The block's flattened text, not its ``html``: the unit shape
+        # is one shape for every engine, and the markup stays in the
+        # volume document for a reader of the tables.
+        text_key="text",
+        type_key="label",
+        frame=_page_frame,
+        owed_rows=functools.partial(_extract_owed_rows, surya),
     ),
 }
 
@@ -434,7 +461,7 @@ def page_size_pt(
     if render:
         width, height = render
         return boundaries.to_points(width, height, width, height)
-    frame = _dots_frame(dots_page or {}, {})
+    frame = _page_frame(dots_page or {}, {})
     if frame is None:
         return None
     dpi = 72.0 if (dots_page or {}).get("render_fallback") else dots_mocr.DPI
