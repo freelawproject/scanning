@@ -1172,13 +1172,15 @@ a.doc-name:hover { text-decoration: underline; }
 /* ------------------------------------------------------------------ */
 
 /* Each column is its own scroll box, so a jump inside one column
-   leaves the other one where the reviewer put it. */
+   leaves the other one where the reviewer put it. The pages column
+   scrolls sideways as well, because a zoomed page is wider than it. */
 .opinion-pages,
 .opinion-text {
-    max-height: 78vh;
+    max-height: 86vh;
     overflow-y: auto;
     position: relative;
 }
+.opinion-pages { overflow-x: auto; }
 
 .opinion-page {
     margin: 0 auto 16px;
@@ -1260,4 +1262,60 @@ a.doc-name:hover { text-decoration: underline; }
 
 .finding-card-live {
     cursor: pointer;
+}
+
+/* The readings of the engines, under the group that differs (#365). */
+/* Not on a selected group: the two rules have the same weight, and
+   this one comes later, so the red of the selection would go. */
+.ensemble-group.differs:not(.ensemble-selected) {
+    border-left-color: rgba(217, 119, 6, 0.75);
+}
+.ensemble-compare {
+    font-size: 10px;
+    padding: 0 5px;
+    border: 1px solid rgba(217, 119, 6, 0.6);
+    border-radius: 9999px;
+    color: #b45309;
+    background: rgba(217, 119, 6, 0.10);
+    cursor: pointer;
+    white-space: nowrap;
+}
+.ensemble-compare:hover,
+.ensemble-compare.open {
+    background: rgba(217, 119, 6, 0.25);
+}
+.ensemble-variants {
+    margin: -4px 0 10px 6px;
+    padding: 6px 8px;
+    border-left: 2px solid rgba(217, 119, 6, 0.75);
+    background: rgba(107, 114, 128, 0.08);
+    border-radius: 0 4px 4px 0;
+}
+.ensemble-variant {
+    display: flex;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 2px 0;
+}
+.ensemble-engine {
+    flex: 0 0 90px;
+    color: #6b7280;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+}
+.ensemble-engine.winner {
+    color: #059669;
+    font-weight: 700;
+}
+.ensemble-engine.winner::after {
+    content: " \2713";
+}
+.ensemble-reading {
+    flex: 1;
+    white-space: pre-wrap;
+}
+.ensemble-reading.absent {
+    color: #9ca3af;
+    font-style: italic;
 }

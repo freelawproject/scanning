@@ -401,9 +401,22 @@ def _fail(opinion: Opinion, message: str, counted: bool) -> None:
     if row is None or row["glue_revision"] != opinion.glue_revision:
         return
     if row["pdf_attempts"] >= MAX_ATTEMPTS:
-        closed = Opinion.objects.filter(
-            pk=opinion.pk, status=OpinionReviewStatus.PROCESSING
-        ).update(status=OpinionReviewStatus.ERROR)
+        # Every status but the two that own themselves: an approved row
+        # keeps the text a person read, and ERROR keeps the reason it
+        # first ended. ``READY_FOR_TEXT_REVIEW`` is in the set (#365),
+        # or a row whose PDF dies after a re-glue would wait for ever
+        # with no alarm, because the swap on ``PROCESSING`` alone would
+        # never land and the row leaves :func:`owed` at the cap.
+        closed = (
+            Opinion.objects.filter(pk=opinion.pk)
+            .exclude(
+                status__in=(
+                    OpinionReviewStatus.TEXT_REVIEW_DONE,
+                    OpinionReviewStatus.ERROR,
+                )
+            )
+            .update(status=OpinionReviewStatus.ERROR)
+        )
         logger.error(
             "opinion %s (scan %s): the redacted PDF failed %d times at "
             "revision %d; %s: %s",

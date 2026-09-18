@@ -7,7 +7,8 @@ Four groups:
 - the write (``opinions.create_rows``): the first run, the second run,
   and the two stale cards;
 - the worker (``opinions.run``): where it parks the scan;
-- the approval and the daemon: the queue and the dispatch.
+- the approval and the daemon: the queue and the dispatch;
+- the promotion to the text review (#365).
 """
 
 from unittest.mock import patch
@@ -856,3 +857,198 @@ class TestFindingCounts(TestCase):
 
         self.assertEqual(counts[self.opinion.pk], (1, 0))
         self.assertEqual(counts[other.pk], (1, 0))
+
+
+class TestTheTextReviewPromotion(TestCase):
+    """``READY_FOR_TEXT_REVIEW`` and its one writer (#365).
+
+    The rule reads the three stamps of the row and no object, so these
+    tests stamp the row the way the two passes do.
+    """
+
+    def setUp(self):
+        self.scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
+        self.opinion = OpinionFactory(scan=self.scan)
+
+    def stamp(self, **fields):
+        """Write the ledgers of the row, as a pass does, and read back."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(**fields)
+        self.opinion.refresh_from_db()
+
+    def ready(self):
+        """Stamp the PDF and the text at the live revision."""
+        self.stamp(
+            redacted_pdf_revision=self.opinion.glue_revision,
+            ocr_glue_revision=self.opinion.glue_revision,
+            ensemble_revision=self.opinion.glue_revision,
+        )
+
+    def test_both_objects_open_the_review(self):
+        self.ready()
+
+        self.assertTrue(opinions.promote_ready(self.opinion))
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+
+    def test_the_text_alone_is_not_enough(self):
+        """The page draws the PDF beside the text, so it waits for both."""
+        self.stamp(
+            ocr_glue_revision=self.opinion.glue_revision,
+            ensemble_revision=self.opinion.glue_revision,
+        )
+
+        self.assertFalse(opinions.promote_ready(self.opinion))
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.status, OpinionReviewStatus.PROCESSING)
+
+    def test_the_pdf_alone_is_not_enough(self):
+        self.stamp(redacted_pdf_revision=self.opinion.glue_revision)
+
+        self.assertFalse(opinions.promote_ready(self.opinion))
+
+    def test_a_text_of_an_older_revision_is_not_the_text(self):
+        """Every stamp must name the live revision, the one rule."""
+        self.ready()
+        self.stamp(glue_revision=1, redacted_pdf_revision=1)
+
+        self.assertFalse(opinions.promote_ready(self.opinion))
+
+    def test_an_approved_opinion_is_left_alone(self):
+        self.ready()
+        self.stamp(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+
+        self.assertFalse(opinions.promote_ready(self.opinion))
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+    def test_an_error_is_left_alone(self):
+        """The way out of ERROR is the work that writes the row again."""
+        self.ready()
+        self.stamp(status=OpinionReviewStatus.ERROR)
+
+        self.assertFalse(opinions.promote_ready(self.opinion))
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.status, OpinionReviewStatus.ERROR)
+
+    def test_a_revision_that_moved_wins_the_swap(self):
+        """A re-glue between the read and the write keeps the row back."""
+        self.ready()
+        stale = Opinion.objects.get(pk=self.opinion.pk)
+        Opinion.objects.filter(pk=self.opinion.pk).update(glue_revision=1)
+
+        self.assertFalse(opinions.promote_ready(stale))
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.status, OpinionReviewStatus.PROCESSING)
+
+    def test_the_pass_promotes_the_rows_that_qualify(self):
+        """The safety net: either pass can be the last one to write."""
+        self.ready()
+        waiting = OpinionFactory(scan=self.scan, first_printed_page=900)
+
+        self.assertEqual(opinions.promote_ready_opinions(), 1)
+
+        self.opinion.refresh_from_db()
+        waiting.refresh_from_db()
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+        self.assertEqual(waiting.status, OpinionReviewStatus.PROCESSING)
+
+    def test_the_pass_promotes_a_row_one_time(self):
+        self.ready()
+
+        self.assertEqual(opinions.promote_ready_opinions(), 1)
+        self.assertEqual(opinions.promote_ready_opinions(), 0)
+
+    def test_the_pass_reads_the_scan_status(self):
+        """A volume an admin sent back invites nobody new.
+
+        The two glue passes and the PDF pass all gate on the scan, so
+        this one does too: the rows of a volume in another status are
+        written again when it comes back, and a reviewer sent to one
+        now would read a text that is about to go.
+        """
+        self.ready()
+        Scan.objects.filter(pk=self.scan.pk).update(
+            status=Status.READY_FOR_REDACTION_REVIEW
+        )
+
+        self.assertEqual(opinions.promote_ready_opinions(), 0)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.status, OpinionReviewStatus.PROCESSING)
+
+    def test_the_pass_takes_no_more_than_its_cap(self):
+        """The collect tick is serial, the rule of the other passes."""
+        self.ready()
+        for index in range(3):
+            other = OpinionFactory(
+                scan=self.scan, first_printed_page=700 + index
+            )
+            Opinion.objects.filter(pk=other.pk).update(
+                redacted_pdf_revision=other.glue_revision,
+                ocr_glue_revision=other.glue_revision,
+                ensemble_revision=other.glue_revision,
+            )
+
+        self.assertEqual(opinions.promote_ready_opinions(limit=2), 2)
+        self.assertEqual(opinions.promote_ready_opinions(limit=2), 2)
+        self.assertEqual(opinions.promote_ready_opinions(limit=2), 0)
+
+    # -- the way back --------------------------------------------------
+
+    def test_a_re_glue_takes_the_row_back(self):
+        """``create_rows`` raises the revision and keeps the status."""
+        self.ready()
+        opinions.promote_ready(self.opinion)
+        self.stamp(glue_revision=self.opinion.glue_revision + 1)
+
+        self.assertTrue(opinions.demote_stale(self.opinion))
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.status, OpinionReviewStatus.PROCESSING)
+
+    def test_a_row_with_both_objects_stays_ready(self):
+        self.ready()
+        opinions.promote_ready(self.opinion)
+
+        self.assertFalse(opinions.demote_stale(self.opinion))
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+
+    def test_an_approved_row_is_never_taken_back(self):
+        """A person read that text; a new revision needs a new approval."""
+        self.ready()
+        self.stamp(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE,
+            glue_revision=self.opinion.glue_revision + 1,
+        )
+
+        self.assertFalse(opinions.demote_stale(self.opinion))
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+    def test_the_pass_takes_back_the_rows_a_re_glue_left(self):
+        self.ready()
+        self.assertEqual(opinions.promote_ready_opinions(), 1)
+        self.stamp(glue_revision=self.opinion.glue_revision + 1)
+
+        self.assertEqual(opinions.promote_ready_opinions(), 1)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.status, OpinionReviewStatus.PROCESSING)

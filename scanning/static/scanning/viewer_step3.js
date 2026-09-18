@@ -36,14 +36,14 @@
 (function () {
     'use strict';
 
-    // The scale the pages are drawn at follows the column: the width
-    // it has, and the height it shows. The ceiling is low on purpose,
-    // the rule of the step-2 viewer, which fits one page in the panel
-    // and never draws above 1.0. A wide screen would else draw a page
-    // of 1160 by 1500 pixels, which is 7 MB of canvas that shows less
-    // than half a page.
-    var MIN_SCALE = 0.4;
-    var MAX_SCALE = 1.2;
+    // The scale the pages are drawn at. The page fits the width of the
+    // column to start with, and the zoom buttons move it between these
+    // two: the reviewer reads the page against the text, so the page
+    // must be readable, and a page wider than the column is scrolled
+    // to the box that is marked.
+    var MIN_SCALE = 0.3;
+    var MAX_SCALE = 3.0;
+    var ZOOM_STEP = 0.25;
 
     // What the page frame and the scroll bar take off the column.
     var COLUMN_PAD = 24;
@@ -71,6 +71,9 @@
     // The size of page one, in points. Every placeholder takes it, so
     // the column has its true height before a page is drawn.
     var pageSize = null;
+
+    // The scale the reviewer asked for, or null for the fit.
+    var zoom = null;
 
     function endpoint(name) {
         return root ? root.dataset[name] : '';
@@ -118,42 +121,66 @@
     // -----------------------------------------------------------------
 
     /**
-     * Return how tall the column shows, in pixels.
+     * Return the scale one page is drawn at.
      *
-     * The stylesheet owns that number (``max-height`` on the two
-     * columns), so this reads it and keeps no copy of it. The height
-     * of the column itself is the height of what is in it before the
-     * pages are drawn, which would make the scale depend on the size
-     * it is about to set.
+     * The width of the column decides it while the reviewer has asked
+     * for nothing: a page fills the column and needs no sideways
+     * scroll, and a resize draws the pages again at the new width.
+     * After a press of a zoom button, that scale is the answer for
+     * every page, and a page wider than the column scrolls.
      *
-     * @returns {number} The height, or 0 when the sheet sets none.
+     * @param {number} width - The width of the page, in points.
+     * @returns {number} The scale.
      */
-    function columnHeight() {
-        var limit = window.getComputedStyle(pagesColumn).maxHeight;
-        var pixels = parseFloat(limit);
-        return isNaN(pixels) ? 0 : pixels;
+    function scaleFor(width) {
+        if (zoom !== null) { return zoom; }
+        if (!pagesColumn || !width) { return MIN_SCALE; }
+        var room = (pagesColumn.clientWidth - COLUMN_PAD) / width;
+        return Math.min(MAX_SCALE, Math.max(MIN_SCALE, room));
     }
 
     /**
-     * Return the scale one page is drawn at.
-     *
-     * The column decides it: the width it has, so a narrow window gets
-     * a smaller page and no sideways scroll, and the height it shows,
-     * so one page of the opinion is one screen of the column. A resize
-     * draws the pages again at the new size.
-     *
-     * @param {number} width - The width of the page, in points.
-     * @param {number} height - The height of the page, in points.
-     * @returns {number} The scale.
+     * Show the scale the pages are drawn at.
      */
-    function scaleFor(width, height) {
-        if (!pagesColumn || !width) { return MIN_SCALE; }
-        var scale = (pagesColumn.clientWidth - COLUMN_PAD) / width;
-        var tall = columnHeight();
-        if (tall && height) {
-            scale = Math.min(scale, (tall - COLUMN_PAD) / height);
+    function showZoom() {
+        var label = document.getElementById('zoom-level');
+        if (!label || !pageSize) { return; }
+        label.textContent = Math.round(scaleFor(pageSize.width) * 100) + '%';
+    }
+
+    /**
+     * Draw every page again at a scale the reviewer asked for.
+     *
+     * @param {string} action - ``in``, ``out`` or ``fit``.
+     */
+    function changeZoom(action) {
+        if (!pageSize) { return; }
+        var before = scaleFor(pageSize.width);
+        if (action === 'fit') {
+            zoom = null;
+        } else {
+            var step = action === 'in' ? ZOOM_STEP : -ZOOM_STEP;
+            zoom = Math.min(MAX_SCALE, Math.max(MIN_SCALE, before + step));
         }
-        return Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale));
+        var after = scaleFor(pageSize.width);
+        sizePlaceholders();
+        redrawRenderedPages();
+        // The column keeps its place in the opinion: every page grew
+        // or shrank by the same factor, and an offset in the old
+        // pixels points at another page in the new ones.
+        if (before) {
+            pagesColumn.scrollTop *= after / before;
+            pagesColumn.scrollLeft *= after / before;
+        }
+        showZoom();
+    }
+
+    function bindZoom() {
+        document.querySelectorAll('[data-zoom]').forEach(function (button) {
+            button.addEventListener('click', function () {
+                changeZoom(button.dataset.zoom);
+            });
+        });
     }
 
     /**
@@ -166,7 +193,7 @@
      */
     function sizePlaceholders() {
         if (!pageSize) { return; }
-        var scale = scaleFor(pageSize.width, pageSize.height);
+        var scale = scaleFor(pageSize.width);
         pagesColumn.querySelectorAll('.opinion-page').forEach(function (page) {
             if (page.dataset.rendered === '1') { return; }
             var wrapper = page.querySelector('.canvas-wrapper');
@@ -271,8 +298,7 @@
     function renderPage(pageDiv, index) {
         if (!pdfDoc || index >= pdfDoc.numPages) { return; }
         pdfDoc.getPage(index + 1).then(function (page) {
-            var size = page.getViewport({ scale: 1 });
-            var scale = scaleFor(size.width, size.height);
+            var scale = scaleFor(page.getViewport({ scale: 1 }).width);
             // The page holds the scale it was drawn at, so a page that
             // crosses the margin again is not drawn again, and a
             // resize that changes the scale is.
@@ -508,7 +534,115 @@
             node.appendChild(document.createTextNode(' '));
             node.appendChild(tag);
         }
+        if (differs(page, group)) {
+            node.appendChild(document.createTextNode(' '));
+            node.appendChild(compareButton(page, group, node));
+            node.classList.add('differs');
+        }
         return node;
+    }
+
+    /**
+     * Return whether the engines did not read one group alike.
+     *
+     * The browser's copy of ``ensemble._differs``, which the card of
+     * the findings and the ``OpinionText`` row both read: a majority,
+     * a word vote, an engine that read nothing, or fewer engines in
+     * the group than the page holds. A group this answers for carries
+     * the badge that opens the readings.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @returns {boolean} Whether they differ.
+     */
+    function differs(page, group) {
+        if (group.agreement === 'majority' || group.agreement === 'voted') {
+            return true;
+        }
+        if ((group.silent || []).length) { return true; }
+        var engines = (page.engines || []).length;
+        return engines > 0
+            && Object.keys(group.engines || {}).length < engines;
+    }
+
+    /**
+     * Build the badge that opens the readings of one group.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @param {HTMLElement} node - The node of the group.
+     * @returns {HTMLElement} The button.
+     */
+    function compareButton(page, group, node) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'ensemble-compare';
+        button.textContent = (page.engines || []).length + ' readings';
+        button.title = 'Show what each engine read here';
+        button.addEventListener('click', function (event) {
+            event.stopPropagation();
+            var standing = node.nextSibling;
+            if (standing && standing.classList
+                    && standing.classList.contains('ensemble-variants')) {
+                standing.remove();
+                button.classList.remove('open');
+                return;
+            }
+            node.parentNode.insertBefore(
+                variantsPanel(page, group), node.nextSibling
+            );
+            button.classList.add('open');
+        });
+        return button;
+    }
+
+    /**
+     * Build the panel that holds one reading per engine.
+     *
+     * Every engine of the page has a line, in the order of the
+     * document, which is the order of ``opinion_ocr.ENGINES`` and
+     * therefore the same on every group of every opinion. The engine
+     * whose reading the text above shows carries the mark, wherever it
+     * falls; an engine that read nothing here, and an engine that drew
+     * no box at all, each say which of the two they are. The reading
+     * enters the DOM with ``textContent``.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @returns {HTMLElement} The panel.
+     */
+    function variantsPanel(page, group) {
+        var panel = document.createElement('div');
+        panel.className = 'ensemble-variants';
+        (page.engines || []).forEach(function (name) {
+            var unit = (group.engines || {})[name];
+            var line = document.createElement('div');
+            line.className = 'ensemble-variant';
+
+            var who = document.createElement('span');
+            who.className = 'ensemble-engine';
+            who.textContent = name;
+            if (name === group.source) {
+                who.classList.add('winner');
+                who.title = 'The reading the text above shows';
+            }
+            line.appendChild(who);
+
+            var reading = document.createElement('span');
+            reading.className = 'ensemble-reading';
+            if (!unit) {
+                reading.classList.add('absent');
+                reading.textContent = 'no box here';
+            } else if (!unit.text) {
+                reading.classList.add('absent');
+                reading.textContent = 'read nothing here';
+            } else {
+                reading.textContent = unit.text;
+            }
+            line.appendChild(reading);
+            panel.appendChild(line);
+        });
+        return panel;
     }
 
     /**
@@ -616,11 +750,18 @@
     }
 
     /**
-     * Bring one element into view inside its own column.
+     * Bring one element into the middle of its own column.
      *
      * The column is the scroll box, so this writes ``scrollTop`` and
-     * never calls ``scrollIntoView``, which would move the window and
-     * take the other column out from under the pointer.
+     * ``scrollLeft`` and never calls ``scrollIntoView``, which would
+     * move the window and take the other column out from under the
+     * pointer. A page zoomed past the width of the column scrolls
+     * sideways too, so the box the reviewer marked is in front of them
+     * and not off the edge.
+     *
+     * An element taller or wider than the column is put at its start,
+     * because the middle of a whole page is not what the reviewer
+     * asked for.
      *
      * @param {HTMLElement} column - The scroll box.
      * @param {HTMLElement} el - The element inside it.
@@ -629,8 +770,22 @@
         if (!column || !el) { return; }
         var frame = column.getBoundingClientRect();
         var box = el.getBoundingClientRect();
-        if (box.top >= frame.top && box.bottom <= frame.bottom) { return; }
-        column.scrollTop += (box.top - frame.top) - (frame.height / 3);
+        if (box.top < frame.top || box.bottom > frame.bottom) {
+            var top = box.top - frame.top + column.scrollTop;
+            column.scrollTop = (
+                box.height > frame.height
+                    ? top
+                    : top - (frame.height - box.height) / 2
+            );
+        }
+        if (box.left < frame.left || box.right > frame.right) {
+            var left = box.left - frame.left + column.scrollLeft;
+            column.scrollLeft = (
+                box.width > frame.width
+                    ? left
+                    : left - (frame.width - box.width) / 2
+            );
+        }
     }
 
     /**
@@ -819,6 +974,7 @@
                     pageSize = { width: size.width, height: size.height };
                     sizePlaceholders();
                     observePages();
+                    showZoom();
                     if (pending !== null) { goToPage(pending); }
                 });
             })
@@ -837,6 +993,7 @@
         textColumn = document.getElementById('opinion-text');
         bindRerun();
         bindFindings();
+        bindZoom();
         if (pagesColumn) {
             pdfjsLib.GlobalWorkerOptions.workerSrc =
                 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/' +
@@ -856,6 +1013,7 @@
             timer = setTimeout(function () {
                 sizePlaceholders();
                 redrawRenderedPages();
+                showZoom();
             }, 200);
         });
     });
