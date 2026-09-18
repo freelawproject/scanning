@@ -41,7 +41,10 @@ from scanning.models import (
     Status,
 )
 from scanning.tests.test_opinion_ocr import (
+    BODY_A,
+    BODY_B,
     OpinionOcrTestCase,
+    block,
     mistral_document,
 )
 from scanning.tests.test_views import ScanningTestCase
@@ -108,6 +111,8 @@ def page_of(page_in_opinion=0, text="the text", groups=(), **values) -> dict:
         "source": {"kind": "original", "pdf_page": page_in_opinion + 2},
         "frame": {"width_pt": WIDTH, "height_pt": HEIGHT},
         "text": text,
+        "engines": ["dots_mocr", "mistral_ocr"],
+        "missing": [],
         "groups": list(groups),
         "dropped": [],
         "counts": counts(**values),
@@ -241,6 +246,34 @@ class TestTheAlignment(TestCase):
         groups = ensemble.align_page(units, WIDTH, HEIGHT)
 
         self.assertEqual(len(groups), 2)
+
+    def test_a_block_over_two_columns_reads_by_column(self):
+        """One engine reads the page as one block; the other reads the
+        paragraphs of both columns. The members of that group must not
+        read across the gutter."""
+        cells = [
+            unit("dots_mocr", 0, (50, 100, 290, 300), "left one"),
+            unit("dots_mocr", 1, (50, 320, 290, 700), "left two"),
+            unit("dots_mocr", 2, (320, 100, 560, 300), "right one"),
+            unit("dots_mocr", 3, (320, 320, 560, 700), "right two"),
+        ]
+        whole = unit("mistral_ocr", 4, (50, 100, 560, 700), "one block")
+
+        groups = ensemble.align_page([*cells, whole], WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(
+            groups[0]["engines"]["dots_mocr"]["text"],
+            "left one left two right one right two",
+        )
+
+    def test_a_unit_of_marks_alone_reads_nothing(self):
+        """A lone ``###`` is a heading mark with no heading."""
+        groups = ensemble.align_page(
+            [unit("dots_mocr", 0, (50, 100, 300, 200), "###")], WIDTH, HEIGHT
+        )
+
+        self.assertEqual(ensemble.resolve(groups[0])["text"], "")
 
     def test_a_group_whose_boxes_barely_match_is_weak(self):
         units = [
@@ -586,6 +619,22 @@ class EnsembleTestCase(OpinionOcrTestCase):
             )
         return self._edit
 
+    def one_body_block(self):
+        """Let Mistral read the body of every page as one block."""
+        document = mistral_document()
+        for page in document["pages"]:
+            page["blocks"] = [
+                block(
+                    BODY_A[0],
+                    BODY_A[1],
+                    BODY_B[2],
+                    BODY_B[3],
+                    text="body A and B",
+                )
+            ]
+        self.objects[self.apply_run.extract_key] = document
+        return document
+
     def stored(self, opinion=None) -> dict:
         """The ensemble document in the bucket."""
         opinion = opinion or self.opinion
@@ -643,6 +692,54 @@ class TestTheDocument(EnsembleTestCase):
         self.assertTrue(page["dropped"][0]["partial"])
         self.assertEqual(page["counts"]["partial"], 1)
 
+    def test_a_box_over_one_cell_of_a_block_is_a_partial_drop(self):
+        """The daily shape of it: one engine reads the body as one
+        block, a redaction covers one cell of the other engine whole,
+        and the group is dropped whole. The reader loses a clean
+        reading, so the page says ``partial``."""
+        self.one_body_block()
+        self.redact(2, BODY_A_PT)
+
+        built = self.run_ensemble()
+
+        page = built["pages"][1]
+        self.assertNotIn("body", page["text"])
+        self.assertTrue(page["dropped"][0]["partial"])
+        self.assertEqual(page["counts"]["partial"], 1)
+
+    def test_a_block_only_one_engine_saw_is_a_disagreement(self):
+        """The other engine drew no box there. Nothing votes, and the
+        page must still say that they did not read it alike."""
+        document = mistral_document()
+        for page in document["pages"]:
+            page["blocks"] = [
+                entry
+                for entry in page["blocks"]
+                if not entry["content"].startswith("body A")
+            ]
+        self.objects[self.apply_run.extract_key] = document
+
+        built = self.run_ensemble()
+
+        page = built["pages"][1]
+        group = next(g for g in page["groups"] if "body A 2" in g["text"])
+        self.assertEqual(group["agreement"], ensemble.SINGLE)
+        self.assertEqual(group["silent"], [])
+        self.assertEqual(page["counts"]["differing"], 1)
+
+    def test_a_page_one_engine_did_not_read_names_it(self):
+        document = mistral_document()
+        document["pages"][2]["blocks"] = []
+        document["pages"][2]["error"] = "not read"
+        self.objects[self.apply_run.extract_key] = document
+
+        built = self.run_ensemble()
+
+        page = built["pages"][1]
+        self.assertEqual(page["engines"], ["dots_mocr", "mistral_ocr"])
+        self.assertEqual(page["missing"], ["mistral_ocr"])
+        self.assertEqual(page["counts"]["differing"], len(page["groups"]))
+
     def test_the_engines_that_differ_make_one_voted_group(self):
         self.disagree()
 
@@ -661,10 +758,10 @@ class TestTheDocument(EnsembleTestCase):
         nothing in. The text stays, and the page says they differ."""
         document = mistral_document()
         for page in document["pages"]:
-            for block in page["blocks"]:
-                if block["content"].startswith("body A"):
-                    block["content"] = ""
-                    block["type"] = "picture"
+            for entry in page["blocks"]:
+                if entry["content"].startswith("body A"):
+                    entry["content"] = ""
+                    entry["type"] = "picture"
         self.objects[self.apply_run.extract_key] = document
 
         built = self.run_ensemble()
@@ -723,9 +820,9 @@ class TestTheDocument(EnsembleTestCase):
         """Make the Mistral read of one block differ from the dots one."""
         document = mistral_document()
         for page in document["pages"]:
-            for block in page["blocks"]:
-                if block["content"].startswith("body A"):
-                    block["content"] = text
+            for entry in page["blocks"]:
+                if entry["content"].startswith("body A"):
+                    entry["content"] = text
         self.objects[self.apply_run.extract_key] = document
 
 
@@ -842,7 +939,10 @@ class TestTheRows(EnsembleTestCase):
                         "start": 0,
                         "end": 8,
                         "agreement": ensemble.UNANIMOUS,
-                        "engines": {"dots_mocr": {"text": "the text"}},
+                        "engines": {
+                            "dots_mocr": {"text": "the text"},
+                            "mistral_ocr": {"text": "the text"},
+                        },
                     }
                 ]
             )
@@ -906,6 +1006,21 @@ class TestTheFindings(EnsembleTestCase):
 
     def test_a_page_the_engines_agree_on_makes_no_card(self):
         self.assertEqual(self.rebuild(unanimous=4), [])
+
+    def test_the_card_names_the_engine_that_did_not_read(self):
+        document = mistral_document()
+        document["pages"][2]["blocks"] = []
+        document["pages"][2]["error"] = "not read"
+        self.objects[self.apply_run.extract_key] = document
+
+        self.run_ensemble()
+
+        card = OpinionFinding.objects.get(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.ENGINES_DISAGREE,
+        )
+        self.assertIn("mistral_ocr did not read this page", card.message)
 
     def test_a_standing_dismissal_mutes_the_new_card(self):
         dismissal = OpinionFindingDismissal.objects.create(
@@ -1094,6 +1209,25 @@ class TestTheLedger(EnsembleTestCase):
         self.assertEqual(self.opinion.ensemble_attempts, 1)
 
     @override_settings(OPINION_ENSEMBLE_MIN_ENGINES=2)
+    def test_a_glue_that_moved_takes_the_rows_back(self):
+        """The OCR glue wrote again while the text was written, so the
+        rows and the cards describe documents that are gone."""
+        opinion = self.glue()
+        documents = ensemble.load_documents(opinion)
+
+        def move(*args, **kwargs):
+            Opinion.objects.filter(pk=opinion.pk).update(
+                ocr_glue_revision=opinion.ocr_glue_revision + 1
+            )
+            return 0
+
+        with patch("scanning.ensemble.rebuild_findings", side_effect=move):
+            ensemble.write(opinion, documents)
+
+        self.assertFalse(OpinionText.objects.filter(opinion=opinion).exists())
+        opinion.refresh_from_db()
+        self.assertIsNone(opinion.ensemble_revision)
+
     def test_an_approved_row_is_not_due(self):
         """A person read its text and said it is right, the rule
         ``opinion_ocr.reglue`` and ``opinions.create_rows`` follow."""
@@ -1215,7 +1349,9 @@ class TestTheButton(EnsembleTestCase, ScanningTestCase):
         response = self.client.post(self.url())
 
         self.assertEqual(response.status_code, 409)
-        self.assertIn("is not in the bucket", response.json()["message"])
+        message = response.json()["message"]
+        self.assertIn("must be written again", message)
+        self.assertNotIn("jobs/opinions", message)
 
     def test_409_for_an_approved_opinion(self):
         self.glue()

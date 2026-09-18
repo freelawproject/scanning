@@ -40,7 +40,10 @@ branch ``extraction_align``, ``pipeline/core/{align,order,consensus}``):
    body splits at a column boundary taken from the **left edges** of
    the body boxes, which survives what a hunt for the gutter does not.
    A box that crosses the boundary is full width and restarts the
-   order below it.
+   order below it. One rule (:func:`reading_order`) orders the groups
+   of a page **and** the members of one engine inside a group: a group
+   can span the gutter, and members ordered by line alone read left
+   one, right one, left two, right two.
 3. **Resolve.** The engines' texts vote. A group they all read the
    same way is ``unanimous``; a group a majority reads the same way is
    ``majority``; a group with no majority is voted word by word; a
@@ -48,7 +51,10 @@ branch ``extraction_align``, ``pipeline/core/{align,order,consensus}``):
 4. **Exclude.** A group any of whose units carries an ``exclusion`` is
    dropped, **after** the alignment and never before it. The ensemble
    experiment of #317 measured that: the engines' boxes differ, so a
-   drop before the alignment leaves one-engine regions behind.
+   drop before the alignment leaves one-engine regions behind. The
+   group goes whole, so a reading inside it that no exclusion covers
+   is text the reader loses, and that is what the
+   ``PARTIAL_REDACTION`` card counts.
 
 **Three deviations from the prototype.**
 
@@ -239,11 +245,37 @@ _WS = re.compile(r"\s+")
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 
 
+#: What an :class:`EnsembleError` is about. The message of the error
+#: names the object it read, which belongs in the log and on the row;
+#: the button answers the line ``views_api`` keeps for the code, so a
+#: key of the bucket never reaches a browser.
+UNREADABLE = "unreadable"
+NO_ENGINE = "no_engine"
+SHORT_DOCUMENT = "short_document"
+
+
 class EnsembleError(Exception):
     """A fact about one row: its text cannot be written.
 
     Spends an attempt on the row. The message goes to
     ``Opinion.error_message``.
+
+    :param message: What failed, for the log and for the row.
+    :param code: Which of :data:`UNREADABLE`, :data:`NO_ENGINE` and
+        :data:`SHORT_DOCUMENT` it is, for the line the button shows.
+    """
+
+    def __init__(self, message: str, code: str = UNREADABLE) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _RevisionMoved(Exception):
+    """The OCR glue wrote again while the text was written (#365).
+
+    Raised inside the transaction of :func:`write` alone, to take back
+    the rows and the cards of a document nothing describes now. The
+    row keeps its old stamp, so the ensemble is due again.
     """
 
 
@@ -271,15 +303,22 @@ class TransientFault(Exception):
 def plain(fragment: str | None) -> str:
     """Return one unit's content with none of its markup.
 
+    A fragment that carries no reading is empty here, whatever its
+    marks: a lone ``###`` is a heading mark with no heading, and a
+    group of one such unit would otherwise write it into the page.
+    :func:`compare_text` is the one rule for "this fragment reads
+    nothing", and :func:`align_page` reads it too.
+
     :param fragment: The engine's text.
     :returns: The text, with the tags and the image placeholders gone
-        and the whitespace collapsed.
+        and the whitespace collapsed; empty when it reads nothing.
     :rtype: str
     """
     if not fragment:
         return ""
     stripped = _TAG.sub(" ", _MD_IMAGE.sub(" ", fragment))
-    return _WS.sub(" ", stripped).strip()
+    shown = _WS.sub(" ", stripped).strip()
+    return shown if compare_text(shown) else ""
 
 
 def compare_text(text: str) -> str:
@@ -404,15 +443,29 @@ class _Union:
 # ---------------------------------------------------------------------------
 
 
-def _merge(members: list[dict], line_band: float) -> dict:
+def _merge(
+    members: list[dict],
+    line_band: float,
+    boundary: float | None,
+    width: float,
+) -> dict:
     """Merge one engine's members of a group into one unit.
+
+    **The members read in the order of the page**, columns included
+    (:func:`reading_order`). One engine can read a page as one block
+    while the other reads every paragraph of both columns, and those
+    paragraphs are then the members of one group: ordered by line
+    band alone they read across the gutter, left one, right one, left
+    two, right two, and the vote turns that into a text no page has.
 
     :param members: The engine's units of the group.
     :param line_band: The height of one line band, in points.
+    :param boundary: The column boundary of the page, or None.
+    :param width: The page width, in points.
     :returns: The merged unit.
     :rtype: dict
     """
-    ordered = line_sort(members, line_band)
+    ordered = reading_order(members, line_band, boundary, width)
     texts = [t for t in (plain(m["text"]) for m in ordered) if t]
     excluded = [m for m in ordered if m["exclusion"]]
     partial = [
@@ -431,6 +484,11 @@ def _merge(members: list[dict], line_band: float) -> dict:
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
         "partial": bool(partial),
+        # Whether this engine read a word here that no exclusion
+        # covers. A group is dropped whole, so a clean reading beside
+        # an excluded one is text the reader loses, and that is what
+        # the ``PARTIAL_REDACTION`` card counts (#365).
+        "clean": any(plain(m["text"]) for m in ordered if not m["exclusion"]),
     }
 
 
@@ -440,18 +498,24 @@ def _round_box(box: list[float]) -> list[float]:
 
 
 def _group(
-    by_engine: dict[str, list[dict]], line_band: float, page_area: float
+    by_engine: dict[str, list[dict]],
+    line_band: float,
+    page_area: float,
+    boundary: float | None,
+    width: float,
 ) -> dict:
     """Build one group from the units of each engine in it.
 
     :param by_engine: ``{engine: its units of this group}``.
     :param line_band: The height of one line band, in points.
     :param page_area: The area of the page, in square points.
+    :param boundary: The column boundary of the page, or None.
+    :param width: The page width, in points.
     :returns: The group.
     :rtype: dict
     """
     merged = {
-        engine: _merge(members, line_band)
+        engine: _merge(members, line_band, boundary, width)
         for engine, members in by_engine.items()
     }
     boxes = [unit["box_pt"] for unit in merged.values()]
@@ -469,12 +533,25 @@ def _group(
         "weak": len(boxes) > 1 and worst < WEAK_IOU,
         "excluded": bool(excluded),
         "reason": excluded[0]["reason"] if excluded else "",
-        "partial": any(unit["partial"] for unit in merged.values()),
+        # A group is dropped whole, so a reading no exclusion covers
+        # beside an excluded one is text the reader loses, and the
+        # card must say so (#365). The redaction over one cell of a
+        # page-wide block is the daily shape of it: the cell is
+        # covered whole, so the unit's own ``partial`` is false, and
+        # the page would lose its body with no card at all.
+        "partial": any(unit["partial"] for unit in merged.values())
+        or bool(excluded)
+        and any(unit["clean"] for unit in merged.values()),
     }
 
 
 def _attach_quiet(
-    quiet: list[dict], groups: list[dict], line_band: float, page_area: float
+    quiet: list[dict],
+    groups: list[dict],
+    line_band: float,
+    page_area: float,
+    boundary: float | None,
+    width: float,
 ) -> None:
     """Put each unit that reads nothing beside the group it covers.
 
@@ -489,6 +566,8 @@ def _attach_quiet(
     :param groups: The groups of the speaking units; changed in place.
     :param line_band: The height of one line band, in points.
     :param page_area: The area of the page, in square points.
+    :param boundary: The column boundary of the page, or None.
+    :param width: The page width, in points.
     :return: None.
     """
     attached: dict[int, dict[str, list[dict]]] = {}
@@ -502,7 +581,13 @@ def _attach_quiet(
                 best, share = index, covered
         if best is None or share < OVERLAP:
             groups.append(
-                _group({unit["engine"]: [unit]}, line_band, page_area)
+                _group(
+                    {unit["engine"]: [unit]},
+                    line_band,
+                    page_area,
+                    boundary,
+                    width,
+                )
             )
             continue
         attached.setdefault(best, {}).setdefault(unit["engine"], []).append(
@@ -514,7 +599,9 @@ def _attach_quiet(
             # engines that read gave it: a silent box must not grow the
             # group, and a redaction over an empty box must not take
             # away text another engine read under its own verdict.
-            groups[index]["engines"][engine] = _merge(members, line_band)
+            groups[index]["engines"][engine] = _merge(
+                members, line_band, boundary, width
+            )
         groups[index]["present"] = _ranked(groups[index]["engines"])
 
 
@@ -541,6 +628,10 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     """
     line_band = LINE_BAND * height
     page_area = width * height
+    # The columns of the page, off the units and not off the groups: a
+    # group can span the gutter, and the members inside it read by
+    # column like everything else (:func:`reading_order`).
+    boundary = column_boundary(units, width, height)
     speaking, quiet = [], []
     for unit in units:
         (speaking if compare_text(unit["text"]) else quiet).append(unit)
@@ -564,8 +655,8 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
             by_engine.setdefault(speaking[index]["engine"], []).append(
                 speaking[index]
             )
-        groups.append(_group(by_engine, line_band, page_area))
-    _attach_quiet(quiet, groups, line_band, page_area)
+        groups.append(_group(by_engine, line_band, page_area, boundary, width))
+    _attach_quiet(quiet, groups, line_band, page_area, boundary, width)
     return groups
 
 
@@ -603,6 +694,54 @@ def line_sort(boxes: list[dict], line_band: float) -> list[dict]:
     )
 
 
+def reading_order(
+    boxes: list[dict], line_band: float, boundary: float | None, width: float
+) -> list[dict]:
+    """Return boxes in the reading order of one page's body.
+
+    **The one rule**, and both levels call it: :func:`place` orders
+    the groups of a page, and :func:`_merge` orders the members of one
+    engine inside a group. A group can span the gutter, so the members
+    inside it need the columns as much as the groups do.
+
+    The left column reads before the right one, and a box that
+    straddles the boundary is full width: it reads where it sits and
+    the order restarts below it.
+
+    :param boxes: Dicts with ``box_pt``.
+    :param line_band: The height of one band, in points.
+    :param boundary: The column boundary, or None for one column.
+    :param width: The page width, in points.
+    :returns: The boxes, ordered.
+    :rtype: list[dict]
+    """
+    if boundary is None:
+        return line_sort(boxes, line_band)
+    band = line_band if line_band > 0 else 1.0
+    separators = sorted(
+        (b for b in boxes if _straddles(b["box_pt"], boundary, width)),
+        key=lambda b: b["box_pt"][1],
+    )
+    rest = [b for b in boxes if not _straddles(b["box_pt"], boundary, width)]
+    ordered: list[dict] = []
+    top = -1.0
+    for separator in [*separators, None]:
+        cut = separator["box_pt"][1] if separator is not None else float("inf")
+        segment = [b for b in rest if top <= b["box_pt"][1] < cut]
+        segment.sort(
+            key=lambda b: (
+                _side(b["box_pt"], boundary),
+                round(b["box_pt"][1] / band),
+                b["box_pt"][0],
+            )
+        )
+        ordered += segment
+        if separator is not None:
+            ordered.append(separator)
+        top = cut
+    return ordered
+
+
 def _split_bands(
     groups: list[dict], height: float
 ) -> tuple[list[dict], list[dict], list[dict]]:
@@ -619,7 +758,7 @@ def _split_bands(
 
 
 def column_boundary(
-    groups: list[dict], width: float, height: float
+    boxes: list[dict], width: float, height: float
 ) -> float | None:
     """Return the x that separates the two columns, or None.
 
@@ -628,14 +767,18 @@ def column_boundary(
     edge less a pad, not the middle of the gap, because the left
     column's text runs up to the gutter.
 
-    :param groups: The groups of the page.
+    The caller decides which boxes it asks about: :func:`align_page`
+    asks about the units, which is every edge the page has, and
+    :func:`place` about the groups it is placing.
+
+    :param boxes: Dicts with ``box_pt``: the units, or the groups.
     :param width: The page width, in points.
     :param height: The page height, in points.
     :returns: The boundary, or None for one column.
     :rtype: float | None
     """
-    _, body, _ = _split_bands(groups, height)
-    edges = sorted(group["box_pt"][0] for group in body)
+    _, body, _ = _split_bands(boxes, height)
+    edges = sorted(box["box_pt"][0] for box in body)
     if len(edges) < MIN_BODY_BOXES:
         return None
     gap, right_edge = 0.0, None
@@ -684,46 +827,19 @@ def place(groups: list[dict], width: float, height: float) -> list[dict]:
     boundary = column_boundary(groups, width, height)
     line_band = LINE_BAND * height
 
-    ordered: list[dict] = []
-    if boundary is None:
-        ordered = [
-            {**group, "band": "body", "column": None}
-            for group in sorted(
-                body, key=lambda g: (g["box_pt"][1], g["box_pt"][0])
-            )
-        ]
-    else:
-        separators = sorted(
-            (g for g in body if _straddles(g["box_pt"], boundary, width)),
-            key=lambda g: g["box_pt"][1],
-        )
-        rest = [
-            g for g in body if not _straddles(g["box_pt"], boundary, width)
-        ]
-        top = -1.0
-        for separator in [*separators, None]:
-            cut = (
-                separator["box_pt"][1] if separator is not None else height + 1
-            )
-            segment = [g for g in rest if top <= g["box_pt"][1] < cut]
-            segment.sort(
-                key=lambda g: (
-                    _side(g["box_pt"], boundary),
-                    g["box_pt"][1],
-                    g["box_pt"][0],
-                )
-            )
-            ordered += [
-                {
-                    **group,
-                    "band": "body",
-                    "column": _side(group["box_pt"], boundary),
-                }
-                for group in segment
-            ]
-            if separator is not None:
-                ordered.append({**separator, "band": "body", "column": None})
-            top = cut
+    ordered = [
+        {
+            **group,
+            "band": "body",
+            "column": (
+                None
+                if boundary is None
+                or _straddles(group["box_pt"], boundary, width)
+                else _side(group["box_pt"], boundary)
+            ),
+        }
+        for group in reading_order(body, line_band, boundary, width)
+    ]
 
     return (
         [
@@ -1043,6 +1159,9 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
     :rtype: dict
     """
     first = next(iter(pages.values()))
+    read = {
+        engine: page for engine, page in pages.items() if "error" not in page
+    }
     entry = {
         "page_in_opinion": page_in_opinion,
         "page_index": first.get("page_index"),
@@ -1050,12 +1169,16 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         "source": first.get("source"),
         "frame": None,
         "text": "",
+        # Every engine of the document, and the ones whose read of
+        # this page failed (#238 does fail single pages). A group of
+        # fewer engines than this is a place they did not read alike,
+        # the rule of :func:`_differs`, so a page one engine did not
+        # read says so on every group of it.
+        "engines": list(pages),
+        "missing": [engine for engine in pages if engine not in read],
         "groups": [],
         "dropped": [],
         "counts": _counts(),
-    }
-    read = {
-        engine: page for engine, page in pages.items() if "error" not in page
     }
     if not read:
         entry["error"] = first.get("error") or "no engine read this page"
@@ -1147,7 +1270,7 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         entry["counts"]["low_confidence"] += read_back["n_low_confidence"]
         if read_back["silent"]:
             entry["counts"]["silent"] += 1
-        if _differs(entry["groups"][-1]):
+        if _differs(entry["groups"][-1], len(pages)):
             entry["counts"]["differing"] += 1
 
     entry["text"] = PARAGRAPH_GAP.join(parts)
@@ -1159,17 +1282,25 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
     return entry
 
 
-def _differs(group: dict) -> bool:
+def _differs(group: dict, engines: int) -> bool:
     """Return whether the engines did not read one group alike.
 
     One rule for the card of the findings and for the entry of
     ``OpinionText.disagreements``, which must count the same places.
 
+    A group **no** other engine has a box for counts too: one engine
+    read a block and the other drew nothing there, which is a place a
+    person must look at, and it is the shape a page one engine did not
+    read takes on every group of it.
+
     :param group: One group of the document.
+    :param engines: How many engines the document holds.
     :returns: Whether it is a disagreement.
     :rtype: bool
     """
-    return bool(group["agreement"] in (MAJORITY, VOTED) or group.get("silent"))
+    if group["agreement"] in (MAJORITY, VOTED) or group.get("silent"):
+        return True
+    return len(group.get("engines") or {}) < engines
 
 
 def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
@@ -1184,7 +1315,7 @@ def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
     """
     engines = [name for name in opinion_ocr.ENGINES if name in documents]
     if not engines:
-        raise EnsembleError("this opinion has no engine document")
+        raise EnsembleError("this opinion has no engine document", NO_ENGINE)
     by_page: dict[str, dict[int, dict]] = {}
     for engine in engines:
         by_page[engine] = {
@@ -1202,7 +1333,8 @@ def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
             if page is None:
                 raise EnsembleError(
                     f"the {engine} document has no page "
-                    f"{page_in_opinion + 1} of this opinion"
+                    f"{page_in_opinion + 1} of this opinion",
+                    SHORT_DOCUMENT,
                 )
             of_page[engine] = page
         entry = build_page(of_page, page_in_opinion)
@@ -1431,6 +1563,7 @@ def _disagreements(page: dict) -> list[dict]:
     :returns: ``[{start, end, agreement, variants}]``.
     :rtype: list[dict]
     """
+    engines = len(page.get("engines") or [])
     return [
         {
             "start": group["start"],
@@ -1441,7 +1574,7 @@ def _disagreements(page: dict) -> list[dict]:
             },
         }
         for group in page["groups"]
-        if _differs(group)
+        if _differs(group, engines)
     ]
 
 
@@ -1485,15 +1618,15 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
         # hold a majority, so a card that read ``counts[MAJORITY]``
         # alone would never be written.
         differing = counts["differing"]
-        if differing:
+        missing = page.get("missing") or []
+        if differing or missing:
             cards.append(
                 _card(
                     opinion,
                     page_number,
                     OpinionCheck.ENGINES_DISAGREE,
                     Issue.Severity.WARNING,
-                    f"The engines differ in {differing} place(s) on this "
-                    "page. The vote picked a read for each.",
+                    _disagree_message(differing, missing),
                     standing,
                 )
             )
@@ -1524,6 +1657,33 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
             )
     OpinionFinding.objects.bulk_create(cards)
     return len(cards)
+
+
+def _disagree_message(differing: int, missing: list[str]) -> str:
+    """Return the line of one ``ENGINES_DISAGREE`` card.
+
+    An engine that did not read the page at all is named: the reader
+    must know that the text of the page comes from the others, and the
+    count alone does not say it.
+
+    :param differing: How many groups the engines did not read alike.
+    :param missing: The engines whose read of the page failed.
+    :returns: The message.
+    :rtype: str
+    """
+    named = ", ".join(missing)
+    if missing and not differing:
+        return (
+            f"{named} did not read this page. The text comes from the "
+            "engine(s) that did."
+        )
+    count = (
+        f"The engines differ in {differing} place(s) on this page. The "
+        "vote picked a read for each."
+    )
+    if missing:
+        return f"{named} did not read this page. {count}"
+    return count
 
 
 def _card(
@@ -1573,10 +1733,11 @@ def _is_row_fault(exc: Exception) -> bool:
     return str(error.get("Code", "")) in {"NoSuchKey", "404"}
 
 
-def _read(key: str) -> dict:
+def _read(key: str, code: str = UNREADABLE) -> dict:
     """Read one JSON object, and say which kind of fault stopped it.
 
     :param key: The object key.
+    :param code: The code of the error a fault of the row raises.
     :returns: The document.
     :rtype: dict
     :raises EnsembleError: When the object is missing or is not JSON.
@@ -1588,7 +1749,8 @@ def _read(key: str) -> dict:
         if _is_row_fault(exc):
             raise EnsembleError(
                 f"the object at {key} is not in the bucket, or is not a "
-                "document this module can read"
+                "document this module can read",
+                code,
             )
         raise TransientFault(f"the read of {key} failed: {exc}") from exc
 
@@ -1615,13 +1777,17 @@ def load_documents(opinion: Opinion) -> dict[str, dict]:
         if name in (manifest.get("engines") or {})
     ]
     if not names:
-        raise EnsembleError(f"the manifest at {manifest_key} names no engine")
+        raise EnsembleError(
+            f"the manifest at {manifest_key} names no engine", NO_ENGINE
+        )
     documents = {}
     for name in names:
         key = opinion_ocr.engine_key(opinion, name)
         document = _read(key)
         if not isinstance(document, dict) or "pages" not in document:
-            raise EnsembleError(f"the object at {key} is not a document")
+            raise EnsembleError(
+                f"the object at {key} is not a document", UNREADABLE
+            )
         documents[name] = document
     return documents
 
@@ -1630,8 +1796,9 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
     """Write one opinion's text, findings and ensemble document.
 
     The document goes up first, then the rows and the findings and the
-    stamp in one transaction: a revision that moved during the write
-    wins the compare-and-swap, and the ensemble is due again.
+    stamp in one transaction, under a lock on the row: a revision that
+    moved during the write wins the compare-and-swap, the rows and the
+    cards go back, and the ensemble is due again.
 
     :param opinion: The row.
     :param documents: :func:`load_documents`.
@@ -1645,15 +1812,27 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
     if not s3_sync.upload_json_object(key, document):
         raise TransientFault(f"the upload to {key} failed")
 
-    with transaction.atomic():
-        write_rows(opinion, document)
-        rebuild_findings(opinion, document)
-        stamped = Opinion.objects.filter(
-            pk=opinion.pk, ocr_glue_revision=opinion.ocr_glue_revision
-        ).update(
-            ensemble_revision=opinion.ocr_glue_revision, ensemble_attempts=0
-        )
-        if stamped:
+    try:
+        with transaction.atomic():
+            # One writer at a time on this row's text. The tick, the
+            # button and the command can all be in this block at once,
+            # and ``update_or_create`` between two of them is a lost
+            # select and an ``IntegrityError``. The lock is held over
+            # row writes alone: no HTTP call is inside it.
+            Opinion.objects.select_for_update().filter(pk=opinion.pk).exists()
+            write_rows(opinion, document)
+            rebuild_findings(opinion, document)
+            stamped = Opinion.objects.filter(
+                pk=opinion.pk, ocr_glue_revision=opinion.ocr_glue_revision
+            ).update(
+                ensemble_revision=opinion.ocr_glue_revision,
+                ensemble_attempts=0,
+            )
+            if not stamped:
+                # The glue wrote the documents again while this ran, so
+                # the rows and the cards above describe documents that
+                # are gone. Take them back and leave the ensemble due.
+                raise _RevisionMoved
             # An ERROR this module wrote is answered by this success:
             # the row is readable again, and the operator who pressed
             # the button or ran the command is the one who decided
@@ -1667,6 +1846,13 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             Opinion.objects.filter(
                 pk=opinion.pk, error_message__startswith=MESSAGE_PREFIX
             ).update(error_message="")
+    except _RevisionMoved:
+        logger.info(
+            "%s of scan %s: the OCR glue moved while the text was written; "
+            "the ensemble is due again",
+            opinion,
+            opinion.scan_id,
+        )
     return document
 
 

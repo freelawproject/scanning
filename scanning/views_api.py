@@ -155,6 +155,25 @@ ENSEMBLE_BUCKET_MESSAGE = (
     "The file store did not answer, so nothing was written. Press the "
     "button again."
 )
+#: The line of each ``ensemble.EnsembleError`` code. The answer is
+#: built from this table and never from the error: the error names the
+#: object it read, and a key of the bucket belongs in the log and on
+#: the row, not in a browser.
+ENSEMBLE_ERROR_MESSAGES = {
+    "unreadable": (
+        "One of the OCR documents of this opinion is missing, or it is "
+        "not a document this portal can read. They must be written "
+        "again before the text can be."
+    ),
+    "no_engine": (
+        "The OCR glue of this opinion wrote no engine document, so "
+        "there is nothing to read."
+    ),
+    "short_document": (
+        "An OCR document of this opinion has fewer pages than the "
+        "opinion. They must be written again before the text can be."
+    ),
+}
 
 #: The two labels the opinion pairing reads: a box of one of them
 #: changes the boundaries, and only the measurement pairs them again.
@@ -813,7 +832,7 @@ def rerun_opinion_ensemble(
         or 409 when the OCR documents are not written or the row
         refuses to read.
     """
-    from scanning import ensemble, opinion_ocr
+    from scanning import ensemble, opinion_ocr, s3_sync
     from scanning.models import OpinionReviewStatus
 
     scan = get_object_or_404(Scan, pk=pk)
@@ -826,6 +845,13 @@ def rerun_opinion_ensemble(
     if not opinion_ocr.is_written(opinion):
         return JsonResponse(
             {"status": "error", "message": ENSEMBLE_NOT_GLUED_MESSAGE},
+            status=409,
+        )
+    if not s3_sync.s3_active():
+        # The reads and the write are the bucket, the rule of
+        # ``ensemble.run_tick``, which asks the same question first.
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_BUCKET_MESSAGE},
             status=409,
         )
     try:
@@ -844,9 +870,22 @@ def rerun_opinion_ensemble(
             status=409,
         )
     except ensemble.EnsembleError as exc:
-        # Every message of this class is one this code wrote.
+        # The line comes from the table above, by the code of the
+        # error: the error itself names the object it read.
+        logger.warning(
+            "%s of scan %s: the ensemble refused the row: %s",
+            opinion,
+            scan.pk,
+            exc,
+        )
         return JsonResponse(
-            {"status": "error", "message": str(exc)}, status=409
+            {
+                "status": "error",
+                "message": ENSEMBLE_ERROR_MESSAGES.get(
+                    exc.code, ENSEMBLE_ERROR_MESSAGES["unreadable"]
+                ),
+            },
+            status=409,
         )
     logger.info(
         "%s of scan %s: %s ran the OCR ensemble again",
