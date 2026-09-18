@@ -14,11 +14,17 @@ DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py test scan
 # Survey the layout-JSON repair over the corpus, changing nothing (#242)
 docker exec scanning-daemon python manage.py reglue_dots_mocr --dry-run
 
+# Glue the Mistral reads again after a transform change (#245)
+docker exec scanning-daemon python manage.py reglue_mistral_ocr --dry-run
+
 # Write the review-2 findings of the volumes already in review 2, once after a deploy (#240 PR D)
 docker exec scanning-daemon python manage.py rebuild_review2_findings
 
 # Write the headnote bracket readings of the volumes already computed (#328)
 docker exec scanning-daemon python manage.py stamp_bracket_readings --dry-run
+
+# Write the OCR documents of a volume's opinions again, after a late engine read or a transform change (#350)
+docker exec scanning-daemon python manage.py reglue_opinion_ocr 2845 --dry-run
 
 # Fit the standing text redaction boxes to the read text, once after a deploy (#279)
 docker exec scanning-daemon python manage.py refit_text_redactions --dry-run
@@ -69,10 +75,10 @@ This file holds what the code and the git history cannot tell a reader: the comm
 State is `Scan.status`. The stages, and where each runs:
 
 1. `run_full_pipeline` (daemon, `process_next_scan`): shards the original (#164), sets `page_count`, creates the CONVERT rows (doctor bitonal, #176) and the ANALYZE rows (dots.mocr on RunPod, #190/#207), then parks the scan in AWAITING or AWAITING_VALIDATION.
-2. Daemon ticks (`submit_external_jobs`, `collect_external_jobs`, serial scheduler, #156). The submit tick starts one detection run and one OCR run per shard set (`yolo.enqueue_missing_runs`, #250; `dots_mocr.enqueue_missing_runs`, #327). The collect tick merges the bitonal shards, glues the dots.mocr run, applies the page numbers (`run_compute_issues`, #204), triggers the apply (#224), merges the detection run and queues the redaction compute (#196), and promotes the review states (#263).
+2. Daemon ticks (`submit_external_jobs`, `collect_external_jobs`, serial scheduler, #156). The submit tick starts one detection run and one OCR run per shard set (`yolo.enqueue_missing_runs`, #250; `dots_mocr.enqueue_missing_runs`, #327). The collect tick merges the bitonal shards, glues the dots.mocr run, applies the page numbers (`run_compute_issues`, #204), triggers the apply (#224), merges the detection run and queues the redaction compute (#196), and promotes the review states (#263). `build_opinion_pdfs` is the fifth daemon task, last in the schedule, and writes one opinion PDF per tick (#336).
 3. Review 1: READY_FOR_PAGE_COMPLETENESS_REVIEW, then PAGE_COMPLETENESS_REVIEW_DONE (`approve_page_completeness`, #151/#154).
 4. The apply (#224): queued work (`APPLY_PAGE_EDITS`) that builds the corrected volume from the `PageEdit` rows under `jobs/apply/a{n}/`.
-5. The redaction compute (#196): queued work (`COMPUTE_REDACTIONS`) that renders every page; parks in READY_FOR_REDACTION_REVIEW, then REDACTION_REVIEW_DONE (`approve_redaction_review`, #263).
+5. The redaction compute (#196): queued work (`COMPUTE_REDACTIONS`) that renders every page; parks in READY_FOR_REDACTION_REVIEW. The approval (`approve_redaction_review`, #263) queues `CREATE_OPINIONS` (#336), whose worker writes the `Opinion` rows and parks in REDACTION_REVIEW_DONE.
 6. Step 3, the file generation, is paused (#173/#206). `start_validate`, `reprocess` and `generate_files` refuse with `utils.PIPELINE_PAUSED_MESSAGE`; nothing queues `run_generate_files`.
 
 - A legacy row (before #173) holds `PENDING_REVIEW` for both reviews, never enters the #154/#263 states, gets no apply and keeps the old buttons. `legacy_review` reads the status; `has_legacy_ocr` asks who read the page numbers. They are different questions
@@ -84,7 +90,7 @@ State is `Scan.status`. The stages, and where each runs:
 
 - Every status write is a compare-and-swap over the current status, never a full `save()`. A second writer is always live: the collect tick, a second tab, the daemon shutdown handler
 - The four review statuses (`models.REVIEW_STATUSES`) and AWAITING are not `BUSY_STATUSES`: no polling, no stale sweep. Only PROCESSING is swept
-- ERROR is terminal; the way back is the admin re-queue. `run_compute_redactions` and `run_apply_page_edits` never write ERROR; their failures count on the run (`provider_meta["apply"]`, `ApplyRun.attempts`), loud then quiet
+- ERROR is terminal; the way back is the admin re-queue. `run_compute_redactions`, `run_apply_page_edits` and `run_create_opinions` never write ERROR; the first two count their failures on the run (`provider_meta["apply"]`, `ApplyRun.attempts`), loud then quiet, and the third parks in READY_FOR_REDACTION_REVIEW with the reason, which the step-2 bar shows (#336)
 - The dots.mocr and detection stages write no scan status while they read. The bitonal stage alone owns AWAITING
 - A derived state has one rule function that every writer and every reader calls: `review_states.redaction_review_ready`, `review_states.final_run`, `yolo.redactions_current`, `_review_flags`, `repairs.has_waiting`, `boundaries.standing`. Never write a second copy
 - There is no user cancel (#219). `Status.CANCELLED` has no writer. A replacement goes on `jobs.abandon_open`, with the status left to the daemon
@@ -112,6 +118,13 @@ State is `Scan.status`. The stages, and where each runs:
 - A Mistral result with a hole is never carried (`carry_stable_holes=False`, #191). The stable-hole rule of #238 trusts a deterministic decoder; a batch line fails from a transient fault
 - `jobs.check_deadline` is the one rule for "this row has waited long enough", and a provider that skips a poll calls it itself. `apply_poll_outcome` returns inside its completion branch, so a finished batch is ended by `_harvest_outcome` alone: a transient fault waits, a missing output file retries, and the deadline ends a PUT that never lands (#191)
 - `EXTRACT` takes either shape (`EITHER_LEVEL_STAGES`, migration 0032): a shard row with no opinion, or an opinion row for an engine that reads opinion PDFs. Only `TIEBREAK` still requires an opinion
+- `mistral_ocr.parse_payload` is the one transform of a stored Mistral result, and both glues call it (#245). A better transform is a re-glue (`reglue_mistral_ocr`) and never a re-paid read. The block text key is internal: the parse reads `text` or `content` and writes `content`. The block box is read from the four `top_left_*`/`bottom_right_*` keys, on the block or under `bbox`, and written as a list (#350)
+- The Mistral glues run on the collect tick and never in `apply.glues_due` (#245): the apply trigger takes `PAGE_COMPLETENESS_REVIEW_DONE` alone, and the read starts later than that status
+- A volume glue writes no copy of what the three stages share (#245): `jobs.volume_result_key` and `jobs.glued_volume_key` for the keys, `jobs.ready_volume_runs` and `jobs.consume_run` for the pass, `jobs.read_run_shards` and `jobs.shard_entry` for the walk and its page arithmetic, `jobs.run_ledger`/`bump_run_ledger` for the retry state (on the head row's `provider_meta`, never in `input_manifest`), `apply.walk_final_pages` for a corrected volume's page walk
+- No review state reads `ApplyRun.extract_key`: `is_complete` and `final_volume_ready` do not change, or a volume nobody read with Mistral would never open review 2 (#245)
+- The apply's EXTRACT rows are created by the collect pass, only for a scan whose live Mistral volume run is glued, and from `apply.stored_shard_manifest` so the carry matches the build's identity (#245)
+- `mistral_ocr.apply_glue_due` is the one rule for writing a corrected volume's Mistral document, and `reglue_mistral_ocr` waives only its last test (#245). Every edit `apply.edit_page_counts` names must have a row first: a document written without them marks the edited pages unread and stamps a key that says the run is done
+- `apply._note_dead_rows` counts a dead row of `GLUE_STAGES` alone (#245). A stage that blocks no glue must not spend the one `dead_row_noted_at` stamp, or the row that does stop the run is never logged
 - Do not add a pass that revives FAILED rows: the admin re-queue changes the status in a second write, and a reviver races it
 - A failure names the volume page range (`jobs._failure_location`). Page numbers are logged 1-based; `from_page`/`to_page` are fitz indexes
 
@@ -130,6 +143,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 ## Review 1
 
 - Approving is a compare-and-swap on READY, open to every logged-in user. Open issues do not block it; a waiting repair request does (#266). The approval gates "Next: Detect" in the view
+- A page with no page number blocks the approval too (`page_numbers.pages_without_number`, #342): the answers are a number, a number the curator cleared, a deletion or a dismissal of that page's card; a `suffixed` page carries a reading and never blocks. The gate reads the data and not the `Issue` rows, it and the repair gate are read in READY alone (the condition `_review_flags` reads), and each refusal flashes its own message
 - A new-pipeline volume is never re-run from the viewer; `start_validate` refuses it for good. A re-run is the admin re-queue
 - `PageEdit` (#214): one standing row per address, partial unique keys over `withdrawn_at IS NULL`. Write through `page_edits.supersede`; undo through `page_edits.withdraw`. Nothing is deleted. `applied_at` is a ledger, not a close. Acting readers go through `current_edits`, never `standing_edits`
 - `has_pending_changes` counts the structural kinds the standing apply run has not built, not the `applied_at` stamp alone
@@ -142,6 +156,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - One page-number gate for the browser (`shared.isPageNumberEntry`, called by both viewers) and one for the server (`_page_number_value`, whose refusal is `PAGE_NUMBER_ERROR`), #319
 - `_project_trailing_gap` (#256) puts one range placeholder on a collapsed missing run at the end of the volume only, from both `page_map` builders
 - A deletion answers the cards of the page it names (`CHECKS_A_DELETION_ANSWERS`, #255), never a `duplicate_page` or `missing_page` card
+- The unnumbered run before the first printed number is one `front_matter` card (`_ask_about_front_matter`), addressed by its first undeleted page, never a run later in the volume or a volume with no number at all; its button sends `pdf_pages` to `delete_page`, which checks every page before it writes one row
 - Every page label is narrowed (`_page_label`) and escaped (`escapeHtml`). A note is escaped only
 - Step-1 buttons bind by delegation on the container, and `refreshSavedLabel` runs after a note changes on a live page
 
@@ -170,7 +185,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - `Redaction` rows are in PDF points; `Detection` rows in 200-dpi pixels. Every output of the compute is a row: `detections.json`, `redaction_rects`, `margin_rects` and `opinions_json` are gone
 - The compute pairs once (`_snapped_document`); `bl_pair` is not imported. A recompute keeps every row; only a first import under a run replaces the model rows
 - A curator starts the compute from step 2 (`compute_redactions_api`, #305), and `REDACTION_COMPUTE_STATUSES` refuses `REDACTION_REVIEW_DONE`, whose way back is the re-queue. `findings.rebuild` is the one recompute that runs in the request, on any pod: it reads rows and nothing else
-- `approve_redaction_review` is the only writer of REDACTION_REVIEW_DONE, and its log line is the only record of who decided. It gates step 3; a legacy volume keeps its link
+- `approve_redaction_review` is the only place a person closes review 2: a compare-and-swap READY to QUEUED with `CREATE_OPINIONS` (`opinions.queue_create_opinions`), and its log line is the only record of who decided. `run_create_opinions` parks in REDACTION_REVIEW_DONE on success and back in READY_FOR_REDACTION_REVIEW with the reason on a failure, never ERROR; the retry is the next press (#336). REDACTION_REVIEW_DONE gates step 3; a legacy volume keeps its link
 - The findings of review 2 are `Issue` rows (`REVIEW2_CHECKS`, `Issue.target`), and `findings.rebuild` is their one writer (#240 PR D). It derives every finding from the detection, boundary and redaction rows, with no S3 read and no render, and runs at the end of the compute (which passes the run it measured in, because its ledger stamp is written after the park) and in every review-2 write endpoint (`_rebuild_findings`), so a card is never older than the last write. `recalculate_issues` excludes `REVIEW2_CHECKS`
 - Stale is read off the rows, never threaded from `resolve`: a standing decision no `decision` FK points at, or a human row whose `apply_run` is not the measured run, is a `stale_*` card. No measured finding is written without a computed boundary
 - `ReviewDismissal` names its target by address plus a copy of the box; `findings.resolve` lands it by `IOU_THRESHOLD` and the finding is written with `Issue.dismissal` set (muted, with Undo). A stale card is withdrawn (`withdraw_stale`), never dismissed (`UndismissableFinding`, 409). Nothing deletes a dismissal
@@ -187,6 +202,26 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - A bracket the reader saw and the model did not is a finding (`brackets.missing`, #328): one `BracketReading` row per dots.mocr cell that **starts** with a bracket, written by the compute and disposable like a model `Detection` row. A candidate whose number its opinion already names is the star-pagination mark, never a finding
 - The opinion of a reading comes from `boundaries.standing`, in the order `reading_key` defines, never from the caption rows. The count of `HEADNOTE` boxes is not the count of headnotes, so no finding is built on it
 - Every page overlay is drawn from its rows at every render and never positioned once: `renderPage` calls the redaction, bounds and dim draws, because a re-render changes the scale. A selected opinion is a cache plus a draw (`_drawDimForPage`), never a one-time paint. Its masks dim, and draw in the `bounds` mode alone: a redaction mode shows the page as the output has it (#311)
+
+## Review 3 (#335)
+
+- An `Opinion` is keyed by `(scan, first printed page, index in that printed page)`, stamped at creation, never by the boundary anchors. A later reading change is a card, never a new key. `page_count` holds the physical count, so no check does arithmetic on the printed numbers
+- `OpinionText` is one row per **page** of an opinion, and it holds an engine reading only where the engines disagree; the whole read of every engine stays on S3. `text` is a cache; `human_text` is the truth and nothing discards it. An edit moves the offsets of `disagreements`, so it answers that page
+- The per-opinion glues live under `jobs/opinions/{first_printed_page}.{index_in_page}/r{glue_revision}/`, the invariant key and never the pk, and a re-glue raises the revision (#350); the creation raises it on every matched row that is not `TEXT_REVIEW_DONE`, so no revision is written twice. The detections and the redactions are not among them: they are rows since #241, and restricting them to one opinion is a query. `approved_text_key` is not a glue, and no re-glue may overwrite it
+- `opinion_ocr.write` is the one writer of an opinion's OCR documents (#350): one `{engine}.json` per engine of `opinion_ocr.ENGINES` plus a `manifest.json` written last. Every unit of the opinion's pages is in the file with its verdict (`exclusion`, `share`, in the three bands of `EXCLUDE_SHARE` and `FULL_SHARE`); nothing is dropped before the ensemble aligns, and `kept_units` is the one reader that applies the verdict. A unit with no box, or on a page with no size, is `unjudged` and never clean text: it may be under a redaction, so it stays out of `kept_units` and counts in the manifest. The page `md` is never copied
+- `ocr_glue_revision == glue_revision` is the one rule for "the OCR glue exists" (`opinion_ocr.is_written`, #350). The glue is pass ten of the collect tick: it walks the due scans newest first and glues the first one whose inputs load, `OPINIONS_PER_TICK` rows of it, so a held volume holds no other; a fact about the scan (no final run, a stale redaction set, an engine the run owes per `engines_owed`, whose last live step decides) holds that scan and spends no attempt; a fact about the row spends `ocr_glue_attempts`, then ERROR. A late engine is a re-glue (`reglue_opinion_ocr`), never a watcher
+- A warning of review 3 is an `OpinionFinding`, never an `Issue` row. It keeps the review-2 rules: one rebuild writes them, a dismissal is its own row that nothing deletes, and a `STALE_OPINION_CHECKS` row cannot be dismissed
+- `OpinionScan` is frozen (#173/#206 paused its writer). `scan.legacy_opinions` reads it, `scan.opinions` reads the new model, and `ExternalJob.opinion` is an `Opinion`
+- `opinions.create_rows` is the one writer of an `Opinion` row (#336): the key is the printed number of the start page (a `suffixed` page shares the bucket of its number, a range page gives its end) plus the rank in `boundaries.standing`. A start page with no number refuses the volume; a key is never guessed from a position. A matched row is updated in place and keeps its status and every human field; only ERROR goes back to PROCESSING
+- The creation writes the `STALE_OPINION_CHECKS` alone and deletes them on a match: `STALE_PAGE_NUMBER` when a live boundary shares the start address under another number, `ORPHANED_OPINION` otherwise. They need the printed numbers, which the rows do not hold; #334's rebuild writes the other checks (#336)
+- A re-derived matched row that no human approved has its `glue_revision` raised by the creation (#335, #336); an approved row is raised by the second-run rule alone. Nothing else writes the revision
+- The redacted PDF of an opinion (#336) is a glue at `opinion_pdf.key`, cut by `blackletter.api.generate` over a source that holds the opinion's pages alone, never the volume, so every index of the payload is in that source's space (`opinion_pdf.payload`). `redacted_pdf_revision == glue_revision` is the one rule for "the PDF exists" (`opinion_pdf.is_written`), `opinion_pdf.due` for "a PDF is owed", and `OPINION_PDF_STATUSES` for which scan statuses the pass reads: #334 extends the set, or every unwritten PDF of a moved scan stops being due in silence
+- The PDF pass is a fact on the row and no hand-off: one PDF per tick (`opinion_pdf.PDFS_PER_TICK`), the scan on disk first and then the newest (`opinion_pdf.next_due`), no `QueuedAction` and no status write on the scan. The first tick of a volume pulls the bitonal copy and the first tick that needs a picture pulls a shard, inside the serial loop, the hazard of the Mistral wave. A fault the rows explain (`OpinionPdfError`) and an unexpected exception both count on `pdf_attempts`, and at `opinion_pdf.MAX_ATTEMPTS` a `PROCESSING` row is `ERROR`, loud then quiet; a `TransientFault` (a pull or a PUT) alone counts nothing. Every fault stamps `pdf_attempted_at`, and the row waits `opinion_pdf.retry_after()`. `owed` is the ledger and `due` is `owed` less that cooldown: the release of the local tree reads `owed`, or one failed PUT on a volume's last opinion re-pulls the whole volume every cooldown
+- The pass never deletes an input inside a tick: the bitonal mirror and the shards stay until the scan has no owed row, or until the daemon starts (`opinion_pdf.release_mirrors`). Its outputs go in the `finally` of the tick that made them. The printed range is the download name alone (`serve_opinion_pdf`, #165)
+- `/opinions/` lists the `Opinion` rows and `/opinions/legacy/` the frozen `OpinionScan` rows (#334). The step-3 tab and the step-2 "Next" button read one pair of flags: `review3_opinions` sends both to the opinions page, `legacy_pipeline` (`stats.LEGACY_STATUSES`, not `legacy_review`) keeps both on `?step=3`, and a new volume with neither gets no link. The flag is not `opinion_count`, which already names the boundaries of step 2
+- The warning badge of the opinions list is `opinions.finding_counts` over the ids of one page, after the pagination, the rule every list badge follows. `/opinions/<pk>/review/` has no write endpoint until the text review lands, so it offers no control (#334)
+- A template writes every opinion PDF address onto its card (`data-redacted-url`), and the viewer reads it: a path a script spells by hand goes stale in silence, because no test reverses it (#334)
+- The review page of an opinion frames `serve_opinion_pdf` under `?disposition=inline`, the one route that answers `SAMEORIGIN` where the site answers `DENY`, and `opinion_file_index` is its `files` index (#334): both read the two ledgers (`opinion_pdf.is_written`, `opinion_ocr.is_written`) and never the bucket. The OCR stamp is one over four files, so an engine document is written only when the run also carries that engine's key, and an entry with no `url` is an object nothing wrote
 
 ## Worker images
 
@@ -215,3 +250,4 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - `TESTING=True` is auto-detected from `sys.argv`: LocMemCache, MD5 password hasher, no debug toolbar URLs
 - `DB_SSL_MODE=prefer` is needed outside Docker
 - `DOCTOR_ENABLED` and `DOCTOR_HOST` default to working values; `RUNPOD_YOLO_ENDPOINT_ID` blank turns detection off and leaves dots.mocr on
+- `BLACKLETTER_LOG_LEVEL` sets the `blackletter` logger, INFO by default; without that entry `generate`'s records reach no handler (blackletter#81)

@@ -7,11 +7,13 @@ from scanning.monitoring import health_check, heartbeat, sentry_fail
 from scanning.views import (
     claim_scan,
     confirm_scan_upload,
+    legacy_opinion_detail,
+    legacy_opinion_list,
+    legacy_opinion_upload,
     login_view,
     logout_view,
-    opinion_detail,
     opinion_list,
-    opinion_upload,
+    opinion_review,
     password_change,
     presign_scan_upload,
     profile,
@@ -64,6 +66,7 @@ from scanning.views_process import (
     dismiss_issue,
     dismiss_page_repair,
     glued_output_index,
+    opinion_file_index,
     page_edit_file,
     process_actions,
     progress_api,
@@ -82,6 +85,8 @@ from scanning.views_process import (
     serve_final_pdf,
     serve_glued_shard,
     serve_glued_volume,
+    serve_opinion_ocr,
+    serve_opinion_pdf,
     serve_original_crop,
     serve_scan_original,
     serve_scan_pdf,
@@ -100,8 +105,29 @@ urlpatterns = [
     path("", scan_list, name="scan_list"),
     path("scans/<int:pk>/", scan_detail, name="scan_detail"),
     path("opinions/", opinion_list, name="opinion_list"),
-    path("opinions/upload/", opinion_upload, name="opinion_upload"),
-    path("opinions/<int:pk>/", opinion_detail, name="opinion_detail"),
+    path(
+        "opinions/<int:pk>/review/",
+        opinion_review,
+        name="opinion_review",
+    ),
+    # The legacy pipeline's opinions keep their pages under
+    # ``legacy/`` (#334). ``legacy`` is not a number, so it cannot
+    # collide with an opinion pk.
+    path(
+        "opinions/legacy/",
+        legacy_opinion_list,
+        name="legacy_opinion_list",
+    ),
+    path(
+        "opinions/legacy/upload/",
+        legacy_opinion_upload,
+        name="legacy_opinion_upload",
+    ),
+    path(
+        "opinions/legacy/<int:pk>/",
+        legacy_opinion_detail,
+        name="legacy_opinion_detail",
+    ),
     path("profile/", profile, name="profile"),
     path("profile/password/", password_change, name="password_change"),
     path("queue/", queue_view, name="queue"),
@@ -185,6 +211,26 @@ urlpatterns = [
         "scans/<int:pk>/glued/apply/a<int:number>/<str:output>/",
         serve_apply_output,
         name="serve_apply_output",
+    ),
+    # The OCR documents of one opinion (#350), one redirect per engine.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/ocr/<str:engine>/",
+        serve_opinion_ocr,
+        name="serve_opinion_ocr",
+    ),
+    # The redacted PDF of one opinion (#336): a redirect to a presigned
+    # GET, named by the printed range for the download alone (#165).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/redacted-pdf/",
+        serve_opinion_pdf,
+        name="serve_opinion_pdf",
+    ),
+    # The glued objects of one opinion (#334), the twin of the volume's
+    # own index: which object exists, and where it is.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/files/",
+        opinion_file_index,
+        name="opinion_file_index",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.
@@ -361,7 +407,7 @@ urlpatterns = [
         name="serve_redacted_pdf",
     ),
     path(
-        "opinions/<int:pk>/pdf/<str:variant>/",
+        "opinions/legacy/<int:pk>/pdf/<str:variant>/",
         serve_opinionscan_pdf,
         name="serve_opinionscan_pdf",
     ),

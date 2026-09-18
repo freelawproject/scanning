@@ -287,10 +287,14 @@ class TestClaimPriority(TestCase):
     def test_an_upload_is_claimed_before_a_compute_before_an_apply(self):
         """The loop is serial, so the queue puts a person's wait first:
         the volunteer's upload, then the curator's approval waiting on
-        its redaction compute, then the apply nobody watches -- whatever
+        its redaction compute, then the approval waiting on its
+        opinions (#336), then the apply nobody watches -- whatever
         their ages."""
         apply_scan = ScanFactory(
             status=Status.QUEUED, queued_action=QueuedAction.APPLY_PAGE_EDITS
+        )
+        opinions_scan = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.CREATE_OPINIONS
         )
         compute_scan = ScanFactory(
             status=Status.QUEUED,
@@ -300,19 +304,26 @@ class TestClaimPriority(TestCase):
         upload_scan = ScanFactory(
             status=Status.QUEUED, queued_action=QueuedAction.FULL_PIPELINE
         )
-        # Oldest first: the apply, then the compute, then the two uploads.
+        # Oldest first: the apply, the opinions, the compute, then the
+        # two uploads.
         for offset, scan in enumerate(
-            (apply_scan, compute_scan, blank_scan, upload_scan)
+            (apply_scan, opinions_scan, compute_scan, blank_scan, upload_scan)
         ):
             Scan.objects.filter(pk=scan.pk).update(
                 date_created=timezone.now() + timedelta(minutes=offset)
             )
 
-        claimed = [Command()._claim_next()[0].pk for _ in range(4)]
+        claimed = [Command()._claim_next()[0].pk for _ in range(5)]
 
         self.assertEqual(
             claimed,
-            [blank_scan.pk, upload_scan.pk, compute_scan.pk, apply_scan.pk],
+            [
+                blank_scan.pk,
+                upload_scan.pk,
+                compute_scan.pk,
+                opinions_scan.pk,
+                apply_scan.pk,
+            ],
         )
         self.assertIsNone(Command()._claim_next())
 

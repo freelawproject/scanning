@@ -19,12 +19,14 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
 
-from scanning import repairs, s3_sync, stats
+from scanning import opinion_pdf, opinions, repairs, s3_sync, stats
 from scanning.forms import (
     OpinionScanUploadForm,
     ProfileForm,
 )
 from scanning.models import (
+    Opinion,
+    OpinionReviewStatus,
     OpinionScan,
     OpinionStatus,
     PendingUpload,
@@ -65,6 +67,27 @@ def logout_view(request: HttpRequest) -> HttpResponse:
     )(request)
 
 
+def _whole_number(value: str | None) -> int | None:
+    """Return a query-string value as an integer, or ``None``.
+
+    The guard of every integer filter of every list page. ``str.isdigit``
+    is not that test: it answers true for ``"\u00b2"``, which ``int``
+    refuses, and Django's ``IntegerField.get_prep_value`` re-raises that
+    ``ValueError`` rather than a ``ValidationError``. A superscript in
+    ``?volume=`` was an unhandled 500.
+
+    :param value: The raw query-string value, or ``None``.
+    :returns: The number, or ``None`` when there is none to read.
+    :rtype: int | None
+    """
+    if not value:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 @login_required
 def scan_list(request: HttpRequest) -> HttpResponse:
     """List scans with opinion count annotation.
@@ -81,7 +104,11 @@ def scan_list(request: HttpRequest) -> HttpResponse:
         # ``uploaded_by`` is joined because every row prints the
         # username: without it the page cost one query per scan.
         Scan.objects.select_related("reporter", "uploaded_by")
-        .annotate(opinion_count=Count("opinions"))
+        # The legacy rows, on purpose: ``opinions`` is the new
+        # ``Opinion`` table since #335, and this column counts what the
+        # legacy pipeline generated. #334 gives the new rows their own
+        # page.
+        .annotate(opinion_count=Count("legacy_opinions"))
         .order_by("-date_created")
     )
 
@@ -91,8 +118,10 @@ def scan_list(request: HttpRequest) -> HttpResponse:
         scans = scans.filter(status=status_filter)
 
     reporter_filter = request.GET.get("reporter")
-    if reporter_filter and reporter_filter.isdigit():
+    if _whole_number(reporter_filter) is not None:
         scans = scans.filter(reporter_id=reporter_filter)
+    else:
+        reporter_filter = ""
 
     source_filter = request.GET.get("source")
     if source_filter:
@@ -100,7 +129,7 @@ def scan_list(request: HttpRequest) -> HttpResponse:
 
     volume_filter = request.GET.get("volume")
     if volume_filter:
-        if volume_filter.isdigit():
+        if _whole_number(volume_filter) is not None:
             scans = scans.filter(volume=volume_filter)
         else:
             messages.error(request, "Volume must be a number.")
@@ -165,51 +194,80 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
 
 @login_required
 def opinion_list(request: HttpRequest) -> HttpResponse:
-    """List opinion scans with filters for scan, reporter, and status.
+    """List the opinions of the third review (#334).
+
+    One flat row per :class:`Opinion`, the rows ``opinions.create_rows``
+    writes after the review-2 approval. The four filters are the shape
+    of the scan list, and the step-3 tab of a volume sends ``scan``.
+
+    The warning count is stamped after the pagination, so one grouped
+    query answers the 50 rows of this page and the size of the corpus
+    never reaches it. This is the badge rule of the scan list (#266).
+
+    The opinions of the legacy pipeline are on their own page
+    (:func:`legacy_opinion_list`), linked from this one.
 
     :param request: The current HTTP request.
     :return: The rendered opinion list page.
     """
-    opinions = OpinionScan.objects.select_related("reporter", "scan").order_by(
-        "reporter__short_name", "volume", "page_start"
+    opinions_qs = Opinion.objects.select_related(
+        "scan", "scan__reporter"
+    ).order_by(
+        "scan__reporter__short_name",
+        "scan__volume",
+        "first_printed_page",
+        "index_in_page",
+        # The last key makes the ordering total. ``Scan`` has no unique
+        # key over (reporter, volume) -- a volume comes in parts -- so
+        # two scans tie on the four keys above, and Postgres may rank
+        # tied rows differently for each page of a LIMIT/OFFSET walk.
+        # An opinion would then show on two pages, or on none.
+        "pk",
     )
 
-    # Filtering
     scan_filter = request.GET.get("scan")
-    if scan_filter and scan_filter.isdigit():
-        opinions = opinions.filter(scan_id=scan_filter)
+    if _whole_number(scan_filter) is not None:
+        opinions_qs = opinions_qs.filter(scan_id=scan_filter)
+    else:
+        scan_filter = ""
 
     reporter_filter = request.GET.get("reporter")
-    if reporter_filter and reporter_filter.isdigit():
-        opinions = opinions.filter(reporter_id=reporter_filter)
+    if _whole_number(reporter_filter) is not None:
+        opinions_qs = opinions_qs.filter(scan__reporter_id=reporter_filter)
+    else:
+        reporter_filter = ""
 
     status_filter = request.GET.get("status")
     if status_filter:
-        opinions = opinions.filter(status=status_filter)
+        opinions_qs = opinions_qs.filter(status=status_filter)
 
     volume_filter = request.GET.get("volume")
     if volume_filter:
-        if volume_filter.isdigit():
-            opinions = opinions.filter(volume=volume_filter)
+        if _whole_number(volume_filter) is not None:
+            opinions_qs = opinions_qs.filter(scan__volume=volume_filter)
         else:
             messages.error(request, "Volume must be a number.")
             volume_filter = ""
 
-    paginator = Paginator(opinions, 50)
-    page_number = request.GET.get("page")
-    page_obj = paginator.get_page(page_number)
+    paginator = Paginator(opinions_qs, 50)
+    page_obj = paginator.get_page(request.GET.get("page"))
+
+    counts = opinions.finding_counts([row.pk for row in page_obj])
+    for row in page_obj:
+        row.open_findings, row.stale_findings = counts.get(row.pk, (0, 0))
 
     return render(
         request,
         "scanning/opinion_list.html",
         {
             "page_obj": page_obj,
-            "status_choices": OpinionStatus.choices,
+            "status_choices": OpinionReviewStatus.choices,
             "reporter_choices": [
                 (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
-            "current_reporter": reporter_filter or "",
+            "current_scan": scan_filter,
+            "current_reporter": reporter_filter,
             "current_status": status_filter or "",
             "current_volume": volume_filter or "",
         },
@@ -217,12 +275,158 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
 
 
 @login_required
-def opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
-    """Display opinion scan detail with side-by-side PDF iframes.
+def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
+    """List the opinions of the legacy pipeline (#334).
+
+    ``OpinionScan`` is frozen (#173, #206): nothing writes it. The new
+    pipeline writes ``Opinion`` rows, which :func:`opinion_list` lists
+    at ``/opinions/``. This page keeps what the legacy pipeline made.
+
+    :param request: The current HTTP request.
+    :return: The rendered legacy opinion list page.
+    """
+    # Not ``opinions``: that name holds the module this view's twin
+    # calls for its warning badge, and a local would hide it.
+    opinions_qs = OpinionScan.objects.select_related(
+        "reporter", "scan"
+    ).order_by("reporter__short_name", "volume", "page_start", "pk")
+
+    # Filtering
+    scan_filter = request.GET.get("scan")
+    if _whole_number(scan_filter) is not None:
+        opinions_qs = opinions_qs.filter(scan_id=scan_filter)
+    else:
+        scan_filter = ""
+
+    reporter_filter = request.GET.get("reporter")
+    if _whole_number(reporter_filter) is not None:
+        opinions_qs = opinions_qs.filter(reporter_id=reporter_filter)
+    else:
+        reporter_filter = ""
+
+    status_filter = request.GET.get("status")
+    if status_filter:
+        opinions_qs = opinions_qs.filter(status=status_filter)
+
+    volume_filter = request.GET.get("volume")
+    if volume_filter:
+        if _whole_number(volume_filter) is not None:
+            opinions_qs = opinions_qs.filter(volume=volume_filter)
+        else:
+            messages.error(request, "Volume must be a number.")
+            volume_filter = ""
+
+    paginator = Paginator(opinions_qs, 50)
+    page_number = request.GET.get("page")
+    page_obj = paginator.get_page(page_number)
+
+    return render(
+        request,
+        "scanning/legacy_opinion_list.html",
+        {
+            "page_obj": page_obj,
+            "status_choices": OpinionStatus.choices,
+            "reporter_choices": [
+                (str(r.pk), f"{r.full_name} ({r.short_name})")
+                for r in Reporter.objects.all()
+            ],
+            # The scan filter is kept, as on the new page: without it
+            # one page turn widened the list to the whole corpus.
+            "current_scan": scan_filter,
+            "current_reporter": reporter_filter,
+            "current_status": status_filter or "",
+            "current_volume": volume_filter or "",
+        },
+    )
+
+
+@login_required
+def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Show one opinion of the third review (#334).
+
+    The first stage of the review interface. It shows what the rows
+    hold: the citation, the printed range, the status, the links to the
+    volume and the boundary, and the findings.
+
+    It also shows the redacted PDF of the opinion (#336) in a frame,
+    when the row says the file was written. ``opinion_pdf.is_written``
+    is the one rule for that, a read of the row and never of the
+    bucket, and the frame is a navigation to ``serve_opinion_pdf``, so
+    this view still makes no S3 call. A staff reader gets the
+    ``files`` link beside it (``opinion_file_index``), the rule of the
+    volume's own glued outputs (#243).
+
+    The page carries **no write control**. The approval, the dismissal
+    and the typing of a page come with the text review itself, which
+    needs ``OpinionText``. A button that an endpoint would refuse is
+    the one thing a viewer must never offer.
+
+    :param request: The current HTTP request.
+    :param pk: The primary key of the opinion.
+    :return: The rendered opinion review page.
+    """
+    opinion = get_object_or_404(
+        Opinion.objects.select_related(
+            "scan", "scan__reporter", "apply_run", "boundary", "approved_by"
+        ),
+        pk=pk,
+    )
+    findings = list(
+        opinion.findings.select_related("dismissal").order_by(
+            "page_in_opinion", "check_name"
+        )
+    )
+    # The label is stamped here, not derived in the template. Page 0 is
+    # a real page and a falsy value, and ``None`` is not a name a
+    # Django template holds, so the test belongs in Python.
+    for row in findings:
+        row.page_label = (
+            "the whole opinion"
+            if row.page_in_opinion is None
+            else f"page {row.page_in_opinion + 1} of the opinion"
+        )
+    open_findings = sum(1 for row in findings if row.dismissal_id is None)
+
+    return render(
+        request,
+        "scanning/opinion_review.html",
+        {
+            "opinion": opinion,
+            "findings": findings,
+            "open_findings": open_findings,
+            # Absent when the PDF pass has not written the file at the
+            # live revision: the template shows the reason instead of a
+            # frame that would answer a 404 JSON.
+            "redacted_pdf_url": (
+                reverse(
+                    "serve_opinion_pdf",
+                    kwargs={
+                        "pk": opinion.scan_id,
+                        "opinion_pk": opinion.pk,
+                    },
+                )
+                if opinion_pdf.is_written(opinion)
+                else ""
+            ),
+            "files_url": reverse(
+                "opinion_file_index",
+                kwargs={"pk": opinion.scan_id, "opinion_pk": opinion.pk},
+            ),
+            # The list the reviewer came from, so the back link keeps
+            # their filters. Never fed to a redirect: it is a query
+            # string on one known route, not a ``next``.
+            "list_query": request.GET.urlencode(),
+        },
+    )
+
+
+@login_required
+def legacy_opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
+    """Show one legacy opinion, with side-by-side PDF frames (#334).
 
     :param request: The current HTTP request.
     :param pk: The primary key of the opinion scan.
-    :return: The rendered opinion detail page.
+    :return: The rendered legacy opinion detail page.
     """
     opinion = get_object_or_404(
         OpinionScan.objects.select_related("reporter", "scan", "uploaded_by"),
@@ -231,14 +435,14 @@ def opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
 
     return render(
         request,
-        "scanning/opinion_detail.html",
+        "scanning/legacy_opinion_detail.html",
         {"opinion": opinion},
     )
 
 
 @login_required
-def opinion_upload(request: HttpRequest) -> HttpResponse:
-    """Handle standalone opinion upload form (superuser only).
+def legacy_opinion_upload(request: HttpRequest) -> HttpResponse:
+    """Upload one legacy opinion, for a superuser alone (#334).
 
     :param request: The current HTTP request.
     :return: The rendered upload form or a redirect on success.
@@ -254,13 +458,13 @@ def opinion_upload(request: HttpRequest) -> HttpResponse:
             opinion.uploaded_by = request.user
             opinion.save()
             messages.success(request, "Opinion uploaded successfully.")
-            return redirect("opinion_detail", pk=opinion.pk)
+            return redirect("legacy_opinion_detail", pk=opinion.pk)
     else:
         form = OpinionScanUploadForm()
 
     return render(
         request,
-        "scanning/opinion_upload.html",
+        "scanning/legacy_opinion_upload.html",
         {"form": form},
     )
 

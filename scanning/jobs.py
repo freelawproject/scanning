@@ -1310,6 +1310,324 @@ def check_result_envelope(
     return envelope["payload"]
 
 
+def volume_result_key(scan, stage: str, engine: str, run: int) -> str:
+    """Return the S3 key one run's glued volume document lives at.
+
+    Under ``jobs/`` on purpose: that prefix is already excluded from the
+    generic processing sync in both directions, and the admin delete
+    already sweeps it. Scoped to the run, like the per-attempt result
+    keys, so a re-run leaves the previous document addressable instead
+    of stomping it.
+
+    One rule for the three stages that glue a volume document
+    (``dots_mocr``, ``yolo``, ``mistral_ocr``). Each keeps a named
+    wrapper, because a reader that lists the outputs holds a callable
+    per output (``views_process.GLUED_OUTPUTS``).
+
+    :param scan: The scan the run belongs to.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param run: The run number.
+    :returns: Key of the form ``{processing_prefix}jobs/{stage}/
+        {engine}/r{run}-volume.json``.
+    :rtype: str
+    """
+    return (
+        f"{s3_sync.s3_processing_prefix(scan)}{s3_sync.JOB_RESULTS_SUBDIR}"
+        f"{stage}/{engine}/r{run}-volume.json"
+    )
+
+
+def ready_volume_runs(
+    stage: str,
+    engine: str,
+    provider: str,
+    live_rows: Callable[[object], list[ExternalJob]],
+    attempts: Callable[[list[ExternalJob]], int],
+    max_attempts: int,
+):
+    """Yield the scans whose live volume run is finished and unglued.
+
+    The prologue every glue pass shares (#202, #196, #245). A run is
+    finished when no row of it waits to be submitted or is in flight,
+    and none is dead: a dead row means the run can never cover the
+    volume, ``run_summary`` already shows it on the process page, and
+    the way forward is a fresh run.
+
+    The rows are the idempotence marker, because no glue pass writes a
+    scan status: a glued run is all ``CONSUMED``, so it drops out of
+    the candidate query. The candidate query therefore asks for one
+    ``COMPLETED`` row, and the exact test follows on the live run.
+
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param provider: A :class:`~scanning.models.JobProvider` value.
+    :param live_rows: The stage's own live-run reader, called per scan.
+    :param attempts: How many times this run's glue has failed, read
+        off the rows by the stage's own ledger.
+    :param max_attempts: How many failures stop the pass.
+    :returns: ``(scan, rows)`` per candidate, the rows in shard order.
+    :rtype: Iterator[tuple[Scan, list[ExternalJob]]]
+    """
+    from scanning.models import Scan
+
+    scan_ids = (
+        Scan.objects.filter(
+            jobs__stage=stage,
+            jobs__engine=engine,
+            jobs__provider=provider,
+            jobs__status=JobStatus.COMPLETED,
+            jobs__apply_run__isnull=True,
+        )
+        .values_list("pk", flat=True)
+        .distinct()
+    )
+    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
+    for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
+        "reporter"
+    ):
+        rows = live_rows(scan)
+        if not rows:
+            continue
+        if any(row.status in unfinished for row in rows):
+            continue
+        if any(row.status in DEAD_JOB_STATUSES for row in rows):
+            continue
+        if not any(row.status == JobStatus.COMPLETED for row in rows):
+            # The candidate row belongs to an older run; the live one
+            # has nothing to glue.
+            continue
+        if attempts(rows) >= max_attempts:
+            continue
+        yield scan, rows
+
+
+def consume_run(rows: list[ExternalJob]) -> int:
+    """Mark a glued run's finished rows as consumed.
+
+    The compare-and-swap of a glue pass: only a ``COMPLETED`` row is
+    taken, so a row another writer moved is left alone. The result
+    objects are **kept**; every stage that calls this passes
+    ``reuse_results`` and a later run carries them.
+
+    :param rows: The glued run's rows.
+    :returns: How many rows were flipped.
+    :rtype: int
+    """
+    return ExternalJob.objects.filter(
+        pk__in=[row.pk for row in rows],
+        status=JobStatus.COMPLETED,
+    ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+
+
+def glued_volume_key(scan, stage: str, engine: str) -> str | None:
+    """Return the key of a target's glued volume document, or nothing.
+
+    A run is glued when every one of its rows is ``CONSUMED``: the glue
+    writes the document and flips the rows in one pass. Said here
+    rather than in each stage, because the test is the same one three
+    times and a reader that only wants the key should not have to know
+    it (``apply._volume_ocr_run``, the text overlay of #262, the flag
+    that shows its button).
+
+    :param scan: The scan (or its pk) to look up.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :returns: The key :func:`volume_result_key` gives the live run, or
+        None when no run is glued.
+    :rtype: str | None
+    """
+    rows = live_run(scan, stage, engine)
+    if rows and all(row.status == JobStatus.CONSUMED for row in rows):
+        return volume_result_key(scan, stage, engine, rows[0].run)
+    return None
+
+
+def run_ledger(rows: list[ExternalJob], key: str) -> dict:
+    """Return one run-level pass's bookkeeping, off the run's first row.
+
+    Kept on the first row's ``provider_meta`` rather than on a field of
+    its own: the counter describes the run, any row of it can carry
+    that, and **``input_manifest`` is off limits** --
+    :func:`_still_describes` compares it exactly, so an added key there
+    would read as a stale run and re-pay for the shards. A new run
+    starts with clean rows, which is what gives a re-read fresh tries.
+
+    :param rows: The live run's rows, ordered by shard index.
+    :param key: The pass's own name in ``provider_meta``: ``"glue"``
+        for the dots.mocr and Mistral volume glues, ``"merge"`` for the
+        detection merge, ``"apply"`` for the page-number apply,
+        ``"glue:a{n}"`` for a corrected volume's own glue.
+    :returns: The stored state, empty when the pass has never failed.
+    :rtype: dict
+    """
+    meta = rows[0].provider_meta or {}
+    return dict(meta.get(key) or {})
+
+
+def ledger_attempts(rows: list[ExternalJob], key: str) -> int:
+    """Return how many times one run-level pass has already failed.
+
+    :param rows: The live run's rows, ordered by shard index.
+    :param key: See :func:`run_ledger`.
+    :returns: The stored attempt count, 0 when none.
+    :rtype: int
+    """
+    return int(run_ledger(rows, key).get("attempts") or 0)
+
+
+def bump_run_ledger(
+    rows: list[ExternalJob], key: str, exc: Exception
+) -> tuple[int, ExternalJob]:
+    """Count one failure of a run-level pass, and say which row carries it.
+
+    The state shape in one place, because four passes keep it: the two
+    glues, the merge and the page-number apply. Every other key of the
+    state survives, so a stamp beside the counter (the apply's
+    ``applied_at``) is not lost by a failure.
+
+    The caller logs, in its own words and with its own logger, and it
+    is the caller that decides what the last attempt means: the reason
+    to give up loudly once, rather than on every tick, belongs with the
+    pass that knows its own retry budget.
+
+    :param rows: The live run's rows, ordered by shard index.
+    :param key: See :func:`run_ledger`.
+    :param exc: What the pass raised.
+    :returns: ``(attempts so far, the row that carries the state)``.
+    :rtype: tuple[int, ExternalJob]
+    """
+    head = rows[0]
+    meta = dict(head.provider_meta or {})
+    state = dict(meta.get(key) or {})
+    attempts = int(state.get("attempts") or 0) + 1
+    state.update(
+        {
+            "attempts": attempts,
+            "last_error": str(exc)[:500],
+            "last_attempt_at": timezone.now().isoformat(),
+        }
+    )
+    meta[key] = state
+    head.provider_meta = meta
+    head.save(update_fields=["provider_meta"])
+    return attempts, head
+
+
+@dataclass
+class ShardRead:
+    """One shard of a glued run, with its payload and its page range.
+
+    :ivar index: The shard's position in the run.
+    :ivar job: The row.
+    :ivar payload: The payload of the stored result envelope.
+    :ivar from_page: The shard's first page, as a fitz index into the
+        volume.
+    :ivar page_count: How many pages the shard holds.
+    """
+
+    index: int
+    job: ExternalJob
+    payload: dict
+    from_page: int
+    page_count: int
+
+
+def read_run_shards(
+    scan,
+    rows: list[ExternalJob],
+    *,
+    action: str,
+    error_cls: type,
+    download: Callable[[str], object] | None = None,
+):
+    """Yield one run's shard payloads in strict order, arithmetic checked.
+
+    The walk every volume glue shares (#202, #196, #245). What it
+    asserts is what a glue cannot do without: the rows cover the
+    shards in order, each names a result, and each starts where the
+    last one ended. A page's volume index is then the shard's
+    ``from_page`` plus its page inside the shard, and nothing else in
+    the document is right if that arithmetic is not.
+
+    The envelope is checked as well, which is all that stands between a
+    paid result and a document glued from the wrong bytes
+    (:func:`check_result_envelope`).
+
+    What is left to each caller is what differs: the pages or the
+    detections inside a payload, the stage's own extra checks, and the
+    per-shard work a stage does on the way past (the layout repair of
+    #242, the page-list stamp).
+
+    :param scan: The scan being glued.
+    :param rows: The live run's rows, ordered by shard index.
+    :param action: The handler action the envelopes must name.
+    :param error_cls: The exception class to raise, so each stage
+        reports its own failure type.
+    :param download: How to fetch and parse one result object. The
+        default reads it straight into memory; a stage that wants the
+        bytes on disk passes its own.
+    :returns: One :class:`ShardRead` per shard, in order.
+    :rtype: Iterator[ShardRead]
+    :raises error_cls: If a result is missing or malformed, or the page
+        arithmetic does not add up.
+    """
+    fetch = download or s3_sync.download_json_object
+    next_page = 0
+    for index, job in enumerate(rows):
+        if job.shard_index != index:
+            raise error_cls(
+                f"scan {scan.pk} shard sequence breaks at position "
+                f"{index}: job {job.pk} covers shard {job.shard_index}"
+            )
+        if not job.result_key:
+            raise error_cls(f"scan {scan.pk} shard {index} has no result key")
+        manifest = job.input_manifest or {}
+        from_page = manifest.get("from_page")
+        page_count = manifest.get("page_count")
+        if from_page != next_page or not isinstance(page_count, int):
+            raise error_cls(
+                f"scan {scan.pk} shard {index} covers pages from "
+                f"{from_page}, expected {next_page}"
+            )
+        payload = check_result_envelope(
+            scan, job, fetch(job.result_key), action, error_cls
+        )
+        yield ShardRead(index, job, payload, from_page, page_count)
+        next_page += page_count
+
+
+def shard_entry(job: ExternalJob, index: int, tuning_keys: tuple = ()) -> dict:
+    """Describe one shard of a glued run for the volume document.
+
+    The provenance a later reader needs to go back to the bytes: which
+    pages, which attempt, and the object itself. A smarter glue over
+    page inserts and deletes re-reads those objects, which is why no
+    stage deletes them.
+
+    :param job: The shard's row.
+    :param index: The shard's position in the run.
+    :param tuning_keys: The manifest keys that override a stage
+        constant for one run, recorded when present.
+    :returns: One entry of the document's ``shards`` list.
+    :rtype: dict
+    """
+    manifest = job.input_manifest or {}
+    entry = {
+        "name": manifest.get("name"),
+        "index": index,
+        "from_page": manifest.get("from_page"),
+        "to_page": manifest.get("to_page"),
+        "page_count": manifest.get("page_count"),
+        "attempt": job.attempt,
+        "result_key": job.result_key,
+    }
+    tuning = {key: manifest[key] for key in tuning_keys if key in manifest}
+    if tuning:
+        entry["tuning"] = tuning
+    return entry
+
+
 def live_run(
     scan, stage: str, engine: str, apply_run=None
 ) -> list[ExternalJob]:

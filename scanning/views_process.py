@@ -23,6 +23,7 @@ from django.http import (
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.urls import reverse
+from django.views.decorators.clickjacking import xframe_options_sameorigin
 from django.views.decorators.http import require_POST
 
 from scanning import (
@@ -31,10 +32,12 @@ from scanning import (
     findings,
     jobs,
     mistral_ocr,
+    opinion_pdf,
     page_edits,
     page_numbers,
     repairs,
     s3_sync,
+    stats,
     yolo,
 )
 from scanning.models import (
@@ -51,10 +54,12 @@ from scanning.models import (
     JobEngine,
     JobStage,
     JobStatus,
+    Opinion,
     OpinionBoundary,
     OpinionScan,
     PageEdit,
     PageRepairRequest,
+    QueuedAction,
     Scan,
     Stage,
     Status,
@@ -88,13 +93,32 @@ REPAIRS_WAITING_MESSAGE = (
     "the new scan, or dismiss the request on the page if it no longer "
     "applies."
 )
+#: Flashed when the approval is refused because a page carries no page
+#: number (#342). The opinions are named by the printed page, so a page
+#: with no number would give one a name nobody approved. It names the
+#: two ways out, as the message above does.
+PAGE_NUMBERS_MISSING_MESSAGE = (
+    "This scan has {count} page{plural} with no page number: {pages}. "
+    "The opinions of this volume are named by their printed page, so "
+    "every page needs one. Type the number on the page, or dismiss its "
+    "\u201cNo page number detected\u201d card when the page carries no "
+    "printed number."
+)
+#: How many pages :func:`page_numbers_missing_message` names. A volume
+#: can leave hundreds, and a message nobody reads to the end helps
+#: nobody; the bar sends the reviewer to the first of them.
+MAX_NAMED_PAGES = 8
 #: Flashed by the review-2 approval of issue #263, and constants for
 #: the same reason as the three above.
 REDACTION_REVIEW_APPROVED_MESSAGE = (
-    "Thank you. The redactions of this scan are marked as reviewed."
+    "Thank you. The opinions of this scan are created on the server, and "
+    "this page reloads when they are ready."
 )
 REDACTION_REVIEW_ALREADY_DONE_MESSAGE = (
     "The redactions of this scan are already marked as reviewed."
+)
+REDACTION_REVIEW_QUEUED_MESSAGE = (
+    "The opinions of this scan are being created. Wait for the page to reload."
 )
 REDACTION_REVIEW_NOT_READY_MESSAGE = (
     "This scan is not ready for the redaction review. The redactions "
@@ -1139,6 +1163,11 @@ GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
         dots_mocr.glued_result_key,
     ),
     "yolo": (JobStage.DETECT, JobEngine.BLACKLETTER, yolo.merged_result_key),
+    "mistral": (
+        JobStage.EXTRACT,
+        JobEngine.MISTRAL_OCR,
+        mistral_ocr.glued_result_key,
+    ),
 }
 
 NO_S3_GLUED_OUTPUT_MESSAGE = (
@@ -1195,12 +1224,12 @@ def _glued_run_rows(
 def _redirect_to_object(
     scan: Scan,
     output: str,
-    run: int,
     key: str,
     *,
     filename: str,
     missing_message: str,
-    label: str,
+    disposition: str = "attachment",
+    **fields,
 ) -> HttpResponse:
     """Send the browser to one object of the bucket, or say why not.
 
@@ -1217,28 +1246,32 @@ def _redirect_to_object(
 
     :param scan: The scan the object belongs to.
     :param output: The slug, for the log line.
-    :param run: The run number, for the log line and the answer.
     :param key: Object key inside the private bucket.
     :param filename: The name the browser saves the file under.
     :param missing_message: The 404 message when the object is absent.
-    :param label: The run's status counts, for the 404 body.
+    :param disposition: ``attachment``, the default, or ``inline`` for
+        a frame that shows the object instead of saving it (#334).
+    :param fields: What names the object in the 404 body and the log
+        line: ``run`` and ``label`` for a glued or an apply output,
+        ``opinion`` and ``revision`` for an opinion's PDF (#336). Each
+        route means something else by its key, so none is fixed here.
     :returns: A 302 to the presigned URL, or a 404 JSON response.
     """
     if not s3_sync.s3_active():
-        return _json_404(NO_S3_GLUED_OUTPUT_MESSAGE, run=run, label=label)
+        return _json_404(NO_S3_GLUED_OUTPUT_MESSAGE, **fields)
     if not s3_sync.object_exists(key):
-        return _json_404(missing_message, run=run, label=label)
+        return _json_404(missing_message, **fields)
     logger.info(
-        "glued output: scan=%s output=%s run=%s key=%s",
+        "glued output: scan=%s output=%s %s key=%s",
         scan.pk,
         output,
-        run,
+        " ".join(f"{name}={value}" for name, value in fields.items()),
         key,
     )
     url = s3_sync.presign_get(
         key,
         GLUED_OUTPUT_PRESIGN_TTL,
-        content_disposition=f'attachment; filename="{filename}"',
+        content_disposition=f'{disposition}; filename="{filename}"',
     )
     return redirect(url)
 
@@ -1279,6 +1312,12 @@ def _shard_entry(scan: Scan, output: str, row: ExternalJob) -> dict:
     has_summary = isinstance((row.provider_meta or {}).get("output"), dict)
     if row.engine == JobEngine.DOTS_MOCR and has_summary:
         entry.update(jobs.page_lists(row))
+    elif row.engine == JobEngine.MISTRAL_OCR and has_summary:
+        # ``failed_pages`` alone (#245): the other three names of
+        # ``jobs.page_lists`` are dots.mocr faults, and an empty list
+        # would read as "none" where the truth is "not a question
+        # here".
+        entry["failed_pages"] = jobs.page_lists(row)["failed_pages"]
     if row.result_key:
         entry["url"] = reverse(
             "serve_glued_shard",
@@ -1394,11 +1433,221 @@ def serve_glued_volume(
     return _redirect_to_object(
         scan,
         output,
-        run,
         key_fn(scan, run),
         filename=f"scan-{scan.pk}-{output}-r{run}.json",
         missing_message=missing,
+        run=run,
         label=label,
+    )
+
+
+#: The 404 of ``serve_opinion_pdf`` before the pass has written the file.
+OPINION_PDF_NOT_WRITTEN_MESSAGE = (
+    "The redacted PDF of this opinion is not written yet. The daemon "
+    "writes one per tick after the redaction review is approved."
+)
+
+
+@login_required
+@xframe_options_sameorigin
+def serve_opinion_pdf(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Send the browser to the redacted PDF of one opinion (#336).
+
+    A developer's route redirects (#243/#262): a 302 to a presigned GET
+    with the printed range as the download name, which is the one place
+    that name lives (#165). ``opinion_pdf.is_written`` is the one rule
+    for "the PDF exists"; before it holds, a 404 that says so, without
+    an S3 HEAD. The review page of #334 reads the same key through the
+    same rule.
+
+    ``?disposition=inline`` asks for the same object in a frame (#334).
+    The review page puts this route in an ``iframe``, which is a
+    navigation and needs no CORS rule, and the browser's own PDF viewer
+    shows the file. Every other caller gets the download name.
+
+    The route answers ``SAMEORIGIN`` where the site answers ``DENY``,
+    because the site's own page frames it: a browser that reads the
+    header on the redirect would otherwise refuse the frame. It is the
+    narrower value, and the right one. An exemption would let any site
+    frame the route, and although the frame ends at the bucket, which
+    is cross-origin and gives its bytes to no page, a third party's
+    page would still make this pod sign a URL.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The opinion's primary key; it must be of that scan.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    label = f"r{opinion.glue_revision}"
+    if not opinion_pdf.is_written(opinion):
+        return _json_404(
+            OPINION_PDF_NOT_WRITTEN_MESSAGE,
+            opinion=opinion.pk,
+            revision=opinion.glue_revision,
+        )
+    return _redirect_to_object(
+        scan,
+        "opinion-pdf",
+        opinion_pdf.key(opinion),
+        filename=opinion_pdf.download_name(opinion),
+        disposition=(
+            "inline"
+            if request.GET.get("disposition") == "inline"
+            else "attachment"
+        ),
+        missing_message=(
+            f"The redacted PDF of opinion {opinion.pk} was written at "
+            f"{label}, but it is not in the bucket."
+        ),
+        opinion=opinion.pk,
+        revision=opinion.glue_revision,
+    )
+
+
+@login_required
+def serve_opinion_ocr(
+    request: HttpRequest, pk: int, opinion_pk: int, engine: str
+) -> HttpResponse:
+    """Send the browser to one engine's OCR document of one opinion (#350).
+
+    A developer's route, so it redirects (#243/#262). ``manifest``
+    names the manifest. A 404 before the glue is written
+    (``opinion_ocr.is_written``), for an engine this module does not
+    know, and for an opinion of another scan.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :param engine: A name of ``opinion_ocr.ENGINES``, or ``manifest``.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    from scanning import opinion_ocr
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if engine != "manifest" and engine not in opinion_ocr.ENGINES:
+        return _json_404(
+            f"Unknown engine {engine!r}. "
+            f"Known: manifest, {', '.join(opinion_ocr.ENGINES)}."
+        )
+    revision = opinion.glue_revision
+    if not opinion_ocr.is_written(opinion):
+        return _json_404(
+            f"The OCR glue of {opinion} is not written at r{revision}.",
+            opinion=opinion.pk,
+            revision=revision,
+            label=opinion.status,
+        )
+    return _redirect_to_object(
+        scan,
+        f"opinion-{engine}",
+        opinion_ocr.engine_key(opinion, engine),
+        filename=(
+            f"scan-{scan.pk}-opinion-{opinion.first_printed_page}."
+            f"{opinion.index_in_page}-r{revision}-{engine}.json"
+        ),
+        missing_message=(
+            f"The OCR glue of {opinion} is stamped at r{revision}, but "
+            f"its {engine} document is not in the bucket."
+        ),
+        opinion=opinion.pk,
+        revision=revision,
+        label=opinion.status,
+    )
+
+
+@login_required
+def opinion_file_index(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """List the glued objects of one opinion (#334).
+
+    The ``files`` index of an opinion, the twin of
+    :func:`glued_output_index` for a volume: the review page links it,
+    and it answers "which object exists, and where is it". Every fact
+    is on the row, so the index makes no S3 call and answers in every
+    environment. It writes no copy of a rule: the two ledgers are
+    ``opinion_pdf.is_written`` and ``opinion_ocr.is_written``, the same
+    two the two routes read. An entry carries its ``url`` only when it
+    is written, the rule of :func:`_shard_entry`, where a link that
+    cannot work is left out.
+
+    **The OCR ledger is one stamp over four files, and the glue writes
+    one file per engine the run has** (``opinion_ocr.write``). So an
+    engine document is written when the stamp is live **and** the run
+    carries that engine's key: a volume nobody read with Mistral is
+    glued from dots.mocr alone, and its ``mistral_ocr.json`` was never
+    put in the bucket. The manifest is written on every glue. A key
+    that lands on the run after the glue reads as written until the
+    next re-glue, the one error left here, and the rarer one.
+
+    The keys are of the live revision (``Opinion.glue_prefix``). A
+    re-glue raises the revision, so this index never names an object of
+    an older prefix, although that object stays in the bucket.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
+    :return: JSON with ``scan``, ``opinion``, ``label``, ``status``,
+        ``glue_revision``, ``prefix`` and ``files``.
+    """
+    from scanning import opinion_ocr
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    files = [
+        {
+            "name": opinion_pdf.REDACTED_NAME,
+            "output": "redacted-pdf",
+            "written": opinion_pdf.is_written(opinion),
+            "key": opinion_pdf.key(opinion),
+            "url": reverse(
+                "serve_opinion_pdf",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    ]
+    ocr_written = opinion_ocr.is_written(opinion)
+    run = opinion.apply_run
+    for engine in (*opinion_ocr.ENGINES, "manifest"):
+        key = opinion_ocr.engine_key(opinion, engine)
+        spec = opinion_ocr.ENGINES.get(engine)
+        has_read = spec is None or bool(
+            run is not None and spec.document_key(run)
+        )
+        files.append(
+            {
+                "name": key.rsplit("/", 1)[-1],
+                "output": f"opinion-{engine}",
+                "written": ocr_written and has_read,
+                "key": key,
+                "url": reverse(
+                    "serve_opinion_ocr",
+                    kwargs={
+                        "pk": scan.pk,
+                        "opinion_pk": opinion.pk,
+                        "engine": engine,
+                    },
+                ),
+            }
+        )
+    for entry in files:
+        if not entry["written"]:
+            entry.pop("url")
+    return JsonResponse(
+        {
+            "scan": scan.pk,
+            "opinion": opinion.pk,
+            "label": str(opinion),
+            "status": opinion.status,
+            "glue_revision": opinion.glue_revision,
+            "prefix": opinion.glue_prefix,
+            "files": files,
+        }
     )
 
 
@@ -1448,9 +1697,9 @@ def serve_glued_shard(
     return _redirect_to_object(
         scan,
         output,
-        run,
         row.result_key,
         filename=f"scan-{scan.pk}-{output}-r{run}-s{shard}.json",
+        run=run,
         missing_message=(
             f"The result of shard {shard} of run {run} is not in the "
             f"bucket ({status})."
@@ -1468,6 +1717,7 @@ APPLY_OUTPUTS: dict[str, tuple[str | None, str]] = {
     "ocr-volume": ("ocr_key", "json"),
     "printed-pages": ("printed_pages_key", "json"),
     "detections-volume": ("detections_key", "json"),
+    "extract-volume": ("extract_key", "json"),
     "page-map": (None, "json"),
 }
 
@@ -1624,9 +1874,9 @@ def serve_apply_output(
     return _redirect_to_object(
         scan,
         f"apply/{output}",
-        number,
         key,
         filename=f"scan-{scan.pk}-apply-{run.label}-{output}.{ext}",
+        run=number,
         missing_message=(
             f"The {output} of apply run {run.label} is not in the bucket."
         ),
@@ -1666,8 +1916,8 @@ def serve_apply_shard(
     return _redirect_to_object(
         scan,
         "apply/shard",
-        number,
         row.result_key,
+        run=number,
         filename=(
             f"scan-{scan.pk}-apply-a{number}-{row.stage}-{row.engine}-"
             f"e{(row.input_manifest or {}).get('edit_id')}"
@@ -1784,6 +2034,12 @@ def _review_flags(
     requests for the sidebar anyway -- and the flag is queried only for
     a caller that does not (the ``process_actions`` fragment).
 
+    ``pages_without_number`` is the second gate of that approval
+    (#342), and it is read in READY alone, which is the condition the
+    view reads: a volume past review 1 pays no query for it, whichever
+    step asks for the bar. The bar shows a note for each gate that
+    refuses, and the button when neither does.
+
     :param scan: The scan the bars are rendered for.
     :param repairs_waiting: Whether a scanner still has to act on this
         scan. ``None`` asks :func:`repairs.has_waiting`.
@@ -1792,8 +2048,10 @@ def _review_flags(
         :func:`findings.open_count`, past the review-1 approval.
     :returns: ``page_review_ready``, ``page_review_done``,
         ``redaction_review_ready``, ``redaction_review_done``,
-        ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting`` and
-        the two pending-edit flags, for the template context.
+        ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting``,
+        ``pages_without_number``, ``legacy_pipeline``,
+        ``review3_opinions`` and the two pending-edit flags, for the
+        template context.
     :rtype: dict
     """
     from scanning import apply, review_states, services
@@ -1820,19 +2078,41 @@ def _review_flags(
         }
     if repairs_waiting is None:
         repairs_waiting = repairs.has_waiting(scan)
+    ready = scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+    # Only where the button is offered (#342). The rule overlays the
+    # page numbers, which is three queries, and no other status reads
+    # the answer.
+    pages_without_number = (
+        page_numbers.pages_without_number(scan) if ready else []
+    )
     if review2 is None:
         review2 = findings.open_count(scan) if approved else (0, 0)
     review2_open, review2_stale = review2
     return {
-        "page_review_ready": (
-            scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
-        ),
+        "page_review_ready": ready,
         "page_review_done": approved,
         "redaction_review_ready": (
             scan.status == Status.READY_FOR_REDACTION_REVIEW
         ),
         "redaction_review_done": (scan.status == Status.REDACTION_REVIEW_DONE),
+        # The last word of the server on a volume parked in review 2
+        # (#336). A failed opinion creation or a failed recompute parks
+        # the scan here with the reason in ``progress_message``, and the
+        # poll reloads the page at once, so without this line the
+        # approve button seems to do nothing.
+        "redaction_review_note": (
+            scan.progress_message
+            if scan.status == Status.READY_FOR_REDACTION_REVIEW
+            else ""
+        ),
         "legacy_review": scan.status == Status.PENDING_REVIEW,
+        # Which pipeline the volume belongs to (#334). Not
+        # ``legacy_review``, which is PENDING_REVIEW alone: a legacy
+        # volume also holds APPROVED and EXTRACTED, and those keep the
+        # step 3 that lists the files the legacy pipeline generated.
+        # ``stats.LEGACY_STATUSES`` is the project's one definition of
+        # a status no new scan can reach.
+        "legacy_pipeline": scan.status in stats.LEGACY_STATUSES,
         # The reopen is a compare-and-swap on DONE (#224), so the
         # button shows only there: a volume in review 2 keeps its
         # badge and loses the button.
@@ -1847,6 +2127,9 @@ def _review_flags(
         "final_space": final_space,
         "final_volume": final_volume,
         "repairs_waiting": repairs_waiting,
+        # The pages review 1 left with no number (#342). The bar names
+        # the count and sends the reviewer to the first of them.
+        "pages_without_number": pages_without_number,
         # "Next: Generate" (#240 PR C): one read for both renders of
         # the bar, or a volume whose only boundary is a curator's
         # showed the link on a full load and hid it after the fragment
@@ -1857,6 +2140,14 @@ def _review_flags(
         # approval only: before it there is no compute and no finding.
         "review2_open": review2_open,
         "review2_stale": review2_stale,
+        # The opinions of review 3 (#334). The step-3 tab links the
+        # opinions page with this scan as its filter, and only when the
+        # rows exist: a tab that opened an empty list would send a
+        # curator to a page with no work on it. A legacy volume has no
+        # ``Opinion`` row and keeps its own step 3. Not
+        # ``opinion_count``, which the step-2 sidebar already uses for
+        # the boundaries of the volume.
+        "review3_opinions": Opinion.objects.filter(scan=scan).count(),
         **page_edits.pending_edit_flags(scan, run),
     }
 
@@ -2311,6 +2602,28 @@ def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=pk)
 
 
+def page_numbers_missing_message(pages: list[int]) -> str:
+    """Name the pages that have no page number, for the refusal (#342).
+
+    At most ``MAX_NAMED_PAGES`` of them, then a count: the message is
+    read in one line at the top of the page, and a volume can leave
+    hundreds. The cards name every one of them, and the note in the
+    bar sends the reviewer to the first.
+
+    :param pages: What ``page_numbers.pages_without_number`` returned.
+    :returns: The message the view flashes.
+    :rtype: str
+    """
+    named = ", ".join(str(page) for page in pages[:MAX_NAMED_PAGES])
+    if len(pages) > MAX_NAMED_PAGES:
+        named += f" and {len(pages) - MAX_NAMED_PAGES} more"
+    return PAGE_NUMBERS_MISSING_MESSAGE.format(
+        count=len(pages),
+        plural="" if len(pages) == 1 else "s",
+        pages=named,
+    )
+
+
 @login_required
 @require_POST
 def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
@@ -2335,6 +2648,22 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
     *issues* still do not block: a suspicion is the curator's to
     judge, and a missing page is not (#151).
 
+    **A page with no page number refuses it too** (#342), which is the
+    one open card that is not a suspicion. The opinions are named by
+    their printed page (#335), so a page nobody numbered would name an
+    opinion by its position in the volume, a number no person approved
+    and one that moves when the first page of the volume moves. The
+    rule is ``page_numbers.pages_without_number``, and its answers are
+    a number, a deletion or a dismissal of that page's card.
+
+    The two rules are read together and each flashes its own message.
+    A reviewer who answers one must see the other without a second
+    press of the button. Both are read in READY alone, which is the
+    condition ``_review_flags`` reads for the bar: in every other
+    status the compare-and-swap below owns the answer, and a volume
+    already approved has locked pages, so a gate would name work
+    nobody can do.
+
     The gate is a read, then the compare-and-swap. A request made
     between the two does not block that approval, and the plan accepts
     it: both acts are decisions of a person, seconds apart, and the way
@@ -2345,11 +2674,29 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
     :return: Redirect to step 1 of the scan processing page.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    if repairs.has_waiting(scan):
-        messages.warning(request, REPAIRS_WAITING_MESSAGE)
-        return redirect(
-            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
-        )
+    # The two gates speak for the status that offers the button, and
+    # for no other. A volume already approved has its pages locked, so
+    # "type the number" would name work nobody can do; the
+    # compare-and-swap below says what is true of such a row instead.
+    # It is the condition ``_review_flags`` reads, so the bar and the
+    # view cannot disagree.
+    if scan.status == Status.READY_FOR_PAGE_COMPLETENESS_REVIEW:
+        refusals = []
+        if repairs.has_waiting(scan):
+            refusals.append(REPAIRS_WAITING_MESSAGE)
+        missing = page_numbers.pages_without_number(scan)
+        if missing:
+            refusals.append(page_numbers_missing_message(missing))
+        if refusals:
+            # One message for each rule, repairs first: the two
+            # refusals are different work for different people, and a
+            # reviewer who answers one must see the other without a
+            # second press.
+            for refusal in refusals:
+                messages.warning(request, refusal)
+            return redirect(
+                reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+            )
     approved = Scan.objects.filter(
         pk=scan.pk, status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
     ).update(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
@@ -2434,18 +2781,22 @@ def reopen_page_review(request: HttpRequest, pk: int) -> HttpResponse:
 def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     """Record that a person reviewed the redactions of this scan.
 
-    The approve button of review 2 (#263), and the only writer of
-    ``REDACTION_REVIEW_DONE``. Every logged-in user may press it, which
-    is the rule of the review-1 approve button (#151): both are the
-    same kind of human decision, and the log line below is the only
-    record of who made this one.
+    The approve button of review 2 (#263), and the only place a person
+    closes it. Every logged-in user may press it, which is the rule of
+    the review-1 approve button (#151): both are the same kind of human
+    decision, and the log line below is the only record of who made
+    this one.
 
-    The write is one compare-and-swap on ``READY_FOR_REDACTION_REVIEW``,
-    never a full instance save. The collect tick and the redaction
-    apply both write that status over the same row
-    (``review_states``), and a scan that was re-queued, errored, or
-    whose geometry is being measured again must not be approved from a
-    stale page a curator left open.
+    The write is one compare-and-swap on ``READY_FOR_REDACTION_REVIEW``
+    (``opinions.queue_create_opinions``, #336): the scan goes to
+    ``QUEUED`` with ``CREATE_OPINIONS``, the daemon writes the
+    ``Opinion`` rows, and its worker parks the scan in
+    ``REDACTION_REVIEW_DONE``. A failure parks it back here with the
+    reason, so the next press is the retry. Never a full instance save:
+    the collect tick and the redaction compute both write the status
+    over the same row (``review_states``), and a scan that was
+    re-queued, errored, or whose geometry is being measured again must
+    not be approved from a stale page a curator left open.
 
     Open detections or unpaired opinions do not block it. The curator
     is the judge of the geometry, exactly as they are the judge of a
@@ -2455,11 +2806,10 @@ def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to step 2 of the scan processing page.
     """
+    from scanning import opinions
+
     scan = get_object_or_404(Scan, pk=pk)
-    approved = Scan.objects.filter(
-        pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
-    ).update(status=Status.REDACTION_REVIEW_DONE)
-    if approved:
+    if opinions.queue_create_opinions(scan):
         logger.info(
             "approve_redaction_review: scan=%s approved by user=%s",
             scan.pk,
@@ -2472,6 +2822,11 @@ def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
         scan.refresh_from_db()
         if scan.status == Status.REDACTION_REVIEW_DONE:
             messages.info(request, REDACTION_REVIEW_ALREADY_DONE_MESSAGE)
+        elif (
+            scan.status in (Status.QUEUED, Status.PROCESSING)
+            and scan.queued_action == QueuedAction.CREATE_OPINIONS
+        ):
+            messages.info(request, REDACTION_REVIEW_QUEUED_MESSAGE)
         else:
             messages.warning(request, REDACTION_REVIEW_NOT_READY_MESSAGE)
     return redirect(
@@ -2890,9 +3245,17 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     page (#214). The apply (#206) decides what a delete does to the
     volume; until then the row is a saved decision and nothing else.
 
-    :param request: The HTTP request (JSON body with pdf_page).
+    Several pages at once, when the body carries ``pdf_pages``: the
+    front-matter card offers the unnumbered run before the first
+    printed number as one decision, and one request is one confirm.
+    Every page is checked before any row is written, so a request that
+    names a page the volume does not have writes nothing.
+
+    :param request: The HTTP request (JSON body with ``pdf_page``, or
+        ``pdf_pages`` for several).
     :param pk: Scan primary key.
-    :return: JSON response confirming the deletion record.
+    :return: JSON response confirming the deletion record, with the
+        pages it marked.
     """
     scan = get_object_or_404(Scan, pk=pk)
     locked = _refuse_locked_edits(scan)
@@ -2902,21 +3265,27 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-    pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
-    if pdf_page is None:
+    raw = data.get("pdf_pages")
+    if raw is None:
+        raw = [data.get("pdf_page")]
+    if not isinstance(raw, list) or not raw:
+        return JsonResponse({"error": "Unknown PDF page."}, status=404)
+    pages = [_pdf_page_of(scan, value) for value in raw]
+    if any(page is None for page in pages):
         return JsonResponse({"error": "Unknown PDF page."}, status=404)
     # A standing deletion is left as it is: a second click has nothing
     # to refresh. An applied one is superseded, so the new decision is
     # a row of its own (#224).
-    page_edits.supersede(
-        scan,
-        PageEdit.Kind.DELETE_PAGE,
-        {"pdf_page": pdf_page},
-        {"source_fingerprint": scan.source_fingerprint},
-        request.user,
-        refresh_open=False,
-    )
-    return JsonResponse({"status": "ok"})
+    for pdf_page in sorted(set(pages)):
+        page_edits.supersede(
+            scan,
+            PageEdit.Kind.DELETE_PAGE,
+            {"pdf_page": pdf_page},
+            {"source_fingerprint": scan.source_fingerprint},
+            request.user,
+            refresh_open=False,
+        )
+    return JsonResponse({"status": "ok", "pdf_pages": sorted(set(pages))})
 
 
 @login_required

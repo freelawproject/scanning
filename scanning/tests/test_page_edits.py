@@ -752,6 +752,102 @@ class TestDeletePageWritesAnEdit(ScanningTestCase):
         self.assertEqual(self._post("delete_page", 9).status_code, 404)
         self.assertFalse(self.scan.page_edits.exists())
 
+    def _post_pages(self, pages):
+        return self.client.post(
+            reverse("delete_page", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"pdf_pages": pages}),
+            content_type="application/json",
+        )
+
+    def test_several_pages_are_marked_in_one_request(self):
+        response = self._post_pages([1, 2, 3])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["pdf_pages"], [1, 2, 3])
+        self.assertEqual(page_edits.deleted_pages(self.scan), {1, 2, 3})
+        self.assertTrue(
+            all(e.author == self.user for e in self.scan.page_edits.all())
+        )
+
+    def test_one_bad_page_refuses_the_whole_request(self):
+        self.assertEqual(self._post_pages([1, 2, 9]).status_code, 404)
+        self.assertFalse(self.scan.page_edits.exists())
+
+    def test_an_empty_list_is_refused(self):
+        self.assertEqual(self._post_pages([]).status_code, 404)
+
+
+class TestFrontMatterCard(TestCase):
+    """The unnumbered run at the front of the volume is one card."""
+
+    def _scan(self, detected, deleted=()):
+        """A scan whose pages read as ``detected``, some marked."""
+        scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            start_page=1,
+            end_page=len(detected),
+            page_count=len(detected),
+            source_fingerprint=f"100:{len(detected)}",
+            ocr_results=[
+                {
+                    "pdf_page": i,
+                    "detected": d,
+                    "type": "single" if d else None,
+                    "zone": "dots-header" if d else None,
+                }
+                for i, d in enumerate(detected, 1)
+            ],
+        )
+        for page in deleted:
+            PageEditFactory(
+                scan=scan,
+                kind=PageEdit.Kind.DELETE_PAGE,
+                pdf_page=page,
+                value="",
+                source_fingerprint=scan.source_fingerprint,
+            )
+        return scan
+
+    def _card(self, scan):
+        from scanning import services
+
+        services.recalculate_issues(scan)
+        return scan.issues.filter(check_name=CheckName.FRONT_MATTER).first()
+
+    def test_the_leading_run_is_one_card_naming_every_page(self):
+        card = self._card(self._scan([None, None, None, "1", "2"]))
+        self.assertIsNotNone(card)
+        self.assertEqual(card.page_number, 1)
+        self.assertEqual(card.severity, "warning")
+        self.assertIn("PDF pages 1-3", card.message)
+        self.assertTrue(card.message.endswith("[1, 2, 3]"))
+
+    def test_an_unnumbered_run_later_in_the_volume_gets_no_card(self):
+        self.assertIsNone(self._card(self._scan(["1", None, None, "4"])))
+
+    def test_a_volume_with_no_number_at_all_gets_no_card(self):
+        self.assertIsNone(self._card(self._scan([None, None, None])))
+
+    def test_marked_pages_are_skipped_and_the_card_shrinks(self):
+        card = self._card(self._scan([None, None, None, "1"], deleted=(1, 2)))
+        self.assertEqual(card.page_number, 3)
+        self.assertIn("PDF page 3", card.message)
+        self.assertTrue(card.message.endswith("[3]"))
+
+    def test_the_card_goes_when_the_run_is_marked(self):
+        self.assertIsNone(
+            self._card(self._scan([None, None, "1"], deleted=(1, 2)))
+        )
+
+    def test_one_no_page_number_card_per_page_still_stands(self):
+        from scanning import services
+
+        scan = self._scan([None, None, "1"])
+        services.recalculate_issues(scan)
+        self.assertEqual(
+            scan.issues.filter(check_name=CheckName.NO_PAGE_NUMBER).count(), 2
+        )
+
 
 class TestPageInsertEndpoints(ScanningTestCase):
     """An insert is addressed by the gap it fills, and can be taken back."""

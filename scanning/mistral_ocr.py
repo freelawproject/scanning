@@ -1,4 +1,6 @@
-"""The Mistral OCR stage (issue #191): rows, render, submit, poll, harvest.
+"""The Mistral OCR stage: rows, render, submit, poll, harvest, glue.
+
+Issues #191 (the job) and #245 (the glue).
 
 One :class:`~scanning.models.ExternalJob` row per shard at
 ``EXTRACT``/``MISTRAL_OCR``/``MISTRAL``, and one Mistral batch job per
@@ -32,9 +34,23 @@ Mistral, and must not be broken:
   transforms it.** The result document holds the output lines and the
   error lines as they came, plus the batch job object. ``markdown``,
   ``blocks``, ``images``, ``tables``, ``usage_info`` and whatever a
-  later model adds all land in S3. The glue (a follow-up) is where
-  ``parse()`` and every other transform run, so a better transform is a
-  re-glue at no API cost, never a re-paid read.
+  later model adds all land in S3. :func:`parse_payload` is the one
+  transform, and both glues call it, so a better transform is a re-glue
+  (``reglue_mistral_ocr``) at no API cost, never a re-paid read.
+- **The two glues run on the collect tick, and never in
+  ``apply.glues_due``** (#245). The apply's own trigger takes a scan in
+  ``PAGE_COMPLETENESS_REVIEW_DONE`` alone, and this read starts later
+  than that status: by hand today, and after the second review once
+  #336 lands. An arm there would miss the normal case for good.
+- **No review state waits for an output of this stage.**
+  ``ApplyRun.extract_key`` is outside ``is_complete``, and the rows of
+  a corrected volume are created outside ``apply._ensure_rows``: an
+  environment that does not pay for Mistral must build its corrected
+  volumes and open its reviews exactly as it does today.
+- **The corrected volume's rows are created only for a volume somebody
+  chose to read.** :func:`finish_ready_applies` takes a scan whose
+  live volume run is glued, which only a person starts, so the pass
+  mints no paid work of its own.
 - **The render is the branch's, line for line.** RGB, ``zoom = 1700 /
   page width``, a resize to exactly 1700x2200. Every engine of the
   ensemble saw that image, and every bbox of every engine lives in
@@ -67,6 +83,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 import tempfile
 import time
 from collections.abc import Iterator
@@ -87,6 +104,7 @@ from scanning.models import (
     JobEngine,
     JobProvider,
     JobStage,
+    JobStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -195,7 +213,7 @@ def model_for(job: ExternalJob) -> str:
 
 
 def ensure_extract_jobs(
-    scan, manifest: dict, *, force_new_run: bool = False
+    scan, manifest: dict, *, force_new_run: bool = False, apply_run=None
 ) -> list[ExternalJob]:
     """Return the live Mistral jobs for ``scan``, creating them if the
     current run does not describe today's shard set.
@@ -215,6 +233,8 @@ def ensure_extract_jobs(
     :param scan: The scan to read.
     :param manifest: The committed shard manifest.
     :param force_new_run: Replace a whole, reusable live run.
+    :param apply_run: The apply run whose one-page shards are read
+        (#245), or None for the volume's own shard set.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -227,6 +247,7 @@ def ensure_extract_jobs(
         reuse_results=True,
         force_new_run=force_new_run,
         carry_stable_holes=False,
+        apply_run=apply_run,
     )
 
 
@@ -882,3 +903,803 @@ def cancel_job(
     if files is None:
         files = [str(f) for f in (job.provider_meta or {}).get("files") or []]
     _delete_files(files)
+
+
+# ── the glue ────────────────────────────────────────────────────────
+#: Version of the volume document this module writes. A reader checks
+#: it before it trusts the page shape. Version 2 (#350) writes every
+#: block box as a four-number list; a version-1 document carries
+#: ``bbox: null`` on every block, because the parse read a field
+#: Mistral does not write, and no geometry may trust it.
+GLUE_SCHEMA_VERSION = 2
+
+#: How many times a run's glue may fail before the pass leaves it
+#: alone. The per-shard results are kept, so a retry costs one small
+#: download and no API payment.
+GLUE_MAX_ATTEMPTS = 3
+
+#: Where the leaked coordinate markers come off the block text
+#: (``pipeline/core/markup.py`` of ai-research, line for line). Mistral
+#: sometimes writes its own box into the text as
+#: ``[BBOX]x0,y0,x1,y1[/BBOX]``, and sometimes leaves the closing tag
+#: out. The inner run therefore takes coordinate characters only --
+#: digits, dots, commas, spaces -- because a permissive inner match
+#: would swallow the sentence after a marker with no closing tag. The
+#: block already carries the box as a field, so the marker is the same
+#: fact restated.
+_BBOX_MARKER = re.compile(
+    r"\[\s*BBOX\s*\][\d.,\t ]*(?:\[\s*/\s*BBOX\s*\])?", re.I
+)
+
+#: The block field the glue writes, and the two it reads. The name is
+#: internal: this repository is the only reader of a glued document.
+#: PR #247's fixture writes ``content`` and the ai-research loader reads
+#: ``text``, so the parse takes either and writes one.
+BLOCK_TEXT_KEY = "content"
+BLOCK_TEXT_FIELDS = ("content", "text")
+
+#: The four corners of a block box, in the order the glue writes them.
+#: A stored batch answer carries them on the block itself (the
+#: ensemble experiment of #317 read them there over scan 2845); the
+#: fixture of PR #247 nests them under ``bbox``. The parse reads both
+#: and writes one list, ``[x0, y0, x1, y1]``, the shape of a dots.mocr
+#: cell, so one geometry reads both engines (#350).
+BLOCK_BOX_KEYS = (
+    "top_left_x",
+    "top_left_y",
+    "bottom_right_x",
+    "bottom_right_y",
+)
+
+
+class MistralGlueError(Exception):
+    """A Mistral run could not be glued into a volume document."""
+
+
+def glued_result_key(scan, run: int) -> str:
+    """Return the S3 key one run's glued volume document lives at.
+
+    This stage's name for :func:`jobs.volume_result_key`, which holds
+    the rule and the reasons.
+
+    :param scan: The scan the run belongs to.
+    :param run: The run number.
+    :returns: Key of the form ``{processing_prefix}jobs/extract/
+        mistral_ocr/r{run}-volume.json``.
+    :rtype: str
+    """
+    return jobs.volume_result_key(
+        scan, JobStage.EXTRACT, JobEngine.MISTRAL_OCR, run
+    )
+
+
+def glued_volume_key(scan) -> str | None:
+    """Return the key of a scan's glued Mistral document, or nothing.
+
+    The live run is glued when every one of its rows is ``CONSUMED``:
+    the glue writes the document and flips the rows in one pass. The
+    twin of ``dots_mocr.glued_volume_key``.
+
+    :param scan: The scan (or its pk) to look up.
+    :returns: The key, or None when no run is glued.
+    :rtype: str | None
+    """
+    return jobs.glued_volume_key(scan, JobStage.EXTRACT, JobEngine.MISTRAL_OCR)
+
+
+def _check_envelope(scan, job: ExternalJob, envelope) -> dict:
+    """Return an envelope's payload, or refuse the envelope.
+
+    :param scan: The scan being glued.
+    :param job: The row whose result the envelope claims to be.
+    :param envelope: The parsed JSON found at ``job.result_key``.
+    :returns: ``envelope["payload"]``.
+    :rtype: dict
+    :raises MistralGlueError: If the envelope is not one this attempt
+        should have produced.
+    """
+    return jobs.check_result_envelope(
+        scan, job, envelope, ACTION, MistralGlueError
+    )
+
+
+def _block_text(block: dict) -> str:
+    """Return one block's text, with the coordinate markers removed.
+
+    :param block: A block as Mistral wrote it.
+    :returns: The text, or an empty string.
+    :rtype: str
+    """
+    for name in BLOCK_TEXT_FIELDS:
+        value = block.get(name)
+        if isinstance(value, str):
+            return _BBOX_MARKER.sub("", value).lstrip()
+    return ""
+
+
+def _block_box(block: dict) -> list[float] | None:
+    """Return one block's box as ``[x0, y0, x1, y1]``, or nothing.
+
+    The four corners are read from :data:`BLOCK_BOX_KEYS` on the block,
+    or from a ``bbox`` dict that holds them. The numbers are kept as
+    they came: every engine of the ai-research ensemble measures in the
+    1700x2200 render space, and a second convention here would have to
+    be undone by every reader. A corner that is missing or not a
+    number, or a box with no area, gives None, so a reader never scales
+    a box that is not one.
+
+    :param block: A block as Mistral wrote it.
+    :returns: The box, or None.
+    :rtype: list[float] | None
+    """
+    source = block
+    if not all(key in block for key in BLOCK_BOX_KEYS):
+        source = block.get("bbox")
+        if not isinstance(source, dict):
+            return None
+    corners = []
+    for key in BLOCK_BOX_KEYS:
+        value = source.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        corners.append(float(value))
+    x0, y0, x1, y1 = corners
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return corners
+
+
+def _blocks(page: dict) -> list[dict]:
+    """Return one page's blocks in this module's own shape.
+
+    ``{"id", "type", "bbox", "content"}`` per block, in the order
+    Mistral wrote them. The box is the list :func:`_block_box` reads
+    off the block, in the 1700x2200 render space, or None.
+
+    :param page: One page of a response body.
+    :returns: The blocks, empty when the answer has none.
+    :rtype: list[dict]
+    """
+    blocks = page.get("blocks")
+    if not isinstance(blocks, list):
+        return []
+    return [
+        {
+            "id": index,
+            "type": block.get("type") or "",
+            "bbox": _block_box(block),
+            BLOCK_TEXT_KEY: _block_text(block),
+        }
+        for index, block in enumerate(blocks)
+        if isinstance(block, dict)
+    ]
+
+
+def _page_of_line(line: dict) -> dict | None:
+    """Return the page one output line answered, or nothing.
+
+    One request carries one page image, so one answer carries one page.
+    A line with an error, with no body, or with no page in its body is
+    a hole, and the caller keeps the page's slot instead.
+
+    :param line: One output line, as Mistral wrote it.
+    :returns: The page dict of this module's shape, or None.
+    :rtype: dict | None
+    """
+    if line.get("error"):
+        return None
+    response = line.get("response")
+    body = (
+        response.get("body") if isinstance(response, dict) else None
+    ) or line.get("body")
+    if not isinstance(body, dict):
+        return None
+    pages = body.get("pages")
+    if not isinstance(pages, list) or not pages:
+        return None
+    page = pages[0]
+    if not isinstance(page, dict):
+        return None
+    read = {
+        "md": page.get("markdown") or "",
+        "blocks": _blocks(page),
+    }
+    if isinstance(page.get("dimensions"), dict):
+        read["dimensions"] = page["dimensions"]
+    return read
+
+
+def parse_payload(payload: dict) -> dict[int, dict]:
+    """Turn one stored result into a page dict per page of its shard.
+
+    **The one transform of a Mistral result.** The harvest stores the
+    output lines verbatim (:func:`harvest`), and this is where they
+    become pages: the body of each line, the page markdown, the blocks
+    with their boxes read into one list shape (:func:`_block_box`) and
+    their text cleaned of the coordinate markers.
+    Both glues call it -- the volume glue over a shard result, the
+    apply glue over a one-page result -- so a better transform is a
+    re-glue at no API cost, and it is right in both documents at once.
+
+    Every page of the shard comes back, keyed by its shard-local page.
+    A page Mistral could not read keeps its slot and carries ``error``
+    instead of text, as the dots.mocr glue does: a hole must be visible
+    to a reader rather than shift the pages after it.
+
+    :param payload: The ``payload`` of a stored result envelope.
+    :returns: ``{shard-local page: page dict}``, one entry per page.
+    :rtype: dict[int, dict]
+    """
+    page_count = int(payload.get("page_count") or 0)
+    lines = payload.get("output")
+    read: dict[int, dict] = {}
+    for line in lines if isinstance(lines, list) else []:
+        if not isinstance(line, dict):
+            continue
+        page_no = page_no_of(line.get("custom_id"))
+        if page_no is None:
+            continue
+        page = _page_of_line(line)
+        if page is not None:
+            read[page_no] = page
+    pages: dict[int, dict] = {}
+    for page_no in range(page_count):
+        page = read.get(page_no)
+        if page is None:
+            page = {
+                "md": "",
+                "blocks": [],
+                "error": "not read: no answer for this page",
+            }
+        pages[page_no] = {"page_no": page_no, **page}
+    return pages
+
+
+def _failed_pages(pages: list[dict], key: str) -> list[int]:
+    """Return the pages that carry no reading, by one page-number field.
+
+    One list, not the four of ``dots_mocr.PAGE_LISTS``: the other three
+    name faults of the dots.mocr worker (a filtered answer, a retry
+    rung, a repaired layout), and this stage has none of them. A list
+    of zeros would read as "none" where the truth is "not a question
+    here".
+
+    :param pages: Page dicts, shard-local or volume-level.
+    :param key: The page-number field to list: ``"page_no"`` for a
+        shard's pages, ``"page_index"`` for the volume document.
+    :returns: The page numbers, in order.
+    :rtype: list[int]
+    """
+    return sorted(page[key] for page in pages if "error" in page)
+
+
+def merge_extract_results(scan, extract_jobs: list[ExternalJob]) -> str:
+    """Glue one run's shard results into a volume document on S3.
+
+    Glues in strict shard order and asserts the page arithmetic:
+    ``page_no`` counts from zero inside a shard, so a page's volume
+    index is the shard's ``from_page`` plus its ``page_no``, and its
+    1-based ``pdf_page`` is that plus one. The volume document is in
+    the **original's** page space, as every other volume document is;
+    the corrected volume's own space is the apply glue
+    (:func:`glue_apply_run`).
+
+    Idempotent: it rebuilds from the result objects every time, so a
+    daemon killed between the upload and the CONSUMED write just glues
+    again. The results are kept and nothing here deletes one.
+
+    It writes no scan status. The stages that read a volume own no
+    review state (#190, #195), and this one runs later than both.
+
+    :param scan: The scan whose run finished.
+    :param extract_jobs: The live run's rows, ordered by shard index.
+    :returns: The S3 key the document was uploaded to.
+    :rtype: str
+    :raises MistralGlueError: If a result is missing, malformed, or the
+        page arithmetic does not add up to the volume.
+    """
+    if not extract_jobs:
+        raise MistralGlueError(f"scan {scan.pk} has no Mistral jobs")
+
+    expected_total = (extract_jobs[0].input_manifest or {}).get(
+        "source_page_count"
+    )
+    run = extract_jobs[0].run
+    started = time.monotonic()
+
+    pages: list[dict] = []
+    shards: list[dict] = []
+    for read in jobs.read_run_shards(
+        scan, extract_jobs, action=ACTION, error_cls=MistralGlueError
+    ):
+        shard_pages = parse_payload(read.payload)
+        if sorted(shard_pages) != list(range(read.page_count)):
+            raise MistralGlueError(
+                f"scan {scan.pk} shard {read.index} answered page(s) "
+                f"{sorted(shard_pages)}, the shard has {read.page_count}"
+            )
+        for page_no in range(read.page_count):
+            page_index = read.from_page + page_no
+            pages.append(
+                {
+                    "page_index": page_index,
+                    "pdf_page": page_index + 1,
+                    "shard_index": read.index,
+                    **shard_pages[page_no],
+                }
+            )
+        shards.append(
+            {
+                **jobs.shard_entry(read.job, read.index, TUNING_KEYS),
+                "model": read.payload.get("model"),
+            }
+        )
+
+    if expected_total is not None and len(pages) != expected_total:
+        raise MistralGlueError(
+            f"scan {scan.pk} glued to {len(pages)} page(s), the original "
+            f"has {expected_total}"
+        )
+
+    document = {
+        "schema_version": GLUE_SCHEMA_VERSION,
+        "engine": str(JobEngine.MISTRAL_OCR),
+        "action": ACTION,
+        "scan_pk": scan.pk,
+        "run": run,
+        "source_page_count": expected_total,
+        "model": shards[0].get("model"),
+        # The space every box of every block lives in, and the copy of
+        # the volume that was read.
+        "render": {
+            "width": RENDER_W,
+            "height": RENDER_H,
+            "source": SOURCE,
+        },
+        "generated_at": timezone.now().isoformat(),
+        "shards": shards,
+        "pages": pages,
+        "failed_pages": _failed_pages(pages, "page_index"),
+    }
+    key = glued_result_key(scan, run)
+    if not s3_sync.upload_json_object(key, document):
+        raise MistralGlueError(
+            f"scan {scan.pk}: the glued document could not be uploaded "
+            f"to {key}"
+        )
+    logger.info(
+        "Glued %d Mistral shard(s) for scan %s into %s (%d page(s), "
+        "%d unread) in %.1fs",
+        len(extract_jobs),
+        scan.pk,
+        key,
+        len(pages),
+        len(document["failed_pages"]),
+        time.monotonic() - started,
+    )
+    return key
+
+
+def _ledger_key(run=None) -> str:
+    """Return the ``provider_meta`` key one glue's ledger lives under.
+
+    Two glues keep a ledger on the volume run's rows: the volume
+    document's, and one per corrected volume, because a scan may have
+    had more than one apply run and each is glued on its own terms.
+
+    :param run: The apply run, or None for the volume document.
+    :returns: ``"glue"``, or ``"glue:a{n}"``.
+    :rtype: str
+    """
+    return "glue" if run is None else f"glue:{run.label}"
+
+
+def _record_glue_failure(
+    scan, extract_jobs: list[ExternalJob], key: str, exc
+) -> None:
+    """Count one glue failure, and give up loudly on the last one.
+
+    The result objects stay in S3, so a retry costs one small download
+    and no API payment. The crossing into "out of tries" is the one
+    ERROR-level event; the way back after a fix is a person clearing
+    the named key on the named row.
+
+    :param scan: The scan whose glue failed.
+    :param extract_jobs: The live run's rows, ordered by shard index.
+    :param key: See :func:`_ledger_key`.
+    :param exc: What the glue raised.
+    :return: None.
+    """
+    attempts, head = jobs.bump_run_ledger(extract_jobs, key, exc)
+    if attempts >= GLUE_MAX_ATTEMPTS:
+        logger.exception(
+            "Gluing the Mistral results (%s) for scan %s failed; giving up "
+            "after %d attempt(s). The shard results stay in S3; clear "
+            "provider_meta['%s'] on job %s to retry.",
+            key,
+            scan.pk,
+            attempts,
+            key,
+            head.pk,
+        )
+    else:
+        logger.warning(
+            "Gluing the Mistral results (%s) for scan %s failed (attempt "
+            "%d of %d): %s",
+            key,
+            scan.pk,
+            attempts,
+            GLUE_MAX_ATTEMPTS,
+            exc,
+        )
+
+
+def _volume_glue_attempts(extract_jobs: list[ExternalJob]) -> int:
+    """Return how many times this run's volume glue has failed.
+
+    :param extract_jobs: The live run's rows, ordered by shard index.
+    :returns: The stored attempt count, 0 when none.
+    :rtype: int
+    """
+    return jobs.ledger_attempts(extract_jobs, _ledger_key())
+
+
+def finish_ready_runs() -> int:
+    """Glue every finished Mistral run into its volume document.
+
+    Runs on the collect tick, next to ``dots_mocr.finish_ready_runs``
+    and ``yolo.finish_ready_runs``, and on the same candidate rule
+    (:func:`jobs.ready_volume_runs`). A glued run is all ``CONSUMED``,
+    which is the idempotence marker, because this pass writes no scan
+    status.
+
+    It asks :func:`enabled` nothing, on purpose: the results are paid
+    for and stored, so a key taken out of the environment after the
+    read must not leave them unglued. What the key gates is spending,
+    and this pass spends nothing.
+
+    :returns: How many runs were glued and consumed.
+    :rtype: int
+    """
+    if not s3_sync.s3_active():
+        return 0
+
+    glued = 0
+    for scan, rows in jobs.ready_volume_runs(
+        JobStage.EXTRACT,
+        JobEngine.MISTRAL_OCR,
+        JobProvider.MISTRAL,
+        live_extract_jobs,
+        _volume_glue_attempts,
+        GLUE_MAX_ATTEMPTS,
+    ):
+        try:
+            merge_extract_results(scan, rows)
+        except Exception as exc:
+            _record_glue_failure(scan, rows, _ledger_key(), exc)
+            continue
+        jobs.consume_run(rows)
+        glued += 1
+
+    return glued
+
+
+# ── the corrected volume (#224, #245) ───────────────────────────────
+def ensure_extract_apply_jobs(scan, run) -> list[ExternalJob]:
+    """Return the Mistral rows of one apply run, creating them if none.
+
+    The pages a curator inserted, replaced or turned have no address in
+    the original, so the volume read does not cover them: they are
+    one-page shards of their own, under ``jobs/apply/pages/e{pk}.pdf``
+    (#224). This is where they are read.
+
+    Created here rather than in ``apply._ensure_rows`` for two reasons.
+    The read starts long after the build -- by hand today, and after
+    the second review once #336 lands -- so the build usually has no
+    Mistral run to join. And ``_ensure_rows`` refuses the whole
+    corrected volume when a stage it needs is off
+    (``apply.GateClosedError``), which must never happen for a stage
+    an environment may simply not pay for.
+
+    Idempotent, like every ``ensure_*`` of this module: a second call
+    hands back the live rows, and the carry gives a replacement run the
+    results already paid for.
+
+    :param scan: The scan.
+    :param run: A built, standing ``ApplyRun``.
+    :returns: The rows, or an empty list for a run with no edited page.
+    :rtype: list[ExternalJob]
+    """
+    from scanning import apply
+
+    manifest = apply.stored_shard_manifest(scan, run)
+    if not manifest["shards"]:
+        return []
+    return ensure_extract_jobs(scan, manifest, apply_run=run)
+
+
+def apply_jobs(scan, run) -> list[ExternalJob]:
+    """Return one apply run's live Mistral rows, in shard order.
+
+    :param scan: The scan.
+    :param run: The apply run.
+    :returns: The rows, or an empty list.
+    :rtype: list[ExternalJob]
+    """
+    return jobs.live_run(
+        scan, JobStage.EXTRACT, JobEngine.MISTRAL_OCR, apply_run=run
+    )
+
+
+def apply_glue_due(
+    run, rows: list[ExternalJob], volume_run: int, *, force: bool = False
+) -> bool:
+    """Return whether the corrected volume's Mistral document can be
+    written now.
+
+    The one rule, called by the pass that writes it and by the command
+    that writes it again. Four things must hold:
+
+    - the run is built;
+    - the volume run is glued (the caller's own test, passed in as its
+      run number);
+    - **every edited page the run's map names has a row**, and no row
+      is unstarted or dead, the way ``apply.glues_due`` judges a stage.
+      Without the first half a document would be written with every
+      edited page marked unread -- and worse, its key would then say
+      the run is done, so nothing would ever read those pages. A run
+      with no edited page (a deletion alone, or an identity run) passes
+      it with no row at all;
+    - the document that stands is not this volume run's already, unless
+      the caller asks for it anyway (``force``: a person running
+      ``reglue_mistral_ocr`` writes the document again on purpose, and
+      only that last test is theirs to skip).
+
+    :param run: The standing ``ApplyRun``.
+    :param rows: The run's Mistral rows (:func:`apply_jobs`).
+    :param volume_run: The glued volume run's number.
+    :param force: Write a document that stands for this volume run
+        again.
+    :returns: Whether to write the document.
+    :rtype: bool
+    """
+    from scanning import apply
+
+    if not run.is_built:
+        return False
+    if any(row.status in apply.BLOCKING_JOB_STATUSES for row in rows):
+        return False
+    named = set(apply.edit_page_counts(run.page_map))
+    if named - {(row.input_manifest or {}).get("edit_id") for row in rows}:
+        return False
+    if force:
+        return True
+    return not (run.extract_key and run.extract_run == volume_run)
+
+
+def glue_apply_run(scan, run, rows: list[ExternalJob], volume_run: int) -> str:
+    """Write the corrected volume's Mistral document, and name it on the
+    run.
+
+    The walk of ``apply._glue_ocr``, over the same page map: a kept
+    page comes from the volume document, an edited page from that
+    edit's own one-page result, every page is renumbered to its final
+    page, and a page the map does not name -- a page a curator deleted
+    -- is simply not walked. So the document is in the corrected
+    volume's page space, and the deleted pages are gone from it.
+
+    A run with no structural edit aliases the volume document rather
+    than copying it, as the OCR glue does for the same case.
+
+    :param scan: The scan.
+    :param run: The built, standing run.
+    :param rows: The run's Mistral rows.
+    :param volume_run: The glued volume run's number.
+    :returns: The key the document lives at.
+    :rtype: str
+    :raises MistralGlueError: If an input is missing or the upload
+        failed.
+    """
+    from scanning import apply
+
+    volume_key = glued_result_key(scan, volume_run)
+    volume = s3_sync.download_json_object(volume_key)
+    if not isinstance(volume, dict) or not volume.get("pages"):
+        raise MistralGlueError(
+            f"scan {scan.pk}: the glued Mistral document at {volume_key} "
+            f"has no pages"
+        )
+    page_map = run.page_map or {}
+    if apply.is_identity_map(page_map):
+        return volume_key
+
+    read = apply._rows_by_edit(rows, JobStage.EXTRACT)
+    edit_pages = {
+        edit_id: parse_payload(apply._result_payload(scan, row, ACTION))
+        for edit_id, row in read.items()
+    }
+    pages = apply.walk_final_pages(
+        page_map,
+        volume["pages"],
+        edit_pages,
+        missing={"md": "", "blocks": []},
+        error_cls=MistralGlueError,
+        what=f"the Mistral volume document of scan {scan.pk}",
+    )
+
+    document = {
+        "schema_version": GLUE_SCHEMA_VERSION,
+        "engine": str(JobEngine.MISTRAL_OCR),
+        "action": ACTION,
+        "scan_pk": scan.pk,
+        "run": volume_run,
+        "apply_run": run.label,
+        "source_page_count": page_map["final_page_count"],
+        "source_fingerprint": run.source_fingerprint,
+        "model": volume.get("model"),
+        "render": volume.get(
+            "render",
+            {"width": RENDER_W, "height": RENDER_H, "source": SOURCE},
+        ),
+        "generated_at": timezone.now().isoformat(),
+        "pages": pages,
+        "failed_pages": _failed_pages(pages, "page_index"),
+    }
+    key = f"{apply.run_prefix(scan, run)}extract-volume.json"
+    if not s3_sync.upload_json_object(key, document):
+        raise MistralGlueError(
+            f"scan {scan.pk}: the corrected volume's Mistral document "
+            f"could not be uploaded to {key}"
+        )
+    return key
+
+
+def _glue_one_apply(scan, run, volume_rows: list[ExternalJob]) -> bool:
+    """Create the rows of one standing run, and glue it when it is due.
+
+    :param scan: The scan.
+    :param run: The standing run.
+    :param volume_rows: The glued volume run's rows.
+    :returns: Whether the document was written.
+    :rtype: bool
+    """
+    from scanning.models import ApplyRun
+
+    volume_run = volume_rows[0].run
+    rows = apply_jobs(scan, run)
+    if not rows:
+        rows = ensure_extract_apply_jobs(scan, run)
+    if not apply_glue_due(run, rows, volume_run):
+        return False
+    key = glue_apply_run(scan, run, rows, volume_run)
+    ApplyRun.objects.filter(pk=run.pk).update(
+        extract_key=key, extract_run=volume_run
+    )
+    run.extract_key, run.extract_run = key, volume_run
+    jobs.consume_run(rows)
+    logger.info(
+        "Glued the Mistral read of scan %s into %s for apply run %s "
+        "(volume run %s, %d edited page(s))",
+        scan.pk,
+        key,
+        run.label,
+        volume_run,
+        len(rows),
+    )
+    return True
+
+
+def _apply_candidates() -> dict[int, int]:
+    """Return the scans that may owe a corrected volume, in three queries.
+
+    The pre-check of :func:`finish_ready_applies`, over the whole
+    corpus at once rather than scan by scan. Every volume ever read
+    keeps a glued run for good, so a per-scan check would cost two
+    queries for each of them on every tick, growing with the corpus --
+    the fault ``apply._candidate_scan_ids`` was written to avoid.
+
+    Each question is one query: the live volume run per scan, the runs
+    that are not glued yet, and the standing built apply runs. A run
+    whose document already names the live volume run drops out here,
+    and :func:`finish_ready_applies` then judges the rest exactly.
+
+    :returns: ``{scan pk: (the standing run, the glued volume run's
+        number)}``.
+    :rtype: dict[int, tuple]
+    """
+    from django.db.models import Max
+
+    from scanning.models import ApplyRun
+
+    rows = ExternalJob.objects.filter(
+        stage=JobStage.EXTRACT,
+        engine=JobEngine.MISTRAL_OCR,
+        provider=JobProvider.MISTRAL,
+        apply_run__isnull=True,
+    )
+    live = {
+        entry["scan_id"]: entry["run"]
+        for entry in rows.values("scan_id").annotate(run=Max("run"))
+    }
+    if not live:
+        return {}
+    # A run with a row of any other status is not glued: the glue
+    # writes the document and flips every row in one pass.
+    for scan_id, run in rows.exclude(status=JobStatus.CONSUMED).values_list(
+        "scan_id", "run"
+    ):
+        if live.get(scan_id) == run:
+            live.pop(scan_id, None)
+    if not live:
+        return {}
+    candidates = {}
+    for run in ApplyRun.objects.filter(
+        scan_id__in=list(live),
+        superseded_at__isnull=True,
+        built_at__isnull=False,
+    ):
+        volume_run = live[run.scan_id]
+        if run.extract_key and run.extract_run == volume_run:
+            continue
+        candidates[run.scan_id] = (run, volume_run)
+    return candidates
+
+
+def finish_ready_applies() -> int:
+    """Read the edited pages of every corrected volume, and glue them.
+
+    The second pass of this stage on the collect tick. For every scan
+    whose live Mistral volume run is glued and whose standing apply run
+    is built, it creates the run's own one-page rows if it has none,
+    and writes the corrected volume's document once every row has
+    answered.
+
+    **A volume nobody read with Mistral pays nothing here.** The
+    candidate is the glued volume run, which only a person starts
+    (``views_process.start_mistral_ocr``), so this pass creates a paid
+    row only for a volume somebody chose to read.
+
+    Not part of ``apply.glues_due`` on purpose (#245). That trigger
+    takes a scan in ``PAGE_COMPLETENESS_REVIEW_DONE`` alone, and this
+    read starts later than that status -- by hand today, and after the
+    second review once #336 lands -- so an arm there would miss the
+    normal case. The work is seconds of JSON over stored objects, which
+    is what the collect tick is for.
+
+    Unlike :func:`finish_ready_runs` this pass does ask
+    :func:`enabled`, because it may create a row, and a row is
+    spending. So an environment with no key writes no corrected
+    volume's document either, even for the identity run that would
+    need no row; the tick writes it as soon as the key returns.
+
+    :returns: How many corrected volumes were glued.
+    :rtype: int
+    """
+    from scanning.models import Scan
+
+    if not s3_sync.s3_active() or not enabled():
+        return 0
+
+    candidates = _apply_candidates()
+    if not candidates:
+        return 0
+    glued = 0
+    for scan in Scan.objects.filter(pk__in=list(candidates)).select_related(
+        "reporter"
+    ):
+        volume_rows = live_extract_jobs(scan)
+        if not volume_rows or any(
+            row.status != JobStatus.CONSUMED for row in volume_rows
+        ):
+            continue
+        run, _volume_run = candidates[scan.pk]
+        key = _ledger_key(run)
+        if jobs.ledger_attempts(volume_rows, key) >= GLUE_MAX_ATTEMPTS:
+            continue
+        try:
+            if _glue_one_apply(scan, run, volume_rows):
+                glued += 1
+        except Exception as exc:
+            _record_glue_failure(scan, volume_rows, key, exc)
+
+    return glued

@@ -677,6 +677,45 @@ class TestTriggerAndWorker(BuildTestCase):
             apply.queue_ready_scans()
             apply.queue_ready_scans()
 
+    def test_a_dead_row_of_a_stage_that_blocks_nothing_is_not_noted(self):
+        """A Mistral row (#245) holds no glue, so a dead one must not
+        say review 2 waits -- and must not spend the one stamp, or the
+        row that really does stop the run is never logged."""
+        self.three_edits()
+        run = apply.build_run(self.scan)
+        run.jobs.update(status=JobStatus.COMPLETED)
+        extract = ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            provider=JobProvider.MISTRAL,
+            apply_run=run,
+            status=JobStatus.FAILED,
+            error_code="TIMEOUT_EXCEEDED",
+            input_manifest={"edit_id": 1, "page_count": 1},
+        )
+
+        with self.assertNoLogs("scanning.apply", level="WARNING"):
+            apply.queue_ready_scans()
+
+        run.refresh_from_db()
+        self.assertIsNone(run.dead_row_noted_at)
+        self.assertEqual(extract.status, JobStatus.FAILED)
+
+        # The blocking row that follows is still noted.
+        ExternalJob.objects.filter(
+            pk=self.rows(run, JobStage.DETECT)[0].pk
+        ).update(status=JobStatus.FAILED, error_code="BAD_INPUT")
+
+        with self.assertLogs("scanning.apply", level="WARNING") as logs:
+            apply.queue_ready_scans()
+
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("BAD_INPUT", logs.output[0])
+        self.assertNotIn("TIMEOUT_EXCEEDED", logs.output[0])
+        run.refresh_from_db()
+        self.assertIsNotNone(run.dead_row_noted_at)
+
     def test_a_scan_still_in_review_is_not_queued(self):
         Scan.objects.filter(pk=self.scan.pk).update(
             status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW

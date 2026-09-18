@@ -46,8 +46,6 @@ from django.utils import timezone
 
 from scanning import jobs, layout_json, runpod_client, s3_sync
 from scanning.models import (
-    DEAD_JOB_STATUSES,
-    IN_FLIGHT_JOB_STATUSES,
     ExternalJob,
     JobEngine,
     JobProvider,
@@ -381,11 +379,8 @@ def run_summary(scan) -> dict | None:
 def glued_result_key(scan, run: int) -> str:
     """Return the S3 key one run's glued volume document lives at.
 
-    Under ``jobs/`` on purpose: that prefix is already excluded from the
-    generic processing sync in both directions, and the admin delete
-    already sweeps it. Scoped to the run, like the per-attempt result
-    keys, so a re-run leaves the previous glue addressable instead of
-    stomping it.
+    This stage's name for :func:`jobs.volume_result_key`, which holds
+    the rule and the reasons.
 
     :param scan: The scan the run belongs to.
     :param run: The run number.
@@ -393,9 +388,8 @@ def glued_result_key(scan, run: int) -> str:
         dots_mocr/r{run}-volume.json``.
     :rtype: str
     """
-    return (
-        f"{s3_sync.s3_processing_prefix(scan)}{s3_sync.JOB_RESULTS_SUBDIR}"
-        f"{JobStage.ANALYZE}/{JobEngine.DOTS_MOCR}/r{run}-volume.json"
+    return jobs.volume_result_key(
+        scan, JobStage.ANALYZE, JobEngine.DOTS_MOCR, run
     )
 
 
@@ -413,10 +407,7 @@ def glued_volume_key(scan) -> str | None:
         None when no run is glued.
     :rtype: str | None
     """
-    rows = live_analyze_jobs(scan)
-    if rows and all(row.status == JobStatus.CONSUMED for row in rows):
-        return glued_result_key(scan, rows[0].run)
-    return None
+    return jobs.glued_volume_key(scan, JobStage.ANALYZE, JobEngine.DOTS_MOCR)
 
 
 def _check_envelope(scan, job: ExternalJob, envelope) -> dict:
@@ -749,52 +740,45 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
 
     pages: list[dict] = []
     shards: list[dict] = []
-    next_page = 0
     # A temp dir, not the output dir: the generic S3 sync sweeps up
-    # everything there, and these are wire artifacts that stay out of it.
+    # everything there, and these are wire artifacts that stay out of
+    # it. The bytes go through the disk because a shard payload carries
+    # ``raw`` for every page (#238), which is the biggest object this
+    # daemon reads.
     with tempfile.TemporaryDirectory(
         prefix=f"{GLUE_TMP_PREFIX}{scan.pk}-"
     ) as tmp:
         tmp_dir = Path(tmp)
-        for index, job in enumerate(analyze_jobs):
-            if job.shard_index != index:
-                raise DotsMocrGlueError(
-                    f"scan {scan.pk} shard sequence breaks at position "
-                    f"{index}: job {job.pk} covers shard {job.shard_index}"
-                )
-            if not job.result_key:
-                raise DotsMocrGlueError(
-                    f"scan {scan.pk} shard {index} has no result key"
-                )
-            manifest = job.input_manifest or {}
-            from_page = manifest.get("from_page")
-            page_count = manifest.get("page_count")
-            if from_page != next_page or not isinstance(page_count, int):
-                raise DotsMocrGlueError(
-                    f"scan {scan.pk} shard {index} covers pages from "
-                    f"{from_page}, expected {next_page}"
-                )
 
-            local = tmp_dir / f"{index:04d}.json"
-            s3_sync.download_object(job.result_key, local)
-            payload = _check_envelope(scan, job, json.loads(local.read_text()))
+        def _download(key: str) -> dict:
+            local = tmp_dir / Path(key).name
+            s3_sync.download_object(key, local)
+            return json.loads(local.read_text())
+
+        for read in jobs.read_run_shards(
+            scan,
+            analyze_jobs,
+            action=ACTION,
+            error_cls=DotsMocrGlueError,
+            download=_download,
+        ):
             shard_pages = sorted(
-                payload.get("pages") or [],
+                read.payload.get("pages") or [],
                 key=lambda page: page.get("page_no", -1),
             )
             answered = [page.get("page_no") for page in shard_pages]
-            if answered != list(range(page_count)):
+            if answered != list(range(read.page_count)):
                 raise DotsMocrGlueError(
-                    f"scan {scan.pk} shard {index} answered page(s) "
-                    f"{answered}, the shard has {page_count}"
+                    f"scan {scan.pk} shard {read.index} answered page(s) "
+                    f"{answered}, the shard has {read.page_count}"
                 )
             # Before the stamp, on purpose (#242): a shard whose every
             # hole the repair closed must be stamped clean, or the
             # carry would re-pay a shard whose result is now whole.
-            _repair_shard(scan, job, shard_pages)
-            _stamp_page_lists(job, shard_pages)
+            _repair_shard(scan, read.job, shard_pages)
+            _stamp_page_lists(read.job, shard_pages)
             for page in shard_pages:
-                page_index = from_page + page["page_no"]
+                page_index = read.from_page + page["page_no"]
                 # ``raw`` -- the model's answer as written (#238) --
                 # stays in the shard object, which is kept for good.
                 # Copying it would double the volume document the
@@ -804,27 +788,11 @@ def merge_dotsmocr_results(scan, analyze_jobs: list[ExternalJob]) -> str:
                     {
                         "page_index": page_index,
                         "pdf_page": page_index + 1,
-                        "shard_index": index,
+                        "shard_index": read.index,
                         **{k: v for k, v in page.items() if k != "raw"},
                     }
                 )
-
-            entry = {
-                "name": manifest.get("name"),
-                "index": index,
-                "from_page": from_page,
-                "to_page": manifest.get("to_page"),
-                "page_count": page_count,
-                "attempt": job.attempt,
-                "result_key": job.result_key,
-            }
-            tuning = {
-                key: manifest[key] for key in TUNING_KEYS if key in manifest
-            }
-            if tuning:
-                entry["tuning"] = tuning
-            shards.append(entry)
-            next_page += page_count
+            shards.append(jobs.shard_entry(read.job, read.index, TUNING_KEYS))
 
     if expected_total is not None and len(pages) != expected_total:
         raise DotsMocrGlueError(
@@ -887,8 +855,7 @@ def _glue_attempts(analyze_jobs: list[ExternalJob]) -> int:
     :returns: The stored attempt count, 0 when none.
     :rtype: int
     """
-    meta = analyze_jobs[0].provider_meta or {}
-    return int((meta.get("glue") or {}).get("attempts") or 0)
+    return jobs.ledger_attempts(analyze_jobs, "glue")
 
 
 def _record_glue_failure(scan, analyze_jobs: list[ExternalJob], exc) -> None:
@@ -907,20 +874,7 @@ def _record_glue_failure(scan, analyze_jobs: list[ExternalJob], exc) -> None:
     :param exc: What the glue raised.
     :return: None.
     """
-    head = analyze_jobs[0]
-    meta = head.provider_meta or {}
-    glue = dict(meta.get("glue") or {})
-    attempts = int(glue.get("attempts") or 0) + 1
-    glue.update(
-        {
-            "attempts": attempts,
-            "last_error": str(exc)[:500],
-            "last_attempt_at": timezone.now().isoformat(),
-        }
-    )
-    meta["glue"] = glue
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
+    attempts, head = jobs.bump_run_ledger(analyze_jobs, "glue", exc)
     if attempts >= GLUE_MAX_ATTEMPTS:
         logger.exception(
             "Gluing dots.mocr results for scan %s failed; giving up after "
@@ -964,36 +918,15 @@ def finish_ready_runs() -> int:
     if not s3_sync.s3_active():
         return 0
 
-    scan_ids = (
-        Scan.objects.filter(
-            jobs__stage=JobStage.ANALYZE,
-            jobs__engine=JobEngine.DOTS_MOCR,
-            jobs__provider=JobProvider.RUNPOD,
-            jobs__status=JobStatus.COMPLETED,
-            jobs__apply_run__isnull=True,
-        )
-        .values_list("pk", flat=True)
-        .distinct()
-    )
-    unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     glued = 0
-    for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
-        "reporter"
+    for scan, rows in jobs.ready_volume_runs(
+        JobStage.ANALYZE,
+        JobEngine.DOTS_MOCR,
+        JobProvider.RUNPOD,
+        live_analyze_jobs,
+        _glue_attempts,
+        GLUE_MAX_ATTEMPTS,
     ):
-        rows = live_analyze_jobs(scan)
-        if not rows:
-            continue
-        if any(row.status in unfinished for row in rows):
-            continue
-        if any(row.status in DEAD_JOB_STATUSES for row in rows):
-            continue
-        if not any(row.status == JobStatus.COMPLETED for row in rows):
-            # The candidate row belongs to an older run; the live one
-            # has nothing to apply.
-            continue
-        if _glue_attempts(rows) >= GLUE_MAX_ATTEMPTS:
-            continue
-
         try:
             merge_dotsmocr_results(scan, rows)
         except Exception as exc:
@@ -1002,10 +935,7 @@ def finish_ready_runs() -> int:
 
         # No delete of the shard results here, deliberately: the future
         # smart glue over page inserts and deletes re-reads them.
-        ExternalJob.objects.filter(
-            pk__in=[row.pk for row in rows],
-            status=JobStatus.COMPLETED,
-        ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+        jobs.consume_run(rows)
         glued += 1
 
     return glued
@@ -1025,8 +955,7 @@ def _apply_state(analyze_jobs: list[ExternalJob]) -> dict:
         ``last_error``, ``last_attempt_at``; empty when never tried.
     :rtype: dict
     """
-    meta = analyze_jobs[0].provider_meta or {}
-    return dict(meta.get("apply") or {})
+    return jobs.run_ledger(analyze_jobs, "apply")
 
 
 def _write_apply_state(analyze_jobs: list[ExternalJob], state: dict) -> None:
@@ -1057,16 +986,7 @@ def _record_apply_failure(scan, analyze_jobs: list[ExternalJob], exc) -> None:
     :param exc: What the apply raised.
     :return: None.
     """
-    state = _apply_state(analyze_jobs)
-    attempts = int(state.get("attempts") or 0) + 1
-    state.update(
-        {
-            "attempts": attempts,
-            "last_error": str(exc)[:500],
-            "last_attempt_at": timezone.now().isoformat(),
-        }
-    )
-    _write_apply_state(analyze_jobs, state)
+    attempts, _head = jobs.bump_run_ledger(analyze_jobs, "apply", exc)
     if attempts >= APPLY_MAX_ATTEMPTS:
         logger.exception(
             "Applying the dots.mocr results for scan %s failed; giving up "
