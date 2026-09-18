@@ -1909,8 +1909,35 @@ class TestBarSaysWhenTheReadIsMissing(ScanningTestCase):
         with (
             override_settings(**DOTS),
             patch("scanning.s3_sync.s3_active", return_value=True),
+            patch(
+                "scanning.sharding.committed_manifest",
+                return_value=(make_manifest(), ""),
+            ),
         ):
             self.assertIn(OCR_NOT_STARTED_MESSAGE, self._bar(scan))
+
+    def test_a_parked_volume_says_why_when_the_sweep_would_refuse_it(self):
+        """The sweep leaves a refused shard set alone until an admin
+        re-queue, so the bar must not promise a read that is not
+        coming."""
+        from scanning.views_process import (
+            OCR_NOT_STARTED_MESSAGE,
+            OCR_REFUSED_MESSAGE,
+        )
+
+        scan = ScanFactory(page_count=30, status=Status.AWAITING_VALIDATION)
+        reason = "The original PDF is not in the bucket."
+        with (
+            override_settings(**DOTS),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch(
+                "scanning.sharding.committed_manifest",
+                return_value=(None, reason),
+            ),
+        ):
+            html = self._bar(scan)
+        self.assertIn(OCR_REFUSED_MESSAGE.format(reason=reason), html)
+        self.assertNotIn(OCR_NOT_STARTED_MESSAGE, html)
 
     def test_a_parked_volume_says_so_when_the_stage_is_off(self):
         from scanning.views_process import OCR_UNAVAILABLE_MESSAGE

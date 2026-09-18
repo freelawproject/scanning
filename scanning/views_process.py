@@ -246,9 +246,10 @@ NO_DETECTIONS_MESSAGE = (
 )
 # What the step-1 bar says about a parked new-pipeline volume with no
 # OCR run at all (#327), in the spot the run's state takes once it
-# exists. Two texts, because the daemon's sweep starts the run when
-# the stage is configured and never when it is not, so the bar must
-# not promise a run that is not coming.
+# exists. Three texts, because the daemon's sweep starts the run when
+# the stage is configured and the shard set still describes the
+# original, and never otherwise, so the bar must not promise a run
+# that is not coming.
 OCR_NOT_STARTED_MESSAGE = (
     "OCR missing: this volume has no OCR run yet. The server starts one "
     "by itself within a few seconds."
@@ -256,6 +257,10 @@ OCR_NOT_STARTED_MESSAGE = (
 OCR_UNAVAILABLE_MESSAGE = (
     "OCR missing: OCR is not configured on this server, so the page "
     "review cannot start. Ask a staff member."
+)
+OCR_REFUSED_MESSAGE = (
+    "OCR missing: the server cannot start the read of this volume. "
+    "{reason} Ask a staff member."
 )
 
 
@@ -317,20 +322,29 @@ def ocr_missing(scan, summary: dict | None) -> str | None:
     look at (``yolo.SWEEP_STATUSES``) gets a line: a legacy volume holds
     PENDING_REVIEW, a queued one is the pipeline's, and an errored one
     has its own banner. Which line depends on whether this environment
-    can start the read (``services.analyze_stage_open``).
+    can start the read (``services.analyze_stage_open``) and, when it
+    can, on whether the sweep would take this volume: it asks
+    ``sharding.committed_manifest`` before it creates a run, and a
+    refused set (a re-uploaded or missing original) is left alone until
+    an admin re-queue re-cuts it. The sweep's memo of that refusal lives
+    in the daemon process, so the bar asks the same question itself, one
+    HEAD and one manifest read, for the rare parked volume with no run.
 
     :param scan: The scan the bar is for.
     :param summary: The run summary, or ``None``.
     :returns: The message, or ``None`` when nothing is missing.
     :rtype: str | None
     """
-    from scanning import services
+    from scanning import services, sharding
 
     if summary is not None or scan.status not in yolo.SWEEP_STATUSES:
         return None
-    if services.analyze_stage_open():
-        return OCR_NOT_STARTED_MESSAGE
-    return OCR_UNAVAILABLE_MESSAGE
+    if not services.analyze_stage_open():
+        return OCR_UNAVAILABLE_MESSAGE
+    manifest, reason = sharding.committed_manifest(scan)
+    if manifest is None:
+        return OCR_REFUSED_MESSAGE.format(reason=reason)
+    return OCR_NOT_STARTED_MESSAGE
 
 
 def detection_message(summary: dict | None) -> str:
