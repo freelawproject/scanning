@@ -36,11 +36,14 @@
 (function () {
     'use strict';
 
-    // The scale the pages are drawn at follows the width of the column,
-    // between these two. A column is about half the window wide, so a
-    // page of it is smaller than the step-2 viewer's.
+    // The scale the pages are drawn at follows the column: the width
+    // it has, and the height it shows. The ceiling is low on purpose,
+    // the rule of the step-2 viewer, which fits one page in the panel
+    // and never draws above 1.0. A wide screen would else draw a page
+    // of 1160 by 1500 pixels, which is 7 MB of canvas that shows less
+    // than half a page.
     var MIN_SCALE = 0.4;
-    var MAX_SCALE = 2.0;
+    var MAX_SCALE = 1.2;
 
     // What the page frame and the scroll bar take off the column.
     var COLUMN_PAD = 24;
@@ -115,19 +118,42 @@
     // -----------------------------------------------------------------
 
     /**
+     * Return how tall the column shows, in pixels.
+     *
+     * The stylesheet owns that number (``max-height`` on the two
+     * columns), so this reads it and keeps no copy of it. The height
+     * of the column itself is the height of what is in it before the
+     * pages are drawn, which would make the scale depend on the size
+     * it is about to set.
+     *
+     * @returns {number} The height, or 0 when the sheet sets none.
+     */
+    function columnHeight() {
+        var limit = window.getComputedStyle(pagesColumn).maxHeight;
+        var pixels = parseFloat(limit);
+        return isNaN(pixels) ? 0 : pixels;
+    }
+
+    /**
      * Return the scale one page is drawn at.
      *
-     * The width of the column decides it, so a narrow window gets a
-     * smaller page and no sideways scroll, and a resize draws the
-     * pages again at the new size.
+     * The column decides it: the width it has, so a narrow window gets
+     * a smaller page and no sideways scroll, and the height it shows,
+     * so one page of the opinion is one screen of the column. A resize
+     * draws the pages again at the new size.
      *
      * @param {number} width - The width of the page, in points.
+     * @param {number} height - The height of the page, in points.
      * @returns {number} The scale.
      */
-    function scaleFor(width) {
+    function scaleFor(width, height) {
         if (!pagesColumn || !width) { return MIN_SCALE; }
-        var room = pagesColumn.clientWidth - COLUMN_PAD;
-        return Math.min(MAX_SCALE, Math.max(MIN_SCALE, room / width));
+        var scale = (pagesColumn.clientWidth - COLUMN_PAD) / width;
+        var tall = columnHeight();
+        if (tall && height) {
+            scale = Math.min(scale, (tall - COLUMN_PAD) / height);
+        }
+        return Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale));
     }
 
     /**
@@ -140,7 +166,7 @@
      */
     function sizePlaceholders() {
         if (!pageSize) { return; }
-        var scale = scaleFor(pageSize.width);
+        var scale = scaleFor(pageSize.width, pageSize.height);
         pagesColumn.querySelectorAll('.opinion-page').forEach(function (page) {
             if (page.dataset.rendered === '1') { return; }
             var wrapper = page.querySelector('.canvas-wrapper');
@@ -191,8 +217,11 @@
     function observePages() {
         observer = new IntersectionObserver(function (entries) {
             entries.forEach(function (entry) {
-                if (!entry.isIntersecting) { return; }
                 var page = entry.target;
+                if (!entry.isIntersecting) {
+                    discardPage(page);
+                    return;
+                }
                 renderPage(page, parseInt(page.dataset.pageIndex, 10));
             });
         }, { root: pagesColumn, rootMargin: RENDER_MARGIN });
@@ -206,6 +235,34 @@
     }
 
     /**
+     * Take back the canvas of a page that left the column.
+     *
+     * A drawn page holds a bitmap of some megabytes, and a long
+     * opinion has fifty pages. The rule is the step-2 viewer's
+     * ``discardPage``: the container keeps its size, so the column
+     * does not jump, and the page is drawn again when it comes back.
+     * The boxes go with the canvas, because they hold the scale of
+     * that render.
+     *
+     * @param {HTMLElement} pageDiv - The container of the page.
+     */
+    function discardPage(pageDiv) {
+        if (pageDiv.dataset.rendered !== '1') { return; }
+        if (pageDiv._renderTask) {
+            try { pageDiv._renderTask.cancel(); } catch (e) { /* gone */ }
+            pageDiv._renderTask = null;
+        }
+        var canvas = pageDiv.querySelector('.pdf-canvas');
+        canvas.width = 0;
+        canvas.height = 0;
+        pageDiv.querySelector('.canvas-wrapper')
+            .querySelectorAll('.ensemble-box')
+            .forEach(function (el) { el.remove(); });
+        pageDiv.dataset.rendered = '';
+        pageDiv.dataset.renderedScale = '';
+    }
+
+    /**
      * Draw one page and its boxes.
      *
      * @param {HTMLElement} pageDiv - The container of the page.
@@ -214,7 +271,8 @@
     function renderPage(pageDiv, index) {
         if (!pdfDoc || index >= pdfDoc.numPages) { return; }
         pdfDoc.getPage(index + 1).then(function (page) {
-            var scale = scaleFor(page.getViewport({ scale: 1 }).width);
+            var size = page.getViewport({ scale: 1 });
+            var scale = scaleFor(size.width, size.height);
             // The page holds the scale it was drawn at, so a page that
             // crosses the margin again is not drawn again, and a
             // resize that changes the scale is.
@@ -652,10 +710,14 @@
      */
     function goToPage(index) {
         var text = document.getElementById('op-text-' + index);
-        // The text column holds no block until the document is read,
-        // and a card is live from the first paint. The jump is kept
-        // and done again when the blocks exist.
-        pending = text ? null : index;
+        // Neither column can answer before its own load. The text
+        // column holds no block until the document is read; the pages
+        // column holds containers of 300 by 150 pixels until the PDF
+        // opens and gives them the size of a page, and a jump measured
+        // against those lands pages away. A card is live from the
+        // first paint, so the jump is kept and done again by whichever
+        // load is still out.
+        pending = (text && pageSize) ? null : index;
         scrollWithin(textColumn, text);
         scrollWithin(pagesColumn, document.getElementById('op-page-' + index));
     }
@@ -757,6 +819,7 @@
                     pageSize = { width: size.width, height: size.height };
                     sizePlaceholders();
                     observePages();
+                    if (pending !== null) { goToPage(pending); }
                 });
             })
             .catch(function (error) {
