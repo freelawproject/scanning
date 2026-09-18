@@ -32,6 +32,9 @@ docker exec scanning-daemon python manage.py reglue_opinion_ocr 2845 --dry-run
 # Fit the standing text redaction boxes to the read text, once after a deploy (#279)
 docker exec scanning-daemon python manage.py refit_text_redactions --dry-run
 
+# Write the text of a volume's opinions again, after a transform change or for a two-engine volume (#365)
+docker exec scanning-daemon python manage.py rerun_opinion_ensemble 2845 --dry-run
+
 # Generate migrations
 DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py makemigrations scanning
 
@@ -228,6 +231,12 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - `/opinions/` lists the `Opinion` rows and `/opinions/legacy/` the frozen `OpinionScan` rows (#334). The step-3 tab and the step-2 "Next" button read one pair of flags: `review3_opinions` sends both to the opinions page, `legacy_pipeline` (`stats.LEGACY_STATUSES`, not `legacy_review`) keeps both on `?step=3`, and a new volume with neither gets no link. The flag is not `opinion_count`, which already names the boundaries of step 2
 - The warning badge of the opinions list is `opinions.finding_counts` over the ids of one page, after the pagination, the rule every list badge follows. `/opinions/<pk>/review/` has no write endpoint until the text review lands, so it offers no control (#334)
 - A template writes every opinion PDF address onto its card (`data-redacted-url`), and the viewer reads it: a path a script spells by hand goes stale in silence, because no test reverses it (#334)
+- `ensemble.py` is the one transform of an opinion's OCR documents, and `ensemble_revision == ocr_glue_revision` is the one rule for "the ensemble exists" (#365). It reads those documents alone: no volume, no PDF, no render. A better transform is a re-run (`rerun_opinion_ensemble`, the button), never a re-paid read
+- The pass is eleven of the collect tick and takes a row with `ocr_engine_count` at least `OPINION_ENSEMBLE_MIN_ENGINES` (3), stamped by the OCR glue (#365): a vote of two engines settles nothing. The button waives that gate, and it is the only way in until Surya joins `opinion_ocr.ENGINES`
+- The alignment is geometry alone, in the points of the volume page, and a group any of whose units carries an exclusion is dropped after it, never before (#317/#365). The reading order comes from the boxes (three bands, a column boundary off the left edges) and reads no `Detection` row, so a curator's edit never moves the text
+- The vote compares `ensemble.compare_text` and shows the winner's own text (#365): the engines differ about the quotes, the dashes and the markdown marks on almost every page, and about the words rarely. No document stores markup; a voted group stores tokens with a `low_confidence` flag and the viewer builds the nodes
+- The ensemble is the one writer of the `OpinionText` rows (#365). `text` and `disagreements` are a cache of the documents; nothing there reads or writes `human_text`
+- `ensemble.rebuild_findings` is the one writer of `ENSEMBLE_CHECKS`, and `opinions.create_rows` keeps the two stale ones (#365). A standing `OpinionFindingDismissal` of the same page and check mutes the new card
 - The review page of an opinion frames `serve_opinion_pdf` under `?disposition=inline`, the one route that answers `SAMEORIGIN` where the site answers `DENY`, and `opinion_file_index` is its `files` index (#334): both read the two ledgers (`opinion_pdf.is_written`, `opinion_ocr.is_written`) and never the bucket. The OCR stamp is one over every engine document of the revision, so an engine document is written only when the run also carries that engine's key, and an entry with no `url` is an object nothing wrote
 
 ## Worker images

@@ -1,6 +1,6 @@
 """Confirm in-flight external jobs and finish the scans they belong to.
 
-Twelve passes, in order.
+Thirteen passes, in order.
 
 **1. ``jobs.sweep_jobs()`` asks after every job still in flight.** How
 it asks depends on the provider:
@@ -97,6 +97,15 @@ in ``REDACTION_REVIEW_DONE`` that owe their glue. Seconds over the
 corrected volume's JSON documents, read once per tick from the local
 mirror. A scan whose run still owes an engine read waits.
 
+**13. ``ensemble.run_tick()`` writes the text of the opinions
+(#365).** For up to ``ENSEMBLE_PER_TICK`` rows whose OCR documents are
+written and whose ensemble stamp is older, it aligns the engines' units,
+puts them in reading order, resolves each group and writes the
+``OpinionText`` rows, the warnings and one document on S3. It reads
+those documents alone: no volume, no PDF, no render. A row with fewer
+engine documents than ``OPINION_ENSEMBLE_MIN_ENGINES`` is not due, so
+nothing runs by itself until the third engine reads.
+
 Examples:
 
     # Run one confirm tick and exit.
@@ -130,7 +139,9 @@ class Command(BaseCommand):
         "Mistral run and every corrected volume that owes its Mistral "
         "document, then glue every finished Surya run and every "
         "corrected volume that owes its Surya document, then write "
-        "the OCR documents of the opinions that owe them."
+        "the OCR documents of the opinions that owe them, then write "
+        "the text of the opinions whose ensemble is older than those "
+        "documents."
     )
 
     def handle(self, *args, **options):
@@ -146,6 +157,7 @@ class Command(BaseCommand):
             apply,
             bitonal,
             dots_mocr,
+            ensemble,
             jobs,
             mistral_ocr,
             opinion_ocr,
@@ -170,6 +182,7 @@ class Command(BaseCommand):
                 read_surya = surya.finish_ready_runs()
                 surya_applies = surya.finish_ready_applies()
                 glued_opinions = opinion_ocr.glue_due()
+                read_opinions = ensemble.run_tick()
                 break
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -202,6 +215,7 @@ class Command(BaseCommand):
                 read_surya,
                 surya_applies,
                 glued_opinions,
+                read_opinions,
             )
         ):
             self.stdout.write(
@@ -216,5 +230,6 @@ class Command(BaseCommand):
                 f"{extracted_applies} corrected volume(s), glued "
                 f"{read_surya} Surya run(s) and {surya_applies} "
                 f"corrected volume(s), wrote the OCR "
-                f"documents of {glued_opinions} opinion(s)"
+                f"documents of {glued_opinions} opinion(s), wrote the "
+                f"text of {read_opinions} opinion(s)"
             )

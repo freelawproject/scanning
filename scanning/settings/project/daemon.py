@@ -52,3 +52,13 @@ DAEMON_OPINION_PDF_INTERVAL = env.int("DAEMON_OPINION_PDF_INTERVAL", default=5)
 OPINION_PDF_RETRY_AFTER_SECONDS = env.int(
     "OPINION_PDF_RETRY_AFTER_SECONDS", default=15 * 60
 )
+
+# How many of an opinion's engine documents must exist before the
+# ensemble runs by itself (#365). Three engines are what the vote
+# needs: with two, every place they differ has no majority and every
+# word of it is low confidence. Surya (#320, #364) is the third, and
+# it is not deployed yet, so the daemon pass writes nothing until then
+# and the "Re run OCR ensemble" button is the way in.
+OPINION_ENSEMBLE_MIN_ENGINES = env.int(
+    "OPINION_ENSEMBLE_MIN_ENGINES", default=3
+)

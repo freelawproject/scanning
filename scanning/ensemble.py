@@ -1,0 +1,1507 @@
+"""The OCR ensemble over one opinion's engine documents (#365).
+
+Every engine reads the whole volume, and ``opinion_ocr`` (#350) cuts
+each read to one opinion and marks the text under a redaction or
+outside the boundary. This module is the next step: it puts the
+engines' units on the same pieces of the page, puts those pieces in
+reading order, resolves each one to the read the engines agree on, and
+writes the result to the ``OpinionText`` rows and to one document on
+S3.
+
+**The input is the opinion documents alone.** No volume document, no
+PDF, no render and no row of review 2. So the work is a few small
+reads and a geometry over about four pages, which is why it runs both
+on the collect tick and in the request of the "Re run OCR ensemble"
+button.
+
+**One space.** Every unit of an opinion document carries ``box_pt``,
+its box in the points of the volume page. The alignment, the order and
+the boxes the viewer draws all use that space, and the redacted PDF of
+the opinion is cut with ``insert_pdf``, which keeps the page size. So a
+box of this document addresses the same place on the page of that PDF.
+
+**Four steps, from the prototype** (the ``ai-research`` repository,
+branch ``extraction_align``, ``pipeline/core/{align,order,consensus}``):
+
+1. **Align.** Two units of different engines link when the
+   intersection covers :data:`OVERLAP` of the smaller box:
+   containment, not IoU, because a small box inside a big one is the
+   same content and scores badly on IoU. A group is a connected
+   component of those links, so one engine's three boxes and another's
+   one box resolve in one pass. A unit of :data:`MAX_AREA` of the page
+   or more does not link, because a whole-page picture box would chain
+   the page into one group.
+2. **Order.** Three bands: the running heads, the body, the foot. The
+   body splits at a column boundary taken from the **left edges** of
+   the body boxes, which survives what a hunt for the gutter does not.
+   A box that crosses the boundary is full width and restarts the
+   order below it.
+3. **Resolve.** The engines' texts vote. A group they all read the
+   same way is ``unanimous``; a group a majority reads the same way is
+   ``majority``; a group with no majority is voted word by word; a
+   group one engine saw is ``single``.
+4. **Exclude.** A group any of whose units carries an ``exclusion`` is
+   dropped, **after** the alignment and never before it. The ensemble
+   experiment of #317 measured that: the engines' boxes differ, so a
+   drop before the alignment leaves one-engine regions behind.
+
+**Three deviations from the prototype.**
+
+- Its constants are pixels of a 1700 by 2200 render. Here they are
+  fractions of the page frame, because a page of a volume is measured
+  in points and no two volumes share a render.
+- It stores HTML with ``<mark>`` elements. This module stores no
+  markup: a voted group stores its words as tokens with a
+  ``low_confidence`` flag, and the viewer builds the nodes. The portal
+  escapes every label it draws, and stored markup would break that.
+- It ranks the engines with a ``PRIORITY`` tuple. Here the order of
+  ``opinion_ocr.ENGINES`` is that rank, so there is no second list.
+- It compares the engines' text as they wrote it. Here the vote
+  compares a key (:func:`compare_text`) and shows the winner's own
+  text. Over one real opinion of seven pages, the quotes, the dashes,
+  the ellipsis and the markdown marks alone made 16 of 77 groups vote
+  word by word and marked 26 words low; with the key, 4 groups vote
+  and 5 words are marked, and every one of those is a difference of
+  reading.
+
+**The ledger is on the row.** ``ensemble_revision ==
+ocr_glue_revision`` is the one rule for "the ensemble describes the
+documents that exist now" (:func:`is_written`), a query and never an S3
+read. A fault of the row spends ``ensemble_attempts``, and at
+:data:`MAX_ATTEMPTS` the row is ``ERROR``: loud, then quiet. The way
+back is a run that works: the button, the command, or the next
+approval, which raises the revision.
+
+**The gate is the engine count.** ``settings.
+OPINION_ENSEMBLE_MIN_ENGINES`` (3) is how many engine documents a row
+must hold before the pass takes it, and ``Opinion.ocr_engine_count``
+is that number, stamped by the OCR glue. A vote of two engines settles
+nothing: every place they differ has no majority. The button waives
+the gate, which is how a two-engine volume is read during development.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+import unicodedata
+from collections import Counter
+from difflib import SequenceMatcher
+from itertools import combinations
+
+from django.conf import settings
+from django.db import transaction
+from django.db.models import F, Q
+from django.utils import timezone
+
+from scanning import opinion_ocr, s3_sync
+from scanning.models import (
+    Issue,
+    Opinion,
+    OpinionCheck,
+    OpinionFinding,
+    OpinionFindingDismissal,
+    OpinionReviewStatus,
+    OpinionText,
+    Status,
+)
+
+logger = logging.getLogger(__name__)
+
+#: Version of the document this module writes.
+SCHEMA_VERSION = 1
+
+#: The file, beside the ``{engine}.json`` files of the OCR glue.
+DOCUMENT = "ensemble.json"
+
+#: The least share of the smaller box two units must share to link.
+OVERLAP = 0.5
+
+#: A unit of this share of the page or more does not link.
+MAX_AREA = 0.5
+
+#: Below this worst pair IoU of the merged boxes a group is weak: the
+#: link rule is permissive, and a text difference of a weak group may
+#: be the alignment and not the engines.
+WEAK_IOU = 0.3
+
+#: The bands, as fractions of the page height. A box wholly above the
+#: first is a running head; a box that starts below the second is a
+#: footer.
+TOP_BAND = 0.085
+BOTTOM_BAND = 0.95
+
+#: The least gap between two left edges, as a fraction of the page
+#: width, that says a second column starts.
+COLUMN_GAP = 0.1176
+
+#: The boundary sits this fraction of the width left of the right
+#: column's first edge.
+EDGE_PAD = 0.0118
+
+#: How far past the boundary a box must reach on both sides to be full
+#: width rather than a column member that overshoots.
+STRADDLE_L = 0.0235
+STRADDLE_R = 0.0353
+
+#: Boxes within this fraction of the height of each other are on one
+#: line and read left to right: two running heads sit level, and a
+#: point of noise must not decide which comes first.
+LINE_BAND = 0.0091
+
+#: The column boundary must lie between these fractions of the width.
+MIN_BOUNDARY = 0.25
+MAX_BOUNDARY = 0.85
+
+#: A page with fewer body boxes reads as one column.
+MIN_BODY_BOXES = 4
+
+#: What joins two groups in a page's text.
+PARAGRAPH_GAP = "\n\n"
+
+#: How the engines agreed on one group.
+UNANIMOUS = "unanimous"
+MAJORITY = "majority"
+VOTED = "voted"
+SINGLE = "single"
+
+#: Why a group is not in the text.
+DROP_EXCLUDED = "excluded"
+DROP_EMPTY = "empty"
+
+#: The checks this module writes. One rebuild is their only writer,
+#: and ``opinions.create_rows`` keeps the two stale ones.
+ENSEMBLE_CHECKS = frozenset(
+    {
+        OpinionCheck.ENGINES_DISAGREE,
+        OpinionCheck.NO_MAJORITY,
+        OpinionCheck.PARTIAL_REDACTION,
+    }
+)
+
+#: How many rows one tick writes. One row is three small reads and a
+#: geometry over about four pages.
+ENSEMBLE_PER_TICK = 10
+
+#: Failed ticks on one row at one revision before the row is ERROR.
+MAX_ATTEMPTS = 3
+
+#: The start of every ``Opinion.error_message`` this module writes, so
+#: a success clears its own message and nobody else's.
+MESSAGE_PREFIX = "OCR ensemble: "
+
+#: What the comparison reads as the same character. The two engines
+#: differ here on almost every page of a real volume, and none of it is
+#: a difference of reading: Mistral writes the curly quotes of the
+#: page, dots.mocr writes the straight ones.
+_SAME_CHARACTER = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201a": "'",
+        "\u201b": "'",
+        "\u2032": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201e": '"',
+        "\u2033": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+        "\u00a0": " ",
+    }
+)
+
+#: The markdown marks a comparison drops: a heading, an emphasis, a
+#: code span. One engine writes ``## FACTS`` where the other writes
+#: ``### FACTS``, and both read the same words.
+_MARKUP = re.compile(r"[*_`~#]+")
+
+#: A run of two periods or more, and a run of spaced periods: one
+#: engine writes ``....`` where the other writes ``. . . .``.
+_DOT_RUN = re.compile(r"\.(?:\s*\.)+")
+
+_TAG = re.compile(r"<[^>]+>")
+_WS = re.compile(r"\s+")
+#: Mistral writes an image placeholder as a block's whole text where
+#: another engine emits an empty figure box: a placeholder, not content.
+_MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+
+
+class EnsembleError(Exception):
+    """A fact about one row: its text cannot be written.
+
+    Spends an attempt on the row. The message goes to
+    ``Opinion.error_message``.
+    """
+
+
+# ---------------------------------------------------------------------------
+# The text of one unit
+# ---------------------------------------------------------------------------
+
+
+def plain(fragment: str | None) -> str:
+    """Return one unit's content with none of its markup.
+
+    :param fragment: The engine's text.
+    :returns: The text, with the tags and the image placeholders gone
+        and the whitespace collapsed.
+    :rtype: str
+    """
+    if not fragment:
+        return ""
+    stripped = _TAG.sub(" ", _MD_IMAGE.sub(" ", fragment))
+    return _WS.sub(" ", stripped).strip()
+
+
+def compare_text(text: str) -> str:
+    """Return the text as the vote compares it, never as it is shown.
+
+    **The comparison is not the text.** The engines agree about the
+    words and differ about the typography: the quotes, the dashes, the
+    ellipsis and the markdown marks. Over one real opinion of seven
+    pages those differences alone made 16 of 77 groups vote word by
+    word and marked 26 words low, and not one of them was a difference
+    of reading. So the vote compares this key, and the winner's own
+    text is what a reader sees.
+
+    :param text: One engine's read.
+    :returns: The key.
+    :rtype: str
+    """
+    folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
+    folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
+    return _WS.sub(" ", folded).strip()
+
+
+def compare_word(word: str) -> str:
+    """Return one word as the vote compares it.
+
+    The word-by-word twin of :func:`compare_text`. One key per word of
+    the read, so the key list and the shown list stay side by side: a
+    mark of its own becomes an empty key, and the vote drops it.
+
+    :param word: One word of one engine's read.
+    :returns: The key, which may be empty.
+    :rtype: str
+    """
+    folded = unicodedata.normalize("NFKC", word).translate(_SAME_CHARACTER)
+    return _DOT_RUN.sub("...", _MARKUP.sub("", folded)).strip()
+
+
+def _pairs(text: str) -> list[tuple[str, str]]:
+    """Return ``[(key, the word as it is shown)]`` for one read."""
+    return [(compare_word(word), word) for word in text.split()]
+
+
+# ---------------------------------------------------------------------------
+# The geometry
+# ---------------------------------------------------------------------------
+
+
+def area(box: list[float]) -> float:
+    """Return the area of one box.
+
+    :param box: ``[x0, y0, x1, y1]``.
+    :returns: The area.
+    :rtype: float
+    """
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def contained(a: list[float], b: list[float]) -> float:
+    """Return the intersection as a share of the smaller box.
+
+    Containment and not IoU: a small box inside a big one is the same
+    content, and IoU calls it a stranger.
+
+    :param a: One box.
+    :param b: The other box.
+    :returns: The share, 0 when either box has no area.
+    :rtype: float
+    """
+    smaller = min(area(a), area(b))
+    if smaller <= 0:
+        return 0.0
+    return opinion_ocr.intersection(a, b) / smaller
+
+
+def iou(a: list[float], b: list[float]) -> float:
+    """Return the plain IoU of two boxes.
+
+    Read on the **merged** boxes alone, to score an alignment.
+
+    :param a: One box.
+    :param b: The other box.
+    :returns: The IoU, 0 when the union has no area.
+    :rtype: float
+    """
+    shared = opinion_ocr.intersection(a, b)
+    union = area(a) + area(b) - shared
+    return shared / union if union > 0 else 0.0
+
+
+def _union_box(boxes: list[list[float]]) -> list[float]:
+    """Return the box that holds every box of ``boxes``."""
+    return [
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    ]
+
+
+class _Union:
+    """Union-find over the units of one page."""
+
+    def __init__(self, size: int) -> None:
+        self.parent = list(range(size))
+
+    def find(self, index: int) -> int:
+        """Return the root of ``index``."""
+        while self.parent[index] != index:
+            self.parent[index] = self.parent[self.parent[index]]
+            index = self.parent[index]
+        return index
+
+    def join(self, left: int, right: int) -> None:
+        """Put two members in one group."""
+        a, b = self.find(left), self.find(right)
+        if a != b:
+            self.parent[a] = b
+
+
+# ---------------------------------------------------------------------------
+# The alignment
+# ---------------------------------------------------------------------------
+
+
+def _merge(members: list[dict], line_band: float) -> dict:
+    """Merge one engine's members of a group into one unit.
+
+    :param members: The engine's units of the group.
+    :param line_band: The height of one line band, in points.
+    :returns: The merged unit.
+    :rtype: dict
+    """
+    ordered = line_sort(members, line_band)
+    texts = [t for t in (plain(m["text"]) for m in ordered) if t]
+    excluded = [m for m in ordered if m["exclusion"]]
+    partial = [
+        m
+        for m in excluded
+        if (m["exclusion"] or {}).get("reason") == "redaction"
+        and m["share"] < opinion_ocr.FULL_SHARE
+    ]
+    return {
+        "ids": [m["id"] for m in ordered],
+        "types": [m["type"] for m in ordered],
+        "box_pt": _round_box(_union_box([m["box_pt"] for m in ordered])),
+        "text": " ".join(texts),
+        "excluded": bool(excluded),
+        "reason": (
+            (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
+        ),
+        "partial": bool(partial),
+    }
+
+
+def _round_box(box: list[float]) -> list[float]:
+    """Return a box rounded the way the viewer draws it."""
+    return [round(value, 2) for value in box]
+
+
+def align_page(units: list[dict], width: float, height: float) -> list[dict]:
+    """Return the aligned groups of one page, unordered.
+
+    :param units: Every engine's units of the page, each with
+        ``engine``, ``id``, ``box_pt``, ``text``, ``type``,
+        ``exclusion`` and ``share``.
+    :param width: The page width, in points.
+    :param height: The page height, in points.
+    :returns: The groups, each with ``engines``, ``present``,
+        ``box_pt``, ``page_scale``, ``alignment_iou``, ``weak`` and the
+        exclusion of its members.
+    :rtype: list[dict]
+    """
+    cutoff = MAX_AREA * width * height
+    page_scale = {
+        index
+        for index, unit in enumerate(units)
+        if area(unit["box_pt"]) >= cutoff
+    }
+    line_band = LINE_BAND * height
+
+    union = _Union(len(units))
+    for left, right in combinations(range(len(units)), 2):
+        if left in page_scale or right in page_scale:
+            continue
+        if units[left]["engine"] == units[right]["engine"]:
+            continue
+        if contained(units[left]["box_pt"], units[right]["box_pt"]) >= OVERLAP:
+            union.join(left, right)
+
+    buckets: dict[int, list[int]] = {}
+    for index in range(len(units)):
+        buckets.setdefault(union.find(index), []).append(index)
+
+    groups = []
+    for indices in buckets.values():
+        by_engine: dict[str, list[dict]] = {}
+        for index in indices:
+            by_engine.setdefault(units[index]["engine"], []).append(
+                units[index]
+            )
+        merged = {
+            engine: _merge(members, line_band)
+            for engine, members in by_engine.items()
+        }
+        boxes = [unit["box_pt"] for unit in merged.values()]
+        worst = round(
+            min((iou(a, b) for a, b in combinations(boxes, 2)), default=1.0), 3
+        )
+        excluded = [u for u in merged.values() if u["excluded"]]
+        groups.append(
+            {
+                "engines": merged,
+                "present": _ranked(merged),
+                "box_pt": _round_box(_union_box(boxes)),
+                "page_scale": any(index in page_scale for index in indices),
+                "alignment_iou": worst,
+                "weak": len(boxes) > 1 and worst < WEAK_IOU,
+                "excluded": bool(excluded),
+                "reason": excluded[0]["reason"] if excluded else "",
+                "partial": any(u["partial"] for u in merged.values()),
+            }
+        )
+    return groups
+
+
+def _ranked(engines) -> list[str]:
+    """Return the engine names in the order the ensemble votes."""
+    order = list(opinion_ocr.ENGINES)
+    return sorted(engines, key=lambda name: _rank(name, order))
+
+
+def _rank(name: str, order: list[str]) -> int:
+    """Return one engine's place in the vote."""
+    return order.index(name) if name in order else len(order)
+
+
+# ---------------------------------------------------------------------------
+# The reading order
+# ---------------------------------------------------------------------------
+
+
+def line_sort(boxes: list[dict], line_band: float) -> list[dict]:
+    """Return boxes top to bottom, left to right inside a line band.
+
+    Used for the head and the foot bands, and for the members of one
+    group, where there are no columns to reason about.
+
+    :param boxes: Dicts with ``box_pt``.
+    :param line_band: The height of one band, in points.
+    :returns: The boxes, ordered.
+    :rtype: list[dict]
+    """
+    band = line_band if line_band > 0 else 1.0
+    return sorted(
+        boxes,
+        key=lambda b: (round(b["box_pt"][1] / band), b["box_pt"][0]),
+    )
+
+
+def _split_bands(
+    groups: list[dict], height: float
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Return the head, the body and the foot of one page."""
+    head, body, foot = [], [], []
+    for group in groups:
+        if group["box_pt"][3] < TOP_BAND * height:
+            head.append(group)
+        elif group["box_pt"][1] > BOTTOM_BAND * height:
+            foot.append(group)
+        else:
+            body.append(group)
+    return head, body, foot
+
+
+def column_boundary(
+    groups: list[dict], width: float, height: float
+) -> float | None:
+    """Return the x that separates the two columns, or None.
+
+    Only the body boxes vote: a running head and a footer straddle the
+    gutter and would hide it. The boundary is the right cluster's first
+    edge less a pad, not the middle of the gap, because the left
+    column's text runs up to the gutter.
+
+    :param groups: The groups of the page.
+    :param width: The page width, in points.
+    :param height: The page height, in points.
+    :returns: The boundary, or None for one column.
+    :rtype: float | None
+    """
+    _, body, _ = _split_bands(groups, height)
+    edges = sorted(group["box_pt"][0] for group in body)
+    if len(edges) < MIN_BODY_BOXES:
+        return None
+    gap, right_edge = 0.0, None
+    for left, right in zip(edges, edges[1:]):
+        if right - left > gap:
+            gap, right_edge = right - left, right
+    if right_edge is None or gap < COLUMN_GAP * width:
+        return None
+    boundary = right_edge - EDGE_PAD * width
+    if not MIN_BOUNDARY * width < boundary < MAX_BOUNDARY * width:
+        return None
+    if sum(1 for edge in edges if edge < boundary) < 2:
+        return None
+    if sum(1 for edge in edges if edge >= boundary) < 2:
+        return None
+    return boundary
+
+
+def _straddles(box: list[float], boundary: float, width: float) -> bool:
+    """Return whether a box crosses the boundary on both sides."""
+    return (
+        box[0] < boundary - STRADDLE_L * width
+        and box[2] > boundary + STRADDLE_R * width
+    )
+
+
+def _side(box: list[float], boundary: float) -> str:
+    """Return which column a box belongs to."""
+    return "L" if (box[0] + box[2]) / 2 < boundary else "R"
+
+
+def place(groups: list[dict], width: float, height: float) -> list[dict]:
+    """Return the groups in reading order, each stamped.
+
+    Every group is placed, the dropped ones included, because the
+    column boundary is read off the boxes of the page and a page whose
+    redacted blocks were taken out first would lose it.
+
+    :param groups: The groups of one page.
+    :param width: The page width, in points.
+    :param height: The page height, in points.
+    :returns: New dicts, with ``band`` and ``column``.
+    :rtype: list[dict]
+    """
+    head, body, foot = _split_bands(groups, height)
+    boundary = column_boundary(groups, width, height)
+    line_band = LINE_BAND * height
+
+    ordered: list[dict] = []
+    if boundary is None:
+        ordered = [
+            {**group, "band": "body", "column": None}
+            for group in sorted(
+                body, key=lambda g: (g["box_pt"][1], g["box_pt"][0])
+            )
+        ]
+    else:
+        separators = sorted(
+            (g for g in body if _straddles(g["box_pt"], boundary, width)),
+            key=lambda g: g["box_pt"][1],
+        )
+        rest = [
+            g for g in body if not _straddles(g["box_pt"], boundary, width)
+        ]
+        top = -1.0
+        for separator in [*separators, None]:
+            cut = (
+                separator["box_pt"][1] if separator is not None else height + 1
+            )
+            segment = [g for g in rest if top <= g["box_pt"][1] < cut]
+            segment.sort(
+                key=lambda g: (
+                    _side(g["box_pt"], boundary),
+                    g["box_pt"][1],
+                    g["box_pt"][0],
+                )
+            )
+            ordered += [
+                {
+                    **group,
+                    "band": "body",
+                    "column": _side(group["box_pt"], boundary),
+                }
+                for group in segment
+            ]
+            if separator is not None:
+                ordered.append({**separator, "band": "body", "column": None})
+            top = cut
+
+    return (
+        [
+            {**group, "band": "head", "column": None}
+            for group in line_sort(head, line_band)
+        ]
+        + ordered
+        + [
+            {**group, "band": "foot", "column": None}
+            for group in line_sort(foot, line_band)
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# The vote
+# ---------------------------------------------------------------------------
+
+
+def _candidates(
+    base: list[tuple[str, str]], other: list[tuple[str, str]]
+) -> tuple[dict[int, list[tuple[str, str]]], dict[int, list[list]]]:
+    """Return one engine's reading of each word of the base read.
+
+    Both sides are ``(key, the word as it is shown)`` pairs, and the
+    alignment runs over the keys alone (:func:`compare_word`): the
+    engines must not vote about a quote mark.
+
+    A substitution maps word for word when the two spans have the same
+    length; else the whole span is that engine's reading of the base's
+    first position, which keeps a two-against-one word split from
+    dropping words in silence.
+
+    :param base: The base engine's pairs.
+    :param other: The other engine's pairs.
+    :returns: ``({position: readings}, {position: inserted runs})``.
+    :rtype: tuple[dict, dict]
+    """
+    at: dict[int, list[tuple[str, str]]] = {}
+    inserted: dict[int, list[list]] = {}
+    base_keys = [key for key, _ in base]
+    other_keys = [key for key, _ in other]
+    matcher = SequenceMatcher(None, base_keys, other_keys, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for index in range(i1, i2):
+                at.setdefault(index, []).append(base[index])
+        elif tag == "replace":
+            if i2 - i1 == j2 - j1:
+                for offset in range(i2 - i1):
+                    at.setdefault(i1 + offset, []).append(other[j1 + offset])
+            else:
+                span = other[j1:j2]
+                joined = (
+                    " ".join(key for key, _ in span),
+                    " ".join(word for _, word in span),
+                )
+                at.setdefault(i1, []).append(joined)
+                for index in range(i1 + 1, i2):
+                    at.setdefault(index, []).append(("", ""))
+        elif tag == "delete":
+            for index in range(i1, i2):
+                at.setdefault(index, []).append(("", ""))
+        elif tag == "insert":
+            inserted.setdefault(i1, []).append(other[j1:j2])
+    return at, inserted
+
+
+def vote_words(
+    base: list[tuple[str, str]], others: list[list[tuple[str, str]]]
+) -> tuple[list[dict], int]:
+    """Return the winning word at each position, as tokens.
+
+    The vote runs over the keys and the answer carries the word as its
+    engine wrote it. No markup: a token is ``{"text": word}``, and a
+    word no majority settled carries ``"low_confidence": True``. The
+    viewer builds the nodes from that.
+
+    :param base: The base engine's ``(key, word)`` pairs.
+    :param others: The other engines' pairs.
+    :returns: ``(tokens, how many positions had no majority)``.
+    :rtype: tuple[list[dict], int]
+    """
+    votes: list[dict[int, list[tuple[str, str]]]] = []
+    inserts: list[dict[int, list[list]]] = []
+    for other in others:
+        at, inserted = _candidates(base, other)
+        votes.append(at)
+        inserts.append(inserted)
+
+    # A strict majority of every reading, the base's own included, so
+    # two engines never settle a word the third disputes.
+    quorum = (len(others) + 3) // 2
+    tokens: list[dict] = []
+    disputed = 0
+    for position in range(len(base) + 1):
+        runs: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
+            (
+                tuple(key for key, _ in run),
+                tuple(word for _, word in run),
+            )
+            for inserted in inserts
+            for run in inserted.get(position, [])
+        ]
+        counted = Counter(keys for keys, _ in runs)
+        for keys, count in counted.items():
+            if count < quorum:
+                continue
+            words = next(words for other, words in runs if other == keys)
+            tokens += [
+                {"text": word, "low_confidence": True} for word in words
+            ]
+        if position == len(base):
+            break
+        readings = [base[position]] + [
+            reading for vote in votes for reading in vote.get(position, [])
+        ]
+        winner, count = Counter(key for key, _ in readings).most_common(1)[0]
+        if count >= quorum:
+            if winner:
+                # "" is the reading of a majority that dropped the word,
+                # and of a mark that carries no reading at all.
+                tokens.append(
+                    {
+                        "text": next(
+                            word for key, word in readings if key == winner
+                        )
+                    }
+                )
+        else:
+            disputed += 1
+            tokens.append({"text": base[position][1], "low_confidence": True})
+    return tokens, disputed
+
+
+def resolve(group: dict) -> dict:
+    """Return the read of one aligned group.
+
+    The engines vote over :func:`compare_text`, and the winner's own
+    text is the answer: the vote must not turn a curly quote into a
+    difference, and a reader must see the page as its engine read it.
+
+    :param group: One group of :func:`align_page`.
+    :returns: ``{agreement, source, agreeing, text, tokens,
+        n_low_confidence}``. ``tokens`` is empty unless the group was
+        voted word by word.
+    :rtype: dict
+    """
+    engines = group["engines"]
+    present = _ranked(engines)
+    base = present[0]
+    if len(present) == 1:
+        return {
+            "agreement": SINGLE,
+            "source": base,
+            "agreeing": [base],
+            "text": engines[base]["text"],
+            "tokens": [],
+            "n_low_confidence": 0,
+        }
+
+    keys = {name: compare_text(engines[name]["text"]) for name in present}
+    winner, votes = Counter(keys[name] for name in present).most_common(1)[0]
+    quorum = (len(present) + 2) // 2
+    if votes >= quorum:
+        agreeing = [name for name in present if keys[name] == winner]
+        return {
+            "agreement": UNANIMOUS if votes == len(present) else MAJORITY,
+            "source": agreeing[0],
+            "agreeing": agreeing,
+            "text": engines[agreeing[0]]["text"],
+            "tokens": [],
+            "n_low_confidence": 0,
+        }
+
+    tokens, disputed = vote_words(
+        _pairs(engines[base]["text"]),
+        [_pairs(engines[name]["text"]) for name in present if name != base],
+    )
+    return {
+        "agreement": VOTED,
+        "source": base,
+        "agreeing": [],
+        "text": " ".join(token["text"] for token in tokens if token["text"]),
+        "tokens": tokens,
+        "n_low_confidence": disputed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The document
+# ---------------------------------------------------------------------------
+
+
+def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
+    """Return one engine's units of one page, placed and unplaced.
+
+    A unit with no ``box_pt`` cannot be aligned. It is ``unjudged``
+    already, so it never reaches the text; it is reported as dropped.
+
+    :param page: One page of an opinion document.
+    :param engine: The engine's name.
+    :returns: ``(the units with a box, the units without one)``.
+    :rtype: tuple[list[dict], list[dict]]
+    """
+    placed, unplaced = [], []
+    for unit in page.get("units") or []:
+        if not isinstance(unit, dict):
+            continue
+        box = opinion_ocr.as_box(unit.get("box_pt"))
+        entry = {
+            "engine": engine,
+            "id": unit.get("id"),
+            "box_pt": box,
+            "text": unit.get("text") or "",
+            "type": unit.get("type") or "",
+            "exclusion": unit.get("exclusion"),
+            "share": unit.get("share") or 0.0,
+        }
+        (placed if box else unplaced).append(entry)
+    return placed, unplaced
+
+
+def _frame(pages: dict[str, dict]) -> tuple[float, float] | None:
+    """Return the page size in points, off the first engine that has it.
+
+    Every engine's page carries the same size: ``opinion_ocr`` measures
+    it from the detections or the dots.mocr render, and the engine only
+    decides the render the box came from.
+
+    :param pages: ``{engine: the page}``.
+    :returns: ``(width, height)``, or None when no engine measured it.
+    :rtype: tuple[float, float] | None
+    """
+    for page in pages.values():
+        frame = page.get("frame") or {}
+        width, height = frame.get("width_pt"), frame.get("height_pt")
+        if width and height:
+            return float(width), float(height)
+    return None
+
+
+def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
+    """Return the ensemble of one page of one opinion.
+
+    :param pages: ``{engine: the page of that engine's document}``.
+    :param page_in_opinion: The 0-based page of the opinion.
+    :returns: The page entry of the document.
+    :rtype: dict
+    """
+    first = next(iter(pages.values()))
+    entry = {
+        "page_in_opinion": page_in_opinion,
+        "page_index": first.get("page_index"),
+        "pdf_page": first.get("pdf_page"),
+        "source": first.get("source"),
+        "frame": None,
+        "text": "",
+        "groups": [],
+        "dropped": [],
+        "counts": {
+            "groups": 0,
+            "dropped": 0,
+            UNANIMOUS: 0,
+            MAJORITY: 0,
+            VOTED: 0,
+            SINGLE: 0,
+            "low_confidence": 0,
+            "partial": 0,
+        },
+    }
+    read = {
+        engine: page for engine, page in pages.items() if "error" not in page
+    }
+    if not read:
+        entry["error"] = first.get("error") or "no engine read this page"
+        return entry
+
+    size = _frame(read)
+    units: list[dict] = []
+    for engine, page in read.items():
+        placed, unplaced = _units_of(page, engine)
+        units += placed
+        for unit in unplaced:
+            entry["dropped"].append(
+                {
+                    "engines": {engine: [unit["id"]]},
+                    "box_pt": None,
+                    "reason": (unit["exclusion"] or {}).get("reason")
+                    or DROP_EXCLUDED,
+                    "partial": False,
+                }
+            )
+    if size is None:
+        # No detection and no render measured this page, so no box of
+        # it is in points and nothing can be aligned. Every unit is
+        # unjudged already, the rule of ``opinion_ocr.verdict``.
+        entry["counts"]["dropped"] = len(entry["dropped"])
+        return entry
+
+    width, height = size
+    entry["frame"] = {
+        "width_pt": round(width, 2),
+        "height_pt": round(height, 2),
+    }
+    ordered = place(align_page(units, width, height), width, height)
+
+    parts: list[str] = []
+    offset = 0
+    for group in ordered:
+        read_back = resolve(group)
+        if group["excluded"] or not read_back["text"]:
+            entry["dropped"].append(
+                {
+                    "engines": {
+                        name: unit["ids"]
+                        for name, unit in group["engines"].items()
+                    },
+                    "box_pt": group["box_pt"],
+                    "reason": (
+                        group["reason"] or DROP_EXCLUDED
+                        if group["excluded"]
+                        else DROP_EMPTY
+                    ),
+                    "partial": group["partial"],
+                }
+            )
+            continue
+        start = offset
+        end = start + len(read_back["text"])
+        offset = end + len(PARAGRAPH_GAP)
+        parts.append(read_back["text"])
+        entry["groups"].append(
+            {
+                "id": len(entry["groups"]),
+                "band": group["band"],
+                "column": group["column"],
+                "box_pt": group["box_pt"],
+                "start": start,
+                "end": end,
+                "agreement": read_back["agreement"],
+                "source": read_back["source"],
+                "agreeing": read_back["agreeing"],
+                "alignment_iou": group["alignment_iou"],
+                "weak": group["weak"],
+                "page_scale": group["page_scale"],
+                "n_low_confidence": read_back["n_low_confidence"],
+                "tokens": read_back["tokens"],
+                "text": read_back["text"],
+                "engines": {
+                    name: {
+                        "ids": unit["ids"],
+                        "box_pt": unit["box_pt"],
+                        "text": unit["text"],
+                    }
+                    for name, unit in group["engines"].items()
+                },
+            }
+        )
+        entry["counts"][read_back["agreement"]] += 1
+        entry["counts"]["low_confidence"] += read_back["n_low_confidence"]
+
+    entry["text"] = PARAGRAPH_GAP.join(parts)
+    entry["counts"]["groups"] = len(entry["groups"])
+    entry["counts"]["dropped"] = len(entry["dropped"])
+    entry["counts"]["partial"] = sum(
+        1 for drop in entry["dropped"] if drop["partial"]
+    )
+    return entry
+
+
+def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
+    """Return the ensemble document of one opinion.
+
+    :param opinion: The row.
+    :param documents: ``{engine: the opinion document of that engine}``.
+    :returns: The document.
+    :rtype: dict
+    :raises EnsembleError: When an engine document lacks a page of the
+        opinion.
+    """
+    engines = [name for name in opinion_ocr.ENGINES if name in documents]
+    if not engines:
+        raise EnsembleError("this opinion has no engine document")
+    by_page: dict[str, dict[int, dict]] = {}
+    for engine in engines:
+        by_page[engine] = {
+            page.get("page_in_opinion"): page
+            for page in documents[engine].get("pages") or []
+            if isinstance(page, dict)
+        }
+
+    pages = []
+    counts = {
+        "groups": 0,
+        "dropped": 0,
+        UNANIMOUS: 0,
+        MAJORITY: 0,
+        VOTED: 0,
+        SINGLE: 0,
+        "low_confidence": 0,
+        "partial": 0,
+    }
+    for page_in_opinion in range(opinion.page_count):
+        of_page = {}
+        for engine in engines:
+            page = by_page[engine].get(page_in_opinion)
+            if page is None:
+                raise EnsembleError(
+                    f"the {engine} document has no page "
+                    f"{page_in_opinion + 1} of this opinion"
+                )
+            of_page[engine] = page
+        entry = build_page(of_page, page_in_opinion)
+        for key, value in entry["counts"].items():
+            counts[key] += value
+        pages.append(entry)
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "scan_pk": opinion.scan_id,
+        "opinion": {
+            "first_printed_page": opinion.first_printed_page,
+            "index_in_page": opinion.index_in_page,
+            "last_printed_page": opinion.last_printed_page,
+            "page_count": opinion.page_count,
+            "glue_revision": opinion.glue_revision,
+        },
+        "apply_run": (opinion.apply_run.label if opinion.apply_run_id else ""),
+        "engines": engines,
+        "params": {
+            "overlap": OVERLAP,
+            "max_area": MAX_AREA,
+            "weak_iou": WEAK_IOU,
+        },
+        "generated_at": timezone.now().isoformat(),
+        "pages": pages,
+        "counts": counts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The keys and the ledger
+# ---------------------------------------------------------------------------
+
+
+def document_key(opinion: Opinion) -> str:
+    """Return the S3 key of one opinion's ensemble document.
+
+    :param opinion: The row.
+    :returns: The key.
+    :rtype: str
+    """
+    prefix = s3_sync.s3_processing_prefix(opinion.scan)
+    return f"{prefix}{opinion.glue_prefix}{DOCUMENT}"
+
+
+def is_written(opinion: Opinion) -> bool:
+    """Return whether the ensemble describes the documents that exist.
+
+    **The one rule**, read off the row and never off the bucket. Both
+    stamps must name the live revision: an ensemble of the documents of
+    an older revision is not the text of this opinion.
+
+    :param opinion: The row.
+    :returns: Whether the text is current.
+    :rtype: bool
+    """
+    return (
+        opinion_ocr.is_written(opinion)
+        and opinion.ensemble_revision is not None
+        and opinion.ensemble_revision == opinion.ocr_glue_revision
+    )
+
+
+def min_engines() -> int:
+    """Return how many engine documents the pass waits for.
+
+    :returns: ``settings.OPINION_ENSEMBLE_MIN_ENGINES``.
+    :rtype: int
+    """
+    return int(getattr(settings, "OPINION_ENSEMBLE_MIN_ENGINES", 3))
+
+
+def due(limit: int | None = None):
+    """Return the rows that owe their ensemble, as a queryset.
+
+    A row whose OCR glue is written at the live revision, that holds
+    at least :func:`min_engines` engine documents, that is not
+    ``ERROR``, that has attempts left, and whose ensemble stamp is not
+    the OCR glue's. The scan must be in ``REDACTION_REVIEW_DONE``: a
+    volume an admin sent back writes no text while it is back.
+
+    :param limit: How many rows to take, newest scan first.
+    :returns: The queryset.
+    """
+    rows = (
+        Opinion.objects.filter(
+            scan__status=Status.REDACTION_REVIEW_DONE,
+            ensemble_attempts__lt=MAX_ATTEMPTS,
+            ocr_glue_revision__isnull=False,
+            ocr_glue_revision=F("glue_revision"),
+            ocr_engine_count__gte=min_engines(),
+        )
+        .exclude(status=OpinionReviewStatus.ERROR)
+        .filter(
+            Q(ensemble_revision__isnull=True)
+            | ~Q(ensemble_revision=F("ocr_glue_revision"))
+        )
+        .order_by("-scan_id", "first_printed_page", "index_in_page")
+    )
+    return rows[:limit] if limit else rows
+
+
+def record_failure(opinion: Opinion, message: str) -> None:
+    """Spend one attempt on the row, and end it at the cap.
+
+    :param opinion: The row.
+    :param message: What failed, for ``error_message``.
+    :return: None.
+    """
+    Opinion.objects.filter(pk=opinion.pk).update(
+        ensemble_attempts=F("ensemble_attempts") + 1,
+        error_message=f"{MESSAGE_PREFIX}{message}",
+    )
+    ended = (
+        Opinion.objects.filter(
+            pk=opinion.pk, ensemble_attempts__gte=MAX_ATTEMPTS
+        )
+        .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+        .update(status=OpinionReviewStatus.ERROR)
+    )
+    if ended:
+        logger.error(
+            "%s of scan %s: the ensemble failed %d times; the row is ERROR "
+            "until the next approval. Last: %s",
+            opinion,
+            opinion.scan_id,
+            MAX_ATTEMPTS,
+            message,
+        )
+    else:
+        logger.warning(
+            "%s of scan %s: the ensemble failed: %s",
+            opinion,
+            opinion.scan_id,
+            message,
+        )
+
+
+# ---------------------------------------------------------------------------
+# The rows
+# ---------------------------------------------------------------------------
+
+
+def _address(page: dict) -> tuple[int | None, int | None]:
+    """Return the durable address of one page of the corrected volume.
+
+    :param page: One page of the document.
+    :returns: ``(the page edit's pk or None, the page of its source)``.
+    :rtype: tuple[int | None, int | None]
+    """
+    source = page.get("source") or {}
+    if source.get("kind") == "original":
+        return None, source.get("pdf_page")
+    return source.get("edit_id"), source.get("page")
+
+
+def write_rows(opinion: Opinion, document: dict) -> int:
+    """Write the ``OpinionText`` rows of one opinion.
+
+    One row per page. ``text`` and ``disagreements`` are written again
+    at every run, because they are a cache of the documents; nothing
+    here reads or writes ``human_text``, which is the truth.
+
+    :param opinion: The row.
+    :param document: :func:`build_document`.
+    :returns: How many rows were written.
+    :rtype: int
+    """
+    written = 0
+    for page in document["pages"]:
+        source_edit_id, source_page = _address(page)
+        OpinionText.objects.update_or_create(
+            opinion=opinion,
+            page_in_opinion=page["page_in_opinion"],
+            defaults={
+                "text": page["text"],
+                "disagreements": _disagreements(page),
+                "source_edit_id": source_edit_id,
+                "source_page": source_page,
+                "page_index": page["page_index"],
+                "apply_run_id": opinion.apply_run_id,
+            },
+        )
+        written += 1
+    OpinionText.objects.filter(
+        opinion=opinion, page_in_opinion__gte=len(document["pages"])
+    ).delete()
+    return written
+
+
+def _disagreements(page: dict) -> list[dict]:
+    """Return one entry per place the engines did not all agree.
+
+    :param page: One page of the document.
+    :returns: ``[{start, end, agreement, variants}]``.
+    :rtype: list[dict]
+    """
+    return [
+        {
+            "start": group["start"],
+            "end": group["end"],
+            "agreement": group["agreement"],
+            "variants": {
+                name: unit["text"] for name, unit in group["engines"].items()
+            },
+        }
+        for group in page["groups"]
+        if group["agreement"] in (MAJORITY, VOTED)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The findings
+# ---------------------------------------------------------------------------
+
+
+def rebuild_findings(opinion: Opinion, document: dict) -> int:
+    """Write the findings of the ensemble again, from the document.
+
+    **The one writer** of :data:`ENSEMBLE_CHECKS`. It deletes and
+    writes those three checks alone, so the two stale checks of
+    ``opinions.create_rows`` stay where they are. A standing dismissal
+    of the same page and check mutes the new card, the rule of
+    ``findings.resolve``; nothing deletes a dismissal.
+
+    :param opinion: The row.
+    :param document: :func:`build_document`.
+    :returns: How many findings were written.
+    :rtype: int
+    """
+    OpinionFinding.objects.filter(
+        opinion=opinion, check_name__in=ENSEMBLE_CHECKS
+    ).delete()
+    standing = {
+        (row.page_in_opinion, row.check_name): row
+        for row in OpinionFindingDismissal.objects.filter(
+            opinion=opinion, withdrawn_at__isnull=True
+        )
+    }
+    cards = []
+    for page in document["pages"]:
+        page_number = page["page_in_opinion"]
+        counts = page["counts"]
+        if counts[MAJORITY]:
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.ENGINES_DISAGREE,
+                    Issue.Severity.WARNING,
+                    f"The engines differ in {counts[MAJORITY]} place(s) on "
+                    "this page. The majority read wins.",
+                    standing,
+                )
+            )
+        if counts["low_confidence"]:
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.NO_MAJORITY,
+                    Issue.Severity.ERROR,
+                    f"{counts['low_confidence']} word(s) on this page have "
+                    "no majority. Read them against the PDF.",
+                    standing,
+                )
+            )
+        if counts["partial"]:
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.PARTIAL_REDACTION,
+                    Issue.Severity.WARNING,
+                    f"A redaction covers part of {counts['partial']} "
+                    "block(s) on this page. The whole block is out of the "
+                    "text.",
+                    standing,
+                )
+            )
+    OpinionFinding.objects.bulk_create(cards)
+    return len(cards)
+
+
+def _card(
+    opinion: Opinion,
+    page_in_opinion: int,
+    check: str,
+    severity: str,
+    message: str,
+    standing: dict,
+) -> OpinionFinding:
+    """Return one finding, muted when a dismissal names it."""
+    return OpinionFinding(
+        opinion=opinion,
+        page_in_opinion=page_in_opinion,
+        check_name=check,
+        severity=severity,
+        message=message,
+        dismissal=standing.get((page_in_opinion, check)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# The write
+# ---------------------------------------------------------------------------
+
+
+def load_documents(opinion: Opinion) -> dict[str, dict]:
+    """Read one opinion's engine documents off S3.
+
+    The manifest names the engines the glue wrote, so the read asks for
+    no file the glue did not write.
+
+    :param opinion: The row.
+    :returns: ``{engine: the document}``.
+    :rtype: dict[str, dict]
+    :raises EnsembleError: When the manifest or a document does not
+        load, or names no engine this module knows.
+    """
+    manifest_key = opinion_ocr.engine_key(opinion, "manifest")
+    try:
+        manifest = s3_sync.download_json_object(manifest_key)
+    except Exception as exc:
+        raise EnsembleError(
+            f"the manifest at {manifest_key} did not load: {exc}"
+        )
+    names = [
+        name
+        for name in opinion_ocr.ENGINES
+        if name in (manifest.get("engines") or {})
+    ]
+    if not names:
+        raise EnsembleError(f"the manifest at {manifest_key} names no engine")
+    documents = {}
+    for name in names:
+        key = opinion_ocr.engine_key(opinion, name)
+        try:
+            document = s3_sync.download_json_object(key)
+        except Exception as exc:
+            raise EnsembleError(f"the document at {key} did not load: {exc}")
+        if not isinstance(document, dict) or "pages" not in document:
+            raise EnsembleError(f"the object at {key} is not a document")
+        documents[name] = document
+    return documents
+
+
+def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
+    """Write one opinion's text, findings and ensemble document.
+
+    The document goes up first, then the rows and the findings and the
+    stamp in one transaction: a revision that moved during the write
+    wins the compare-and-swap, and the ensemble is due again.
+
+    :param opinion: The row.
+    :param documents: :func:`load_documents`.
+    :returns: The document.
+    :rtype: dict
+    :raises EnsembleError: On a fact about the row.
+    """
+    document = build_document(opinion, documents)
+    key = document_key(opinion)
+    if not s3_sync.upload_json_object(key, document):
+        raise EnsembleError(f"the document could not be uploaded to {key}")
+
+    with transaction.atomic():
+        write_rows(opinion, document)
+        rebuild_findings(opinion, document)
+        stamped = Opinion.objects.filter(
+            pk=opinion.pk, ocr_glue_revision=opinion.ocr_glue_revision
+        ).update(
+            ensemble_revision=opinion.ocr_glue_revision, ensemble_attempts=0
+        )
+        if stamped:
+            # An ERROR this module wrote is answered by this success:
+            # the row is readable again, and the operator who pressed
+            # the button or ran the command is the one who decided
+            # that. The message says whose ERROR it is, so no other
+            # work's failure is cleared here.
+            Opinion.objects.filter(
+                pk=opinion.pk,
+                status=OpinionReviewStatus.ERROR,
+                error_message__startswith=MESSAGE_PREFIX,
+            ).update(status=OpinionReviewStatus.PROCESSING)
+            Opinion.objects.filter(
+                pk=opinion.pk, error_message__startswith=MESSAGE_PREFIX
+            ).update(error_message="")
+    return document
+
+
+def rerun(opinion: Opinion) -> dict:
+    """Read the documents of one opinion and write its text again.
+
+    The body of the button and of the command. It waives the engine
+    gate, which is the only way a two-engine volume is read today.
+
+    :param opinion: The row.
+    :returns: The document.
+    :rtype: dict
+    :raises EnsembleError: On a fact about the row.
+    """
+    return write(opinion, load_documents(opinion))
+
+
+# ---------------------------------------------------------------------------
+# The pass
+# ---------------------------------------------------------------------------
+
+
+def run_tick(limit: int = ENSEMBLE_PER_TICK) -> int:
+    """Write the text of up to ``limit`` rows that owe it.
+
+    The eleventh pass of the collect tick. The rows are walked newest
+    scan first, the rule of ``opinion_ocr.glue_due``. A fault of one
+    row spends that row's attempt and the pass goes on.
+
+    :param limit: How many rows to write.
+    :returns: How many rows were written.
+    :rtype: int
+    """
+    if not s3_sync.s3_active():
+        return 0
+    rows = list(due(limit).select_related("scan", "apply_run"))
+    if not rows:
+        return 0
+    started = time.monotonic()
+    written = 0
+    for opinion in rows:
+        try:
+            document = rerun(opinion)
+        except EnsembleError as exc:
+            record_failure(opinion, str(exc))
+            continue
+        except Exception:
+            logger.exception(
+                "%s of scan %s: the ensemble raised",
+                opinion,
+                opinion.scan_id,
+            )
+            record_failure(opinion, "the ensemble raised; see the log")
+            continue
+        written += 1
+        logger.info(
+            "%s of scan %s: the text was written from %s (%d group(s), "
+            "%d dropped, %d low-confidence word(s))",
+            opinion,
+            opinion.scan_id,
+            ", ".join(document["engines"]),
+            document["counts"]["groups"],
+            document["counts"]["dropped"],
+            document["counts"]["low_confidence"],
+        )
+    logger.info(
+        "the ensemble wrote %d of %d due opinion(s) in %.1fs",
+        written,
+        len(rows),
+        time.monotonic() - started,
+    )
+    return written

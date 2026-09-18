@@ -34,6 +34,7 @@ from scanning.models import (
     Detection,
     DetectionDecision,
     Issue,
+    Opinion,
     OpinionBoundary,
     OpinionScan,
     Redaction,
@@ -129,6 +130,18 @@ STANDING_FINDING_MESSAGE = "The finding was standing already."
 WITHDRAWN_DECISION_MESSAGE = "The decision was withdrawn."
 STANDING_DECISION_MESSAGE = "The decision was withdrawn already."
 REBUILT_FINDINGS_MESSAGE = "The findings were written again from the rows."
+
+#: The answers of the "Re run OCR ensemble" button of review 3 (#365).
+#: The text lives here, the rule of the review-2 writes above.
+ENSEMBLE_RERUN_MESSAGE = (
+    "The text was written again from {engines}: {groups} block(s) read, "
+    "{dropped} left out, {low} word(s) with no majority."
+)
+ENSEMBLE_NOT_GLUED_MESSAGE = (
+    "The OCR documents of this opinion are not written at the live "
+    "revision, so there is nothing to read yet. The daemon writes them "
+    "after the redaction review."
+)
 
 #: The two labels the opinion pairing reads: a box of one of them
 #: changes the boundaries, and only the measurement pairs them again.
@@ -759,6 +772,67 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
         "scan %s: %s queued a redaction recompute", scan.pk, request.user
     )
     return JsonResponse({"status": "queued", "message": message}, status=202)
+
+
+@login_required
+@require_POST
+def rerun_opinion_ensemble(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Read this opinion's OCR documents again and write its text (#365).
+
+    The "Re run OCR ensemble" button of review 3. The work is a few
+    small S3 reads and a geometry over the pages of one opinion, so it
+    runs here and not on the daemon: the rule of
+    :func:`rebuild_findings`, whose twin ``compute_redactions_api``
+    renders every page and therefore queues.
+
+    It **waives the engine gate**. The daemon pass waits for
+    ``OPINION_ENSEMBLE_MIN_ENGINES`` engine documents, which no volume
+    has until the third engine reads; this button is how a curator
+    reads a two-engine volume, and how everybody sees the answer of a
+    changed transform without a re-paid read.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: JSON with the message, 404 for an opinion of another scan,
+        or 409 when the OCR documents are not written or the row
+        refuses to read.
+    """
+    from scanning import ensemble, opinion_ocr
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not opinion_ocr.is_written(opinion):
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_NOT_GLUED_MESSAGE},
+            status=409,
+        )
+    try:
+        document = ensemble.rerun(opinion)
+    except ensemble.EnsembleError as exc:
+        return JsonResponse(
+            {"status": "error", "message": str(exc)}, status=409
+        )
+    logger.info(
+        "%s of scan %s: %s ran the OCR ensemble again",
+        opinion,
+        scan.pk,
+        request.user,
+    )
+    counts = document["counts"]
+    return JsonResponse(
+        {
+            "status": "ok",
+            "message": ENSEMBLE_RERUN_MESSAGE.format(
+                engines=", ".join(document["engines"]),
+                groups=counts["groups"],
+                dropped=counts["dropped"],
+                low=counts["low_confidence"],
+            ),
+        }
+    )
 
 
 @login_required
