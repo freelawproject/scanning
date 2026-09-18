@@ -14,9 +14,10 @@
  *   spells no path of its own (#334), and the web pod reads no byte of
  *   either object.
  * - **Every overlay is drawn at every render.** A box holds the points
- *   of the volume page, and the scale changes with the zoom and with
- *   the width of the column, so the render draws the boxes again.
- *   Nothing is positioned one time (#311).
+ *   of the volume page, and the scale follows the width of the column,
+ *   so the render draws the boxes again. Nothing is positioned one
+ *   time (#311). A page holds the scale it was drawn at, so it is
+ *   drawn again only when that scale changes.
  * - **The document holds no markup.** A voted group holds tokens with
  *   a ``low_confidence`` flag, and this module builds the nodes. Every
  *   string enters the DOM with ``textContent``.
@@ -35,9 +36,14 @@
 (function () {
     'use strict';
 
-    // The scale the pages are drawn at. A column is about half the
-    // window wide, so the render is smaller than the step-2 viewer's.
-    var SCALE = 1.1;
+    // The scale the pages are drawn at follows the width of the column,
+    // between these two. A column is about half the window wide, so a
+    // page of it is smaller than the step-2 viewer's.
+    var MIN_SCALE = 0.4;
+    var MAX_SCALE = 2.0;
+
+    // What the page frame and the scroll bar take off the column.
+    var COLUMN_PAD = 24;
 
     // How far outside the column a page is drawn, for the lazy render.
     var RENDER_MARGIN = '600px';
@@ -54,8 +60,31 @@
     // The group under the pointer, so a move clears the one before it.
     var selected = null;
 
+    // The page a card of the findings asked for before the text was
+    // read. The text column holds no block until then, so the jump is
+    // done again when the blocks exist.
+    var pending = null;
+
+    // The size of page one, in points. Every placeholder takes it, so
+    // the column has its true height before a page is drawn.
+    var pageSize = null;
+
     function endpoint(name) {
         return root ? root.dataset[name] : '';
+    }
+
+    /**
+     * Return the CSRF token of the page.
+     *
+     * The hidden input of the header's sign-out form, which every page
+     * of the portal has, and which the other viewers read the same
+     * way.
+     *
+     * @returns {string} The token.
+     */
+    function csrfToken() {
+        var field = document.querySelector('[name=csrfmiddlewaretoken]');
+        return field ? field.value : '';
     }
 
     /**
@@ -84,6 +113,42 @@
     // -----------------------------------------------------------------
     // The left column: the pages of the redacted PDF
     // -----------------------------------------------------------------
+
+    /**
+     * Return the scale one page is drawn at.
+     *
+     * The width of the column decides it, so a narrow window gets a
+     * smaller page and no sideways scroll, and a resize draws the
+     * pages again at the new size.
+     *
+     * @param {number} width - The width of the page, in points.
+     * @returns {number} The scale.
+     */
+    function scaleFor(width) {
+        if (!pagesColumn || !width) { return MIN_SCALE; }
+        var room = pagesColumn.clientWidth - COLUMN_PAD;
+        return Math.min(MAX_SCALE, Math.max(MIN_SCALE, room / width));
+    }
+
+    /**
+     * Give every placeholder the size of a drawn page.
+     *
+     * A bare canvas lays out at 300 by 150 pixels, and a placeholder
+     * of that size puts a jump to page nine several pages out. The
+     * size of page one is the size of the others, so the whole column
+     * takes it as soon as the PDF opens.
+     */
+    function sizePlaceholders() {
+        if (!pageSize) { return; }
+        var scale = scaleFor(pageSize.width);
+        pagesColumn.querySelectorAll('.opinion-page').forEach(function (page) {
+            if (page.dataset.rendered === '1') { return; }
+            var wrapper = page.querySelector('.canvas-wrapper');
+            wrapper.style.width = (pageSize.width * scale) + 'px';
+            wrapper.style.height = (pageSize.height * scale) + 'px';
+            page.style.width = (pageSize.width * scale) + 'px';
+        });
+    }
 
     /**
      * Build one empty container per page of the opinion.
@@ -131,6 +196,10 @@
                 renderPage(page, parseInt(page.dataset.pageIndex, 10));
             });
         }, { root: pagesColumn, rootMargin: RENDER_MARGIN });
+        // A page that leaves the column and comes back is drawn
+        // again at every crossing without the guard in
+        // :func:`renderPage`, the rule of ``renderedPages`` in the
+        // step-2 viewer.
         pagesColumn.querySelectorAll('.opinion-page').forEach(function (page) {
             observer.observe(page);
         });
@@ -145,7 +214,12 @@
     function renderPage(pageDiv, index) {
         if (!pdfDoc || index >= pdfDoc.numPages) { return; }
         pdfDoc.getPage(index + 1).then(function (page) {
-            var viewport = page.getViewport({ scale: SCALE });
+            var scale = scaleFor(page.getViewport({ scale: 1 }).width);
+            // The page holds the scale it was drawn at, so a page that
+            // crosses the margin again is not drawn again, and a
+            // resize that changes the scale is.
+            if (pageDiv.dataset.renderedScale === String(scale)) { return; }
+            var viewport = page.getViewport({ scale: scale });
             var canvas = pageDiv.querySelector('.pdf-canvas');
             var wrapper = pageDiv.querySelector('.canvas-wrapper');
             canvas.width = viewport.width;
@@ -154,6 +228,7 @@
             wrapper.style.height = viewport.height + 'px';
             pageDiv.style.width = viewport.width + 'px';
             pageDiv.dataset.rendered = '1';
+            pageDiv.dataset.renderedScale = String(scale);
 
             if (pageDiv._renderTask) {
                 try { pageDiv._renderTask.cancel(); } catch (e) { /* gone */ }
@@ -171,7 +246,28 @@
                 // resize with no second rule.
                 drawBoxes(pageDiv, index, viewport.scale);
             }, function () { /* swallow a cancel */ });
+        }, function (error) {
+            // A page that does not open leaves a blank canvas and no
+            // word of why, and a presigned URL that died is the
+            // likeliest reason, so the page says so.
+            pageDiv.dataset.rendered = '';
+            pageDiv.dataset.renderedScale = '';
+            failed(
+                pageDiv,
+                'Page ' + (index + 1) + ' did not open: ' + error.message
+            );
         });
+    }
+
+    /**
+     * Put one line on a page that did not open.
+     *
+     * @param {HTMLElement} pageDiv - The container of the page.
+     * @param {string} message - What failed.
+     */
+    function failed(pageDiv, message) {
+        if (pageDiv.querySelector('.opinion-text-error')) { return; }
+        pageDiv.appendChild(note('opinion-text-error', message));
     }
 
     /**
@@ -227,10 +323,32 @@
     }
 
     /**
-     * Draw the boxes of every page that is already rendered.
+     * Draw the boxes of every page that is already drawn.
      *
-     * The document and the PDF arrive in either order, and a resize
-     * changes every scale, so this is called after each of the three.
+     * The document and the PDF arrive in either order. When the PDF is
+     * first, its pages are drawn with no box on them, and this puts
+     * the boxes on them once the document lands. It draws no page: the
+     * canvas holds the render, and the scale is the one it was drawn
+     * at.
+     */
+    function redrawBoxes() {
+        if (!pagesColumn) { return; }
+        pagesColumn.querySelectorAll('.opinion-page').forEach(function (page) {
+            if (page.dataset.rendered !== '1') { return; }
+            drawBoxes(
+                page,
+                parseInt(page.dataset.pageIndex, 10),
+                parseFloat(page.dataset.renderedScale)
+            );
+        });
+    }
+
+    /**
+     * Draw every page that is already drawn, at the scale it needs now.
+     *
+     * A resize changes the width of the column and therefore the
+     * scale; a page whose scale did not change is left alone by
+     * :func:`renderPage`.
      */
     function redrawRenderedPages() {
         if (!pagesColumn) { return; }
@@ -348,20 +466,29 @@
      */
     function groupNote(page, group) {
         var names = Object.keys(group.engines || {});
-        var engines = (page.engines || []).length;
-        if (group.agreement === 'single' || (engines && names.length < engines)) {
-            return '[' + names.join(', ') + ' alone]';
+        var silent = group.silent || [];
+        var absent = (page.engines || []).filter(function (name) {
+            return names.indexOf(name) < 0;
+        });
+        var parts = [];
+        if (group.agreement === 'single') {
+            // The engine that read, and not every engine with a box
+            // here: a silent engine has a box and no word in it, and
+            // it is named by the clause below as what it is.
+            parts.push(group.source + ' alone');
+        } else if (group.agreement === 'majority') {
+            parts.push((group.agreeing || []).join(', ') + ' agree');
         }
-        if ((group.silent || []).length) {
-            return '[' + group.silent.join(', ') + ' read nothing here]';
+        if (silent.length) {
+            parts.push(silent.join(', ') + ' read nothing here');
         }
-        if (group.agreement === 'majority') {
-            return '[' + (group.agreeing || []).join(', ') + ' agree]';
+        if (absent.length) {
+            parts.push('no box from ' + absent.join(', '));
         }
         if (group.weak) {
-            return '[the boxes of the engines hardly meet]';
+            parts.push('the boxes hardly meet');
         }
-        return '';
+        return parts.length ? '[' + parts.join('; ') + ']' : '';
     }
 
     // -----------------------------------------------------------------
@@ -384,7 +511,15 @@
         selected = { page: page, group: group };
         paintSelection();
         if (from === 'text') {
-            scrollWithin(pagesColumn, boxFor(page, group));
+            // A page the observer has not drawn has no box yet, and
+            // the pages column is what must move before it draws one.
+            // So the container of the page is the answer, and it is
+            // there from the first paint.
+            scrollWithin(
+                pagesColumn,
+                boxFor(page, group)
+                    || document.getElementById('op-page-' + page)
+            );
         } else {
             scrollWithin(textColumn, nodeFor(page, group));
         }
@@ -516,7 +651,12 @@
      * @param {number} index - The 0-based page of the opinion.
      */
     function goToPage(index) {
-        scrollWithin(textColumn, document.getElementById('op-text-' + index));
+        var text = document.getElementById('op-text-' + index);
+        // The text column holds no block until the document is read,
+        // and a card is live from the first paint. The jump is kept
+        // and done again when the blocks exist.
+        pending = text ? null : index;
+        scrollWithin(textColumn, text);
         scrollWithin(pagesColumn, document.getElementById('op-page-' + index));
     }
 
@@ -540,7 +680,7 @@
             fetch(endpoint('rerunUrl'), {
                 method: 'POST',
                 credentials: 'same-origin',
-                headers: { 'X-CSRFToken': root.dataset.csrf }
+                headers: { 'X-CSRFToken': csrfToken() }
             })
                 .then(function (response) {
                     return response.json().then(function (data) {
@@ -593,7 +733,8 @@
                 doc = data;
                 drawText();
                 summarise();
-                redrawRenderedPages();
+                redrawBoxes();
+                if (pending !== null) { goToPage(pending); }
             })
             .catch(function (error) {
                 textColumn.appendChild(note(
@@ -611,7 +752,12 @@
             })
             .then(function (pdf) {
                 pdfDoc = pdf;
-                observePages();
+                return pdf.getPage(1).then(function (page) {
+                    var size = page.getViewport({ scale: 1 });
+                    pageSize = { width: size.width, height: size.height };
+                    sizePlaceholders();
+                    observePages();
+                });
             })
             .catch(function (error) {
                 pagesColumn.appendChild(note(
@@ -637,12 +783,17 @@
         }
         loadText();
         if (pagesColumn && textColumn) { bindPointers(); }
-        // A resize changes the width of a column, and every box holds
-        // the scale of its render, so the drawn pages are drawn again.
+        // A resize changes the width of a column, and the scale
+        // follows that width, so the pages are drawn again. A page
+        // whose scale did not change is left alone by
+        // :func:`renderPage`.
         var timer = null;
         window.addEventListener('resize', function () {
             clearTimeout(timer);
-            timer = setTimeout(redrawRenderedPages, 200);
+            timer = setTimeout(function () {
+                sizePlaceholders();
+                redrawRenderedPages();
+            }, 200);
         });
     });
 }());

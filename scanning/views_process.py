@@ -1503,7 +1503,9 @@ def opinion_pdf_url(
     ``opinion_pdf.is_written`` is the one rule for "the PDF exists", a
     read of the row. One ``head_object`` follows it, so a row that is
     stamped and an object that is gone do not send pdf.js to an S3
-    error page.
+    error page. The signature lives as long as the original's
+    (``ORIGINAL_VIEW_PRESIGN_TTL``), because the reader scrolls for
+    hours and every range is one more request.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -1519,7 +1521,15 @@ def opinion_pdf_url(
             revision=opinion.glue_revision,
         )
     return _presigned_opinion_object(
-        opinion_pdf.key(opinion), opinion.glue_revision, opinion.pk
+        opinion_pdf.key(opinion),
+        opinion.glue_revision,
+        opinion.pk,
+        # pdf.js holds this URL for the life of the page and asks for
+        # another range whenever the reviewer scrolls, so the signature
+        # must outlive the reading. ``GLUED_OUTPUT_PRESIGN_TTL`` is ten
+        # minutes, the size of one download, and a range after it would
+        # be a 403 on a page that shows no reason.
+        ttl=settings.ORIGINAL_VIEW_PRESIGN_TTL,
     )
 
 
@@ -1559,7 +1569,11 @@ def opinion_ensemble_url(
 
 
 def _presigned_opinion_object(
-    key: str, revision: int | None, opinion_pk: int
+    key: str,
+    revision: int | None,
+    opinion_pk: int,
+    *,
+    ttl: int = GLUED_OUTPUT_PRESIGN_TTL,
 ) -> JsonResponse:
     """Answer one object of an opinion as a URL the browser reads.
 
@@ -1570,6 +1584,8 @@ def _presigned_opinion_object(
     :param key: Object key inside the private bucket.
     :param revision: The glue revision the row is stamped at.
     :param opinion_pk: The row, for the body of a 404.
+    :param ttl: How long the signature lives. The default is one read
+        of one object; a file pdf.js keeps reading takes the long one.
     :returns: JSON with ``url`` and ``revision``, or a 404.
     :rtype: JsonResponse
     """
@@ -1590,7 +1606,7 @@ def _presigned_opinion_object(
         )
     return JsonResponse(
         {
-            "url": s3_sync.presign_get(key, GLUED_OUTPUT_PRESIGN_TTL),
+            "url": s3_sync.presign_get(key, ttl),
             "revision": revision,
         }
     )

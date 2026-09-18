@@ -90,9 +90,8 @@ is that number, stamped by the OCR glue. A vote of two engines settles
 nothing: every place they differ has no majority. Surya (#368) is the
 third engine, so a volume whose run carries all three keys opens the
 pass by itself. A volume read by two engines waits, and the command
-``rerun_opinion_ensemble`` and the endpoint ``ensemble/rerun/`` waive
-the gate for it. No page posts to the endpoint yet: the viewer of #365
-puts the button on it.
+``rerun_opinion_ensemble``, the endpoint ``ensemble/rerun/`` and the
+button of the review page waive the gate for it.
 """
 
 from __future__ import annotations

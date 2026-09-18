@@ -22,12 +22,13 @@ import json
 from io import StringIO
 from unittest.mock import patch
 
+from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
-from scanning import ensemble, opinion_ocr, opinion_pdf
+from scanning import ensemble, opinion_ocr, opinion_pdf, views_process
 from scanning.factories import ScanFactory
 from scanning.models import (
     Issue,
@@ -1548,6 +1549,36 @@ class TestTheReaderRoutes(EnsembleTestCase, ScanningTestCase):
         self.assertEqual(response.json()["revision"], 0)
         key, _ttl = presign.call_args.args
         self.assertEqual(key, opinion_pdf.key(self.opinion))
+
+    def test_the_pdf_signature_outlives_the_reading(self):
+        """pdf.js asks for another range whenever the reviewer scrolls.
+
+        Ten minutes is the size of one download (#243). A range after
+        the signature dies is a 403 on a page that shows no reason, so
+        the PDF takes the lifetime of the original's own URL.
+        """
+        self.write_the_pdf()
+
+        with patch(
+            "scanning.s3_sync.presign_get", return_value="https://s3/pdf"
+        ) as presign:
+            self.client.get(self.url("opinion_pdf_url"))
+
+        _key, ttl = presign.call_args.args
+        self.assertEqual(ttl, settings.ORIGINAL_VIEW_PRESIGN_TTL)
+        self.assertGreater(ttl, views_process.GLUED_OUTPUT_PRESIGN_TTL)
+
+    def test_the_document_signature_is_one_read_long(self):
+        """One ``fetch`` at load, so the short lifetime is the right one."""
+        self.run_ensemble()
+
+        with patch(
+            "scanning.s3_sync.presign_get", return_value="https://s3/e"
+        ) as presign:
+            self.client.get(self.url("opinion_ensemble_url"))
+
+        _key, ttl = presign.call_args.args
+        self.assertEqual(ttl, views_process.GLUED_OUTPUT_PRESIGN_TTL)
 
     def test_the_pdf_route_names_no_download(self):
         """A ``Content-Disposition`` makes a browser save the file.
