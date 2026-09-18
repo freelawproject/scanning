@@ -104,7 +104,6 @@ from scanning.models import (
     JobEngine,
     JobProvider,
     JobStage,
-    JobStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -1280,20 +1279,6 @@ def merge_extract_results(scan, extract_jobs: list[ExternalJob]) -> str:
     return key
 
 
-def _ledger_key(run=None) -> str:
-    """Return the ``provider_meta`` key one glue's ledger lives under.
-
-    Two glues keep a ledger on the volume run's rows: the volume
-    document's, and one per corrected volume, because a scan may have
-    had more than one apply run and each is glued on its own terms.
-
-    :param run: The apply run, or None for the volume document.
-    :returns: ``"glue"``, or ``"glue:a{n}"``.
-    :rtype: str
-    """
-    return "glue" if run is None else f"glue:{run.label}"
-
-
 def _record_glue_failure(
     scan, extract_jobs: list[ExternalJob], key: str, exc
 ) -> None:
@@ -1306,7 +1291,7 @@ def _record_glue_failure(
 
     :param scan: The scan whose glue failed.
     :param extract_jobs: The live run's rows, ordered by shard index.
-    :param key: See :func:`_ledger_key`.
+    :param key: See :func:`jobs.glue_ledger_key`.
     :param exc: What the glue raised.
     :return: None.
     """
@@ -1341,7 +1326,7 @@ def _volume_glue_attempts(extract_jobs: list[ExternalJob]) -> int:
     :returns: The stored attempt count, 0 when none.
     :rtype: int
     """
-    return jobs.ledger_attempts(extract_jobs, _ledger_key())
+    return jobs.ledger_attempts(extract_jobs, jobs.glue_ledger_key())
 
 
 def finish_ready_runs() -> int:
@@ -1376,7 +1361,7 @@ def finish_ready_runs() -> int:
         try:
             merge_extract_results(scan, rows)
         except Exception as exc:
-            _record_glue_failure(scan, rows, _ledger_key(), exc)
+            _record_glue_failure(scan, rows, jobs.glue_ledger_key(), exc)
             continue
         jobs.consume_run(rows)
         glued += 1
@@ -1385,6 +1370,17 @@ def finish_ready_runs() -> int:
 
 
 # ── the corrected volume (#224, #245) ───────────────────────────────
+#: Which document of a corrected volume this stage writes, for the
+#: shared prologue (``jobs.ready_apply_runs``).
+APPLY_GLUE_TARGET = jobs.ApplyGlueTarget(
+    stage=JobStage.EXTRACT,
+    engine=JobEngine.MISTRAL_OCR,
+    provider=JobProvider.MISTRAL,
+    key_field="extract_key",
+    run_field="extract_run",
+)
+
+
 def ensure_extract_apply_jobs(scan, run) -> list[ExternalJob]:
     """Return the Mistral rows of one apply run, creating them if none.
 
@@ -1589,70 +1585,15 @@ def _glue_one_apply(scan, run, volume_rows: list[ExternalJob]) -> bool:
     return True
 
 
-def _apply_candidates() -> dict[int, int]:
-    """Return the scans that may owe a corrected volume, in three queries.
-
-    The pre-check of :func:`finish_ready_applies`, over the whole
-    corpus at once rather than scan by scan. Every volume ever read
-    keeps a glued run for good, so a per-scan check would cost two
-    queries for each of them on every tick, growing with the corpus --
-    the fault ``apply._candidate_scan_ids`` was written to avoid.
-
-    Each question is one query: the live volume run per scan, the runs
-    that are not glued yet, and the standing built apply runs. A run
-    whose document already names the live volume run drops out here,
-    and :func:`finish_ready_applies` then judges the rest exactly.
-
-    :returns: ``{scan pk: (the standing run, the glued volume run's
-        number)}``.
-    :rtype: dict[int, tuple]
-    """
-    from django.db.models import Max
-
-    from scanning.models import ApplyRun
-
-    rows = ExternalJob.objects.filter(
-        stage=JobStage.EXTRACT,
-        engine=JobEngine.MISTRAL_OCR,
-        provider=JobProvider.MISTRAL,
-        apply_run__isnull=True,
-    )
-    live = {
-        entry["scan_id"]: entry["run"]
-        for entry in rows.values("scan_id").annotate(run=Max("run"))
-    }
-    if not live:
-        return {}
-    # A run with a row of any other status is not glued: the glue
-    # writes the document and flips every row in one pass.
-    for scan_id, run in rows.exclude(status=JobStatus.CONSUMED).values_list(
-        "scan_id", "run"
-    ):
-        if live.get(scan_id) == run:
-            live.pop(scan_id, None)
-    if not live:
-        return {}
-    candidates = {}
-    for run in ApplyRun.objects.filter(
-        scan_id__in=list(live),
-        superseded_at__isnull=True,
-        built_at__isnull=False,
-    ):
-        volume_run = live[run.scan_id]
-        if run.extract_key and run.extract_run == volume_run:
-            continue
-        candidates[run.scan_id] = (run, volume_run)
-    return candidates
-
-
 def finish_ready_applies() -> int:
     """Read the edited pages of every corrected volume, and glue them.
 
-    The second pass of this stage on the collect tick. For every scan
-    whose live Mistral volume run is glued and whose standing apply run
-    is built, it creates the run's own one-page rows if it has none,
-    and writes the corrected volume's document once every row has
-    answered.
+    The second pass of this stage on the collect tick. Its candidates
+    are ``jobs.ready_apply_runs``, the prologue both ``EXTRACT`` stages
+    share: a scan whose live Mistral volume run is glued and whose
+    standing apply run is built. For each one it creates the run's own
+    one-page rows if it has none, and writes the corrected volume's
+    document once every row has answered.
 
     **A volume nobody read with Mistral pays nothing here.** The
     candidate is the glued volume run, which only a person starts
@@ -1675,31 +1616,24 @@ def finish_ready_applies() -> int:
     :returns: How many corrected volumes were glued.
     :rtype: int
     """
-    from scanning.models import Scan
-
     if not s3_sync.s3_active() or not enabled():
         return 0
 
-    candidates = _apply_candidates()
-    if not candidates:
-        return 0
     glued = 0
-    for scan in Scan.objects.filter(pk__in=list(candidates)).select_related(
-        "reporter"
+    for candidate in jobs.ready_apply_runs(
+        APPLY_GLUE_TARGET, live_extract_jobs, GLUE_MAX_ATTEMPTS
     ):
-        volume_rows = live_extract_jobs(scan)
-        if not volume_rows or any(
-            row.status != JobStatus.CONSUMED for row in volume_rows
-        ):
-            continue
-        run, _volume_run = candidates[scan.pk]
-        key = _ledger_key(run)
-        if jobs.ledger_attempts(volume_rows, key) >= GLUE_MAX_ATTEMPTS:
-            continue
         try:
-            if _glue_one_apply(scan, run, volume_rows):
+            if _glue_one_apply(
+                candidate.scan, candidate.run, candidate.volume_rows
+            ):
                 glued += 1
         except Exception as exc:
-            _record_glue_failure(scan, volume_rows, key, exc)
+            _record_glue_failure(
+                candidate.scan,
+                candidate.volume_rows,
+                candidate.ledger_key,
+                exc,
+            )
 
     return glued

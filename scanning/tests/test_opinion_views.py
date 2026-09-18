@@ -456,6 +456,7 @@ class TestOpinionFileIndex(ScanningTestCase):
                 "redacted.pdf",
                 "dots_mocr.json",
                 "mistral_ocr.json",
+                "surya.json",
                 "manifest.json",
             ],
         )
@@ -474,7 +475,7 @@ class TestOpinionFileIndex(ScanningTestCase):
             self.assertNotIn("url", entry)
 
     def test_an_engine_the_run_never_read_is_not_written(self):
-        """The stamp is one over four files, the glue writes what it has.
+        """The stamp is one over every file, the glue writes what it has.
 
         ``opinion_ocr.write`` writes one document per engine the run
         carries, so a stamped row of a volume nobody read with Mistral
@@ -489,6 +490,7 @@ class TestOpinionFileIndex(ScanningTestCase):
         self.assertTrue(files["manifest.json"]["written"])
         self.assertFalse(files["mistral_ocr.json"]["written"])
         self.assertNotIn("url", files["mistral_ocr.json"])
+        self.assertFalse(files["surya.json"]["written"])
 
     def test_an_engine_the_run_read_is_written(self):
         ApplyRun.objects.filter(pk=self.run.pk).update(

@@ -147,6 +147,62 @@ def mistral_document(pages=PAGES) -> dict:
     }
 
 
+def surya_block(x0, y0, x1, y1, text="The court held.", label="Text") -> dict:
+    """One Surya block, as the volume glue of #368 writes it."""
+    return {
+        "order": 0,
+        "label": label,
+        "raw_label": label.lower(),
+        "bbox": [x0, y0, x1, y1],
+        "confidence": 0.98,
+        "html": f"<p>{text}</p>",
+        "text": text,
+        "skipped": False,
+        "error": False,
+    }
+
+
+def surya_document(pages=PAGES, width=IMG_W, height=IMG_H) -> dict:
+    """A corrected volume's Surya document over ``pages`` pages.
+
+    Surya measures in the page's own render, as dots.mocr does, so the
+    boxes scale by ``width`` and the document carries no ``render``.
+    """
+    factor = width / IMG_W
+    return {
+        "schema_version": 1,
+        "engine": "surya",
+        "run": 1,
+        "dpi": 200,
+        "source": "original",
+        "pages": [
+            {
+                "page_index": index,
+                "pdf_page": index + 1,
+                "source": {"kind": "original", "pdf_page": index + 1},
+                "origin_width": width,
+                "origin_height": height,
+                "text": f"page {index + 1}",
+                "blocks": [
+                    surya_block(
+                        *(v * factor for v in HEADER),
+                        text="878 N. C.",
+                        label="PageHeader",
+                    ),
+                    surya_block(
+                        *(v * factor for v in BODY_A), text=f"body A {index}"
+                    ),
+                    surya_block(
+                        *(v * factor for v in BODY_B), text=f"body B {index}"
+                    ),
+                ],
+            }
+            for index in range(pages)
+        ],
+        "failed_pages": [],
+    }
+
+
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class OpinionOcrTestCase(TestCase):
     """A closed review 2, a corrected volume, two engine documents.
@@ -224,8 +280,12 @@ class OpinionOcrTestCase(TestCase):
         prefix.start()
         self.addCleanup(prefix.stop)
 
-    def make_run(self, scan, mistral=True, number=1) -> ApplyRun:
-        """A complete apply run whose engine documents are in the bucket."""
+    def make_run(self, scan, mistral=True, surya=False, number=1) -> ApplyRun:
+        """A complete apply run whose engine documents are in the bucket.
+
+        Surya is off by default, because a volume is read with it by
+        hand and most are not (#368).
+        """
         run = glued_run(scan, number=number)
         prefix = f"processing/{scan.pk}/a/{scan.volume}/1/"
         run.ocr_key = f"{prefix}jobs/apply/a{number}/ocr-volume.json"
@@ -237,7 +297,12 @@ class OpinionOcrTestCase(TestCase):
             self.objects[run.extract_key] = mistral_document()
         else:
             run.extract_key = ""
-        run.save(update_fields=["ocr_key", "extract_key"])
+        if surya:
+            run.surya_key = f"{prefix}jobs/apply/a{number}/surya-volume.json"
+            self.objects[run.surya_key] = surya_document()
+        else:
+            run.surya_key = ""
+        run.save(update_fields=["ocr_key", "extract_key", "surya_key"])
         return run
 
     def measure(self, scan, run) -> list[ExternalJob]:
@@ -689,6 +754,177 @@ class TestTheDocument(OpinionOcrTestCase):
         self.assertEqual(unit["type"], "text")
         self.assertEqual(unit["exclusion"]["reason"], "redaction")
         self.assertEqual(document["source"]["key"], self.apply_run.extract_key)
+
+
+# ── the third engine ─────────────────────────────────────────────────
+class TestTheSuryaEngine(OpinionOcrTestCase):
+    """Surya is one entry of ``ENGINES`` and no other code (#368)."""
+
+    def add_surya(self, document=None):
+        """Give the run a Surya document, as its own glue would."""
+        self.apply_run.surya_key = (
+            f"{self.prefix}jobs/apply/a1/surya-volume.json"
+        )
+        self.objects[self.apply_run.surya_key] = (
+            document if document is not None else surya_document()
+        )
+        self.apply_run.save(update_fields=["surya_key"])
+
+    def surya_doc(self):
+        """The opinion's Surya document, as written."""
+        return self.uploads[opinion_ocr.engine_key(self.opinion, "surya")]
+
+    def test_surya_is_last_in_the_table(self):
+        """The order of the table is the rank of the ensemble vote
+        (#365), and the entry that arrives last takes the last rank."""
+        self.assertEqual(
+            list(opinion_ocr.ENGINES),
+            ["dots_mocr", "mistral_ocr", "surya"],
+        )
+
+    def test_a_run_read_with_three_engines_writes_three_documents(self):
+        self.add_surya()
+
+        engines = opinion_ocr.write(self.opinion, self.inputs())
+
+        self.assertEqual(engines, ["dots_mocr", "mistral_ocr", "surya"])
+        manifest = self.uploads[
+            opinion_ocr.engine_key(self.opinion, "manifest")
+        ]
+        self.assertEqual(
+            list(manifest["engines"]),
+            ["dots_mocr", "mistral_ocr", "surya"],
+        )
+        self.assertEqual(
+            manifest["engines"]["surya"]["source_key"],
+            self.apply_run.surya_key,
+        )
+
+    def test_the_document_reads_the_block_shape(self):
+        self.add_surya()
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        document = self.surya_doc()
+        self.assertEqual(document["engine"], "surya")
+        self.assertEqual(len(document["pages"]), 3)
+        unit = self.unit(document, 1, "body A")
+        self.assertEqual(unit["type"], "Text")
+        self.assertEqual(unit["text"], "body A 2")
+        self.assertIsNone(unit["exclusion"])
+        header = self.unit(document, 1, "878 N. C.")
+        self.assertEqual(header["type"], "PageHeader")
+        # The markup stays in the volume document: one unit shape for
+        # every engine.
+        self.assertNotIn("html", unit)
+
+    def test_a_block_under_a_redaction_is_excluded(self):
+        self.add_surya()
+        self.redact(2, to_pt(BODY_A))
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        unit = self.unit(self.surya_doc(), 1, "body A")
+        self.assertEqual(unit["exclusion"]["reason"], "redaction")
+        self.assertGreaterEqual(unit["share"], opinion_ocr.FULL_SHARE)
+        self.assertEqual(
+            opinion_ocr.kept_units(self.surya_doc()["pages"][1]),
+            [
+                u
+                for u in self.surya_doc()["pages"][1]["units"]
+                if not u["text"].startswith("body A")
+            ],
+        )
+
+    def test_the_box_comes_from_the_page_and_not_the_document(self):
+        """Surya reports the render of each page, as dots.mocr does, so
+        a page rendered at another size still gives the same points."""
+        self.add_surya(surya_document(width=3400, height=4400))
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        document = self.surya_doc()
+        unit = self.unit(document, 1, "body A")
+        self.assertEqual(unit["bbox"], [200, 600, 1600, 1800])
+        for got, want in zip(unit["box_pt"], to_pt(BODY_A)):
+            self.assertAlmostEqual(got, want, delta=0.5)
+        self.assertEqual(document["pages"][0]["frame"]["render_width"], 3400.0)
+
+    def test_a_volume_nobody_read_with_surya_glues_two_engines(self):
+        engines = opinion_ocr.write(self.opinion, self.inputs())
+
+        self.assertEqual(engines, ["dots_mocr", "mistral_ocr"])
+        self.assertNotIn(
+            opinion_ocr.engine_key(self.opinion, "surya"), self.uploads
+        )
+
+    def test_a_live_surya_read_holds_the_scan(self):
+        """The Mistral rule, engine for engine: a read on its way holds
+        the glue, so the documents are written once with every engine
+        the volume was read with."""
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine="surya",
+            status=JobStatus.SUBMITTED,
+        )
+
+        self.assertEqual(
+            opinion_ocr.engines_owed(self.scan, self.apply_run), ["surya"]
+        )
+        with self.assertLogs("scanning.opinion_ocr", level="INFO"):
+            self.assertEqual(opinion_ocr.glue_due(), 0)
+
+    def test_a_live_read_of_the_edited_pages_holds_the_scan(self):
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine="surya",
+            status=JobStatus.CONSUMED,
+        )
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine="surya",
+            apply_run=self.apply_run,
+            run=2,
+            status=JobStatus.PENDING,
+        )
+
+        self.assertEqual(
+            opinion_ocr.engines_owed(self.scan, self.apply_run), ["surya"]
+        )
+
+    def test_a_dead_surya_run_holds_nothing(self):
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine="surya",
+            status=JobStatus.FAILED,
+        )
+
+        self.assertEqual(
+            opinion_ocr.engines_owed(self.scan, self.apply_run), []
+        )
+        self.assertEqual(opinion_ocr.glue_due(), 1)
+
+    def test_a_late_read_is_a_re_glue_and_not_a_watcher(self):
+        """An opinion whose glue stands does not wait for a third
+        engine; the operator runs ``reglue_opinion_ocr`` (#350)."""
+        opinion_ocr.write(self.opinion, self.inputs())
+        self.add_surya()
+
+        self.assertEqual(opinion_ocr.glue_due(), 0)
+
+        opinion_ocr.reglue(self.scan)
+
+        self.assertEqual(opinion_ocr.glue_due(), 1)
+        self.assertIn(
+            opinion_ocr.engine_key(
+                Opinion.objects.get(pk=self.opinion.pk), "surya"
+            ),
+            self.uploads,
+        )
 
 
 # ── the ledger ───────────────────────────────────────────────────────
@@ -1205,7 +1441,9 @@ class TestTheRoute(OpinionOcrTestCase, ScanningTestCase):
         self.assertIn("not written at r0", response.json()["error"])
 
     def test_404_for_an_unknown_engine(self):
-        response = self.client.get(self.url("surya"))
+        # An engine of no entry. Surya is one since #368, so the name
+        # here is an engine nobody reads with.
+        response = self.client.get(self.url("lighton"))
 
         self.assertEqual(response.status_code, 404)
         self.assertIn("Unknown engine", response.json()["error"])

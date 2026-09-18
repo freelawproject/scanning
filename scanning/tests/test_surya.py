@@ -555,6 +555,16 @@ class TestTheFilesIndex(ScanningTestCase):
         self.assertEqual(len(data["runs"][0]["shards"]), 2)
         self.assertFalse(data["runs"][0]["glued"])
 
+    def test_the_index_reads_the_list_names_off_the_glue(self):
+        """One table of names (``surya.PAGE_LISTS``, #368), so a fifth
+        list reaches the index with the glue that reports it."""
+        from scanning import views_process
+
+        self.assertEqual(
+            views_process.SHARD_PAGE_LISTS[JobEngine.SURYA],
+            tuple(name for name, _member in surya.PAGE_LISTS),
+        )
+
     def test_a_shard_carries_the_workers_own_page_lists(self):
         ExternalJob.objects.filter(pk=self.rows[0].pk).update(
             status=JobStatus.COMPLETED,
@@ -580,7 +590,8 @@ class TestTheFilesIndex(ScanningTestCase):
         self.assertNotIn("repaired_pages", shard)
 
     def test_the_volume_route_says_the_run_is_not_glued(self):
-        # There is no glue yet (#364), so this is the true answer.
+        # The rows of this fixture are not all COMPLETED, so the pass
+        # of #368 glued nothing and the object is not in the bucket.
         with (
             patch("scanning.s3_sync.s3_active", return_value=True),
             patch("scanning.s3_sync.object_exists", return_value=False),
