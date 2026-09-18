@@ -139,6 +139,28 @@ def make_dropped_page(page_no: int) -> dict:
     return page
 
 
+def _fixture_lost_content(page: dict) -> bool:
+    """Whether one page lost content, written out by hand.
+
+    The third copy of the rule, and the fixture's own: the worker has
+    one (``handler._lost_content``) and the glue has one
+    (``surya._lost_content``), and a test of this module compares those
+    two against each other. This one is here so the lists of a payload
+    are not computed by the code under test.
+
+    :param page: One page of a result.
+    :returns: Whether a div was refused or a parsed entry has no block.
+    :rtype: bool
+    """
+    if page.get("dropped_blocks"):
+        return True
+    divs = page.get("raw_divs")
+    if not isinstance(divs, int):
+        return False
+    parsed = page.get("parsed_blocks")
+    return divs > (parsed if isinstance(parsed, int) else 0)
+
+
 def make_payload(pages: list[dict]) -> dict:
     """Build the payload the worker PUTs for one shard.
 
@@ -156,10 +178,7 @@ def make_payload(pages: list[dict]) -> dict:
         "empty_pages": [p["page_no"] for p in pages if p.get("empty")],
         "fallback_pages": [p["page_no"] for p in pages if "fallback" in p],
         "dropped_block_pages": [
-            p["page_no"]
-            for p in pages
-            if p.get("dropped_blocks")
-            or p.get("raw_divs", 0) > p.get("parsed_blocks", 0)
+            p["page_no"] for p in pages if _fixture_lost_content(p)
         ],
         "duration_ms": 9000,
     }
@@ -325,6 +344,64 @@ class TestPageLists(TestCase):
         self.assertEqual(lists["empty_pages"], [0])
 
 
+class TestTheLostContentRule(TestCase):
+    """The glue's copy of the worker's rule, against the worker's own.
+
+    Both answer "did something in the answer not reach the blocks",
+    over the same three fields, and the two must agree: the worker
+    names the pages of one shard, and the glue names the pages of a
+    volume and of a corrected volume, where a page has moved. The
+    worker's module is imported here alone, because it needs its
+    worker-only dependencies stubbed.
+    """
+
+    #: Every shape the two rules are asked about, including the counts
+    #: that are absent and the parse that answered nothing.
+    SHAPES = (
+        {"page_no": 0},
+        {"raw_divs": 0, "parsed_blocks": 0},
+        {"raw_divs": 2, "parsed_blocks": 2},
+        {"raw_divs": 3, "parsed_blocks": 2},
+        {"raw_divs": 2, "parsed_blocks": None},
+        {"raw_divs": 0, "parsed_blocks": None},
+        {"raw_divs": None, "parsed_blocks": 2},
+        {"dropped_blocks": [{"order": 1}]},
+        {"dropped_blocks": []},
+        {"dropped_blocks": [], "raw_divs": 4, "parsed_blocks": 1},
+    )
+
+    def test_the_two_copies_answer_the_same_pages(self):
+        from scanning.tests.test_runpod_surya_handler import (
+            handler as worker,
+        )
+
+        for shape in self.SHAPES:
+            with self.subTest(shape=shape):
+                self.assertIs(
+                    surya._lost_content(shape),
+                    worker._lost_content(shape),
+                )
+
+    def test_the_worker_reports_every_list_the_glue_sorts(self):
+        """A list the glue names and the worker's summary drops would
+        be empty on every row of the files index."""
+        from scanning.tests.test_runpod_surya_handler import (
+            handler as worker,
+        )
+
+        for name, _member in surya.PAGE_LISTS:
+            with self.subTest(name=name):
+                self.assertIn(name, worker._SUMMARY_FIELDS)
+
+    def test_the_fixture_answers_the_same_pages_too(self):
+        """So a payload's own lists describe what the glue will find."""
+        for shape in self.SHAPES:
+            with self.subTest(shape=shape):
+                self.assertIs(
+                    _fixture_lost_content(shape), surya._lost_content(shape)
+                )
+
+
 # ── the volume document ─────────────────────────────────────────────
 class TestMergeSuryaResults(SuryaRunMixin, TestCase):
     """Gluing the shard results into one document."""
@@ -389,11 +466,12 @@ class TestMergeSuryaResults(SuryaRunMixin, TestCase):
         self.assertEqual(document["fallback_pages"], [3])
         self.assertEqual(document["failed_pages"], [])
 
-    def test_the_derived_lists_agree_with_the_lists_the_worker_wrote(self):
-        """The membership rule lives in this module, and the worker has
-        its own copy over the same fields. The two must answer the same
-        pages, so the fixture's own lists are compared with the glue's,
-        shard by shard."""
+    def test_the_derived_lists_agree_with_the_lists_of_the_payload(self):
+        """The glue sorts the pages again rather than renumber the
+        worker's lists, so the two must name the same pages. The
+        payload's lists are the fixture's own arithmetic, and
+        :class:`TestTheLostContentRule` is what holds the fixture, the
+        glue and the worker to one answer."""
         shard = [
             make_page(0),
             make_failed_page(1),

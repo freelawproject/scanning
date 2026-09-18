@@ -1268,15 +1268,12 @@ SHARD_PAGE_LISTS: dict[str, tuple[str, ...]] = {
     JobEngine.DOTS_MOCR: jobs.PAGE_LIST_NAMES,
     # One list: a batch line either answered or it did not (#245).
     JobEngine.MISTRAL_OCR: ("failed_pages",),
-    # The worker's four (#320/#364): the pages that raised, the pages
-    # that came back with no block twice, the pages surya re-read block
-    # by block, and the pages whose parse lost a block.
-    JobEngine.SURYA: (
-        "failed_pages",
-        "empty_pages",
-        "fallback_pages",
-        "dropped_block_pages",
-    ),
+    # The worker's own lists (#320/#364/#368): the pages that raised,
+    # the pages that came back with no block twice, the pages surya
+    # re-read block by block, and the pages whose parse lost a block.
+    # Read off the glue's table, so a fifth list reaches the index with
+    # the glue that reports it.
+    JobEngine.SURYA: tuple(name for name, _member in surya.PAGE_LISTS),
 }
 
 
@@ -1576,8 +1573,10 @@ def opinion_file_index(
     is written, the rule of :func:`_shard_entry`, where a link that
     cannot work is left out.
 
-    **The OCR ledger is one stamp over four files, and the glue writes
-    one file per engine the run has** (``opinion_ocr.write``). So an
+    **The OCR ledger is one stamp over every file of the revision, and
+    the glue writes one file per engine the run has**
+    (``opinion_ocr.write``). The count follows ``opinion_ocr.ENGINES``,
+    which #368 made three plus the manifest, so no reader counts. So an
     engine document is written when the stamp is live **and** the run
     carries that engine's key: a volume nobody read with Mistral is
     glued from dots.mocr alone, and its ``mistral_ocr.json`` was never

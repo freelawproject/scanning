@@ -148,7 +148,8 @@ class Command(BaseCommand):
     def _sweep_leaked_stage_dirs(self, cutoff: float) -> int:
         """Delete leaked merge and glue scratch directories.
 
-        The bitonal merge, the dots.mocr glue and the detection merge
+        The bitonal merge, the dots.mocr glue, the Surya glue, the
+        detection merge, the Mistral render and the apply's build
         download shard results
         into ``TemporaryDirectory`` dirs in the system temp dir --
         outside ``PROCESSING_TMP_DIR``, so the sweep above never sees
@@ -165,6 +166,7 @@ class Command(BaseCommand):
         from scanning.bitonal import MERGE_TMP_PREFIX
         from scanning.dots_mocr import GLUE_TMP_PREFIX
         from scanning.mistral_ocr import RENDER_TMP_PREFIX
+        from scanning.surya import GLUE_TMP_PREFIX as SURYA_TMP_PREFIX
         from scanning.yolo import MERGE_TMP_PREFIX as DETECT_TMP_PREFIX
 
         if getattr(settings, "TESTING", False):
@@ -185,6 +187,7 @@ class Command(BaseCommand):
                 (
                     MERGE_TMP_PREFIX,
                     GLUE_TMP_PREFIX,
+                    SURYA_TMP_PREFIX,
                     DETECT_TMP_PREFIX,
                     RENDER_TMP_PREFIX,
                     BUILD_TMP_PREFIX,

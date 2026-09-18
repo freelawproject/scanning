@@ -285,7 +285,8 @@ def _lost_content(page: dict) -> bool:
     different questions. The worker names the pages of one shard, in
     the shard's own numbering. This names the pages of a volume, and
     the apply glue names the pages of a corrected volume, where a page
-    has moved. A test pins the two answers against each other.
+    has moved. ``test_surya_glue.TestTheLostContentRule`` pins the two
+    copies against each other, over the shapes both guard.
 
     :param page: One page of a result or of a document.
     :returns: Whether the page lost content on the way to its blocks.
@@ -517,7 +518,7 @@ def _glue_attempts(extract_jobs: list[ExternalJob]) -> int:
     :returns: The stored attempt count, 0 when none.
     :rtype: int
     """
-    return jobs.ledger_attempts(extract_jobs, "glue")
+    return jobs.ledger_attempts(extract_jobs, jobs.glue_ledger_key())
 
 
 def _record_glue_failure(
@@ -591,7 +592,7 @@ def finish_ready_runs() -> int:
         try:
             merge_surya_results(scan, rows)
         except Exception as exc:
-            _record_glue_failure(scan, rows, "glue", exc)
+            _record_glue_failure(scan, rows, jobs.glue_ledger_key(), exc)
             continue
         jobs.consume_run(rows)
         glued += 1
