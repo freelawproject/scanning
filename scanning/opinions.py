@@ -534,3 +534,84 @@ def finding_counts(opinion_ids) -> dict[int, tuple[int, int]]:
         )
     )
     return {row["opinion_id"]: (row["open"], row["stale"]) for row in rows}
+
+
+# ---------------------------------------------------------------------------
+# The review state
+# ---------------------------------------------------------------------------
+
+
+def text_review_ready(opinion: Opinion) -> bool:
+    """Return whether an opinion has everything the text review needs.
+
+    **The one rule**, read off the row and never off the bucket: the
+    redacted PDF of the live revision (``opinion_pdf.is_written``) and
+    the text of that revision (``ensemble.is_written``, which holds the
+    OCR glue's own stamp inside it). The review page draws those two
+    objects and nothing else, so a row that has them is a row a person
+    can work on.
+
+    :param opinion: The row.
+    :returns: Whether the review can start.
+    :rtype: bool
+    """
+    from scanning import ensemble, opinion_pdf
+
+    return opinion_pdf.is_written(opinion) and ensemble.is_written(opinion)
+
+
+def promote_ready(opinion: Opinion) -> bool:
+    """Take one opinion to ``READY_FOR_TEXT_REVIEW``.
+
+    A compare-and-swap over ``PROCESSING`` and the revision the caller
+    read: a re-glue that landed between the read and the write wins,
+    and the row is a candidate again when its two objects are written
+    at the new revision. ``TEXT_REVIEW_DONE`` and ``ERROR`` are not
+    touched; the way out of ``ERROR`` is the work that writes the row
+    again.
+
+    :param opinion: The row.
+    :returns: Whether this call moved the row.
+    :rtype: bool
+    """
+    if not text_review_ready(opinion):
+        return False
+    moved = Opinion.objects.filter(
+        pk=opinion.pk,
+        status=OpinionReviewStatus.PROCESSING,
+        glue_revision=opinion.glue_revision,
+    ).update(status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW)
+    if moved:
+        logger.info(
+            "%s of scan %s is ready for the text review",
+            opinion,
+            opinion.scan_id,
+        )
+    return bool(moved)
+
+
+def promote_ready_opinions() -> int:
+    """Take every qualifying opinion to the text review.
+
+    The twin of ``review_states.promote_ready_scans`` for one opinion,
+    and the one writer of ``READY_FOR_TEXT_REVIEW`` (#365). The two
+    objects are written by two passes that know nothing of each other,
+    and either can be last, so the promotion is a pass of its own
+    rather than a line in both.
+
+    The candidates are the rows that still say ``PROCESSING`` and whose
+    three stamps name the live revision. That filter is the shape of
+    the two rules and not a second copy of them:
+    :func:`text_review_ready` decides, row by row.
+
+    :returns: How many opinions were promoted.
+    :rtype: int
+    """
+    candidates = Opinion.objects.filter(
+        status=OpinionReviewStatus.PROCESSING,
+        glue_revision__isnull=False,
+        redacted_pdf_revision=F("glue_revision"),
+        ocr_glue_revision=F("glue_revision"),
+        ensemble_revision=F("glue_revision"),
+    )
+    return sum(1 for row in candidates if promote_ready(row))

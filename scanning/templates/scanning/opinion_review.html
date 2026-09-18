@@ -128,20 +128,45 @@
 
 {% include "scanning/_opinion_findings.html" %}
 
+
+{% endblock %}
+
 {% comment %}
-  The two columns. Every address is an attribute here, and the script
-  reads them: a path a script spells by hand goes stale in silence,
-  because no test reverses it (#334).
+  The two columns, over the whole width of the window (#365). The
+  reviewer reads a page of a book beside its text, and the container of
+  the site took a third of the room. Every address is an attribute
+  here, and the script reads them: a path a script spells by hand goes
+  stale in silence, because no test reverses it (#334).
 {% endcomment %}
+{% block full_width_content %}
 <div id="opinion-review"
-     class="opinion-review grid grid-cols-1 lg:grid-cols-2 gap-6"
+     class="opinion-review grid grid-cols-1 lg:grid-cols-2 gap-2 px-2 pb-4"
      data-pdf-url-endpoint="{{ pdf_url_endpoint }}"
      data-ensemble-url-endpoint="{{ ensemble_url_endpoint }}"
      data-rerun-url="{{ rerun_url }}"
      data-page-count="{{ opinion.page_count }}">
 
-  <div class="card">
-    <h2 class="text-sm font-bold mb-3">The redacted PDF</h2>
+  <div class="card p-2">
+    <div class="flex items-center gap-2 mb-1">
+      <h2 class="text-xs font-bold">The redacted PDF</h2>
+      {% if redacted_pdf_url %}
+      {% comment %}
+        The zoom of the pages column. The page fits the width of the
+        column to start with, and these change it; the label is the
+        scale of the render.
+      {% endcomment %}
+      <div class="ml-auto flex items-center gap-1">
+        <button type="button" class="btn-ghost text-xs px-2 py-0.5"
+                data-zoom="out" title="Smaller pages">&minus;</button>
+        <span id="zoom-level"
+              class="text-xs text-gray-500 dark:text-gray-400 w-12 text-center"></span>
+        <button type="button" class="btn-ghost text-xs px-2 py-0.5"
+                data-zoom="in" title="Bigger pages">+</button>
+        <button type="button" class="btn-ghost text-xs px-2 py-0.5"
+                data-zoom="fit" title="Fit the page to the column">Fit</button>
+      </div>
+      {% endif %}
+    </div>
     {% if redacted_pdf_url %}
     <div id="opinion-pages" class="opinion-pages"></div>
     {% else %}
@@ -152,10 +177,10 @@
     {% endif %}
   </div>
 
-  <div class="card">
-    <h2 class="text-sm font-bold mb-3">
+  <div class="card p-2">
+    <h2 class="text-xs font-bold mb-1">
       The text
-      <span id="ensemble-summary" class="text-xs font-normal text-gray-500 dark:text-gray-400"></span>
+      <span id="ensemble-summary" class="font-normal text-gray-500 dark:text-gray-400"></span>
     </h2>
     {% if ensemble_written %}
     <div id="opinion-text" class="opinion-text"></div>

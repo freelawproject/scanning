@@ -106,6 +106,13 @@ those documents alone: no volume, no PDF, no render. A row with fewer
 engine documents than ``OPINION_ENSEMBLE_MIN_ENGINES`` is not due, so
 nothing runs by itself until the third engine reads.
 
+**14. ``opinions.promote_ready_opinions()`` opens the text review
+(#365).** An opinion whose redacted PDF and whose text are both written
+at the live revision goes from ``PROCESSING`` to
+``READY_FOR_TEXT_REVIEW``. The two objects come from two passes that
+know nothing of each other and either can be last, so the promotion is
+a pass of its own, the twin of pass 8 for a scan.
+
 Examples:
 
     # Run one confirm tick and exit.
@@ -161,6 +168,7 @@ class Command(BaseCommand):
             jobs,
             mistral_ocr,
             opinion_ocr,
+            opinions,
             review_states,
             surya,
             yolo,
@@ -183,6 +191,7 @@ class Command(BaseCommand):
                 surya_applies = surya.finish_ready_applies()
                 glued_opinions = opinion_ocr.glue_due()
                 read_opinions = ensemble.run_tick()
+                ready_opinions = opinions.promote_ready_opinions()
                 break
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -216,6 +225,7 @@ class Command(BaseCommand):
                 surya_applies,
                 glued_opinions,
                 read_opinions,
+                ready_opinions,
             )
         ):
             self.stdout.write(
@@ -231,5 +241,6 @@ class Command(BaseCommand):
                 f"{read_surya} Surya run(s) and {surya_applies} "
                 f"corrected volume(s), wrote the OCR "
                 f"documents of {glued_opinions} opinion(s), wrote the "
-                f"text of {read_opinions} opinion(s)"
+                f"text of {read_opinions} opinion(s), opened {ready_opinions} "
+                f"text review(s)"
             )
