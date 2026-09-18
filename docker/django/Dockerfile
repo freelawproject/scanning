@@ -43,8 +43,8 @@ WORKDIR /opt/scanning
 # Split so each image resolves only the deps it needs and layer caching keys  #
 # on pyproject.toml + uv.lock alone (source changes don't bust the venv).     #
 #   deps-web  lean base only         -> web image (detection offloaded)        #
-#   deps-ml   base + local-ml extra  -> daemon image + offline/local detection #
-#   deps-dev  everything incl. dev   -> local dev (docker-compose)             #
+#   deps-ml   base + local-ml extra  -> daemon image (see the stage's note)   #
+#   deps-dev  base + dev extra       -> local dev (docker-compose) and CI     #
 ##############################################################################
 FROM build-base AS deps-web
 
@@ -53,52 +53,41 @@ COPY pyproject.toml uv.lock ./
 # excludes both, so no torch/paddle/ultralytics lands here. Detection is
 # offloaded to RunPod, so the web tier never runs a model in-process.
 # blackletter >=0.1.1 ships no YOLO weights in the wheel, so nothing to
-# strip here; the daemon image (deps-ml) bakes the weights it needs.
+# strip here, and no stage bakes one since #360.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync
 
 FROM build-base AS deps-ml
 
 COPY pyproject.toml uv.lock ./
-# local-ml pulls the CPU torch/paddle/ultralytics stack for in-process
-# detection (offline daemon, or RUNPOD_ENABLED=False). No dev tooling.
+# local-ml pulls the CPU torch/paddle/ultralytics stack. No dev tooling.
+# The stack runs nothing here any more: in-process detection is gone
+# (#360), and `RUNPOD_ENABLED=False` only stops the dispatch. It stays
+# because nobody has run the daemon's own work -- the redaction compute
+# and the opinion PDF pass -- without it. Base blackletter imports
+# torch and ultralytics lazily, so a lean daemon is likely. It is not
+# proven. Prove it on a real volume, then this stage is `deps-web`.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --extra local-ml
 
-# Bake all three YOLO weights into the venv. blackletter >=0.1.1 ships
-# no weights in the wheel; ensure_weights() downloads missing ones from
-# Hugging Face into site-packages/blackletter/weights/. That must happen
-# here at build time: local detection (RUNPOD_ENABLED=False) requests
-# small+medium+large, detect() downloads any missing weight instead of
-# skipping it, and prod-ml runs as www-data with a root-owned /opt/venv,
-# so a first-use download would raise PermissionError. The offline
-# daemon needs the weights on disk anyway. Weights already on disk
-# resolve without touching the network, so this makes ensure_weights a
-# noop at runtime. Retry so a flaky HF doesn't fail the build; then
-# assert the files landed and smoke-load each with YOLO(...) to catch
-# truncated or corrupted downloads.
-RUN set -e; \
-    for i in 1 2 3; do \
-      python -c "from blackletter.api import ensure_weights; ensure_weights(['small', 'medium', 'large'])" \
-        && break; \
-      echo "ensure_weights attempt $i failed; sleeping 10s"; \
-      sleep 10; \
-    done \
- && python -c "\
-import blackletter, pathlib; \
-from ultralytics import YOLO; \
-wd = pathlib.Path(blackletter.__file__).resolve().parent / 'weights'; \
-sizes = {'small.pt': 15_000_000, 'medium.pt': 40_000_000, 'large.pt': 100_000_000}; \
-missing = [n for n, s in sizes.items() if not (wd / n).is_file() or (wd / n).stat().st_size < s]; \
-assert not missing, f'weights missing or truncated: {missing}'; \
-[YOLO(str(wd / n)) for n in sizes]; \
-print('baked weights OK:', {n: (wd / n).stat().st_size // 1024 // 1024 for n in sizes})"
+# The three YOLO weights this stage used to bake (small, medium, large)
+# went with the legacy pipeline (#360). No module of the app calls
+# `blackletter.api.detect` or `ensure_weights`: `yolo.py` sends every
+# detection to RunPod, and the worker image (#194) bakes `bl_warm.pt`
+# alone. A stage that runs a model here again must bake its weight the
+# same way, because prod-ml runs as www-data with a root-owned
+# /opt/venv and a first-use download would raise PermissionError.
 
 FROM build-base AS deps-dev
 
 COPY pyproject.toml uv.lock ./
+# Dev tooling, and no `local-ml`: no test runs a model since #360, and
+# base blackletter imports torch and ultralytics lazily. This is the
+# image the CI tests run in, where the extra used to cost every test
+# job a multi-gigabyte download for nothing. A developer who wants
+# in-process detection in this container adds `--extra local-ml` back.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --all-extras
+    uv sync --extra dev
 
 ##############################################################################
 # static-builder: install npm packages and compile Tailwind CSS.             #
@@ -115,9 +104,8 @@ RUN npm run build
 
 ##############################################################################
 # dev: full image used for local development (docker-compose `target: dev`).  #
-# Source is bind-mounted over /opt/scanning at run time; keeps uv + dev deps  #
-# and the full ML stack so RUNPOD_ENABLED can be toggled off and everything   #
-# runs locally.                                                                #
+# Source is bind-mounted over /opt/scanning at run time; keeps uv and the dev #
+# deps. It carries no ML stack since #360: detection runs on RunPod.          #
 ##############################################################################
 FROM build-base AS dev
 
@@ -201,9 +189,9 @@ USER www-data
 ENTRYPOINT ["/bin/sh", "/opt/scanning/docker/django/docker-entrypoint.sh"]
 
 ##############################################################################
-# prod-ml: slim runtime for the daemon (also the offline/local-detection      #
-# image). Same layout as prod-web but carries the heavy CPU ML stack so        #
-# detection/OCR can run in-process, plus the full OpenCV/torch/paddle libs.    #
+# prod-ml: slim runtime for the daemon. Same layout as prod-web, plus the     #
+# heavy CPU ML stack and the full OpenCV/torch/paddle libs. Nothing runs a    #
+# model in this image since #360; the deps-ml stage says why it stays.        #
 ##############################################################################
 FROM python:3.12-slim AS prod-ml
 

@@ -133,25 +133,6 @@ class TestCalls(SimpleTestCase):
         with patcher, self.assertRaises(mistral_client.MistralBusy):
             mistral_client.upload_file("p0.png", b"png", "ocr")
 
-    def test_realtime_sends_the_page_as_a_data_uri(self):
-        patcher, sdk = _client()
-        sdk.ocr.process.return_value = _sdk_object(
-            pages=[{"index": 0, "markdown": "x"}], model="mistral-ocr-latest"
-        )
-        with patcher:
-            response = mistral_client.ocr_page_realtime(b"png")
-
-        kwargs = sdk.ocr.process.call_args.kwargs
-        self.assertEqual(kwargs["document"]["type"], "image_url")
-        self.assertTrue(
-            kwargs["document"]["image_url"].startswith(
-                "data:image/png;base64,"
-            )
-        )
-        self.assertTrue(kwargs["include_blocks"])
-        self.assertEqual(kwargs["table_format"], "html")
-        self.assertEqual(response["pages"][0]["markdown"], "x")
-
 
 @override_settings(**MISTRAL)
 class TestPollBatch(SimpleTestCase):

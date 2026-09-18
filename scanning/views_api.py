@@ -767,9 +767,11 @@ def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
     """Refuse to generate opinion files while the pipeline is paused.
 
     File generation is post-review-1 processing, which issue #173
-    stops until the new OCR stack reaches that stage. The generation
-    code (``services.run_generate_files``) is kept, but nothing queues
-    it; this view fails with the unified pipeline-paused message.
+    stops until the new OCR stack reaches that stage. The old
+    volume-level generation code is deleted (#360), and #206 rebuilds
+    the step over the corrected volume and the ``Opinion`` rows, where
+    ``opinion_pdf`` already writes one redacted PDF per opinion
+    (#336). This view fails with the unified pipeline-paused message.
 
     The review-2 approval is the gate of step 3 (#263), and it is
     checked here first (#269), before the paused flash: a template gate
@@ -800,11 +802,11 @@ def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
 def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
     """Mark a scan as approved.
 
-    Generate Files already pushed every output file to
-    ``processing/<pk>/...`` on S3, so this view is a pure status flip:
-    it validates that file generation has run, then sets
-    ``status=APPROVED``. Phase 2 will wire Approve into the
-    LLM-extraction handoff.
+    A pure status flip: it asks for ``Stage.APPROVED`` from step 3,
+    then writes ``status=APPROVED``. No scan reaches that stage while
+    the step is paused (#173), and the S3 copy the approval once made
+    went with the old generation code (#360). What an approval means
+    over the ``Opinion`` rows is #206's question.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
