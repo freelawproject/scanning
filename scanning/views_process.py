@@ -6,6 +6,7 @@ import logging
 import os
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
@@ -38,6 +39,7 @@ from scanning import (
     repairs,
     s3_sync,
     stats,
+    surya,
     yolo,
 )
 from scanning.models import (
@@ -408,6 +410,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     dots_run = dots_mocr.run_summary(scan)
     yolo_run = yolo.run_summary(scan)
     mistral_run = mistral_ocr.run_summary(scan)
+    surya_run = surya.run_summary(scan)
 
     # The pages a reviewer asked a scanner to scan again, or the gaps
     # they asked a scanner to fill (#249). The waiting ones raise the
@@ -656,6 +659,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "dots_run": dots_run,
             "yolo_run": yolo_run,
             "mistral_run": mistral_run,
+            "surya_run": surya_run,
             "detect_message": detection_message(yolo_run),
             **flags,
             "final_space": final_space,
@@ -731,6 +735,9 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     mistral_run = mistral_ocr.run_summary(scan)
     if mistral_run:
         data["mistral_run"] = mistral_run
+    surya_run = surya.run_summary(scan)
+    if surya_run:
+        data["surya_run"] = surya_run
     return JsonResponse(data)
 
 
@@ -1114,9 +1121,11 @@ def serve_final_pdf(request: HttpRequest, pk: int) -> HttpResponse:
 #: hours and is the wrong size here.
 GLUED_OUTPUT_PRESIGN_TTL = 600
 
-#: Slug -> (stage, engine, glued key function): the two glued documents
-#: of issue #243. The outputs differ in nothing else, so a third engine
-#: is one more entry, not a view.
+#: Slug -> (stage, engine, glued key function): the glued documents of
+#: issue #243. The outputs differ in nothing else, so one more engine is
+#: one more entry, not a view. Surya is listed although no pass glues it
+#: yet (#364): the index reads the rows, and the volume route answers
+#: "not glued yet" for a key with no object, which is the true answer.
 GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
     "dots-mocr": (
         JobStage.ANALYZE,
@@ -1129,7 +1138,22 @@ GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
         JobEngine.MISTRAL_OCR,
         mistral_ocr.glued_result_key,
     ),
+    # Surya (#364) has no glue yet, so its volume route answers "not
+    # glued yet" for every run. The index is the point: it lists the
+    # runs, the shards and the result objects a reader needs to see
+    # what the worker wrote.
+    "surya": (JobStage.EXTRACT, JobEngine.SURYA, surya.glued_result_key),
 }
+
+#: What a start button says when the committed manifest describes no
+#: shard at all. ``ensure_*`` then creates no row, and the "already
+#: read" line would address ``created[0]`` and raise. A manifest like
+#: that is a fault of the cut, not of the press, so the answer names
+#: it rather than claiming a read that never happened.
+NO_SHARDS_TO_READ_MESSAGE = (
+    "This volume's shard set lists no part to read. Re-cut it with the "
+    "admin re-queue before you start a read."
+)
 
 NO_S3_GLUED_OUTPUT_MESSAGE = (
     "No glued output exists without S3: the daemon glues into the "
@@ -1237,6 +1261,29 @@ def _redirect_to_object(
     return redirect(url)
 
 
+#: Which page lists one engine's summary carries, keyed by engine. Each
+#: engine reports its own faults and no other's, so an empty list of a
+#: name the engine does not report would read as "none" where the truth
+#: is "not a question here". One table, because the index is the triage
+#: tool and a second copy of a name would go stale in silence.
+SHARD_PAGE_LISTS: dict[str, tuple[str, ...]] = {
+    # The two holes, the pages a retry rung saved, and the pages whose
+    # layout JSON was repaired (#242).
+    JobEngine.DOTS_MOCR: jobs.PAGE_LIST_NAMES,
+    # One list: a batch line either answered or it did not (#245).
+    JobEngine.MISTRAL_OCR: ("failed_pages",),
+    # The worker's four (#320/#364): the pages that raised, the pages
+    # that came back with no block twice, the pages surya re-read block
+    # by block, and the pages whose parse lost a block.
+    JobEngine.SURYA: (
+        "failed_pages",
+        "empty_pages",
+        "fallback_pages",
+        "dropped_block_pages",
+    ),
+}
+
+
 def _shard_entry(scan: Scan, output: str, row: ExternalJob) -> dict:
     """Describe one shard row for the glued-output index.
 
@@ -1270,15 +1317,11 @@ def _shard_entry(scan: Scan, output: str, row: ExternalJob) -> dict:
         "to_page": to_page + 1 if isinstance(to_page, int) else None,
         "page_count": manifest.get("page_count"),
     }
-    has_summary = isinstance((row.provider_meta or {}).get("output"), dict)
-    if row.engine == JobEngine.DOTS_MOCR and has_summary:
-        entry.update(jobs.page_lists(row))
-    elif row.engine == JobEngine.MISTRAL_OCR and has_summary:
-        # ``failed_pages`` alone (#245): the other three names of
-        # ``jobs.page_lists`` are dots.mocr faults, and an empty list
-        # would read as "none" where the truth is "not a question
-        # here".
-        entry["failed_pages"] = jobs.page_lists(row)["failed_pages"]
+    summary = (row.provider_meta or {}).get("output")
+    if isinstance(summary, dict):
+        for name in SHARD_PAGE_LISTS.get(row.engine, ()):
+            value = summary.get(name)
+            entry[name] = list(value) if isinstance(value, list) else []
     if row.result_key:
         entry["url"] = reverse(
             "serve_glued_shard",
@@ -1734,9 +1777,11 @@ def _apply_run_entry(scan: Scan, run, rows: list, measured: bool) -> dict:
             "error_code": row.error_code,
             "page_count": manifest.get("page_count"),
         }
-        has_summary = isinstance((row.provider_meta or {}).get("output"), dict)
-        if row.engine == JobEngine.DOTS_MOCR and has_summary:
-            entry.update(jobs.page_lists(row))
+        summary = (row.provider_meta or {}).get("output")
+        if isinstance(summary, dict):
+            for name in SHARD_PAGE_LISTS.get(row.engine, ()):
+                value = summary.get(name)
+                entry[name] = list(value) if isinstance(value, list) else []
         if row.result_key:
             entry["url"] = reverse(
                 "serve_apply_shard",
@@ -2237,6 +2282,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "dots_run": dots_mocr.run_summary(scan),
         "yolo_run": yolo_run,
         "mistral_run": mistral_ocr.run_summary(scan),
+        "surya_run": surya.run_summary(scan),
         "detect_message": detection_message(yolo_run),
         **_review_flags(scan),
     }
@@ -2333,32 +2379,125 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=scan.pk)
 
 
-@login_required
-@require_POST
-def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
-    """Start the dots.mocr stage over a scan's original shards (#190).
+@dataclass(frozen=True)
+class ShardRead:
+    """What one engine's start button says, asks and calls.
 
-    Staff only. Since #207 the pipeline enqueues this stage for every
-    new upload, so this button is the manual way in: a fresh run over
-    an edited volume, or a backfill for a scan uploaded while the
-    stage was button-only. Every press can start real graphics
-    processing unit (GPU) work on RunPod that costs money, which is
-    why it stays behind the staff gate.
+    The three buttons (#190, #191, #364) are one view: each writes one
+    ``ExternalJob`` row per original shard, behind the same four gates,
+    and each answers the same five messages. Only the words and the
+    three functions differ, so they are an entry here rather than a
+    copy of the view.
 
-    **This request makes no call to RunPod.** It writes one
-    ``ExternalJob`` row per shard and returns; the daemon's next
-    ``submit_external_jobs`` tick sends them, and ``collect_external_jobs``
-    polls and retries them. That keeps a request thread off a slow HTTP
-    call, and it is what makes the run survive a redeployed web pod.
+    :ivar name: The view's name, for its log line.
+    :ivar label: What a message calls this read ("Mistral OCR").
+    :ivar off_label: What the "not switched on" line calls it. The
+        dots.mocr button says "OCR" everywhere else, but naming the
+        engine is what makes its two switches findable.
+    :ivar cost: What a press spends, in the staff refusal.
+    :ivar switches: The environment names an operator must set.
+    :ivar dispatch: What the daemon does next, in the success line.
+        Mistral renders the pages itself before it sends them.
+    :ivar is_enabled: Whether this stage may be dispatched at all.
+    :ivar run_summary: The live run of this engine, or ``None``.
+    :ivar create: The row creator. **This is what costs money**, which
+        is why the AST test of ``TestKnownEnqueuePaths`` pins the
+        modules that name one.
+    """
 
-    It also never cuts shards. ``sharding.committed_manifest`` verifies
-    the stored set against the original with one ``head_object``, so this
-    view neither downloads a multi-gigabyte PDF nor reads ``shards/``
-    directly. A stale or missing set is refused, because re-cutting is
-    the pipeline's job.
+    name: str
+    label: str
+    off_label: str
+    cost: str
+    switches: str
+    dispatch: str
+    is_enabled: Callable[[], bool]
+    run_summary: Callable[[Scan], dict | None]
+    create: Callable[[Scan, dict], list[ExternalJob]]
+
+
+def _shard_reads() -> dict[str, ShardRead]:
+    """Return the three reads over a volume's original shards.
+
+    Rebuilt on each call, and deliberately not cached, for the reason
+    ``jobs._runpod_engines`` is: the entries read functions off the
+    stage modules at build time, so a test that patches
+    ``mistral_ocr.enabled`` reaches this table too.
+
+    :returns: The table, keyed by engine.
+    :rtype: dict[str, ShardRead]
+    """
+    return {
+        JobEngine.DOTS_MOCR: ShardRead(
+            name="start_dots_mocr",
+            label="OCR",
+            off_label="dots.mocr",
+            cost="GPU time",
+            switches="DOTS_MOCR_ENABLED and RUNPOD_DOTSMOCR_ENDPOINT_ID",
+            dispatch="sends them to RunPod",
+            is_enabled=dots_mocr.enabled,
+            run_summary=dots_mocr.run_summary,
+            create=dots_mocr.ensure_analyze_jobs,
+        ),
+        JobEngine.MISTRAL_OCR: ShardRead(
+            name="start_mistral_ocr",
+            label="Mistral OCR",
+            off_label="Mistral OCR",
+            cost="money",
+            switches="MISTRAL_API_KEY",
+            # The daemon renders every page of the shard before it
+            # uploads it, which is minutes rather than a POST (#191).
+            dispatch="renders and sends them",
+            is_enabled=mistral_ocr.enabled,
+            run_summary=mistral_ocr.run_summary,
+            create=mistral_ocr.ensure_extract_jobs,
+        ),
+        JobEngine.SURYA: ShardRead(
+            name="start_surya_ocr",
+            label="Surya OCR",
+            off_label="Surya OCR",
+            cost="money",
+            switches="RUNPOD_SURYA_ENDPOINT_ID",
+            dispatch="sends them to RunPod",
+            is_enabled=surya.enabled,
+            run_summary=surya.run_summary,
+            create=surya.ensure_extract_jobs,
+        ),
+    }
+
+
+def _start_shard_read(
+    request: HttpRequest, pk: int, spec: ShardRead
+) -> HttpResponse:
+    """Create one engine's rows over a scan's original shards.
+
+    The body of the three start buttons. Four gates, in this order:
+
+    1. **Staff only.** Every press can start real paid work.
+    2. **The stage must be switched on.** An environment that must not
+       spend leaves the engine's key or endpoint id unset.
+    3. **An open run is not restarted.** It means the daemon is still
+       working on the last press. A *finished* run is reused rather
+       than refused, which is what keeps the creator from paying twice
+       for shards already read.
+    4. **The shard set must be committed.**
+       ``sharding.committed_manifest`` verifies the stored set against
+       the original with one ``head_object``, and a stale or missing
+       set is refused, because re-cutting is the pipeline's job. So a
+       web pod never pulls the original.
+
+    **This request calls no provider.** It writes one ``ExternalJob``
+    row per shard and returns; the daemon's next ``submit_external_jobs``
+    tick sends them, and ``collect_external_jobs`` polls, harvests and
+    retries them. That keeps a request thread off a slow HTTP call, and
+    it is what makes a run survive a redeployed web pod.
+
+    The answer says what happened and never more: a dispatch that is
+    coming, a run that was reused, or a shard set with nothing in it.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
+    :param spec: Which read to start.
     :return: Redirect to the scan processing page.
     """
     from scanning import sharding
@@ -2369,26 +2508,23 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
     if not request.user.is_staff:
         messages.error(
             request,
-            "Only staff can start OCR: each run costs GPU time.",
+            f"Only staff can start {spec.label}: each run costs {spec.cost}.",
         )
         return back
 
-    if not dots_mocr.enabled():
+    if not spec.is_enabled():
         messages.warning(
             request,
-            "dots.mocr is not switched on in this environment. Set "
-            "DOTS_MOCR_ENABLED and RUNPOD_DOTSMOCR_ENDPOINT_ID first.",
+            f"{spec.off_label} is not switched on in this environment. "
+            f"Set {spec.switches} first.",
         )
         return back
 
-    # An open run means the daemon is still working on the last press.
-    # A finished run is reused rather than refused, which is what keeps
-    # ``ensure_analyze_jobs`` from paying twice for shards already read.
-    summary = dots_mocr.run_summary(scan)
+    summary = spec.run_summary(scan)
     if summary and summary["open"]:
         messages.info(
             request,
-            f"OCR run {summary['run']} is already going: "
+            f"{spec.label} run {summary['run']} is already going: "
             f"{summary['done']} of {summary['total']} part(s) done.",
         )
         return back
@@ -2398,10 +2534,11 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
         messages.warning(request, reason)
         return back
 
-    created = dots_mocr.ensure_analyze_jobs(scan, manifest)
+    created = spec.create(scan, manifest)
     queued = sum(1 for job in created if job.status == JobStatus.PENDING)
     logger.info(
-        "start_dots_mocr: scan=%s user=%s run=%s shards=%d queued=%d",
+        "%s: scan=%s user=%s run=%s shards=%d queued=%d",
+        spec.name,
         scan.pk,
         request.user.pk,
         created[0].run if created else "?",
@@ -2411,19 +2548,38 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
     if queued:
         messages.success(
             request,
-            f"Queued OCR for {queued} part(s) of this volume. The "
-            "daemon sends them to RunPod within a few seconds.",
+            f"Queued {spec.label} for {queued} part(s) of this volume. "
+            f"The daemon {spec.dispatch} within a few seconds.",
         )
-    else:
-        # ``ensure_analyze_jobs`` reused a run that is already done, so
-        # nothing was queued and nothing will be sent. Saying otherwise
-        # would have staff waiting on a dispatch that is not coming.
+    elif created:
+        # The creator reused a run that is already done, so nothing was
+        # queued and nothing will be sent. Saying otherwise would have
+        # staff waiting on a dispatch that is not coming.
         messages.info(
             request,
             f"This volume was already read: run {created[0].run} covers "
             f"all {len(created)} part(s). Nothing new was queued.",
         )
+    else:
+        messages.warning(request, NO_SHARDS_TO_READ_MESSAGE)
     return back
+
+
+@login_required
+@require_POST
+def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
+    """Start the dots.mocr stage over a scan's original shards (#190).
+
+    Since #207 the pipeline creates these rows for every new upload, so
+    this button is the manual way in: a fresh run over an edited
+    volume, or a backfill for a scan uploaded while the stage was
+    button-only.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: See :func:`_start_shard_read`.
+    """
+    return _start_shard_read(request, pk, _shard_reads()[JobEngine.DOTS_MOCR])
 
 
 @login_required
@@ -2431,93 +2587,35 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
 def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
     """Start the Mistral OCR read over a scan's shards (#191).
 
-    Staff only, and the only way into this stage until a daemon trigger
-    lands. Every press can start real paid work on Mistral's batch API.
-
-    The read is over the original shards, so the button waits on no
-    review state and on no redacted volume: the set exists from the
-    moment the pipeline cut it. ``MISTRAL_API_KEY`` is the switch an
-    environment holds, and an environment that must not spend leaves
-    the key unset.
-
-    **This request makes no call to Mistral.** It writes one
-    ``ExternalJob`` row per shard and returns; the daemon's next
-    ``submit_external_jobs`` tick renders, uploads and submits them,
-    and ``collect_external_jobs`` polls, harvests and retries them.
-    The render is the daemon's work, so a web pod never opens the
-    volume.
-
-    It also never cuts shards. ``sharding.committed_manifest`` verifies
-    the stored set against the original with one ``head_object``, and a
-    stale or missing set is refused, because re-cutting is the
-    pipeline's job.
+    The only way into this stage until a daemon trigger lands. The read
+    is over the original shards, so the button waits on no review state
+    and on no redacted volume: the set exists from the moment the
+    pipeline cut it.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: Redirect to the scan processing page.
+    :return: See :func:`_start_shard_read`.
     """
-    from scanning import sharding
-
-    scan = get_object_or_404(Scan, pk=pk)
-    back = redirect("scan_process", pk=scan.pk)
-
-    if not request.user.is_staff:
-        messages.error(
-            request,
-            "Only staff can start Mistral OCR: each run costs money.",
-        )
-        return back
-
-    if not mistral_ocr.enabled():
-        messages.warning(
-            request,
-            "Mistral OCR is not switched on in this environment. Set "
-            "MISTRAL_API_KEY first.",
-        )
-        return back
-
-    # An open run means the daemon is still working on the last press.
-    # A finished run is reused rather than refused, which is what keeps
-    # ``ensure_extract_jobs`` from paying twice for shards already read.
-    summary = mistral_ocr.run_summary(scan)
-    if summary and summary["open"]:
-        messages.info(
-            request,
-            f"Mistral OCR run {summary['run']} is already going: "
-            f"{summary['done']} of {summary['total']} part(s) done.",
-        )
-        return back
-
-    manifest, reason = sharding.committed_manifest(scan)
-    if manifest is None:
-        messages.warning(request, reason)
-        return back
-
-    created = mistral_ocr.ensure_extract_jobs(scan, manifest)
-    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
-    logger.info(
-        "start_mistral_ocr: scan=%s user=%s run=%s shards=%d queued=%d",
-        scan.pk,
-        request.user.pk,
-        created[0].run if created else "?",
-        len(created),
-        queued,
+    return _start_shard_read(
+        request, pk, _shard_reads()[JobEngine.MISTRAL_OCR]
     )
-    if queued:
-        messages.success(
-            request,
-            f"Queued Mistral OCR for {queued} part(s) of this volume. The "
-            "daemon renders and sends them within a few seconds.",
-        )
-    else:
-        # ``ensure_extract_jobs`` reused a run that is already done, so
-        # nothing was queued and nothing will be sent.
-        messages.info(
-            request,
-            f"This volume was already read: run {created[0].run} covers "
-            f"all {len(created)} part(s). Nothing new was queued.",
-        )
-    return back
+
+
+@login_required
+@require_POST
+def start_surya_ocr(request: HttpRequest, pk: int) -> HttpResponse:
+    """Start the Surya OCR read over a scan's shards (#364).
+
+    The only way into this stage: no tick and no pipeline arm creates a
+    Surya row. The read is over the original shards, so the button
+    waits on no review state, and the pages are unredacted, which is
+    what a reader of the headnote brackets needs (#303).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: See :func:`_start_shard_read`.
+    """
+    return _start_shard_read(request, pk, _shard_reads()[JobEngine.SURYA])
 
 
 @login_required

@@ -352,7 +352,7 @@ class TestPerEngineKnobs(ScanningTestCase):
         # replaces. Only the ensure_* wrappers create rows, so this is
         # an internal fault, and it reads as an unconfigured endpoint.
         row = self._row()
-        row.engine = JobEngine.SURYA
+        row.engine = JobEngine.LIGHTON_OCR
         with self.assertRaises(jobs.UnknownRunpodEngine):
             jobs._runpod_endpoint(row)
 
