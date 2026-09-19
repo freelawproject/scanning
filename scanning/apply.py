@@ -85,7 +85,9 @@ APPLY_MAX_ATTEMPTS = 3
 
 #: The kinds that need a one-page shard of their own: an image or a PDF
 #: the curator sent, or a page of the original turned the right way up.
-#: A deletion costs no job -- the glue drops the page's slice.
+#: A deletion costs no job -- the glue drops the page's slice -- and a
+#: move costs none either (#261): the page keeps the content every
+#: stage read, and the map alone says where it goes.
 SHARD_KINDS = (
     PageEdit.Kind.INSERT_PAGE,
     PageEdit.Kind.REPLACE_PAGE,
@@ -179,6 +181,9 @@ class ApplyPlan:
 
     :ivar source_page_count: Pages in the original.
     :ivar deleted_pages: The 1-based original pages the final PDF drops.
+    :ivar moved_pages: The 1-based original pages the final PDF holds
+        at another place (#261), for the counts; the place itself is
+        in ``pages``.
     :ivar edits: The current structural rows the plan read, in primary
         key order. These are the rows a build stamps.
     :ivar pages: One entry per final page, in order. Each is
@@ -194,6 +199,7 @@ class ApplyPlan:
 
     source_page_count: int
     deleted_pages: list[int] = field(default_factory=list)
+    moved_pages: list[int] = field(default_factory=list)
     edits: list[PageEdit] = field(default_factory=list)
     pages: list[dict] = field(default_factory=list)
 
@@ -246,7 +252,9 @@ class ApplyPlan:
         """Return the offset map as the run stores it.
 
         :returns: ``schema_version``, ``source_page_count``,
-            ``final_page_count``, ``deleted_pages`` and ``pages``.
+            ``final_page_count``, ``deleted_pages``, ``moved_pages``
+            and ``pages``. A map from before #261 has no
+            ``moved_pages``; every reader takes that as none.
         :rtype: dict
         """
         return {
@@ -254,6 +262,7 @@ class ApplyPlan:
             "source_page_count": self.source_page_count,
             "final_page_count": self.final_page_count,
             "deleted_pages": list(self.deleted_pages),
+            "moved_pages": list(self.moved_pages),
             "pages": list(self.pages),
         }
 
@@ -262,9 +271,11 @@ def is_identity_map(page_map: dict) -> bool:
     """Return whether a stored map keeps every original page in place.
 
     The one test of "nothing to build", for the plan and the three
-    glues alike: every final page is an original page, and there are
-    as many as the original has. Written once, because three copies of
-    the expression and a fourth over the rows could disagree.
+    glues alike: every final page is an original page, in its own
+    place, and there are as many as the original has. The place is
+    part of the test since #261: a move keeps every page and changes
+    the volume. Written once, because three copies of the expression
+    and a fourth over the rows could disagree.
 
     :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
     :returns: Whether the final PDF is the original, page for page.
@@ -272,7 +283,9 @@ def is_identity_map(page_map: dict) -> bool:
     """
     entries = page_map.get("pages", [])
     return len(entries) == page_map.get("source_page_count") and all(
-        entry["source"]["kind"] == "original" for entry in entries
+        entry["source"]["kind"] == "original"
+        and entry["source"]["pdf_page"] == entry["final_page"]
+        for entry in entries
     )
 
 
@@ -378,10 +391,11 @@ def edit_page_count(edit: PageEdit) -> int:
     rotation turns one page of the original.
 
     :param edit: A structural row.
-    :returns: The page count. A deletion contributes none.
+    :returns: The page count. A deletion contributes none, and a move
+        none either: it places an original page, it adds no page.
     :rtype: int
     """
-    if edit.kind == PageEdit.Kind.DELETE_PAGE:
+    if edit.kind in (PageEdit.Kind.DELETE_PAGE, PageEdit.Kind.MOVE_PAGE):
         return 0
     if edit.kind == PageEdit.Kind.ROTATE_PAGE:
         return 1
@@ -443,7 +457,11 @@ def plan_run(
     - a replaced page gives its slot to the pages of the uploaded file;
     - a rotated page keeps its slot, as a shard of its own;
     - the images of a gap follow the page the gap names, in ``ordinal``
-      order, and anchor 0 goes before page 1.
+      order, and anchor 0 goes before page 1;
+    - a moved page (#261) leaves its slot and lands in the gap its
+      anchor names: after the anchor's own slot, before the images of
+      that gap, and in page order when several pages land in one gap.
+      An anchor past the last page lands last, as an insert does.
 
     A page both deleted and replaced is deleted: the deletion is the
     stronger decision, and a curator who wants the replacement takes
@@ -451,7 +469,10 @@ def plan_run(
     outranked the same way. The losing row stays in ``edits`` -- the
     build stamps it, and the trigger compares that set with the
     standing rows -- but it is not in :attr:`ApplyPlan.shard_edits`,
-    so no shard is cut and nothing is paid for it.
+    so no shard is cut and nothing is paid for it. A move outranks
+    nothing and is outranked by nothing: what lands in the gap is
+    whatever the page's own rows make of it -- the original page, its
+    replacement, its turned copy, or nothing for a deleted page.
 
     :param scan: The scan whose rows to read.
     :param page_counts: ``{edit pk: pages}`` for the uploaded files,
@@ -469,6 +490,7 @@ def plan_run(
     replacements = page_edits.replacements_by_page(scan)
     rotations = page_edits.rotations_by_page(scan)
     gaps = page_edits.inserts_by_gap(scan)
+    moves = page_edits.moves_by_page(scan)
     edits = sorted(
         page_edits.current_edits(scan, *PageEdit.STRUCTURAL_KINDS),
         key=lambda edit: edit.pk,
@@ -501,9 +523,9 @@ def plan_run(
         e.pdf_page: e for e in edits if e.kind == PageEdit.Kind.ROTATE_PAGE
     }
     last = scan.page_count
-    for edit in gaps.get(0, []):
-        emit_upload(edit)
-    for pdf_page in range(1, last + 1):
+
+    def emit_slot(pdf_page: int) -> None:
+        """Emit what the page's own rows make of it, wherever it lands."""
         if pdf_page in deleted:
             pass
         elif pdf_page in replacements:
@@ -526,18 +548,23 @@ def plan_run(
             )
         else:
             emit({"kind": "original", "pdf_page": pdf_page})
-        for edit in gaps.get(pdf_page, []):
-            emit_upload(edit)
-    # An insert anchored past the last page has no gap to fill. It is
-    # placed last rather than dropped: a curator uploaded it, and the
-    # viewer shows it there too (``page_edits.project_inserts``).
-    for anchor in sorted(anchor for anchor in gaps if anchor > last):
-        for edit in gaps[anchor]:
-            emit_upload(edit)
+
+    # The order of the slots is ``page_edits.slot_order``, the rule the
+    # sequence analysis reads too (#261). An insert, or a move,
+    # anchored past the last page has no gap to fill and is placed
+    # last rather than dropped: a curator decided it, and the viewer
+    # shows it there too (``page_edits.project_inserts``).
+    for kind, number in page_edits.slot_order(last, moves, anchors=gaps):
+        if kind == "page":
+            emit_slot(number)
+        else:
+            for edit in gaps.get(number, []):
+                emit_upload(edit)
 
     return ApplyPlan(
         source_page_count=scan.page_count,
         deleted_pages=sorted(deleted),
+        moved_pages=sorted(moves),
         edits=edits,
         pages=pages,
     )
@@ -2771,7 +2798,7 @@ def describe_map(page_map: dict) -> dict:
     :param page_map: A stored offset map (:meth:`ApplyPlan.to_map`).
     :returns: ``final_page_count``, ``deleted``, ``inserted`` (edits,
         not pages: one insert may hold several), ``replaced``,
-        ``rotated`` and ``identity``.
+        ``rotated``, ``moved`` and ``identity``.
     :rtype: dict
     """
     inserted: set[int] = set()
@@ -2795,5 +2822,6 @@ def describe_map(page_map: dict) -> dict:
         "inserted": len(inserted),
         "replaced": len(replaced),
         "rotated": len(rotated),
+        "moved": len(page_map.get("moved_pages") or []),
         "identity": is_identity_map(page_map),
     }

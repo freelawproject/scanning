@@ -630,6 +630,38 @@ class TestTriggerAndWorker(BuildTestCase):
         with patch("scanning.services.convert_stage_open", return_value=False):
             self.assertEqual(apply.phase_due(self.scan), "build")
 
+    def test_a_volume_with_moves_alone_builds_a_final_pdf_and_no_row(self):
+        # #261: a move is a structural edit that pays no stage. The run
+        # is not the identity, so a final PDF is written, but no shard
+        # is cut and no job row is created, and a closed gate holds it
+        # no more than it holds a deletion.
+        move = self.edit(
+            PageEdit.Kind.MOVE_PAGE, pdf_page=4, anchor_pdf_page=2
+        )
+        with patch("scanning.services.convert_stage_open", return_value=False):
+            self.assertEqual(apply.phase_due(self.scan), "build")
+            run = apply.build_run(self.scan)
+
+        prefix = apply.run_prefix(self.scan, run)
+        self.assertTrue(run.is_built)
+        self.assertEqual(run.final_pdf_key, f"{prefix}final.pdf")
+        self.assertEqual(
+            sorted(self.uploads),
+            sorted([f"{prefix}final.pdf", f"{prefix}page_map.json"]),
+        )
+        self.assertEqual(run.jobs.count(), 0)
+        self.assertEqual(run.page_map["final_page_count"], self.PAGES)
+        self.assertEqual(run.page_map["moved_pages"], [4])
+        self.assertEqual(
+            [e["source"]["pdf_page"] for e in run.page_map["pages"]],
+            [1, 2, 4, 3, 5, 6],
+        )
+        self.assertFalse(apply.is_identity_map(run.page_map))
+        self.assertEqual(run.edit_ids, [move.pk])
+        move.refresh_from_db()
+        self.assertEqual(move.applied_run, run)
+        self.assertIsNotNone(move.applied_at)
+
     def test_a_gate_closed_at_build_time_costs_no_attempt_and_no_upload(
         self,
     ):

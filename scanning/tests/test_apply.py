@@ -6,6 +6,7 @@ approval, and the reopen. The build phase and the glues have their own
 modules (``test_apply_build.py``, ``test_apply_glue.py``).
 """
 
+import hashlib
 import io
 import json
 import pathlib
@@ -272,6 +273,139 @@ class TestPlanRun(ApplyTestCase):
 
         self.assertEqual(self.sources(plan)[-1], ("e", tail.pk, 0))
 
+    def move(self, pdf_page, anchor):
+        """Write one standing move (#261).
+
+        :param pdf_page: The page that moves.
+        :param anchor: The original page it lands after.
+        :returns: The row.
+        """
+        return self.edit(
+            PageEdit.Kind.MOVE_PAGE, pdf_page=pdf_page, anchor_pdf_page=anchor
+        )
+
+    def test_two_transposed_pages_are_one_move(self):
+        # Scan 2854 of the issue: pages 885 and 886 print 880 and 879.
+        # Here pages 3 and 4 are transposed, so 4 goes after 2.
+        row = self.move(4, 2)
+
+        plan = apply.plan_run(self.scan)
+
+        self.assertEqual(
+            self.sources(plan),
+            [("o", 1), ("o", 2), ("o", 4), ("o", 3), ("o", 5), ("o", 6)],
+        )
+        self.assertFalse(plan.is_identity)
+        self.assertFalse(apply.is_identity_map(plan.to_map()))
+        self.assertEqual(plan.final_page_count, self.PAGES)
+        self.assertEqual(plan.moved_pages, [4])
+        self.assertEqual(plan.to_map()["moved_pages"], [4])
+        self.assertEqual(plan.to_map()["deleted_pages"], [])
+        # Considered and stamped, but no shard is cut and no page added.
+        self.assertIn(row, plan.edits)
+        self.assertEqual(plan.shard_edits, [])
+        self.assertEqual(apply.edit_page_count(row), 0)
+        self.assertEqual(apply.originals_to_final(plan.to_map())[4], 3)
+        self.assertEqual(apply.originals_to_final(plan.to_map())[3], 4)
+
+    def test_a_move_to_the_gap_before_its_page_changes_nothing(self):
+        self.move(4, 3)
+
+        plan = apply.plan_run(self.scan)
+
+        self.assertEqual(
+            self.sources(plan), [("o", p) for p in range(1, self.PAGES + 1)]
+        )
+        self.assertTrue(plan.is_identity)
+
+    def test_a_move_before_page_1_and_one_past_the_end(self):
+        self.move(5, 0)
+        self.move(2, 99)
+
+        plan = apply.plan_run(self.scan)
+
+        self.assertEqual(
+            self.sources(plan),
+            [("o", 5), ("o", 1), ("o", 3), ("o", 4), ("o", 6), ("o", 2)],
+        )
+
+    def test_moved_pages_land_in_page_order_before_the_inserts(self):
+        leaf = self.edit(PageEdit.Kind.INSERT_PAGE, anchor_pdf_page=1)
+        self.move(6, 1)
+        self.move(4, 1)
+
+        plan = apply.plan_run(self.scan, page_counts={leaf.pk: 1})
+
+        self.assertEqual(
+            self.sources(plan),
+            [
+                ("o", 1),
+                ("o", 4),
+                ("o", 6),
+                ("e", leaf.pk, 0),
+                ("o", 2),
+                ("o", 3),
+                ("o", 5),
+            ],
+        )
+
+    def test_a_moved_page_keeps_its_own_rows(self):
+        # What lands in the gap is what the page's rows make of it: a
+        # deleted page lands nowhere, a turned one lands as its shard.
+        self.move(2, 4)
+        self.edit(PageEdit.Kind.DELETE_PAGE, pdf_page=2)
+        turn = self.edit(PageEdit.Kind.ROTATE_PAGE, pdf_page=6, value="90")
+        self.move(6, 0)
+
+        plan = apply.plan_run(self.scan)
+
+        self.assertEqual(
+            self.sources(plan),
+            [("e", turn.pk, 0), ("o", 1), ("o", 3), ("o", 4), ("o", 5)],
+        )
+        self.assertEqual(plan.pages[0]["source"]["pdf_page"], 6)
+        self.assertEqual(plan.deleted_pages, [2])
+        self.assertEqual(plan.moved_pages, [2, 6])
+        self.assertEqual(plan.shard_edits, [turn])
+
+    def test_the_gap_after_a_moved_page_stays_where_the_page_was(self):
+        # An anchor is an original address, so a page moved to after a
+        # page that itself moved lands at that page's old slot.
+        self.move(2, 5)
+        self.move(4, 2)
+
+        plan = apply.plan_run(self.scan)
+
+        self.assertEqual(
+            self.sources(plan),
+            [("o", 1), ("o", 4), ("o", 3), ("o", 5), ("o", 2), ("o", 6)],
+        )
+
+    def test_a_stale_move_is_not_planned(self):
+        self.edit(
+            PageEdit.Kind.MOVE_PAGE,
+            pdf_page=4,
+            anchor_pdf_page=2,
+            source_fingerprint="9:9",
+        )
+
+        plan = apply.plan_run(self.scan)
+
+        self.assertTrue(plan.is_identity)
+
+    def test_describe_map_counts_the_moves(self):
+        self.move(4, 2)
+
+        described = apply.describe_map(apply.plan_run(self.scan).to_map())
+
+        self.assertEqual(described["moved"], 1)
+        self.assertEqual(described["deleted"], 0)
+        self.assertFalse(described["identity"])
+        # A map from before #261 has no ``moved_pages``.
+        self.assertEqual(
+            apply.describe_map({"pages": [], "deleted_pages": []})["moved"], 0
+        )
+
 
 class TestBuildFinalPdf(ApplyTestCase):
     """The walk, over the plan."""
@@ -336,6 +470,31 @@ class TestBuildFinalPdf(ApplyTestCase):
         # A turned page reports its rectangle as it displays.
         self.assertEqual(shapes[4], (792, 612, 90))
         self.assertEqual(shapes[3], (612, 792, 0))
+
+    def test_a_moved_page_is_written_at_its_new_place(self):
+        # Every page of the synthetic volume carries its own image, so
+        # the digests say which original page each final page holds.
+        self.edit(PageEdit.Kind.MOVE_PAGE, pdf_page=4, anchor_pdf_page=2)
+        plan = apply.plan_run(self.scan)
+
+        def digests(doc):
+            return [
+                hashlib.md5(
+                    doc.extract_image(page.get_images()[0][0])["image"]
+                ).hexdigest()
+                for page in doc
+            ]
+
+        with fitz.open(str(self.original)) as source:
+            before = digests(source)
+            with apply.build_final_pdf(source, plan) as out:
+                after = digests(out)
+
+        self.assertEqual(len(set(before)), self.PAGES)
+        self.assertEqual(
+            after,
+            [before[0], before[1], before[3], before[2], before[4], before[5]],
+        )
 
     def test_a_shard_with_too_few_pages_is_refused(self):
         leaf = self.edit(PageEdit.Kind.INSERT_PAGE, anchor_pdf_page=1)
@@ -584,6 +743,8 @@ class TestEditLock(ApplyTestCase):
         ("assign_page", {"pdf_page": 1, "page_number": "7"}),
         ("delete_page", {"pdf_page": 1}),
         ("undo_delete_page", {"pdf_page": 1}),
+        ("move_page", {"pdf_page": 1, "anchor_pdf_page": 2}),
+        ("undo_move_page", {"pdf_page": 1}),
         ("remove_page_insert", {"edit_id": 1}),
         ("undo_replace_page", {"pdf_page": 1}),
         ("rotate_page", {"pdf_page": 1, "degrees": "90"}),

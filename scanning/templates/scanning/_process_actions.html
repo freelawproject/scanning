@@ -210,11 +210,11 @@ reach step 2.
   staff "files" link opens the run's outputs, the #243 shape.
 {% endcomment %}
   {% if final_volume %}
-  <span class="text-sm text-gray-600 mr-2" title="Apply run {{ final_volume.label }}: {{ final_volume.final_page_count }} page(s), {{ final_volume.deleted }} deleted, {{ final_volume.inserted }} inserted, {{ final_volume.replaced }} replaced, {{ final_volume.rotated }} rotated">
+  <span class="text-sm text-gray-600 mr-2" title="Apply run {{ final_volume.label }}: {{ final_volume.final_page_count }} page(s), {{ final_volume.deleted }} deleted, {{ final_volume.inserted }} inserted, {{ final_volume.replaced }} replaced, {{ final_volume.rotated }} rotated, {{ final_volume.moved }} moved">
     {% if final_volume.measured and final_volume.identity %}
     Showing the volume as uploaded: the page review made no page edits.
     {% elif final_volume.measured %}
-    Showing the corrected volume {{ final_volume.label }}: {{ final_volume.final_page_count }} pages ({{ final_volume.deleted }} deleted, {{ final_volume.inserted }} inserted, {{ final_volume.replaced }} replaced, {{ final_volume.rotated }} rotated).
+    Showing the corrected volume {{ final_volume.label }}: {{ final_volume.final_page_count }} pages ({{ final_volume.deleted }} deleted, {{ final_volume.inserted }} inserted, {{ final_volume.replaced }} replaced, {{ final_volume.rotated }} rotated, {{ final_volume.moved }} moved).
     {% else %}
     The corrected volume {{ final_volume.label }} is built. Its redactions are being measured; this is the volume as uploaded until then.
     {% endif %}
