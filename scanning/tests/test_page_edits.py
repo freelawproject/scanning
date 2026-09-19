@@ -2385,7 +2385,8 @@ class TestMovePageEndpoints(ScanningTestCase):
         scan = self._scan(["1", "2", "4", "3", "5", "6", "4", "3", "8"])
         html = self._step_one(scan).content.decode()
 
-        self.assertEqual(html.count('data-check="backward_page"'), 2)
+        # Two cards for 3, and one for the 4 that follows 6.
+        self.assertEqual(html.count('data-check="backward_page"'), 3)
         self.assertNotIn("swapPages(this)", html)
 
     def test_a_locked_volume_offers_no_swap(self):
