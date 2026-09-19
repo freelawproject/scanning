@@ -453,6 +453,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         missing_pages = scan.missing_pages
         replaced_pages = {}
         deleted_pages: list[int] = []
+        moves: dict[int, int] = {}
         duplicate_indices: set[int] = set()
         flagged_indices: set[int] = set()
         idx_to_logical = {}
@@ -547,14 +548,30 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         for r in ocr_results:
             ocr_by_page[r["pdf_page"]] = r
 
+        # The sidebar lists the pages in the order the corrected volume
+        # holds them (#261): a page a curator moved sits at its new
+        # place, with a badge, and the ORDER divider it answered is
+        # gone. The entries are the cache's own, still addressed by
+        # ``pdf_page``.
+        moves = page_edits.moves_by_page(scan)
+        ocr_results = page_edits.order_by_moves(ocr_results, moves)
+
         # Annotate sequence issues for the sidebar page list. Duplicates are taken
         # from ``duplicate_indices`` (the same page_map data the viewer uses);
         # ``seq_issue`` only covers ordering anomalies (backward / gap).
-        prev_num = None
+        #
+        # Two adjacent pages whose printed numbers run backward by one
+        # are a transposed pair, the case of #261: the card for that
+        # printed number gets a button that moves the later page to
+        # before the earlier one. A backward step of more than one is
+        # a misread, so it gets no button.
+        swaps: dict[int, dict] = {}
+        prev_num = prev_pdf = None
         for r in ocr_results:
             r["seq_issue"] = ""
             r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
             r["is_replaced"] = r["pdf_page"] in replaced_pages
+            r["is_moved"] = r["pdf_page"] in moves
             r["needs_repair"] = r["pdf_page"] in pages_needing_repair
             if r.get("type") == page_numbers.SUFFIXED:
                 # The book adds this page between two numbered ones, so
@@ -573,9 +590,19 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 diff = num - prev_num
                 if diff < 0:
                     r["seq_issue"] = "backward"
+                    if diff == -1 and prev_pdf == r["pdf_page"] - 1:
+                        swaps[num] = {
+                            "pdf_page": r["pdf_page"],
+                            "anchor_pdf_page": prev_pdf - 1,
+                        }
                 elif diff > 2:
                     r["seq_issue"] = "gap"
             prev_num = num
+            prev_pdf = r["pdf_page"]
+        if scan.status not in LOCKED_STATUSES:
+            for i in issues:
+                if i.check_name == CheckName.BACKWARD_PAGE:
+                    i.swap = swaps.get(i.page_number)
         deleted_pages = sorted(page_edits.deleted_pages(scan))
 
     has_detections = Detection.objects.filter(scan=scan).exists()
@@ -676,6 +703,9 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "detect_warnings": detect_warnings,
             **review_findings,
             "deleted_pages_json": json.dumps(deleted_pages),
+            "moved_pages_json": json.dumps(
+                {str(page): anchor for page, anchor in moves.items()}
+            ),
             # The rule of the step-1 bar (#151): the viewer must not
             # offer a control the endpoint refuses. Step 2 runs while
             # a new-pipeline volume is in DONE, which locks every page
@@ -3539,6 +3569,100 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
             refresh_open=False,
         )
     return JsonResponse({"status": "ok", "pdf_pages": sorted(set(pages))})
+
+
+#: The refusal of a move whose anchor is its own page.
+MOVE_ONTO_ITSELF_MESSAGE = "A page cannot follow itself."
+
+
+@login_required
+@require_POST
+def move_page(request: HttpRequest, pk: int) -> HttpResponse:
+    """Move a page of the original to after another one (#261).
+
+    Two adjacent pages scanned in the wrong order, the case the
+    ``backward_page`` card finds: one ``PageEdit`` row, addressed by
+    the page that moves and the original page it lands after (0 for
+    before page 1), the insert's vocabulary. The apply (#224) writes
+    the page at its new place and pays no read for it; until then the
+    row is a saved decision, and the page map is rebuilt so the viewer
+    and the sidebar draw the corrected order at once.
+
+    Both addresses are checked before the row is written. A second
+    move of the same page refreshes the open row, as a page number
+    does; an applied row is superseded.
+
+    :param request: The HTTP request (JSON body with ``pdf_page`` and
+        ``anchor_pdf_page``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the move record.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
+    anchor = data.get("anchor_pdf_page")
+    if anchor == 0 or anchor == "0":
+        anchor = 0
+    else:
+        anchor = _pdf_page_of(scan, anchor)
+    if pdf_page is None or anchor is None:
+        return JsonResponse({"error": "Unknown PDF page."}, status=404)
+    if anchor == pdf_page:
+        return JsonResponse({"error": MOVE_ONTO_ITSELF_MESSAGE}, status=409)
+    from scanning import services
+
+    page_edits.supersede(
+        scan,
+        PageEdit.Kind.MOVE_PAGE,
+        {"pdf_page": pdf_page},
+        {
+            "anchor_pdf_page": anchor,
+            "source_fingerprint": scan.source_fingerprint,
+        },
+        request.user,
+    )
+    services.rebuild_page_map(scan)
+    return JsonResponse(
+        {"status": "ok", "pdf_page": pdf_page, "anchor_pdf_page": anchor}
+    )
+
+
+@login_required
+@require_POST
+def undo_move_page(request: HttpRequest, pk: int) -> HttpResponse:
+    """Take back a page move, leaving the page where it was scanned.
+
+    The row is stamped, not deleted (#232), like every decision a
+    curator takes back.
+
+    :param request: The HTTP request (JSON body with ``pdf_page``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the undo.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    from scanning import services
+
+    page_edits.withdraw(
+        page_edits.standing_edits(scan, PageEdit.Kind.MOVE_PAGE).filter(
+            pdf_page=data.get("pdf_page")
+        ),
+        request.user,
+    )
+    services.rebuild_page_map(scan)
+    return JsonResponse({"status": "ok"})
 
 
 @login_required

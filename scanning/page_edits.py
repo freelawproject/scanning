@@ -33,6 +33,7 @@ Two rules run through it:
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Iterator
 
 from django.db import IntegrityError, transaction
 from django.urls import reverse
@@ -327,6 +328,103 @@ def rotations_by_page(scan: Scan) -> dict[int, int]:
         edit.pdf_page: int(edit.value)
         for edit in current_edits(scan, PageEdit.Kind.ROTATE_PAGE)
     }
+
+
+def moves_by_page(scan: Scan) -> dict[int, int]:
+    """Return the standing moves, keyed by the page that moves (#261).
+
+    What the apply reads to write a page at another place, so it holds
+    the current rows only: a move written against another original
+    names a page nobody chose.
+
+    :param scan: The scan to read.
+    :returns: ``{pdf_page: anchor_pdf_page}``, the original page each
+        moved page follows in the corrected volume; 0 puts it before
+        page 1. One row per page at most, which the partial unique
+        key holds.
+    :rtype: dict[int, int]
+    """
+    return {
+        edit.pdf_page: edit.anchor_pdf_page
+        for edit in current_edits(scan, PageEdit.Kind.MOVE_PAGE)
+    }
+
+
+def slot_order(
+    page_count: int, moves: dict[int, int], anchors: Iterable[int] = ()
+) -> Iterator[tuple[str, int]]:
+    """Yield the slots of a corrected volume, in order (#261).
+
+    The one rule of where a moved page goes, read by the apply's plan
+    (``apply.plan_run``) and by the feed of the sequence analysis
+    (:func:`order_by_moves`), so the card a curator answers with a
+    move and the volume the apply builds agree. Two events:
+
+    - ``("page", p)`` for every original page, in the order the
+      corrected volume holds them. A moved page leaves its own slot
+      and comes right after its anchor's slot, in page order when
+      several land on one anchor;
+    - ``("gap", a)`` after the slot of original page ``a`` and after
+      the moved pages that landed there, where the images anchored on
+      ``a`` follow. Anchor 0 comes first.
+
+    An anchor is an original address, so the gap after a page that
+    itself moved stays where that page was. An anchor past the last
+    page comes last, as an insert anchored there does.
+
+    :param page_count: Pages in the original.
+    :param moves: ``{pdf_page: anchor}``, :func:`moves_by_page`.
+    :param anchors: Further anchors that need a gap event past the
+        end: the plan passes the anchors of its inserts.
+    :returns: The events.
+    """
+    landing: dict[int, list[int]] = {}
+    for pdf_page in sorted(moves):
+        landing.setdefault(moves[pdf_page], []).append(pdf_page)
+
+    def gap(anchor: int) -> Iterator[tuple[str, int]]:
+        for pdf_page in landing.get(anchor, []):
+            yield ("page", pdf_page)
+        yield ("gap", anchor)
+
+    yield from gap(0)
+    for pdf_page in range(1, page_count + 1):
+        if pdf_page not in moves:
+            yield ("page", pdf_page)
+        yield from gap(pdf_page)
+    past = {a for a in set(landing) | set(anchors) if a > page_count}
+    for anchor in sorted(past):
+        yield from gap(anchor)
+
+
+def order_by_moves(results: list[dict], moves: dict[int, int]) -> list[dict]:
+    """Return the OCR entries in the order the corrected volume holds them.
+
+    What the sequence analysis and the sidebar read (#261): a page a
+    curator moved is judged, and shown, at its new place, so the
+    ``backward_page`` card the move answers goes away on the next
+    recompute and the viewer draws the pages as the corrected volume
+    will hold them. The entries are the same dicts, not copies, and
+    ``Scan.ocr_results`` keeps the original's order: every entry is
+    still addressed by its ``pdf_page``.
+
+    :param results: The OCR entries, one per original page.
+    :param moves: ``{pdf_page: anchor}``, :func:`moves_by_page`.
+    :returns: The entries, reordered. An entry no slot names (a page
+        past the count) keeps its place at the end.
+    :rtype: list[dict]
+    """
+    if not moves:
+        return list(results)
+    by_page = {r["pdf_page"]: r for r in results}
+    page_count = max(by_page, default=0)
+    ordered = [
+        by_page.pop(number)
+        for kind, number in slot_order(page_count, moves)
+        if kind == "page" and number in by_page
+    ]
+    ordered.extend(r for r in results if r["pdf_page"] in by_page)
+    return ordered
 
 
 def inserts_by_gap(scan: Scan) -> dict[int, list[PageEdit]]:

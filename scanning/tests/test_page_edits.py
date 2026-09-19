@@ -9,6 +9,7 @@ that overlay these rows live in ``test_services.py`` and
 
 import json
 import pathlib
+import re
 import tempfile
 from unittest import mock
 
@@ -25,7 +26,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from scanning import page_edits, s3_sync, views_process
+from scanning import page_edits, page_numbers, s3_sync, views_process
 from scanning.factories import PageEditFactory, ScanFactory, UserFactory
 from scanning.models import CheckName, Issue, PageEdit, Scan, Status
 from scanning.tests.test_sharding import write_image_volume
@@ -83,6 +84,61 @@ class TestPageEditConstraints(TestCase):
             kind=PageEdit.Kind.DELETE_PAGE,
             pdf_page=4,
             anchor_pdf_page=3,
+        )
+
+    def test_a_move_names_its_page_and_its_gap(self):
+        # #261: the page that moves, and the original page it follows.
+        edit = PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.MOVE_PAGE,
+            pdf_page=886,
+            anchor_pdf_page=884,
+            value="",
+        )
+        self.assertEqual(
+            str(edit), "Move a page to another place p.886 to after p.884"
+        )
+        self._refused(
+            kind=PageEdit.Kind.MOVE_PAGE,
+            pdf_page=886,
+            anchor_pdf_page=None,
+            value="",
+        )
+        self._refused(
+            kind=PageEdit.Kind.MOVE_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=884,
+            value="",
+        )
+
+    def test_a_move_may_go_before_page_1_but_not_after_itself(self):
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.MOVE_PAGE,
+            pdf_page=3,
+            anchor_pdf_page=0,
+            value="",
+        )
+        self._refused(
+            kind=PageEdit.Kind.MOVE_PAGE,
+            pdf_page=4,
+            anchor_pdf_page=4,
+            value="",
+        )
+
+    def test_one_standing_move_per_page(self):
+        PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.MOVE_PAGE,
+            pdf_page=3,
+            anchor_pdf_page=0,
+            value="",
+        )
+        self._refused(
+            kind=PageEdit.Kind.MOVE_PAGE,
+            pdf_page=3,
+            anchor_pdf_page=5,
+            value="",
         )
 
     def test_a_dismissal_names_its_check(self):
@@ -1990,3 +2046,248 @@ class TestPendingEditFlags(TestCase):
         self.assertFalse(
             page_edits.pending_edit_flags(self.scan)["has_pending_changes"]
         )
+
+
+class TestSlotOrder(TestCase):
+    """The one rule of where a moved page goes (#261)."""
+
+    def _results(self, detected):
+        return [
+            {"pdf_page": i, "detected": d, "type": "single"}
+            for i, d in enumerate(detected, 1)
+        ]
+
+    def test_a_transposed_pair_reads_in_order_once_moved(self):
+        results = self._results(["1", "2", "4", "3", "5", "6"])
+
+        ordered = page_edits.order_by_moves(results, {4: 2})
+
+        self.assertEqual([r["detected"] for r in ordered], list("123456"))
+        self.assertEqual([r["pdf_page"] for r in ordered], [1, 2, 4, 3, 5, 6])
+        # The same dicts, so a later write on one is seen by both lists.
+        self.assertIs(ordered[2], results[3])
+        # The cache is not touched.
+        self.assertEqual([r["pdf_page"] for r in results], [1, 2, 3, 4, 5, 6])
+
+    def test_no_move_is_a_copy_in_the_same_order(self):
+        results = self._results(["1", "2"])
+        ordered = page_edits.order_by_moves(results, {})
+        self.assertEqual(ordered, results)
+        self.assertIsNot(ordered, results)
+
+    def test_the_events_of_the_slots(self):
+        events = list(page_edits.slot_order(4, {3: 0, 1: 4}, anchors=[9]))
+        self.assertEqual(
+            events,
+            [
+                ("page", 3),
+                ("gap", 0),
+                ("gap", 1),
+                ("page", 2),
+                ("gap", 2),
+                ("gap", 3),
+                ("page", 4),
+                ("page", 1),
+                ("gap", 4),
+                ("gap", 9),
+            ],
+        )
+
+    def test_an_entry_no_slot_names_keeps_its_place_at_the_end(self):
+        results = self._results(["1", "2", "3"])
+        results.append({"pdf_page": 9, "detected": "9", "type": "single"})
+        ordered = page_edits.order_by_moves(results, {2: 0})
+        self.assertEqual([r["pdf_page"] for r in ordered], [2, 1, 3, 9])
+
+
+class TestMovePageEndpoints(ScanningTestCase):
+    """``move_page`` and its undo (#261), over the rows and the page."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = self._scan(["1", "2", "4", "3", "5", "6"])
+
+    def _scan(self, detected):
+        """A reviewed scan whose pages read as ``detected``."""
+        return ScanFactory(
+            page_count=len(detected),
+            source_fingerprint=f"100:{len(detected)}",
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            start_page=1,
+            end_page=len(detected),
+            ocr_results=[
+                {
+                    "pdf_page": i,
+                    "detected": d,
+                    "type": "single",
+                    "score": 1.0,
+                    "zone": "dots-header",
+                }
+                for i, d in enumerate(detected, 1)
+            ],
+        )
+
+    def _post(self, name, **body):
+        return self.client.post(
+            reverse(name, kwargs={"pk": self.scan.pk}),
+            data=json.dumps(body),
+            content_type="application/json",
+        )
+
+    def _step_one(self, scan=None):
+        scan = scan or self.scan
+        from scanning import services
+
+        services.recalculate_issues(scan)
+        return self.client.get(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+        )
+
+    def _map_order(self):
+        self.scan.refresh_from_db()
+        return [
+            e["pdf_index"] + 1
+            for e in self.scan.page_map
+            if e.get("type") == "pdf_page"
+        ]
+
+    def test_a_move_becomes_one_row_and_reorders_the_page_map(self):
+        response = self._post("move_page", pdf_page=4, anchor_pdf_page=2)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"status": "ok", "pdf_page": 4, "anchor_pdf_page": 2},
+        )
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.kind, PageEdit.Kind.MOVE_PAGE)
+        self.assertEqual((edit.pdf_page, edit.anchor_pdf_page), (4, 2))
+        self.assertEqual(edit.author, self.user)
+        self.assertEqual(edit.source_fingerprint, "100:6")
+        self.assertEqual(self._map_order(), [1, 2, 4, 3, 5, 6])
+        self.scan.refresh_from_db()
+        self.assertEqual(
+            [r["pdf_page"] for r in self.scan.ocr_results], [1, 2, 3, 4, 5, 6]
+        )
+
+    def test_a_second_move_of_the_page_refreshes_the_row(self):
+        self._post("move_page", pdf_page=4, anchor_pdf_page=2)
+        self._post("move_page", pdf_page=4, anchor_pdf_page=0)
+
+        edit = self.scan.page_edits.get()
+        self.assertEqual(edit.anchor_pdf_page, 0)
+        self.assertEqual(self._map_order(), [4, 1, 2, 3, 5, 6])
+
+    def test_the_addresses_are_checked_before_anything_is_written(self):
+        for body, status in (
+            ({"pdf_page": 4, "anchor_pdf_page": 4}, 409),
+            ({"pdf_page": 7, "anchor_pdf_page": 2}, 404),
+            ({"pdf_page": 4, "anchor_pdf_page": 7}, 404),
+            ({"pdf_page": 4}, 404),
+            ({"anchor_pdf_page": 2}, 404),
+            ({"pdf_page": "x", "anchor_pdf_page": 2}, 404),
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    self._post("move_page", **body).status_code, status
+                )
+        self.assertEqual(self.scan.page_edits.count(), 0)
+        self.assertEqual(
+            self._post("move_page", pdf_page=4, anchor_pdf_page=4).json()[
+                "error"
+            ],
+            views_process.MOVE_ONTO_ITSELF_MESSAGE,
+        )
+
+    def test_an_undo_withdraws_the_row_and_restores_the_order(self):
+        self._post("move_page", pdf_page=4, anchor_pdf_page=2)
+
+        response = self._post("undo_move_page", pdf_page=4)
+
+        self.assertEqual(response.status_code, 200)
+        edit = self.scan.page_edits.get()
+        self.assertIsNotNone(edit.withdrawn_at)
+        self.assertEqual(edit.withdrawn_by, self.user)
+        self.assertEqual(self._map_order(), [1, 2, 3, 4, 5, 6])
+        # A second undo is a no-op.
+        self.assertEqual(
+            self._post("undo_move_page", pdf_page=4).status_code, 200
+        )
+
+    def test_the_move_answers_the_backward_card_on_the_next_recompute(self):
+        from scanning import services
+
+        services.recalculate_issues(self.scan)
+        self.assertEqual(
+            self.scan.issues.filter(
+                check_name=CheckName.BACKWARD_PAGE
+            ).count(),
+            1,
+        )
+
+        self._post("move_page", pdf_page=4, anchor_pdf_page=2)
+        services.recalculate_issues(self.scan)
+
+        self.assertFalse(
+            self.scan.issues.filter(
+                check_name=CheckName.BACKWARD_PAGE
+            ).exists()
+        )
+        self.assertFalse(
+            self.scan.issues.filter(check_name=CheckName.MISSING_PAGE).exists()
+        )
+
+    def test_the_card_of_a_transposed_pair_offers_the_swap(self):
+        html = self._step_one().content.decode()
+
+        self.assertIn("swapPages(this)", html)
+        self.assertIn('data-pdf-page="4" data-anchor="2"', html)
+        self.assertIn("Swap PDF pages 3 and 4", html)
+        # The sidebar still shows the scanned order, with the divider.
+        self.assertIn("ORDER", html)
+        self.assertNotIn("page-moved-badge", html)
+
+    def test_a_backward_step_of_more_than_one_gets_no_button(self):
+        scan = self._scan(["1", "2", "5", "3", "4", "6"])
+        html = self._step_one(scan).content.decode()
+
+        self.assertIn("goes backward", html)
+        self.assertNotIn("swapPages(this)", html)
+
+    def test_a_pair_that_is_not_adjacent_gets_no_button(self):
+        # 4 printed on page 3, a lettered page between (which breaks no
+        # sequence, #319), 3 printed on page 5: a backward step of one,
+        # but the two pages are not neighbours.
+        scan = self._scan(["1", "2", "4", "10a", "3", "5"])
+        for entry in scan.ocr_results:
+            if entry["detected"] == "10a":
+                entry["type"] = page_numbers.SUFFIXED
+        scan.save(update_fields=["ocr_results"])
+        html = self._step_one(scan).content.decode()
+
+        self.assertIn("goes backward", html)
+        self.assertNotIn("swapPages(this)", html)
+
+    def test_after_the_move_the_page_lists_the_corrected_order(self):
+        self._post("move_page", pdf_page=4, anchor_pdf_page=2)
+
+        html = self._step_one().content.decode()
+
+        self.assertNotIn("swapPages(this)", html)
+        self.assertNotIn(">ORDER<", html)
+        self.assertEqual(html.count("page-moved-badge"), 1)
+        self.assertIn('movedPages: {"4": 2}', html)
+        sidebar = html[html.index('id="pages-list"') :]
+        rows = [int(m) for m in re.findall(r'data-pdf-index="(\d+)"', sidebar)]
+        self.assertEqual(rows[:6], [0, 1, 3, 2, 4, 5])
+
+    def test_a_locked_volume_offers_no_swap(self):
+        Scan.objects.filter(pk=self.scan.pk).update(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+        self.scan.refresh_from_db()
+        html = self._step_one().content.decode()
+
+        self.assertIn("goes backward", html)
+        self.assertNotIn("swapPages(this)", html)

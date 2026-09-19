@@ -3090,6 +3090,15 @@ class PageEdit(AbstractDateTimeModel):
       only. A printed number cannot be an address: front matter has
       none, and two pages can both print 1074 -- which is one of the
       defects review 1 exists to find.
+    - **A move is addressed by the page that moves and the gap it
+      lands in** (#261). ``pdf_page`` is the page, ``anchor_pdf_page``
+      the original page it follows in the corrected volume, with 0
+      for "before page 1", the insert's vocabulary. Two adjacent pages
+      scanned in the wrong order, the case the ``backward_page`` card
+      finds, are one row: the later page moved to after the page
+      before the pair. The moved page keeps its own content and its
+      own rows; the apply (#224) writes it at its new place and pays
+      no read for it, because every stage read the page where it was.
     - **A decision stands until it is withdrawn, and it is never
       rewritten or deleted.** A curator who takes the decision back
       stamps ``withdrawn_at`` and ``withdrawn_by`` (#232), and that is
@@ -3129,6 +3138,7 @@ class PageEdit(AbstractDateTimeModel):
         INSERT_PAGE = "insert_page", "Insert a page image"
         REPLACE_PAGE = "replace_page", "Replace a page with an image"
         ROTATE_PAGE = "rotate_page", "Rotate a page"
+        MOVE_PAGE = "move_page", "Move a page to another place"
         DISMISS_ISSUE = "dismiss_issue", "Dismiss an issue"
 
     #: Kinds that change what the volume is, so the apply (#206) must
@@ -3140,6 +3150,7 @@ class PageEdit(AbstractDateTimeModel):
         Kind.INSERT_PAGE,
         Kind.REPLACE_PAGE,
         Kind.ROTATE_PAGE,
+        Kind.MOVE_PAGE,
     )
 
     scan = models.ForeignKey(
@@ -3178,8 +3189,8 @@ class PageEdit(AbstractDateTimeModel):
         null=True,
         blank=True,
         help_text=(
-            "Inserts only: the 1-based original page the image "
-            "follows. 0 puts the image before page 1."
+            "Inserts and moves: the 1-based original page the image, "
+            "or the moved page, follows. 0 puts it before page 1."
         ),
     )
     ordinal = models.PositiveSmallIntegerField(
@@ -3289,13 +3300,19 @@ class PageEdit(AbstractDateTimeModel):
         ]
         constraints = [
             # One address column per kind, so a null is never a second
-            # meaning of a column. An insert lives in a gap; every
+            # meaning of a column. An insert lives in a gap; a move
+            # names its page and the gap it lands in (#261); every
             # other kind lives on a page.
             models.CheckConstraint(
                 condition=(
                     models.Q(
                         kind="insert_page",
                         pdf_page__isnull=True,
+                        anchor_pdf_page__isnull=False,
+                    )
+                    | models.Q(
+                        kind="move_page",
+                        pdf_page__isnull=False,
                         anchor_pdf_page__isnull=False,
                     )
                     | models.Q(
@@ -3330,6 +3347,16 @@ class PageEdit(AbstractDateTimeModel):
                     | models.Q(value__in=PAGE_EDIT_ROTATIONS)
                 ),
                 name="page_edit_rotation_is_a_quarter_turn",
+            ),
+            # A page cannot follow itself. A move to the gap before its
+            # own page is allowed, as it changes nothing: the plan
+            # reads it as the page in its place.
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(kind="move_page")
+                    | ~models.Q(anchor_pdf_page=models.F("pdf_page"))
+                ),
+                name="page_edit_move_leaves_its_page",
             ),
             # The unique keys are partial over the standing rows: one
             # decision per address. A row leaves that set in one way
@@ -3380,11 +3407,12 @@ class PageEdit(AbstractDateTimeModel):
         ]
 
     def __str__(self):
-        where = (
-            f"after p.{self.anchor_pdf_page}"
-            if self.kind == self.Kind.INSERT_PAGE
-            else f"p.{self.pdf_page}"
-        )
+        if self.kind == self.Kind.INSERT_PAGE:
+            where = f"after p.{self.anchor_pdf_page}"
+        elif self.kind == self.Kind.MOVE_PAGE:
+            where = f"p.{self.pdf_page} to after p.{self.anchor_pdf_page}"
+        else:
+            where = f"p.{self.pdf_page}"
         value = f" = {self.value!r}" if self.value else ""
         state = ""
         if self.withdrawn_at is not None:
