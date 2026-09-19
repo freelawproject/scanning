@@ -525,6 +525,13 @@ def project_inserts(scan: Scan, page_map: list[dict]) -> list[dict]:
     carries ``anchor_pdf_page``, the upload sends it back, and the row
     stores it once.
 
+    The walk follows :func:`slot_order`, the rule the apply's plan
+    walks (#261), so an image is drawn where the corrected volume
+    holds it: after the anchor's own slot and the pages moved onto it,
+    and for an anchor that itself moved, where that page was. The page
+    map comes in that order too (:func:`order_by_moves`), and a
+    placeholder between two pages is stamped with the gap it sits in.
+
     An insert whose placeholder is gone -- a later OCR run read the
     number the placeholder stood for -- is still shown, right after its
     anchor page. Dropping it would hide a page a curator uploaded.
@@ -543,36 +550,56 @@ def project_inserts(scan: Scan, page_map: list[dict]) -> list[dict]:
     :rtype: list[dict]
     """
     gaps = inserts_by_gap(scan)
+    moves = moves_by_page(scan)
+    entries = list(page_map)
+    index_of = {
+        entry["pdf_index"]: position
+        for position, entry in enumerate(entries)
+        if entry.get("type") == "pdf_page"
+    }
+    page_count = max((index + 1 for index in index_of), default=0)
     out: list[dict] = []
     placed: set[int] = set()
-    anchor = 0
-    queue = list(gaps.get(0, []))
+    queue: list[PageEdit] = []
+    gap = 0
+    pos = 0
 
-    def _flush(queued):
-        """Emit the images of a gap the walk is leaving.
+    def _flush() -> None:
+        """Emit the images still queued for the gap the walk is leaving."""
+        placed.update(edit.pk for edit in queue)
+        out.extend(_inserted_entry(edit, None) for edit in queue)
+        queue.clear()
 
-        :param queued: The rows still queued for that gap.
-        :returns: Their page map entries.
-        """
-        placed.update(edit.pk for edit in queued)
-        return [_inserted_entry(edit, None) for edit in queued]
-
-    for entry in page_map:
-        if entry.get("type") == "pdf_page":
-            out.extend(_flush(queue))
+    def _emit_until(stop: int) -> None:
+        """Emit the entries before ``stop``: a placeholder takes the
+        next queued image, or carries the gap it sits in."""
+        nonlocal pos
+        while pos < stop:
+            entry = entries[pos]
+            pos += 1
+            if entry.get("type") == "missing":
+                entry = dict(entry, anchor_pdf_page=gap)
+                if queue:
+                    edit = queue.pop(0)
+                    placed.add(edit.pk)
+                    out.append(_inserted_entry(edit, entry))
+                    continue
             out.append(entry)
-            anchor = entry["pdf_index"] + 1
-            queue = list(gaps.get(anchor, []))
+
+    for kind, number in slot_order(page_count, moves):
+        if kind == "gap":
+            gap = number
+            queue.extend(gaps.get(number, []))
             continue
-        if entry.get("type") == "missing":
-            entry = dict(entry, anchor_pdf_page=anchor)
-            if queue:
-                edit = queue.pop(0)
-                placed.add(edit.pk)
-                out.append(_inserted_entry(edit, entry))
-                continue
-        out.append(entry)
-    out.extend(_flush(queue))
+        at = index_of.get(number - 1)
+        if at is None or at < pos:
+            continue
+        _emit_until(at)
+        _flush()
+        out.append(entries[at])
+        pos = at + 1
+    _emit_until(len(entries))
+    _flush()
 
     out.extend(
         _inserted_entry(edit, None, unplaced=True)

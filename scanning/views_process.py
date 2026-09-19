@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -564,8 +565,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # are a transposed pair, the case of #261: the card for that
         # printed number gets a button that moves the later page to
         # before the earlier one. A backward step of more than one is
-        # a misread, so it gets no button.
-        swaps: dict[int, dict] = {}
+        # a misread, so it gets no button. The card names a printed
+        # number and nothing else, so a number two pairs share, or two
+        # cards share, gets no button either: the wrong pair would move
+        # the wrong page.
+        swaps: dict[int, list[dict]] = {}
         prev_num = prev_pdf = None
         for r in ocr_results:
             r["seq_issue"] = ""
@@ -591,18 +595,25 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 if diff < 0:
                     r["seq_issue"] = "backward"
                     if diff == -1 and prev_pdf == r["pdf_page"] - 1:
-                        swaps[num] = {
-                            "pdf_page": r["pdf_page"],
-                            "anchor_pdf_page": prev_pdf - 1,
-                        }
+                        swaps.setdefault(num, []).append(
+                            {
+                                "pdf_page": r["pdf_page"],
+                                "anchor_pdf_page": prev_pdf - 1,
+                            }
+                        )
                 elif diff > 2:
                     r["seq_issue"] = "gap"
             prev_num = num
             prev_pdf = r["pdf_page"]
         if scan.status not in LOCKED_STATUSES:
-            for i in issues:
-                if i.check_name == CheckName.BACKWARD_PAGE:
-                    i.swap = swaps.get(i.page_number)
+            backward = [
+                i for i in issues if i.check_name == CheckName.BACKWARD_PAGE
+            ]
+            cards = Counter(i.page_number for i in backward)
+            for i in backward:
+                pairs = swaps.get(i.page_number, [])
+                if len(pairs) == 1 and cards[i.page_number] == 1:
+                    i.swap = pairs[0]
         deleted_pages = sorted(page_edits.deleted_pages(scan))
 
     has_detections = Detection.objects.filter(scan=scan).exists()

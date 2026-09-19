@@ -1653,6 +1653,102 @@ class TestProjectInserts(TestCase):
         self.assertEqual(out[-1]["type"], "inserted")
         self.assertEqual(out[-1]["logical_number"], "4")
 
+    def test_an_image_past_the_last_page_is_unplaced(self):
+        from scanning import page_edits
+
+        self._insert(9, logical_page="9")
+
+        out = page_edits.project_inserts(self.scan, self.page_map)
+
+        self.assertEqual(out[-1]["type"], "inserted")
+        self.assertTrue(out[-1]["unplaced"])
+
+    def _moved_map(self):
+        """A six-page scan whose page 4 moved to after page 2 (#261),
+        and its page map in that order, with a placeholder between the
+        two pages of the pair and one before the last page."""
+        scan = ScanFactory(page_count=6, source_fingerprint="100:6")
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.MOVE_PAGE,
+            pdf_page=4,
+            anchor_pdf_page=2,
+            value="",
+            source_fingerprint="100:6",
+        )
+        page_map = [
+            {"type": "pdf_page", "pdf_index": 0, "logical_number": 1},
+            {"type": "pdf_page", "pdf_index": 1, "logical_number": 2},
+            {"type": "pdf_page", "pdf_index": 3, "logical_number": 3},
+            {"type": "missing", "logical_number": 4},
+            {"type": "pdf_page", "pdf_index": 2, "logical_number": 5},
+            {"type": "pdf_page", "pdf_index": 4, "logical_number": 6},
+            {"type": "missing", "logical_number": 7},
+            {"type": "pdf_page", "pdf_index": 5, "logical_number": 8},
+        ]
+        return scan, page_map
+
+    def test_an_image_follows_the_slot_of_its_anchor_when_pages_moved(self):
+        # The gap after page 4 is where page 4 was scanned, after page 3,
+        # the place the apply gives it (``slot_order``); the viewer must
+        # draw it there and not after the moved page.
+        from scanning import page_edits
+
+        scan, page_map = self._moved_map()
+        after_four = PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=4,
+            value="",
+            source_fingerprint="100:6",
+        )
+        after_two = PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=2,
+            value="",
+            source_fingerprint="100:6",
+        )
+
+        out = page_edits.project_inserts(scan, page_map)
+
+        shape = [
+            (e["type"], e.get("pdf_index"), e.get("insert_edit_id"))
+            for e in out
+        ]
+        self.assertEqual(
+            shape,
+            [
+                ("pdf_page", 0, None),
+                ("pdf_page", 1, None),
+                ("pdf_page", 3, None),
+                # The placeholder between the pair sits in gap 2 and
+                # takes the image anchored there.
+                ("inserted", None, after_two.pk),
+                ("pdf_page", 2, None),
+                # Where page 4 was: after page 3, before page 5.
+                ("inserted", None, after_four.pk),
+                ("pdf_page", 4, None),
+                ("missing", None, None),
+                ("pdf_page", 5, None),
+            ],
+        )
+        self.assertFalse(any(e.get("unplaced") for e in out))
+        self.assertEqual(out[7]["anchor_pdf_page"], 5)
+
+    def test_a_placeholder_between_a_moved_pair_carries_the_anchor(self):
+        from scanning import page_edits
+
+        scan, page_map = self._moved_map()
+
+        out = page_edits.project_inserts(scan, page_map)
+
+        self.assertEqual(out[3]["type"], "missing")
+        self.assertEqual(out[3]["anchor_pdf_page"], 2)
+        self.assertEqual(out[6]["anchor_pdf_page"], 5)
+
 
 class TestMigratePageInsertImagesCommand(ScanningTestCase):
     """The command that moves a migrated image off the pod's disk."""
@@ -2281,6 +2377,16 @@ class TestMovePageEndpoints(ScanningTestCase):
         sidebar = html[html.index('id="pages-list"') :]
         rows = [int(m) for m in re.findall(r'data-pdf-index="(\d+)"', sidebar)]
         self.assertEqual(rows[:6], [0, 1, 3, 2, 4, 5])
+
+    def test_a_printed_number_two_pairs_share_gets_no_button(self):
+        # A repeated printed number, the defect review 1 exists to find:
+        # both cards name 3, and the pair of either would move the
+        # other's page.
+        scan = self._scan(["1", "2", "4", "3", "5", "6", "4", "3", "8"])
+        html = self._step_one(scan).content.decode()
+
+        self.assertEqual(html.count('data-check="backward_page"'), 2)
+        self.assertNotIn("swapPages(this)", html)
 
     def test_a_locked_volume_offers_no_swap(self):
         Scan.objects.filter(pk=self.scan.pk).update(
