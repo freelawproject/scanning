@@ -182,7 +182,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - `apply.local_copy` mirrors one key under `output_dir`; never the whole-prefix pull. `geometry_pdf_path` is the one rule for which PDF the geometry reads
 - The OCR glue repairs the one-page reads too (`_repair_edit_pages`). Run `reglue_dots_mocr` before `reread_failed_pages`
 - `export_pdf` runs the apply's own walk (`build_final_pdf`) and answers an `ApplyError` with 409
-- A move (`PageEdit.Kind.MOVE_PAGE`, #261) is addressed like an insert, the page in `pdf_page` and the gap in `anchor_pdf_page`, and costs no shard: `plan_run` writes the page after its anchor's own slot and before that gap's inserts, whatever the page's own rows make of it. A map with every page in another place is not the identity, so `is_identity_map` reads the place, never the kinds alone
+- A move (`PageEdit.Kind.MOVE_PAGE`, #261) is addressed like an insert, the page in `pdf_page` and the gap in `anchor_pdf_page`, and costs no shard: `plan_run` writes the page after its anchor's own slot and before that gap's inserts, whatever the page's own rows make of it. A map with every page in another place is not the identity, so `is_identity_map` reads the place, never the kinds alone. The bitonal copy and every glue read the map's order and pay no read for a moved page, so a move needs no rule of its own (#383)
 
 ## Review 2 (#195, #196, #240, #263)
 

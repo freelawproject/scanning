@@ -590,6 +590,34 @@ class TestRelocateManualRows(TestCase):
         self.assertEqual(row.apply_run, run)
         self.assertEqual(row.source_page, 3)
 
+    def _run_with_a_moved_page(self):
+        """Return a run whose map holds page 3 before page 2 (#261).
+
+        The shape ``apply.plan_run`` writes for a move: every page is
+        still an ``original`` entry, and the place is the only change.
+
+        :returns: The run.
+        """
+        page_map = identity_map(3)
+        page_map["moved_pages"] = [3]
+        page_map["pages"][1]["source"] = {"kind": "original", "pdf_page": 3}
+        page_map["pages"][2]["source"] = {"kind": "original", "pdf_page": 2}
+        return glued_run(self.scan, number=2, page_map=page_map)
+
+    def test_a_box_on_a_moved_page_follows_the_page(self):
+        # #383: a move re-orders the pages and re-reads none of them,
+        # so a hand-drawn box must land on the page it was drawn on.
+        row = self._manual(page_index=2, source_page=3)
+        run = self._run_with_a_moved_page()
+
+        moved, unplaced = detections.relocate_manual_rows(self.scan, run)
+
+        self.assertEqual((moved, unplaced), (1, []))
+        row.refresh_from_db()
+        self.assertEqual(row.page_index, 1)
+        self.assertEqual(row.source_page, 3)
+        self.assertEqual(row.apply_run, run)
+
     def test_a_box_on_the_deleted_page_is_left_and_logged(self):
         row = self._manual(page_index=1, source_page=2)
         run = self._run_without_page_2()

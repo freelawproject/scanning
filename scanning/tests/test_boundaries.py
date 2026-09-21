@@ -660,6 +660,37 @@ class TestRelocateHumanRows(TestCase):
         )
         self.assertEqual(added.apply_run, run)
 
+    def test_a_boundary_on_a_moved_page_follows_the_page(self):
+        # #383: a move re-orders the pages of the corrected volume, so
+        # the start and the end of a human boundary follow their pages.
+        scan = ScanFactory(page_count=3)
+        added = OpinionBoundaryFactory(
+            scan=scan,
+            origin=OpinionBoundary.Origin.HUMAN,
+            kind=OpinionBoundary.Kind.ADD,
+            ordinal=None,
+            start_source_page=3,
+            start_page_index=2,
+            end_source_page=3,
+            end_page_index=2,
+        )
+        # Page 3 comes back to after page 1, the shape ``plan_run``
+        # writes: every page is still an ``original`` entry.
+        page_map = identity_map(3)
+        page_map["moved_pages"] = [3]
+        page_map["pages"][1]["source"] = {"kind": "original", "pdf_page": 3}
+        page_map["pages"][2]["source"] = {"kind": "original", "pdf_page": 2}
+        run = glued_run(scan, page_map=page_map)
+
+        moved, unplaced = boundaries.relocate_human_rows(scan, run)
+
+        self.assertEqual((moved, unplaced), (1, []))
+        added.refresh_from_db()
+        self.assertEqual(
+            (added.start_page_index, added.end_page_index), (1, 1)
+        )
+        self.assertEqual(added.apply_run, run)
+
     def test_a_row_on_a_deleted_page_is_left_and_logged(self):
         scan = ScanFactory(page_count=3)
         added = OpinionBoundaryFactory(
