@@ -1319,3 +1319,19 @@ a.doc-name:hover { text-decoration: underline; }
     color: #9ca3af;
     font-style: italic;
 }
+/* The words of one reading that the shown reading does not hold
+   (#380). A solid rule and a stronger ground than ``.ensemble-low``,
+   which marks a word the vote left open: the two say different
+   things. */
+.ensemble-diff {
+    background: rgba(217, 119, 6, 0.30);
+    border-bottom: 2px solid #b45309;
+    border-radius: 2px;
+}
+/* The line that says why the text shows one engine's reading (#380). */
+.ensemble-why {
+    margin: 0 0 6px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: #6b7280;
+}

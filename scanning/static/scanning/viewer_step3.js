@@ -20,7 +20,9 @@
  *   drawn again only when that scale changes.
  * - **The document holds no markup.** A voted group holds tokens with
  *   a ``low_confidence`` flag, and this module builds the nodes. Every
- *   string enters the DOM with ``textContent``.
+ *   string enters the DOM with ``textContent``. The words that differ
+ *   are measured here too (#380), over the text as it is shown and
+ *   never over the key of ``ensemble.compare_text``.
  * - **A box takes no pointer.** One hit test on the wrapper finds the
  *   box under the pointer, the rule of ``ocr_text.js``: a box that
  *   took the pointer would swallow the clicks of the page.
@@ -50,6 +52,13 @@
 
     // How far outside the column a page is drawn, for the lazy render.
     var RENDER_MARGIN = '600px';
+
+    // The longest reading the panel compares word by word (#380). The
+    // table of the comparison is quadratic, and a group is one
+    // paragraph, so this guard never fires on real work. It is here
+    // because a whole page in one group would otherwise hold the
+    // browser.
+    var MAX_DIFF_WORDS = 1000;
 
     var root = null;
     var pagesColumn = null;
@@ -531,6 +540,8 @@
             var tag = document.createElement('span');
             tag.className = 'ensemble-note';
             tag.textContent = line;
+            tag.title = 'What the engines did here. Press the readings'
+                + ' badge to see each one.';
             node.appendChild(document.createTextNode(' '));
             node.appendChild(tag);
         }
@@ -578,7 +589,8 @@
         button.type = 'button';
         button.className = 'ensemble-compare';
         button.textContent = (page.engines || []).length + ' readings';
-        button.title = 'Show what each engine read here';
+        button.title = 'Show what each engine read here, and why this'
+            + ' reading won';
         button.addEventListener('click', function (event) {
             event.stopPropagation();
             var standing = node.nextSibling;
@@ -607,6 +619,9 @@
      * no box at all, each say which of the two they are. The reading
      * enters the DOM with ``textContent``.
      *
+     * The panel opens with the reason the shown reading won (#380),
+     * and each line marks the words that differ from it.
+     *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
      * @returns {HTMLElement} The panel.
@@ -614,6 +629,14 @@
     function variantsPanel(page, group) {
         var panel = document.createElement('div');
         panel.className = 'ensemble-variants';
+
+        var reason = winnerReason(page, group);
+        var why = document.createElement('p');
+        why.className = 'ensemble-why';
+        why.textContent = reason;
+        panel.appendChild(why);
+
+        var marks = panelMarks(page, group);
         (page.engines || []).forEach(function (name) {
             var unit = (group.engines || {})[name];
             var line = document.createElement('div');
@@ -624,7 +647,7 @@
             who.textContent = name;
             if (name === group.source) {
                 who.classList.add('winner');
-                who.title = 'The reading the text above shows';
+                who.title = reason;
             }
             line.appendChild(who);
 
@@ -637,12 +660,286 @@
                 reading.classList.add('absent');
                 reading.textContent = 'read nothing here';
             } else {
-                reading.textContent = unit.text;
+                readingNodes(reading, unit.text, marks[name]);
             }
             line.appendChild(reading);
             panel.appendChild(line);
         });
         return panel;
+    }
+
+    /**
+     * Return the sentence that says why the text shows one reading.
+     *
+     * The green check on an engine name says which engine won and not
+     * why (#380). The reason is the agreement of the group plus the
+     * rank, and the rank is the order of the engines of the page,
+     * which is the order of ``opinion_ocr.ENGINES``. So this viewer
+     * spells no engine name of its own, and a fourth engine costs it
+     * no change.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @returns {string} The sentence.
+     */
+    function winnerReason(page, group) {
+        var source = group.source;
+        var agreeing = group.agreeing || [];
+        var reason;
+        if (group.agreement === 'single') {
+            reason = source + ' alone read words here, so the text'
+                + ' shows its reading.';
+        } else if (group.agreement === 'voted') {
+            reason = 'No reading held a majority, so the words were'
+                + ' voted one by one over ' + source + "'s reading,"
+                + ' which ranks first of the engines that read.';
+        } else if (group.agreement === 'majority') {
+            reason = agreeing.join(' and ') + ' read this the same, and'
+                + ' the text shows ' + source + "'s own reading,"
+                + ' which ranks first of them.';
+        } else {
+            reason = 'Every engine that read words here read them the'
+                + ' same, and the text shows ' + source + "'s own"
+                + ' reading, which ranks first.';
+        }
+        return reason + ' The rank is '
+            + (page.engines || []).join(', ') + '.';
+    }
+
+    // -----------------------------------------------------------------
+    // The words that differ (#380)
+    //
+    // **The comparison is the text as it is shown.** ``compare_text``
+    // is the rule of the vote, and it folds the quotes, the dashes and
+    // the markdown marks, because those are not differences of
+    // reading. This is another question: where must the eye go? A
+    // curly quote against a straight one is what the reviewer came to
+    // see. So this code holds no table and normalizes nothing, and a
+    // reader must not copy ``ensemble.compare_word`` into it.
+    //
+    // The mark says nothing about the vote. ``differs`` alone decides
+    // which group carries the badge that opens the panel.
+    // -----------------------------------------------------------------
+
+    /**
+     * Return the words of one reading, each with its own range.
+     *
+     * The range is into the reading itself, so the panel draws the
+     * spacing the engine wrote.
+     *
+     * @param {string} text - One engine's reading.
+     * @returns {Array} ``[{text, start, end}]``.
+     */
+    function words(text) {
+        var pattern = /\S+/g;
+        var found = [];
+        var match = pattern.exec(text);
+        while (match !== null) {
+            found.push({
+                text: match[0],
+                start: match.index,
+                end: match.index + match[0].length
+            });
+            match = pattern.exec(text);
+        }
+        return found;
+    }
+
+    /**
+     * Return the ranges of two readings that do not answer each other.
+     *
+     * The common start and the common end go first, which is most of
+     * two readings of one paragraph. What is left is compared word by
+     * word, and a middle longer than ``MAX_DIFF_WORDS`` is marked
+     * whole: the reviewer still sees where the two readings part.
+     *
+     * @param {string} source - The reading the text above shows.
+     * @param {string} other - One other engine's reading.
+     * @returns {Object} ``{source: [[start, end]], other: [[start, end]]}``.
+     */
+    function diffSpans(source, other) {
+        var left = words(source);
+        var right = words(other);
+        var head = 0;
+        var tail = 0;
+        while (head < left.length && head < right.length
+                && left[head].text === right[head].text) {
+            head += 1;
+        }
+        while (tail < left.length - head && tail < right.length - head
+                && left[left.length - 1 - tail].text
+                    === right[right.length - 1 - tail].text) {
+            tail += 1;
+        }
+        var a = left.slice(head, left.length - tail);
+        var b = right.slice(head, right.length - tail);
+        if (!a.length && !b.length) {
+            return { source: [], other: [] };
+        }
+        if (a.length > MAX_DIFF_WORDS || b.length > MAX_DIFF_WORDS) {
+            return { source: ranges(a, null), other: ranges(b, null) };
+        }
+        var marked = uncommon(a, b);
+        return {
+            source: ranges(a, marked.left),
+            other: ranges(b, marked.right)
+        };
+    }
+
+    /**
+     * Mark the words of two lists that the other list does not hold.
+     *
+     * The longest common subsequence of the two, and every word
+     * outside it is marked. The table is built from the end, and the
+     * walk from the start takes the same path the table was built on.
+     *
+     * @param {Array} a - The words of one reading.
+     * @param {Array} b - The words of the other.
+     * @returns {Object} ``{left: [boolean], right: [boolean]}``.
+     */
+    function uncommon(a, b) {
+        var width = b.length + 1;
+        var table = new Uint16Array((a.length + 1) * width);
+        var left = [];
+        var right = [];
+        var i;
+        var j;
+        for (i = a.length - 1; i >= 0; i -= 1) {
+            for (j = b.length - 1; j >= 0; j -= 1) {
+                table[i * width + j] = a[i].text === b[j].text
+                    ? table[(i + 1) * width + j + 1] + 1
+                    : Math.max(
+                        table[(i + 1) * width + j],
+                        table[i * width + j + 1]
+                    );
+            }
+        }
+        for (i = 0; i < a.length; i += 1) { left.push(true); }
+        for (j = 0; j < b.length; j += 1) { right.push(true); }
+        i = 0;
+        j = 0;
+        while (i < a.length && j < b.length) {
+            if (a[i].text === b[j].text) {
+                left[i] = false;
+                right[j] = false;
+                i += 1;
+                j += 1;
+            } else if (table[(i + 1) * width + j]
+                    >= table[i * width + j + 1]) {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        return { left: left, right: right };
+    }
+
+    /**
+     * Return the ranges of the marked words, joined where they touch.
+     *
+     * Two words that follow each other in the list have only
+     * whitespace between them, so one mark carries both.
+     *
+     * @param {Array} list - The words, each with its range.
+     * @param {Array} marked - One flag per word, or null for every
+     *     word.
+     * @returns {Array} ``[[start, end]]``.
+     */
+    function ranges(list, marked) {
+        var found = [];
+        var open = null;
+        var previous = -2;
+        list.forEach(function (word, position) {
+            if (marked && !marked[position]) { return; }
+            if (open && position === previous + 1) {
+                open[1] = word.end;
+            } else {
+                open = [word.start, word.end];
+                found.push(open);
+            }
+            previous = position;
+        });
+        return found;
+    }
+
+    /**
+     * Return the ranges of two or more lists, joined where they meet.
+     *
+     * @param {Array} spans - The ranges, in any order.
+     * @returns {Array} ``[[start, end]]``, in order and apart.
+     */
+    function mergeRanges(spans) {
+        var found = [];
+        spans.slice().sort(function (one, two) {
+            return one[0] - two[0];
+        }).forEach(function (span) {
+            var last = found[found.length - 1];
+            if (last && span[0] <= last[1]) {
+                last[1] = Math.max(last[1], span[1]);
+            } else {
+                found.push([span[0], span[1]]);
+            }
+        });
+        return found;
+    }
+
+    /**
+     * Return the ranges each engine's line marks.
+     *
+     * Every engine is compared with the reading the text above shows.
+     * That reading carries the marks of every comparison, so the word
+     * in question is marked on every line of the panel.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @returns {Object} ``{engine: [[start, end]]}``.
+     */
+    function panelMarks(page, group) {
+        var engines = group.engines || {};
+        var source = engines[group.source];
+        var marks = {};
+        var union = [];
+        if (!source || !source.text) { return marks; }
+        (page.engines || []).forEach(function (name) {
+            var unit = engines[name];
+            if (name === group.source || !unit || !unit.text) { return; }
+            var spans = diffSpans(source.text, unit.text);
+            marks[name] = spans.other;
+            union = union.concat(spans.source);
+        });
+        marks[group.source] = mergeRanges(union);
+        return marks;
+    }
+
+    /**
+     * Draw one reading, with a span over each marked range.
+     *
+     * Every string enters the DOM with ``textContent``, the rule of
+     * this module. A reading with no range is one text node, so a
+     * group the engines read alike loses nothing.
+     *
+     * @param {HTMLElement} parent - The node of the reading.
+     * @param {string} text - The reading.
+     * @param {Array} spans - The ranges to mark, or nothing.
+     * @returns {void}
+     */
+    function readingNodes(parent, text, spans) {
+        var at = 0;
+        (spans || []).forEach(function (span) {
+            if (span[0] > at) {
+                parent.appendChild(
+                    document.createTextNode(text.slice(at, span[0]))
+                );
+            }
+            var mark = document.createElement('span');
+            mark.className = 'ensemble-diff';
+            mark.textContent = text.slice(span[0], span[1]);
+            parent.appendChild(mark);
+            at = span[1];
+        });
+        if (at < text.length) {
+            parent.appendChild(document.createTextNode(text.slice(at)));
+        }
     }
 
     /**
