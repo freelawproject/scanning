@@ -315,6 +315,24 @@ def run_is_glued(summary: dict | None) -> bool:
     return summary["statuses"].get(JobStatus.CONSUMED) == summary["total"]
 
 
+def engine_label(name: str) -> str:
+    """Return what a person calls one OCR engine (#381).
+
+    ``JobEngine`` carries the name already, as the label of its own
+    choice ("dots.mocr", "Mistral OCR", "Surya"). The dropdown and
+    every refusal of :func:`scan_ocr_text_url` read it here, so the
+    words are not copied into a second table. ``ShardRead`` keeps its
+    own two: one of them is a message word ("OCR run started"), not
+    the engine's name.
+
+    :param name: A ``JobEngine`` value, which is a key of
+        ``opinion_ocr.ENGINES``.
+    :returns: The label of that choice.
+    :rtype: str
+    """
+    return JobEngine(name).label
+
+
 def ocr_run_summaries(scan) -> dict[str, dict | None]:
     """Return one run summary per OCR engine, in the table's order.
 
@@ -374,7 +392,7 @@ def ocr_text_engines(
         entries.append(
             {
                 "name": name,
-                "label": spec.label,
+                "label": engine_label(name),
                 "available": available,
                 "selected": False,
             }
@@ -1125,7 +1143,11 @@ def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
         key = spec.document_key(run)
         if not key:
             return JsonResponse(
-                {"error": NO_READ_FINAL_TEXT_MESSAGE.format(label=spec.label)},
+                {
+                    "error": NO_READ_FINAL_TEXT_MESSAGE.format(
+                        label=engine_label(name)
+                    )
+                },
                 status=404,
             )
         space = "final"
@@ -1133,7 +1155,11 @@ def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
         key = spec.module.glued_volume_key(scan)
         if not key:
             return JsonResponse(
-                {"error": NO_READ_TEXT_MESSAGE.format(label=spec.label)},
+                {
+                    "error": NO_READ_TEXT_MESSAGE.format(
+                        label=engine_label(name)
+                    )
+                },
                 status=404,
             )
 
@@ -1145,7 +1171,11 @@ def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
     size = s3_sync.object_size(key)
     if size is None:
         return JsonResponse(
-            {"error": OCR_TEXT_OBJECT_GONE_MESSAGE.format(label=spec.label)},
+            {
+                "error": OCR_TEXT_OBJECT_GONE_MESSAGE.format(
+                    label=engine_label(name)
+                )
+            },
             status=404,
         )
     # No ``content_disposition``: that header makes a browser save a
@@ -1158,7 +1188,7 @@ def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
             "space": space,
             "size": size,
             "engine": spec.name,
-            "label": spec.label,
+            "label": engine_label(name),
             "fields": spec.fields,
         }
     )

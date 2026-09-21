@@ -35,6 +35,7 @@ from scanning.views_process import (
     NO_S3_GLUED_OUTPUT_MESSAGE,
     OCR_TEXT_OBJECT_GONE_MESSAGE,
     UNKNOWN_OCR_ENGINE_MESSAGE,
+    engine_label,
     ocr_text_engines,
     run_is_glued,
 )
@@ -273,7 +274,7 @@ class TestOcrTextUrl(ScanningTestCase):
                 self.assertEqual(response.status_code, 200)
                 body = response.json()
                 self.assertEqual(body["engine"], name)
-                self.assertEqual(body["label"], spec.label)
+                self.assertEqual(body["label"], engine_label(name))
                 self.assertEqual(body["fields"], spec.fields)
                 presign.assert_called_once_with(
                     spec.module.glued_result_key(scan, 4),
@@ -290,7 +291,7 @@ class TestOcrTextUrl(ScanningTestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(
             response.json()["error"],
-            NO_READ_TEXT_MESSAGE.format(label="Surya OCR"),
+            NO_READ_TEXT_MESSAGE.format(label="Surya"),
         )
 
     def test_an_unknown_engine_is_refused(self):
@@ -350,7 +351,7 @@ class TestOcrTextUrl(ScanningTestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(
             response.json()["error"],
-            NO_READ_FINAL_TEXT_MESSAGE.format(label="Surya OCR"),
+            NO_READ_FINAL_TEXT_MESSAGE.format(label="Surya"),
         )
 
 
@@ -483,7 +484,7 @@ class TestOcrTextButton(ScanningTestCase):
         for name, spec in opinion_ocr.ENGINES.items():
             with self.subTest(engine=name):
                 self.assertContains(response, f'value="{name}"')
-                self.assertContains(response, spec.label)
+                self.assertContains(response, engine_label(name))
         # dots.mocr read nothing here, so it is offered and refused,
         # and the engine that did read is the one the select opens on.
         self.assertContains(
@@ -545,7 +546,7 @@ class TestTheBrowserNamesNoEngine(TestCase):
         for name, spec in opinion_ocr.ENGINES.items():
             with self.subTest(engine=name):
                 self.assertNotIn(name, code)
-                self.assertNotIn(spec.label, code)
+                self.assertNotIn(engine_label(name), code)
                 self.assertNotIn(f'"{spec.units_key}"', code)
                 self.assertNotIn(f"'{spec.units_key}'", code)
                 self.assertNotIn(f'"{spec.type_key}"', code)

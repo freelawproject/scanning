@@ -55,6 +55,14 @@
     // Each entry is ``{1-based page: page entry}``, kept for the life
     // of the page: a reviewer who compares two engines on one page
     // must not pay for the second read twice (#381).
+    //
+    // Every engine at once, and no cap. Measured on the documents of
+    // scan 2845: about 4.6 KB of index per page, near enough 9 KB of
+    // heap, so a 1300-page volume is about 11 MB per engine and the
+    // three are about 34 MB. The viewer holds rendered page canvases
+    // of a few MB each beside it, so a cap would add state and a way
+    // to be wrong for a small part of the tab. The big object is the
+    // document the read parses, and it is dropped here.
     var indexes = {};
     // The engine the select holds. The view writes the options and
     // marks the first one that read, so this is never a name the
@@ -144,12 +152,17 @@
         });
         if (!select) return;
         select.addEventListener('change', function () {
+            // The engine that is drawn, before the name moves. A read
+            // that fails puts the reviewer back on it, with its boxes:
+            // they were comparing it against the one they just picked,
+            // and a refusal must cost them neither.
+            var drawn = enabled ? engine : null;
             engine = select.value;
             if (!enabled) return;
             // The boxes on the page are the other engine's. Clear them
             // before the read, so the page never carries two reads.
             setEnabled(button, false);
-            show(button, select);
+            show(button, select, drawn);
         });
     };
 
@@ -159,12 +172,14 @@
      * @param {HTMLElement} button - The toolbar button.
      * @param {HTMLElement} [select] - The engine select, to put back
      *     on a refusal.
+     * @param {string|null} [drawn] - The engine whose boxes the page
+     *     held before this switch, to give back on a refusal.
      */
-    function show(button, select) {
+    function show(button, select, drawn) {
         if (engine && indexes[engine]) {
             setEnabled(button, true);
         } else {
-            load(button, select);
+            load(button, select, drawn);
         }
     }
 
@@ -208,7 +223,7 @@
 
     // --- The load, in two fetches ---
 
-    function load(button, select) {
+    function load(button, select, drawn) {
         var cfg = config();
         if (!cfg.ocrTextUrlApi || !engine) return;
         // The button and the select are both dead until this answers,
@@ -260,35 +275,18 @@
             })
             .catch(function (err) {
                 stopWaiting(button, label);
-                // Put the select back on the engine that is drawn, so
-                // the control never names a read the page does not
-                // hold.
-                if (select) {
-                    engine = select.value = drawnEngine(select);
+                // A switch that failed gives the page back exactly as
+                // it was: the engine that was drawn, its name in the
+                // select and its boxes on the pages. The read is in
+                // hand already, so this costs no second fetch. A
+                // failure of the button's own press leaves the overlay
+                // off, which is where the reviewer left it.
+                if (select && drawn) {
+                    engine = select.value = drawn;
+                    setEnabled(button, true);
                 }
                 failed(err, documentUrl);
             });
-    }
-
-    /**
-     * The engine whose read the page holds, for a select to fall back
-     * to: the one that is drawn, else the first that is loaded, else
-     * the first option that is not disabled.
-     *
-     * @param {HTMLElement} select - The engine select.
-     * @returns {string} An engine name.
-     */
-    function drawnEngine(select) {
-        var options = select.options;
-        for (var i = 0; i < options.length; i++) {
-            if (!options[i].disabled && indexes[options[i].value]) {
-                return options[i].value;
-            }
-        }
-        for (var j = 0; j < options.length; j++) {
-            if (!options[j].disabled) return options[j].value;
-        }
-        return select.value;
     }
 
     /**
@@ -401,6 +399,10 @@
         pages.forEach(function (page) {
             var number = page.pdf_page;
             if (!number) return;
+            // ``bbox`` is not in ``fields``: every engine's unit
+            // names its box that, and the glue reads it that way for
+            // all three (``opinion_ocr``). It is the unit shape, not
+            // an engine's own word for a thing.
             var units = page[fields.units] || [];
             var boxed = 0;
             var cells = units.filter(function (unit) {

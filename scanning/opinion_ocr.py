@@ -162,9 +162,9 @@ class ScanHeld(Exception):
 class EngineSpec:
     """How one engine's corrected-volume document is read.
 
-    :param name: The ``JobEngine`` value, and the file name.
-    :param label: What a person calls this engine. The words the start
-        buttons and the text overlay's dropdown use (#381).
+    :param name: The ``JobEngine`` value, and the file name. What a
+        person calls the engine is that choice's own label
+        (``JobEngine(name).label``) and is not copied here (#381).
     :param key_field: The ``ApplyRun`` field that names the document.
     :param units_key: The page field that holds the units.
     :param text_key: The unit field that holds the text.
@@ -182,7 +182,6 @@ class EngineSpec:
     """
 
     name: str
-    label: str
     key_field: str
     units_key: str
     text_key: str
@@ -268,10 +267,12 @@ def _extract_owed_rows(stage, scan: Scan, run) -> list:
 #: A third engine is one entry here and no other code. Every reader
 #: walks this table: the glue, the files index, the file route,
 #: ``engines_owed``, and the text overlay of the viewer (#381).
+#:
+#: What a person calls an engine is not here: ``JobEngine`` carries
+#: that already, as the label of its own choice.
 ENGINES: dict[str, EngineSpec] = {
     "dots_mocr": EngineSpec(
         name="dots_mocr",
-        label="dots.mocr",
         key_field="ocr_key",
         units_key="cells",
         text_key="text",
@@ -282,7 +283,6 @@ ENGINES: dict[str, EngineSpec] = {
     ),
     "mistral_ocr": EngineSpec(
         name="mistral_ocr",
-        label="Mistral OCR",
         key_field="extract_key",
         units_key="blocks",
         text_key=mistral_ocr.BLOCK_TEXT_KEY,
@@ -293,7 +293,6 @@ ENGINES: dict[str, EngineSpec] = {
     ),
     "surya": EngineSpec(
         name="surya",
-        label="Surya OCR",
         key_field="surya_key",
         units_key="blocks",
         # The block's flattened text, not its ``html``: the unit shape
