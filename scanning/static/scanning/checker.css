@@ -326,6 +326,25 @@ a.doc-name:hover { text-decoration: underline; }
     cursor: progress;
 }
 .zoom-toolbar .zoom-btn:disabled:hover { background: #3f4347; }
+/* The engine of the text overlay (#381). It sits beside the "Text"
+   button and carries its colours, because the pair is one control. An
+   engine that read nothing stays in the list, greyed. */
+.zoom-toolbar .zoom-select {
+    background: #3f4347;
+    color: #f3f4f6;
+    border: 1px solid #585c61;
+    border-radius: 4px;
+    padding: 3px 6px;
+    font-size: 12px;
+    line-height: 1.2;
+    cursor: pointer;
+}
+.zoom-toolbar .zoom-select:hover { background: #4b5056; }
+.zoom-toolbar .zoom-select:disabled {
+    opacity: 0.6;
+    cursor: progress;
+}
+.zoom-toolbar .zoom-select option:disabled { color: #9ca3af; }
 .zoom-toolbar .zoom-pct {
     color: #f3f4f6;
     font-size: 12px;
