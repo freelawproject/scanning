@@ -118,6 +118,7 @@ class TestApplyReaders(TestCase):
                 "inserted": 1,
                 "replaced": 0,
                 "rotated": 0,
+                "moved": 0,
                 "identity": False,
             },
         )

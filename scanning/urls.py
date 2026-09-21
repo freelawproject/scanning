@@ -67,6 +67,7 @@ from scanning.views_process import (
     dismiss_issue,
     dismiss_page_repair,
     glued_output_index,
+    move_page,
     opinion_ensemble_url,
     opinion_file_index,
     opinion_pdf_url,
@@ -99,6 +100,7 @@ from scanning.views_process import (
     start_surya_ocr,
     start_validate,
     undo_delete_page,
+    undo_move_page,
     undo_replace_page,
 )
 
@@ -315,6 +317,12 @@ urlpatterns = [
         "scans/<int:pk>/undo-delete-page/",
         undo_delete_page,
         name="undo_delete_page",
+    ),
+    path("scans/<int:pk>/move-page/", move_page, name="move_page"),
+    path(
+        "scans/<int:pk>/move-page/undo/",
+        undo_move_page,
+        name="undo_move_page",
     ),
     path("scans/<int:pk>/insert/", add_page_insert, name="add_page_insert"),
     path(

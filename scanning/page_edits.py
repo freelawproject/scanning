@@ -33,6 +33,7 @@ Two rules run through it:
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Iterator
 
 from django.db import IntegrityError, transaction
 from django.urls import reverse
@@ -329,6 +330,103 @@ def rotations_by_page(scan: Scan) -> dict[int, int]:
     }
 
 
+def moves_by_page(scan: Scan) -> dict[int, int]:
+    """Return the standing moves, keyed by the page that moves (#261).
+
+    What the apply reads to write a page at another place, so it holds
+    the current rows only: a move written against another original
+    names a page nobody chose.
+
+    :param scan: The scan to read.
+    :returns: ``{pdf_page: anchor_pdf_page}``, the original page each
+        moved page follows in the corrected volume; 0 puts it before
+        page 1. One row per page at most, which the partial unique
+        key holds.
+    :rtype: dict[int, int]
+    """
+    return {
+        edit.pdf_page: edit.anchor_pdf_page
+        for edit in current_edits(scan, PageEdit.Kind.MOVE_PAGE)
+    }
+
+
+def slot_order(
+    page_count: int, moves: dict[int, int], anchors: Iterable[int] = ()
+) -> Iterator[tuple[str, int]]:
+    """Yield the slots of a corrected volume, in order (#261).
+
+    The one rule of where a moved page goes, read by the apply's plan
+    (``apply.plan_run``) and by the feed of the sequence analysis
+    (:func:`order_by_moves`), so the card a curator answers with a
+    move and the volume the apply builds agree. Two events:
+
+    - ``("page", p)`` for every original page, in the order the
+      corrected volume holds them. A moved page leaves its own slot
+      and comes right after its anchor's slot, in page order when
+      several land on one anchor;
+    - ``("gap", a)`` after the slot of original page ``a`` and after
+      the moved pages that landed there, where the images anchored on
+      ``a`` follow. Anchor 0 comes first.
+
+    An anchor is an original address, so the gap after a page that
+    itself moved stays where that page was. An anchor past the last
+    page comes last, as an insert anchored there does.
+
+    :param page_count: Pages in the original.
+    :param moves: ``{pdf_page: anchor}``, :func:`moves_by_page`.
+    :param anchors: Further anchors that need a gap event past the
+        end: the plan passes the anchors of its inserts.
+    :returns: The events.
+    """
+    landing: dict[int, list[int]] = {}
+    for pdf_page in sorted(moves):
+        landing.setdefault(moves[pdf_page], []).append(pdf_page)
+
+    def gap(anchor: int) -> Iterator[tuple[str, int]]:
+        for pdf_page in landing.get(anchor, []):
+            yield ("page", pdf_page)
+        yield ("gap", anchor)
+
+    yield from gap(0)
+    for pdf_page in range(1, page_count + 1):
+        if pdf_page not in moves:
+            yield ("page", pdf_page)
+        yield from gap(pdf_page)
+    past = {a for a in set(landing) | set(anchors) if a > page_count}
+    for anchor in sorted(past):
+        yield from gap(anchor)
+
+
+def order_by_moves(results: list[dict], moves: dict[int, int]) -> list[dict]:
+    """Return the OCR entries in the order the corrected volume holds them.
+
+    What the sequence analysis and the sidebar read (#261): a page a
+    curator moved is judged, and shown, at its new place, so the
+    ``backward_page`` card the move answers goes away on the next
+    recompute and the viewer draws the pages as the corrected volume
+    will hold them. The entries are the same dicts, not copies, and
+    ``Scan.ocr_results`` keeps the original's order: every entry is
+    still addressed by its ``pdf_page``.
+
+    :param results: The OCR entries, one per original page.
+    :param moves: ``{pdf_page: anchor}``, :func:`moves_by_page`.
+    :returns: The entries, reordered. An entry no slot names (a page
+        past the count) keeps its place at the end.
+    :rtype: list[dict]
+    """
+    if not moves:
+        return list(results)
+    by_page = {r["pdf_page"]: r for r in results}
+    page_count = max(by_page, default=0)
+    ordered = [
+        by_page.pop(number)
+        for kind, number in slot_order(page_count, moves)
+        if kind == "page" and number in by_page
+    ]
+    ordered.extend(r for r in results if r["pdf_page"] in by_page)
+    return ordered
+
+
 def inserts_by_gap(scan: Scan) -> dict[int, list[PageEdit]]:
     """Return the images to insert, keyed by the page they follow.
 
@@ -427,6 +525,13 @@ def project_inserts(scan: Scan, page_map: list[dict]) -> list[dict]:
     carries ``anchor_pdf_page``, the upload sends it back, and the row
     stores it once.
 
+    The walk follows :func:`slot_order`, the rule the apply's plan
+    walks (#261), so an image is drawn where the corrected volume
+    holds it: after the anchor's own slot and the pages moved onto it,
+    and for an anchor that itself moved, where that page was. The page
+    map comes in that order too (:func:`order_by_moves`), and a
+    placeholder between two pages is stamped with the gap it sits in.
+
     An insert whose placeholder is gone -- a later OCR run read the
     number the placeholder stood for -- is still shown, right after its
     anchor page. Dropping it would hide a page a curator uploaded.
@@ -445,36 +550,65 @@ def project_inserts(scan: Scan, page_map: list[dict]) -> list[dict]:
     :rtype: list[dict]
     """
     gaps = inserts_by_gap(scan)
+    moves = moves_by_page(scan)
+    entries = list(page_map)
+    index_of = {
+        entry["pdf_index"]: position
+        for position, entry in enumerate(entries)
+        if entry.get("type") == "pdf_page"
+    }
+    page_count = max((index + 1 for index in index_of), default=0)
     out: list[dict] = []
     placed: set[int] = set()
-    anchor = 0
-    queue = list(gaps.get(0, []))
+    queue: list[PageEdit] = []
+    gap = 0
+    pos = 0
 
-    def _flush(queued):
-        """Emit the images of a gap the walk is leaving.
+    def _flush() -> None:
+        """Emit the images still queued for the gap the walk is leaving."""
+        placed.update(edit.pk for edit in queue)
+        out.extend(_inserted_entry(edit, None) for edit in queue)
+        queue.clear()
 
-        :param queued: The rows still queued for that gap.
-        :returns: Their page map entries.
-        """
-        placed.update(edit.pk for edit in queued)
-        return [_inserted_entry(edit, None) for edit in queued]
-
-    for entry in page_map:
-        if entry.get("type") == "pdf_page":
-            out.extend(_flush(queue))
+    def _emit_until(stop: int) -> None:
+        """Emit the entries before ``stop``: a placeholder takes the
+        next queued image, or carries the gap it sits in."""
+        nonlocal pos
+        while pos < stop:
+            entry = entries[pos]
+            pos += 1
+            if entry.get("type") == "missing":
+                entry = dict(entry, anchor_pdf_page=gap)
+                if queue:
+                    edit = queue.pop(0)
+                    placed.add(edit.pk)
+                    out.append(_inserted_entry(edit, entry))
+                    continue
             out.append(entry)
-            anchor = entry["pdf_index"] + 1
-            queue = list(gaps.get(anchor, []))
-            continue
-        if entry.get("type") == "missing":
-            entry = dict(entry, anchor_pdf_page=anchor)
-            if queue:
-                edit = queue.pop(0)
-                placed.add(edit.pk)
-                out.append(_inserted_entry(edit, entry))
+
+    for kind, number in slot_order(page_count, moves):
+        if kind == "gap":
+            # A gap the map cannot show: the anchor page is not in it.
+            # The walk stays in the gap it is in, so a placeholder
+            # keeps the anchor a curator can upload against, and the
+            # images of the absent page go last, flagged ``unplaced``.
+            # The apply's plan needs no such test: it walks every
+            # original page, and the map is the one thing that loses
+            # one.
+            if number and number - 1 not in index_of:
                 continue
-        out.append(entry)
-    out.extend(_flush(queue))
+            gap = number
+            queue.extend(gaps.get(number, []))
+            continue
+        at = index_of.get(number - 1)
+        if at is None or at < pos:
+            continue
+        _emit_until(at)
+        _flush()
+        out.append(entries[at])
+        pos = at + 1
+    _emit_until(len(entries))
+    _flush()
 
     out.extend(
         _inserted_entry(edit, None, unplaced=True)

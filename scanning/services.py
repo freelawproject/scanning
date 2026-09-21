@@ -1273,7 +1273,12 @@ def rebuild_page_map(scan: "Scan") -> None:
     # what makes the viewer show a number the moment it is typed.
     ocr_results, _stale = page_edits.overlay_page_numbers(scan, ocr_results)
     exp_start, exp_end = _expected_range(scan)
-    analysis = build_analysis(ocr_results, exp_start, exp_end)
+    # A moved page is judged at its new place (#261), so the analysis
+    # reads the corrected order; the cache keeps the original's.
+    ordered = page_edits.order_by_moves(
+        ocr_results, page_edits.moves_by_page(scan)
+    )
+    analysis = build_analysis(ordered, exp_start, exp_end)
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
@@ -1368,7 +1373,14 @@ def recalculate_issues(scan: "Scan") -> None:
                 ocr_results = new_results
                 scan.ocr_results = ocr_results
 
-    analysis = build_analysis(ocr_results, exp_start, exp_end)
+    # A moved page is judged at its new place (#261): the sequence
+    # analysis reads the corrected order, so the ``backward_page`` card
+    # a move answers is not built again. The cache keeps the original's
+    # order, since every entry is addressed by its ``pdf_page``.
+    ordered = page_edits.order_by_moves(
+        ocr_results, page_edits.moves_by_page(scan)
+    )
+    analysis = build_analysis(ordered, exp_start, exp_end)
 
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
