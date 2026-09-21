@@ -2069,6 +2069,54 @@ class TestAnInsertTheMapCannotPlace(TestCase):
 
         self.assertEqual([e["insert_edit_id"] for e in out], [edit.pk])
 
+    def test_an_insert_on_a_page_the_map_lost_is_flagged(self):
+        """The anchor page is not in the map, so the walk has no slot.
+
+        The apply's plan walks every original page and places the
+        image after the anchor. The map is the one thing that loses a
+        page, so the viewer says so instead of drawing the image at a
+        position the plan does not share.
+        """
+        from scanning import page_edits
+
+        scan = ScanFactory(page_count=3)
+        page_map = [
+            {"type": "pdf_page", "pdf_index": 0, "logical_number": 1},
+            {"type": "pdf_page", "pdf_index": 2, "logical_number": 3},
+        ]
+        edit = PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=2,
+            value="",
+        )
+
+        out = page_edits.project_inserts(scan, page_map)
+
+        self.assertEqual(out[-1]["insert_edit_id"], edit.pk)
+        self.assertTrue(out[-1]["unplaced"])
+
+    def test_a_placeholder_carries_the_last_gap_the_map_holds(self):
+        """A page the map lost moves no anchor.
+
+        The stamp is the address an upload comes back under, so it
+        names a page the volume shows. Page 2 is not in the map, and
+        the placeholder between pages 1 and 3 still says page 1.
+        """
+        from scanning import page_edits
+
+        scan = ScanFactory(page_count=3)
+        page_map = [
+            {"type": "pdf_page", "pdf_index": 0, "logical_number": 1},
+            {"type": "missing", "logical_number": 2},
+            {"type": "pdf_page", "pdf_index": 2, "logical_number": 3},
+        ]
+
+        out = page_edits.project_inserts(scan, page_map)
+
+        self.assertEqual(out[1]["anchor_pdf_page"], 1)
+
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class TestPendingEditFlags(TestCase):

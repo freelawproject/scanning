@@ -588,6 +588,15 @@ def project_inserts(scan: Scan, page_map: list[dict]) -> list[dict]:
 
     for kind, number in slot_order(page_count, moves):
         if kind == "gap":
+            # A gap the map cannot show: the anchor page is not in it.
+            # The walk stays in the gap it is in, so a placeholder
+            # keeps the anchor a curator can upload against, and the
+            # images of the absent page go last, flagged ``unplaced``.
+            # The apply's plan needs no such test: it walks every
+            # original page, and the map is the one thing that loses
+            # one.
+            if number and number - 1 not in index_of:
+                continue
             gap = number
             queue.extend(gaps.get(number, []))
             continue
