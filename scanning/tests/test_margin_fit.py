@@ -244,3 +244,158 @@ class TestBlackletterReadsIt(TestCase):
             (250.0, 100.0, 1450.0, 1900.0), detections=(column,)
         )
         self.assertAlmostEqual(bounds[3], 716.0, places=0)
+
+    def test_a_clipped_column_no_longer_pins_the_strip(self):
+        """The bug of #370, and the fix, in blackletter's own pull-back.
+
+        A column box drawn out to the page edge pins the left strip at
+        its edge, which drops it; the same page through
+        ``clipped_pages`` keeps the strip up to the text box.
+        """
+        from blackletter import margins
+
+        column = BLDetection(
+            bbox=BBox(x1=0.5, y1=130.0, x2=760.0, y2=2050.0),
+            label=Label.TEXT_COLUMN,
+            confidence=0.33,
+            page_index=0,
+        )
+        raw = page(detections=(column,))
+        raw.text_box = (240.0, 75.0, 1450.0, 2010.0)
+        # The content box the fit arrives at: text box plus the buffer.
+        bounds = (81.4, 22.0, 527.0, 728.6)
+
+        def strips(subject):
+            rects = margins._rects_for_bounds(
+                bounds, *POINTS, margins.DEFAULT_BUFFER
+            )
+            margins._shrink_rects_for_detections(subject, rects)
+            return [
+                r
+                for r in rects
+                if r["x1"] - r["x0"] > 1 and r["y1"] - r["y0"] > 1
+            ]
+
+        self.assertFalse(
+            [r for r in strips(raw) if r["x0"] == 0 and r["x1"] < 600]
+        )
+        (clipped,) = margin_fit.clipped_pages([raw])
+        left = [r for r in strips(clipped) if r["x0"] == 0 and r["x1"] < 600]
+        self.assertEqual(len(left), 1)
+        self.assertAlmostEqual(left[0]["x1"], 76.4, places=1)
+
+
+class TestClippedPages(TestCase):
+    """The column and image boxes the margin measure reads (#370)."""
+
+    #: The text of the fixture page, in render pixels.
+    TEXT_BOX = (240.0, 75.0, 1450.0, 2010.0)
+
+    @staticmethod
+    def _detection(label, *box, confidence=0.5):
+        return BLDetection(
+            bbox=BBox(x1=box[0], y1=box[1], x2=box[2], y2=box[3]),
+            label=label,
+            confidence=confidence,
+            page_index=0,
+        )
+
+    def _page(self, *detections, text_box=TEXT_BOX):
+        subject = page(detections=detections)
+        subject.text_box = text_box
+        return subject
+
+    def test_a_column_over_the_blot_is_held_at_the_text_box(self):
+        """The x-bounds move in to the text box plus the strips' buffer."""
+        from blackletter.margins import DEFAULT_BUFFER
+
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
+        (clipped,) = margin_fit.clipped_pages([self._page(column)])
+        box = clipped.detections[0].bbox
+        pad = DEFAULT_BUFFER / clipped.scale_x
+        self.assertAlmostEqual(box.x1, 240.0 - pad, places=3)
+        self.assertEqual(box.x2, 760.0)
+
+    def test_a_column_keeps_its_own_y_bounds(self):
+        """The y-bounds hold the fit off a last line the reader missed."""
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 60.0, 760.0, 2150.0)
+        (clipped,) = margin_fit.clipped_pages([self._page(column)])
+        box = clipped.detections[0].bbox
+        self.assertEqual((box.y1, box.y2), (60.0, 2150.0))
+
+    def test_an_image_is_held_on_both_axes(self):
+        from blackletter.margins import DEFAULT_BUFFER
+
+        image = self._detection(Label.IMAGE, 17.0, 40.0, 1700.0, 2100.0)
+        (clipped,) = margin_fit.clipped_pages([self._page(image)])
+        box = clipped.detections[0].bbox
+        pad_x = DEFAULT_BUFFER / clipped.scale_x
+        pad_y = DEFAULT_BUFFER / clipped.scale_y
+        self.assertAlmostEqual(box.x1, 240.0 - pad_x, places=3)
+        self.assertAlmostEqual(box.x2, 1450.0 + pad_x, places=3)
+        self.assertAlmostEqual(box.y1, 75.0 - pad_y, places=3)
+        self.assertAlmostEqual(box.y2, 2010.0 + pad_y, places=3)
+
+    def test_other_labels_are_untouched(self):
+        """A key icon at the edge keeps its pull-back."""
+        icon = self._detection(Label.KEY_ICON, 10.0, 2100.0, 60.0, 2150.0)
+        (clipped,) = margin_fit.clipped_pages([self._page(icon)])
+        self.assertIs(clipped.detections[0], icon)
+
+    def test_a_page_with_no_text_box_is_the_same_object(self):
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
+        subject = self._page(column, text_box=None)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+
+    def test_a_page_with_nothing_to_clip_is_the_same_object(self):
+        column = self._detection(
+            Label.TEXT_COLUMN, 250.0, 130.0, 760.0, 2000.0
+        )
+        subject = self._page(column)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+
+    def test_the_input_is_never_mutated(self):
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
+        subject = self._page(column)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIsNot(clipped, subject)
+        self.assertIsNot(clipped.detections, subject.detections)
+        self.assertEqual(subject.detections[0].bbox.x1, 0.5)
+        self.assertIs(subject.detections[0], column)
+
+    def test_the_copy_keeps_the_page(self):
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
+        subject = self._page(column)
+        subject.index = 7
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertEqual(clipped.index, 7)
+        self.assertEqual(clipped.text_box, self.TEXT_BOX)
+        self.assertEqual(clipped.scale_x, subject.scale_x)
+        self.assertEqual(clipped.midpoint, subject.midpoint)
+
+    def test_a_box_wholly_outside_is_kept(self):
+        """Dropping it would let a strip cover what it described."""
+        image = self._detection(Label.IMAGE, 1500.0, 100.0, 1690.0, 400.0)
+        subject = self._page(image)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+
+    def test_a_box_below_the_keep_ratio_is_kept(self):
+        """A picture the reader gave no cell keeps pinning the strip."""
+        # Two thirds of this image lies right of the text box.
+        image = self._detection(Label.IMAGE, 1300.0, 100.0, 1690.0, 400.0)
+        subject = self._page(image)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+
+    def test_a_narrow_text_box_clips_nothing(self):
+        """The one-column read of a two-column page."""
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
+        subject = self._page(column, text_box=(860.0, 75.0, 1450.0, 2010.0))
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+
+    def test_no_pages(self):
+        self.assertEqual(margin_fit.clipped_pages([]), [])

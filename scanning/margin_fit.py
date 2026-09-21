@@ -35,15 +35,68 @@ it. That is the same split as ``ocr_applied``.
 The cells are the measurement ``text_fit`` reads (#279) and
 ``columns`` reads (#308), and ``text_fit.load_document`` stays the one
 rule for which OCR document they come from (#328).
+
+**The boxes the margin measure reads are held inside that text box
+too** (#370). The fit above arrives at the right content box on a
+blotted page, and two model boxes then undo it: blackletter pulls every
+strip back off any detection it would cover
+(``margins._shrink_rects_for_detections``), and lets a ``TEXT_COLUMN``
+hold the fit (``HOLD_LABELS``). On scan 1841 of this app (147 pages)
+the model drew an ``IMAGE`` box over the whole text body of 93 pages,
+and on some pages the ``TEXT_COLUMN`` box itself, out onto the blot and
+up to the page edge; the strip on that side was then pinned at the
+box's edge or dropped: 16 pages with no left strip, 14 with no right,
+55 of 73 edge blots uncovered.
+
+**The rule**, in :func:`clipped_pages`:
+
+    A ``TEXT_COLUMN`` box (its x-bounds) and an ``IMAGE`` box (both
+    axes) are read inside the page's text box, padded by the buffer the
+    strips leave, on a copy of the page. A real picture is a cell, so it
+    is inside the box; a text column is inside it by definition; the
+    part of either box outside it is over dirt.
+
+The column's y-bounds stay the model's own: they are what holds the fit
+off a last line the reader missed. Two guards, the refusals visible from
+this side of blackletter: a page whose text box is narrower than
+``MIN_TEXT_WIDTH_FRACTION`` of the render (the one-column read of a
+two-column page, where blackletter refuses the fit and the clip would be
+the only effect) is left alone, and a box the clip would cut below
+``CLIP_MIN_KEEP_RATIO`` of itself (a partial read, a plate with no cell)
+is kept as it is, never dropped: a dropped box lets a strip cover what
+it described. Under that rule scan 1841 lost no side strip, covered every
+blot, and put no strip over a cell. The copies are for the margin
+measure alone: the headnote rects and the outside-opinion masks read
+the document's own column boxes, and must not change. When blackletter
+takes the rule, :func:`clipped_pages` is a deletion.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
+
+from blackletter.margins import DEFAULT_BUFFER, MIN_TEXT_WIDTH_FRACTION
+from blackletter.models import BBox, Label
 
 from scanning.text_fit import PageCells
 
 logger = logging.getLogger(__name__)
+
+#: The labels whose boxes are read inside the text box (#370): the two
+#: the model draws out onto a blot along the page edge.
+CLIPPED_LABELS = frozenset({Label.TEXT_COLUMN, Label.IMAGE})
+
+#: Of those, the labels clipped on the x axis alone. A column's y-bounds
+#: are the one thing holding the fit off a last line the reader missed.
+X_ONLY_LABELS = frozenset({Label.TEXT_COLUMN})
+
+#: The least of itself a box may keep for the clip to stand. A blot
+#: overrun is a sliver (the most any box of scan 1841 lost was a third);
+#: a box that would lose more disagrees with the reader grossly, which
+#: is a partial read or a picture the reader gave no cell, and it keeps
+#: pinning the strip as it does today.
+CLIP_MIN_KEEP_RATIO = 0.5
 
 
 def _held(value: float, limit: float) -> float:
@@ -157,3 +210,100 @@ def fit_pages(document, cells: dict[int, PageCells]) -> int:
             pages - fitted,
         )
     return fitted
+
+
+def _clipped_box(bbox: BBox, frame: BBox, x_only: bool) -> BBox | None:
+    """Return ``bbox`` held inside ``frame``, or None when the clip is refused.
+
+    :param bbox: The detection's box, in the page's pixels.
+    :param frame: The padded text box, in the same pixels.
+    :param x_only: Whether to leave the y-bounds as they are.
+    :returns: The clipped box, or None when it would be empty or keep
+        less than :data:`CLIP_MIN_KEEP_RATIO` of the box's area.
+    :rtype: BBox | None
+    """
+    x1 = max(bbox.x1, frame.x1)
+    x2 = min(bbox.x2, frame.x2)
+    y1, y2 = (
+        (bbox.y1, bbox.y2)
+        if x_only
+        else (max(bbox.y1, frame.y1), min(bbox.y2, frame.y2))
+    )
+    if x2 <= x1 or y2 <= y1:
+        return None
+    area = (bbox.x2 - bbox.x1) * (bbox.y2 - bbox.y1)
+    if area <= 0:
+        return None
+    if (x2 - x1) * (y2 - y1) / area < CLIP_MIN_KEEP_RATIO:
+        return None
+    return BBox(x1=x1, y1=y1, x2=x2, y2=y2)
+
+
+def clipped_pages(pages) -> list:
+    """Return the pages with their column and image boxes held inside the text box.
+
+    A page is returned as the same object when nothing is clipped: it
+    has no text box, its text box is narrower than
+    ``MIN_TEXT_WIDTH_FRACTION`` of the render, or no box of
+    :data:`CLIPPED_LABELS` reaches past the frame. Otherwise a copy is
+    returned whose changed detections are copies too; the page given and
+    its detections are never mutated.
+
+    The frame is the text box padded by ``margins.DEFAULT_BUFFER`` on
+    every side, the buffer ``compute_margin_rects`` defaults to and the
+    one ``services._measure_margin_rects`` lets it default to. The two
+    move together: a strip stands that buffer off the content box, so a
+    box held at the same distance pins nothing the fit did not already
+    leave.
+
+    :param pages: The blackletter pages of the document.
+    :returns: The pages, in order, for the margin measure.
+    :rtype: list
+    """
+    out = []
+    read = clipped = kept = gated = 0
+    for page in pages:
+        box = page.text_box
+        if box is None:
+            out.append(page)
+            continue
+        read += 1
+        tx1, ty1, tx2, ty2 = (float(v) for v in box)
+        if tx2 - tx1 < MIN_TEXT_WIDTH_FRACTION * float(page.img_width):
+            gated += 1
+            out.append(page)
+            continue
+        pad_x = DEFAULT_BUFFER / page.scale_x
+        pad_y = DEFAULT_BUFFER / page.scale_y
+        frame = BBox(
+            x1=tx1 - pad_x, y1=ty1 - pad_y, x2=tx2 + pad_x, y2=ty2 + pad_y
+        )
+        detections = []
+        changed = False
+        for det in page.detections:
+            if det.label not in CLIPPED_LABELS:
+                detections.append(det)
+                continue
+            held = _clipped_box(det.bbox, frame, det.label in X_ONLY_LABELS)
+            if held is None:
+                kept += 1
+                detections.append(det)
+                continue
+            if held == det.bbox:
+                detections.append(det)
+                continue
+            clipped += 1
+            changed = True
+            detections.append(replace(det, bbox=held))
+        out.append(replace(page, detections=detections) if changed else page)
+    if read:
+        logger.info(
+            "Margin boxes: %d page(s) with a text box, %d column/image box(es) "
+            "held inside it, %d kept whole below the keep ratio, %d page(s) "
+            "skipped for a narrow text box",
+            read,
+            clipped,
+            kept,
+            gated,
+        )
+    return out

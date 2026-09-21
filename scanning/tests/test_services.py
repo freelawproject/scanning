@@ -683,6 +683,35 @@ class TestMeasureMarginRects(TestCase):
             self.assertEqual(margins[0]["page_index"], 0)
             self.assertEqual(Redaction.objects.filter(scan=scan).count(), 0)
 
+    def test_measures_against_clipped_copies(self):
+        """The document's own column box is not what blackletter reads (#370)."""
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            self._with_column(scan)
+            document = self._document(scan)
+            from dataclasses import replace
+
+            page = document.pages[0]
+            column = page.detections[0]
+            page.detections[0] = replace(
+                column, bbox=replace(column.bbox, x1=0.5)
+            )
+            page.text_box = (240.0, 200.0, 1450.0, 2000.0)
+
+            with patch.object(
+                services, "compute_margin_rects", return_value=[]
+            ) as measure:
+                services._measure_margin_rects(str(PDF_PATH), document)
+
+            (read,) = measure.call_args.kwargs["pages"]
+            self.assertGreater(read.detections[0].bbox.x1, 200.0)
+            self.assertEqual(document.pages[0].detections[0].bbox.x1, 0.5)
+
     def test_does_not_measure_anything_without_detections(self):
         """Without detections the bounds would come from the page's marks
         alone, so bleed-through at a page edge suppresses that page's top
