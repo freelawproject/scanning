@@ -1455,6 +1455,17 @@ document.addEventListener('DOMContentLoaded', function () {
         );
     }
 
+    // The container of an original page. The ``page-*`` ids are not one
+    // address space: a PDF page takes its own number, a placeholder and
+    // an inserted page take the printed one, so ``getElementById`` can
+    // answer with the placeholder of another page and the move lands
+    // beside it. Only a PDF page carries ``data-pdf-index``.
+    function pageContainer(pdfPage) {
+        return container.querySelector(
+            '.page-container[data-pdf-index="' + (pdfPage - 1) + '"]'
+        );
+    }
+
     function markSidebarMoved(pdfPage, on) {
         var row = sidebarRow(pdfPage);
         if (!row) { return; }
@@ -1494,11 +1505,11 @@ document.addEventListener('DOMContentLoaded', function () {
             }
             if (!SCAN_CONFIG.movedPages) { SCAN_CONFIG.movedPages = {}; }
             SCAN_CONFIG.movedPages[String(pdfPage)] = anchor;
-            var pageDiv = document.getElementById('page-' + pdfPage);
+            var pageDiv = pageContainer(pdfPage);
             if (pageDiv) {
                 placeAfterAnchor(
                     pageDiv,
-                    anchor === 0 ? null : document.getElementById('page-' + anchor),
+                    anchor === 0 ? null : pageContainer(anchor),
                     container
                 );
                 markPageAsMoved(pageDiv, pdfPage, anchor);
