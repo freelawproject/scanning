@@ -682,6 +682,11 @@ class TestMeasureMarginRects(TestCase):
             self.assertTrue(margins)
             self.assertEqual(margins[0]["page_index"], 0)
             self.assertEqual(Redaction.objects.filter(scan=scan).count(), 0)
+            # Every page has its four strips (#370).
+            from scanning import margin_fit
+
+            for entry in margins:
+                self.assertTrue(all(margin_fit._sides(entry).values()), entry)
 
     def test_measures_against_clipped_copies(self):
         """The document's own column box is not what blackletter reads (#370)."""
@@ -711,6 +716,27 @@ class TestMeasureMarginRects(TestCase):
             (read,) = measure.call_args.kwargs["pages"]
             self.assertGreater(read.detections[0].bbox.x1, 200.0)
             self.assertEqual(document.pages[0].detections[0].bbox.x1, 0.5)
+
+    def test_every_page_gets_four_strips(self):
+        """A page the measure left alone gets the curator's handles (#370)."""
+        from types import SimpleNamespace
+
+        from scanning import services
+
+        entry = {
+            "page_index": 0,
+            "rects": [],
+            "page_width": 612.0,
+            "page_height": 792.0,
+        }
+        with patch.object(
+            services, "compute_margin_rects", return_value=[entry]
+        ):
+            (measured,) = services._measure_margin_rects(
+                str(PDF_PATH),
+                SimpleNamespace(pages=[SimpleNamespace(text_box=None)]),
+            )
+        self.assertEqual(len(measured["rects"]), 4)
 
     def test_does_not_measure_anything_without_detections(self):
         """Without detections the bounds would come from the page's marks

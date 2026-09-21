@@ -69,6 +69,12 @@ blot, and put no strip over a cell. The copies are for the margin
 measure alone: the headnote rects and the outside-opinion masks read
 the document's own column boxes, and must not change. When blackletter
 takes the rule, :func:`clipped_pages` is a deletion.
+
+**Every page gets its four strips** (:func:`ensure_strips`, #370). A
+curator widens a strip by dragging it and draws one from nothing with
+more work, so a strip the measure did not give a page is a
+``MIN_STRIP_PT`` handle at its page edge. It is the same strip at every
+compute, so a dismissal of it lands on the next.
 """
 
 from __future__ import annotations
@@ -97,6 +103,11 @@ X_ONLY_LABELS = frozenset({Label.TEXT_COLUMN})
 #: is a partial read or a picture the reader gave no cell, and it keeps
 #: pinning the strip as it does today.
 CLIP_MIN_KEEP_RATIO = 0.5
+
+#: The width, in PDF points, of a strip :func:`ensure_strips` adds where
+#: the measure gave none. About 2 mm: invisible on a trimmed reporter
+#: page, and one resize handle wide in the step-2 viewer.
+MIN_STRIP_PT = 6.0
 
 
 def _held(value: float, limit: float) -> float:
@@ -307,3 +318,100 @@ def clipped_pages(pages) -> list:
             gated,
         )
     return out
+
+
+def _sides(entry: dict) -> dict:
+    """Name the strips of one page as ``margins._rects_for_bounds`` lays them out.
+
+    A full-width strip at the top edge is the top, one at the bottom
+    edge the bottom; a strip at the left edge is the left, one at the
+    right edge the right.
+
+    :param entry: One ``compute_margin_rects`` entry.
+    :returns: ``{"top", "bottom", "left", "right"}``, each a rect or None.
+    :rtype: dict
+    """
+    pw = float(entry["page_width"])
+    ph = float(entry["page_height"])
+    sides = {"top": None, "bottom": None, "left": None, "right": None}
+    for rect in entry.get("rects") or []:
+        full_width = rect["x0"] <= 1 and rect["x1"] >= pw - 1
+        if full_width and rect["y0"] <= 1:
+            sides["top"] = rect
+        elif full_width and rect["y1"] >= ph - 1:
+            sides["bottom"] = rect
+        elif rect["x0"] <= 1:
+            sides["left"] = rect
+        elif rect["x1"] >= pw - 1:
+            sides["right"] = rect
+    return sides
+
+
+def ensure_strips(entries: list, min_pt: float = MIN_STRIP_PT) -> int:
+    """Give every page the four strips, adding a thin one where the measure gave none.
+
+    The top and bottom are added first, full width and ``min_pt`` tall;
+    a side is added ``min_pt`` wide, spanning the rows between the top
+    and bottom strips, as blackletter lays the sides out. Coordinates
+    are rounded to a tenth of a point, as blackletter's are. A page too
+    small to hold two strips is left alone.
+
+    :param entries: The ``compute_margin_rects`` entries, mutated in place.
+    :param min_pt: The width of an added strip, in PDF points.
+    :returns: How many strips were added.
+    :rtype: int
+    """
+    added = 0
+    for entry in entries:
+        pw = float(entry.get("page_width") or 0)
+        ph = float(entry.get("page_height") or 0)
+        if pw <= 2 * min_pt or ph <= 2 * min_pt:
+            continue
+        rects = entry.setdefault("rects", [])
+        sides = _sides(entry)
+        if sides["top"] is None:
+            sides["top"] = {
+                "x0": 0,
+                "y0": 0,
+                "x1": round(pw, 1),
+                "y1": round(min_pt, 1),
+            }
+            rects.append(sides["top"])
+            added += 1
+        if sides["bottom"] is None:
+            sides["bottom"] = {
+                "x0": 0,
+                "y0": round(ph - min_pt, 1),
+                "x1": round(pw, 1),
+                "y1": round(ph, 1),
+            }
+            rects.append(sides["bottom"])
+            added += 1
+        y0 = sides["top"]["y1"]
+        y1 = sides["bottom"]["y0"]
+        if sides["left"] is None:
+            rects.append(
+                {
+                    "x0": 0,
+                    "y0": round(y0, 1),
+                    "x1": round(min_pt, 1),
+                    "y1": round(y1, 1),
+                }
+            )
+            added += 1
+        if sides["right"] is None:
+            rects.append(
+                {
+                    "x0": round(pw - min_pt, 1),
+                    "y0": round(y0, 1),
+                    "x1": round(pw, 1),
+                    "y1": round(y1, 1),
+                }
+            )
+            added += 1
+    if added:
+        logger.info(
+            "Margin strips: %d thin strip(s) added where the measure gave none",
+            added,
+        )
+    return added

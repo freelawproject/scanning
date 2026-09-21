@@ -399,3 +399,77 @@ class TestClippedPages(TestCase):
 
     def test_no_pages(self):
         self.assertEqual(margin_fit.clipped_pages([]), [])
+
+
+class TestEnsureStrips(TestCase):
+    """Every page gets its four strips (#370)."""
+
+    PW, PH = POINTS
+
+    def _entry(self, *rects):
+        return {
+            "page_index": 0,
+            "rects": [dict(r) for r in rects],
+            "page_width": self.PW,
+            "page_height": self.PH,
+        }
+
+    TOP = {"x0": 0, "y0": 0, "x1": 612.0, "y1": 22.4}
+    BOTTOM = {"x0": 0, "y0": 736.8, "x1": 612.0, "y1": 792.0}
+    LEFT = {"x0": 0, "y0": 22.4, "x1": 64.7, "y1": 736.8}
+    RIGHT = {"x0": 564.8, "y0": 22.4, "x1": 612.0, "y1": 736.8}
+
+    def test_four_present_adds_nothing(self):
+        entry = self._entry(self.TOP, self.BOTTOM, self.LEFT, self.RIGHT)
+        before = [dict(r) for r in entry["rects"]]
+        self.assertEqual(margin_fit.ensure_strips([entry]), 0)
+        self.assertEqual(entry["rects"], before)
+
+    def test_a_missing_side_gets_a_handle_between_the_rows(self):
+        entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry]), 1)
+        self.assertIn(
+            {"x0": 0, "y0": 22.4, "x1": margin_fit.MIN_STRIP_PT, "y1": 736.8},
+            entry["rects"],
+        )
+
+    def test_missing_rows_get_full_width_handles(self):
+        entry = self._entry(self.LEFT, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry]), 2)
+        self.assertIn(
+            {"x0": 0, "y0": 0, "x1": 612.0, "y1": 6.0}, entry["rects"]
+        )
+        self.assertIn(
+            {"x0": 0, "y0": 786.0, "x1": 612.0, "y1": 792.0}, entry["rects"]
+        )
+
+    def test_a_page_with_no_strips_gets_four(self):
+        """A plate page the measure left alone."""
+        entry = self._entry()
+        self.assertEqual(margin_fit.ensure_strips([entry]), 4)
+        self.assertEqual(
+            entry["rects"],
+            [
+                {"x0": 0, "y0": 0, "x1": 612.0, "y1": 6.0},
+                {"x0": 0, "y0": 786.0, "x1": 612.0, "y1": 792.0},
+                {"x0": 0, "y0": 6.0, "x1": 6.0, "y1": 786.0},
+                {"x0": 606.0, "y0": 6.0, "x1": 612.0, "y1": 786.0},
+            ],
+        )
+
+    def test_a_tiny_page_is_left_alone(self):
+        entry = {
+            "page_index": 0,
+            "rects": [],
+            "page_width": 10.0,
+            "page_height": 10.0,
+        }
+        self.assertEqual(margin_fit.ensure_strips([entry]), 0)
+        self.assertEqual(entry["rects"], [])
+
+    def test_the_width_is_the_callers(self):
+        entry = self._entry(self.TOP, self.BOTTOM, self.LEFT)
+        margin_fit.ensure_strips([entry], min_pt=4.0)
+        self.assertIn(
+            {"x0": 608.0, "y0": 22.4, "x1": 612.0, "y1": 736.8}, entry["rects"]
+        )

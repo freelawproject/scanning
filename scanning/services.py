@@ -921,7 +921,10 @@ def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
     page's text box: the model draws both out onto a blot along the
     page edge, and the pull-back then pins the strip at the box's edge
     or drops it. The document's own boxes stay as they are, because the
-    headnote rects and the outside-opinion masks read them.
+    headnote rects and the outside-opinion masks read them. Every page
+    then gets its four strips (``margin_fit.ensure_strips``): a strip
+    the measure gave no page is a thin handle at the edge for the
+    curator to widen.
 
     :param pdf_path: Path to the PDF to compute margins for.
     :param document: The snapped document the rects were measured from.
@@ -938,6 +941,7 @@ def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
         entries = compute_margin_rects(
             str(pdf_path), pages=margin_fit.clipped_pages(document.pages)
         )
+        margin_fit.ensure_strips(entries)
         return entries
 
 
