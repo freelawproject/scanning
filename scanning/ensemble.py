@@ -878,7 +878,7 @@ def place(groups: list[dict], width: float, height: float) -> list[dict]:
 
 def _candidates(
     base: list[tuple[str, str]], other: list[tuple[str, str]]
-) -> tuple[dict[int, list[tuple[str, str]]], dict[int, list[list]]]:
+) -> tuple[dict[int, list[tuple[str, str] | None]], dict[int, list[list]]]:
     """Return one engine's reading of each word of the base read.
 
     Both sides are ``(key, the word as it is shown)`` pairs, and the
@@ -890,12 +890,21 @@ def _candidates(
     first position, which keeps a two-against-one word split from
     dropping words in silence.
 
+    **The rest of such a span abstains** (#391). ``None`` is "this
+    engine's reading of this word is recorded at another position",
+    and ``("", "")`` is "this engine read nothing here". The two must
+    never be one value. Two engines that join what the base split
+    leave two positions behind, and an empty reading in both of them
+    is a majority that deletes the base's word: ``¶ 235-236.`` against
+    ``¶¶235–236.`` lost the number and nothing said so.
+
     :param base: The base engine's pairs.
     :param other: The other engine's pairs.
-    :returns: ``({position: readings}, {position: inserted runs})``.
+    :returns: ``({position: readings}, {position: inserted runs})``,
+        where a reading is a pair, or ``None`` for an abstention.
     :rtype: tuple[dict, dict]
     """
-    at: dict[int, list[tuple[str, str]]] = {}
+    at: dict[int, list[tuple[str, str] | None]] = {}
     inserted: dict[int, list[list]] = {}
     base_keys = [key for key, _ in base]
     other_keys = [key for key, _ in other]
@@ -916,8 +925,13 @@ def _candidates(
                 )
                 at.setdefault(i1, []).append(joined)
                 for index in range(i1 + 1, i2):
-                    at.setdefault(index, []).append(("", ""))
+                    # The span is recorded above. This engine has no
+                    # word of its own to put here, and it did not drop
+                    # one either, so it does not vote (#391).
+                    at.setdefault(index, []).append(None)
         elif tag == "delete":
+            # An engine that truly read nothing here. It votes, and a
+            # majority of such votes drops the word.
             for index in range(i1, i2):
                 at.setdefault(index, []).append(("", ""))
         elif tag == "insert":
@@ -1003,7 +1017,10 @@ def vote_words(
         if position == len(base):
             break
         readings = [base[position]] + [
-            reading for vote in votes for reading in vote.get(position, [])
+            reading
+            for vote in votes
+            for reading in vote.get(position, [])
+            if reading is not None
         ]
         winner, count = Counter(key for key, _ in readings).most_common(1)[0]
         if count >= quorum:
@@ -1015,10 +1032,11 @@ def vote_words(
                         word for key, word in readings if key == winner
                     )
                 }
-                if count < len(readings):
-                    # Every engine has one reading of every position of
-                    # the base, a deletion included, so a count short of
-                    # the whole is a word an engine read otherwise.
+                if count < total:
+                    # Short of every engine of the group, and not short
+                    # of the readings: an engine that abstains here
+                    # (#391) confirmed nothing, so its silence must not
+                    # read as one more voice for the winner.
                     token["majority"] = True
                 tokens.append(token)
         else:

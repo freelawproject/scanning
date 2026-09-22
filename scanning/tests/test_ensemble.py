@@ -643,6 +643,54 @@ class TestTheVote(TestCase):
         )
         self.assertEqual(disputed, 1)
 
+    def test_a_join_of_two_words_never_deletes_the_second(self):
+        """#391: two engines read the pilcrow and the number as one
+        word, and the base read them as two. The span is recorded at
+        the first position, so the second holds no reading of theirs.
+        That is not a vote to drop the word, and it deleted a citation
+        number of a real opinion."""
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("La.), \u00b6 235-236. No one"),
+            [
+                ensemble._pairs("La.), \u00b6\u00b6235\u2013236. No one"),
+                ensemble._pairs("La.), \u00b61235-236. No one"),
+            ],
+        )
+
+        self.assertEqual(
+            " ".join(token["text"] for token in tokens),
+            "La.), \u00b6 235-236. No one",
+        )
+        marked = [t["text"] for t in tokens if t.get("low_confidence")]
+        self.assertEqual(marked, ["\u00b6", "235-236."])
+        self.assertEqual(disputed, 2)
+
+    def test_an_engine_that_abstains_confirms_nothing(self):
+        """A word the other engines did not answer for is not a word
+        every engine read, so it carries the majority flag (#380)."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("alpha beta gamma delta"),
+            [
+                ensemble._pairs("alpha betagamma delta"),
+                ensemble._pairs("alpha beta gamma delta"),
+            ],
+        )
+
+        by_word = {token["text"]: token for token in tokens}
+        self.assertEqual(by_word["gamma"].get("majority"), True)
+
+    def test_an_engine_that_read_nothing_still_votes_to_drop(self):
+        """A deletion is a reading, and a majority of them drops the
+        word. #391 changed the join alone."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("alpha beta gamma"),
+            [ensemble._pairs("alpha gamma"), ensemble._pairs("alpha gamma")],
+        )
+
+        self.assertEqual(
+            [token["text"] for token in tokens], ["alpha", "gamma"]
+        )
+
     def test_a_word_only_a_minority_read_is_dropped(self):
         tokens, disputed = ensemble.vote_words(
             ensemble._pairs("alpha gamma"),
