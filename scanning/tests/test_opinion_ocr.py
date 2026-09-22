@@ -122,6 +122,34 @@ def dots_document(pages=PAGES, width=IMG_W, height=IMG_H, failed=()) -> dict:
     }
 
 
+#: The approved page number of every page of the fixture: the value
+#: the ``HEADER`` cell carries. A fixture, not a sequence.
+PRINTED = "878"
+
+
+def printed_document(pages=PAGES, value=PRINTED) -> dict:
+    """A corrected volume's printed-page map over ``pages`` pages.
+
+    The document ``apply.printed_pages`` writes, with ``value`` on
+    every page. ``None`` gives a map whose pages carry no number.
+    """
+    return {
+        "schema_version": 1,
+        "apply_run": "a1",
+        "final_page_count": pages,
+        "pages": [
+            {
+                "final_page": index + 1,
+                "printed": value,
+                "type": "single" if value else None,
+                "by": "model" if value else None,
+                "source": {"kind": "original", "pdf_page": index + 1},
+            }
+            for index in range(pages)
+        ],
+    }
+
+
 def mistral_document(pages=PAGES) -> dict:
     """A corrected volume's Mistral document over ``pages`` pages."""
     return {
@@ -290,6 +318,10 @@ class OpinionOcrTestCase(TestCase):
         prefix = f"processing/{scan.pk}/a/{scan.volume}/1/"
         run.ocr_key = f"{prefix}jobs/apply/a{number}/ocr-volume.json"
         self.objects[run.ocr_key] = dots_document()
+        run.printed_pages_key = (
+            f"{prefix}jobs/apply/a{number}/printed_pages.json"
+        )
+        self.objects[run.printed_pages_key] = printed_document()
         if mistral:
             run.extract_key = (
                 f"{prefix}jobs/apply/a{number}/extract-volume.json"
@@ -302,7 +334,14 @@ class OpinionOcrTestCase(TestCase):
             self.objects[run.surya_key] = surya_document()
         else:
             run.surya_key = ""
-        run.save(update_fields=["ocr_key", "extract_key", "surya_key"])
+        run.save(
+            update_fields=[
+                "ocr_key",
+                "printed_pages_key",
+                "extract_key",
+                "surya_key",
+            ]
+        )
         return run
 
     def measure(self, scan, run) -> list[ExternalJob]:
@@ -552,9 +591,10 @@ class TestTheVerdict(OpinionOcrTestCase):
         )
         self.assertGreaterEqual(unit["share"], 0.99)
         self.assertIsNone(self.unit(document, 1, "body B")["exclusion"])
-        # The header above the caption on the first page is the other
-        # exclusion, a neighbour's text.
-        self.assertEqual(document["counts"]["excluded"], 2)
+        # The header above the caption on the first page is a
+        # neighbour's text, and the headers of the two other pages are
+        # the page number (#396).
+        self.assertEqual(document["counts"]["excluded"], 4)
         self.assertEqual(document["counts"]["partial"], 0)
 
     def test_a_touch_under_a_tenth_is_kept(self):
@@ -594,9 +634,113 @@ class TestTheVerdict(OpinionOcrTestCase):
         self.assertGreaterEqual(header["share"], opinion_ocr.FULL_SHARE)
         # The body below the caption belongs to the opinion.
         self.assertIsNone(self.unit(document, 0, "body B")["exclusion"])
-        # A middle page has no neighbour.
-        self.assertIsNone(self.unit(document, 1, "878")["exclusion"])
+        # A middle page has no neighbour: its header is the page number
+        # (#396), and the mask of the opinion before wins on the first.
+        self.assertEqual(
+            self.unit(document, 1, "878")["exclusion"]["reason"],
+            opinion_ocr.PAGE_NUMBER,
+        )
         self.assertEqual(first["page_index"], 1)
+
+    def test_the_header_that_carries_the_page_number_is_excluded(self):
+        """The approved number of the page is in the running head, and
+        every engine reads the two as one unit (#396). The verdict is
+        read in each engine's own text, so the Mistral block gets it
+        too, off no dots.mocr box."""
+        self.write()
+
+        for engine in ("dots_mocr", "mistral_ocr"):
+            document = self.uploads[
+                opinion_ocr.engine_key(self.opinion, engine)
+            ]
+            header = self.unit(document, 1, "878 N. C.")
+            self.assertEqual(
+                header["exclusion"],
+                {"reason": opinion_ocr.PAGE_NUMBER, "printed": PRINTED},
+                engine,
+            )
+            self.assertEqual(header["share"], 1.0, engine)
+            self.assertNotIn(
+                "878 N. C.",
+                [
+                    u["text"]
+                    for u in opinion_ocr.kept_units(document["pages"][1])
+                ],
+            )
+            # Two of the three pages: the first page's header is the
+            # mask of the opinion before.
+            self.assertEqual(document["counts"]["page_number"], 2, engine)
+            self.assertEqual(document["counts"]["partial"], 0, engine)
+
+    def test_a_body_cell_that_ends_in_the_number_is_kept(self):
+        """The band is required: a citation at the end of a paragraph
+        is opinion text."""
+        document = dots_document()
+        document["pages"][2]["cells"][1]["text"] = "the court said, at 878"
+        self.objects[self.apply_run.ocr_key] = document
+
+        written = self.write()
+
+        unit = self.unit(written, 1, "the court said")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_header_with_another_number_is_kept(self):
+        """The value is required: a head cell that carries a number the
+        page is not approved as is not the page number. The parallel
+        citation page is the daily shape of it."""
+        document = dots_document()
+        document["pages"][2]["cells"][0]["text"] = "877 N. C."
+        self.objects[self.apply_run.ocr_key] = document
+
+        written = self.write()
+
+        self.assertIsNone(self.unit(written, 1, "877")["exclusion"])
+        self.assertEqual(written["counts"]["page_number"], 1)
+
+    def test_a_number_in_the_middle_of_the_head_line_is_not_the_number(self):
+        document = dots_document()
+        document["pages"][2]["cells"][0]["text"] = "Cite as 878 A.3d 1"
+        self.objects[self.apply_run.ocr_key] = document
+
+        written = self.write()
+
+        self.assertIsNone(self.unit(written, 1, "Cite as")["exclusion"])
+
+    def test_a_redaction_over_the_header_wins_over_the_page_number(self):
+        row = self.redact(2, to_pt(HEADER))
+
+        document = self.write()
+
+        header = self.unit(document, 1, "878")
+        self.assertEqual(header["exclusion"]["reason"], "redaction")
+        self.assertEqual(header["exclusion"]["redaction_id"], row.pk)
+        self.assertEqual(document["counts"]["page_number"], 1)
+
+    def test_a_page_with_no_approved_number_keeps_its_header(self):
+        """No number, no verdict: the curator cleared it, or the page
+        never printed one. A page the map lacks reads the same."""
+        printed = printed_document()
+        printed["pages"][2]["printed"] = None
+        printed["pages"][2]["type"] = None
+        printed["pages"][2]["by"] = None
+        del printed["pages"][3]
+        self.objects[self.apply_run.printed_pages_key] = printed
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "878")["exclusion"])
+        self.assertIsNone(self.unit(document, 2, "878")["exclusion"])
+        self.assertEqual(document["counts"]["page_number"], 0)
+
+    def test_a_curators_label_the_page_does_not_print_matches_nothing(self):
+        printed = printed_document()
+        printed["pages"][2]["printed"] = "1234"
+        printed["pages"][2]["by"] = "curator"
+        self.objects[self.apply_run.printed_pages_key] = printed
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "878")["exclusion"])
 
     def test_the_share_is_the_maximum_and_not_the_sum(self):
         x0, y0, x1, y1 = to_pt(BODY_A)
@@ -642,8 +786,9 @@ class TestTheVerdict(OpinionOcrTestCase):
         )
         self.assertEqual(written["counts"]["unjudged"], 1)
         # An unjudged unit is not an excluded one: the three judged
-        # units under the page-wide box, plus the header of page 0.
-        self.assertEqual(written["counts"]["excluded"], 4)
+        # units under the page-wide box, plus the header of page 0 and
+        # the page number of page 2.
+        self.assertEqual(written["counts"]["excluded"], 5)
 
     def test_a_page_with_no_size_leaves_every_unit_unjudged(self):
         """No detection in the run's space and no dots.mocr render: the
@@ -671,8 +816,9 @@ class TestTheVerdict(OpinionOcrTestCase):
         self.assertEqual(
             manifest["engines"]["dots_mocr"]["counts"]["unjudged"], 3
         )
-        # The other pages are judged as before.
-        self.assertEqual(len(opinion_ocr.kept_units(written["pages"][2])), 3)
+        # The other pages are judged as before: the body is kept and
+        # the page number is not.
+        self.assertEqual(len(opinion_ocr.kept_units(written["pages"][2])), 2)
 
 
 # ── the document ─────────────────────────────────────────────────────
@@ -695,7 +841,7 @@ class TestTheDocument(OpinionOcrTestCase):
         document = self.write()
 
         kept = opinion_ocr.kept_units(document["pages"][1])
-        self.assertEqual([u["text"] for u in kept], ["878 N. C.", "body B 2"])
+        self.assertEqual([u["text"] for u in kept], ["body B 2"])
         self.assertEqual(
             [u["text"] for u in opinion_ocr.kept_units(document["pages"][0])],
             ["body A 1", "body B 1"],
@@ -814,6 +960,10 @@ class TestTheSuryaEngine(OpinionOcrTestCase):
         self.assertIsNone(unit["exclusion"])
         header = self.unit(document, 1, "878 N. C.")
         self.assertEqual(header["type"], "PageHeader")
+        # The third engine reads the page number too (#396).
+        self.assertEqual(
+            header["exclusion"]["reason"], opinion_ocr.PAGE_NUMBER
+        )
         # The markup stays in the volume document: one unit shape for
         # every engine.
         self.assertNotIn("html", unit)
@@ -832,7 +982,7 @@ class TestTheSuryaEngine(OpinionOcrTestCase):
             [
                 u
                 for u in self.surya_doc()["pages"][1]["units"]
-                if not u["text"].startswith("body A")
+                if u["text"].startswith("body B")
             ],
         )
 
@@ -1092,7 +1242,13 @@ class TestThePass(OpinionOcrTestCase):
 
         self.assertEqual(
             sorted(self.pulls),
-            sorted([self.apply_run.ocr_key, self.apply_run.extract_key]),
+            sorted(
+                [
+                    self.apply_run.ocr_key,
+                    self.apply_run.extract_key,
+                    self.apply_run.printed_pages_key,
+                ]
+            ),
         )
         # The mirror serves the next tick.
         self.pulls.clear()
@@ -1308,6 +1464,18 @@ class TestThePass(OpinionOcrTestCase):
         self.assertIn(
             "mistral_ocr document did not load", "\n".join(logs.output)
         )
+
+    def test_a_printed_page_map_that_does_not_pull_holds_the_scan(self):
+        """The page numbers are an input of the glue (#396), and a fact
+        about the scan."""
+        del self.objects[self.apply_run.printed_pages_key]
+
+        with self.assertLogs("scanning.opinion_ocr", level="INFO") as logs:
+            self.assertEqual(opinion_ocr.glue_due(), 0)
+
+        self.assertIn("printed-page map did not load", "\n".join(logs.output))
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.ocr_glue_attempts, 0)
 
     def test_a_lost_boundary_spends_an_attempt_and_three_end_the_row(self):
         Opinion.objects.filter(pk=self.opinion.pk).update(boundary=None)

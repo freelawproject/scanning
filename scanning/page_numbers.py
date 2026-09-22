@@ -335,6 +335,28 @@ def _corner_distance(bbox: list, width: int | float, side: str) -> float:
     return max(distance, 0) / width
 
 
+def band_of(bbox: list, height: int | float) -> str | None:
+    """Name the band a box sits in, if any.
+
+    The one rule for "this box is in the head or the foot of its page",
+    in whatever space the box and the height share: the dots.mocr
+    render for a cell of the volume document, PDF points for a unit of
+    an opinion's OCR document (``opinion_ocr.verdict``, #396).
+
+    :param bbox: The box, ``[x0, y0, x1, y1]``.
+    :param height: The page's height, the space the box lives in.
+    :returns: ``"header"``, ``"footer"``, or None for the body.
+    :rtype: str | None
+    """
+    if len(bbox) < 4 or not height:
+        return None
+    if bbox[3] < HEAD_BAND * height:
+        return "header"
+    if bbox[1] > FOOT_BAND * height:
+        return "footer"
+    return None
+
+
 def _band(cell: dict, origin_height: int | float) -> str | None:
     """Name the band a cell sits in, if any.
 
@@ -344,14 +366,39 @@ def _band(cell: dict, origin_height: int | float) -> str | None:
     :returns: ``"header"``, ``"footer"``, or None for the body.
     :rtype: str | None
     """
-    bbox = cell.get("bbox") or []
-    if len(bbox) < 4 or not origin_height:
-        return None
-    if bbox[3] < HEAD_BAND * origin_height:
-        return "header"
-    if bbox[1] > FOOT_BAND * origin_height:
-        return "footer"
-    return None
+    return band_of(cell.get("bbox") or [], origin_height)
+
+
+def carries_number(text: str, value: str | None) -> bool:
+    """Say whether one line of ``text`` ends in the page number ``value``.
+
+    The reader of the OCR glue's third verdict (#396): a unit in the
+    head or the foot band whose text carries the approved number of
+    its page is the printed page number, and the running head with it,
+    because every engine reads the two as one unit. The line is read
+    the way review 1 read it (:func:`_line_readings`), so the noise
+    rules hold here too: a superscript digit is dropped, the stray
+    ``L`` of the parallel-page icon is forgiven, and a number buried in
+    the middle of a line -- a year, a docket number, a citation -- is
+    no reading. So ``Cite as 218 A.3d 677 -- 679`` carries ``679`` and
+    not ``218``.
+
+    :param text: The unit's text, as the engine wrote it.
+    :param value: The approved number of the page, as
+        ``apply.printed_pages`` stores it (``"679"``, ``"913-925"``,
+        ``"2094a"``), or None for a page with no number.
+    :returns: Whether a line of the text offers that value at one of
+        its ends.
+    :rtype: bool
+    """
+    if not value or not text:
+        return False
+    wanted = str(value)
+    for line in _clean(text).splitlines():
+        for detected, _type, _side in _line_readings(line.strip()):
+            if detected == wanted:
+                return True
+    return False
 
 
 def _score(

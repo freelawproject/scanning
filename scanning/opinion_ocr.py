@@ -20,6 +20,22 @@ any of whose units carries an exclusion; :func:`kept_units` is the one
 reader for a consumer that wants the clean text alone. The excluded
 text stays under ``jobs/``, which nothing serves without a login.
 
+**A printed page number is not opinion text either** (#396). It is
+approved by review 1 and frozen by the apply in the printed-page map
+(``apply.printed_pages``), which holds the value of every final page
+and no position: every engine reads the number inside a larger unit,
+with the running head. So the glue reads the approved value and finds
+it in each engine's own text: a unit that sits in the head or the foot
+band and one of whose lines ends in that value
+(``page_numbers.carries_number``) carries the exclusion
+``page_number``, and the running head goes with it. Both conditions
+are required. The band alone takes every head cell, number or not;
+the value alone takes a body line that ends in the same digits, which
+is opinion text. Nothing is read off a dots.mocr box, so a page
+dots.mocr failed still loses the headers of the other engines, and a
+page whose approved number the engines did not print (a curator's
+label on an inserted page, or no number at all) keeps every unit.
+
 **A unit nobody could measure is not clean text.** A unit with no box,
 or on a page whose size no detection and no render gives, carries the
 third verdict :data:`UNJUDGED`, counts in ``unjudged`` on the page and
@@ -83,6 +99,7 @@ from scanning import (
     boundaries,
     dots_mocr,
     mistral_ocr,
+    page_numbers,
     redactions,
     review_states,
     s3_sync,
@@ -128,6 +145,11 @@ MAX_ATTEMPTS = 3
 #: The verdict of a unit nobody could measure: no box, or a page with
 #: no size. Not clean text, and not a redaction either.
 UNJUDGED = "unjudged"
+
+#: The verdict of the unit that holds the printed page number (#396):
+#: in the head or the foot band, and one of its lines ends in the
+#: approved number of its page. Taken whole, running head included.
+PAGE_NUMBER = "page_number"
 
 #: The start of every ``Opinion.error_message`` this module writes, so
 #: a success clears its own message and nobody else's: the field is
@@ -409,12 +431,16 @@ class ScanInputs:
         reader paints.
     :param renders: ``{page_index: (img_width, img_height)}`` of the
         live detections, for the page size in points.
+    :param printed: ``{page_index: value}``, the approved page number
+        of every final page that has one, off the run's printed-page
+        map (#396).
     """
 
     run: object
     documents: dict[str, dict] = field(default_factory=dict)
     redactions: dict[int, list[dict]] = field(default_factory=dict)
     renders: dict[int, tuple[int, int]] = field(default_factory=dict)
+    printed: dict[int, str] = field(default_factory=dict)
 
 
 def load_inputs(scan: Scan) -> ScanInputs:
@@ -430,7 +456,7 @@ def load_inputs(scan: Scan) -> ScanInputs:
     :rtype: ScanInputs
     :raises ScanHeld: When the corrected volume is not built, the
         redactions are not measured against it, an engine is owed, or
-        a document does not pull.
+        a document does not pull, the printed-page map included.
     """
     run = review_states.final_run(scan)
     if run is None:
@@ -458,6 +484,7 @@ def load_inputs(scan: Scan) -> ScanInputs:
         raise ScanHeld("the run has no engine document")
 
     inputs = ScanInputs(run=run, documents=documents)
+    inputs.printed = _printed_numbers(scan, run)
     for entry in redactions.visible_by_page(scan):
         inputs.redactions[entry["page_index"]] = entry["rects"]
     # The run's space alone: a human row ``detections.relocate_rows``
@@ -470,6 +497,39 @@ def load_inputs(scan: Scan) -> ScanInputs:
     ):
         inputs.renders.setdefault(page_index, (width, height))
     return inputs
+
+
+def _printed_numbers(scan: Scan, run) -> dict[int, str]:
+    """Read the approved page number of every final page (#396).
+
+    The run's printed-page map, through ``apply.local_copy`` like the
+    engine documents, so a second tick over the scan pulls nothing.
+    The map is the one review 1 approved: the model's reading with the
+    curator's own numbers over it (``apply.printed_pages``). A page
+    with no number is absent, so a reader's ``get`` answers None.
+
+    :param scan: The scan.
+    :param run: The final apply run.
+    :returns: ``{page_index: value}``.
+    :rtype: dict[int, str]
+    :raises ScanHeld: When the map does not load, a fact about the
+        scan.
+    """
+    key = run.printed_pages_key
+    try:
+        document = json.loads(apply.local_copy(scan, key).read_text())
+    except (apply.ApplyError, OSError, ValueError) as exc:
+        raise ScanHeld(f"the printed-page map did not load: {exc}")
+    if not isinstance(document, dict) or "pages" not in document:
+        raise ScanHeld(f"the object at {key} is not a printed-page map")
+    printed: dict[int, str] = {}
+    for page in document["pages"] or []:
+        if not isinstance(page, dict) or not page.get("printed"):
+            continue
+        final = page.get("final_page")
+        if isinstance(final, int) and final > 0:
+            printed[final - 1] = str(page["printed"])
+    return printed
 
 
 # ---------------------------------------------------------------------------
@@ -576,13 +636,19 @@ def verdict(
     box_pt: list[float] | None,
     rects: list[dict],
     masks: list[dict],
+    text: str = "",
+    printed: str | None = None,
+    height_pt: float | None = None,
 ) -> tuple[dict | None, float]:
     """Return one unit's ``(exclusion, share)``.
 
     A redaction that covers :data:`EXCLUDE_SHARE` or more of the unit
-    names itself; else a neighbour's mask that does; else nothing. The
-    share is the larger of the two, so a partial verdict is read off
-    the file as ``share < FULL_SHARE``.
+    names itself; else a neighbour's mask that does; else the printed
+    page number, when the unit sits in the head or the foot band and
+    one of its lines ends in the approved number of its page (#396);
+    else nothing. The share is the larger of the two boxes' shares,
+    so a partial verdict is read off the file as ``share <
+    FULL_SHARE``; a page-number unit is taken whole and carries 1.0.
 
     A unit with no box, or on a page with no size, cannot be judged.
     It carries the third verdict, :data:`UNJUDGED`, so a reader tells
@@ -594,6 +660,11 @@ def verdict(
         no box or on a page with no size.
     :param rects: The redaction boxes of the page, in points.
     :param masks: The outside masks of the page, in points.
+    :param text: The unit's text, as the engine wrote it.
+    :param printed: The approved page number of the page, or None for
+        a page with none.
+    :param height_pt: The page's height in points, the space of
+        ``box_pt``; None leaves the band unread.
     :returns: The verdict.
     :rtype: tuple[dict | None, float]
     """
@@ -615,9 +686,39 @@ def verdict(
         }
     elif out_share >= EXCLUDE_SHARE:
         exclusion = {"reason": "outside"}
+    elif is_page_number(box_pt, text, printed, height_pt):
+        exclusion = {"reason": PAGE_NUMBER, "printed": printed}
+        share = 1.0
     else:
         exclusion = None
     return exclusion, round(share, 4)
+
+
+def is_page_number(
+    box_pt: list[float],
+    text: str,
+    printed: str | None,
+    height_pt: float | None,
+) -> bool:
+    """Say whether a unit is the printed page number of its page (#396).
+
+    Both conditions, and the one rule for them: the box sits in the
+    head or the foot band (``page_numbers.band_of``), and a line of
+    the text ends in the approved value
+    (``page_numbers.carries_number``).
+
+    :param box_pt: The unit's box in points.
+    :param text: The unit's text.
+    :param printed: The approved number of the page, or None.
+    :param height_pt: The page's height in points, or None.
+    :returns: Whether the unit is the page number.
+    :rtype: bool
+    """
+    if not printed or not height_pt:
+        return False
+    if page_numbers.band_of(box_pt, height_pt) is None:
+        return False
+    return page_numbers.carries_number(text, printed)
 
 
 def kept_units(page: dict) -> list[dict]:
@@ -675,7 +776,13 @@ def build_document(
     }
     pages: list[dict] = []
     failed: list[int] = []
-    counts = {"units": 0, "excluded": 0, "partial": 0, "unjudged": 0}
+    counts = {
+        "units": 0,
+        "excluded": 0,
+        "partial": 0,
+        "unjudged": 0,
+        "page_number": 0,
+    }
     for offset in range(opinion.page_count):
         page_index = opinion.start_page_index + offset
         page = by_index.get(page_index)
@@ -708,6 +815,7 @@ def build_document(
             continue
         rects = inputs.redactions.get(page_index, [])
         page_masks = masks.get(page_index, [])
+        printed = inputs.printed.get(page_index)
         for index, unit in enumerate(page.get(spec.units_key) or []):
             if not isinstance(unit, dict):
                 continue
@@ -721,20 +829,31 @@ def build_document(
                     round(box[2] * sx, 2),
                     round(box[3] * sy, 2),
                 ]
-            exclusion, share = verdict(box_pt, rects, page_masks)
+            text = unit.get(spec.text_key)
+            if not isinstance(text, str):
+                text = ""
+            exclusion, share = verdict(
+                box_pt,
+                rects,
+                page_masks,
+                text,
+                printed,
+                size[1] if size else None,
+            )
             counts["units"] += 1
             if exclusion is not None and exclusion["reason"] == UNJUDGED:
                 counts["unjudged"] += 1
             elif exclusion is not None:
                 counts["excluded"] += 1
+                if exclusion["reason"] == PAGE_NUMBER:
+                    counts["page_number"] += 1
                 if share < FULL_SHARE:
                     counts["partial"] += 1
-            text = unit.get(spec.text_key)
             entry["units"].append(
                 {
                     "id": index,
                     "type": unit.get(spec.type_key) or "",
-                    "text": text if isinstance(text, str) else "",
+                    "text": text,
                     "bbox": unit.get("bbox"),
                     "box_pt": box_pt,
                     "exclusion": exclusion,

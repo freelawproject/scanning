@@ -1788,11 +1788,12 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
 
 
 #: What took a block out of the text, in words. ``opinion_ocr``
-#: writes both reasons, and a card must not call the mask of the
-#: opinion before a redaction.
+#: writes the three reasons, and a card must not call the mask of the
+#: opinion before, or the page number (#396), a redaction.
 _REASON_WORDS = {
     "redaction": "a redaction",
     "outside": "the mask of the opinion before",
+    opinion_ocr.PAGE_NUMBER: "the page number",
 }
 
 

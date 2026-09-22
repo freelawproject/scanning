@@ -857,12 +857,26 @@ class TestTheDocument(EnsembleTestCase):
         document = self.run_ensemble()
 
         page = document["pages"][1]
-        self.assertEqual(page["text"], "878 N. C.\n\nbody A 2\n\nbody B 2")
+        self.assertEqual(page["text"], "body A 2\n\nbody B 2")
         self.assertEqual(
             [group["agreement"] for group in page["groups"]],
-            [ensemble.UNANIMOUS] * 3,
+            [ensemble.UNANIMOUS] * 2,
         )
-        self.assertEqual([g["band"] for g in page["groups"]][0], "head")
+        self.assertEqual([g["band"] for g in page["groups"]], ["body", "body"])
+
+    def test_the_page_number_is_left_out(self):
+        """The running head carries the approved number of the page,
+        and the glue marks it in every engine (#396). The group goes
+        whole, with no partial: every engine read the head alike."""
+        document = self.run_ensemble()
+
+        page = document["pages"][1]
+        self.assertEqual(len(page["dropped"]), 1)
+        drop = page["dropped"][0]
+        self.assertEqual(drop["reason"], opinion_ocr.PAGE_NUMBER)
+        self.assertFalse(drop["partial"])
+        self.assertEqual(sorted(drop["engines"]), ["dots_mocr", "mistral_ocr"])
+        self.assertEqual(page["counts"]["partial"], 0)
 
     def test_the_text_of_the_opinion_before_is_left_out(self):
         """The first page is shared, and the running head above the
@@ -889,10 +903,12 @@ class TestTheDocument(EnsembleTestCase):
         document = self.run_ensemble()
 
         page = document["pages"][1]
-        self.assertEqual(page["text"], "878 N. C.\n\nbody B 2")
-        self.assertEqual(len(page["dropped"]), 1)
-        self.assertEqual(page["dropped"][0]["reason"], "redaction")
-        self.assertEqual(page["counts"]["dropped"], 1)
+        self.assertEqual(page["text"], "body B 2")
+        self.assertEqual(
+            sorted(d["reason"] for d in page["dropped"]),
+            [opinion_ocr.PAGE_NUMBER, "redaction"],
+        )
+        self.assertEqual(page["counts"]["dropped"], 2)
 
     def test_a_part_of_a_block_under_a_box_is_a_partial_drop(self):
         self.redact(2, [36.0, 108.0, 288.0, 200.0])
@@ -900,8 +916,14 @@ class TestTheDocument(EnsembleTestCase):
         document = self.run_ensemble()
 
         page = document["pages"][1]
-        self.assertTrue(page["dropped"][0]["partial"])
+        self.assertTrue(self.redaction_drop(page)["partial"])
         self.assertEqual(page["counts"]["partial"], 1)
+
+    @staticmethod
+    def redaction_drop(page: dict) -> dict:
+        """The one drop of a page a redaction made; the page number
+        makes the other (#396)."""
+        return next(d for d in page["dropped"] if d["reason"] == "redaction")
 
     def test_a_box_over_one_cell_of_a_block_is_a_partial_drop(self):
         """The daily shape of it: one engine reads the body as one
@@ -915,7 +937,7 @@ class TestTheDocument(EnsembleTestCase):
 
         page = built["pages"][1]
         self.assertNotIn("body", page["text"])
-        self.assertTrue(page["dropped"][0]["partial"])
+        self.assertTrue(self.redaction_drop(page)["partial"])
         self.assertEqual(page["counts"]["partial"], 1)
 
     def test_a_block_only_one_engine_saw_is_a_disagreement(self):
@@ -1026,7 +1048,9 @@ class TestTheDocument(EnsembleTestCase):
         self.assertEqual(document["opinion"]["first_printed_page"], 502)
         self.assertEqual(document["apply_run"], "a1")
         self.assertEqual(len(document["pages"]), 3)
-        self.assertEqual(document["counts"]["groups"], 8)
+        # Two body groups a page: every header is out, the first as
+        # the opinion before and the others as the page number.
+        self.assertEqual(document["counts"]["groups"], 6)
 
     def test_the_document_lands_beside_the_engine_files(self):
         self.run_ensemble()
@@ -1069,7 +1093,7 @@ class TestTheRows(EnsembleTestCase):
         self.assertIsNone(rows[0].source_edit_id)
         self.assertEqual(rows[0].apply_run_id, self.apply_run.pk)
         self.assertTrue(rows[0].text.startswith("body A 1"))
-        self.assertTrue(rows[1].text.startswith("878 N. C."))
+        self.assertTrue(rows[1].text.startswith("body A 2"))
 
     def test_the_text_is_a_cache_and_the_human_text_is_not(self):
         self.run_ensemble()
@@ -1294,6 +1318,27 @@ class TestTheFindings(EnsembleTestCase):
         )
         self.assertIn("The mask of the opinion before", card.message)
         self.assertNotIn("redaction covers", card.message)
+
+    def test_the_partial_card_names_the_page_number(self):
+        """One engine glued the head to the first paragraph, and the
+        group went whole (#396). The card must not call that a
+        redaction."""
+        page = page_of(partial=1)
+        page["dropped"] = [
+            {
+                "engines": {},
+                "box_pt": None,
+                "reason": opinion_ocr.PAGE_NUMBER,
+                "partial": True,
+            }
+        ]
+
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        card = OpinionFinding.objects.get(
+            opinion=self.opinion, check_name=OpinionCheck.PARTIAL_REDACTION
+        )
+        self.assertIn("The page number covers part of", card.message)
 
     def test_a_standing_dismissal_mutes_the_new_card(self):
         dismissal = OpinionFindingDismissal.objects.create(
@@ -1616,7 +1661,7 @@ class TestTheButton(EnsembleTestCase, ScanningTestCase):
         body = response.json()
         self.assertEqual(body["status"], "ok")
         self.assertIn("dots_mocr, mistral_ocr", body["message"])
-        self.assertIn("8 block(s)", body["message"])
+        self.assertIn("6 block(s)", body["message"])
         self.opinion.refresh_from_db()
         self.assertTrue(ensemble.is_written(self.opinion))
 
