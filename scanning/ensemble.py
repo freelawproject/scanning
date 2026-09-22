@@ -101,6 +101,7 @@ import re
 import time
 import unicodedata
 from collections import Counter
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from itertools import combinations
 
@@ -876,9 +877,35 @@ def place(groups: list[dict], width: float, height: float) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Carried:
+    """One engine's reading of this word, held at an earlier position.
+
+    The engines vote word by word over the base engine's reading, and
+    one engine's reading of two base words is one word of its own.
+    :func:`_candidates` records that reading at the first position of
+    the span it covers, and marks the rest of the span with this
+    (#391).
+
+    **The vote of this engine here follows what won at the head.** The
+    winning reading at the head holds this word already, so this
+    engine votes to drop the base's own word: to keep it would write
+    the tail of the span twice. The head went another way, so the
+    reading of this word is not in the answer at all, and this engine
+    does not vote: to count it as an empty reading would let two
+    engines that only joined two words delete one of them.
+
+    :param head: The base position that holds this engine's reading.
+    :param key: The key of that reading, as the vote compares it.
+    """
+
+    head: int
+    key: str
+
+
 def _candidates(
     base: list[tuple[str, str]], other: list[tuple[str, str]]
-) -> tuple[dict[int, list[tuple[str, str] | None]], dict[int, list[list]]]:
+) -> tuple[dict[int, list[tuple[str, str] | Carried]], dict[int, list[list]]]:
     """Return one engine's reading of each word of the base read.
 
     Both sides are ``(key, the word as it is shown)`` pairs, and the
@@ -890,21 +917,22 @@ def _candidates(
     first position, which keeps a two-against-one word split from
     dropping words in silence.
 
-    **The rest of such a span abstains** (#391). ``None`` is "this
-    engine's reading of this word is recorded at another position",
-    and ``("", "")`` is "this engine read nothing here". The two must
-    never be one value. Two engines that join what the base split
-    leave two positions behind, and an empty reading in both of them
-    is a majority that deletes the base's word: ``¶ 235-236.`` against
-    ``¶¶235–236.`` lost the number and nothing said so.
+    **The rest of such a span is carried** (#391). :class:`Carried`
+    is "this engine's reading of this word is recorded at another
+    position", and ``("", "")`` is "this engine read nothing here".
+    The two must never be one value. Two engines that join what the
+    base split leave two positions behind, and an empty reading in
+    both of them is a majority that deletes the base's word:
+    ``¶ 235-236.`` against ``¶¶235–236.`` lost the number and nothing
+    said so.
 
     :param base: The base engine's pairs.
     :param other: The other engine's pairs.
     :returns: ``({position: readings}, {position: inserted runs})``,
-        where a reading is a pair, or ``None`` for an abstention.
+        where a reading is a pair, or a :class:`Carried`.
     :rtype: tuple[dict, dict]
     """
-    at: dict[int, list[tuple[str, str] | None]] = {}
+    at: dict[int, list[tuple[str, str] | Carried]] = {}
     inserted: dict[int, list[list]] = {}
     base_keys = [key for key, _ in base]
     other_keys = [key for key, _ in other]
@@ -925,10 +953,11 @@ def _candidates(
                 )
                 at.setdefault(i1, []).append(joined)
                 for index in range(i1 + 1, i2):
-                    # The span is recorded above. This engine has no
-                    # word of its own to put here, and it did not drop
-                    # one either, so it does not vote (#391).
-                    at.setdefault(index, []).append(None)
+                    # The span is recorded above, and how this engine
+                    # votes here follows what wins there (#391).
+                    at.setdefault(index, []).append(
+                        Carried(head=i1, key=joined[0])
+                    )
         elif tag == "delete":
             # An engine that truly read nothing here. It votes, and a
             # majority of such votes drops the word.
@@ -986,6 +1015,9 @@ def vote_words(
     quorum = (len(others) + 3) // 2
     tokens: list[dict] = []
     disputed = 0
+    # The key the answer holds at each base position the vote has
+    # passed, which a carried reading of a later position reads (#391).
+    chosen: dict[int, str] = {}
     for position in range(len(base) + 1):
         runs: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
             (
@@ -1016,14 +1048,15 @@ def vote_words(
             disputed += len(words)
         if position == len(base):
             break
-        readings = [base[position]] + [
-            reading
-            for vote in votes
-            for reading in vote.get(position, [])
-            if reading is not None
-        ]
+        readings = [base[position]]
+        for vote in votes:
+            for reading in vote.get(position, []):
+                cast = _vote_of(reading, chosen)
+                if cast is not None:
+                    readings.append(cast)
         winner, count = Counter(key for key, _ in readings).most_common(1)[0]
         if count >= quorum:
+            chosen[position] = winner
             if winner:
                 # "" is the reading of a majority that dropped the word,
                 # and of a mark that carries no reading at all.
@@ -1034,15 +1067,43 @@ def vote_words(
                 }
                 if count < total:
                     # Short of every engine of the group, and not short
-                    # of the readings: an engine that abstains here
-                    # (#391) confirmed nothing, so its silence must not
-                    # read as one more voice for the winner.
+                    # of the readings: an engine that carried its
+                    # reading elsewhere (#391) confirmed nothing, so
+                    # its silence must not read as one more voice.
                     token["majority"] = True
                 tokens.append(token)
         else:
+            chosen[position] = base[position][0]
             disputed += 1
             tokens.append({"text": base[position][1], "low_confidence": True})
     return tokens, disputed
+
+
+def _vote_of(
+    reading: tuple[str, str] | Carried, chosen: dict[int, str]
+) -> tuple[str, str] | None:
+    """Return how one engine votes at one word of the base read.
+
+    A plain reading is its own vote. A :class:`Carried` reading
+    follows the head of its span (#391):
+
+    - the head took that engine's own reading, so the answer already
+      holds this word and the engine votes to drop the base's: to keep
+      it would write the tail of the span twice;
+    - the head went another way, so the engine's reading of this word
+      is nowhere in the answer, and it does not vote at all: an empty
+      reading of two engines that only joined two words would delete
+      one of them.
+
+    :param reading: One entry of ``_candidates``'s first answer.
+    :param chosen: ``{position: the key the answer holds}``, for every
+        position the vote has passed.
+    :returns: The vote, or ``None`` for no vote.
+    :rtype: tuple[str, str] | None
+    """
+    if not isinstance(reading, Carried):
+        return reading
+    return ("", "") if chosen.get(reading.head) == reading.key else None
 
 
 def resolve(group: dict) -> dict:

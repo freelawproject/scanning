@@ -665,6 +665,40 @@ class TestTheVote(TestCase):
         self.assertEqual(marked, ["\u00b6", "235-236."])
         self.assertEqual(disputed, 2)
 
+    def test_a_join_two_engines_agree_on_writes_the_tail_once(self):
+        """The other side of #391: both engines joined the two base
+        words the same way, and their reading won at the head. It
+        holds the tail already, so the base's own tail word must not
+        go in after it."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("the wordone wordtwo end"),
+            [
+                ensemble._pairs("the wordonewordtwo end"),
+                ensemble._pairs("the wordonewordtwo end"),
+            ],
+        )
+
+        self.assertEqual(
+            " ".join(token["text"] for token in tokens),
+            "the wordonewordtwo end",
+        )
+
+    def test_a_join_one_engine_alone_makes_leaves_the_split(self):
+        """One engine cannot carry the head, so the base's two words
+        both stand."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("the wordone wordtwo end"),
+            [
+                ensemble._pairs("the wordonewordtwo end"),
+                ensemble._pairs("the wordone wordtwo end"),
+            ],
+        )
+
+        self.assertEqual(
+            " ".join(token["text"] for token in tokens),
+            "the wordone wordtwo end",
+        )
+
     def test_an_engine_that_abstains_confirms_nothing(self):
         """A word the other engines did not answer for is not a word
         every engine read, so it carries the majority flag (#380)."""
