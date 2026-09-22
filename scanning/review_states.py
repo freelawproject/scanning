@@ -211,6 +211,16 @@ def preview_only(scan: Scan, rows: list | None = None, run=_UNSET) -> bool:
     corrected volume; it is short, so in practice this is a review-1
     view.
 
+    One volume gets neither this nor review 2: a run with a dead row
+    stays incomplete until an operator supersedes it (#224), so it
+    keeps the step-2 note about the build and no preview is drawn under
+    it. That is the same answer review 2 gives there, and it is the
+    operator's to change.
+
+    The writes of step 2 are refused by the status alone
+    (``views_api._refuse_closed_review``), not by this rule: a volume
+    in review 1 with no run at all must refuse them too.
+
     :param scan: The scan to judge.
     :param rows: The live detection rows, when the caller has them.
         Read here otherwise.

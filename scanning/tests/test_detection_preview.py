@@ -29,9 +29,10 @@ from scanning.models import (
     Status,
 )
 from scanning.tests.test_jobs import make_manifest
+from scanning.tests.test_success_messages import WRITE_VIEWS
 from scanning.tests.test_views import ScanningTestCase
 from scanning.tests.test_yolo_apply import glued_run, merged_scan
-from scanning.views_api import PREVIEW_READ_ONLY_MESSAGE
+from scanning.views_api import REVIEW_NOT_OPEN_MESSAGE
 
 
 def previewable_scan(
@@ -331,7 +332,8 @@ class TestWhatTheViewerReads(ScanningTestCase):
 
 
 class TestEveryWriteRefuses(ScanningTestCase):
-    """The gate of the preview, in the view and not in the template."""
+    """The gate of review 2's writes, in the view and not in the
+    template."""
 
     #: Every write step 2 can reach, with a body that would otherwise
     #: be taken. The refusal comes before the body is read, so a body
@@ -355,10 +357,29 @@ class TestEveryWriteRefuses(ScanningTestCase):
         ("bake_redactions", {}),
     ]
 
+    #: The three that name a row in the URL.
+    ROW_WRITES = (
+        "move_redaction",
+        "dismiss_redaction",
+        "restore_redaction",
+    )
+
     def setUp(self):
         self.user = self.make_user(username="reviewer")
         self.client.force_login(self.user)
         self.scan, self.rows = previewable_scan()
+
+    def test_every_write_of_review_two_is_named_here(self):
+        """The list is written by hand, and ``WRITE_VIEWS`` is the
+        project's definition of a review-2 write (#322). A write added
+        later must not pass that pin and skip this one in silence.
+
+        Containment, not equality: the gate also covers three writes
+        that answer no success message and are outside that set.
+        """
+        named = {name for name, _ in self.WRITES} | set(self.ROW_WRITES)
+
+        self.assertEqual(set(WRITE_VIEWS) - named, set())
 
     def test_every_write_of_step_two_answers_409(self):
         for name, body in self.WRITES:
@@ -371,17 +392,13 @@ class TestEveryWriteRefuses(ScanningTestCase):
 
                 self.assertEqual(response.status_code, 409)
                 self.assertEqual(
-                    response.json()["message"], PREVIEW_READ_ONLY_MESSAGE
+                    response.json()["message"], REVIEW_NOT_OPEN_MESSAGE
                 )
 
     def test_the_per_row_writes_answer_409(self):
         """They 404 today only because no row exists; the gate is what
         makes the rule true whatever the rows are."""
-        for name in (
-            "move_redaction",
-            "dismiss_redaction",
-            "restore_redaction",
-        ):
+        for name in self.ROW_WRITES:
             with self.subTest(endpoint=name):
                 response = self.client.post(
                     reverse(
@@ -420,6 +437,54 @@ class TestEveryWriteRefuses(ScanningTestCase):
                 scan=self.scan, kind=PageEdit.Kind.DELETE_PAGE
             ).exists()
         )
+
+    def test_a_volume_with_no_detection_run_refuses_too(self):
+        """The gate is the status, not the preview (#388). A box
+        written in review 1 is built into nothing, whether the
+        detections are merged or the run has not started."""
+        from scanning.models import Redaction
+
+        scan = ScanFactory(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
+
+        response = self.client.post(
+            reverse("add_redaction", kwargs={"pk": scan.pk}),
+            data=json.dumps(
+                {"page_index": 0, "x0": 1, "y0": 2, "x1": 3, "y1": 4}
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(Redaction.objects.filter(scan=scan).exists())
+
+    def test_an_apply_in_progress_refuses_too(self):
+        """The corrected volume is being built, so the page space the
+        box would name is the one it is about to leave behind."""
+        scan, _ = previewable_scan(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        ApplyRun.objects.create(scan=scan, number=1)
+
+        response = self.client.post(
+            reverse("add_redaction", kwargs={"pk": scan.pk}),
+            data=json.dumps(
+                {"page_index": 0, "x0": 1, "y0": 2, "x1": 3, "y1": 4}
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 409)
+
+    def test_the_legacy_step_two_still_writes(self):
+        """Its rows are the old pipeline's, and its step 2 lives in
+        ``PENDING_REVIEW``."""
+        scan = ScanFactory(status=Status.PENDING_REVIEW)
+
+        response = self.client.post(
+            reverse("rebuild_findings", kwargs={"pk": scan.pk}),
+            data="{}",
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
 
     def test_a_volume_outside_the_preview_is_not_gated(self):
         scan = ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
