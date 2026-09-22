@@ -51,6 +51,61 @@ def pages(*indexes, scale=0.5):
     ]
 
 
+#: The four strips of page 17 of scan 1841 (#371), in points.
+TOP = {"x0": 0.0, "y0": 0.0, "x1": 612.0, "y1": 19.7}
+LEFT = {"x0": 0.0, "y0": 19.7, "x1": 81.4, "y1": 734.3}
+BOTTOM = {"x0": 0.0, "y0": 734.3, "x1": 612.0, "y1": 792.0}
+RIGHT = {"x0": 535.2, "y0": 19.7, "x1": 612.0, "y1": 734.3}
+
+
+class TestStripContentBox(TestCase):
+    """The box a page's strips leave (#371)."""
+
+    def test_four_strips_give_the_box_between_them(self):
+        self.assertEqual(
+            redactions.strip_content_box([TOP, LEFT, BOTTOM, RIGHT], 612, 792),
+            (81.4, 19.7, 535.2, 734.3),
+        )
+
+    def test_a_side_with_no_strip_is_the_page_edge(self):
+        self.assertEqual(
+            redactions.strip_content_box([BOTTOM], 612, 792),
+            (0.0, 0.0, 612.0, 734.3),
+        )
+
+    def test_no_strips_give_the_page_frame(self):
+        self.assertEqual(
+            redactions.strip_content_box([], 612, 792),
+            (0.0, 0.0, 612.0, 792.0),
+        )
+
+    def test_a_strip_off_every_edge_names_no_side(self):
+        """A curator's box in the middle of the page is not a margin."""
+        inner = {"x0": 100.0, "y0": 100.0, "x1": 200.0, "y1": 200.0}
+        self.assertEqual(
+            redactions.strip_content_box([inner], 612, 792),
+            (0.0, 0.0, 612.0, 792.0),
+        )
+
+    def test_clip_holds_a_box_inside(self):
+        content = (81.4, 19.7, 535.2, 734.3)
+        self.assertEqual(
+            redactions.clip_to_content((66.2, 636.5, 298.8, 792.0), content),
+            (81.4, 636.5, 298.8, 734.3),
+        )
+        self.assertEqual(
+            redactions.clip_to_content((100.0, 100.0, 200.0, 200.0), content),
+            (100.0, 100.0, 200.0, 200.0),
+        )
+
+    def test_clip_refuses_a_box_it_would_empty(self):
+        self.assertIsNone(
+            redactions.clip_to_content(
+                (100.0, 750.0, 200.0, 790.0), (81.4, 19.7, 535.2, 734.3)
+            )
+        )
+
+
 class TestWriteComputed(TestCase):
     def setUp(self):
         self.scan = ScanFactory(page_count=3, source_fingerprint="10:3")

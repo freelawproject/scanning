@@ -21,6 +21,7 @@ and sets the computed row's ``decision``, which hides it.
 
 Nothing in this module reads a file or renders a page: the compute
 hands it what blackletter returned and the document it measured with.
+
 """
 
 from __future__ import annotations
@@ -61,6 +62,61 @@ def _round(value: float) -> float:
 # ---------------------------------------------------------------------------
 # The compute writes
 # ---------------------------------------------------------------------------
+
+#: A strip within this many points of a page edge lies on it, the
+#: tolerance ``margins._rects_for_bounds`` rounds within.
+_EDGE_PT = 1.0
+
+
+def strip_content_box(
+    strips: list[dict], page_width: float, page_height: float
+) -> tuple[float, float, float, float]:
+    """Return the box the margin strips of one page leave, in points.
+
+    Each strip is named by the page edge it lies on, as
+    ``blackletter.margins._rects_for_bounds`` lays them out: a full-width
+    strip at the top edge is the top, one at the bottom edge the bottom,
+    and a strip at the left or right edge is that side. A side with no
+    strip is the page edge. (#370's ``margin_fit._sides`` names them the
+    same way; when it lands, one of the two reads the other.)
+
+    :param strips: The page's strips, ``{x0, y0, x1, y1}`` in points.
+    :param page_width: The page width, in points.
+    :param page_height: The page height, in points.
+    :returns: ``(x0, y0, x1, y1)``, in points.
+    """
+    x0, y0, x1, y1 = 0.0, 0.0, float(page_width), float(page_height)
+    for strip in strips:
+        sx0, sy0 = float(strip["x0"]), float(strip["y0"])
+        sx1, sy1 = float(strip["x1"]), float(strip["y1"])
+        full_width = sx0 <= _EDGE_PT and sx1 >= page_width - _EDGE_PT
+        if full_width and sy0 <= _EDGE_PT:
+            y0 = max(y0, sy1)
+        elif full_width and sy1 >= page_height - _EDGE_PT:
+            y1 = min(y1, sy0)
+        elif sx0 <= _EDGE_PT:
+            x0 = max(x0, sx1)
+        elif sx1 >= page_width - _EDGE_PT:
+            x1 = min(x1, sx0)
+    return x0, y0, x1, y1
+
+
+def clip_to_content(
+    box: tuple[float, float, float, float],
+    content: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+    """Hold a box inside a content box.
+
+    :param box: ``(x0, y0, x1, y1)``.
+    :param content: The box to hold it in, same shape.
+    :returns: The intersection, or None when it has no area, which the
+        caller reads as a refusal and keeps the box.
+    """
+    x0, y0 = max(box[0], content[0]), max(box[1], content[1])
+    x1, y1 = min(box[2], content[2]), min(box[3], content[3])
+    if x0 >= x1 or y0 >= y1:
+        return None
+    return x0, y0, x1, y1
 
 
 def write_computed(
