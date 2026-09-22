@@ -3195,7 +3195,10 @@ class PageEdit(AbstractDateTimeModel):
     )
     ordinal = models.PositiveSmallIntegerField(
         default=0,
-        help_text="Inserts only: the order of several images in one gap.",
+        help_text=(
+            "Inserts and moves: the order of several images in one gap, "
+            "or of several moved pages landing on one anchor."
+        ),
     )
 
     value = models.CharField(

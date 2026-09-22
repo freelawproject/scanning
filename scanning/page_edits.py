@@ -337,6 +337,12 @@ def moves_by_page(scan: Scan) -> dict[int, int]:
     the current rows only: a move written against another original
     names a page nobody chose.
 
+    The dict is in landing order, and :func:`slot_order` trusts it:
+    several pages that land on one anchor come in ``ordinal`` order,
+    then page order (#395). A reorder of a shuffled span writes its
+    rows with ordinals, because a span scanned in reverse has no
+    anchors that put its pages right by page order alone.
+
     :param scan: The scan to read.
     :returns: ``{pdf_page: anchor_pdf_page}``, the original page each
         moved page follows in the corrected volume; 0 puts it before
@@ -344,10 +350,11 @@ def moves_by_page(scan: Scan) -> dict[int, int]:
         key holds.
     :rtype: dict[int, int]
     """
-    return {
-        edit.pdf_page: edit.anchor_pdf_page
-        for edit in current_edits(scan, PageEdit.Kind.MOVE_PAGE)
-    }
+    rows = sorted(
+        current_edits(scan, PageEdit.Kind.MOVE_PAGE),
+        key=lambda edit: (edit.anchor_pdf_page, edit.ordinal, edit.pdf_page),
+    )
+    return {edit.pdf_page: edit.anchor_pdf_page for edit in rows}
 
 
 def slot_order(
@@ -362,8 +369,9 @@ def slot_order(
 
     - ``("page", p)`` for every original page, in the order the
       corrected volume holds them. A moved page leaves its own slot
-      and comes right after its anchor's slot, in page order when
-      several land on one anchor;
+      and comes right after its anchor's slot; several that land on
+      one anchor come in the order of ``moves``, which
+      :func:`moves_by_page` gives as ordinal then page (#395);
     - ``("gap", a)`` after the slot of original page ``a`` and after
       the moved pages that landed there, where the images anchored on
       ``a`` follow. Anchor 0 comes first.
@@ -373,14 +381,15 @@ def slot_order(
     page comes last, as an insert anchored there does.
 
     :param page_count: Pages in the original.
-    :param moves: ``{pdf_page: anchor}``, :func:`moves_by_page`.
+    :param moves: ``{pdf_page: anchor}`` in landing order,
+        :func:`moves_by_page`.
     :param anchors: Further anchors that need a gap event past the
         end: the plan passes the anchors of its inserts.
     :returns: The events.
     """
     landing: dict[int, list[int]] = {}
-    for pdf_page in sorted(moves):
-        landing.setdefault(moves[pdf_page], []).append(pdf_page)
+    for pdf_page, anchor in moves.items():
+        landing.setdefault(anchor, []).append(pdf_page)
 
     def gap(anchor: int) -> Iterator[tuple[str, int]]:
         for pdf_page in landing.get(anchor, []):
