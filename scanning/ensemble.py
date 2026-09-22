@@ -939,8 +939,13 @@ def vote_words(
       engine. The reader must be able to tell that word from one every
       engine read, because the panel above it says the group had no
       majority as a whole (#380).
-    - ``"low_confidence": True``: no majority settled it. The base
-      engine's word is kept, or a run a tie put in.
+    - ``"low_confidence": True``: a person must read it. Either no
+      majority settled the word, and the base engine's own word is
+      kept, or the base never read it and the engines that did put it
+      in.
+    - ``"inserted": True``, beside the flag above: the second of those
+      two. They are different faults and they read differently, so the
+      viewer must not name one of them for both (#380).
 
     A word the base engine did not read is put in, marked and counted
     when the engines that read it are a majority or a tie: the base is
@@ -988,7 +993,8 @@ def vote_words(
                 continue
             words = next(words for other, words in runs if other == keys)
             tokens += [
-                {"text": word, "low_confidence": True} for word in words
+                {"text": word, "low_confidence": True, "inserted": True}
+                for word in words
             ]
             # A word the base did not read is marked, so it is counted
             # too: the mark the viewer draws and the card the findings

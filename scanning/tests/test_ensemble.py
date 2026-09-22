@@ -486,6 +486,36 @@ class TestTheVote(TestCase):
         marked = [t["text"] for t in answer["tokens"] if t.get("majority")]
         self.assertEqual(marked, ["beta", "delta"])
 
+    def test_a_word_the_base_never_read_says_so(self):
+        """#380: a run the engines put in and a word no majority
+        settled are both marked, and they read differently. The viewer
+        names one of them, so the token must say which it is."""
+        answer = ensemble.resolve(
+            self.read(
+                "the court held today",
+                "the court plainly held today",
+                "the court plainly held todya",
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.VOTED)
+        put_in = [t["text"] for t in answer["tokens"] if t.get("inserted")]
+        self.assertEqual(put_in, ["plainly"])
+        for token in answer["tokens"]:
+            if token.get("inserted"):
+                self.assertTrue(token.get("low_confidence"), token)
+
+    def test_a_word_no_majority_settles_is_not_an_inserted_word(self):
+        answer = ensemble.resolve(
+            self.read(
+                "alpha beta gamma", "alpha xeta gamma", "alpha zeta gamma"
+            )
+        )
+
+        marked = [t for t in answer["tokens"] if t.get("low_confidence")]
+        self.assertEqual([t["text"] for t in marked], ["beta"])
+        self.assertIsNone(marked[0].get("inserted"))
+
     def test_a_word_every_engine_read_carries_no_flag(self):
         answer = ensemble.resolve(
             self.read(
@@ -603,7 +633,11 @@ class TestTheVote(TestCase):
             tokens,
             [
                 {"text": "alpha"},
-                {"text": "beta", "low_confidence": True},
+                {
+                    "text": "beta",
+                    "low_confidence": True,
+                    "inserted": True,
+                },
                 {"text": "gamma"},
             ],
         )

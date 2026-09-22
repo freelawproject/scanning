@@ -522,10 +522,16 @@
             tokens.forEach(function (token, position) {
                 var span = document.createElement('span');
                 span.textContent = token.text;
-                if (token.low_confidence) {
+                if (token.low_confidence && token.inserted) {
+                    span.className = 'ensemble-low';
+                    span.title = 'The first engine that read here did'
+                        + ' not read this word. The engines that read'
+                        + ' it put it in.';
+                } else if (token.low_confidence) {
                     span.className = 'ensemble-low';
                     span.title = 'No majority settled this word. It is'
-                        + ' the reading of the first engine by rank.';
+                        + ' the reading of the first engine that read'
+                        + ' here.';
                 } else if (token.majority) {
                     span.className = 'ensemble-voted';
                     span.title = 'A majority chose this word, and not'
@@ -754,8 +760,9 @@
             + ' first of those, and the reason line names them.'],
         ['No majority', 'the words are voted one by one over the first'
             + ' engine that read. A word most engines read carries a'
-            + ' light mark; a word no majority settled carries a'
-            + ' strong one.'],
+            + ' light mark. A word no majority settled carries a'
+            + ' strong one, and so does a word that engine did not'
+            + ' read at all.'],
         ['One engine alone', 'the others read nothing here, so its'
             + ' reading stands.'],
         ['The vote', 'compares the readings with the quotes, the'
