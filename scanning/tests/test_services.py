@@ -717,10 +717,28 @@ class TestMeasureMarginRects(TestCase):
             self.assertGreater(read.detections[0].bbox.x1, 200.0)
             self.assertEqual(document.pages[0].detections[0].bbox.x1, 0.5)
 
-    def test_every_page_gets_four_strips(self):
-        """A page the measure left alone gets the curator's handles (#370)."""
+    @staticmethod
+    def _bare_page(*detections):
+        """One blackletter page of the fixture frame, with no text box."""
         from types import SimpleNamespace
 
+        from blackletter.models import Page
+
+        return SimpleNamespace(
+            pages=[
+                Page(
+                    index=0,
+                    pdf_width=612.0,
+                    pdf_height=792.0,
+                    img_width=1700,
+                    img_height=2200,
+                    detections=list(detections),
+                )
+            ]
+        )
+
+    def test_every_page_gets_four_strips(self):
+        """A page the measure left alone gets the curator's handles (#370)."""
         from scanning import services
 
         entry = {
@@ -733,10 +751,39 @@ class TestMeasureMarginRects(TestCase):
             services, "compute_margin_rects", return_value=[entry]
         ):
             (measured,) = services._measure_margin_rects(
-                str(PDF_PATH),
-                SimpleNamespace(pages=[SimpleNamespace(text_box=None)]),
+                str(PDF_PATH), self._bare_page()
             )
         self.assertEqual(len(measured["rects"]), 4)
+
+    def test_a_handle_is_held_off_the_pages_the_measure_read(self):
+        """The handles see the same detections the strips did (#370)."""
+        from blackletter.models import BBox, Label
+        from blackletter.models import Detection as BLDetection
+
+        from scanning import services
+
+        column = BLDetection(
+            bbox=BBox(x1=0.0, y1=130.0, x2=760.0, y2=2050.0),
+            label=Label.TEXT_COLUMN,
+            confidence=0.5,
+            page_index=0,
+        )
+        entry = {
+            "page_index": 0,
+            "rects": [],
+            "page_width": 612.0,
+            "page_height": 792.0,
+        }
+        with patch.object(
+            services, "compute_margin_rects", return_value=[entry]
+        ):
+            (measured,) = services._measure_margin_rects(
+                str(PDF_PATH), self._bare_page(column)
+            )
+        self.assertEqual(len(measured["rects"]), 3)
+        self.assertFalse(
+            [r for r in measured["rects"] if r["x0"] == 0 and r["x1"] < 600]
+        )
 
     def test_does_not_measure_anything_without_detections(self):
         """Without detections the bounds would come from the page's marks

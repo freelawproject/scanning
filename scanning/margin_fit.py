@@ -74,7 +74,10 @@ takes the rule, :func:`clipped_pages` is a deletion.
 curator widens a strip by dragging it and draws one from nothing with
 more work, so a strip the measure did not give a page is a
 ``MIN_STRIP_PT`` handle at its page edge. It is the same strip at every
-compute, so a dismissal of it lands on the next.
+compute, so a dismissal of it lands on the next. A handle is a strip
+like the others: it is held off the detections by blackletter's own
+pull-back, and one a detection at the page edge collapses is not added,
+because a strip never covers a detection.
 """
 
 from __future__ import annotations
@@ -82,7 +85,12 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 
-from blackletter.margins import DEFAULT_BUFFER, MIN_TEXT_WIDTH_FRACTION
+from blackletter.margins import (
+    DEFAULT_BUFFER,
+    MIN_TEXT_WIDTH_FRACTION,
+    _page_size_agrees,
+    _shrink_rects_for_detections,
+)
 from blackletter.models import BBox, Label
 
 from scanning.text_fit import PageCells
@@ -347,7 +355,9 @@ def _sides(entry: dict) -> dict:
     return sides
 
 
-def ensure_strips(entries: list, min_pt: float = MIN_STRIP_PT) -> int:
+def ensure_strips(
+    entries: list, pages=None, min_pt: float = MIN_STRIP_PT
+) -> int:
     """Give every page the four strips, adding a thin one where the measure gave none.
 
     The top and bottom are added first, full width and ``min_pt`` tall;
@@ -356,19 +366,36 @@ def ensure_strips(entries: list, min_pt: float = MIN_STRIP_PT) -> int:
     are rounded to a tenth of a point, as blackletter's are. A page too
     small to hold two strips is left alone.
 
+    A handle is held off the detections of its page by the rule every
+    strip obeys, blackletter's ``_shrink_rects_for_detections`` (every
+    label outside ``NO_PUSHBACK_LABELS``, boxes wider than a pixel), and
+    one that collapses is not added: a scan cropped tight on the gutter
+    side gets no left strip today, on purpose, and a handle there would
+    be white over the type. ``pages`` are the pages the measure read
+    (the clipped copies), matched by index; a page the caller did not
+    pass, or one whose frame is not the entry's, gets its handles held
+    off nothing, as blackletter reads such a page's detections.
+
     :param entries: The ``compute_margin_rects`` entries, mutated in place.
+    :param pages: The blackletter pages the entries were measured on.
     :param min_pt: The width of an added strip, in PDF points.
     :returns: How many strips were added.
     :rtype: int
     """
+    by_index = {page.index: page for page in pages or []}
     added = 0
+    held = 0
     for entry in entries:
         pw = float(entry.get("page_width") or 0)
         ph = float(entry.get("page_height") or 0)
         if pw <= 2 * min_pt or ph <= 2 * min_pt:
             continue
-        rects = entry.setdefault("rects", [])
+        # ``or []`` because the other readers of these entries read
+        # ``rects`` that way, and an explicit None must not crash here.
+        rects = entry.get("rects") or []
+        entry["rects"] = rects
         sides = _sides(entry)
+        handles = []
         if sides["top"] is None:
             sides["top"] = {
                 "x0": 0,
@@ -376,8 +403,7 @@ def ensure_strips(entries: list, min_pt: float = MIN_STRIP_PT) -> int:
                 "x1": round(pw, 1),
                 "y1": round(min_pt, 1),
             }
-            rects.append(sides["top"])
-            added += 1
+            handles.append(sides["top"])
         if sides["bottom"] is None:
             sides["bottom"] = {
                 "x0": 0,
@@ -385,12 +411,11 @@ def ensure_strips(entries: list, min_pt: float = MIN_STRIP_PT) -> int:
                 "x1": round(pw, 1),
                 "y1": round(ph, 1),
             }
-            rects.append(sides["bottom"])
-            added += 1
+            handles.append(sides["bottom"])
         y0 = sides["top"]["y1"]
         y1 = sides["bottom"]["y0"]
         if sides["left"] is None:
-            rects.append(
+            handles.append(
                 {
                     "x0": 0,
                     "y0": round(y0, 1),
@@ -398,9 +423,8 @@ def ensure_strips(entries: list, min_pt: float = MIN_STRIP_PT) -> int:
                     "y1": round(y1, 1),
                 }
             )
-            added += 1
         if sides["right"] is None:
-            rects.append(
+            handles.append(
                 {
                     "x0": round(pw - min_pt, 1),
                     "y0": round(y0, 1),
@@ -408,10 +432,25 @@ def ensure_strips(entries: list, min_pt: float = MIN_STRIP_PT) -> int:
                     "y1": round(y1, 1),
                 }
             )
-            added += 1
-    if added:
+        if not handles:
+            continue
+        page = by_index.get(entry.get("page_index"))
+        if page is not None and _page_size_agrees(page, pw, ph):
+            _shrink_rects_for_detections(page, handles)
+            kept = [
+                h
+                for h in handles
+                if h["x1"] - h["x0"] > 1 and h["y1"] - h["y0"] > 1
+            ]
+            held += len(handles) - len(kept)
+            handles = kept
+        rects.extend(handles)
+        added += len(handles)
+    if added or held:
         logger.info(
-            "Margin strips: %d thin strip(s) added where the measure gave none",
+            "Margin strips: %d thin strip(s) added where the measure gave "
+            "none, %d withheld for a detection at the page edge",
             added,
+            held,
         )
     return added

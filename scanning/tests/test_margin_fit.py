@@ -473,3 +473,68 @@ class TestEnsureStrips(TestCase):
         self.assertIn(
             {"x0": 608.0, "y0": 22.4, "x1": 612.0, "y1": 736.8}, entry["rects"]
         )
+
+    def test_rects_none_is_read_as_empty(self):
+        """The other readers of these entries read ``rects`` with ``or []``."""
+        entry = self._entry()
+        entry["rects"] = None
+        self.assertEqual(margin_fit.ensure_strips([entry]), 4)
+        self.assertEqual(len(entry["rects"]), 4)
+
+    @staticmethod
+    def _page_with(label, *box):
+        subject = page(
+            detections=(
+                BLDetection(
+                    bbox=BBox(x1=box[0], y1=box[1], x2=box[2], y2=box[3]),
+                    label=label,
+                    confidence=0.5,
+                    page_index=0,
+                ),
+            )
+        )
+        return subject
+
+    def test_a_handle_never_covers_a_detection(self):
+        """A scan cropped tight on the gutter side gets no left strip today."""
+        column = self._page_with(Label.TEXT_COLUMN, 0.0, 130.0, 760.0, 2050.0)
+        entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry], [column]), 0)
+        self.assertIsNone(margin_fit._sides(entry)["left"])
+        self.assertEqual(len(entry["rects"]), 3)
+
+    def test_a_picture_at_the_top_edge_withholds_the_top_handle(self):
+        image = self._page_with(Label.IMAGE, 300.0, 0.0, 1400.0, 900.0)
+        entry = self._entry(self.LEFT, self.RIGHT, self.BOTTOM)
+        self.assertEqual(margin_fit.ensure_strips([entry], [image]), 0)
+        self.assertIsNone(margin_fit._sides(entry)["top"])
+
+    def test_a_detection_off_the_edge_does_not_block_the_handle(self):
+        column = self._page_with(
+            Label.TEXT_COLUMN, 250.0, 130.0, 760.0, 2050.0
+        )
+        entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry], [column]), 1)
+        self.assertIn(
+            {"x0": 0, "y0": 22.4, "x1": 6.0, "y1": 736.8}, entry["rects"]
+        )
+
+    def test_a_header_detection_holds_no_handle(self):
+        """blackletter's ``NO_PUSHBACK_LABELS``: a folio at the edge is bleed-through."""
+        number = self._page_with(Label.PAGE_NUMBER, 1400.0, 0.0, 1470.0, 40.0)
+        entry = self._entry(self.LEFT, self.RIGHT, self.BOTTOM)
+        self.assertEqual(margin_fit.ensure_strips([entry], [number]), 1)
+        self.assertIsNotNone(margin_fit._sides(entry)["top"])
+
+    def test_a_page_the_caller_did_not_pass_is_held_off_nothing(self):
+        column = self._page_with(Label.TEXT_COLUMN, 0.0, 130.0, 760.0, 2050.0)
+        column.index = 3
+        entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry], [column]), 1)
+
+    def test_a_page_of_another_frame_is_held_off_nothing(self):
+        """blackletter ignores the detections of such a page too."""
+        column = self._page_with(Label.TEXT_COLUMN, 0.0, 130.0, 760.0, 2050.0)
+        column.pdf_width = 500.0
+        entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry], [column]), 1)
