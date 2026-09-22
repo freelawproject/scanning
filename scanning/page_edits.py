@@ -469,7 +469,7 @@ def _longest_ordered(pages: list[int]) -> set[int]:
 
 
 def sorted_window(sequence: list[tuple[int, int]], index: int) -> dict | None:
-    """The reorder that answers a backward step of the printed numbers.
+    """The span that answers a backward step of the printed numbers.
 
     ``sequence`` holds the numbered pages of one unbroken run of
     physical neighbours, in the order the volume holds them, each a
@@ -482,29 +482,27 @@ def sorted_window(sequence: list[tuple[int, int]], index: int) -> dict | None:
     continuing the number before the window and met by the number after
     it (or the run's end on either side). A transposed pair, a page
     pulled early or late by several slots, two blocks scanned the wrong
-    way round (``186..189, 184, 185``) and a span scanned in reverse are
-    all this rule. A step whose window never closes -- a misread, a
-    duplicate inside it, a hole beside it -- gets no answer: sorting by
-    a wrong number moves the wrong page, and the curator corrects the
-    number first.
+    way round (``186..189, 184, 185``), an interleaved shuffle and a
+    span scanned in reverse are all this rule. A step whose window never
+    closes -- a misread, a duplicate inside it, a hole beside it -- gets
+    no answer: sorting by a wrong number moves the wrong page, and the
+    curator corrects the number first.
 
-    The window is grown from the pair at the step: a neighbour whose
-    number the window still lacks joins it, and a boundary number that
-    sits on the far side of the window pulls the window over to it.
+    The window is grown from the pair at the step, and every growth is
+    forced: a number the window's range lacks is fetched from the
+    nearest page outside that holds it, and a boundary number that
+    sits beside or on the far side of the window pulls the window over
+    to it. So the window is the smallest that closes, when one does.
 
-    The rows are ``MOVE_PAGE`` rows, as few as the shape allows: the
-    pages already in order (the longest such set) keep their slots, and
-    every other page lands after the nearest kept page below it in the
-    sorted order, or before the window when there is none, in
-    ``ordinal`` order there. ``slot_order`` then yields the sort.
+    The rows are not decided here: :func:`rows_for_order` derives them
+    from the whole corrected order with this window sorted in place,
+    so a correction beside an earlier one lands where the numbers say.
 
     :param sequence: ``(pdf_page, number)`` pairs, the run's order.
     :param index: The position of the page whose number steps back.
-    :returns: ``{"pdf_pages", "order", "moves", "swap"}``: the window
-        in scanned order, the same pages in corrected order, the rows
-        to write (``pdf_page``, ``anchor_pdf_page``, ``ordinal``) and
-        whether the window is a transposed pair. None when the step
-        has no answer.
+    :returns: ``{"pdf_pages", "order", "swap"}``: the window in scanned
+        order, the same pages in corrected order, and whether it is a
+        transposed pair. None when the step has no answer.
     :rtype: dict | None
     """
     if index < 1 or index >= len(sequence):
@@ -516,56 +514,119 @@ def sorted_window(sequence: list[tuple[int, int]], index: int) -> dict | None:
     while True:
         window = nums[a : b + 1]
         lo, hi = min(window), max(window)
-        grown = False
-        if a > 0 and lo < nums[a - 1] < hi:
-            a -= 1
-            grown = True
-        if b < last and lo < nums[b + 1] < hi:
-            b += 1
-            grown = True
-        if grown:
+        if hi - lo > last or len(set(window)) != len(window):
+            # A range wider than the run never closes, and a duplicate
+            # inside the window can not be sorted.
+            return None
+        missing = set(range(lo, hi + 1)) - set(window)
+        if missing:
+            # The nearest page outside that holds a number the window
+            # lacks joins it, on whichever side it sits.
+            left = next(
+                (k for k in range(a - 1, -1, -1) if nums[k] in missing), None
+            )
+            right = next(
+                (k for k in range(b + 1, last + 1) if nums[k] in missing), None
+            )
+            if left is None and right is None:
+                return None
+            if right is None or (left is not None and a - left <= right - b):
+                a = left
+            else:
+                b = right
             continue
-        # A boundary that fails because its number sits on the other
-        # side of the window: the window reaches over to it.
-        if a > 0 and nums[a - 1] != lo - 1 and lo - 1 in nums[b + 1 :]:
-            b = nums.index(lo - 1, b + 1)
+        # The window is one consecutive run. Its neighbours must
+        # continue it, or the window is not closed: a neighbour that
+        # continues the other side joins it, a boundary number that
+        # sits on the far side pulls the window over to it, and any
+        # other neighbour joins it too, since a window that ends here
+        # would have to be met by it. Every growth is forced, so the
+        # window that closes is the smallest one.
+        if a > 0 and nums[a - 1] != lo - 1:
+            if nums[a - 1] != hi + 1 and lo - 1 in nums[b + 1 :]:
+                b = nums.index(lo - 1, b + 1)
+            else:
+                a -= 1
             continue
-        if b < last and nums[b + 1] != hi + 1 and hi + 1 in nums[:a]:
-            a = nums.index(hi + 1, 0, a)
+        if b < last and nums[b + 1] != hi + 1:
+            if nums[b + 1] != lo - 1 and hi + 1 in nums[:a]:
+                a = nums.index(hi + 1, 0, a)
+            else:
+                b += 1
             continue
         break
-    window = nums[a : b + 1]
-    lo, hi = min(window), max(window)
-    if hi - lo != b - a or len(set(window)) != len(window):
-        return None
-    if a > 0 and nums[a - 1] != lo - 1:
-        return None
-    if b < last and nums[b + 1] != hi + 1:
-        return None
     if not all(pages[k + 1] == pages[k] + 1 for k in range(a, b)):
         return None
     by_number = {n: p for p, n in sequence[a : b + 1]}
-    order = [by_number[n] for n in range(lo, hi + 1)]
+    return {
+        "pdf_pages": pages[a : b + 1],
+        "order": [by_number[n] for n in range(lo, hi + 1)],
+        "swap": b - a == 1,
+    }
+
+
+def rows_for_order(order: list[int]) -> list[dict]:
+    """The ``MOVE_PAGE`` rows that make the volume read in ``order``.
+
+    ``order`` is every original page, in the order the corrected volume
+    should hold them. The pages already in increasing order (the
+    longest such set) keep their slots and no row; every other page
+    lands after the nearest kept page before it in ``order``, or before
+    page 1 when there is none, in ``ordinal`` order there. A kept page
+    never moves, so an anchor is always a page at its own slot, and
+    :func:`slot_order` yields exactly ``order`` (#395).
+
+    The rows are derived from the whole order and not from one window,
+    so the set replaces whatever stands: a second correction beside a
+    first one, a swap of #379 or a partly undone reorder all fold into
+    one consistent set, and the endpoint writes the difference.
+
+    :param order: The original pages in corrected order.
+    :returns: ``[{"pdf_page", "anchor_pdf_page", "ordinal"}, ...]`` in
+        landing order.
+    :rtype: list[dict]
+    """
     kept = _longest_ordered(order)
-    before = pages[a] - 1
-    anchor = before
+    anchor = 0
     counts: dict[int, int] = {}
-    moves = []
+    rows = []
     for page in order:
         if page in kept:
             anchor = page
             continue
         ordinal = counts.get(anchor, 0)
         counts[anchor] = ordinal + 1
-        moves.append(
+        rows.append(
             {"pdf_page": page, "anchor_pdf_page": anchor, "ordinal": ordinal}
         )
-    return {
-        "pdf_pages": pages[a : b + 1],
-        "order": order,
-        "moves": moves,
-        "swap": b - a == 1,
-    }
+    return rows
+
+
+def sorted_order(current: list[int], window: dict) -> list[int]:
+    """``current`` with the window's pages in their corrected order.
+
+    :param current: Every original page in the order the volume holds
+        them now (the moves applied).
+    :param window: A :func:`sorted_window` answer.
+    :returns: The order the card's button asks for.
+    :rtype: list[int]
+    """
+    slots = iter(window["order"])
+    inside = set(window["pdf_pages"])
+    return [next(slots) if page in inside else page for page in current]
+
+
+def _displaced(window: dict) -> tuple[int, int] | None:
+    """The one page a window moves, and the page it goes after, when
+    the window's order differs from the scanned one by one page alone.
+    0 stands for before the first page of the window."""
+    scanned, order = window["pdf_pages"], window["order"]
+    for page in scanned:
+        rest = [p for p in scanned if p != page]
+        if [p for p in order if p != page] == rest:
+            at = order.index(page)
+            return page, (order[at - 1] if at else 0)
+    return None
 
 
 def move_label(window: dict) -> str:
@@ -573,13 +634,16 @@ def move_label(window: dict) -> str:
     pages = window["pdf_pages"]
     if window.get("swap"):
         return f"Swap PDF pages {pages[0]} and {pages[1]}"
-    if len(window["moves"]) == 1:
-        move = window["moves"][0]
-        anchor = move["anchor_pdf_page"]
+    displaced = _displaced(window)
+    if displaced is not None:
+        page, after = displaced
+        before = pages[0] - 1
         where = (
-            "before PDF page 1" if anchor == 0 else f"after PDF page {anchor}"
+            "before PDF page 1"
+            if after == 0 and before == 0
+            else f"after PDF page {after or before}"
         )
-        return f"Move PDF page {move['pdf_page']} to {where}"
+        return f"Move PDF page {page} to {where}"
     return f"Reorder PDF pages {pages[0]} to {pages[-1]} by printed number"
 
 
