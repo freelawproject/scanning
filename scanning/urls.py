@@ -7,6 +7,7 @@ from scanning.monitoring import health_check, heartbeat, sentry_fail
 from scanning.views import (
     claim_scan,
     confirm_scan_upload,
+    dismiss_repair_from_queue,
     legacy_opinion_detail,
     legacy_opinion_list,
     legacy_opinion_upload,
@@ -138,6 +139,11 @@ urlpatterns = [
     path("profile/password/", password_change, name="password_change"),
     path("queue/", queue_view, name="queue"),
     path("repairs/", repair_queue, name="repair_queue"),
+    path(
+        "repairs/<int:pk>/dismiss/",
+        dismiss_repair_from_queue,
+        name="dismiss_repair_from_queue",
+    ),
     path("stats/", stats_view, name="stats"),
     path(
         "queue/<str:reporter_slug>/<int:vol>/",

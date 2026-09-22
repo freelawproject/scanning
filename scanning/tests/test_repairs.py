@@ -902,6 +902,151 @@ class TestRepairQueue(RepairTestCase):
         self.assertContains(response, "No page waits for a scanner.")
 
 
+class TestDismissFromTheQueue(RepairTestCase):
+    """The Dismiss button of the queue page (#249).
+
+    A missing-page request draws its card on the placeholder of its
+    gap, and the placeholder goes when the printed sequence stops
+    showing the gap. The request then waits with no button on the
+    page and holds the review-1 approval (#266). The queue offers the
+    same button, under the same rule as ``dismiss_page_repair``.
+    """
+
+    def _dismiss_from_queue(self, request_id, query=""):
+        """POST the queue's Dismiss form.
+
+        :param request_id: The request to dismiss.
+        :param query: The query string of the list the button was on.
+        :returns: The response.
+        """
+        return self.client.post(
+            reverse("dismiss_repair_from_queue", kwargs={"pk": request_id})
+            + query
+        )
+
+    def test_an_open_request_offers_the_button(self):
+        self._insert(anchor=1, label="2")
+        response = self.client.get(reverse("repair_queue"))
+        row = self.scan.repair_requests.get()
+
+        self.assertContains(
+            response,
+            reverse("dismiss_repair_from_queue", kwargs={"pk": row.pk}),
+        )
+        self.assertContains(response, ">Dismiss</button>")
+
+    def test_a_dismissed_request_offers_none(self):
+        self._insert(anchor=1, label="2")
+        row = self.scan.repair_requests.get()
+        repairs.dismiss(self.scan.repair_requests.all(), self.user)
+
+        response = self.client.get(
+            reverse("repair_queue"), {"state": "dismissed"}
+        )
+
+        self.assertNotContains(
+            response,
+            reverse("dismiss_repair_from_queue", kwargs={"pk": row.pk}),
+        )
+        self.assertNotContains(response, ">Dismiss</button>")
+
+    def test_the_form_carries_the_list_query(self):
+        self._insert(anchor=1, label="2")
+        row = self.scan.repair_requests.get()
+
+        response = self.client.get(
+            reverse("repair_queue"), {"state": "all", "page": "1"}
+        )
+
+        self.assertContains(
+            response,
+            reverse("dismiss_repair_from_queue", kwargs={"pk": row.pk})
+            + "?state=all&amp;page=1",
+        )
+
+    def test_a_dismissal_stamps_the_row_and_returns_to_the_list(self):
+        self._insert(anchor=1, label="2")
+        row = self.scan.repair_requests.get()
+        other = self.make_user()
+        self.client.force_login(other)
+
+        response = self._dismiss_from_queue(row.pk, "?state=all&page=1")
+
+        self.assertRedirects(
+            response,
+            reverse("repair_queue") + "?state=all&page=1",
+            fetch_redirect_response=False,
+        )
+        row.refresh_from_db()
+        self.assertIsNotNone(row.dismissed_at)
+        # Any logged-in user, the rule of the page card's button.
+        self.assertEqual(row.dismissed_by, other)
+        self.assertEqual(row.date_modified, row.dismissed_at)
+        self.assertFalse(repairs.has_waiting(self.scan))
+        flashed = [m.message for m in get_messages(response.wsgi_request)]
+        self.assertIn("Request dismissed.", flashed)
+
+    def test_a_stray_query_key_is_dropped(self):
+        self._insert(anchor=1, label="2")
+        row = self.scan.repair_requests.get()
+
+        response = self._dismiss_from_queue(
+            row.pk, "?state=waiting&next=https://evil.example/"
+        )
+
+        self.assertRedirects(
+            response,
+            reverse("repair_queue") + "?state=waiting",
+            fetch_redirect_response=False,
+        )
+
+    def test_a_second_dismissal_is_a_no_op(self):
+        self._insert(anchor=1, label="2")
+        row = self.scan.repair_requests.get()
+        repairs.dismiss(self.scan.repair_requests.all(), self.user)
+        first = self.scan.repair_requests.get()
+        other = self.make_user()
+        self.client.force_login(other)
+
+        response = self._dismiss_from_queue(row.pk)
+
+        self.assertRedirects(
+            response, reverse("repair_queue"), fetch_redirect_response=False
+        )
+        row.refresh_from_db()
+        self.assertEqual(row.dismissed_at, first.dismissed_at)
+        self.assertEqual(row.dismissed_by, self.user)
+        flashed = [m.message for m in get_messages(response.wsgi_request)]
+        self.assertIn("This request was already dismissed.", flashed)
+
+    def test_an_unknown_request_is_404(self):
+        self.assertEqual(self._dismiss_from_queue(999).status_code, 404)
+
+    def test_a_get_is_refused(self):
+        self._insert(anchor=1, label="2")
+        row = self.scan.repair_requests.get()
+
+        response = self.client.get(
+            reverse("dismiss_repair_from_queue", kwargs={"pk": row.pk})
+        )
+
+        self.assertEqual(response.status_code, 405)
+        row.refresh_from_db()
+        self.assertIsNone(row.dismissed_at)
+
+    def test_login_is_required(self):
+        self._insert(anchor=1, label="2")
+        row = self.scan.repair_requests.get()
+        self.client.logout()
+
+        response = self._dismiss_from_queue(row.pk)
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn(reverse("login"), response["Location"])
+        row.refresh_from_db()
+        self.assertIsNone(row.dismissed_at)
+
+
 class TestWaitingCounts(RepairTestCase):
     """The count the badge of the scan list reads (issue #266)."""
 
