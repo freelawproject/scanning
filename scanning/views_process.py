@@ -555,6 +555,15 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             else None
         ),
     )
+    # The preview shows the model's boxes and nothing else (#388). The
+    # findings, the boundaries and the redactions of a volume in it are
+    # either absent or left over from a superseded run (a reopen keeps
+    # the rows until the next import), and both answers are wrong on a
+    # page that judges today's detections. The read above is paid on
+    # this path alone, and the page renders no findings section.
+    preview = step >= 2 and flags["preview_available"]
+    if preview:
+        review_findings = {}
     final_space = step >= 2 and flags["final_space"]
     printed_warning = None
     if final_space:
@@ -745,7 +754,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         for page, row in ocr_by_page.items()
         if (span := printed_page_span(row.get("detected"), row.get("type")))
     }
-    opinions = boundaries.viewer_payload(scan, page_spans)
+    # No boundary reaches the preview (#388), for the reason the
+    # findings do not: the pairing is the compute's own output, so a
+    # row here is a superseded run's, and its card carries a dismiss
+    # the endpoint refuses.
+    opinions = [] if preview else boundaries.viewer_payload(scan, page_spans)
     opinion_count = sum(1 for op in opinions if not op["dismissed"])
 
     # Build a set of page indices that contain IMAGE detections
@@ -818,6 +831,10 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "detect_message": detection_message(yolo_run),
             **flags,
             "final_space": final_space,
+            # The step-scoped answer (#388): the rule is true of the
+            # volume, the banner and the locks are true of step 2
+            # alone. Step 1 of the same volume is an open page review.
+            "preview_only": preview,
             # The text overlay's dropdown (#262, #381). One entry per
             # engine, so the control says which reads exist and which
             # do not; the template draws the pair when one is
@@ -846,8 +863,13 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             # locked and keeps its page-number control. The final space
             # is locked whatever the status (#269): a page number there
             # is a page of the corrected volume, not an address
-            # ``assign_page`` takes.
-            "page_edits_locked": final_space or scan.status in LOCKED_STATUSES,
+            # ``assign_page`` takes. The preview is locked too (#388),
+            # and only as a step-2 render: the same volume's step 1 is
+            # an open page review, whose edits this flag must not take
+            # away.
+            "page_edits_locked": (
+                final_space or preview or scan.status in LOCKED_STATUSES
+            ),
             "repair_requests": repair_requests,
             "waiting_repairs": waiting_repairs,
             "replaced_pages_json": json.dumps(
@@ -2453,6 +2475,13 @@ def _review_flags(
     requests for the sidebar anyway -- and the flag is queried only for
     a caller that does not (the ``process_actions`` fragment).
 
+    ``preview_available`` is the detection preview of #388, and
+    ``preview_approved`` says which disclaimer it gets: a volume whose
+    page review is still open must approve it, and an approved one must
+    wait for the corrected volume. The rule is
+    ``review_states.preview_only``, and a render turns it into
+    ``preview_only``, which is that rule on a step-2 page.
+
     ``pages_without_number`` is the second gate of that approval
     (#342), and it is read in READY alone, which is the condition the
     view reads: a volume past review 1 pays no query for it, whichever
@@ -2467,7 +2496,8 @@ def _review_flags(
         :func:`findings.open_count`, past the review-1 approval.
     :returns: ``page_review_ready``, ``page_review_done``,
         ``redaction_review_ready``, ``redaction_review_done``,
-        ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting``,
+        ``preview_available``, ``preview_approved``, ``legacy_review``,
+        ``has_legacy_ocr``, ``repairs_waiting``,
         ``pages_without_number``, ``legacy_pipeline``,
         ``review3_opinions`` and the two pending-edit flags, for the
         template context.
@@ -2485,9 +2515,15 @@ def _review_flags(
     # rows measured on the original would put the final PDF under boxes
     # of another space, the one thing step 2 must never show.
     final = review_states.final_run(scan, run)
+    detect_rows = yolo.live_detect_jobs(scan) if final is not None else None
     final_space = final is not None and yolo.redactions_current(
-        yolo.live_detect_jobs(scan), final
+        detect_rows, final
     )
+    # The read-only step 2 of a volume with no measured geometry
+    # (#388). The run is the one read above, and the rows are read by
+    # the rule itself, past its status check: a volume no preview can
+    # reach pays no query for one.
+    preview_available = review_states.preview_only(scan, detect_rows, run)
     final_volume = None
     if final is not None:
         final_volume = {
@@ -2514,6 +2550,16 @@ def _review_flags(
             scan.status == Status.READY_FOR_REDACTION_REVIEW
         ),
         "redaction_review_done": (scan.status == Status.REDACTION_REVIEW_DONE),
+        # The detection preview (#388). ``preview_available`` is the
+        # rule, true of the volume whichever step is rendered, because
+        # step 1 links the preview and the step-2 tab marks it. The
+        # page turns it into ``preview_only``, the step-2 render, which
+        # is what the banner and the locks read: step 1 of the same
+        # volume is an open page review. ``preview_approved`` picks the
+        # disclaimer: a volume whose page review is still open must be
+        # approved, an approved one must wait for the corrected volume.
+        "preview_available": preview_available,
+        "preview_approved": preview_available and done,
         # The last word of the server on a volume parked in review 2
         # (#336). A failed opinion creation or a failed recompute parks
         # the scan here with the reason in ``progress_message``, and the
@@ -2685,6 +2731,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         step = 1
 
     yolo_run = yolo.run_summary(scan)
+    flags = _review_flags(scan)
     context = {
         "scan": scan,
         "step": step,
@@ -2697,7 +2744,10 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "mistral_run": mistral_ocr.run_summary(scan),
         "surya_run": surya.run_summary(scan),
         "detect_message": detection_message(yolo_run),
-        **_review_flags(scan),
+        **flags,
+        # Step-scoped, as the page renders it (#388): the bar of step 1
+        # belongs to the page review, whichever state step 2 is in.
+        "preview_only": step >= 2 and flags["preview_available"],
     }
     html = render_to_string(
         "scanning/_process_actions.html", context, request=request

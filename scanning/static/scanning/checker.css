@@ -386,6 +386,19 @@ a.doc-name:hover { text-decoration: underline; }
     font-size: 10px;
     font-weight: 700;
 }
+/* A page marked for deletion, in the detection preview (#388). The
+   page review has not been built into the volume yet, so the page is
+   still there and still shows its boxes; the badge says what the
+   volume will lose, and the preview offers no undo, which is step 1's
+   own control. */
+.deleted-badge {
+    background: #dc2626;
+    color: white;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+}
 .page-container.flagged {
     box-shadow: 0 0 0 3px #ef4444, 0 2px 8px rgba(0,0,0,0.3);
 }
