@@ -1816,8 +1816,9 @@ def _partial_message(page: dict) -> str:
     """Return the line of one ``PARTIAL_REDACTION`` card.
 
     The reason is read off the drops the count came from: a group goes
-    whole, and the box that took it is a redaction or the mask of the
-    opinion before (``opinion_ocr.verdict`` writes both).
+    whole, and what took it is a redaction, the mask of the opinion
+    before or the page number (``opinion_ocr.verdict`` writes the
+    three).
 
     :param page: One page of the document.
     :returns: The message.

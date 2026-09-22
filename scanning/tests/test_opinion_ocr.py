@@ -672,6 +672,56 @@ class TestTheVerdict(OpinionOcrTestCase):
             self.assertEqual(document["counts"]["page_number"], 2, engine)
             self.assertEqual(document["counts"]["partial"], 0, engine)
 
+    def low_head_cell(self, category):
+        """A two-line head cell that ends below the band, on page 2."""
+        dots = dots_document()
+        dots["pages"][2]["cells"][0] = cell(
+            100,
+            50,
+            800,
+            300,
+            text="STATE v. SMITH\nCite as 218 A.3d 877 -- 878",
+            category=category,
+        )
+        self.objects[self.apply_run.ocr_key] = dots
+
+    def test_a_labelled_head_cell_below_the_band_is_the_page_number(self):
+        """A two-line head cell with the ``Cite as`` line can end below
+        the band. Review 1 read its number through the label, and the
+        glue takes the label too."""
+        self.low_head_cell("Page-header")
+
+        document = self.write()
+
+        header = self.unit(document, 1, "STATE v. SMITH")
+        self.assertEqual(
+            header["exclusion"]["reason"], opinion_ocr.PAGE_NUMBER
+        )
+
+    def test_a_body_cell_below_the_band_is_judged_by_the_band(self):
+        """The same box and the same text under a body label: no zone,
+        so the number at the end of its line keeps it in the text."""
+        self.low_head_cell("Text")
+
+        document = self.write()
+
+        self.assertIsNone(
+            self.unit(document, 1, "STATE v. SMITH")["exclusion"]
+        )
+
+    def test_a_labelled_cell_with_a_headnote_number_is_kept(self):
+        """dots.mocr labels a headnote number ``Page-header`` too, in
+        the body. The value is what keeps it."""
+        dots = dots_document()
+        dots["pages"][2]["cells"][1] = cell(
+            *BODY_A, text="1", category="Page-header"
+        )
+        self.objects[self.apply_run.ocr_key] = dots
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "1")["exclusion"])
+
     def test_a_body_cell_that_ends_in_the_number_is_kept(self):
         """The band is required: a citation at the end of a paragraph
         is opinion text."""
@@ -919,6 +969,37 @@ class TestTheSuryaEngine(OpinionOcrTestCase):
     def surya_doc(self):
         """The opinion's Surya document, as written."""
         return self.uploads[opinion_ocr.engine_key(self.opinion, "surya")]
+
+    def test_a_marked_header_is_the_page_number(self):
+        """Mistral writes the running head as a heading, dots.mocr sets
+        bold marks, Surya a bullet. The reader folds them first, or the
+        group drops on the dots.mocr cell alone and the page gets a
+        partial card for the clean Mistral block beside it."""
+        mistral = mistral_document()
+        mistral["pages"][2]["blocks"][0]["content"] = "# 878 N. C."
+        self.objects[self.apply_run.extract_key] = mistral
+        dots = dots_document()
+        dots["pages"][2]["cells"][0]["text"] = "**878 N. C.**"
+        self.objects[self.apply_run.ocr_key] = dots
+        surya = surya_document()
+        surya["pages"][2]["blocks"][0]["text"] = "• 878 N. C."
+        self.add_surya(surya)
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine, prefix in (
+            ("dots_mocr", "**878"),
+            ("mistral_ocr", "# 878"),
+            ("surya", "• 878"),
+        ):
+            document = self.uploads[
+                opinion_ocr.engine_key(self.opinion, engine)
+            ]
+            header = self.unit(document, 1, prefix)
+            self.assertEqual(
+                header["exclusion"]["reason"], opinion_ocr.PAGE_NUMBER, engine
+            )
+            self.assertEqual(document["counts"]["partial"], 0, engine)
 
     def test_surya_is_last_in_the_table(self):
         """The order of the table is the rank of the ensemble vote

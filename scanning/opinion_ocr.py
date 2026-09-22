@@ -25,16 +25,19 @@ approved by review 1 and frozen by the apply in the printed-page map
 (``apply.printed_pages``), which holds the value of every final page
 and no position: every engine reads the number inside a larger unit,
 with the running head. So the glue reads the approved value and finds
-it in each engine's own text: a unit that sits in the head or the foot
-band and one of whose lines ends in that value
+it in each engine's own text: a unit in the head or the foot zone --
+by its band (``page_numbers.band_of``) or by the engine's own label
+(``page_numbers.is_head_or_foot_label``), the two signals review 1
+takes a candidate by -- one of whose lines ends in that value
 (``page_numbers.carries_number``) carries the exclusion
 ``page_number``, and the running head goes with it. Both conditions
-are required. The band alone takes every head cell, number or not;
+are required. The zone alone takes every head cell, number or not;
 the value alone takes a body line that ends in the same digits, which
 is opinion text. Nothing is read off a dots.mocr box, so a page
-dots.mocr failed still loses the headers of the other engines, and a
-page whose approved number the engines did not print (a curator's
-label on an inserted page, or no number at all) keeps every unit.
+dots.mocr failed still loses the headers of the other engines. A page
+whose approved number the engines did not write keeps every unit: a
+header the model misread and a curator corrected, a curator's label
+on an inserted page, or no number at all.
 
 **A unit nobody could measure is not clean text.** A unit with no box,
 or on a page whose size no detection and no render gives, carries the
@@ -639,12 +642,13 @@ def verdict(
     text: str = "",
     printed: str | None = None,
     height_pt: float | None = None,
+    label: str = "",
 ) -> tuple[dict | None, float]:
     """Return one unit's ``(exclusion, share)``.
 
     A redaction that covers :data:`EXCLUDE_SHARE` or more of the unit
     names itself; else a neighbour's mask that does; else the printed
-    page number, when the unit sits in the head or the foot band and
+    page number, when the unit sits in the head or the foot zone and
     one of its lines ends in the approved number of its page (#396);
     else nothing. The share is the larger of the two boxes' shares,
     so a partial verdict is read off the file as ``share <
@@ -665,6 +669,7 @@ def verdict(
         a page with none.
     :param height_pt: The page's height in points, the space of
         ``box_pt``; None leaves the band unread.
+    :param label: The unit's label, as the engine wrote it.
     :returns: The verdict.
     :rtype: tuple[dict | None, float]
     """
@@ -686,7 +691,7 @@ def verdict(
         }
     elif out_share >= EXCLUDE_SHARE:
         exclusion = {"reason": "outside"}
-    elif is_page_number(box_pt, text, printed, height_pt):
+    elif is_page_number(box_pt, text, printed, height_pt, label):
         exclusion = {"reason": PAGE_NUMBER, "printed": printed}
         share = 1.0
     else:
@@ -699,24 +704,30 @@ def is_page_number(
     text: str,
     printed: str | None,
     height_pt: float | None,
+    label: str = "",
 ) -> bool:
     """Say whether a unit is the printed page number of its page (#396).
 
-    Both conditions, and the one rule for them: the box sits in the
-    head or the foot band (``page_numbers.band_of``), and a line of
-    the text ends in the approved value
-    (``page_numbers.carries_number``).
+    Both conditions, and the one rule for them: the unit is in the head
+    or the foot zone, by its band (``page_numbers.band_of``) or by the
+    engine's label (``page_numbers.is_head_or_foot_label``), the two
+    signals review 1 takes a candidate by; and a line of the text ends
+    in the approved value (``page_numbers.carries_number``).
 
     :param box_pt: The unit's box in points.
     :param text: The unit's text.
     :param printed: The approved number of the page, or None.
     :param height_pt: The page's height in points, or None.
+    :param label: The unit's label, as the engine wrote it.
     :returns: Whether the unit is the page number.
     :rtype: bool
     """
-    if not printed or not height_pt:
+    if not printed:
         return False
-    if page_numbers.band_of(box_pt, height_pt) is None:
+    in_zone = page_numbers.is_head_or_foot_label(label) or (
+        bool(height_pt) and page_numbers.band_of(box_pt, height_pt) is not None
+    )
+    if not in_zone:
         return False
     return page_numbers.carries_number(text, printed)
 
@@ -832,6 +843,7 @@ def build_document(
             text = unit.get(spec.text_key)
             if not isinstance(text, str):
                 text = ""
+            label = unit.get(spec.type_key) or ""
             exclusion, share = verdict(
                 box_pt,
                 rects,
@@ -839,6 +851,7 @@ def build_document(
                 text,
                 printed,
                 size[1] if size else None,
+                label,
             )
             counts["units"] += 1
             if exclusion is not None and exclusion["reason"] == UNJUDGED:
@@ -852,7 +865,7 @@ def build_document(
             entry["units"].append(
                 {
                     "id": index,
-                    "type": unit.get(spec.type_key) or "",
+                    "type": label,
                     "text": text,
                     "bbox": unit.get("bbox"),
                     "box_pt": box_pt,

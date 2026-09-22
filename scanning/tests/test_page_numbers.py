@@ -664,11 +664,58 @@ class TestCarriesNumber(SimpleTestCase):
         self.assertFalse(page_numbers.carries_number("", "878"))
 
     def test_a_body_paragraph_that_ends_in_the_number(self):
-        """The reader answers the text alone; the glue adds the band,
+        """The reader answers the text alone; the glue adds the zone,
         which is what keeps this paragraph in the text."""
         self.assertTrue(
             page_numbers.carries_number("the court said, at 878", "878")
         )
+
+    def test_the_marks_of_the_engines_are_folded_first(self):
+        """Mistral and dots.mocr set heading and bold marks around the
+        head, Surya a bullet. None of them is a token."""
+        for text in (
+            "# 878 N. C.",
+            "## 878 N. C.",
+            "**878 N. C.**",
+            "• 878 N. C.",
+            "**878** N. C.",
+        ):
+            self.assertTrue(page_numbers.carries_number(text, "878"), text)
+        self.assertTrue(
+            page_numbers.carries_number(
+                "Cite as 218 A.3d 677 -- **679**", "679"
+            )
+        )
+        self.assertTrue(
+            page_numbers.carries_number("# Cite as 218 A.3d 677 -- 679", "679")
+        )
+        self.assertFalse(
+            page_numbers.carries_number("# Cite as 218 A.3d 677 -- 679", "218")
+        )
+
+
+class TestIsHeadOrFootLabel(SimpleTestCase):
+    """The label rule beside the band rule (#396)."""
+
+    def test_the_two_engines_that_label_the_head_and_the_foot(self):
+        for label in (
+            "Page-header",
+            "Page-footer",
+            "PageHeader",
+            "PageFooter",
+        ):
+            self.assertTrue(page_numbers.is_head_or_foot_label(label), label)
+
+    def test_every_other_label_is_the_body(self):
+        for label in (
+            "Text",
+            "SectionHeader",
+            "Section-header",
+            "text",
+            "",
+            None,
+        ):
+            self.assertFalse(page_numbers.is_head_or_foot_label(label), label)
 
 
 class TestBandOf(SimpleTestCase):
