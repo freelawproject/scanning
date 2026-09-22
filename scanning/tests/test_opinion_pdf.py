@@ -401,6 +401,38 @@ class TestPartOneBumpsTheRevision(TestCase):
         self.assertEqual(second.status, OpinionReviewStatus.TEXT_REVIEW_DONE)
 
 
+class TestSourceOfAMovedPage(TestCase):
+    """The picture of a page comes from the page the map names (#383).
+
+    The PDF pulls the colour of a page out of the original's shard, so
+    a volume with a moved page (#261) must read the map and never the
+    final index: the picture would otherwise be another page's.
+    """
+
+    def _moved_map(self):
+        """Return a map that holds original page 3 before page 2."""
+        page_map = identity_map(3)
+        page_map["moved_pages"] = [3]
+        page_map["pages"][1]["source"] = {"kind": "original", "pdf_page": 3}
+        page_map["pages"][2]["source"] = {"kind": "original", "pdf_page": 2}
+        return page_map
+
+    def test_each_final_page_names_its_own_original(self):
+        scan = ScanFactory(page_count=3)
+        run = make_run(scan)
+        run.page_map = self._moved_map()
+        run.save(update_fields=["page_map"])
+
+        self.assertEqual(
+            [opinion_pdf._source_of(run, index) for index in range(3)],
+            [
+                {"kind": "original", "pdf_page": 1},
+                {"kind": "original", "pdf_page": 3},
+                {"kind": "original", "pdf_page": 2},
+            ],
+        )
+
+
 class TestPayload(OpinionPdfCase):
     def test_the_rows_land_in_the_small_source_space(self):
         row = self.opinion(start=1, end=3)
