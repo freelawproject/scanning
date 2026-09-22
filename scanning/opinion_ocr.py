@@ -162,13 +162,20 @@ class ScanHeld(Exception):
 class EngineSpec:
     """How one engine's corrected-volume document is read.
 
-    :param name: The ``JobEngine`` value, and the file name.
+    :param name: The ``JobEngine`` value, and the file name. What a
+        person calls the engine is that choice's own label
+        (``JobEngine(name).label``) and is not copied here (#381).
     :param key_field: The ``ApplyRun`` field that names the document.
     :param units_key: The page field that holds the units.
     :param text_key: The unit field that holds the text.
     :param type_key: The unit field that holds the engine's label.
     :param frame: Returns the render size ``(width, height)`` a page's
         boxes are measured in, or None.
+    :param module: The stage's module (``dots_mocr``, ``mistral_ocr``,
+        ``surya``), for the two functions all three share:
+        ``glued_volume_key(scan)`` and ``run_summary(scan)``. The
+        volume document is what the text overlay reads (#381), and the
+        corrected volume's is what this module reads.
     :param owed_rows: Returns the rows that say a read of this engine
         is on its way for a scan and run: a live volume run, or the
         rows of the run's own edited pages.
@@ -180,11 +187,30 @@ class EngineSpec:
     text_key: str
     type_key: str
     frame: Callable[[dict, dict], tuple[float, float] | None]
+    module: object
     owed_rows: Callable[[Scan, object], list]
 
     def document_key(self, run) -> str:
         """The S3 key of this engine's document for ``run``."""
         return getattr(run, self.key_field) or ""
+
+    @property
+    def fields(self) -> dict[str, str]:
+        """The field names a reader of this engine's pages needs.
+
+        The three names that differ between the engines, in one dict.
+        The text overlay's endpoint answers it beside the presigned URL
+        (#381), so the browser reads a document it knows nothing about
+        and a fourth engine is one more entry of :data:`ENGINES`.
+
+        :returns: ``{"units", "text", "type"}``.
+        :rtype: dict[str, str]
+        """
+        return {
+            "units": self.units_key,
+            "text": self.text_key,
+            "type": self.type_key,
+        }
 
 
 def _page_frame(page: dict, document: dict) -> tuple[float, float] | None:
@@ -239,8 +265,11 @@ def _extract_owed_rows(stage, scan: Scan, run) -> list:
 #: measurement is what moves it.
 #:
 #: A third engine is one entry here and no other code. Every reader
-#: walks this table: the glue, the files index, the file route, and
-#: ``engines_owed``.
+#: walks this table: the glue, the files index, the file route,
+#: ``engines_owed``, and the text overlay of the viewer (#381).
+#:
+#: What a person calls an engine is not here: ``JobEngine`` carries
+#: that already, as the label of its own choice.
 ENGINES: dict[str, EngineSpec] = {
     "dots_mocr": EngineSpec(
         name="dots_mocr",
@@ -249,6 +278,7 @@ ENGINES: dict[str, EngineSpec] = {
         text_key="text",
         type_key="category",
         frame=_page_frame,
+        module=dots_mocr,
         owed_rows=lambda scan, run: dots_mocr.live_analyze_jobs(scan),
     ),
     "mistral_ocr": EngineSpec(
@@ -258,6 +288,7 @@ ENGINES: dict[str, EngineSpec] = {
         text_key=mistral_ocr.BLOCK_TEXT_KEY,
         type_key="type",
         frame=_mistral_frame,
+        module=mistral_ocr,
         owed_rows=functools.partial(_extract_owed_rows, mistral_ocr),
     ),
     "surya": EngineSpec(
@@ -270,9 +301,15 @@ ENGINES: dict[str, EngineSpec] = {
         text_key="text",
         type_key="label",
         frame=_page_frame,
+        module=surya,
         owed_rows=functools.partial(_extract_owed_rows, surya),
     ),
 }
+
+#: The engine a reader gets when nobody named one (#381): the first
+#: entry of :data:`ENGINES`. dots.mocr is the read the pipeline pays
+#: for on every volume, so it is the one that is there.
+DEFAULT_ENGINE = next(iter(ENGINES))
 
 
 # ---------------------------------------------------------------------------

@@ -398,15 +398,29 @@ body.boundary-pick .opinion-nav.picking {
         <button type="button" class="zoom-btn" data-zoom-action="in" title="Zoom in" aria-label="Zoom in">+</button>
         <button type="button" class="zoom-btn zoom-reset" data-zoom-action="reset" title="Reset zoom">Reset</button>
         {% comment %}
-          The text overlay (#262). It draws the text dots.mocr read on
-          each page of the viewport, so a reviewer can judge what a
-          blurry page or a page with bleedthrough cost the reading. The
-          button is here and not in the page label, which carries four
-          buttons already, and it holds for the whole document.
+          The text overlay (#262, #381). It draws the text one OCR
+          engine read on each page of the viewport, so a reviewer can
+          judge what a blurry page or a page with bleedthrough cost the
+          reading. The button is here and not in the page label, which
+          carries four buttons already, and it holds for the whole
+          document.
+
+          The select names the engine, and the view decides which ones
+          read this volume (``ocr_text_engines``). An engine that read
+          nothing is offered disabled rather than hidden: a viewer must
+          not hide the state of a read, and a chooser must not offer a
+          selection the endpoint refuses.
         {% endcomment %}
         {% if ocr_text_available %}
         <button type="button" class="zoom-btn ocr-text-btn" id="ocr-text-toggle"
                 title="Show the text the OCR read on each page">Text</button>
+        <select id="ocr-text-engine" class="zoom-select"
+                aria-label="Which OCR read the text overlay draws"
+                title="Which OCR read the text overlay draws">
+          {% for engine in ocr_text_engines %}
+          <option value="{{ engine.name }}"{% if engine.selected %} selected{% endif %}{% if not engine.available %} disabled{% endif %}>{{ engine.label }}{% if not engine.available %} (not read){% endif %}</option>
+          {% endfor %}
+        </select>
         {% endif %}
         {% comment %}
           The overlay cue and the guide (#299). The key "r" was the only

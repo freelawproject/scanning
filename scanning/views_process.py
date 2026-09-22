@@ -260,17 +260,32 @@ FINAL_VOLUME_NOT_READY_MESSAGE = (
     "The corrected volume of this scan is not ready yet. Reload the "
     "page in a minute."
 )
-#: The 404 of ``scan_ocr_text_url`` for a volume nobody has read yet
-#: (#262): no dots.mocr run of this scan is glued.
+#: The 404 of ``scan_ocr_text_url`` for a volume this engine has not
+#: read yet (#262): no glued run of it. Every message of this endpoint
+#: names the engine since #381, because the dropdown offers three and a
+#: message that says "the OCR" would leave a reader guessing which one.
 NO_READ_TEXT_MESSAGE = (
-    "The OCR has not read this volume yet, so there is no text to show."
+    "{label} has not read this volume yet, so there is no text to show."
+)
+#: The 404 of ``scan_ocr_text_url`` in the final space, for an engine
+#: that read the original and not the corrected volume (#381).
+#: ``ApplyRun.is_complete`` counts neither ``extract_key`` nor
+#: ``surya_key``, so review 2 opens on a volume only dots.mocr read
+#: there (#245, #368).
+NO_READ_FINAL_TEXT_MESSAGE = (
+    "{label} has not read the corrected volume of this scan yet, so "
+    "there is no text to show over its pages."
 )
 #: The 404 of ``scan_ocr_text_url`` when the document was written and
 #: is not in the bucket any more (#262).
 OCR_TEXT_OBJECT_GONE_MESSAGE = (
-    "The OCR text of this volume is not in the bucket. Ask a staff "
-    "member to glue the run again."
+    "The text {label} read of this volume is not in the bucket. Ask a "
+    "staff member to glue the run again."
 )
+#: The 400 of ``scan_ocr_text_url`` for an engine nobody has (#381).
+#: A person never sees it: the dropdown offers the names of
+#: ``opinion_ocr.ENGINES`` and no other.
+UNKNOWN_OCR_ENGINE_MESSAGE = "Unknown OCR engine {engine!r}. Known: {known}."
 #: The 409 of ``serve_final_pdf`` when the run's bitonal copy is the
 #: original itself: a 1-bit upload skips the conversion, and the
 #: preview route never streams the original (#185).
@@ -280,14 +295,17 @@ FINAL_VOLUME_IS_ORIGINAL_MESSAGE = (
 )
 
 
-def dots_run_is_glued(summary: dict | None) -> bool:
-    """Say whether a scan's live dots.mocr run is glued (#262).
+def run_is_glued(summary: dict | None) -> bool:
+    """Say whether a scan's live run of one engine is glued (#262).
 
     Off the summary the process view reads already
-    (``dots_mocr.run_summary``), so the text overlay's button costs no
+    (``jobs.run_summary``), so the text overlay's dropdown costs no
     query. The glue writes the document and flips every row to
     ``CONSUMED`` in one pass, so "every row consumed" is the same test
-    :func:`dots_mocr.glued_volume_key` makes against the rows.
+    :func:`jobs.glued_volume_key` makes against the rows.
+
+    One function for the three engines, not three (#381): the test is
+    the shared one, and the summary is the shared shape.
 
     :param summary: The run summary, or None when the stage never ran.
     :returns: Whether a glued volume document exists for the live run.
@@ -296,6 +314,95 @@ def dots_run_is_glued(summary: dict | None) -> bool:
     if not summary:
         return False
     return summary["statuses"].get(JobStatus.CONSUMED) == summary["total"]
+
+
+def engine_label(name: str) -> str:
+    """Return what a person calls one OCR engine (#381).
+
+    ``JobEngine`` carries the name already, as the label of its own
+    choice ("dots.mocr", "Mistral OCR", "Surya"). The dropdown and
+    every refusal of :func:`scan_ocr_text_url` read it here, so the
+    words are not copied into a second table. ``ShardRead`` keeps its
+    own two: one of them is a message word ("OCR run started"), not
+    the engine's name.
+
+    :param name: A ``JobEngine`` value, which is a key of
+        ``opinion_ocr.ENGINES``.
+    :returns: The label of that choice.
+    :rtype: str
+    """
+    return JobEngine(name).label
+
+
+def ocr_run_summaries(scan) -> dict[str, dict | None]:
+    """Return one run summary per OCR engine, in the table's order.
+
+    One walk of ``opinion_ocr.ENGINES`` (#381), because every engine
+    has the same ``run_summary(scan)``. The process view reads the
+    three by name for the action bar and hands the whole dict to
+    :func:`ocr_text_engines`, so the summaries are read once.
+
+    :param scan: The scan to describe.
+    :returns: ``{engine name: summary or None}``.
+    :rtype: dict[str, dict | None]
+    """
+    from scanning import opinion_ocr
+
+    return {
+        name: spec.module.run_summary(scan)
+        for name, spec in opinion_ocr.ENGINES.items()
+    }
+
+
+def ocr_text_engines(
+    summaries: dict[str, dict | None], final_run, final_space: bool
+) -> list[dict]:
+    """Describe every OCR engine for the text overlay's dropdown (#381).
+
+    One entry per engine of ``opinion_ocr.ENGINES``, in that table's
+    order, so dots.mocr is first and is the default. ``available`` is
+    the same question :func:`scan_ocr_text_url` asks, in the space the
+    viewer draws: the ``ApplyRun`` field in the final space, a glued
+    volume run in the original one.
+
+    The dropdown offers an engine that did not read, disabled and
+    labelled: a viewer must not hide the state of a read, and a
+    chooser must not offer a selection the endpoint refuses.
+
+    ``selected`` marks the first engine that did read, because an HTML
+    select opens on its first option whether that option is disabled or
+    not. dots.mocr is first in the table, so it is the default wherever
+    it read.
+
+    :param summaries: ``{engine name: run summary or None}``, the
+        summaries the process view reads already.
+    :param final_run: The ``ApplyRun`` of the corrected volume, or
+        None.
+    :param final_space: Whether the viewer draws the corrected volume.
+    :returns: ``[{"name", "label", "available", "selected"}]``.
+    :rtype: list[dict]
+    """
+    from scanning import opinion_ocr
+
+    entries = []
+    for name, spec in opinion_ocr.ENGINES.items():
+        if final_space:
+            available = bool(final_run and spec.document_key(final_run))
+        else:
+            available = run_is_glued(summaries.get(name))
+        entries.append(
+            {
+                "name": name,
+                "label": engine_label(name),
+                "available": available,
+                "selected": False,
+            }
+        )
+    for entry in entries:
+        if entry["available"]:
+            entry["selected"] = True
+            break
+    return entries
 
 
 def detection_message(summary: dict | None) -> str:
@@ -408,10 +515,14 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
 
     # No external stage writes a scan status by design (#190, #195,
     # #191), so their rows are the only place their progress lives.
-    dots_run = dots_mocr.run_summary(scan)
+    # One walk of ``opinion_ocr.ENGINES`` for the OCR engines (#381):
+    # the action bar reads the three by name and the text overlay's
+    # dropdown reads them all, off the same summaries.
+    ocr_runs = ocr_run_summaries(scan)
+    dots_run = ocr_runs["dots_mocr"]
+    mistral_run = ocr_runs["mistral_ocr"]
+    surya_run = ocr_runs["surya"]
     yolo_run = yolo.run_summary(scan)
-    mistral_run = mistral_ocr.run_summary(scan)
-    surya_run = surya.run_summary(scan)
 
     # The pages a reviewer asked a scanner to scan again, or the gaps
     # they asked a scanner to fill (#249). The waiting ones raise the
@@ -677,6 +788,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # finding, so it stays a warning line.
     detect_warnings = []
 
+    # The text overlay's dropdown (#262, #381), off the summaries the
+    # page already read and the run the flags already found.
+    ocr_engines = ocr_text_engines(
+        ocr_runs, flags["final_run"], bool(final_space)
+    )
+
     if printed_warning:
         detect_warnings.insert(0, printed_warning)
 
@@ -701,12 +818,17 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "detect_message": detection_message(yolo_run),
             **flags,
             "final_space": final_space,
-            # The text overlay's button (#262). The final space always
-            # has its OCR document (``ApplyRun.is_complete`` counts
-            # it), and every other page reads the volume document, so
-            # a legacy PaddleOCR volume gets no button.
-            "ocr_text_available": bool(final_space)
-            or dots_run_is_glued(dots_run),
+            # The text overlay's dropdown (#262, #381). One entry per
+            # engine, so the control says which reads exist and which
+            # do not; the template draws the pair when one is
+            # available, and a legacy PaddleOCR volume gets neither.
+            "ocr_text_engines": ocr_engines,
+            # The pair is drawn when one engine read this volume. Off
+            # the one list, so the control and its options never
+            # disagree.
+            "ocr_text_available": any(
+                engine["available"] for engine in ocr_engines
+            ),
             "opinions": opinions,
             "opinion_count": opinion_count,
             "opinions_json": json.dumps(opinions),
@@ -1020,27 +1142,67 @@ def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
     the pages of the corrected volume would sit one page out from the
     first deletion onwards.
 
+    Which engine is the ``engine`` parameter (#381), a name of
+    ``opinion_ocr.ENGINES``, dots.mocr by default. The answer carries
+    that engine's ``fields`` as well, so the browser reads a document
+    whose shape it holds no copy of: a fourth engine is one more entry
+    of that table and no script change.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON with ``url``, ``space`` and ``size``; a 409 when the
-        final space has no document, a 404 when nothing was read, when
-        the object is gone, or when S3 is off.
+    :return: JSON with ``url``, ``space``, ``size``, ``engine``,
+        ``label`` and ``fields``; a 400 for an engine nobody has, a 409
+        when the corrected volume is not built, a 404 when this engine
+        read nothing, when the object is gone, or when S3 is off.
     """
+    from scanning import opinion_ocr
+
     scan = get_object_or_404(Scan, pk=pk)
+    name = request.GET.get("engine") or opinion_ocr.DEFAULT_ENGINE
+    spec = opinion_ocr.ENGINES.get(name)
+    if spec is None:
+        return JsonResponse(
+            {
+                "error": UNKNOWN_OCR_ENGINE_MESSAGE.format(
+                    engine=name, known=", ".join(opinion_ocr.ENGINES)
+                )
+            },
+            status=400,
+        )
     space = "original"
     if request.GET.get("space") == "final":
         from scanning import review_states
 
         run = review_states.final_run(scan)
-        if run is None or not run.ocr_key:
+        if run is None:
             return JsonResponse(
                 {"error": FINAL_VOLUME_NOT_READY_MESSAGE}, status=409
             )
-        space, key = "final", run.ocr_key
-    else:
-        key = dots_mocr.glued_volume_key(scan)
+        # The corrected volume exists and this engine did not read it:
+        # that is a fact about the engine, not about the volume, and
+        # only dots.mocr is guaranteed (#245, #368).
+        key = spec.document_key(run)
         if not key:
-            return JsonResponse({"error": NO_READ_TEXT_MESSAGE}, status=404)
+            return JsonResponse(
+                {
+                    "error": NO_READ_FINAL_TEXT_MESSAGE.format(
+                        label=engine_label(name)
+                    )
+                },
+                status=404,
+            )
+        space = "final"
+    else:
+        key = spec.module.glued_volume_key(scan)
+        if not key:
+            return JsonResponse(
+                {
+                    "error": NO_READ_TEXT_MESSAGE.format(
+                        label=engine_label(name)
+                    )
+                },
+                status=404,
+            )
 
     if not s3_sync.s3_active():
         return JsonResponse({"error": NO_S3_GLUED_OUTPUT_MESSAGE}, status=404)
@@ -1050,13 +1212,27 @@ def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
     size = s3_sync.object_size(key)
     if size is None:
         return JsonResponse(
-            {"error": OCR_TEXT_OBJECT_GONE_MESSAGE}, status=404
+            {
+                "error": OCR_TEXT_OBJECT_GONE_MESSAGE.format(
+                    label=engine_label(name)
+                )
+            },
+            status=404,
         )
     # No ``content_disposition``: that header makes a browser save a
     # named file, which is what the routes of #243 want and the
     # opposite of what a ``fetch`` wants.
     url = s3_sync.presign_get(key, GLUED_OUTPUT_PRESIGN_TTL)
-    return JsonResponse({"url": url, "space": space, "size": size})
+    return JsonResponse(
+        {
+            "url": url,
+            "space": space,
+            "size": size,
+            "engine": spec.name,
+            "label": engine_label(name),
+            "fields": spec.fields,
+        }
+    )
 
 
 @login_required
