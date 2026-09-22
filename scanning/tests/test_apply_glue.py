@@ -4,8 +4,12 @@ Three glues over one offset map: the final bitonal copy, the final OCR
 volume with its printed-page map, and the final detections. Each is
 judged on its own inputs. S3 is stood in for by a dict of objects, so
 the tests read what would be written and never the bucket.
+
+``TestMoveGlues`` holds the three glues to a moved page (#261/#383):
+the map is the order, and a move pays nothing.
 """
 
+import hashlib
 import json
 import pathlib
 from unittest.mock import patch
@@ -24,7 +28,7 @@ from scanning.models import (
     Status,
 )
 from scanning.runpod_client import RESULT_SCHEMA_VERSION
-from scanning.tests.test_apply import MEDIA_ROOT
+from scanning.tests.test_apply import MEDIA_ROOT, png_bytes
 from scanning.tests.test_apply_build import BuildTestCase
 from scanning.tests.test_jobs import make_manifest
 
@@ -494,6 +498,193 @@ class TestGlues(GlueTestCase):
         run.refresh_from_db()
         self.assertTrue(run.bitonal_key)
         self.assertEqual(run.attempts, 0)
+
+
+@override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestMoveGlues(GlueTestCase):
+    """A moved page (#261) through the bitonal copy and the three glues.
+
+    A move is the one structural edit that pays nothing: the page keeps
+    the content every stage read, and the page map alone says where it
+    goes. So each glue writes the page at its new place, out of the
+    volume documents, and the run creates no job row for it (#383).
+    """
+
+    def image_digests(self, data: bytes) -> list[str]:
+        """Return the digest of each page's image, in page order.
+
+        Every page of the synthetic volume carries its own image, so the
+        digests say which original page each final page holds.
+
+        :param data: The bytes of a PDF.
+        :returns: One digest per page.
+        :rtype: list[str]
+        """
+        with fitz.open(stream=data, filetype="pdf") as doc:
+            return [
+                hashlib.md5(
+                    doc.extract_image(page.get_images()[0][0])["image"]
+                ).hexdigest()
+                for page in doc
+            ]
+
+    def moved_run(self, pdf_page=4, anchor=2):
+        """Move one page, build the run, and answer every row it made.
+
+        The pair of the issue: page 4 comes back to after page 2, so
+        the original's pages 3 and 4 change place.
+
+        :param pdf_page: The page that moves.
+        :param anchor: The original page it lands after.
+        :returns: The built run.
+        """
+        self.edit(
+            PageEdit.Kind.MOVE_PAGE, pdf_page=pdf_page, anchor_pdf_page=anchor
+        )
+        run = apply.build_run(self.scan)
+        self.complete_rows(run)
+        return run
+
+    def test_the_bitonal_glue_writes_the_pages_in_the_corrected_order(self):
+        before = self.image_digests(self.objects[self.volume_bitonal_key])
+        run = self.moved_run()
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        self.assertEqual(
+            run.bitonal_key, f"{apply.run_prefix(self.scan, run)}bitonal.pdf"
+        )
+        self.assertEqual(len(set(before)), self.PAGES)
+        self.assertEqual(
+            self.image_digests(self.objects[run.bitonal_key]),
+            [before[0], before[1], before[3], before[2], before[4], before[5]],
+        )
+
+    def test_the_ocr_glue_and_the_printed_pages_follow_the_move(self):
+        self.volume_ocr_run()
+        # The curator's number names an original page, so it travels
+        # with the page it names.
+        self.edit(PageEdit.Kind.SET_NUMBER, pdf_page=4, value="44")
+        run = self.moved_run()
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        document = self.objects[run.ocr_key]
+        self.assertEqual(
+            [page["pdf_page"] for page in document["pages"]],
+            list(range(1, self.PAGES + 1)),
+        )
+        # ``text_fit``, ``brackets`` and the page lists key the pages
+        # of this document by ``page_index``, so it is the final page
+        # and never the original's.
+        self.assertEqual(
+            [page["page_index"] for page in document["pages"]],
+            list(range(self.PAGES)),
+        )
+        self.assertEqual(
+            [page["source"]["pdf_page"] for page in document["pages"]],
+            [1, 2, 4, 3, 5, 6],
+        )
+        self.assertEqual(
+            [page["md"] for page in document["pages"]],
+            ["1", "2", "4", "3", "5", "6"],
+        )
+        printed = self.objects[run.printed_pages_key]
+        self.assertEqual(
+            [
+                (page["final_page"], page["printed"], page["by"])
+                for page in printed["pages"]
+            ],
+            [
+                (1, "1", "model"),
+                (2, "2", "model"),
+                (3, "44", "curator"),
+                (4, "3", "model"),
+                (5, "5", "model"),
+                (6, "6", "model"),
+            ],
+        )
+
+    def test_the_detections_glue_carries_the_boxes_of_a_moved_page(self):
+        self.volume_detect_run()
+        run = self.moved_run()
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        document = self.objects[run.detections_key]
+        self.assertEqual(
+            sorted(
+                (det["source"]["pdf_page"], det["pdf_page"])
+                for det in document["detections"]
+            ),
+            [(1, 1), (2, 2), (3, 4), (4, 3), (5, 5), (6, 6)],
+        )
+        self.assertEqual(
+            [
+                det["page_index"]
+                for det in document["detections"]
+                if det["source"]["pdf_page"] == 4
+            ],
+            [2],
+        )
+
+    def test_a_page_moved_onto_a_deleted_page_takes_its_slot(self):
+        before = self.image_digests(self.objects[self.volume_bitonal_key])
+        self.edit(PageEdit.Kind.DELETE_PAGE, pdf_page=3)
+        run = self.moved_run(pdf_page=5, anchor=3)
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        # An anchor is an original address, so the gap of the deleted
+        # page 3 is still there and the moved page 5 fills it.
+        self.assertEqual(
+            self.image_digests(self.objects[run.bitonal_key]),
+            [before[0], before[1], before[4], before[3], before[5]],
+        )
+
+    def test_a_page_moved_onto_a_replaced_page_lands_after_it(self):
+        self.volume_ocr_run()
+        swap = self.upload_edit(
+            PageEdit.Kind.REPLACE_PAGE, "r.png", png_bytes(), pdf_page=2
+        )
+        run = self.moved_run(pdf_page=5, anchor=2)
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        document = self.objects[run.ocr_key]
+        self.assertEqual(
+            [
+                ("e", page["source"]["edit_id"])
+                if page["source"]["kind"] == "edit"
+                else ("o", page["source"]["pdf_page"])
+                for page in document["pages"]
+            ],
+            [("o", 1), ("e", swap.pk), ("o", 5), ("o", 3), ("o", 4), ("o", 6)],
+        )
+
+    def test_a_move_alone_pays_nothing_and_writes_every_glue(self):
+        self.volume_ocr_run()
+        self.volume_detect_run()
+        run = self.moved_run()
+
+        # No shard is cut, so no stage is paid for the page again.
+        self.assertEqual(run.jobs.count(), 0)
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        prefix = apply.run_prefix(self.scan, run)
+        self.assertEqual(run.bitonal_key, f"{prefix}bitonal.pdf")
+        self.assertEqual(run.ocr_key, f"{prefix}ocr-volume.json")
+        self.assertEqual(run.printed_pages_key, f"{prefix}printed_pages.json")
+        self.assertEqual(run.detections_key, f"{prefix}detections-volume.json")
+        self.assertTrue(run.is_glued)
+        self.assertIsNone(apply.phase_due(self.scan))
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)

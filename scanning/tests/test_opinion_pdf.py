@@ -53,7 +53,7 @@ from scanning.tests.test_boundaries import (
 from scanning.tests.test_detections import model_row
 from scanning.tests.test_opinions import make_run
 from scanning.tests.test_views import ScanningTestCase
-from scanning.tests.test_yolo_apply import identity_map
+from scanning.tests.test_yolo_apply import identity_map, moved_map
 
 PAGES = 6
 
@@ -399,6 +399,30 @@ class TestPartOneBumpsTheRevision(TestCase):
         self.assertEqual(second.glue_revision, 0)
         self.assertEqual(second.pdf_attempts, 2)
         self.assertEqual(second.status, OpinionReviewStatus.TEXT_REVIEW_DONE)
+
+
+class TestSourceOfAMovedPage(TestCase):
+    """The picture of a page comes from the page the map names (#383).
+
+    The PDF pulls the colour of a page out of the original's shard, so
+    a volume with a moved page (#261) must read the map and never the
+    final index: the picture would otherwise be another page's.
+    """
+
+    def test_each_final_page_names_its_own_original(self):
+        scan = ScanFactory(page_count=3)
+        run = make_run(scan)
+        run.page_map = moved_map(3, page=3, anchor=1)
+        run.save(update_fields=["page_map"])
+
+        self.assertEqual(
+            [opinion_pdf._source_of(run, index) for index in range(3)],
+            [
+                {"kind": "original", "pdf_page": 1},
+                {"kind": "original", "pdf_page": 3},
+                {"kind": "original", "pdf_page": 2},
+            ],
+        )
 
 
 class TestPayload(OpinionPdfCase):

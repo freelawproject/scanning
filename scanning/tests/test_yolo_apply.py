@@ -122,6 +122,35 @@ def identity_map(pages: int) -> dict:
     }
 
 
+def moved_map(pages: int, page: int, anchor: int) -> dict:
+    """Return a stored page map with one page moved (#261).
+
+    The shape ``apply.plan_run`` writes for a move, which
+    ``test_apply_build`` pins: every page is still an ``original``
+    entry, and the place is the only change. The moved page leaves its
+    own slot and lands right after the anchor's slot; anchor 0 puts it
+    before page 1.
+
+    :param pages: The page count.
+    :param page: The 1-based original page that moves.
+    :param anchor: The 1-based original page it lands after, or 0.
+    :returns: The map, in the shape of ``ApplyPlan.to_map``.
+    """
+    order = [number for number in range(1, pages + 1) if number != page]
+    order.insert(0 if anchor == 0 else order.index(anchor) + 1, page)
+    return {
+        **identity_map(pages),
+        "moved_pages": [page],
+        "pages": [
+            {
+                "final_page": final,
+                "source": {"kind": "original", "pdf_page": number},
+            }
+            for final, number in enumerate(order, start=1)
+        ],
+    }
+
+
 def glued_run(scan, number: int = 1, page_map: dict | None = None) -> ApplyRun:
     """Create a complete apply run for ``scan``.
 

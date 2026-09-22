@@ -240,6 +240,30 @@ class TestApplyGlue(MistralApplyTestCase):
             list(range(7)),
         )
 
+    def test_a_moved_page_is_written_at_its_new_place(self):
+        # #383: a move (#261) costs no read. The page keeps the text
+        # the volume run already paid for, and the map alone says where
+        # the document holds it.
+        self.edit(PageEdit.Kind.MOVE_PAGE, pdf_page=4, anchor_pdf_page=2)
+        run = apply.build_run(self.scan)
+        self.volume_extract_run()
+
+        self.assertEqual(mistral_ocr.finish_ready_applies(), 1)
+
+        run.refresh_from_db()
+        self.assertEqual(run.jobs.filter(stage=JobStage.EXTRACT).count(), 0)
+        pages = self.objects[run.extract_key]["pages"]
+        self.assertEqual(
+            [page["pdf_page"] for page in pages], list(range(1, 7))
+        )
+        self.assertEqual(
+            [page["source"]["pdf_page"] for page in pages], [1, 2, 4, 3, 5, 6]
+        )
+        self.assertEqual(
+            [page["md"] for page in pages],
+            [f"volume {p}" for p in (1, 2, 4, 3, 5, 6)],
+        )
+
     def test_a_deleted_page_is_gone_and_the_kept_pages_move_up(self):
         run, _ = self.read_run()
 

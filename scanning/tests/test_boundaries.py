@@ -18,7 +18,11 @@ from scanning.factories import (
 )
 from scanning.models import Detection, OpinionBoundary, PageEdit
 from scanning.tests.test_detections import model_row
-from scanning.tests.test_yolo_apply import glued_run, identity_map
+from scanning.tests.test_yolo_apply import (
+    glued_run,
+    identity_map,
+    moved_map,
+)
 
 IMG_W, IMG_H = 1700, 2200
 PAGE_W, PAGE_H = 612.0, 792.0
@@ -657,6 +661,32 @@ class TestRelocateHumanRows(TestCase):
         added.refresh_from_db()
         self.assertEqual(
             (added.start_page_index, added.end_page_index), (0, 1)
+        )
+        self.assertEqual(added.apply_run, run)
+
+    def test_a_boundary_on_a_moved_page_follows_the_page(self):
+        # #383: a move re-orders the pages of the corrected volume, so
+        # the start and the end of a human boundary follow their pages.
+        scan = ScanFactory(page_count=3)
+        added = OpinionBoundaryFactory(
+            scan=scan,
+            origin=OpinionBoundary.Origin.HUMAN,
+            kind=OpinionBoundary.Kind.ADD,
+            ordinal=None,
+            start_source_page=3,
+            start_page_index=2,
+            end_source_page=3,
+            end_page_index=2,
+        )
+        # Page 3 comes back to after page 1.
+        run = glued_run(scan, page_map=moved_map(3, page=3, anchor=1))
+
+        moved, unplaced = boundaries.relocate_human_rows(scan, run)
+
+        self.assertEqual((moved, unplaced), (1, []))
+        added.refresh_from_db()
+        self.assertEqual(
+            (added.start_page_index, added.end_page_index), (1, 1)
         )
         self.assertEqual(added.apply_run, run)
 
