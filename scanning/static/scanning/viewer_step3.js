@@ -524,7 +524,12 @@
                 span.textContent = token.text;
                 if (token.low_confidence) {
                     span.className = 'ensemble-low';
-                    span.title = 'The engines did not agree on this word.';
+                    span.title = 'No majority settled this word. It is'
+                        + ' the reading of the first engine by rank.';
+                } else if (token.majority) {
+                    span.className = 'ensemble-voted';
+                    span.title = 'A majority chose this word, and not'
+                        + ' every engine read it so.';
                 }
                 node.appendChild(span);
                 if (position < tokens.length - 1) {
@@ -622,8 +627,9 @@
      * The text above shows the source engine's own reading, except in
      * a voted group, where the words are voted over it and a word of
      * another engine can win. So the panel opens with the reason that
-     * engine is the source (#380), and each line marks the words that
-     * differ from its reading.
+     * engine is the source (#380), each line marks the words that
+     * differ from the text above, and the button beside the reason
+     * opens the rules of the vote.
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
@@ -637,6 +643,8 @@
         var why = document.createElement('p');
         why.className = 'ensemble-why';
         why.textContent = reason;
+        why.appendChild(document.createTextNode(' '));
+        why.appendChild(helpButton(why));
         panel.appendChild(why);
 
         var marks = panelMarks(page, group);
@@ -709,6 +717,73 @@
             + (page.engines || []).join(', ') + '.';
     }
 
+    /**
+     * Build the button that opens the rules of the vote.
+     *
+     * @param {HTMLElement} why - The reason line, which the block
+     *     goes under.
+     * @returns {HTMLElement} The button.
+     */
+    function helpButton(why) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'ensemble-ask';
+        button.textContent = '?';
+        button.title = 'How the ensemble chooses a reading';
+        button.addEventListener('click', function (event) {
+            event.stopPropagation();
+            var standing = why.nextSibling;
+            if (standing && standing.classList
+                    && standing.classList.contains('ensemble-help')) {
+                standing.remove();
+                button.classList.remove('open');
+                return;
+            }
+            why.parentNode.insertBefore(voteHelp(), why.nextSibling);
+            button.classList.add('open');
+        });
+        return button;
+    }
+
+    //: The rules of the vote, as a reader of the panel needs them.
+    //: One line per outcome, in the order the ensemble tries them.
+    var VOTE_RULES = [
+        ['Every engine alike', 'the text shows the reading of the'
+            + ' first engine by rank.'],
+        ['Most of them alike', 'the text shows the reading of the'
+            + ' first of those, and the reason line names them.'],
+        ['No majority', 'the words are voted one by one over the first'
+            + ' engine that read. A word most engines read carries a'
+            + ' light mark; a word no majority settled carries a'
+            + ' strong one.'],
+        ['One engine alone', 'the others read nothing here, so its'
+            + ' reading stands.'],
+        ['The vote', 'compares the readings with the quotes, the'
+            + ' dashes and the markdown marks folded, so typography'
+            + ' never decides it. The marks in this panel do show'
+            + ' typography.']
+    ];
+
+    /**
+     * Build the block that holds the rules of the vote.
+     *
+     * @returns {HTMLElement} The block.
+     */
+    function voteHelp() {
+        var help = document.createElement('div');
+        help.className = 'ensemble-help';
+        VOTE_RULES.forEach(function (rule) {
+            var row = document.createElement('p');
+            var name = document.createElement('span');
+            name.className = 'ensemble-help-name';
+            name.textContent = rule[0];
+            row.appendChild(name);
+            row.appendChild(document.createTextNode(' \u2014 ' + rule[1]));
+            help.appendChild(row);
+        });
+        return help;
+    }
+
     // -----------------------------------------------------------------
     // The words that differ (#380)
     //
@@ -749,20 +824,20 @@
     }
 
     /**
-     * Return the ranges of two readings that do not answer each other.
+     * Return the ranges of one reading that the text above lacks.
      *
      * The common start and the common end go first, which is most of
      * two readings of one paragraph. What is left is compared word by
      * word, and a middle longer than ``MAX_DIFF_WORDS`` is marked
      * whole: the reviewer still sees where the two readings part.
      *
-     * @param {string} source - The source engine's own reading.
-     * @param {string} other - One other engine's reading.
-     * @returns {Object} ``{source: [[start, end]], other: [[start, end]]}``.
+     * @param {string} shown - The text above, which the ensemble wrote.
+     * @param {string} reading - One engine's own reading.
+     * @returns {Array} ``[[start, end]]``, into ``reading``.
      */
-    function diffSpans(source, other) {
-        var left = words(source);
-        var right = words(other);
+    function diffSpans(shown, reading) {
+        var left = words(shown);
+        var right = words(reading);
         var head = 0;
         var tail = 0;
         while (head < left.length && head < right.length
@@ -776,34 +851,29 @@
         }
         var a = left.slice(head, left.length - tail);
         var b = right.slice(head, right.length - tail);
-        if (!a.length && !b.length) {
-            return { source: [], other: [] };
-        }
+        if (!a.length && !b.length) { return []; }
         if (a.length > MAX_DIFF_WORDS || b.length > MAX_DIFF_WORDS) {
-            return { source: ranges(a, null), other: ranges(b, null) };
+            return ranges(b, null);
         }
-        var marked = uncommon(a, b);
-        return {
-            source: ranges(a, marked.left),
-            other: ranges(b, marked.right)
-        };
+        return ranges(b, uncommon(a, b).right);
     }
 
     /**
-     * Mark the words of two lists that the other list does not hold.
+     * Mark the words of the second list that the first does not hold.
      *
-     * The longest common subsequence of the two, and every word
-     * outside it is marked. The table is built from the end, and the
-     * walk from the start takes the same path the table was built on.
+     * The longest common subsequence of the two, and every word of
+     * ``b`` outside it is marked. The table is built from the end, and
+     * the walk from the start takes the same path the table was built
+     * on.
      *
-     * @param {Array} a - The words of one reading.
-     * @param {Array} b - The words of the other.
-     * @returns {Object} ``{left: [boolean], right: [boolean]}``.
+     * @param {Array} a - The words of the text above.
+     * @param {Array} b - The words of one engine's reading.
+     * @returns {Object} ``{right: [boolean]}``, one flag per word of
+     *     ``b``.
      */
     function uncommon(a, b) {
         var width = b.length + 1;
         var table = new Uint16Array((a.length + 1) * width);
-        var left = [];
         var right = [];
         var i;
         var j;
@@ -817,13 +887,11 @@
                     );
             }
         }
-        for (i = 0; i < a.length; i += 1) { left.push(true); }
         for (j = 0; j < b.length; j += 1) { right.push(true); }
         i = 0;
         j = 0;
         while (i < a.length && j < b.length) {
             if (a[i].text === b[j].text) {
-                left[i] = false;
                 right[j] = false;
                 i += 1;
                 j += 1;
@@ -834,7 +902,7 @@
                 j += 1;
             }
         }
-        return { left: left, right: right };
+        return { right: right };
     }
 
     /**
@@ -866,53 +934,31 @@
     }
 
     /**
-     * Return the ranges of two or more lists, joined where they meet.
-     *
-     * @param {Array} spans - The ranges, in any order.
-     * @returns {Array} ``[[start, end]]``, in order and apart.
-     */
-    function mergeRanges(spans) {
-        var found = [];
-        spans.slice().sort(function (one, two) {
-            return one[0] - two[0];
-        }).forEach(function (span) {
-            var last = found[found.length - 1];
-            if (last && span[0] <= last[1]) {
-                last[1] = Math.max(last[1], span[1]);
-            } else {
-                found.push([span[0], span[1]]);
-            }
-        });
-        return found;
-    }
-
-    /**
      * Return the ranges each engine's line marks.
      *
-     * Every engine is compared with the source engine's own reading,
-     * which the text above shows, or, in a voted group, which the
-     * words were voted over. That line carries the marks of every
-     * comparison, so the word in question is marked on every line of
-     * the panel.
+     * **Every engine is compared with the text above**, and never with
+     * the line that carries the check. The two are the same reading in
+     * a single, a majority and a unanimous group, because the source
+     * engine is always inside the agreeing set. They are not the same
+     * in a voted group: the words are voted one by one, and the text
+     * above holds another engine's word wherever the others outvoted
+     * the source. So each line marks what it alone did, and the line
+     * of the source marks the words the vote took from it.
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
      * @returns {Object} ``{engine: [[start, end]]}``.
      */
     function panelMarks(page, group) {
+        var shown = group.text || '';
         var engines = group.engines || {};
-        var source = engines[group.source];
         var marks = {};
-        var union = [];
-        if (!source || !source.text) { return marks; }
+        if (!shown) { return marks; }
         (page.engines || []).forEach(function (name) {
             var unit = engines[name];
-            if (name === group.source || !unit || !unit.text) { return; }
-            var spans = diffSpans(source.text, unit.text);
-            marks[name] = spans.other;
-            union = union.concat(spans.source);
+            if (!unit || !unit.text) { return; }
+            marks[name] = diffSpans(shown, unit.text);
         });
-        marks[group.source] = mergeRanges(union);
         return marks;
     }
 

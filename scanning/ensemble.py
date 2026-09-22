@@ -123,8 +123,9 @@ from scanning.models import (
 
 logger = logging.getLogger(__name__)
 
-#: Version of the document this module writes.
-SCHEMA_VERSION = 1
+#: Version of the document this module writes. 2 marks a voted word
+#: that a majority settled (#380).
+SCHEMA_VERSION = 2
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue.
 DOCUMENT = "ensemble.json"
@@ -930,9 +931,16 @@ def vote_words(
     """Return the winning word at each position, as tokens.
 
     The vote runs over the keys and the answer carries the word as its
-    engine wrote it. No markup: a token is ``{"text": word}``, and a
-    word no majority settled carries ``"low_confidence": True``. The
-    viewer builds the nodes from that.
+    engine wrote it. No markup: a token is ``{"text": word}``, and the
+    viewer builds the nodes from it. Two flags say what the vote did
+    with the word, and a token carries at most one of them:
+
+    - ``"majority": True``: a majority settled it, and not every
+      engine. The reader must be able to tell that word from one every
+      engine read, because the panel above it says the group had no
+      majority as a whole (#380).
+    - ``"low_confidence": True``: no majority settled it. The base
+      engine's word is kept, or a run a tie put in.
 
     A word the base engine did not read is put in, marked and counted
     when the engines that read it are a majority or a tie: the base is
@@ -996,13 +1004,17 @@ def vote_words(
             if winner:
                 # "" is the reading of a majority that dropped the word,
                 # and of a mark that carries no reading at all.
-                tokens.append(
-                    {
-                        "text": next(
-                            word for key, word in readings if key == winner
-                        )
-                    }
-                )
+                token = {
+                    "text": next(
+                        word for key, word in readings if key == winner
+                    )
+                }
+                if count < len(readings):
+                    # Every engine has one reading of every position of
+                    # the base, a deletion included, so a count short of
+                    # the whole is a word an engine read otherwise.
+                    token["majority"] = True
+                tokens.append(token)
         else:
             disputed += 1
             tokens.append({"text": base[position][1], "low_confidence": True})
