@@ -619,6 +619,64 @@ def load_merged_document(scan, run: int) -> dict:
     return load_document_at(scan, merged_result_key(scan, run))
 
 
+def preview_entries(
+    scan, detect_jobs: list[ExternalJob] | None = None
+) -> list[dict]:
+    """Return the merged run's boxes in the shape the viewer draws.
+
+    The read behind the detection preview of #388, and the twin of
+    ``views_api.serve_detections``: the same keys, from the merged
+    document instead of the ``Detection`` rows, because a volume whose
+    redactions nobody measured has no rows. The boxes are in the page
+    space of the volume as uploaded, which is the space the bitonal
+    copy the preview shows is in.
+
+    Every entry carries ``"id": None`` and ``"preview": True``. The id
+    is what each per-box control of the viewer posts, and there is no
+    row to name: a preview box can be drawn and nothing else.
+
+    The document is read from S3 on each call and is a few hundred
+    kilobytes for a volume. That is the cost of the page, paid once per
+    load, and it is why this is not on the review-2 path.
+
+    :param scan: The scan to read.
+    :param detect_jobs: The live detection rows, when the caller has
+        them. Read here otherwise.
+    :returns: One dict per box, ordered by page and by the top of the
+        box; empty when the run holds none.
+    :rtype: list[dict]
+    :raises DetectMergeError: If the merged document is absent,
+        unreadable, or describes another original.
+    """
+    rows = live_detect_jobs(scan) if detect_jobs is None else detect_jobs
+    if not rows:
+        return []
+    document = load_merged_document(scan, rows[0].run)
+    entries = [
+        {
+            # No row is behind a preview box, so no control may name
+            # one. The viewer reads this and offers none.
+            "id": None,
+            "preview": True,
+            "page_index": entry["page_index"],
+            "label": entry.get("label", ""),
+            "label_id": entry.get("label_id"),
+            "confidence": entry.get("confidence", 0),
+            "bbox": entry.get("bbox") or [0, 0, 1, 1],
+            "img_width": entry.get("img_width", 0),
+            "img_height": entry.get("img_height", 0),
+            "model_count": entry.get("model_count", 1),
+            # A model drew every one of them: the preview opens before
+            # anybody could draw a box of their own.
+            "manual": False,
+            "decision": None,
+        }
+        for entry in document.get("detections") or []
+    ]
+    entries.sort(key=lambda e: (e["page_index"], e["bbox"][1], e["bbox"][0]))
+    return entries
+
+
 def load_document_at(scan, key: str) -> dict:
     """Read a detections document at ``key``, and refuse a stale one.
 

@@ -66,6 +66,44 @@ def _rebuild_findings(scan: Scan) -> None:
     findings.rebuild(scan)
 
 
+#: The 409 of every write of step 2 while the volume is a preview
+#: (#388). One sentence, because the viewer shows it as it comes.
+PREVIEW_READ_ONLY_MESSAGE = (
+    "This is a preview of the detections, not the redaction review. "
+    "Nothing can be changed here: approve the page completeness review "
+    "and wait for the corrected volume to be built."
+)
+
+
+def _refuse_preview(scan: Scan) -> JsonResponse | None:
+    """Refuse a step-2 write on a volume shown as a preview (#388).
+
+    The first thing every write of the redaction review does, the twin
+    of ``views_process._refuse_locked_edits``. The preview draws the
+    merged detection document, which is no row of this database and is
+    in the page space of the volume as uploaded, so a box written
+    against it would address a volume the apply has not built yet: the
+    import that follows the first compute would throw a model row away
+    and leave a human row measured against nothing.
+
+    The gate is here and not in the template alone, for the reason the
+    review-1 gates are (#151): a template hides a button, and only a
+    view refuses a direct POST.
+
+    :param scan: The scan the write is about.
+    :returns: A 409 answer naming the reason, or None when the write
+        may proceed.
+    :rtype: JsonResponse | None
+    """
+    from scanning import review_states
+
+    if not review_states.preview_only(scan):
+        return None
+    return JsonResponse(
+        {"status": "error", "message": PREVIEW_READ_ONLY_MESSAGE}, status=409
+    )
+
+
 # The success lines of the review-2 writes (#322). Every write answers
 # one of these as ``message``, and the viewer shows it as a success
 # toast: a curator who moves a box had no sign that the server kept it,
@@ -204,11 +242,30 @@ def _parse_json_body(request: HttpRequest) -> dict | JsonResponse:
 def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     """Return active detections for a scan as JSON.
 
+    A volume shown as a preview (#388) answers the merged detection
+    document instead of the rows (``yolo.preview_entries``), in the
+    same shape: it has no rows, and the ones a reopened volume left
+    behind are measured in a page space the preview does not show. A
+    document that cannot be read answers an empty list, because the
+    page around it still renders.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: JSON response with a list of detection dicts.
     """
+    from scanning import review_states, yolo
+
     scan = get_object_or_404(Scan, pk=pk)
+    if review_states.preview_only(scan):
+        try:
+            return JsonResponse(yolo.preview_entries(scan), safe=False)
+        except Exception:
+            logger.exception(
+                "serve_detections: the merged detections of scan %s did "
+                "not load",
+                scan.pk,
+            )
+            return JsonResponse([], safe=False)
     dets = (
         Detection.objects.live()
         .filter(scan=scan)
@@ -253,9 +310,13 @@ def serve_opinions(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with a list of opinion dicts.
     """
-    from scanning import boundaries
+    from scanning import boundaries, review_states
 
     scan = get_object_or_404(Scan, pk=pk)
+    if review_states.preview_only(scan):
+        # The pairing is the compute's own output (#388): a row here
+        # belongs to a run the preview does not show.
+        return JsonResponse([], safe=False)
     return JsonResponse(boundaries.viewer_payload(scan), safe=False)
 
 
@@ -306,6 +367,8 @@ def dismiss_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import boundaries
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -352,6 +415,8 @@ def restore_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import boundaries
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -433,6 +498,8 @@ def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import boundaries, detections
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -509,16 +576,21 @@ def serve_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     The redaction rects and the margin strips in one list (#240, PR B),
     read off the ``Redaction`` rows the compute wrote and the curator
     edited. Nothing is computed here: a volume the compute has not
-    reached answers an empty list.
+    reached answers an empty list, and so does one shown as a preview
+    (#388).
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: ``[{page_index, rects: [{id, x0, y0, x1, y1, fill,
         rect_type, origin}]}]``.
     """
-    from scanning import redactions
+    from scanning import redactions, review_states
 
     scan = get_object_or_404(Scan, pk=pk)
+    if review_states.preview_only(scan):
+        # A preview shows the model's boxes and no measured geometry
+        # (#388), including the rows a reopened volume left behind.
+        return JsonResponse([], safe=False)
     return JsonResponse(redactions.visible_by_page(scan), safe=False)
 
 
@@ -591,6 +663,8 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import redactions
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -635,6 +709,8 @@ def move_redaction(
     from scanning import redactions
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -682,6 +758,8 @@ def dismiss_redaction(
     from scanning import redactions
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     row = _redaction_of(scan, redaction_id)
     if row is None or row.bbox is None:
         return _redaction_error("Redaction not found", 404)
@@ -715,6 +793,8 @@ def restore_redaction(
     from scanning import redactions
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     row = _redaction_of(scan, redaction_id)
     if row is None:
         return _redaction_error("Redaction not found", 404)
@@ -1134,6 +1214,8 @@ def apply_rect_to_opinion(
     :return: JSON response confirming the operation.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     opinion = get_object_or_404(OpinionScan, pk=opinion_pk, scan=scan)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
@@ -1287,6 +1369,8 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1326,6 +1410,8 @@ def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1363,6 +1449,8 @@ def withdraw_stale_edit(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1466,6 +1554,8 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     if scan.status in BUSY_STATUSES:
         return JsonResponse(
             {"status": "error", "message": FINDINGS_BUSY_MESSAGE}, status=409
@@ -1503,6 +1593,8 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1556,6 +1648,8 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1641,6 +1735,8 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     det = _parse_json_body(request)
     if isinstance(det, JsonResponse):
         return det
@@ -1749,6 +1845,8 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1787,6 +1885,8 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with the bake result.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     if not Path(scan.output_dir).is_dir():
         return JsonResponse(
             {"status": "error", "message": "No output dir"}, status=400
@@ -1839,6 +1939,8 @@ def export_pdf(
     from scanning import apply
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_preview(scan)) is not None:
+        return refusal
     # Resolve the source PDF before the temp file exists, so a missing
     # original is a clean 404 rather than a leaked temp file.
     original = local_original_pdf(scan)

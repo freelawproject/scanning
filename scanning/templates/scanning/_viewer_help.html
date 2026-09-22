@@ -40,11 +40,29 @@
       <b>Solid</b> &mdash; draws the same boxes, filled black or white, as the output has them.
     </li>
   </ul>
+  {% comment %}
+    The guide follows the page (#388): under a preview there is nothing
+    to select and nothing to write, so the two parts that describe
+    those controls are replaced by the one line that is true there.
+  {% endcomment %}
+  {% if preview_only %}
+  <p class="viewer-help-note">
+    This volume is a preview: the boxes are the detection model's own, and
+    nothing on the page can be selected, moved, drawn or dismissed.
+  </p>
+  {% else %}
   <p class="viewer-help-note">
     Double click a redaction box or a margin strip to select it. Drag it,
     change its size, or dismiss it. A dismissal deletes nothing.
   </p>
+  {% endif %}
 
+  {% comment %}
+    The detections part and the findings part both name buttons the
+    preview does not have (#388): the selection, the Draw, the two
+    recomputes.
+  {% endcomment %}
+  {% if not preview_only %}
   <div id="viewer-help-detections" hidden>
     <h3>Detections</h3>
     <ul class="viewer-help-list">
@@ -66,6 +84,7 @@
     <li>The second one runs on the server and takes this volume out of the review for a minute or more. Your boxes and your decisions are kept.</li>
     <li>One thing it can change: a text box you dismissed can come back when the new reading makes it much narrower. Dismiss it again.</li>
   </ul>
+  {% endif %}
 
   <h3>Keys</h3>
   <ul class="viewer-help-list">

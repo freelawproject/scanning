@@ -44,6 +44,12 @@ Two callers, deliberately:
 A legacy volume is out of both. Its step 2 lives in ``PENDING_REVIEW``,
 because the #154 and #263 states describe a flow it never went through
 (``services._park_after_redactions`` already makes that split).
+
+One state lives *before* this edge: :func:`preview_only` (#388), the
+read-only step 2 of a volume whose redactions nobody has measured. It
+is here because it is the same question asked from the other side --
+"the real review cannot open yet, and nothing is being built for it" --
+and two rules that disagreed would show a preview over the review.
 """
 
 from __future__ import annotations
@@ -153,6 +159,82 @@ def redaction_review_ready(
         return False
     run = final_run(scan, run)
     return yolo.redactions_current(rows, run)
+
+
+#: The statuses a detection preview is offered in (#388). Review 1,
+#: open or approved: those are the volumes whose geometry nobody has
+#: measured yet, and the only ones whose step 2 has nothing of its own
+#: to show. Spelled out rather than derived from "not review 2": the
+#: legacy ``PENDING_REVIEW`` step 2 has its own rows, and an errored or
+#: an unconverted volume is nobody's to preview.
+PREVIEW_STATUSES = (
+    Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+    Status.PAGE_COMPLETENESS_REVIEW_DONE,
+)
+
+
+def preview_only(scan: Scan, rows: list | None = None, run=_UNSET) -> bool:
+    """Return whether step 2 shows this scan as a read-only preview.
+
+    Issue #388. A volume from a new partner, or in a reporter's own
+    format, is judged by its detections long before anybody knows
+    whether its page numbers can be read: the page-number gate of #342
+    can hold review 1 for days, and until it lifts nothing shows what
+    blackletter found. The preview opens step 2 over the two documents
+    that exist by then -- the bitonal copy and the merged document of
+    the volume detection run -- and computes nothing.
+
+    It is **not** review 2, and every caller treats it as its own
+    state: the boxes are the model's own, in the page space of the
+    volume as uploaded, and no row of the database is behind them.
+    That is why every write of step 2 refuses under it
+    (``views_api._refuse_preview``) and why the page says so.
+
+    The conditions, and what answers each one:
+
+    - **The volume is in review 1** (:data:`PREVIEW_STATUSES`). Both
+      of those are parked human states and neither is busy
+      (``models.REVIEW_STATUSES``), so a scan the daemon holds is out
+      by its status alone.
+    - **A detection run is merged.** The preview draws that document,
+      so a run still in flight has nothing to draw
+      (``yolo.live_detect_jobs``, every row ``CONSUMED``).
+    - **Review 2 is not ready** (:func:`redaction_review_ready`), and
+      **no apply is in progress** (a standing run that is not
+      complete). Both say the same thing from two sides: the moment the
+      corrected volume exists, or is being built, the real review owns
+      step 2 and the preview is out of the way.
+
+    The approved status is in the set on purpose. Between the approval
+    and the apply's first run there is a window with no standing run,
+    which is exactly the volume whose disclaimer says to wait for the
+    corrected volume; it is short, so in practice this is a review-1
+    view.
+
+    :param scan: The scan to judge.
+    :param rows: The live detection rows, when the caller has them.
+        Read here otherwise.
+    :param run: The standing apply run, when the caller has it. Read
+        here otherwise.
+    :returns: Whether the preview may be shown.
+    :rtype: bool
+    """
+    from scanning import apply, yolo
+
+    if scan.status not in PREVIEW_STATUSES:
+        return False
+    if rows is None:
+        rows = yolo.live_detect_jobs(scan)
+    if not rows or any(row.status != JobStatus.CONSUMED for row in rows):
+        return False
+    if run is _UNSET:
+        run = apply.current_run(scan)
+    if run is not None and not run.is_complete:
+        # The corrected volume is being built. What it builds is the
+        # page space the real review reads, so nothing is previewed
+        # over the pages it is about to leave behind.
+        return False
+    return not redaction_review_ready(scan, rows, run)
 
 
 def promote_ready_scans() -> int:

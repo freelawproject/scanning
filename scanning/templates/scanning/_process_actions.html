@@ -179,6 +179,16 @@ reach step 2.
     {% endif %}
   </form>
   {% endif %}
+  {% comment %}
+    The way into the detection preview (#388). A link, not a form:
+    step 2 renders the merged detection document read only, and starts
+    and pays for nothing. It is offered beside "Next: Detect" and not
+    in its place, because the two say different things -- one walks to
+    the review, this one says the review is not open yet.
+  {% endcomment %}
+  {% if preview_available %}
+  <a href="?step=2" class="btn-outline text-sm no-underline" title="Look at the boxes the detection model found, over the volume as uploaded. Read only: the redaction review opens when the corrected volume is built.">Preview detections &rarr;</a>
+  {% endif %}
   {% endif %}
 
 {% elif step == 2 %}
@@ -201,6 +211,25 @@ reach step 2.
   turns the second one false while the volume is still in the legacy
   step 2, and the link would go with it.
 {% endcomment %}
+{% comment %}
+  The bar of the detection preview (#388). Nothing on this page writes,
+  so the bar offers nothing: a bar that showed the recompute or the
+  approve button would send a reviewer to an action the view refuses.
+  The note names the state, the link goes back to the work that opens
+  the real review, and the disclaimer over the pages says the rest.
+{% endcomment %}
+  {% if preview_only %}
+  <span class="text-sm text-amber-800 dark:text-amber-200 mr-2">
+    Preview of the detections, read only.
+    {% if preview_approved %}
+    The corrected volume is built next; the redaction review opens when its redactions are measured.
+    {% else %}
+    The redaction review opens after the page completeness approval.
+    {% endif %}
+  </span>
+  <a href="?step=1" class="btn-outline text-sm no-underline" title="Back to the page completeness review">&larr; Back to the page review</a>
+
+{% else %}
 {% comment %}
   Which volume the reviewer sees (#269). Step 2 shows the corrected
   volume of the standing apply run once the redactions are measured
@@ -298,6 +327,7 @@ reach step 2.
   <a href="{% url 'opinion_list' %}?scan={{ scan.pk }}" class="btn-primary text-sm no-underline" style="background:#059669" title="Review the text of the opinions of this volume">Next: Opinion text &rarr;</a>
   {% elif has_opinions and legacy_pipeline %}
   <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
+  {% endif %}
   {% endif %}
 
 {% elif step == 3 %}

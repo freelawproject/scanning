@@ -530,8 +530,12 @@ class TestStepTwoShowsTheCorrectedVolume(ScanningTestCase):
         self.assertIn("being measured", html)
 
     def test_no_run_says_the_volume_is_not_built(self):
-        scan, _ = merged_scan(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
-        ApplyRun.objects.filter(scan=scan).delete()
+        """A volume with no detection run either: one whose run is
+        merged and whose corrected volume is not built is the preview
+        of #388, and its bar is the preview's own."""
+        scan = ScanFactory(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE, page_count=2
+        )
 
         html = self._page(scan).content.decode()
 
