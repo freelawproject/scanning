@@ -2192,6 +2192,220 @@ class TestPendingEditFlags(TestCase):
         )
 
 
+class TestSortedWindow(TestCase):
+    """``page_edits.sorted_window``, the card's one rule (#261, #395)."""
+
+    @staticmethod
+    def _seq(numbers, first_page=1):
+        return [(first_page + i, n) for i, n in enumerate(numbers)]
+
+    def _window(self, numbers, first_page=1):
+        """The answer of the one backward step in ``numbers``."""
+        seq = self._seq(numbers, first_page)
+        steps = [i for i in range(1, len(seq)) if seq[i][1] < seq[i - 1][1]]
+        self.assertEqual(len(steps), 1, "one backward step per case")
+        return page_edits.sorted_window(seq, steps[0])
+
+    def _order(self, numbers, window, first_page=1):
+        """The printed numbers the window's rows produce, read through
+        ``slot_order`` as the plan and the sidebar read them."""
+        seq = dict(self._seq(numbers, first_page))
+        moves = {
+            m["pdf_page"]: m["anchor_pdf_page"]
+            for m in sorted(
+                window["moves"],
+                key=lambda m: (
+                    m["anchor_pdf_page"],
+                    m["ordinal"],
+                    m["pdf_page"],
+                ),
+            )
+        }
+        last = first_page + len(numbers) - 1
+        pages = [
+            n
+            for kind, n in page_edits.slot_order(last, moves)
+            if kind == "page"
+        ]
+        return [seq[p] for p in pages if p in seq]
+
+    def test_a_transposed_pair_is_the_swap(self):
+        window = self._window([878, 880, 879, 881], first_page=883)
+
+        self.assertEqual(window["pdf_pages"], [884, 885])
+        self.assertEqual(window["order"], [885, 884])
+        self.assertTrue(window["swap"])
+        self.assertEqual(
+            window["moves"],
+            [{"pdf_page": 885, "anchor_pdf_page": 883, "ordinal": 0}],
+        )
+
+    def test_a_pair_at_the_start_goes_before_page_1(self):
+        window = self._window([2, 1, 3])
+
+        self.assertEqual(
+            window["moves"],
+            [{"pdf_page": 2, "anchor_pdf_page": 0, "ordinal": 0}],
+        )
+
+    def test_a_page_pulled_early_goes_after_the_run(self):
+        # Scan 3409 of the issue.
+        numbers = [785, 788, 786, 787, 789, 790]
+        window = self._window(numbers, first_page=785)
+
+        self.assertEqual(window["pdf_pages"], [786, 787, 788])
+        self.assertFalse(window["swap"])
+        self.assertEqual(
+            window["moves"],
+            [{"pdf_page": 786, "anchor_pdf_page": 788, "ordinal": 0}],
+        )
+        self.assertEqual(
+            self._order(numbers, window, 785), [785, 786, 787, 788, 789, 790]
+        )
+
+    def test_a_page_pulled_late_goes_after_its_predecessor(self):
+        numbers = [785, 787, 788, 786, 789]
+        window = self._window(numbers, first_page=785)
+
+        self.assertEqual(
+            window["moves"],
+            [{"pdf_page": 788, "anchor_pdf_page": 785, "ordinal": 0}],
+        )
+        self.assertEqual(
+            self._order(numbers, window, 785), [785, 786, 787, 788, 789]
+        )
+
+    def test_two_blocks_the_wrong_way_round_move_the_smaller_one(self):
+        # 184 and 185 scanned after 186..189: two rows, both landing
+        # after the page printing 183, in ordinal order.
+        numbers = [183, 186, 187, 188, 189, 184, 185, 190, 191]
+        window = self._window(numbers, first_page=4)
+
+        self.assertEqual(window["pdf_pages"], [5, 6, 7, 8, 9, 10])
+        self.assertEqual(window["order"], [9, 10, 5, 6, 7, 8])
+        self.assertEqual(
+            window["moves"],
+            [
+                {"pdf_page": 9, "anchor_pdf_page": 4, "ordinal": 0},
+                {"pdf_page": 10, "anchor_pdf_page": 4, "ordinal": 1},
+            ],
+        )
+        self.assertEqual(
+            self._order(numbers, window, 4), list(range(183, 192))
+        )
+
+    def test_a_block_pulled_early_lands_after_the_run_it_skipped(self):
+        numbers = [1, 2, 7, 8, 3, 4, 5, 6, 9]
+        window = self._window(numbers)
+
+        self.assertEqual(
+            window["moves"],
+            [
+                {"pdf_page": 3, "anchor_pdf_page": 8, "ordinal": 0},
+                {"pdf_page": 4, "anchor_pdf_page": 8, "ordinal": 1},
+            ],
+        )
+        self.assertEqual(self._order(numbers, window), list(range(1, 10)))
+
+    def test_a_span_in_reverse_needs_the_ordinals(self):
+        # Four pages scanned backwards: no choice of anchors puts them
+        # right by page order, so the rows carry ordinals.
+        numbers = [1, 5, 4, 3, 2, 6]
+        seq = self._seq(numbers)
+        for step in (2, 3, 4):
+            window = page_edits.sorted_window(seq, step)
+            self.assertEqual(window["pdf_pages"], [2, 3, 4, 5])
+            self.assertEqual(
+                window["moves"],
+                [
+                    {"pdf_page": 5, "anchor_pdf_page": 1, "ordinal": 0},
+                    {"pdf_page": 4, "anchor_pdf_page": 1, "ordinal": 1},
+                    {"pdf_page": 3, "anchor_pdf_page": 1, "ordinal": 2},
+                ],
+            )
+            self.assertEqual(self._order(numbers, window), [1, 2, 3, 4, 5, 6])
+
+    def test_the_window_reaches_over_to_its_boundary_number(self):
+        # 4, 3, 2 after 1: the pair 4, 3 is complete but 2 sits on the
+        # far side, so the window takes it in.
+        numbers = [1, 4, 3, 2, 5]
+        seq = self._seq(numbers)
+        for step in (2, 3):
+            window = page_edits.sorted_window(seq, step)
+            self.assertEqual(window["pdf_pages"], [2, 3, 4])
+            self.assertEqual(self._order(numbers, window), [1, 2, 3, 4, 5])
+
+    def test_a_shuffle_of_many_pages_sorts_whole(self):
+        numbers = [10, 14, 12, 16, 11, 15, 13, 17]
+        seq = self._seq(numbers)
+        steps = [i for i in range(1, len(seq)) if seq[i][1] < seq[i - 1][1]]
+        for step in steps:
+            window = page_edits.sorted_window(seq, step)
+            self.assertEqual(window["pdf_pages"], [2, 3, 4, 5, 6, 7])
+            self.assertEqual(window["order"], [5, 3, 7, 2, 6, 4])
+            self.assertEqual(self._order(numbers, window), list(range(10, 18)))
+
+    def test_a_run_that_stops_short_is_not_answered(self):
+        # 788 pulled early, but 787 is nowhere: a hole in the window.
+        self.assertIsNone(self._window([785, 788, 786, 790, 791]))
+
+    def test_a_window_beside_a_hole_is_not_answered(self):
+        # 788 early and 785 missing: the number before the window does
+        # not continue it, so the reading is not trusted.
+        self.assertIsNone(self._window([784, 788, 786, 787, 789]))
+        # A transposed pair between two holes, the same.
+        self.assertIsNone(self._window([183, 187, 186, 189]))
+
+    def test_a_misread_is_not_answered(self):
+        self.assertIsNone(self._window([1, 2, 3, 6, 4, 7, 8]))
+        self.assertIsNone(self._window([1, 2, 50, 3, 5, 6]))
+        self.assertIsNone(self._window([87, 279, 89, 90]))
+
+    def test_a_duplicate_inside_the_window_is_not_answered(self):
+        self.assertIsNone(self._window([1, 3, 2, 3, 4]))
+
+    def test_a_span_that_crosses_another_page_is_not_answered(self):
+        # A lettered page between 4 and 3 breaks the neighbours.
+        seq = [(1, 1), (2, 2), (3, 4), (5, 3), (6, 5)]
+        self.assertIsNone(page_edits.sorted_window(seq, 3))
+        # The same with a run: 5 early, an unnumbered page in the run.
+        seq = [(1, 1), (2, 2), (3, 5), (4, 3), (6, 4), (7, 6)]
+        self.assertIsNone(page_edits.sorted_window(seq, 3))
+
+    def test_an_index_off_the_run_is_not_answered(self):
+        self.assertIsNone(page_edits.sorted_window([(1, 2), (2, 1)], 0))
+        self.assertIsNone(page_edits.sorted_window([(1, 2), (2, 1)], 2))
+
+    def test_the_label_names_the_shape(self):
+        self.assertEqual(
+            page_edits.move_label(self._window([1, 2, 4, 3, 5])),
+            "Swap PDF pages 3 and 4",
+        )
+        self.assertEqual(
+            page_edits.move_label(self._window([1, 2, 5, 3, 4, 6])),
+            "Move PDF page 3 to after PDF page 5",
+        )
+        # 1 pulled late: one row, the page after the run it belongs before.
+        self.assertEqual(
+            page_edits.move_label(self._window([3, 1, 2, 4])),
+            "Move PDF page 1 to after PDF page 3",
+        )
+        # 3 pulled early to the front: one row, before page 1.
+        self.assertEqual(
+            page_edits.move_label(self._window([2, 3, 1, 4])),
+            "Move PDF page 3 to before PDF page 1",
+        )
+        window = page_edits.sorted_window(self._seq([1, 5, 4, 3, 2, 6]), 2)
+        self.assertEqual(
+            page_edits.move_label(window),
+            "Reorder PDF pages 2 to 5 by printed number",
+        )
+        self.assertEqual(
+            page_edits.move_title(window),
+            "Put PDF pages 5, 4, 3, 2 in that order",
+        )
+
+
 class TestSlotOrder(TestCase):
     """The one rule of where a moved page goes (#261)."""
 
@@ -2200,6 +2414,15 @@ class TestSlotOrder(TestCase):
             {"pdf_page": i, "detected": d, "type": "single"}
             for i, d in enumerate(detected, 1)
         ]
+
+    def test_several_pages_on_one_anchor_land_in_the_order_given(self):
+        # A span in reverse (#395): the dict's order is the landing
+        # order, ordinal then page as ``moves_by_page`` yields it, not
+        # page order.
+        events = list(page_edits.slot_order(6, {5: 1, 4: 1, 3: 1}))
+        self.assertEqual(
+            [n for kind, n in events if kind == "page"], [1, 5, 4, 3, 2, 6]
+        )
 
     def test_a_transposed_pair_reads_in_order_once_moved(self):
         results = self._results(["1", "2", "4", "3", "5", "6"])
@@ -2252,14 +2475,19 @@ class TestMovePageEndpoints(ScanningTestCase):
         self.client.force_login(self.user)
         self.scan = self._scan(["1", "2", "4", "3", "5", "6"])
 
-    def _scan(self, detected):
-        """A reviewed scan whose pages read as ``detected``."""
+    def _scan(self, detected, start_page=None, end_page=None):
+        """A reviewed scan whose pages read as ``detected``.
+
+        The printed range defaults to one number per page from 1, so a
+        volume that starts higher passes its own range, or the readings
+        are out of range and corrected before any card is built.
+        """
         return ScanFactory(
             page_count=len(detected),
             source_fingerprint=f"100:{len(detected)}",
             status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
-            start_page=1,
-            end_page=len(detected),
+            start_page=start_page or 1,
+            end_page=end_page or len(detected),
             ocr_results=[
                 {
                     "pdf_page": i,
@@ -2300,10 +2528,12 @@ class TestMovePageEndpoints(ScanningTestCase):
         response = self._post("move_page", pdf_page=4, anchor_pdf_page=2)
 
         self.assertEqual(response.status_code, 200)
+        answer = response.json()
+        self.assertEqual(answer["status"], "ok")
         self.assertEqual(
-            response.json(),
-            {"status": "ok", "pdf_page": 4, "anchor_pdf_page": 2},
+            (answer["pdf_page"], answer["anchor_pdf_page"]), (4, 2)
         )
+        self.assertEqual(len(answer["moves"]), 1)
         edit = self.scan.page_edits.get()
         self.assertEqual(edit.kind, PageEdit.Kind.MOVE_PAGE)
         self.assertEqual((edit.pdf_page, edit.anchor_pdf_page), (4, 2))
@@ -2385,19 +2615,201 @@ class TestMovePageEndpoints(ScanningTestCase):
     def test_the_card_of_a_transposed_pair_offers_the_swap(self):
         html = self._step_one().content.decode()
 
-        self.assertIn("swapPages(this)", html)
-        self.assertIn('data-pdf-page="4" data-anchor="2"', html)
+        self.assertIn("movePage(this)", html)
+        self.assertIn(
+            'data-moves="[{&quot;pdf_page&quot;: 4, &quot;anchor_pdf_page&quot;: 2, '
+            '&quot;ordinal&quot;: 0}]"',
+            html,
+        )
         self.assertIn("Swap PDF pages 3 and 4", html)
+        self.assertIn('title="Put PDF pages 4, 3 in that order"', html)
         # The sidebar still shows the scanned order, with the divider.
         self.assertIn("ORDER", html)
         self.assertNotIn("page-moved-badge", html)
 
-    def test_a_backward_step_of_more_than_one_gets_no_button(self):
+    def test_a_page_pulled_early_offers_a_move_past_the_run(self):
+        # The case of scan 3409 (#395): 5 scanned two slots early. The
+        # card on 3 moves the page printing 5 to after the page
+        # printing 4.
         scan = self._scan(["1", "2", "5", "3", "4", "6"])
         html = self._step_one(scan).content.decode()
 
         self.assertIn("goes backward", html)
-        self.assertNotIn("swapPages(this)", html)
+        self.assertIn("movePage(this)", html)
+        self.assertIn(
+            "&quot;pdf_page&quot;: 3, &quot;anchor_pdf_page&quot;: 5", html
+        )
+        self.assertIn("Move PDF page 3 to after PDF page 5", html)
+        self.assertNotIn("Swap PDF pages", html)
+
+    def test_a_page_pulled_late_offers_a_move_back_to_its_place(self):
+        # The mirror shape: 3 scanned two slots late goes after the
+        # page printing 2.
+        scan = self._scan(["1", "2", "4", "5", "3", "6"])
+        html = self._step_one(scan).content.decode()
+
+        self.assertIn("movePage(this)", html)
+        self.assertIn(
+            "&quot;pdf_page&quot;: 5, &quot;anchor_pdf_page&quot;: 2", html
+        )
+        self.assertIn("Move PDF page 5 to after PDF page 2", html)
+
+    def test_two_blocks_the_wrong_way_round_offer_one_reorder(self):
+        # The case of the issue's second comment: 184 and 185 scanned
+        # after 186..189. One button, two rows.
+        scan = self._scan(
+            ["183", "186", "187", "188", "189", "184", "185", "190", "191"],
+            start_page=183,
+            end_page=191,
+        )
+        html = self._step_one(scan).content.decode()
+
+        self.assertEqual(html.count("movePage(this)"), 1)
+        self.assertIn("Reorder PDF pages 2 to 7 by printed number", html)
+        self.assertIn(
+            'title="Put PDF pages 6, 7, 2, 3, 4, 5 in that order"', html
+        )
+        self.assertIn(
+            "&quot;pdf_page&quot;: 6, &quot;anchor_pdf_page&quot;: 1, "
+            "&quot;ordinal&quot;: 0",
+            html,
+        )
+        self.assertIn(
+            "&quot;pdf_page&quot;: 7, &quot;anchor_pdf_page&quot;: 1, "
+            "&quot;ordinal&quot;: 1",
+            html,
+        )
+
+    def test_a_span_in_reverse_offers_the_reorder_on_each_card(self):
+        scan = self._scan(["1", "5", "4", "3", "2", "6"])
+        html = self._step_one(scan).content.decode()
+
+        self.assertEqual(html.count('data-check="backward_page"'), 3)
+        self.assertEqual(
+            html.count("Reorder PDF pages 2 to 5 by printed number"), 3
+        )
+
+    def test_a_reorder_writes_every_row_and_lists_the_corrected_order(self):
+        self.scan = self._scan(
+            ["183", "186", "187", "188", "189", "184", "185", "190", "191"],
+            start_page=183,
+            end_page=191,
+        )
+        response = self._post(
+            "move_page",
+            moves=[
+                {"pdf_page": 6, "anchor_pdf_page": 1, "ordinal": 0},
+                {"pdf_page": 7, "anchor_pdf_page": 1, "ordinal": 1},
+            ],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["moves"]), 2)
+        rows = {
+            e.pdf_page: (e.anchor_pdf_page, e.ordinal)
+            for e in page_edits.current_edits(
+                self.scan, PageEdit.Kind.MOVE_PAGE
+            )
+        }
+        self.assertEqual(rows, {6: (1, 0), 7: (1, 1)})
+        self.assertEqual(self._map_order(), [1, 6, 7, 2, 3, 4, 5, 8, 9])
+
+        html = self._step_one().content.decode()
+        self.assertNotIn("movePage(this)", html)
+        self.assertNotIn("goes backward", html)
+        self.assertEqual(html.count("page-moved-badge"), 2)
+
+    def test_a_reversed_span_reads_in_order_once_reordered(self):
+        self.scan = self._scan(["1", "5", "4", "3", "2", "6"])
+        response = self._post(
+            "move_page",
+            moves=[
+                {"pdf_page": 5, "anchor_pdf_page": 1, "ordinal": 0},
+                {"pdf_page": 4, "anchor_pdf_page": 1, "ordinal": 1},
+                {"pdf_page": 3, "anchor_pdf_page": 1, "ordinal": 2},
+            ],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._map_order(), [1, 5, 4, 3, 2, 6])
+        html = self._step_one().content.decode()
+        self.assertNotIn("goes backward", html)
+        self.assertFalse(
+            self.scan.issues.filter(check_name=CheckName.MISSING_PAGE).exists()
+        )
+
+    def test_a_reorder_with_a_bad_address_writes_nothing(self):
+        response = self._post(
+            "move_page",
+            moves=[
+                {"pdf_page": 4, "anchor_pdf_page": 2},
+                {"pdf_page": 99, "anchor_pdf_page": 2},
+            ],
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(
+            page_edits.current_edits(self.scan, PageEdit.Kind.MOVE_PAGE)
+        )
+
+    def test_a_reorder_that_names_a_page_twice_is_refused(self):
+        response = self._post(
+            "move_page",
+            moves=[
+                {"pdf_page": 4, "anchor_pdf_page": 2},
+                {"pdf_page": 4, "anchor_pdf_page": 1},
+            ],
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(
+            page_edits.current_edits(self.scan, PageEdit.Kind.MOVE_PAGE)
+        )
+
+    def test_an_empty_reorder_is_refused(self):
+        self.assertEqual(self._post("move_page", moves=[]).status_code, 400)
+        self.assertEqual(self._post("move_page", moves=["4"]).status_code, 400)
+        self.assertEqual(
+            self._post(
+                "move_page",
+                moves=[{"pdf_page": 4, "anchor_pdf_page": 2, "ordinal": -1}],
+            ).status_code,
+            400,
+        )
+
+    def test_moves_by_page_yields_the_landing_order(self):
+        self.scan = self._scan(["1", "5", "4", "3", "2", "6"])
+        for pdf_page, ordinal in ((3, 2), (5, 0), (4, 1)):
+            PageEditFactory(
+                scan=self.scan,
+                kind=PageEdit.Kind.MOVE_PAGE,
+                pdf_page=pdf_page,
+                anchor_pdf_page=1,
+                ordinal=ordinal,
+                source_fingerprint=self.scan.source_fingerprint,
+            )
+
+        self.assertEqual(list(page_edits.moves_by_page(self.scan)), [5, 4, 3])
+
+    def test_a_misread_gets_no_button(self):
+        # 6 read on page 4 of a volume whose numbers are all in range,
+        # so nothing corrects it: the step back to 4 fits no shape, and
+        # the card offers nothing.
+        scan = self._scan(["1", "2", "3", "6", "4", "7", "8"])
+        html = self._step_one(scan).content.decode()
+
+        self.assertIn("goes backward", html)
+        self.assertNotIn("movePage(this)", html)
+
+    def test_a_displaced_page_the_volume_prints_twice_gets_no_button(self):
+        # 5 on page 3 fits the pulled-early shape, but the volume prints
+        # 5 again later, so the card cannot tell which page is out of
+        # place.
+        scan = self._scan(["1", "2", "5", "3", "4", "5", "6"])
+        html = self._step_one(scan).content.decode()
+
+        self.assertIn("goes backward", html)
+        self.assertNotIn("movePage(this)", html)
 
     def test_a_pair_that_is_not_adjacent_gets_no_button(self):
         # 4 printed on page 3, a lettered page between (which breaks no
@@ -2411,14 +2823,14 @@ class TestMovePageEndpoints(ScanningTestCase):
         html = self._step_one(scan).content.decode()
 
         self.assertIn("goes backward", html)
-        self.assertNotIn("swapPages(this)", html)
+        self.assertNotIn("movePage(this)", html)
 
     def test_after_the_move_the_page_lists_the_corrected_order(self):
         self._post("move_page", pdf_page=4, anchor_pdf_page=2)
 
         html = self._step_one().content.decode()
 
-        self.assertNotIn("swapPages(this)", html)
+        self.assertNotIn("movePage(this)", html)
         self.assertNotIn(">ORDER<", html)
         self.assertEqual(html.count("page-moved-badge"), 1)
         self.assertIn('movedPages: {"4": 2}', html)
@@ -2435,7 +2847,7 @@ class TestMovePageEndpoints(ScanningTestCase):
 
         # Two cards for 3, and one for the 4 that follows 6.
         self.assertEqual(html.count('data-check="backward_page"'), 3)
-        self.assertNotIn("swapPages(this)", html)
+        self.assertNotIn("movePage(this)", html)
 
     def test_a_locked_volume_offers_no_swap(self):
         Scan.objects.filter(pk=self.scan.pk).update(
@@ -2445,4 +2857,4 @@ class TestMovePageEndpoints(ScanningTestCase):
         html = self._step_one().content.decode()
 
         self.assertIn("goes backward", html)
-        self.assertNotIn("swapPages(this)", html)
+        self.assertNotIn("movePage(this)", html)
