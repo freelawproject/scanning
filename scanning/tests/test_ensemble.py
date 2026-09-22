@@ -470,6 +470,100 @@ class TestTheVote(TestCase):
         marked = [t for t in answer["tokens"] if t.get("low_confidence")]
         self.assertEqual([t["text"] for t in marked], ["beta"])
 
+    def test_a_word_a_majority_settles_says_so(self):
+        """#380: the reader must tell a word every engine read from a
+        word two of three read, and the vote is the only rule for
+        that."""
+        answer = ensemble.resolve(
+            self.read(
+                "alpha beta gamma delta",
+                "alpha xeta gamma delta",
+                "alpha beta gamma zelta",
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.VOTED)
+        marked = [t["text"] for t in answer["tokens"] if t.get("majority")]
+        self.assertEqual(marked, ["beta", "delta"])
+
+    def test_a_word_the_base_never_read_says_so(self):
+        """#380: a run the engines put in and a word no majority
+        settled are both marked, and they read differently. The viewer
+        names one of them, so the token must say which it is."""
+        answer = ensemble.resolve(
+            self.read(
+                "the court held today",
+                "the court plainly held today",
+                "the court plainly held todya",
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.VOTED)
+        put_in = [t["text"] for t in answer["tokens"] if t.get("inserted")]
+        self.assertEqual(put_in, ["plainly"])
+        for token in answer["tokens"]:
+            if token.get("inserted"):
+                self.assertTrue(token.get("low_confidence"), token)
+
+    def test_a_word_no_majority_settles_is_not_an_inserted_word(self):
+        answer = ensemble.resolve(
+            self.read(
+                "alpha beta gamma", "alpha xeta gamma", "alpha zeta gamma"
+            )
+        )
+
+        marked = [t for t in answer["tokens"] if t.get("low_confidence")]
+        self.assertEqual([t["text"] for t in marked], ["beta"])
+        self.assertIsNone(marked[0].get("inserted"))
+
+    def test_a_word_every_engine_read_carries_no_flag(self):
+        answer = ensemble.resolve(
+            self.read(
+                "alpha beta gamma delta",
+                "alpha xeta gamma delta",
+                "alpha beta gamma zelta",
+            )
+        )
+
+        plain = [
+            token["text"]
+            for token in answer["tokens"]
+            if not token.get("majority") and not token.get("low_confidence")
+        ]
+        self.assertEqual(plain, ["alpha", "gamma"])
+
+    def test_a_word_no_majority_settles_is_not_a_majority_word(self):
+        """The two flags never meet on one token."""
+        answer = ensemble.resolve(
+            self.read(
+                "alpha beta gamma", "alpha xeta gamma", "alpha zeta gamma"
+            )
+        )
+
+        for token in answer["tokens"]:
+            self.assertFalse(
+                token.get("majority") and token.get("low_confidence"),
+                token,
+            )
+        marked = [t["text"] for t in answer["tokens"] if t.get("majority")]
+        self.assertEqual(marked, [])
+
+    def test_a_word_a_folded_difference_leaves_alone_is_unanimous(self):
+        """#378, #380: the vote folds the typography, so a curly quote
+        never makes a word a majority word. The panel's own marks do
+        show it, and they are not this flag."""
+        answer = ensemble.resolve(
+            self.read(
+                "the court's order stands",
+                "the court’s order stnads",
+                "the court's order stadns",
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.VOTED)
+        marked = [t["text"] for t in answer["tokens"] if t.get("majority")]
+        self.assertEqual(marked, [])
+
     def test_no_token_carries_markup(self):
         """The prototype stored ``<mark>``; this module stores a flag,
         and the viewer builds the nodes."""
@@ -539,7 +633,11 @@ class TestTheVote(TestCase):
             tokens,
             [
                 {"text": "alpha"},
-                {"text": "beta", "low_confidence": True},
+                {
+                    "text": "beta",
+                    "low_confidence": True,
+                    "inserted": True,
+                },
                 {"text": "gamma"},
             ],
         )

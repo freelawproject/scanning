@@ -1338,3 +1338,60 @@ a.doc-name:hover { text-decoration: underline; }
     color: #9ca3af;
     font-style: italic;
 }
+/* The words of one reading that the shown reading does not hold
+   (#380). A solid rule and a stronger ground than ``.ensemble-low``,
+   which marks a word the vote left open: the two say different
+   things. */
+.ensemble-diff {
+    background: rgba(217, 119, 6, 0.30);
+    border-bottom: 2px solid #b45309;
+    border-radius: 2px;
+}
+/* The line that says why the text shows one engine's reading (#380). */
+.ensemble-why {
+    margin: 0 0 6px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: #6b7280;
+}
+/* The button that opens the rules of the vote (#380). */
+.ensemble-ask {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    line-height: 12px;
+    padding: 0;
+    border: 1px solid #9ca3af;
+    border-radius: 9999px;
+    font-size: 10px;
+    color: #6b7280;
+    background: transparent;
+    cursor: pointer;
+}
+.ensemble-ask:hover,
+.ensemble-ask.open {
+    color: #1f2937;
+    border-color: #6b7280;
+    background: rgba(107, 114, 128, 0.15);
+}
+.ensemble-help {
+    margin: 0 0 8px;
+    padding: 6px 8px;
+    border-left: 2px solid rgba(107, 114, 128, 0.5);
+    background: rgba(107, 114, 128, 0.08);
+    border-radius: 0 4px 4px 0;
+    font-size: 11px;
+    line-height: 1.5;
+    color: #4b5563;
+}
+.ensemble-help p {
+    margin: 0 0 2px;
+}
+.ensemble-help-name {
+    font-weight: 700;
+}
+/* A word of a voted group that a majority chose, beside
+   ``.ensemble-low``, which marks a word no majority settled (#380). */
+.ensemble-voted {
+    background: rgba(217, 119, 6, 0.12);
+}
