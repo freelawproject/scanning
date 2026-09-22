@@ -10,9 +10,12 @@ Four rules run through it:
 - **A request is dismissed, never deleted.** ``dismiss`` stamps the
   row. The row stays as the audit.
 - **Fulfilled is derived.** A request is fulfilled when a standing
-  ``INSERT_PAGE`` or ``REPLACE_PAGE`` edit exists at its address.
-  No stamp, so the upload cannot race one, and an undo of the upload
-  reopens the request for free.
+  ``INSERT_PAGE`` or ``REPLACE_PAGE`` edit exists at its address, or
+  when a one-page missing-page request is answered by a replacement
+  of either page beside its gap that no other open request claims
+  (#393): a clear-cut case fulfils by itself, an ambiguous one waits
+  for a person to dismiss. No stamp, so the upload cannot race one,
+  and an undo of the upload reopens the request for free.
 - **A stale request is marked, never dropped.** A request made
   against an earlier upload of the original names a page the
   reviewer saw then. A person judges it; nothing applies it.
@@ -25,9 +28,13 @@ Four rules run through it:
 
 from __future__ import annotations
 
+import re
+
 from django.db.models import (
+    BooleanField,
     Count,
     Exists,
+    ExpressionWrapper,
     F,
     OuterRef,
     Q,
@@ -49,11 +56,10 @@ NOTE_MAX_CHARS = 500
 QUEUE_STATES = ("waiting", "fulfilled", "dismissed", "all")
 
 
-def _fulfilling_edits():
-    """Return the ``PageEdit`` rows that fulfil the outer request.
+def _later_standing_edits():
+    """Return the ``PageEdit`` rows that may fulfil the outer request.
 
-    An insert in the gap fulfils an INSERT; a replacement of the page
-    fulfils a REPLACE. Three conditions, all needed:
+    Three conditions, all needed, and shared by the two shapes below:
 
     - **The edit is later than the request.** A reviewer who finds the
       replacement blurry too asks again, and an edit that was already
@@ -83,7 +89,7 @@ def _fulfilling_edits():
     query already carries. Do not write it as
     ``Q(scan__source_fingerprint="")`` again.
 
-    :returns: A queryset for an ``Exists`` annotation.
+    :returns: A queryset the two shapes narrow by address.
     :rtype: QuerySet
     """
     same_original = (
@@ -91,20 +97,130 @@ def _fulfilling_edits():
         | Q(Exact(OuterRef("scan__source_fingerprint"), Value("")))
         | Q(source_fingerprint=OuterRef("scan__source_fingerprint"))
     )
-    at_the_address = Q(
-        kind=PageEdit.Kind.REPLACE_PAGE,
-        pdf_page=OuterRef("pdf_page"),
-    ) | Q(
-        kind=PageEdit.Kind.INSERT_PAGE,
-        anchor_pdf_page=OuterRef("anchor_pdf_page"),
-    )
     return PageEdit.objects.filter(
         same_original,
-        at_the_address,
         scan=OuterRef("scan"),
         withdrawn_at__isnull=True,
         date_created__gt=OuterRef("date_created"),
     )
+
+
+def _edits_at_the_address():
+    """Return the edits of the request's own shape at its address.
+
+    An insert in the gap fulfils an INSERT; a replacement of the page
+    fulfils a REPLACE. A REPLACE request has no anchor and an INSERT
+    request has no page, so each clause matches its own action alone.
+
+    :returns: A queryset for an ``Exists`` annotation.
+    :rtype: QuerySet
+    """
+    return _later_standing_edits().filter(
+        Q(
+            kind=PageEdit.Kind.REPLACE_PAGE,
+            pdf_page=OuterRef("pdf_page"),
+        )
+        | Q(
+            kind=PageEdit.Kind.INSERT_PAGE,
+            anchor_pdf_page=OuterRef("anchor_pdf_page"),
+        )
+    )
+
+
+def _rival_claims_on_the_replaced_page():
+    """Return the other open requests that claim the replaced page.
+
+    The neighbour rule fires on a clear-cut case alone (#393). When
+    the reviewer asked for two things beside one page -- a rescan of
+    the page and a missing leaf beside it, or a leaf on each side of
+    it -- one rescan cannot answer both, and which one it answers is
+    a person's call. So a replacement of page P counts for the
+    request beside it only when no other open request claims P: a
+    REPLACE request at P, or an INSERT request at P's other gap. A
+    dismissed rival frees the page, because the reviewer withdrew one
+    of the two claims.
+
+    Two levels out: the innermost ``OuterRef`` is the edit's page,
+    the doubled one is the request being judged, which is not its own
+    rival.
+
+    :returns: A queryset for a ``~Exists`` inside the edit subquery.
+    :rtype: QuerySet
+    """
+    return (
+        PageRepairRequest.objects.filter(
+            scan=OuterRef("scan"), dismissed_at__isnull=True
+        )
+        .exclude(pk=OuterRef(OuterRef("pk")))
+        .filter(
+            Q(
+                action=PageRepairRequest.Action.REPLACE,
+                pdf_page=OuterRef("pdf_page"),
+            )
+            | Q(
+                action=PageRepairRequest.Action.INSERT,
+                anchor_pdf_page__in=(
+                    OuterRef("pdf_page") - 1,
+                    OuterRef("pdf_page"),
+                ),
+            )
+        )
+    )
+
+
+def _replacements_beside_the_gap():
+    """Return the replacements of either page beside an INSERT request's gap.
+
+    The obvious case of #393: a blurry page with no number gives the
+    reviewer a Replace button and a missing-page placeholder after
+    it. The reviewer asks at the placeholder, the scanner scans the
+    blurry page again, and the new page is the one asked for. The
+    scanner did the work at the gap's edge, so the request is
+    fulfilled. Both neighbours count, because the analysis may place
+    the placeholder on either side of the page it could not read.
+
+    Only a clear-cut case counts: the replaced page must be claimed
+    by no other open request (:func:`_rival_claims_on_the_replaced_page`).
+    An ambiguous case waits for a person, who dismisses the request
+    that is answered.
+
+    The anchor is null on a REPLACE request, so this matches nothing
+    there. :func:`annotate_fulfilled` adds the other half of the rule,
+    which lives on the request row: a replacement is one page exactly
+    (``REPLACEMENT_IS_ONE_PAGE_MESSAGE``), so it never answers a
+    request for a range of pages.
+
+    :returns: A queryset for an ``Exists`` annotation.
+    :rtype: QuerySet
+    """
+    return (
+        _later_standing_edits()
+        .filter(
+            Q(kind=PageEdit.Kind.REPLACE_PAGE)
+            & (
+                Q(pdf_page=OuterRef("anchor_pdf_page"))
+                | Q(pdf_page=OuterRef("anchor_pdf_page") + 1)
+            )
+        )
+        .exclude(Exists(_rival_claims_on_the_replaced_page()))
+    )
+
+
+#: The label of a request for a range of pages holds one mark between
+#: its ends (#233). The viewer sends the map's hyphen; an older viewer
+#: may send the en dash ``_PAGE_LABEL_RE`` accepts. A replacement is
+#: one page, so it answers no such request, whichever mark it holds.
+RANGE_LABEL_RE = r"[-\u2013]"
+
+
+def is_range_label(label: str) -> bool:
+    """Return whether a request's label names a range of pages.
+
+    :param label: ``PageRepairRequest.logical_page``.
+    :returns: Whether the label holds a range mark.
+    :rtype: bool
+    """
+    return re.search(RANGE_LABEL_RE, label or "") is not None
 
 
 def annotate_fulfilled(rows: QuerySet) -> QuerySet:
@@ -116,15 +232,65 @@ def annotate_fulfilled(rows: QuerySet) -> QuerySet:
     page it follows, so the gap comes after that page and before the
     next.
 
+    ``fulfilled`` is one of two shapes (#393): an edit of the request's
+    own kind at its address (``fulfilled_at_address``), or a
+    replacement of either page beside the gap of a one-page INSERT
+    request (``fulfilled_beside``). The two are kept as their own
+    annotations so :func:`as_dict` can say which shape answered, and
+    the viewer can tell the reviewer what to check.
+
     :param rows: ``PageRepairRequest`` rows.
-    :returns: The same rows, each with a boolean ``fulfilled`` and an
+    :returns: The same rows, each with the booleans ``fulfilled``,
+        ``fulfilled_at_address`` and ``fulfilled_beside``, and an
         integer ``sort_address``.
     :rtype: QuerySet
     """
-    return rows.annotate(
-        fulfilled=Exists(_fulfilling_edits()),
-        sort_address=Coalesce(F("pdf_page") * 2, F("anchor_pdf_page") * 2 + 1),
-    ).order_by("scan_id", "sort_address", "pk")
+    return (
+        rows.annotate(
+            fulfilled_at_address=Exists(_edits_at_the_address()),
+            fulfilled_beside=Exists(_replacements_beside_the_gap()),
+        )
+        .annotate(
+            fulfilled=ExpressionWrapper(
+                Q(fulfilled_at_address=True)
+                | (
+                    Q(fulfilled_beside=True)
+                    & ~Q(logical_page__regex=RANGE_LABEL_RE)
+                ),
+                output_field=BooleanField(),
+            ),
+            sort_address=Coalesce(
+                F("pdf_page") * 2, F("anchor_pdf_page") * 2 + 1
+            ),
+        )
+        .order_by("scan_id", "sort_address", "pk")
+    )
+
+
+def fulfilled_by(row: PageRepairRequest) -> str | None:
+    """Return the kind of edit that answered the request, or ``None``.
+
+    ``"insert"`` is an insert in the gap of an INSERT request;
+    ``"replace"`` is a replacement of the page of a REPLACE request, or
+    of a page beside the gap of an INSERT request (#393). The viewer
+    reads it with ``action``: an INSERT request answered by
+    ``"replace"`` is the one whose new page the reviewer must check
+    against the page asked for.
+
+    :param row: A request with the annotations of
+        :func:`annotate_fulfilled`.
+    :returns: ``"insert"``, ``"replace"`` or ``None``.
+    :rtype: str | None
+    """
+    if not getattr(row, "fulfilled", False):
+        return None
+    if getattr(row, "fulfilled_at_address", False):
+        return (
+            "insert"
+            if row.action == PageRepairRequest.Action.INSERT
+            else "replace"
+        )
+    return "replace"
 
 
 def open_requests(scan: Scan) -> QuerySet:
@@ -269,6 +435,7 @@ def as_dict(row: PageRepairRequest, scan: Scan) -> dict:
             timezone.localtime(row.date_created), "Y-m-d"
         ),
         "fulfilled": bool(getattr(row, "fulfilled", False)),
+        "fulfilled_by": fulfilled_by(row),
         "stale": is_stale(row, scan),
         "nav_pdf_index": row.nav_pdf_index,
     }
@@ -282,6 +449,92 @@ def viewer_payload(scan: Scan) -> list[dict]:
     :rtype: list[dict]
     """
     return [as_dict(row, scan) for row in open_requests(scan)]
+
+
+def project_requests(page_map: list[dict], requests: list[dict]) -> list[dict]:
+    """Give every open INSERT request a placeholder in the viewer (#393).
+
+    The viewer draws an INSERT request on the placeholder of its gap,
+    and a placeholder is a ``missing`` entry of the page map, which
+    the sequence analysis alone writes. When the sequence stops
+    showing the gap -- the blurry page was scanned again and read, or
+    a curator typed its number -- the placeholder goes, and with it
+    the request's note, its Dismiss button and its insert form. The
+    request then waits with no control on the page, and holds the
+    review-1 approval (#266).
+
+    So a request whose gap has no placeholder gets one here, flagged
+    ``from_request``, right after the page it follows and after the
+    images already uploaded into that gap. The viewer draws it as a
+    placeholder whose heading says why it stands on a closed
+    sequence. A request whose anchor page is not in the map goes
+    last, like an unplaced insert (``page_edits.project_inserts``).
+
+    This is a projection for the viewer and never a write to the
+    stored map: a ``missing`` entry stored for a request would tell
+    the sequence checks that a page is missing when the sequence says
+    it is not.
+
+    :param page_map: The page map to render, after
+        ``page_edits.project_inserts`` stamped the anchors.
+    :param requests: :func:`viewer_payload`'s dicts.
+    :returns: The page map with one placeholder per uncovered request.
+        Not modified in place.
+    :rtype: list[dict]
+    """
+    covered = {
+        entry.get("anchor_pdf_page")
+        for entry in page_map
+        if entry.get("type") == "missing"
+    }
+    uncovered = [
+        r
+        for r in requests
+        if r["action"] == PageRepairRequest.Action.INSERT
+        and r["anchor_pdf_page"] not in covered
+    ]
+    if not uncovered:
+        return page_map
+
+    def _placeholder(r: dict) -> dict:
+        label = str(r["logical_page"] or "")
+        entry = {
+            "type": "missing",
+            "logical_number": label,
+            "anchor_pdf_page": r["anchor_pdf_page"],
+            "from_request": True,
+        }
+        ends = re.split(RANGE_LABEL_RE, label, maxsplit=1)
+        if len(ends) == 2 and ends[0].isdigit() and ends[1].isdigit():
+            entry["missing_range"] = [int(ends[0]), int(ends[1])]
+        return entry
+
+    out = list(page_map)
+    unplaced: list[dict] = []
+    for r in sorted(uncovered, key=lambda r: r["anchor_pdf_page"]):
+        anchor = r["anchor_pdf_page"]
+        if anchor == 0:
+            at = 0
+        else:
+            at = next(
+                (
+                    position + 1
+                    for position, entry in enumerate(out)
+                    if entry.get("type") == "pdf_page"
+                    and entry.get("pdf_index") == anchor - 1
+                ),
+                None,
+            )
+            if at is None:
+                unplaced.append(_placeholder(r))
+                continue
+        # The images already uploaded into this gap come first, so the
+        # card reads "and this one is still asked for".
+        while at < len(out) and out[at].get("type") == "inserted":
+            at += 1
+        out.insert(at, _placeholder(r))
+    out.extend(unplaced)
+    return out
 
 
 def queue(state: str = "waiting") -> QuerySet:

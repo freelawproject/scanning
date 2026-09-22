@@ -13,10 +13,11 @@ from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db.models import Count
-from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.http import urlencode
 from django.views.decorators.http import require_POST
 
 from scanning import (
@@ -37,6 +38,7 @@ from scanning.models import (
     OpinionReviewStatus,
     OpinionScan,
     OpinionStatus,
+    PageRepairRequest,
     PendingUpload,
     Priority,
     QueueStatus,
@@ -660,6 +662,51 @@ def repair_queue(request: HttpRequest) -> HttpResponse:
             # context processor that feeds the header badge: one query.
         },
     )
+
+
+#: The query keys the queue reads. The dismissal returns the user to
+#: the list they pressed the button on, and carries no other key.
+REPAIR_QUEUE_KEYS = ("state", "reporter", "page")
+
+
+@login_required
+@require_POST
+def dismiss_repair_from_queue(request: HttpRequest, pk: int) -> HttpResponse:
+    """Close a repair request from the queue page (#393).
+
+    The same rule as ``dismiss_page_repair``, the button on the page
+    card: any logged-in user may dismiss, the row is stamped and never
+    deleted, and a second press is a no-op. The card is not always
+    there. A missing-page request draws its button on the placeholder
+    of its gap, and the placeholder goes when the printed sequence
+    stops showing the gap; the request then waits with no button
+    anywhere, and holds the review-1 approval (#266). This view is the
+    button that never goes.
+
+    The redirect returns to the queue with the same filters. The keys
+    are ``REPAIR_QUEUE_KEYS`` and the target is the queue itself, so
+    no ``next`` string reaches a template.
+
+    :param request: The HTTP request. Its query string is the queue's.
+    :param pk: The request to dismiss.
+    :return: A redirect to the queue.
+    """
+    rows = PageRepairRequest.objects.filter(pk=pk)
+    if not rows.exists():
+        raise Http404("Unknown request.")
+    if repairs.dismiss(rows, request.user):
+        messages.success(request, "Request dismissed.")
+    else:
+        messages.info(request, "This request was already dismissed.")
+    query = {
+        key: request.GET[key]
+        for key in REPAIR_QUEUE_KEYS
+        if request.GET.get(key)
+    }
+    url = reverse("repair_queue")
+    if query:
+        url += "?" + urlencode(query)
+    return redirect(url)
 
 
 @login_required
