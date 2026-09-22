@@ -29,8 +29,12 @@ footer; its one other bottom bound is the ink, and a blot down the page
 edge carries the ink to the edge (#323, #370). The strips of the same
 page come from the read text and say where it ends, so the writer holds
 every text rect inside the box they leave (:func:`strip_content_box`),
-smaller only, on all four sides. A rect the clip would empty is written
-as it is: a dropped box hides what it described from the curator.
+smaller only, on all four sides. Every page has its four strips (#370),
+and a strip the measure gave no page is a thin handle at the page edge,
+pushed off every ``TEXT_COLUMN``: a headnote rect snapped to its column
+loses nothing to it, and one grown onto edge ink loses the blot. A rect
+the clip would empty is written as it is: a dropped box hides what it
+described from the curator.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ from statistics import median
 from django.db import transaction
 from django.utils import timezone
 
-from scanning import detections
+from scanning import detections, margin_fit
 from scanning.detections import IOU_THRESHOLD, iou
 from scanning.models import ApplyRun, Redaction, Scan
 from scanning.text_fit import TEXT_RECT_TYPES
@@ -74,41 +78,31 @@ def _round(value: float) -> float:
 # The compute writes
 # ---------------------------------------------------------------------------
 
-#: A strip within this many points of a page edge lies on it, the
-#: tolerance ``margins._rects_for_bounds`` rounds within.
-_EDGE_PT = 1.0
 
-
-def strip_content_box(
-    strips: list[dict], page_width: float, page_height: float
-) -> tuple[float, float, float, float]:
+def strip_content_box(entry: dict) -> tuple[float, float, float, float]:
     """Return the box the margin strips of one page leave, in points.
 
-    Each strip is named by the page edge it lies on, as
-    ``blackletter.margins._rects_for_bounds`` lays them out: a full-width
-    strip at the top edge is the top, one at the bottom edge the bottom,
-    and a strip at the left or right edge is that side. A side with no
-    strip is the page edge. (#370's ``margin_fit._sides`` names them the
-    same way; when it lands, one of the two reads the other.)
+    The strips are named by the page edge each lies on
+    (``margin_fit._sides``, the one rule), and the box is what the four
+    leave between them. Every page has its four strips
+    (``margin_fit.ensure_strips``, #370); a side the entry still lacks
+    is the page edge.
 
-    :param strips: The page's strips, ``{x0, y0, x1, y1}`` in points.
-    :param page_width: The page width, in points.
-    :param page_height: The page height, in points.
+    :param entry: One ``compute_margin_rects`` entry, with its
+        ``page_width``, ``page_height`` and ``rects`` in points.
     :returns: ``(x0, y0, x1, y1)``, in points.
     """
-    x0, y0, x1, y1 = 0.0, 0.0, float(page_width), float(page_height)
-    for strip in strips:
-        sx0, sy0 = float(strip["x0"]), float(strip["y0"])
-        sx1, sy1 = float(strip["x1"]), float(strip["y1"])
-        full_width = sx0 <= _EDGE_PT and sx1 >= page_width - _EDGE_PT
-        if full_width and sy0 <= _EDGE_PT:
-            y0 = max(y0, sy1)
-        elif full_width and sy1 >= page_height - _EDGE_PT:
-            y1 = min(y1, sy0)
-        elif sx0 <= _EDGE_PT:
-            x0 = max(x0, sx1)
-        elif sx1 >= page_width - _EDGE_PT:
-            x1 = min(x1, sx0)
+    sides = margin_fit._sides(entry)
+    x0, y0 = 0.0, 0.0
+    x1, y1 = float(entry["page_width"]), float(entry["page_height"])
+    if sides["top"] is not None:
+        y0 = float(sides["top"]["y1"])
+    if sides["bottom"] is not None:
+        y1 = float(sides["bottom"]["y0"])
+    if sides["left"] is not None:
+        x0 = float(sides["left"]["x1"])
+    if sides["right"] is not None:
+        x1 = float(sides["right"]["x0"])
     return x0, y0, x1, y1
 
 
@@ -128,20 +122,6 @@ def clip_to_content(
     if x0 >= x1 or y0 >= y1:
         return None
     return x0, y0, x1, y1
-
-
-def _page_size(page, entry: dict) -> tuple[float, float] | None:
-    """The size in points of the page a margin entry describes.
-
-    :param page: The blackletter ``Page`` of that index, or None.
-    :param entry: The ``compute_margin_rects`` entry.
-    :returns: ``(width, height)``, or None when neither names it.
-    """
-    width = getattr(page, "pdf_width", None) or entry.get("page_width")
-    height = getattr(page, "pdf_height", None) or entry.get("page_height")
-    if not width or not height:
-        return None
-    return float(width), float(height)
 
 
 def write_computed(
@@ -167,7 +147,8 @@ def write_computed(
     its page's strips leave (#371): all four sides, smaller only, and a
     rect the clip would empty is written as it is. The other types are
     left alone: a white one sits in the margin by design, and the strips
-    are already pulled back off a key icon.
+    are already pulled back off a key icon. An entry that names no page
+    size clips nothing on its page.
 
     One transaction: a reader between the delete and the writes would
     see no box at all.
@@ -201,14 +182,11 @@ def write_computed(
         "apply_run": run,
         "detect_run": detect_run,
     }
-    by_index = {page.index: page for page in pages}
-    content_boxes = {}
-    for entry in margins_pt:
-        size = _page_size(by_index.get(entry["page_index"]), entry)
-        if size is not None:
-            content_boxes[entry["page_index"]] = strip_content_box(
-                entry.get("rects") or [], *size
-            )
+    content_boxes = {
+        entry["page_index"]: strip_content_box(entry)
+        for entry in margins_pt
+        if entry.get("page_width") and entry.get("page_height")
+    }
     text_rects = clipped = refused = 0
     removed: list[float] = []
     for entry in rects_px:

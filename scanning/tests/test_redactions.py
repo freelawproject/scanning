@@ -39,23 +39,15 @@ def computed(scan, **fields) -> Redaction:
     return Redaction.objects.create(**values)
 
 
-def pages(*indexes, scale=0.5, size=(612.0, 792.0)):
+def pages(*indexes, scale=0.5):
     """Fake blackletter pages with one scale.
 
     :param indexes: The page indexes.
     :param scale: Points per pixel.
-    :param size: The page size in points, ``(width, height)``.
     :returns: The list.
     """
     return [
-        SimpleNamespace(
-            index=i,
-            scale_x=scale,
-            scale_y=scale,
-            pdf_width=size[0],
-            pdf_height=size[1],
-        )
-        for i in indexes
+        SimpleNamespace(index=i, scale_x=scale, scale_y=scale) for i in indexes
     ]
 
 
@@ -64,6 +56,22 @@ TOP = {"x0": 0.0, "y0": 0.0, "x1": 612.0, "y1": 19.7}
 LEFT = {"x0": 0.0, "y0": 19.7, "x1": 81.4, "y1": 734.3}
 BOTTOM = {"x0": 0.0, "y0": 734.3, "x1": 612.0, "y1": 792.0}
 RIGHT = {"x0": 535.2, "y0": 19.7, "x1": 612.0, "y1": 734.3}
+
+
+def strips(*rects, page_index=1, size=(612.0, 792.0)):
+    """One ``compute_margin_rects`` entry, in points.
+
+    :param rects: The strips.
+    :param page_index: The page.
+    :param size: The page size, ``(width, height)``.
+    :returns: The entry.
+    """
+    return {
+        "page_index": page_index,
+        "rects": [dict(r) for r in rects],
+        "page_width": size[0],
+        "page_height": size[1],
+    }
 
 
 def rect(x0, y0, x1, y1, type="headnote", fill="black"):
@@ -85,19 +93,20 @@ class TestStripContentBox(TestCase):
 
     def test_four_strips_give_the_box_between_them(self):
         self.assertEqual(
-            redactions.strip_content_box([TOP, LEFT, BOTTOM, RIGHT], 612, 792),
+            redactions.strip_content_box(strips(TOP, LEFT, BOTTOM, RIGHT)),
             (81.4, 19.7, 535.2, 734.3),
         )
 
     def test_a_side_with_no_strip_is_the_page_edge(self):
+        """The exception since #370 gave every page four strips."""
         self.assertEqual(
-            redactions.strip_content_box([BOTTOM], 612, 792),
+            redactions.strip_content_box(strips(BOTTOM)),
             (0.0, 0.0, 612.0, 734.3),
         )
 
     def test_no_strips_give_the_page_frame(self):
         self.assertEqual(
-            redactions.strip_content_box([], 612, 792),
+            redactions.strip_content_box(strips()),
             (0.0, 0.0, 612.0, 792.0),
         )
 
@@ -105,7 +114,7 @@ class TestStripContentBox(TestCase):
         """A curator's box in the middle of the page is not a margin."""
         inner = {"x0": 100.0, "y0": 100.0, "x1": 200.0, "y1": 200.0}
         self.assertEqual(
-            redactions.strip_content_box([inner], 612, 792),
+            redactions.strip_content_box(strips(inner)),
             (0.0, 0.0, 612.0, 792.0),
         )
 
@@ -181,12 +190,12 @@ class TestWriteComputed(TestCase):
         self.assertEqual(margin.bbox, [0.0, 0.0, 20.0, 50.0])
         self.assertEqual((margin.source_page, margin.page_index), (3, 2))
 
-    def _write(self, rects, strips=(TOP, LEFT, BOTTOM, RIGHT), page=None):
+    def _write(self, rects, entry=None):
         """Write one page of rects under the page-17 strips.
 
         :param rects: The pixel rects of page index 1.
-        :param strips: The strips of that page, in points.
-        :param page: The page objects, ``pages(1)`` by default.
+        :param entry: The margin entry of that page, the four strips of
+            page 17 by default.
         :returns: The written count.
         """
         return redactions.write_computed(
@@ -194,8 +203,8 @@ class TestWriteComputed(TestCase):
             None,
             3,
             [{"page_index": 1, "rects": list(rects)}],
-            [{"page_index": 1, "rects": [dict(s) for s in strips]}],
-            page or pages(1),
+            [entry or strips(TOP, LEFT, BOTTOM, RIGHT)],
+            pages(1),
         )
 
     def test_a_text_rect_is_held_inside_the_strips(self):
@@ -251,20 +260,15 @@ class TestWriteComputed(TestCase):
         self.assertIn("1 refused", logs.output[0])
 
     def test_a_side_with_no_strip_clips_nothing_on_that_side(self):
-        self._write([rect(132.4, 1273.0, 597.6, 1584.0)], strips=[BOTTOM])
+        self._write([rect(132.4, 1273.0, 597.6, 1584.0)], strips(BOTTOM))
 
         row = Redaction.objects.get(scan=self.scan, rect_type="headnote")
         self.assertEqual(row.bbox, [66.2, 636.5, 298.8, 734.3])
 
-    def test_a_page_with_no_size_and_no_strips_is_written_as_measured(self):
-        page = [SimpleNamespace(index=1, scale_x=0.5, scale_y=0.5)]
-        written = redactions.write_computed(
-            self.scan,
-            None,
-            3,
-            [{"page_index": 1, "rects": [rect(132.4, 1273.0, 597.6, 1584.0)]}],
-            [{"page_index": 1, "rects": [dict(BOTTOM)]}],
-            page,
+    def test_an_entry_with_no_page_size_clips_nothing(self):
+        written = self._write(
+            [rect(132.4, 1273.0, 597.6, 1584.0)],
+            {"page_index": 1, "rects": [dict(BOTTOM)]},
         )
 
         self.assertEqual(written, 2)
