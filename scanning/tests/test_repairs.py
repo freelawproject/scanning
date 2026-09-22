@@ -541,6 +541,68 @@ class TestFulfilledIsDerived(RepairTestCase):
 
         self.assertFalse(repairs.open_requests(self.scan).get().fulfilled)
 
+    def test_a_rescan_request_on_the_replaced_page_keeps_the_gap_waiting(self):
+        # The reviewer asked for two things: a rescan of page 1 and a
+        # leaf after it. One rescan answers the rescan request alone;
+        # which claim it settles is a person's call (#393).
+        self._insert(anchor=1, label="2")
+        self._replace(pdf_page=1)
+        self._replacement(1)
+
+        rows = repairs.open_requests(self.scan)
+
+        self.assertFalse(rows.get(action="insert").fulfilled)
+        self.assertTrue(rows.get(action="replace").fulfilled)
+        self.assertTrue(repairs.has_waiting(self.scan))
+
+    def test_a_dismissed_rival_frees_the_replaced_page(self):
+        self._insert(anchor=1, label="2")
+        self._replace(pdf_page=1)
+        self._replacement(1)
+        repairs.dismiss(
+            self.scan.repair_requests.filter(
+                action=PageRepairRequest.Action.REPLACE
+            ),
+            self.user,
+        )
+
+        self.assertTrue(repairs.open_requests(self.scan).get().fulfilled)
+        self.assertFalse(repairs.has_waiting(self.scan))
+
+    def test_a_leaf_asked_on_each_side_of_the_page_fulfils_neither(self):
+        # Two gaps beside page 2, one rescan of page 2: ambiguous.
+        self._insert(anchor=1, label="2")
+        self._insert(anchor=2, label="3a")
+        self._replacement(2)
+
+        rows = list(repairs.open_requests(self.scan))
+
+        self.assertEqual([row.fulfilled for row in rows], [False, False])
+        self.assertTrue(repairs.has_waiting(self.scan))
+
+    def test_a_rival_on_the_other_neighbour_changes_nothing(self):
+        # A rescan request on page 2 claims page 2 alone; a rescan of
+        # page 1 still answers the gap after page 1.
+        self._insert(anchor=1, label="2")
+        self._replace(pdf_page=2)
+        self._replacement(1)
+
+        rows = repairs.open_requests(self.scan)
+
+        self.assertTrue(rows.get(action="insert").fulfilled)
+        self.assertFalse(rows.get(action="replace").fulfilled)
+
+    def test_an_en_dash_marks_a_range_too(self):
+        # ``_PAGE_LABEL_RE`` accepts the en dash an older viewer may
+        # send; a replacement answers no range, whichever mark.
+        self._insert(anchor=3, label="4\u201313")
+        self._replacement(3)
+
+        self.assertFalse(repairs.open_requests(self.scan).get().fulfilled)
+        self.assertTrue(repairs.is_range_label("4\u201313"))
+        self.assertTrue(repairs.is_range_label("4-13"))
+        self.assertFalse(repairs.is_range_label("2094a"))
+
     def test_fulfilled_by_names_the_shape_that_answered(self):
         self._insert(anchor=1, label="2")
         self._replace(pdf_page=3)
@@ -1271,6 +1333,13 @@ class TestProjectRequests(RepairTestCase):
 
         self.assertEqual(out[-1]["missing_range"], [4, 13])
         self.assertEqual(out[-1]["logical_number"], "4-13")
+
+    def test_an_en_dash_label_marks_a_range_too(self):
+        out = repairs.project_requests(
+            self.FLAT_MAP, [self._row(3, label="4\u201313")]
+        )
+
+        self.assertEqual(out[-1]["missing_range"], [4, 13])
 
     def test_a_request_whose_anchor_is_not_in_the_map_goes_last(self):
         out = repairs.project_requests(self.FLAT_MAP, [self._row(9)])

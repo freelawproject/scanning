@@ -12,9 +12,10 @@ Four rules run through it:
 - **Fulfilled is derived.** A request is fulfilled when a standing
   ``INSERT_PAGE`` or ``REPLACE_PAGE`` edit exists at its address, or
   when a one-page missing-page request is answered by a replacement
-  of either page beside its gap (#393). No stamp, so the upload
-  cannot race one, and an undo of the upload reopens the request for
-  free.
+  of either page beside its gap that no other open request claims
+  (#393): a clear-cut case fulfils by itself, an ambiguous one waits
+  for a person to dismiss. No stamp, so the upload cannot race one,
+  and an undo of the upload reopens the request for free.
 - **A stale request is marked, never dropped.** A request made
   against an earlier upload of the original names a page the
   reviewer saw then. A person judges it; nothing applies it.
@@ -26,6 +27,8 @@ Four rules run through it:
 """
 
 from __future__ import annotations
+
+import re
 
 from django.db.models import (
     BooleanField,
@@ -124,6 +127,47 @@ def _edits_at_the_address():
     )
 
 
+def _rival_claims_on_the_replaced_page():
+    """Return the other open requests that claim the replaced page.
+
+    The neighbour rule fires on a clear-cut case alone (#393). When
+    the reviewer asked for two things beside one page -- a rescan of
+    the page and a missing leaf beside it, or a leaf on each side of
+    it -- one rescan cannot answer both, and which one it answers is
+    a person's call. So a replacement of page P counts for the
+    request beside it only when no other open request claims P: a
+    REPLACE request at P, or an INSERT request at P's other gap. A
+    dismissed rival frees the page, because the reviewer withdrew one
+    of the two claims.
+
+    Two levels out: the innermost ``OuterRef`` is the edit's page,
+    the doubled one is the request being judged, which is not its own
+    rival.
+
+    :returns: A queryset for a ``~Exists`` inside the edit subquery.
+    :rtype: QuerySet
+    """
+    return (
+        PageRepairRequest.objects.filter(
+            scan=OuterRef("scan"), dismissed_at__isnull=True
+        )
+        .exclude(pk=OuterRef(OuterRef("pk")))
+        .filter(
+            Q(
+                action=PageRepairRequest.Action.REPLACE,
+                pdf_page=OuterRef("pdf_page"),
+            )
+            | Q(
+                action=PageRepairRequest.Action.INSERT,
+                anchor_pdf_page__in=(
+                    OuterRef("pdf_page") - 1,
+                    OuterRef("pdf_page"),
+                ),
+            )
+        )
+    )
+
+
 def _replacements_beside_the_gap():
     """Return the replacements of either page beside an INSERT request's gap.
 
@@ -135,6 +179,11 @@ def _replacements_beside_the_gap():
     fulfilled. Both neighbours count, because the analysis may place
     the placeholder on either side of the page it could not read.
 
+    Only a clear-cut case counts: the replaced page must be claimed
+    by no other open request (:func:`_rival_claims_on_the_replaced_page`).
+    An ambiguous case waits for a person, who dismisses the request
+    that is answered.
+
     The anchor is null on a REPLACE request, so this matches nothing
     there. :func:`annotate_fulfilled` adds the other half of the rule,
     which lives on the request row: a replacement is one page exactly
@@ -144,18 +193,34 @@ def _replacements_beside_the_gap():
     :returns: A queryset for an ``Exists`` annotation.
     :rtype: QuerySet
     """
-    return _later_standing_edits().filter(
-        Q(kind=PageEdit.Kind.REPLACE_PAGE)
-        & (
-            Q(pdf_page=OuterRef("anchor_pdf_page"))
-            | Q(pdf_page=OuterRef("anchor_pdf_page") + 1)
+    return (
+        _later_standing_edits()
+        .filter(
+            Q(kind=PageEdit.Kind.REPLACE_PAGE)
+            & (
+                Q(pdf_page=OuterRef("anchor_pdf_page"))
+                | Q(pdf_page=OuterRef("anchor_pdf_page") + 1)
+            )
         )
+        .exclude(Exists(_rival_claims_on_the_replaced_page()))
     )
 
 
-#: The label of a request for a range of pages holds one hyphen
-#: (#233). A replacement is one page, so it answers no such request.
-RANGE_LABEL_MARK = "-"
+#: The label of a request for a range of pages holds one mark between
+#: its ends (#233). The viewer sends the map's hyphen; an older viewer
+#: may send the en dash ``_PAGE_LABEL_RE`` accepts. A replacement is
+#: one page, so it answers no such request, whichever mark it holds.
+RANGE_LABEL_RE = r"[-\u2013]"
+
+
+def is_range_label(label: str) -> bool:
+    """Return whether a request's label names a range of pages.
+
+    :param label: ``PageRepairRequest.logical_page``.
+    :returns: Whether the label holds a range mark.
+    :rtype: bool
+    """
+    return re.search(RANGE_LABEL_RE, label or "") is not None
 
 
 def annotate_fulfilled(rows: QuerySet) -> QuerySet:
@@ -190,7 +255,7 @@ def annotate_fulfilled(rows: QuerySet) -> QuerySet:
                 Q(fulfilled_at_address=True)
                 | (
                     Q(fulfilled_beside=True)
-                    & ~Q(logical_page__contains=RANGE_LABEL_MARK)
+                    & ~Q(logical_page__regex=RANGE_LABEL_RE)
                 ),
                 output_field=BooleanField(),
             ),
@@ -439,9 +504,9 @@ def project_requests(page_map: list[dict], requests: list[dict]) -> list[dict]:
             "anchor_pdf_page": r["anchor_pdf_page"],
             "from_request": True,
         }
-        first, mark, last = label.partition(RANGE_LABEL_MARK)
-        if mark and first.isdigit() and last.isdigit():
-            entry["missing_range"] = [int(first), int(last)]
+        ends = re.split(RANGE_LABEL_RE, label, maxsplit=1)
+        if len(ends) == 2 and ends[0].isdigit() and ends[1].isdigit():
+            entry["missing_range"] = [int(ends[0]), int(ends[1])]
         return entry
 
     out = list(page_map)

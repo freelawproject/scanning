@@ -672,7 +672,7 @@ REPAIR_QUEUE_KEYS = ("state", "reporter", "page")
 @login_required
 @require_POST
 def dismiss_repair_from_queue(request: HttpRequest, pk: int) -> HttpResponse:
-    """Close a repair request from the queue page (#249).
+    """Close a repair request from the queue page (#393).
 
     The same rule as ``dismiss_page_repair``, the button on the page
     card: any logged-in user may dismiss, the row is stamped and never

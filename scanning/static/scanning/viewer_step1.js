@@ -329,18 +329,28 @@ document.addEventListener('DOMContentLoaded', function () {
         // keeps its note, its Dismiss button and its form until a
         // person closes it. Say so, or the card reads as a gap.
         var fromRequest = !!entry.from_request;
+        var request = fromRequest ? findRepair('insert', entry.anchor_pdf_page) : null;
+        var answered = !!(request && request.fulfilled);
         var found = range
             ? 'These pages were not found in the document.'
             : 'This page was not found in the document.';
-        if (fromRequest) {
+        var state = 'MISSING';
+        if (answered) {
+            // An upload answered the request, and the image or the
+            // rescan stands beside this card. The row is open until
+            // the reviewer judges the new page.
+            state = 'REQUESTED, ANSWERED';
+            found = 'A scanner answered this request. Check the new page, ' +
+                'then dismiss the request or ask again.';
+        } else if (fromRequest) {
+            state = 'REQUESTED';
             found = 'The page sequence shows no gap here now, but a scanner was asked for ' +
                 (range ? 'these pages' : 'this page') + ' after PDF p.' +
                 escapeHtml(entry.anchor_pdf_page) +
                 '. If the request is answered or no longer applies, dismiss it.';
         }
         pageDiv.innerHTML =
-            '<div class="page-label">' + heading + ' &mdash; ' +
-            (fromRequest ? 'REQUESTED' : 'MISSING') + '</div>' +
+            '<div class="page-label">' + heading + ' &mdash; ' + state + '</div>' +
             '<div class="missing-placeholder">' +
             '  <p>' + found + '</p>' +
             (pageEditsLocked
@@ -367,7 +377,7 @@ document.addEventListener('DOMContentLoaded', function () {
         pageDiv.dataset.anchorPdfPage = entry.anchor_pdf_page;
         if (range) { pageDiv.dataset.missingRange = '1'; }
         if (fromRequest) { pageDiv.dataset.fromRequest = '1'; }
-        drawRepairNote(pageDiv, findRepair('insert', entry.anchor_pdf_page));
+        drawRepairNote(pageDiv, request || findRepair('insert', entry.anchor_pdf_page));
 
         var fileInput = pageDiv.querySelector('input[type="file"]');
         if (!fileInput) { return; }
