@@ -1757,3 +1757,103 @@ class TestReglueCommand(OpinionOcrTestCase):
     def test_an_unknown_scan_is_an_error(self):
         with self.assertRaises(CommandError):
             self.run_command("999999")
+
+
+# ── the footnote zone (#399) ─────────────────────────────────────────
+#: A footnote band across both columns, in render pixels.
+BAND = (100, 1600, 1600, 2100)
+
+
+class TestTheFootnoteZone(OpinionOcrTestCase):
+    """The ``FOOTNOTES`` detections of the run, frozen on every page."""
+
+    def band(self, page_index, in_run=True, box=BAND) -> Detection:
+        """One footnote detection over final page ``page_index``.
+
+        ``in_run=False`` leaves the row outside the run's space, the
+        shape of a human row ``detections.relocate_rows`` could not
+        place.
+        """
+        return model_row(
+            self.scan,
+            apply_run=self.apply_run if in_run else None,
+            label=opinion_ocr.FOOTNOTE_LABEL,
+            label_id=int(Label.FOOTNOTES),
+            page_index=page_index,
+            source_page=page_index + 1,
+            x0=box[0],
+            y0=box[1],
+            x1=box[2],
+            y1=box[3],
+            img_width=IMG_W,
+            img_height=IMG_H,
+        )
+
+    def test_a_band_is_a_zone_in_points_on_every_engine_page(self):
+        self.band(2)
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine in ("dots_mocr", "mistral_ocr"):
+            document = self.uploads[
+                opinion_ocr.engine_key(self.opinion, engine)
+            ]
+            self.assertEqual(
+                document["pages"][1]["zones"], {"footnotes": [to_pt(BAND)]}
+            )
+            self.assertEqual(document["pages"][0]["zones"], {"footnotes": []})
+        manifest = self.uploads[
+            opinion_ocr.engine_key(self.opinion, "manifest")
+        ]
+        self.assertEqual(
+            manifest["engines"]["dots_mocr"]["counts"]["footnote_zones"], 1
+        )
+
+    def test_a_band_outside_the_run_s_space_is_no_zone(self):
+        """The run's space alone, the rule of ``inputs.renders``."""
+        self.band(2, in_run=False)
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][1]["zones"], {"footnotes": []})
+
+    def test_a_withdrawn_band_is_no_zone(self):
+        row = self.band(2)
+        row.active = False
+        row.save(update_fields=["active"])
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][1]["zones"], {"footnotes": []})
+
+    def test_a_page_with_no_size_carries_no_zone(self):
+        """No size puts nothing in points. The band alone is a size, so
+        the page must lose its dots.mocr render too."""
+        self.band(2)
+        Detection.objects.filter(scan=self.scan, page_index=2).delete()
+        document = dots_document()
+        del document["pages"][2]["origin_width"]
+        self.objects[self.apply_run.ocr_key] = document
+
+        written = self.write()
+
+        self.assertIsNone(written["pages"][1]["frame"])
+        self.assertEqual(written["pages"][1]["zones"], {"footnotes": []})
+
+    def test_every_engine_names_its_footnote_labels(self):
+        """The spellings each engine writes, measured on the corpus
+        (#399): lowercase for Mistral, CamelCase for Surya."""
+        for spec in opinion_ocr.ENGINES.values():
+            self.assertIsInstance(spec.footnote_types, frozenset)
+            self.assertTrue(spec.footnote_types, spec.name)
+        self.assertEqual(
+            opinion_ocr.ENGINES["dots_mocr"].footnote_types, {"Footnote"}
+        )
+        self.assertEqual(
+            opinion_ocr.ENGINES["mistral_ocr"].footnote_types,
+            {"references", "footer", "aside_text"},
+        )
+        self.assertEqual(
+            opinion_ocr.ENGINES["surya"].footnote_types,
+            {"Footnote", "Bibliography"},
+        )

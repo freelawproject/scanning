@@ -2411,8 +2411,8 @@ class OpinionReviewStatus(models.TextChoices):
 class OpinionCheck(models.TextChoices):
     """What an :class:`OpinionFinding` is about (#334).
 
-    The first six are the warnings the review shows on a page. The last
-    three are facts about the opinion row itself.
+    The first seven are the warnings the review shows on a page. The
+    last three are facts about the opinion row itself.
     """
 
     ENGINES_DISAGREE = "engines_disagree", "The engines do not all agree"
@@ -2424,6 +2424,10 @@ class OpinionCheck(models.TextChoices):
         "A redaction covers part of a cell",
     )
     PAGE_NOT_READ = "page_not_read", "This page has no text"
+    FOOTNOTE_UNSURE = (
+        "footnote_unsure",
+        "An engine read a footnote no detection covers",
+    )
     PAGE_GAP = "page_gap", "A gap in the printed page numbers"
     STALE_PAGE_NUMBER = "stale_page_number", "The printed number changed"
     ORPHANED_OPINION = "orphaned_opinion", "No boundary matches this opinion"
@@ -2881,13 +2885,24 @@ class OpinionText(AbstractDateTimeModel):
             "rebuilt from the glued runs plus the human rows."
         ),
     )
+    footnotes = models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "The resolved text of the page's footnotes, in reading order "
+            "(#399). A cache like ``text``, and never a part of it: the "
+            "tagger reads ``text`` alone. The ``footnotes`` entries of "
+            "``disagreements`` point into this field."
+        ),
+    )
     disagreements = models.JSONField(
         default=list,
         blank=True,
         help_text=(
             "One entry per place the engines differ: "
-            "``{'start': int, 'end': int, 'variants': {engine: text}}``, "
-            "with the offsets against ``text``. Empty when they agree."
+            "``{'start': int, 'end': int, 'section': 'text' | 'footnotes', "
+            "'variants': {engine: text}}``, with the offsets against the "
+            "field ``section`` names. Empty when they agree."
         ),
     )
     human_text = models.TextField(

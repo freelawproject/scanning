@@ -53,6 +53,17 @@ review-2 row and the viewer use), ``exclusion`` and ``share``. The
 page ``md`` is not copied: it is the whole page, redacted text
 included, and it cannot carry a verdict.
 
+**The footnote zone is a fact of the page, frozen here (#399).** The
+``FOOTNOTES`` detections of the run, in points, go on every engine's
+page as ``zones.footnotes``, the twin of ``frame``. The ensemble puts
+an aligned group in the footnotes when the zone covers it, and it
+reads no ``Detection`` row for that: the zone is written here, beside
+the verdicts the redaction rows give, and a box a curator moves after
+the glue is answered by ``reglue_opinion_ocr`` like every other late
+fact. The engines' own footnote labels (``EngineSpec.footnote_types``)
+are exact and rare, so they decide nothing and the ensemble reads them
+for one card alone.
+
 **The path is the invariant key.** ``Opinion.glue_prefix`` is
 ``jobs/opinions/{first_printed_page}.{index_in_page}/r{glue_revision}/``,
 so a script that walks the bucket finds an opinion by the printed page
@@ -94,6 +105,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from blackletter.models import Label
 from django.db.models import F, Q
 from django.utils import timezone
 
@@ -120,8 +132,12 @@ from scanning.models import (
 
 logger = logging.getLogger(__name__)
 
-#: Version of the documents this module writes.
-SCHEMA_VERSION = 1
+#: Version of the documents this module writes. 2 puts the footnote
+#: zone on every page (#399).
+SCHEMA_VERSION = 2
+
+#: The detection label of the footnote band of a page (#399).
+FOOTNOTE_LABEL = Label.FOOTNOTES.name
 
 #: The file that says a revision is glued, written last.
 MANIFEST = "manifest.json"
@@ -204,6 +220,12 @@ class EngineSpec:
     :param owed_rows: Returns the rows that say a read of this engine
         is on its way for a scan and run: a live volume run, or the
         rows of the run's own edited pages.
+    :param footnote_types: The values of ``type_key`` this engine
+        writes on a footnote (#399), in the engine's own spelling.
+        Measured on the corpus, they are exact and rare: a footnote
+        label is almost never wrong and misses most footnotes. So they
+        never decide a section; the ensemble reads them for the
+        ``FOOTNOTE_UNSURE`` card alone.
     """
 
     name: str
@@ -214,6 +236,7 @@ class EngineSpec:
     frame: Callable[[dict, dict], tuple[float, float] | None]
     module: object
     owed_rows: Callable[[Scan, object], list]
+    footnote_types: frozenset[str] = frozenset()
 
     def document_key(self, run) -> str:
         """The S3 key of this engine's document for ``run``."""
@@ -305,6 +328,7 @@ ENGINES: dict[str, EngineSpec] = {
         frame=_page_frame,
         module=dots_mocr,
         owed_rows=lambda scan, run: dots_mocr.live_analyze_jobs(scan),
+        footnote_types=frozenset({"Footnote"}),
     ),
     "mistral_ocr": EngineSpec(
         name="mistral_ocr",
@@ -315,6 +339,9 @@ ENGINES: dict[str, EngineSpec] = {
         frame=_mistral_frame,
         module=mistral_ocr,
         owed_rows=functools.partial(_extract_owed_rows, mistral_ocr),
+        # Lowercase, as the harvest stores them. ``footer`` holds
+        # footnote text on these pages; the running foot is ``header``.
+        footnote_types=frozenset({"references", "footer", "aside_text"}),
     ),
     "surya": EngineSpec(
         name="surya",
@@ -328,6 +355,8 @@ ENGINES: dict[str, EngineSpec] = {
         frame=_page_frame,
         module=surya,
         owed_rows=functools.partial(_extract_owed_rows, surya),
+        # ``ListGroup`` is not here: it names a real list as often.
+        footnote_types=frozenset({"Footnote", "Bibliography"}),
     ),
 }
 
@@ -437,6 +466,9 @@ class ScanInputs:
     :param printed: ``{page_index: value}``, the approved page number
         of every final page that has one, off the run's printed-page
         map (#396).
+    :param footnotes: ``{page_index: [Detection]}``, the live
+        ``FOOTNOTES`` rows of the run (#399), in render pixels. They
+        become the page's zone in points once the page size is known.
     """
 
     run: object
@@ -444,6 +476,7 @@ class ScanInputs:
     redactions: dict[int, list[dict]] = field(default_factory=dict)
     renders: dict[int, tuple[int, int]] = field(default_factory=dict)
     printed: dict[int, str] = field(default_factory=dict)
+    footnotes: dict[int, list] = field(default_factory=dict)
 
 
 def load_inputs(scan: Scan) -> ScanInputs:
@@ -499,6 +532,15 @@ def load_inputs(scan: Scan) -> ScanInputs:
         .distinct()
     ):
         inputs.renders.setdefault(page_index, (width, height))
+    # The footnote band of every page, the run's space alone again
+    # (#399). A hand-drawn row counts like a model row: a curator who
+    # drew the band said where the footnotes are.
+    for row in (
+        Detection.objects.live()
+        .filter(scan=scan, apply_run=run, label=FOOTNOTE_LABEL)
+        .order_by("page_index", "y0", "x0")
+    ):
+        inputs.footnotes.setdefault(row.page_index, []).append(row)
     return inputs
 
 
@@ -567,6 +609,32 @@ def page_size_pt(
     dpi = 72.0 if (dots_page or {}).get("render_fallback") else dots_mocr.DPI
     scale = POINTS_PER_INCH / dpi
     return frame[0] * scale, frame[1] * scale
+
+
+def zones_pt(rows: list, size: tuple[float, float]) -> list[list[float]]:
+    """Return the footnote zone of one page, in points (#399).
+
+    One box per ``FOOTNOTES`` row, off the row's own render size, the
+    rule of ``opinion_pdf._image_rects``: the fields as they are, so a
+    zero render size falls back to the render density.
+
+    :param rows: The page's ``FOOTNOTES`` detections.
+    :param size: The page size in points.
+    :returns: ``[[x0, y0, x1, y1], ...]``, rounded like every box.
+    :rtype: list[list[float]]
+    """
+    zones = []
+    for row in rows:
+        x0, y0 = boundaries.to_points(
+            row.x0, row.y0, row.img_width, row.img_height, *size
+        )
+        x1, y1 = boundaries.to_points(
+            row.x1, row.y1, row.img_width, row.img_height, *size
+        )
+        box = as_box([x0, y0, x1, y1])
+        if box is not None:
+            zones.append([round(v, 2) for v in box])
+    return zones
 
 
 def as_box(value) -> list[float] | None:
@@ -793,6 +861,7 @@ def build_document(
         "partial": 0,
         "unjudged": 0,
         "page_number": 0,
+        "footnote_zones": 0,
     }
     for offset in range(opinion.page_count):
         page_index = opinion.start_page_index + offset
@@ -810,6 +879,11 @@ def build_document(
             "pdf_page": page_index + 1,
             "source": page.get("source"),
             "frame": None,
+            # The footnote band of the page, in points (#399). The same
+            # value on every engine's page, because it is a fact of the
+            # page and not of the engine. Empty when no detection drew
+            # it, or when no size puts it in points.
+            "zones": {"footnotes": []},
             "units": [],
         }
         if size and frame:
@@ -819,6 +893,11 @@ def build_document(
                 "render_width": frame[0],
                 "render_height": frame[1],
             }
+        if size:
+            entry["zones"]["footnotes"] = zones_pt(
+                inputs.footnotes.get(page_index, []), size
+            )
+            counts["footnote_zones"] += len(entry["zones"]["footnotes"])
         if "error" in page:
             entry["error"] = page["error"]
             failed.append(page_index)
