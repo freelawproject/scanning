@@ -1485,9 +1485,10 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // The card's button (#261, #395): the rows that put a shuffled span
-    // in the order of its printed numbers, one for each page that
-    // moves. One page is drawn at its new place here; several reload,
-    // because the server's order is the one place that cannot disagree.
+    // in the order of its printed numbers, the whole set of the volume's
+    // moves. One page is drawn at its new place here; anything else
+    // reloads, because the server's order is the one place that cannot
+    // disagree.
     window.movePage = function (btn) {
         var moves;
         try { moves = JSON.parse(btn.dataset.moves || '[]'); } catch (e) { return; }
@@ -1504,7 +1505,11 @@ document.addEventListener('DOMContentLoaded', function () {
                 showToast(data.error || 'Could not move this page.');
                 return;
             }
-            if (moves.length > 1) {
+            // The list replaces the standing set. Only the one move
+            // of a volume with none other is drawn here: beside other
+            // moves the slot depends on their ordinals too.
+            var standing = Object.keys(SCAN_CONFIG.movedPages || {}).length;
+            if (moves.length > 1 || standing) {
                 window.location.reload();
                 return;
             }

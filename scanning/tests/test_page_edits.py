@@ -2193,7 +2193,8 @@ class TestPendingEditFlags(TestCase):
 
 
 class TestSortedWindow(TestCase):
-    """``page_edits.sorted_window``, the card's one rule (#261, #395)."""
+    """``page_edits.sorted_window`` and ``rows_for_order``, the card's
+    rule and its rows (#261, #395)."""
 
     @staticmethod
     def _seq(numbers, first_page=1):
@@ -2206,21 +2207,19 @@ class TestSortedWindow(TestCase):
         self.assertEqual(len(steps), 1, "one backward step per case")
         return page_edits.sorted_window(seq, steps[0])
 
+    def _rows(self, numbers, window, first_page=1):
+        """The rows of the window over a volume nobody moved yet."""
+        pages = [p for p, _ in self._seq(numbers, first_page)]
+        return page_edits.rows_for_order(
+            page_edits.sorted_order(pages, window)
+        )
+
     def _order(self, numbers, window, first_page=1):
         """The printed numbers the window's rows produce, read through
         ``slot_order`` as the plan and the sidebar read them."""
         seq = dict(self._seq(numbers, first_page))
-        moves = {
-            m["pdf_page"]: m["anchor_pdf_page"]
-            for m in sorted(
-                window["moves"],
-                key=lambda m: (
-                    m["anchor_pdf_page"],
-                    m["ordinal"],
-                    m["pdf_page"],
-                ),
-            )
-        }
+        rows = self._rows(numbers, window, first_page)
+        moves = {m["pdf_page"]: m["anchor_pdf_page"] for m in rows}
         last = first_page + len(numbers) - 1
         pages = [
             n
@@ -2230,21 +2229,23 @@ class TestSortedWindow(TestCase):
         return [seq[p] for p in pages if p in seq]
 
     def test_a_transposed_pair_is_the_swap(self):
-        window = self._window([878, 880, 879, 881], first_page=883)
+        numbers = [878, 880, 879, 881]
+        window = self._window(numbers, first_page=883)
 
         self.assertEqual(window["pdf_pages"], [884, 885])
         self.assertEqual(window["order"], [885, 884])
         self.assertTrue(window["swap"])
         self.assertEqual(
-            window["moves"],
+            self._rows(numbers, window, 883),
             [{"pdf_page": 885, "anchor_pdf_page": 883, "ordinal": 0}],
         )
 
     def test_a_pair_at_the_start_goes_before_page_1(self):
-        window = self._window([2, 1, 3])
+        numbers = [2, 1, 3]
+        window = self._window(numbers)
 
         self.assertEqual(
-            window["moves"],
+            self._rows(numbers, window),
             [{"pdf_page": 2, "anchor_pdf_page": 0, "ordinal": 0}],
         )
 
@@ -2256,7 +2257,7 @@ class TestSortedWindow(TestCase):
         self.assertEqual(window["pdf_pages"], [786, 787, 788])
         self.assertFalse(window["swap"])
         self.assertEqual(
-            window["moves"],
+            self._rows(numbers, window, 785),
             [{"pdf_page": 786, "anchor_pdf_page": 788, "ordinal": 0}],
         )
         self.assertEqual(
@@ -2268,7 +2269,7 @@ class TestSortedWindow(TestCase):
         window = self._window(numbers, first_page=785)
 
         self.assertEqual(
-            window["moves"],
+            self._rows(numbers, window, 785),
             [{"pdf_page": 788, "anchor_pdf_page": 785, "ordinal": 0}],
         )
         self.assertEqual(
@@ -2284,7 +2285,7 @@ class TestSortedWindow(TestCase):
         self.assertEqual(window["pdf_pages"], [5, 6, 7, 8, 9, 10])
         self.assertEqual(window["order"], [9, 10, 5, 6, 7, 8])
         self.assertEqual(
-            window["moves"],
+            self._rows(numbers, window, 4),
             [
                 {"pdf_page": 9, "anchor_pdf_page": 4, "ordinal": 0},
                 {"pdf_page": 10, "anchor_pdf_page": 4, "ordinal": 1},
@@ -2299,7 +2300,7 @@ class TestSortedWindow(TestCase):
         window = self._window(numbers)
 
         self.assertEqual(
-            window["moves"],
+            self._rows(numbers, window),
             [
                 {"pdf_page": 3, "anchor_pdf_page": 8, "ordinal": 0},
                 {"pdf_page": 4, "anchor_pdf_page": 8, "ordinal": 1},
@@ -2316,7 +2317,7 @@ class TestSortedWindow(TestCase):
             window = page_edits.sorted_window(seq, step)
             self.assertEqual(window["pdf_pages"], [2, 3, 4, 5])
             self.assertEqual(
-                window["moves"],
+                self._rows(numbers, window),
                 [
                     {"pdf_page": 5, "anchor_pdf_page": 1, "ordinal": 0},
                     {"pdf_page": 4, "anchor_pdf_page": 1, "ordinal": 1},
@@ -2324,6 +2325,28 @@ class TestSortedWindow(TestCase):
                 ],
             )
             self.assertEqual(self._order(numbers, window), [1, 2, 3, 4, 5, 6])
+
+    def test_an_interleaved_shuffle_closes_on_the_number_it_lacks(self):
+        # 102, 100, 103, 101: the pair 102, 100 lacks 101, which sits
+        # two slots away behind 103, so the window reaches to it.
+        numbers = [99, 102, 100, 103, 101, 104]
+        seq = self._seq(numbers)
+        for step in (2, 4):
+            window = page_edits.sorted_window(seq, step)
+            self.assertEqual(window["pdf_pages"], [2, 3, 4, 5])
+            self.assertEqual(
+                self._order(numbers, window), list(range(99, 105))
+            )
+
+    def test_a_neighbour_the_window_cannot_be_met_by_joins_it(self):
+        # 13, 12 is a run, but 10 follows it: the window cannot end
+        # there, so it grows over 10 and then fetches 11.
+        numbers = [9, 11, 13, 12, 10, 14]
+        seq = self._seq(numbers)
+        for step in (3, 4):
+            window = page_edits.sorted_window(seq, step)
+            self.assertEqual(window["pdf_pages"], [2, 3, 4, 5])
+            self.assertEqual(self._order(numbers, window), list(range(9, 15)))
 
     def test_the_window_reaches_over_to_its_boundary_number(self):
         # 4, 3, 2 after 1: the pair 4, 3 is complete but 2 sits on the
@@ -2335,6 +2358,14 @@ class TestSortedWindow(TestCase):
             self.assertEqual(window["pdf_pages"], [2, 3, 4])
             self.assertEqual(self._order(numbers, window), [1, 2, 3, 4, 5])
 
+    def test_a_reversal_at_the_start_of_the_run_answers_every_card(self):
+        numbers = [3, 2, 1, 4]
+        seq = self._seq(numbers)
+        for step in (1, 2):
+            window = page_edits.sorted_window(seq, step)
+            self.assertEqual(window["pdf_pages"], [1, 2, 3])
+            self.assertEqual(self._order(numbers, window), [1, 2, 3, 4])
+
     def test_a_shuffle_of_many_pages_sorts_whole(self):
         numbers = [10, 14, 12, 16, 11, 15, 13, 17]
         seq = self._seq(numbers)
@@ -2344,6 +2375,40 @@ class TestSortedWindow(TestCase):
             self.assertEqual(window["pdf_pages"], [2, 3, 4, 5, 6, 7])
             self.assertEqual(window["order"], [5, 3, 7, 2, 6, 4])
             self.assertEqual(self._order(numbers, window), list(range(10, 18)))
+
+    def test_every_permutation_of_a_span_is_answered_and_sorted(self):
+        # The rule over every shuffle of up to six pages between two
+        # pages in order: each step closes a window, and the rows put
+        # that window in order and move nothing outside it. A step may
+        # close a window smaller than the whole shuffle (11, 10 inside
+        # 11, 10, 12, 14, 13): the other step answers the rest.
+        from itertools import permutations
+
+        for size in range(2, 7):
+            for perm in permutations(range(10, 10 + size)):
+                numbers = [9, *perm, 10 + size]
+                seq = self._seq(numbers)
+                steps = [
+                    i for i in range(1, len(seq)) if seq[i][1] < seq[i - 1][1]
+                ]
+                for step in steps:
+                    window = page_edits.sorted_window(seq, step)
+                    self.assertIsNotNone(window, (numbers, step))
+                    by_page = dict(seq)
+                    expected = [
+                        by_page[p]
+                        for p in page_edits.sorted_order(
+                            [p for p, _ in seq], window
+                        )
+                    ]
+                    inside = [by_page[p] for p in window["pdf_pages"]]
+                    self.assertEqual(
+                        sorted(inside),
+                        list(range(min(inside), max(inside) + 1)),
+                    )
+                    self.assertEqual(
+                        self._order(numbers, window), expected, (numbers, step)
+                    )
 
     def test_a_run_that_stops_short_is_not_answered(self):
         # 788 pulled early, but 787 is nowhere: a hole in the window.
@@ -2360,6 +2425,8 @@ class TestSortedWindow(TestCase):
         self.assertIsNone(self._window([1, 2, 3, 6, 4, 7, 8]))
         self.assertIsNone(self._window([1, 2, 50, 3, 5, 6]))
         self.assertIsNone(self._window([87, 279, 89, 90]))
+        # A range wider than the run never closes, whatever it holds.
+        self.assertIsNone(self._window([1, 2, 9999, 3, 4, 5]))
 
     def test_a_duplicate_inside_the_window_is_not_answered(self):
         self.assertIsNone(self._window([1, 3, 2, 3, 4]))
@@ -2376,6 +2443,36 @@ class TestSortedWindow(TestCase):
         self.assertIsNone(page_edits.sorted_window([(1, 2), (2, 1)], 0))
         self.assertIsNone(page_edits.sorted_window([(1, 2), (2, 1)], 2))
 
+    def test_the_rows_fold_a_window_into_the_moves_that_stand(self):
+        # The reviewer's case: pages 4..8 print 10, 12, 13, 11, 14. A
+        # first card moved page 7 after page 4. The curator then
+        # corrects 5 and 6 (they were transposed), and the new window
+        # is judged in the corrected order, where 7 sits after 4.
+        current = [1, 2, 3, 4, 7, 5, 6, 8]
+        numbers = {4: 10, 7: 11, 5: 13, 6: 12, 8: 14}
+        seq = [(p, numbers[p]) for p in current if p in numbers]
+        window = page_edits.sorted_window(seq, 3)
+
+        self.assertEqual(window["pdf_pages"], [5, 6])
+        order = page_edits.sorted_order(current, window)
+        self.assertEqual(order, [1, 2, 3, 4, 7, 6, 5, 8])
+        rows = page_edits.rows_for_order(order)
+        moves = {m["pdf_page"]: m["anchor_pdf_page"] for m in rows}
+        pages = [n for k, n in page_edits.slot_order(8, moves) if k == "page"]
+        self.assertEqual(pages, order)
+        self.assertEqual(
+            [numbers[p] for p in pages if p in numbers], [10, 11, 12, 13, 14]
+        )
+
+    def test_the_rows_of_an_order_are_as_few_as_the_shape_allows(self):
+        self.assertEqual(page_edits.rows_for_order([1, 2, 3]), [])
+        self.assertEqual(
+            page_edits.rows_for_order([2, 1, 3]),
+            [{"pdf_page": 2, "anchor_pdf_page": 0, "ordinal": 0}],
+        )
+        # Six pages, two out of place: two rows, not four.
+        self.assertEqual(len(page_edits.rows_for_order([1, 5, 6, 2, 3, 4])), 2)
+
     def test_the_label_names_the_shape(self):
         self.assertEqual(
             page_edits.move_label(self._window([1, 2, 4, 3, 5])),
@@ -2385,12 +2482,12 @@ class TestSortedWindow(TestCase):
             page_edits.move_label(self._window([1, 2, 5, 3, 4, 6])),
             "Move PDF page 3 to after PDF page 5",
         )
-        # 1 pulled late: one row, the page after the run it belongs before.
+        # 1 pulled late: one page moves, to after the run it followed.
         self.assertEqual(
             page_edits.move_label(self._window([3, 1, 2, 4])),
             "Move PDF page 1 to after PDF page 3",
         )
-        # 3 pulled early to the front: one row, before page 1.
+        # 3 pulled early to the front: one page moves, before page 1.
         self.assertEqual(
             page_edits.move_label(self._window([2, 3, 1, 4])),
             "Move PDF page 3 to before PDF page 1",
@@ -2681,13 +2778,31 @@ class TestMovePageEndpoints(ScanningTestCase):
         )
 
     def test_a_span_in_reverse_offers_the_reorder_on_each_card(self):
+        # Three steps, one window: the rule runs once and every card
+        # of the span carries its answer.
         scan = self._scan(["1", "5", "4", "3", "2", "6"])
-        html = self._step_one(scan).content.decode()
+        with mock.patch.object(
+            page_edits, "sorted_window", wraps=page_edits.sorted_window
+        ) as rule:
+            html = self._step_one(scan).content.decode()
 
+        self.assertEqual(rule.call_count, 1)
         self.assertEqual(html.count('data-check="backward_page"'), 3)
         self.assertEqual(
             html.count("Reorder PDF pages 2 to 5 by printed number"), 3
         )
+
+    def test_a_step_with_no_window_is_judged_once(self):
+        # Two misreads in one run: each step is tried once and neither
+        # gets a button.
+        scan = self._scan(["1", "2", "3", "6", "4", "9", "7", "8", "10"])
+        with mock.patch.object(
+            page_edits, "sorted_window", wraps=page_edits.sorted_window
+        ) as rule:
+            html = self._step_one(scan).content.decode()
+
+        self.assertEqual(rule.call_count, 2)
+        self.assertNotIn("movePage(this)", html)
 
     def test_a_reorder_writes_every_row_and_lists_the_corrected_order(self):
         self.scan = self._scan(
@@ -2738,6 +2853,82 @@ class TestMovePageEndpoints(ScanningTestCase):
             self.scan.issues.filter(check_name=CheckName.MISSING_PAGE).exists()
         )
 
+    def test_a_reorder_replaces_the_moves_that_stand(self):
+        # A standing row the list does not name is withdrawn, a row
+        # equal to a standing one is left alone, and the rest are
+        # written: the list is the whole set of the volume's moves.
+        first = self._post("move_page", pdf_page=4, anchor_pdf_page=2)
+        self.assertEqual(first.status_code, 200)
+        kept = page_edits.current_edits(self.scan, PageEdit.Kind.MOVE_PAGE)[0]
+        PageEdit.objects.filter(pk=kept.pk).update(applied_at=timezone.now())
+        stray = PageEditFactory(
+            scan=self.scan,
+            kind=PageEdit.Kind.MOVE_PAGE,
+            pdf_page=6,
+            anchor_pdf_page=0,
+            source_fingerprint=self.scan.source_fingerprint,
+        )
+
+        response = self._post(
+            "move_page",
+            moves=[
+                {"pdf_page": 4, "anchor_pdf_page": 2, "ordinal": 0},
+                {"pdf_page": 5, "anchor_pdf_page": 2, "ordinal": 1},
+            ],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        rows = {
+            e.pdf_page: (e.anchor_pdf_page, e.ordinal, e.pk)
+            for e in page_edits.current_edits(
+                self.scan, PageEdit.Kind.MOVE_PAGE
+            )
+        }
+        self.assertEqual(set(rows), {4, 5})
+        # The applied row of page 4 is the same row, not a new one.
+        self.assertEqual(rows[4][2], kept.pk)
+        stray.refresh_from_db()
+        self.assertIsNotNone(stray.withdrawn_at)
+        self.assertEqual(self._map_order(), [1, 2, 4, 5, 3, 6])
+
+    def test_a_single_move_adds_to_the_moves_that_stand(self):
+        self._post("move_page", pdf_page=4, anchor_pdf_page=2)
+        self._post("move_page", pdf_page=6, anchor_pdf_page=0)
+
+        self.assertEqual(set(page_edits.moves_by_page(self.scan)), {4, 6})
+
+    def test_a_second_correction_beside_a_first_one_lands_in_order(self):
+        # Pages 4..8 print 10, 12, 13, 11, 14: the first card moves
+        # page 7 after page 4. Then the curator corrects pages 5 and 6,
+        # which were transposed, and the card for 12 offers rows over
+        # the whole order: page 6 lands after page 7, not under it.
+        self.scan = self._scan(
+            ["1", "2", "3", "10", "12", "13", "11", "14"],
+            start_page=1,
+            end_page=14,
+        )
+        self._post("move_page", pdf_page=7, anchor_pdf_page=4)
+        for entry in self.scan.ocr_results:
+            if entry["pdf_page"] == 5:
+                entry["detected"] = "13"
+            if entry["pdf_page"] == 6:
+                entry["detected"] = "12"
+        self.scan.save(update_fields=["ocr_results"])
+
+        html = self._step_one().content.decode()
+        self.assertIn("Swap PDF pages 5 and 6", html)
+        rows = json.loads(
+            re.search(r'data-moves="([^"]+)"', html)
+            .group(1)
+            .replace("&quot;", '"')
+        )
+        response = self._post("move_page", moves=rows)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._map_order(), [1, 2, 3, 4, 7, 6, 5, 8])
+        html = self._step_one().content.decode()
+        self.assertNotIn("goes backward", html)
+
     def test_a_reorder_with_a_bad_address_writes_nothing(self):
         response = self._post(
             "move_page",
@@ -2769,13 +2960,23 @@ class TestMovePageEndpoints(ScanningTestCase):
     def test_an_empty_reorder_is_refused(self):
         self.assertEqual(self._post("move_page", moves=[]).status_code, 400)
         self.assertEqual(self._post("move_page", moves=["4"]).status_code, 400)
-        self.assertEqual(
-            self._post(
-                "move_page",
-                moves=[{"pdf_page": 4, "anchor_pdf_page": 2, "ordinal": -1}],
-            ).status_code,
-            400,
-        )
+        # An ordinal the column cannot hold is refused here, not by
+        # the database: a negative one, and one past a small integer.
+        for ordinal in (-1, 32768, "many"):
+            self.assertEqual(
+                self._post(
+                    "move_page",
+                    moves=[
+                        {
+                            "pdf_page": 4,
+                            "anchor_pdf_page": 2,
+                            "ordinal": ordinal,
+                        }
+                    ],
+                ).status_code,
+                400,
+                ordinal,
+            )
 
     def test_moves_by_page_yields_the_landing_order(self):
         self.scan = self._scan(["1", "5", "4", "3", "2", "6"])

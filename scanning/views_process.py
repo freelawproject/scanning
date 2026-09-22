@@ -14,6 +14,7 @@ import fitz
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.http import (
     FileResponse,
@@ -728,14 +729,35 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                     r["seq_issue"] = "gap"
             prev_num = num
         printed = Counter(num for run in runs for _, num in run)
+        current_order = [r["pdf_page"] for r in ocr_results]
         offers: dict[int, list[dict]] = {}
+        answered: set[tuple[int, int]] = set()
         for run_index, index, num in backward_steps:
-            window = page_edits.sorted_window(runs[run_index], index)
+            if (run_index, index) in answered:
+                continue
+            answered.add((run_index, index))
+            run = runs[run_index]
+            window = page_edits.sorted_window(run, index)
             if window is None:
                 continue
-            numbers = dict(runs[run_index])
-            if all(printed[numbers[p]] == 1 for p in window["pdf_pages"]):
-                offers.setdefault(num, []).append(window)
+            numbers = dict(run)
+            if any(printed[numbers[p]] != 1 for p in window["pdf_pages"]):
+                continue
+            # The rows come from the whole corrected order with the
+            # window sorted in place, so they fold into the moves that
+            # stand (an earlier correction, a swap of #379), and the
+            # endpoint replaces the standing set with them.
+            window["rows"] = page_edits.rows_for_order(
+                page_edits.sorted_order(current_order, window)
+            )
+            # Every step inside the window is answered by it: a span in
+            # reverse has one step per page and one window, so the
+            # window is computed once and each card carries it.
+            covered = set(window["pdf_pages"])
+            for other_run, other_index, other_num in backward_steps:
+                if other_run == run_index and run[other_index][0] in covered:
+                    answered.add((other_run, other_index))
+                    offers.setdefault(other_num, []).append(window)
         if scan.status not in LOCKED_STATUSES:
             backward = [
                 i for i in issues if i.check_name == CheckName.BACKWARD_PAGE
@@ -748,7 +770,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                         **found[0],
                         "label": page_edits.move_label(found[0]),
                         "title": page_edits.move_title(found[0]),
-                        "moves_json": json.dumps(found[0]["moves"]),
+                        "moves_json": json.dumps(found[0]["rows"]),
                     }
         deleted_pages = sorted(page_edits.deleted_pages(scan))
 
@@ -3842,12 +3864,16 @@ def move_page(request: HttpRequest, pk: int) -> HttpResponse:
     saved decision, and the page map is rebuilt so the viewer and the
     sidebar draw the corrected order at once.
 
-    The body is one move (``pdf_page``, ``anchor_pdf_page``) or a list
-    of them under ``moves``, the reorder the card offers. Every
-    address is checked before any row is written, and the rows go in
-    one transaction: a reorder half written is an order nobody chose.
-    A second move of the same page refreshes the open row, as a page
-    number does; an applied row is superseded.
+    The body is one move (``pdf_page``, ``anchor_pdf_page``), which is
+    added to the moves that stand, or a list of them under ``moves``,
+    the reorder the card offers, which **replaces** the standing set:
+    the card derives its rows from the whole corrected order
+    (``page_edits.rows_for_order``), so a page in no row of the list
+    goes back to its slot, and a row equal to the standing one is left
+    alone, applied or not. Every address is checked before any row is
+    written, and the rows go in one transaction: a reorder half written
+    is an order nobody chose. A second move of the same page refreshes
+    the open row, as a page number does; an applied row is superseded.
 
     :param request: The HTTP request (JSON body).
     :param pk: Scan primary key.
@@ -3862,6 +3888,7 @@ def move_page(request: HttpRequest, pk: int) -> HttpResponse:
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
     requested = data.get("moves")
+    replace = requested is not None
     if requested is None:
         requested = [data]
     if not isinstance(requested, list) or not requested:
@@ -3882,11 +3909,12 @@ def move_page(request: HttpRequest, pk: int) -> HttpResponse:
             return JsonResponse(
                 {"error": MOVE_ONTO_ITSELF_MESSAGE}, status=409
             )
+        # The column's own range (a small positive integer), so a
+        # value it cannot hold is refused here and not by the database.
         try:
             ordinal = int(item.get("ordinal", 0))
-        except (TypeError, ValueError):
-            return JsonResponse({"error": "Invalid JSON"}, status=400)
-        if ordinal < 0:
+            PageEdit._meta.get_field("ordinal").run_validators(ordinal)
+        except (TypeError, ValueError, ValidationError):
             return JsonResponse({"error": "Invalid JSON"}, status=400)
         moves.append(
             {
@@ -3899,8 +3927,29 @@ def move_page(request: HttpRequest, pk: int) -> HttpResponse:
         return JsonResponse({"error": "A page is named twice."}, status=409)
     from scanning import services
 
+    standing = {
+        edit.pdf_page: edit
+        for edit in page_edits.current_edits(scan, PageEdit.Kind.MOVE_PAGE)
+    }
     with transaction.atomic():
+        if replace:
+            gone = [
+                edit.pk
+                for pdf_page, edit in standing.items()
+                if pdf_page not in {m["pdf_page"] for m in moves}
+            ]
+            if gone:
+                page_edits.withdraw(
+                    PageEdit.objects.filter(pk__in=gone), request.user
+                )
         for move in moves:
+            edit = standing.get(move["pdf_page"])
+            if (
+                edit is not None
+                and edit.anchor_pdf_page == move["anchor_pdf_page"]
+                and edit.ordinal == move["ordinal"]
+            ):
+                continue
             page_edits.supersede(
                 scan,
                 PageEdit.Kind.MOVE_PAGE,
