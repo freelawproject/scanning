@@ -1998,6 +1998,10 @@ def run_compute_redactions(scan_pk: int) -> None:
         # The rows are the store (#240 PR B): the computed rows are
         # written again, the standing dismissals land on them, and the
         # human rows follow the page space the geometry was measured in.
+        # The writer holds every text rect inside the strips it writes
+        # for the same page (#371): blackletter's footer bound is the
+        # page height on a page with no bottom-margin detection, and its
+        # ink clamp follows a blot to the page edge.
         _update_progress(scan_pk, "Writing the redactions...")
         with _log_stage("Redaction rows"):
             written = redactions.write_computed(
