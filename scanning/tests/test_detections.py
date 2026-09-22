@@ -10,7 +10,11 @@ from django.test import TestCase
 from scanning import detections
 from scanning.factories import ScanFactory, UserFactory
 from scanning.models import Detection, DetectionDecision, PageEdit
-from scanning.tests.test_yolo_apply import glued_run, identity_map
+from scanning.tests.test_yolo_apply import (
+    glued_run,
+    identity_map,
+    moved_map,
+)
 
 
 def model_row(scan, **fields) -> Detection:
@@ -593,16 +597,11 @@ class TestRelocateManualRows(TestCase):
     def _run_with_a_moved_page(self):
         """Return a run whose map holds page 3 before page 2 (#261).
 
-        The shape ``apply.plan_run`` writes for a move: every page is
-        still an ``original`` entry, and the place is the only change.
-
         :returns: The run.
         """
-        page_map = identity_map(3)
-        page_map["moved_pages"] = [3]
-        page_map["pages"][1]["source"] = {"kind": "original", "pdf_page": 3}
-        page_map["pages"][2]["source"] = {"kind": "original", "pdf_page": 2}
-        return glued_run(self.scan, number=2, page_map=page_map)
+        return glued_run(
+            self.scan, number=2, page_map=moved_map(3, page=3, anchor=1)
+        )
 
     def test_a_box_on_a_moved_page_follows_the_page(self):
         # #383: a move re-orders the pages and re-reads none of them,

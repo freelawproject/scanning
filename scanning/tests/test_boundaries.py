@@ -18,7 +18,11 @@ from scanning.factories import (
 )
 from scanning.models import Detection, OpinionBoundary, PageEdit
 from scanning.tests.test_detections import model_row
-from scanning.tests.test_yolo_apply import glued_run, identity_map
+from scanning.tests.test_yolo_apply import (
+    glued_run,
+    identity_map,
+    moved_map,
+)
 
 IMG_W, IMG_H = 1700, 2200
 PAGE_W, PAGE_H = 612.0, 792.0
@@ -674,13 +678,8 @@ class TestRelocateHumanRows(TestCase):
             end_source_page=3,
             end_page_index=2,
         )
-        # Page 3 comes back to after page 1, the shape ``plan_run``
-        # writes: every page is still an ``original`` entry.
-        page_map = identity_map(3)
-        page_map["moved_pages"] = [3]
-        page_map["pages"][1]["source"] = {"kind": "original", "pdf_page": 3}
-        page_map["pages"][2]["source"] = {"kind": "original", "pdf_page": 2}
-        run = glued_run(scan, page_map=page_map)
+        # Page 3 comes back to after page 1.
+        run = glued_run(scan, page_map=moved_map(3, page=3, anchor=1))
 
         moved, unplaced = boundaries.relocate_human_rows(scan, run)
 

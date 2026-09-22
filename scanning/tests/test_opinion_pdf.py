@@ -53,7 +53,7 @@ from scanning.tests.test_boundaries import (
 from scanning.tests.test_detections import model_row
 from scanning.tests.test_opinions import make_run
 from scanning.tests.test_views import ScanningTestCase
-from scanning.tests.test_yolo_apply import identity_map
+from scanning.tests.test_yolo_apply import identity_map, moved_map
 
 PAGES = 6
 
@@ -409,18 +409,10 @@ class TestSourceOfAMovedPage(TestCase):
     final index: the picture would otherwise be another page's.
     """
 
-    def _moved_map(self):
-        """Return a map that holds original page 3 before page 2."""
-        page_map = identity_map(3)
-        page_map["moved_pages"] = [3]
-        page_map["pages"][1]["source"] = {"kind": "original", "pdf_page": 3}
-        page_map["pages"][2]["source"] = {"kind": "original", "pdf_page": 2}
-        return page_map
-
     def test_each_final_page_names_its_own_original(self):
         scan = ScanFactory(page_count=3)
         run = make_run(scan)
-        run.page_map = self._moved_map()
+        run.page_map = moved_map(3, page=3, anchor=1)
         run.save(update_fields=["page_map"])
 
         self.assertEqual(

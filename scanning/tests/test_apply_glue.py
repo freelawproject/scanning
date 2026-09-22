@@ -5,8 +5,8 @@ volume with its printed-page map, and the final detections. Each is
 judged on its own inputs. S3 is stood in for by a dict of objects, so
 the tests read what would be written and never the bucket.
 
-The last class holds the three glues to a moved page (#261/#383): the
-map is the order, and a move pays nothing.
+``TestMoveGlues`` holds the three glues to a moved page (#261/#383):
+the map is the order, and a move pays nothing.
 """
 
 import hashlib
@@ -576,6 +576,13 @@ class TestMoveGlues(GlueTestCase):
             [page["pdf_page"] for page in document["pages"]],
             list(range(1, self.PAGES + 1)),
         )
+        # ``text_fit``, ``brackets`` and the page lists key the pages
+        # of this document by ``page_index``, so it is the final page
+        # and never the original's.
+        self.assertEqual(
+            [page["page_index"] for page in document["pages"]],
+            list(range(self.PAGES)),
+        )
         self.assertEqual(
             [page["source"]["pdf_page"] for page in document["pages"]],
             [1, 2, 4, 3, 5, 6],
@@ -639,7 +646,7 @@ class TestMoveGlues(GlueTestCase):
             [before[0], before[1], before[4], before[3], before[5]],
         )
 
-    def test_a_page_moved_onto_a_replaced_page_follows_its_new_image(self):
+    def test_a_page_moved_onto_a_replaced_page_lands_after_it(self):
         self.volume_ocr_run()
         swap = self.upload_edit(
             PageEdit.Kind.REPLACE_PAGE, "r.png", png_bytes(), pdf_page=2
