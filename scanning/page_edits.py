@@ -436,6 +436,159 @@ def order_by_moves(results: list[dict], moves: dict[int, int]) -> list[dict]:
     return ordered
 
 
+def _longest_ordered(pages: list[int]) -> set[int]:
+    """The pages of ``pages`` that already stand in increasing order.
+
+    A longest increasing subsequence, by patience sorting. Its pages
+    keep their slots; every other page of the span moves.
+    """
+    tails: list[int] = []
+    tail_index: list[int] = []
+    previous: list[int | None] = [None] * len(pages)
+    for i, page in enumerate(pages):
+        lo, hi = 0, len(tails)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if tails[mid] < page:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo == len(tails):
+            tails.append(page)
+            tail_index.append(i)
+        else:
+            tails[lo] = page
+            tail_index[lo] = i
+        previous[i] = tail_index[lo - 1] if lo else None
+    kept: set[int] = set()
+    at: int | None = tail_index[-1] if tail_index else None
+    while at is not None:
+        kept.add(pages[at])
+        at = previous[at]
+    return kept
+
+
+def sorted_window(sequence: list[tuple[int, int]], index: int) -> dict | None:
+    """The reorder that answers a backward step of the printed numbers.
+
+    ``sequence`` holds the numbered pages of one unbroken run of
+    physical neighbours, in the order the volume holds them, each a
+    ``(pdf_page, number)`` pair; ``index`` is the position whose number
+    steps back from the one before it, the ``backward_page`` card.
+
+    Wherever the numbers are trusted, the corrected order is the sort
+    by printed number (#261, #395). The answer is the smallest window
+    around the step whose numbers are a shuffle of one consecutive run,
+    continuing the number before the window and met by the number after
+    it (or the run's end on either side). A transposed pair, a page
+    pulled early or late by several slots, two blocks scanned the wrong
+    way round (``186..189, 184, 185``) and a span scanned in reverse are
+    all this rule. A step whose window never closes -- a misread, a
+    duplicate inside it, a hole beside it -- gets no answer: sorting by
+    a wrong number moves the wrong page, and the curator corrects the
+    number first.
+
+    The window is grown from the pair at the step: a neighbour whose
+    number the window still lacks joins it, and a boundary number that
+    sits on the far side of the window pulls the window over to it.
+
+    The rows are ``MOVE_PAGE`` rows, as few as the shape allows: the
+    pages already in order (the longest such set) keep their slots, and
+    every other page lands after the nearest kept page below it in the
+    sorted order, or before the window when there is none, in
+    ``ordinal`` order there. ``slot_order`` then yields the sort.
+
+    :param sequence: ``(pdf_page, number)`` pairs, the run's order.
+    :param index: The position of the page whose number steps back.
+    :returns: ``{"pdf_pages", "order", "moves", "swap"}``: the window
+        in scanned order, the same pages in corrected order, the rows
+        to write (``pdf_page``, ``anchor_pdf_page``, ``ordinal``) and
+        whether the window is a transposed pair. None when the step
+        has no answer.
+    :rtype: dict | None
+    """
+    if index < 1 or index >= len(sequence):
+        return None
+    pages = [p for p, _ in sequence]
+    nums = [n for _, n in sequence]
+    last = len(nums) - 1
+    a, b = index - 1, index
+    while True:
+        window = nums[a : b + 1]
+        lo, hi = min(window), max(window)
+        grown = False
+        if a > 0 and lo < nums[a - 1] < hi:
+            a -= 1
+            grown = True
+        if b < last and lo < nums[b + 1] < hi:
+            b += 1
+            grown = True
+        if grown:
+            continue
+        # A boundary that fails because its number sits on the other
+        # side of the window: the window reaches over to it.
+        if a > 0 and nums[a - 1] != lo - 1 and lo - 1 in nums[b + 1 :]:
+            b = nums.index(lo - 1, b + 1)
+            continue
+        if b < last and nums[b + 1] != hi + 1 and hi + 1 in nums[:a]:
+            a = nums.index(hi + 1, 0, a)
+            continue
+        break
+    window = nums[a : b + 1]
+    lo, hi = min(window), max(window)
+    if hi - lo != b - a or len(set(window)) != len(window):
+        return None
+    if a > 0 and nums[a - 1] != lo - 1:
+        return None
+    if b < last and nums[b + 1] != hi + 1:
+        return None
+    if not all(pages[k + 1] == pages[k] + 1 for k in range(a, b)):
+        return None
+    by_number = {n: p for p, n in sequence[a : b + 1]}
+    order = [by_number[n] for n in range(lo, hi + 1)]
+    kept = _longest_ordered(order)
+    before = pages[a] - 1
+    anchor = before
+    counts: dict[int, int] = {}
+    moves = []
+    for page in order:
+        if page in kept:
+            anchor = page
+            continue
+        ordinal = counts.get(anchor, 0)
+        counts[anchor] = ordinal + 1
+        moves.append(
+            {"pdf_page": page, "anchor_pdf_page": anchor, "ordinal": ordinal}
+        )
+    return {
+        "pdf_pages": pages[a : b + 1],
+        "order": order,
+        "moves": moves,
+        "swap": b - a == 1,
+    }
+
+
+def move_label(window: dict) -> str:
+    """The words of the card's button for a :func:`sorted_window`."""
+    pages = window["pdf_pages"]
+    if window.get("swap"):
+        return f"Swap PDF pages {pages[0]} and {pages[1]}"
+    if len(window["moves"]) == 1:
+        move = window["moves"][0]
+        anchor = move["anchor_pdf_page"]
+        where = (
+            "before PDF page 1" if anchor == 0 else f"after PDF page {anchor}"
+        )
+        return f"Move PDF page {move['pdf_page']} to {where}"
+    return f"Reorder PDF pages {pages[0]} to {pages[-1]} by printed number"
+
+
+def move_title(window: dict) -> str:
+    """The tooltip: the order the button writes, page by page."""
+    order = ", ".join(str(p) for p in window["order"])
+    return f"Put PDF pages {order} in that order"
+
+
 def inserts_by_gap(scan: Scan) -> dict[int, list[PageEdit]]:
     """Return the images to insert, keyed by the page they follow.
 
