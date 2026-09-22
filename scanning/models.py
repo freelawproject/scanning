@@ -3696,10 +3696,12 @@ class PageRepairRequest(AbstractDateTimeModel):
       reviewer asked for and who judged it unnecessary.
     - **Fulfilled is derived, not stamped.** A request is fulfilled
       when a standing ``INSERT_PAGE`` or ``REPLACE_PAGE`` edit exists
-      at its address (``repairs._fulfilling_edits``), and made after
-      the request. No writer stamps
-      it, so the upload cannot race a stamp, and an undo of the upload
-      (#232) reopens the request with no second writer.
+      at its address (``repairs._edits_at_the_address``), and made
+      after the request; a one-page INSERT request is fulfilled too by
+      a replacement of either page beside its gap
+      (``repairs._replacements_beside_the_gap``, #393). No writer
+      stamps it, so the upload cannot race a stamp, and an undo of the
+      upload (#232) reopens the request with no second writer.
     - **One open request per address.** The unique key is partial over
       the rows with no dismissal. A second request for the same page
       answers the first row. A dismissed row frees the address.

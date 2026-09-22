@@ -587,6 +587,10 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # remaining placeholder is stamped with the physical page it
         # follows, so an upload can send that address back (#214).
         page_map = page_edits.project_inserts(scan, scan.page_map)
+        # Every open missing-page request keeps a placeholder, whether
+        # or not the sequence still shows its gap (#393): the note, the
+        # Dismiss button and the insert form live on it.
+        page_map = repairs.project_requests(page_map, repair_requests)
         missing_pages = scan.missing_pages
 
         # The pages a curator replaced (#232). The viewer draws a note on
