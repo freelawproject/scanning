@@ -916,17 +916,35 @@ def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
     also uses the detections to tighten the content box. Nothing is
     written.
 
+    The measure reads copies of the pages (``margin_fit.clipped_pages``,
+    #370) whose ``TEXT_COLUMN`` and ``IMAGE`` boxes are held inside the
+    page's text box: the model draws both out onto a blot along the
+    page edge, and the pull-back then pins the strip at the box's edge
+    or drops it. The document's own boxes stay as they are, because the
+    headnote rects and the outside-opinion masks read them. Every page
+    then gets its four strips (``margin_fit.ensure_strips``): a strip
+    the measure gave no page is a thin handle at the edge for the
+    curator to widen, held off the detections like every strip, so a
+    page whose content box blackletter could not establish gets four
+    handles too.
+
     :param pdf_path: Path to the PDF to compute margins for.
     :param document: The snapped document the rects were measured from.
-    :return: blackletter's strips, in points; empty for a document with
-        no pages, because without detections the bounds would come from
-        the page's marks alone, and bleed-through at a page edge would
-        suppress that page's top strip: a worse answer than none.
+    :return: One entry per page, in points, each with its strips; empty
+        for a document with no pages, because without detections the
+        bounds would come from the page's marks alone, and bleed-through
+        at a page edge would suppress that page's top strip: a worse
+        answer than none.
     """
+    from scanning import margin_fit
+
     if not document.pages:
         return []
     with _log_stage("Margin rects"):
-        return compute_margin_rects(str(pdf_path), pages=document.pages)
+        pages = margin_fit.clipped_pages(document.pages)
+        entries = compute_margin_rects(str(pdf_path), pages=pages)
+        margin_fit.ensure_strips(entries, pages)
+        return entries
 
 
 # ---------------------------------------------------------------------------

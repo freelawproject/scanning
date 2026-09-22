@@ -682,6 +682,108 @@ class TestMeasureMarginRects(TestCase):
             self.assertTrue(margins)
             self.assertEqual(margins[0]["page_index"], 0)
             self.assertEqual(Redaction.objects.filter(scan=scan).count(), 0)
+            # Every page has its four strips (#370).
+            from scanning import margin_fit
+
+            for entry in margins:
+                self.assertTrue(all(margin_fit._sides(entry).values()), entry)
+
+    def test_measures_against_clipped_copies(self):
+        """The document's own column box is not what blackletter reads (#370)."""
+        from scanning import services
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scan = _make_scan_with_output(
+                tmpdir,
+                reporter=ReporterFactory(short_name="a3d"),
+            )
+            self._with_column(scan)
+            document = self._document(scan)
+            from dataclasses import replace
+
+            page = document.pages[0]
+            column = page.detections[0]
+            page.detections[0] = replace(
+                column, bbox=replace(column.bbox, x1=0.5)
+            )
+            page.text_box = (240.0, 200.0, 1450.0, 2000.0)
+
+            with patch.object(
+                services, "compute_margin_rects", return_value=[]
+            ) as measure:
+                services._measure_margin_rects(str(PDF_PATH), document)
+
+            (read,) = measure.call_args.kwargs["pages"]
+            self.assertGreater(read.detections[0].bbox.x1, 200.0)
+            self.assertEqual(document.pages[0].detections[0].bbox.x1, 0.5)
+
+    @staticmethod
+    def _bare_page(*detections):
+        """One blackletter page of the fixture frame, with no text box."""
+        from types import SimpleNamespace
+
+        from blackletter.models import Page
+
+        return SimpleNamespace(
+            pages=[
+                Page(
+                    index=0,
+                    pdf_width=612.0,
+                    pdf_height=792.0,
+                    img_width=1700,
+                    img_height=2200,
+                    detections=list(detections),
+                )
+            ]
+        )
+
+    def test_every_page_gets_four_strips(self):
+        """A page the measure left alone gets the curator's handles (#370)."""
+        from scanning import services
+
+        entry = {
+            "page_index": 0,
+            "rects": [],
+            "page_width": 612.0,
+            "page_height": 792.0,
+        }
+        with patch.object(
+            services, "compute_margin_rects", return_value=[entry]
+        ):
+            (measured,) = services._measure_margin_rects(
+                str(PDF_PATH), self._bare_page()
+            )
+        self.assertEqual(len(measured["rects"]), 4)
+
+    def test_a_handle_is_held_off_the_pages_the_measure_read(self):
+        """The handles see the same detections the strips did (#370)."""
+        from blackletter.models import BBox, Label
+        from blackletter.models import Detection as BLDetection
+
+        from scanning import services
+
+        column = BLDetection(
+            bbox=BBox(x1=0.0, y1=130.0, x2=760.0, y2=2050.0),
+            label=Label.TEXT_COLUMN,
+            confidence=0.5,
+            page_index=0,
+        )
+        entry = {
+            "page_index": 0,
+            "rects": [],
+            "page_width": 612.0,
+            "page_height": 792.0,
+        }
+        with patch.object(
+            services, "compute_margin_rects", return_value=[entry]
+        ):
+            (measured,) = services._measure_margin_rects(
+                str(PDF_PATH), self._bare_page(column)
+            )
+        self.assertEqual(len(measured["rects"]), 3)
+        self.assertFalse(
+            [r for r in measured["rects"] if r["x0"] == 0 and r["x1"] < 600]
+        )
 
     def test_does_not_measure_anything_without_detections(self):
         """Without detections the bounds would come from the page's marks
