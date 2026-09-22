@@ -613,14 +613,17 @@
      *
      * Every engine of the page has a line, in the order of the
      * document, which is the order of ``opinion_ocr.ENGINES`` and
-     * therefore the same on every group of every opinion. The engine
-     * whose reading the text above shows carries the mark, wherever it
-     * falls; an engine that read nothing here, and an engine that drew
-     * no box at all, each say which of the two they are. The reading
-     * enters the DOM with ``textContent``.
+     * therefore the same on every group of every opinion. The source
+     * engine carries the mark, wherever it falls; an engine that read
+     * nothing here, and an engine that drew no box at all, each say
+     * which of the two they are. The reading enters the DOM with
+     * ``textContent``.
      *
-     * The panel opens with the reason the shown reading won (#380),
-     * and each line marks the words that differ from it.
+     * The text above shows the source engine's own reading, except in
+     * a voted group, where the words are voted over it and a word of
+     * another engine can win. So the panel opens with the reason that
+     * engine is the source (#380), and each line marks the words that
+     * differ from its reading.
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
@@ -753,7 +756,7 @@
      * word, and a middle longer than ``MAX_DIFF_WORDS`` is marked
      * whole: the reviewer still sees where the two readings part.
      *
-     * @param {string} source - The reading the text above shows.
+     * @param {string} source - The source engine's own reading.
      * @param {string} other - One other engine's reading.
      * @returns {Object} ``{source: [[start, end]], other: [[start, end]]}``.
      */
@@ -886,9 +889,11 @@
     /**
      * Return the ranges each engine's line marks.
      *
-     * Every engine is compared with the reading the text above shows.
-     * That reading carries the marks of every comparison, so the word
-     * in question is marked on every line of the panel.
+     * Every engine is compared with the source engine's own reading,
+     * which the text above shows, or, in a voted group, which the
+     * words were voted over. That line carries the marks of every
+     * comparison, so the word in question is marked on every line of
+     * the panel.
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
