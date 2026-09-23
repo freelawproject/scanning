@@ -975,13 +975,6 @@ def _expected_range(scan: "Scan") -> tuple[int | None, int | None]:
     return scan.start_page or 1, scan.end_page
 
 
-#: Prefix :mod:`scanning.page_numbers` stamps on the ``zone`` of every
-#: entry it reads off a dots.mocr run (``dots-header``,
-#: ``dots-footer``). It is what tells a new-pipeline page number from a
-#: legacy PaddleOCR one.
-DOTS_ZONE_PREFIX = "dots-"
-
-
 def has_legacy_ocr(scan: "Scan") -> bool:
     """Return whether a scan's page numbers came from the retired OCR.
 
@@ -990,9 +983,10 @@ def has_legacy_ocr(scan: "Scan") -> bool:
     only reproduce them. Review 1 says so instead of pretending to redo
     the work (#151).
 
-    Two signals answer it, because neither alone is enough. A ``dots-``
-    zone proves the new stage wrote the entry, but a volume dots read
-    with no number on any page carries none. An ``ANALYZE`` job row
+    Two signals answer it, because neither alone is enough. An engine's
+    zone prefix (``dots-``, ``mistral-``; ``page_numbers.is_model_zone``)
+    proves the new stage wrote the entry, but a volume dots read with
+    no number on any page carries none. An ``ANALYZE`` job row
     proves the new stage ran at all, and it outlives a recompute. A
     scan with no readings at all is not legacy: it has nothing to
     recompute either way, and the caller handles that first.
@@ -1005,10 +999,12 @@ def has_legacy_ocr(scan: "Scan") -> bool:
     :returns: ``True`` when the readings are the retired stage's.
     :rtype: bool
     """
+    from scanning import page_numbers
+
     if not scan.ocr_results:
         return False
     if any(
-        (entry.get("zone") or "").startswith(DOTS_ZONE_PREFIX)
+        page_numbers.is_model_zone(entry.get("zone"))
         for entry in scan.ocr_results
     ):
         return False
@@ -1559,6 +1555,13 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
     conditional DB update, so it can neither revive a cancelled scan
     nor write a stale READY over a concurrent approval (#151).
 
+    The other engines' glued volume documents, when a person started
+    them, fill the pages dots.mocr left blank (#351,
+    ``page_numbers.fallback_documents``). They are read after the
+    dots.mocr document, so a volume nobody read with them costs one
+    download as before, and a fallback that does not load is logged
+    and left out rather than holding the volume out of review 1.
+
     :param scan: The scan whose live run is fully glued.
     :param result_key: S3 key of the run's glued volume JSON.
     :returns: Whether the apply completed. False means the scan left
@@ -1569,7 +1572,8 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
 
     started = time.monotonic()
     document = s3_sync.download_json_object(result_key)
-    results = page_numbers.ocr_results_from_volume(document)
+    fallbacks = page_numbers.fallback_documents(scan)
+    results = page_numbers.ocr_results_from_volume(document, fallbacks)
     # Overlay before the save, not only inside recalculate_issues: a
     # scan that fails the edge below keeps this blob until its next
     # recompute, and the viewer would show the model's reading over a
@@ -1602,11 +1606,16 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
 
     logger.info(
         "compute_issues: scan %s: %d page(s), %d without a number, "
-        "%d issue(s), in %.1fs",
+        "%d issue(s), %s, in %.1fs",
         scan.pk,
         len(results),
         sum(1 for entry in results if not entry["detected"]),
         scan.issues.count(),
+        (
+            "filled from " + ", ".join(sorted(fallbacks))
+            if fallbacks
+            else "no other engine read"
+        ),
         time.monotonic() - started,
     )
     return True

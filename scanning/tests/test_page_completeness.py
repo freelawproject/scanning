@@ -88,6 +88,13 @@ class TestHasLegacyOcr(ScanningTestCase):
         scan = ScanFactory(ocr_results=dots_results())
         self.assertFalse(services.has_legacy_ocr(scan))
 
+    def test_another_engine_s_zone_is_the_new_pipeline(self):
+        """A number Mistral or Surya filled in (#351) is a model read."""
+        results = legacy_results()
+        results[0]["zone"] = "mistral-header"
+        scan = ScanFactory(ocr_results=results)
+        self.assertFalse(services.has_legacy_ocr(scan))
+
     def test_no_zone_and_no_run_is_the_retired_stage(self):
         scan = ScanFactory(ocr_results=legacy_results())
         self.assertTrue(services.has_legacy_ocr(scan))
