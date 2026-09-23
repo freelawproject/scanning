@@ -650,6 +650,29 @@ class TestMoveGlues(GlueTestCase):
             ],
         )
 
+    def test_a_fallback_document_that_is_no_document_fills_nothing(self):
+        """A stored object that parses as JSON but is no document is
+        left out, like a document that does not load: the glue writes
+        the map from dots.mocr alone."""
+        self.volume_ocr_run()
+        rows = mistral_ocr.ensure_extract_jobs(
+            self.scan, make_manifest(1, self.PAGES)
+        )
+        ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
+            status=JobStatus.CONSUMED
+        )
+        self.objects[mistral_ocr.glued_volume_key(self.scan)] = None
+        run = self.moved_run()
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        printed = self.objects[run.printed_pages_key]
+        self.assertEqual(
+            [page["printed"] for page in printed["pages"]],
+            ["1", "2", "4", "3", "5", "6"],
+        )
+
     def test_the_detections_glue_carries_the_boxes_of_a_moved_page(self):
         self.volume_detect_run()
         run = self.moved_run()

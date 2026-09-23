@@ -2188,7 +2188,7 @@ def _final_fallbacks(scan: Scan, page_map: dict) -> dict[str, dict]:
 
     projected = {}
     for name, volume in page_numbers.fallback_documents(scan).items():
-        pages = volume.get("pages")
+        pages = volume.get("pages") if isinstance(volume, dict) else None
         if not isinstance(pages, list):
             continue
         try:
