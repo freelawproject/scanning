@@ -729,9 +729,14 @@ class TestIsHeadOrFootLabel(SimpleTestCase):
             "PageHeader",
             "PageFooter",
             "header",
-            "footer",
         ):
             self.assertTrue(page_numbers.is_head_or_foot_label(label), label)
+
+    def test_mistral_s_footer_is_footnote_text(self):
+        """The label holds footnotes on the pages measured (#399), and a
+        footnote line that ends in a page number must stay in the text,
+        so the foot of a Mistral page is judged by its band alone."""
+        self.assertFalse(page_numbers.is_head_or_foot_label("footer"))
 
     def test_every_other_label_is_the_body(self):
         for label in (
@@ -970,8 +975,9 @@ class TestTheOtherEnginesFillTheBlanks(SimpleTestCase):
             list(opinion_ocr.ENGINES), ["dots_mocr", "mistral_ocr", "surya"]
         )
 
-    def test_the_neighbour_pass_sees_every_engine(self):
-        """Both neighbours ask for 11; dots.mocr read the parallel
+    def test_the_neighbour_pass_overrules_a_dots_pick(self):
+        """The one case another engine overrules the primary read.
+        Both neighbours ask for 11; dots.mocr read the parallel
         citation page of page 2, and Mistral read the number."""
         results = self.read(
             {
@@ -1031,6 +1037,38 @@ class TestTheOtherEnginesFillTheBlanks(SimpleTestCase):
             )[0]["detected"]
         )
 
+    def test_the_marks_of_the_engines_are_folded_first(self):
+        """Mistral and dots.mocr set heading and bold marks around a
+        head line, Surya a bullet (#396): none of them is a token, or
+        the number would be read in the middle of its line."""
+        for text in ("# 2", "**2**", "# 2 FEDERAL REPORTER, 3d SERIES"):
+            with self.subTest(text=text):
+                results = self.read(
+                    {2: [RUNNING_HEAD]},
+                    mistral_ocr=mistral_document({2: [mistral_block(text)]}),
+                )
+                self.assertEqual(results[0]["detected"], "2")
+                self.assertEqual(results[0]["ocr"], text)
+        results = self.read(
+            {3: [RUNNING_HEAD]},
+            surya=surya_document({3: [surya_block("• 3")]}),
+        )
+        self.assertEqual(results[0]["detected"], "3")
+
+    def test_a_page_with_no_width_keeps_the_reading_before_the_gate(self):
+        """The gate is about the reporter title a quarter of the page
+        in; a malformed page has no corner to measure."""
+        entry = page_numbers.extract_page_number(
+            make_page(
+                2,
+                [cell("2 FEDERAL REPORTER", bbox=[357, 59, 864, 84])],
+                origin_width=0,
+            )
+        )
+
+        self.assertEqual(entry["detected"], "2")
+        self.assertEqual(entry["score"], 0.5)
+
     def test_the_pages_are_dots_pages(self):
         """An engine's page the dots.mocr document does not hold
         answers nothing, and a dots.mocr page it lacks stays blank."""
@@ -1068,10 +1106,13 @@ class TestTheOtherEnginesFillTheBlanks(SimpleTestCase):
 class TestTheEngineTable(SimpleTestCase):
     """What the reader needs of every entry of ``opinion_ocr.ENGINES``."""
 
-    def test_every_engine_names_both_bands(self):
+    def test_every_engine_names_the_head(self):
+        """The foot too where the engine has a label for it: Mistral's
+        ``footer`` is footnote text and is left out."""
         for name, spec in opinion_ocr.ENGINES.items():
             with self.subTest(engine=name):
-                self.assertEqual(
+                self.assertIn("header", spec.band_labels.values())
+                self.assertLessEqual(
                     set(spec.band_labels.values()), {"header", "footer"}
                 )
 

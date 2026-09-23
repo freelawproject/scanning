@@ -593,6 +593,23 @@ class TestFinishReadyRuns(MistralRunMixin, ScanningTestCase):
         self.assertIn("mistral_ocr volume is glued", logs.output[-1])
         self.assertEqual(len(rows), 1)
 
+    def test_a_run_that_has_not_applied_needs_no_hand_back(self):
+        """The apply still to come reads the new document itself."""
+        scan, _rows = self.build(shard_count=1, pages_per_shard=1)
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.AWAITING_VALIDATION
+        )
+        rows = dots_mocr.ensure_analyze_jobs(scan, make_manifest(1, 1))
+        ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
+            status=JobStatus.CONSUMED
+        )
+
+        self.assertEqual(mistral_ocr.finish_ready_runs(), 1)
+
+        self.assertEqual(
+            dots_mocr._apply_state(dots_mocr.live_analyze_jobs(scan)), {}
+        )
+
     def test_an_approved_volume_keeps_its_page_numbers(self):
         """Review 1 is over, so nothing may rewrite the numbers."""
         scan, _rows = self.build(shard_count=1, pages_per_shard=1)

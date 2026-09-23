@@ -422,11 +422,11 @@ def is_head_or_foot_label(label: str | None) -> bool:
 
     The labels are the engine table's (``EngineSpec.band_labels``,
     #351), so a fourth engine's spelling is one entry there and no
-    code here. Mistral's ``header`` and ``footer`` are in it: its
-    ``header`` is the running head, and its ``footer`` the foot of the
-    page, which holds footnote text as often, and a footnote line that
-    ends in the approved number is what this rule leaves to
-    :func:`carries_number`.
+    code here. Mistral's ``header`` is in it and its ``footer`` is
+    not: that label holds footnote text on the pages measured (#399),
+    and a footnote line that ends in a page number is text the
+    ensemble must keep. So a Mistral block at the foot of the page is
+    judged by its band alone, as #396 judged every Mistral block.
 
     :param label: The unit's label, as the engine wrote it.
     :returns: Whether an engine of ``opinion_ocr.ENGINES`` names the
@@ -562,6 +562,20 @@ def engine_candidates(page: dict, document: dict, spec) -> list[dict]:
     box has no band and no corner, so only a whole-line number in a
     labelled unit is read off it, at half marks.
 
+    Every line is folded before it is read, by the one rule
+    :func:`carries_number` folds with (``ensemble.compare_text`` plus
+    the bullet): Mistral and dots.mocr set heading and bold marks
+    around a head line (``# 878 N. C.``, ``**679**``), Surya a bullet,
+    and a mark that stands as a token would put the number in the
+    middle of its line. The ``ocr`` of a candidate keeps the text as
+    the engine wrote it.
+
+    The corner gate holds where the page has a width. A page with no
+    geometry has no corner to measure, and a word of a longer line on
+    it is read at half marks as before #351: the gate is about the
+    reporter title a quarter of the page in, not about a malformed
+    page.
+
     :param page: One ``pages[]`` entry of the engine's glued volume
         document.
     :param document: That document, for the engines whose render size
@@ -571,6 +585,8 @@ def engine_candidates(page: dict, document: dict, spec) -> list[dict]:
         when the page was filtered, failed, or shows no number.
     :rtype: list[dict]
     """
+    from scanning.ensemble import compare_text
+
     width, height = spec.frame(page, document) or (0, 0)
 
     candidates = []
@@ -585,11 +601,11 @@ def engine_candidates(page: dict, document: dict, spec) -> list[dict]:
             continue
         text = unit.get(spec.text_key) or ""
         for index, line in enumerate(_clean(text).splitlines()):
-            line = line.strip()
+            line = compare_text(line).lstrip(_BULLETS).strip()
             for detected, number_type, side in _line_readings(line):
                 distance = _corner_distance(bbox, width, side)
                 corner = distance <= CORNER_BAND
-                if side != "both" and not corner:
+                if side != "both" and width and not corner:
                     # One word of a longer line, away from the corner:
                     # the volume number of the reporter title (#351).
                     continue
@@ -771,11 +787,13 @@ def ocr_results_from_volume(
     entry whose page the new run did not report, in silence.
 
     The other engines answer the pages dots.mocr left blank (#351).
-    dots.mocr's own reading stands wherever it has one; a page it has
-    none for takes the best reading of the first engine, in the order
-    of ``opinion_ocr.ENGINES``, that offers one. The neighbour pass
-    then sees every engine's candidates of every page, so a number
-    both neighbours ask for is taken from whichever engine read it.
+    dots.mocr's own reading is the pick wherever it has one; a page it
+    has none for takes the best reading of the first engine, in the
+    order of ``opinion_ocr.ENGINES``, that offers one. The neighbour
+    pass then sees every engine's candidates of every page, so a
+    number both neighbours ask for is taken from whichever engine read
+    it, over a dots.mocr pick too: the one case another engine
+    overrules the primary read.
     The pages are dots.mocr's: an engine's page that dots.mocr's
     document does not hold answers nothing.
 

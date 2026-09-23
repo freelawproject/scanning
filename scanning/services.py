@@ -984,9 +984,10 @@ def has_legacy_ocr(scan: "Scan") -> bool:
     the work (#151).
 
     Two signals answer it, because neither alone is enough. An engine's
-    zone prefix (``dots-``, ``mistral-``; ``page_numbers.is_model_zone``)
-    proves the new stage wrote the entry, but a volume dots read with
-    no number on any page carries none. An ``ANALYZE`` job row
+    zone prefix (``dots-``, ``mistral-``, ``surya-``;
+    ``page_numbers.is_model_zone``) proves the new stage wrote the
+    entry, but a volume dots read with no number on any page carries
+    none. An ``ANALYZE`` job row
     proves the new stage ran at all, and it outlives a recompute. A
     scan with no readings at all is not legacy: it has nothing to
     recompute either way, and the caller handles that first.
