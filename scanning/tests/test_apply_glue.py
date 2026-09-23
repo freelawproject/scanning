@@ -17,7 +17,7 @@ from unittest.mock import patch
 import fitz
 from django.test import override_settings
 
-from scanning import apply, dots_mocr, yolo
+from scanning import apply, dots_mocr, mistral_ocr, yolo
 from scanning.models import (
     ExternalJob,
     JobStage,
@@ -601,6 +601,49 @@ class TestMoveGlues(GlueTestCase):
                 (1, "1", "model"),
                 (2, "2", "model"),
                 (3, "44", "curator"),
+                (4, "3", "model"),
+                (5, "5", "model"),
+                (6, "6", "model"),
+            ],
+        )
+
+    def test_the_printed_pages_take_the_other_engines_numbers(self):
+        """The fallback of #351 reaches the corrected volume: page 4
+        has no dots.mocr number, the glued Mistral volume has one, and
+        the moved page carries it to its final place."""
+        from scanning.tests.test_page_numbers import (
+            mistral_block,
+            mistral_document,
+        )
+
+        ocr_key = self.volume_ocr_run()
+        self.objects[ocr_key]["pages"][3]["cells"] = []
+        rows = mistral_ocr.ensure_extract_jobs(
+            self.scan, make_manifest(1, self.PAGES)
+        )
+        ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
+            status=JobStatus.CONSUMED
+        )
+        self.objects[mistral_ocr.glued_volume_key(self.scan)] = (
+            mistral_document(
+                {p: [mistral_block(str(p))] for p in range(1, self.PAGES + 1)}
+            )
+        )
+        run = self.moved_run()
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        printed = self.objects[run.printed_pages_key]
+        self.assertEqual(
+            [
+                (page["final_page"], page["printed"], page["by"])
+                for page in printed["pages"]
+            ],
+            [
+                (1, "1", "model"),
+                (2, "2", "model"),
+                (3, "4", "model"),
                 (4, "3", "model"),
                 (5, "5", "model"),
                 (6, "6", "model"),
