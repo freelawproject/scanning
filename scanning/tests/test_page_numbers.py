@@ -617,3 +617,122 @@ class TestOcrResultsFromVolume(SimpleTestCase):
 
         self.assertEqual(results[0]["detected"], "677")
         self.assertEqual(results[0]["zone"], "dots-header")
+
+
+class TestCarriesNumber(SimpleTestCase):
+    """The reader of the OCR glue's page-number verdict (#396)."""
+
+    def test_the_number_at_the_start_of_the_running_head(self):
+        self.assertTrue(page_numbers.carries_number("878 N. C.", "878"))
+
+    def test_the_number_at_the_end_of_the_cite_as_line(self):
+        text = "STATE v. SMITH\nCite as 218 A.3d 677 -- 679"
+        self.assertTrue(page_numbers.carries_number(text, "679"))
+
+    def test_a_number_buried_in_the_line_is_no_reading(self):
+        text = "STATE v. SMITH\nCite as 218 A.3d 677 -- 679"
+        self.assertFalse(page_numbers.carries_number(text, "218"))
+        self.assertFalse(page_numbers.carries_number(text, "677"))
+
+    def test_the_first_page_carries_its_own_number_in_the_cite_line(self):
+        """On the first page of an opinion the ``Cite as`` line ends in
+        the page's own number."""
+        self.assertTrue(
+            page_numbers.carries_number("Cite as 218 A.3d 677", "677")
+        )
+
+    def test_another_number_is_not_the_page_number(self):
+        self.assertFalse(page_numbers.carries_number("877 N. C.", "878"))
+
+    def test_a_range_and_a_suffixed_number(self):
+        self.assertTrue(
+            page_numbers.carries_number(
+                "913–925 ATLANTIC REPORTER, 2d SERIES", "913-925"
+            )
+        )
+        self.assertTrue(
+            page_numbers.carries_number("2094a ATLANTIC REPORTER", "2094a")
+        )
+
+    def test_the_stray_l_and_a_superscript_are_forgiven(self):
+        self.assertTrue(page_numbers.carries_number("878L N. C.", "878"))
+        self.assertTrue(page_numbers.carries_number("878¹ N. C.", "878"))
+
+    def test_no_value_and_no_text_read_as_nothing(self):
+        self.assertFalse(page_numbers.carries_number("878 N. C.", None))
+        self.assertFalse(page_numbers.carries_number("878 N. C.", ""))
+        self.assertFalse(page_numbers.carries_number("", "878"))
+
+    def test_a_body_paragraph_that_ends_in_the_number(self):
+        """The reader answers the text alone; the glue adds the zone,
+        which is what keeps this paragraph in the text."""
+        self.assertTrue(
+            page_numbers.carries_number("the court said, at 878", "878")
+        )
+
+    def test_the_marks_of_the_engines_are_folded_first(self):
+        """Mistral and dots.mocr set heading and bold marks around the
+        head, Surya a bullet. None of them is a token."""
+        for text in (
+            "# 878 N. C.",
+            "## 878 N. C.",
+            "**878 N. C.**",
+            "• 878 N. C.",
+            "**878** N. C.",
+        ):
+            self.assertTrue(page_numbers.carries_number(text, "878"), text)
+        self.assertTrue(
+            page_numbers.carries_number(
+                "Cite as 218 A.3d 677 -- **679**", "679"
+            )
+        )
+        self.assertTrue(
+            page_numbers.carries_number("# Cite as 218 A.3d 677 -- 679", "679")
+        )
+        self.assertFalse(
+            page_numbers.carries_number("# Cite as 218 A.3d 677 -- 679", "218")
+        )
+
+
+class TestIsHeadOrFootLabel(SimpleTestCase):
+    """The label rule beside the band rule (#396)."""
+
+    def test_the_two_engines_that_label_the_head_and_the_foot(self):
+        for label in (
+            "Page-header",
+            "Page-footer",
+            "PageHeader",
+            "PageFooter",
+        ):
+            self.assertTrue(page_numbers.is_head_or_foot_label(label), label)
+
+    def test_every_other_label_is_the_body(self):
+        for label in (
+            "Text",
+            "SectionHeader",
+            "Section-header",
+            "text",
+            "",
+            None,
+        ):
+            self.assertFalse(page_numbers.is_head_or_foot_label(label), label)
+
+
+class TestBandOf(SimpleTestCase):
+    """One band rule for a render box and for a box in points."""
+
+    def test_the_head_the_foot_and_the_body_in_points(self):
+        self.assertEqual(
+            page_numbers.band_of([36, 18, 300, 43], 792), "header"
+        )
+        self.assertEqual(
+            page_numbers.band_of([36, 760, 300, 780], 792), "footer"
+        )
+        self.assertIsNone(page_numbers.band_of([36, 100, 300, 700], 792))
+
+    def test_a_box_that_reaches_below_the_band_is_the_body(self):
+        self.assertIsNone(page_numbers.band_of([36, 18, 300, 200], 792))
+
+    def test_no_geometry_is_the_body(self):
+        self.assertIsNone(page_numbers.band_of([], 792))
+        self.assertIsNone(page_numbers.band_of([36, 18, 300, 43], 0))

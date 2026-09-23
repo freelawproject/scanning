@@ -1788,11 +1788,12 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
 
 
 #: What took a block out of the text, in words. ``opinion_ocr``
-#: writes both reasons, and a card must not call the mask of the
-#: opinion before a redaction.
+#: writes the three reasons, and a card must not call the mask of the
+#: opinion before, or the page number (#396), a redaction.
 _REASON_WORDS = {
     "redaction": "a redaction",
     "outside": "the mask of the opinion before",
+    opinion_ocr.PAGE_NUMBER: "the page number",
 }
 
 
@@ -1815,8 +1816,9 @@ def _partial_message(page: dict) -> str:
     """Return the line of one ``PARTIAL_REDACTION`` card.
 
     The reason is read off the drops the count came from: a group goes
-    whole, and the box that took it is a redaction or the mask of the
-    opinion before (``opinion_ocr.verdict`` writes both).
+    whole, and what took it is a redaction, the mask of the opinion
+    before or the page number (``opinion_ocr.verdict`` writes the
+    three).
 
     :param page: One page of the document.
     :returns: The message.
