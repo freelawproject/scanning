@@ -56,6 +56,21 @@ branch ``extraction_align``, ``pipeline/core/{align,order,consensus}``):
    is text the reader loses, and that is what the
    ``PARTIAL_REDACTION`` card counts.
 
+**A fifth step, the section (#399).** The ``FOOTNOTES`` detection of a
+page is one band across both columns, and the engines read one cell
+per footnote per column. The OCR glue freezes that band on every
+page as ``zones.footnotes``, in points, and :func:`section` puts an
+aligned group in the footnotes when the zone covers
+:data:`FOOTNOTE_SHARE` of its box. The group goes whole, the rule of
+the exclusion, and the zone alone decides: the engines' own footnote
+labels are exact and rare (one unit in seven under a zone carries one,
+one in 188 outside), so a label that decided would lose most footnotes
+to the body. A label outside every zone is the ``FOOTNOTE_UNSURE``
+card, and nothing more. The two sections are ordered apart, by the
+same rule and the same column boundary, so the body joins across a
+footnote at the foot of the left column, and the page carries two
+texts, ``text`` and ``footnotes``, each with its own offsets.
+
 **Three deviations from the prototype.**
 
 - Its constants are pixels of a 1700 by 2200 render. Here they are
@@ -125,8 +140,9 @@ from scanning.models import (
 logger = logging.getLogger(__name__)
 
 #: Version of the document this module writes. 2 marks a voted word
-#: that a majority settled (#380).
-SCHEMA_VERSION = 2
+#: that a majority settled (#380). 3 puts every group in a section and
+#: gives the page a second text, the footnotes (#399).
+SCHEMA_VERSION = 3
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue.
 DOCUMENT = "ensemble.json"
@@ -181,6 +197,16 @@ MIN_BODY_BOXES = 4
 #: What joins two groups in a page's text.
 PARAGRAPH_GAP = "\n\n"
 
+#: The two sections of a page (#399), named after the ``OpinionText``
+#: fields they fill.
+BODY = "text"
+FOOTNOTES = "footnotes"
+
+#: The share of a group's box a footnote zone must cover for the group
+#: to be a footnote. A footnote group sits inside the band almost
+#: whole and a body group outside it whole, so the value moves little.
+FOOTNOTE_SHARE = 0.5
+
 #: How the engines agreed on one group.
 UNANIMOUS = "unanimous"
 MAJORITY = "majority"
@@ -204,6 +230,7 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.NO_MAJORITY,
         OpinionCheck.PARTIAL_REDACTION,
         OpinionCheck.PAGE_NOT_READ,
+        OpinionCheck.FOOTNOTE_UNSURE,
     }
 )
 
@@ -828,21 +855,36 @@ def _side(box: list[float], boundary: float) -> str:
     return "L" if (box[0] + box[2]) / 2 < boundary else "R"
 
 
-def place(groups: list[dict], width: float, height: float) -> list[dict]:
+#: "No boundary was passed": :func:`place` reads it off the groups.
+_PAGE_BOUNDARY = object()
+
+
+def place(
+    groups: list[dict],
+    width: float,
+    height: float,
+    boundary=_PAGE_BOUNDARY,
+) -> list[dict]:
     """Return the groups in reading order, each stamped.
 
     Every group is placed, the dropped ones included, because the
     column boundary is read off the boxes of the page and a page whose
     redacted blocks were taken out first would lose it.
 
-    :param groups: The groups of one page.
+    :param groups: The groups of one page, or of one section of it.
     :param width: The page width, in points.
     :param height: The page height, in points.
+    :param boundary: The column boundary of the page, or None for one
+        column. Left out, it is read off ``groups``. :func:`build_page`
+        passes the boundary of the whole page (#399), read before the
+        footnotes were taken out, so the body splits at the gutter the
+        whole page shows.
     :returns: New dicts, with ``band`` and ``column``.
     :rtype: list[dict]
     """
     head, body, foot = _split_bands(groups, height)
-    boundary = column_boundary(groups, width, height)
+    if boundary is _PAGE_BOUNDARY:
+        boundary = column_boundary(groups, width, height)
     line_band = LINE_BAND * height
 
     ordered = [
@@ -870,6 +912,151 @@ def place(groups: list[dict], width: float, height: float) -> list[dict]:
             for group in line_sort(foot, line_band)
         ]
     )
+
+
+def place_footnotes(
+    groups: list[dict],
+    width: float,
+    height: float,
+    boundary: float | None,
+) -> list[dict]:
+    """Return the footnote groups in reading order, each stamped.
+
+    No band split (#399): the head and the foot bands of :func:`place`
+    are the running head and the running foot, facts of the body, and
+    a footnote section has neither. Split by band, the last line of a
+    left footnote falls into the foot band and reads after every right
+    footnote, with no column. So every footnote group is ordered by
+    :func:`reading_order` alone, with the boundary of the whole page,
+    because two footnotes cannot find a gutter of their own.
+
+    :param groups: The footnote groups of one page.
+    :param width: The page width, in points.
+    :param height: The page height, in points.
+    :param boundary: The column boundary of the page, or None.
+    :returns: New dicts, with ``band`` (always ``footnotes``) and
+        ``column``.
+    :rtype: list[dict]
+    """
+    return [
+        {
+            **group,
+            "band": FOOTNOTES,
+            "column": (
+                None
+                if boundary is None
+                or _straddles(group["box_pt"], boundary, width)
+                else _side(group["box_pt"], boundary)
+            ),
+        }
+        for group in reading_order(groups, LINE_BAND * height, boundary, width)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The section
+# ---------------------------------------------------------------------------
+
+
+def zone_share(box: list[float], zones: list[list[float]]) -> float:
+    """Return the largest share of ``box`` one zone covers.
+
+    The maximum over the zones and not the sum, the rule of
+    ``opinion_ocr.covered_share``.
+
+    :param box: ``[x0, y0, x1, y1]`` in points.
+    :param zones: The zones, in the same space.
+    :returns: The share, 0 for a box with no area.
+    :rtype: float
+    """
+    size = area(box)
+    if size <= 0:
+        return 0.0
+    return max(
+        (opinion_ocr.intersection(box, zone) / size for zone in zones),
+        default=0.0,
+    )
+
+
+def _labelled_footnote(engine: str, unit: dict) -> bool:
+    """Return whether one engine called every member of its reading a
+    footnote.
+
+    A silent engine's label counts for nothing: it read no word here,
+    so it says nothing about what the words are. A merged unit of
+    mixed labels (a footnote cell glued to a body cell) is not
+    labelled either.
+
+    :param engine: The engine's name.
+    :param unit: Its merged unit of the group (:func:`_merge`).
+    :returns: Whether it is labelled.
+    :rtype: bool
+    """
+    if not plain(unit.get("text")):
+        return False
+    spec = opinion_ocr.ENGINES.get(engine)
+    types = unit.get("types") or []
+    return bool(spec and types) and all(
+        kind in spec.footnote_types for kind in types
+    )
+
+
+def section(group: dict, zones: list[list[float]]) -> tuple[str, bool]:
+    """Return which section one aligned group takes, and whether an
+    engine doubts it.
+
+    **The one rule** (#399), over the aligned group and never a unit:
+    a group goes whole to one section, the rule of the exclusion. The
+    zone alone decides. The engines' footnote labels are exact and
+    rare (``opinion_ocr.EngineSpec.footnote_types``), so they never
+    move a group: a body-labelled group under the zone is the daily
+    shape, three zone pages in four, and raises nothing. A
+    footnote-labelled group outside every zone is a detection the
+    model missed, and that is the doubt the ``FOOTNOTE_UNSURE`` card
+    counts.
+
+    :param group: One group of :func:`align_page`.
+    :param zones: The page's footnote zones, in points.
+    :returns: ``(BODY or FOOTNOTES, whether an engine labelled a
+        footnote outside the zone)``.
+    :rtype: tuple[str, bool]
+    """
+    in_zone = (
+        bool(zones) and zone_share(group["box_pt"], zones) >= FOOTNOTE_SHARE
+    )
+    labelled = any(
+        _labelled_footnote(name, unit)
+        for name, unit in group["engines"].items()
+    )
+    return (FOOTNOTES if in_zone else BODY), (labelled and not in_zone)
+
+
+def _footnote_labellers(group: dict) -> list[str]:
+    """Return the engines that labelled one group a footnote, ranked."""
+    return _ranked(
+        name
+        for name, unit in group["engines"].items()
+        if _labelled_footnote(name, unit)
+    )
+
+
+def _zones_of(pages: dict[str, dict]) -> list[list[float]]:
+    """Return the footnote zones of one page, off the first engine
+    page that carries them.
+
+    Every engine's page carries the same zones: the glue writes the
+    page's fact on each of them, the rule of ``frame``.
+
+    :param pages: ``{engine: the page}``.
+    :returns: The zones, in points.
+    :rtype: list[list[float]]
+    """
+    for page in pages.values():
+        zones = (page.get("zones") or {}).get("footnotes") or []
+        boxes = [box for box in map(opinion_ocr.as_box, zones) if box]
+        if boxes:
+            return boxes
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -1260,6 +1447,8 @@ def _counts() -> dict:
         "differing": 0,
         "low_confidence": 0,
         "partial": 0,
+        "footnote_groups": 0,
+        "footnote_doubt": 0,
     }
 
 
@@ -1281,7 +1470,9 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         "pdf_page": first.get("pdf_page"),
         "source": first.get("source"),
         "frame": None,
+        "zones": {"footnotes": []},
         "text": "",
+        "footnotes": "",
         # Every engine of the document, and the ones whose read of
         # this page failed (#238 does fail single pages). A group of
         # fewer engines than this is a place they did not read alike,
@@ -1327,10 +1518,24 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         "width_pt": round(width, 2),
         "height_pt": round(height, 2),
     }
-    ordered = place(align_page(units, width, height), width, height)
+    zones = _zones_of(read)
+    entry["zones"] = {"footnotes": zones}
+    groups = align_page(units, width, height)
+    # The columns of the page, off every group of it and before the
+    # split into sections (#399): the footnotes are set in two columns
+    # too, and a page with two footnotes has too few boxes of its own
+    # to find its gutter.
+    boundary = column_boundary(groups, width, height)
+    by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
+    for group in groups:
+        group["section"], group["footnote_doubt"] = section(group, zones)
+        by_section[group["section"]].append(group)
+    ordered = place(
+        by_section[BODY], width, height, boundary=boundary
+    ) + place_footnotes(by_section[FOOTNOTES], width, height, boundary)
 
-    parts: list[str] = []
-    offset = 0
+    parts: dict[str, list[str]] = {BODY: [], FOOTNOTES: []}
+    offsets: dict[str, int] = {BODY: 0, FOOTNOTES: 0}
     for group in ordered:
         read_back = resolve(group)
         if group["excluded"] or not read_back["text"]:
@@ -1350,15 +1555,19 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
                 }
             )
             continue
-        start = offset
+        name = group["section"]
+        start = offsets[name]
         end = start + len(read_back["text"])
-        offset = end + len(PARAGRAPH_GAP)
-        parts.append(read_back["text"])
+        offsets[name] = end + len(PARAGRAPH_GAP)
+        parts[name].append(read_back["text"])
         entry["groups"].append(
             {
                 "id": len(entry["groups"]),
                 "band": group["band"],
                 "column": group["column"],
+                "section": name,
+                "footnote_doubt": group["footnote_doubt"],
+                "footnote_by": _footnote_labellers(group),
                 "box_pt": group["box_pt"],
                 "start": start,
                 "end": end,
@@ -1388,8 +1597,13 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
             entry["counts"]["silent"] += 1
         if _differs(entry["groups"][-1], len(pages)):
             entry["counts"]["differing"] += 1
+        if name == FOOTNOTES:
+            entry["counts"]["footnote_groups"] += 1
+        if group["footnote_doubt"]:
+            entry["counts"]["footnote_doubt"] += 1
 
-    entry["text"] = PARAGRAPH_GAP.join(parts)
+    entry["text"] = PARAGRAPH_GAP.join(parts[BODY])
+    entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
     entry["counts"]["groups"] = len(entry["groups"])
     entry["counts"]["dropped"] = len(entry["dropped"])
     entry["counts"]["partial"] = sum(
@@ -1633,9 +1847,10 @@ def _address(page: dict) -> tuple[int | None, int | None]:
 def write_rows(opinion: Opinion, document: dict) -> int:
     """Write the ``OpinionText`` rows of one opinion.
 
-    One row per page. ``text`` and ``disagreements`` are written again
-    at every run, because they are a cache of the documents; nothing
-    here reads or writes ``human_text``, which is the truth.
+    One row per page. ``text``, ``footnotes`` and ``disagreements`` are
+    written again at every run, because they are a cache of the
+    documents; nothing here reads or writes ``human_text``, which is
+    the truth.
 
     :param opinion: The row.
     :param document: :func:`build_document`.
@@ -1650,6 +1865,7 @@ def write_rows(opinion: Opinion, document: dict) -> int:
             page_in_opinion=page["page_in_opinion"],
             defaults={
                 "text": page["text"],
+                "footnotes": page.get("footnotes") or "",
                 "disagreements": _disagreements(page),
                 "source_edit_id": source_edit_id,
                 "source_page": source_page,
@@ -1675,8 +1891,12 @@ def write_rows(opinion: Opinion, document: dict) -> int:
 def _disagreements(page: dict) -> list[dict]:
     """Return one entry per place the engines did not all agree.
 
+    ``section`` names the field of the row the offsets point into
+    (#399): ``text`` for the body, ``footnotes`` for the footnotes. A
+    group of a document older than the sections is body text.
+
     :param page: One page of the document.
-    :returns: ``[{start, end, agreement, variants}]``.
+    :returns: ``[{start, end, section, agreement, variants}]``.
     :rtype: list[dict]
     """
     engines = len(page.get("engines") or [])
@@ -1684,6 +1904,7 @@ def _disagreements(page: dict) -> list[dict]:
         {
             "start": group["start"],
             "end": group["end"],
+            "section": group.get("section") or BODY,
             "agreement": group["agreement"],
             "variants": {
                 name: unit["text"] for name, unit in group["engines"].items()
@@ -1703,7 +1924,7 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
     """Write the findings of the ensemble again, from the document.
 
     **The one writer** of :data:`ENSEMBLE_CHECKS`. It deletes and
-    writes those three checks alone, so the two stale checks of
+    writes those checks alone, so the two stale checks of
     ``opinions.create_rows`` stay where they are. A standing dismissal
     of the same page and check mutes the new card, the rule of
     ``findings.resolve``; nothing deletes a dismissal.
@@ -1783,6 +2004,17 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
+        if counts.get("footnote_doubt"):
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.FOOTNOTE_UNSURE,
+                    Issue.Severity.WARNING,
+                    _footnote_message(page),
+                    standing,
+                )
+            )
     OpinionFinding.objects.bulk_create(cards)
     return len(cards)
 
@@ -1836,6 +2068,29 @@ def _partial_message(page: dict) -> str:
     return (
         f"{said[0].upper()}{said[1:]} covers part of {count} block(s) on "
         "this page. The whole block is out of the text."
+    )
+
+
+def _footnote_message(page: dict) -> str:
+    """Return the line of one ``FOOTNOTE_UNSURE`` card (#399).
+
+    It names the engines, because the reader judges the label against
+    the page: a footnote the detection missed sits in the body text
+    until a person moves it.
+
+    :param page: One page of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    doubtful = [g for g in page["groups"] if g.get("footnote_doubt")]
+    count = (page.get("counts") or {}).get("footnote_doubt") or len(doubtful)
+    engines = _ranked(
+        {name for group in doubtful for name in group.get("footnote_by") or []}
+    )
+    named = ", ".join(engines) or "An engine"
+    return (
+        f"{named} read {count} block(s) of this page as a footnote, but no "
+        "footnote detection covers them. They are in the body text."
     )
 
 
