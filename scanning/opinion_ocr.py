@@ -353,7 +353,10 @@ ENGINES: dict[str, EngineSpec] = {
         frame=_mistral_frame,
         module=mistral_ocr,
         owed_rows=functools.partial(_extract_owed_rows, mistral_ocr),
-        band_labels={"header": "header", "footer": "footer"},
+        # ``footer`` is not a band label: it holds footnote text on the
+        # pages measured (#399), so a block at the foot of a Mistral
+        # page is judged by its band alone (#351).
+        band_labels={"header": "header"},
         zone_prefix="mistral-",
         # Lowercase, as the harvest stores them. ``footer`` holds
         # footnote text on these pages; the running foot is ``header``.
