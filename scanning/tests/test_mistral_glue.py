@@ -17,11 +17,13 @@ from unittest.mock import patch
 
 from django.test import override_settings
 
-from scanning import jobs, mistral_ocr, s3_sync
+from scanning import dots_mocr, jobs, mistral_ocr, s3_sync
 from scanning.factories import ScanFactory
 from scanning.models import (
     ExternalJob,
     JobStatus,
+    Scan,
+    Status,
 )
 from scanning.tests.test_jobs import make_manifest
 from scanning.tests.test_mistral_ocr import MISTRAL
@@ -558,6 +560,54 @@ class TestFinishReadyRuns(MistralRunMixin, ScanningTestCase):
 
         self.assertEqual(mistral_ocr.finish_ready_runs(), 1)
         self.assertEqual(mistral_ocr.finish_ready_runs(), 0)
+
+    def applied_dots_run(self, scan):
+        """Glue and apply a dots.mocr run for ``scan``, on paper.
+
+        :param scan: The scan.
+        :returns: The run's rows.
+        """
+        rows = dots_mocr.ensure_analyze_jobs(scan, make_manifest(1, 1))
+        ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
+            status=JobStatus.CONSUMED
+        )
+        rows = dots_mocr.live_analyze_jobs(scan)
+        dots_mocr._write_apply_state(rows, {"applied_at": "2026-09-23"})
+        return rows
+
+    def test_a_glued_run_hands_the_page_numbers_back(self):
+        """The hand-back of #351: the apply reads this document on the
+        next tick and fills the pages dots.mocr left blank."""
+        scan, _rows = self.build(shard_count=1, pages_per_shard=1)
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        rows = self.applied_dots_run(scan)
+
+        with self.assertLogs("scanning.dots_mocr", level="INFO") as logs:
+            self.assertEqual(mistral_ocr.finish_ready_runs(), 1)
+
+        self.assertEqual(
+            dots_mocr._apply_state(dots_mocr.live_analyze_jobs(scan)), {}
+        )
+        self.assertIn("mistral_ocr volume is glued", logs.output[-1])
+        self.assertEqual(len(rows), 1)
+
+    def test_an_approved_volume_keeps_its_page_numbers(self):
+        """Review 1 is over, so nothing may rewrite the numbers."""
+        scan, _rows = self.build(shard_count=1, pages_per_shard=1)
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE
+        )
+        self.applied_dots_run(scan)
+
+        self.assertEqual(mistral_ocr.finish_ready_runs(), 1)
+
+        self.assertTrue(
+            dots_mocr._apply_state(dots_mocr.live_analyze_jobs(scan))[
+                "applied_at"
+            ]
+        )
 
     def test_an_open_run_waits(self):
         scan, rows = self.build(shard_count=2, pages_per_shard=1)

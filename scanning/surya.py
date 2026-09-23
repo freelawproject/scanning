@@ -54,7 +54,7 @@ from pathlib import Path
 from django.conf import settings
 from django.utils import timezone
 
-from scanning import jobs, runpod_client, s3_sync
+from scanning import dots_mocr, jobs, runpod_client, s3_sync
 from scanning.models import (
     ExternalJob,
     JobEngine,
@@ -574,6 +574,11 @@ def finish_ready_runs() -> int:
     after the read must not leave them unglued. What that id gates is
     spending, and this pass spends nothing.
 
+    A glued run hands a volume still in review 1 back to the
+    page-number apply (``dots_mocr.reopen_apply_after_read``, #351),
+    so this document fills the pages dots.mocr left blank on the
+    next tick.
+
     :returns: How many runs were glued and consumed.
     :rtype: int
     """
@@ -596,6 +601,7 @@ def finish_ready_runs() -> int:
             continue
         jobs.consume_run(rows)
         glued += 1
+        dots_mocr.reopen_apply_after_read(scan, str(JobEngine.SURYA))
 
     return glued
 
