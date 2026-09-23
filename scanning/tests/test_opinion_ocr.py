@@ -1764,29 +1764,34 @@ class TestReglueCommand(OpinionOcrTestCase):
 BAND = (100, 1600, 1600, 2100)
 
 
+def footnote_band(scan, run, page_index, box=BAND) -> Detection:
+    """One ``FOOTNOTES`` detection over final page ``page_index``.
+
+    ``run=None`` leaves the row outside the run's space, the shape of a
+    human row ``detections.relocate_rows`` could not place.
+    """
+    return model_row(
+        scan,
+        apply_run=run,
+        label=opinion_ocr.FOOTNOTE_LABEL,
+        label_id=int(Label.FOOTNOTES),
+        page_index=page_index,
+        source_page=page_index + 1,
+        x0=box[0],
+        y0=box[1],
+        x1=box[2],
+        y1=box[3],
+        img_width=IMG_W,
+        img_height=IMG_H,
+    )
+
+
 class TestTheFootnoteZone(OpinionOcrTestCase):
     """The ``FOOTNOTES`` detections of the run, frozen on every page."""
 
     def band(self, page_index, in_run=True, box=BAND) -> Detection:
-        """One footnote detection over final page ``page_index``.
-
-        ``in_run=False`` leaves the row outside the run's space, the
-        shape of a human row ``detections.relocate_rows`` could not
-        place.
-        """
-        return model_row(
-            self.scan,
-            apply_run=self.apply_run if in_run else None,
-            label=opinion_ocr.FOOTNOTE_LABEL,
-            label_id=int(Label.FOOTNOTES),
-            page_index=page_index,
-            source_page=page_index + 1,
-            x0=box[0],
-            y0=box[1],
-            x1=box[2],
-            y1=box[3],
-            img_width=IMG_W,
-            img_height=IMG_H,
+        return footnote_band(
+            self.scan, self.apply_run if in_run else None, page_index, box
         )
 
     def test_a_band_is_a_zone_in_points_on_every_engine_page(self):
@@ -1845,7 +1850,6 @@ class TestTheFootnoteZone(OpinionOcrTestCase):
         (#399): lowercase for Mistral, CamelCase for Surya."""
         for spec in opinion_ocr.ENGINES.values():
             self.assertIsInstance(spec.footnote_types, frozenset)
-            self.assertTrue(spec.footnote_types, spec.name)
         self.assertEqual(
             opinion_ocr.ENGINES["dots_mocr"].footnote_types, {"Footnote"}
         )

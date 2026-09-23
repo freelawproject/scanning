@@ -45,8 +45,8 @@ from scanning.tests.test_opinion_ocr import (
     BODY_A,
     BODY_B,
     OpinionOcrTestCase,
-    TestTheFootnoteZone,
     block,
+    footnote_band,
     mistral_document,
     to_pt,
 )
@@ -2231,6 +2231,24 @@ class TestTheTwoTexts(TestCase):
         ]
         self.assertEqual([g["column"] for g in notes], ["L", "R"])
 
+    def test_a_footnote_in_the_foot_band_keeps_its_column(self):
+        """A short last footnote sits in the foot band of ``place``,
+        which reads with no column (review of #401). The footnotes
+        split no band."""
+        low_zone = [40.0, 690.0, 580.0, 785.0]
+        right = ((RIGHT_X[0], 700, RIGHT_X[1], 780), "2. right note")
+        left = ((LEFT_X[0], 760, LEFT_X[1], 780), "1. left note")
+        page = build(
+            read_units(*self.TWO_COLUMNS, right, left), zones=[low_zone]
+        )
+
+        self.assertEqual(page["footnotes"], "1. left note\n\n2. right note")
+        notes = [
+            g for g in page["groups"] if g["section"] == ensemble.FOOTNOTES
+        ]
+        self.assertEqual([g["column"] for g in notes], ["L", "R"])
+        self.assertEqual({g["band"] for g in notes}, {ensemble.FOOTNOTES})
+
     def test_every_group_names_its_section_and_its_own_offsets(self):
         page = build(
             read_units(*self.TWO_COLUMNS, self.RIGHT_NOTE, self.LEFT_NOTE),
@@ -2302,7 +2320,7 @@ class TestTheFootnotesOfAnOpinion(EnsembleTestCase):
     BAND_B = (BODY_B[0], BODY_B[1] - 20, BODY_B[2] + 800, BODY_B[3] + 20)
 
     def band(self, page_index):
-        TestTheFootnoteZone.band(self, page_index, box=self.BAND_B)
+        footnote_band(self.scan, self.apply_run, page_index, self.BAND_B)
 
     def test_the_footnotes_of_a_page_are_their_own_text(self):
         self.band(2)
@@ -2310,7 +2328,8 @@ class TestTheFootnotesOfAnOpinion(EnsembleTestCase):
         document = self.run_ensemble()
 
         page = document["pages"][1]
-        self.assertEqual(page["text"], "878 N. C.\n\nbody A 2")
+        # The header is the printed page number, excluded since #396.
+        self.assertEqual(page["text"], "body A 2")
         self.assertEqual(page["footnotes"], "body B 2")
         self.assertEqual(page["zones"], {"footnotes": [to_pt(self.BAND_B)]})
         # The first page masks its header, above the caption.
@@ -2323,7 +2342,7 @@ class TestTheFootnotesOfAnOpinion(EnsembleTestCase):
         self.run_ensemble()
 
         row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
-        self.assertEqual(row.text, "878 N. C.\n\nbody A 2")
+        self.assertEqual(row.text, "body A 2")
         self.assertEqual(row.footnotes, "body B 2")
         other = OpinionText.objects.get(
             opinion=self.opinion, page_in_opinion=0

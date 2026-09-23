@@ -876,9 +876,9 @@ def place(
     :param height: The page height, in points.
     :param boundary: The column boundary of the page, or None for one
         column. Left out, it is read off ``groups``. :func:`build_page`
-        passes the boundary of the whole page (#399), so the body and
-        the footnotes split at the same gutter and the footnotes of a
-        page with two footnotes still read by column.
+        passes the boundary of the whole page (#399), read before the
+        footnotes were taken out, so the body splits at the gutter the
+        whole page shows.
     :returns: New dicts, with ``band`` and ``column``.
     :rtype: list[dict]
     """
@@ -912,6 +912,45 @@ def place(
             for group in line_sort(foot, line_band)
         ]
     )
+
+
+def place_footnotes(
+    groups: list[dict],
+    width: float,
+    height: float,
+    boundary: float | None,
+) -> list[dict]:
+    """Return the footnote groups in reading order, each stamped.
+
+    No band split (#399): the head and the foot bands of :func:`place`
+    are the running head and the running foot, facts of the body, and
+    a footnote section has neither. Split by band, the last line of a
+    left footnote falls into the foot band and reads after every right
+    footnote, with no column. So every footnote group is ordered by
+    :func:`reading_order` alone, with the boundary of the whole page,
+    because two footnotes cannot find a gutter of their own.
+
+    :param groups: The footnote groups of one page.
+    :param width: The page width, in points.
+    :param height: The page height, in points.
+    :param boundary: The column boundary of the page, or None.
+    :returns: New dicts, with ``band`` (always ``footnotes``) and
+        ``column``.
+    :rtype: list[dict]
+    """
+    return [
+        {
+            **group,
+            "band": FOOTNOTES,
+            "column": (
+                None
+                if boundary is None
+                or _straddles(group["box_pt"], boundary, width)
+                else _side(group["box_pt"], boundary)
+            ),
+        }
+        for group in reading_order(groups, LINE_BAND * height, boundary, width)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1493,7 +1532,7 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         by_section[group["section"]].append(group)
     ordered = place(
         by_section[BODY], width, height, boundary=boundary
-    ) + place(by_section[FOOTNOTES], width, height, boundary=boundary)
+    ) + place_footnotes(by_section[FOOTNOTES], width, height, boundary)
 
     parts: dict[str, list[str]] = {BODY: [], FOOTNOTES: []}
     offsets: dict[str, int] = {BODY: 0, FOOTNOTES: 0}
