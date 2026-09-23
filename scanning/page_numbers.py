@@ -72,13 +72,40 @@ A page the worker failed or filtered has no cells and gets
 ``detected=None``; the sequence analysis reports it as
 ``no_page_number`` and interpolates across it, and review 1's manual
 assignment is the human backstop.
+
+**The other engines fill the pages dots.mocr left blank** (issue
+#351). dots.mocr drops the corner number from its own output on
+whole runs of pages -- one volume lost it on every other page -- while
+Mistral and Surya read the same number as a header block of their
+own. So :func:`ocr_results_from_volume` takes the glued volume
+documents of the engines a person started, and walks them with the one
+geometry through ``opinion_ocr.ENGINES``, whose entries say where an
+engine keeps its units, its text and its band labels. dots.mocr's
+reading stands wherever it has one, because it is the read every
+volume pays for and the one every rule here was measured on; the first
+other engine, in the order of that table, answers a page it has none
+for. The neighbour pass sees every engine's candidates, so a reading
+both neighbours ask for is taken from whichever engine offers it. The
+``zone`` of an entry names the engine that read it (``mistral-header``).
+
+**A token of a longer line is trusted at the corner alone** (#351).
+The running head of a left page is ``992 FEDERAL REPORTER, 3d
+SERIES``, and its first token is the volume number. That token used
+to be read as the page number, at half marks, on every left page whose
+own number dots.mocr had dropped: a wrong number in place of an empty
+card, which no gate refuses and no fallback reaches. A number that is
+one word of a longer line is the page number only when the line
+reaches the corner (``CORNER_BAND``); a whole-line number is trusted
+anywhere in the band, because a volume whose number is centred in the
+footer has no rival to lose to.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 
-from scanning.services import DOTS_ZONE_PREFIX
+logger = logging.getLogger(__name__)
 
 #: Band fractions of the page render height, from ai-research
 #: ``pipeline/core/order.py``: a cell entirely above HEAD_BAND is a
@@ -88,20 +115,20 @@ FOOT_BAND = 0.95
 
 #: How near its own edge of the page a token must sit to read as a
 #: corner one, as a fraction of the page width. It grades the score and
-#: names a trusted reading; it never gates the rank, because a volume
-#: whose number is centred in the footer has no rival to lose to.
+#: names a trusted reading. It gates one thing (#351): a number that is
+#: a word of a longer line is a candidate at the corner alone, because
+#: away from it that word is the volume number of the reporter title.
+#: A whole-line number is never gated, because a volume whose number
+#: is centred in the footer has no rival to lose to.
 CORNER_BAND = 0.25
 
-HEADER_CATEGORY = "Page-header"
-FOOTER_CATEGORY = "Page-footer"
-
-#: The head and foot labels of the engines, folded to letters in lower
-#: case: dots.mocr writes ``Page-header`` and ``Page-footer``, Surya
-#: ``PageHeader`` and ``PageFooter``. Mistral labels no head, so its
-#: blocks are judged by the band alone (:func:`is_head_or_foot_label`,
-#: #396).
-HEAD_FOOT_LABELS = frozenset({"pageheader", "pagefooter"})
-_LETTERS_ONLY = re.compile(r"[^a-z]")
+#: The engine whose document is the volume reading and whose pages are
+#: the entries (#351): the first of ``opinion_ocr.ENGINES``, the read
+#: the pipeline pays for on every volume. The others fill its blanks.
+#: Spelled here and pinned to ``opinion_ocr.DEFAULT_ENGINE`` by a test,
+#: because that module imports this one (#396) and the table is read
+#: at the call (:func:`engines`).
+PRIMARY_ENGINE = "dots_mocr"
 
 #: The marks Surya sets before a list line. Not a markdown mark, so the
 #: fold of the vote (``ensemble.compare_text``) keeps it.
@@ -158,6 +185,21 @@ _EMPTY = {
     "zone": None,
     "ocr": None,
 }
+
+
+def engines() -> dict:
+    """Return the engine table, ``opinion_ocr.ENGINES``.
+
+    Read at the call and not at the top, because ``opinion_ocr``
+    imports this module for its band and label rules (#396), and a
+    table imported at the top would close a cycle.
+
+    :returns: ``{engine name: EngineSpec}``.
+    :rtype: dict
+    """
+    from scanning.opinion_ocr import ENGINES
+
+    return ENGINES
 
 
 def _clean(text: str) -> str:
@@ -369,18 +411,6 @@ def band_of(bbox: list, height: int | float) -> str | None:
     return None
 
 
-def _band(cell: dict, origin_height: int | float) -> str | None:
-    """Name the band a cell sits in, if any.
-
-    :param cell: One dots layout cell (``bbox``, ``category``, ``text``).
-    :param origin_height: The page's render height, the space the bbox
-        lives in.
-    :returns: ``"header"``, ``"footer"``, or None for the body.
-    :rtype: str | None
-    """
-    return band_of(cell.get("bbox") or [], origin_height)
-
-
 def is_head_or_foot_label(label: str | None) -> bool:
     """Say whether an engine's label names the head or the foot (#396).
 
@@ -390,13 +420,22 @@ def is_head_or_foot_label(label: str | None) -> bool:
     a two-line head cell that ends below the band keeps the number
     review 1 read through its label.
 
+    The labels are the engine table's (``EngineSpec.band_labels``,
+    #351), so a fourth engine's spelling is one entry there and no
+    code here. Mistral's ``header`` and ``footer`` are in it: its
+    ``header`` is the running head, and its ``footer`` the foot of the
+    page, which holds footnote text as often, and a footnote line that
+    ends in the approved number is what this rule leaves to
+    :func:`carries_number`.
+
     :param label: The unit's label, as the engine wrote it.
-    :returns: Whether it is one of :data:`HEAD_FOOT_LABELS`.
+    :returns: Whether an engine of ``opinion_ocr.ENGINES`` names the
+        head or the foot with it.
     :rtype: bool
     """
     if not label:
         return False
-    return _LETTERS_ONLY.sub("", str(label).lower()) in HEAD_FOOT_LABELS
+    return any(label in spec.band_labels for spec in engines().values())
 
 
 def carries_number(text: str, value: str | None) -> bool:
@@ -513,48 +552,77 @@ def _rank_key(candidate: dict) -> tuple:
     )
 
 
-def page_candidates(page: dict) -> list[dict]:
-    """Read every page number one page's cells offer, best first.
+def engine_candidates(page: dict, document: dict, spec) -> list[dict]:
+    """Read every page number one engine's page offers, best first.
 
-    :param page: One ``pages[]`` entry of the glued volume document.
-    :returns: The ranked candidates. Empty when the page was filtered,
-        failed, or shows no number.
+    The one geometry over the three documents (#351): the entry of
+    ``opinion_ocr.ENGINES`` says where the page keeps its units, its
+    text and its labels and what render its boxes are measured in, and
+    everything after that is the same for every engine. A unit with no
+    box has no band and no corner, so only a whole-line number in a
+    labelled unit is read off it, at half marks.
+
+    :param page: One ``pages[]`` entry of the engine's glued volume
+        document.
+    :param document: That document, for the engines whose render size
+        is written on it and not on the page.
+    :param spec: The engine's ``opinion_ocr.EngineSpec``.
+    :returns: The ranked candidates, each naming its ``engine``. Empty
+        when the page was filtered, failed, or shows no number.
     :rtype: list[dict]
     """
-    origin_height = page.get("origin_height") or 0
-    origin_width = page.get("origin_width") or 0
-    label_zone = {HEADER_CATEGORY: "header", FOOTER_CATEGORY: "footer"}
+    width, height = spec.frame(page, document) or (0, 0)
 
     candidates = []
-    for cell in page.get("cells") or []:
-        label = cell.get("category")
-        band = _band(cell, origin_height)
-        zone = label_zone.get(label) or band
+    for unit in page.get(spec.units_key) or []:
+        if not isinstance(unit, dict):
+            continue
+        labelled = spec.band_labels.get(unit.get(spec.type_key))
+        bbox = unit.get("bbox") or []
+        band = band_of(bbox, height)
+        zone = labelled or band
         if zone is None:
             continue
-        text = cell.get("text") or ""
-        bbox = cell.get("bbox") or []
+        text = unit.get(spec.text_key) or ""
         for index, line in enumerate(_clean(text).splitlines()):
             line = line.strip()
             for detected, number_type, side in _line_readings(line):
-                distance = _corner_distance(bbox, origin_width, side)
+                distance = _corner_distance(bbox, width, side)
+                corner = distance <= CORNER_BAND
+                if side != "both" and not corner:
+                    # One word of a longer line, away from the corner:
+                    # the volume number of the reporter title (#351).
+                    continue
                 candidates.append(
                     {
+                        "engine": spec.name,
                         "zone": zone,
                         "detected": detected,
                         "type": number_type,
                         "line": index,
                         "distance": distance,
                         "score": _score(
-                            label in label_zone,
+                            labelled is not None,
                             band is not None,
-                            distance <= CORNER_BAND,
+                            corner,
                             side == "both",
                         ),
                         "ocr": text,
                     }
                 )
     return sorted(candidates, key=_rank_key)
+
+
+def page_candidates(page: dict) -> list[dict]:
+    """Read every page number one dots.mocr page's cells offer, best first.
+
+    :param page: One ``pages[]`` entry of the glued dots.mocr volume
+        document.
+    :returns: The ranked candidates. Empty when the page was filtered,
+        failed, or shows no number.
+    :rtype: list[dict]
+    """
+    return engine_candidates(page, {}, engines()[PRIMARY_ENGINE])
 
 
 def _entry(page: dict, candidate: dict | None) -> dict:
@@ -574,11 +642,12 @@ def _entry(page: dict, candidate: dict | None) -> dict:
     }
     if candidate is None:
         return entry
+    prefix = engines()[candidate["engine"]].zone_prefix
     entry.update(
         detected=candidate["detected"],
         type=candidate["type"],
         score=candidate["score"],
-        zone=f"{DOTS_ZONE_PREFIX}{candidate['zone']}",
+        zone=f"{prefix}{candidate['zone']}",
         ocr=candidate["ocr"],
     )
     return entry
@@ -660,7 +729,37 @@ def _resolve_by_neighbours(
     return resolved
 
 
-def ocr_results_from_volume(document: dict) -> list[dict]:
+def _fallback_engines(
+    fallbacks: dict[str, dict] | None,
+) -> list[tuple[object, dict, dict[int, dict]]]:
+    """Index the other engines' documents, in the order of the table.
+
+    :param fallbacks: ``{engine name: glued volume document}``.
+    :returns: ``(spec, document, {pdf_page: page})`` per engine that
+        has a document with pages, the first engine of the table left
+        out because it is the primary read.
+    :rtype: list[tuple[object, dict, dict[int, dict]]]
+    """
+    indexed = []
+    for name, spec in engines().items():
+        if name == PRIMARY_ENGINE:
+            continue
+        document = (fallbacks or {}).get(name)
+        pages = document.get("pages") if isinstance(document, dict) else None
+        if not isinstance(pages, list):
+            continue
+        by_page = {
+            page["pdf_page"]: page
+            for page in pages
+            if isinstance(page, dict) and "pdf_page" in page
+        }
+        indexed.append((spec, document, by_page))
+    return indexed
+
+
+def ocr_results_from_volume(
+    document: dict, fallbacks: dict[str, dict] | None = None
+) -> list[dict]:
     """Convert one glued volume document into ``Scan.ocr_results``.
 
     One entry per page, in ``pdf_page`` order, and pure machine output:
@@ -671,15 +770,100 @@ def ocr_results_from_volume(document: dict) -> list[dict]:
     convention any new writer could forget, and one that dropped an
     entry whose page the new run did not report, in silence.
 
-    :param document: The glued volume JSON (issue #202).
+    The other engines answer the pages dots.mocr left blank (#351).
+    dots.mocr's own reading stands wherever it has one; a page it has
+    none for takes the best reading of the first engine, in the order
+    of ``opinion_ocr.ENGINES``, that offers one. The neighbour pass
+    then sees every engine's candidates of every page, so a number
+    both neighbours ask for is taken from whichever engine read it.
+    The pages are dots.mocr's: an engine's page that dots.mocr's
+    document does not hold answers nothing.
+
+    :param document: The glued dots.mocr volume JSON (issue #202).
+    :param fallbacks: ``{engine name: glued volume document}`` of the
+        other engines, in the same page space. Missing or None for a
+        volume nobody read with them.
     :returns: The new ``ocr_results`` list.
     :rtype: list[dict]
     """
     pages = sorted(document["pages"], key=lambda p: p["pdf_page"])
-    candidates = [page_candidates(page) for page in pages]
-    chosen = [options[0] if options else None for options in candidates]
+    others = _fallback_engines(fallbacks)
+    candidates: list[list[dict]] = []
+    chosen: list[dict | None] = []
+    for page in pages:
+        options = page_candidates(page)
+        pick = options[0] if options else None
+        for spec, other_document, by_page in others:
+            other = by_page.get(page["pdf_page"])
+            if other is None:
+                continue
+            found = engine_candidates(other, other_document, spec)
+            if pick is None and found:
+                pick = found[0]
+            options = options + found
+        candidates.append(options)
+        chosen.append(pick)
     chosen = _resolve_by_neighbours(chosen, candidates)
     return [_entry(page, candidate) for page, candidate in zip(pages, chosen)]
+
+
+def fallback_documents(scan) -> dict[str, dict]:
+    """Load the glued volume documents of the engines after the first.
+
+    The documents :func:`ocr_results_from_volume` fills the blank pages
+    from (#351), keyed by engine name, and the one place that decides
+    which documents those are: the glued volume run of every engine of
+    ``opinion_ocr.ENGINES`` but the primary, so a volume nobody read
+    with an engine has no entry for it.
+
+    A document that does not load is logged and left out, never
+    raised: the primary read is what opens review 1, and an optional
+    engine must not hold a volume out of it. The fallback is read
+    again on the next apply, which the engine's glue asks for
+    (``dots_mocr.reopen_apply_after_read``) and ``reapply_page_numbers``
+    asks for by hand.
+
+    :param scan: The scan.
+    :returns: ``{engine name: document}``.
+    :rtype: dict[str, dict]
+    """
+    from scanning import s3_sync
+
+    documents = {}
+    for name, spec in engines().items():
+        if name == PRIMARY_ENGINE:
+            continue
+        key = spec.module.glued_volume_key(scan)
+        if not key:
+            continue
+        try:
+            documents[name] = s3_sync.download_json_object(key)
+        except Exception:
+            logger.exception(
+                "scan %s: the %s volume document at %s did not load; the "
+                "page numbers are read without it",
+                scan.pk,
+                name,
+                key,
+            )
+    return documents
+
+
+def is_model_zone(zone: str | None) -> bool:
+    """Return whether a ``zone`` was stamped by an engine of the table.
+
+    What tells a new-pipeline reading from a legacy PaddleOCR one
+    (``services.has_legacy_ocr``): every engine stamps its own prefix
+    (``opinion_ocr.EngineSpec.zone_prefix``) in front of the band.
+
+    :param zone: The ``zone`` of one ``ocr_results`` entry.
+    :returns: Whether an engine of ``opinion_ocr.ENGINES`` wrote it.
+    :rtype: bool
+    """
+    return any(
+        (zone or "").startswith(spec.zone_prefix)
+        for spec in engines().values()
+    )
 
 
 def pages_without_number(scan) -> list[int]:
