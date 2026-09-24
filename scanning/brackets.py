@@ -159,7 +159,9 @@ def strip_line_tokens(text: str) -> tuple[str, list[str]]:
 
     A match whose numbers :func:`expand` refuses stays, so ``[120]``, a
     printed page number, is not deleted. The white space before the
-    token and every newline stay; the white space after it goes.
+    token stays and the white space after it goes. A token that fills
+    its line takes the whole line with it, one newline included, so
+    ``[3]\\nText`` gives ``Text`` and no empty line.
 
     :param text: One unit's text, as the engine wrote it.
     :returns: ``(the text, the tokens deleted)``, each token as the
@@ -169,18 +171,25 @@ def strip_line_tokens(text: str) -> tuple[str, list[str]]:
     """
     parts: list[str] = []
     removed: list[str] = []
-    end = 0
+    kept = 0
     for match in LINE_TOKEN.finditer(text):
         if not expand(match):
             continue
         whole = match.group(0)
         start = match.start() + len(whole) - len(whole.lstrip(" \t"))
-        parts.append(text[end:start])
-        removed.append(whole.strip(" \t"))
         end = match.end()
+        if end == len(text) or text[end] == "\n":
+            start = match.start()
+            if end < len(text):
+                end += 1
+            elif start > kept and text[start - 1] == "\n":
+                start -= 1
+        parts.append(text[kept:start])
+        removed.append(whole.strip(" \t"))
+        kept = end
     if not removed:
         return text, []
-    parts.append(text[end:])
+    parts.append(text[kept:])
     return "".join(parts), removed
 
 

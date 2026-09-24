@@ -1977,6 +1977,42 @@ class TestTheBracketToken(OpinionOcrTestCase):
 
         self.assertEqual(unit["exclusion"]["reason"], "redaction")
         self.assertEqual(unit["exclusion"]["rect_type"], "manual")
+        self.assertEqual(unit["text"], "[1] The court held.")
+
+    def test_a_curator_s_box_inside_the_line_keeps_the_bracket(self):
+        """A box over a word, 108 pt from the left edge of the unit."""
+        self.body_a(2, "[1] The court held.")
+        self.bracket(
+            2, box=(400, 305, 435, 330), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_curator_s_box_wider_than_a_bracket_keeps_it(self):
+        """61.2 pt wide, a tenth of nothing: no deletion, no exclusion."""
+        self.body_a(2, "[1] The court held.")
+        self.bracket(
+            2, box=(105, 305, 275, 330), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_curator_s_box_taller_than_a_bracket_keeps_it(self):
+        """21.2 pt high."""
+        self.body_a(2, "[1] The court held.")
+        self.bracket(
+            2, box=(105, 305, 140, 364), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
 
     def test_the_label_of_the_unit_does_not_matter(self):
         self.body_a(2, "[2] An accused is entitled", category="List-item")
@@ -2023,3 +2059,45 @@ class TestTheBracketToken(OpinionOcrTestCase):
 
         self.assertEqual(unit["exclusion"]["rect_type"], "headnote")
         self.assertEqual(unit["text"], "The court held.")
+
+
+class TestTheBracketBox(TestCase):
+    """``opinion_ocr.is_bracket_box`` on its limits (#373)."""
+
+    #: A unit, in points.
+    UNIT = [36.0, 108.0, 288.0, 324.0]
+
+    @staticmethod
+    def rect(x0, y0, x1, y1, rect_type=Redaction.MANUAL_TYPE):
+        return {"rect_type": rect_type, "x0": x0, "y0": y0, "x1": x1, "y1": y1}
+
+    def check(self, *args, **kwargs):
+        return opinion_ocr.is_bracket_box(
+            self.rect(*args, **kwargs), self.UNIT
+        )
+
+    def test_a_manual_box_on_each_limit_counts(self):
+        self.assertTrue(self.check(36.0, 110.0, 96.0, 130.0))
+        self.assertTrue(self.check(56.0, 110.0, 70.0, 120.0))
+        self.assertTrue(self.check(16.0, 110.0, 40.0, 120.0))
+
+    def test_a_manual_box_past_a_limit_does_not(self):
+        self.assertFalse(self.check(36.0, 110.0, 96.1, 120.0))
+        self.assertFalse(self.check(36.0, 110.0, 50.0, 130.1))
+        self.assertFalse(self.check(56.1, 110.0, 70.0, 120.0))
+
+    def test_a_bracket_box_counts_at_any_size(self):
+        self.assertTrue(
+            self.check(36.0, 108.0, 288.0, 324.0, rect_type="HEADNOTE_BRACKET")
+        )
+
+    def test_a_box_that_does_not_touch_the_unit_does_not(self):
+        self.assertFalse(
+            self.check(36.0, 400.0, 50.0, 410.0, rect_type="HEADNOTE_BRACKET")
+        )
+        self.assertFalse(self.check(36.0, 400.0, 50.0, 410.0))
+
+    def test_another_type_never_counts(self):
+        self.assertFalse(
+            self.check(36.0, 110.0, 50.0, 120.0, rect_type="headnote")
+        )

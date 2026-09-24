@@ -503,3 +503,12 @@ class TestTheLineTokens(ScanningTestCase):
 
     def test_the_bracket_alone_leaves_an_empty_text(self):
         self.assertEqual(self.strip("[3]"), ("", ["[3]"]))
+
+    def test_a_bracket_that_fills_its_line_takes_the_newline(self):
+        self.assertEqual(self.strip("[3]\nText"), ("Text", ["[3]"]))
+        self.assertEqual(
+            self.strip("II\n[4, 5]\nThe court"), ("II\nThe court", ["[4, 5]"])
+        )
+
+    def test_a_bracket_on_the_last_line_takes_the_newline_before(self):
+        self.assertEqual(self.strip("Text\n[3]"), ("Text", ["[3]"]))

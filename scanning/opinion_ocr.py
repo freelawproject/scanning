@@ -44,12 +44,12 @@ inside a paragraph, so a share over it answers wrong both ways: about
 a hundredth of a paragraph, and the text keeps ``[1]``; a tenth of a
 short line, and the ensemble drops the words beside it. So a
 ``HEADNOTE_BRACKET`` box never goes into :func:`verdict`, and a unit
-that one of :data:`TOKEN_RECT_TYPES` intersects loses the bracket at
-the start of each of its lines (``brackets.strip_line_tokens``), in
+that a bracket box touches (:func:`is_bracket_box`) loses the bracket
+at the start of each of its lines (``brackets.strip_line_tokens``), in
 every engine and whatever its label. The unit names the tokens it lost
 in ``removed``. The redactions decide the text as they decide the PDF:
-a bracket the model did not box stays in both, and the
-``MISSING_HEADNOTE_BRACKET`` card of #328 asks a curator for the box.
+a bracket the model did not box stays in both until a curator boxes
+it, one of the two ways :data:`TOKEN_RECT_TYPES` names.
 
 **A unit nobody could measure is not clean text.** A unit with no box,
 or on a page whose size no detection and no render gives, carries the
@@ -151,12 +151,38 @@ logger = logging.getLogger(__name__)
 #: unit text (#373).
 SCHEMA_VERSION = 3
 
-#: The redaction types whose box deletes the bracket token of the unit
-#: it intersects (#373): the model's bracket box, and the box a curator
-#: draws over a bracket the model missed, which the
-#: ``MISSING_HEADNOTE_BRACKET`` card asks for. A ``manual`` box is also
-#: measured by :func:`verdict`, because it can be over anything.
+#: The redaction types whose box can delete the bracket token of the
+#: unit it touches (#373). A curator fixes a bracket the model missed
+#: in one of two ways, and both count:
+#:
+#: - a ``HEADNOTE_BRACKET`` detection, then a recompute, which writes a
+#:   ``HEADNOTE_BRACKET`` redaction, the type of the model's own box.
+#:   It also closes the ``MISSING_HEADNOTE_BRACKET`` card of #328,
+#:   which reads the detections;
+#: - a plain redaction, which the card does not see. Its type,
+#:   ``manual``, is the type of every box a curator draws, over a name
+#:   or over anything, so it counts only with the size and the place of
+#:   a bracket (:func:`is_bracket_box`), and :func:`verdict` still
+#:   measures it.
+#:
+#: A ``HEADNOTE_BRACKET`` box never excludes a unit, whatever its size.
+#: So a bracket box the model draws over a whole paragraph blacks out
+#: the PDF, and the text keeps the words; the survey of #373 found
+#: none. A guard on the share would bring back the lost paragraph: one
+#: engine can read the bracket as a unit alone, and the ensemble drops
+#: the whole group when one engine excludes a unit.
 TOKEN_RECT_TYPES = frozenset({brackets.BRACKET_LABEL, Redaction.MANUAL_TYPE})
+
+#: The size and the place a plain curator redaction must have to count
+#: as a bracket box, in points. The model's 981 bracket boxes of scans
+#: 2845, 1828 and 1841 are 13 to 48 wide, 10 to 14 high, and start 0.7
+#: to 14.4 from the left edge of their cell, where the bracket opens
+#: the line. A curator draws by hand, so each limit is larger than the
+#: largest model box. The indent is a distance either way: a box that
+#: starts left of the unit also counts.
+MANUAL_BRACKET_MAX_WIDTH_PT = 60.0
+MANUAL_BRACKET_MAX_HEIGHT_PT = 20.0
+MANUAL_BRACKET_MAX_INDENT_PT = 20.0
 
 #: The detection label of the footnote band of a page (#399).
 FOOTNOTE_LABEL = Label.FOOTNOTES.name
@@ -746,23 +772,45 @@ def covered_share(
     return best, hit
 
 
-def touches(box: list[float], rects: list[dict]) -> bool:
-    """Return whether one of ``rects`` shares any area with ``box``.
+def is_bracket_box(rect: dict, box: list[float]) -> bool:
+    """Return whether ``rect`` is a bracket box of the unit ``box`` (#373).
 
-    The test of the bracket deletion (#373): a bracket box is a glyph,
-    so the size of its share of the unit says nothing, and any overlap
-    is the unit it sits in.
+    A bracket box is a glyph, so the size of its share of the unit says
+    nothing: any overlap is the unit it sits in. A ``HEADNOTE_BRACKET``
+    rect needs the overlap alone. A ``manual`` rect also needs the size
+    and the place of a bracket (``MANUAL_BRACKET_MAX_*``), because a
+    curator draws that type over anything; see :data:`TOKEN_RECT_TYPES`.
 
-    :param box: ``[x0, y0, x1, y1]`` in points.
-    :param rects: Dicts with ``x0``, ``y0``, ``x1``, ``y1`` in points.
-    :returns: Whether a rect overlaps the box.
+    :param rect: A dict with ``rect_type``, ``x0``, ``y0``, ``x1`` and
+        ``y1``, in points.
+    :param box: The unit's ``[x0, y0, x1, y1]`` in points.
+    :returns: Whether the rect deletes the unit's bracket tokens.
     :rtype: bool
     """
-    for rect in rects:
-        other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
-        if other is not None and intersection(box, other) > 0:
-            return True
-    return False
+    kind = rect.get("rect_type")
+    if kind not in TOKEN_RECT_TYPES:
+        return False
+    other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
+    if other is None or intersection(box, other) <= 0:
+        return False
+    if kind == brackets.BRACKET_LABEL:
+        return True
+    return (
+        other[2] - other[0] <= MANUAL_BRACKET_MAX_WIDTH_PT
+        and other[3] - other[1] <= MANUAL_BRACKET_MAX_HEIGHT_PT
+        and abs(other[0] - box[0]) <= MANUAL_BRACKET_MAX_INDENT_PT
+    )
+
+
+def touches(box: list[float], rects: list[dict]) -> bool:
+    """Return whether one of ``rects`` is a bracket box of ``box``.
+
+    :param box: The unit's ``[x0, y0, x1, y1]`` in points.
+    :param rects: The page's rects of :data:`TOKEN_RECT_TYPES`.
+    :returns: Whether the unit loses its bracket tokens.
+    :rtype: bool
+    """
+    return any(is_bracket_box(rect, box) for rect in rects)
 
 
 def verdict(
