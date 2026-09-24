@@ -1236,14 +1236,17 @@ a.doc-name:hover { text-decoration: underline; }
     border-color: rgba(107, 114, 128, 0.7);
     background: rgba(107, 114, 128, 0.06);
 }
-.ensemble-box.weak {
-    border-style: dashed;
-}
 /* The section of a box (#399). The colour is the agreement, so the */
 /* section takes the border style, and the zone band shows the rule. */
 .ensemble-box[data-section="footnotes"] {
     border-style: double;
     border-width: 3px;
+}
+/* After the section rule, which has the same weight: the zone band */
+/* shows the section of a weak box, and nothing else shows the doubt. */
+.ensemble-box.weak {
+    border-style: dashed;
+    border-width: 1px;
 }
 .ensemble-zone {
     position: absolute;
@@ -1260,6 +1263,10 @@ a.doc-name:hover { text-decoration: underline; }
     border-color: #dc2626;
     border-width: 2px;
     background: rgba(220, 38, 38, 0.12);
+}
+/* A double border under 3px draws as one solid line. */
+.ensemble-box[data-section="footnotes"].ensemble-selected {
+    border-width: 3px;
 }
 
 .opinion-text-page {

@@ -392,7 +392,6 @@
         ((page.zones || {}).footnotes || []).forEach(function (box) {
             var zone = document.createElement('div');
             zone.className = 'ensemble-zone';
-            zone.title = 'The footnote zone of this page';
             placeOver(zone, box, scale);
             wrapper.appendChild(zone);
         });
@@ -1127,9 +1126,11 @@
         if (group.footnote_doubt) {
             // The group is in the body, because the zone alone decides
             // (#399). The engines named here are the document's own.
+            var labellers = group.footnote_by || [];
             parts.push(
-                (group.footnote_by || []).join(', ')
-                + ' call this a footnote; no footnote zone here'
+                labellers.join(', ')
+                + (labellers.length === 1 ? ' calls' : ' call')
+                + ' this a footnote; no footnote zone here'
             );
         }
         return parts.length ? '[' + parts.join('; ') + ']' : '';
@@ -1387,7 +1388,7 @@
         if (!summary || !doc) { return; }
         var counts = doc.counts || {};
         var footnotes = counts.footnote_groups
-            ? ', ' + counts.footnote_groups + ' footnote block(s)'
+            ? ', ' + counts.footnote_groups + ' of them footnotes'
             : '';
         summary.textContent = (
             '— ' + (doc.engines || []).join(', ') + ', ' +
