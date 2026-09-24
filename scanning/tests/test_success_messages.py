@@ -445,6 +445,10 @@ class TestDetectionMessages(DetectionEndpointMixin, ScanningTestCase):
         self.assertEqual(
             response.json()["message"], views_api.APPROVED_DETECTION_MESSAGE
         )
+        # The approval is a move by zero (#414): the answer names the
+        # hand-drawn row, and the viewer's entry follows it.
+        self.assertEqual(response.json()["replaced_id"], det.pk)
+        self.assertNotEqual(response.json()["detection_id"], det.pk)
 
 
 class TestBoundaryMessages(ScanningTestCase):

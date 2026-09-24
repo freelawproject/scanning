@@ -468,6 +468,27 @@ def move_model_row(
         )
 
 
+def approve_model_row(scan: Scan, row: Detection, user) -> Detection:
+    """Approve a model box: a move by zero (#414).
+
+    The curator keeps the box as the model drew it, so the two writes
+    are the move's (:func:`move_model_row`) at the row's own bbox: a
+    deactivation of the model row, and a hand-drawn row that names it
+    in ``replaces``. The hand-drawn row reads 1.0, carries no
+    ``found_by``, and survives every import; an ``APPROVE`` decision
+    survived only when the model drew the box again within
+    :data:`IOU_THRESHOLD`. That kind keeps its readers for the rows
+    that carry one, and has no writer now.
+
+    :param scan: The scan.
+    :param row: The model row (never a hand-drawn one; the view answers
+        that case without a write).
+    :param user: The curator.
+    :returns: The hand-drawn row that now holds the box.
+    """
+    return move_model_row(scan, row, [row.x0, row.y0, row.x1, row.y1], user)
+
+
 # ---------------------------------------------------------------------------
 # The resolution after an import
 # ---------------------------------------------------------------------------

@@ -374,10 +374,14 @@ function approveDetection(btn) {
             // renders every page and takes the volume out of review,
             // and re-pairing on request is off for now. The view says
             // what the edit did and did not change (#322): the
-            // approval raises the confidence the next pairing reads,
-            // and the card stays (its chip reads 1.0 and loses the
-            // check mark) until that pairing runs. The section is
-            // fetched again (#240 PR D).
+            // approval makes the box the curator's own (#414), which
+            // the next pairing reads at 1.0, and the card stays (its
+            // chip reads 1.0 and loses the check mark) until that
+            // pairing runs. The page's box follows the row that holds
+            // it now, and the section is fetched again (#240 PR D).
+            if (window.adoptDetection) {
+                window.adoptDetection(data.replaced_id, data.detection_id);
+            }
             showSaved(data);
             refreshFindings();
         })

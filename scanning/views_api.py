@@ -159,13 +159,16 @@ STANDING_DETECTION_MESSAGE = "The box is there already."
 OWN_DETECTION_MESSAGE = (
     "This box is your own, so it needs no approval: it reads 1.0 already."
 )
+#: An approval is a move by zero (#414): the box is the curator's own
+#: from here on, and a new import keeps it.
 APPROVED_DETECTION_MESSAGE = (
-    "The detection was approved: the box reads 1.0 now. The card stays "
-    "until the opinions are paired again."
+    "The detection was approved: the box is your own now and reads 1.0. "
+    "A new import keeps it. The card stays until the opinions are paired "
+    "again."
 )
 APPROVED_BRACKET_MESSAGE = (
-    "The bracket was approved: the box reads 1.0 now, and the next "
-    "compute redacts it."
+    "The bracket was approved: the box is your own now and reads 1.0. "
+    "A new import keeps it, and the next compute redacts it."
 )
 DISMISSED_DETECTION_MESSAGE = (
     "The detection was dismissed. Nothing was deleted."
@@ -311,8 +314,9 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
             # reviewer draws the box, so until it came from here a
             # hand-added box lost both on the next page load (PR #167).
             "manual": d.model_name == Detection.ModelName.MANUAL,
-            # The standing curator decision on a model row (#240):
-            # "approve" here is why the confidence reads 1.0.
+            # The standing curator decision on a model row (#240). An
+            # "approve" is a row written before #414; since then an
+            # approval is a hand-drawn row (``manual``) over a dismiss.
             "decision": d.decision.kind if d.decision_id else None,
         }
         for d in dets
@@ -1801,14 +1805,14 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
     )
     if near is not None:
         message = STANDING_DETECTION_MESSAGE
+        holder = near
         if near.model_name != Detection.ModelName.MANUAL:
-            message = APPROVED_DETECTION_MESSAGE
-            # No run passed: ``decide`` resolves one only for a row with
-            # no address, so the common case costs no ledger read.
+            # A box drawn over a model box approves it (#414): the
+            # model row gets a dismiss and the curator a hand-drawn row
+            # at the same box, and ``detection_id`` names that row.
+            message = _approval_message(near, manual=False)
             try:
-                detections.decide(
-                    scan, near, DetectionDecision.Kind.APPROVE, request.user
-                )
+                holder = detections.approve_model_row(scan, near, request.user)
             except detections.UnaddressableDetection:
                 return _unaddressable()
         _rebuild_findings(scan)
@@ -1816,7 +1820,8 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
             {
                 "status": "ok",
                 "added": False,
-                "detection_id": near.pk,
+                "detection_id": holder.pk,
+                "replaced_id": near.pk,
                 "message": message,
             }
         )
@@ -1853,9 +1858,9 @@ def _approval_message(row: Detection, manual: bool) -> str:
     """Return what an approval of ``row`` changed, for the viewer (#322).
 
     A bracket box is approved from its ``low_confidence_headnote_bracket``
-    card (#410): the 1.0 lifts it over the redaction gate, so the card
-    goes now and the next compute redacts it. Every other approval waits
-    for the next pairing.
+    card (#410): the hand-drawn row reads 1.0, over the redaction gate,
+    so the card goes now and the next compute redacts it. Every other
+    approval waits for the next pairing.
     """
     from blackletter.models import Label
 
@@ -1869,18 +1874,22 @@ def _approval_message(row: Detection, manual: bool) -> str:
 @login_required
 @require_POST
 def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
-    """Approve a detection: its confidence reads 1.0 from now on.
+    """Approve a detection: the box becomes the curator's own.
 
-    A model row gets an ``approve`` decision (#240), which the next
-    import lands on the same box again. A hand-drawn row is the
-    curator's already and needs none, and the message says so (#322):
-    this view writes nothing for one.
+    An approval is a move by zero (#414, ``detections.approve_model_row``):
+    the model row gets a dismiss, and a hand-drawn row at the same box
+    reads 1.0 and survives every import. The response names that row,
+    and the viewer addresses it from then on, as after a move. A
+    hand-drawn row is the curator's already and needs none, and the
+    message says so (#322): this view writes nothing for one.
 
     :param request: The HTTP request (JSON body with ``detection_id``
         (int, DB pk)).
     :param pk: Scan primary key.
-    :return: JSON response with ``updated`` count and the ``message``
-        the viewer shows (#322), or 404 if not found.
+    :return: JSON response with ``updated`` count, ``detection_id`` of
+        the row that holds the box now, ``replaced_id`` of the row the
+        request named and the ``message`` the viewer shows (#322), or
+        404 if not found.
     """
     from scanning import detections
 
@@ -1896,11 +1905,10 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
             {"status": "error", "message": "Detection not found"}, status=404
         )
     manual = row.model_name == Detection.ModelName.MANUAL
+    holder = row
     if not manual:
         try:
-            detections.decide(
-                scan, row, DetectionDecision.Kind.APPROVE, request.user
-            )
+            holder = detections.approve_model_row(scan, row, request.user)
         except detections.UnaddressableDetection:
             return _unaddressable()
     _rebuild_findings(scan)
@@ -1908,6 +1916,8 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
         {
             "status": "ok",
             "updated": 1,
+            "detection_id": holder.pk,
+            "replaced_id": row.pk,
             "message": _approval_message(row, manual),
         }
     )
