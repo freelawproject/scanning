@@ -2150,11 +2150,66 @@ def _glue_ocr(
         if not s3_sync.upload_json_object(ocr_key, document):
             raise ApplyError("could not upload the final OCR volume")
 
-    printed = printed_pages(scan, run, document)
+    printed = printed_pages(
+        scan, run, document, _final_fallbacks(scan, page_map)
+    )
     printed_key = f"{prefix}printed_pages.json"
     if not s3_sync.upload_json_object(printed_key, printed):
         raise ApplyError("could not upload the printed pages")
     return ocr_key, printed_key
+
+
+def _final_fallbacks(scan: Scan, page_map: dict) -> dict[str, dict]:
+    """Project the other engines' volume documents into the final space.
+
+    The pages of a corrected volume that the other engines fill in
+    (#351, ``page_numbers.fallback_documents``). Their volume documents
+    are in the original's page space, like dots.mocr's, so the same
+    walk renumbers them (:func:`walk_final_pages`), with no result for
+    an edited page: that page is the curator's own upload, which
+    carries its label, or a page dots.mocr read again on its own.
+
+    The corrected volume's own Mistral and Surya documents
+    (``ApplyRun.extract_key``, ``ApplyRun.surya_key``) are not read
+    here: the tick writes them after this glue, and a printed-page map
+    that waited for them would hold a volume nobody read with them.
+    The review-1 reading was filled from these same volume documents,
+    so the map agrees with what the reviewer approved.
+
+    A document the walk refuses is logged and left out: it fills no
+    page, and the map is still written.
+
+    :param scan: The scan.
+    :param page_map: The run's stored map.
+    :returns: ``{engine name: document}``, pages in the final space.
+    :rtype: dict[str, dict]
+    """
+    from scanning import page_numbers
+
+    projected = {}
+    for name, volume in page_numbers.fallback_documents(scan).items():
+        pages = volume.get("pages") if isinstance(volume, dict) else None
+        if not isinstance(pages, list):
+            continue
+        try:
+            walked = walk_final_pages(
+                page_map,
+                pages,
+                {},
+                missing={},
+                error_cls=ApplyError,
+                what=f"the {name} volume document",
+            )
+        except ApplyError as exc:
+            logger.warning(
+                "apply: scan %s: %s; its page numbers fill no page of "
+                "the printed-page map",
+                scan.pk,
+                exc,
+            )
+            continue
+        projected[name] = {**volume, "pages": walked}
+    return projected
 
 
 def _repair_edit_pages(
@@ -2207,21 +2262,29 @@ def _repair_edit_pages(
         )
 
 
-def printed_pages(scan: Scan, run: ApplyRun, document: dict) -> dict:
+def printed_pages(
+    scan: Scan,
+    run: ApplyRun,
+    document: dict,
+    fallbacks: dict[str, dict] | None = None,
+) -> dict:
     """Return the frozen printed-page map, in the final page space.
 
     The glued read, through the same reading as review 1
-    (``page_numbers.ocr_results_from_volume``), overlaid with the
-    curator's decisions: a ``SET_NUMBER`` row lands on the slot its
-    original page holds (a replaced or rotated page included), and an
-    inserted page carries the label its row was uploaded under. The
-    curator outranks the model. Citations use printed pages, so this
-    map is a product of the apply, not review scaffolding.
+    (``page_numbers.ocr_results_from_volume``, the other engines'
+    documents filling the blanks, #351), overlaid with the curator's
+    decisions: a ``SET_NUMBER`` row lands on the slot its original
+    page holds (a replaced or rotated page included), and an inserted
+    page carries the label its row was uploaded under. The curator
+    outranks the model. Citations use printed pages, so this map is a
+    product of the apply, not review scaffolding.
 
     :param scan: The scan.
     :param run: The built run.
     :param document: The final OCR volume, or the volume's own when the
         run aliases it.
+    :param fallbacks: The other engines' documents in the same page
+        space (:func:`_final_fallbacks`), or None.
     :returns: ``pages`` of ``final_page``, ``printed``, ``type``,
         ``by`` (``model``, ``curator`` or None) and ``source``.
     :rtype: dict
@@ -2229,7 +2292,7 @@ def printed_pages(scan: Scan, run: ApplyRun, document: dict) -> dict:
     from scanning import page_numbers
 
     page_map = run.page_map
-    results = page_numbers.ocr_results_from_volume(document)
+    results = page_numbers.ocr_results_from_volume(document, fallbacks)
     by_final = {entry["pdf_page"]: entry for entry in results}
     pages = []
     for entry in page_map["pages"]:

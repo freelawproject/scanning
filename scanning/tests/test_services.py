@@ -2310,6 +2310,91 @@ class TestRunComputeIssues(TestCase):
         self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
         self.assertFalse(scan.issues.exists())
 
+    def _mistral_run(self, scan):
+        """Glue a Mistral volume run for ``scan``, on paper.
+
+        :param scan: The scan.
+        :returns: The key of its glued document.
+        """
+        from scanning import mistral_ocr
+        from scanning.models import ExternalJob, JobStatus
+        from scanning.tests.test_jobs import make_manifest
+
+        rows = mistral_ocr.ensure_extract_jobs(scan, make_manifest(1, 2))
+        ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
+            status=JobStatus.CONSUMED
+        )
+        return mistral_ocr.glued_volume_key(scan)
+
+    def test_another_engine_s_document_fills_the_blank_pages(self):
+        """The fallback of #351: page 2 has no dots.mocr number, and
+        the glued Mistral document has one."""
+        from scanning import services
+        from scanning.tests.test_page_numbers import (
+            mistral_block,
+            mistral_document,
+        )
+
+        scan = self._make_scan()
+        mistral_key = self._mistral_run(scan)
+        documents = {
+            "jobs/x/r1-volume.json": self._document(["1", None]),
+            mistral_key: mistral_document({2: [mistral_block("2")]}),
+        }
+
+        with patch(
+            "scanning.s3_sync.download_json_object",
+            side_effect=lambda key: documents[key],
+        ) as download:
+            done = services.run_compute_issues(scan, "jobs/x/r1-volume.json")
+
+        self.assertTrue(done)
+        self.assertEqual(
+            [key for (key,), _ in download.call_args_list],
+            ["jobs/x/r1-volume.json", mistral_key],
+        )
+        scan.refresh_from_db()
+        self.assertEqual(
+            [
+                (r["pdf_page"], r["detected"], r["zone"])
+                for r in scan.ocr_results
+            ],
+            [(1, "1", "dots-header"), (2, "2", "mistral-header")],
+        )
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+
+    def test_a_fallback_that_does_not_load_is_left_out(self):
+        """An optional engine never holds a volume out of review 1."""
+        from scanning import services
+
+        scan = self._make_scan()
+        mistral_key = self._mistral_run(scan)
+
+        def download(key):
+            if key == mistral_key:
+                raise RuntimeError("boom")
+            return self._document(["1", None])
+
+        with patch(
+            "scanning.s3_sync.download_json_object", side_effect=download
+        ):
+            with self.assertLogs("scanning.page_numbers", level="ERROR"):
+                done = services.run_compute_issues(
+                    scan, "jobs/x/r1-volume.json"
+                )
+
+        self.assertTrue(done)
+        scan.refresh_from_db()
+        self.assertEqual(
+            [(r["pdf_page"], r["detected"]) for r in scan.ocr_results],
+            [(1, "1"), (2, None)],
+        )
+        self.assertEqual(
+            scan.status, Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT, DEVELOPMENT=True)
 class TestFullPipelineConvertBranches(TestCase):

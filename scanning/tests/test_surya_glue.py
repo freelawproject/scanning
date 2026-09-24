@@ -21,9 +21,9 @@ from unittest.mock import patch
 
 from django.test import TestCase
 
-from scanning import surya
+from scanning import dots_mocr, surya
 from scanning.factories import ScanFactory
-from scanning.models import ExternalJob, JobStatus, Status
+from scanning.models import ExternalJob, JobStatus, Scan, Status
 from scanning.tests.test_jobs import make_manifest
 
 
@@ -547,6 +547,29 @@ class TestFinishReadyRuns(SuryaRunMixin, TestCase):
 
         self.assertEqual(surya.finish_ready_runs(), 1)
         self.assertEqual(surya.finish_ready_runs(), 0)
+
+    def test_a_glued_run_hands_the_page_numbers_back(self):
+        """The hand-back of #351, the twin of the Mistral glue's: a
+        volume in review 1 whose dots.mocr run applied is read again."""
+        scan, _rows = self.build(shard_count=1, pages_per_shard=1)
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
+        )
+        rows = dots_mocr.ensure_analyze_jobs(scan, make_manifest(1, 1))
+        ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
+            status=JobStatus.CONSUMED
+        )
+        dots_mocr._write_apply_state(
+            dots_mocr.live_analyze_jobs(scan), {"applied_at": "2026-09-23"}
+        )
+
+        with self.assertLogs("scanning.dots_mocr", level="INFO") as logs:
+            self.assertEqual(surya.finish_ready_runs(), 1)
+
+        self.assertEqual(
+            dots_mocr._apply_state(dots_mocr.live_analyze_jobs(scan)), {}
+        )
+        self.assertIn("surya volume is glued", logs.output[-1])
 
     def test_the_pass_writes_no_scan_status(self):
         scan, _rows = self.build(shard_count=1, pages_per_shard=1)

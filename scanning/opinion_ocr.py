@@ -220,6 +220,16 @@ class EngineSpec:
     :param owed_rows: Returns the rows that say a read of this engine
         is on its way for a scan and run: a live volume run, or the
         rows of the run's own edited pages.
+    :param band_labels: The engine's own names for a running head and
+        a footer, each mapped to ``"header"`` or ``"footer"``. The
+        page-number reader (``page_numbers``, #351) walks every
+        engine's document with them, so a label the engine spells
+        differently is one entry here and no code.
+    :param zone_prefix: What the reader stamps in front of the band on
+        the ``zone`` of an ``ocr_results`` entry it read off this
+        engine (``dots-header``), so a person sees which engine read
+        the number and ``services.has_legacy_ocr`` tells a model read
+        from a legacy one.
     :param footnote_types: The values of ``type_key`` this engine
         writes on a footnote (#399), in the engine's own spelling.
         Measured on the corpus, they are exact and rare: a footnote
@@ -236,6 +246,8 @@ class EngineSpec:
     frame: Callable[[dict, dict], tuple[float, float] | None]
     module: object
     owed_rows: Callable[[Scan, object], list]
+    band_labels: dict[str, str]
+    zone_prefix: str
     footnote_types: frozenset[str] = frozenset()
 
     def document_key(self, run) -> str:
@@ -328,6 +340,8 @@ ENGINES: dict[str, EngineSpec] = {
         frame=_page_frame,
         module=dots_mocr,
         owed_rows=lambda scan, run: dots_mocr.live_analyze_jobs(scan),
+        band_labels={"Page-header": "header", "Page-footer": "footer"},
+        zone_prefix="dots-",
         footnote_types=frozenset({"Footnote"}),
     ),
     "mistral_ocr": EngineSpec(
@@ -339,6 +353,11 @@ ENGINES: dict[str, EngineSpec] = {
         frame=_mistral_frame,
         module=mistral_ocr,
         owed_rows=functools.partial(_extract_owed_rows, mistral_ocr),
+        # ``footer`` is not a band label: it holds footnote text on the
+        # pages measured (#399), so a block at the foot of a Mistral
+        # page is judged by its band alone (#351).
+        band_labels={"header": "header"},
+        zone_prefix="mistral-",
         # Lowercase, as the harvest stores them. ``footer`` holds
         # footnote text on these pages; the running foot is ``header``.
         footnote_types=frozenset({"references", "footer", "aside_text"}),
@@ -355,6 +374,8 @@ ENGINES: dict[str, EngineSpec] = {
         frame=_page_frame,
         module=surya,
         owed_rows=functools.partial(_extract_owed_rows, surya),
+        band_labels={"PageHeader": "header", "PageFooter": "footer"},
+        zone_prefix="surya-",
         # ``ListGroup`` is not here: it names a real list as often.
         footnote_types=frozenset({"Footnote", "Bibliography"}),
     ),

@@ -1025,3 +1025,38 @@ def reopen_apply(scan, dry_run: bool = False) -> bool:
     if not dry_run:
         _write_apply_state(rows, {})
     return True
+
+
+def reopen_apply_after_read(scan, engine: str) -> bool:
+    """Read the page numbers again once another engine's volume is glued.
+
+    The hand-back of #351, called by the Mistral and the Surya volume
+    glues after they consume a run. The apply fills the pages dots.mocr
+    left blank from those documents (``page_numbers.fallback_documents``),
+    but it ran when the dots.mocr run was glued, and a person starts
+    the other engines later than that. So a volume in review 1 is
+    handed back to the pass, which reads the stored documents again on
+    the next tick: no GPU time, no new run, and the numbers a curator
+    typed survive (:func:`reopen_apply`).
+
+    A volume outside ``APPLY_STATUSES`` is left alone: its review 1 is
+    over, and nothing may rewrite the numbers a person approved. A
+    volume whose dots.mocr run has not applied yet needs no hand-back,
+    because the apply that is still to come reads the new document.
+
+    :param scan: The scan whose other engine's run was just glued.
+    :param engine: That engine's name, for the log line.
+    :returns: Whether an applied run was handed back.
+    :rtype: bool
+    """
+    if scan.status not in APPLY_STATUSES:
+        return False
+    if not reopen_apply(scan):
+        return False
+    logger.info(
+        "scan %s: the %s volume is glued; the page numbers are read "
+        "again on the next tick",
+        scan.pk,
+        engine,
+    )
+    return True

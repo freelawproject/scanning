@@ -66,7 +66,9 @@ It joins the stored per-shard results of any scan whose Mistral rows
 are all ``COMPLETED`` into one volume JSON on S3 and flips the rows to
 ``CONSUMED`` (#245). Like the other two glues it writes no scan status
 and keeps the results: the glue is where every transform runs, so a
-better transform is a re-glue at no API cost.
+better transform is a re-glue at no API cost. A glued run hands a
+volume still in review 1 back to pass 4, so its document fills the page
+numbers dots.mocr left blank on the next tick (#351).
 
 **9. ``mistral_ocr.finish_ready_applies()`` reads the edited pages.**
 For a scan whose Mistral volume run is glued and whose corrected
@@ -81,8 +83,8 @@ review state reads its output.
 joins the stored per-shard results of any scan whose Surya rows are all
 ``COMPLETED`` into one volume JSON on S3 and flips the rows to
 ``CONSUMED`` (#368). The twin of pass 8, engine for engine: no scan
-status, the results kept, and the glue as the one transform of a
-result.
+status, the results kept, the glue as the one transform of a result,
+and the hand-back to pass 4 (#351).
 
 **11. ``surya.finish_ready_applies()`` reads the edited pages.** The
 twin of pass 9 for Surya (#368): for a scan whose Surya volume run is
