@@ -15,6 +15,13 @@ the viewer would take that away, and nothing on the page would say so.
 **A class with no rule draws nothing.** The viewer writes the marks as
 spans. A class the stylesheet does not name leaves the words plain,
 and the panel looks like a panel with no difference in it.
+
+**The section is the group's own (#399).** The ensemble writes the body
+groups of a page before its footnote groups, so a viewer that split
+the page by position would look right on every page of today's
+documents and go wrong in silence the day the order changes. The page
+column draws the footnote zones beside the boxes, and a zone left
+over from an older scale is a band in the wrong place.
 """
 
 import pathlib
@@ -22,7 +29,7 @@ import re
 
 from django.test import SimpleTestCase
 
-from scanning import opinion_ocr
+from scanning import ensemble, opinion_ocr
 
 STATIC = pathlib.Path(__file__).resolve().parent.parent / "static" / "scanning"
 VIEWER = STATIC / "viewer_step3.js"
@@ -87,9 +94,50 @@ class TestEveryPanelClassHasARule(SimpleTestCase):
         }
         self.assertIn("ensemble-diff", written, "the mark is gone")
         self.assertIn("ensemble-why", written, "the reason line is gone")
+        self.assertIn("ensemble-footnotes", written, "the block is gone")
+        self.assertIn("ensemble-zone", written, "the zone is gone")
         for name in sorted(written):
             self.assertIn(
                 f".{name}",
                 styles,
                 f"{name} has no rule in checker.css",
             )
+
+
+class TestTheSectionIsTheGroupsOwn(SimpleTestCase):
+    """The viewer splits a page by ``group.section`` (#399)."""
+
+    def test_the_viewer_spells_the_sections_of_the_ensemble(self):
+        """A renamed section would put every footnote in the body."""
+        source = VIEWER.read_text()
+        for name, value in (
+            ("BODY", ensemble.BODY),
+            ("FOOTNOTES", ensemble.FOOTNOTES),
+        ):
+            self.assertRegex(source, rf"var {name} = '{re.escape(value)}';")
+
+    def test_the_split_reads_the_group_and_not_the_page_text(self):
+        """The page's ``footnotes`` string is text, not a list of groups."""
+        source = VIEWER.read_text()
+        self.assertIn("group.section === FOOTNOTES", source)
+        self.assertNotRegex(source, r"\bpage\.footnotes\b")
+
+    def test_a_footnote_box_has_a_rule(self):
+        """The colour is the agreement, so the section needs its own rule."""
+        self.assertIn(
+            '.ensemble-box[data-section="footnotes"]', STYLES.read_text()
+        )
+
+
+class TestTheZonesGoWithTheBoxes(SimpleTestCase):
+    """Every removal of the boxes of a page removes its zones too."""
+
+    def test_no_removal_takes_the_boxes_alone(self):
+        """A zone of an older scale would stay on the page."""
+        source = VIEWER.read_text()
+        self.assertNotRegex(
+            source,
+            r"querySelectorAll\(\s*'\.ensemble-box'\s*\)\s*"
+            r"\.forEach\(function \(el\) \{\s*el\.remove",
+        )
+        self.assertIn("'.ensemble-box, .ensemble-zone'", source)

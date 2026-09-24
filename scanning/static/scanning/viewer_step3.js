@@ -33,6 +33,11 @@
  *
  * The link between the columns is the group id. A text node carries
  * ``data-page`` and ``data-group``; so does its box.
+ *
+ * A group says its section (#399), and the section is read off the
+ * group and never off its place in the list: a page shows its body
+ * text, then its footnotes in a block of their own, and the page
+ * draws its footnote zones under the boxes.
  */
 
 (function () {
@@ -59,6 +64,11 @@
     // because a whole page in one group would otherwise hold the
     // browser.
     var MAX_DIFF_WORDS = 1000;
+
+    // The two sections of a page (#399), the values of
+    // ``ensemble.BODY`` and ``ensemble.FOOTNOTES``.
+    var BODY = 'text';
+    var FOOTNOTES = 'footnotes';
 
     var root = null;
     var pagesColumn = null;
@@ -291,9 +301,7 @@
         var canvas = pageDiv.querySelector('.pdf-canvas');
         canvas.width = 0;
         canvas.height = 0;
-        pageDiv.querySelector('.canvas-wrapper')
-            .querySelectorAll('.ensemble-box')
-            .forEach(function (el) { el.remove(); });
+        clearOverlays(pageDiv.querySelector('.canvas-wrapper'));
         pageDiv.dataset.rendered = '';
         pageDiv.dataset.renderedScale = '';
     }
@@ -364,11 +372,13 @@
     }
 
     /**
-     * Draw the box of every group of one page.
+     * Draw the footnote zones and the box of every group of one page.
      *
      * A box is in the points of the volume page, and the opinion PDF
      * keeps the page size, so the scale of the render is the only
-     * conversion.
+     * conversion. The zones go in first, so every box is drawn over
+     * them. A zone is not a box: :func:`boxUnder` reads the boxes
+     * alone, so a zone never takes the hit test (#399).
      *
      * @param {HTMLElement} pageDiv - The container of the page.
      * @param {number} index - The 0-based page of the opinion.
@@ -376,11 +386,15 @@
      */
     function drawBoxes(pageDiv, index, scale) {
         var wrapper = pageDiv.querySelector('.canvas-wrapper');
-        wrapper.querySelectorAll('.ensemble-box').forEach(function (el) {
-            el.remove();
-        });
+        clearOverlays(wrapper);
         var page = pageOf(index);
         if (!page) { return; }
+        ((page.zones || {}).footnotes || []).forEach(function (box) {
+            var zone = document.createElement('div');
+            zone.className = 'ensemble-zone';
+            placeOver(zone, box, scale);
+            wrapper.appendChild(zone);
+        });
         (page.groups || []).forEach(function (group) {
             var box = group.box_pt;
             if (!box) { return; }
@@ -389,14 +403,52 @@
             el.dataset.page = String(index);
             el.dataset.group = String(group.id);
             el.dataset.agreement = group.agreement;
+            el.dataset.section = sectionOf(group);
             if (group.weak) { el.classList.add('weak'); }
-            el.style.left = (box[0] * scale) + 'px';
-            el.style.top = (box[1] * scale) + 'px';
-            el.style.width = ((box[2] - box[0]) * scale) + 'px';
-            el.style.height = ((box[3] - box[1]) * scale) + 'px';
+            if (group.footnote_doubt) { el.classList.add('ensemble-doubt'); }
+            placeOver(el, box, scale);
             wrapper.appendChild(el);
         });
         if (selected && selected.page === index) { paintSelection(); }
+    }
+
+    /**
+     * Remove every overlay of one page: the boxes and the zones.
+     *
+     * @param {HTMLElement} wrapper - The canvas wrapper of the page.
+     */
+    function clearOverlays(wrapper) {
+        wrapper.querySelectorAll('.ensemble-box, .ensemble-zone')
+            .forEach(function (el) { el.remove(); });
+    }
+
+    /**
+     * Put one element over a box of the page.
+     *
+     * @param {HTMLElement} el - The element.
+     * @param {number[]} box - ``[x0, y0, x1, y1]`` in points.
+     * @param {number} scale - The scale of the render.
+     */
+    function placeOver(el, box, scale) {
+        el.style.left = (box[0] * scale) + 'px';
+        el.style.top = (box[1] * scale) + 'px';
+        el.style.width = ((box[2] - box[0]) * scale) + 'px';
+        el.style.height = ((box[3] - box[1]) * scale) + 'px';
+    }
+
+    /**
+     * Return the section of one group: ``text`` or ``footnotes``.
+     *
+     * The group says it (``ensemble.section``, #399). The order of the
+     * groups is not the section, and a document written before the
+     * sections (schema 2) holds no ``section``, so its groups are body
+     * text, as they were.
+     *
+     * @param {Object} group - The group entry.
+     * @returns {string} The section.
+     */
+    function sectionOf(group) {
+        return group.section === FOOTNOTES ? FOOTNOTES : BODY;
     }
 
     /**
@@ -457,6 +509,12 @@
 
     /**
      * Build the text column from the document.
+     *
+     * A page shows its body text, then its footnotes in a block of
+     * their own (#399). Each group says its section, and the order of
+     * the groups does not: the split reads :func:`sectionOf` and never
+     * the page's ``footnotes`` string, which is the text and not the
+     * groups. A page with no footnote group has no block.
      */
     function drawText() {
         textColumn.textContent = '';
@@ -478,12 +536,41 @@
                     'opinion-text-error', 'No block of this page holds text.'
                 ));
             } else {
+                var footnotes = [];
                 page.groups.forEach(function (group) {
-                    block.appendChild(groupNode(page, group));
+                    if (sectionOf(group) === FOOTNOTES) {
+                        footnotes.push(group);
+                    } else {
+                        block.appendChild(groupNode(page, group));
+                    }
                 });
+                if (footnotes.length) {
+                    block.appendChild(footnoteBlock(page, footnotes));
+                }
             }
             textColumn.appendChild(block);
         });
+    }
+
+    /**
+     * Build the footnote block of one page.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object[]} groups - The footnote groups, in document order.
+     * @returns {HTMLElement} The block.
+     */
+    function footnoteBlock(page, groups) {
+        var block = document.createElement('div');
+        block.className = 'ensemble-footnotes';
+        var label = document.createElement('div');
+        label.className = 'ensemble-footnotes-label';
+        label.textContent = 'Footnotes';
+        label.title = 'The text under the footnote zone of this page.';
+        block.appendChild(label);
+        groups.forEach(function (group) {
+            block.appendChild(groupNode(page, group));
+        });
+        return block;
     }
 
     function note(className, text) {
@@ -512,6 +599,7 @@
         node.dataset.group = String(group.id);
         node.dataset.agreement = group.agreement;
         if (group.weak) { node.classList.add('weak'); }
+        if (group.footnote_doubt) { node.classList.add('ensemble-doubt'); }
 
         var tokens = (group.tokens || []).filter(function (token) {
             return token.text;
@@ -1035,6 +1123,16 @@
         if (group.weak) {
             parts.push('the boxes hardly meet');
         }
+        if (group.footnote_doubt) {
+            // The group is in the body, because the zone alone decides
+            // (#399). The engines named here are the document's own.
+            var labellers = group.footnote_by || [];
+            parts.push(
+                labellers.join(', ')
+                + (labellers.length === 1 ? ' calls' : ' call')
+                + ' this a footnote; no footnote zone here'
+            );
+        }
         return parts.length ? '[' + parts.join('; ') + ']' : '';
     }
 
@@ -1289,9 +1387,12 @@
         var summary = document.getElementById('ensemble-summary');
         if (!summary || !doc) { return; }
         var counts = doc.counts || {};
+        var footnotes = counts.footnote_groups
+            ? ', ' + counts.footnote_groups + ' of them footnotes'
+            : '';
         summary.textContent = (
             '— ' + (doc.engines || []).join(', ') + ', ' +
-            (counts.groups || 0) + ' block(s), ' +
+            (counts.groups || 0) + ' block(s)' + footnotes + ', ' +
             (counts.low_confidence || 0) + ' word(s) with no majority'
         );
     }
