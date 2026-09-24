@@ -6,7 +6,9 @@ start a run for every fingerprinted shard set that has none of theirs
 yet, so a new upload, a backlog from before the sweep and a volume
 uploaded while the stage was off all get their run, and the rows go out
 in the wave of the same tick. The rule is one run per shard set, ever:
-a dead run is not re-run by a tick.
+a dead run under the scan's own fingerprint is not re-run by a tick. A
+run from before the fingerprint column is adopted when it is whole, and
+replaced with a carry when a row of it is dead.
 
 Each provider counts its own in-flight rows against its own cap, so one
 saturated endpoint cannot starve another: doctor's ceiling is its replica

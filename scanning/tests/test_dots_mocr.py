@@ -1900,12 +1900,22 @@ class TestBarSaysWhenTheReadIsMissing(ScanningTestCase):
         )
         return response.json()["html"]
 
+    def _parked(self, **overrides):
+        # The fingerprint is what the sweep names a shard set by; the
+        # factory's blank default is the case the sweep skips.
+        fields = {
+            "page_count": 30,
+            "status": Status.AWAITING_VALIDATION,
+            "source_fingerprint": "3072:30",
+        }
+        return ScanFactory(**{**fields, **overrides})
+
     def test_a_parked_volume_says_the_read_is_coming_when_the_stage_is_on(
         self,
     ):
         from scanning.views_process import OCR_NOT_STARTED_MESSAGE
 
-        scan = ScanFactory(page_count=30, status=Status.AWAITING_VALIDATION)
+        scan = self._parked()
         with (
             override_settings(**DOTS),
             patch("scanning.s3_sync.s3_active", return_value=True),
@@ -1925,7 +1935,7 @@ class TestBarSaysWhenTheReadIsMissing(ScanningTestCase):
             OCR_REFUSED_MESSAGE,
         )
 
-        scan = ScanFactory(page_count=30, status=Status.AWAITING_VALIDATION)
+        scan = self._parked()
         reason = "The original PDF is not in the bucket."
         with (
             override_settings(**DOTS),
@@ -1938,6 +1948,29 @@ class TestBarSaysWhenTheReadIsMissing(ScanningTestCase):
             html = self._bar(scan)
         self.assertIn(OCR_REFUSED_MESSAGE.format(reason=reason), html)
         self.assertNotIn(OCR_NOT_STARTED_MESSAGE, html)
+
+    def test_a_volume_with_no_fingerprint_is_not_promised_a_read(self):
+        """The sweep skips a blank ``source_fingerprint`` for good, so
+        the bar names the re-queue instead of a read that never comes.
+        The manifest is not asked: the answer is on the row."""
+        from scanning.views_process import (
+            OCR_NO_FINGERPRINT_REASON,
+            OCR_NOT_STARTED_MESSAGE,
+            OCR_REFUSED_MESSAGE,
+        )
+
+        scan = self._parked(source_fingerprint="")
+        with (
+            override_settings(**DOTS),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.sharding.committed_manifest") as committed,
+        ):
+            html = self._bar(scan)
+        self.assertIn(
+            OCR_REFUSED_MESSAGE.format(reason=OCR_NO_FINGERPRINT_REASON), html
+        )
+        self.assertNotIn(OCR_NOT_STARTED_MESSAGE, html)
+        committed.assert_not_called()
 
     def test_a_parked_volume_says_so_when_the_stage_is_off(self):
         from scanning.views_process import OCR_UNAVAILABLE_MESSAGE

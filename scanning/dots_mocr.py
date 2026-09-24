@@ -230,11 +230,16 @@ def enqueue_missing_runs() -> int:
     tick right after it and before the wave, under the same rule: a
     scan whose current shard set (``Scan.source_fingerprint``) has no
     ANALYZE row at all, alive or dead, gets exactly one run, and a
-    dead run is a staff decision (``start_dots_mocr``,
-    ``reread_failed_pages``), not a tick. A run from before the
-    fingerprint column is blank, so it is a candidate; the creator
-    hands it back when it still describes today's set, and the sweep
-    stamps it rather than count it. The pipeline
+    dead run under that fingerprint is a staff decision
+    (``start_dots_mocr``, ``reread_failed_pages``), not a tick. A run
+    from before the fingerprint column is blank, so it is a candidate;
+    the creator hands it back when it still describes today's set and
+    holds no dead row, and the sweep stamps it rather than count it. A
+    blank run with a dead row is replaced with a carry, so its dead
+    shards are re-paid once by a tick, and the new run carries the
+    fingerprint, so a second death waits for a person. On the corpus
+    of 2026-09-24 that was 6 parked volumes; the other 681 candidates
+    were adopted at no cost. The pipeline
     (``services._can_analyze``) creates the rows for a new upload when
     the stage is configured; this catches up the volume it could not
     start. Without it a volume uploaded while the endpoint id or the

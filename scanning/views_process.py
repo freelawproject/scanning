@@ -265,6 +265,14 @@ OCR_REFUSED_MESSAGE = (
     "OCR missing: the server cannot start the read of this volume. "
     "{reason} Ask a staff member."
 )
+#: The reason of a volume with no ``source_fingerprint``: the sweep
+#: names a shard set by it, so a blank one is skipped for good, and
+#: only the pipeline (through an admin re-queue) stamps one.
+OCR_NO_FINGERPRINT_REASON = (
+    "This volume was sharded before the pipeline stamped fingerprints, "
+    "so the server cannot tell which shard set to read. Re-queue it so "
+    "the pipeline stamps one."
+)
 
 
 #: The step-2 warning when the run's printed pages could not be read
@@ -344,7 +352,10 @@ def ocr_missing(scan, summary: dict | None) -> str | None:
     PENDING_REVIEW, a queued one is the pipeline's, and an errored one
     has its own banner. Which line depends on whether this environment
     can start the read (``services.analyze_stage_open``) and, when it
-    can, on whether the sweep would take this volume: it asks
+    can, on whether the sweep would take this volume. The sweep names a
+    shard set by ``Scan.source_fingerprint`` and skips a blank one for
+    good, so that volume is told to ask for the admin re-queue, the
+    one path that stamps it. Otherwise it asks
     ``sharding.committed_manifest`` before it creates a run, and a
     refused set (a re-uploaded or missing original) is left alone until
     an admin re-queue re-cuts it. The sweep's memo of that refusal lives
@@ -362,6 +373,8 @@ def ocr_missing(scan, summary: dict | None) -> str | None:
         return None
     if not services.analyze_stage_open():
         return OCR_UNAVAILABLE_MESSAGE
+    if not scan.source_fingerprint:
+        return OCR_REFUSED_MESSAGE.format(reason=OCR_NO_FINGERPRINT_REASON)
     manifest, reason = sharding.committed_manifest(scan)
     if manifest is None:
         return OCR_REFUSED_MESSAGE.format(reason=reason)
