@@ -39,6 +39,18 @@ whose approved number the engines did not write keeps every unit: a
 header the model misread and a curator corrected, a curator's label
 on an inserted page, or no number at all.
 
+**A headnote bracket is the one deletion** (#373). Its box is a glyph
+inside a paragraph, so a share over it answers wrong both ways: about
+a hundredth of a paragraph, and the text keeps ``[1]``; a tenth of a
+short line, and the ensemble drops the words beside it. So a
+``HEADNOTE_BRACKET`` box never goes into :func:`verdict`, and a unit
+that a bracket box touches (:func:`is_bracket_box`) loses the bracket
+at the start of each of its lines (``brackets.strip_line_tokens``), in
+every engine and whatever its label. The unit names the tokens it lost
+in ``removed``. The redactions decide the text as they decide the PDF:
+a bracket the model did not box stays in both until a curator boxes
+it, one of the two ways :data:`TOKEN_RECT_TYPES` names.
+
 **A unit nobody could measure is not clean text.** A unit with no box,
 or on a page whose size no detection and no render gives, carries the
 third verdict :data:`UNJUDGED`, counts in ``unjudged`` on the page and
@@ -112,6 +124,7 @@ from django.utils import timezone
 from scanning import (
     apply,
     boundaries,
+    brackets,
     dots_mocr,
     mistral_ocr,
     page_numbers,
@@ -126,6 +139,7 @@ from scanning.models import (
     Detection,
     Opinion,
     OpinionReviewStatus,
+    Redaction,
     Scan,
     Status,
 )
@@ -133,8 +147,42 @@ from scanning.models import (
 logger = logging.getLogger(__name__)
 
 #: Version of the documents this module writes. 2 puts the footnote
-#: zone on every page (#399).
-SCHEMA_VERSION = 2
+#: zone on every page (#399); 3 deletes the headnote bracket from the
+#: unit text (#373).
+SCHEMA_VERSION = 3
+
+#: The redaction types whose box can delete the bracket token of the
+#: unit it touches (#373). A curator fixes a bracket the model missed
+#: in one of two ways, and both count:
+#:
+#: - a ``HEADNOTE_BRACKET`` detection, then a recompute, which writes a
+#:   ``HEADNOTE_BRACKET`` redaction, the type of the model's own box.
+#:   It also closes the ``MISSING_HEADNOTE_BRACKET`` card of #328,
+#:   which reads the detections;
+#: - a plain redaction, which the card does not see. Its type,
+#:   ``manual``, is the type of every box a curator draws, over a name
+#:   or over anything, so it counts only with the size and the place of
+#:   a bracket (:func:`is_bracket_box`), and :func:`verdict` still
+#:   measures it.
+#:
+#: A ``HEADNOTE_BRACKET`` box never excludes a unit, whatever its size.
+#: So a bracket box the model draws over a whole paragraph blacks out
+#: the PDF, and the text keeps the words; the survey of #373 found
+#: none. A guard on the share would bring back the lost paragraph: one
+#: engine can read the bracket as a unit alone, and the ensemble drops
+#: the whole group when one engine excludes a unit.
+TOKEN_RECT_TYPES = frozenset({brackets.BRACKET_LABEL, Redaction.MANUAL_TYPE})
+
+#: The size and the place a plain curator redaction must have to count
+#: as a bracket box, in points. The model's 981 bracket boxes of scans
+#: 2845, 1828 and 1841 are 13 to 48 wide, 10 to 14 high, and start 0.7
+#: to 14.4 from the left edge of their cell, where the bracket opens
+#: the line. A curator draws by hand, so each limit is larger than the
+#: largest model box. The indent is a distance either way: a box that
+#: starts left of the unit also counts.
+MANUAL_BRACKET_MAX_WIDTH_PT = 60.0
+MANUAL_BRACKET_MAX_HEIGHT_PT = 20.0
+MANUAL_BRACKET_MAX_INDENT_PT = 20.0
 
 #: The detection label of the footnote band of a page (#399).
 FOOTNOTE_LABEL = Label.FOOTNOTES.name
@@ -724,6 +772,47 @@ def covered_share(
     return best, hit
 
 
+def is_bracket_box(rect: dict, box: list[float]) -> bool:
+    """Return whether ``rect`` is a bracket box of the unit ``box`` (#373).
+
+    A bracket box is a glyph, so the size of its share of the unit says
+    nothing: any overlap is the unit it sits in. A ``HEADNOTE_BRACKET``
+    rect needs the overlap alone. A ``manual`` rect also needs the size
+    and the place of a bracket (``MANUAL_BRACKET_MAX_*``), because a
+    curator draws that type over anything; see :data:`TOKEN_RECT_TYPES`.
+
+    :param rect: A dict with ``rect_type``, ``x0``, ``y0``, ``x1`` and
+        ``y1``, in points.
+    :param box: The unit's ``[x0, y0, x1, y1]`` in points.
+    :returns: Whether the rect deletes the unit's bracket tokens.
+    :rtype: bool
+    """
+    kind = rect.get("rect_type")
+    if kind not in TOKEN_RECT_TYPES:
+        return False
+    other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
+    if other is None or intersection(box, other) <= 0:
+        return False
+    if kind == brackets.BRACKET_LABEL:
+        return True
+    return (
+        other[2] - other[0] <= MANUAL_BRACKET_MAX_WIDTH_PT
+        and other[3] - other[1] <= MANUAL_BRACKET_MAX_HEIGHT_PT
+        and abs(other[0] - box[0]) <= MANUAL_BRACKET_MAX_INDENT_PT
+    )
+
+
+def touches(box: list[float], rects: list[dict]) -> bool:
+    """Return whether one of ``rects`` is a bracket box of ``box``.
+
+    :param box: The unit's ``[x0, y0, x1, y1]`` in points.
+    :param rects: The page's rects of :data:`TOKEN_RECT_TYPES`.
+    :returns: Whether the unit loses its bracket tokens.
+    :rtype: bool
+    """
+    return any(is_bracket_box(rect, box) for rect in rects)
+
+
 def verdict(
     box_pt: list[float] | None,
     rects: list[dict],
@@ -883,6 +972,7 @@ def build_document(
         "unjudged": 0,
         "page_number": 0,
         "footnote_zones": 0,
+        "brackets_removed": 0,
     }
     for offset in range(opinion.page_count):
         page_index = opinion.start_page_index + offset
@@ -925,6 +1015,13 @@ def build_document(
             pages.append(entry)
             continue
         rects = inputs.redactions.get(page_index, [])
+        # A bracket box deletes its token and is not measured (#373).
+        token_rects = [
+            r for r in rects if r.get("rect_type") in TOKEN_RECT_TYPES
+        ]
+        rects = [
+            r for r in rects if r.get("rect_type") != brackets.BRACKET_LABEL
+        ]
         page_masks = masks.get(page_index, [])
         printed = inputs.printed.get(page_index)
         for index, unit in enumerate(page.get(spec.units_key) or []):
@@ -943,6 +1040,10 @@ def build_document(
             text = unit.get(spec.text_key)
             if not isinstance(text, str):
                 text = ""
+            removed: list[str] = []
+            if box_pt is not None and touches(box_pt, token_rects):
+                text, removed = brackets.strip_line_tokens(text)
+                counts["brackets_removed"] += len(removed)
             label = unit.get(spec.type_key) or ""
             exclusion, share = verdict(
                 box_pt,
@@ -962,17 +1063,18 @@ def build_document(
                     counts["page_number"] += 1
                 if share < FULL_SHARE:
                     counts["partial"] += 1
-            entry["units"].append(
-                {
-                    "id": index,
-                    "type": label,
-                    "text": text,
-                    "bbox": unit.get("bbox"),
-                    "box_pt": box_pt,
-                    "exclusion": exclusion,
-                    "share": share,
-                }
-            )
+            out = {
+                "id": index,
+                "type": label,
+                "text": text,
+                "bbox": unit.get("bbox"),
+                "box_pt": box_pt,
+                "exclusion": exclusion,
+                "share": share,
+            }
+            if removed:
+                out["removed"] = removed
+            entry["units"].append(out)
         pages.append(entry)
 
     return {
