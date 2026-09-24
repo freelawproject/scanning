@@ -39,6 +39,18 @@ whose approved number the engines did not write keeps every unit: a
 header the model misread and a curator corrected, a curator's label
 on an inserted page, or no number at all.
 
+**A headnote bracket is the one deletion** (#373). Its box is a glyph
+inside a paragraph, so a share over it answers wrong both ways: about
+a hundredth of a paragraph, and the text keeps ``[1]``; a tenth of a
+short line, and the ensemble drops the words beside it. So a
+``HEADNOTE_BRACKET`` box never goes into :func:`verdict`, and a unit
+that one of :data:`TOKEN_RECT_TYPES` intersects loses the bracket at
+the start of each of its lines (``brackets.strip_line_tokens``), in
+every engine and whatever its label. The unit names the tokens it lost
+in ``removed``. The redactions decide the text as they decide the PDF:
+a bracket the model did not box stays in both, and the
+``MISSING_HEADNOTE_BRACKET`` card of #328 asks a curator for the box.
+
 **A unit nobody could measure is not clean text.** A unit with no box,
 or on a page whose size no detection and no render gives, carries the
 third verdict :data:`UNJUDGED`, counts in ``unjudged`` on the page and
@@ -112,6 +124,7 @@ from django.utils import timezone
 from scanning import (
     apply,
     boundaries,
+    brackets,
     dots_mocr,
     mistral_ocr,
     page_numbers,
@@ -126,6 +139,7 @@ from scanning.models import (
     Detection,
     Opinion,
     OpinionReviewStatus,
+    Redaction,
     Scan,
     Status,
 )
@@ -133,8 +147,16 @@ from scanning.models import (
 logger = logging.getLogger(__name__)
 
 #: Version of the documents this module writes. 2 puts the footnote
-#: zone on every page (#399).
-SCHEMA_VERSION = 2
+#: zone on every page (#399); 3 deletes the headnote bracket from the
+#: unit text (#373).
+SCHEMA_VERSION = 3
+
+#: The redaction types whose box deletes the bracket token of the unit
+#: it intersects (#373): the model's bracket box, and the box a curator
+#: draws over a bracket the model missed, which the
+#: ``MISSING_HEADNOTE_BRACKET`` card asks for. A ``manual`` box is also
+#: measured by :func:`verdict`, because it can be over anything.
+TOKEN_RECT_TYPES = frozenset({brackets.BRACKET_LABEL, Redaction.MANUAL_TYPE})
 
 #: The detection label of the footnote band of a page (#399).
 FOOTNOTE_LABEL = Label.FOOTNOTES.name
@@ -724,6 +746,25 @@ def covered_share(
     return best, hit
 
 
+def touches(box: list[float], rects: list[dict]) -> bool:
+    """Return whether one of ``rects`` shares any area with ``box``.
+
+    The test of the bracket deletion (#373): a bracket box is a glyph,
+    so the size of its share of the unit says nothing, and any overlap
+    is the unit it sits in.
+
+    :param box: ``[x0, y0, x1, y1]`` in points.
+    :param rects: Dicts with ``x0``, ``y0``, ``x1``, ``y1`` in points.
+    :returns: Whether a rect overlaps the box.
+    :rtype: bool
+    """
+    for rect in rects:
+        other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
+        if other is not None and intersection(box, other) > 0:
+            return True
+    return False
+
+
 def verdict(
     box_pt: list[float] | None,
     rects: list[dict],
@@ -883,6 +924,7 @@ def build_document(
         "unjudged": 0,
         "page_number": 0,
         "footnote_zones": 0,
+        "brackets_removed": 0,
     }
     for offset in range(opinion.page_count):
         page_index = opinion.start_page_index + offset
@@ -925,6 +967,13 @@ def build_document(
             pages.append(entry)
             continue
         rects = inputs.redactions.get(page_index, [])
+        # A bracket box deletes its token and is not measured (#373).
+        token_rects = [
+            r for r in rects if r.get("rect_type") in TOKEN_RECT_TYPES
+        ]
+        rects = [
+            r for r in rects if r.get("rect_type") != brackets.BRACKET_LABEL
+        ]
         page_masks = masks.get(page_index, [])
         printed = inputs.printed.get(page_index)
         for index, unit in enumerate(page.get(spec.units_key) or []):
@@ -943,6 +992,10 @@ def build_document(
             text = unit.get(spec.text_key)
             if not isinstance(text, str):
                 text = ""
+            removed: list[str] = []
+            if box_pt is not None and touches(box_pt, token_rects):
+                text, removed = brackets.strip_line_tokens(text)
+                counts["brackets_removed"] += len(removed)
             label = unit.get(spec.type_key) or ""
             exclusion, share = verdict(
                 box_pt,
@@ -962,17 +1015,18 @@ def build_document(
                     counts["page_number"] += 1
                 if share < FULL_SHARE:
                     counts["partial"] += 1
-            entry["units"].append(
-                {
-                    "id": index,
-                    "type": label,
-                    "text": text,
-                    "bbox": unit.get("bbox"),
-                    "box_pt": box_pt,
-                    "exclusion": exclusion,
-                    "share": share,
-                }
-            )
+            out = {
+                "id": index,
+                "type": label,
+                "text": text,
+                "bbox": unit.get("bbox"),
+                "box_pt": box_pt,
+                "exclusion": exclusion,
+                "share": share,
+            }
+            if removed:
+                out["removed"] = removed
+            entry["units"].append(out)
         pages.append(entry)
 
     return {

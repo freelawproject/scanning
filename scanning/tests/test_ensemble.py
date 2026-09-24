@@ -2449,3 +2449,23 @@ class TestTheFootnoteCard(TestTheFindings):
 
     def test_the_check_is_the_rebuild_s_own(self):
         self.assertIn(OpinionCheck.FOOTNOTE_UNSURE, ensemble.ENSEMBLE_CHECKS)
+
+
+class TestTheBracketToken(EnsembleTestCase):
+    """The bracket a box redacts never reaches the text (#373)."""
+
+    def test_the_text_of_the_page_holds_no_bracket(self):
+        for key, units, field in (
+            (self.apply_run.ocr_key, "cells", "text"),
+            (self.apply_run.extract_key, "blocks", "content"),
+        ):
+            self.objects[key]["pages"][2][units][1][field] = "[1] body A 2"
+        self.redact(
+            2, to_pt((105, 305, 140, 330)), rect_type="HEADNOTE_BRACKET"
+        )
+
+        document = self.run_ensemble()
+
+        self.assertEqual(document["pages"][1]["text"], "body A 2\n\nbody B 2")
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
+        self.assertNotIn("[1]", row.text)

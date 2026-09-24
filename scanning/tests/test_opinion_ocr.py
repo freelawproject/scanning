@@ -1758,6 +1758,29 @@ class TestReglueCommand(OpinionOcrTestCase):
         with self.assertRaises(CommandError):
             self.run_command("999999")
 
+    def test_all_moves_every_volume(self):
+        other = ScanFactory(
+            page_count=PAGES,
+            status=Status.REDACTION_REVIEW_DONE,
+            source_fingerprint="fp2",
+        )
+        run = self.make_run(other)
+        second = self.make_opinion(
+            other, run, self.make_boundary(other, run, 1, 2), 700
+        )
+
+        output = self.run_command("--all")
+
+        self.assertIn("Moved 2 opinion(s)", output)
+        for row in (self.opinion, second):
+            row.refresh_from_db()
+            self.assertEqual(row.glue_revision, 1)
+
+    def test_all_and_a_scan_are_refused_and_so_is_neither(self):
+        for args in (("--all", str(self.scan.pk)), ()):
+            with self.assertRaises(CommandError):
+                self.run_command(*args)
+
 
 # ── the footnote zone (#399) ─────────────────────────────────────────
 #: A footnote band across both columns, in render pixels.
@@ -1861,3 +1884,142 @@ class TestTheFootnoteZone(OpinionOcrTestCase):
             opinion_ocr.ENGINES["surya"].footnote_types,
             {"Footnote", "Bibliography"},
         )
+
+
+# ── the headnote bracket (#373) ──────────────────────────────────────
+#: A bracket glyph at the start of ``BODY_A``, in render pixels.
+BRACKET = (105, 305, 140, 330)
+
+
+class TestTheBracketToken(OpinionOcrTestCase):
+    """A bracket box deletes the bracket of the unit it touches."""
+
+    def body_a(self, page_index, text, category=None, bbox=BODY_A):
+        """Give ``BODY_A`` of one page ``text`` in both engines."""
+        cells = self.objects[self.apply_run.ocr_key]["pages"][page_index][
+            "cells"
+        ]
+        cells[1]["text"] = text
+        cells[1]["bbox"] = list(bbox) if bbox else None
+        if category:
+            cells[1]["category"] = category
+        blocks = self.objects[self.apply_run.extract_key]["pages"][page_index][
+            "blocks"
+        ]
+        blocks[1]["content"] = text
+        blocks[1]["bbox"] = list(bbox) if bbox else None
+
+    def bracket(self, page_index, box=BRACKET, rect_type="HEADNOTE_BRACKET"):
+        return self.redact(page_index, to_pt(box), rect_type=rect_type)
+
+    def mistral(self):
+        return self.uploads[
+            opinion_ocr.engine_key(self.opinion, "mistral_ocr")
+        ]
+
+    def test_the_bracket_leaves_the_paragraph_in_every_engine(self):
+        self.body_a(2, "[1] The court held.")
+        self.bracket(2)
+
+        document = self.write()
+
+        for doc in (document, self.mistral()):
+            unit = doc["pages"][1]["units"][1]
+            self.assertEqual(unit["text"], "The court held.")
+            self.assertIsNone(unit["exclusion"])
+            self.assertEqual(unit["removed"], ["[1]"])
+        self.assertEqual(document["counts"]["brackets_removed"], 1)
+        self.assertEqual(document["schema_version"], 3)
+
+    def test_a_large_bracket_box_no_longer_drops_the_words(self):
+        """A share of 0.3 excluded the unit before #373."""
+        self.body_a(2, "[14, 15] It is well settled that")
+        self.bracket(2, box=(100, 300, 800, 480))
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "It is well settled that")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_bracket_no_box_touches_stays(self):
+        """The PDF shows it too; #328's card asks for the box."""
+        self.body_a(2, "[1] The court held.")
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+        self.assertNotIn("removed", unit)
+
+    def test_a_bracket_box_elsewhere_on_the_page_leaves_it(self):
+        self.body_a(2, "[1] The court held.")
+        self.bracket(2, box=(105, 1005, 140, 1030))
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+
+    def test_a_curator_s_box_deletes_the_bracket_too(self):
+        self.body_a(2, "[1] The court held.")
+        self.bracket(2, rect_type=Redaction.MANUAL_TYPE)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "The court held.")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_curator_s_large_box_still_excludes(self):
+        self.body_a(2, "[1] The court held.")
+        self.bracket(
+            2, box=(100, 300, 800, 480), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["exclusion"]["reason"], "redaction")
+        self.assertEqual(unit["exclusion"]["rect_type"], "manual")
+
+    def test_the_label_of_the_unit_does_not_matter(self):
+        self.body_a(2, "[2] An accused is entitled", category="List-item")
+        self.bracket(2)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "An accused is entitled")
+
+    def test_a_joined_block_loses_the_bracket_of_every_line(self):
+        self.body_a(2, "[2] First.\n[3-5] Second.")
+        self.bracket(2)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "First.\nSecond.")
+        self.assertEqual(unit["removed"], ["[2]", "[3-5]"])
+
+    def test_a_unit_with_no_box_keeps_its_text(self):
+        """Unjudged: ``kept_units`` leaves it out already."""
+        self.body_a(2, "[1] The court held.", bbox=None)
+        self.bracket(2)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+        self.assertEqual(unit["exclusion"]["reason"], opinion_ocr.UNJUDGED)
+
+    def test_the_bracket_alone_leaves_an_empty_clean_unit(self):
+        self.body_a(2, "[3]", bbox=(100, 300, 150, 330))
+        self.bracket(2)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_headnote_box_still_excludes_its_unit(self):
+        self.body_a(2, "[1] The court held.")
+        self.bracket(2)
+        self.redact(2, to_pt(BODY_A), rect_type="headnote")
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["exclusion"]["rect_type"], "headnote")
+        self.assertEqual(unit["text"], "The court held.")

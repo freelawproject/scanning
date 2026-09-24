@@ -82,7 +82,18 @@ logger = logging.getLogger(__name__)
 #: turned 18 candidates into 93 on scan 2845. A bracket is always the
 #: first characters of its cell: all 61 on scan 1828, 913 of 988
 #: tokens on scan 2845.
-TOKEN = re.compile(r"^\[\s*(\d{1,3})\s*(?:([,\-–—])\s*(\d{1,3})\s*)?\]")
+_TOKEN_BODY = r"\[\s*(\d{1,3})\s*(?:([,\-–—])\s*(\d{1,3})\s*)?\]"
+TOKEN = re.compile("^" + _TOKEN_BODY)
+
+#: A headnote bracket at the start of **any line** of a text, with the
+#: white space around it, for the OCR text of an opinion (#373). The
+#: engines other than dots.mocr join paragraphs, so one block can hold
+#: a bracket at the start of each of its lines. One token per line: in
+#: ``[10] [22] Next`` the second token is a star-pagination mark. A
+#: bracketed number inside a line is a footnote reference or a bracket
+#: the page prints, and stays. The groups are :data:`TOKEN`'s, so
+#: :func:`expand` reads a match of either.
+LINE_TOKEN = re.compile(r"(?m)^[ \t]*" + _TOKEN_BODY + r"[ \t]*")
 
 #: The label of the boxes this module compares itself with.
 BRACKET_LABEL = "HEADNOTE_BRACKET"
@@ -125,7 +136,7 @@ def expand(match: re.Match) -> tuple[int, ...]:
     four it spans: a curator reads a range as every number in it, and
     so does the sequence.
 
-    :param match: A :data:`TOKEN` match.
+    :param match: A :data:`TOKEN` or :data:`LINE_TOKEN` match.
     :returns: The numbers, in order; empty when they are not headnote
         numbers.
     """
@@ -141,6 +152,36 @@ def expand(match: re.Match) -> tuple[int, ...]:
     if separator == ",":
         return (first, second)
     return tuple(range(first, second + 1))
+
+
+def strip_line_tokens(text: str) -> tuple[str, list[str]]:
+    """Delete the headnote bracket at the start of every line (#373).
+
+    A match whose numbers :func:`expand` refuses stays, so ``[120]``, a
+    printed page number, is not deleted. The white space before the
+    token and every newline stay; the white space after it goes.
+
+    :param text: One unit's text, as the engine wrote it.
+    :returns: ``(the text, the tokens deleted)``, each token as the
+        engine wrote it; the text unchanged and an empty list when no
+        line starts with a token.
+    :rtype: tuple[str, list[str]]
+    """
+    parts: list[str] = []
+    removed: list[str] = []
+    end = 0
+    for match in LINE_TOKEN.finditer(text):
+        if not expand(match):
+            continue
+        whole = match.group(0)
+        start = match.start() + len(whole) - len(whole.lstrip(" \t"))
+        parts.append(text[end:start])
+        removed.append(whole.strip(" \t"))
+        end = match.end()
+    if not removed:
+        return text, []
+    parts.append(text[end:])
+    return "".join(parts), removed
 
 
 def read_document(document: dict | None) -> dict[int, list[Reading]]:
