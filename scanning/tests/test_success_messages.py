@@ -368,6 +368,20 @@ class TestDetectionMessages(DetectionEndpointMixin, ScanningTestCase):
             response.json()["message"], views_api.APPROVED_DETECTION_MESSAGE
         )
 
+    def test_the_approval_of_a_bracket_names_the_compute(self):
+        """#410: a bracket approved from its card is over the gate now."""
+        scan, det = self._make_scan_with_detection(
+            label="HEADNOTE_BRACKET", confidence=0.25
+        )
+
+        response = self._post(
+            "approve_detection", scan, {"detection_id": det.pk}
+        )
+
+        self.assertEqual(
+            response.json()["message"], views_api.APPROVED_BRACKET_MESSAGE
+        )
+
     def test_a_hand_drawn_row_is_told_it_needs_no_approval(self):
         """The view writes nothing for a row the curator drew, so the
         line must not claim an approval: the box reads 1.0 from birth."""

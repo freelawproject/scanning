@@ -51,6 +51,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from blackletter.bl_warm import rows_are_bl_warm
 from blackletter.models import Label
 from blackletter.scanner import label_confidence
 from django.db import transaction
@@ -335,8 +336,9 @@ def _detection_finding(
     """Build the dict of a finding about one detection box.
 
     The metadata is what ``_getDetectionData`` in ``viewer_sidebar.js``
-    reads off the card, so the Approve and Delete buttons of the card
-    work as they did on the unmatched cards, plus the source address
+    reads off the card, so the Approve and Delete buttons work on every
+    card ``_review_findings.html`` shows them on (the unmatched cards
+    and ``low_confidence_headnote_bracket``), plus the source address
     the dismissal is keyed by.
     """
     return {
@@ -542,26 +544,45 @@ def _low_confidence_bracket_findings(scan: Scan):
     ``brackets.missing``, and leaves the bracket in the deliverable
     (#410).
 
-    The gate is blackletter's own function, read with the model family
-    of each row (the import writes ``BL_WARM`` for a bl-warm run), and
-    never a copy of the number. A hand-drawn row is left out: it carries
-    no model confidence. The test is the confidence alone, not the
-    cover, so a black box a curator draws over the bracket does not
-    close the card; the dismissal does.
+    The gate is blackletter's own function, and the model family is the
+    one the compute reads: ``rows_are_bl_warm`` over the ``found_by`` of
+    the live model rows, one flag for the volume, the list
+    ``services.detection_entries`` hands it. A hand-drawn row is left
+    out: it carries no model confidence and no provenance. The family
+    is read only when a box is under the higher gate, so a volume with
+    no weak bracket pays one query.
+
+    The card offers the two detection buttons: an approval writes 1.0
+    on the row, so the card goes and the next compute redacts the box;
+    a deletion takes out a wrong box, and ``brackets.missing`` then
+    judges the reading under it.
     """
     label = Label.HEADNOTE_BRACKET
     gates = {
         bl_warm: label_confidence(label, bl_warm) for bl_warm in (True, False)
     }
-    for det in (
+    model_rows = (
         Detection.objects.live()
-        .filter(
-            scan=scan, label=label.name, confidence__lt=max(gates.values())
-        )
+        .filter(scan=scan)
         .exclude(model_name=Detection.ModelName.MANUAL)
-        .order_by("page_index", "y0")
-    ):
-        gate = gates[det.model_name == Detection.ModelName.BL_WARM]
+    )
+    weak = list(
+        model_rows.filter(
+            label=label.name, confidence__lt=max(gates.values())
+        ).order_by("page_index", "y0")
+    )
+    if not weak:
+        return
+    bl_warm = rows_are_bl_warm(
+        [
+            {"found_by": found_by}
+            for found_by in model_rows.exclude(found_by=[]).values_list(
+                "found_by", flat=True
+            )
+        ]
+    )
+    gate = gates[bl_warm]
+    for det in weak:
         if det.confidence >= gate:
             continue
         yield _detection_finding(
@@ -569,7 +590,9 @@ def _low_confidence_bracket_findings(scan: Scan):
             Issue.Target.REDACTION,
             det,
             f"A headnote bracket box (confidence {det.confidence:.2f}) is "
-            f"under the redaction gate ({gate:.2f}), so it is not redacted.",
+            f"under the redaction gate ({gate:.2f}), so it is not redacted. "
+            "Approve it to redact it at the next compute, or delete it if "
+            "it is not a bracket.",
         )
 
 
