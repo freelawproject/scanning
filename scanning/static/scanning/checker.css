@@ -1239,6 +1239,23 @@ a.doc-name:hover { text-decoration: underline; }
 .ensemble-box.weak {
     border-style: dashed;
 }
+/* The section of a box (#399). The colour is the agreement, so the */
+/* section takes the border style, and the zone band shows the rule. */
+.ensemble-box[data-section="footnotes"] {
+    border-style: double;
+    border-width: 3px;
+}
+.ensemble-zone {
+    position: absolute;
+    pointer-events: none;
+    box-sizing: border-box;
+    border-top: 1px dashed rgba(8, 145, 178, 0.8);
+    background: rgba(8, 145, 178, 0.07);
+}
+.ensemble-box.ensemble-doubt {
+    outline: 1px dashed #b45309;
+    outline-offset: 2px;
+}
 .ensemble-box.ensemble-selected {
     border-color: #dc2626;
     border-width: 2px;
@@ -1282,6 +1299,25 @@ a.doc-name:hover { text-decoration: underline; }
 .ensemble-group.ensemble-selected {
     background: rgba(220, 38, 38, 0.10);
     border-left-color: #dc2626;
+}
+.ensemble-group.ensemble-doubt:not(.ensemble-selected) {
+    border-left-style: dashed;
+    border-left-color: #b45309;
+}
+.ensemble-footnotes {
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px dashed rgba(8, 145, 178, 0.6);
+}
+.ensemble-footnotes .ensemble-group {
+    font-size: 12px;
+}
+.ensemble-footnotes-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #0e7490;
+    margin-bottom: 6px;
 }
 .ensemble-low {
     background: rgba(217, 119, 6, 0.25);
