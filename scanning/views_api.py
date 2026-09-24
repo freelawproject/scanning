@@ -163,6 +163,10 @@ APPROVED_DETECTION_MESSAGE = (
     "The detection was approved: the box reads 1.0 now. The card stays "
     "until the opinions are paired again."
 )
+APPROVED_BRACKET_MESSAGE = (
+    "The bracket was approved: the box reads 1.0 now, and the next "
+    "compute redacts it."
+)
 DISMISSED_DETECTION_MESSAGE = (
     "The detection was dismissed. Nothing was deleted."
 )
@@ -1845,6 +1849,23 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
     )
 
 
+def _approval_message(row: Detection, manual: bool) -> str:
+    """Return what an approval of ``row`` changed, for the viewer (#322).
+
+    A bracket box is approved from its ``low_confidence_headnote_bracket``
+    card (#410): the 1.0 lifts it over the redaction gate, so the card
+    goes now and the next compute redacts it. Every other approval waits
+    for the next pairing.
+    """
+    from blackletter.models import Label
+
+    if manual:
+        return OWN_DETECTION_MESSAGE
+    if row.label == Label.HEADNOTE_BRACKET.name:
+        return APPROVED_BRACKET_MESSAGE
+    return APPROVED_DETECTION_MESSAGE
+
+
 @login_required
 @require_POST
 def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
@@ -1887,9 +1908,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
         {
             "status": "ok",
             "updated": 1,
-            "message": (
-                OWN_DETECTION_MESSAGE if manual else APPROVED_DETECTION_MESSAGE
-            ),
+            "message": _approval_message(row, manual),
         }
     )
 

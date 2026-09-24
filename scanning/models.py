@@ -1078,6 +1078,10 @@ class CheckName(models.TextChoices):
         "missing_headnote_bracket",
         "Headnote bracket the model did not find",
     )
+    LOW_CONFIDENCE_HEADNOTE_BRACKET = (
+        "low_confidence_headnote_bracket",
+        "Headnote bracket under the redaction gate",
+    )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
         "Detection decision not applied",
@@ -1146,6 +1150,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.UNCOVERED_PAGES,
         CheckName.UNCOVERED_HEADNOTE,
         CheckName.MISSING_HEADNOTE_BRACKET,
+        CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
     }
 )
 
